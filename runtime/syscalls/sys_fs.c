@@ -228,12 +228,19 @@ int64_t sys_fs_write(ppu_context* ctx)
     uint32_t nwritten_addr = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+        /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
+        if (nwritten_addr != 0)
+            write_be64(nwritten_addr, size);
+        return CELL_OK;
+    }
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
+    if (!f->active || !f->fp) {
+        if (nwritten_addr != 0)
+            write_be64(nwritten_addr, size);
+        return CELL_OK;
+    }
 
     const void* buf = vm_to_host(buf_addr);
     size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
