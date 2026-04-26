@@ -746,7 +746,29 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    return savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
+    /* funcStat is a GUEST function pointer (OPD address from the
+     * recompiled game), not a host callable — savedata_execute can't
+     * invoke it directly. Until we add a guest-callback marshaller for
+     * the SaveData struct family (StatGet/StatSet/FileStat in guest
+     * big-endian memory) just return NODATA / CBRESULT to match what
+     * RPCS3's trace shows games observe on first run with no saves.
+     *
+     * That covers flOw's actual code path: cellSaveDataAutoLoad2 fails
+     * with 0x8002b401 (CBRESULT[1] = "callback rejected") on the very
+     * first launch and the title screen advances regardless. */
+    char save_path[1024];
+    build_save_path(save_path, sizeof(save_path), dirName);
+    if (!dir_exists(save_path)) {
+        printf("[cellSaveData] AutoLoad2: no save data — returning CBRESULT [1]\n");
+        return CELL_SAVEDATA_ERROR_CBRESULT;
+    }
+
+    /* If save data DOES exist a real implementation would marshal
+     * StatGet into guest memory and dispatch the callback through
+     * g_ps3_guest_caller. Not implemented yet; treat as NODATA so we
+     * fail predictably rather than mis-host-calling the guest pointer. */
+    printf("[cellSaveData] AutoLoad2: save data exists but guest callback marshalling is unimplemented — returning NODATA\n");
+    return CELL_SAVEDATA_ERROR_NODATA;
 }
 
 s32 cellSaveDataDelete2(u32 container)
