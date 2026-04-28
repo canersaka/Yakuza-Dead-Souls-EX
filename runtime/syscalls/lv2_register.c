@@ -122,6 +122,13 @@ typedef struct {
     uint32_t index;          /* slot within the group */
     int32_t  exit_status;
     uint32_t entry_point;    /* initial SPU image entry (informational) */
+    /* Args block passed via sys_spu_thread_initialize (.args_ea) and
+     * sys_spu_thread_set_argument (per-thread). For SPURS this holds the
+     * 4 register-style args (arg1..arg4) packed into a guest struct.
+     * The PPU fallback receives args_ea so it can decode whatever format
+     * the registered job expects. */
+    uint32_t args_ea;
+    uint32_t args_size;
 } spu_thread_t;
 
 typedef struct {
@@ -263,6 +270,8 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     uint32_t group_id   = (uint32_t)ctx->gpr[4];
     uint32_t thread_num = (uint32_t)ctx->gpr[5];
     uint32_t img_ea     = (uint32_t)ctx->gpr[6];
+    /* attr_ea         = (uint32_t)ctx->gpr[7];  // unused */
+    uint32_t args_ea    = (uint32_t)ctx->gpr[8];
 
     spu_group_t* g = spu_find_group(group_id);
     if (!g) {
@@ -281,14 +290,16 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
+    t->args_ea   = args_ea;
+    t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
     if (thread_num < 8)
         g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
 
     vm_write_be32(out_tid_ea, t->tid);
 
-    fprintf(stderr, "[SPU] thread_init group=0x%X index=%u img=0x%08X -> tid=0x%X entry=0x%08X\n",
-            group_id, thread_num, img_ea, t->tid, t->entry_point);
+    fprintf(stderr, "[SPU] thread_init group=0x%X index=%u img=0x%08X args=0x%08X -> tid=0x%X entry=0x%08X\n",
+            group_id, thread_num, img_ea, args_ea, t->tid, t->entry_point);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -317,13 +328,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
         if (fb) {
-            int32_t rc = fb(t->tid, /*args_ea*/ 0, /*args_size*/ 0, user);
+            int32_t rc = fb(t->tid, t->args_ea, t->args_size, user);
             t->exit_status = rc;
             if (rc < worst) worst = rc;
             fallbacks_run++;
             fprintf(stderr, "[SPU] group_start id=0x%X thread tid=0x%X "
-                    "entry=0x%08X -> PPU fallback rc=%d\n",
-                    id, t->tid, t->entry_point, rc);
+                    "entry=0x%08X args=0x%08X -> PPU fallback rc=%d\n",
+                    id, t->tid, t->entry_point, t->args_ea, rc);
         }
     }
 
@@ -425,8 +436,18 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
 /* sys_spu_thread_set_argument(tid, arg_ea) — doesn't affect us, log only */
 static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 {
-    fprintf(stderr, "[SPU] thread_set_argument tid=0x%llX arg=0x%llX\n",
-            (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4]);
+    uint32_t tid    = (uint32_t)ctx->gpr[3];
+    uint32_t arg_ea = (uint32_t)ctx->gpr[4];
+
+    /* Update the per-thread args pointer so any registered PPU fallback
+     * picks it up at sys_spu_thread_group_start time. The shape of the
+     * struct at arg_ea is whatever the game registered for — typically
+     * a packed (arg1,arg2,arg3,arg4) tuple of 4 u64s on real SPUs. */
+    spu_thread_t* t = spu_find_thread(tid);
+    if (t) t->args_ea = arg_ea;
+
+    fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
+            tid, arg_ea);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
