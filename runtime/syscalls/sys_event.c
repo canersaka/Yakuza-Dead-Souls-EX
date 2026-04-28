@@ -504,6 +504,23 @@ int64_t sys_event_port_disconnect(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Public helper for non-syscall callers: push an event into a queue by
+ * ID. Returns 0 on success, -1 if the queue is unknown/inactive or full. */
+int sys_event_queue_push_by_id(uint32_t queue_id,
+                               uint64_t source, uint64_t data1,
+                               uint64_t data2,  uint64_t data3)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return -1;
+    sys_event_t evt;
+    evt.source = source;
+    evt.data1  = data1;
+    evt.data2  = data2;
+    evt.data3  = data3;
+    return event_queue_push(q, &evt);
+}
+
 int64_t sys_event_port_send(ppu_context* ctx)
 {
     uint32_t port_id = LV2_ARG_U32(ctx, 0);

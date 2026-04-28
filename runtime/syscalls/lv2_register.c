@@ -21,6 +21,7 @@
 #include "sys_memory.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
+#include "sys_event.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -170,6 +171,11 @@ typedef struct {
     char     name[32];
     int32_t  exit_status;        /* final ppu-side status the group reports */
     uint32_t cause;              /* how the group ended */
+    /* Event queue connected via sys_spu_thread_group_connect_event[_all_threads].
+     * When the group transitions to STOPPED (in group_join), an event is pushed
+     * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
+     * PPU code blocked on sys_event_queue_receive wakes up. */
+    uint32_t event_queue_id;
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -488,11 +494,23 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
+    /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
+     * event with type-specific data; we collapse to a "group stopped" tag
+     * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
+     * blocked in sys_event_queue_receive on this queue wakes up here. */
+    if (g->event_queue_id) {
+        sys_event_queue_push_by_id(g->event_queue_id,
+                                   (uint64_t)g->id,
+                                   (uint64_t)(int64_t)g->exit_status,
+                                   (uint64_t)g->cause,
+                                   0);
+    }
+
     vm_write_be32(cause_ea,  g->cause);
     vm_write_be32(status_ea, (uint32_t)g->exit_status);
 
-    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d\n",
-            id, g->cause, g->exit_status);
+    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
+            id, g->cause, g->exit_status, g->event_queue_id);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -579,6 +597,42 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 
     fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
             tid, arg_ea);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_group_connect_event(group_id, queue_id, event_type)
+ * sys_spu_thread_group_connect_event_all_threads(group_id, queue_id, name, port)
+ *
+ * Both bind a SYS_EVENT queue to the group; we record queue_id so
+ * group_join can push a completion event. Sony's docs distinguish event
+ * types (group state changes vs SPU-emitted user events) but we collapse
+ * them into "the queue gets notified when the group transitions to
+ * STOPPED" — sufficient for the common SPURS pattern. */
+static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
+{
+    uint32_t group_id = (uint32_t)ctx->gpr[3];
+    uint32_t queue_id = (uint32_t)ctx->gpr[4];
+    spu_group_t* g = spu_find_group(group_id);
+    if (!g) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    g->event_queue_id = queue_id;
+    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
+            group_id, queue_id);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
+{
+    uint32_t group_id = (uint32_t)ctx->gpr[3];
+    spu_group_t* g = spu_find_group(group_id);
+    if (g) g->event_queue_id = 0;
+    fprintf(stderr, "[SPU] group_disconnect_event group=0x%X\n", group_id);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -853,12 +907,12 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_EXIT_STATUS, sys_spu_thread_get_exit_status_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,   sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_read_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
 }
