@@ -115,6 +115,20 @@ static int64_t sys_tty_read(ppu_context* ctx)
 #define MAX_SPU_GROUPS   32
 #define MAX_SPU_THREADS  (MAX_SPU_GROUPS * 8)
 
+#ifdef _WIN32
+#  include <windows.h>
+typedef HANDLE spu_thread_handle_t;
+typedef HANDLE spu_thread_event_t;
+#else
+#  include <pthread.h>
+typedef pthread_t spu_thread_handle_t;
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             done;
+} spu_thread_event_t;
+#endif
+
 typedef struct {
     int      in_use;
     uint32_t tid;            /* thread id (unique across all groups) */
@@ -129,6 +143,16 @@ typedef struct {
      * the registered job expects. */
     uint32_t args_ea;
     uint32_t args_size;
+    /* Async fallback execution. host_thread is set when group_start spawned
+     * a host thread for this SPU thread's PPU fallback; finish_event is
+     * signalled when the handler returns; running indicates the thread is
+     * still in flight. group_join waits on finish_event for each running
+     * thread. */
+    spu_thread_handle_t host_thread;
+    spu_thread_event_t  finish_event;
+    int                 running;
+    spu_ppu_fallback_fn fb_handler;
+    void*               fb_user;
 } spu_thread_t;
 
 typedef struct {
@@ -305,6 +329,34 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
+/* Host-thread entry for a PPU-fallback SPU thread. */
+#ifdef _WIN32
+static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
+#else
+static void* spu_fallback_thread_proc(void* arg)
+#endif
+{
+    spu_thread_t* t = (spu_thread_t*)arg;
+    int32_t rc = 0;
+    if (t->fb_handler) {
+        rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
+    }
+    t->exit_status = rc;
+    /* Mark complete and signal anyone waiting in group_join. */
+#ifdef _WIN32
+    t->running = 0;
+    SetEvent(t->finish_event);
+    return 0;
+#else
+    pthread_mutex_lock(&t->finish_event.mu);
+    t->running = 0;
+    t->finish_event.done = 1;
+    pthread_cond_broadcast(&t->finish_event.cv);
+    pthread_mutex_unlock(&t->finish_event.mu);
+    return NULL;
+#endif
+}
+
 /* sys_spu_thread_group_start(id) */
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
@@ -314,12 +366,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     g->state = SPU_GROUP_STATE_RUNNING;
 
     /* For each thread in the group, look up a registered PPU fallback by
-     * the thread's SPU image entry point. If found, run it (synchronously,
-     * for now — async execution can come later). The fallback's return
-     * value becomes the thread's exit status; the worst (most negative)
-     * status across threads becomes the group's status. */
-    int32_t worst = 0;
-    int     fallbacks_run = 0;
+     * the thread's SPU image entry point. Threads with a fallback run on
+     * a host thread (real concurrency, like real SPUs). Threads without
+     * a fallback complete instantly with status 0.
+     * group_join() blocks until all spawned host threads finish. */
+    int spawned = 0;
+    int instant = 0;
     for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
@@ -327,25 +379,42 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!t->in_use) continue;
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
-        if (fb) {
-            int32_t rc = fb(t->tid, t->args_ea, t->args_size, user);
-            t->exit_status = rc;
-            if (rc < worst) worst = rc;
-            fallbacks_run++;
-            fprintf(stderr, "[SPU] group_start id=0x%X thread tid=0x%X "
-                    "entry=0x%08X args=0x%08X -> PPU fallback rc=%d\n",
-                    id, t->tid, t->entry_point, t->args_ea, rc);
+        if (!fb) {
+            t->exit_status = 0;
+            t->running = 0;
+            instant++;
+            continue;
         }
+        t->fb_handler = fb;
+        t->fb_user    = user;
+        t->running    = 1;
+#ifdef _WIN32
+        /* Manual-reset event so multiple group_join callers all see "set" */
+        if (!t->finish_event)
+            t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        else
+            ResetEvent(t->finish_event);
+        t->host_thread = CreateThread(NULL, 0, spu_fallback_thread_proc, t, 0, NULL);
+#else
+        pthread_mutex_init(&t->finish_event.mu, NULL);
+        pthread_cond_init(&t->finish_event.cv, NULL);
+        t->finish_event.done = 0;
+        pthread_create(&t->host_thread, NULL, spu_fallback_thread_proc, t);
+#endif
+        fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
+                id, t->tid, t->entry_point, t->args_ea);
+        spawned++;
     }
 
-    g->state = SPU_GROUP_STATE_STOPPED;
-    g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-    g->exit_status = worst;
-    if (fallbacks_run > 0) {
-        fprintf(stderr, "[SPU] group_start id=0x%X (%d PPU fallbacks ran, group status=%d)\n",
-                id, fallbacks_run, worst);
+    if (spawned == 0) {
+        g->state = SPU_GROUP_STATE_STOPPED;
+        g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        g->exit_status = 0;
+        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback for any of %u thread(s); instantly completed)\n",
+                id, g->num_threads);
     } else {
-        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback; instantly completed)\n", id);
+        fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
+                id, spawned, instant);
     }
     fflush(stderr);
     ctx->gpr[3] = 0;
@@ -376,6 +445,43 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
         g->state == SPU_GROUP_STATE_READY) {
         g->state = SPU_GROUP_STATE_STOPPED;
     }
+
+    /* Wait for any host-thread fallbacks to finish, then collect the
+     * worst exit status. Real SPU group_join is a blocking syscall —
+     * games rely on it to know all SPU work is done before reading
+     * back results. */
+    if (g->state == SPU_GROUP_STATE_RUNNING) {
+        int32_t worst = 0;
+        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+            uint32_t idx = g->thread_indices[i];
+            if (idx >= MAX_SPU_THREADS) continue;
+            spu_thread_t* t = &s_spu_threads[idx];
+            if (!t->in_use) continue;
+            if (t->running) {
+#ifdef _WIN32
+                if (t->finish_event)
+                    WaitForSingleObject(t->finish_event, INFINITE);
+                if (t->host_thread) {
+                    CloseHandle(t->host_thread);
+                    t->host_thread = NULL;
+                }
+#else
+                pthread_mutex_lock(&t->finish_event.mu);
+                while (!t->finish_event.done)
+                    pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
+                pthread_mutex_unlock(&t->finish_event.mu);
+                pthread_join(t->host_thread, NULL);
+                pthread_mutex_destroy(&t->finish_event.mu);
+                pthread_cond_destroy(&t->finish_event.cv);
+#endif
+            }
+            if (t->exit_status < worst) worst = t->exit_status;
+        }
+        g->exit_status = worst;
+        g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        g->state       = SPU_GROUP_STATE_STOPPED;
+    }
+
     vm_write_be32(cause_ea,  g->cause);
     vm_write_be32(status_ea, (uint32_t)g->exit_status);
 
