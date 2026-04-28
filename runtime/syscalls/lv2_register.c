@@ -20,6 +20,7 @@
 #include "sys_timer.h"
 #include "sys_memory.h"
 #include "sys_fs.h"
+#include "ps3emu/spu_fallback.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -300,11 +301,41 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     spu_group_t* g = spu_find_group(id);
     if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return -1; }
     g->state = SPU_GROUP_STATE_RUNNING;
-    /* With no real SPU, the threads immediately "complete" with status 0. */
+
+    /* For each thread in the group, look up a registered PPU fallback by
+     * the thread's SPU image entry point. If found, run it (synchronously,
+     * for now — async execution can come later). The fallback's return
+     * value becomes the thread's exit status; the worst (most negative)
+     * status across threads becomes the group's status. */
+    int32_t worst = 0;
+    int     fallbacks_run = 0;
+    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (!t->in_use) continue;
+        void* user = NULL;
+        spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
+        if (fb) {
+            int32_t rc = fb(t->tid, /*args_ea*/ 0, /*args_size*/ 0, user);
+            t->exit_status = rc;
+            if (rc < worst) worst = rc;
+            fallbacks_run++;
+            fprintf(stderr, "[SPU] group_start id=0x%X thread tid=0x%X "
+                    "entry=0x%08X -> PPU fallback rc=%d\n",
+                    id, t->tid, t->entry_point, rc);
+        }
+    }
+
     g->state = SPU_GROUP_STATE_STOPPED;
     g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-    g->exit_status = 0;
-    fprintf(stderr, "[SPU] group_start id=0x%X (instantly completed)\n", id);
+    g->exit_status = worst;
+    if (fallbacks_run > 0) {
+        fprintf(stderr, "[SPU] group_start id=0x%X (%d PPU fallbacks ran, group status=%d)\n",
+                id, fallbacks_run, worst);
+    } else {
+        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback; instantly completed)\n", id);
+    }
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
