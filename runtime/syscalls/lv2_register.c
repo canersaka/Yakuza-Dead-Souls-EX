@@ -451,6 +451,82 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_image_open(*img, *path) — load an SPU ELF from the VFS, parse its
+ * ELF32 header, and write the entry point + USER image type into the
+ * sys_spu_image struct. The actual segment/code data isn't materialised
+ * (we don't execute SPU); we only need entry to be correct so the SPU
+ * PPU-fallback registry (ps3emu/spu_fallback.h) can match jobs by entry.
+ *
+ * sys_spu_image layout (16 bytes):
+ *   +0  type    : u32  (0 = KERNEL, 1 = USER)
+ *   +4  entry   : u32
+ *   +8  segs    : u32 (EA of segment array, 0 if not materialised)
+ *   +12 nsegs   : u32
+ */
+static int64_t sys_spu_image_open_handler(ppu_context* ctx)
+{
+    extern uint8_t* vm_base;
+    uint32_t img_ea  = (uint32_t)ctx->gpr[3];
+    uint32_t path_ea = (uint32_t)ctx->gpr[4];
+
+    if (img_ea && vm_base) {
+        memset(vm_base + img_ea, 0, 16);
+        vm_write_be32(img_ea + 0, 1);        /* type = USER */
+    }
+
+    if (!path_ea || !vm_base) {
+        fprintf(stderr, "[SPU] image_open img=0x%08X path=NULL — empty image\n", img_ea);
+        fflush(stderr);
+        ctx->gpr[3] = 0;
+        return 0;
+    }
+
+    const char* ps3_path = (const char*)(vm_base + path_ea);
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+
+    FILE* f = fopen(host_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' (host: %s) — open failed\n",
+                img_ea, ps3_path, host_path);
+        fflush(stderr);
+        /* Sony returns CELL_ENOENT for missing SPU images. Games often
+         * pre-check, so a soft success keeps them moving. */
+        ctx->gpr[3] = 0;
+        return 0;
+    }
+
+    /* ELF32 header is 52 bytes. We need:
+     *   +16  e_type    (2 bytes)   2 = ET_EXEC
+     *   +18  e_machine (2 bytes)   23 = EM_SPU
+     *   +24  e_entry   (4 bytes)
+     */
+    uint8_t hdr[52];
+    size_t got = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+
+    uint32_t entry = 0;
+    int valid_elf = 0;
+    if (got >= 52 && hdr[0] == 0x7F && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        valid_elf = 1;
+        /* Big-endian on PS3 */
+        entry = ((uint32_t)hdr[24] << 24) |
+                ((uint32_t)hdr[25] << 16) |
+                ((uint32_t)hdr[26] <<  8) |
+                ((uint32_t)hdr[27]);
+    }
+
+    if (img_ea && vm_base) {
+        vm_write_be32(img_ea + 4, entry);
+    }
+
+    fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' entry=0x%08X%s\n",
+            img_ea, ps3_path, entry, valid_elf ? "" : " (header invalid — entry left 0)");
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 /* Catch-all stub for SPU syscalls we don't model individually yet. */
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
@@ -495,7 +571,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
      * above for contract notes. */
     lv2_syscall_register(tbl, 169,                            sys_spu_thread_stub); /* deprecated */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
-    lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_import_handler);
+    lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,    sys_spu_thread_group_create_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,   sys_spu_thread_group_destroy_handler);
