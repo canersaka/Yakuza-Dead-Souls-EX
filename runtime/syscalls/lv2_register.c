@@ -528,13 +528,26 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_get_exit_status(tid, *status) */
+/* sys_spu_thread_get_exit_status(tid, *status)
+ * Real PS3: returns CELL_ESRCH for unknown tid, CELL_ESTAT if thread is
+ * still running (caller should join the group first), otherwise 0 with
+ * the exit code written through. */
 static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
 {
     uint32_t tid       = (uint32_t)ctx->gpr[3];
     uint32_t status_ea = (uint32_t)ctx->gpr[4];
     spu_thread_t* t = spu_find_thread(tid);
-    vm_write_be32(status_ea, t ? (uint32_t)t->exit_status : 0);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    if (t->running) {
+        /* Still in flight — Sony's behaviour. Games that want the exit code
+         * synchronously should call group_join first. */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
+        return -1;
+    }
+    vm_write_be32(status_ea, (uint32_t)t->exit_status);
     ctx->gpr[3] = 0;
     return 0;
 }
