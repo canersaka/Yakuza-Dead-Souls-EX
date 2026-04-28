@@ -28,6 +28,10 @@ int  spu_register_ppu_fallback(uint32_t entry_point,
 int  spu_unregister_ppu_fallback(uint32_t entry_point);
 spu_ppu_fallback_fn spu_lookup_ppu_fallback(uint32_t entry_point,
                                             void** out_user);
+
+/* Local store access (256 KB per thread, lazily allocated) */
+uint8_t* spu_thread_get_local_store(uint32_t tid);
+uint32_t spu_thread_local_store_size(void);
 ```
 
 Handler args:
@@ -88,6 +92,41 @@ Find the entry point via the `[SPU] image_open` log:
   event, then collects the worst exit status into the group state.
 - `sys_spu_thread_get_exit_status` returns CELL_ESTAT (0x80010003) if the
   thread is still in flight — match Sony's documented behaviour.
+
+## Local store
+
+Each SPU thread has a virtual 256 KB local store, allocated lazily on
+first `sys_spu_thread_write_ls` / `_read_ls` syscall (or on first
+`spu_thread_get_local_store` call). PPU code uses the syscalls; the
+fallback handler reaches the same buffer via `spu_thread_get_local_store(tid)`.
+
+Typical pattern:
+
+```c
+/* PPU side, before group_start */
+sys_spu_thread_write_ls(tid, /*offset*/ 0x100, /*value*/ src_ea, /*type*/ 4);
+sys_spu_thread_write_ls(tid, /*offset*/ 0x104, /*value*/ dst_ea, /*type*/ 4);
+
+/* Fallback handler */
+static int32_t my_decompress_fallback(uint32_t tid, uint32_t args_ea,
+                                      uint32_t args_size, void* user)
+{
+    uint8_t* ls = spu_thread_get_local_store(tid);
+    uint32_t src_ea = (ls[0x100] << 24) | (ls[0x101] << 16) |
+                      (ls[0x102] <<  8) |  ls[0x103];
+    uint32_t dst_ea = (ls[0x104] << 24) | (ls[0x105] << 16) |
+                      (ls[0x106] <<  8) |  ls[0x107];
+    /* ... do the work, write completion flag back to LS ... */
+    ls[0x200] = 1;
+    return 0;
+}
+
+/* PPU side, after group_join */
+uint64_t done = 0;
+sys_spu_thread_read_ls(tid, /*offset*/ 0x200, &done, /*type*/ 1);
+```
+
+The buffer is freed when `sys_spu_thread_group_destroy` runs.
 
 ## Caveats
 
