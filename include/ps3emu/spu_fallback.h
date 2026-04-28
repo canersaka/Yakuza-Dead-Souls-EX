@@ -78,6 +78,20 @@ int  spu_unregister_ppu_fallback(uint32_t entry_point);
 spu_ppu_fallback_fn spu_lookup_ppu_fallback(uint32_t entry_point,
                                             void** out_user);
 
+/*
+ * Get a pointer to a SPU thread's virtual local store (256 KB). Lazily
+ * allocated on first read/write. Returns NULL if tid is unknown.
+ *
+ * Safe to call from a PPU fallback handler — typical usage is a job that
+ * the PPU populated via sys_spu_thread_write_ls before group_start, so
+ * the fallback reads its inputs from LS, computes results, and writes
+ * outputs back. The PPU then reads them via sys_spu_thread_read_ls.
+ */
+uint8_t* spu_thread_get_local_store(uint32_t tid);
+
+/* Local store size in bytes (always 256 KB to match real SPU). */
+uint32_t spu_thread_local_store_size(void);
+
 #ifdef __cplusplus
 }
 #endif

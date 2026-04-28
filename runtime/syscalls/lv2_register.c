@@ -153,6 +153,12 @@ typedef struct {
     int                 running;
     spu_ppu_fallback_fn fb_handler;
     void*               fb_user;
+    /* Virtual local store. Real SPU has 256 KB. Allocated lazily on first
+     * sys_spu_thread_write_ls / read_ls. PPU fallbacks can also reach this
+     * via the public spu_thread_get_local_store() helper, simulating the
+     * common pattern where the PPU writes job state into LS, the SPU runs
+     * and writes results back to LS, then PPU reads them. */
+    uint8_t*            local_store;
 } spu_thread_t;
 
 typedef struct {
@@ -500,8 +506,14 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
     if (g) {
         for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
             uint32_t idx = g->thread_indices[i];
-            if (idx < MAX_SPU_THREADS)
-                s_spu_threads[idx].in_use = 0;
+            if (idx < MAX_SPU_THREADS) {
+                spu_thread_t* t = &s_spu_threads[idx];
+                if (t->local_store) {
+                    free(t->local_store);
+                    t->local_store = NULL;
+                }
+                t->in_use = 0;
+            }
         }
         g->in_use = 0;
     }
@@ -571,6 +583,121 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
     ctx->gpr[3] = 0;
     return 0;
 }
+
+/* SPU virtual local store. Real hardware: 256 KB per SPU. We allocate on
+ * first read/write so the common case (group with no LS access) doesn't
+ * waste 256 KB × num_threads. */
+#define SPU_LS_SIZE  (256 * 1024)
+static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t)
+{
+    if (!t) return NULL;
+    if (!t->local_store) {
+        t->local_store = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    }
+    return t->local_store;
+}
+
+/* sys_spu_thread_write_ls(tid, ls_offset, value, type)
+ * Writes 1/2/4/8 bytes (per `type`: 1/2/4/8) into the SPU thread's LS
+ * at ls_offset. Real PS3 sees this stored to the SPU's local memory; we
+ * keep an independent per-thread buffer that the PPU and any registered
+ * fallback can access via spu_thread_get_local_store(). */
+static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
+{
+    uint32_t tid       = (uint32_t)ctx->gpr[3];
+    uint32_t ls_offset = (uint32_t)ctx->gpr[4];
+    uint64_t value     = (uint64_t)ctx->gpr[5];
+    uint32_t type      = (uint32_t)ctx->gpr[6];
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    if (ls_offset + type > SPU_LS_SIZE) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EFAULT */
+        return -1;
+    }
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    if (!ls) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; /* CELL_ENOMEM */
+        return -1;
+    }
+    /* Big-endian store, mirroring guest convention. */
+    switch (type) {
+    case 1: ls[ls_offset] = (uint8_t)value; break;
+    case 2: ls[ls_offset+0] = (uint8_t)(value >> 8);
+            ls[ls_offset+1] = (uint8_t)value; break;
+    case 4: for (int i = 0; i < 4; i++)
+                ls[ls_offset+i] = (uint8_t)(value >> ((3-i)*8));
+            break;
+    case 8: for (int i = 0; i < 8; i++)
+                ls[ls_offset+i] = (uint8_t)(value >> ((7-i)*8));
+            break;
+    default:
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        return -1;
+    }
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_read_ls(tid, ls_offset, *value_out, type) */
+static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
+{
+    extern uint8_t* vm_base;
+    uint32_t tid       = (uint32_t)ctx->gpr[3];
+    uint32_t ls_offset = (uint32_t)ctx->gpr[4];
+    uint32_t value_ea  = (uint32_t)ctx->gpr[5];
+    uint32_t type      = (uint32_t)ctx->gpr[6];
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t || !value_ea || !vm_base) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    if (ls_offset + type > SPU_LS_SIZE) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        return -1;
+    }
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    if (!ls) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004;
+        return -1;
+    }
+    /* Big-endian load → write to guest as 8 bytes (always); the syscall
+     * is documented to write a u64 with the value zero-extended in the
+     * high bits. */
+    uint64_t value = 0;
+    switch (type) {
+    case 1: value = ls[ls_offset]; break;
+    case 2: value = ((uint64_t)ls[ls_offset] << 8) | ls[ls_offset+1]; break;
+    case 4:
+        for (int i = 0; i < 4; i++)
+            value = (value << 8) | ls[ls_offset+i];
+        break;
+    case 8:
+        for (int i = 0; i < 8; i++)
+            value = (value << 8) | ls[ls_offset+i];
+        break;
+    default:
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        return -1;
+    }
+    /* Write 8-byte BE value to guest. */
+    uint8_t* p = vm_base + value_ea;
+    for (int i = 0; i < 8; i++)
+        p[i] = (uint8_t)(value >> ((7-i)*8));
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* Public: get the local-store buffer for a SPU thread (for use by
+ * PPU-fallback handlers). Allocates on demand. */
+uint8_t* spu_thread_get_local_store(uint32_t tid)
+{
+    return spu_thread_get_or_alloc_ls(spu_find_thread(tid));
+}
+
+uint32_t spu_thread_local_store_size(void) { return SPU_LS_SIZE; }
 
 /* sys_spu_image_import(*img, *source, type) — just log entry & return success.
  * We could parse the SPU ELF header and write entry into the image struct,
@@ -728,8 +855,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_read_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
