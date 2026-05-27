@@ -6,6 +6,9 @@
  */
 
 #include "cellSaveData.h"
+#include "ps3emu/guest_call.h"
+#include "../../runtime/ppu/ppu_memory.h"
+#include "../../runtime/memory/vm.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -73,6 +76,128 @@ static int dir_exists(const char* path)
 #else
     return S_ISDIR(st.st_mode);
 #endif
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest-callback marshalling
+ *
+ * The funcStat / funcFile callbacks the game registers are GUEST function
+ * pointers (OPD addresses), not host-callable. We have to:
+ *   1. Allocate guest memory for the StatGet/StatSet/CBResult structures
+ *   2. Write the structs in big-endian format
+ *   3. Dispatch the OPD via g_ps3_guest_caller with the guest pointers
+ *   4. Read the structures back (game may have updated CBResult.result)
+ *
+ * Layout (sizes in PS3 ABI, all big-endian):
+ *   CellSaveDataCBResult:    4 + 4 + 4 + 256        = 268 bytes
+ *   CellSaveDataStatGet:     4 + 4 + 56 + 1408 + 24 + 4 ≈ 1500 bytes
+ *   CellSaveDataStatSet:     4 + 4 + 4              = 12 bytes (pointers + reCreateMode)
+ *
+ * We use a fixed scratch region at 0x024E0000 (128 KB, just before the
+ * cmdbuf region at 0x02500000). Only one savedata operation is in flight
+ * at a time, so a bump allocator is sufficient.
+ * -----------------------------------------------------------------------*/
+
+#define SAVEDATA_SCRATCH_BASE  0x024E0000u
+#define SAVEDATA_SCRATCH_SIZE  0x00020000u  /* 128 KB */
+
+static uint32_t s_scratch_next = SAVEDATA_SCRATCH_BASE;
+
+static void scratch_reset(void) { s_scratch_next = SAVEDATA_SCRATCH_BASE; }
+
+static uint32_t scratch_alloc(uint32_t size)
+{
+    /* 16-byte align */
+    size = (size + 0xF) & ~0xFu;
+    if (s_scratch_next + size > SAVEDATA_SCRATCH_BASE + SAVEDATA_SCRATCH_SIZE)
+        return 0;
+    uint32_t addr = s_scratch_next;
+    s_scratch_next += size;
+    /* Zero-init */
+    memset(vm_base + addr, 0, size);
+    return addr;
+}
+
+/* Big-endian struct field writers. Offsets are in PS3 ABI layout. */
+static void marshal_cbresult_init(uint32_t addr, s32 result)
+{
+    vm_write32(addr + 0,  (uint32_t)result);     /* result */
+    vm_write32(addr + 4,  0);                    /* progressBarInc */
+    vm_write32(addr + 8,  0);                    /* errNeedSizeKB */
+    /* invalidMsg[256] left zero */
+}
+
+static s32 marshal_cbresult_read_result(uint32_t addr)
+{
+    return (s32)vm_read32(addr + 0);
+}
+
+/* PS3 ABI layout of CellSaveDataStatGet (all big-endian on PPC, 32-bit pointers):
+ *   s32 hddFreeSizeKB                     +0
+ *   u32 isNewData                         +4
+ *   CellSaveDataDirStat dir               +8   (s64*3 + char[32] = 56 bytes)
+ *   CellSaveDataSystemFileParam getParam  +64  (128+128+1024+4+4+8+256 = 1552 bytes)
+ *   u32 bind                              +1616
+ *   s32 sizeKB                            +1620
+ *   s32 sysSizeKB                         +1624
+ *   u32 fileNum                           +1628
+ *   u32 fileListNum                       +1632
+ *   ptr fileList                          +1636 (32-bit guest ptr)
+ *   total                                 1640 bytes
+ */
+#define SAVEDATA_STATGET_SIZE   1640u
+#define SAVEDATA_STATSET_SIZE   16u    /* setParam ptr + reCreateMode + indicator ptr */
+#define SAVEDATA_CBRESULT_SIZE  272u   /* s32 + u32 + s32 + char[256] */
+
+static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
+                                  s32 sizeKB, u32 fileNum)
+{
+    vm_write32(addr + 0,    1024 * 1024);    /* hddFreeSizeKB = 1 GB */
+    vm_write32(addr + 4,    is_new ? 1 : 0); /* isNewData */
+    vm_write64(addr + 8,    0);              /* dir.st_atime */
+    vm_write64(addr + 16,   0);              /* dir.st_mtime */
+    vm_write64(addr + 24,   0);              /* dir.st_ctime */
+    if (dirName) {
+        size_t len = strnlen(dirName, CELL_SAVEDATA_DIRNAME_SIZE - 1);
+        memcpy(vm_base + addr + 32, dirName, len);
+        ((char*)vm_base)[addr + 32 + len] = 0;
+    }
+    /* getParam (+64..+1615) left zero — no PARAM.SFO data */
+    vm_write32(addr + 1616, 0);              /* bind */
+    vm_write32(addr + 1620, (uint32_t)sizeKB); /* sizeKB */
+    vm_write32(addr + 1624, 0);              /* sysSizeKB */
+    vm_write32(addr + 1628, fileNum);        /* fileNum */
+    vm_write32(addr + 1632, 0);              /* fileListNum */
+    vm_write32(addr + 1636, 0);              /* fileList ptr (NULL — no files) */
+}
+
+/* Dispatch funcStat callback via the guest-caller hook.
+ * Returns the cbResult.result value the callback wrote, or
+ * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed. */
+static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName)
+{
+    if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+
+    scratch_reset();
+    uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
+    uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
+    if (!cb_ea || !get_ea || !set_ea) {
+        printf("[cellSaveData] scratch alloc failed\n");
+        return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+    }
+
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT);
+    marshal_statget_init(get_ea, is_new, dirName, 0, 0);
+    /* StatSet zero-init by scratch_alloc */
+
+    printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d)\n",
+           func_opd, cb_ea, get_ea, set_ea, is_new);
+    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0);
+
+    s32 result = marshal_cbresult_read_result(cb_ea);
+    printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
+    return result;
 }
 
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
@@ -740,35 +865,33 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
+    (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
+    (void)container; (void)userdata;
     printf("[cellSaveData] AutoLoad2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
 
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    /* funcStat is a GUEST function pointer (OPD address from the
-     * recompiled game), not a host callable — savedata_execute can't
-     * invoke it directly. Until we add a guest-callback marshaller for
-     * the SaveData struct family (StatGet/StatSet/FileStat in guest
-     * big-endian memory) just return NODATA / CBRESULT to match what
-     * RPCS3's trace shows games observe on first run with no saves.
-     *
-     * That covers flOw's actual code path: cellSaveDataAutoLoad2 fails
-     * with 0x8002b401 (CBRESULT[1] = "callback rejected") on the very
-     * first launch and the title screen advances regardless. */
+    /* funcStat is the GAME's guest-OPD address. Marshal StatGet/Set/CB
+     * into guest BE memory and dispatch through g_ps3_guest_caller.
+     * Even on first-run-no-data, the game observes funcStat fire with
+     * isNewData=1 so its title state machine can advance. */
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
-    if (!dir_exists(save_path)) {
-        printf("[cellSaveData] AutoLoad2: no save data — returning CBRESULT [1]\n");
+    int is_new = !dir_exists(save_path);
+
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+    s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
+
+    if (cb < 0) {
+        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+            return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
-
-    /* If save data DOES exist a real implementation would marshal
-     * StatGet into guest memory and dispatch the callback through
-     * g_ps3_guest_caller. Not implemented yet; treat as NODATA so we
-     * fail predictably rather than mis-host-calling the guest pointer. */
-    printf("[cellSaveData] AutoLoad2: save data exists but guest callback marshalling is unimplemented — returning NODATA\n");
-    return CELL_SAVEDATA_ERROR_NODATA;
+    /* OK_LAST or OK_NEXT — with no actual file load infrastructure for
+     * now, succeed without invoking funcFile. */
+    return CELL_OK;
 }
 
 s32 cellSaveDataDelete2(u32 container)
@@ -810,17 +933,26 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
                           CellSaveDataFileCallback funcFile,
                           u32 container, void* userdata)
 {
+    (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
+    (void)container; (void)userdata;
     printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
-    /* Same path as AutoLoad2: report no-data instead of host-calling
-     * the guest funcStat pointer. */
+
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
-    if (!dir_exists(save_path))
+    int is_new = !dir_exists(save_path);
+
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+    s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
+
+    if (cb < 0) {
+        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+            return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
-    return CELL_SAVEDATA_ERROR_NODATA;
+    }
+    return CELL_OK;
 }
 
 s32 cellSaveDataDelete(u32 version, const char* dirName,
