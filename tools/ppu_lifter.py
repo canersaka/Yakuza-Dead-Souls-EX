@@ -210,6 +210,9 @@ class PPULifter:
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+        # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
+        # comment above func_ADDR so dispatch stays address-based.
+        self.name_map: dict[int, str] = {}
 
     def lift_function(self, instructions: list[Instruction],
                       start: int, end: int) -> LiftedFunction:
@@ -1429,10 +1432,10 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
 
-        # Float/int convert
+        # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
-            uimm = int(ops[2]) if len(ops) > 2 else 0
+            uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
             src_ty = "int32_t" if mn == "vcfsx" else "uint32_t"
             scale = f" / {1 << uimm}.0f" if uimm > 0 else ""
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
@@ -1440,7 +1443,7 @@ class PPULifter:
 
         if mn == "vctsxs" or mn == "vctuxs":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
-            uimm = int(ops[2]) if len(ops) > 2 else 0
+            uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
             dst_ty = "int32_t" if mn == "vctsxs" else "uint32_t"
             scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
             return (f"{{ {dst_ty}* d=({dst_ty}*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
@@ -1755,6 +1758,9 @@ class PPULifter:
         sorted_addrs = sorted(func_by_addr.keys())
 
         for i, func in enumerate(self.functions):
+            label = self.name_map.get(func.start_addr)
+            if label:
+                lines.append(f"/* {label} */")
             lines.append(f"void {func.name}(ppu_context* ctx) {{")
             for bline in func.body_lines:
                 lines.append(f"    {bline}" if not bline.endswith(":") else bline)
@@ -1818,6 +1824,9 @@ def main() -> None:
     parser.add_argument("--little-endian", action="store_true")
     parser.add_argument("--functions", metavar="FILE",
                         help="JSON file with function list [{start, end}, ...]")
+    parser.add_argument("--names", metavar="FILE", default=None,
+                        help="JSON name map from ghidra_names.py "
+                             "({\"0xADDR\": {\"label\": ...}}); emitted as comments")
     args = parser.parse_args()
 
     with open(args.input, "rb") as f:
@@ -1866,6 +1875,25 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter()
+
+    # Optional: load a recovered-name map (from Ghidra analysis) to annotate
+    # generated functions with meaningful names as comments.
+    if args.names:
+        import json as _json
+        with open(args.names) as nf:
+            nm = _json.load(nf)
+        loaded = 0
+        for k, v in nm.items():
+            try:
+                addr = int(str(k), 16)
+            except ValueError:
+                continue
+            label = v.get("label") if isinstance(v, dict) else str(v)
+            if label:
+                lifter.name_map[addr] = label
+                loaded += 1
+        print(f"  Loaded {loaded} recovered names from {args.names}")
+
     for start, end in func_bounds:
         lifter.lift_function(all_insns, start, end)
 
