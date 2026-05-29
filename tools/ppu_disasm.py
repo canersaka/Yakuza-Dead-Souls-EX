@@ -868,20 +868,19 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         xo_full = bits(insn, 21, 31)   # was bits(21,30) — missed bit 31 (XO LSB)
         xo_6 = bits(insn, 26, 31)
 
-        # VA-form (6-bit xo at bits 26-31)
+        # VA-form (6-bit xo at bits 26-31). XOs corrected per kakaroto/ps3ida
+        # PPCAltivec (VXA macro) — the 36-45 range was previously scrambled,
+        # mislabeling vperm/vsel/vsldoi and the whole vmsum* family.
         vmx_va = {
+            32: "vmhaddshs", 33: "vmhraddshs", 34: "vmladduhm",
+            36: "vmsumubm", 37: "vmsummbm", 38: "vmsumuhm", 39: "vmsumuhs",
+            40: "vmsumshm", 41: "vmsumshs",
+            42: "vsel", 43: "vperm", 44: "vsldoi",
             46: "vmaddfp", 47: "vnmsubfp",
-            32: "vmhaddshs", 33: "vmhraddshs",
-            34: "vmladduhm",
-            37: "vmsumubm", 38: "vmsummbm",
-            40: "vmsumuhm", 41: "vmsumuhs",
-            44: "vmsumshm", 45: "vmsumshs",
-            36: "vperm", 43: "vsel",
-            42: "vsldoi",
         }
         if xo_6 in vmx_va:
             result.mnemonic = vmx_va[xo_6]
-            if xo_6 == 42:  # vsldoi — 4th operand is shift count, not vector reg
+            if xo_6 == 44:  # vsldoi — 4th operand is a shift count, not a vector reg
                 result.operands = f"v{vd}, v{va}, v{vb}, {vc}"
             else:
                 result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
@@ -950,9 +949,9 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             12: "vmrghb", 76: "vmrghh", 140: "vmrghw",
             268: "vmrglb", 332: "vmrglh", 396: "vmrglw",
 
-            # Convert
-            394: "vcfsx", 330: "vcfux",
-            970: "vctsxs", 906: "vctuxs",
+            # Convert (vcfux/vcfsx/vctuxs/vctsxs) — these carry a UIMM scale in
+            # the vA field, so they are decoded below with the dedicated
+            # "vD, vB, UIMM" operand form, not here.
 
             # Pack/unpack
             782: "vpkuhum", 846: "vpkuwum",
@@ -984,11 +983,15 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"v{vd}, v{va}, v{vb}"
             return result
 
-        # Splat (vspltb/h/w): "vD, vB, UIMM" — the vA field (bits 11-15) is the
-        # element-index immediate, NOT a register. XOs 524/588/652.
-        vmx_splat = {524: "vspltb", 588: "vsplth", 652: "vspltw"}
-        if xo_full in vmx_splat:
-            result.mnemonic = vmx_splat[xo_full]
+        # VX instructions whose vA field (bits 11-15) is an immediate, not a
+        # register: splats (element index) and FP<->int converts (scale).
+        # All emit "vD, vB, UIMM" so the lifter reads a bare integer at ops[2].
+        vmx_uimm = {
+            524: "vspltb", 588: "vsplth", 652: "vspltw",
+            330: "vcfux", 394: "vcfsx", 906: "vctuxs", 970: "vctsxs",
+        }
+        if xo_full in vmx_uimm:
+            result.mnemonic = vmx_uimm[xo_full]
             result.operands = f"v{vd}, v{vb}, {va}"
             return result
 
