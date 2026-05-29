@@ -92,19 +92,30 @@ RI18_TABLE: dict[int, str] = {
     0b0110001: "brsl",    # branch relative and set link
     0b0110010: "bra",     # branch absolute
     0b0110011: "brasl",   # branch absolute and set link
-    0b0110100: "brnz",    # branch if not zero
-    0b0110101: "brz",     # branch if zero
-    0b0110110: "brhnz",   # branch if halfword not zero
-    0b0110111: "brhz",    # branch if halfword zero
+    # NOTE: brnz/brz/brhnz/brhz are RI16 form (9-bit opcode + RT register),
+    # NOT RI18 — they were moved to RI16_TABLE below.
 }
 
-# RI16 format: opcd(9) i16(16) rt(7)  -- actually 9-bit opcode
+# RI16 format: opcd(9) i16(16) rt(7)
+# NOTE: RI16 must be checked BEFORE RI10 in the decoder because some RI16
+# opcodes share the top 8 bits with RI10 entries (e.g. brz op9=0x040 vs
+# shlhi op8=0x20, brnz op9=0x042 vs shli op8=0x21).
 RI16_TABLE: dict[int, str] = {
     0b010000011: "iohl",  # immediate or halfword lower
     0b011000100: "lqa",   # load quadword (absolute address)
     0b001000100: "stqa",  # store quadword (absolute address)
     0b011000001: "hbra",  # hint for branch (absolute)
     0b011000010: "hbrr",  # hint for branch (relative)
+    # Conditional branches: op9(9)|i16(16)|RT(7). RT is tested; branch if
+    # condition true. Target = PC + sign_extend(i16,16)*4.
+    0b001000000: "brz",   # branch if zero word
+    0b001000010: "brnz",  # branch if not zero word
+    0b001000110: "brhz",  # branch if zero halfword
+    0b001000111: "brhnz", # branch if not zero halfword
+    # NOTE: lqr(0x067)/stqr(0x065) are excluded here because they share op9
+    # with rotmai(op8=0x33)/rotmi(op8=0x32) when i10_top1=1.  All useful
+    # rotate-mask shifts use i10_top1=1, so lqr/stqr entries would mis-decode
+    # the majority of rotate instructions.  Treat them as .word for now.
 }
 
 # RI10 format: opcd(8) i10(10) ra(7) rt(7)
@@ -129,6 +140,18 @@ RI10_TABLE: dict[int, str] = {
     0b01011110: "clgtbi", # compare logical greater than byte immediate
     0b01110100: "mpyi",   # multiply immediate
     0b01110101: "mpyui",  # multiply unsigned immediate
+    # Rotate/shift immediate (RI10, confirmed from binary analysis)
+    # NOTE: shlhi(0x20)/shli(0x21) share top-8-bits with brz/brnz (op9=0x040/0x042).
+    # Because RI16 is checked first, RI10 only fires for i10_top1=1 variants.
+    0b00100000: "shlhi",  # shift left halfword immediate
+    0b00100001: "shli",   # shift left word immediate
+    0b00110010: "rotmi",  # rotate and mask word immediate
+    0b00110011: "rotmai", # rotate and mask algebraic word immediate
+    0b00111110: "rotmhi",  # rotate and mask halfword immediate (logical/unsigned)
+    0b00010010: "rotmahi", # rotate and mask algebraic halfword immediate (signed)
+                           # sh = (-I7)&31; 677 occurrences in SPURS kernel
+    0b00111000: "rothi",  # rotate halfword immediate
+    0b00110000: "roti",   # rotate word immediate
 }
 
 # RI8 format: opcd(9+) ... we handle these specially
@@ -263,10 +286,14 @@ SPU_RR: dict[int, str] = {
     # Hint for branch
     0b00110101100: "hbr",
 
-    # Channel
+    # Channel (confirmed opcodes from binary analysis of PS3 SPU programs)
+    # rdch RT, CA: read channel CA into RT.  op11=0x00D, channel in bits 11-7.
     0b00000001101: "rdch",
-    0b00000001101 + 0x400: "rchcnt",
-    0b00000001100: "wrch",
+    # rchcnt RT, CA: read channel count.    op11=0x00F, channel in bits 11-7.
+    0b00000001111: "rchcnt",
+    # wrch CA, RT: write RT to channel CA.  op11=0x10D, channel in bits 11-7.
+    # (NOT 0x00C — that was wrong; 0x10D confirmed by DMA setup sequences.)
+    0b00100001101: "wrch",
 
     # Stop and signal
     0b00000000000: "stop",
@@ -290,36 +317,36 @@ SPU_RR: dict[int, str] = {
     0b01110110110: "fscrwr",  # floating-point status write
 }
 
-# Channel names
+# Channel names — corrected per IBM Cell BE Architecture Manual v1.02
+# Channel number is in bits 11-7 of rdch/wrch/rchcnt instructions.
 CHANNEL_NAMES = {
-    0: "SPU_RdEventStat",
-    1: "SPU_WrEventMask",
-    2: "SPU_WrEventAck",
-    3: "SPU_RdSigNotify1",
-    4: "SPU_RdSigNotify2",
-    7: "SPU_WrDec",
-    8: "SPU_RdDec",
+    0:  "SPU_RdEventStat",
+    1:  "SPU_WrEventMask",
+    2:  "SPU_WrEventAck",
+    3:  "SPU_RdSigNotify1",
+    4:  "SPU_RdSigNotify2",
+    7:  "SPU_WrDec",
+    8:  "SPU_RdDec",
+    9:  "MFC_WrMSSyncReq",
     11: "SPU_RdEventMask",
     13: "SPU_RdMachStat",
     14: "SPU_WrSRR0",
     15: "SPU_RdSRR0",
-    21: "SPU_WrOuttrMbox",
-    22: "SPU_RdInMbox",
-    23: "SPU_WrOutMbox",
-    24: "MFC_WrMSSyncReq",
-    25: "MFC_RdTagMask",
-    26: "MFC_LSA",
-    27: "MFC_EAH",
-    28: "MFC_EAL",
-    29: "MFC_Size",
-    30: "MFC_TagID",
-    31: "MFC_Cmd",
-    32: "MFC_WrTagMask",
-    33: "MFC_WrTagUpdate",
-    34: "MFC_RdTagStat",
-    35: "MFC_RdListStallStat",
-    36: "MFC_WrListStallAck",
-    37: "MFC_RdAtomicStat",
+    16: "MFC_LSA",
+    17: "MFC_EAH",
+    18: "MFC_EAL",
+    19: "MFC_Size",
+    20: "MFC_TagID",
+    21: "MFC_Cmd",
+    22: "MFC_WrTagMask",
+    23: "MFC_WrTagUpdate",
+    24: "MFC_RdTagStat",
+    25: "MFC_RdListStallStat",
+    26: "MFC_WrListStallAck",
+    27: "MFC_RdAtomicStat",
+    28: "SPU_WrOutMbox",
+    29: "SPU_RdInMbox",
+    30: "SPU_WrOutIntrMbox",
 }
 
 # ---------------------------------------------------------------------------
@@ -379,6 +406,8 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         return result
 
     # ---- RI16 format (9-bit opcode) ----
+    # Must be checked BEFORE RI10 — some RI16 op9 values share top 8 bits
+    # with RI10 entries (brz/shlhi both have op8=0x20; brnz/shli have op8=0x21).
     if op9 in RI16_TABLE:
         mne = RI16_TABLE[op9]
         result.mnemonic = mne
@@ -389,8 +418,35 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             result.operands = f"0x{i16 & 0xFFFF:X}, $r{rt}"
         elif mne == "iohl":
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
+        elif mne in ("brz", "brnz", "brhz", "brhnz"):
+            target = i16 * 4 + addr
+            result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
+        elif mne in ("lqr", "stqr"):
+            target = i16 * 4 + addr
+            result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
         else:
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
+        return result
+
+    # ---- Channel instructions (checked BEFORE RI10 to avoid wrch/shli clash) ----
+    # wrch (op11=0x10D) shares op8=0x21 with shli; must be identified by op11.
+    # Format: op11(11) | zeros(2) | channel(5) | zeros(2) | RT(7)
+    # Channel address: bits 11-7 of instruction = (insn >> 7) & 0x1F
+    _ch_field = (insn >> 7) & 0x1F
+    if op11 == 0b00000001101:   # rdch RT, CA    op11=0x00D=13
+        _ch = CHANNEL_NAMES.get(_ch_field, f"ch{_ch_field}")
+        result.mnemonic = "rdch"
+        result.operands = f"$r{rt}, {_ch}"
+        return result
+    if op11 == 0b00100001101:   # wrch CA, RT    op11=0x10D=269
+        _ch = CHANNEL_NAMES.get(_ch_field, f"ch{_ch_field}")
+        result.mnemonic = "wrch"
+        result.operands = f"{_ch}, $r{rt}"
+        return result
+    if op11 == 0b00000001111:   # rchcnt RT, CA  op11=0x00F=15
+        _ch = CHANNEL_NAMES.get(_ch_field, f"ch{_ch_field}")
+        result.mnemonic = "rchcnt"
+        result.operands = f"$r{rt}, {_ch}"
         return result
 
     # ---- RI10 format (8-bit opcode) ----
@@ -406,29 +462,6 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             result.operands = f"$r{rt}, {disp}($r{ra})"
         else:
             result.operands = f"$r{rt}, $r{ra}, {i10}"
-        return result
-
-    # ---- Channel instructions (special RI7 variants) ----
-    # rdch: opcode 00000001101, rt, ra encodes channel
-    if op11 == 0b00000001101:
-        ch = ra
-        ch_name = CHANNEL_NAMES.get(ch, f"ch{ch}")
-        result.mnemonic = "rdch"
-        result.operands = f"$r{rt}, {ch_name}"
-        return result
-
-    if op11 == 0b00000001100:
-        ch = ra
-        ch_name = CHANNEL_NAMES.get(ch, f"ch{ch}")
-        result.mnemonic = "wrch"
-        result.operands = f"{ch_name}, $r{rt}"
-        return result
-
-    if op11 == 0b00000001111:
-        ch = ra
-        ch_name = CHANNEL_NAMES.get(ch, f"ch{ch}")
-        result.mnemonic = "rchcnt"
-        result.operands = f"$r{rt}, {ch_name}"
         return result
 
     # ---- RR format (11-bit opcode) ----

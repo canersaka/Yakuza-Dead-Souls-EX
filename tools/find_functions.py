@@ -302,7 +302,8 @@ class FunctionFinder:
         new_targets: list[int] = []
         sorted_funcs = sorted(self.functions.values(), key=lambda f: f.start)
 
-        for target in sorted_targets := sorted(all_targets):
+        sorted_targets = sorted(all_targets)
+        for target in sorted_targets:
             inside = False
             for func in sorted_funcs:
                 if func.start <= target < func.end:
