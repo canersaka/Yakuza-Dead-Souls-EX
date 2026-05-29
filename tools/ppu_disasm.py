@@ -894,7 +894,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
 
         vmx_cmp = {
             6: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
-            198: "vcmpeqfp", 326: "vcmpbfp", 454: "vcmpgefp",
+            198: "vcmpeqfp", 966: "vcmpbfp", 454: "vcmpgefp",
             710: "vcmpgtfp",
             518: "vcmpgtsb", 582: "vcmpgtsh", 646: "vcmpgtsw",
             774: "vcmpgtub", 838: "vcmpgtuh", 902: "vcmpgtuw",
@@ -930,17 +930,20 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             514: "vminub", 578: "vminuh", 642: "vminuw",
             770: "vminsb", 834: "vminsh", 898: "vminsw",
 
-            # Logical
-            1028: "vand", 1092: "vandc", 1220: "vor", 1284: "vxor",
-            1348: "vnor",
+            # Logical (XOs corrected per kakaroto/ps3ida PPCAltivec + NXP ALTIVECPEM:
+            # vor=1156, vxor=1220, vnor=1284 — were previously shifted +64, which
+            # mislabeled 327 vxor (mostly vxor vD,vX,vX register-clears) as vor)
+            1028: "vand", 1092: "vandc", 1156: "vor", 1220: "vxor",
+            1284: "vnor",
 
             # Shift
             260: "vslb", 324: "vslh", 388: "vslw",
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
 
-            # Splat
-            1098: "vspltb", 1162: "vsplth", 1226: "vspltw",
+            # Splat immediate (vspltis*) — the non-immediate vspltb/h/w are
+            # handled separately below with the UIMM operand form. Their correct
+            # XOs are 524/588/652 (were wrongly 1098/1162/1226 here).
             780: "vspltisb", 844: "vspltish", 908: "vspltisw",
 
             # Merge
@@ -979,6 +982,14 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         if xo_full in vmx_vx:
             result.mnemonic = vmx_vx[xo_full]
             result.operands = f"v{vd}, v{va}, v{vb}"
+            return result
+
+        # Splat (vspltb/h/w): "vD, vB, UIMM" — the vA field (bits 11-15) is the
+        # element-index immediate, NOT a register. XOs 524/588/652.
+        vmx_splat = {524: "vspltb", 588: "vsplth", 652: "vspltw"}
+        if xo_full in vmx_splat:
+            result.mnemonic = vmx_splat[xo_full]
+            result.operands = f"v{vd}, v{vb}, {va}"
             return result
 
         # lvx / stvx (X-form under opcode 31 actually, but some are opcd 4)
