@@ -73,9 +73,16 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+    fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
+            (unsigned long long)info->ctx.thread_id,
+            (unsigned long long)info->entry_addr);
+
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
         g_ppu_thread_entry_trampoline(&info->ctx);
+    } else {
+        fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
+                (unsigned long long)info->ctx.thread_id);
     }
 
     /* Mark as finished */
@@ -196,6 +203,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 #endif
         *out = be_id;
     }
+
+    fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+            t->name, (unsigned long long)entry, (unsigned long long)arg,
+            stack_size, priority);
 
     /* Create the host thread */
 #ifdef _WIN32

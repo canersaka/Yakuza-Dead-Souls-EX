@@ -863,7 +863,9 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         va = ra
         vb = bits(insn, 16, 20)
         vc = bits(insn, 21, 25)
-        xo_full = bits(insn, 21, 30)
+        # AltiVec VX-form has an 11-bit XO at bits 21-31; extract the full 11 bits.
+        # Bit 21 doubles as the Rc flag for compare (VC-form) instructions.
+        xo_full = bits(insn, 21, 31)   # was bits(21,30) — missed bit 31 (XO LSB)
         xo_6 = bits(insn, 26, 31)
 
         # VA-form (6-bit xo at bits 26-31)
@@ -885,13 +887,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
             return result
 
-        # VX-form (11-bit xo in bits 21-30, but bit 21 = Rc for compares)
-        # For non-compare instructions, xo is bits 21-30 (10 bits effectively)
-        # For compare instructions, bit 21 is Rc flag
-
-        # Compare instructions (bit 21 = Rc): strip Rc to get base xo
-        xo_10 = bits(insn, 22, 30)  # 9-bit sub-opcode ignoring Rc
+        # VX-form: xo_full is now 11 bits (bits 21-31).
+        # For compare (VC-form) instructions, bit 21 is Rc; XO_10 is bits 22-31.
         vmx_cmp_rc = bit(insn, 21)  # Rc bit for compare instructions
+        xo_10 = bits(insn, 22, 31)  # 10-bit XO (bits 22-31), no Rc
 
         vmx_cmp = {
             6: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
@@ -900,11 +899,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             518: "vcmpgtsb", 582: "vcmpgtsh", 646: "vcmpgtsw",
             774: "vcmpgtub", 838: "vcmpgtuh", 902: "vcmpgtuw",
         }
-        # Check if this is a compare (xo_10 matches a compare, with or without Rc)
-        cmp_xo = xo_10 | (vmx_cmp_rc << 9)  # reconstruct with Rc=0 to check
-        # Actually, the compare xo values above are the FULL 10-bit values (without Rc)
-        # So check xo_full with Rc masked off: xo_full & ~(1 << 9) = bits 22-30
-        base_cmp_xo = xo_full & ~(1 << 9)  # strip Rc bit
+        # Strip Rc (bit 10 of the 11-bit xo_full) to get the base 10-bit XO
+        base_cmp_xo = xo_full & ~(1 << 10)  # strip Rc bit (now bit 10 of 11-bit field)
         if base_cmp_xo in vmx_cmp:
             mne = vmx_cmp[base_cmp_xo]
             if vmx_cmp_rc:

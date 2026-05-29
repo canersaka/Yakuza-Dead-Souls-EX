@@ -926,6 +926,18 @@ class PPULifter:
                     f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
                     f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a ^ b) & 1) << (31 - {bt})); }}")
 
+        if mn == "crorc":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a | (~b & 1)) << (31 - {bt})); }}")
+
+        if mn == "crandc":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a & (~b & 1)) << (31 - {bt})); }}")
+
         # mcrf — move condition register field
         if mn == "mcrf":
             # mcrf crD, crS — copy 4-bit CR field
@@ -1441,6 +1453,123 @@ class PPULifter:
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
                     f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; d[i]=r; }} }}")
+
+        # ------- Additional VMX integer instructions -------
+        # Byte compare equal
+        if mn.startswith("vcmpequb"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++) d[i]=a[i]==b[i]?0xFFu:0u; }}")
+
+        # Saturating add
+        if mn == "vaddsbs":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
+                    f"int8_t* b=(int8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int8_t)(r>127?127:r<-128?-128:r);}} }}")
+        if mn == "vadduhs":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{uint32_t r=(uint32_t)a[i]+(uint32_t)b[i]; d[i]=(uint16_t)(r>65535u?65535u:r);}} }}")
+        if mn == "vaddshs":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int16_t)(r>32767?32767:r<-32768?-32768:r);}} }}")
+        if mn == "vadduws":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{uint64_t r=(uint64_t)a[i]+(uint64_t)b[i]; d[i]=(uint32_t)(r>0xFFFFFFFFu?0xFFFFFFFFu:r);}} }}")
+
+        # Subtract saturate
+        if mn == "vsubsws":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
+                    f"int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)a[i]-(int64_t)b[i]; d[i]=(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} }}")
+
+        # Shifts and rotates
+        if mn == "vslb":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++) d[i]=(uint8_t)(a[i]<<(b[i]&7u)); }}")
+        if mn == "vslw":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]<<(b[i]&31u); }}")
+        if mn == "vrlb":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++){{uint8_t s=b[i]&7u; d[i]=(a[i]<<s)|(a[i]>>(8u-s));}} }}")
+        if mn == "vrlw":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{uint32_t s=b[i]&31u; d[i]=(a[i]<<s)|(a[i]>>(32u-s));}} }}")
+        if mn == "vsraw":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
+
+        # (vmaxsw handled above by the generic vmax/vmin loop)
+
+        # Integer multiply (odd/even halfword)
+        if mn == "vmulouh":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"d[0]=(uint32_t)a[1]*(uint32_t)b[1]; d[1]=(uint32_t)a[3]*(uint32_t)b[3]; "
+                    f"d[2]=(uint32_t)a[5]*(uint32_t)b[5]; d[3]=(uint32_t)a[7]*(uint32_t)b[7]; }}")
+        if mn == "vmuleuh":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"d[0]=(uint32_t)a[0]*(uint32_t)b[0]; d[1]=(uint32_t)a[2]*(uint32_t)b[2]; "
+                    f"d[2]=(uint32_t)a[4]*(uint32_t)b[4]; d[3]=(uint32_t)a[6]*(uint32_t)b[6]; }}")
+        if mn == "vmulosh":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+                    f"d[0]=(int32_t)a[1]*(int32_t)b[1]; d[1]=(int32_t)a[3]*(int32_t)b[3]; "
+                    f"d[2]=(int32_t)a[5]*(int32_t)b[5]; d[3]=(int32_t)a[7]*(int32_t)b[7]; }}")
+
+        # Average unsigned byte
+        if mn == "vavgub":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++) d[i]=(uint8_t)(((unsigned)a[i]+(unsigned)b[i]+1u)>>1); }}")
+
+        # Splat byte (vspltb vD, vB, UIMM — UIMM encoded in vA field)
+        if mn == "vspltb":
+            vd = int(ops[0][1:]); uimm = int(ops[1][1:]); vb = int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"uint8_t v=b[{uimm}&15]; for(int i=0;i<16;i++) d[i]=v; }}")
+
+        # Pack signed halfword signed saturate
+        if mn == "vpkshss":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
+
+        # vmsummbm (VA-form, 4 operands)
+        if mn == "vmsummbm":
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
+            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; int32_t* cc=(int32_t*)&ctx->vr[{vc}]; "
+                    f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
+
+        # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
 
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
