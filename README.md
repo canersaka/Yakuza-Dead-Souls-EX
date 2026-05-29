@@ -313,6 +313,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 This project does not contain any proprietary Sony code, encryption keys, or copyrighted material. It provides clean-room implementations of system library interfaces based on publicly documented behavior. You must provide your own legally obtained PS3 game files.
 
+## Acknowledgments
+
+- **[gnome41](https://github.com/gnome41/ps3recomp-dbz-budokai-hd)** — while porting *DBZ Budokai HD*, gnome41's fork surfaced and fixed real bugs in the shared SDK that we've incorporated upstream: the AltiVec VX-form 11-bit XO extraction fix (~3800 instructions were mis-decoded), 19 additional VMX integer lifter handlers + `crorc`/`crandc`, SPU decoder corrections (RI16 branch forms, channel opcodes per the IBM Cell BE manual), and a `find_functions.py` walrus syntax fix.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
