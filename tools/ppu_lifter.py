@@ -104,6 +104,11 @@ static inline int __builtin_clz(unsigned int x) {
     _BitScanReverse(&idx, x);
     return 31 - (int)idx;
 }
+static inline int __builtin_clzll(unsigned long long x) {
+    unsigned long idx;
+    _BitScanReverse64(&idx, x);
+    return 63 - (int)idx;
+}
 static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
     int64_t hi;
     _mul128(a, b, &hi);
