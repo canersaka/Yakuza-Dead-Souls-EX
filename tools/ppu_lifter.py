@@ -388,6 +388,11 @@ class PPULifter:
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             return f"ctx->gpr[{ra}] = __builtin_clz((uint32_t)ctx->gpr[{rs}]);"
 
+        if mn in ("cntlzd", "cntlzd."):
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return (f"ctx->gpr[{ra}] = ctx->gpr[{rs}] ? "
+                    f"__builtin_clzll(ctx->gpr[{rs}]) : 64;")
+
         # ------- Shift / Rotate -------
         if mn.startswith("rlwinm"):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
@@ -558,6 +563,12 @@ class PPULifter:
                 return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
+
+        if mn == "stfiwx":
+            # Store the low 32 bits of the FPR's raw contents as an integer word.
+            frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write32({ea}, (uint32_t)tmp); }}"
 
         # ------- Compare -------
         if mn in ("cmpwi", "cmpdi"):
@@ -804,7 +815,7 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
 
-        if mn_base in ("fctiwz",):
+        if mn_base in ("fctiw", "fctiwz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             return (f"{{ int32_t iv = (int32_t)ctx->fpr[{frb}]; uint64_t tmp; "
@@ -828,6 +839,16 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
+
+        if mn_base in ("frsqrte", "frsqrtes"):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+
+        if mn_base in ("fre", "fres"):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return f"ctx->fpr[{frd}] = 1.0 / ctx->fpr[{frb}];"
 
         if mn_base == "fsel":
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])

@@ -495,7 +495,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             40: "subf", 8: "subfc", 136: "subfe",
             235: "mullw", 75: "mulhw", 11: "mulhwu",
             491: "divw", 459: "divwu",
-            233: "mulld", 73: "mulhd",
+            233: "mulld", 73: "mulhd", 9: "mulhdu",
             489: "divd", 457: "divdu",
         }
         if xo_9 in xo_arith_2op:
@@ -583,6 +583,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             599: ("lfdx", False), 631: ("lfdux", False),
             663: ("stfsx", False), 695: ("stfsux", False),
             727: ("stfdx", False), 759: ("stfdux", False),
+            983: ("stfiwx", False),
         }
         if xo_full in x_ldst:
             mne, has_dot = x_ldst[xo_full]
@@ -789,7 +790,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         fp_a = {
             21: "fadd", 20: "fsub", 25: "fmul", 18: "fdiv",
             29: "fmadd", 28: "fmsub", 31: "fnmadd", 30: "fnmsub",
-            23: "fsel", 22: "fsqrt",
+            23: "fsel", 22: "fsqrt", 26: "frsqrte", 24: "fre",
         }
         if xo_5 in fp_a:
             mne = fp_a[xo_5]
@@ -802,6 +803,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
             elif xo_5 == 23:  # fsel
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
+            elif xo_5 in (26, 24):  # frsqrte / fre: frd, frb
+                result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
             return result
@@ -809,7 +812,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         fp_x = {
             0: "fcmpu", 32: "fcmpo",
             12: "frsp", 14: "fctiw", 15: "fctiwz",
-            846: "fctid", 847: "fctidz", 814: "fcfid",
+            814: "fctid", 815: "fctidz", 846: "fcfid",
             40: "fneg", 72: "fmr", 264: "fabs", 136: "fnabs",
             64: "mcrfs",
             583: "mffs", 711: "mtfsf",
@@ -843,7 +846,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         rc = bit(insn, 31)
         fps = {21: "fadds", 20: "fsubs", 25: "fmuls", 18: "fdivs",
                29: "fmadds", 28: "fmsubs", 31: "fnmadds", 30: "fnmsubs",
-               22: "fsqrts", 24: "fres"}
+               22: "fsqrts", 24: "fres", 26: "frsqrtes"}
         if xo_5 in fps:
             mne = fps[xo_5]
             if rc:
@@ -853,6 +856,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}"
             elif xo_5 in (29, 28, 31, 30):
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
+            elif xo_5 in (24, 26):  # fres / frsqrtes: frd, frb
+                result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
             return result
