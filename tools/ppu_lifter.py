@@ -1855,6 +1855,94 @@ class PPULifter:
 # CLI
 # ---------------------------------------------------------------------------
 
+def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
+    """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
+
+    Handles both absolute tables (entry = case address) and base-relative
+    offset tables (entry = signed offset, case = table_base + offset — the
+    pattern gcc emits, e.g. `lwz r11,disp(r2); lwzx r0,idx,r11; add r0,r0,r11;
+    mtctr r0; bctr`). These computed `bctr` targets are invisible to static
+    branch-target discovery, so without this the switch cases never get lifted
+    and the runtime indirect-call lands on an unlifted address.
+
+    Returns {dispatcher_addr: sorted [case target addrs]}.
+    """
+    def mem_disp(op):
+        try:
+            return int(op.split('(')[0].strip(), 0)
+        except ValueError:
+            return None
+    tables = {}
+    n = len(all_insns)
+    for i in range(n):
+        if all_insns[i].mnemonic != 'bctr':
+            continue
+        win = all_insns[max(0, i - 30):i]
+        # the ctr source register (last mtctr before the bctr)
+        rC = None
+        for w in reversed(win):
+            if w.mnemonic == 'mtctr':
+                rC = w.operands.strip(); break
+            if w.mnemonic in ('bctr', 'bctrl', 'blr', 'bl', 'blrl'):
+                break
+        if rC is None:
+            continue
+        # the indexed table load
+        lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
+        if lwzx is None:
+            continue
+        p = [x.strip() for x in lwzx.operands.split(',')]
+        if len(p) != 3:
+            continue
+        r_val, _r_idx, r_base = p
+        # offset table iff an `add rC, *, r_base` combines the loaded value + base
+        is_offset = any(
+            w.mnemonic == 'add' and
+            [x.strip() for x in w.operands.split(',')][0] == rC and
+            r_base in [x.strip() for x in w.operands.split(',')][1:]
+            for w in win)
+        # table base pointer: `lwz r_base, disp(r2)` -> *(toc + disp)
+        disp = None
+        for w in reversed(win):
+            if w.mnemonic == 'lwz':
+                a = [x.strip() for x in w.operands.split(',')]
+                if len(a) == 2 and a[0] == r_base and '(r2)' in a[1]:
+                    disp = mem_disp(a[1]); break
+        if disp is None or not toc:
+            continue
+        table_base = read_u32((toc + disp) & 0xFFFFFFFF)
+        if table_base is None:
+            continue
+        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
+        count = None
+        for w in reversed(win):
+            if w.mnemonic in ('cmplwi', 'cmpwi'):
+                try:
+                    count = int(w.operands.split(',')[-1].strip(), 0)
+                except ValueError:
+                    count = None
+                break
+        if count is None or count < 0 or count > 4096:
+            count = 256
+        targets = []
+        for k in range(count + 1):
+            v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
+            if v is None:
+                break
+            if is_offset:
+                off = v - (1 << 32) if (v & 0x80000000) else v
+                t = (table_base + off) & 0xFFFFFFFF
+            else:
+                t = v
+            if text_lo <= t < text_hi and t % 4 == 0:
+                targets.append(t)
+            else:
+                break
+        if targets:
+            tables[all_insns[i].addr] = sorted(set(targets))
+    return tables
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PPU to C lifter for PS3 recompilation")
     parser.add_argument("input", help="Input ELF or raw binary")
@@ -1914,6 +2002,51 @@ def main() -> None:
     if not func_bounds:
         print("No functions found. Use --functions to provide a function list.", file=sys.stderr)
         sys.exit(1)
+
+    # ----- jump-table (computed bctr) discovery ---------------------------
+    # gcc switch dispatchers reach their case blocks via `mtctr; bctr` through
+    # a data jump table — computed targets static analysis can't see, so the
+    # cases never get lifted and the runtime indirect-call lands on an unlifted
+    # address. Read the tables and add each case target as a SMALL standalone
+    # function (bounded by the next case/function). Their `b <continuation>`
+    # then references the continuation, which the mid-function pass lifts as a
+    # tail-entry of whatever real function contains it. (We deliberately do NOT
+    # extend the dispatcher function over the case block: the mid-entry tail
+    # mechanism lifts target..func_end, so a far end explodes the output.)
+    jt_targets = set()
+    if not args.raw:
+        try:
+            seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
+                        elf.get_segment_data(elf.program_headers.index(ph)))
+                       for ph in elf.program_headers
+                       if ph.p_type == PT_LOAD and ph.p_filesz > 0]
+            def _read_u32(a):
+                for v0, v1, d in seg_map:
+                    if v0 <= a and a + 4 <= v1:
+                        return int.from_bytes(d[a - v0:a - v0 + 4],
+                                              'big' if big_endian else 'little')
+                return None
+            text_lo = min(s for s, _ in func_bounds)
+            text_hi = max(e for _, e in func_bounds)
+            toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
+            tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
+            for ts in tables.values():
+                jt_targets.update(ts)
+            import bisect
+            fb = dict(func_bounds)
+            allstarts = sorted(set(fb) | jt_targets)
+            added = 0
+            for t in sorted(jt_targets):
+                if t in fb:
+                    continue
+                k = bisect.bisect_right(allstarts, t)
+                fb[t] = allstarts[k] if k < len(allstarts) else text_hi
+                added += 1
+            func_bounds = sorted(fb.items())
+            print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets, "
+                  f"+{added} case funcs")
+        except Exception as exc:
+            print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
     print(f"Lifting {len(func_bounds)} functions...")
 
