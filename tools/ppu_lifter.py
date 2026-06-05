@@ -293,11 +293,15 @@ class PPULifter:
 
         if mn in ("add", "add.", "addo", "addo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{ra}] + (uint32_t)ctx->gpr[{rb}]);"
+            # PPC `add` is a full 64-bit add. Truncating to 32 bits breaks
+            # genuine 64-bit arithmetic such as the SWAR word-at-a-time strlen
+            # (`add rX, masked_word, 0x7F7F7F7F7F7F7F7F`), which then never
+            # detects the terminator byte in the high word and scans forever.
+            return f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + ctx->gpr[{rb}];"
 
-        if mn in ("subf", "subf.", "subfo"):
+        if mn in ("subf", "subf.", "subfo", "subfo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rb}] - (uint32_t)ctx->gpr[{ra}]);"
+            return f"ctx->gpr[{rd}] = ctx->gpr[{rb}] - ctx->gpr[{ra}];"
 
         if mn == "subfic":
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
@@ -497,7 +501,13 @@ class PPULifter:
                 expr = f"{helper}(ctx->gpr[{base}] + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
-                return f"ctx->gpr[{rd_i}] = {expr};"
+                line = f"ctx->gpr[{rd_i}] = {expr};"
+                # Update forms (ldu/lwzu/lhzu/lbzu/lhau): EA = base+disp, then
+                # base = EA. Without this the base pointer never advances, so
+                # e.g. the SWAR strcpy (`ldu rX,8(rsrc)`) copies one word forever.
+                if mn.endswith("u"):
+                    line += f" ctx->gpr[{base}] += {disp};"
+                return line
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
         # ------- Stores -------
@@ -528,6 +538,13 @@ class PPULifter:
         if mn in idx_load_map:
             helper = idx_load_map[mn]
             rd_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # Indexed update forms (lbzux/lhzux/lwzux): EA = ra+rb, then ra = EA.
+            if mn.endswith("ux") and ra_i != "0":
+                cast = ""
+                if mn in ("lhax", "lwax"):
+                    cast = "(int64_t)(int16_t)" if "h" in mn else "(int64_t)(int32_t)"
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"ctx->gpr[{rd_i}] = {cast}{helper}(ea); ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             expr = f"{helper}({ea})"
             if mn in ("lhax", "lwax"):

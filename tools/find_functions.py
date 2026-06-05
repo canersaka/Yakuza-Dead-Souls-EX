@@ -173,7 +173,24 @@ class FunctionFinder:
                 i += 1
                 continue
 
-            func_start = insn.addr
+            # The PPC64 ELFv1 prologue may allocate the frame *before* saving
+            # LR, i.e. `stdu r1,-X(r1)` then `mflr r0`. In that case the true
+            # function entry (and the address used as a bl target) is the stdu,
+            # one instruction earlier — anchoring on mflr registers the start
+            # 4 bytes late, which later makes find_leaf_functions discard the
+            # real entry as a sub-min_size sliver. Back up to the stdu so the
+            # start matches the actual call target.
+            start_idx = i
+            if i > 0 and _is_stack_alloc(self.instructions[i - 1]):
+                start_idx = i - 1
+                prev = self.instructions[i - 1]
+                ops = prev.operands.replace(" ", "")
+                try:
+                    stack_size = abs(int(ops.split(",")[1].split("(")[0], 0))
+                except (ValueError, IndexError):
+                    pass
+
+            func_start = self.instructions[start_idx].addr
             func = Function(start=func_start, stack_size=stack_size,
                             has_prologue=True)
 
