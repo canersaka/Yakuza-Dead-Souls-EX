@@ -128,6 +128,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
+#ifdef SPU_DMA_LOG
+    { extern int g_spu_dma_log; if (g_spu_dma_log-- > 0)
+        fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
+                mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
+#endif
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);

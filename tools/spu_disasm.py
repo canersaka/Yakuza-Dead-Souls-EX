@@ -85,15 +85,15 @@ RRR_TABLE: dict[int, str] = {
 # RI18 format: opcd(7) i18(18) rt(7)
 RI18_TABLE: dict[int, str] = {
     0b0100001: "ila",     # immediate load address (unsigned 18-bit)
-    0b0100010: "ilhu",    # immediate load halfword upper
-    0b0100000: "ilh",     # immediate load halfword
-    0b0100011: "il",      # immediate load word (sign-extended 16-bit)
-    0b0110000: "br",      # branch relative
-    0b0110001: "brsl",    # branch relative and set link
-    0b0110010: "bra",     # branch absolute
-    0b0110011: "brasl",   # branch absolute and set link
-    # NOTE: brnz/brz/brhnz/brhz are RI16 form (9-bit opcode + RT register),
-    # NOT RI18 — they were moved to RI16_TABLE below.
+    0b0001000: "hbra",    # 0x08 hint for branch (absolute) — pure perf hint
+    0b0001001: "hbrr",    # 0x09 hint for branch (relative) — pure perf hint
+    # NOTE: il/ilh/ilhu are RI16 (9-bit op), NOT RI18 — their 7-bit prefix is
+    # 0x20, which previously shadowed all three as "ilh" here (RI18 is checked
+    # before RI16). They live in RI16_TABLE below; ila is the only RI16-prefix
+    # immediate loader that is genuinely RI18.
+    # NOTE: br/brsl/bra/brasl are RI16 (9-bit op 0x060/0x062/0x064/0x066), NOT
+    # RI18 — placing them here at 0x30-0x33 mis-decoded them (and shadowed iohl
+    # 0xC1 as "br"). Moved to RI16_TABLE. brnz/brz/brhnz/brhz are RI16 too.
 }
 
 # RI16 format: opcd(9) i16(16) rt(7)
@@ -101,21 +101,30 @@ RI18_TABLE: dict[int, str] = {
 # opcodes share the top 8 bits with RI10 entries (e.g. brz op9=0x040 vs
 # shlhi op8=0x20, brnz op9=0x042 vs shli op8=0x21).
 RI16_TABLE: dict[int, str] = {
-    0b010000011: "iohl",  # immediate or halfword lower
-    0b011000100: "lqa",   # load quadword (absolute address)
-    0b001000100: "stqa",  # store quadword (absolute address)
-    0b011000001: "hbra",  # hint for branch (absolute)
-    0b011000010: "hbrr",  # hint for branch (relative)
-    # Conditional branches: op9(9)|i16(16)|RT(7). RT is tested; branch if
-    # condition true. Target = PC + sign_extend(i16,16)*4.
-    0b001000000: "brz",   # branch if zero word
-    0b001000010: "brnz",  # branch if not zero word
-    0b001000110: "brhz",  # branch if zero halfword
-    0b001000111: "brhnz", # branch if not zero halfword
-    # NOTE: lqr(0x067)/stqr(0x065) are excluded here because they share op9
-    # with rotmai(op8=0x33)/rotmi(op8=0x32) when i10_top1=1.  All useful
-    # rotate-mask shifts use i10_top1=1, so lqr/stqr entries would mis-decode
-    # the majority of rotate instructions.  Treat them as .word for now.
+    # --- Rebuilt from the authoritative SPU ISA opcode table (rpcs3
+    # SPUOpcodes.h). The previous table had lqr/stqr/fsmbi WRONGLY excluded
+    # (mis-decoded as RI10 rotate-immediates) and brhz/brhnz/stqa/lqa/hbra at
+    # wrong opcodes — corrupting every SPU lift. op9 = (insn >> 23) & 0x1FF. ---
+    # immediate loads
+    0b010000001: "il",     # 0x081 immediate load word (sign-extended 16-bit)
+    0b010000010: "ilhu",   # 0x082 immediate load halfword upper
+    0b010000011: "ilh",    # 0x083 immediate load halfword
+    0b011000001: "iohl",   # 0x0C1 immediate or halfword lower
+    # branches relative / absolute (+ set link) + PC-relative/absolute loads
+    0b001100000: "bra",    # 0x060 branch absolute
+    0b001100001: "lqa",    # 0x061 load quadword (absolute address)
+    0b001100010: "brasl",  # 0x062 branch absolute + set link
+    0b001100100: "br",     # 0x064 branch relative
+    0b001100101: "fsmbi",  # 0x065 form select mask byte immediate
+    0b001100110: "brsl",   # 0x066 branch relative + set link
+    0b001100111: "lqr",    # 0x067 load quadword (instruction-relative)
+    # conditional branches + absolute/relative stores
+    0b001000000: "brz",    # 0x040 branch if zero word
+    0b001000001: "stqa",   # 0x041 store quadword (absolute address)
+    0b001000010: "brnz",   # 0x042 branch if not zero word
+    0b001000100: "brhz",   # 0x044 branch if zero halfword
+    0b001000110: "brhnz",  # 0x046 branch if not zero halfword
+    0b001000111: "stqr",   # 0x047 store quadword (instruction-relative)
 }
 
 # RI10 format: opcd(8) i10(10) ra(7) rt(7)
@@ -128,6 +137,9 @@ RI10_TABLE: dict[int, str] = {
     0b00001101: "sfhi",   # subtract from halfword immediate
     0b00010100: "andi",   # and word immediate
     0b00000100: "ori",    # or word immediate
+    0b00000101: "orhi",   # or halfword immediate            (op8 0x05)
+    0b00010101: "andhi",  # and halfword immediate           (op8 0x15)
+    0b00010110: "andbi",  # and byte immediate               (op8 0x16)
     0b01000100: "xori",   # xor word immediate
     0b01111100: "ceqi",   # compare equal word immediate
     0b01111101: "ceqhi",  # compare equal halfword immediate
@@ -140,18 +152,10 @@ RI10_TABLE: dict[int, str] = {
     0b01011110: "clgtbi", # compare logical greater than byte immediate
     0b01110100: "mpyi",   # multiply immediate
     0b01110101: "mpyui",  # multiply unsigned immediate
-    # Rotate/shift immediate (RI10, confirmed from binary analysis)
-    # NOTE: shlhi(0x20)/shli(0x21) share top-8-bits with brz/brnz (op9=0x040/0x042).
-    # Because RI16 is checked first, RI10 only fires for i10_top1=1 variants.
-    0b00100000: "shlhi",  # shift left halfword immediate
-    0b00100001: "shli",   # shift left word immediate
-    0b00110010: "rotmi",  # rotate and mask word immediate
-    0b00110011: "rotmai", # rotate and mask algebraic word immediate
-    0b00111110: "rotmhi",  # rotate and mask halfword immediate (logical/unsigned)
-    0b00010010: "rotmahi", # rotate and mask algebraic halfword immediate (signed)
-                           # sh = (-I7)&31; 677 occurrences in SPURS kernel
-    0b00111000: "rothi",  # rotate halfword immediate
-    0b00110000: "roti",   # rotate word immediate
+    # NOTE: the rotate/shift IMMEDIATE forms (roti/rotmi/rotmai/shli/rothi/
+    # rothmi/rotmahi/shlhi) are RI7 (op11 0x78-0x7f), NOT RI10 — they are
+    # handled in the ri7_table inside spu_decode(). The old spurious RI10
+    # entries here mis-decoded fsmbi/lqr/stqr/cbd/orx and have been removed.
 }
 
 # RI8 format: opcd(9+) ... we handle these specially
@@ -210,111 +214,56 @@ RR_TABLE_CORRECT: dict[int, str] = {
 
 # Let's define the real SPU 11-bit RR opcodes properly
 SPU_RR: dict[int, str] = {
-    # Arithmetic
-    0b00011000000: "a",
-    0b00001000000: "sf",
-    0b11001000000: "ah",
-    0b00001001000: "sfh",
-    0b01101000000: "addx",
-    0b01000000000: "sfx",
-    0b00011000010: "cg",
-    0b00001000010: "bg",
-    0b01010100101: "clz",
-    0b01010110100: "cntb",
-    0b00110110010: "gbh",
-    0b00110110000: "gb",
-    0b00110110001: "gbh",
-
-    # Multiply
-    0b01111000100: "mpy",
-    0b01111001100: "mpyu",
-    0b01111000101: "mpyh",
-    0b01111001101: "mpyhhu",
-    0b01111000110: "mpys",
-    0b01111001110: "mpyhh",
-
-    # Logical
-    0b00011000001: "and",
-    0b00001000001: "or",
-    0b01001000001: "xor",
-    0b00011001001: "andc",
-    0b01011000001: "orc",
-    0b00001001001: "nand",
-    0b00001000001: "or",  # also mr (move register) when ra==rb
-    0b01001000001: "xor",
-    0b10011000001: "nor",
-    0b01001000000: "orx",
-
-    # Shift/Rotate
-    0b00001011111: "shlqbii",
-    0b00001011011: "shlqbi",
-    0b00111011111: "rotqbii",
-    0b00111011011: "rotqbi",
-    0b00001011100: "shlqbybi",
-    0b00111011100: "rotqbybi",
-    0b00001111111: "shlqbyi",
-    0b00111111111: "rotqbyi",
-    0b00001111100: "shlqby",
-    0b00111111100: "rotqby",
-    0b00001011000: "shl",
-    0b00001011001: "shlh",
-    0b00001111000: "rot",
-    0b00001111001: "roth",
-    0b00001011100: "shlqbybi",
-    0b00001111100: "rotqby",
-    0b00001100000: "shr",     # shift right (placeholder)
-
-    # Compare
-    0b01111000000: "ceq",
-    0b01111001000: "ceqh",
-    0b01111010000: "ceqb",
-    0b01001000000: "cgt",
-    0b01001001000: "cgth",
-    0b01001010000: "cgtb",
-    0b01011000000: "clgt",
-    0b01011001000: "clgth",
-    0b01011010000: "clgtb",
-
-    # Branch
-    0b00110101000: "bi",      # branch indirect
-    0b00110101001: "bisl",    # branch indirect and set link
-    0b00100101000: "biz",     # branch indirect if zero
-    0b00100101001: "binz",    # branch indirect if not zero
-    0b00100101010: "bihz",    # branch indirect if halfword zero
-    0b00100101011: "bihnz",   # branch indirect if halfword not zero
-
-    # Hint for branch
-    0b00110101100: "hbr",
-
-    # Channel (confirmed opcodes from binary analysis of PS3 SPU programs)
-    # rdch RT, CA: read channel CA into RT.  op11=0x00D, channel in bits 11-7.
-    0b00000001101: "rdch",
-    # rchcnt RT, CA: read channel count.    op11=0x00F, channel in bits 11-7.
-    0b00000001111: "rchcnt",
-    # wrch CA, RT: write RT to channel CA.  op11=0x10D, channel in bits 11-7.
-    # (NOT 0x00C — that was wrong; 0x10D confirmed by DMA setup sequences.)
-    0b00100001101: "wrch",
-
-    # Stop and signal
-    0b00000000000: "stop",
-    0b00000000001: "lnop",
-    0b01000000001: "nop",
-    0b00000000010: "sync",
-    0b00000000011: "dsync",
-
-    # Floating-point
-    0b01011000100: "fa",      # floating add
-    0b01011000101: "fs",      # floating subtract
-    0b01011000110: "fm",      # floating multiply
-    0b01111000010: "fceq",    # floating compare equal
-    0b01011000010: "fcgt",    # floating compare greater than
-    0b01110000010: "fcmeq",   # floating compare magnitude equal
-    0b01010000010: "fcmgt",   # floating compare magnitude greater than
-    0b00110111000: "fi",      # floating interpolate
-    0b00110111010: "frest",   # floating reciprocal estimate
-    0b00110111001: "frsqest", # floating reciprocal square root estimate
-    0b01010110110: "fscrrd",  # floating-point status read
-    0b01110110110: "fscrwr",  # floating-point status write
+    # --- Rebuilt verbatim from the authoritative SPU ISA opcode table (rpcs3
+    # SPUOpcodes.h). Key = 11-bit opcode (insn >> 21). The RI8 float
+    # conversions (cflts/cfltu/csflt/cuflt) are decoded separately in
+    # spu_decode(); RI7 rotate/shift/gen-control immediates live in ri7_table.
+    # Operand strings for RR ops are display-only -- the lifter dispatches on
+    # the mnemonic and reads raw register fields. ---
+    # control / channels
+    0x000: "stop", 0x001: "lnop", 0x002: "sync", 0x003: "dsync",
+    0x00c: "mfspr", 0x00d: "rdch", 0x00f: "rchcnt",
+    0x10c: "mtspr", 0x10d: "wrch", 0x201: "nop", 0x140: "stopd",
+    # integer arithmetic
+    0x040: "sf", 0x041: "or", 0x042: "bg", 0x048: "sfh", 0x049: "nor",
+    0x053: "absdb", 0x0c0: "a", 0x0c1: "and", 0x0c2: "cg", 0x0c8: "ah",
+    0x0c9: "nand", 0x0d3: "avgb",
+    0x340: "addx", 0x341: "sfx", 0x342: "cgx", 0x343: "bgx",
+    0x346: "mpyhha", 0x34e: "mpyhhau",
+    # rotate / shift (register-variable)
+    0x058: "rot", 0x059: "rotm", 0x05a: "rotma", 0x05b: "shl",
+    0x05c: "roth", 0x05d: "rothm", 0x05e: "rotmah", 0x05f: "shlh",
+    0x1cc: "rotqbybi", 0x1cd: "rotqmbybi", 0x1cf: "shlqbybi",
+    0x1d8: "rotqbi", 0x1d9: "rotqmbi", 0x1db: "shlqbi",
+    0x1dc: "rotqby", 0x1dd: "rotqmby", 0x1df: "shlqby",
+    # gather / form-select-mask / count / extend
+    0x1b0: "gb", 0x1b1: "gbh", 0x1b2: "gbb",
+    0x1b4: "fsm", 0x1b5: "fsmh", 0x1b6: "fsmb",
+    0x2a5: "clz", 0x2a6: "xswd", 0x2ae: "xshw", 0x2b4: "cntb", 0x2b6: "xsbh",
+    0x1f0: "orx",
+    # generate-controls-for-insertion (x-form)
+    0x1d4: "cbx", 0x1d5: "chx", 0x1d6: "cwx", 0x1d7: "cdx",
+    # load/store indexed
+    0x1c4: "lqx", 0x144: "stqx",
+    # branches (register-indirect)
+    0x1a8: "bi", 0x1a9: "bisl", 0x1aa: "iret", 0x1ab: "bisled",
+    0x128: "biz", 0x129: "binz", 0x12a: "bihz", 0x12b: "bihnz", 0x1ac: "hbr",
+    # logical
+    0x241: "xor", 0x249: "eqv", 0x2c1: "andc", 0x2c9: "orc",
+    # compares
+    0x240: "cgt", 0x248: "cgth", 0x250: "cgtb", 0x253: "sumb", 0x258: "hgt",
+    0x2c0: "clgt", 0x2c8: "clgth", 0x2d0: "clgtb", 0x2d8: "hlgt",
+    0x3c0: "ceq", 0x3c8: "ceqh", 0x3d0: "ceqb", 0x3d8: "heq",
+    # multiply
+    0x3c4: "mpy", 0x3c5: "mpyh", 0x3c6: "mpyhh", 0x3c7: "mpys",
+    0x3cc: "mpyu", 0x3ce: "mpyhhu",
+    # floating point
+    0x2c2: "fcgt", 0x2c3: "dfcgt", 0x2c4: "fa", 0x2c5: "fs", 0x2c6: "fm",
+    0x2ca: "fcmgt", 0x2cb: "dfcmgt", 0x2cc: "dfa", 0x2cd: "dfs", 0x2ce: "dfm",
+    0x35c: "dfma", 0x35d: "dfms", 0x35e: "dfnms", 0x35f: "dfnma",
+    0x3c2: "fceq", 0x3c3: "dfceq", 0x3ca: "fcmeq", 0x3cb: "dfcmeq",
+    0x3b8: "fesd", 0x3b9: "frds", 0x398: "fscrrd", 0x3ba: "fscrwr",
+    0x3bf: "dftsv", 0x3d4: "fi", 0x1b8: "frest", 0x1b9: "frsqest",
 }
 
 # Channel names — corrected per IBM Cell BE Architecture Manual v1.02
@@ -416,11 +365,19 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             result.operands = f"$r{rt}, 0x{lsa:X}"
         elif mne in ("hbra", "hbrr"):
             result.operands = f"0x{i16 & 0xFFFF:X}, $r{rt}"
-        elif mne == "iohl":
+        elif mne == "il":
+            result.operands = f"$r{rt}, {sign_extend(i16, 16)}"
+        elif mne in ("iohl", "ilh", "ilhu"):
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
         elif mne in ("brz", "brnz", "brhz", "brhnz"):
             target = i16 * 4 + addr
             result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
+        elif mne in ("br", "brsl"):       # relative; brsl sets link reg (RT, from raw word)
+            target = (i16 * 4 + addr) & 0x3FFFF
+            result.operands = f"0x{target:X}"
+        elif mne in ("bra", "brasl"):     # absolute
+            target = (i16 * 4) & 0x3FFFF
+            result.operands = f"0x{target:X}"
         elif mne in ("lqr", "stqr"):
             target = i16 * 4 + addr
             result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
@@ -464,6 +421,16 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             result.operands = f"$r{rt}, $r{ra}, {i10}"
         return result
 
+    # ---- RI8 format (10-bit opcode, 8-bit immediate): float<->int conversions ----
+    op10 = (insn >> 22) & 0x3FF
+    ri8_table = {0b0111011000: "cflts", 0b0111011001: "cfltu",
+                 0b0111011010: "csflt", 0b0111011011: "cuflt"}
+    if op10 in ri8_table:
+        result.mnemonic = ri8_table[op10]
+        i8 = (insn >> 14) & 0xFF
+        result.operands = f"$r{rt}, $r{ra}, {i8}"
+        return result
+
     # ---- RR format (11-bit opcode) ----
     if op11 in SPU_RR:
         mne = SPU_RR[op11]
@@ -485,7 +452,7 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             return result
 
         # Single-operand
-        if mne in ("clz", "cntb", "gb", "gbh", "fscrrd", "orx"):
+        if mne in ("clz", "cntb", "gb", "gbh", "fscrrd", "orx", "fsm", "fsmb"):
             result.operands = f"$r{rt}, $r{ra}"
             return result
 
@@ -495,13 +462,29 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
 
     # ---- Shift/rotate immediate forms (RI7 = 11-bit opcode, 7-bit immediate) ----
     # These have the format: opcd(11) i7(7) ra(7) rt(7)
+    # Rebuilt from the authoritative SPU ISA table (op11 = insn >> 21).
     ri7_table: dict[int, str] = {
-        0b00001111011: "shlqbii",  # shift left quadword by bits immediate
-        0b00111111011: "rotqbii",  # rotate quadword by bits immediate
-        0b00001111111: "shlqbyi",  # shift left quadword by bytes immediate
-        0b00111111111: "rotqbyi",  # rotate quadword by bytes immediate
-        0b00001111100: "shlqby",
-        0b00111111100: "rotqby",
+        # word / halfword rotate & shift immediate (0x78-0x7f)
+        0b00001111000: "roti",      # 0x78 rotate word immediate
+        0b00001111001: "rotmi",     # 0x79 rotate & mask word immediate
+        0b00001111010: "rotmai",    # 0x7a rotate & mask algebraic word immediate
+        0b00001111011: "shli",      # 0x7b shift left word immediate
+        0b00001111100: "rothi",     # 0x7c rotate halfword immediate
+        0b00001111101: "rothmi",    # 0x7d rotate & mask halfword immediate
+        0b00001111110: "rotmahi",   # 0x7e rotate & mask algebraic halfword immediate
+        0b00001111111: "shlhi",     # 0x7f shift left halfword immediate
+        # generate-controls-for-insertion d-form (0x1F4-0x1F7)
+        0b00111110100: "cbd",       # 0x1F4 gen controls for byte insertion
+        0b00111110101: "chd",       # 0x1F5 gen controls for halfword insertion
+        0b00111110110: "cwd",       # 0x1F6 gen controls for word insertion
+        0b00111110111: "cdd",       # 0x1F7 gen controls for doubleword insertion
+        # quadword rotate & shift by bits/bytes immediate (0x1F8-0x1FF)
+        0b00111111000: "rotqbii",   # 0x1F8 rotate quadword by bits immediate
+        0b00111111001: "rotqmbii",  # 0x1F9 rotate & mask quadword by bits immediate
+        0b00111111011: "shlqbii",   # 0x1FB shift left quadword by bits immediate
+        0b00111111100: "rotqbyi",   # 0x1FC rotate quadword by bytes immediate
+        0b00111111101: "rotqmbyi",  # 0x1FD rotate & mask quadword by bytes immediate
+        0b00111111111: "shlqbyi",   # 0x1FF shift left quadword by bytes immediate
     }
     if op11 in ri7_table:
         i7 = rb  # bits 14-20
