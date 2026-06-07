@@ -56,6 +56,9 @@ ps3recomp/
 │   ├── ppu_lifter.py         # PPU assembly -> C code lifter
 │   ├── spu_disasm.py         # SPU instruction set disassembler
 │   ├── spu_lifter.py         # SPU assembly -> C code lifter
+│   ├── extract_spu_images.py # Extract embedded SPU images from PRX/ELF
+│   ├── find_spu_functions.py # SPU function boundary detection
+│   ├── wrap_spu_elf.py       # Wrap a raw SPU blob as a loadable ELF
 │   ├── prx_analyzer.py       # Analyze PRX imports/exports and NIDs
 │   ├── nid_database.py       # Function Name ID (NID) resolver
 │   ├── find_functions.py     # Function boundary detection
@@ -67,9 +70,11 @@ ps3recomp/
 │   │   ├── ppu_memory.h      # Memory access macros (loads, stores, byte-swap)
 │   │   └── ppu_ops.h         # Instruction operation macros
 │   ├── spu/                  # SPU execution context
-│   │   ├── spu_context.h     # 128x128-bit register file, channels
-│   │   ├── spu_local_store.h # 256KB local memory simulation
-│   │   └── spu_dma.h         # DMA transfer engine
+│   │   ├── spu_context.h     # 128×128-bit register file, 256KB local store, image_id
+│   │   ├── spu_channels.c    # Channel ops + per-image function-table dispatch
+│   │   ├── spu_helpers.h     # SPU intrinsics (incl. float conversions)
+│   │   ├── spu_dma.h         # DMA (MFC) transfer engine
+│   │   └── tests/            # Self-contained SPU runtime tests
 │   ├── memory/               # Memory subsystem
 │   │   ├── vm.h              # Virtual memory manager (256MB address space)
 │   │   └── atomic.h          # PS3 atomic operations (lwarx/stwcx)
@@ -113,7 +118,7 @@ ps3recomp/
 ├── patches/                  # Patches for upstream tools
 │   └── xenonrecomp-ppu.patch # XenonRecomp adaptations for PPU (Cell != Xenon)
 │
-└── docs/                     # Documentation (15 documents, 65K+ words)
+└── docs/                     # Documentation (incl. ARCHITECTURE, RUNTIME, SPU_LIFTER, RSX_GRAPHICS, ...)
     ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
     ├── GETTING_STARTED.md     # How to recompile your first PS3 game
     ├── MODULE_STATUS.md       # Implementation status of all HLE modules
@@ -175,13 +180,16 @@ The pipeline follows the same proven approach as our [360tools](https://github.c
 
 The SPU is the elephant in the room. Each SPU has its own instruction set, its own 256KB memory, and communicates with the PPU via DMA and mailbox channels. Our approach:
 
-1. **SPU programs are self-contained** — they live in ELF segments loaded to local store
-2. **Recompile each SPU program separately** — dedicated lifter handles the SPU ISA
-3. **SPU local store becomes a thread-local array** — 256KB per "virtual SPU"
-4. **DMA operations become memcpy** — with proper synchronization
+1. **SPU programs are self-contained** — they live in ELF segments loaded to local store (`extract_spu_images.py` pulls them out of PRX/ELF)
+2. **Recompile each SPU program separately** — dedicated `spu_disasm.py` + `spu_lifter.py` handle the SPU ISA
+3. **SPU local store becomes an array** — 256KB per "virtual SPU"
+4. **DMA operations become memcpy** — via the MFC engine (`spu_dma.h`)
 5. **Channels become cross-thread message queues** — preserving ordering guarantees
+6. **Per-image function-table dispatch** — `image_id` lets multiple SPU programs (e.g. a SPURS kernel, a policy module, and a job) coexist at overlapping local-store addresses
 
-This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
+This mirrors how RPCS3 handles SPU but at compile time rather than runtime. The
+disassembler, lifter, and runtime are functional and covered by self-contained
+tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
 
 ## Module Status
 
@@ -238,6 +246,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
 | **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12/Vulkan backends, shader strategy |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
+| **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU ISA decoding/lifting, the runtime model (local store, channels, DMA, per-image dispatch), and the SPU tests |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
 
 ## Getting Started
@@ -275,6 +284,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 |------|----------|--------|------|
 | **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
+| **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14.7K functions; boots through CRT + GCM init with a live D3D12 window; a Konami arcade *emulator* EBOOT that routes rendering through CRI middleware on SPURS SPU tasks — drove the SPU recompilation work; blocked on the SPU-task pipeline | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
@@ -325,6 +335,23 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
+### v0.6.0 — *"SPU, For Real This Time"* (June 2026)
+- **SPU recompilation, corrected end-to-end**: rebuilt `spu_disasm.py`'s opcode tables from rpcs3's authoritative SPUOpcodes.h. Pervasive mis-decodes (lqr/stqr/fsmbi were excluded from RI16 and shadowed by spurious RI10 rotate entries; RI16 branch/load forms at wrong opcodes; ~15 wrong SPU_RR entries; missing RI8 float conversions) had silently corrupted *every* SPU lift.
+- **SPU lifter fall-through fix**: `spu_lifter.py` now emits a tail-call when a function ends in a non-branch — previously such functions fell off the end and truncated execution mid-image. Added cflts/cfltu/csflt/cuflt float conversions.
+- **Per-image SPU dispatch**: added `image_id` to the SPU context + an image-tagged function registry (`spu_channels.c`, `spu_begin_image()`), so a SPURS kernel, a policy module, and a job can coexist at overlapping local-store addresses.
+- **SPU tooling**: `extract_spu_images.py` (pull SPU images from PRX/ELF), `find_spu_functions.py` (SPU function bounds), `wrap_spu_elf.py` (wrap raw SPU blobs).
+- **SPU runtime tests**: self-contained sum / shufb / DMA / brsl-return tests under `runtime/spu/tests/`, plus `test_spu_helpers.c`. New `docs/SPU_LIFTER.md`.
+- **New port target — The Simpsons Arcade Game** (NPUB30563): a Konami arcade-emulator EBOOT that drove all of the above. Boots through the CRT to full GCM init with a live D3D12 window; rendering is gated behind the game's CRI-middleware-on-SPURS task pipeline.
+
+### v0.5.1 — *"All-Register FIFO"* (April 2026)
+- **All-register FIFO flag clearing**: PhyreEngine sets +0x18 pending flags on r27/r28/r30/r26 (4 structures). Previously only cleared r31. Now clears all, solving 2 of 3 init spin levels.
+- **Watchdog CTR=0 patching**: Background thread detects NULL function pointer spins, patches heap objects with NOP OPDs.
+- **D3D12 backend active**: Device FL11.0, vertex-colored PSO, batched DrawInstanced, VSync present. First GPU-rendered geometry from PS3 recomp.
+- **Level data rendering**: flOw XML level definitions parsed — authentic ocean gradient, snake creatures, food objects, particles. 486 vertices per frame.
+- **Batched DRAW_ARRAYS**: RSX method format caps at 255 verts per command. Auto-batching splits larger draws.
+- **Control register host-endian**: RSX MMIO accessed via lwbrx/stwbrx in recompiled code. Fixed endianness for put/get/ref.
+- **flOw progress**: D3D12 renders Level 3 scene at ~17fps. 12 subsystems ticking. Full GCM pipeline: NV40 → RSX processor → D3D12. Render context init blocked by 3rd-level data loop (no HLE escape).
+
 ### v0.5.0 — *"Pixels on Screen"* (April 2026)
 - **RSX command buffer processing wired up**: `gcm_flush_guest_cmdbuf()` now initializes RSX state via `rsx_state_init()`, passes NV40 commands to `rsx_process_command_buffer()`, and dispatches to the backend. Games can write GCM commands and see results on screen.
 - **FIFO watchdog thread**: Background thread monitors `ctrl->put` for changes, scans command buffer for SET_REFERENCE (method 0x0050) and WRITE_BACK_END_LABEL (0x1D6C), updates `ctrl->get`/`ctrl->ref` automatically. Breaks cellGcmFinish spin loops without needing HLE bridge interception.
@@ -358,7 +385,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 - **SEH-based crash recovery**: Three CRT constructors that access unmapped guest memory are caught via structured exception handling and recovered from, allowing startup to continue past constructor failures.
 - **malloc override**: Bump allocator at guest address range 0x00A00000-0x10000000 provides malloc/free for recompiled code without requiring full guest heap infrastructure.
 
-### v0.4.1 — *"First Light+" (March 2026)
+### v0.4.1 — *"First Light+"* (March 2026)
 - **RPCS3 audit**: Cross-referenced all major modules against RPCS3's implementations. Added 28 cellGcmSys functions, 5 sysPrxForUser functions, 4 cellSpurs functions. cellGcmSys now at 61+ functions (was 33).
 - **D3D12 backend**: Real vertex upload from guest memory with BE byte-swap, DrawInstanced, vertex attrib + shader logging, blend/depth/stencil state callbacks, texture format decode (25 RSX→DXGI mappings). 990 lines.
 - **Image encoding**: Real PNG + JPEG encoding via stb_image_write v1.16. ARGB→RGBA/RGB swizzle, configurable quality, in-memory encoding.
@@ -520,12 +547,3 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 *"The Cell Processor was ahead of its time. Now it's time to bring it to ours."*
-
-### v0.5.1 — *"All-Register FIFO"* (April 2026)
-- **All-register FIFO flag clearing**: PhyreEngine sets +0x18 pending flags on r27/r28/r30/r26 (4 structures). Previously only cleared r31. Now clears all, solving 2 of 3 init spin levels.
-- **Watchdog CTR=0 patching**: Background thread detects NULL function pointer spins, patches heap objects with NOP OPDs.
-- **D3D12 backend active**: Device FL11.0, vertex-colored PSO, batched DrawInstanced, VSync present. First GPU-rendered geometry from PS3 recomp.
-- **Level data rendering**: flOw XML level definitions parsed — authentic ocean gradient, snake creatures, food objects, particles. 486 vertices per frame.
-- **Batched DRAW_ARRAYS**: RSX method format caps at 255 verts per command. Auto-batching splits larger draws.
-- **Control register host-endian**: RSX MMIO accessed via lwbrx/stwbrx in recompiled code. Fixed endianness for put/get/ref.
-- **flOw progress**: D3D12 renders Level 3 scene at ~17fps. 12 subsystems ticking. Full GCM pipeline: NV40 → RSX processor → D3D12. Render context init blocked by 3rd-level data loop (no HLE escape).
