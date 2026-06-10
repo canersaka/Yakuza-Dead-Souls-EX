@@ -22,7 +22,7 @@ Changes made on top of upstream ps3recomp for the Yakuza: Dead Souls port:
     - opcode-31: added missing loads lvlx=519, lvrx=551, lvlxl=775, ldbrx=532
 
 - **Added the matching lifter handlers in `ppu_lifter.py`** so the now-correctly-named
-  ops generate real C instead of TODO stubs:
+  ops generate real C instead of TODOs:
     - addc, subfc (carry arithmetic, incl. ./o variants) — the original 63k TODOs
     - ldbrx; lvlx/lvlxl; lvrx/lvrxl; vsrw; vsububs; vsum2sws; vupkhsh; vrfim
     - dispatched vand (the spec existed but was never wired up)
