@@ -1,6 +1,7 @@
 # ps3recomp-yakuzadeadsouls
 > ** This is a fork of [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp), for the sole purpose of creating a PC port of Yakuza Dead Souls**
-> **All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet).
+>
+> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet).
 
 ## Changes
 
