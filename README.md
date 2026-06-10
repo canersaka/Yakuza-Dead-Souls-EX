@@ -1,4 +1,41 @@
-# ps3recomp
+# ps3recomp-yakuzadeadsouls
+> ** This is a fork of [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp), for the sole purpose of creating a PC port of Yakuza Dead Souls**
+> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet).
+
+## Changes
+
+Changes made on top of upstream ps3recomp for the Yakuza: Dead Souls port:
+
+- **Fixed a VMX (AltiVec) opcode-table mix-up in `ppu_disasm.py`** — ~26 instructions
+  were decoding to the wrong operation (e.g. `vmaxfp`→`vminfp`, `vcfsx`→`vrefp`),
+  silently generating wrong code. Verified against the AltiVec PEM (Appendix A).
+    - vmx_cmp: signed/unsigned GT compares were swapped → vcmpgts{b,h,w}=774/838/902,
+      vcmpgtu{b,h,w}=518/582/646
+    - vmx_vx float: vrefp 842→266, vrsqrtefp 778→330, vmaxfp 266→1034, vminfp 1034→1098;
+      added vrfim=714
+    - vmx_vx max: vmaxub 256→2, vmaxuh 320→66, vmaxuw 384→130
+    - vmx_vx pack: corrected the 8-entry vpk* permutation (vpkuhum=14, vpkuhus=142,
+      vpkuwum=78, vpkuwus=206, vpkshss=398, vpkshus=270, vpkswss=462, vpkswus=334)
+    - vmx_vx sum: vsumsws 1032→1928, vsum4sbs/vsum4shs swapped → 1800/1608
+    - vmx_uimm: vcfux 330→778, vcfsx 394→842
+    - opcode-31: added missing loads lvlx=519, lvrx=551, lvlxl=775, ldbrx=532
+
+- **Added the matching lifter handlers in `ppu_lifter.py`** so the now-correctly-named
+  ops generate real C instead of TODO stubs:
+    - addc, subfc (carry arithmetic, incl. ./o variants) — the original 63k TODOs
+    - ldbrx; lvlx/lvlxl; lvrx/lvrxl; vsrw; vsububs; vsum2sws; vupkhsh; vrfim
+    - dispatched vand (the spec existed but was never wired up)
+    - fixed vrefp/vrsqrtefp to read vB instead of vA
+    - added progress logging to the lift loop (QoL)
+
+- **Verified**: decode tested on real EBOOT + synthesized words (18/18); the new handlers
+  compiled with MSVC and passed behavioral unit tests (9/9).
+
+- **Result**: across the 30,721 functions in functions.json, the only remaining lift TODO
+  is `.word` (708 = data bytes embedded in `.text`), down from 73,219.
+
+This repo only contains the changes to the recompilation tools, the actual finished executable will be found in it's own dedicated repo.
+---
 
 ### *Because the Cell processor deserves a second life*
 
