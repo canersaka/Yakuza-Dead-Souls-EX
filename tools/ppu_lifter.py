@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -215,6 +216,7 @@ class PPULifter:
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+        self._valid_addrs: set[int] | None = None  # cache: addrs of real instructions
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -696,11 +698,18 @@ class PPULifter:
             cond = self._branch_condition(mn, ops)
             return f"if ({cond}) return;"
 
-        # Conditional indirect call/return through CTR: b<cond>ctr [cr]
-        # Used by vtable dispatch with a predicate.
-        if (mn.endswith("ctr") and mn not in ("bctr", "bctrl") and
-                mn.startswith("b")):
+        # Conditional indirect branch/call through CTR: b<cond>ctr / b<cond>ctrl.
+        # The target is in CTR (resolved at runtime), so always dispatch
+        # indirectly — never a fixed target. The "l" (link) forms are CALLS
+        # (execution continues after); the non-link forms are tail branches
+        # (return after dispatch). NOTE: bcctrl ends in "ctrl", so it must be
+        # caught here, before the conditional-branch-with-target handler below
+        # (otherwise its operand was mis-parsed as a bogus address).
+        if (mn.startswith("b") and mn not in ("bctr", "bctrl") and
+                (mn.endswith("ctr") or mn.endswith("ctrl"))):
             cond = self._branch_condition(mn, ops)
+            if mn.endswith("ctrl"):   # conditional indirect CALL — continue after
+                return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
             return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
 
         # Conditional branches
@@ -935,6 +944,26 @@ class PPULifter:
                     f"((result <= ctx->gpr[{rb}] && ca) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
+        # ------- addc/subfc (carry arithmetic, carry-out only, no carry-in) -------
+        # startswith() captures the . (record) and o (overflow) variants, matching
+        # the addme/subfme/subfze family. CA is XER bit 29.
+        # addc:  rD = rA + rB; CA = carry out of the add (unsigned wrap => result < rA).
+        if mn.startswith("addc"):
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t result = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((result < ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        # subfc: rD = ~rA + rB + 1 (= rB - rA); CA = carry out of ~rA + rB + 1,
+        # which equals 1 iff rB >= rA (unsigned).
+        if mn.startswith("subfc"):
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t result = ~ctx->gpr[{ra}] + ctx->gpr[{rb}] + 1; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((ctx->gpr[{rb}] >= ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
         # ------- Condition register logical ops -------
         if mn == "cror":
             bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
@@ -1089,6 +1118,15 @@ class PPULifter:
                     f"uint16_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 2); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
+        if mn == "ldbrx":
+            # Load doubleword byte-reverse: a raw 8-byte copy yields the
+            # byte-reversed (little-endian) value on the LE host, same convention
+            # as lhbrx above.
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint64_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 8); "
+                    f"ctx->gpr[{rd}] = raw; }}")
+
         if mn == "sthbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
@@ -1181,6 +1219,31 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
+
+        # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
+        # [EA&15 .. 15] of the aligned quadword left-justified into vD and
+        # zero-fills the right; lvrx is the mirror (fills the right end). lvlxl
+        # is lvlx with a cache hint (same data). Byte-loop matches the raw-byte
+        # convention used by vperm/lvsl.
+        if mn == "lvlx" or mn == "lvlxl":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
+                    f"for (int i = 0; i < 16; i++) d[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0; }}")
+
+        if mn == "lvrx" or mn == "lvrxl":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
+                    f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
 
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -1391,7 +1454,7 @@ class PPULifter:
             "vminsb":  None, "vminsh": None, "vminsw": None,
         }
 
-        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm"):
+        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm", "vand"):
             ty, cnt, op = vmx_int_binop[mn]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
@@ -1466,14 +1529,19 @@ class PPULifter:
 
         # Float reciprocal estimate / reciprocal sqrt estimate
         if mn == "vrefp":
-            vd, vb = int(ops[0][1:]), int(ops[1][1:]) if len(ops) > 1 else int(ops[0][1:])
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=1.0f/b[i]; }}")
 
         if mn == "vrsqrtefp":
-            vd, vb = int(ops[0][1:]), int(ops[1][1:]) if len(ops) > 1 else int(ops[0][1:])
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
+
+        if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
 
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
@@ -1537,6 +1605,33 @@ class PPULifter:
                     f"int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++){{int64_t r=(int64_t)a[i]-(int64_t)b[i]; d[i]=(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} }}")
 
+        if mn == "vsububs":  # subtract unsigned byte, saturate to [0,255]
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<16;i++){{int32_t r=(int32_t)a[i]-(int32_t)b[i]; d[i]=(uint8_t)(r<0?0:r);}} }}")
+
+        if mn == "vsum2sws":
+            # AltiVec PEM: d.word1 = SAT_s32(a.w0 + a.w1 + b.w1);
+            #              d.word3 = SAT_s32(a.w2 + a.w3 + b.w3); d.word0 = d.word2 = 0.
+            # (word index = BE element, matching the VMX handlers above.) temp
+            # buffer so vD may alias vA/vB.
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ int32_t* a=(int32_t*)&ctx->vr[{va}]; int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
+                    f"int64_t s0=(int64_t)a[0]+a[1]+b[1]; int64_t s1=(int64_t)a[2]+a[3]+b[3]; "
+                    f"int32_t r[4]={{0,0,0,0}}; "
+                    f"r[1]=(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
+                    f"r[3]=(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
+        if mn == "vupkhsh":
+            # Unpack high signed halfword: sign-extend the high 4 halfwords
+            # (BE elements 0-3) to 4 words. temp so vD may alias vB.
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)b[i]; "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
         # Shifts and rotates
         if mn == "vslb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -1548,6 +1643,11 @@ class PPULifter:
             return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
                     f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=a[i]<<(b[i]&31u); }}")
+        if mn == "vsrw":  # vector shift right word (logical), per-element count = b[i] & 31
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
         if mn == "vrlb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
@@ -1685,6 +1785,13 @@ class PPULifter:
 
         # Build an interval map: sorted list of (start, end) for existing funcs
         func_intervals = sorted((f.start_addr, f.end_addr) for f in self.functions)
+        start_list = [s for s, _ in func_intervals]
+
+        # Set of real instruction addresses, so we only lift code (not data /
+        # bogus targets). Cached — the instruction stream doesn't change.
+        if self._valid_addrs is None:
+            self._valid_addrs = {insn.addr for insn in all_insns}
+        valid_addrs = self._valid_addrs
 
         count = 0
         for target in sorted(all_refs):
@@ -1706,10 +1813,21 @@ class PPULifter:
                     break
 
             if container is None:
+                # Target is outside every known function: a function the
+                # boundary detection (functions.json) missed. Lift it as a NEW
+                # function if it's a real code address, bounded by the next
+                # function start so it can't run away. Non-code (bogus) targets
+                # are left undefined and get a no-op stub at emit time.
+                if target in valid_addrs:
+                    ni = bisect.bisect_right(start_list, target)
+                    end = start_list[ni] if ni < len(start_list) else target + 0x1000
+                    self.lift_function(all_insns, target, end)
+                    defined.add(target)
+                    count += 1
                 continue
 
             fstart, fend = container
-            # Lift the tail: from target to fend
+            # Lift the tail: from target to fend (mid-function entry point)
             tail_func = self.lift_function(all_insns, target, fend)
             # lift_function already appends to self.functions, so it's included
             # in output. Update defined set so we don't re-generate.
@@ -1728,9 +1846,10 @@ class PPULifter:
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
-        # Also declare any call targets that aren't defined
+        # Also declare any referenced targets (calls AND branch/trampoline
+        # targets) that aren't defined, so the source always compiles.
         defined = {f.start_addr for f in self.functions}
-        for target in sorted(self.call_targets - defined):
+        for target in sorted((self.call_targets | self.branch_targets) - defined):
             lines.append(f"void func_{target:08X}(ppu_context* ctx); /* external */")
         lines.append("")
         return "\n".join(lines)
@@ -1837,6 +1956,18 @@ class PPULifter:
 
             lines.append("}")
             lines.append("")
+
+        # No-op stub bodies for referenced targets that could not be lifted
+        # (genuinely bogus/unresolved branch or call targets — not real code).
+        # Declared /* external */ in the header; defined here so the program
+        # links and a mis-resolved branch is a harmless no-op rather than a
+        # link error or crash.
+        defined_addrs = {f.start_addr for f in self.functions}
+        for target in sorted((self.call_targets | self.branch_targets) - defined_addrs):
+            lines.append(
+                f"void func_{target:08X}(ppu_context* ctx) {{ (void)ctx; "
+                f"/* unresolved target 0x{target:08X} */ }}")
+        lines.append("")
 
         # Function table
         lines.append("/* Function table */")
@@ -2070,15 +2201,18 @@ def main() -> None:
                 loaded += 1
         print(f"  Loaded {loaded} recovered names from {args.names}")
 
-    for start, end in func_bounds:
+    _n_funcs = len(func_bounds)
+    for _i, (start, end) in enumerate(func_bounds):
         lifter.lift_function(all_insns, start, end)
+        if _i % 100 == 0 or _i == _n_funcs - 1:
+            print(f"  ... lifted {_i + 1}/{_n_funcs} functions", flush=True)
 
     # Resolve mid-function entry points: generate tail-entry functions for
     # branch/trampoline targets that land inside existing function bodies.
     # This runs iteratively because newly generated tail-entry functions may
     # themselves contain branches to other mid-function addresses.
     total_mid = 0
-    max_passes = 10
+    max_passes = 30  # generalized discovery (incl. missed functions) converges transitively
     for pass_num in range(1, max_passes + 1):
         n = lifter.generate_mid_function_entries(all_insns)
         if n == 0:
@@ -2096,6 +2230,7 @@ def main() -> None:
     with open(header_path, "w") as f:
         f.write(lifter.emit_header())
 
+    print("Building C source (~263 MB in memory — this is the long silent phase)...", flush=True)
     with open(source_path, "w") as f:
         f.write(lifter.emit_source())
 

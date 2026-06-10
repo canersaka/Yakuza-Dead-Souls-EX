@@ -771,6 +771,22 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "lvsr"
             result.operands = f"v{rd}, r{ra}, r{rb}"
             return result
+        if xo_full == 519:  # lvlx (Cell ext: Load Vector Left Indexed)
+            result.mnemonic = "lvlx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 551:  # lvrx (Cell ext: Load Vector Right Indexed)
+            result.mnemonic = "lvrx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 775:  # lvlxl (Cell ext: Load Vector Left Indexed Last)
+            result.mnemonic = "lvlxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 532:  # ldbrx (Load Doubleword Byte-Reverse Indexed)
+            result.mnemonic = "ldbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
 
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
@@ -900,8 +916,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             6: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
             198: "vcmpeqfp", 966: "vcmpbfp", 454: "vcmpgefp",
             710: "vcmpgtfp",
-            518: "vcmpgtsb", 582: "vcmpgtsh", 646: "vcmpgtsw",
-            774: "vcmpgtub", 838: "vcmpgtuh", 902: "vcmpgtuw",
+            774: "vcmpgtsb", 838: "vcmpgtsh", 902: "vcmpgtsw",
+            518: "vcmpgtub", 582: "vcmpgtuh", 646: "vcmpgtuw",
         }
         # Strip Rc (bit 10 of the 11-bit xo_full) to get the base 10-bit XO
         base_cmp_xo = xo_full & ~(1 << 10)  # strip Rc bit (now bit 10 of 11-bit field)
@@ -917,8 +933,9 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         vmx_vx = {
             # Float arithmetic
             10: "vaddfp", 74: "vsubfp",
-            842: "vrefp", 778: "vrsqrtefp",
-            266: "vmaxfp", 1034: "vminfp",
+            266: "vrefp", 330: "vrsqrtefp",
+            1034: "vmaxfp", 1098: "vminfp",
+            714: "vrfim",  # round to FP integer toward -inf (floor)
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",
@@ -929,7 +946,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             1792: "vsubsbs", 1856: "vsubshs", 1920: "vsubsws",
 
             # Integer min/max
-            256: "vmaxub", 320: "vmaxuh", 384: "vmaxuw",
+            2: "vmaxub", 66: "vmaxuh", 130: "vmaxuw",
             258: "vmaxsb", 322: "vmaxsh", 386: "vmaxsw",
             514: "vminub", 578: "vminuh", 642: "vminuw",
             770: "vminsb", 834: "vminsh", 898: "vminsw",
@@ -959,10 +976,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             # "vD, vB, UIMM" operand form, not here.
 
             # Pack/unpack
-            782: "vpkuhum", 846: "vpkuwum",
-            14: "vpkuhus", 78: "vpkuwus",
-            398: "vpkshus", 462: "vpkswus",
-            270: "vpkshss", 334: "vpkswss",
+            14: "vpkuhum", 78: "vpkuwum",
+            142: "vpkuhus", 206: "vpkuwus",
+            270: "vpkshus", 334: "vpkswus",
+            398: "vpkshss", 462: "vpkswss",
             526: "vupkhsb", 590: "vupkhsh",
             654: "vupklsb", 718: "vupklsh",
 
@@ -980,8 +997,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             776: "vmulesb", 840: "vmulesh",
 
             # Sum across
-            1032: "vsumsws", 1672: "vsum2sws",
-            1544: "vsum4ubs", 1608: "vsum4sbs", 1800: "vsum4shs",
+            1928: "vsumsws", 1672: "vsum2sws",
+            1544: "vsum4ubs", 1800: "vsum4sbs", 1608: "vsum4shs",
         }
         if xo_full in vmx_vx:
             result.mnemonic = vmx_vx[xo_full]
@@ -993,7 +1010,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         # All emit "vD, vB, UIMM" so the lifter reads a bare integer at ops[2].
         vmx_uimm = {
             524: "vspltb", 588: "vsplth", 652: "vspltw",
-            330: "vcfux", 394: "vcfsx", 906: "vctuxs", 970: "vctsxs",
+            778: "vcfux", 842: "vcfsx", 906: "vctuxs", 970: "vctsxs",
         }
         if xo_full in vmx_uimm:
             result.mnemonic = vmx_uimm[xo_full]

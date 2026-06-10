@@ -59,6 +59,26 @@ env/
 # Recompiled output (generated, not tracked)
 recompiled/
 
+# Generated lifter output (regenerated on every relift; ~263 MB)
+recomp/ppu_recomp.c
+recomp/ppu_recomp.h
+
+# RPCS3 source dropped in as a local-only reference oracle (GPLv2 — do NOT commit)
+emu/
+
+# Lifter logs / scratch
+lift_log.txt
+lift_out.txt
+lift_err.txt
+analysis.txt
+
+# Reference manuals (large / copyrighted — local only, never commit)
+*.pdf
+
+# Local working notes (keep out of the public fork)
+SUMMARY.md
+STATUS.md
+
 # Game files (never commit these)
 *.elf
 *.ELF
