@@ -75,9 +75,14 @@ analysis.txt
 # Reference manuals (large / copyrighted — local only, never commit)
 *.pdf
 
-# Local working notes (keep out of the public fork)
+# Local working notes / AI-assistant files (keep out of the public fork)
 SUMMARY.md
 STATUS.md
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.aider*
 
 # Game files (never commit these)
 *.elf
