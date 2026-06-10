@@ -29,9 +29,6 @@ Changes made on top of upstream ps3recomp for the Yakuza: Dead Souls port:
     - fixed vrefp/vrsqrtefp to read vB instead of vA
     - added progress logging to the lift loop (QoL)
 
-- **Verified**: decode tested on real EBOOT + synthesized words (18/18); the new handlers
-  compiled with MSVC and passed behavioral unit tests (9/9).
-
 - **Result**: across the 30,721 functions in functions.json, the only remaining lift TODO
   is `.word` (708 = data bytes embedded in `.text`), down from 73,219.
 
