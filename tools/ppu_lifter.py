@@ -217,6 +217,8 @@ class PPULifter:
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
         self._valid_addrs: set[int] | None = None  # cache: addrs of real instructions
+        self._sorted_insns: list | None = None       # instructions sorted by addr (index)
+        self._sorted_addrs: list[int] | None = None  # parallel addr list for bisect
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -230,11 +232,20 @@ class PPULifter:
             end_addr=end,
         )
 
+        # Address index, built once: instructions sorted by address + a parallel
+        # address list. We grab this function's instruction slice by binary
+        # search instead of scanning the entire instruction list on every call.
+        # This turns lifting from O(functions x total_instructions) into ~O(total).
+        if self._sorted_insns is None:
+            self._sorted_insns = sorted(instructions, key=lambda i: i.addr)
+            self._sorted_addrs = [i.addr for i in self._sorted_insns]
+        lo = bisect.bisect_left(self._sorted_addrs, start)
+        hi = bisect.bisect_left(self._sorted_addrs, end)
+        window = self._sorted_insns[lo:hi]   # exactly the instrs with start <= addr < end
+
         # Collect branch targets within the function for labels
         internal_targets: set[int] = set()
-        for insn in instructions:
-            if insn.addr < start or insn.addr >= end:
-                continue
+        for insn in window:
             if insn.mnemonic.startswith("b") and insn.mnemonic not in (
                     "blr", "bctr", "bctrl", "bl", "blrl"):
                 ops = _parse_operands(insn.operands)
@@ -247,10 +258,7 @@ class PPULifter:
                         except ValueError:
                             pass
 
-        for insn in instructions:
-            if insn.addr < start or insn.addr >= end:
-                continue
-
+        for insn in window:
             # Label
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
@@ -1793,8 +1801,13 @@ class PPULifter:
             self._valid_addrs = {insn.addr for insn in all_insns}
         valid_addrs = self._valid_addrs
 
+        n_refs = len(all_refs)
+        print(f"    discovery: {n_refs} referenced targets to check...", flush=True)
         count = 0
-        for target in sorted(all_refs):
+        for idx, target in enumerate(sorted(all_refs)):
+            if idx and idx % 500 == 0:
+                print(f"      ... {idx}/{n_refs} checked, {count} new functions lifted",
+                      flush=True)
             # Binary search: find the function whose range contains target
             container = None
             lo, hi = 0, len(func_intervals) - 1
@@ -2213,14 +2226,19 @@ def main() -> None:
     # themselves contain branches to other mid-function addresses.
     total_mid = 0
     max_passes = 30  # generalized discovery (incl. missed functions) converges transitively
+    print(f"Main lift done ({len(lifter.functions)} functions). Now discovering functions "
+          f"reachable from the lifted code (calls/branches not in functions.json)...", flush=True)
     for pass_num in range(1, max_passes + 1):
+        print(f"  -- discovery pass {pass_num} --", flush=True)
         n = lifter.generate_mid_function_entries(all_insns)
         if n == 0:
+            print(f"  discovery converged after pass {pass_num} (nothing new).", flush=True)
             break
         total_mid += n
-        print(f"  Mid-function pass {pass_num}: generated {n} tail-entry wrappers ({total_mid} total)")
+        print(f"  pass {pass_num}: +{n} functions ({total_mid} discovered, "
+              f"{len(lifter.functions)} total)", flush=True)
     if total_mid:
-        print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
+        print(f"  Discovery done: +{total_mid} functions ({len(lifter.functions)} total).", flush=True)
 
     os.makedirs(args.output, exist_ok=True)
 
