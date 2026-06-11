@@ -536,14 +536,18 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         x_shift = {
             24: "slw", 536: "srw", 792: "sraw", 824: "srawi",
             27: "sld", 539: "srd", 794: "srad", 826: "sradi",
+            827: "sradi",
         }
         if xo_full in x_shift:
             mne = x_shift[xo_full]
             if rc:
                 mne += "."
             result.mnemonic = mne
-            if xo_full in (824, 826):
-                result.operands = f"r{ra}, r{rd}, {rb}"
+            if xo_full in (824, 826, 827):
+                # sradi is XS-form: sh[5] lives in bit 30, so the 10-bit
+                # field reads 827 when the shift is >= 32.
+                sh = rb + (32 if xo_full == 827 else 0)
+                result.operands = f"r{ra}, r{rd}, {sh}"
             else:
                 result.operands = f"r{ra}, r{rd}, r{rb}"
             return result
