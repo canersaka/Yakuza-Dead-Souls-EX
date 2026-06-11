@@ -31,7 +31,7 @@ Makefile
 *.gch
 *.pch
 
-# IDE / Editor files
+# IDE / editor files
 .vs/
 .vscode/
 *.suo
@@ -56,14 +56,12 @@ dist/
 venv/
 env/
 
-# Recompiled output (generated, not tracked)
+# Generated lifter output
 recompiled/
-
-# Generated lifter output (regenerated on every relift; ~263 MB)
 recomp/ppu_recomp.c
 recomp/ppu_recomp.h
 
-# RPCS3 source dropped in as a local-only reference oracle (GPLv2 — do NOT commit)
+# Local reference source (GPL)
 emu/
 
 # Lifter logs / scratch
@@ -72,10 +70,15 @@ lift_out.txt
 lift_err.txt
 analysis.txt
 
-# Reference manuals (large / copyrighted — local only, never commit)
+# Generated runner sources
+yakuza/func_table_gen.cpp
+yakuza/import_bridges_gen.cpp
+yakuza/imports.json
+
+# Reference manuals
 *.pdf
 
-# Local working notes / AI-assistant files (keep out of the public fork)
+# Local notes and tool config
 SUMMARY.md
 STATUS.md
 CLAUDE.md
@@ -84,7 +87,7 @@ AGENTS.md
 .cursor/
 .aider*
 
-# Game files (never commit these)
+# Game files
 *.elf
 *.ELF
 *.self
@@ -97,15 +100,11 @@ AGENTS.md
 *.SFO
 *.sprx
 *.SPRX
-
-# Decryption keys
 *.keys
 *.rap
 
 # OS files
-.DS_Store
 Desktop.ini
-Thumbs.db
 ehthumbs.db
 
 # Logs
