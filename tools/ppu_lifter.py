@@ -88,6 +88,18 @@ extern "C"
 #endif
 void lv2_syscall(ppu_context* ctx);
 
+/* Function table (defined in ppu_recomp.c, sentinel-terminated).
+ * The game project's indirect-call dispatcher builds its lookup from this. */
+typedef struct { uint64_t addr; void (*func)(ppu_context*); const char* name; } func_entry;
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const func_entry function_table[];
+extern const uint64_t  function_table_count;  /* entries, excluding sentinel */
+#ifdef __cplusplus
+}
+#endif
+
 """
 
 SOURCE_PREAMBLE = """\
@@ -1982,14 +1994,15 @@ class PPULifter:
                 f"/* unresolved target 0x{target:08X} */ }}")
         lines.append("")
 
-        # Function table
+        # Function table (typedef + extern declaration live in the header;
+        # external linkage so the game project's dispatcher can use it)
         lines.append("/* Function table */")
-        lines.append("typedef struct { uint64_t addr; void (*func)(ppu_context*); const char* name; } func_entry;")
-        lines.append(f"static const func_entry function_table[] = {{")
+        lines.append(f"const func_entry function_table[] = {{")
         for func in self.functions:
             lines.append(f'    {{ 0x{func.start_addr:08X}ULL, {func.name}, "{func.name}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
+        lines.append(f"const uint64_t function_table_count = {len(self.functions)};")
         lines.append("")
 
         return "\n".join(lines)
