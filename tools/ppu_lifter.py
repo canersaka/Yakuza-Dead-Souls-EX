@@ -1813,6 +1813,39 @@ class PPULifter:
         return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
 
     # ------------------------------------------------------------------ #
+    # Code-coverage contract
+    # ------------------------------------------------------------------ #
+
+    def set_code_ranges(self, bounds) -> None:
+        """Record the merged [start, end) spans of the trusted function map.
+        Any NEW entry the lifter invents afterwards (jump-table case targets,
+        discovery lifts) must start inside these spans. Executable segments
+        also contain read-only data; a junk target pointing into data used to
+        get lifted with `end = next known function start`, which can be
+        megabytes away across that data -- producing megabytes of garbage
+        code per junk target. Outside-coverage targets become no-op stubs."""
+        merged: list[list[int]] = []
+        for s, e in sorted(bounds):
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        self.code_ranges = merged
+        self._code_starts = [m[0] for m in merged]
+
+    def _in_code(self, addr: int) -> bool:
+        if getattr(self, "code_ranges", None) is None:
+            return True
+        i = bisect.bisect_right(self._code_starts, addr) - 1
+        return i >= 0 and addr < self.code_ranges[i][1]
+
+    def _code_range_end(self, addr: int) -> int:
+        i = bisect.bisect_right(self._code_starts, addr) - 1
+        if i >= 0 and addr < self.code_ranges[i][1]:
+            return self.code_ranges[i][1]
+        return addr
+
+    # ------------------------------------------------------------------ #
     # Mid-function entry point resolution
     # ------------------------------------------------------------------ #
 
@@ -1844,6 +1877,13 @@ class PPULifter:
             self._valid_addrs = {insn.addr for insn in all_insns}
         valid_addrs = self._valid_addrs
 
+        # The sorted-instruction cache backs the code-plausibility probe
+        # below; make sure it exists even if no lift_function call built it
+        # yet (the parallel path reaches discovery with a fresh cache).
+        if self._sorted_insns is None:
+            self._sorted_insns = sorted(all_insns, key=lambda i: i.addr)
+            self._sorted_addrs = [i.addr for i in self._sorted_insns]
+
         n_refs = len(all_refs)
         print(f"    discovery: {n_refs} referenced targets to check...", flush=True)
         count = 0
@@ -1869,17 +1909,37 @@ class PPULifter:
                     break
 
             if container is None:
-                # Target is outside every known function: a function the
-                # boundary detection (functions.json) missed. Lift it as a NEW
-                # function if it's a real code address, bounded by the next
-                # function start so it can't run away. Non-code (bogus) targets
-                # are left undefined and get a no-op stub at emit time.
+                # Target is outside every known function: either a function
+                # the boundary detection missed, or junk pointing into data.
+                # Tell them apart by the distance to the next known function:
+                # a real missed function is hemmed in by neighbors (small
+                # bound), while a junk target in a read-only data region has
+                # no neighbors for a very long way -- lifting those used to
+                # produce megabytes of garbage code per target. Inside the
+                # trusted code coverage, lift bounded by the span; outside,
+                # lift only if the bound is tight; otherwise emit a no-op
+                # stub.
                 if target in valid_addrs:
                     ni = bisect.bisect_right(start_list, target)
                     end = start_list[ni] if ni < len(start_list) else target + 0x1000
-                    self.lift_function(all_insns, target, end)
-                    defined.add(target)
-                    count += 1
+                    if self._in_code(target):
+                        end = min(end, self._code_range_end(target))
+                    else:
+                        # Outside the trusted map: real missed functions are
+                        # hemmed in by neighbors AND decode cleanly; junk
+                        # targets in data regions fail one or both. Without
+                        # this, garbage lifts reference more junk targets and
+                        # the cascade produces megabytes of nonsense code.
+                        if end - target > 0x4000:
+                            continue   # data desert -> no-op stub at emit time
+                        lo = bisect.bisect_left(self._sorted_addrs, target)
+                        probe = self._sorted_insns[lo:lo + 16]
+                        if not probe or any(p.mnemonic == ".word" for p in probe):
+                            continue   # doesn't decode as code -> stub
+                    if end > target:
+                        self.lift_function(all_insns, target, end)
+                        defined.add(target)
+                        count += 1
                 continue
 
             fstart, fend = container
@@ -1910,8 +1970,11 @@ class PPULifter:
         lines.append("")
         return "\n".join(lines)
 
-    def emit_source(self) -> str:
-        """Generate the C source file content."""
+    def _preamble_lines(self) -> list[str]:
+        """Source preamble + static-inline helper functions, emitted into
+        every chunk file (the helpers are `static inline`, so duplicating
+        them across translation units is harmless and keeps each chunk
+        self-contained)."""
         lines = [SOURCE_PREAMBLE]
 
         # Emit helper macros
@@ -1970,75 +2033,124 @@ class PPULifter:
         lines.append("    return (ppc_rotl64(rs, sh) & mask) | (ra & ~mask);")
         lines.append("}")
         lines.append("")
+        return lines
 
-        # Build address-to-function map for fallthrough resolution
-        func_by_addr = {f.start_addr: f for f in self.functions}
-        sorted_addrs = sorted(func_by_addr.keys())
+    def _function_def_lines(self, func, func_by_addr, sorted_addrs,
+                            addr_index) -> list[str]:
+        """C lines for one lifted function (body + fallthrough trampoline)."""
+        lines: list[str] = []
+        label = self.name_map.get(func.start_addr)
+        if label:
+            lines.append(f"/* {label} */")
+        lines.append(f"void {func.name}(ppu_context* ctx) {{")
+        for bline in func.body_lines:
+            lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
-        for i, func in enumerate(self.functions):
-            if i % 10000 == 0:
-                print(f"  ... emitting {i}/{len(self.functions)} functions", flush=True)
-            label = self.name_map.get(func.start_addr)
-            if label:
-                lines.append(f"/* {label} */")
-            lines.append(f"void {func.name}(ppu_context* ctx) {{")
-            for bline in func.body_lines:
-                lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+        # If a function doesn't end with blr/b/bctr (a return or unconditional
+        # branch), PPC execution falls through to the next address. The lifter
+        # may split one logical function into pieces at boundary points, so
+        # chain them via the trampoline to avoid deep host call stacks.
+        needs_fallthrough = True
+        if func.body_lines:
+            last_line = func.body_lines[-1].strip().rstrip(';')
+            if (last_line.startswith('return') or
+                'goto ' in last_line or
+                last_line.startswith('func_') or
+                last_line.startswith('lv2_syscall') or
+                '{ func_' in last_line):
+                needs_fallthrough = False
 
-            # Check if this function needs a fallthrough call to the next function.
-            # On PPC, if a function doesn't end with blr/b/bctr (a return or
-            # unconditional branch), execution falls through to the next address.
-            # The lifter may split one logical function into multiple pieces at
-            # function boundary points, so we need to chain them.
-            needs_fallthrough = True
-            if func.body_lines:
-                last_line = func.body_lines[-1].strip().rstrip(';')
-                if (last_line.startswith('return') or
-                    'goto ' in last_line or
-                    last_line.startswith('func_') or
-                    last_line.startswith('lv2_syscall') or
-                    '{ func_' in last_line):
-                    needs_fallthrough = False
+        if needs_fallthrough:
+            addr_idx = addr_index.get(func.start_addr)
+            if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
+                next_func = func_by_addr[sorted_addrs[addr_idx + 1]]
+                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){next_func.name}; return; }}")
 
-            if needs_fallthrough:
-                # Find the next function by address.
-                # Use trampoline pattern to avoid deep call chains.
-                try:
-                    addr_idx = sorted_addrs.index(func.start_addr)
-                    if addr_idx + 1 < len(sorted_addrs):
-                        next_addr = sorted_addrs[addr_idx + 1]
-                        next_func = func_by_addr[next_addr]
-                        lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){next_func.name}; return; }}")
-                except ValueError:
-                    pass
+        lines.append("}")
+        lines.append("")
+        return lines
 
-            lines.append("}")
-            lines.append("")
-
+    def _stub_and_table_lines(self) -> list[str]:
+        """No-op stubs for unresolved targets + the exported function table.
+        Emitted once, into the final chunk file."""
+        lines: list[str] = []
         # No-op stub bodies for referenced targets that could not be lifted
-        # (genuinely bogus/unresolved branch or call targets — not real code).
-        # Declared /* external */ in the header; defined here so the program
-        # links and a mis-resolved branch is a harmless no-op rather than a
-        # link error or crash.
+        # (bogus/unresolved branch or call targets). Declared /* external */ in
+        # the header; a mis-resolved branch becomes a harmless no-op rather than
+        # a link error or crash.
         defined_addrs = {f.start_addr for f in self.functions}
         for target in sorted((self.call_targets | self.branch_targets) - defined_addrs):
             lines.append(
                 f"void func_{target:08X}(ppu_context* ctx) {{ (void)ctx; "
                 f"/* unresolved target 0x{target:08X} */ }}")
         lines.append("")
-
-        # Function table (typedef + extern declaration live in the header;
-        # external linkage so the game project's dispatcher can use it)
+        # Function table (typedef + extern decl live in the header; external
+        # linkage so the game project's dispatcher can use it).
         lines.append("/* Function table */")
-        lines.append(f"const func_entry function_table[] = {{")
+        lines.append("const func_entry function_table[] = {")
         for func in self.functions:
             lines.append(f'    {{ 0x{func.start_addr:08X}ULL, {func.name}, "{func.name}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append(f"const uint64_t function_table_count = {len(self.functions)};")
         lines.append("")
+        return lines
 
+    def emit_source(self) -> str:
+        """Full single-file C source (kept for callers/tests; the real build
+        uses write_source_files, which splits to stay under the MSVC source
+        line limit)."""
+        func_by_addr = {f.start_addr: f for f in self.functions}
+        sorted_addrs = sorted(func_by_addr.keys())
+        addr_index = {a: i for i, a in enumerate(sorted_addrs)}
+        lines = self._preamble_lines()
+        for func in self.functions:
+            lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+        lines += self._stub_and_table_lines()
         return "\n".join(lines)
+
+    def write_source_files(self, out_dir: str, base: str = "ppu_recomp",
+                           ext: str = ".cpp", max_lines: int = 600_000) -> list[str]:
+        """Write the C source split across chunk files, each well under the
+        MSVC 16,777,215 source-line limit. Splitting also lets the build
+        compile chunks in parallel and rebuild incrementally. Returns the
+        list of written paths. Chunks are cut only at function boundaries."""
+        func_by_addr = {f.start_addr: f for f in self.functions}
+        sorted_addrs = sorted(func_by_addr.keys())
+        addr_index = {a: i for i, a in enumerate(sorted_addrs)}
+
+        preamble = self._preamble_lines()
+        written: list[str] = []
+        chunk_idx = 0
+
+        def flush(body_lines: list[str], trailer: list[str] | None = None) -> None:
+            nonlocal chunk_idx
+            path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
+            with open(path, "w") as f:
+                f.write("\n".join(preamble + body_lines + (trailer or [])))
+            written.append(path)
+            print(f"  wrote {os.path.basename(path)} "
+                  f"({len(preamble) + len(body_lines) + len(trailer or [])} lines)",
+                  flush=True)
+            chunk_idx += 1
+
+        cur: list[str] = []
+        cur_len = len(preamble)
+        n = len(self.functions)
+        for i, func in enumerate(self.functions):
+            if i % 10000 == 0:
+                print(f"  ... emitting {i}/{n} functions", flush=True)
+            deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+            if cur and cur_len + len(deflines) > max_lines:
+                flush(cur)
+                cur = []
+                cur_len = len(preamble)
+            cur += deflines
+            cur_len += len(deflines)
+
+        # Final chunk carries the stubs + function table.
+        flush(cur, self._stub_and_table_lines())
+        return written
 
 
 # ---------------------------------------------------------------------------
@@ -2280,6 +2392,20 @@ def main() -> None:
     # tail-entry of whatever real function contains it. (We deliberately do NOT
     # extend the dispatcher function over the case block: the mid-entry tail
     # mechanism lifts target..func_end, so a far end explodes the output.)
+    # Merged spans of the trusted function map: new entries (jump-table case
+    # targets, discovery lifts) must start inside these, or they're data.
+    code_spans: list[list[int]] = []
+    for s, e in sorted(func_bounds):
+        if code_spans and s <= code_spans[-1][1]:
+            code_spans[-1][1] = max(code_spans[-1][1], e)
+        else:
+            code_spans.append([s, e])
+    span_starts = [s for s, _ in code_spans]
+
+    def _span_in_code(a: int) -> bool:
+        i = bisect.bisect_right(span_starts, a) - 1
+        return i >= 0 and a < code_spans[i][1]
+
     jt_targets = set()
     if not args.raw:
         try:
@@ -2299,7 +2425,8 @@ def main() -> None:
             tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
             for ts in tables.values():
                 jt_targets.update(ts)
-            import bisect
+            n_raw = len(jt_targets)
+            jt_targets = {t for t in jt_targets if _span_in_code(t)}
             fb = dict(func_bounds)
             allstarts = sorted(set(fb) | jt_targets)
             added = 0
@@ -2307,17 +2434,20 @@ def main() -> None:
                 if t in fb:
                     continue
                 k = bisect.bisect_right(allstarts, t)
-                fb[t] = allstarts[k] if k < len(allstarts) else text_hi
+                end = allstarts[k] if k < len(allstarts) else text_hi
+                i = bisect.bisect_right(span_starts, t) - 1
+                fb[t] = min(end, code_spans[i][1])
                 added += 1
             func_bounds = sorted(fb.items())
-            print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets, "
-                  f"+{added} case funcs")
+            print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets "
+                  f"({n_raw - len(jt_targets)} rejected as data), +{added} case funcs")
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter()
+    lifter.set_code_ranges(func_bounds)
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -2373,19 +2503,39 @@ def main() -> None:
     os.makedirs(args.output, exist_ok=True)
 
     header_path = os.path.join(args.output, args.header_name)
-    source_path = os.path.join(args.output, args.source_name)
-
     with open(header_path, "w") as f:
         f.write(lifter.emit_header())
 
-    print("Building C source (~263 MB in memory — this is the long silent phase)...", flush=True)
-    with open(source_path, "w") as f:
-        f.write(lifter.emit_source())
+    # Remove stale output from older lifter versions (the single-file .c and
+    # any previous chunk set) so the build doesn't pick up both.
+    import glob as _glob
+    base = args.source_name[:-2] if args.source_name.endswith(".c") else args.source_name
+    for stale in ([os.path.join(args.output, args.source_name)] +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    print("Writing C source (split into chunks)...", flush=True)
+    paths = lifter.write_source_files(args.output, base=base)
+
+    word_todos = 0
+    insn_todos = 0
+    for fn in lifter.functions:
+        for ln in fn.body_lines:
+            if "/* TODO" in ln:
+                if ".word" in ln:
+                    word_todos += 1
+                else:
+                    insn_todos += 1
 
     print(f"Wrote {header_path}")
-    print(f"Wrote {source_path}")
+    print(f"Wrote {len(paths)} source chunks: "
+          f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
+    print(f"  TODOs: {insn_todos} unhandled instructions (real gaps), "
+          f"{word_todos} .word lines (data in text, harmless)")
 
 
 if __name__ == "__main__":
