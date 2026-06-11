@@ -59,6 +59,7 @@ env/
 # Generated lifter output
 recompiled/
 recomp/ppu_recomp.c
+recomp/ppu_recomp_*.cpp
 recomp/ppu_recomp.h
 
 # Local reference source (GPL)

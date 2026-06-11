@@ -107,31 +107,6 @@ static int load_elf(const char* path, uint64_t* entry_out)
 }
 
 /* ---------------------------------------------------------------------------
- * Hand-lifted _start (0xDDDA6C..0xDDDA94)
- *
- * The function scanner missed the ELF entry (it sits in a detection gap, so
- * it isn't in functions.json / the lifted output). Ten instructions:
- *   li/oris/ori r2, <entry OPD>; lwz r2,4(r2)   -- TOC from own OPD
- *   stdu r1,-0x70(r1); li r14,0; std r14,0(r1)  -- frame + null back-chain
- *   bl 0xDDDB74                                 -- CRT init
- *   li r3,0; <falls through to 0xDDDA94>        -- exit path
- * Remove once a relift includes the entry (functions.json now seeds it).
- * -----------------------------------------------------------------------*/
-
-static void yz_entry_start(ppu_context* ctx)
-{
-    ctx->gpr[2] = vm_read32(0x01353C18 + 4);
-    ctx->gpr[1] -= 0x70;
-    vm_write64(ctx->gpr[1], 0);
-    ctx->gpr[14] = 0;
-    func_00DDDB74(ctx);
-    yz_drain_trampolines(ctx);
-    ctx->gpr[3] = 0;
-    func_00DDDA94(ctx);
-    yz_drain_trampolines(ctx);
-}
-
-/* ---------------------------------------------------------------------------
  * Guest-callback adapter (HLE modules -> recompiled code)
  * -----------------------------------------------------------------------*/
 
@@ -214,8 +189,6 @@ int main(int argc, char** argv)
     printf("[boot] entry OPD: code=0x%08X toc=0x%08X\n", entry_code, entry_toc);
 
     yz_ppu_fn entry_fn = yz_lookup_func(entry_code);
-    if (!entry_fn && entry_code == 0x00DDDA6Cu)
-        entry_fn = yz_entry_start;   /* hand-lifted _start, see above */
     if (!entry_fn) {
         fprintf(stderr, "ERROR: entry 0x%08X not in function table (%u funcs)\n",
                 entry_code, g_yz_func_count);
