@@ -59,7 +59,7 @@ env/
 # Recompiled output (generated, not tracked)
 recompiled/
 
-# Game files (never commit these)
+# Game files 
 *.elf
 *.ELF
 *.self
