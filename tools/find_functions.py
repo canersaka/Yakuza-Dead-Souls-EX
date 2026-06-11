@@ -10,14 +10,14 @@ Analyses a PPU ELF or raw binary for function entry/exit points by:
   - Detecting standard PPU prologues (mflr r0; stw/std r0, X(r1); stwu/stdu r1, -Y(r1))
   - Detecting epilogues (lwz/ld r0, X(r1); mtlr r0; blr)
   - Following bl (branch-and-link) targets to discover called functions
-  - Closing inter-function gaps so no text bytes go unattributed (stray data
-    lifts harmlessly as .word)
+  - Clipping overlapping ranges so every byte belongs to at most one function
+    (inter-function padding/data is deliberately left unattributed; the
+    lifter's discovery pass picks up any genuinely reachable stragglers)
   - Building a call graph
 
 Usage:
     python find_functions.py <input_elf_or_bin> [--raw] [--base ADDR] [--json]
                              [--call-graph] [--min-size N] [--no-opd]
-                             [--no-close-gaps] [--gap-cap N]
 """
 
 import argparse
@@ -139,14 +139,11 @@ class FunctionFinder:
 
     def __init__(self, instructions: list[Instruction], min_size: int = 8,
                  seeds: set[int] | None = None,
-                 exec_ranges: list[tuple[int, int]] | None = None,
-                 close_gaps: bool = True, gap_cap: int = 0x10000):
+                 exec_ranges: list[tuple[int, int]] | None = None):
         self.instructions = instructions
         self.min_size = min_size  # minimum function size in bytes
         self.seeds = seeds or set()           # known-true starts (.opd, entry)
         self.exec_ranges = exec_ranges or []  # [(lo, hi)] of executable text
-        self.close_gaps_enabled = close_gaps
-        self.gap_cap = gap_cap                # max gap (bytes) to sweep into a function
 
         # Build addr -> index lookup
         self._addr_to_idx: dict[int, int] = {}
@@ -401,14 +398,33 @@ class FunctionFinder:
     def apply_seeds(self) -> int:
         """Register every seed address (.opd descriptors, ELF entry) as a
         function start. Seeds are ground truth, so they bypass min_size.
-        Ends are placeholders here; close_gaps assigns the real ones."""
+        Each seeded function ends at its first blr (a return), bounded by
+        the next known start -- the same rule the other passes use. Code
+        reachable past a first blr is picked up as branch-target entries or
+        by the lifter's discovery pass, never by blind range extension
+        (extending ranges sweeps inter-function padding/data in as garbage
+        instructions)."""
+        import bisect
+        live_seeds = [a for a in self.seeds
+                      if a in self._addr_to_idx and a not in self.functions]
+        all_starts = sorted(set(self.functions.keys()) | set(live_seeds))
         added = 0
-        for addr in self.seeds:
-            if addr in self.functions:
-                continue
-            if addr not in self._addr_to_idx:
-                continue
-            self.functions[addr] = Function(start=addr, end=addr + 4)
+        for addr in live_seeds:
+            k = bisect.bisect_right(all_starts, addr)
+            nxt = all_starts[k] if k < len(all_starts) else None
+            idx = self._addr_to_idx[addr]
+            end = None
+            for j in range(idx, min(idx + 2000, len(self.instructions))):
+                cur = self.instructions[j]
+                if nxt is not None and cur.addr >= nxt:
+                    end = nxt
+                    break
+                if _is_blr(cur):
+                    end = cur.addr + 4
+                    break
+            if end is None:
+                end = nxt if nxt is not None else addr + 4
+            self.functions[addr] = Function(start=addr, end=max(end, addr + 4))
             added += 1
         return added
 
@@ -442,33 +458,24 @@ class FunctionFinder:
             dropped += 1
         return dropped
 
-    def close_all_gaps(self) -> int:
-        """Extend each function's end to the next function's start so no
-        text bytes go unattributed (also clips overlaps). Gaps larger than
-        gap_cap are assumed to be data and left open."""
+    def clip_overlaps(self) -> int:
+        """Trim any function whose detected end runs past the next function's
+        start, so every byte belongs to at most one function. Gaps between
+        functions (alignment padding, embedded data) are left unattributed
+        on purpose -- lifting them produces garbage code."""
         if not self.functions:
             return 0
-
-        def seg_end(addr: int) -> int:
-            for lo, hi in self.exec_ranges:
-                if lo <= addr < hi:
-                    return hi
-            return addr + 4
-
         starts = sorted(self.functions.keys())
-        closed = 0
+        clipped = 0
         for i, start in enumerate(starts):
             func = self.functions[start]
-            nxt = starts[i + 1] if i + 1 < len(starts) else seg_end(start)
-            if func.end > nxt:
-                func.end = nxt           # clip overlap
-            elif func.end < nxt:
-                if nxt - max(func.end, start + 4) <= self.gap_cap or func.end <= start:
-                    func.end = nxt
-                    closed += 1
+            nxt = starts[i + 1] if i + 1 < len(starts) else None
+            if nxt is not None and func.end > nxt:
+                func.end = nxt
+                clipped += 1
             if func.end <= start:
-                func.end = min(start + 4, nxt)
-        return closed
+                func.end = start + 4 if nxt is None else min(start + 4, nxt)
+        return clipped
 
     def run(self) -> list[Function]:
         """Run all detection passes and return sorted function list."""
@@ -496,10 +503,9 @@ class FunctionFinder:
                   f"-{dropped} prologue slivers -> {len(self.functions)} "
                   f"({time.time() - t:.1f}s)")
 
-        if self.close_gaps_enabled:
-            t = time.time()
-            closed = self.close_all_gaps()
-            _note(f"gap closure: {closed} gaps closed ({time.time() - t:.1f}s)")
+        t = time.time()
+        clipped = self.clip_overlaps()
+        _note(f"overlap clipping: {clipped} ranges trimmed ({time.time() - t:.1f}s)")
 
         self.build_call_graph()
         _note(f"done: {len(self.functions)} functions total "
@@ -590,11 +596,6 @@ def main() -> None:
                         help="Minimum function size in bytes (default: 8)")
     parser.add_argument("--no-opd", action="store_true",
                         help="Skip .opd descriptor seeding (ELF inputs)")
-    parser.add_argument("--no-close-gaps", action="store_true",
-                        help="Leave inter-function gaps open")
-    parser.add_argument("--gap-cap", type=lambda x: int(x, 0), default=0x10000,
-                        help="Largest gap (bytes) to sweep into the preceding "
-                             "function (default: 0x10000)")
     parser.add_argument("--output", "-o", metavar="FILE",
                         help="Write function list to JSON file (for use with ppu_lifter)")
     args = parser.parse_args()
@@ -648,9 +649,7 @@ def main() -> None:
           f"{len(exec_ranges)} executable segment(s)")
 
     finder = FunctionFinder(all_insns, min_size=args.min_size, seeds=seeds,
-                            exec_ranges=exec_ranges,
-                            close_gaps=not args.no_close_gaps,
-                            gap_cap=args.gap_cap)
+                            exec_ranges=exec_ranges)
     functions = finder.run()
 
     if seeds:
