@@ -29,6 +29,18 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 static uint32_t s_total_allocated = 0;
 
+/* Guest threads are real host threads; serialize the bump allocator. */
+#ifdef _WIN32
+static SRWLOCK s_bump_lock = SRWLOCK_INIT;
+static void bump_lock(void)   { AcquireSRWLockExclusive(&s_bump_lock); }
+static void bump_unlock(void) { ReleaseSRWLockExclusive(&s_bump_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_bump_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
+static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
+#endif
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -68,6 +80,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     if (size == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
+    bump_lock();
+
     /* Initialize bump pointer on first call */
     if (g_sys_mem_bump_ptr == 0)
         g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
@@ -76,33 +90,41 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
     /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     /* Find a free allocation slot */
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
     s_total_allocated += size;
 
-    /* Commit the pages (window is outside the pre-committed main region);
-     * fresh commits are already zeroed by the OS */
-    if (vm_commit(alloc_addr, size) != CELL_OK)
-        return (int64_t)(int32_t)CELL_ENOMEM;
-
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
-
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
-    a->active       = 1;
+    a->active       = 1;       /* claim the slot before unlocking */
     a->addr         = alloc_addr;
     a->size         = size;
     a->container_id = 0;
+
+    bump_unlock();
+
+    /* Commit the pages (window is outside the pre-committed main region);
+     * fresh commits are already zeroed by the OS */
+    if (vm_commit(alloc_addr, size) != CELL_OK) {
+        a->active = 0;
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
@@ -246,16 +268,22 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     if (alignment == 0) alignment = 0x10000;
     size = VM_ALIGN_UP(size, alignment);
 
+    bump_lock();
+
     if (g_sys_mem_bump_ptr == 0)
         g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
+
+    bump_unlock();
 
     /* Commit the reserved region */
     vm_commit(alloc_addr, size);
