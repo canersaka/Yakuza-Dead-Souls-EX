@@ -57,3 +57,17 @@ extern "C" int64_t  yz_sc_thread_get_stack_information(ppu_context* ctx);
 extern "C" void  yz_install_imports(void);
 extern yz_ppu_fn g_yz_import_bridges[];
 extern const unsigned g_yz_import_count;
+
+/* gcm guest-side structures (import_overrides.cpp) ----------------------------
+ * _cellGcmInitBody builds these in runner scratch. The game's SDK-inline gcm
+ * code walks CellGcmContextData in guest memory itself (EBOOT layout, verified
+ * from func_00EBC0C8/EBC128: begin@+0, end@+4, current@+8, callback@+0xC; the
+ * callback field holds an OPD whose code word the game mtctr/bctrl's). */
+#define YZ_GCM_CTX_ADDR     0x0FF80000u  /* CellGcmContextData (16 B) */
+#define YZ_GCM_CB_OPD_ADDR  0x0FF80020u  /* synthetic OPD for the fifo callback */
+#define YZ_GCM_CTRL_ADDR    0x0FF80040u  /* CellGcmControl put/get/ref */
+#define YZ_GCM_LABELS_ADDR  0x0FF81000u  /* RSX label area, 256 x 16 B */
+#define YZ_GCM_CB_FAKE_KEY  0xFE100000u  /* routed by import_bridge_for() */
+#define YZ_GCM_LOCAL_BASE   0xC0000000u  /* RSX local memory (matches libs) */
+#define YZ_GCM_LOCAL_SIZE   0x0F900000u  /* 249 MB, real-hardware value */
+extern "C" void yz_gcm_fifo_callback(ppu_context* ctx);

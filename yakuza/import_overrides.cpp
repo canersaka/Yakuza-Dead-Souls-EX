@@ -130,6 +130,417 @@ extern "C" void yz_ovr_sys_ppu_thread_get_id(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * gcm initialization (_cellGcmInitBody and friends)
+ *
+ * The game's gcm code is SDK-inline: it walks CellGcmContextData in GUEST
+ * memory itself (layout verified from the EBOOT: begin@+0, end@+4,
+ * current@+8, callback@+0xC) and writes RSX commands through ctx->current.
+ * So init must build guest-visible structures; the libs host-side state
+ * (offset table, io mappings, flip machinery) is kept in sync by calling
+ * the libs cellGcmInit. Semantics cross-checked against RPCS3
+ * _cellGcmInitBody (Emu/Cell/Modules/cellGcmSys.cpp) and the real boot's
+ * libgcm trace in RPCS3.log -- reimplemented, not copied.
+ * -----------------------------------------------------------------------*/
+extern "C" int32_t cellGcmInit(uint32_t cmdSize, uint32_t ioSize, uint32_t ioAddress);
+extern "C" int32_t cellGcmIoOffsetToAddress(uint32_t ioOffset, uint32_t* ea);
+extern "C" int32_t cellGcmAddressToOffset(uint32_t address, uint32_t* offset);
+extern "C" int32_t cellGcmGetTiledPitchSize(uint32_t size, uint32_t* pitch);
+extern "C" uint32_t cellGcmGetTimeStampLocation(uint32_t index, uint32_t* location);
+
+static uint32_t yz_gcm_io_addr;
+static uint32_t yz_gcm_io_size;
+
+/* ---- Minimal RSX fifo consumer ("mini-RSX") --------------------------------
+ * The game's SDK-inline flush/finish writes ctrl->put and spins until
+ * ctrl->get (and for SetReference waits, ctrl->ref) catch up — on real
+ * hardware the RSX advances them. This host thread walks the command
+ * stream from get to put: follows jumps, skips methods by their count
+ * field, and executes SET_REFERENCE (NV406E method 0x050; the EBOOT's own
+ * inline SetReference writes header 0x00040050) by storing the operand to
+ * ctrl->ref. No other method does anything yet — that is the D3D12 tier-1
+ * wiring, later. */
+/* Execute one method register write. Returns 0 normally, 1 if the fifo
+ * must stall (semaphore acquire not yet satisfied).
+ * Semaphore semantics mirror RPCS3 (emu/RSX/NV47/HW/nv4097.cpp,
+ * rsx_methods.cpp, RSXThread.cpp get_address): each class has a context-DMA
+ * selector + offset register; the DMA selects where the semaphore lives:
+ *   0x66606660/0x66616661 -> label area (what cellGcmGetLabelAddress returns)
+ *   0xFEED0001            -> main memory via the io map (offset = io offset)
+ *   0xFEED0000            -> RSX local memory
+ * back_end release swizzles the value (ARGB shuffle); the others are raw. */
+static uint32_t yz_rsx_sem_dma_406e = 0x66616661;  /* RPCS3 reset values */
+static uint32_t yz_rsx_sem_dma_4097 = 0x66606660;
+static uint32_t yz_rsx_sem_off_406e;
+static uint32_t yz_rsx_sem_off_4097;
+
+static uint32_t yz_rsx_sem_addr(uint32_t dma, uint32_t offset)
+{
+    switch (dma) {
+    case 0x66606660u:
+    case 0x66616661u:
+        return YZ_GCM_LABELS_ADDR + (offset & 0xFFCu);
+    case 0xFEED0001u: {                           /* main memory via io map */
+        uint32_t ea = 0;
+        if (cellGcmIoOffsetToAddress(offset, &ea) == 0 && ea)
+            return ea;
+        return 0;
+    }
+    case 0xFEED0000u:                             /* RSX local memory */
+        return (offset < YZ_GCM_LOCAL_SIZE) ? YZ_GCM_LOCAL_BASE + offset : 0;
+    default: {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[rsx] unknown semaphore context dma 0x%08X\n", dma);
+        }
+        return 0;
+    }
+    }
+}
+
+/* NV3062 (2D surface) + NV308A (image-from-cpu) state: the SDK's
+ * cellGcmInlineTransfer writes data words into memory through the 2D blit
+ * engine — Yakuza uses it to publish its flip/vsync counters to a spot in
+ * io memory that the PPU then polls. Semantics per RPCS3 nv308a.cpp:
+ * A8R8G8B8/Y32 is a raw word copy to dst_offset + x*4 + y*pitch; operands
+ * with index >= SIZE_OUT.x are skipped. */
+static uint32_t yz_rsx_blit_dst_dma = 0xFEED0000;
+static uint32_t yz_rsx_blit_dst_off;
+static uint32_t yz_rsx_blit_pitch   = 64;
+static uint32_t yz_rsx_blit_fmt     = 0xB;     /* a8r8g8b8 */
+static uint32_t yz_rsx_blit_point;
+static uint32_t yz_rsx_blit_size_out = 0x00010001;
+
+static int yz_rsx_method(uint32_t method, uint32_t arg)
+{
+    if (method >= 0xA400 && method < 0xAB00) {     /* NV308A_COLOR window */
+        uint32_t index = (method - 0xA400) >> 2;
+        uint32_t out_x = yz_rsx_blit_size_out & 0xFFFFu;
+        if (index >= out_x)
+            return 0;                              /* clipped: skip */
+        if (yz_rsx_blit_fmt != 0xB && yz_rsx_blit_fmt != 0x8 /* y32 */) {
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[rsx] NV308A color format 0x%X unsupported\n",
+                        yz_rsx_blit_fmt);
+            }
+            return 0;
+        }
+        uint32_t x = (yz_rsx_blit_point & 0xFFFFu) + index;
+        uint32_t y = yz_rsx_blit_point >> 16;
+        uint32_t pitch = yz_rsx_blit_pitch & 0xFFFFu;
+        uint32_t addr = yz_rsx_sem_addr(yz_rsx_blit_dst_dma,
+                                        yz_rsx_blit_dst_off + x * 4 + y * pitch);
+        if (addr)
+            vm_write32(addr, arg);
+        return 0;
+    }
+
+    uint32_t addr;
+    switch (method) {
+    case 0x6184:                                  /* NV3062 DMA_IMAGE_SOURCE */
+        break;
+    case 0x6188:                                  /* NV3062 DMA_IMAGE_DESTIN */
+        yz_rsx_blit_dst_dma = arg;
+        break;
+    case 0x6300:                                  /* NV3062 SET_COLOR_FORMAT */
+        yz_rsx_blit_fmt = arg & 0xFFFFu;
+        break;
+    case 0x6304:                                  /* NV3062 SET_PITCH (src<<16|dst) */
+        yz_rsx_blit_pitch = arg;
+        break;
+    case 0x630C:                                  /* NV3062 SET_OFFSET_DESTIN */
+        yz_rsx_blit_dst_off = arg;
+        break;
+    case 0xA304:                                  /* NV308A_POINT (y<<16|x) */
+        yz_rsx_blit_point = arg;
+        break;
+    case 0xA308:                                  /* NV308A_SIZE_OUT */
+        yz_rsx_blit_size_out = arg;
+        break;
+    }
+    switch (method) {
+    case 0x050:                                   /* NV406E SET_REFERENCE */
+        vm_write32(YZ_GCM_CTRL_ADDR + 8, arg);
+        break;
+    case 0x060:                                   /* NV406E SET_CONTEXT_DMA_SEMAPHORE */
+        yz_rsx_sem_dma_406e = arg;
+        break;
+    case 0x064:                                   /* NV406E SEMAPHORE_OFFSET */
+        yz_rsx_sem_off_406e = arg;
+        break;
+    case 0x068:                                   /* NV406E SEMAPHORE_ACQUIRE */
+        addr = yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
+        if (addr && vm_read32(addr) != arg)
+            return 1;                             /* stall, retry later */
+        break;
+    case 0x06C:                                   /* NV406E SEMAPHORE_RELEASE */
+        addr = yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
+        if (addr)
+            vm_write32(addr, arg);
+        break;
+    case 0x1A4:                                   /* NV4097 SET_CONTEXT_DMA_SEMAPHORE */
+        yz_rsx_sem_dma_4097 = arg;
+        break;
+    case 0x1D6C:                                  /* NV4097 SET_SEMAPHORE_OFFSET */
+        yz_rsx_sem_off_4097 = arg;
+        break;
+    case 0x1D70:                                  /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+        addr = yz_rsx_sem_addr(yz_rsx_sem_dma_4097, yz_rsx_sem_off_4097);
+        if (addr)
+            vm_write32(addr, (arg & 0xFF00FF00u) |
+                             ((arg & 0xFFu) << 16) | ((arg >> 16) & 0xFFu));
+        break;
+    case 0x1D74:                                  /* TEXTURE_READ_SEMAPHORE_RELEASE */
+        addr = yz_rsx_sem_addr(yz_rsx_sem_dma_4097, yz_rsx_sem_off_4097);
+        if (addr)
+            vm_write32(addr, arg);
+        break;
+    default:
+        break;                                    /* rendering methods: later */
+    }
+    return 0;
+}
+
+static DWORD WINAPI yz_rsx_consumer(LPVOID)
+{
+    static int warned_offmap = 0, warned_badret = 0;
+    uint32_t call_return = ~0u;   /* RSX has a single-level call stack */
+    for (;;) {
+        uint32_t put = vm_read32(YZ_GCM_CTRL_ADDR + 0);
+        uint32_t get = vm_read32(YZ_GCM_CTRL_ADDR + 4);
+        int budget = 1 << 20;   /* bail out of garbage/loops, resync below */
+        while (get != put && budget-- > 0) {
+            uint32_t ea = 0;
+            if (cellGcmIoOffsetToAddress(get, &ea) != 0 || ea == 0) {
+                if (!warned_offmap) {
+                    warned_offmap = 1;
+                    fprintf(stderr, "[rsx] get=0x%08X not io-mapped; resync to put\n", get);
+                }
+                get = put;
+                break;
+            }
+            uint32_t cmd = vm_read32(ea);
+            if ((cmd & 0xE0000003u) == 0x20000000u) {       /* old jump */
+                uint32_t tgt = cmd & 0x1FFFFFFCu;
+                if (tgt == get) break;   /* self-jump: idle until overwritten */
+                get = tgt;
+                continue;
+            }
+            if ((cmd & 3u) == 1u) {                          /* new jump */
+                uint32_t tgt = cmd & 0xFFFFFFFCu;
+                if (tgt == get) break;
+                get = tgt;
+                continue;
+            }
+            if ((cmd & 3u) == 2u) {                          /* call */
+                call_return = get + 4;
+                get = cmd & 0xFFFFFFFCu;
+                continue;
+            }
+            if (cmd == 0x00020000u) {                        /* return */
+                if (call_return != ~0u) {
+                    get = call_return;
+                    call_return = ~0u;
+                    continue;
+                }
+                if (!warned_badret) {
+                    warned_badret = 1;
+                    fprintf(stderr, "[rsx] RETURN without CALL at get=0x%08X\n", get);
+                }
+                get = put;
+                break;
+            }
+            uint32_t count  = (cmd >> 18) & 0x7FF;
+            uint32_t noninc = cmd & 0x40000000u;
+            uint32_t method = cmd & 0x3FFFCu;
+            int stalled = 0;
+            for (uint32_t i = 0; i < count && !stalled; i++) {
+                uint32_t op_ea = 0;
+                if (cellGcmIoOffsetToAddress(get + 4 + i * 4, &op_ea) != 0 || !op_ea)
+                    break;
+                stalled = yz_rsx_method(noninc ? method : method + i * 4,
+                                        vm_read32(op_ea));
+            }
+            if (stalled)
+                break;   /* leave get at this packet; re-poll the semaphore */
+            get += 4 + count * 4;
+        }
+        vm_write32(YZ_GCM_CTRL_ADDR + 4, get);
+        Sleep(1);
+    }
+    return 0;
+}
+
+/* Fifo-overflow callback: the game calls ctx->callback(ctx, count) when
+ * current+4 > end and retries while it returns 0. Wrap the buffer: flush
+ * what's pending, let the consumer drain it (so the rewind can't overwrite
+ * unconsumed commands), then append a jump-to-begin and rewind. */
+extern "C" void yz_gcm_fifo_callback(ppu_context* ctx)
+{
+    uint32_t gctx = (uint32_t)ctx->gpr[3];
+    if (gctx) {
+        uint32_t begin = vm_read32(gctx);
+        uint32_t cur   = vm_read32(gctx + 8);
+        uint32_t begin_off = begin - yz_gcm_io_addr;
+        uint32_t cur_off   = cur - yz_gcm_io_addr;
+        vm_write32(YZ_GCM_CTRL_ADDR, cur_off);             /* flush pending */
+        for (int spin = 0; spin < 1000; spin++) {          /* drain (<=1s) */
+            if (vm_read32(YZ_GCM_CTRL_ADDR + 4) == cur_off)
+                break;
+            Sleep(1);
+        }
+        vm_write32(cur, 0x20000000u | begin_off);          /* jump to begin */
+        vm_write32(gctx + 8, begin);                       /* current = begin */
+        vm_write32(YZ_GCM_CTRL_ADDR, begin_off);           /* put = begin */
+    }
+    ctx->gpr[3] = 0;
+}
+
+extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
+{
+    uint32_t ctx_slot = (uint32_t)ctx->gpr[3];   /* CellGcmContextData** */
+    uint32_t cmd_size = (uint32_t)ctx->gpr[4];
+    uint32_t io_size  = (uint32_t)ctx->gpr[5];
+    uint32_t io_addr  = (uint32_t)ctx->gpr[6];
+
+    printf("[gcm] _cellGcmInitBody(ctx**=0x%08X, cmdSize=0x%X, ioSize=0x%X, "
+           "ioAddr=0x%08X)\n", ctx_slot, cmd_size, io_size, io_addr);
+
+    /* Host-side state: offset table, io mapping, config, flip machinery. */
+    cellGcmInit(cmd_size, io_size, io_addr);
+
+    /* RSX local memory: reserved by vm_init, commit it now (the game may
+     * address it via config.localAddress / cellGcmAddressToOffset). */
+    VirtualAlloc(vm_base + YZ_GCM_LOCAL_BASE, YZ_GCM_LOCAL_SIZE,
+                 MEM_COMMIT, PAGE_READWRITE);
+
+    yz_gcm_io_addr = io_addr;
+    yz_gcm_io_size = io_size;
+
+    /* Synthetic OPD for the fifo callback (code word = runner fake key). */
+    vm_write32(YZ_GCM_CB_OPD_ADDR,     YZ_GCM_CB_FAKE_KEY);
+    vm_write32(YZ_GCM_CB_OPD_ADDR + 4, 0);
+
+    /* Guest context over the game's io buffer. First 4 KB reserved (matches
+     * libgcm); use the WHOLE default command buffer as one segment (no RSX
+     * consumer yet, so no need for libgcm's 32 KB fragment rotation). */
+    uint32_t begin = io_addr + 0x1000;
+    uint32_t end   = io_addr + (cmd_size ? cmd_size : 0x10000) - 4;
+    vm_write32(YZ_GCM_CTX_ADDR + 0x0, begin);
+    vm_write32(YZ_GCM_CTX_ADDR + 0x4, end);
+    vm_write32(YZ_GCM_CTX_ADDR + 0x8, begin);
+    vm_write32(YZ_GCM_CTX_ADDR + 0xC, YZ_GCM_CB_OPD_ADDR);
+
+    /* Control register block (put/get/ref). */
+    vm_write32(YZ_GCM_CTRL_ADDR + 0, 0);
+    vm_write32(YZ_GCM_CTRL_ADDR + 4, 0);
+    vm_write32(YZ_GCM_CTRL_ADDR + 8, 0);
+
+    /* Label area returned by cellGcmGetLabelAddress (16 B stride). */
+    memset(vm_base + YZ_GCM_LABELS_ADDR, 0, 256 * 16);
+
+    /* The reserved first 4 KB of io space starts with a jump into the
+     * buffer, so the consumer can start from get=0. */
+    vm_write32(io_addr, 0x20000000u | 0x1000u);
+
+    static int rsx_started = 0;
+    if (!rsx_started) {
+        rsx_started = 1;
+        CreateThread(NULL, 0, yz_rsx_consumer, NULL, 0, NULL);
+    }
+
+    /* Hand the context to the game. */
+    vm_write32(ctx_slot, YZ_GCM_CTX_ADDR);
+    ctx->gpr[3] = 0;
+}
+
+/* BE out-param marshals for the gcm helpers the fifo path depends on
+ * (the game's inline flush does AddressToOffset(current) -> ctrl->put;
+ * a host-endian result is a byte-swapped put). */
+extern "C" void yz_ovr_cellGcmAddressToOffset(ppu_context* ctx)
+{
+    uint32_t off = 0;
+    int32_t  rc  = cellGcmAddressToOffset((uint32_t)ctx->gpr[3], &off);
+    if (rc == 0 && ctx->gpr[4])
+        vm_write32(ctx->gpr[4], off);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+extern "C" void yz_ovr_cellGcmGetTiledPitchSize(ppu_context* ctx)
+{
+    uint32_t pitch = 0;
+    int32_t  rc    = cellGcmGetTiledPitchSize((uint32_t)ctx->gpr[3], &pitch);
+    if (rc == 0 && ctx->gpr[4])
+        vm_write32(ctx->gpr[4], pitch);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
+{
+    uint32_t loc = 0;
+    uint32_t rc  = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3], &loc);
+    if (ctx->gpr[4])
+        vm_write32(ctx->gpr[4], loc);
+    ctx->gpr[3] = rc;
+}
+
+/* Returns a pointer the game reads/polls -> must be a guest address
+ * (libs returns a host static; same class as GetControlRegister). */
+extern "C" void yz_ovr_cellGcmGetLabelAddress(ppu_context* ctx)
+{
+    ctx->gpr[3] = YZ_GCM_LABELS_ADDR + ((uint32_t)ctx->gpr[3] & 0xFF) * 0x10;
+}
+
+/* SDK-internal flip entry points take the gcm CONTEXT as the first arg
+ * (RPCS3: _cellGcmSetFlipCommand(ctx, id)); the libs single-arg versions
+ * would receive the context pointer as the buffer id and silently fail,
+ * leaving flip status WAITING forever. */
+extern "C" int32_t cellGcmSetFlipCommand(uint32_t bufferId);
+extern "C" int32_t cellGcmSetFlipCommandWithWaitLabel(uint32_t bufferId,
+                                                      uint32_t labelIndex,
+                                                      uint32_t labelValue);
+
+extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)
+        cellGcmSetFlipCommand((uint32_t)ctx->gpr[4]);
+}
+
+extern "C" void yz_ovr__cellGcmSetFlipCommandWithWaitLabel(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)
+        cellGcmSetFlipCommandWithWaitLabel((uint32_t)ctx->gpr[4],
+                                           (uint32_t)ctx->gpr[5],
+                                           (uint32_t)ctx->gpr[6]);
+}
+
+/* The game polls put/get/ref through this pointer (SDK-inline flush/finish
+ * write it directly), so it must be a GUEST address -- the libs version
+ * returns a host static, which the pointer-return bridge mangles. */
+extern "C" void yz_ovr_cellGcmGetControlRegister(ppu_context* ctx)
+{
+    ctx->gpr[3] = YZ_GCM_CTRL_ADDR;
+}
+
+/* Guest struct fields are big-endian; the libs version memcpy's host-endian
+ * (same class as cellSysutilGetSystemParamInt). Field order per SDK:
+ * localAddress, ioAddress, localSize, ioSize, memoryFrequency, coreFrequency. */
+extern "C" void yz_ovr_cellGcmGetConfiguration(ppu_context* ctx)
+{
+    uint32_t cfg = (uint32_t)ctx->gpr[3];
+    if (!cfg) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return; }
+    vm_write32(cfg + 0x00, YZ_GCM_LOCAL_BASE);
+    vm_write32(cfg + 0x04, yz_gcm_io_addr);
+    vm_write32(cfg + 0x08, YZ_GCM_LOCAL_SIZE);
+    vm_write32(cfg + 0x0C, yz_gcm_io_size);
+    vm_write32(cfg + 0x10, 650000000);
+    vm_write32(cfg + 0x14, 500000000);
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
  * cellSysutilGetSystemParamInt(id, vm::ptr<s32>)
  *
  * The generic bridge would pass a raw host pointer and the libs HLE stores

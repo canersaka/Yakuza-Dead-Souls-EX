@@ -191,6 +191,21 @@ def main():
         # libs HLE writes int out-params host-endian; ctx-aware override
         # marshals through vm_write32 (big-endian) instead.
         "cellSysutilGetSystemParamInt",
+        # gcm init: must build GUEST-side context/control structures (the
+        # game's SDK-inline gcm code walks them in guest memory directly).
+        "_cellGcmInitBody",
+        "cellGcmGetControlRegister",
+        "cellGcmGetConfiguration",
+        # gcm BE out-params / guest-address returns (fifo path depends on
+        # AddressToOffset: the inline flush stores its result to ctrl->put).
+        "cellGcmAddressToOffset",
+        "cellGcmGetTiledPitchSize",
+        "cellGcmGetTimeStampLocation",
+        "cellGcmGetLabelAddress",
+        # SDK-internal flip entries take (ctx, id, ...) — libs versions
+        # lack the leading context arg.
+        "_cellGcmSetFlipCommand",
+        "_cellGcmSetFlipCommandWithWaitLabel",
     }
 
     resolved, implemented_n = 0, 0

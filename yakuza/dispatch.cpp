@@ -59,6 +59,8 @@ static yz_ppu_fn import_bridge_for(uint32_t code)
     if (code >= YZ_IMPORT_FAKE_BASE &&
         code <  YZ_IMPORT_FAKE_BASE + g_yz_import_count * 4)
         return g_yz_import_bridges[(code - YZ_IMPORT_FAKE_BASE) / 4];
+    if (code == YZ_GCM_CB_FAKE_KEY)   /* runner-owned gcm fifo callback */
+        return yz_gcm_fifo_callback;
     return nullptr;
 }
 
