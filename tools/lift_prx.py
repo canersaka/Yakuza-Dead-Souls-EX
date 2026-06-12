@@ -194,6 +194,24 @@ def main():
             code = be32(img, opd_ea - args.base)
             code_addrs.add(code)
             opd_map[opd] = f"0x{code:08X}"
+
+    # ALSO seed every internal OPD: scan the image for {code, toc} pairs
+    # with toc == the module TOC and code inside text. Functions referenced
+    # only through data OPDs (e.g. SPURS passes its PPU handler-thread
+    # entries to sys_ppu_thread_create) are invisible to the lifter's
+    # branch discovery — without these seeds they lift as nothing and the
+    # threads exit instantly (observed live with pxd::SpursHdlr0/1).
+    text_lo = args.base + text_va
+    text_hi = args.base + text_va + text_sz
+    toc_ea = toc + args.base
+    n_opd_seeds = 0
+    for off in range(0, len(img) - 7, 4):
+        if be32(img, off + 4) != toc_ea:
+            continue
+        code = be32(img, off)
+        if text_lo <= code < text_hi and (code & 3) == 0 and code not in code_addrs:
+            code_addrs.add(code)
+            n_opd_seeds += 1
     seeds = sorted(code_addrs)
     text_end = args.base + text_va + text_sz
     funcs = []
@@ -218,7 +236,8 @@ def main():
     print(f"relocations applied: " + ", ".join(f"type{k} x{v}" for k, v in sorted(counts.items())))
     print(f"exports: {n_exp} funcs in {len(exports)} libs; imports: {n_imp} funcs "
           f"in {len(imports)} libs")
-    print(f"function seeds: {len(funcs)} (region-bounded; lifter discovery fills interiors)")
+    print(f"function seeds: {len(funcs)} ({n_opd_seeds} from internal OPD scan; "
+          f"region-bounded; lifter discovery fills interiors)")
 
 
 if __name__ == "__main__":
