@@ -551,7 +551,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                expr = f"{helper}(ctx->gpr[{base}] + {disp})"
+                expr = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
                 line = f"ctx->gpr[{rd_i}] = {expr};"
@@ -575,7 +575,7 @@ class PPULifter:
             rs_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                line = f"{helper}(ctx->gpr[{base}] + {disp}, ctx->gpr[{rs_i}]);"
+                line = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp}, ctx->gpr[{rs_i}]);"
                 # Handle update forms
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -609,7 +609,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32(ctx->gpr[{base}] + {disp});"
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp});"
 
         # ------- Indexed Stores -------
         idx_store_map = {
@@ -634,7 +634,7 @@ class PPULifter:
         if mn in ("stfsx", "stfdx"):
             frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
-            if "s" in mn:
+            if "fs" in mn:
                 return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
@@ -826,22 +826,30 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    return (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                    line = (f"{{ uint32_t tmp = vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    return (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    line = (f"{{ uint64_t tmp = vm_read64((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+                # Update forms (lfsu/lfdu): RA <- EA, same as the integer path.
+                if mn.endswith("u"):
+                    line += f" ctx->gpr[{base}] += {disp};"
+                return line
 
         if mn in ("stfs", "stfsu", "stfd", "stfdu"):
             frs = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                if "s" in mn:
-                    return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
-                            f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
+                if "fs" in mn:
+                    line = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
+                            f"memcpy(&tmp, &ftmp, 4); vm_write32((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
                 else:
-                    return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
-                            f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                    line = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
+                            f"vm_write64((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+                # Update forms (stfsu/stfdu): RA <- EA, same as the integer path.
+                if mn.endswith("u"):
+                    line += f" ctx->gpr[{base}] += {disp};"
+                return line
 
         # ------- FP arithmetic -------
         fp_binary = {
@@ -1095,34 +1103,34 @@ class PPULifter:
         # ------- Store/load with update indexed -------
         if mn == "stdux":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"vm_write64(ea, ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
 
         if mn == "stwux":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
 
         if mn == "ldux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = vm_read64(ea); ctx->gpr[{ra}] = ea; }}")
 
         if mn == "lwzux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = vm_read32(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Atomic load/store with reservation -------
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
                     f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
@@ -1132,13 +1140,13 @@ class PPULifter:
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
                     f"vm_write64(ea, ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
@@ -1153,19 +1161,19 @@ class PPULifter:
         # ------- Byte-reverse loads/stores -------
         if mn == "lwbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 4); "
                     f"ctx->gpr[{rd}] = raw; }}") # NOTE: no bswap — reads in host (LE) order
 
         if mn == "stwbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
                     f"memcpy(vm_base + (uint32_t)ea, &raw, 4); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint16_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 2); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
@@ -1174,25 +1182,25 @@ class PPULifter:
             # byte-reversed (little-endian) value on the LE host, same convention
             # as lhbrx above.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint64_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 8); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "sthbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
                     f"memcpy(vm_base + (uint32_t)ea, &raw, 2); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = (int64_t)(int32_t)vm_read32(ea); }}")
 
         if mn == "lhaux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = (int64_t)(int16_t)vm_read16(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Move from time base -------
@@ -1213,7 +1221,7 @@ class PPULifter:
         if mn == "dcbz":
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0x7FULL; "
+            return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0x7FULL; "
                     f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
@@ -1261,14 +1269,14 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+            return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0xFULL; "
                     f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
 
         if mn == "stvx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+            return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0xFULL; "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
@@ -1280,7 +1288,7 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
@@ -1290,7 +1298,7 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
@@ -1303,7 +1311,7 @@ class PPULifter:
             # These load a single element into the vector register.
             # For simplicity, zero the register and load at the element position.
             size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"memset(&ctx->vr[{vd}], 0, 16); "
                     f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
 
@@ -1312,7 +1320,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
@@ -1323,10 +1331,10 @@ class PPULifter:
             # lvsl: for byte offset b, generates {b, b+1, b+2, ..., b+15}
             # lvsr: generates {16-b, 17-b, ..., 31-b}
             if mn == "lvsl":
-                return (f"{{ uint8_t b = (uint8_t)((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF); "
+                return (f"{{ uint8_t b = (uint8_t)(((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & 0xF); "
                         f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
             else:
-                return (f"{{ uint8_t b = (uint8_t)(16 - ((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF)); "
+                return (f"{{ uint8_t b = (uint8_t)(16 - (((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & 0xF)); "
                         f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
 
         # VMX permute (vperm) — critical for unaligned loads
