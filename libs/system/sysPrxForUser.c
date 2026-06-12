@@ -244,10 +244,13 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
 
+extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
+#define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
+
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
-    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s')\n",
-           attr ? attr->name : "???");
+    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
+           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
 
     if (!lwmutex)
         return CELL_EFAULT;
@@ -288,8 +291,13 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
-    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
+    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+        printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
+               "sleep_queue=0x%08X (%s) -> ESRCH\n",
+               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
         return CELL_ESRCH;
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&s_lwmutex[slot].cs);
