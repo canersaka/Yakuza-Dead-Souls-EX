@@ -188,6 +188,9 @@ def main():
         "sys_ppu_thread_exit",
         "sys_ppu_thread_once",
         "sys_lwmutex_destroy",
+        # libs HLE writes int out-params host-endian; ctx-aware override
+        # marshals through vm_write32 (big-endian) instead.
+        "cellSysutilGetSystemParamInt",
     }
 
     resolved, implemented_n = 0, 0
