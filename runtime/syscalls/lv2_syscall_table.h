@@ -209,8 +209,8 @@ extern "C" {
 #define SYS_FS_GET_BLOCK_SIZE           841
 
 /* Misc */
-#define SYS_TTY_READ                    400
-#define SYS_TTY_WRITE                   402
+#define SYS_TTY_READ                    402
+#define SYS_TTY_WRITE                   403
 #define SYS_DBG_GET_THREAD_LIST         610
 
 /* Upper limit for the dispatch table */
