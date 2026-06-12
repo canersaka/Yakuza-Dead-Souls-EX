@@ -184,6 +184,10 @@ def main():
         "_sys_heap_free",
         "sys_time_get_system_time",
         "sys_ppu_thread_get_id",
+        "sys_ppu_thread_create",
+        "sys_ppu_thread_exit",
+        "sys_ppu_thread_once",
+        "sys_lwmutex_destroy",
     }
 
     resolved, implemented_n = 0, 0
