@@ -19,6 +19,7 @@
 #include "sys_event.h"
 #include "sys_timer.h"
 #include "sys_memory.h"
+#include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
 #include "sys_event.h"
@@ -879,6 +880,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Memory management */
     sys_memory_init(tbl);
+    sys_vm_init(tbl);
 
     /* Filesystem */
     sys_fs_init(tbl);
