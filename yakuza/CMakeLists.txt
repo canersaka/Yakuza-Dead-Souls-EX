@@ -32,9 +32,16 @@ if(NOT RECOMP_CHUNKS)
     message(FATAL_ERROR "No recomp/ppu_recomp_*.cpp chunks found -- run the lifter first.")
 endif()
 
-add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS})
+# LLE-lifted firmware PRX modules (currently libsre = Sony's SPURS library),
+# produced by tools/lift_prx.py + the lifter into recomp_prx/. Optional: the
+# runner builds without them until the libsre lift has been run.
+file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/recomp_prx/libsre_recomp_*.cpp")
+
+add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
 set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)
-target_include_directories(ppu_recomp_objs PRIVATE "${PS3RECOMP_DIR}/recomp")
+target_include_directories(ppu_recomp_objs PRIVATE
+    "${PS3RECOMP_DIR}/recomp"
+    "${PS3RECOMP_DIR}/recomp_prx")
 if(MSVC)
     # /Od: machine-generated code; optimizing it costs minutes and gigabytes
     # per chunk for little runtime benefit at this stage.
