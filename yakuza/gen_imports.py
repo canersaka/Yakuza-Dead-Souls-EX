@@ -45,6 +45,14 @@ from nid_database import get_default_db, compute_nid
 ELF = os.path.join(ROOT, "game", "EBOOT.elf")
 OUT = os.path.join(HERE, "import_bridges_gen.cpp")
 
+# LLE-lifted firmware modules (tools/lift_prx.py + the lifter). Exports here
+# WIN over HLE bridges: the game's import slots are pointed at Sony's real
+# OPDs instead of synthetic bridge OPDs. The module's own imports are
+# appended to the bridge table (their stubs share the sce li/oris/lwz shape,
+# so the installer's slot extraction works unchanged).
+LLE_EXPORTS = os.path.join(ROOT, "recomp_prx", "libsre_exports.json")
+LLE_IMPORTS = os.path.join(ROOT, "recomp_prx", "libsre_imports.json")
+
 PT_PROC_PRX_PARAM = 0x60000002
 
 
@@ -140,6 +148,29 @@ def main():
             imports.append((module, nid, nid2name.get(nid), slot))
         off += structsize
 
+    # ---- LLE module exports/imports -------------------------------------
+    import json
+    lle_opds = {}      # (lib, nid) -> export OPD guest addr
+    if os.path.exists(LLE_EXPORTS):
+        ex = json.load(open(LLE_EXPORTS))
+        for lib, funcs in ex["exports"].items():
+            for nid_s, opd_s in funcs.items():
+                lle_opds[(lib, int(nid_s, 16))] = int(opd_s, 16)
+        print(f"LLE exports loaded: {sum(len(v) for v in ex['exports'].values())} "
+              f"funcs from {ex['module']} ({', '.join(ex['exports'])})")
+    else:
+        print(f"WARNING: {LLE_EXPORTS} missing -- generating without LLE binding")
+
+    lle_first = None   # index of the first LLE-module import entry
+    if os.path.exists(LLE_IMPORTS):
+        lle_imp = json.load(open(LLE_IMPORTS))
+        lle_first = len(imports)
+        for lib, funcs in lle_imp.items():
+            for nid_s, stub_s in funcs.items():
+                nid = int(nid_s, 16)
+                imports.append((lib, nid, nid2name.get(nid), int(stub_s, 16)))
+        print(f"LLE module imports appended: {len(imports) - lle_first}")
+
     def implemented(name):
         return name in defined
 
@@ -206,6 +237,15 @@ def main():
         # lack the leading context arg.
         "_cellGcmSetFlipCommand",
         "_cellGcmSetFlipCommandWithWaitLabel",
+        # SPU image loading (LLE libsre imports the embedded SPURS kernels):
+        # parses the SPU ELF in guest memory, writes BE guest structs.
+        "sys_spu_image_import",
+        "sys_spu_image_close",
+        # printf family: guest varargs need format-driven %s/%p translation
+        # (raw guest pointers fault when host vprintf dereferences them).
+        "_sys_printf",
+        "_sys_sprintf",
+        "_sys_snprintf",
     }
 
     resolved, implemented_n = 0, 0
@@ -224,6 +264,10 @@ def main():
     lines.append('extern "C" {')
     seen_decl = set()
     for module, nid, name, slot in imports:
+        if (module, nid) in lle_opds:
+            if name:
+                resolved += 1
+            continue   # LLE-bound: no host bridge needed
         if name:
             resolved += 1
             if name in OVERRIDES:
@@ -236,9 +280,18 @@ def main():
     lines.append("}")
     lines.append("")
 
-    bridges = []   # c identifiers, one per import, in order
+    bridges = []   # c identifiers (or None = LLE-bound), one per import, in order
+    lle_bound = 0
+    lle_libs = {lib for (lib, _nid) in lle_opds}
     emitted = set()
     for module, nid, name, slot in imports:
+        if (module, nid) in lle_opds:
+            lle_bound += 1
+            bridges.append(None)
+            continue
+        if module in lle_libs:
+            print(f"WARNING: {module}::{name or f'0x{nid:08X}'} not exported by "
+                  f"the LLE module -- falling back to HLE/stub")
         if name and name in OVERRIDES:
             implemented_n += 1
             ident = f"yz_ovr_{name}"
@@ -300,32 +353,54 @@ def main():
         bridges.append(ident)
     lines.append("")
 
-    lines.append("struct yz_import_entry { uint32_t slot; yz_ppu_fn fn; };")
+    lines.append("/* lle_opd != 0: import binds to a lifted firmware module's real export")
+    lines.append(" * OPD (Sony's code) instead of a host bridge; fn is unused. */")
+    lines.append("struct yz_import_entry { uint32_t slot; yz_ppu_fn fn; uint32_t lle_opd; };")
     lines.append("static const yz_import_entry yz_imports[] = {")
     for (module, nid, name, slot), ident in zip(imports, bridges):
         comment = f"{module}::{name if name else f'0x{nid:08X}'}"
-        lines.append(f"    {{ 0x{slot:08X}u, {ident} }}, /* {comment} */")
+        if ident is None:
+            opd = lle_opds[(module, nid)]
+            lines.append(f"    {{ 0x{slot:08X}u, nullptr, 0x{opd:08X}u }}, /* {comment} -> LLE */")
+        else:
+            lines.append(f"    {{ 0x{slot:08X}u, {ident}, 0 }}, /* {comment} */")
     lines.append("};")
     lines.append(f"const unsigned g_yz_import_count = {len(imports)}u;")
     lines.append("yz_ppu_fn g_yz_import_bridges[{0}];".format(len(imports)))
+    lines.append("")
+    lines.append("/* Import names (diagnostics) + index of the first LLE-module entry")
+    lines.append(" * (dispatch traces calls made by the LLE firmware module). */")
+    lines.append("const char* const g_yz_import_names[] = {")
+    for module, nid, name, slot in imports:
+        label = name if name else f"0x{nid:08X}"
+        lines.append(f'    "{module}::{label}",')
+    lines.append("};")
+    first = lle_first if lle_first is not None else len(imports)
+    lines.append(f"const unsigned g_yz_lle_import_first = {first}u;")
     lines.append("")
     lines.append("extern \"C\" void yz_install_imports(void) {")
     lines.append("    for (unsigned i = 0; i < g_yz_import_count; i++) {")
     lines.append("        uint32_t opd  = YZ_IMPORT_OPD_BASE + i * 8;")
     lines.append("        uint32_t stub = yz_imports[i].slot;  /* stub CODE address */")
-    lines.append("        vm_write32(opd,     YZ_IMPORT_FAKE_BASE + i * 4);")
-    lines.append("        vm_write32(opd + 4, 0);  /* TOC unused by host bridges */")
+    lines.append("        if (yz_imports[i].lle_opd) {")
+    lines.append("            opd = yz_imports[i].lle_opd;   /* Sony's real OPD */")
+    lines.append("        } else {")
+    lines.append("            vm_write32(opd,     YZ_IMPORT_FAKE_BASE + i * 4);")
+    lines.append("            vm_write32(opd + 4, 0);  /* TOC unused by host bridges */")
+    lines.append("        }")
     lines.append("        /* The real data slot is encoded in the stub:")
     lines.append("         *   li r12,0; oris r12,r12,HI; lwz r12,LO(r12); ... */")
     lines.append("        uint32_t w1 = vm_read32(stub + 4), w2 = vm_read32(stub + 8);")
     lines.append("        if ((w1 >> 16) == 0x658Cu && (w2 >> 16) == 0x818Cu) {")
     lines.append("            uint32_t slot = ((w1 & 0xFFFFu) << 16) + (uint32_t)(int32_t)(int16_t)(w2 & 0xFFFFu);")
     lines.append("            vm_write32(slot, opd);")
-    lines.append("        } else {")
+    lines.append("        } else if (!yz_imports[i].lle_opd) {")
     lines.append("            /* unexpected stub shape: plant the descriptor over the")
     lines.append("             * stub bytes (slots self-point at the stub) */")
     lines.append("            vm_write32(stub,     YZ_IMPORT_FAKE_BASE + i * 4);")
     lines.append("            vm_write32(stub + 4, 0);")
+    lines.append("        } else {")
+    lines.append('            fprintf(stderr, "[imports] LLE entry %u: unexpected stub shape at 0x%08X\\n", i, stub);')
     lines.append("        }")
     lines.append("        g_yz_import_bridges[i] = yz_imports[i].fn;")
     lines.append("    }")
@@ -336,8 +411,10 @@ def main():
         f.write("\n".join(lines))
 
     print(f"{len(imports)} imported funcs across modules; "
-          f"{resolved} NIDs resolved to names; {implemented_n} have host impls; "
-          f"{len(imports) - implemented_n} stubbed. {nvar_total} variable imports (NOT handled).")
+          f"{resolved} NIDs resolved to names; {lle_bound} LLE-bound; "
+          f"{implemented_n} have host impls; "
+          f"{len(imports) - implemented_n - lle_bound} stubbed. "
+          f"{nvar_total} variable imports (NOT handled).")
     print(f"wrote {OUT}")
 
 

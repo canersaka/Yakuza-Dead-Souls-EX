@@ -103,7 +103,30 @@ extern "C" void yz_init_syscalls(void)
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+    /* TEMP DEBUG (SPURS bring-up): log the first call of each syscall
+     * number with args + result so silent failures inside the LLE module
+     * are visible. Strip once SPURS init survives. */
+    uint32_t num = (uint32_t)ctx->gpr[11];
+    static unsigned char seen[1100];
+    int first = (num < sizeof(seen)) && !seen[num];
+    /* SPU-management family: log every call (SPURS bring-up), not just the
+     * first — except the usleep-class noise. */
+    int spu_range = (num >= 82 && num <= 200 && num != 141 && num != 145 &&
+                     num != 147);
+    uint64_t a3 = ctx->gpr[3], a4 = ctx->gpr[4], a5 = ctx->gpr[5], a6 = ctx->gpr[6];
+
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
+
+    if (first || spu_range) {
+        seen[num] = 1;
+        fprintf(stderr, "[LV2%s t%u] sc %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)"
+                " -> 0x%llX\n", first ? ":first" : "",
+                yz_thread_current_id(), num,
+                (unsigned long long)a3, (unsigned long long)a4,
+                (unsigned long long)a5, (unsigned long long)a6,
+                (unsigned long long)ctx->gpr[3]);
+        fflush(stderr);
+    }
 }
 
 /* Guest-callback hook g_ps3_guest_caller: defined by the runtime

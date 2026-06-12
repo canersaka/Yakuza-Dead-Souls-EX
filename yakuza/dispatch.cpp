@@ -75,7 +75,23 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
 
     /* Bridges complete entirely on the host, so call directly. */
     if (yz_ppu_fn bridge = import_bridge_for(target)) {
+        /* TEMP DEBUG (SPURS bring-up): trace every import call made by the
+         * LLE firmware module (indices >= g_yz_lle_import_first) with args
+         * and result. Strip once SPURS init survives. */
+        unsigned idx = (target - YZ_IMPORT_FAKE_BASE) / 4;
+        int trace = target != YZ_GCM_CB_FAKE_KEY &&
+                    idx >= g_yz_lle_import_first && idx < g_yz_import_count;
+        if (trace)
+            fprintf(stderr, "[lle-call t%u] %s(r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)\n",
+                    yz_thread_current_id(), g_yz_import_names[idx],
+                    (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6]);
         bridge(ctx);
+        if (trace) {
+            fprintf(stderr, "[lle-call t%u]   -> 0x%llX\n",
+                    yz_thread_current_id(), (unsigned long long)ctx->gpr[3]);
+            fflush(stderr);
+        }
         return;
     }
 

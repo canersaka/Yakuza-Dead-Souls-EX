@@ -57,6 +57,16 @@ extern "C" int64_t  yz_sc_thread_get_stack_information(ppu_context* ctx);
 extern "C" void  yz_install_imports(void);
 extern yz_ppu_fn g_yz_import_bridges[];
 extern const unsigned g_yz_import_count;
+extern const char* const g_yz_import_names[];
+extern const unsigned g_yz_lle_import_first;
+
+/* LLE firmware modules ---------------------------------------------------------
+ * Sony's libsre (cellSpurs/cellSync/cellDaisy/cellSheap/cellOvis), decrypted
+ * from firmware and relocated to a fixed guest base by tools/lift_prx.py,
+ * then lifted alongside the game (recomp_prx/). The flat image includes the
+ * zero-filled bss tail; the game's SPURS-family imports bind to its export
+ * OPDs and its own 32 import slots are patched by yz_install_imports(). */
+#define YZ_LIBSRE_BASE 0x02000000u
 
 /* gcm guest-side structures (import_overrides.cpp) ----------------------------
  * _cellGcmInitBody builds these in runner scratch. The game's SDK-inline gcm
