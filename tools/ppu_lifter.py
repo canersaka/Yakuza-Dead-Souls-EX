@@ -227,6 +227,7 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
+    fallthrough_addr: int = 0  # execution continues here past end_addr (0 = none)
 
 
 class PPULifter:
@@ -286,6 +287,17 @@ class PPULifter:
             c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
+
+        # PPC execution falls through past end_addr unless the last
+        # instruction is an unconditional control transfer (the mnemonics
+        # whose translation never continues: blr/blrl -> return, b -> goto or
+        # trampoline, bctr -> indirect dispatch + return). The continuation
+        # is at end_addr itself -- NOT the next function in the map, which
+        # may sit past an unmapped gap. Register it as a branch target so
+        # gap continuations get lifted by the discovery pass.
+        if window and window[-1].mnemonic not in ("b", "blr", "blrl", "bctr"):
+            func.fallthrough_addr = end
+            self.branch_targets.add(end)
 
         self.functions.append(func)
         return func
@@ -2043,8 +2055,7 @@ class PPULifter:
         lines.append("")
         return lines
 
-    def _function_def_lines(self, func, func_by_addr, sorted_addrs,
-                            addr_index) -> list[str]:
+    def _function_def_lines(self, func) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
         lines: list[str] = []
         label = self.name_map.get(func.start_addr)
@@ -2054,25 +2065,13 @@ class PPULifter:
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
-        # If a function doesn't end with blr/b/bctr (a return or unconditional
-        # branch), PPC execution falls through to the next address. The lifter
-        # may split one logical function into pieces at boundary points, so
-        # chain them via the trampoline to avoid deep host call stacks.
-        needs_fallthrough = True
-        if func.body_lines:
-            last_line = func.body_lines[-1].strip().rstrip(';')
-            if (last_line.startswith('return') or
-                'goto ' in last_line or
-                last_line.startswith('func_') or
-                last_line.startswith('lv2_syscall') or
-                '{ func_' in last_line):
-                needs_fallthrough = False
-
-        if needs_fallthrough:
-            addr_idx = addr_index.get(func.start_addr)
-            if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
-                next_func = func_by_addr[sorted_addrs[addr_idx + 1]]
-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){next_func.name}; return; }}")
+        # If the function's last instruction isn't an unconditional control
+        # transfer, PPC execution falls through to end_addr (decided at lift
+        # time, see lift_function). Chain via the trampoline to avoid deep
+        # host call stacks.
+        if func.fallthrough_addr:
+            lines.append(f"        {{ g_trampoline_fn = (void(*)(void*))"
+                         f"func_{func.fallthrough_addr:08X}; return; }}")
 
         lines.append("}")
         lines.append("")
@@ -2108,12 +2107,9 @@ class PPULifter:
         """Full single-file C source (kept for callers/tests; the real build
         uses write_source_files, which splits to stay under the MSVC source
         line limit)."""
-        func_by_addr = {f.start_addr: f for f in self.functions}
-        sorted_addrs = sorted(func_by_addr.keys())
-        addr_index = {a: i for i, a in enumerate(sorted_addrs)}
         lines = self._preamble_lines()
         for func in self.functions:
-            lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+            lines += self._function_def_lines(func)
         lines += self._stub_and_table_lines()
         return "\n".join(lines)
 
@@ -2123,10 +2119,6 @@ class PPULifter:
         MSVC 16,777,215 source-line limit. Splitting also lets the build
         compile chunks in parallel and rebuild incrementally. Returns the
         list of written paths. Chunks are cut only at function boundaries."""
-        func_by_addr = {f.start_addr: f for f in self.functions}
-        sorted_addrs = sorted(func_by_addr.keys())
-        addr_index = {a: i for i, a in enumerate(sorted_addrs)}
-
         preamble = self._preamble_lines()
         written: list[str] = []
         chunk_idx = 0
@@ -2148,7 +2140,7 @@ class PPULifter:
         for i, func in enumerate(self.functions):
             if i % 10000 == 0:
                 print(f"  ... emitting {i}/{n} functions", flush=True)
-            deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+            deflines = self._function_def_lines(func)
             if cur and cur_len + len(deflines) > max_lines:
                 flush(cur)
                 cur = []
@@ -2287,7 +2279,8 @@ def _worker_lift(task):
         lifter._sorted_insns = None
         lifter._sorted_addrs = None
         f = lifter.lift_function(insns, start, end)
-        results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls))
+        results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
+                        f.fallthrough_addr))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -2315,10 +2308,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                   f"elapsed {elapsed / 60:.1f}m eta {eta / 60:.1f}m", flush=True)
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls in results_by_idx[idx0]:
+        for name, s, e, body, calls, fallthrough in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls))
+                body_lines=body, calls=calls, fallthrough_addr=fallthrough))
 
 
 def main() -> None:
