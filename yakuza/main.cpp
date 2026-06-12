@@ -44,6 +44,9 @@ extern "C" uint64_t yz_tls_vaddr = 0, yz_tls_filesz = 0, yz_tls_memsz = 0;
 static uint32_t g_malloc_pagesize = 0x100000;
 static uint64_t g_proc_param_vaddr = 0;
 
+/* runtime/syscalls/lv2_register.c — served by sys_process_get_sdk_version */
+extern "C" uint32_t g_ps3_sdk_version;
+
 static int load_elf(const char* path, uint64_t* entry_out)
 {
     FILE* f = fopen(path, "rb");
@@ -118,13 +121,52 @@ static int load_elf(const char* path, uint64_t* entry_out)
     fclose(f);
     *entry_out = e_entry;
     if (g_proc_param_vaddr) {
-        /* segments are loaded; read malloc_pagesize (offset 0x18, BE) */
+        /* segments are loaded; read malloc_pagesize (offset 0x18, BE) and
+         * sdk_version (offset 0xC, BE — served by sys_process_get_sdk_version) */
         uint32_t v;
         memcpy(&v, vm_base + (uint32_t)g_proc_param_vaddr + 0x18, 4);
         v = _byteswap_ulong(v);
         if (v) g_malloc_pagesize = v;
-        printf("[boot] PROC_PARAM: malloc_pagesize=0x%X\n", g_malloc_pagesize);
+        memcpy(&v, vm_base + (uint32_t)g_proc_param_vaddr + 0x0C, 4);
+        v = _byteswap_ulong(v);
+        if (v && v != 0xFFFFFFFFu) g_ps3_sdk_version = v;
+        printf("[boot] PROC_PARAM: malloc_pagesize=0x%X sdk_version=0x%X\n",
+               g_malloc_pagesize, g_ps3_sdk_version);
     }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * LLE firmware module loader (flat relocated image from tools/lift_prx.py)
+ * -----------------------------------------------------------------------*/
+
+static int load_prx_image(const char* path, uint32_t base)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: cannot open %s -- regenerate with "
+                "tools/lift_prx.py (the lifted code in this build expects it)\n",
+                path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 ||
+        (uint64_t)base < VM_MAIN_MEM_BASE ||
+        (uint64_t)base + (uint64_t)size > (uint64_t)VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
+        fprintf(stderr, "ERROR: %s [0x%08X +0x%lX] outside main memory\n",
+                path, base, size);
+        fclose(f);
+        return -1;
+    }
+    if (fread(vm_base + base, 1, (size_t)size, f) != (size_t)size) {
+        fprintf(stderr, "ERROR: short read on %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    printf("[boot] LLE module %s: 0x%08X +0x%lX\n", path, base, size);
     return 0;
 }
 
@@ -284,6 +326,11 @@ int main(int argc, char** argv)
 
     uint64_t e_entry = 0;
     if (load_elf(elf_path, &e_entry) != 0)
+        return 1;
+
+    /* LLE firmware: Sony's libsre at its lift_prx relocation base. Must be
+     * in place before yz_install_imports patches its import slots. */
+    if (load_prx_image("recomp_prx/libsre_image.bin", YZ_LIBSRE_BASE) != 0)
         return 1;
 
     /* PS3 e_entry points at an OPD descriptor: word0 = code, word1 = TOC */

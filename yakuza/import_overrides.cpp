@@ -16,6 +16,8 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 
+#include "ps3emu/error_codes.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -570,4 +572,267 @@ extern "C" void yz_ovr_sys_lwmutex_destroy(ppu_context* ctx)
             (uint32_t)ctx->gpr[3], (unsigned long long)ctx->lr);
     void* p = ctx->gpr[3] ? (void*)(vm_base + (uint32_t)ctx->gpr[3]) : NULL;
     ctx->gpr[3] = (uint64_t)(int64_t)sys_lwmutex_destroy(p);
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_spu_image_import(img*, src, type) -- user-level SPU ELF loader.
+ *
+ * Sony's libsre (LLE SPURS) calls this to import its embedded SPURS-kernel
+ * SPU ELFs (ELF32 BE, EM_SPU; verified at image vaddrs 0x20380/0x20C00,
+ * entries 0x818/0x848). Semantics from RPCS3 sys_spu_.cpp
+ * sys_spu_image_import (DIRECT path) + sys_spu.h get_nsegs/fill:
+ *   - per PT_LOAD: COPY segment {ls=p_vaddr, size=p_filesz, addr=src+p_offset}
+ *     plus FILL {ls=p_vaddr+p_filesz, size=p_memsz-p_filesz, value=0} for bss;
+ *   - per PT_NOTE (p_type 4): INFO segment {size=0x20, addr=src+p_offset+0x14};
+ *   - any other p_type: ENOEXEC.
+ * Guest structs (BE): sys_spu_image {type@0=USER, entry@4, segs@8, nsegs@12},
+ * sys_spu_segment 0x18 bytes {type@0, ls@4, size@8, addr/value@0x10}.
+ * The segment table is consumed at thread-group start when the kernel image
+ * is deployed to SPU local store (7d).
+ * -----------------------------------------------------------------------*/
+extern "C" void yz_ovr_sys_spu_image_import(ppu_context* ctx)
+{
+    uint32_t img_ea = (uint32_t)ctx->gpr[3];
+    uint32_t src    = (uint32_t)ctx->gpr[4];
+    uint32_t type   = (uint32_t)ctx->gpr[5];
+
+    const uint8_t* e = vm_base + src;
+    if (!img_ea || !src || memcmp(e, "\x7f""ELF", 4) != 0 ||
+        e[4] != 1 /*ELF32*/ || e[5] != 2 /*BE*/ ||
+        ((e[18] << 8) | e[19]) != 23 /*EM_SPU*/) {
+        fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X type=%u: "
+                "not an ELF32-BE EM_SPU image -> ENOEXEC\n", img_ea, src, type);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOEXEC;
+        return;
+    }
+
+    uint32_t entry     = vm_read32(src + 0x18);
+    uint32_t phoff     = vm_read32(src + 0x1C);
+    uint32_t phentsize = (uint32_t)((e[0x2A] << 8) | e[0x2B]);
+    uint32_t phnum     = (uint32_t)((e[0x2C] << 8) | e[0x2D]);
+    if (!phnum || phentsize < 32) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOEXEC;
+        return;
+    }
+
+    /* Count segments (oracle: get_nsegs) */
+    int32_t nsegs = 0;
+    for (uint32_t i = 0; i < phnum; i++) {
+        uint32_t ph      = src + phoff + i * phentsize;
+        uint32_t p_type  = vm_read32(ph + 0x00);
+        uint32_t p_filesz= vm_read32(ph + 0x10);
+        uint32_t p_memsz = vm_read32(ph + 0x14);
+        if (p_type != 1 && p_type != 4) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOEXEC;
+            return;
+        }
+        if (p_type == 1 && p_memsz != p_filesz && p_filesz) nsegs += 2;
+        else nsegs += 1;
+    }
+
+    uint32_t segs_ea = yz_heap_alloc((uint32_t)nsegs * 0x18u, 16);
+    if (!segs_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOMEM;
+        return;
+    }
+
+    /* Fill segments (oracle: sys_spu_image::fill) */
+    uint32_t s = segs_ea;
+    for (uint32_t i = 0; i < phnum; i++) {
+        uint32_t ph       = src + phoff + i * phentsize;
+        uint32_t p_type   = vm_read32(ph + 0x00);
+        uint32_t p_offset = vm_read32(ph + 0x04);
+        uint32_t p_vaddr  = vm_read32(ph + 0x08);
+        uint32_t p_filesz = vm_read32(ph + 0x10);
+        uint32_t p_memsz  = vm_read32(ph + 0x14);
+        if (p_type == 1) {
+            if (p_filesz) {
+                vm_write32(s + 0x00, 1);                 /* COPY */
+                vm_write32(s + 0x04, p_vaddr);
+                vm_write32(s + 0x08, p_filesz);
+                vm_write32(s + 0x10, src + p_offset);
+                s += 0x18;
+            }
+            if (p_memsz > p_filesz) {
+                vm_write32(s + 0x00, 2);                 /* FILL */
+                vm_write32(s + 0x04, p_vaddr + p_filesz);
+                vm_write32(s + 0x08, p_memsz - p_filesz);
+                vm_write32(s + 0x10, 0);
+                s += 0x18;
+            }
+        } else { /* p_type == 4 */
+            vm_write32(s + 0x00, 4);                     /* INFO */
+            vm_write32(s + 0x04, 0);
+            vm_write32(s + 0x08, 0x20);
+            vm_write32(s + 0x10, src + p_offset + 0x14);
+            s += 0x18;
+        }
+    }
+
+    vm_write32(img_ea + 0x0, 0);                  /* SYS_SPU_IMAGE_TYPE_USER */
+    vm_write32(img_ea + 0x4, entry);
+    vm_write32(img_ea + 0x8, segs_ea);
+    vm_write32(img_ea + 0xC, (uint32_t)nsegs);
+
+    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X type=%u "
+            "-> entry=0x%X nsegs=%d segs=0x%08X\n",
+            img_ea, src, type, entry, nsegs, segs_ea);
+    ctx->gpr[3] = 0;
+}
+
+/* sys_spu_image_close: our USER images keep their segment tables in the
+ * runner bump heap (never reclaimed), so close is success/no-op. */
+extern "C" void yz_ovr_sys_spu_image_close(ppu_context* ctx)
+{
+    fprintf(stderr, "[SPU] image_close img=0x%08X\n", (uint32_t)ctx->gpr[3]);
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest-aware printf family.
+ *
+ * The generic bridges pass vararg slots raw, so a guest %s pointer reaches
+ * host vprintf and is dereferenced as a host address (observed live: Sony''s
+ * libsre printed a warning with %s -> fault on guest 0x0202xxxx). This
+ * formatter walks the format string itself and translates %s/%p arguments.
+ *
+ * Vararg slots per the PPC64 ELF ABI: integer args r3..r10, then the
+ * caller''s parameter save area at r1+0x30 (8 doubleword home slots for
+ * r3..r10, 9th arg onward at r1+0x70). Floats in prototype-less calls are
+ * mirrored into the GPR image, so %f can reinterpret the GPR bits.
+ * -----------------------------------------------------------------------*/
+static int yz_format_guest(char* out, size_t outsz, ppu_context* ctx,
+                           uint32_t fmt_ea, int first_vararg /* 0 = r3 */)
+{
+    const char* f = (const char*)(vm_base + fmt_ea);
+    size_t o = 0;
+    int ai = first_vararg;
+
+    /* fetch integer-arg slot i (0-based from r3) */
+    #define YZ_ARG(i) ((i) < 8 ? ctx->gpr[3 + (i)] \
+                              : vm_read64(ctx->gpr[1] + 0x30 + (uint64_t)(i) * 8))
+
+    while (*f && o + 1 < outsz) {
+        if (*f != '%') { out[o++] = *f++; continue; }
+
+        /* collect the conversion spec; '*' width/precision consumes an
+         * integer argument (e.g. SPURS prints names with %.*s) */
+        char spec[32];
+        size_t sl = 0;
+        spec[sl++] = *f++;                      /* '%' */
+        while (*f && sl < sizeof(spec) - 16 &&
+               (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '0' ||
+                (*f >= '0' && *f <= '9') || *f == '.' || *f == '*')) {
+            if (*f == '*') {
+                int w = (int)(int32_t)(uint32_t)YZ_ARG(ai++);
+                sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", w);
+                f++;
+            } else {
+                spec[sl++] = *f++;
+            }
+        }
+        int l_count = 0;
+        while (*f == 'l' || *f == 'h' || *f == 'z') {
+            if (*f == 'l') l_count++;
+            f++;                                /* length mods re-added below */
+        }
+        char conv = *f ? *f++ : 0;
+        if (!conv) break;
+
+        char piece[512];
+        piece[0] = 0;
+        uint64_t a;
+        switch (conv) {
+        case '%':
+            piece[0] = '%'; piece[1] = 0;
+            break;
+        case 's': {
+            a = YZ_ARG(ai++);
+            /* guard: a %s arg below the loaded image range is not a string
+             * pointer (mis-indexed vararg or genuine garbage) */
+            const char* s = ((uint32_t)a >= 0x10000u)
+                          ? (const char*)(vm_base + (uint32_t)a)
+                          : (a ? "(badptr)" : "(null)");
+            spec[sl++] = 's'; spec[sl] = 0;
+            snprintf(piece, sizeof(piece), spec, s);
+            break;
+        }
+        case 'c':
+            a = YZ_ARG(ai++);
+            spec[sl++] = 'c'; spec[sl] = 0;
+            snprintf(piece, sizeof(piece), spec, (int)a);
+            break;
+        case 'p':
+            a = YZ_ARG(ai++);
+            snprintf(piece, sizeof(piece), "0x%08X", (uint32_t)a);
+            break;
+        case 'd': case 'i':
+            a = YZ_ARG(ai++);
+            spec[sl++] = 'l'; spec[sl++] = 'l'; spec[sl++] = conv; spec[sl] = 0;
+            /* PS3 long = 64-bit; plain int = 32 */
+            snprintf(piece, sizeof(piece), spec,
+                     l_count ? (long long)a : (long long)(int32_t)(uint32_t)a);
+            break;
+        case 'u': case 'x': case 'X': case 'o':
+            a = YZ_ARG(ai++);
+            spec[sl++] = 'l'; spec[sl++] = 'l'; spec[sl++] = conv; spec[sl] = 0;
+            snprintf(piece, sizeof(piece), spec,
+                     l_count ? (unsigned long long)a
+                             : (unsigned long long)(uint32_t)a);
+            break;
+        case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
+            a = YZ_ARG(ai++);
+            double d;
+            memcpy(&d, &a, 8);                  /* GPR image of the double */
+            spec[sl++] = conv; spec[sl] = 0;
+            snprintf(piece, sizeof(piece), spec, d);
+            break;
+        }
+        default:
+            /* unknown conversion: emit it literally, consume one arg */
+            a = YZ_ARG(ai++);
+            snprintf(piece, sizeof(piece), "%%%c?(0x%llX)", conv,
+                     (unsigned long long)a);
+            break;
+        }
+        size_t pl = strlen(piece);
+        if (pl > outsz - 1 - o) pl = outsz - 1 - o;
+        memcpy(out + o, piece, pl);
+        o += pl;
+    }
+    #undef YZ_ARG
+    out[o] = 0;
+    return (int)o;
+}
+
+extern "C" void yz_ovr__sys_printf(ppu_context* ctx)
+{
+    char buf[2048];
+    int n = yz_format_guest(buf, sizeof(buf), ctx, (uint32_t)ctx->gpr[3], 1);
+    printf("[PS3] %s", buf);
+    fflush(stdout);
+    ctx->gpr[3] = (uint64_t)(int64_t)n;
+}
+
+extern "C" void yz_ovr__sys_sprintf(ppu_context* ctx)
+{
+    char buf[2048];
+    int n = yz_format_guest(buf, sizeof(buf), ctx, (uint32_t)ctx->gpr[4], 2);
+    uint32_t dst = (uint32_t)ctx->gpr[3];
+    if (dst) memcpy(vm_base + dst, buf, (size_t)n + 1);
+    ctx->gpr[3] = (uint64_t)(int64_t)n;
+}
+
+extern "C" void yz_ovr__sys_snprintf(ppu_context* ctx)
+{
+    char buf[2048];
+    int n = yz_format_guest(buf, sizeof(buf), ctx, (uint32_t)ctx->gpr[5], 3);
+    uint32_t dst  = (uint32_t)ctx->gpr[3];
+    uint32_t size = (uint32_t)ctx->gpr[4];
+    if (dst && size) {
+        uint32_t copy = (uint32_t)n < size - 1 ? (uint32_t)n : size - 1;
+        memcpy(vm_base + dst, buf, copy);
+        *(vm_base + dst + copy) = 0;
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)n;
 }
