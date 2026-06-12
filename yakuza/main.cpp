@@ -32,7 +32,11 @@ static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32
 
 /* PT_TLS template info, forwarded to the guest entry in r8/r9/r10
  * (the CRT passes them through to sys_initialize_tls). */
-static uint64_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+/* TLS template, shared with threads.cpp (per-thread TLS blocks) */
+extern "C" uint64_t yz_tls_vaddr = 0, yz_tls_filesz = 0, yz_tls_memsz = 0;
+#define g_tls_vaddr  yz_tls_vaddr
+#define g_tls_filesz yz_tls_filesz
+#define g_tls_memsz  yz_tls_memsz
 /* From PT_PROC_PARAM (0x60000001), sys_process_param_t.malloc_pagesize.
  * lv2 passes it to the entry point in r12; the CRT stores it into the libc
  * malloc config, where 0 makes every malloc fail. Default is 1 MB when the
@@ -305,6 +309,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "ERROR: stack allocation failed\n");
         return 1;
     }
+
+    yz_threads_init(stack_base, 1024 * 1024);
 
     static ppu_context ctx;   /* zero-initialized */
     ctx.gpr[1] = ((uint64_t)stack_base + 1024 * 1024 - 0x100) & ~0xFull;
