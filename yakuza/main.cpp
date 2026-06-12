@@ -33,6 +33,12 @@ static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32
 /* PT_TLS template info, forwarded to the guest entry in r8/r9/r10
  * (the CRT passes them through to sys_initialize_tls). */
 static uint64_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+/* From PT_PROC_PARAM (0x60000001), sys_process_param_t.malloc_pagesize.
+ * lv2 passes it to the entry point in r12; the CRT stores it into the libc
+ * malloc config, where 0 makes every malloc fail. Default is 1 MB when the
+ * segment is absent, same as RPCS3's loader. */
+static uint32_t g_malloc_pagesize = 0x100000;
+static uint64_t g_proc_param_vaddr = 0;
 
 static int load_elf(const char* path, uint64_t* entry_out)
 {
@@ -75,6 +81,10 @@ static int load_elf(const char* path, uint64_t* entry_out)
             g_tls_memsz  = p_memsz;
             continue;
         }
+        if (p_type == 0x60000001 /*PT_PROC_PARAM*/) {
+            g_proc_param_vaddr = p_vaddr;
+            continue;
+        }
         if (p_type != 1 /*PT_LOAD*/ || p_memsz == 0)
             continue;
 
@@ -103,6 +113,14 @@ static int load_elf(const char* path, uint64_t* entry_out)
 
     fclose(f);
     *entry_out = e_entry;
+    if (g_proc_param_vaddr) {
+        /* segments are loaded; read malloc_pagesize (offset 0x18, BE) */
+        uint32_t v;
+        memcpy(&v, vm_base + (uint32_t)g_proc_param_vaddr + 0x18, 4);
+        v = _byteswap_ulong(v);
+        if (v) g_malloc_pagesize = v;
+        printf("[boot] PROC_PARAM: malloc_pagesize=0x%X\n", g_malloc_pagesize);
+    }
     return 0;
 }
 
@@ -137,12 +155,53 @@ static void guest_caller(uint32_t opd_addr,
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h>
+
+/* Map a host code address back to the lifted guest function containing it:
+ * the table entry whose host fn pointer is the greatest one <= RIP. Lifted
+ * functions are laid out back-to-back in the chunk objs, so nearest-below
+ * is the containing function (bounded to 16 MB to reject non-lifted RIPs). */
+static const yz_func_entry* yz_func_from_host(const void* rip)
+{
+    const yz_func_entry* best = nullptr;
+    for (unsigned i = 0; i < g_yz_func_count; i++) {
+        const void* fn = (const void*)g_yz_func_table[i].fn;
+        if (fn <= rip && (!best || fn > (const void*)best->fn))
+            best = &g_yz_func_table[i];
+    }
+    if (best && (uintptr_t)rip - (uintptr_t)best->fn > 0x1000000)
+        return nullptr;
+    return best;
+}
 
 static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
     fprintf(stderr, "\n[crash] exception 0x%08lX at host %p",
             er->ExceptionCode, er->ExceptionAddress);
+    /* Module-relative RVA: stable across ASLR, resolvable against the
+     * linker map (yakuza_recomp.map) without any debug info. */
+    fprintf(stderr, " (rva 0x%llX)",
+            (unsigned long long)((uintptr_t)er->ExceptionAddress -
+                                 (uintptr_t)GetModuleHandleW(NULL)));
+    if (const yz_func_entry* fe = yz_func_from_host(er->ExceptionAddress))
+        fprintf(stderr, " (in func_%08X +0x%llX)", fe->addr,
+                (unsigned long long)((uintptr_t)er->ExceptionAddress -
+                                     (uintptr_t)fe->fn));
+    /* PDB symbol for the faulting host code — authoritative for runtime/HLE
+     * code, and disambiguates when the table hit above is a tiny stub the
+     * linker happened to place just before the real function. */
+    {
+        char buf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)buf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        if (SymFromAddr(GetCurrentProcess(),
+                        (DWORD64)(uintptr_t)er->ExceptionAddress, &disp, sym))
+            fprintf(stderr, " [sym %s+0x%llX]", sym->Name,
+                    (unsigned long long)disp);
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
         uint64_t va = (uint64_t)er->ExceptionInformation[1];
         fprintf(stderr, ", %s host addr 0x%llX",
@@ -158,6 +217,45 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
     for (unsigned i = 0; i < 16 && i < g_yz_last_idx; i++)
         fprintf(stderr, " 0x%08X",
                 g_yz_last_targets[(g_yz_last_idx - 1 - i) & 15]);
+    /* Return-address candidates from the faulting thread's stack: values
+     * pointing into our image are callers (the faulting accessor is a leaf,
+     * so the direct caller is at/near [rsp]). Resolved via the func table. */
+    if (ep->ContextRecord) {
+        uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+        const uint64_t* sp = (const uint64_t*)ep->ContextRecord->Rsp;
+        fprintf(stderr, "\n[crash] stack return candidates:");
+        int shown = 0;
+        for (int i = 0; i < 64 && shown < 6; i++) {
+            uint64_t v = 0;
+            if (IsBadReadPtr(sp + i, 8)) break;
+            v = sp[i];
+            if (v < mod || v > mod + 0x40000000ull) continue;
+            fprintf(stderr, "\n    rva 0x%llX",
+                    (unsigned long long)(v - mod));
+            if (const yz_func_entry* fe = yz_func_from_host((const void*)v))
+                fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                        (unsigned long long)(v - (uintptr_t)fe->fn));
+            shown++;
+        }
+    }
+    /* Guest watch regions: dumped on crash for post-mortem inspection. */
+    static const struct { uint32_t addr; uint32_t len; const char* tag; }
+    watches[] = {
+        { 0x016C34B0, 0x50, "malloc arena info" },
+        { 0x016C34D8, 0x40, "malloc heap struct" },
+    };
+    for (size_t w = 0; w < sizeof(watches) / sizeof(watches[0]); w++) {
+        fprintf(stderr, "\n[crash] watch %s @0x%08X:", watches[w].tag,
+                watches[w].addr);
+        for (uint32_t i = 0; i < watches[w].len; i += 4) {
+            if (i % 16 == 0)
+                fprintf(stderr, "\n    +0x%02X:", i);
+            uint32_t v;
+            memcpy(&v, vm_base + watches[w].addr + i, 4);
+            v = _byteswap_ulong(v);  /* guest is big-endian */
+            fprintf(stderr, " %08X", v);
+        }
+    }
     fprintf(stderr, "\n");
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
@@ -169,6 +267,7 @@ int main(int argc, char** argv)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);  /* load yakuza_recomp.pdb */
     SetUnhandledExceptionFilter(yz_crash_handler);
 
     printf("=== Yakuza: Dead Souls recomp runner ===\n");
@@ -239,6 +338,11 @@ int main(int argc, char** argv)
     ctx.gpr[8]  = g_tls_vaddr;
     ctx.gpr[9]  = g_tls_filesz;
     ctx.gpr[10] = g_tls_memsz;
+    /* lv2 also passes (verified vs RPCS3 ppu_load_exec + the CRT at
+     * 0xDDDB74, which stores r12 into the libc malloc config — leaving it
+     * 0 makes every malloc return NULL): */
+    ctx.gpr[11] = e_entry;              /* entry descriptor address */
+    ctx.gpr[12] = g_malloc_pagesize;    /* sys_process_param malloc_pagesize */
     printf("[boot] TLS template: vaddr=0x%08llX filesz=0x%llX memsz=0x%llX\n",
            (unsigned long long)g_tls_vaddr, (unsigned long long)g_tls_filesz,
            (unsigned long long)g_tls_memsz);

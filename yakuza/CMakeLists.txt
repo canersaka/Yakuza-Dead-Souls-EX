@@ -56,7 +56,8 @@ target_include_directories(yakuza_recomp PRIVATE
     "${PS3RECOMP_DIR}/include"
 )
 
-target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime)
+# dbghelp: crash-handler symbol resolution (SymFromAddr against the PDB)
+target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp)
 
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
@@ -65,5 +66,7 @@ if(MSVC)
         /Zc:__cplusplus
     )
     target_compile_definitions(yakuza_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_link_options(yakuza_recomp PRIVATE /INCREMENTAL:NO)
+    # /MAP: symbol->RVA listing so crash-handler RVAs resolve to functions
+    target_link_options(yakuza_recomp PRIVATE /INCREMENTAL:NO
+        /MAP:${CMAKE_BINARY_DIR}/yakuza_recomp.map)
 endif()
