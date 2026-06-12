@@ -82,6 +82,7 @@ yakuza/imports.json
 # Local notes and tool config
 SUMMARY.md
 STATUS.md
+CHEATSHEET.md
 CLAUDE.md
 AGENTS.md
 .claude/
