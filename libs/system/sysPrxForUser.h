@@ -101,8 +101,13 @@ s32 _sys_printf(const char* fmt, ...);
 s32 _sys_sprintf(char* buf, const char* fmt, ...);
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...);
 s32 _sys_strlen(const char* str);
-s32 _sys_strncpy(char* dst, const char* src, u32 size);
-s32 _sys_strcat(char* dst, const char* src);
+char* _sys_strncpy(char* dst, const char* src, u32 size);
+char* _sys_strcat(char* dst, const char* src);
+s32 _sys_strncmp(const char* s1, const char* s2, u32 max);
+char* _sys_strcpy(char* dst, const char* src);
+char* _sys_strncat(char* dst, const char* src, u32 max);
+s32 _sys_vprintf(const char* fmt, u32 va_guest);
+s32 _sys_vsnprintf(char* buf, u32 size, const char* fmt, u32 va_guest);
 s32 _sys_strcmp(const char* s1, const char* s2);
 void* _sys_memset(void* dst, s32 val, u32 size);
 void* _sys_memcpy(void* dst, const void* src, u32 size);
@@ -120,7 +125,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex);
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex);
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex);
 
-/* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
+/* Reset all lwmutex/lwcond state ??? call before CRT redirect to game main */
 void sys_lwmutex_reset_all(void);
 
 /* ---------------------------------------------------------------------------
