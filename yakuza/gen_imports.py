@@ -288,10 +288,14 @@ def main():
             ident = f"yz_imp_stub_{module}_{nid:08X}"
             if ident not in emitted:
                 emitted.add(ident)
+                # Honest failure: returning CELL_OK from a stub that produced
+                # no out-data poisons the game (it consumes garbage handles and
+                # crashes far from the cause). CELL_ENOSYS makes the game take
+                # its own error paths and the boot log name the real gap.
                 lines.append(f"static void {ident}(ppu_context* ctx) {{")
                 lines.append(f"    static int warned = 0;")
-                lines.append(f'    if (!warned) {{ warned = 1; fprintf(stderr, "[import] unimplemented {module}::{label}\\n"); }}')
-                lines.append(f"    ctx->gpr[3] = 0; /* CELL_OK */")
+                lines.append(f'    if (!warned) {{ warned = 1; fprintf(stderr, "[import] unimplemented {module}::{label} -> CELL_ENOSYS\\n"); }}')
+                lines.append(f"    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ENOSYS */")
                 lines.append("}")
         bridges.append(ident)
     lines.append("")
