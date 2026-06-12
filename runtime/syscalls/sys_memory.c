@@ -3,6 +3,7 @@
  */
 
 #include "sys_memory.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -18,6 +19,13 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+
+/* Guest window handed out by sys_memory_allocate / sys_mmapper.
+ * 0x40000000+ matches where the real lv2 places these allocations (verified
+ * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
+ * the pre-committed main region, so pages are committed on demand. */
+#define SYS_MEM_ALLOC_BASE  0x40000000u
+#define SYS_MEM_ALLOC_END   0x50000000u
 
 static uint32_t s_total_allocated = 0;
 
@@ -44,6 +52,9 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t flags     = LV2_ARG_U32(ctx, 1);
     uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
 
+    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
+            size, flags);
+
     /* Determine alignment based on page size flags */
     uint32_t alignment;
     if (flags & SYS_MEMORY_PAGE_SIZE_1M) {
@@ -58,19 +69,14 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     /* Initialize bump pointer on first call */
-    if (g_sys_mem_bump_ptr == 0) {
-        /* Start allocations at 0x20000000 to avoid overlapping with:
-         *   - ELF segments (0x00010000 - 0x00900000)
-         *   - CRT malloc heap (0x00A00000 - 0x10000000)
-         *   - RSX/rodata region (0x10000000 - 0x20000000) */
-        g_sys_mem_bump_ptr = 0x20000000;
-    }
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
     /* Align bump pointer */
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
     /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END)
         return (int64_t)(int32_t)CELL_ENOMEM;
 
     /* Find a free allocation slot */
@@ -85,8 +91,12 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     g_sys_mem_bump_ptr += size;
     s_total_allocated += size;
 
-    /* Zero the allocated memory */
-    memset(vm_to_host(alloc_addr), 0, size);
+    /* Commit the pages (window is outside the pre-committed main region);
+     * fresh commits are already zeroed by the OS */
+    if (vm_commit(alloc_addr, size) != CELL_OK)
+        return (int64_t)(int32_t)CELL_ENOMEM;
+
+    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
 
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
     a->active       = 1;
@@ -130,6 +140,7 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
 
+    fprintf(stderr, "[sys_memory] get_user_memory_size()\n");
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
         uint32_t avail = total - s_total_allocated;
@@ -235,13 +246,12 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     if (alignment == 0) alignment = 0x10000;
     size = VM_ALIGN_UP(size, alignment);
 
-    if (g_sys_mem_bump_ptr == 0) {
-        g_sys_mem_bump_ptr = 0x02000000;
-    }
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
-    if (g_sys_mem_bump_ptr + size > VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END)
         return (int64_t)(int32_t)CELL_ENOMEM;
 
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
