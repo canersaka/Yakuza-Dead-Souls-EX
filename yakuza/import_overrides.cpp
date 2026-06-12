@@ -129,6 +129,26 @@ extern "C" void yz_ovr_sys_ppu_thread_get_id(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * cellSysutilGetSystemParamInt(id, vm::ptr<s32>)
+ *
+ * The generic bridge would pass a raw host pointer and the libs HLE stores
+ * host-endian (LE); the guest then loads the value with lwz and sees it
+ * byte-swapped. Marshal through a host local and store with vm_write32,
+ * which writes guest (big-endian) order.
+ * -----------------------------------------------------------------------*/
+extern "C" int32_t cellSysutilGetSystemParamInt(int32_t id, int32_t* value);
+
+extern "C" void yz_ovr_cellSysutilGetSystemParamInt(ppu_context* ctx)
+{
+    int32_t  v  = 0;
+    int32_t* hp = ctx->gpr[4] ? &v : NULL;
+    int32_t  rc = cellSysutilGetSystemParamInt((int32_t)ctx->gpr[3], hp);
+    if (hp && rc == 0)
+        vm_write32(ctx->gpr[4], (uint32_t)v);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
 /* Diagnostic wrapper: log the guest caller (lr) of every lwmutex destroy,
  * then forward to the libs implementation. */
 extern "C" int32_t sys_lwmutex_destroy(void* lwmutex);
