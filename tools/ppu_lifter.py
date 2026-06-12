@@ -2434,7 +2434,27 @@ def main() -> None:
             for ts in tables.values():
                 jt_targets.update(ts)
             n_raw = len(jt_targets)
-            jt_targets = {t for t in jt_targets if _span_in_code(t)}
+            # Case targets inside the trusted map are accepted outright. A
+            # target in a MAP GAP can still be real code the scanner missed
+            # (multi-epilogue functions get cut at an internal blr and their
+            # switch cases land past the cut) — accept those iff a 16-word
+            # decode probe at the target looks like code, mirroring the
+            # discovery-pass plausibility probe.
+            insn_addrs = sorted(i.addr for i in all_insns
+                                if i.mnemonic != ".word")
+            def _gap_target_plausible(a: int) -> bool:
+                j = bisect.bisect_left(insn_addrs, a)
+                if j >= len(insn_addrs) or insn_addrs[j] != a:
+                    return False
+                ok = 0
+                for k in range(16):
+                    if j + k < len(insn_addrs) and \
+                       insn_addrs[j + k] == a + 4 * k:
+                        ok += 1
+                return ok >= 14
+            in_span = {t for t in jt_targets if _span_in_code(t)}
+            gap_ok = {t for t in jt_targets - in_span if _gap_target_plausible(t)}
+            jt_targets = in_span | gap_ok
             fb = dict(func_bounds)
             allstarts = sorted(set(fb) | jt_targets)
             added = 0
@@ -2444,11 +2464,18 @@ def main() -> None:
                 k = bisect.bisect_right(allstarts, t)
                 end = allstarts[k] if k < len(allstarts) else text_hi
                 i = bisect.bisect_right(span_starts, t) - 1
-                fb[t] = min(end, code_spans[i][1])
+                if i >= 0 and t < code_spans[i][1]:
+                    end = min(end, code_spans[i][1])
+                else:
+                    # gap target: no containing span to clamp to; cap at the
+                    # discovery pass's 16 KB distance bound instead
+                    end = min(end, t + 0x4000)
+                fb[t] = end
                 added += 1
             func_bounds = sorted(fb.items())
             print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets "
-                  f"({n_raw - len(jt_targets)} rejected as data), +{added} case funcs")
+                  f"({len(gap_ok)} gap-rescued, {n_raw - len(jt_targets)} rejected as data), "
+                  f"+{added} case funcs")
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
