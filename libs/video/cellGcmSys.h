@@ -93,12 +93,15 @@ typedef struct CellGcmControl {
 /* GCM context data — the game reads/writes this to submit RSX commands.
  * On PS3, gCellGcmCurrentContext points to one of these.
  * All pointer fields are guest addresses (u32) in the recomp.
- * Layout verified from compiled PS3 SDK inline functions: callback is at offset 0. */
+ * Layout verified against compiled SDK inline code (Yakuza: Dead Souls
+ * EBOOT, command-write helper at 0xEBC0C8) and RPCS3's CellGcmContextData:
+ * begin/end/current/callback, with callback LAST (offset 0xC). The fields
+ * are big-endian in guest memory — byte-swap on host access. */
 typedef struct CellGcmContextData {
-    u32 callback;   /* overflow callback function OPD (guest addr) */
     u32 begin;      /* start of command buffer (guest addr) */
     u32 end;        /* end of command buffer (guest addr) */
     u32 current;    /* current write position (guest addr) */
+    u32 callback;   /* overflow callback function OPD (guest addr) */
 } CellGcmContextData;
 
 /* Display buffer configuration */
