@@ -25,6 +25,8 @@
 #include "sys_event.h"
 
 #include <stdio.h>
+#include <stdlib.h>  /* calloc/free: without the prototype MSVC assumed int
+                        and truncated the 64-bit local_store pointer */
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -264,13 +266,18 @@ static int64_t sys_spu_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_create(out_id_ea, num, name_ea, attr_ea) */
+/* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
+ *
+ * lv2 signature per RPCS3 sys_spu.h: r5 is the group PRIORITY (SPURS
+ * passes 250), NOT a name pointer. The name lives inside the attribute
+ * struct, reduced_sys_spu_thread_group_attribute (BE):
+ *   +0 u32 nsize (name length incl. NUL), +4 u32 name ptr, +8 s32 type. */
 static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
-    uint32_t name_ea  = (uint32_t)ctx->gpr[5];
+    int32_t  prio     = (int32_t)ctx->gpr[5];
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
 
     spu_group_t* g = spu_alloc_group();
@@ -283,6 +290,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     if (num > 8) num = 8;
     g->num_threads = num;
 
+    int32_t  gtype   = 0;
+    uint32_t name_ea = 0;
+    if (attr_ea) {
+        uint32_t nsize = vm_read_be32(attr_ea + 0);
+        name_ea        = vm_read_be32(attr_ea + 4);
+        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
+        if (!nsize) name_ea = 0;
+    }
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -293,8 +308,8 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 
     vm_write_be32(out_ea, g->id);
 
-    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u name=%.31s attr=0x%08X\n",
-            g->id, num, g->name, attr_ea);
+    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
+            g->id, num, prio, gtype, g->name);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -857,6 +872,70 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
     return 0;
 }
 
+/* sys_process_getpid (1) — lv2 returns 1 for the game process (RPCS3
+ * sys_process.cpp: "sys_process_getpid() -> 1"; the real-HW trace shows
+ * libsre calling get_sdk_version with pid=0x1). */
+static int64_t sys_process_getpid_handler(ppu_context* ctx)
+{
+    ctx->gpr[3] = 1;
+    return 1;
+}
+
+/* sys_process_get_sdk_version (25): (pid, u32* version). Writes the
+ * process's SDK version from PROC_PARAM (offset 0xC); the loader sets
+ * g_ps3_sdk_version. Yakuza: Dead Souls = 0x350001 (RPCS3 ppu_loader). */
+uint32_t g_ps3_sdk_version = 0x00350001;
+
+static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
+{
+    uint32_t version_ea = (uint32_t)ctx->gpr[4];
+    if (!version_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
+    vm_write_be32(version_ea, g_ps3_sdk_version);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_process_is_spu_lock_line_reservation_address (14)
+ *
+ * r3 = addr, r4 = access-right flags (SPU_THR = 0x2, RAW_SPU = 0x1).
+ * Asks lv2 whether SPUs may place lock-line reservations (GETLLAR/PUTLLC)
+ * on the given effective address. SPURS calls this while validating its
+ * management areas during initialization; a failure aborts SPURS init.
+ *
+ * Contract from RPCS3 sys_process.cpp process_is_spu_lock_line_reservation
+ * _address(), mapped onto OUR guest layout: flags must be non-zero and
+ * contain only the two SPU bits (else EINVAL); main memory, the sys_memory
+ * window and RSX local memory are reservation-capable (OK); PPU stacks and
+ * sys_vm regions are not (EPERM); anything unmapped is EINVAL. */
+static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx)
+{
+    uint32_t addr  = (uint32_t)ctx->gpr[3];
+    uint64_t flags = ctx->gpr[4];
+    int64_t  rc;
+
+    if (!flags || (flags & ~0x3ull)) {
+        rc = (int64_t)(int32_t)CELL_EINVAL;
+    } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
+        rc = 0;                                   /* main memory */
+    } else if (addr >= 0x40000000u && addr < 0x50000000u) {
+        rc = 0;                                   /* sys_memory window */
+    } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
+        rc = 0;                                   /* RSX local memory */
+    } else if (addr >= 0xD0000000u && addr < 0xE0000000u) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* PPU stack area */
+    } else if (addr >= SYS_VM_REGION_BASE && addr < SYS_VM_REGION_END) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* sys_vm memory */
+    } else {
+        rc = (int64_t)(int32_t)CELL_EINVAL;       /* unmapped */
+    }
+
+    ctx->gpr[3] = (uint64_t)rc;
+    return rc;
+}
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
@@ -885,6 +964,11 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* Filesystem */
     sys_fs_init(tbl);
 
+    /* Process queries */
+    lv2_syscall_register(tbl, 1,  sys_process_getpid_handler);
+    lv2_syscall_register(tbl, 25, sys_process_get_sdk_version_handler);
+    lv2_syscall_register(tbl, 14, sys_process_is_spu_lock_line_reservation_address);
+
     /* TTY (debug console I/O — used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
     lv2_syscall_register(tbl, SYS_TTY_WRITE, sys_tty_write);
@@ -892,7 +976,6 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* SPU syscalls — we don't execute SPU code but the PPU-side wrappers
      * need consistent IDs and out-params. See the stateful group tracker
      * above for contract notes. */
-    lv2_syscall_register(tbl, 169,                            sys_spu_thread_stub); /* deprecated */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);
