@@ -1,0 +1,549 @@
+# ps3recomp
+
+### *Because the Cell processor deserves a second life*
+
+> Static recompilation runtime libraries for PlayStation 3 titles.
+> Turn PS3 binaries into native executables. No emulator required.
+
+---
+
+## What Is This?
+
+**ps3recomp** is an open-source toolkit that provides the runtime libraries, system stubs, and analysis tools needed to **statically recompile PlayStation 3 games into native PC executables**.
+
+Instead of interpreting or dynamically recompiling PowerPC/SPU instructions at runtime (what emulators like RPCS3 do brilliantly), we take the opposite approach: **translate everything ahead of time** into C/C++ that compiles with your favorite compiler on any modern platform.
+
+This is the same philosophy behind:
+- [N64Recomp](https://github.com/N64Recomp/N64Recomp) (N64 -> native)
+- [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) (Xbox 360 -> native)
+- [PS2Recomp](https://github.com/ran-j/PS2Recomp) (PS2 -> native)
+- [burnout3](https://github.com/sp00nznet/burnout3) (Original Xbox -> native)
+- [360tools](https://github.com/sp00nznet/360tools) (Xbox 360 -> native)
+
+...but for the PS3's glorious, terrifying **Cell Broadband Engine**.
+
+## Why PS3?
+
+The PlayStation 3 has over **3,000 titles** and some of the most beloved games ever made. RPCS3 has done heroic work making ~70% of the library playable through emulation, but static recompilation offers something different:
+
+- **Native performance** — no runtime translation overhead
+- **Lower hardware requirements** — runs on mid-range PCs
+- **Moddability** — recompiled C/C++ is infinitely more hackable than PPC binaries
+- **Preservation** — native ports survive long after emulators stop being maintained
+- **Portability** — compile for Windows, Linux, macOS, ARM, whatever
+
+## The Challenge
+
+The PS3's Cell processor is a beast unlike anything else:
+
+| Component | What It Is | Why It's Hard |
+|-----------|-----------|---------------|
+| **PPU** | PowerPC 64-bit main CPU | Custom ISA extensions, VMX/AltiVec SIMD |
+| **6x SPU** | 128-bit SIMD vector processors | Proprietary ISA, 256KB local store, explicit DMA |
+| **Memory** | 256MB XDR RAM | 128-byte alignment requirements, split bus |
+| **LV2 Kernel** | Proprietary OS layer | ~300+ system calls, complex threading model |
+| **PRX Modules** | Dynamic libraries | 100+ system libraries with intricate interdependencies |
+
+We don't shy away from hard problems. We just break them into smaller ones.
+
+## Architecture
+
+```
+ps3recomp/
+├── tools/                    # Binary analysis & recompilation pipeline
+│   ├── elf_parser.py         # Parse PS3 ELF/SELF/PRX binaries
+│   ├── ppu_disasm.py         # PowerPC disassembler with PS3 extensions
+│   ├── ppu_lifter.py         # PPU assembly -> C code lifter
+│   ├── spu_disasm.py         # SPU instruction set disassembler
+│   ├── spu_lifter.py         # SPU assembly -> C code lifter
+│   ├── extract_spu_images.py # Extract embedded SPU images from PRX/ELF
+│   ├── find_spu_functions.py # SPU function boundary detection
+│   ├── wrap_spu_elf.py       # Wrap a raw SPU blob as a loadable ELF
+│   ├── prx_analyzer.py       # Analyze PRX imports/exports and NIDs
+│   ├── nid_database.py       # Function Name ID (NID) resolver
+│   ├── find_functions.py     # Function boundary detection
+│   └── generate_stubs.py     # Auto-generate HLE stubs from RPCS3 modules
+│
+├── runtime/                  # Core runtime for recompiled executables
+│   ├── ppu/                  # PPU execution context
+│   │   ├── ppu_context.h     # Register file, CR, LR, CTR, FPSCR
+│   │   ├── ppu_memory.h      # Memory access macros (loads, stores, byte-swap)
+│   │   └── ppu_ops.h         # Instruction operation macros
+│   ├── spu/                  # SPU execution context
+│   │   ├── spu_context.h     # 128×128-bit register file, 256KB local store, image_id
+│   │   ├── spu_channels.c    # Channel ops + per-image function-table dispatch
+│   │   ├── spu_helpers.h     # SPU intrinsics (incl. float conversions)
+│   │   ├── spu_dma.h         # DMA (MFC) transfer engine
+│   │   └── tests/            # Self-contained SPU runtime tests
+│   ├── memory/               # Memory subsystem
+│   │   ├── vm.h              # Virtual memory manager (256MB address space)
+│   │   └── atomic.h          # PS3 atomic operations (lwarx/stwcx)
+│   └── syscalls/             # LV2 kernel system call implementations
+│       ├── sys_ppu_thread.h  # Thread creation/management
+│       ├── sys_mutex.h       # Mutex/cond synchronization
+│       ├── sys_memory.h      # Memory allocation/mapping
+│       ├── sys_fs.h          # Filesystem operations
+│       ├── sys_prx.h         # PRX module loading
+│       └── lv2_syscall_table.h # Full syscall dispatch table
+│
+├── libs/                     # HLE library implementations (from RPCS3's module system)
+│   ├── audio/                # cellAudio, cellAdec, libmixer, libsnd3, libsynth2
+│   ├── video/                # cellGcmSys, cellResc, cellVideoOut, cellVpost, cellVdec
+│   ├── input/                # cellPad, cellKb, cellMouse, cellGem
+│   ├── network/              # cellNetCtl, cellHttp, cellHttps, cellSsl, sceNp*
+│   ├── filesystem/           # cellFs, cellGame, cellSaveData, cellStorage
+│   ├── system/               # cellSysutil, cellSysmodule, cellRtc, sysPrxForUser
+│   ├── spurs/                # cellSpurs, cellFiber, cellSpursJq, cellDaisy (SPU task management)
+│   ├── sync/                 # cellSync, cellSync2 (cross-PPU/SPU synchronization)
+│   ├── codec/                # cellJpgDec, cellPngDec, cellGifDec, cellPamf, cellDmux, cellAdecAtrac3p, cellAdecCelp8, cellVdecDivx
+│   ├── font/                 # cellFont, cellFontFT, cellFreeType, cellL10n
+│   └── misc/                 # cellScreenshot, cellSubdisplay, cellImeJp, cellVideoExport, cellMusicExport, cellGameRecording, etc.
+│
+├── include/ps3emu/           # Public API headers
+│   ├── ps3types.h            # Fundamental PS3 types (u8-u128, s8-s64, be_t<>)
+│   ├── endian.h              # Big-endian <-> little-endian conversion
+│   ├── nid.h                 # NID hashing and lookup
+│   ├── module.h              # Module registration framework
+│   └── error_codes.h         # PS3 system error codes (CELL_OK, CELL_E*)
+│
+├── templates/project/        # Starter template for new game ports
+│   ├── CMakeLists.txt        # Build system
+│   ├── main.cpp              # Application entry point
+│   ├── stubs.cpp             # Game-specific function overrides
+│   └── config.toml           # Recompiler configuration
+│
+├── config/                   # Reference configurations
+│   └── example.toml          # Example recompilation config
+│
+├── patches/                  # Patches for upstream tools
+│   └── xenonrecomp-ppu.patch # XenonRecomp adaptations for PPU (Cell != Xenon)
+│
+└── docs/                     # Documentation (incl. ARCHITECTURE, RUNTIME, SPU_LIFTER, RSX_GRAPHICS, ...)
+    ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
+    ├── GETTING_STARTED.md     # How to recompile your first PS3 game
+    ├── MODULE_STATUS.md       # Implementation status of all HLE modules
+    ├── MODULES_REFERENCE.md   # Detailed per-module documentation (all 77+)
+    ├── RUNTIME.md             # Runtime reference: VM, PPU/SPU contexts, types
+    ├── SYSCALLS.md            # All LV2 kernel syscall implementations
+    ├── NID_SYSTEM.md          # PS3 NID linking system explained
+    ├── TOOLS.md               # Recompiler pipeline tools reference
+    ├── BUILDING.md            # Build system, compilers, platform notes
+    ├── GAME_PORTING_GUIDE.md  # Step-by-step game porting walkthrough
+    └── PLATFORM_ABSTRACTION.md # Win32/POSIX cross-platform details
+```
+
+## How It Works
+
+The pipeline follows the same proven approach as our [360tools](https://github.com/sp00nznet/360tools) and [burnout3](https://github.com/sp00nznet/burnout3) projects, adapted for the Cell architecture:
+
+```
+   PS3 Game Disc / PKG
+         │
+         ▼
+   ┌─────────────┐
+   │  SELF/EBOOT  │  Encrypted PS3 executable
+   │  Decryption  │  (requires keys / fSELF)
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  ELF Parser  │  Extract sections, segments, relocations
+   │  + PRX Scan  │  Identify imported NIDs & library deps
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  PPU Disasm  │  Disassemble PowerPC 64-bit + VMX
+   │  + Analysis  │  Function boundaries, jump tables, ABI
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  PPU Lifter  │  PowerPC → C code generation
+   │  + SPU Lift  │  SPU programs → C code generation
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  Link with   │  ps3recomp runtime + HLE libs
+   │  Runtime     │  Provides all PS3 OS services
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  Compile &   │  MSVC / GCC / Clang
+   │  Ship!       │  Native x86-64 executable
+   └─────────────┘
+```
+
+## SPU Strategy
+
+The SPU is the elephant in the room. Each SPU has its own instruction set, its own 256KB memory, and communicates with the PPU via DMA and mailbox channels. Our approach:
+
+1. **SPU programs are self-contained** — they live in ELF segments loaded to local store (`extract_spu_images.py` pulls them out of PRX/ELF)
+2. **Recompile each SPU program separately** — dedicated `spu_disasm.py` + `spu_lifter.py` handle the SPU ISA
+3. **SPU local store becomes an array** — 256KB per "virtual SPU"
+4. **DMA operations become memcpy** — via the MFC engine (`spu_dma.h`)
+5. **Channels become cross-thread message queues** — preserving ordering guarantees
+6. **Per-image function-table dispatch** — `image_id` lets multiple SPU programs (e.g. a SPURS kernel, a policy module, and a job) coexist at overlapping local-store addresses
+
+This mirrors how RPCS3 handles SPU but at compile time rather than runtime. The
+disassembler, lifter, and runtime are functional and covered by self-contained
+tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
+
+## Module Status
+
+We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode), 250+ files, 70,000+ lines of code.**
+
+| Category | Modules | Status |
+|----------|---------|--------|
+| **Kernel Threading** | sys_ppu_thread, sys_mutex, sys_cond, sys_semaphore, sys_rwlock | ✅ Complete |
+| **Kernel Events** | sys_event (queues, ports, flags), sys_timer | ✅ Complete |
+| **Kernel Memory** | sys_memory, sys_mmapper (containers, shared mem) | ✅ Complete |
+| **Kernel Filesystem** | sys_fs (path mapping, real I/O) | ✅ Complete |
+| **Filesystem** | cellFs (real file I/O, dir ops, stat, path translation) | ✅ Complete |
+| **Save System** | cellSaveData (callback-driven, PARAM.SFO), cellGame | ✅ Complete |
+| **Input** | cellPad (XInput/SDL2), cellKb, cellMouse | ✅ Complete |
+| **Audio** | cellAudio (WASAPI/SDL2, mixing thread, multi-port) | ✅ Complete |
+| **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
+| **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
+| **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
+| **Network** | sys_net (BSD sockets), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp*, sceNpTrophy | ✅ Complete |
+| **Hardware** | cellUsbd (USB), cellCamera (PS Eye), cellGem (PS Move) — stub, no devices | ✅ Complete |
+| **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
+| **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
+| **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
+| **Resolution** | cellResc (display modes, scaling, interlace, aspect ratio) | ✅ Complete |
+| **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
+| **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
+| **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
+| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps), RSX command processor (NV47xx parsing, state tracking, backend callbacks), null backend (Win32 window) | ✅ Complete |
+| **SPURS** | cellSpurs (management APIs, event flags, task/workload tracking), cellSpursJq (job queues with wait/signal), cellDaisy (real ring buffer FIFO) | ✅ Complete |
+| **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
+| **Media Pipeline** | cellPamf (real PAMF header + stream descriptor parsing), cellDmux (callback sequencing), cellVdec/cellAdec (PICOUT/PCMOUT callbacks, no actual decode — needs FFmpeg), cellSail (state machine) | 🔨 Partial |
+| **HTTP/HTTPS** | cellHttp (real HTTP/1.1 via native sockets), cellHttps (TLS stub with cert management) | ✅ Complete |
+| **Misc/Export** | cellSubdisplay, cellImeJp, cellVideoExport, cellMusicExport, cellPhotoExport/Import, cellGameRecording, cellPrint, cellRemotePlay | ✅ Complete |
+
+Full status tracking: [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md)
+
+## Documentation
+
+We've written extensive docs covering every aspect of the project. Whether you're contributing, porting a game, or just trying to understand how PS3 static recompilation works, there's a doc for you.
+
+| Document | What It Covers |
+|----------|---------------|
+| **[Getting Started](docs/GETTING_STARTED.md)** | Prerequisites, installation, first recompilation walkthrough |
+| **[Architecture](docs/ARCHITECTURE.md)** | Cell processor overview, recomp pipeline stages, memory model, comparison with RPCS3 |
+| **[Building](docs/BUILDING.md)** | CMake build system, compiler support, platform-specific notes, troubleshooting |
+| **[Game Porting Guide](docs/GAME_PORTING_GUIDE.md)** | Full 12-phase walkthrough for porting a PS3 game — with [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) |
+| **[Custom Modules](docs/CUSTOM_MODULES.md)** | Step-by-step tutorial for writing new HLE modules — NID system, calling convention bridge, patterns |
+| **[FAQ & Troubleshooting](docs/FAQ.md)** | Common questions, build errors, runtime crashes, lifter issues, performance tips |
+| **[Contributing](CONTRIBUTING.md)** | Development setup, code style, PR guidelines, ways to contribute |
+| **[Runtime Reference](docs/RUNTIME.md)** | Virtual memory manager, PPU/SPU execution contexts, type system, endianness, syscall dispatch, DMA engine |
+| **[Syscall Reference](docs/SYSCALLS.md)** | All LV2 kernel syscalls: threading, sync, events, timers, memory, filesystem |
+| **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
+| **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 93+ HLE modules — what they do and how they're implemented |
+| **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
+| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12/Vulkan backends, shader strategy |
+| **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
+| **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU ISA decoding/lifting, the runtime model (local store, channels, DMA, per-image dispatch), and the SPU tests |
+| **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
+
+## Getting Started
+
+> **Prerequisites**: Python 3.10+, CMake 3.20+, a C17/C++20 compiler (MSVC 19.x, GCC 12+, or Clang 15+)
+
+```bash
+# Clone the repo
+git clone https://github.com/sp00nznet/ps3recomp.git
+cd ps3recomp
+
+# Install Python tools
+pip install -r requirements.txt
+
+# Analyze a decrypted PS3 ELF
+python tools/elf_parser.py /path/to/EBOOT.ELF --output analysis/
+
+# Disassemble PPU code
+python tools/ppu_disasm.py analysis/EBOOT.ELF --output disasm/
+
+# Lift to C
+python tools/ppu_lifter.py disasm/ --output recomp/
+
+# Build with the runtime
+cd templates/project
+cmake -B build -G Ninja
+cmake --build build
+```
+
+See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
+
+## Game Ports Using ps3recomp
+
+| Game | Title ID | Status | Repo |
+|------|----------|--------|------|
+| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
+| **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14.7K functions; boots through CRT + GCM init with a live D3D12 window; a Konami arcade *emulator* EBOOT that routes rendering through CRI middleware on SPURS SPU tasks — drove the SPU recompilation work; blocked on the SPU-task pipeline | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
+
+Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
+
+## Relationship to Other Projects
+
+| Project | Role |
+|---------|------|
+| **[RPCS3](https://github.com/RPCS3/rpcs3)** | Our primary reference for HLE module behavior and system call semantics. Standing on the shoulders of giants. |
+| **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)** | PowerPC recompiler for Xbox 360. Both CPUs are PowerPC — we adapt its lifter for PPU-specific extensions. |
+| **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** | Pioneered the modern static recomp approach. Our architecture follows the same "recompile to C, link with runtime" philosophy. |
+| **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** | Sibling project for PS2. Different ISA (MIPS vs PowerPC) but same spirit. |
+| **[360tools](https://github.com/sp00nznet/360tools)** | Our own Xbox 360 toolkit. ps3recomp follows the same project structure and conventions. |
+| **[pcrecomp](https://github.com/sp00nznet/pcrecomp)** | Our PC recompilation toolkit. Shared philosophy of "analyze → disassemble → lift → link → ship". |
+
+## Building Blocks We Leverage
+
+- **RPCS3's HLE modules** — 100+ modules of battle-tested PS3 system behavior
+- **XenonRecomp's PowerPC lifter** — adapted for Cell PPU (same ISA family, different extensions)
+- **LLVM** — for optimized native code generation from lifted C
+- **Vulkan / Direct3D 12** — for RSX graphics translation
+- **SDL2** — cross-platform input, audio, windowing
+
+## Contributing
+
+This is a massive undertaking and we need help. Here's how to get involved:
+
+- **HLE Module Authors** — Port RPCS3's C++ HLE implementations to standalone link-time libraries
+- **PPU/SPU Experts** — Improve the disassembler and lifter accuracy
+- **Graphics Engineers** — Build the RSX → Vulkan/D3D12 translation layer
+- **Game Testers** — Try recompiling titles and report what breaks
+- **Documentation** — Help us map out the PS3's system library landscape
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Legal
+
+This project does not contain any proprietary Sony code, encryption keys, or copyrighted material. It provides clean-room implementations of system library interfaces based on publicly documented behavior. You must provide your own legally obtained PS3 game files.
+
+## Acknowledgments
+
+- **[gnome41](https://github.com/gnome41/ps3recomp-dbz-budokai-hd)** — while porting *DBZ Budokai HD*, gnome41's fork surfaced and fixed real bugs in the shared SDK that we've incorporated upstream: the AltiVec VX-form 11-bit XO extraction fix (~3800 instructions were mis-decoded), 19 additional VMX integer lifter handlers + `crorc`/`crandc`, SPU decoder corrections (RI16 branch forms, channel opcodes per the IBM Cell BE manual), and a `find_functions.py` walrus syntax fix.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## Changelog
+
+### v0.6.0 — *"SPU, For Real This Time"* (June 2026)
+- **SPU recompilation, corrected end-to-end**: rebuilt `spu_disasm.py`'s opcode tables from rpcs3's authoritative SPUOpcodes.h. Pervasive mis-decodes (lqr/stqr/fsmbi were excluded from RI16 and shadowed by spurious RI10 rotate entries; RI16 branch/load forms at wrong opcodes; ~15 wrong SPU_RR entries; missing RI8 float conversions) had silently corrupted *every* SPU lift.
+- **SPU lifter fall-through fix**: `spu_lifter.py` now emits a tail-call when a function ends in a non-branch — previously such functions fell off the end and truncated execution mid-image. Added cflts/cfltu/csflt/cuflt float conversions.
+- **Per-image SPU dispatch**: added `image_id` to the SPU context + an image-tagged function registry (`spu_channels.c`, `spu_begin_image()`), so a SPURS kernel, a policy module, and a job can coexist at overlapping local-store addresses.
+- **SPU tooling**: `extract_spu_images.py` (pull SPU images from PRX/ELF), `find_spu_functions.py` (SPU function bounds), `wrap_spu_elf.py` (wrap raw SPU blobs).
+- **SPU runtime tests**: self-contained sum / shufb / DMA / brsl-return tests under `runtime/spu/tests/`, plus `test_spu_helpers.c`. New `docs/SPU_LIFTER.md`.
+- **New port target — The Simpsons Arcade Game** (NPUB30563): a Konami arcade-emulator EBOOT that drove all of the above. Boots through the CRT to full GCM init with a live D3D12 window; rendering is gated behind the game's CRI-middleware-on-SPURS task pipeline.
+
+### v0.5.1 — *"All-Register FIFO"* (April 2026)
+- **All-register FIFO flag clearing**: PhyreEngine sets +0x18 pending flags on r27/r28/r30/r26 (4 structures). Previously only cleared r31. Now clears all, solving 2 of 3 init spin levels.
+- **Watchdog CTR=0 patching**: Background thread detects NULL function pointer spins, patches heap objects with NOP OPDs.
+- **D3D12 backend active**: Device FL11.0, vertex-colored PSO, batched DrawInstanced, VSync present. First GPU-rendered geometry from PS3 recomp.
+- **Level data rendering**: flOw XML level definitions parsed — authentic ocean gradient, snake creatures, food objects, particles. 486 vertices per frame.
+- **Batched DRAW_ARRAYS**: RSX method format caps at 255 verts per command. Auto-batching splits larger draws.
+- **Control register host-endian**: RSX MMIO accessed via lwbrx/stwbrx in recompiled code. Fixed endianness for put/get/ref.
+- **flOw progress**: D3D12 renders Level 3 scene at ~17fps. 12 subsystems ticking. Full GCM pipeline: NV40 → RSX processor → D3D12. Render context init blocked by 3rd-level data loop (no HLE escape).
+
+### v0.5.0 — *"Pixels on Screen"* (April 2026)
+- **RSX command buffer processing wired up**: `gcm_flush_guest_cmdbuf()` now initializes RSX state via `rsx_state_init()`, passes NV40 commands to `rsx_process_command_buffer()`, and dispatches to the backend. Games can write GCM commands and see results on screen.
+- **FIFO watchdog thread**: Background thread monitors `ctrl->put` for changes, scans command buffer for SET_REFERENCE (method 0x0050) and WRITE_BACK_END_LABEL (0x1D6C), updates `ctrl->get`/`ctrl->ref` automatically. Breaks cellGcmFinish spin loops without needing HLE bridge interception.
+- **Control register endianness fix**: RSX DMA control registers (put/get/ref) are MMIO accessed via `stwbrx`/`lwbrx` in recompiled code (host-endian, no byte-swap). The HLE now reads/writes these in host-endian via direct `uint32_t*` access instead of `vm_write32` (which byte-swaps for big-endian).
+- **Command buffer IO mapping**: `cellGcmInit` now maps the command buffer region (1MB-aligned) via `cellGcmMapMainMemory` so `cellGcmAddressToOffset` succeeds for buffer addresses. Previously only the game's explicit mapping was registered.
+- **AddressToOffset fallback**: Bridge now synthesizes offsets for unmapped addresses in the heap/command buffer range (0xA00000-0x2000000), preventing failures in GCM inline code that converts arbitrary guest addresses to RSX offsets.
+- **GCM callback handler upgrade**: Buffer overflow callback now flushes pending commands via `rsx_process_command_buffer`, updates control register put/get, then resets `ctx->current`. Previously only reset current without processing.
+- **cellGcmSetFlip error logging**: Bridge logs failed flip commands with buffer ID and error code. Fixed buffer ID passing (game passes context ptr in r3 and buffer ID in r4, but bridge reads r3 as buffer ID).
+- **flOw progress**: **Window visible with animated clear color!** Full GCM rendering pipeline working: NV40 clear commands → RSX processor → null backend → Win32 window repaint. 12 subsystems ticking with inline switch case implementation. 1200+ frames, buffer flips alternating 0/1. **Next blocker**: PhyreEngine FIFO sync protocol blocks render context creation — not cellGcmFinish, needs custom sync protocol investigation.
+
+### v0.4.3 — *"Living Code"* (March 2026)
+- **Lifter: mid-function tail-entry resolution**: When a trampoline branch targets an address inside an existing function body, the lifter now generates a real tail-entry function containing the code from that address to the function's end. Eliminated ~23K stubs in flOw (91K → 101K real functions). Iterative resolution handles chains of mid-function entries.
+- **TLS `__declspec(thread)` fix**: `g_trampoline_fn` declaration mismatch caused MSVC to compile 37K+ writes as direct stores to the read-only TLS template in `.rdata`, crashing with AV WRITE. Fixed by declaring `__declspec(thread)` consistently across all translation units.
+- **DRAIN_TRAMPOLINE after all calls**: Lifter now emits the trampoline drain macro after every `bl` (direct call) and `bctrl` (indirect call). Previously only emitted in the preamble; callers that set `g_trampoline_fn` and returned wouldn't have their chains drained.
+- **CTR decrement wrap fix**: `bdnz`/`bdz` decremented CTR as uint64, causing loops with 32-bit counts sign-extended to ~0xFFFFFFFF_8XXXXXXX to wrap past zero into 18-quintillion-iteration infinite loops. Fixed: `ctx->ctr = (uint32_t)(ctx->ctr - 1)`.
+- **MSVC compatibility in lifter output**: `__builtin_clz` replaced with `_BitScanReverse`, `__int128` multiply replaced with `_mul128`/`_umul128` intrinsics, all function/memory declarations wrapped in `extern "C"` for correct C++ linkage.
+- **ppu_context struct expanded**: Added VMX/AltiVec `ppu_vr vr[32]`, `vscr`, `fpscr`, `cia`, `reserve_addr`/`reserve_value`, `thread_id` fields. Enables full VMX vector operations, atomic reservations, and thread identification.
+- **sys_lwmutex_reset_all()**: New function to destroy all lwmutex/lwcond state for clean CRT abort redirect. Prevents deadlocks when CRT initialization is interrupted mid-mutex-lock.
+- **RLD instruction decode fix** (ppu_disasm.py): MD-form rotate instructions use 3-bit sub-opcode (bits 27-29), MDS-form uses 4-bit (bits 27-30). Was using wrong bit fields, producing incorrect `rldcl`/`rldcr` decoding.
+- **Inline VM access optimization**: Game projects can define `vm_read`/`vm_write` as inline functions in ppu_recomp.cpp preamble, bypassing function call overhead. Eliminates ~100x slowdown on byte-by-byte memory operations (critical for CRT memset of multi-GB address spaces).
+- **cellSysmodule duplicate fix**: `cellSysmoduleLoadModule` returns CELL_OK for already-loaded modules instead of CELL_SYSMODULE_ERROR_DUPLICATED. Games like flOw treat the error as fatal.
+- **OPD-resolved ELF constructors**: Extracted 166 constructor OPD entries from `.ctors` section, resolved through OPD to real function addresses (0x12F14, 0x1CD2C, etc.), and execute them directly. Constructors now allocate PhyreEngine objects (3 objects with malloc + lwmutex_create).
+- **flOw progress**: Game boots through CRT, runs 166 constructors (creating PhyreEngine globals), loads all modules (NP, SPURS, USBD, JPGDEC, NET), registers sysutil callback with correct function pointer (0x84C630). PhyreEngine enters early init and makes 10+ memory allocations. 102K+ recompiled functions. **Next blocker**: PhyreEngine asserts on null internal pointers — needs CRT full init or manual global initialization.
+
+### v0.4.2 — *"Main Event"* (March 2026)
+- **flOw reaches game main() initialization**: CRT startup completes, abort intercepted via longjmp redirect, game enters `func_000CB9CC` with clean stack. Loads modules (GCM_SYS, SPURS, USBD, JPGDEC, NET), registers sysutil callback. First PS3 recomp project to reach game-level code execution.
+- **Trampoline system for split-function chains**: `convert_trampolines.py` and `post_lift.py` transform fallthrough edges between split functions into explicit trampoline calls. When the lifter splits a large function at branch targets, the resulting pieces are chained via trampolines so control flow is preserved without relying on physical code adjacency.
+- **DRAIN_TRAMPOLINE pattern**: Macro inserted after every `bl` call site in `ppu_recomp.cpp` (143K+ sites) to drain pending trampoline returns. Prevents unbounded host stack growth when recompiled split-function chains would otherwise nest deeply through call/return mismatches. Converts deep recursion into a flat loop.
+- **Manual dispatch stub registration**: `indirect_dispatch.cpp` supports registering stubs for mid-function entry points that the lifter does not emit as standalone functions. Allows `bctrl` indirect calls to reach branch targets inside split functions via hash table lookup.
+- **cellSysmodule complete module ID name mapping**: 30+ module IDs now map to correct human-readable names (0x00=NET, 0x0A=SPURS, 0x10=GCM_SYS, 0x17=Camera, 0x1C=USBD, etc.). Previously showed wrong names for several IDs.
+- **SEH-based crash recovery**: Three CRT constructors that access unmapped guest memory are caught via structured exception handling and recovered from, allowing startup to continue past constructor failures.
+- **malloc override**: Bump allocator at guest address range 0x00A00000-0x10000000 provides malloc/free for recompiled code without requiring full guest heap infrastructure.
+
+### v0.4.1 — *"First Light+"* (March 2026)
+- **RPCS3 audit**: Cross-referenced all major modules against RPCS3's implementations. Added 28 cellGcmSys functions, 5 sysPrxForUser functions, 4 cellSpurs functions. cellGcmSys now at 61+ functions (was 33).
+- **D3D12 backend**: Real vertex upload from guest memory with BE byte-swap, DrawInstanced, vertex attrib + shader logging, blend/depth/stencil state callbacks, texture format decode (25 RSX→DXGI mappings). 990 lines.
+- **Image encoding**: Real PNG + JPEG encoding via stb_image_write v1.16. ARGB→RGBA/RGB swizzle, configurable quality, in-memory encoding.
+- **dcbz fix**: `dcbz` (data cache block zero) now zeroes 128 bytes instead of being a no-op. This was THE root cause of the flOw PhyreEngine init stall — dcbz loops ran trillions of no-op iterations.
+- **VMX disasm critical fix**: lvx/stvx decode was in unreachable code path. Moved to main opcode 31 block, eliminating 6,620 TODO instructions.
+- **VMX disasm duplicate key fix**: VX-form decode table had overlapping keys. Split compares into separate table with Rc bit handling. Added 60+ VMX VX-form instructions.
+- **Lifter**: 100+ instruction mnemonics across 18 categories. New: dcbz (real memset), bctrl→ps3_indirect_call, VMX int/float/logical/compare/convert/splat/merge/shift, mcrf, rlwnm, creqv, mffs/mtfsf, byte-reverse loads, load algebraic, all cache/sync ops. **~10K TODOs remaining** (down from 27K).
+- **sys_get_random_number**: Real crypto RNG via BCryptGenRandom / /dev/urandom.
+- **stb_image_write v1.16**: Vendored for PNG/JPEG encoding.
+- **cellSail**: Expanded to 28 functions with descriptor management for Tokyo Jungle.
+- **sceNpCommerce2 + cellSysutilNpEula**: New modules for Tokyo Jungle.
+- **RSX primitive/vertex/texture mapping**: Complete utility headers for D3D12 translation.
+- **Documentation**: 8 docs updated with comprehensive rewrites. RSX_GRAPHICS.md now 16KB with full D3D12 capability matrix, vertex format tables, shader translation strategy.
+- **97+ complete modules**, 250+ files, 70K+ lines of code.
+
+### v0.4.0 — *"First Light"* (March 2026)
+- **RSX Command Buffer Processor**: New NV47xx GPU command parser (`rsx_commands.h/.c`) — FIFO command buffer parsing, state tracking for surfaces, viewport, scissor, clear, blend, depth/stencil, culling, color mask, alpha test, textures (16 units × 8 registers), vertex attributes (16 × format/offset), shader programs (fragment/vertex), draw arrays + draw indexed. Backend callback interface (`rsx_backend`) with 12 dispatch points for pluggable rendering.
+- **Null RSX Backend**: Win32 window backend (`rsx_null_backend.h/.c`) — creates a window, displays RSX clear color via GDI, FPS counter and debug overlay. Proves command pipeline works before D3D12/Vulkan.
+- **D3D12 RSX Backend**: Real GPU rendering backend (`rsx_d3d12_backend.h/.c`) — D3D12 device (FL 11.0), DXGI swap chain (double-buffered flip-discard), RTV descriptor heap, fence-based frame sync, clear to RSX color, VSync present. Ready for vertex buffer upload and shader translation.
+- **cellPamf**: Upgraded from Partial — real PAMF stream descriptor parsing (AVC profile/level/resolution, ATRAC3+ channels from actual descriptor bytes), EP table navigation via header offsets.
+- **cellVdec**: Upgraded callback pipeline — generates PICOUT callbacks with populated CellVdecPicItem (codec type, PTS/DTS, dimensions) after each DecodeAu. Games checking decode completion now proceed correctly.
+- **cellAdec**: Same treatment — generates PCMOUT callbacks with channel count, sample rate, bit depth. Silence output but correct pipeline flow.
+- **cellDmux**: Improved callback sequencing and AU tracking for proper ES dispatch.
+- **cellSpursJq**: Better job submission/completion tracking, TryWait returns BUSY correctly.
+- **cellDaisy**: Marked Complete (was already a real ring buffer implementation).
+- **Image decoders**: cellPngDec, cellJpgDec, cellGifDec upgraded with real stb_image v2.30 decoding paths, guest memory path translation via `cellfs_translate_path()`.
+- **cellSync2**: Timed mutex lock (spin with SwitchToThread/pthread_mutex_timedlock).
+- **stb_image.h**: Vendored v2.30 for PNG/JPG/GIF decoding.
+- **Lifter**: Split-function fallthrough fix, branch-target function detection, bctrl→ps3_indirect_call dispatch. Scalar: rldcl/rldcr, addze/addme/subfze/subfme, mulld/divd/mulhd/mulhdu, adde/subfe, cror/crand/crnand/crxor/crnor/creqv, mcrf, rlwnm, stdux/ldux, lwarx/stwcx./ldarx/stdcx., lwbrx/stwbrx/lhbrx/sthbrx, lwax/lhaux, mftb/mftbu, lswi/stswi, tw/td, mffs/mtfsf, cache/sync no-ops. **VMX/AltiVec**: lvx/stvx/lvebx/stvebx/lvsl/lvsr, vperm, vmaddfp/vnmsubfp/vaddfp/vsubfp, vsel, vsldoi, vmsumshm, vand/vandc/vor/vxor/vnor, vaddubm/vadduhm/vadduwm/vsububm/vsubuhm/vsubuwm, vmaxub-sw/vminub-sw/vmaxfp/vminfp, vspltb/vsplth/vspltw/vspltisb/vspltish/vspltisw, vmrghb-w/vmrglb-w, vcfsx/vcfux/vctsxs/vctuxs, vrefp/vrsqrtefp, vcmpeqfp/vcmpgefp/vcmpgtfp/vcmpbfp/vcmpequb-w/vcmpgtub-w/vcmpgtsb-w. **~20K fewer TODO instructions on relift** (27K→~7K estimated).
+- **Disassembler**: XO-form arithmetic split (addze/addme/subfze/subfme), rldcl/rldcr register-shift rotate, byte-reverse loads, load algebraic, mftb, string word, VMX shift helpers.
+- **Runtime**: sys_tty_write/read (syscall 402/403), unimplemented syscall logging, WASAPI COM GUID fix, all duplicate symbol warnings eliminated.
+- **Documentation**: CONTRIBUTING.md, docs/CUSTOM_MODULES.md, docs/FAQ.md, updated case study with flOw v0.4.0 technical lessons.
+- **SPURS**: Upgraded from Partial to Complete (management + event flags + job queues + Daisy FIFO all functional).
+- **95 complete modules**, only media decode (cellVdec/cellAdec need FFmpeg) remains truly partial.
+
+### v0.3.1 — *"Finishing the Sweep"* (March 2026)
+- **16 new modules** — clearing out nearly every remaining "Not Started" module
+- **cellFontFT**: FreeType font rendering — 16 font slots, fallback metrics (ascender=0.8×size), glyph bitmap stubs, kerning
+- **cellFreeType**: FreeType2 library wrapper — reports version 2.4.12 (PS3 firmware 4.x)
+- **cellSpursJq**: SPURS Job Queue — queue create/destroy, job push (completes immediately), wait, port system, 16 max queues
+- **cellDaisy**: SPURS Daisy Chain FIFO pipes — **real ring buffer** with push/pop, 32 max pipes, 256 max depth, count/free queries
+- **cellHttps**: HTTPS client — TLS stub with CA cert and client cert management, verify level config, 8 handles
+- **cellSubdisplay**: PS Vita Remote Play — init/start/stop lifecycle, always reports not connected, empty touch data
+- **cellImeJp**: Japanese IME — character input, backspace, confirm, passthrough conversion (no kanji dictionary), 4 handles
+- **cellVideoExport**: Video export to XMB — init/end, export fires NOT_SUPPORTED callback
+- **cellMusicExport**: Music export to XMB — init/end, export fires NOT_SUPPORTED callback
+- **cellGameRecording**: In-game video recording — start/stop/pause/resume state tracking, no actual capture
+- **cellAdecAtrac3p**: ATRAC3+ audio decoder — 2048 samples/frame, mono/stereo, 44.1/48kHz, outputs silence
+- **cellAdecCelp8**: CELP8 voice codec — 160 samples/frame @ 8kHz mono, multiple bitrate modes, outputs silence
+- **cellVdecDivx**: DivX video decoder — Mobile/Home/HD profiles, outputs black frames
+- **cellPhotoExport / cellPhotoImport**: Photo export/import to/from XMB — NOT_SUPPORTED stubs with callbacks
+- **cellPrint**: USB printer support — init/end, reports 0 printers
+- **cellRemotePlay**: Remote Play availability — init/end, always unavailable
+- **93 complete modules** (up from 77), only ~3 niche modules remain unstarted
+
+### v0.3.0 — *"Full Metal RSX"* (March 2026)
+- **cellGcmSys**: Major upgrade from Partial to Complete — command buffer control (put/get/ref), local memory bump allocator, IO memory mapping with proper offset table population (1MB page granularity), flip handler + VBlank callbacks, 15 tile slots + 8 zcull regions, 256 report data + label slots, platform-native timestamps, GetTiledPitchSize, 27+ functions total
+- **cellHttp**: Major upgrade from Partial to Complete — real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolution via getaddrinfo, TCP connect, request formatting with custom headers, response header parsing (status code, Content-Length, Connection: close), streaming body receive, per-transaction socket lifecycle, SO_RCVTIMEO/SO_SNDTIMEO timeouts
+- **cellSpurs**: Event flags now use real OS blocking — CRITICAL_SECTION + CONDITION_VARIABLE (Windows) / pthread_mutex + pthread_cond (POSIX) via side table, EventFlagWait truly blocks until condition met, broadcast on EventFlagSet
+- **77 complete modules** (up from 75), 3 remaining partial (cellVdec/cellAdec need FFmpeg, cellDmux/cellSpurs management-only)
+
+### v0.2.5 — *"The Long Tail"* (March 2026)
+- **13 more modules** — mopping up the remaining "Not Started" list
+- **cellFsUtility**: Recursive mkdir, file read/write/copy/size/exists helpers
+- **cellSail**: Media player lifecycle — state machine with immediate finish (stub, no actual playback)
+- **cellVoice**: Voice chat port management — create/delete/connect, no actual voice data
+- **cellMic**: Microphone — reports no device attached
+- **cellRudp**: Reliable UDP — context management, connect/send return NOT_CONNECTED
+- **sceNpClans**: NP clan system — create/join/leave/search (offline stub)
+- **cellMusicDecode** / **cellMusicDecode2**: Background music decode stubs
+- **cellBGDL**: Background download manager — empty download list
+- **cellVideoUpload**: Video upload — returns NOT_SUPPORTED
+- **cellLicenseArea**: License verification — Americas default, all areas valid
+- **cellOvis**: Overlay system — no-op stubs
+- **cellScreenshot**: Upgraded from Partial to Complete
+- **75 complete modules** (up from 62), only ~19 "Not Started" remain
+
+### v0.2.4 — *"Peripheral Vision"* (March 2026)
+- **13 new modules** in one batch — biggest single release yet
+- **sceNpUtil**: Bandwidth test (fake 100 Mbps), NP environment, online ID validation, parental control
+- **sceNpCommerce**: Commerce context management, store operations return NOT_CONNECTED
+- **sceNpMatching2**: Matchmaking contexts with start/stop, signaling/room callbacks (offline stub)
+- **sceNpSignaling**: P2P signaling contexts, connection ops return NOT_CONNECTED
+- **sceNpSns**: Facebook/Twitter social integration stubs
+- **cellVpost**: Video post-processing handle management, query/exec stubs
+- **cellJpgEnc**: JPEG encoder handles (encode needs stb_image_write)
+- **cellPngEnc**: PNG encoder handles (encode needs stb_image_write)
+- **sys_interrupt**: Interrupt tag/thread tracking (no real interrupts in HLE)
+- **cellSheap**: Shared heap bump allocator with block tracking, alloc/free/query
+- **cellUsbd**: USB device driver — LDD registration, empty device list
+- **cellCamera**: PlayStation Eye — reports no camera attached
+- **cellGem**: PlayStation Move — reports no controllers connected
+- **62 complete modules** (up from 49), new `libs/hardware/` directory
+
+### v0.2.3 — *"Half a Hundred"* (March 2026)
+- **sysPrxForUser**: Upgraded from stub to real — lwmutex backed by CRITICAL_SECTION/pthread_mutex, lwcond backed by CONDITION_VARIABLE/pthread_cond, real host threads, heap management, snprintf, string/mem ops
+- **cellSysutil**: Upgraded — BGM playback control, system cache mount/clear, disc game check, license area
+- **cellSysmodule**: Upgraded to complete — all module names mapped
+- **cellPamf**: PAMF container parser — big-endian header parsing, stream queries, AVC/ATRAC3+/LPCM/AC3 codec info, entry point navigation
+- **cellDmux**: AV demuxer — open/close, ES management, stream feed/reset, AU retrieval, flush callbacks
+- **cellVdec**: Video decoder API — H.264/MPEG2 codec types, AU submit with AUDONE callback (actual decode needs FFmpeg)
+- **cellAdec**: Audio decoder API — AAC/ATRAC3+/MP3 codec types, AU submit with AUDONE callback (actual decode needs FFmpeg)
+- **cellNet**: Network core — Winsock/POSIX initialization, DNS resolver with real getaddrinfo
+- **cellSsl**: SSL/TLS lifecycle — init/end, certificate stubs, cryptographic RNG (BCryptGenRandom/urandom)
+- **sceNpTus**: NP Title User Storage — local variable/data storage with set/get/add/delete per slot
+- **49 complete modules** (up from 42), 3 partial modules upgraded to complete
+
+### v0.2.2 — *"Fiber Optics"* (March 2026)
+- **cellL10n**: Full Unicode conversion — UTF-8 ↔ UTF-16 ↔ UTF-32 ↔ UCS-2, ISO-8859-1, ASCII, generic `l10n_convert()` API
+- **cellFiber**: Cooperative multitasking with native OS fibers (Windows `CreateFiber`/POSIX `ucontext`), 64 concurrent fibers, sleep/wakeup
+- **cellResc**: Resolution scaling/conversion — display mode config, buffer management, interlace tables, aspect ratio, flip/vblank handlers
+- **cellHttpUtil**: URL parsing/building, percent-encoding/decoding, form URL encoding, Base64 codec
+- **sceNpBasic**: Friends list, presence management, messaging, game invitations, block list (offline stub)
+- **cellKey2char**: HID keyboard scancode → Unicode character conversion, US-101 layout, shift/caps handling
+- **cellAvconfExt**: Audio output device info, sound availability queries, LPCM/AC3/DTS config, video gamma
+- **cellGameExec**: Boot parameters, exit to shelf, boot game info
+- **42 complete modules** (up from 34)
+
+### v0.2.1 — *"Now With Sockets"* (March 2026)
+- **sys_net**: Full BSD socket API — socket, bind, listen, accept, connect, send, recv, sendto, recvfrom, poll, select, setsockopt/getsockopt, getsockname, shutdown, close, gethostbyname, inet_aton, errno
+- Wraps Winsock2 (Windows) and POSIX sockets (Linux/macOS) with PS3 error code translation
+- PS3-specific SO_NBIO non-blocking mode support
+- 128-socket descriptor table with host FD mapping
+- **34 complete modules** (up from 33)
+- First game port target: **flOw** (NPUA80001) — see [sp00nznet/flow](https://github.com/sp00nznet/flow)
+
+### v0.2.0 — *"Now We're Cooking with Cell"* (March 2026)
+- **33 complete module implementations** — up from 7 stubs
+- **Real threading**: sys_ppu_thread creates actual host threads (CreateThread/pthreads)
+- **Full synchronization suite**: Mutexes with deadlock detection, condvars, semaphores, rwlocks, event queues/flags
+- **Functional filesystem**: cellFs and sys_fs with configurable PS3-to-host path mapping, real file I/O, directory enumeration
+- **Save data system**: cellSaveData with full callback-driven save/load flow, directory management
+- **Game utilities**: cellGame boot check, content paths, PARAM.SFO reading
+- **Real gamepad input**: cellPad with XInput (Windows) and SDL2 (cross-platform) backends, analog sticks, triggers, rumble
+- **Keyboard & mouse**: cellKb with raw/ASCII modes, cellMouse with delta accumulation and ring buffer
+- **Real audio output**: cellAudio with WASAPI/SDL2 backends, background mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix
+- **Image decoders**: cellPngDec, cellJpgDec, cellGifDec with stb_image backend
+- **Font rendering**: cellFont with stb_truetype backend and fallback metrics
+- **Network**: cellNetCtl with real host IP detection, sceNp with configurable PSN identity
+- **Trophy system**: sceNpTrophy with persistent JSON storage, unlock timestamps, progress tracking
+- **SPURS framework**: cellSpurs management APIs (workloads, tasks, tasksets, event flags)
+- **Sync primitives**: cellSync (atomic spinlocks, barriers, lock-free queues), cellSync2 (OS-backed mutex/cond/sem)
+- **System utilities**: cellRtc (real clock with PS3 epoch), cellVideoOut, cellMsgDialog, cellOskDialog, cellUserInfo, cellScreenshot
+- **Memory management**: sys_memory with bump allocator, containers, shared memory, mmapper
+- **Timers**: sys_timer with QueryPerformanceCounter/clock_gettime, periodic events, PS3 timebase frequency
+
+### v0.1.0 — *"Hello, Cell"* (March 2026)
+- Initial project structure and architecture
+- PS3 ELF/SELF/PRX binary parser
+- PPU disassembler with full PowerPC 64-bit + VMX support
+- PPU → C code lifter (instruction-level translation)
+- SPU disassembler and lifter (basic support)
+- NID database with 2000+ function name mappings
+- Core runtime: PPU context, memory model, big-endian support
+- LV2 syscall stubs: threading, memory, filesystem, PRX loading
+- HLE library stubs for 15+ core modules
+- Template project for bootstrapping new game ports
+
+---
+
+*"The Cell Processor was ahead of its time. Now it's time to bring it to ours."*

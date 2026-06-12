@@ -1,0 +1,187 @@
+# PS3 HLE Module Status
+
+Status of HLE (High-Level Emulation) implementations for PS3 system modules in ps3recomp.
+
+**Legend:**
+- **Not Started**: No implementation exists
+- **Stubbed**: Functions exist but only log and return CELL_OK
+- **Partial**: Core functions implemented, advanced features missing
+- **Complete**: Fully functional for known game use cases
+
+## System / Core
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| sysPrxForUser | Core Runtime | **Complete** | Real host threads, lwmutex (CRITICAL_SECTION/pthread), lwcond (CV/pthread_cond), heap alloc, printf/snprintf, string/mem ops |
+| cellSysmodule | Module Loader | **Complete** | Load/unload tracking, 55+ module ID constants, name lookup |
+| cellSysutil | System Utility | **Complete** | Callbacks, system params, BGM playback, system cache, disc game check, license area |
+| sys_ppu_thread | Kernel Threading | **Complete** | Real host threads (CreateThread/pthreads), join, detach, priority, rename |
+| sys_fs | Kernel Filesystem | **Complete** | Full file I/O with PS3-to-host path mapping, directory ops, stat, big-endian output |
+| sys_memory | Kernel Memory | **Complete** | Bump allocator from VM, containers, shared memory, mmapper |
+| sys_event | Kernel Events | **Complete** | Event queues (circular buffer), ports (connect/send), 64-bit event flags (AND/OR wait) |
+| sys_mutex | Kernel Mutex | **Complete** | CRITICAL_SECTION/pthread_mutex, recursive, timed lock, deadlock detection |
+| sys_cond | Kernel Condvar | **Complete** | CONDITION_VARIABLE/pthread_cond, timed wait, signal, broadcast |
+| sys_semaphore | Kernel Semaphore | **Complete** | Win32 Semaphore/POSIX sem_t, timeout, multi-count post |
+| sys_rwlock | Kernel RWLock | **Complete** | SRWLock/pthread_rwlock, full read/write/try variants |
+| sys_timer | Kernel Timer | **Complete** | QueryPerformanceCounter/clock_gettime, periodic event timers, usleep, timebase freq |
+| sys_interrupt | Kernel Interrupt | **Complete** | Interrupt tag/thread management, EOI (stub — no real interrupts) |
+
+## Filesystem
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellFs | Filesystem | **Complete** | Real file I/O, configurable path mapping, dir enumeration, stat, truncate, chmod |
+| cellFsUtility | FS Utility | **Complete** | MkdirAll, GetFileSize, ReadFile, WriteFile, CopyFile, Exists |
+
+## Input
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL2 backends, analog sticks, triggers, pressure buttons, rumble |
+| cellKb | Keyboard | **Complete** | Key event injection, raw/ASCII modes, modifier/LED tracking |
+| cellMouse | Mouse | **Complete** | Delta accumulation, buttons, wheel, buffered ring-buffer mode |
+
+## Graphics
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellGcmSys | RSX System | **Complete** | Command buffer control, local mem allocator, IO mapping with offset tables, flip handler/VBlank callbacks, tile/zcull config, report/label areas, timestamps, 27+ functions |
+| RSX Command Processor | GPU Commands | **Complete** | NV47xx FIFO parsing, state tracking (surfaces, viewport, scissor, blend, depth/stencil, cull, color mask, alpha test, 16 texture units, 16 vertex attribs, shader programs), draw arrays/indexed dispatch, rsx_backend callback interface. Null backend (Win32 window + clear color). Needs D3D12/Vulkan for actual rendering. |
+| cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
+| cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
+
+## Audio
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellAudio | Audio Output | **Complete** | WASAPI (Win) / SDL2 backends, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
+| cellVoice | Voice Chat | **Complete** | Port management, connect/disconnect, start/stop, read/write (no actual voice data) |
+| cellMic | Microphone | **Complete** | Init/end, all queries report no microphone attached |
+
+## Media / Codec
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
+| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PICOUT callbacks (populated PicItem), no actual H.264/MPEG2 decode (needs FFmpeg) |
+| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem), no actual AAC/ATRAC3+ decode (needs FFmpeg) |
+| cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set with callback sequencing, AU retrieval, flush |
+| cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
+| cellJpgDec | JPEG Decode | **Complete** | Header parsing + stb_image decode, file/buffer sources |
+| cellPngDec | PNG Decode | **Complete** | Header parsing + stb_image decode, RGBA/ARGB/RGB output |
+| cellGifDec | GIF Decode | **Complete** | Header parsing + stb_image decode |
+| cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
+| cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
+| cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause, immediate finish (no actual playback) |
+| cellAdecAtrac3p | ATRAC3+ Decode | **Complete** | ATRAC3plus audio decoder — open/close/decode/reset, outputs silence (2048 samples/frame), mono/stereo, 44.1/48kHz |
+| cellAdecCelp8 | CELP8 Decode | **Complete** | CELP8 voice codec — open/close/decode/reset, outputs silence (160 samples/frame @ 8kHz mono), multiple bitrate modes |
+| cellVdecDivx | DivX Decode | **Complete** | DivX video decoder — open/close/decode/reset, outputs black frames, Mobile/Home/HD profiles |
+
+## Font / Text
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellFont | Font Rendering | **Complete** | Full lifecycle, stb_truetype backend, fallback metrics without STB |
+| cellFontFT | FreeType Font | **Complete** | FreeType-based rendering, 16 font slots, fallback metrics (ascender=0.8×size, descender=-0.2×size), empty glyph bitmaps, kerning stub |
+| cellFreeType | FreeType | **Complete** | FreeType2 library wrapper, reports version 2.4.12 (PS3 firmware 4.x), init/end lifecycle |
+| cellL10n | Localization | **Complete** | UTF-8/16/32/UCS-2 bidirectional, ISO-8859-1, ASCII, generic converter API |
+
+## Network
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| sys_net | BSD Sockets | **Complete** | Full BSD socket API — socket, bind, listen, accept, connect, send/recv/sendto/recvfrom, poll, select, setsockopt/getsockopt, shutdown, close, gethostbyname, inet_aton, errno |
+| cellNet | Network Core | **Complete** | Winsock/POSIX init, DNS resolver with real getaddrinfo, async poll |
+| cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
+| cellHttp | HTTP Client | **Complete** | Real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolve, send/recv, header parsing, Content-Length, custom headers, timeouts |
+| cellHttps | HTTPS Client | **Complete** | TLS/SSL client stub — init/end lifecycle, CA cert and client cert management, verify level config, no actual TLS (needs crypto lib) |
+| cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
+| cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
+| cellRudp | Reliable UDP | **Complete** | Context management, bind/close work, connect/send/recv return NOT_CONNECTED |
+
+## PSN / NP
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| sceNp | NP Core | **Complete** | Configurable username, fake NP IDs, account region/age |
+| sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub) |
+| sceNpCommerce | NP Commerce | **Complete** | Context management, store operations return NOT_CONNECTED (offline stub) |
+| sceNpClans | NP Clans | **Complete** | Create/join/leave/search clans, all return NOT_CONNECTED (offline stub) |
+| sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |
+| sceNpMatching2 | NP Matching | **Complete** | Context start/stop, signaling/room callbacks, operations return SERVER_NOT_AVAILABLE |
+| sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
+| sceNpSns | NP SNS | **Complete** | Facebook/Twitter stubs, operations return NOT_CONNECTED |
+| sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking |
+| sceNpUtil | NP Utility | **Complete** | Bandwidth test (fake 100Mbps), NP environment, online ID validation, parental control |
+
+## System Utilities (cellSysutil sub-modules)
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellSaveData | Save Data | **Complete** | Callback-driven save/load, directory enumeration, file ops, simplified PARAM.SFO |
+| cellGame | Game Utility | **Complete** | Boot check, content permit, param read, data directory management |
+| cellMsgDialog | Message Dialog | **Complete** | Prints to stdout, auto-responds YES/OK, progress bar tracking |
+| cellOskDialog | OSK Dialog | **Complete** | UTF-16 support, configurable default response, async pattern |
+| cellVideoUpload | Video Upload | **Complete** | Init/term, upload returns NOT_SUPPORTED |
+| cellScreenshot | Screenshot | **Complete** | Enable/disable, parameter/overlay tracking (capture via GCM integration) |
+| cellBGDL | Background DL | **Complete** | Init/term, download list always empty, start returns BUSY |
+| cellUserInfo | User Info | **Complete** | Default user (00000001/"User"), GetStat/GetList/SelectUser |
+
+## SPU / Multi-core
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). No actual SPU execution |
+| cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
+| cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
+| cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
+| cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
+| cellSync2 | Sync Primitives 2 | **Complete** | OS-backed mutex/cond/semaphore/queue with timeouts |
+
+## Hardware / Peripheral
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellUsbd | USB Driver | **Complete** | LDD registration, device list returns empty, pipe/transfer ops return NO_DEVICE |
+| cellCamera | Camera | **Complete** | Init/end, all device queries return DEVICE_NOT_FOUND / not attached |
+| cellGem | Move Controller | **Complete** | Init/end, GetInfo reports 0 connected, all queries return NOT_CONNECTED |
+| cellAvconfExt | AV Config | **Complete** | Audio output device info, sound availability, configuration, gamma control |
+
+## Miscellaneous
+
+| Module | Category | Status | Notes |
+|---|---|---|---|
+| cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
+| cellOvis | Overlay | **Complete** | Init/term, overlay create/destroy/invalidate (no-op stubs) |
+| cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
+| cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
+| cellSubdisplay | Sub-display | **Complete** | PS Vita Remote Play stub — init/end/start/stop lifecycle, always reports not connected, touch data returns empty |
+| cellImeJp | IME Japanese | **Complete** | Japanese IME — open/close/reset, input mode config, add/backspace/confirm, passthrough conversion (no kanji), 4 handles |
+| cellGameExec | Game Execute | **Complete** | Exit params, boot game info, ExitToShelf |
+| cellLicenseArea | License Area | **Complete** | Region check (Americas default), all areas valid |
+| cellMusicDecode | Music Decode | **Complete** | Init/finish, decode returns NOT_SUPPORTED |
+| cellMusicDecode2 | Music Decode 2 | **Complete** | Init/finalize, decode returns NOT_SUPPORTED, format info stub |
+| cellVideoExport | Video Export | **Complete** | Video export to XMB — init/end, export/abort/progress, returns NOT_SUPPORTED with callback |
+| cellMusicExport | Music Export | **Complete** | Music export to XMB — init/end, export/progress, returns NOT_SUPPORTED with callback |
+| cellGameRecording | Game Recording | **Complete** | In-game recording — init/end/start/stop/pause/resume, IsRecording, duration query (no actual capture) |
+| cellPhotoExport | Photo Export | **Complete** | Photo export to XMB — init/end, export returns NOT_SUPPORTED with callback |
+| cellPhotoImport | Photo Import | **Complete** | Photo import from XMB — init/end, import returns NOT_SUPPORTED with callback |
+| cellPrint | Print Utility | **Complete** | USB printer support — init/end, GetPrinterCount always returns 0 |
+| cellRemotePlay | Remote Play | **Complete** | Remote Play availability — init/end, IsAvailable returns 0, status reports disconnected |
+
+## Summary
+
+| Status | Count |
+|---|---|
+| **Complete** | 93 |
+| Partial | 3 |
+| Not Started | ~3 |
+| **Total** | **~99** |
+
+## Next Priorities
+
+1. **RSX command buffer processing** — Translate NV47xx methods to Vulkan/D3D12 draw calls (the graphics mountain)
+2. **cellSpurs** — Actual SPU program execution on host threads
+3. **cellVdec / cellAdec / cellDmux** — Integrate FFmpeg for actual video/audio decoding and demuxing
+4. **cellJpgEnc / cellPngEnc** — Integrate stb_image_write for actual encoding
+5. **Remaining niche modules** — cellAdecExt, cellAudioExt, and any other game-specific needs
