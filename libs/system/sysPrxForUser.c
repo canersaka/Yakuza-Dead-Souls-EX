@@ -41,6 +41,19 @@ typedef struct {
 static LwMutexSlot s_lwmutex[MAX_LWMUTEX];
 static u32 s_lwmutex_next = 0;
 
+/* Guards slot allocation in the create paths now that guest threads are
+ * real host threads. Lock/unlock/signal stay lock-free: they only touch
+ * the slot the caller already owns. */
+#ifdef _WIN32
+static SRWLOCK s_slot_lock = SRWLOCK_INIT;
+static void slot_lock(void)   { AcquireSRWLockExclusive(&s_slot_lock); }
+static void slot_unlock(void) { ReleaseSRWLockExclusive(&s_slot_lock); }
+#else
+static pthread_mutex_t s_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static void slot_lock(void)   { pthread_mutex_lock(&s_slot_lock); }
+static void slot_unlock(void) { pthread_mutex_unlock(&s_slot_lock); }
+#endif
+
 /* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
 void sys_lwmutex_reset_all(void)
 {
@@ -255,6 +268,7 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
     if (!lwmutex)
         return CELL_EFAULT;
 
+    slot_lock();
     u32 idx = s_lwmutex_next;
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
         u32 slot = (idx + i) % MAX_LWMUTEX;
@@ -279,9 +293,11 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
+            slot_unlock();
             return CELL_OK;
         }
     }
+    slot_unlock();
     return CELL_EAGAIN;
 }
 
@@ -292,10 +308,18 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+#ifdef _WIN32
+        printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
+               "sleep_queue=0x%08X (%s) [host tid %lu] -> ESRCH\n",
+               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use",
+               GetCurrentThreadId());
+#else
         printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
                "sleep_queue=0x%08X (%s) -> ESRCH\n",
                YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
+#endif
         return CELL_ESRCH;
     }
 
@@ -353,21 +377,42 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
-    printf("[sysPrxForUser] sys_lwmutex_destroy()\n");
+#ifdef _WIN32
+    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
+           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
+#else
+    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X)\n",
+           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0);
+#endif
 
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
-    if (slot < MAX_LWMUTEX && s_lwmutex[slot].in_use) {
-#ifdef _WIN32
-        DeleteCriticalSection(&s_lwmutex[slot].cs);
-#else
-        pthread_mutex_destroy(&s_lwmutex[slot].mtx);
-#endif
-        s_lwmutex[slot].in_use = 0;
+    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+        printf("[sysPrxForUser] sys_lwmutex_destroy -> ESRCH\n");
+        return CELL_ESRCH;   /* already destroyed / never created */
     }
 
+    /* lv2 refuses to destroy a held lwmutex (CELL_EBUSY) - games rely on
+     * this when tearing down a heap another thread is still allocating
+     * from: the EBUSY keeps the lock (and the heap) alive. */
+#ifdef _WIN32
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
+        return CELL_EBUSY;
+    }
+    LeaveCriticalSection(&s_lwmutex[slot].cs);
+    DeleteCriticalSection(&s_lwmutex[slot].cs);
+#else
+    if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
+        return CELL_EBUSY;
+    pthread_mutex_unlock(&s_lwmutex[slot].mtx);
+    pthread_mutex_destroy(&s_lwmutex[slot].mtx);
+#endif
+    s_lwmutex[slot].in_use = 0;
+
     memset(lwmutex, 0, sizeof(*lwmutex));
+    printf("[sysPrxForUser] sys_lwmutex_destroy -> OK\n");
     return CELL_OK;
 }
 
@@ -384,6 +429,7 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
     if (!lwcond || !lwmutex)
         return CELL_EFAULT;
 
+    slot_lock();
     u32 idx = s_lwcond_next;
     for (u32 i = 0; i < MAX_LWCOND; i++) {
         u32 slot = (idx + i) % MAX_LWCOND;
@@ -400,9 +446,11 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
 
             lwcond->lwcond_queue = slot + 1;
             s_lwcond_next = (slot + 1) % MAX_LWCOND;
+            slot_unlock();
             return CELL_OK;
         }
     }
+    slot_unlock();
     return CELL_EAGAIN;
 }
 
