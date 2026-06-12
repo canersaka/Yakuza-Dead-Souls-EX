@@ -45,6 +45,7 @@ add_executable(yakuza_recomp
     main.cpp
     dispatch.cpp
     shims.cpp
+    threads.cpp
     func_table_gen.cpp
     import_bridges_gen.cpp
     import_overrides.cpp

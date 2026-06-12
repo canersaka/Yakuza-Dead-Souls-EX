@@ -64,16 +64,20 @@ extern "C" void yz_ovr_sys_initialize_tls(ppu_context* ctx)
  * CRT heap (_sys_heap_*): simple bump allocator, free is a no-op.
  * -----------------------------------------------------------------------*/
 static uint32_t yz_heap_ptr = YZ_HEAP_BASE;
+static SRWLOCK  yz_heap_lock = SRWLOCK_INIT;
 
 static uint32_t yz_heap_alloc(uint32_t size, uint32_t align)
 {
     if (align < 16) align = 16;
+    AcquireSRWLockExclusive(&yz_heap_lock);
     uint32_t base = (yz_heap_ptr + align - 1) & ~(align - 1);
     if (base + size > YZ_HEAP_END) {
+        ReleaseSRWLockExclusive(&yz_heap_lock);
         fprintf(stderr, "[heap] OUT OF MEMORY (req 0x%X)\n", size);
         return 0;
     }
     yz_heap_ptr = base + size;
+    ReleaseSRWLockExclusive(&yz_heap_lock);
     return base;
 }
 
@@ -121,6 +125,18 @@ extern "C" void yz_ovr_sys_time_get_system_time(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 extern "C" void yz_ovr_sys_ppu_thread_get_id(ppu_context* ctx)
 {
-    vm_write64(ctx->gpr[3], 1 /* main PPU thread */);
+    vm_write64(ctx->gpr[3], (uint64_t)yz_thread_current_id());
     ctx->gpr[3] = 0;
+}
+
+/* Diagnostic wrapper: log the guest caller (lr) of every lwmutex destroy,
+ * then forward to the libs implementation. */
+extern "C" int32_t sys_lwmutex_destroy(void* lwmutex);
+
+extern "C" void yz_ovr_sys_lwmutex_destroy(ppu_context* ctx)
+{
+    fprintf(stderr, "[import] sys_lwmutex_destroy(guest=0x%08X) from lr=0x%08llX\n",
+            (uint32_t)ctx->gpr[3], (unsigned long long)ctx->lr);
+    void* p = ctx->gpr[3] ? (void*)(vm_base + (uint32_t)ctx->gpr[3]) : NULL;
+    ctx->gpr[3] = (uint64_t)(int64_t)sys_lwmutex_destroy(p);
 }
