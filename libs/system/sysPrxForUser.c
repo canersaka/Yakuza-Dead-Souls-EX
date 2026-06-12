@@ -215,24 +215,64 @@ s32 _sys_strlen(const char* str)
     return (s32)strlen(str);
 }
 
-s32 _sys_strncpy(char* dst, const char* src, u32 size)
+char* _sys_strncpy(char* dst, const char* src, u32 size)
 {
-    if (!dst || !src) return CELL_EFAULT;
-    strncpy(dst, src, size);
-    return CELL_OK;
+    /* returns dst, like libc (RPCS3 sys_libc_.cpp: vm::ptr<char> return).
+     * Sony's firmware code chains these returns. */
+    if (!dst || !src) return dst;
+    return strncpy(dst, src, size);
 }
 
-s32 _sys_strcat(char* dst, const char* src)
+char* _sys_strcat(char* dst, const char* src)
 {
-    if (!dst || !src) return CELL_EFAULT;
-    strcat(dst, src);
-    return CELL_OK;
+    /* returns dst (RPCS3 sys_libc_.cpp) — observed live: libsre passes the
+     * return of strcat straight into the next string call. */
+    if (!dst || !src) return dst;
+    return strcat(dst, src);
 }
 
 s32 _sys_strcmp(const char* s1, const char* s2)
 {
     if (!s1 || !s2) return -1;
     return strcmp(s1, s2);
+}
+
+s32 _sys_strncmp(const char* s1, const char* s2, u32 max)
+{
+    /* RPCS3 sys_libc_.cpp returns exactly -1/0/1 */
+    if (!s1 || !s2) return -1;
+    int r = strncmp(s1, s2, max);
+    return (r > 0) - (r < 0);
+}
+
+char* _sys_strcpy(char* dst, const char* src)
+{
+    /* returns dst (RPCS3 sys_libc_.cpp: vm::ptr<char> return) */
+    if (!dst || !src) return dst;
+    return strcpy(dst, src);
+}
+
+char* _sys_strncat(char* dst, const char* src, u32 max)
+{
+    /* appends at most max chars then terminates; returns dst */
+    if (!dst || !src) return dst;
+    return strncat(dst, src, max);
+}
+
+/* RPCS3 implements both as CELL_OK no-ops (sys_libc_.cpp todo stubs) and
+ * boots SPURS-heavy titles with that; guest va_list is not interpretable
+ * by a host vararg call anyway. */
+s32 _sys_vprintf(const char* fmt, u32 va_guest)
+{
+    (void)fmt; (void)va_guest;
+    return CELL_OK;
+}
+
+s32 _sys_vsnprintf(char* buf, u32 size, const char* fmt, u32 va_guest)
+{
+    (void)fmt; (void)va_guest;
+    if (buf && size) buf[0] = '\0';
+    return CELL_OK;
 }
 
 void* _sys_memset(void* dst, s32 val, u32 size)
