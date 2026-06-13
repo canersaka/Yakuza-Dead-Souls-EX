@@ -368,7 +368,11 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         mne = RI16_TABLE[op9]
         result.mnemonic = mne
         if mne in ("lqa", "stqa"):
-            lsa = (i16 & 0x3FFF) << 4
+            # a-form absolute: LSA = (I16 << 2) & 0x3FFF0 (I16 is a word offset,
+            # scaled x4, forced to a 16-byte boundary). Matches RPCS3
+            # spu_ls_target(0, i16). NB: x4, not x16 — the immediate is a word
+            # index, and the result is 16-byte aligned.
+            lsa = ((i16 & 0xFFFF) << 2) & 0x3FFF0
             result.operands = f"$r{rt}, 0x{lsa:X}"
         elif mne in ("hbra", "hbrr"):
             result.operands = f"0x{i16 & 0xFFFF:X}, $r{rt}"
@@ -386,8 +390,10 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             target = (i16 * 4) & 0x3FFFF
             result.operands = f"0x{target:X}"
         elif mne in ("lqr", "stqr"):
-            target = i16 * 4 + addr
-            result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
+            # r-form: LSA = (pc + (I16 << 2)) & 0x3FFF0 (16-byte aligned, per
+            # RPCS3 spu_ls_target(pc, i16)). I16 is sign-extended (relative).
+            target = (i16 * 4 + addr) & 0x3FFF0
+            result.operands = f"$r{rt}, 0x{target:X}"
         else:
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
         return result
