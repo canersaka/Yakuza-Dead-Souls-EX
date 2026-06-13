@@ -223,6 +223,23 @@ static void guest_caller(uint32_t opd_addr,
 #include <windows.h>
 #include <dbghelp.h>
 
+/* Host vblank driver. The game's frame loop spin-waits in lifted code on guest
+ * state that its registered vblank handler updates (on real HW the RSX raises a
+ * vblank interrupt ~59.94x/s). With no real RSX/vsync we tick vblank from a host
+ * thread so the handler fires and the frame loop advances -- the WINDOW
+ * milestone glue. cellGcmTickVBlank() no-ops until the guest registers a handler
+ * and g_ps3_guest_caller is installed, so starting this early is safe. */
+extern "C" void cellGcmTickVBlank(void);   /* libs/video/cellGcmSys.c */
+
+static DWORD WINAPI yz_vblank_thread(LPVOID)
+{
+    for (;;) {
+        Sleep(16);            /* ~62.5 Hz; close enough to PS3 vblank */
+        cellGcmTickVBlank();
+    }
+    return 0;
+}
+
 /* Map a host code address back to the lifted guest function containing it:
  * the table entry whose host fn pointer is the greatest one <= RIP. Lifted
  * functions are laid out back-to-back in the chunk objs, so nearest-below
@@ -257,6 +274,62 @@ static const yz_func_entry* yz_func_from_guest(uint32_t addr)
         }
     }
     return best;
+}
+
+/* Dump guest registers + walk the PPC64 back-chain (per-frame code pointers +
+ * total depth). Shared by the crash handler and the stall watchdog. */
+static void yz_dump_guest_state(const ppu_context* gc, const char* tag)
+{
+    if (!gc) return;
+    fprintf(stderr, "\n[%s] guest cia=0x%08X lr=0x%08X ctr=0x%08X r1=0x%08X",
+            tag, (uint32_t)gc->cia, (uint32_t)gc->lr, (uint32_t)gc->ctr,
+            (uint32_t)gc->gpr[1]);
+    fprintf(stderr, "\n[%s] guest gpr:", tag);
+    for (int r = 0; r < 32; r++) {
+        if (r % 8 == 0) fprintf(stderr, "\n    r%-2d:", r);
+        fprintf(stderr, " %016llX", (unsigned long long)gc->gpr[r]);
+    }
+    const uint32_t EXE_LO = 0x00010000u, EXE_HI = 0x01310768u;
+    fprintf(stderr, "\n[%s] guest back-chain (per-frame code pointers):", tag);
+    uint32_t sp = (uint32_t)gc->gpr[1];
+    int total = 0;
+    for (int depth = 0; depth < 1200 && sp >= 0x10000u; depth++) {
+        if (vm_base && IsBadReadPtr(vm_base + sp, 8)) break;
+        uint32_t back = (uint32_t)vm_read64(sp);
+        if (back <= sp || back < 0x10000u) break;   /* must climb upward */
+        total++;
+        if (depth < 10) {
+            fprintf(stderr, "\n    #%-2d sp=0x%08X size=0x%X:", depth, sp, back - sp);
+            uint32_t lim = back - sp; if (lim > 0x120) lim = 0x120;
+            for (uint32_t off = 0; off + 8 <= lim; off += 8) {
+                if (vm_base && IsBadReadPtr(vm_base + sp + off, 8)) break;
+                uint32_t v = (uint32_t)vm_read64(sp + off);
+                if (v >= EXE_LO && v < EXE_HI) {
+                    fprintf(stderr, "\n        +0x%02X -> 0x%08X", off, v);
+                    if (const yz_func_entry* fe = yz_func_from_guest(v))
+                        fprintf(stderr, " (func_%08X +0x%X)", fe->addr, v - fe->addr);
+                }
+            }
+        }
+        sp = back;
+    }
+    fprintf(stderr, "\n[%s] back-chain total frames: %d\n", tag, total);
+}
+
+/* Main thread's context, exposed for the stall watchdog (thread_local
+ * g_yz_cur_ctx isn't readable from another host thread). */
+ppu_context* g_yz_main_ctx = nullptr;
+
+/* TEMP DEBUG (window bring-up): after the boot has had time to reach its frame
+ * loop, dump the main thread's guest call stack so we can see what it spin-waits
+ * on. */
+static DWORD WINAPI yz_stall_watchdog(LPVOID)
+{
+    Sleep(10000);
+    if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, "watchdog-10s");
+    Sleep(5000);
+    if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, "watchdog-15s");
+    return 0;
 }
 
 static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
@@ -305,51 +378,7 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
 
     /* Guest state + PPC64 back-chain walk: names the real guest call chain
      * (the host return-address scan below misses direct bl callers). */
-    if (g_yz_cur_ctx) {
-        const ppu_context* gc = g_yz_cur_ctx;
-        fprintf(stderr,
-                "\n[crash] guest cia=0x%08X lr=0x%08X ctr=0x%08X r1=0x%08X",
-                (uint32_t)gc->cia, (uint32_t)gc->lr, (uint32_t)gc->ctr,
-                (uint32_t)gc->gpr[1]);
-        fprintf(stderr, "\n[crash] guest gpr:");
-        for (int r = 0; r < 32; r++) {
-            if (r % 8 == 0) fprintf(stderr, "\n    r%-2d:", r);
-            fprintf(stderr, " %016llX", (unsigned long long)gc->gpr[r]);
-        }
-        /* Executable guest range (EBOOT first PT_LOAD, R+X): a slot holding a
-         * value here is a real code pointer / saved return address. The ELFv1
-         * +16 LR slot proved unreliable for the lifter's frames, so scan each
-         * frame for code pointers instead. */
-        const uint32_t EXE_LO = 0x00010000u, EXE_HI = 0x01310768u;
-        fprintf(stderr, "\n[crash] guest back-chain (per-frame code pointers):");
-        uint32_t sp = (uint32_t)gc->gpr[1];
-        int total = 0;
-        for (int depth = 0; depth < 1200 && sp >= 0x10000u; depth++) {
-            if (vm_base && IsBadReadPtr(vm_base + sp, 8)) break;
-            uint32_t back = (uint32_t)vm_read64(sp);
-            if (back <= sp || back < 0x10000u) break;   /* must climb upward */
-            total++;
-            /* Print details for the first 8 frames only (the rest are the
-             * repeating recursion body); just count the depth otherwise. */
-            if (depth < 8) {
-                fprintf(stderr, "\n    #%-2d sp=0x%08X size=0x%X:", depth, sp,
-                        back - sp);
-                uint32_t lim = back - sp; if (lim > 0xB0) lim = 0xB0;
-                for (uint32_t off = 0; off + 8 <= lim; off += 8) {
-                    if (vm_base && IsBadReadPtr(vm_base + sp + off, 8)) break;
-                    uint32_t v = (uint32_t)vm_read64(sp + off);
-                    if (v >= EXE_LO && v < EXE_HI) {
-                        fprintf(stderr, "\n        +0x%02X -> 0x%08X", off, v);
-                        if (const yz_func_entry* fe = yz_func_from_guest(v))
-                            fprintf(stderr, " (func_%08X +0x%X)", fe->addr,
-                                    v - fe->addr);
-                    }
-                }
-            }
-            sp = back;
-        }
-        fprintf(stderr, "\n[crash] back-chain total frames: %d", total);
-    }
+    yz_dump_guest_state(g_yz_cur_ctx, "crash");
     /* Return-address candidates from the faulting thread's stack: values
      * pointing into our image are callers (the faulting accessor is a leaf,
      * so the direct caller is at/near [rsp]). Resolved via the func table. */
@@ -498,7 +527,15 @@ int main(int argc, char** argv)
            entry_code, (unsigned long long)ctx.gpr[1],
            (unsigned long long)ctx.gpr[2]);
 
+    /* Drive guest vblank handlers while the game runs (no real RSX vsync). */
+    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);
+    /* Stall watchdog: dumps the main thread's guest call stack if the boot
+     * parks (uncomment to diagnose a hang). */
+    (void)yz_stall_watchdog;
+    /* CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL); */
+
     g_yz_cur_ctx = &ctx;
+    g_yz_main_ctx = &ctx;
     entry_fn(&ctx);
     yz_drain_trampolines(&ctx);
 
