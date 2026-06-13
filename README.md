@@ -1,7 +1,10 @@
-# ps3recomp-yakuzadeadsouls
-> ** This is a fork of [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp), for the sole purpose of creating a PC port of Yakuza Dead Souls**
->
-> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet).
+# Yakuza-Dead-Souls-EX
+
+A Yakuza: Dead Souls recompilation effort — a native PC port of the PS3 game, built with [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp).
+
+Work on this project began 6/9/26, on the 15th anniversary of the original release of Yakuza: Dead Souls (RGG: Of The End) on PS3.
+
+> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet). This repo carries my fixes to those tools plus the Yakuza-specific port; the general, game-agnostic fixes get sent back upstream.
 
 
 Found and fixed various issues in the original ps3recomp tools. With it's help a lot of progress has been made. The game now builds and boots a long way in.
@@ -20,7 +23,7 @@ If any of my work can help anyone out or further their projects please let me kn
 Changes made on top of upstream ps3recomp for the Yakuza: Dead Souls port:
 
 
-This repo only contains the changes to the recompilation tools, the actual finished executable will be found in it's own dedicated repo.
+This repo is the home of the port — it carries the recompiler with my fixes plus the Yakuza-specific runner and build. The general, game-agnostic fixes also go upstream to [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) as separate pull requests. (You bring your own legally dumped copy of the game; no game code or binaries are distributed here.)
 ---
 
 ### *Because the Cell processor deserves a second life*
