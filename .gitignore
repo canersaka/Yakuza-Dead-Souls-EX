@@ -118,3 +118,6 @@ recomp_prx/
 # boot logs
 boot_out.txt
 boot_err.txt
+
+# guest filesystem root (disc dump / hdd / save data - junctions to local files)
+gamedata/
