@@ -148,6 +148,7 @@ static DWORD WINAPI thr_proc(LPVOID pv)
     ctx.gpr[3]  = p.arg;
     ctx.gpr[13] = p.r13;
     vm_write64(p.sp, 0);  /* null back-chain */
+    g_yz_cur_ctx = &ctx;  /* crash handler walks this thread's back-chain */
 
     fprintf(stderr, "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X\n",
             p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp);
