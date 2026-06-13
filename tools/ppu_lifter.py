@@ -160,6 +160,10 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * Must match the __declspec(thread) definition in indirect_dispatch. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+/* TOC repair before each trampoline dispatch (dispatch.cpp): restores the
+ * game module's TOC when a guest function is reached with r2==0 (a gcm callback
+ * invoked by its bare code address skips the OPD's TOC load). */
+extern "C" void yz_tramp_guard(void*, void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
  * Converts cross-fragment fallthrough chains into iterative loops. */
@@ -167,6 +171,7 @@ extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
     while (g_trampoline_fn) { \\
         void(*_tf)(void*) = g_trampoline_fn; \\
         g_trampoline_fn = 0; \\
+        yz_tramp_guard((void*)_tf,(void*)(ctx)); \\
         _tf((void*)(ctx)); \\
     } \\
 } while(0)

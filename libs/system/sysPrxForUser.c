@@ -738,8 +738,14 @@ s32 console_write(const void* buf, u32 len)
 
 s32 sys_process_get_paramsfo(void* buf)
 {
-    /* PARAM.SFO data — return a minimal valid SFO with title ID */
+    /* _sys_process_get_paramsfo fills a FIXED 0x40-byte buffer (the firmware
+     * ABI; callers allocate exactly 0x40 on the stack -- e.g. libgcm's
+     * _cellGcmInitBody zeroes 0x40 then calls this, with its saved non-volatile
+     * registers immediately after the buffer). Writing more (was 256) overruns
+     * the caller's frame and smashes its saved r26-r31 -> the caller restores 0
+     * and faults. Zeroing 0x40 yields a minimal/empty param.sfo (callers
+     * strncmp the title id and fall through to the default path). */
     if (!buf) return CELL_EFAULT;
-    memset(buf, 0, 256);
+    memset(buf, 0, 0x40);
     return CELL_OK;
 }
