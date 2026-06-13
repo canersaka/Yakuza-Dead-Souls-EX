@@ -162,8 +162,12 @@ int64_t sys_fs_open(ppu_context* ctx)
         fp = fopen(host_path, "w+b");
     }
 
-    if (!fp)
+    if (!fp) {
+        fprintf(stderr, "[sys_fs] open FAILED: %s\n", host_path);
         return (int64_t)(int32_t)CELL_ENOENT;
+    }
+
+    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     f->active = 1;

@@ -43,6 +43,10 @@ file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
 )
+# Exclude test harnesses (e.g. runtime/spu/tests/*): they have their own main()
+# and #include per-game generated headers (spu_recomp.h) that don't exist in a
+# plain runtime-library build.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/")
 
 # ---------------------------------------------------------------------------
 # Static library

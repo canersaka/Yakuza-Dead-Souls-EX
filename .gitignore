@@ -31,7 +31,7 @@ Makefile
 *.gch
 *.pch
 
-# IDE / Editor files
+# IDE / editor files
 .vs/
 .vscode/
 *.suo
@@ -56,10 +56,40 @@ dist/
 venv/
 env/
 
-# Recompiled output (generated, not tracked)
+# Generated lifter output
 recompiled/
+recomp/ppu_recomp.c
+recomp/ppu_recomp_*.cpp
+recomp/ppu_recomp.h
 
-# Game files 
+# Local reference source (GPL)
+emu/
+
+# Lifter logs / scratch
+lift_log.txt
+lift_out.txt
+lift_err.txt
+analysis.txt
+
+# Generated runner sources
+yakuza/func_table_gen.cpp
+yakuza/import_bridges_gen.cpp
+yakuza/imports.json
+
+# Reference manuals
+*.pdf
+
+# Local notes and tool config
+SUMMARY.md
+STATUS.md
+CHEATSHEET.md
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.aider*
+
+# Game files
 *.elf
 *.ELF
 *.self
@@ -72,16 +102,22 @@ recompiled/
 *.SFO
 *.sprx
 *.SPRX
-
-# Decryption keys
 *.keys
 *.rap
 
 # OS files
-.DS_Store
 Desktop.ini
-Thumbs.db
 ehthumbs.db
 
 # Logs
 *.log
+
+# firmware-LLE outputs (derived from decrypted Sony modules - never commit)
+recomp_prx/
+
+# boot logs
+boot_out.txt
+boot_err.txt
+
+# guest filesystem root (disc dump / hdd / save data - junctions to local files)
+gamedata/

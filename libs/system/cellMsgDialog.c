@@ -6,16 +6,22 @@
  */
 
 #include "cellMsgDialog.h"
+#include "ps3emu/guest_call.h"
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
+/* The callback / userdata args are GUEST addresses, not host pointers: the
+ * callback is an OPD that must be dispatched through g_ps3_guest_caller (see
+ * ps3emu/guest_call.h), never called as a host function pointer. Store them as
+ * guest EAs. */
 static int                   s_dialog_open = 0;
-static CellMsgDialogCallback s_callback    = NULL;
-static void*                 s_userdata    = NULL;
+static uint32_t              s_callback_opd = 0;
+static uint32_t              s_userdata_ea  = 0;
 static CellMsgDialogType     s_type        = 0;
 
 /* Progress bar state */
@@ -43,10 +49,10 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
     }
 
-    s_dialog_open = 1;
-    s_callback    = callback;
-    s_userdata    = userdata;
-    s_type        = type;
+    s_dialog_open  = 1;
+    s_callback_opd = (uint32_t)(uintptr_t)callback;
+    s_userdata_ea  = (uint32_t)(uintptr_t)userdata;
+    s_type         = type;
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */
@@ -75,10 +81,12 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
             printf("[cellMsgDialog] Auto-responding: NONE (no buttons)\n");
         }
 
-        /* Close and invoke callback */
+        /* Close and dispatch the guest callback (OPD) via the guest caller.
+         * Guest signature: void cb(s32 buttonType, void* userdata) -> r3/r4. */
         s_dialog_open = 0;
-        if (s_callback) {
-            s_callback(result, s_userdata);
+        if (s_callback_opd) {
+            ps3_invoke_guest(s_callback_opd, (uint64_t)(uint32_t)result,
+                             (uint64_t)s_userdata_ea, 0, 0);
         }
     } else {
         printf("[cellMsgDialog] Progress bar dialog opened (will close on explicit Close/Abort)\n");
@@ -97,9 +105,11 @@ s32 cellMsgDialogClose(float delayMs)
 
     s_dialog_open = 0;
 
-    if (s_callback) {
-        s_callback(CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
-        s_callback = NULL;
+    if (s_callback_opd) {
+        ps3_invoke_guest(s_callback_opd,
+                         (uint64_t)(uint32_t)CELL_MSGDIALOG_BUTTON_NONE,
+                         (uint64_t)s_userdata_ea, 0, 0);
+        s_callback_opd = 0;
     }
 
     return CELL_OK;
@@ -115,9 +125,11 @@ s32 cellMsgDialogAbort(void)
 
     s_dialog_open = 0;
 
-    if (s_callback) {
-        s_callback(CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
-        s_callback = NULL;
+    if (s_callback_opd) {
+        ps3_invoke_guest(s_callback_opd,
+                         (uint64_t)(uint32_t)CELL_MSGDIALOG_BUTTON_ESCAPE,
+                         (uint64_t)s_userdata_ea, 0, 0);
+        s_callback_opd = 0;
     }
 
     return CELL_OK;
