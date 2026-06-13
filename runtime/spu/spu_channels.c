@@ -27,6 +27,11 @@ __declspec(thread) jmp_buf* g_spu_halt_jmp = 0;
 _Thread_local jmp_buf* g_spu_halt_jmp = 0;
 #endif
 
+/* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
+ * cross-function tail branch in lifted SPU code; drained iteratively by the
+ * enclosing call site or the host-thread driver. */
+SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+
 void spu_halt(spu_context* ctx, int status)
 {
     ctx->status = (uint32_t)status;
@@ -240,7 +245,12 @@ void spu_indirect_branch(spu_context* ctx)
         if (unk_log > 0) {
             unk_log--;
             uint32_t a = ctx->pc & SPU_LS_MASK;
-            fprintf(stderr, "[SPU] unknown branch LS 0x%05X (image %d) bytes:", a, ctx->image_id);
+            fprintf(stderr, "[SPU] unknown branch full_pc=0x%08X LS 0x%05X (image %d) "
+                    "gpr0=%08X_%08X gpr1=%08X_%08X gpr2=%08X_%08X bytes:",
+                    ctx->pc, a, ctx->image_id,
+                    ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[1],
+                    ctx->gpr[1]._u32[0], ctx->gpr[1]._u32[1],
+                    ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1]);
             for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[(a + i) & SPU_LS_MASK]);
             fprintf(stderr, "\n");
             fflush(stderr);
