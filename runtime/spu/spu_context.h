@@ -90,6 +90,19 @@ extern "C" {
 #define MFC_EIEIO_CMD       0xC8
 #define MFC_SYNC_CMD        0xCC
 
+/* Lock-line (128-byte cache line) atomics — the SPURS kernel scheduler
+ * claims workloads with GETLLAR/PUTLLC loops. */
+#define MFC_PUTLLC_CMD      0xB4
+#define MFC_PUTLLUC_CMD     0xB0
+#define MFC_PUTQLLUC_CMD    0xB8
+#define MFC_GETLLAR_CMD     0xD0
+
+/* MFC_RdAtomicStat result values (RPCS3 MFC.h, CBEA ch. 9) */
+#define MFC_PUTLLC_SUCCESS  0
+#define MFC_PUTLLC_FAILURE  1
+#define MFC_PUTLLUC_SUCCESS 2
+#define MFC_GETLLAR_SUCCESS 4
+
 /* ---------------------------------------------------------------------------
  * Channel state
  * -----------------------------------------------------------------------*/
