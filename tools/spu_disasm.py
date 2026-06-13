@@ -72,14 +72,20 @@ class SPUInstruction:
 #   - 11-bit (bits 0-10) -- RR, RRR, special
 # ---------------------------------------------------------------------------
 
-# RRR format: opcd(4) rt(7) rb(7) ra(7) rc(7)
+# RRR format, reading the word from the MSB: OP(4) RT(7) RB(7) RA(7) RC(7)
+# -- the DESTINATION (RT) is the field right after the opcode (bits >>21,
+# RPCS3's op.rt4); the low 7 bits are RC. Opcode values per the SPU ISA
+# (verified against RPCS3 SPUOpcodes.h and by hand-decoding Sony's SPURS
+# kernel entry, whose cdd/cwd+shufb insert idiom only decodes sanely with
+# selb=0b1000, shufb=0b1011 -- the old table had them swapped AND printed
+# the RC field as the destination).
 RRR_TABLE: dict[int, str] = {
+    0b1000: "selb",       # select bits
+    0b1011: "shufb",      # shuffle bytes
     0b1100: "mpya",       # multiply and add
+    0b1101: "fnms",       # floating negative multiply-subtract
     0b1110: "fma",        # floating multiply-add
     0b1111: "fms",        # floating multiply-subtract
-    0b1101: "fnms",       # floating negative multiply-subtract
-    0b1011: "selb",       # select bits
-    0b1000: "shufb",      # shuffle bytes
 }
 
 # RI18 format: opcd(7) i18(18) rt(7)
@@ -327,7 +333,8 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
     if op4 in RRR_TABLE:
         mne = RRR_TABLE[op4]
         result.mnemonic = mne
-        result.operands = f"$r{rt}, $r{ra}, $r{rb}, $r{rc}"
+        # RRR destination is the high field (>>21); low 7 bits are RC.
+        result.operands = f"$r{rc}, $r{ra}, $r{rb}, $r{rt}"
         return result
 
     # ---- RI18 format (7-bit opcode) ----
