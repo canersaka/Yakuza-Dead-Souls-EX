@@ -65,6 +65,12 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
+/* The PS3 ABI packs CellFsStat to 4-byte alignment: the 64-bit fields sit at
+ * 4-byte (not 8-byte) offsets, so st_size is at +0x24 and the struct is 52
+ * bytes (RPCS3 sys_fs.h: be_t<s64,4>, CHECK_SIZE_ALIGN(CellFsStat,52,4)).
+ * Without #pragma pack the host would 8-align the s64s, putting st_size at +0x28
+ * (56-byte struct) and the guest would read its size from the wrong offset. */
+#pragma pack(push, 4)
 typedef struct CellFsStat {
     s32  st_mode;
     s32  st_uid;
@@ -80,6 +86,7 @@ typedef struct CellFsDirectoryEntry {
     CellFsStat attribute;
     char       entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
 } CellFsDirectoryEntry;
+#pragma pack(pop)
 
 /* Opaque file/directory descriptors */
 typedef s32 CellFsFd;
