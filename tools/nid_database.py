@@ -32,10 +32,12 @@ import sys
 # ---------------------------------------------------------------------------
 
 # The suffix that Sony appends before hashing.
-# This is the well-known suffix used for PS3 NID generation.
+# This is the well-known 16-byte suffix used for PS3 NID generation
+# (verified against a real EBOOT import table and RPCS3's ppu_generate_id;
+# matches PS3_NID_SUFFIX in include/ps3emu/nid.h).
 NID_SUFFIX = bytes([
-    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x01,
-    0xC0, 0xA8, 0x43, 0x09,
+    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x90,
+    0x56, 0x64, 0x27, 0x49, 0x94, 0x89, 0x74, 0x1A,
 ])
 
 
@@ -46,8 +48,9 @@ def compute_nid(name: str, suffix: bytes = NID_SUFFIX) -> int:
     """
     h = hashlib.sha1(name.encode("utf-8") + suffix)
     digest = h.digest()
-    # NID = first 4 bytes, big-endian
-    return struct.unpack(">I", digest[:4])[0]
+    # NID = first 4 bytes, LITTLE-endian (matches RPCS3 ppu_generate_id and
+    # the NIDs found in real import tables).
+    return struct.unpack("<I", digest[:4])[0]
 
 # ---------------------------------------------------------------------------
 # Built-in database

@@ -15,6 +15,48 @@
 #include "spu_dma.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <setjmp.h>
+
+/* Per-thread unwind target: a halted SPU (stop instruction, or an indirect
+ * branch into unlifted code) must abort the lifted call chain rather than
+ * return into it and spin. The host thread proc sets this with setjmp;
+ * spu_halt() longjmps back to it. */
+#if defined(_MSC_VER)
+__declspec(thread) jmp_buf* g_spu_halt_jmp = 0;
+#else
+_Thread_local jmp_buf* g_spu_halt_jmp = 0;
+#endif
+
+/* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
+ * cross-function tail branch in lifted SPU code; drained iteratively by the
+ * enclosing call site or the host-thread driver. */
+SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+
+void spu_halt(spu_context* ctx, int status)
+{
+    ctx->status = (uint32_t)status;
+    if (g_spu_halt_jmp)
+        longjmp(*g_spu_halt_jmp, 1);
+    /* No unwind target (e.g. unit test): fall back to returning. */
+}
+
+/* ===========================================================================
+ * Global lock-line lock (GETLLAR/PUTLLC transactions across all SPU host
+ * threads). A C11 atomic_flag spinlock keeps this portable; the critical
+ * sections are tiny (two 128-byte memcpy + memcmp).
+ * ===========================================================================*/
+#include <stdatomic.h>   /* MSVC: needs /experimental:c11atomics (set by the
+                            runtime CMake flags) */
+static atomic_flag s_lockline = ATOMIC_FLAG_INIT;
+void spu_lockline_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire))
+        ;
+}
+void spu_lockline_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_lockline, memory_order_release);
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -181,6 +223,13 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
     return NULL;
 }
 
+/* Does a lifted function exist at this LS address (any image)? Lets the
+ * lv2 layer decide between real SPU execution and PPU fallbacks. */
+int spu_have_function(uint32_t addr)
+{
+    return spu_lookup(addr, 0) != NULL;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
@@ -188,9 +237,26 @@ void spu_indirect_branch(spu_context* ctx)
         fn(ctx);
         return;
     }
-    fprintf(stderr, "[SPU] indirect branch to unknown LS address 0x%05X (image %d)\n",
-            ctx->pc & SPU_LS_MASK, ctx->image_id);
-    ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+    /* TEMP DEBUG (7d): on the first few unknown branches, dump what's at the
+     * target LS — distinguishes "real code DMA'd in at runtime" (must lift)
+     * from "zero/garbage" (bad dispatch). Strip once workloads run. */
+    {
+        static int unk_log = 6;
+        if (unk_log > 0) {
+            unk_log--;
+            uint32_t a = ctx->pc & SPU_LS_MASK;
+            fprintf(stderr, "[SPU] unknown branch full_pc=0x%08X LS 0x%05X (image %d) "
+                    "gpr0=%08X_%08X gpr1=%08X_%08X gpr2=%08X_%08X bytes:",
+                    ctx->pc, a, ctx->image_id,
+                    ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[1],
+                    ctx->gpr[1]._u32[0], ctx->gpr[1]._u32[1],
+                    ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1]);
+            for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[(a + i) & SPU_LS_MASK]);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+    spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);   /* unwinds; does not return */
 }
 
 /* ===========================================================================
