@@ -187,6 +187,7 @@ class SPULifter:
         self.unsupported: dict[str, int] = {}
         self.trace = trace
         self.header_name = "spu_recomp.h"   # what emit_source #includes
+        self.register_name = "spu_recomp_register"  # global init fn name
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -308,7 +309,7 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
-            "cg": "spu_cg",
+            "cg": "spu_cg", "bg": "spu_bg",
             # Phase 2: register-variable shifts/rotates
             "shl": "spu_shl", "shlh": "spu_shlh",
             "rot": "spu_rot", "roth": "spu_roth",
@@ -475,6 +476,13 @@ class SPULifter:
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
             tgt_reg = _reg(ops[1])
+            # $r0 is the link register: a conditional branch to it is a
+            # conditional function return — emit a host return so it composes
+            # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
+            # Dispatching to the return address would miss the C frame and
+            # land on an unregistered mid-function PC.
+            if tgt_reg == "0":
+                return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return; }}")
 
@@ -521,7 +529,7 @@ class SPULifter:
         lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
         lines.append("/* Call once at init to register this image's functions for")
         lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
-        lines.append("void spu_recomp_register(void);")
+        lines.append(f"void {self.register_name}(void);")
         lines.append("")
         return "\n".join(lines)
 
@@ -560,7 +568,7 @@ class SPULifter:
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
-        lines.append("void spu_recomp_register(void) {")
+        lines.append(f"void {self.register_name}(void) {{")
         lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
         lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
@@ -579,6 +587,9 @@ def main() -> None:
     p.add_argument("--output", "-o", default=".", help="Output directory")
     p.add_argument("--header-name", default="spu_recomp.h")
     p.add_argument("--source-name", default="spu_recomp.c")
+    p.add_argument("--register-name", default="spu_recomp_register",
+                   help="Name of the emitted global registration function "
+                        "(override to link multiple SPU images together).")
     p.add_argument("--base", type=lambda x: int(x, 0), default=0,
                    help="Base local-store address")
     p.add_argument("--offset", type=lambda x: int(x, 0), default=0)
@@ -627,6 +638,7 @@ def main() -> None:
 
     lifter = SPULifter(trace=args.trace)
     lifter.header_name = args.header_name
+    lifter.register_name = args.register_name
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)

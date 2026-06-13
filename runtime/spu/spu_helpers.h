@@ -199,6 +199,9 @@ static inline u128 spu_gbb(u128 a) {
     u128 r = spu_zero(); r._u32[0]=v; return r;
 }
 static inline u128 spu_cg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)a._u32[i]+(uint64_t)b._u32[i])>>32); return r; }
+/* Borrow generate: carry-out of (b + ~a + 1) == (b >= a unsigned ? 1 : 0).
+ * The subtract-side sibling of cg; pairs with sf/sfx for extended subtraction. */
+static inline u128 spu_bg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)b._u32[i]+(uint64_t)(~a._u32[i])+1u)>>32); return r; }
 static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
 /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
 static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s32[i]=((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
