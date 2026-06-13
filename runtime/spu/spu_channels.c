@@ -15,6 +15,25 @@
 #include "spu_dma.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <setjmp.h>
+
+/* Per-thread unwind target: a halted SPU (stop instruction, or an indirect
+ * branch into unlifted code) must abort the lifted call chain rather than
+ * return into it and spin. The host thread proc sets this with setjmp;
+ * spu_halt() longjmps back to it. */
+#if defined(_MSC_VER)
+__declspec(thread) jmp_buf* g_spu_halt_jmp = 0;
+#else
+_Thread_local jmp_buf* g_spu_halt_jmp = 0;
+#endif
+
+void spu_halt(spu_context* ctx, int status)
+{
+    ctx->status = (uint32_t)status;
+    if (g_spu_halt_jmp)
+        longjmp(*g_spu_halt_jmp, 1);
+    /* No unwind target (e.g. unit test): fall back to returning. */
+}
 
 /* ===========================================================================
  * Global lock-line lock (GETLLAR/PUTLLC transactions across all SPU host
@@ -227,7 +246,7 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         }
     }
-    ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+    spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);   /* unwinds; does not return */
 }
 
 /* ===========================================================================
