@@ -193,6 +193,11 @@ static inline u128 spu_gbh(u128 a) {
     uint32_t v=0; for(int i=0;i<8;i++) v |= ((uint32_t)(a._u16[i]&1) << (7-i));
     u128 r = spu_zero(); r._u32[0]=v; return r;
 }
+/* gather LSB of each byte; exact inverse of spu_fsmb (bit 15-i <-> _u8[i]) */
+static inline u128 spu_gbb(u128 a) {
+    uint32_t v=0; for(int i=0;i<16;i++) v |= ((uint32_t)(a._u8[i]&1) << (15-i));
+    u128 r = spu_zero(); r._u32[0]=v; return r;
+}
 static inline u128 spu_cg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)a._u32[i]+(uint64_t)b._u32[i])>>32); return r; }
 static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
 /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
