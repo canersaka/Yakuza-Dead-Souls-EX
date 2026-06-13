@@ -48,6 +48,10 @@ if(MSVC)
     target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
 endif()
 
+# Lifted SPU images (Sony's SPURS kernel, extracted from libsre by
+# tools/lift_prx.py + tools/spu_lifter.py). Optional like the PRX chunks.
+file(GLOB SPU_KERNELS CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c")
+
 add_executable(yakuza_recomp
     main.cpp
     dispatch.cpp
@@ -56,12 +60,14 @@ add_executable(yakuza_recomp
     func_table_gen.cpp
     import_bridges_gen.cpp
     import_overrides.cpp
+    ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )
 
 target_include_directories(yakuza_recomp PRIVATE
     "${PS3RECOMP_DIR}/recomp"
     "${PS3RECOMP_DIR}/include"
+    "${PS3RECOMP_DIR}/runtime/spu"
 )
 
 # dbghelp: crash-handler symbol resolution (SymFromAddr against the PDB)

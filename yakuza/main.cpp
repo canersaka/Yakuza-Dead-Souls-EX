@@ -47,6 +47,10 @@ static uint64_t g_proc_param_vaddr = 0;
 /* runtime/syscalls/lv2_register.c — served by sys_process_get_sdk_version */
 extern "C" uint32_t g_ps3_sdk_version;
 
+/* recomp_prx/spurs_kernel2.c (generated, C) — registers the lifted SPURS
+ * kernel for SPU indirect-branch dispatch. */
+extern "C" void spu_recomp_register(void);
+
 static int load_elf(const char* path, uint64_t* entry_out)
 {
     FILE* f = fopen(path, "rb");
@@ -332,6 +336,12 @@ int main(int argc, char** argv)
      * in place before yz_install_imports patches its import slots. */
     if (load_prx_image("recomp_prx/libsre_image.bin", YZ_LIBSRE_BASE) != 0)
         return 1;
+
+    /* Lifted SPU images: register Sony's SPURS kernel (recomp_prx/
+     * spurs_kernel2.c, compiled in) so sys_spu_thread_group_start can run
+     * it for real. */
+    spu_recomp_register();
+    printf("[boot] SPU images registered (SPURS kernel2)\n");
 
     /* PS3 e_entry points at an OPD descriptor: word0 = code, word1 = TOC */
     uint32_t entry_code = vm_read32(e_entry);
