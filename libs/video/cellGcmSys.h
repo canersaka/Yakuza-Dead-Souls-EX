@@ -329,8 +329,9 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
 /* Notify data area (similar to report data) */
 void* cellGcmGetNotifyDataAddress(u32 index);
 
-/* Timestamp location query */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
+/* Timestamp query for a report at a given memory location (0=local, 1=main).
+ * Returns the report's u64 timer (PS3 ABI: u64 (*)(u32 index, u32 location)). */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location);
 
 /* Default FIFO size configuration */
 s32 cellGcmSetDefaultFifoSize(u32 size);

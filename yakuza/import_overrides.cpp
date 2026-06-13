@@ -147,7 +147,7 @@ extern "C" int32_t cellGcmInit(uint32_t cmdSize, uint32_t ioSize, uint32_t ioAdd
 extern "C" int32_t cellGcmIoOffsetToAddress(uint32_t ioOffset, uint32_t* ea);
 extern "C" int32_t cellGcmAddressToOffset(uint32_t address, uint32_t* offset);
 extern "C" int32_t cellGcmGetTiledPitchSize(uint32_t size, uint32_t* pitch);
-extern "C" uint32_t cellGcmGetTimeStampLocation(uint32_t index, uint32_t* location);
+extern "C" uint64_t cellGcmGetTimeStampLocation(uint32_t index, uint32_t location);
 
 static uint32_t yz_gcm_io_addr;
 static uint32_t yz_gcm_io_size;
@@ -479,13 +479,14 @@ extern "C" void yz_ovr_cellGcmGetTiledPitchSize(ppu_context* ctx)
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
 
+/* u64 cellGcmGetTimeStampLocation(u32 index, u32 location) -- RETURNS the report
+ * timer; r4 is the memory-location enum (0=local, 1=main), NOT an out-param
+ * pointer. The old override mis-read r4 as a guest pointer and vm_write32'd to
+ * it, crashing when the game passed location=1 (write to guest 0x1). */
 extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
 {
-    uint32_t loc = 0;
-    uint32_t rc  = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3], &loc);
-    if (ctx->gpr[4])
-        vm_write32(ctx->gpr[4], loc);
-    ctx->gpr[3] = rc;
+    ctx->gpr[3] = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3],
+                                              (uint32_t)ctx->gpr[4]);
 }
 
 /* Returns a pointer the game reads/polls -> must be a guest address
