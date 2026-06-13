@@ -386,6 +386,15 @@ void sys_memory_init(lv2_syscall_table* tbl)
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
 
+    /* Commit the whole window up front. On real hardware the user lpar is
+     * mapped beyond the game's current allocations, and Sony's own code
+     * relies on it: the SPURS kernel's boot code GETs a resume-context
+     * probe from spurs+0xD0000 — memory the game only sys_memory-allocates
+     * a few milliseconds later (a benign race on real HW; the kernel
+     * validates the contents and treats garbage as a cold boot). Host
+     * pages still materialize lazily on first touch. */
+    vm_commit(SYS_MEM_ALLOC_BASE, SYS_MEM_ALLOC_END - SYS_MEM_ALLOC_BASE);
+
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
