@@ -427,10 +427,13 @@ static void* spu_exec_thread_proc(void* arg)
     sctx->status = SPU_STATUS_RUNNING;
     jmp_buf halt_jb;
     g_spu_halt_jmp = &halt_jb;
+    g_spu_trampoline_fn = 0;
     if (setjmp(halt_jb) == 0) {
         spu_indirect_branch(sctx);   /* runs until stop; halt longjmps back */
+        SPU_DRAIN(sctx);             /* iterate tail-call chains (scheduler loop) */
     }
     g_spu_halt_jmp = 0;
+    g_spu_trampoline_fn = 0;
 
     fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X)\n",
             t->tid, sctx->status, sctx->pc);
