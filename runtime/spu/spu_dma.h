@@ -262,6 +262,16 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+        /* Sony's SPURS kernel/system-service tags lock-line atomic EAs with
+         * bit 31 (a memory coherency/cache attribute the Cell MFC strips when
+         * resolving the real address). The SPURS management area lives at the
+         * instance base (e.g. 0x40197C80); the SPU does GETLLAR/PUTLLC against
+         * base|0x80000000. We model one backing store for the line, so clear
+         * the attribute bit to reach it. Scoped to lock-line only: regular DMA
+         * already uses the clean base, and legit VRAM DMA (0xC0000000+) must
+         * keep bit 31. Verified live: base reads 0x40197C80, masked EA hits the
+         * real instance and the SPURS CAS handshake then advances. */
+        ea &= ~0x80000000ull;
         uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
         spu_lockline_lock();
