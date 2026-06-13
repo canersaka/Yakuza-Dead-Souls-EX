@@ -3,11 +3,14 @@
 >
 > All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet).
 
-Where things stand. Found a fixed various issues in the original ps3recomp tools. With it's help a lot of progress has been made. The game now builds and boots a long way in.
+
+Found and fixed various issues in the original ps3recomp tools. With it's help a lot of progress has been made. The game now builds and boots a long way in.
 
 I started with raw recompiler output full of holes, over 73,000 instructions that either weren't translated at all or were silently decoding to the wrong operation. I went through and fixed every one by crossreferencing with the official PowerPC and Cell manuals, so the CPU translation is now correct and complete for this game. From there it turned into a long grind of actually getting it to boot: each run made it a little further before hitting a wall, memory allocation, the threading system, the C-runtime handover, and a string of separate bugs that were invisible until the boot physically reached them.
 
 I got the entire graphics command pipeline standing up and behaving exactly like a real PS3 (real rendering comes later, but the plumbing works). I added support for actually running the PS3's SPU cores. And most recently, instead of faking the PS3's multi-core job system (SPURS), it's been recompiled and now executes for real, with the core scheduler running as native SPU code on its own threads. Next up is getting its first job to run, then the filesystem and opening a real window; full graphics rendering is the long road after that.
+
+If any of my work can help anyone out or further their projects please let me know! 
 
 > 
 ## Changes
