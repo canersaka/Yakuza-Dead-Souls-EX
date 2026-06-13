@@ -861,11 +861,17 @@ void* cellGcmGetNotifyDataAddress(u32 index)
     return &s_notify_data[index * 16];
 }
 
-/* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
+/* Returns the RSX timestamp (report timer) for the given report index.
+ * `location` selects local (0) vs main (1) report memory; this HLE keeps a
+ * single report pool, so both behave the same (cf. cellGcmGetTimeStamp).
+ * PS3 ABI: u64 cellGcmGetTimeStampLocation(u32 index, u32 location). */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 {
-    if (location) *location = CELL_GCM_LOCATION_LOCAL;
-    return 0;
+    (void)location;
+    if (index >= CELL_GCM_MAX_REPORT_COUNT)
+        return 0;
+    s_report_data[index].timestamp = get_timestamp_ns();
+    return s_report_data[index].timestamp;
 }
 
 /* SetTileInfo — alternative to SetTile with same parameters */

@@ -3,6 +3,7 @@
  */
 
 #include "sys_memory.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -19,7 +20,26 @@ uint32_t g_sys_mem_bump_ptr = 0;
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
 
+/* Guest window handed out by sys_memory_allocate / sys_mmapper.
+ * 0x40000000+ matches where the real lv2 places these allocations (verified
+ * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
+ * the pre-committed main region, so pages are committed on demand. */
+#define SYS_MEM_ALLOC_BASE  0x40000000u
+#define SYS_MEM_ALLOC_END   0x50000000u
+
 static uint32_t s_total_allocated = 0;
+
+/* Guest threads are real host threads; serialize the bump allocator. */
+#ifdef _WIN32
+static SRWLOCK s_bump_lock = SRWLOCK_INIT;
+static void bump_lock(void)   { AcquireSRWLockExclusive(&s_bump_lock); }
+static void bump_unlock(void) { ReleaseSRWLockExclusive(&s_bump_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_bump_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
+static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
+#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -44,6 +64,9 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t flags     = LV2_ARG_U32(ctx, 1);
     uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
 
+    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
+            size, flags);
+
     /* Determine alignment based on page size flags */
     uint32_t alignment;
     if (flags & SYS_MEMORY_PAGE_SIZE_1M) {
@@ -57,42 +80,51 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     if (size == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
+    bump_lock();
+
     /* Initialize bump pointer on first call */
-    if (g_sys_mem_bump_ptr == 0) {
-        /* Start allocations at 0x20000000 to avoid overlapping with:
-         *   - ELF segments (0x00010000 - 0x00900000)
-         *   - CRT malloc heap (0x00A00000 - 0x10000000)
-         *   - RSX/rodata region (0x10000000 - 0x20000000) */
-        g_sys_mem_bump_ptr = 0x20000000;
-    }
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
     /* Align bump pointer */
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
     /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     /* Find a free allocation slot */
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
     s_total_allocated += size;
 
-    /* Zero the allocated memory */
-    memset(vm_to_host(alloc_addr), 0, size);
-
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
-    a->active       = 1;
+    a->active       = 1;       /* claim the slot before unlocking */
     a->addr         = alloc_addr;
     a->size         = size;
     a->container_id = 0;
+
+    bump_unlock();
+
+    /* Commit the pages (window is outside the pre-committed main region);
+     * fresh commits are already zeroed by the OS */
+    if (vm_commit(alloc_addr, size) != CELL_OK) {
+        a->active = 0;
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
@@ -130,6 +162,7 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
 
+    fprintf(stderr, "[sys_memory] get_user_memory_size()\n");
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
         uint32_t avail = total - s_total_allocated;
@@ -235,17 +268,22 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     if (alignment == 0) alignment = 0x10000;
     size = VM_ALIGN_UP(size, alignment);
 
-    if (g_sys_mem_bump_ptr == 0) {
-        g_sys_mem_bump_ptr = 0x02000000;
-    }
+    bump_lock();
+
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
-    if (g_sys_mem_bump_ptr + size > VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
+
+    bump_unlock();
 
     /* Commit the reserved region */
     vm_commit(alloc_addr, size);
@@ -347,6 +385,15 @@ void sys_memory_init(lv2_syscall_table* tbl)
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
+
+    /* Commit the whole window up front. On real hardware the user lpar is
+     * mapped beyond the game's current allocations, and Sony's own code
+     * relies on it: the SPURS kernel's boot code GETs a resume-context
+     * probe from spurs+0xD0000 — memory the game only sys_memory-allocates
+     * a few milliseconds later (a benign race on real HW; the kernel
+     * validates the contents and treats garbage as a cold boot). Host
+     * pages still materialize lazily on first touch. */
+    vm_commit(SYS_MEM_ALLOC_BASE, SYS_MEM_ALLOC_END - SYS_MEM_ALLOC_BASE);
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);

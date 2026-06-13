@@ -19,11 +19,14 @@
 #include "sys_event.h"
 #include "sys_timer.h"
 #include "sys_memory.h"
+#include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
 #include "sys_event.h"
 
 #include <stdio.h>
+#include <stdlib.h>  /* calloc/free: without the prototype MSVC assumed int
+                        and truncated the 64-bit local_store pointer */
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -137,6 +140,15 @@ typedef struct {
     uint32_t index;          /* slot within the group */
     int32_t  exit_status;
     uint32_t entry_point;    /* initial SPU image entry (informational) */
+    uint32_t img_ea;         /* guest sys_spu_image struct (segment table) */
+    /* Thread arguments captured AT sys_spu_thread_initialize time (lv2
+     * copies them then — games reuse one guest block for all threads,
+     * rewriting it between calls; reading it lazily hands every thread
+     * the last thread's values. Observed live with SPURS spu_num). */
+    uint64_t args[4];
+    /* Real SPU execution (lifted images): full architectural context.
+     * Allocated at group_start when the entry resolves to lifted code. */
+    struct spu_context* sctx;
     /* Args block passed via sys_spu_thread_initialize (.args_ea) and
      * sys_spu_thread_set_argument (per-thread). For SPURS this holds the
      * 4 register-style args (arg1..arg4) packed into a guest struct.
@@ -263,13 +275,18 @@ static int64_t sys_spu_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_create(out_id_ea, num, name_ea, attr_ea) */
+/* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
+ *
+ * lv2 signature per RPCS3 sys_spu.h: r5 is the group PRIORITY (SPURS
+ * passes 250), NOT a name pointer. The name lives inside the attribute
+ * struct, reduced_sys_spu_thread_group_attribute (BE):
+ *   +0 u32 nsize (name length incl. NUL), +4 u32 name ptr, +8 s32 type. */
 static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
-    uint32_t name_ea  = (uint32_t)ctx->gpr[5];
+    int32_t  prio     = (int32_t)ctx->gpr[5];
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
 
     spu_group_t* g = spu_alloc_group();
@@ -282,6 +299,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     if (num > 8) num = 8;
     g->num_threads = num;
 
+    int32_t  gtype   = 0;
+    uint32_t name_ea = 0;
+    if (attr_ea) {
+        uint32_t nsize = vm_read_be32(attr_ea + 0);
+        name_ea        = vm_read_be32(attr_ea + 4);
+        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
+        if (!nsize) name_ea = 0;
+    }
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -292,8 +317,8 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 
     vm_write_be32(out_ea, g->id);
 
-    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u name=%.31s attr=0x%08X\n",
-            g->id, num, g->name, attr_ea);
+    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
+            g->id, num, prio, gtype, g->name);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -323,11 +348,18 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     }
     t->group_id = group_id;
     t->index    = thread_num;
+    t->img_ea   = img_ea;
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
+    /* Capture the 4 u64 args NOW (lv2 copy semantics — see struct note). */
+    for (int a = 0; a < 4; a++) {
+        uint64_t hi = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8)     : 0;
+        uint64_t lo = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8 + 4) : 0;
+        t->args[a] = (hi << 32) | lo;
+    }
 
     if (thread_num < 8)
         g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
@@ -339,6 +371,87 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Real SPU execution (lifted images, e.g. Sony's SPURS kernel)
+ *
+ * The thread's sys_spu_image segment table is deployed into a fresh
+ * 256 KB local store, args land in gpr[3..6] (one 64-bit value each, in
+ * the preferred doubleword — RPCS3 sys_spu.cpp: gpr[3+i] = from64(0,
+ * arg[i])), pc = entry, and the lifted code runs until it stops. The
+ * lifted code tail-calls between functions; the host thread gets a large
+ * stack in case the compiler does not collapse a long chain.
+ * -----------------------------------------------------------------------*/
+#include "../spu/spu_context.h"
+#include <setjmp.h>
+void spu_indirect_branch(spu_context* sctx);   /* runtime/spu/spu_channels.c */
+int  spu_have_function(uint32_t addr);
+/* per-thread unwind target for SPU halt (spu_channels.c) */
+#if defined(_MSC_VER)
+extern __declspec(thread) jmp_buf* g_spu_halt_jmp;
+#else
+extern _Thread_local jmp_buf* g_spu_halt_jmp;
+#endif
+
+static void spu_deploy_image(spu_context* sctx, uint32_t img_ea)
+{
+    extern uint8_t* vm_base;
+    uint32_t segs_ea = vm_read_be32(img_ea + 0x8);
+    int32_t  nsegs   = (int32_t)vm_read_be32(img_ea + 0xC);
+    for (int32_t i = 0; i < nsegs && segs_ea; i++) {
+        uint32_t s     = segs_ea + (uint32_t)i * 0x18;
+        uint32_t type  = vm_read_be32(s + 0x00);
+        uint32_t ls    = vm_read_be32(s + 0x04) & SPU_LS_MASK;
+        uint32_t size  = vm_read_be32(s + 0x08);
+        uint32_t addr  = vm_read_be32(s + 0x10);
+        if (size > SPU_LS_SIZE - ls) size = SPU_LS_SIZE - ls;
+        if (type == 1)      memcpy(&sctx->ls[ls], vm_base + addr, size); /* COPY */
+        else if (type == 2) memset(&sctx->ls[ls], (int)addr, size);      /* FILL */
+        /* type 4 = INFO: not loaded */
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI spu_exec_thread_proc(LPVOID arg)
+#else
+static void* spu_exec_thread_proc(void* arg)
+#endif
+{
+    spu_thread_t* t = (spu_thread_t*)arg;
+    spu_context* sctx = t->sctx;
+
+    fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X\n",
+            t->tid, sctx->pc);
+
+    sctx->status = SPU_STATUS_RUNNING;
+    jmp_buf halt_jb;
+    g_spu_halt_jmp = &halt_jb;
+    g_spu_trampoline_fn = 0;
+    if (setjmp(halt_jb) == 0) {
+        spu_indirect_branch(sctx);   /* runs until stop; halt longjmps back */
+        SPU_DRAIN(sctx);             /* iterate tail-call chains (scheduler loop) */
+    }
+    g_spu_halt_jmp = 0;
+    g_spu_trampoline_fn = 0;
+
+    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X)\n",
+            t->tid, sctx->status, sctx->pc);
+    fflush(stderr);
+
+    t->exit_status = 0;
+#ifdef _WIN32
+    t->running = 0;
+    SetEvent(t->finish_event);
+    return 0;
+#else
+    pthread_mutex_lock(&t->finish_event.mu);
+    t->running = 0;
+    t->finish_event.done = 1;
+    pthread_cond_broadcast(&t->finish_event.cv);
+    pthread_mutex_unlock(&t->finish_event.mu);
+    return NULL;
+#endif
 }
 
 /* Host-thread entry for a PPU-fallback SPU thread. */
@@ -389,6 +502,54 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
         if (!t->in_use) continue;
+
+        /* Real SPU execution first: if a lifted image covers the entry
+         * point, run the actual SPU code on a host thread. */
+        if (spu_have_function(t->entry_point)) {
+            if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
+            if (t->sctx) {
+                spu_context* sctx = t->sctx;
+                memset(sctx, 0, sizeof(*sctx));
+                sctx->spu_id       = t->tid;
+                sctx->spu_group_id = id;
+                if (t->img_ea) spu_deploy_image(sctx, t->img_ea);
+                /* args captured at thread_initialize -> gpr[3..6]
+                 * preferred DW (lane 0 = high word, lane 1 = low word) */
+                for (int a = 0; a < 4; a++) {
+                    sctx->gpr[3 + a]._u32[0] = (uint32_t)(t->args[a] >> 32);
+                    sctx->gpr[3 + a]._u32[1] = (uint32_t)t->args[a];
+                }
+                sctx->pc = t->entry_point & SPU_LS_MASK;
+                t->running = 1;
+#ifdef _WIN32
+                if (!t->finish_event)
+                    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+                else
+                    ResetEvent(t->finish_event);
+                /* 64 MB stack: lifted SPU code tail-calls between
+                 * functions; give the chain room if the compiler keeps
+                 * the frames. */
+                t->host_thread = CreateThread(NULL, 64 * 1024 * 1024,
+                                              spu_exec_thread_proc, t,
+                                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+#else
+                pthread_mutex_init(&t->finish_event.mu, NULL);
+                pthread_cond_init(&t->finish_event.cv, NULL);
+                t->finish_event.done = 0;
+                pthread_create(&t->host_thread, NULL, spu_exec_thread_proc, t);
+#endif
+                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
+                        "args=0x%08X -> REAL SPU execution "
+                        "(arg1=0x%08X%08X arg2=0x%08X%08X arg3=0x%08X%08X)\n",
+                        id, t->tid, t->entry_point, t->args_ea,
+                        sctx->gpr[3]._u32[0], sctx->gpr[3]._u32[1],
+                        sctx->gpr[4]._u32[0], sctx->gpr[4]._u32[1],
+                        sctx->gpr[5]._u32[0], sctx->gpr[5]._u32[1]);
+                spawned++;
+                continue;
+            }
+        }
+
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
         if (!fb) {
@@ -593,7 +754,14 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
      * struct at arg_ea is whatever the game registered for — typically
      * a packed (arg1,arg2,arg3,arg4) tuple of 4 u64s on real SPUs. */
     spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->args_ea = arg_ea;
+    if (t) {
+        t->args_ea = arg_ea;
+        for (int a = 0; a < 4; a++) {     /* lv2 copy semantics */
+            uint64_t hi = arg_ea ? vm_read_be32(arg_ea + (uint32_t)a * 8)     : 0;
+            uint64_t lo = arg_ea ? vm_read_be32(arg_ea + (uint32_t)a * 8 + 4) : 0;
+            t->args[a] = (hi << 32) | lo;
+        }
+    }
 
     fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
             tid, arg_ea);
@@ -856,6 +1024,70 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
     return 0;
 }
 
+/* sys_process_getpid (1) — lv2 returns 1 for the game process (RPCS3
+ * sys_process.cpp: "sys_process_getpid() -> 1"; the real-HW trace shows
+ * libsre calling get_sdk_version with pid=0x1). */
+static int64_t sys_process_getpid_handler(ppu_context* ctx)
+{
+    ctx->gpr[3] = 1;
+    return 1;
+}
+
+/* sys_process_get_sdk_version (25): (pid, u32* version). Writes the
+ * process's SDK version from PROC_PARAM (offset 0xC); the loader sets
+ * g_ps3_sdk_version. Yakuza: Dead Souls = 0x350001 (RPCS3 ppu_loader). */
+uint32_t g_ps3_sdk_version = 0x00350001;
+
+static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
+{
+    uint32_t version_ea = (uint32_t)ctx->gpr[4];
+    if (!version_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
+    vm_write_be32(version_ea, g_ps3_sdk_version);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_process_is_spu_lock_line_reservation_address (14)
+ *
+ * r3 = addr, r4 = access-right flags (SPU_THR = 0x2, RAW_SPU = 0x1).
+ * Asks lv2 whether SPUs may place lock-line reservations (GETLLAR/PUTLLC)
+ * on the given effective address. SPURS calls this while validating its
+ * management areas during initialization; a failure aborts SPURS init.
+ *
+ * Contract from RPCS3 sys_process.cpp process_is_spu_lock_line_reservation
+ * _address(), mapped onto OUR guest layout: flags must be non-zero and
+ * contain only the two SPU bits (else EINVAL); main memory, the sys_memory
+ * window and RSX local memory are reservation-capable (OK); PPU stacks and
+ * sys_vm regions are not (EPERM); anything unmapped is EINVAL. */
+static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx)
+{
+    uint32_t addr  = (uint32_t)ctx->gpr[3];
+    uint64_t flags = ctx->gpr[4];
+    int64_t  rc;
+
+    if (!flags || (flags & ~0x3ull)) {
+        rc = (int64_t)(int32_t)CELL_EINVAL;
+    } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
+        rc = 0;                                   /* main memory */
+    } else if (addr >= 0x40000000u && addr < 0x50000000u) {
+        rc = 0;                                   /* sys_memory window */
+    } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
+        rc = 0;                                   /* RSX local memory */
+    } else if (addr >= 0xD0000000u && addr < 0xE0000000u) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* PPU stack area */
+    } else if (addr >= SYS_VM_REGION_BASE && addr < SYS_VM_REGION_END) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* sys_vm memory */
+    } else {
+        rc = (int64_t)(int32_t)CELL_EINVAL;       /* unmapped */
+    }
+
+    ctx->gpr[3] = (uint64_t)rc;
+    return rc;
+}
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
@@ -879,9 +1111,15 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Memory management */
     sys_memory_init(tbl);
+    sys_vm_init(tbl);
 
     /* Filesystem */
     sys_fs_init(tbl);
+
+    /* Process queries */
+    lv2_syscall_register(tbl, 1,  sys_process_getpid_handler);
+    lv2_syscall_register(tbl, 25, sys_process_get_sdk_version_handler);
+    lv2_syscall_register(tbl, 14, sys_process_is_spu_lock_line_reservation_address);
 
     /* TTY (debug console I/O — used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
@@ -890,7 +1128,6 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* SPU syscalls — we don't execute SPU code but the PPU-side wrappers
      * need consistent IDs and out-params. See the stateful group tracker
      * above for contract notes. */
-    lv2_syscall_register(tbl, 169,                            sys_spu_thread_stub); /* deprecated */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);

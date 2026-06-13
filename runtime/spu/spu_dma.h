@@ -17,6 +17,7 @@
 
 #include "spu_context.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -64,7 +65,21 @@ typedef struct mfc_engine {
 
     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
     uint32_t    tag_completed;
+
+    /* Lock-line reservation (GETLLAR/PUTLLC). A 128-byte snapshot of the
+     * line is taken under the global lock-line lock; PUTLLC commits only
+     * if main memory still matches it (compare-and-swap semantics, the
+     * same scheme RPCS3 uses). */
+    uint64_t    resv_ea;          /* line EA (128-aligned), 0 = none */
+    uint8_t     resv_data[128];
+    int         resv_active;
+    uint32_t    atomic_stat;      /* last MFC_RdAtomicStat value */
 } mfc_engine;
+
+/* Single process-wide lock serializing lock-line transactions across all
+ * SPU host threads (defined in spu_channels.c). */
+void spu_lockline_lock(void);
+void spu_lockline_unlock(void);
 
 /* External: pointer to host mapping of PS3 main memory.
  * Must be set by the VM manager before any DMA. */
@@ -229,6 +244,65 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
+    /* TEMP DEBUG (7d bring-up): trace DMAs that load WORKLOAD CODE into LS
+     * (lsa in the workload region >=0x900, code-sized). These reveal the
+     * source EA + size of the SPURS system-service / policy blobs we must
+     * lift. Strip once SPURS workloads run. */
+    if (mfc_is_get(cmd) && (lsa & SPU_LS_MASK) >= 0x900 && size >= 0x80) {
+        static int wl_log = 40;
+        if (wl_log > 0) {
+            wl_log--;
+            fprintf(stderr, "[spu-wl] spu=%X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
+                    spu->spu_id, cmd, lsa & SPU_LS_MASK, (uint32_t)ea, size);
+            fflush(stderr);
+        }
+    }
+
+    /* Lock-line atomics: a 128-byte line, EA implicitly 128-aligned, the
+     * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
+    if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+        cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+        /* Sony's SPURS kernel/system-service tags lock-line atomic EAs with
+         * bit 31 (a memory coherency/cache attribute the Cell MFC strips when
+         * resolving the real address). The SPURS management area lives at the
+         * instance base (e.g. 0x40197C80); the SPU does GETLLAR/PUTLLC against
+         * base|0x80000000. We model one backing store for the line, so clear
+         * the attribute bit to reach it. Scoped to lock-line only: regular DMA
+         * already uses the clean base, and legit VRAM DMA (0xC0000000+) must
+         * keep bit 31. Verified live: base reads 0x40197C80, masked EA hits the
+         * real instance and the SPURS CAS handshake then advances. */
+        ea &= ~0x80000000ull;
+        uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
+        uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
+        spu_lockline_lock();
+        switch (cmd) {
+        case MFC_GETLLAR_CMD:
+            memcpy(ls_ptr, line, 128);
+            memcpy(mfc->resv_data, line, 128);
+            mfc->resv_ea     = ea & ~127ull;
+            mfc->resv_active = 1;
+            mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+            break;
+        case MFC_PUTLLC_CMD:
+            if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
+                memcmp(line, mfc->resv_data, 128) == 0) {
+                memcpy(line, ls_ptr, 128);
+                mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
+            } else {
+                mfc->atomic_stat = MFC_PUTLLC_FAILURE;
+            }
+            mfc->resv_active = 0;
+            break;
+        default: /* PUTLLUC / PUTQLLUC: unconditional line store */
+            memcpy(line, ls_ptr, 128);
+            mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;
+            break;
+        }
+        spu_lockline_unlock();
+        mfc->tag_completed |= (1u << tag);
+        return 0;
+    }
+
     /* Execute the transfer */
     if (mfc_is_list(cmd)) {
         rc = mfc_do_list_transfer(spu, lsa, ea, size, cmd);
@@ -336,10 +410,7 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
     case MFC_RdListStallStat:
         return 0; /* no stalls in synchronous mode */
     case MFC_RdAtomicStat:
-        /* Atomic operation status: 0 = success (MFC_PUTLLC_SUCCESS),
-         * 1 = failed (MFC_PUTLLC_FAILURE). In single-threaded recomp,
-         * atomic ops always succeed. */
-        return 0; /* MFC_PUTLLC_SUCCESS */
+        return mfc->atomic_stat;
     default:
         return 0;
     }

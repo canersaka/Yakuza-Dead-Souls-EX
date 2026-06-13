@@ -6,6 +6,7 @@
  */
 
 #include "cellFs.h"
+#include "ps3emu/endian.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -143,6 +144,23 @@ int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 /* ---------------------------------------------------------------------------
  * Host stat -> CellFsStat conversion
  * -----------------------------------------------------------------------*/
+
+/* CellFsStat is written into guest (big-endian) memory; byte-swap every
+ * multi-byte field in place. The game reads st_size etc. via lwz/ld which
+ * byte-swap, so a host-endian struct yields garbage (e.g. a 0x...00 size that
+ * fails asset parsing). Call after filling the struct natively. */
+static void cellfs_stat_to_be(CellFsStat* sb)
+{
+    sb->st_mode    = (s32)ps3_bswap32((u32)sb->st_mode);
+    sb->st_uid     = (s32)ps3_bswap32((u32)sb->st_uid);
+    sb->st_gid     = (s32)ps3_bswap32((u32)sb->st_gid);
+    sb->st_atime   = (s64)ps3_bswap64((u64)sb->st_atime);
+    sb->st_mtime   = (s64)ps3_bswap64((u64)sb->st_mtime);
+    sb->st_ctime   = (s64)ps3_bswap64((u64)sb->st_ctime);
+    sb->st_size    = ps3_bswap64(sb->st_size);
+    sb->st_blksize = ps3_bswap64(sb->st_blksize);
+}
+
 static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
 {
     memset(sb, 0, sizeof(CellFsStat));
@@ -185,6 +203,8 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
     sb->st_ctime = (s64)hst->st_ctime;
     sb->st_size  = (u64)hst->st_size;
     sb->st_blksize = 4096;
+
+    cellfs_stat_to_be(sb);
 }
 
 /* ---------------------------------------------------------------------------
@@ -344,7 +364,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     s_files[slot].flags   = flags;
     s_files[slot].host_fp = fp;
 
-    *fd = slot;
+    *fd = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
     return CELL_OK;
 }
@@ -382,7 +402,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     }
 
     if (nread)
-        *nread = bytes_read;
+        *nread = ps3_bswap64(bytes_read);
 
     return CELL_OK;
 }
@@ -404,7 +424,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
     }
 
     if (nwrite)
-        *nwrite = bytes_written;
+        *nwrite = ps3_bswap64(bytes_written);
 
     return CELL_OK;
 }
@@ -428,7 +448,7 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
         s64 cur = (s64)ftello(s_files[fd].host_fp);
 #endif
         if (pos)
-            *pos = (u64)cur;
+            *pos = ps3_bswap64((u64)cur);
     } else {
         if (pos)
             *pos = 0;
@@ -469,6 +489,7 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
     memset(sb, 0, sizeof(CellFsStat));
     sb->st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
     sb->st_blksize = 4096;
+    cellfs_stat_to_be(sb);
     return CELL_OK;
 }
 
@@ -556,8 +577,8 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
     if (!path)
         return CELL_EFAULT;
 
-    if (sector_size) *sector_size = 512;
-    if (block_size)  *block_size  = 4096;
+    if (sector_size) *sector_size = ps3_bswap64(512);
+    if (block_size)  *block_size  = ps3_bswap64(4096);
 
     return CELL_OK;
 }
@@ -570,10 +591,10 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     if (!path)
         return CELL_EFAULT;
 
-    if (block_size) *block_size = 4096;
+    if (block_size) *block_size = ps3_bswap32(4096);
 
     /* Report ~1GB free by default */
-    if (free_block_count) *free_block_count = (u64)(1024ULL * 1024 * 1024 / 4096);
+    u64 free_blocks = (u64)(1024ULL * 1024 * 1024 / 4096);
 
 #ifdef _WIN32
     {
@@ -581,11 +602,13 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
         if (translate_path(path, host_path, sizeof(host_path)) == 0) {
             ULARGE_INTEGER free_bytes;
             if (GetDiskFreeSpaceExA(host_path, &free_bytes, NULL, NULL)) {
-                if (free_block_count) *free_block_count = (u64)(free_bytes.QuadPart / 4096);
+                free_blocks = (u64)(free_bytes.QuadPart / 4096);
             }
         }
     }
 #endif
+
+    if (free_block_count) *free_block_count = ps3_bswap64(free_blocks);
 
     return CELL_OK;
 }
@@ -647,7 +670,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
     }
 #endif
 
-    *fd = slot;
+    *fd = (CellFsDir)ps3_bswap32((u32)slot);   /* guest reads the dir fd big-endian */
     printf("[cellFs] Opendir: dir_fd=%d -> '%s'\n", slot, host_path);
     return CELL_OK;
 }
@@ -693,8 +716,9 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread)
         entry->attribute.st_size = (u64)file_size.QuadPart;
     }
     entry->attribute.st_blksize = 4096;
+    cellfs_stat_to_be(&entry->attribute);
 
-    *nread = 1;
+    *nread = ps3_bswap64(1);
 #else
     struct dirent* de = readdir(s_dirs[fd].host_dir);
     if (!de) {
@@ -716,9 +740,10 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread)
         /* Minimal fallback */
         entry->attribute.st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
         entry->attribute.st_blksize = 4096;
+        cellfs_stat_to_be(&entry->attribute);
     }
 
-    *nread = 1;
+    *nread = ps3_bswap64(1);
 #endif
 
     return CELL_OK;
