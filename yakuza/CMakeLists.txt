@@ -48,9 +48,13 @@ if(MSVC)
     target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
 endif()
 
-# Lifted SPU images (Sony's SPURS kernel, extracted from libsre by
-# tools/lift_prx.py + tools/spu_lifter.py). Optional like the PRX chunks.
-file(GLOB SPU_KERNELS CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c")
+# Lifted SPU images (Sony's SPURS kernel + system-service workload, extracted
+# from libsre by tools/lift_prx.py + tools/spu_lifter.py). Listed explicitly:
+# spurs_kernel1.c is excluded (unused; its register fn would collide), and each
+# image has a distinct --register-name so their globals don't clash.
+file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
+    "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c"
+    "${PS3RECOMP_DIR}/recomp_prx/spurs_sysservice.c")
 
 add_executable(yakuza_recomp
     main.cpp
