@@ -384,8 +384,15 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
  * stack in case the compiler does not collapse a long chain.
  * -----------------------------------------------------------------------*/
 #include "../spu/spu_context.h"
+#include <setjmp.h>
 void spu_indirect_branch(spu_context* sctx);   /* runtime/spu/spu_channels.c */
 int  spu_have_function(uint32_t addr);
+/* per-thread unwind target for SPU halt (spu_channels.c) */
+#if defined(_MSC_VER)
+extern __declspec(thread) jmp_buf* g_spu_halt_jmp;
+#else
+extern _Thread_local jmp_buf* g_spu_halt_jmp;
+#endif
 
 static void spu_deploy_image(spu_context* sctx, uint32_t img_ea)
 {
@@ -416,10 +423,14 @@ static void* spu_exec_thread_proc(void* arg)
 
     fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X\n",
             t->tid, sctx->pc);
-    fflush(stderr);
 
     sctx->status = SPU_STATUS_RUNNING;
-    spu_indirect_branch(sctx);   /* runs until stop/halt */
+    jmp_buf halt_jb;
+    g_spu_halt_jmp = &halt_jb;
+    if (setjmp(halt_jb) == 0) {
+        spu_indirect_branch(sctx);   /* runs until stop; halt longjmps back */
+    }
+    g_spu_halt_jmp = 0;
 
     fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X)\n",
             t->tid, sctx->status, sctx->pc);
