@@ -1964,8 +1964,27 @@ class PPULifter:
                             continue   # data desert -> no-op stub at emit time
                         lo = bisect.bisect_left(self._sorted_addrs, target)
                         probe = self._sorted_insns[lo:lo + 16]
-                        if not probe or any(p.mnemonic == ".word" for p in probe):
-                            continue   # doesn't decode as code -> stub
+                        # A switch dispatcher is a short code block
+                        # (lwz/lwzx/add/mtctr; bctr) immediately followed by its
+                        # jump-TABLE DATA, which decodes as `.word`. Such a target
+                        # is real code, so don't reject it just because `.word`
+                        # appears within 16 insns: accept iff the run up to the
+                        # first `.word` ends in an unconditional control transfer
+                        # (b/bctr/blr/blrl). Junk data targets instead hit `.word`
+                        # with no preceding terminator.
+                        _TERMS = ("b", "bctr", "blr", "blrl", "bctrl")
+                        if not probe or probe[0].addr != target:
+                            continue   # nothing decodes here -> stub
+                        saw_term = False
+                        for _p in probe:
+                            if _p.mnemonic == ".word":
+                                break
+                            if _p.mnemonic in _TERMS:
+                                saw_term = True
+                                break
+                        if not saw_term and any(p.mnemonic == ".word"
+                                                for p in probe):
+                            continue   # data, not code -> stub
                     if end > target:
                         self.lift_function(all_insns, target, end)
                         defined.add(target)
