@@ -445,7 +445,9 @@ class SPULifter:
             link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                return f"{link} spu_func_{tgt:08X}(ctx);"
+                # Call, then drain any tail-call the callee left pending so
+                # cross-function loops run iteratively (constant host stack).
+                return f"{link} spu_func_{tgt:08X}(ctx); SPU_DRAIN(ctx);"
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -455,8 +457,10 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"spu_func_{tgt:08X}(ctx); return; }}")
+            # Cross-function conditional branch = conditional tail call: hand
+            # the target to the trampoline and unwind (see SPU_DRAIN).
+            return (f"if ({cond}) {{ g_spu_trampoline_fn = spu_func_{tgt:08X}; "
+                    f"return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -465,13 +469,17 @@ class SPULifter:
             # discipline matches the C function nesting from brsl.
             if tgt_reg == "0":
                 return "return;"
+            # Indirect tail branch: set pc and trampoline to the dispatcher,
+            # then unwind so an enclosing SPU_DRAIN re-enters (no nesting).
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return;")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
             link_rt = insn.raw & 0x7F            # link reg dropped from operands
             tgt_reg = _reg(ops[0])
+            # Indirect call: dispatch, then drain the callee's tail-calls.
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx); "
+                    f"SPU_DRAIN(ctx);")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -484,7 +492,7 @@ class SPULifter:
             if tgt_reg == "0":
                 return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -513,7 +521,8 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; spu_func_{tgt:08X}(ctx); return; }}"
+        # Cross-function unconditional branch = tail call: trampoline + unwind.
+        return f"{{ g_spu_trampoline_fn = spu_func_{tgt:08X}; return; }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
