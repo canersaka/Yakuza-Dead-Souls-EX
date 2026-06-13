@@ -304,6 +304,34 @@ static inline int spu_channel_has_data(const spu_channel* ch)
     return ch->count > 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Tail-call trampoline
+ *
+ * A cross-function SPU branch (br / bi to another function) is a tail call:
+ * it transfers control without growing the SPU call depth. The lifter must
+ * not emit it as a nested host C call, or an infinite tail-call loop (e.g.
+ * the SPURS scheduler) would overflow the host stack. Instead the tail
+ * transfer sets g_spu_trampoline_fn and returns; an enclosing SPU_DRAIN loop
+ * (after every call site, and at the host-thread driver) re-enters
+ * iteratively, so such loops run at constant stack depth. Mirrors the PPU
+ * lifter's g_trampoline_fn / DRAIN_TRAMPOLINE.
+ * -----------------------------------------------------------------------*/
+#if defined(_MSC_VER)
+#  define SPU_THREAD_LOCAL __declspec(thread)
+#else
+#  define SPU_THREAD_LOCAL _Thread_local
+#endif
+
+extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+
+#define SPU_DRAIN(ctx) do {                                   \
+        while (g_spu_trampoline_fn) {                          \
+            void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
+            g_spu_trampoline_fn = 0;                           \
+            _tf(ctx);                                          \
+        }                                                     \
+    } while (0)
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
