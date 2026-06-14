@@ -47,6 +47,13 @@ extern "C" void yz_init_syscalls(void);
 extern "C" void     yz_threads_init(uint32_t main_stack_base,
                                     uint32_t main_stack_size);
 extern "C" uint32_t yz_thread_current_id(void);
+extern "C" void*    yz_thread_context(uint32_t tid);   /* live ppu_context*, NULL if none */
+/* lv2 wait recorder (diagnostic): shims.cpp records the in-flight syscall per
+ * thread; the stall dump (main.cpp) reads it to name what each thread blocks on. */
+extern "C" void yz_wait_enter(uint32_t num, uint64_t a3, uint64_t a4, uint64_t a5);
+extern "C" void yz_wait_exit(void);
+extern "C" int  yz_wait_get(uint32_t tid, uint32_t* num, uint64_t* a3,
+                            uint64_t* a4, uint64_t* a5, uint32_t* held_ms);
 extern "C" int64_t  yz_sc_thread_yield(ppu_context* ctx);
 extern "C" int64_t  yz_sc_thread_join(ppu_context* ctx);
 extern "C" int64_t  yz_sc_thread_set_priority(ppu_context* ctx);
@@ -73,6 +80,14 @@ extern const unsigned g_yz_lle_import_first;
  * OPDs and its own 32 import slots are patched by yz_install_imports(). */
 #define YZ_LIBSRE_BASE 0x02000000u
 
+/* Sony's libgcm_sys (cellGcmSys), decrypted + relocated to a fixed base by
+ * tools/lift_prx.py and lifted alongside the game (recomp_prx/). Its 102
+ * cellGcmSys exports replace our gcm HLE: the game's cellGcmSys imports bind
+ * to libgcm's export OPDs, libgcm drives the RSX via the sys_rsx syscalls
+ * (668-677, see sys_rsx in import_overrides.cpp). The flat image carries the
+ * TOC at 0x02114000 (referenced by the export OPDs) + the zero-filled bss. */
+#define YZ_LIBGCM_BASE 0x02100000u
+
 /* gcm guest-side structures (import_overrides.cpp) ----------------------------
  * _cellGcmInitBody builds these in runner scratch. The game's SDK-inline gcm
  * code walks CellGcmContextData in guest memory itself (EBOOT layout, verified
@@ -86,3 +101,19 @@ extern const unsigned g_yz_lle_import_first;
 #define YZ_GCM_LOCAL_BASE   0xC0000000u  /* RSX local memory (matches libs) */
 #define YZ_GCM_LOCAL_SIZE   0x0F900000u  /* 249 MB, real-hardware value */
 extern "C" void yz_gcm_fifo_callback(ppu_context* ctx);
+
+/* sys_rsx syscalls (lv2 668-677) -- Sony's libgcm drives the RSX through these.
+ * Implemented in import_overrides.cpp (alongside the FIFO consumer they feed),
+ * registered into the lv2 table by yz_init_syscalls (shims.cpp). */
+extern "C" int64_t yz_sys_rsx_memory_allocate(ppu_context* ctx);   /* 668 0x29C */
+extern "C" int64_t yz_sys_rsx_memory_free(ppu_context* ctx);       /* 669 0x29D */
+extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx);  /* 670 0x29E */
+extern "C" int64_t yz_sys_rsx_context_free(ppu_context* ctx);      /* 671 0x29F */
+extern "C" int64_t yz_sys_rsx_context_iomap(ppu_context* ctx);     /* 672 0x2A0 */
+extern "C" int64_t yz_sys_rsx_context_iounmap(ppu_context* ctx);   /* 673 0x2A1 */
+extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx); /* 674 0x2A2 */
+extern "C" int64_t yz_sys_rsx_device_map(ppu_context* ctx);        /* 675 0x2A3 */
+extern "C" int64_t yz_sys_rsx_device_unmap(ppu_context* ctx);      /* 676 0x2A4 */
+extern "C" int64_t yz_sys_rsx_attribute(ppu_context* ctx);         /* 677 0x2A5 */
+/* Host vblank tick: publishes flip completion + vBlank counters (main.cpp). */
+extern "C" void yz_rsx_vblank_tick(void);
