@@ -264,7 +264,19 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_unlock(&q->lock);
 #endif
 
-    /* Write event to guest memory in big-endian */
+    /* The lv2 ABI returns the event in GPRs r4-r7; the pointer arg is IGNORED
+     * (RPCS3 names it `dummy_event` and writes the result to ppu.gpr[4..7],
+     * sys_event.cpp:499). Sony's libgcm interrupt thread reads these registers
+     * to decode the vblank/flip cause -- if they are not set it sees stale
+     * garbage and never dispatches the game's handler (the render loop then
+     * never advances). Set the registers; also keep the legacy buffer write
+     * for any caller that reads the (non-standard) out-pointer. */
+    ctx->gpr[4] = evt.source;
+    ctx->gpr[5] = evt.data1;
+    ctx->gpr[6] = evt.data2;
+    ctx->gpr[7] = evt.data3;
+
+    /* Legacy: also write event to guest memory in big-endian (harmless). */
     if (event_addr != 0) {
         uint64_t* out = (uint64_t*)vm_to_host(event_addr);
         out[0] = bswap64(evt.source);
