@@ -45,15 +45,16 @@ extern "C" uint64_t yz_tls_vaddr, yz_tls_filesz, yz_tls_memsz;
 #define MAX_GUEST_THREADS 64
 
 typedef struct {
-    int      in_use;
-    int      started;
-    uint32_t tid;
-    HANDLE   handle;
-    int32_t  priority;
-    uint32_t stack_base;
-    uint32_t stack_size;
-    uint64_t exit_code;
-    char     name[28];
+    int          in_use;
+    int          started;
+    uint32_t     tid;
+    HANDLE       handle;
+    ppu_context* ctx;          /* live guest context (host-stack local in thr_proc) */
+    int32_t      priority;
+    uint32_t     stack_base;
+    uint32_t     stack_size;
+    uint64_t     exit_code;
+    char         name[28];
 } thr_rec;
 
 static thr_rec          s_threads[MAX_GUEST_THREADS];
@@ -86,6 +87,80 @@ static thr_rec* thr_find(uint32_t tid)
 }
 
 extern "C" uint32_t yz_thread_current_id(void) { return s_cur_tid; }
+
+/* Authoritative live guest context for a thread (NULL if not a running guest
+ * thread). The stall dump reads guest PC/GPRs from this instead of walking the
+ * host stack -- a blocked thread parked in an lv2 wait still holds the syscall
+ * args in its GPRs, so this names what it is waiting on without guessing. */
+extern "C" void* yz_thread_context(uint32_t tid)
+{
+    thr_lock();
+    thr_rec* t = thr_find(tid);
+    void* c = t ? (void*)t->ctx : NULL;
+    thr_unlock();
+    return c;
+}
+
+/* ---- lv2 wait recorder (blocker #21 diagnostic) ---------------------------
+ * shims.cpp's central lv2_syscall records the in-flight syscall per guest
+ * thread here (before it dispatches, which may block), and clears it on
+ * return. A stall dump then reads, for every blocked thread, EXACTLY which
+ * syscall it is parked in + the object-id args + how long -- the authoritative
+ * "what is this thread waiting on" the host-stack walk can only guess at. */
+typedef struct { uint32_t num; uint64_t a3, a4, a5; DWORD since; int active; } wait_slot;
+static wait_slot s_wait[256];
+
+extern "C" void yz_wait_enter(uint32_t num, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    uint32_t tid = s_cur_tid;
+    if (tid >= 256) return;
+    s_wait[tid].num   = num;
+    s_wait[tid].a3    = a3;
+    s_wait[tid].a4    = a4;
+    s_wait[tid].a5    = a5;
+    s_wait[tid].since = GetTickCount();
+    s_wait[tid].active = 1;   /* cleared by yz_wait_exit on return */
+}
+
+extern "C" void yz_wait_exit(void)
+{
+    uint32_t tid = s_cur_tid;
+    if (tid < 256) s_wait[tid].active = 0;
+}
+
+/* Returns 1 + fills the out-params if thread `tid` is currently inside a
+ * syscall (i.e. blocked / mid-call); 0 if it is running guest code. */
+extern "C" int yz_wait_get(uint32_t tid, uint32_t* num, uint64_t* a3,
+                           uint64_t* a4, uint64_t* a5, uint32_t* held_ms)
+{
+    if (tid >= 256 || !s_wait[tid].active) return 0;
+    if (num)     *num     = s_wait[tid].num;
+    if (a3)      *a3      = s_wait[tid].a3;
+    if (a4)      *a4      = s_wait[tid].a4;
+    if (a5)      *a5      = s_wait[tid].a5;
+    if (held_ms) *held_ms = GetTickCount() - s_wait[tid].since;
+    return 1;
+}
+
+/* TEMP DIAG (blocker #21 producer hunt): snapshot all live guest threads
+ * (tid/name/handle) and invoke cb for each OUTSIDE the lock, so the callback may
+ * safely suspend+walk each thread's host stack without risking a lock deadlock. */
+extern "C" void yz_for_each_thread(void (*cb)(uint32_t tid, const char* name, void* handle))
+{
+    struct snap_t { uint32_t tid; char name[28]; HANDLE h; } snap[MAX_GUEST_THREADS];
+    int n = 0;
+    thr_lock();
+    for (int i = 0; i < MAX_GUEST_THREADS; i++)
+        if (s_threads[i].in_use && s_threads[i].started && s_threads[i].handle) {
+            snap[n].tid = s_threads[i].tid;
+            strncpy(snap[n].name, s_threads[i].name, sizeof(snap[n].name) - 1);
+            snap[n].name[sizeof(snap[n].name) - 1] = 0;
+            snap[n].h = s_threads[i].handle;
+            n++;
+        }
+    thr_unlock();
+    for (int i = 0; i < n; i++) cb(snap[i].tid, snap[i].name, (void*)snap[i].h);
+}
 
 /* Register the main thread so join/priority/stack-info work on id 1. */
 extern "C" void yz_threads_init(uint32_t main_stack_base, uint32_t main_stack_size)
@@ -150,6 +225,13 @@ static DWORD WINAPI thr_proc(LPVOID pv)
     vm_write64(p.sp, 0);  /* null back-chain */
     g_yz_cur_ctx = &ctx;  /* crash handler walks this thread's back-chain */
 
+    /* Publish this thread's live context so a stall dump can read its guest
+     * PC/GPRs directly (authoritative) instead of guessing from a host-stack
+     * walk -- the cross-thread g_yz_cur_ctx is thread_local and unreadable. */
+    thr_lock();
+    if (thr_rec* ts = thr_find(p.tid)) ts->ctx = &ctx;
+    thr_unlock();
+
     fprintf(stderr, "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X\n",
             p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp);
 
@@ -158,8 +240,10 @@ static DWORD WINAPI thr_proc(LPVOID pv)
 
     thr_lock();
     thr_rec* t = thr_find(p.tid);
-    if (t && !t->exit_code)
-        t->exit_code = ctx.gpr[3];
+    if (t) {
+        if (!t->exit_code) t->exit_code = ctx.gpr[3];
+        t->ctx = NULL;     /* ctx local is about to go out of scope */
+    }
     thr_unlock();
 
     fprintf(stderr, "[thread %u] exited r3=0x%llX\n",
