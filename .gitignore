@@ -78,6 +78,7 @@ yakuza/imports.json
 
 # Reference manuals
 *.pdf
+RSX ISA Documentation Search.md
 
 # Local notes and tool config
 SUMMARY.md
@@ -121,3 +122,7 @@ boot_err.txt
 
 # guest filesystem root (disc dump / hdd / save data - junctions to local files)
 gamedata/
+
+# RPCS3 full install (binaries + firmware PRX + game data + RSX captures) — oracle resource only; never commit (GPL binaries, firmware, multi-GB)
+rpcs3-v0.0.41-19452-e379fba9_win64_msvc/
+rpcs3-*/
