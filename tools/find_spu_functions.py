@@ -240,6 +240,83 @@ def detect_functions(buf, base_override=None, verbose=True):
         if code_start <= t < code_end:
             seed_starts.add(t)
 
+    # Return addresses of INDIRECT calls (bisl/bisld/bisle): these branch to a
+    # register target and set the link to the next instruction (addr+4). The
+    # callee returns there, so addr+4 is a real function boundary the branch-
+    # target scan misses (the target is a register, not an immediate). Without
+    # seeding it, the callee's return lands mid-function and the runtime
+    # dispatcher halts "unknown branch" (e.g. the SPURS kernel's service dispatch
+    # `bisl $r11` at 0x834 returns to 0x838 inside func_00000820). brsl/brasl
+    # (direct calls) already have their targets seeded above; their return
+    # points are normally followed by the lifter's inline continuation, but the
+    # indirect-call return is the one that must split.
+    for ins in insns:
+        if ins.mnemonic in ("bisl", "bisld", "bisle"):
+            ret = ins.addr + 4
+            if code_start <= ret < code_end:
+                seed_starts.add(ret)
+
+    # INDIRECT-DISPATCH TARGETS the brsl/branch scan can't resolve. SPU code
+    # reaches many functions only through *computed* branches (bi/bisl on a
+    # register), so their entry addresses never appear as a branch operand.
+    # Two idioms cover almost all of them:
+    #   (a) JUMP TABLES -- the function address is stored as a 32-bit word in the
+    #       image (a dispatch table, usually .rodata embedded in .text). Scan
+    #       every 4-aligned word for a value that is itself a 4-aligned address
+    #       inside the code range. (This is what finds e.g. the SPURS taskset
+    #       policy's 0x10F8, stored at word 0xFBC.)
+    #   (b) IMMEDIATE function pointers -- `ila $rX, addr` then `bisl $rX`.
+    # Over-seeding is safe: the lifter splits a function at any boundary and
+    # chains the fall-through with a tail call, and every 4-aligned address in
+    # the code range is a valid SPU instruction boundary, so a spurious seed at
+    # worst yields an extra (never-called) function.
+    n_tbl = 0
+    for off in range(0, len(code) - 3, 4):
+        v = be_u32(code, off)
+        if code_start <= v < code_end and (v & 3) == 0 and v not in seed_starts:
+            seed_starts.add(v)
+            n_tbl += 1
+    n_imm = 0
+    for ins in insns:
+        if ins.mnemonic == "ila":                 # 18-bit immediate ADDRESS load
+            toks = ins.operands.split(",")
+            if len(toks) >= 2:
+                try:
+                    v = int(toks[-1].strip(), 0)
+                except ValueError:
+                    continue
+                if code_start <= v < code_end and (v & 3) == 0 and v not in seed_starts:
+                    seed_starts.add(v)
+                    n_imm += 1
+
+    #   (c) COMPUTED-BRANCH (Duff's-device) targets. SPU compilers emit a
+    #       `bi $rX` (rX != $r0, i.e. not a return) that jumps to base+offset
+    #       INTO a nearby unrolled load/store run to handle a partial head/tail.
+    #       The offset is data-dependent (derived from a size/count at runtime),
+    #       so the target appears neither as a branch operand nor as a stored
+    #       table word -- e.g. the SPURS taskset policy's task-region memset:
+    #       `bi $r5` at 0x2234 lands on one of the eight unrolled stores at
+    #       0x223C..0x2258 depending on the size, and the dispatcher halts
+    #       "unknown branch" on the mid-function PC. Seed every instruction in
+    #       the straight-line block that follows a computed `bi`, up to (and
+    #       including) the first control-flow instruction -- that block IS the
+    #       unrolled run the branch lands in. Over-seeding is safe (see above).
+    n_comp = 0
+    _CF = ("br", "bra", "brsl", "brasl", "bi", "bisl", "bisld", "bisle",
+           "bisled", "biz", "binz", "bihz", "bihnz", "brz", "brnz", "brhz",
+           "brhnz", "iret", "stop", "stopd")
+    for i, ins in enumerate(insns):
+        if ins.mnemonic == "bi" and not is_return(ins):
+            for j in range(i + 1, min(i + 1 + 64, len(insns))):
+                a = insns[j].addr
+                if not (code_start <= a < code_end):
+                    break
+                if a not in seed_starts:
+                    seed_starts.add(a)
+                    n_comp += 1
+                if insns[j].mnemonic in _CF:
+                    break
+
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
     if not seed_starts:
@@ -278,6 +355,8 @@ def detect_functions(buf, base_override=None, verbose=True):
               f"{len(collect_brsl_targets(insns))} brsl/brasl + "
               f"{len(collect_branch_targets(insns)) - len(collect_brsl_targets(insns))} "
               f"other branch targets, "
+              f"{n_tbl} jump-table + {n_imm} ila-immediate + {n_comp} "
+              f"computed-branch indirect targets, "
               f"{len(sorted_starts)} unique starts")
         print(f"Detected {len(cleaned)} function(s)")
         if cleaned:

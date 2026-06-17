@@ -188,11 +188,16 @@ class SPULifter:
         self.trace = trace
         self.header_name = "spu_recomp.h"   # what emit_source #includes
         self.register_name = "spu_recomp_register"  # global init fn name
+        # Per-image C symbol prefix for the emitted functions. Images that load
+        # to OVERLAPPING LS addresses (e.g. the SPURS system service and a
+        # taskset policy module both at LS 0xA00) would otherwise emit colliding
+        # `spu_func_<addr>` symbols and fail to link. Give each its own prefix.
+        self.func_prefix = "spu_func_"
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
                       start: int, end: int) -> LiftedFunction:
-        func = LiftedFunction(name=f"spu_func_{start:08X}",
+        func = LiftedFunction(name=f"{self.func_prefix}{start:08X}",
                               start_addr=start, end_addr=end)
 
         internal: set[int] = set()
@@ -227,8 +232,15 @@ class SPULifter:
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
+            # Fall-through is a TAIL transfer: route it through the trampoline
+            # (g_spu_trampoline_fn + the enclosing SPU_DRAIN), NOT a nested host
+            # call. A direct call grows the host stack one frame per fall-through,
+            # which overflows on long straight-line runs -- catastrophic under
+            # --seed-all (one function per instruction). Mirrors the cross-function
+            # branch path and the design note in spu_context.h.
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; spu_func_{end:08X}(ctx); return; }}")
+                f"    {{ ctx->pc = 0x{end:X}; g_spu_trampoline_fn = "
+                f"{self.func_prefix}{end:08X}; return; }}")
 
         self.functions.append(func)
         return func
@@ -265,6 +277,10 @@ class SPULifter:
             return "/* nop */;"
         if mn in ("sync", "dsync"):
             return "/* sync */;"
+        if mn == "fscrwr":
+            # Write FP status/control register -- we don't model FPSCR (rounding
+            # mode / exception flags), so this is a no-op (matches spu_fscrrd=0).
+            return "/* fscrwr (FPSCR not modelled) */;"
         if mn == "stop":
             return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
 
@@ -310,6 +326,7 @@ class SPULifter:
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
             "cg": "spu_cg", "bg": "spu_bg",
+            "sumb": "spu_sumb",   # sum bytes of each word into the two halfwords
             # Phase 2: register-variable shifts/rotates
             "shl": "spu_shl", "shlh": "spu_shlh",
             "rot": "spu_rot", "roth": "spu_roth",
@@ -333,7 +350,7 @@ class SPULifter:
             "clz": "spu_clz", "cntb": "spu_cntb",
             "fscrrd": "spu_fscrrd",
             "gb": "spu_gb", "gbh": "spu_gbh", "gbb": "spu_gbb",
-            "frsqest": "spu_frsqest",
+            "frsqest": "spu_frsqest", "frest": "spu_frest",
             # Phase 3
             "xsbh": "spu_xsbh", "xshw": "spu_xshw", "xswd": "spu_xswd",
             "orx": "spu_orx",
@@ -447,7 +464,7 @@ class SPULifter:
                 self.call_targets.add(tgt)
                 # Call, then drain any tail-call the callee left pending so
                 # cross-function loops run iteratively (constant host stack).
-                return f"{link} spu_func_{tgt:08X}(ctx); SPU_DRAIN(ctx);"
+                return f"{link} {self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx);"
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -459,7 +476,7 @@ class SPULifter:
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail call: hand
             # the target to the trampoline and unwind (see SPU_DRAIN).
-            return (f"if ({cond}) {{ g_spu_trampoline_fn = spu_func_{tgt:08X}; "
+            return (f"if ({cond}) {{ g_spu_trampoline_fn = {self.func_prefix}{tgt:08X}; "
                     f"return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
@@ -506,7 +523,13 @@ class SPULifter:
     def _cond(self, mn: str, reg: str) -> str:
         """Condition expression on preferred slot for conditional branches."""
         word = f"ctx->gpr[{reg}]._u32[0]"
-        half = f"ctx->gpr[{reg}]._u16[1]"   # preferred halfword (lane 1 of word 0)
+        # brhz/brhnz test the rightmost 16 bits of the preferred word (SPU bytes
+        # 2-3). Our u128 stores word values, so on a little-endian host the low
+        # halfword of _u32[0] is _u16[0] (bytes 2-3 in SPU big-endian order);
+        # _u16[1] is the LEFT (high) halfword. Use _u16[0]. (Was _u16[1] -- a
+        # byte-order bug that made every halfword conditional branch test the
+        # wrong 16 bits; e.g. the SPURS service's ActivateWorkload trigger.)
+        half = f"ctx->gpr[{reg}]._u16[0]"   # preferred halfword = low 16 bits of word 0
         table = {
             "brz": f"{word} == 0",      "brnz": f"{word} != 0",
             "brhz": f"{half} == 0",     "brhnz": f"{half} != 0",
@@ -522,7 +545,7 @@ class SPULifter:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
         # Cross-function unconditional branch = tail call: trampoline + unwind.
-        return f"{{ g_spu_trampoline_fn = spu_func_{tgt:08X}; return; }}"
+        return f"{{ g_spu_trampoline_fn = {self.func_prefix}{tgt:08X}; return; }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -532,7 +555,7 @@ class SPULifter:
         defined = {f.start_addr for f in self.functions}
         for t in sorted(self.call_targets | self.branch_targets):
             if t not in defined:
-                lines.append(f"void spu_func_{t:08X}(spu_context* ctx); /* external */")
+                lines.append(f"void {self.func_prefix}{t:08X}(spu_context* ctx); /* external */")
         lines.append("")
         lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
         lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
@@ -564,7 +587,7 @@ class SPULifter:
             lines.append(" * function detector did not seed (typically conditional")
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
-                lines.append(f"void spu_func_{t:08X}(spu_context* ctx) {{")
+                lines.append(f"void {self.func_prefix}{t:08X}(spu_context* ctx) {{")
                 lines.append(f"    ctx->pc = 0x{t:X}u; spu_indirect_branch(ctx);")
                 lines.append("}")
             lines.append("")
@@ -599,6 +622,11 @@ def main() -> None:
     p.add_argument("--register-name", default="spu_recomp_register",
                    help="Name of the emitted global registration function "
                         "(override to link multiple SPU images together).")
+    p.add_argument("--func-prefix", default="spu_func_",
+                   help="C symbol prefix for emitted functions (override for "
+                        "images that load to OVERLAPPING LS addresses, e.g. the "
+                        "SPURS service vs a taskset policy both at LS 0xA00, so "
+                        "their spu_func_<addr> symbols don't collide at link).")
     p.add_argument("--base", type=lambda x: int(x, 0), default=0,
                    help="Base local-store address")
     p.add_argument("--offset", type=lambda x: int(x, 0), default=0)
@@ -615,6 +643,18 @@ def main() -> None:
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
                         "unless spu_trace_init(path) is called by the harness.")
+    p.add_argument("--seed-all", action="store_true",
+                   help="Treat EVERY 4-aligned instruction as its own function "
+                        "entry (the lifter splits anywhere and chains fall-through "
+                        "with tail calls, so semantics are preserved). Use for "
+                        "modules with COMPUTED-branch dispatch whose targets cannot "
+                        "be resolved statically -- e.g. the SPURS taskset policy mixes "
+                        "Duff's-device memsets with convergent error-code jump tables, "
+                        "so an indirect branch can land on essentially any mid-function "
+                        "PC. With this, every such PC is a registered entry and the "
+                        "dispatcher never halts 'unknown branch'. Over-seeds heavily "
+                        "(one C function per instruction) -- only for small, "
+                        "perf-noncritical images like the policy module.")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -643,11 +683,19 @@ def main() -> None:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
 
+    if args.seed_all:
+        # Every 4-aligned instruction becomes its own function entry. SPU
+        # instructions are fixed 4 bytes, so this covers every possible
+        # computed-branch landing site; the lifter chains the fall-through.
+        n = len(data) & ~3
+        bounds = [(base + i, base + i + 4) for i in range(0, n, 4)]
+
     insns = disassemble_spu(data, base)
 
     lifter = SPULifter(trace=args.trace)
     lifter.header_name = args.header_name
     lifter.register_name = args.register_name
+    lifter.func_prefix = args.func_prefix
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)

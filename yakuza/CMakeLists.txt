@@ -35,7 +35,9 @@ endif()
 # LLE-lifted firmware PRX modules (currently libsre = Sony's SPURS library),
 # produced by tools/lift_prx.py + the lifter into recomp_prx/. Optional: the
 # runner builds without them until the libsre lift has been run.
-file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/recomp_prx/libsre_recomp_*.cpp")
+file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS
+    "${PS3RECOMP_DIR}/recomp_prx/libsre_recomp_*.cpp"
+    "${PS3RECOMP_DIR}/recomp_prx/libgcm_sys_recomp_*.cpp")
 
 add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
 set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)
@@ -54,7 +56,9 @@ endif()
 # image has a distinct --register-name so their globals don't clash.
 file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c"
-    "${PS3RECOMP_DIR}/recomp_prx/spurs_sysservice.c")
+    "${PS3RECOMP_DIR}/recomp_prx/spurs_sysservice.c"
+    "${PS3RECOMP_DIR}/recomp_prx/policy_module.c"   # taskset policy module (libsre 0x02023680), loaded to LS 0xA00 over the service
+    "${PS3RECOMP_DIR}/recomp_prx/gs_task.c")   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580
 
 add_executable(yakuza_recomp
     main.cpp
@@ -72,10 +76,12 @@ target_include_directories(yakuza_recomp PRIVATE
     "${PS3RECOMP_DIR}/recomp"
     "${PS3RECOMP_DIR}/include"
     "${PS3RECOMP_DIR}/runtime/spu"
+    "${PS3RECOMP_DIR}/libs/video"   # rsx_commands.h / rsx_null_backend.h
 )
 
 # dbghelp: crash-handler symbol resolution (SymFromAddr against the PDB)
-target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp)
+# user32/gdi32: the null RSX backend opens a Win32 window + GDI present
+target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp user32 gdi32)
 
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
@@ -84,7 +90,10 @@ if(MSVC)
         /Zc:__cplusplus
     )
     target_compile_definitions(yakuza_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
-    # /MAP: symbol->RVA listing so crash-handler RVAs resolve to functions
-    target_link_options(yakuza_recomp PRIVATE /INCREMENTAL:NO
+    # /MAP: symbol->RVA listing so crash-handler RVAs resolve to functions.
+    # /OPT:NOICF: do NOT fold identical functions -- the many empty/nop SPU
+    # functions (e.g. gs_task 0x7444/0xB770) would otherwise collapse to shared
+    # addresses and the SPU spin profiler would mis-attribute hops to them.
+    target_link_options(yakuza_recomp PRIVATE /INCREMENTAL:NO /OPT:NOICF
         /MAP:${CMAKE_BINARY_DIR}/yakuza_recomp.map)
 endif()
