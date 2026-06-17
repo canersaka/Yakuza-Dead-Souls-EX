@@ -30,7 +30,9 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -50,10 +52,49 @@ extern "C" uint16_t vm_read16(uint64_t addr) { uint16_t v; memcpy(&v, ea(addr), 
 extern "C" uint32_t vm_read32(uint64_t addr) { uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
 extern "C" uint64_t vm_read64(uint64_t addr) { uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
 
-extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { *ea(addr) = val; }
-extern "C" void vm_write16(uint64_t addr, uint16_t val) { uint16_t v = ps3_bswap16(val); memcpy(ea(addr), &v, 2); }
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { uint32_t v = ps3_bswap32(val); memcpy(ea(addr), &v, 4); }
-extern "C" void vm_write64(uint64_t addr, uint64_t val) { uint64_t v = ps3_bswap64(val); memcpy(ea(addr), &v, 8); }
+/* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
+ * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
+ * lock-line so the kernel's PUTLLC memcmp sees it (else the bump is clobbered).
+ * Fast path: spu_coh_is_reserved() is a range check + O(1) bitmap lookup, so the
+ * overwhelming majority of writes (stack/game data/cmd buffer) skip the lock. */
+extern "C" int  spu_coh_is_reserved(uint32_t addr);
+extern "C" void spu_lockline_lock(void);
+extern "C" void spu_lockline_unlock(void);
+/* DIAG (env YZ_WATCH_BD): catch any PPU store covering spurs+0xBD
+ * (sysSrvMsgUpdateWorkload @ 0x40197D3D) to find who writes the bad 0xE0. */
+extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
+/* Raise SPU_EVENT_LR on any SPU whose GETLLAR reservation covers this line --
+ * the SPURS idle-service wakeup (spu_channels.c). */
+extern "C" void spu_coh_notify_write(uint32_t addr);
+#define VM_WRITE_COH(addr, src, n) do { \
+        yz_watch_bd((uint32_t)(addr), (src), (n)); \
+        if (spu_coh_is_reserved((uint32_t)(addr))) { \
+            spu_lockline_lock(); memcpy(ea(addr), (src), (n)); spu_lockline_unlock(); \
+            spu_coh_notify_write((uint32_t)(addr)); \
+        } else memcpy(ea(addr), (src), (n)); } while (0)
+extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
+    static int on = -1; if (on < 0) on = getenv("YZ_WATCH_BD") ? 1 : 0;
+    if (!on) return;
+    static unsigned long seq = 0; seq++;
+    /* Watch the two coupled fields the workload-add must set together:
+     * wklState1[2] (spurs+0x82) and sysSrvMsgUpdateWorkload (spurs+0xBD). */
+    struct { uint32_t a; const char* nm; } tg[] = {
+        {0x40197D02u, "wklState1[2]"}, {0x40197D3Du, "msgUpd@0xBD"},
+        {0x40197D00u, "wklState1[0]"}, {0x40197D01u, "wklState1[1]"},
+    };
+    for (auto& t : tg) {
+        if (addr <= t.a && t.a < addr + n) {
+            uint8_t b = ((const uint8_t*)src)[t.a - addr];
+            fprintf(stderr, "[watch] #%lu %-13s <- 0x%02X (store addr=0x%08X n=%u ra=%p)\n",
+                    seq, t.nm, b, addr, n, _ReturnAddress());
+            fflush(stderr);
+        }
+    }
+}
+extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { VM_WRITE_COH(addr, &val, 1); }
+extern "C" void vm_write16(uint64_t addr, uint16_t val) { uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); }
+extern "C" void vm_write64(uint64_t addr, uint64_t val) { uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 
 /* ---------------------------------------------------------------------------
  * LV2 syscall dispatch
@@ -99,6 +140,20 @@ extern "C" void yz_init_syscalls(void)
     lv2_syscall_register(&g_lv2_syscalls, 47, yz_sc_thread_set_priority);
     lv2_syscall_register(&g_lv2_syscalls, 48, yz_sc_thread_get_priority);
     lv2_syscall_register(&g_lv2_syscalls, 49, yz_sc_thread_get_stack_information);
+
+    /* sys_rsx (668-677): the RSX driver syscalls Sony's LLE libgcm issues via
+     * `sc`. They build the RsxDriverInfo/dma_control/reports guest contract and
+     * drive flip/vblank completion (import_overrides.cpp). */
+    lv2_syscall_register(&g_lv2_syscalls, 668, yz_sys_rsx_memory_allocate);
+    lv2_syscall_register(&g_lv2_syscalls, 669, yz_sys_rsx_memory_free);
+    lv2_syscall_register(&g_lv2_syscalls, 670, yz_sys_rsx_context_allocate);
+    lv2_syscall_register(&g_lv2_syscalls, 671, yz_sys_rsx_context_free);
+    lv2_syscall_register(&g_lv2_syscalls, 672, yz_sys_rsx_context_iomap);
+    lv2_syscall_register(&g_lv2_syscalls, 673, yz_sys_rsx_context_iounmap);
+    lv2_syscall_register(&g_lv2_syscalls, 674, yz_sys_rsx_context_attribute);
+    lv2_syscall_register(&g_lv2_syscalls, 675, yz_sys_rsx_device_map);
+    lv2_syscall_register(&g_lv2_syscalls, 676, yz_sys_rsx_device_unmap);
+    lv2_syscall_register(&g_lv2_syscalls, 677, yz_sys_rsx_attribute);
 }
 
 extern "C" void lv2_syscall(ppu_context* ctx)
@@ -107,17 +162,48 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * number with args + result so silent failures inside the LLE module
      * are visible. Strip once SPURS init survives. */
     uint32_t num = (uint32_t)ctx->gpr[11];
+
+    /* sys_dbg_* (972, 0x3CC): RPCS3 stubs this as null_func (no-op success);
+     * Sony's libgcm calls it on the interrupt path and IGNORES the result, but
+     * our default ENOSYS spams the log. Match the oracle: succeed silently. */
+    if (num == 972) { ctx->gpr[3] = 0; return; }
+
+    /* DIAG (flip-wait hunt): where does the render thread (t1) call usleep from?
+     * lr = caller of the usleep loop = t1's actual spin. r4/r5 carry the address
+     * it is polling. This pins t1's loop (the global indirect ring is not
+     * per-thread, so it mis-attributed t7's pump calls to t1). */
+    if (num == 141 && yz_thread_current_id() == 1) {
+        static int n = 0;
+        if (n < 16) { n++;
+            fprintf(stderr, "[diag t1] usleep(%lld) lr=0x%08llX r4=0x%llX r5=0x%llX\n",
+                    (long long)ctx->gpr[3], (unsigned long long)ctx->lr,
+                    (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]);
+            fflush(stderr);
+        }
+    }
+
     static unsigned char seen[1100];
     int first = (num < sizeof(seen)) && !seen[num];
     /* SPU-management family: log every call (SPURS bring-up), not just the
      * first — except the usleep-class noise. */
     int spu_range = (num >= 82 && num <= 200 && num != 141 && num != 145 &&
                      num != 147);
+    /* DIAG (vblank-dispatch hunt): log EVERY syscall the gcm interrupt thread
+     * (t7) makes, so we can see whether it does anything beyond sc 130 receive
+     * (e.g. a semaphore_post / lwcond_signal == the handler waking the render
+     * thread). usleep-class excluded to avoid drowning the signal. */
+    int intr = (yz_thread_current_id() == 7) && num != 141 && num != 145 &&
+               num != 147 && num != 130;  /* drop sc130 receive spam */
     uint64_t a3 = ctx->gpr[3], a4 = ctx->gpr[4], a5 = ctx->gpr[5], a6 = ctx->gpr[6];
 
+    /* Record the in-flight syscall so a stall dump can name exactly what each
+     * blocked thread is parked in (object-id args survive in the GPRs while the
+     * dispatch below blocks). Cleared on return. (blocker #21 diagnostic) */
+    yz_wait_enter(num, a3, a4, a5);
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
+    yz_wait_exit();
 
-    if (first || spu_range) {
+    if (first || spu_range || intr) {
         seen[num] = 1;
         fprintf(stderr, "[LV2%s t%u] sc %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)"
                 " -> 0x%llX\n", first ? ":first" : "",

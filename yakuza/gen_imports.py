@@ -50,8 +50,20 @@ OUT = os.path.join(HERE, "import_bridges_gen.cpp")
 # OPDs instead of synthetic bridge OPDs. The module's own imports are
 # appended to the bridge table (their stubs share the sce li/oris/lwz shape,
 # so the installer's slot extraction works unchanged).
-LLE_EXPORTS = os.path.join(ROOT, "recomp_prx", "libsre_exports.json")
-LLE_IMPORTS = os.path.join(ROOT, "recomp_prx", "libsre_imports.json")
+#   - libsre:     cellSpurs/cellSync/cellDaisy/cellSheap/cellOvis (SPURS).
+#   - libgcm_sys: cellGcmSys (the RSX driver) -- drives sys_rsx (668-677).
+# Each pair is (exports.json, imports.json) under recomp_prx/. Exports from all
+# modules merge into one (lib, nid) -> OPD map; imports from all modules are
+# appended after the game's own imports (LLE binding still wins over OVERRIDES).
+LLE_MODULES = [
+    ("libsre_exports.json",     "libsre_imports.json"),
+    # libgcm_sys: RE-ADDED 2026-06-14g -- RPCS3.log PROVES RPCS3 renders this game
+    # with LLE cellGcmSys (Sony's real code in liblv2 @0x019xxxx), so HLE was
+    # BACKWARDS. The gcm layer is not the problem; our RSX consumer's control plane
+    # is. Back on LLE (matching RPCS3) to find the real divergence. The HLE overrides
+    # in import_overrides.cpp go inert (LLE binding wins).
+    ("libgcm_sys_exports.json", "libgcm_sys_imports.json"),
+]
 
 PT_PROC_PRX_PARAM = 0x60000002
 
@@ -151,25 +163,33 @@ def main():
     # ---- LLE module exports/imports -------------------------------------
     import json
     lle_opds = {}      # (lib, nid) -> export OPD guest addr
-    if os.path.exists(LLE_EXPORTS):
-        ex = json.load(open(LLE_EXPORTS))
+    for exp_name, _imp_name in LLE_MODULES:
+        path = os.path.join(ROOT, "recomp_prx", exp_name)
+        if not os.path.exists(path):
+            print(f"WARNING: {path} missing -- generating without its LLE binding")
+            continue
+        ex = json.load(open(path))
         for lib, funcs in ex["exports"].items():
             for nid_s, opd_s in funcs.items():
                 lle_opds[(lib, int(nid_s, 16))] = int(opd_s, 16)
-        print(f"LLE exports loaded: {sum(len(v) for v in ex['exports'].values())} "
-              f"funcs from {ex['module']} ({', '.join(ex['exports'])})")
-    else:
-        print(f"WARNING: {LLE_EXPORTS} missing -- generating without LLE binding")
+        print(f"LLE exports loaded from {ex['module']}: "
+              f"{sum(len(v) for v in ex['exports'].values())} funcs "
+              f"({', '.join(ex['exports'])})")
 
     lle_first = None   # index of the first LLE-module import entry
-    if os.path.exists(LLE_IMPORTS):
-        lle_imp = json.load(open(LLE_IMPORTS))
-        lle_first = len(imports)
+    for _exp_name, imp_name in LLE_MODULES:
+        path = os.path.join(ROOT, "recomp_prx", imp_name)
+        if not os.path.exists(path):
+            continue
+        lle_imp = json.load(open(path))
+        if lle_first is None:
+            lle_first = len(imports)
+        n0 = len(imports)
         for lib, funcs in lle_imp.items():
             for nid_s, stub_s in funcs.items():
                 nid = int(nid_s, 16)
                 imports.append((lib, nid, nid2name.get(nid), int(stub_s, 16)))
-        print(f"LLE module imports appended: {len(imports) - lle_first}")
+        print(f"LLE module imports appended from {imp_name}: {len(imports) - n0}")
 
     def implemented(name):
         return name in defined
@@ -233,6 +253,10 @@ def main():
         "cellGcmGetTiledPitchSize",
         "cellGcmGetTimeStampLocation",
         "cellGcmGetLabelAddress",
+        # io map: must populate the CONSUMER's iomap (g_rsx_iomap_ea), not the
+        # libs offset table (HLE gcm root-cause fix, 2026-06-14f).
+        "cellGcmMapEaIoAddress",
+        "cellGcmUnmapEaIoAddress",
         # SDK-internal flip entries take (ctx, id, ...) — libs versions
         # lack the leading context arg.
         "_cellGcmSetFlipCommand",
@@ -256,10 +280,15 @@ def main():
     # (Yakuza crashed in cellSpursCreateTask2WithBinInfo). Stubbing the same
     # set RPCS3 stubs lets the boot proceed; the offloaded SPU task work does
     # not run (same tradeoff RPCS3 makes). Revisit for correctness later.
+    # 2026-06-16b: UN-STUB the task lifecycle the game uses for its render SPU
+    # task (CreateTask2WithBinInfo + Join/TryJoin) -> bind to LLE libsre so Sony's
+    # real task creation runs on the already-running SPURS kernel. The render
+    # deadlock at frame 3 fires right after this CALL is stubbed; RPCS3 runs it
+    # (LLE libsre). Expect to hit the old crash here -> that's the 1f entry to fix,
+    # NOT a reason to stub. (Set YZ_RESTUB to A/B if it regresses early.)
     FORCE_HLE_OK = {
-        "cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo",
-        "cellSpursCreateTaskWithAttribute", "cellSpursJoinTask2",
-        "cellSpursTryJoinTask2", "cellSpursJoinTaskset",
+        "cellSpursCreateTask2",
+        "cellSpursCreateTaskWithAttribute", "cellSpursJoinTaskset",
         "cellSpursDestroyTaskset2", "cellSpursGetTasksetInfo",
         "cellSpursGetJobPipelineInfo", "cellSpursJobHeaderSetJobbin2Param",
         "_cellSpursTaskAttributeInitialize", "_cellSpursQueueInitialize",

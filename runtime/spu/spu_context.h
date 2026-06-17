@@ -13,6 +13,7 @@
 #include "../../include/ps3emu/ps3types.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -244,6 +245,27 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+    /* DIAG (YZ_SPU_PROF): watch ActivateWorkload's write to the kernel-context
+     * wklRunnable1 field (LS 0x1EC, word2 of the 0x1E0 quadword). Logs when the
+     * rebuilt runnable mask is nonzero -- proves whether the rebuild produced
+     * the expected 0xE0000000 (wids 0,1,2). */
+    extern int g_spu_prof_on;
+    /* DIAG: ActivateWorkload's wklStatus1 writeback (LS 0x2D90) is rare and
+     * unique to ActivateWorkload. Dump the wklState1 line (0x2D80) it sees and
+     * the status it computes, to tell whether it saw RUNNABLE(2) and rebuilt. */
+    if (g_spu_prof_on && lsa == 0x2D90u) {
+        extern unsigned long g_spu_wrun_log;
+        if (g_spu_wrun_log < 40) {
+            g_spu_wrun_log++;
+            const uint8_t* st = &ctx->ls[0x2D80];   /* wklState1[0..15] copy */
+            const uint8_t* nv = (const uint8_t*)&val; /* new wklStatus1[0..15] */
+            fprintf(stderr, "[spu-aw] spu=%X state[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X "
+                    "newStatus(host bytes)=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    ctx->spu_id, st[0],st[1],st[2],st[3],st[4],st[5],st[6],st[7],
+                    nv[0],nv[1],nv[2],nv[3],nv[4],nv[5],nv[6],nv[7]);
+            fflush(stderr);
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -323,11 +345,22 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 #endif
 
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+/* Current ctx of the SPU thread inside SPU_DRAIN -- lets spu_prof_hop() read LS
+ * for targeted gate diagnostics (e.g. dumping a polled flag). Diagnostic only. */
+extern SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx;
+
+/* Function-level spin profiler (spu_channels.c, env YZ_SPU_PROF). When the
+ * gate is set, each trampoline re-entry is histogrammed by target LS address
+ * so we can see which lifted SPURS functions the SPU threads spin in. Off by
+ * default -- one predicted-not-taken branch per hop. */
+extern int g_spu_prof_on;
+void spu_prof_hop(void* fn);
 
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
             g_spu_trampoline_fn = 0;                           \
+            if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
             _tf(ctx);                                          \
         }                                                     \
     } while (0)
