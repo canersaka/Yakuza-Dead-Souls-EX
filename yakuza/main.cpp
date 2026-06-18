@@ -28,6 +28,10 @@
  * the host return-address scan alone misses most of the guest chain). */
 thread_local ppu_context* g_yz_cur_ctx = nullptr;
 
+/* Game module TOC (set from the entry OPD); used by the dispatcher's TOC repair
+ * (dispatch.cpp yz_tramp_guard). */
+extern "C" uint32_t g_yz_game_toc;
+
 /* ---------------------------------------------------------------------------
  * Minimal big-endian ELF64 loader (PT_LOAD only)
  * -----------------------------------------------------------------------*/
@@ -58,6 +62,20 @@ extern "C" uint32_t g_ps3_sdk_version;
  * dispatch. The kernel DMAs the service to LS 0xA00 and branches there. */
 extern "C" void spu_recomp_register(void);
 extern "C" void spu_recomp_register_sysservice(void);
+/* recomp_prx/gs_task.c (generated) — the game's Edge geometry render task
+ * (gs_task.elf, EBOOT SPU img #3 @0x0127A580, LS base 0x3000, entry 0x3050).
+ * Registered so spu_indirect_branch runs it once the SPURS kernel dispatches
+ * the taskset that owns it (1f). */
+extern "C" void spu_recomp_register_gstask(void);
+/* recomp_prx/policy_module.c (generated) — the SPURS taskset POLICY module
+ * (libsre ea 0x02023680). The kernel DMAs it to LS 0xA00 -- SAME address as the
+ * system service -- so they must register under DISTINCT image ids and the
+ * runtime switches ctx->image_id by DMA source EA (spu_dma.h). */
+extern "C" void spu_recomp_register_policy(void);
+extern "C" void spu_begin_image(int image_id);
+/* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
+extern "C" int g_spu_prof_on;
+extern "C" int g_yz_watch_dlist;
 
 static int load_elf(const char* path, uint64_t* entry_out)
 {
@@ -223,19 +241,16 @@ static void guest_caller(uint32_t opd_addr,
 #include <windows.h>
 #include <dbghelp.h>
 
-/* Host vblank driver. The game's frame loop spin-waits in lifted code on guest
- * state that its registered vblank handler updates (on real HW the RSX raises a
- * vblank interrupt ~59.94x/s). With no real RSX/vsync we tick vblank from a host
- * thread so the handler fires and the frame loop advances -- the WINDOW
- * milestone glue. cellGcmTickVBlank() no-ops until the guest registers a handler
- * and g_ps3_guest_caller is installed, so starting this early is safe. */
-extern "C" void cellGcmTickVBlank(void);   /* libs/video/cellGcmSys.c */
-
+/* Host vblank driver. The game's frame loop polls guest state (driver_info
+ * head vBlankCount + flip completion) that on real HW the RSX vblank interrupt
+ * (~59.94x/s) updates. yz_rsx_vblank_tick (import_overrides.cpp) bumps those
+ * counters and publishes any pending flip's done bit; it no-ops until sys_rsx
+ * context_allocate has set up the driver_info, so starting early is safe. */
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
     for (;;) {
         Sleep(16);            /* ~62.5 Hz; close enough to PS3 vblank */
-        cellGcmTickVBlank();
+        yz_rsx_vblank_tick();
     }
     return 0;
 }
@@ -255,6 +270,107 @@ static const yz_func_entry* yz_func_from_host(const void* rip)
     if (best && (uintptr_t)rip - (uintptr_t)best->fn > 0x1000000)
         return nullptr;
     return best;
+}
+
+/* ---------------------------------------------------------------------------
+ * TEMP DIAG: memory write-watch (page-guard + single-step) to find the wild
+ * write that zeroes the gcm-state TOC global at guest 0x0135A5C0 (only when the
+ * FIFO consumer runs). Catches the exact writer's RIP across all threads.
+ * -----------------------------------------------------------------------*/
+static uint32_t g_watch_guest = 0;       /* 0 = disabled */
+static void*    g_watch_host  = nullptr;
+static int      g_watch_log_after = 0;
+
+/* Forward decls so the watch handler can name the GUEST function doing the write
+ * (defined later in this TU). */
+extern ppu_context* g_yz_main_ctx;
+static void yz_dump_guest_state(const ppu_context* gc, const char* tag);
+
+static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    uintptr_t page = (uintptr_t)g_watch_host & ~(uintptr_t)0xFFF;
+    if (code == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[0] == 1 /*write*/) {
+        uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        if (tgt >= page && tgt < page + 0x1000) {
+            if (tgt == (uintptr_t)g_watch_host) {
+                void* rip = (void*)ep->ContextRecord->Rip;
+                uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+                uint64_t before;
+                memcpy(&before, g_watch_host, 8);
+                fprintf(stderr, "[watch] WRITE to guest 0x%08X (was 0x%llX) rip rva 0x%llX",
+                        g_watch_guest, (unsigned long long)before,
+                        (unsigned long long)((uintptr_t)rip - mod));
+                if (const yz_func_entry* fe = yz_func_from_host(rip))
+                    fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                            (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
+                fprintf(stderr, " tid=%lu\n", GetCurrentThreadId());
+                /* Name the ACTUAL writing thread: the VEH runs in the context of
+                 * the faulting thread, so yz_thread_current_id() (thread_local
+                 * s_cur_tid) is the WRITER's guest tid -- not necessarily t1.
+                 * Dump ITS live guest PC/GPRs: this names the builder thread and
+                 * the lifted function doing the write, whichever thread it is. */
+                { static int gd = 0; if (gd < 6) { gd++;
+                    uint32_t wtid = yz_thread_current_id();
+                    ppu_context* wctx = (ppu_context*)yz_thread_context(wtid);
+                    if (!wctx) wctx = g_yz_main_ctx;   /* tid 1 = main */
+                    fprintf(stderr, "[watch] writer guest tid=%u\n", wtid);
+                    if (wctx) yz_dump_guest_state(wctx, "watch-writer"); } }
+                /* Caller chain: vm_write32 is generic; the return addresses on
+                 * the stack name who actually wanted this write (consumer /
+                 * lifted PPU / SPU DMA). rva is for the .map; func_ for lifted. */
+                const uint64_t* sp = (const uint64_t*)ep->ContextRecord->Rsp;
+                int shown = 0;
+                for (int i = 0; i < 48 && shown < 8; i++) {
+                    if (IsBadReadPtr((void*)(sp + i), 8)) break;
+                    uint64_t v = sp[i];
+                    if (v < mod || v > mod + 0x40000000ull) continue;
+                    const yz_func_entry* fe = yz_func_from_host((void*)v);
+                    fprintf(stderr, "    caller[+0x%X] rva 0x%llX", i * 8,
+                            (unsigned long long)(v - mod));
+                    if (fe && fe->addr != 0xFFFFFFE4u)
+                        fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                                (unsigned long long)(v - (uintptr_t)fe->fn));
+                    fprintf(stderr, "\n");
+                    shown++;
+                }
+                fflush(stderr);
+                g_watch_log_after = 1;   /* log the new value post single-step */
+            }
+            DWORD old;
+            VirtualProtect((void*)page, 0x1000, PAGE_READWRITE, &old);
+            ep->ContextRecord->EFlags |= 0x100;   /* trap flag -> single-step */
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (code == EXCEPTION_SINGLE_STEP && g_watch_host) {
+        if (g_watch_log_after) {
+            g_watch_log_after = 0;
+            uint64_t after;
+            memcpy(&after, g_watch_host, 8);
+            fprintf(stderr, "[watch]   -> now 0x%llX\n", (unsigned long long)after);
+            fflush(stderr);
+        }
+        DWORD old;
+        VirtualProtect((void*)page, 0x1000, PAGE_READONLY, &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+extern "C" void yz_watch_arm(uint32_t guest_addr)
+{
+    if (g_watch_guest) return;   /* arm once */
+    g_watch_guest = guest_addr;
+    g_watch_host  = vm_base + guest_addr;
+    AddVectoredExceptionHandler(1, yz_watch_veh);
+    DWORD old;
+    VirtualProtect((void*)((uintptr_t)g_watch_host & ~(uintptr_t)0xFFF),
+                   0x1000, PAGE_READONLY, &old);
+    fprintf(stderr, "[watch] armed write-watch on guest 0x%08X (host %p)\n",
+            guest_addr, g_watch_host);
 }
 
 /* Map a guest code address back to its lifted function: the table entry whose
@@ -314,23 +430,381 @@ static void yz_dump_guest_state(const ppu_context* gc, const char* tag)
         sp = back;
     }
     fprintf(stderr, "\n[%s] back-chain total frames: %d\n", tag, total);
+
+    /* TEMP DEBUG (flip stall): dump memory at the pointer-like registers + the
+     * known gcm sync locations, so we can see exactly which value the parked
+     * render thread is polling for "flip done". */
+    auto dump_at = [&](const char* nm, uint32_t a) {
+        if (a < 0x10000u || a >= 0xE0000000u) return;
+        if (vm_base && IsBadReadPtr(vm_base + a, 16)) return;
+        fprintf(stderr, "    [%s] @0x%08X:", nm, a);
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read32(a + i * 4));
+        fprintf(stderr, "\n");
+    };
+    fprintf(stderr, "[%s] polled-memory probe:\n", tag);
+    dump_at("r3", (uint32_t)gc->gpr[3]);
+    dump_at("r4", (uint32_t)gc->gpr[4]);
+    dump_at("r5", (uint32_t)gc->gpr[5]);
+    dump_at("r6", (uint32_t)gc->gpr[6]);
+    dump_at("r29", (uint32_t)gc->gpr[29]);
+    dump_at("r30", (uint32_t)gc->gpr[30]);
+    dump_at("r31", (uint32_t)gc->gpr[31]);
+    dump_at("fence", 0x40C00000u);          /* the flip/vsync counter (blocker #12) */
+    dump_at("dma-ctrl@40", 0x10000040u);    /* LLE dma_control: +0x40 PUT +0x44 GET +0x48 REF */
+    dump_at("driver_info", 0x10100000u);    /* RsxDriverInfo head (flipFlags/vBlankCount) */
+    dump_at("reports", 0x10200000u);        /* label/report area the consumer writes */
+
+    /* gcm command-buffer state the game's render wrapper spins on: func_00E9BC9C
+     * reads pointers at TOC[-0x7410/-0x7414/-0x740C] and the space check is
+     * roughly [bufdesc+8](current)+4 < [bufdesc+4](limit). Shows whether t1 is
+     * waiting on a cached GET/limit that the consumer isn't refreshing. */
+    /* libgcm command-buffer GEOMETRY (drives the out-of-space callback's
+     * fragment math, 0x02103AAC): config = *(libgcm_TOC[-0x7FD8]). The wrap path
+     * computes newBegin = config[0x14] + config[0x28]*4, newEnd via
+     * config[0x30]/0x38. A degenerate newBegin==current => the self-jump that
+     * parks GET. Dump the geometry to find the bad param. (libgcm TOC=0x02114000) */
+    {
+        uint32_t cfgp = vm_read32(0x02114000u - 0x7FD8u);   /* config struct ptr */
+        fprintf(stderr, "    [gcm-cfg] *TOC[-7FD8]=0x%08X\n", cfgp);
+        if (cfgp >= 0x10000u && cfgp < 0xE0000000u) {
+            fprintf(stderr, "    [gcm-cfg] +10=%08X begin+14=%08X end+18=%08X +1C=%08X "
+                    "+28=%08X +30=%08X +38=%08X +48=%08X\n",
+                    vm_read32(cfgp+0x10), vm_read32(cfgp+0x14), vm_read32(cfgp+0x18),
+                    vm_read32(cfgp+0x1C), vm_read32(cfgp+0x28), vm_read32(cfgp+0x30),
+                    vm_read32(cfgp+0x38), vm_read32(cfgp+0x48));
+        }
+    }
+    if (g_yz_game_toc) {
+        uint32_t ctx10 = vm_read32(g_yz_game_toc - 0x7410);
+        uint32_t ptr14 = vm_read32(g_yz_game_toc - 0x7414);
+        uint32_t lim0C = vm_read32(g_yz_game_toc - 0x740C);
+        fprintf(stderr, "    [gcm] ctx@-7410=0x%08X p@-7414=0x%08X p@-740C=0x%08X\n",
+                ctx10, ptr14, lim0C);
+        dump_at("ctx10",    ctx10);
+        dump_at("ctx10+20", ctx10 + 0x20);
+        dump_at("p740C",    lim0C);
+        if (ptr14 >= 0x10000u && ptr14 < 0xE0000000u) {
+            uint32_t bd = vm_read32(ptr14);
+            fprintf(stderr, "    [gcm] bufdesc=*(p@-7414)=0x%08X (cur=[+8] limit=[+4])\n", bd);
+            dump_at("bufdesc", bd);
+        }
+        /* DEFERRED STOPPER-RELEASE LIST (blocker #21 RE, 2026-06-14e): the game's
+         * gcm flush/reserve (func_00E9BC9C/B630/BF14) places a self-jump stopper at
+         * each commit and RELEASES the previous one -- immediately (write 0) iff
+         * same-fragment (S[0x24]==ctx->end), else DEFERRED into a [tag=127, stopper_ea]
+         * list at S[8]..S[0] (0x20 stride). If nothing drains that list, the deferred
+         * stoppers (incl. the io 0x300000 one GET parks on) never release -> deadlock.
+         * Dump the list + flag the entry matching GET's stopper. S = *(game_toc-0x7410). */
+        if (ctx10 >= 0x10000u && ctx10 < 0xE0000000u) {
+            uint32_t S = ctx10;
+            uint32_t lbase = vm_read32(S + 0x08);   /* list base   */
+            uint32_t lhead = vm_read32(S + 0x00);   /* list write head */
+            uint32_t llim  = vm_read32(S + 0x04);   /* list limit  */
+            uint32_t getio = vm_read32(0x10000044u);          /* current GET io offset */
+            uint32_t getea = 0x40400000u + getio;             /* GET's stopper ea (main ring) */
+            fprintf(stderr, "    [defer] S=0x%08X list base=0x%08X head=0x%08X lim=0x%08X "
+                    "S[1C]=0x%08X S[20]=0x%08X S[24]=0x%08X | GET io=0x%06X ea=0x%08X\n",
+                    S, lbase, lhead, llim, vm_read32(S+0x1C), vm_read32(S+0x20),
+                    vm_read32(S+0x24), getio, getea);
+            if (lbase >= 0x10000u && lbase < 0xE0000000u && lhead >= lbase &&
+                (lhead - lbase) <= 0x4000u) {
+                int n = 0, hit = -1;
+                for (uint32_t e = lbase; e < lhead && n < 80; e += 0x20, n++) {
+                    uint32_t tag = vm_read32(e + 0), ptr = vm_read32(e + 4);
+                    int is_get = (ptr == getea);
+                    if (is_get) hit = n;
+                    if (n < 32 || is_get)
+                        fprintf(stderr, "      [defer #%2d] tag=0x%X stopper_ea=0x%08X (io 0x%06X)%s\n",
+                                n, tag, ptr, ptr - 0x40400000u, is_get ? "  <<< == GET stopper" : "");
+                }
+                fprintf(stderr, "    [defer] %d pending entries; GET's stopper %s in the list\n",
+                        n, hit >= 0 ? "IS" : "is NOT");
+            }
+        }
+    }
 }
 
 /* Main thread's context, exposed for the stall watchdog (thread_local
  * g_yz_cur_ctx isn't readable from another host thread). */
 ppu_context* g_yz_main_ctx = nullptr;
+static HANDLE g_yz_main_hthread = nullptr;
+
+/* Suspend the main/guest thread and dump its HOST rip + stack-return
+ * candidates, reverse-mapped to lifted guest functions. When the guest ctx is
+ * frozen but CPU spins, this names the host (lifted) function actually
+ * executing -- i.e. the spin/poll loop. (TEMP DEBUG, watchdog only.) */
+/* Suspend an arbitrary guest thread and walk its HOST stack, reverse-mapping
+ * return addresses to lifted guest functions -- names what each thread is
+ * actually executing (the spin/wait it is parked in). (TEMP DIAG, blocker #21) */
+static void yz_dump_host_stack_of(HANDLE h, const char* tag)
+{
+    if (!h) return;
+    if (SuspendThread(h) == (DWORD)-1) return;
+    CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(h, &cx)) {
+        uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+        void* rip = (void*)cx.Rip;
+        fprintf(stderr, "[%s] HOST rip rva 0x%llX", tag,
+                (unsigned long long)((uintptr_t)rip - mod));
+        if (const yz_func_entry* fe = yz_func_from_host(rip))
+            fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                    (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
+        fprintf(stderr, "\n[%s] HOST stack chain:", tag);
+        const uint64_t* sp = (const uint64_t*)cx.Rsp;
+        int shown = 0;
+        for (int i = 0; i < 800 && shown < 14; i++) {
+            if (IsBadReadPtr((void*)(sp + i), 8)) break;
+            uint64_t v = sp[i];
+            if (v < mod || v > mod + 0x40000000ull) continue;
+            const yz_func_entry* fe = yz_func_from_host((void*)v);
+            if (!fe) continue;
+            fprintf(stderr, "\n    [+0x%03X] func_%08X +0x%llX", i * 8, fe->addr,
+                    (unsigned long long)(v - (uintptr_t)fe->fn));
+            shown++;
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+    ResumeThread(h);
+}
+
+extern "C" void yz_for_each_thread(void (*cb)(uint32_t, const char*, void*));
+
+/* Name the well-known blocking lv2 syscalls so the per-thread dump reads as
+ * "BLOCKED in sys_event_queue_receive" instead of a bare number. */
+static const char* yz_sc_name(uint32_t num)
+{
+    switch (num) {
+        case 85:  return "sys_event_flag_wait";
+        case 92:  return "sys_semaphore_wait";
+        case 97:  return "sys_lwmutex_lock";
+        case 102: return "sys_mutex_lock";
+        case 107: return "sys_cond_wait";
+        case 113: return "sys_lwcond_wait";
+        case 130: return "sys_event_queue_receive";
+        case 141: return "sys_timer_usleep";
+        case 44:  return "sys_ppu_thread_join";
+        default:  return "";
+    }
+}
+
+static void yz_dump_one_thread_cb(uint32_t tid, const char* name, void* handle)
+{
+    char tag[48];
+    _snprintf(tag, sizeof(tag), "thr t%u \"%s\"", tid, name ? name : "?");
+    tag[sizeof(tag) - 1] = 0;
+
+    /* (1) AUTHORITATIVE: which syscall is this thread parked in right now? The
+     * object-id args survive in the GPRs while the dispatch blocks, so this
+     * names exactly what it waits on -- no host-stack guessing. */
+    uint32_t scn = 0, held = 0; uint64_t a3 = 0, a4 = 0, a5 = 0;
+    if (yz_wait_get(tid, &scn, &a3, &a4, &a5, &held)) {
+        const char* nm = yz_sc_name(scn);
+        fprintf(stderr, "[%s] BLOCKED in sc %u%s%s%s (r3=0x%llX r4=0x%llX r5=0x%llX) "
+                "for %ums\n", tag, scn, *nm ? " " : "", nm, "",
+                (unsigned long long)a3, (unsigned long long)a4,
+                (unsigned long long)a5, (unsigned)held);
+    } else {
+        fprintf(stderr, "[%s] in guest code (not currently in a syscall)\n", tag);
+    }
+
+    /* (2) AUTHORITATIVE: the thread's live guest context (PC/GPRs/back-chain).
+     * Suspend FIRST, then fetch the context: a thread that exits mid-dump clears
+     * its ctx on the way out, so reading it only while frozen avoids racing a
+     * dangling host-stack-local ppu_context (the install_check_thread crash). */
+    if (HANDLE h = (HANDLE)handle) {
+        if (SuspendThread(h) != (DWORD)-1) {
+            if (ppu_context* gc = (ppu_context*)yz_thread_context(tid))
+                yz_dump_guest_state(gc, tag);
+            ResumeThread(h);
+        }
+    }
+
+    /* (3) Secondary, lossy corroboration: the host-stack reverse-map. */
+    yz_dump_host_stack_of((HANDLE)handle, tag);
+}
+/* Dump every guest thread's host stack -- finds the blocked producer. */
+static void yz_dump_all_threads(const char* tag)
+{
+    fprintf(stderr, "[%s] === all guest threads ===\n", tag);
+    if (g_yz_main_hthread) {
+        /* t1 wait status (its full guest state is dumped by the caller). */
+        uint32_t scn = 0, held = 0; uint64_t a3 = 0, a4 = 0, a5 = 0;
+        if (yz_wait_get(1, &scn, &a3, &a4, &a5, &held)) {
+            const char* nm = yz_sc_name(scn);
+            fprintf(stderr, "[thr t1 \"main\"] BLOCKED in sc %u %s (r3=0x%llX r4=0x%llX "
+                    "r5=0x%llX) for %ums\n", scn, nm, (unsigned long long)a3,
+                    (unsigned long long)a4, (unsigned long long)a5, (unsigned)held);
+        } else {
+            fprintf(stderr, "[thr t1 \"main\"] in guest code (spin/poll, not in a syscall)\n");
+        }
+        yz_dump_host_stack_of(g_yz_main_hthread, "thr t1 \"main\"");
+    }
+    yz_for_each_thread(yz_dump_one_thread_cb);
+}
+
+static void yz_dump_main_host_stack(const char* tag)
+{
+    if (!g_yz_main_hthread) return;
+    if (SuspendThread(g_yz_main_hthread) == (DWORD)-1) return;
+    CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(g_yz_main_hthread, &cx)) {
+        uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+        void* rip = (void*)cx.Rip;
+        fprintf(stderr, "[%s] main HOST rip rva 0x%llX", tag,
+                (unsigned long long)((uintptr_t)rip - mod));
+        if (const yz_func_entry* fe = yz_func_from_host(rip))
+            fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                    (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
+        fprintf(stderr, "\n[%s] main HOST stack chain:", tag);
+        const uint64_t* sp = (const uint64_t*)cx.Rsp;
+        int shown = 0;
+        for (int i = 0; i < 600 && shown < 20; i++) {
+            if (IsBadReadPtr((void*)(sp + i), 8)) break;
+            uint64_t v = sp[i];
+            if (v < mod || v > mod + 0x40000000ull) continue;
+            const yz_func_entry* fe = yz_func_from_host((void*)v);
+            if (!fe) continue;
+            fprintf(stderr, "\n    [+0x%03X] func_%08X +0x%llX", i * 8, fe->addr,
+                    (unsigned long long)(v - (uintptr_t)fe->fn));
+            shown++;
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+    ResumeThread(g_yz_main_hthread);
+}
 
 /* TEMP DEBUG (window bring-up): after the boot has had time to reach its frame
  * loop, dump the main thread's guest call stack so we can see what it spin-waits
  * on. */
 static DWORD WINAPI yz_stall_watchdog(LPVOID)
 {
-    Sleep(10000);
-    if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, "watchdog-10s");
-    Sleep(5000);
-    if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, "watchdog-15s");
+    /* Sample the main thread's call stack a few times after it has reached the
+     * post-load stall (shaders open ~by 30s). Identical stacks across samples
+     * => t1 is parked; that names the guest function it spin-waits in. */
+    Sleep(30000);
+    if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
+                         yz_dump_main_host_stack("watchdog-30s"); }
+    Sleep(15000);
+    if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
+                         yz_dump_main_host_stack("watchdog-45s"); }
+    Sleep(15000);
+    if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
+                         yz_dump_main_host_stack("watchdog-60s"); }
     return 0;
 }
+
+/* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
+ * Samples the FIFO GET/PUT, the command word at GET, the flip fence, and t1's
+ * ctr every ~120ms WITHOUT suspending any thread, and logs ONLY on change -- so
+ * the stderr becomes a compact timeline of every distinct (ctr,GET,PUT,cmd,
+ * fence) state and the exact millisecond the render loop latches into the
+ * deadlock. Unlike the 30s watchdog (which only ever sees the frozen end-state),
+ * this catches the TRANSITION: fence climbing 0->1->2 then freezing the moment
+ * GET freezes at io 0x300000. When the state goes quiet (~2.4s no change) it
+ * fires ONE full guest+host dump AT THE STALL EDGE, so the heavy snapshot lands
+ * on the park itself instead of an arbitrary 30s later. */
+/* Pointers to the MAIN (t1) thread's trampoline ring, captured on the main
+ * thread so the (separate) trace-stall thread can print t1's recent indirect-
+ * call path -- reliable, unlike the nearest-symbol back-chain that misattributes
+ * return addresses to data/strings (2026-06-14h: func_01114E4C was a string). */
+static void**    g_yz_main_tramp     = nullptr;
+static uint64_t* g_yz_main_tramp_r31 = nullptr;
+static unsigned* g_yz_main_tramp_idx = nullptr;
+
+static DWORD WINAPI yz_rsx_state_trace(LPVOID)
+{
+    uint32_t lctr=~0u, lget=~1u, lput=~0u, lcmd=~0u, lfence=~0u, ldepth=~0u, lcend=~0u, lsp=~0u;
+    int quiet = 0, edge_dumped = 0, lines = 0;
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        Sleep(30);
+        if (!vm_base) continue;
+        const uint32_t put   = vm_read32(0x10000040u);   /* dma_control +0x40 PUT */
+        const uint32_t get   = vm_read32(0x10000044u);   /* dma_control +0x44 GET */
+        const uint32_t fence = vm_read32(0x40C00000u);   /* flip/vsync counter    */
+        const uint32_t ctr   = g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u;
+        uint32_t cmd = 0u;                               /* command word at GET    */
+        const uint32_t ea = 0x40400000u + get;           /* FIFO io base (bufdesc+0x14) */
+        if (vm_base && !IsBadReadPtr(vm_base + ea, 4)) cmd = vm_read32(ea);
+
+        /* PRODUCER-SIDE gcm release/defer state (Phase 1 linchpin, 2026-06-15g):
+         * S=*(game_toc-0x7410); S[0x20]=pending stopper, S[0x24]=frag-end saved when it
+         * was placed; ctx->end=*(*(game_toc-0x7414))+4 = current frag-end. A release
+         * DEFERS iff S[0x24]!=ctx->end at release time; op-list depth=(S[0]-S[8])/0x20
+         * grows by one per defer. Goal: watch the FIRST cross-segment defer form. */
+        uint32_t s20=0,s24=0,cend=0,ccur=0,depth=0;
+        if (g_yz_game_toc) {
+            uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+            if (S >= 0x10000u && S < 0xE0000000u) {
+                s20 = vm_read32(S+0x20u); s24 = vm_read32(S+0x24u);
+                uint32_t base = vm_read32(S+0x08u), head = vm_read32(S+0x00u);
+                if (head >= base && head-base <= 0x40000u) depth = (head-base)/0x20u;
+            }
+            uint32_t p14 = vm_read32(g_yz_game_toc - 0x7414u);
+            if (p14 >= 0x10000u && p14 < 0xE0000000u) {
+                uint32_t gc = vm_read32(p14);
+                if (gc >= 0x10000u && gc < 0xE0000000u) { cend = vm_read32(gc+4u); ccur = vm_read32(gc+8u); }
+            }
+        }
+
+        if (ctr!=lctr || get!=lget || put!=lput || cmd!=lcmd || fence!=lfence ||
+            depth!=ldepth || cend!=lcend || s20!=lsp) {
+            if (lines < 8000) {
+                fprintf(stderr, "[trace +%6lums] GET=0x%08X PUT=0x%08X fence=%u | "
+                        "ctx.end=0x%08X cur=0x%08X S[24]=0x%08X S[20]=0x%08X oplist=%u%s\n",
+                        (unsigned long)(GetTickCount()-t0), get, put, fence,
+                        cend, ccur, s24, s20, depth,
+                        (cend && s24 && cend != s24) ? "  <CROSS-SEG (next release DEFERS)" : "");
+                fflush(stderr);
+                lines++;
+            }
+            lctr=ctr; lget=get; lput=put; lcmd=cmd; lfence=fence;
+            ldepth=depth; lcend=cend; lsp=s20; quiet=0;
+        } else if (++quiet == 80 && !edge_dumped && g_yz_main_ctx) {   /* ~2.4s still */
+            edge_dumped = 1;
+            fprintf(stderr, "[trace] state QUIET ~2.4s -> full dump AT THE STALL EDGE:\n");
+            yz_dump_guest_state(g_yz_main_ctx, "trace-stall");
+            yz_dump_main_host_stack("trace-stall");
+            yz_dump_all_threads("trace-stall");
+            /* t1's RELIABLE recent control flow: the indirect-call targets (guest
+             * addrs recorded at call time) + t1's trampoline-hop chain (newest
+             * first). Unlike the back-chain, these are real call targets, so they
+             * name the game function path INTO the stall (what t1 did before it
+             * wedged) without nearest-symbol misattribution. */
+            { extern uint32_t g_yz_last_targets[16]; extern unsigned g_yz_last_idx;
+              fprintf(stderr, "[trace-stall] t1 recent indirect targets (newest first):");
+              for (unsigned i = 0; i < 16 && i < g_yz_last_idx; i++) {
+                  uint32_t t = g_yz_last_targets[(g_yz_last_idx - 1 - i) & 15];
+                  fprintf(stderr, " 0x%08X", t);
+                  if (const yz_func_entry* fe = yz_func_from_guest(t))
+                      fprintf(stderr, "(func_%08X)", fe->addr);
+              }
+              fprintf(stderr, "\n"); }
+            if (g_yz_main_tramp && g_yz_main_tramp_idx) {
+                fprintf(stderr, "[trace-stall] t1 trampoline-hop chain (newest first):\n");
+                unsigned idx = *g_yz_main_tramp_idx;
+                for (unsigned i = 0; i < 28 && i < idx; i++) {
+                    unsigned slot = (idx - 1 - i) & 255;
+                    const yz_func_entry* fe = yz_func_from_host(g_yz_main_tramp[slot]);
+                    fprintf(stderr, "    func_%08X r31=%08llX\n",
+                            fe ? fe->addr : 0xFFFFFFFFu,
+                            (unsigned long long)g_yz_main_tramp_r31[slot]);
+                }
+            }
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
+/* Trampoline-hop ring (defined in dispatch.cpp); dumped by the crash handler
+ * to reconstruct the cross-chunk control-flow path into a fault. (#19d) */
+extern "C" __declspec(thread) void*    g_yz_tramp_ring[256];
+extern "C" __declspec(thread) uint64_t g_yz_tramp_r31[256];
+extern "C" __declspec(thread) uint64_t g_yz_tramp_r1[256];
+extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 
 static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
 {
@@ -376,6 +850,19 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
         fprintf(stderr, " 0x%08X",
                 g_yz_last_targets[(g_yz_last_idx - 1 - i) & 15]);
 
+    /* Recent trampoline chunk hops (newest first): the cross-chunk control-flow
+     * path into the fault. Reverse-mapped host fn ptr -> guest func. (#19d) */
+    fprintf(stderr, "\n[crash] recent trampoline chunks (newest first; r31/r1 at hop entry):");
+    for (unsigned i = 0; i < 256 && i < g_yz_tramp_idx; i++) {
+        unsigned slot = (g_yz_tramp_idx - 1 - i) & 255;
+        const yz_func_entry* fe = yz_func_from_host(g_yz_tramp_ring[slot]);
+        fprintf(stderr, "\n    func_%08X  r31=%08llX r1=%08llX",
+                fe ? fe->addr : 0xFFFFFFFFu,
+                (unsigned long long)g_yz_tramp_r31[slot],
+                (unsigned long long)g_yz_tramp_r1[slot]);
+    }
+
+
     /* Guest state + PPC64 back-chain walk: names the real guest call chain
      * (the host return-address scan below misses direct bl callers). */
     yz_dump_guest_state(g_yz_cur_ctx, "crash");
@@ -385,18 +872,18 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
     if (ep->ContextRecord) {
         uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
         const uint64_t* sp = (const uint64_t*)ep->ContextRecord->Rsp;
-        fprintf(stderr, "\n[crash] stack return candidates:");
+        fprintf(stderr, "\n[crash] stack return candidates (host call chain):");
         int shown = 0;
-        for (int i = 0; i < 64 && shown < 6; i++) {
+        for (int i = 0; i < 768 && shown < 40; i++) {
             uint64_t v = 0;
             if (IsBadReadPtr(sp + i, 8)) break;
             v = sp[i];
             if (v < mod || v > mod + 0x40000000ull) continue;
-            fprintf(stderr, "\n    rva 0x%llX",
-                    (unsigned long long)(v - mod));
-            if (const yz_func_entry* fe = yz_func_from_host((const void*)v))
-                fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
-                        (unsigned long long)(v - (uintptr_t)fe->fn));
+            const yz_func_entry* fe = yz_func_from_host((const void*)v);
+            /* only show entries that resolve to a real lifted/runtime func */
+            if (!fe) continue;
+            fprintf(stderr, "\n    [+0x%03X] func_%08X +0x%llX", i * 8, fe->addr,
+                    (unsigned long long)(v - (uintptr_t)fe->fn));
             shown++;
         }
     }
@@ -449,17 +936,44 @@ int main(int argc, char** argv)
     if (load_prx_image("recomp_prx/libsre_image.bin", YZ_LIBSRE_BASE) != 0)
         return 1;
 
+    /* LLE firmware: Sony's libgcm_sys (RSX driver). Same contract as libsre --
+     * the flat image includes its TOC (0x02114000) referenced by the export
+     * OPDs the game's cellGcmSys imports bind to. Must be loaded before
+     * yz_install_imports. The driver issues sys_rsx syscalls (668-677). */
+    if (load_prx_image("recomp_prx/libgcm_sys_image.bin", YZ_LIBGCM_BASE) != 0)
+        return 1;
+    (void)&yz_watch_arm;   /* write-watch available for debugging; not armed */
+
     /* Lifted SPU images: register Sony's SPURS kernel (recomp_prx/
      * spurs_kernel2.c) and the system-service workload (spurs_sysservice.c,
      * runs at LS 0xA00) so sys_spu_thread_group_start can run them for real. */
-    spu_recomp_register();
-    spu_recomp_register_sysservice();
-    printf("[boot] SPU images registered (SPURS kernel2 + system service)\n");
+    /* Distinct image ids so the overlapping LS-0xA00 images (system service vs
+     * taskset policy) are disambiguated by ctx->image_id (set on DMA dispatch,
+     * spu_dma.h). Kernel (LS 0x290..) and gs_task (LS 0x3000) don't overlap, so
+     * image 0 (matches any) is fine for them. */
+    spu_begin_image(0); spu_recomp_register();            /* kernel  */
+    spu_begin_image(1); spu_recomp_register_sysservice(); /* system service @0xA00 */
+    spu_begin_image(2); spu_recomp_register_policy();     /* taskset policy @0xA00 */
+    spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 */
+    printf("[boot] SPU images registered (kernel + service + policy + gs_task)\n");
+
+    /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
+     * SPU tail-call trampoline hop by target LS addr -> pins which lifted
+     * SPURS functions the SPU threads spin in (the scheduler loops via
+     * trampolines, invisible to spu_indirect_branch). Set before threads run. */
+    g_spu_prof_on = getenv("YZ_SPU_PROF") ? 1 : 0;
+    g_yz_watch_dlist = getenv("YZ_WATCH_DLIST") ? 1 : 0;
 
     /* PS3 e_entry points at an OPD descriptor: word0 = code, word1 = TOC */
     uint32_t entry_code = vm_read32(e_entry);
     uint32_t entry_toc  = vm_read32(e_entry + 4);
     printf("[boot] entry OPD: code=0x%08X toc=0x%08X\n", entry_code, entry_toc);
+
+    /* The game module has a single fixed TOC. Recorded so the dispatcher can
+     * restore it when a guest function is reached with r2==0 -- happens when a
+     * gcm callback (e.g. the flip/vblank handler) is invoked by its bare code
+     * address instead of its OPD, so the OPD's TOC load is skipped. */
+    g_yz_game_toc = entry_toc;
 
     yz_ppu_fn entry_fn = yz_lookup_func(entry_code);
     if (!entry_fn) {
@@ -530,12 +1044,26 @@ int main(int argc, char** argv)
     /* Drive guest vblank handlers while the game runs (no real RSX vsync). */
     CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);
     /* Stall watchdog: dumps the main thread's guest call stack if the boot
-     * parks (uncomment to diagnose a hang). */
-    (void)yz_stall_watchdog;
-    /* CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL); */
+     * parks (TEMP DEBUG: diagnosing the post-shader-open stall). */
+    CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL);
+    /* High-frequency RSX state tracer (TEMP DEBUG): compact GET/PUT/fence/ctr
+     * timeline + a full dump at the stall edge. Env-gated so default runs stay
+     * clean; on for the deadlock investigation. */
+    if (getenv("YZ_TRACE_RSX"))
+        CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
+    /* Capture this (main/t1) thread's trampoline-ring instance for the stall dump. */
+    g_yz_main_tramp     = g_yz_tramp_ring;
+    g_yz_main_tramp_r31 = g_yz_tramp_r31;
+    g_yz_main_tramp_idx = &g_yz_tramp_idx;
+    /* Real handle to this (main/guest) thread, so the watchdog can suspend it
+     * and read its HOST rip/stack -- names the host (lifted) function it spins
+     * in when the guest ctx alone is ambiguous (TEMP DEBUG). */
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                    GetCurrentProcess(), &g_yz_main_hthread,
+                    0, FALSE, DUPLICATE_SAME_ACCESS);
     entry_fn(&ctx);
     yz_drain_trampolines(&ctx);
 
