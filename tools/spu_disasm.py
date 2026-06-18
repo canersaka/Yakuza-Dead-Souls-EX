@@ -150,12 +150,15 @@ RI10_TABLE: dict[int, str] = {
     0b01111100: "ceqi",   # compare equal word immediate
     0b01111101: "ceqhi",  # compare equal halfword immediate
     0b01111110: "ceqbi",  # compare equal byte immediate
+    0b01111111: "heqi",   # halt if equal immediate              (op8 0x7F)
     0b01001100: "cgti",   # compare greater than word immediate
     0b01001101: "cgthi",  # compare greater than halfword immediate
     0b01001110: "cgtbi",  # compare greater than byte immediate
+    0b01001111: "hgti",   # halt if greater than immediate       (op8 0x4F)
     0b01011100: "clgti",  # compare logical greater than word immediate
     0b01011101: "clgthi", # compare logical greater than halfword immediate
     0b01011110: "clgtbi", # compare logical greater than byte immediate
+    0b01011111: "hlgti",  # halt if logically greater than immediate (op8 0x5F)
     0b01110100: "mpyi",   # multiply immediate
     0b01110101: "mpyui",  # multiply unsigned immediate
     # NOTE: the rotate/shift IMMEDIATE forms (roti/rotmi/rotmai/shli/rothi/
