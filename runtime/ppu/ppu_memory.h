@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,6 +109,21 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
+    /* DIAG (env YZ_WATCH_DLIST): watch PPU writes to the io 0x1104D00 display
+     * list (EA 0x41504D00). Tells whether the PPU producer (t1) ever writes the
+     * REAL contents over the 0xA2000500 placeholder -> it's the producer and the
+     * deadlock is a fixable consumer circular wait; vs never -> producer missing
+     * (gs_task). One branch, predicted not-taken; harmless when env unset. */
+    if (addr >= 0x41504C00u && addr < 0x41504E00u) {   /* io 0x1104D00 display list */
+        extern int g_yz_watch_dlist;
+        if (g_yz_watch_dlist) {
+            extern unsigned long g_yz_dlist_w;
+            if (g_yz_dlist_w < 120) { g_yz_dlist_w++;
+                fprintf(stderr, "[dlist-w] EA=0x%08X = 0x%08X\n", addr, val);
+                fflush(stderr);
+            }
+        }
+    }
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
