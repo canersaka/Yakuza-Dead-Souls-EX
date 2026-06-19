@@ -18,7 +18,11 @@
 #include "spu_context.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <excpt.h>   /* __try/__except for guarding DMA against bad EAs */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -148,13 +152,49 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
-    if (mfc_is_get(cmd)) {
-        /* GET: main memory -> local store */
-        memcpy(ls_ptr, ea_ptr, size);
-    } else if (mfc_is_put(cmd)) {
-        /* PUT: local store -> main memory */
-        memcpy(ea_ptr, ls_ptr, size);
+    /* The 4 GB guest space is RESERVED but only specific regions are COMMITTED
+     * (main RAM, stacks, on-demand allocations). A DMA with a bad EA (e.g. the
+     * SPURS GUID-trace buffer when tracing is unconfigured -- RPCS3 no-ops
+     * cellSpursModulePutTrace entirely) points into reserved-but-uncommitted
+     * memory, so `vm_base + ea` is a wild pointer and the memcpy segfaults the
+     * host. Guard the copy: on an access violation, log + skip the transfer (a
+     * benign no-op, matching RPCS3's trace stub) instead of crashing. */
+#ifdef _WIN32
+    __try {
+#endif
+        if (mfc_is_get(cmd)) {
+            /* GET: main memory -> local store */
+            memcpy(ls_ptr, ea_ptr, size);
+            /* SPURS workload dispatch: the kernel DMAs the selected workload's code
+             * to LS 0xA00, then branches there. The system service and the taskset
+             * POLICY module both live at LS 0xA00, so pick which lifted image
+             * spu_indirect_branch resolves by the DMA SOURCE EA. (image ids match
+             * main.cpp: 1=service, 2=policy @0x02023680.) */
+            if (lsa == 0xA00u && size >= 0x400u) {
+                int img = ((uint32_t)ea == 0x02023680u) ? 2 : 1;
+                if (spu->image_id != img) {
+                    extern int g_spu_prof_on;
+                    if (g_spu_prof_on)
+                        fprintf(stderr, "[spu-img] spu=%X LS0xA00 <- ea=0x%08X size=0x%X => image %d (%s)\n",
+                                spu->spu_id, (uint32_t)ea, size, img, img==2?"POLICY":"SERVICE");
+                    spu->image_id = img;
+                }
+            }
+        } else if (mfc_is_put(cmd)) {
+            /* PUT: local store -> main memory */
+            memcpy(ea_ptr, ls_ptr, size);
+        }
+#ifdef _WIN32
+    } __except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION */
+                ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        static int w = 0; if (w < 24) { w++;
+            fprintf(stderr, "[spu-dma] SKIP faulting %s ea=0x%08X size=%u lsa=0x%05X "
+                    "(reserved/uncommitted guest mem -- e.g. unconfigured SPURS trace buffer)\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", (uint32_t)ea, size, lsa);
+            fflush(stderr); }
+        return 0;   /* benign skip */
     }
+#endif
 
     return 0;
 }
@@ -258,6 +298,37 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    /* DIAG (YZ_SPU_PROF): gs_task LAUNCH DMAs. The taskset policy, once it
+     * selects a task, DMAs the task_info (to LS 0x2780), then spursTasksetLoadElf
+     * DMAs the task ELF header + segments (GET from the gs_task ELF EA ~0x0127xxxx
+     * into LS 0x3000+). These happen LATE -- after the [spu-wl] cap above is
+     * spent on early kernel/service loads -- so log them separately (higher cap)
+     * to confirm whether the launch actually reaches LoadElf. */
+    /* Capture the gs_task CellSpursTaskset EA from the task_info DMA (the policy
+     * GETs taskset->task_info[taskId] (taskset+0x80) into LS 0x2780). taskset base
+     * = ea - 0x80; its bitset line (running@0x00) is at that 128-aligned addr.
+     * Used by the YZ_CLEARRUN bootstrap below. */
+    if (cmd == MFC_GET_CMD && (lsa & SPU_LS_MASK) == 0x2780u
+            && (uint32_t)ea >= 0x40000000u && size <= 0x40u) {
+        extern uint32_t g_yz_taskset_ea;
+        g_yz_taskset_ea = ((uint32_t)ea - 0x80u) & ~0x7Fu;
+    }
+    if (g_spu_prof_on && cmd == MFC_GET_CMD          /* regular GET only (NOT GETLLAR 0xD0) */
+            && ((((lsa & SPU_LS_MASK) >= 0x2780u) && ((lsa & SPU_LS_MASK) < 0xC000u))
+                || ((uint32_t)ea >= 0x01200000u && (uint32_t)ea < 0x01300000u))) {
+        /* Arm the dispatch-tail hop trace (spu_channels.c spu_prof_hop) on the
+         * gs_task ELF read, so we can watch where the policy diverges from StartTask. */
+        { extern int g_spu_dtrace_spu;
+          if ((uint32_t)ea >= 0x01200000u && (uint32_t)ea < 0x01300000u)
+              g_spu_dtrace_spu = (int)spu->spu_id; }
+        static int gl = 0;
+        if (gl < 200) { gl++;
+            fprintf(stderr, "[gst-dma] spu=%X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
+                    spu->spu_id, cmd, lsa & SPU_LS_MASK, (uint32_t)ea, size);
+            fflush(stderr);
+        }
+    }
+
     /* Lock-line atomics: a 128-byte line, EA implicitly 128-aligned, the
      * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
@@ -276,16 +347,163 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
         spu_lockline_lock();
         switch (cmd) {
-        case MFC_GETLLAR_CMD:
+        case MFC_GETLLAR_CMD: {
+            extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
+            extern void spu_coh_reserve(uint32_t);   /* mark this line for PPU-write coherence */
+            g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)(ea & ~127ull);
+            { extern void spu_llar_note(uint32_t); extern int g_spu_prof_on;
+              if (g_spu_prof_on) spu_llar_note((uint32_t)(ea & ~127ull)); }
+            spu_coh_reserve((uint32_t)(ea & ~127ull));
             memcpy(ls_ptr, line, 128);
+            /* CONFIRMATION EXPERIMENT (env YZ_FRC): force wklReadyCount1[2]=1 (the
+             * gs_task taskset, wid=2) in the SPURS mgmt line so the kernel select's
+             * `readyCount > contention` gate passes. Proves whether readyCount is
+             * the sole remaining block to dispatching wid=2 -> the taskset policy
+             * module -> gs_task. Patches the source line too so it persists across
+             * the kernel's PUTLLC. */
+            { static int frc = -1; if (frc < 0) frc = getenv("YZ_FRC") ? 1 : 0;
+              if (frc && (ea & ~127ull) == 0x40197C80ull) { line[0x02] = 1; ls_ptr[0x02] = 1; } }
+            /* BOOTSTRAP (env YZ_CLEARRUN): gs_task (task 0) is stuck `running`
+             * (taskset running@0x00 bit 0x80) but never launched, so SELECT_TASK
+             * (readyButNotRunning = ready & ~running) can't re-select it and the
+             * policy idle-polls forever. Clear its running bit on the taskset
+             * bitset GETLLAR so SELECT_TASK re-selects it -> StartTask -> (the
+             * kernel resume above completes the poll) -> bi savedContextLr=0x3050
+             * launches gs_task. Decisive test of the task-level bootstrap. */
+            { extern uint32_t g_yz_taskset_ea;
+              static int cr = -1; if (cr < 0) cr = getenv("YZ_CLEARRUN") ? 1 : 0;
+              if (cr && g_yz_taskset_ea && (uint32_t)(ea & ~127ull) == g_yz_taskset_ea
+                  && (line[0x00] & 0x80u)) {
+                  line[0x00] &= ~0x80u; ls_ptr[0x00] &= ~0x80u;   /* clear running task 0 */
+                  extern int g_spu_prof_on;
+                  if (g_spu_prof_on) { static int n=0; if (n<8){n++;
+                      fprintf(stderr, "[yz-clearrun] cleared gs_task running bit @taskset 0x%08X -> selectable\n", g_yz_taskset_ea);
+                      fflush(stderr);} }
+              } }
             memcpy(mfc->resv_data, line, 128);
             mfc->resv_ea     = ea & ~127ull;
             mfc->resv_active = 1;
             mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
-            break;
+            /* DIAG (YZ_SPU_PROF): on a wklState1-line GETLLAR (mgmt+0x80), if this
+             * SPU's own sysSrvMsgUpdateWorkload bit (line[0x3D]) is SET, the SPU is
+             * about to process a workload-update kick -- log the state it sees. This
+             * tells us whether the kicks reach the SPU with RUNNABLE state. */
+            if (g_spu_prof_on && (ea & ~127ull) == 0x40197D00ull) {
+                uint32_t spuNum = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)
+                                | ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
+                if (line[0x3D] & (1u << (spuNum & 31))) {
+                    extern unsigned long g_spu_kick_log;
+                    if (g_spu_kick_log < 40) {
+                        g_spu_kick_log++;
+                        fprintf(stderr, "[spu-kick] spu=%X spuNum=%u sees msgUpd=0x%02X (bit set) "
+                                "state[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                spu->spu_id, spuNum, line[0x3D],
+                                line[0],line[1],line[2],line[3],line[4],line[5],line[6],line[7]);
+                        fflush(stderr);
+                    }
+                }
+            }
+            /* DIAG (YZ_SPU_PROF): on a mgmt-line GETLLAR, dump the
+             * SpursKernelContext (LS 0x100) selection gates. Tests whether
+             * wklCurrentId==SYS_SERVICE(0x20) -- the clear-guard the polling
+             * service needs (oracle cellSpursSpu.cpp:492). Fields per
+             * cellSpurs.h SpursKernelContext: spuNum@0x1C8, wklCurrentId@0x1DC,
+             * sysSrvInitialised@0x1EA, wklRunnable1@0x1EC. */
+            if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
+                extern unsigned long g_spu_lsdump_n;
+                const uint8_t* k0 = spu->ls;
+                uint16_t wrun0 = (uint16_t)(((uint16_t)k0[0x1EC]<<8)|k0[0x1ED]);
+                int wid2_armed = (wrun0 & 0x2000) && ((k0[0x1A2] & 0x0F) > 0);  /* runnable + has prio = the spuNum-4 case */
+                /* Sample throughout the run, AND always when wid=2 is schedulable
+                 * modulo readyCount (run+prio) so we never miss the priority SPU. */
+                if ((((g_spu_getllar_n % 4000000UL) < 2) || wid2_armed) && g_spu_lsdump_n < 400) {
+                    g_spu_lsdump_n++;
+                    const uint8_t* k = spu->ls;
+                    uint32_t spuNum = ((uint32_t)k[0x1C8]<<24)|((uint32_t)k[0x1C9]<<16)|((uint32_t)k[0x1CA]<<8)|k[0x1CB];
+                    uint32_t wclId  = ((uint32_t)k[0x1DC]<<24)|((uint32_t)k[0x1DD]<<16)|((uint32_t)k[0x1DE]<<8)|k[0x1DF];
+                    uint16_t wrun1  = (uint16_t)(((uint16_t)k[0x1EC]<<8)|k[0x1ED]);
+                    /* k[0x2D80..] = the local copy of the spurs wklState1 line
+                     * (mgmt+0x80) from the LAST ProcessRequests GETLLAR. Dump the
+                     * per-workload state bytes + the message byte the SPU sees, the
+                     * spuNum bit it tests, and ctxt->priority[0..3] (LS 0x1A0) +
+                     * spuIdling (0x1EB) so we can tell whether ActivateWorkload ran
+                     * and why the wklRunnable rebuild yields 0. */
+                    const uint8_t* w = k + 0x2D80;
+                    /* Select gate for wid=2 (oracle cellSpursSpu.cpp:519-521), read
+                     * straight from the GETLLAR'd mgmt line + kernel ctx:
+                     *   runnable = wklRunnable1 & (0x8000>>2)=0x2000  (k@0x1EC)
+                     *   priority = ctxt->priority[2] & 0x0F           (k@0x1A2)
+                     *   maxCont  = wklMaxContention[2] & 0x0F         (line@0x52)
+                     *   cont     = wklCurrentContention[2]            (line@0x22)
+                     *   readyCnt = wklReadyCount1[2]                  (line@0x02) */
+                    unsigned rc2 = line[0x02], curcont2 = line[0x22], maxc2 = line[0x52] & 0x0F;
+                    /* REAL contention per oracle cellSpursSpu.cpp:467-479:
+                     *   contention[i] = (wklCurrentContention[i] - wklLocContention[i]) & 0xF
+                     *   for a POLL, if i != wklCurrentId, also add pendingContention[i].
+                     * The old dump used RAW wklCurrentContention -> overstated the gate. */
+                    unsigned loccont2 = k[0x182] & 0x0F;
+                    unsigned realcont2 = (curcont2 - loccont2) & 0x0F;
+                    unsigned pend2 = (unsigned)((line[0x32] - k[0x192]) & 0x0F);
+                    if (wclId != 2) realcont2 = (realcont2 + pend2) & 0x0F;  /* poll: non-current adds pending */
+                    unsigned sig2 = ((((unsigned)line[0x70] << 8) | line[0x71]) & (0x8000u >> 2)) ? 1 : 0;
+                    unsigned prio2 = k[0x1A2] & 0x0F, run2 = (wrun1 & 0x2000) ? 1 : 0;
+                    int sel = run2 && prio2 > 0 && maxc2 > realcont2 && (sig2 || rc2 > realcont2);
+                    fprintf(stderr, "[spu-ls] spu=%X n%u wklCur=0x%X wklRun1=0x%04X idle=%u "
+                            "| state1[0..3]=%02X%02X%02X%02X msgUpd=0x%02X msg72=0x%02X "
+                            "| wid2: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d\n",
+                            spu->spu_id, spuNum, wclId, wrun1, k[0x1EB],
+                            w[0],w[1],w[2],w[3], w[0x3D], line[0x72],
+                            run2, prio2, maxc2, curcont2, loccont2, realcont2, rc2, sig2, sel);
+                    fflush(stderr);
+                }
+            }
+            break; }
         case MFC_PUTLLC_CMD:
+            if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
+                extern unsigned long g_spu_mgmt_put_ok, g_spu_mgmt_put_fail;
+                if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
+                    memcmp(line, mfc->resv_data, 128) == 0) g_spu_mgmt_put_ok++;
+                else g_spu_mgmt_put_fail++;
+            }
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                 memcmp(line, mfc->resv_data, 128) == 0) {
+                /* DIAG (YZ_SPU_PROF): on a successful CAS of the SPURS mgmt
+                 * line (0x40197C80), log mutations to the fields that gate
+                 * workload selection -- sysSrvMessage@0x72 and wklReadyCount1
+                 * [0..3]@0x00. Pins whether the SERVICE itself makes wid=2
+                 * selectable, or whether that must come from the PPU side. */
+                if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
+                    extern unsigned long g_spu_putllc_log;
+                    const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
+                    int changed = (b[0x72] != a[0x72]) || (b[0] != a[0]) ||
+                                  (b[1] != a[1]) || (b[2] != a[2]) || (b[3] != a[3]);
+                    if (changed && g_spu_putllc_log < 80) {
+                        g_spu_putllc_log++;
+                        fprintf(stderr, "[spu-put] spu=%X mgmt CAS: sysSrvMsg %02X->%02X "
+                                "readyCnt[0..3] %02X%02X%02X%02X->%02X%02X%02X%02X\n",
+                                spu->spu_id, b[0x72], a[0x72],
+                                b[0], b[1], b[2], b[3], a[0], a[1], a[2], a[3]);
+                        fflush(stderr);
+                    }
+                }
+                /* DIAG (YZ_SPU_PROF): the SPURS wklState1 line CAS (0x40197D00).
+                 * Show how ProcessRequests/ActivateWorkload mutate the gating
+                 * bytes: msgUpd(0x3D), wklState1[0..3]@0x00, wklStatus1[0..3]@0x10. */
+                if (g_spu_prof_on && (ea & ~127ull) == 0x40197D00ull) {
+                    extern unsigned long g_spu_putllc_log;
+                    const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
+                    int changed = memcmp(b, a, 128) != 0;
+                    if (changed && g_spu_putllc_log < 120) {
+                        g_spu_putllc_log++;
+                        fprintf(stderr, "[spu-put80] spu=%X CAS: msgUpd(0x3D) %02X->%02X "
+                                "state[0..3] %02X%02X%02X%02X->%02X%02X%02X%02X "
+                                "status[0..3] %02X%02X%02X%02X->%02X%02X%02X%02X\n",
+                                spu->spu_id, b[0x3D], a[0x3D],
+                                b[0],b[1],b[2],b[3], a[0],a[1],a[2],a[3],
+                                b[0x10],b[0x11],b[0x12],b[0x13], a[0x10],a[0x11],a[0x12],a[0x13]);
+                        fflush(stderr);
+                    }
+                }
                 memcpy(line, ls_ptr, 128);
                 mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
             } else {
@@ -301,6 +519,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         spu_lockline_unlock();
         mfc->tag_completed |= (1u << tag);
         return 0;
+    }
+
+    /* DIAG (YZ_SPU_PROF): steady-state sampler for GETs that read the SPURS
+     * mgmt struct BEYOND the poll line (offset >= 0x80: wklState1@0x80,
+     * wklInfo1@0xB00). The service's UpdateWorkload refreshes wklInfo here and
+     * rebuilds wklRunnable1. Logging the first 40 such GETs AFTER 20M GETLLARs
+     * (well into the steady-state deadlock) tests whether UpdateWorkload still
+     * runs post-init, or whether the service stopped processing the update. */
+    if (g_spu_prof_on && mfc_is_get(cmd) && !mfc_is_list(cmd)) {
+        uint32_t off = (uint32_t)ea - 0x40197C80u;
+        if (off >= 0x80 && off < 0x2000) {
+            extern unsigned long g_spu_getllar_n, g_spu_getn2;
+            if (g_spu_getllar_n > 20000000UL && g_spu_getn2 < 40) {
+                g_spu_getn2++;
+                fprintf(stderr, "[spu-get] spu=%X mgmt+0x%X -> LS 0x%05X size=0x%X (steady)\n",
+                        spu->spu_id, off, lsa & SPU_LS_MASK, size);
+                fflush(stderr);
+            }
+        }
     }
 
     /* Execute the transfer */
