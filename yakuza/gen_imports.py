@@ -286,28 +286,49 @@ def main():
     # deadlock at frame 3 fires right after this CALL is stubbed; RPCS3 runs it
     # (LLE libsre). Expect to hit the old crash here -> that's the 1f entry to fix,
     # NOT a reason to stub. (Set YZ_RESTUB to A/B if it regresses early.)
-    FORCE_HLE_OK = {
-        "cellSpursCreateTask2",
-        "cellSpursCreateTaskWithAttribute", "cellSpursJoinTaskset",
-        "cellSpursDestroyTaskset2", "cellSpursGetTasksetInfo",
-        "cellSpursGetJobPipelineInfo", "cellSpursJobHeaderSetJobbin2Param",
-        "_cellSpursTaskAttributeInitialize", "_cellSpursQueueInitialize",
-        "_cellSpursSemaphoreInitialize", "_cellSpursLFQueuePopBody",
-        "cellSpursQueuePushBody", "cellSpursQueuePopBody",
-        "cellSpursQueueAttachLv2EventQueue", "cellSpursQueueDetachLv2EventQueue",
-        "cellSpursQueueClear", "cellSpursQueueDepth", "cellSpursQueueSize",
-        "cellSpursQueueGetDirection", "cellSpursQueueGetEntrySize",
-        "cellSpursQueueGetTasksetAddress", "cellSpursSemaphoreGetTasksetAddress",
-        "cellSpursLFQueueGetTasksetAddress",
-        "cellSpursSetExceptionEventHandler", "cellSpursUnsetExceptionEventHandler",
-        "cellSpursRemoveSystemWorkloadForUtility",
-        "cellSpursTaskAttributeSetExitCodeContainer",
-        "cellSpursTaskExitCodeGet", "cellSpursTaskExitCodeInitialize",
-        "cellSpursTaskExitCodeTryGet", "cellSpursTaskGenerateLsPattern",
-        "cellSpursTaskGetContextSaveAreaSize",
-        "cellSpursTaskGetLoadableSegmentPattern",
-        "cellSpursTaskGetReadOnlyAreaPattern",
-    }
+    # 2026-06-20: UN-STUB the Queue / LFQueue / Semaphore DATA-FLOW primitives.
+    # These were stubbed as CELL_OK no-ops on the false premise that "RPCS3
+    # mirrors this" -- but RPCS3 LLE-loads libsre for BLUS30826 and runs the REAL
+    # versions. The game's gs_task (Edge geometry) job is pushed via
+    # cellSpursQueuePushBody onto the SPURS queue at EA 0x40197180; our no-op
+    # returned OK and wrote NOTHING, so gs_task polled an empty queue forever and
+    # never produced frame-3 geometry (io 0x1104D00 stayed stale -> the render
+    # wall). Binding these to LLE libsre makes the push actually write the queue.
+    # 2026-06-20 STUB AUDIT (run with --audit): EVERY remaining force-stubbed entry
+    # the game imports has real libsre code behind it ("CELL_OK stub, no LLE code" = 0).
+    # So shadowing them with no-ops is pure correctness debt. Emptied -> all bind to
+    # Sony's real lifted code (LLE). The movie phase never reaches task-lifecycle calls,
+    # so this is risk-free there; for gameplay it's the correct LLE behavior. If any one
+    # regresses an early boot, re-add ONLY that name here (the boot log will name it).
+    FORCE_HLE_OK = set()
+
+    if "--audit" in sys.argv:
+        # Stub audit: for every function the GAME imports, classify how we bind
+        # it and flag the dangerous class -- stubs that SHADOW real lifted
+        # firmware code (LLE export exists but a CELL_OK/ENOSYS stub hides it).
+        lle_groups = {lib for (lib, _n) in lle_opds}
+        shadowed, hle_ok_nocode, missing_lle, enosys_other = [], [], [], []
+        for (module, nid, name, _slot) in imports:
+            in_lle = (module, nid) in lle_opds
+            in_hle_ok = bool(name) and name in FORCE_HLE_OK
+            is_host = bool(name) and (name in OVERRIDES or implemented(name))
+            label = name or f"0x{nid:08X}"
+            if in_hle_ok and in_lle:
+                shadowed.append(f"{module}::{label}")          # un-stub: real code exists
+            elif in_hle_ok and not in_lle:
+                hle_ok_nocode.append(f"{module}::{label}")     # CELL_OK stub, no LLE code
+            elif not in_lle and not is_host:
+                (missing_lle if module in lle_groups else enosys_other).append(f"{module}::{label}")
+        def dump(title, items):
+            print(f"\n[{title}] ({len(items)})")
+            for s in sorted(items):
+                print(f"    {s}")
+        print("===== STUB AUDIT (game imports) =====")
+        dump("SHADOWED -- stubbed but LLE firmware code EXISTS -> UN-STUB", shadowed)
+        dump("CELL_OK stub, no LLE code (intentional; verify game tolerates)", hle_ok_nocode)
+        dump("ENOSYS stub from an LLE module -- lift/export GAP (cellSpurs/cellGcm/...)", missing_lle)
+        dump("ENOSYS stub from non-LLE modules (HLE gap; need impl if game relies)", enosys_other)
+        sys.exit(0)
 
     resolved, implemented_n = 0, 0
     lines = []
