@@ -214,6 +214,18 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         }
     }
 
+    /* SINGLE-SEGMENT override (env YZ_ONESEG, 2026-06-20): libgcm's segment-recycle
+     * reserve (func_02103AAC) wedges when GET is parked outside the ring (in an
+     * unfinalized display list) and the producer must recycle a 1 MB segment. Promote
+     * the FIFO to ONE buffer-spanning segment so the producer writes linearly and never
+     * recycles mid-frame. Returns 1 -> handled, skip the real reserve (don't set the
+     * trampoline = the bctrl returns to the producer with end already extended). */
+    if (target == 0x02103AACu) {
+        extern int yz_gcm_reserve_oneseg(ppu_context*);
+        static int en = -1; if (en < 0) en = getenv("YZ_ONESEG") ? 1 : 0;
+        if (en && yz_gcm_reserve_oneseg(ctx)) return;
+    }
+
     /* Bridges complete entirely on the host, so call directly. */
     if (yz_ppu_fn bridge = import_bridge_for(target)) {
         /* TEMP DEBUG (SPURS bring-up): trace every import call made by the
