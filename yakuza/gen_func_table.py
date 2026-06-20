@@ -40,6 +40,7 @@ def main():
         os.path.join(here, "..", "recomp", "ppu_recomp.h"),
         os.path.join(here, "..", "recomp_prx", "libsre_recomp.h"),
         os.path.join(here, "..", "recomp_prx", "libgcm_sys_recomp.h"),
+        os.path.join(here, "..", "recomp_prx", "pxd_shader_recomp.h"),
     ]
     headers = [h for h in headers if os.path.exists(h)] or sys.exit("no headers found")
 
