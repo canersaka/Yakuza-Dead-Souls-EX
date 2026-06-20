@@ -795,6 +795,36 @@ static DWORD WINAPI yz_watch_dlea_mon(LPVOID)
     return 0;
 }
 
+/* OP-LIST APPEND TRACE (env YZ_WATCH_OPLIST, 2026-06-20 pt25b): the data-patch APPLY
+ * never runs (the deadlock is before frame-finalize), but the APPEND does -- t1 builds
+ * the frame, deferring data patches (tag 0x04/0x08/0x09) into the op-list. Arm a
+ * write-watch on the op-list BASE (entry[0]'s tag field, which the YZ_DUMP_SEG dump
+ * showed is a tag-0x08 data patch); the watch fires in the appender's context and dumps
+ * its reliable caller chain -> NAMES the function that defers a data patch. That function
+ * (+ its apply mirror, usually the same module) is the key to the drain. base = *(S+8),
+ * S = *(game_toc-0x7410). Arms once the op-list is allocated. */
+static DWORD WINAPI yz_oplist_watch_mon(LPVOID)
+{
+    for (int i = 0; i < 4000; i++) {
+        if (g_yz_game_toc) {
+            uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+            if (S >= 0x10000u && S < 0xE0000000u) {
+                uint32_t base = vm_read32(S + 0x08u);
+                if (base >= 0x10000u && base < 0xE0000000u) {
+                    fprintf(stderr, "[oplist-watch] arming write-watch on op-list base 0x%08X "
+                            "(S=0x%08X) -- names the data-patch APPENDER\n", base, S);
+                    fflush(stderr);
+                    yz_watch_arm(base);   /* entry[0] tag field */
+                    return 0;
+                }
+            }
+        }
+        Sleep(5);
+    }
+    fprintf(stderr, "[oplist-watch] op-list base never resolved; not armed\n");
+    return 0;
+}
+
 /* Pacing A/B (2026-06-20, LAYER-1). The consumer is a background CreateThread that
  * Sleep(1)s at every idle/park point. On Windows Sleep(1) rounds up to the timer
  * quantum (~1 ms with timeBeginPeriod, else ~15 ms), so when GET catches up to PUT
@@ -1623,6 +1653,8 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
             CreateThread(NULL, 0, yz_watch_dlea_mon, NULL, 0, NULL);
         if (getenv("YZ_SEGBIG"))         /* single big FIFO segment so t1 never recycle-wedges */
             CreateThread(NULL, 0, yz_segsize_mon, NULL, 0, NULL);
+        if (getenv("YZ_WATCH_OPLIST"))   /* name the data-patch APPENDER (drain RE, pt25b) */
+            CreateThread(NULL, 0, yz_oplist_watch_mon, NULL, 0, NULL);
         /* DIAG: catch who writes the jump-to-self stopper at io 0x300000
          * (ea 0x40700000). Reveals the game function/caller that parks the RSX
          * there -- flush safety-stopper vs deliberate pause vs corruption. */

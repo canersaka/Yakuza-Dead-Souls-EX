@@ -288,6 +288,10 @@ static unsigned long g_watch_traps = 0;  /* total in-page traps (slowdown safety
  * (defined later in this TU). */
 extern ppu_context* g_yz_main_ctx;
 static void yz_dump_guest_state(const ppu_context* gc, const char* tag);
+/* Trampoline-hop ring (defined in dispatch.cpp) -- the reliable caller chain the
+ * watch handler uses (the host back-chain mis-symbolizes memcpy/data-lr paths). */
+extern "C" __declspec(thread) void*    g_yz_tramp_ring[256];
+extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 
 static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
 {
@@ -344,6 +348,15 @@ static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
                     fprintf(stderr, "\n");
                     shown++;
                 }
+                /* Trampoline-ring (RELIABLE; the host back-chain mis-symbolizes the
+                 * memcpy/data-lr append path -- see the appender hunt, pt25b). Names the
+                 * recent GAME funcs that led here = the real appender + its callers. */
+                { fprintf(stderr, "[watch] tramp-ring (newest first):");
+                  for (unsigned k = 0; k < 14 && k < g_yz_tramp_idx; k++) {
+                      unsigned slot = (g_yz_tramp_idx - 1 - k) & 255;
+                      const yz_func_entry* fe2 = yz_func_from_host(g_yz_tramp_ring[slot]);
+                      if (fe2) fprintf(stderr, " func_%08X", fe2->addr); }
+                  fprintf(stderr, "\n"); }
                 fflush(stderr);
                 if (acc == 1) g_watch_log_after = 1;   /* writes: log new value */
             }
