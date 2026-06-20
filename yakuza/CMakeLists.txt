@@ -37,7 +37,8 @@ endif()
 # runner builds without them until the libsre lift has been run.
 file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/libsre_recomp_*.cpp"
-    "${PS3RECOMP_DIR}/recomp_prx/libgcm_sys_recomp_*.cpp")
+    "${PS3RECOMP_DIR}/recomp_prx/libgcm_sys_recomp_*.cpp"
+    "${PS3RECOMP_DIR}/recomp_prx/pxd_shader_recomp_*.cpp")
 
 add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
 set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)

@@ -142,6 +142,112 @@ extern "C" void yz_ovr_sys_ppu_thread_get_id(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_prx: runtime loading of the GAME's own engine PRX modules (pt26).
+ *
+ * The OgreZ engine sys_prx_load_module's its shader module (pxd_shader,
+ * data/module/ps3/ogrez_shader_ps3.ppu.sprx) then sys_prx_start_module's it;
+ * with both stubbed ENOSYS the shader subsystem never inits and the render
+ * thread spin-waits forever (the post-logo stall). We decrypt + relocate +
+ * lift the module statically (tools/decrypt_self.py -> lift_prx -> the lifter;
+ * image at 0x02200000), so here we just satisfy the prx ABI: load -> a handle,
+ * start -> RUN the module's module_start (it sets up the shader subsystem the
+ * engine waits on). pxd_shader exports only module_start/stop and imports 0,
+ * so module_start is self-contained and safe to run inline on the caller. */
+struct yz_prx_mod { uint32_t handle, start_opd, toc; int started; const char* name; };
+static yz_prx_mod g_yz_prx_mods[8];
+static int        g_yz_prx_nmods = 0;
+
+static yz_prx_mod* yz_prx_find(uint32_t handle)
+{
+    for (int i = 0; i < g_yz_prx_nmods; i++)
+        if (g_yz_prx_mods[i].handle == handle) return &g_yz_prx_mods[i];
+    return nullptr;
+}
+
+static const char* yz_guest_cstr(uint32_t gaddr, char* buf, int n)
+{
+    int i = 0;
+    if (gaddr >= 0x10000u && gaddr < 0xE0000000u)
+        for (; i < n - 1; i++) { uint8_t c = vm_read8(gaddr + (uint32_t)i); buf[i] = (char)c; if (!c) break; }
+    buf[i] = 0;
+    return buf;
+}
+
+extern "C" void yz_ovr_sys_prx_load_module(ppu_context* ctx)
+{
+    char path[256];
+    yz_guest_cstr((uint32_t)ctx->gpr[3], path, sizeof(path));
+    uint32_t handle = 0, start_opd = 0, toc = 0; const char* nm = "?";
+    if (strstr(path, "ogrez_shader")) {        /* pxd_shader: lifted + loaded */
+        handle = 0x23000001u; start_opd = 0x0266AFD8u; toc = 0x02673020u; nm = "pxd_shader";
+    }
+    if (!handle) {                              /* not LLE'd yet (e.g. dfengine) */
+        fprintf(stderr, "[prx] load_module('%s') -> ENOSYS (module not LLE'd yet)\n", path);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ENOSYS */
+        return;
+    }
+    if (!yz_prx_find(handle) && g_yz_prx_nmods < 8)
+        g_yz_prx_mods[g_yz_prx_nmods++] = { handle, start_opd, toc, 0, nm };
+    fprintf(stderr, "[prx] load_module('%s') -> handle 0x%08X (%s)\n", path, handle, nm);
+    ctx->gpr[3] = handle;
+}
+
+extern "C" void yz_ovr_sys_prx_start_module(ppu_context* ctx)
+{
+    uint32_t handle = (uint32_t)ctx->gpr[3];
+    uint32_t modres = (uint32_t)ctx->gpr[6];   /* int* out: module_start result */
+    yz_prx_mod* m = yz_prx_find(handle);
+    if (!m) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; return; } /* EINVAL */
+    if (!m->started) {
+        m->started = 1;
+        uint64_t a_args = ctx->gpr[4], a_argp = ctx->gpr[5];   /* start_module(id,args,argp,...) */
+        fprintf(stderr, "[prx] start_module 0x%08X: running %s module_start(args=0x%llX argp=0x%llX) opd 0x%08X\n",
+                handle, m->name, (unsigned long long)a_args, (unsigned long long)a_argp, m->start_opd);
+        ctx->gpr[3] = a_args;   /* module_start(size_t args, void* argp) -- pass the game's */
+        ctx->gpr[4] = a_argp;
+        yz_call_guest_opd(m->start_opd, ctx);   /* sets r2=module TOC, runs it, drains */
+        uint32_t res = (uint32_t)ctx->gpr[3];
+        fprintf(stderr, "[prx] %s module_start returned 0x%08X\n", m->name, res);
+        if (modres >= 0x10000u && modres < 0xE0000000u) vm_write32(modres, res);
+    }
+    ctx->gpr[3] = 0;   /* CELL_OK */
+}
+
+extern "C" void yz_ovr_sys_prx_stop_module(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+extern "C" void yz_ovr_sys_prx_unload_module(ppu_context* ctx)   { ctx->gpr[3] = 0; }
+extern "C" void yz_ovr_sys_prx_register_library(ppu_context* ctx){ ctx->gpr[3] = 0; }
+
+/* DRM check: disc content has no NPDRM. Returning ENOSYS made the game take its
+ * DRM/trophy error path (-> cellMsgDialogOpen2). Report "available" (CELL_OK) so the
+ * title sequence proceeds normally. (pt26 stub-fix test for the post-logo stall.) */
+extern "C" void yz_ovr_sceNpDrmIsAvailable(ppu_context* ctx) { ctx->gpr[3] = 0; }
+
+/* Audio output (pt26 — THE post-frame-3 black-screen gate). The OgreZ engine's early
+ * init spin-polls cellAudioOutGetState until the output reports ENABLED + CELL_OK
+ * before it proceeds (proven: t1.ctr = the cellAudioOutGetState import fake-key
+ * 0xFE00018C, looping in func_00B1559C -> usleep). Stubbed ENOSYS => never ready =>
+ * deadlock. Report a configured stereo/48kHz LPCM primary output so the engine advances.
+ * CellAudioOutState: state u8@0, encoder u8@1, reserved[6], downMixer be32@8, soundMode
+ * {type u8@C, channel u8@D, fs u8@E, rsvd u8@F, layout be32@10}. */
+extern "C" void yz_ovr_cellAudioOutGetState(ppu_context* ctx)
+{
+    uint32_t s = (uint32_t)ctx->gpr[5];   /* CellAudioOutState* */
+    if (s >= 0x10000u && s < 0xE0000000u) {
+        vm_write8(s + 0x0u, 0);      /* state   = CELL_AUDIO_OUT_OUTPUT_STATE_ENABLED (0) */
+        vm_write8(s + 0x1u, 0);      /* encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM (0) */
+        for (uint32_t i = 2; i < 8; i++) vm_write8(s + i, 0);   /* reserved[6] */
+        vm_write32(s + 0x8u, 0);     /* downMixer = NONE */
+        vm_write8(s + 0xCu, 0);      /* soundMode.type    = LPCM */
+        vm_write8(s + 0xDu, 2);      /* soundMode.channel = 2 (stereo) */
+        vm_write8(s + 0xEu, 0x04u);  /* soundMode.fs      = 48KHz */
+        vm_write8(s + 0xFu, 0);      /* soundMode.reserved */
+        vm_write32(s + 0x10u, 1);    /* soundMode.layout  = 2CH */
+    }
+    ctx->gpr[3] = 0;   /* CELL_OK */
+}
+extern "C" void yz_ovr_cellAudioOutConfigure(ppu_context* ctx) { ctx->gpr[3] = 0; }   /* CELL_OK */
+
+/* ---------------------------------------------------------------------------
  * RSX driver (LLE): sys_rsx syscalls + FIFO consumer
  *
  * Sony's real libgcm_sys (recomp_prx/libgcm_sys_*) now runs the gcm API; the

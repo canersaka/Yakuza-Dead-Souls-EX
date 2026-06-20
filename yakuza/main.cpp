@@ -1097,6 +1097,13 @@ int main(int argc, char** argv)
      * yz_install_imports. The driver issues sys_rsx syscalls (668-677). */
     if (load_prx_image("recomp_prx/libgcm_sys_image.bin", YZ_LIBGCM_BASE) != 0)
         return 1;
+
+    /* LLE the GAME's own runtime-loaded engine PRX: pxd_shader (OgreZ shader
+     * module). The game sys_prx_load_module's it from data/module/ps3/; we
+     * decrypted (tools/decrypt_self.py) + relocated it to 0x02200000. Its image
+     * holds the TOC (0x02673020) + module_start OPD the sys_prx overrides invoke.
+     * Optional (build/boot works without it); only the shader path needs it. */
+    load_prx_image("recomp_prx/ogrez_shader_ps3.ppu_image.bin", 0x02200000u);
     (void)&yz_watch_arm;   /* write-watch available for debugging; not armed */
 
     /* Lifted SPU images: register Sony's SPURS kernel (recomp_prx/
