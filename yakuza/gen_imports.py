@@ -227,6 +227,22 @@ def main():
     # Imports that need ppu_context access -> hand-written bridges in
     # import_overrides.cpp. These take precedence over libs/ implementations.
     OVERRIDES = {
+        # runtime PRX loading of the game's own engine modules (pxd_shader):
+        # load -> handle, start -> run the module's module_start (inits the
+        # shader subsystem the render thread spin-waits on). See import_overrides.cpp.
+        "sys_prx_load_module",
+        "sys_prx_start_module",
+        "sys_prx_stop_module",
+        "sys_prx_unload_module",
+        "sys_prx_register_library",
+        # DRM availability: disc content -> report OK so the title sequence doesn't
+        # take the DRM/trophy error path (cellMsgDialog). pt26 stub-fix test.
+        "sceNpDrmIsAvailable",
+        # audio output: the engine's early init spin-polls GetState until ENABLED+OK
+        # (THE post-frame-3 black-screen gate, t1.ctr=0xFE00018C). Report a ready
+        # stereo/48kHz LPCM output + accept Configure. See import_overrides.cpp.
+        "cellAudioOutGetState",
+        "cellAudioOutConfigure",
         "sys_initialize_tls",
         "_sys_heap_create_heap",
         "_sys_heap_delete_heap",
