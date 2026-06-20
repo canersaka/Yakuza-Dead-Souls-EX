@@ -505,11 +505,11 @@ class PPULifter:
 
         if mn in ("sraw", "sraw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
+            return f"ctx->gpr[{ra}] = ppc_sraw(&ctx->xer, (int32_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("srawi", "srawi."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
+            return f"ctx->gpr[{ra}] = ppc_sraw(&ctx->xer, (int32_t)ctx->gpr[{rs}], {_imm(ops[2])});"
 
         # ------- 64-bit Rotate / Shift -------
         if mn.startswith("rldicl"):
@@ -559,11 +559,11 @@ class PPULifter:
 
         if mn in ("srad", "srad."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 63));"
+            return f"ctx->gpr[{ra}] = (uint64_t)ppc_srad(&ctx->xer, (int64_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 0x7F));"
 
         if mn in ("sradi", "sradi."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
+            return f"ctx->gpr[{ra}] = (uint64_t)ppc_srad(&ctx->xer, (int64_t)ctx->gpr[{rs}], {_imm(ops[2])});"
 
         # ------- Loads -------
         load_map = {
@@ -840,8 +840,22 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
-        if mn in ("mtcr", "mtcrf"):
+        if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
+        if mn == "mtcrf":
+            # mtcrf CRM, rS -- update ONLY the CR fields whose CRM bit is set
+            # (the others are preserved). CR0 = cr bits 28-31 ... CR7 = bits 0-3;
+            # CRM 0x80 selects CR0 ... 0x01 selects CR7.
+            crm = int(ops[0], 0) if len(ops) > 1 else 0xFF
+            mask = 0
+            for f in range(8):
+                if crm & (0x80 >> f):
+                    mask |= 0xF << (28 - 4 * f)
+            rS = _reg_idx(ops[-1])
+            if mask == 0xFFFFFFFF:
+                return f"ctx->cr = (uint32_t)ctx->gpr[{rS}];"
+            return (f"ctx->cr = (ctx->cr & 0x{(~mask) & 0xFFFFFFFF:08X}u) | "
+                    f"((uint32_t)ctx->gpr[{rS}] & 0x{mask:08X}u);")
 
         # ------- Syscall -------
         if mn == "sc":
@@ -2040,7 +2054,7 @@ class PPULifter:
         # Emit helper macros
         lines.append("/* Rotate helpers */")
         lines.append("static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {")
-        lines.append("    uint32_t rotated = (rs << sh) | (rs >> (32 - sh));")
+        lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
         lines.append("    uint32_t mask;")
         lines.append("    if (mb <= me) {")
         lines.append("        mask = ((uint32_t)-1 >> mb) & ((uint32_t)-1 << (31 - me));")
@@ -2051,7 +2065,7 @@ class PPULifter:
         lines.append("}")
         lines.append("")
         lines.append("static inline uint32_t ppc_rlwimi(uint32_t ra, uint32_t rs, int sh, int mb, int me) {")
-        lines.append("    uint32_t rotated = (rs << sh) | (rs >> (32 - sh));")
+        lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
         lines.append("    uint32_t mask;")
         lines.append("    if (mb <= me) {")
         lines.append("        mask = ((uint32_t)-1 >> mb) & ((uint32_t)-1 << (31 - me));")
@@ -2065,7 +2079,7 @@ class PPULifter:
         lines.append("/* 64-bit rotate helpers */")
         lines.append("static inline uint64_t ppc_rotl64(uint64_t v, int n) {")
         lines.append("    n &= 63;")
-        lines.append("    return (v << n) | (v >> (64 - n));")
+        lines.append("    return n ? ((v << n) | (v >> (64 - n))) : v;")
         lines.append("}")
         lines.append("static inline uint64_t ppc_mask64(int mb, int me) {")
         lines.append("    uint64_t mask;")
@@ -2091,6 +2105,24 @@ class PPULifter:
         lines.append("    int me = 63 - sh;")
         lines.append("    uint64_t mask = ppc_mask64(mb, me);")
         lines.append("    return (ppc_rotl64(rs, sh) & mask) | (ra & ~mask);")
+        lines.append("}")
+        lines.append("")
+        # Shift-right-algebraic with XER[CA]. CA = rS<0 AND any 1-bits shifted out.
+        # Also clamps shift counts >= width (PPC yields all-sign; a raw C shift by
+        # >= the width is undefined). The carry feeds adde/addze/subfe consumers.
+        lines.append("static inline int64_t ppc_sraw(uint32_t* xer, int32_t rs, int n) {")
+        lines.append("    int sh = n & 0x3F;")
+        lines.append("    uint32_t so = (sh == 0) ? 0u : ((sh >= 32) ? (uint32_t)rs : ((uint32_t)rs & (((uint32_t)1u << sh) - 1u)));")
+        lines.append("    uint32_t ca = (rs < 0 && so != 0u) ? 1u : 0u;")
+        lines.append("    *xer = (*xer & ~(1u << 29)) | (ca << 29);")
+        lines.append("    return (int64_t)((sh >= 32) ? (rs >> 31) : (rs >> sh));")
+        lines.append("}")
+        lines.append("static inline int64_t ppc_srad(uint32_t* xer, int64_t rs, int n) {")
+        lines.append("    int sh = n & 0x7F;")
+        lines.append("    uint64_t so = (sh == 0) ? 0ull : ((sh >= 64) ? (uint64_t)rs : ((uint64_t)rs & (((uint64_t)1ull << sh) - 1ull)));")
+        lines.append("    uint32_t ca = (rs < 0 && so != 0ull) ? 1u : 0u;")
+        lines.append("    *xer = (*xer & ~(1u << 29)) | (ca << 29);")
+        lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
         return lines
