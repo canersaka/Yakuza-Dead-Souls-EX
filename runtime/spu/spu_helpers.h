@@ -121,16 +121,24 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+     * control, and the result) through SPU_W so a control supplied as an immediate
+     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+     * SPU-byte-order selectors to match. */
     uint8_t cat[32];
-    for (int i=0;i<16;i++) cat[i]=a._u8[i];
-    for (int i=0;i<16;i++) cat[16+i]=b._u8[i];
+    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
     u128 r;
-    for (int i=0;i<16;i++) {
-        uint8_t s=c._u8[i];
-        if      ((s & 0xE0)==0xE0) r._u8[i]=0x80;
-        else if ((s & 0xC0)==0xC0) r._u8[i]=0xFF;
-        else if ((s & 0xC0)==0x80) r._u8[i]=0x00;
-        else                       r._u8[i]=cat[s & 0x1F];
+    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+        uint8_t v;
+        if      ((s & 0xE0)==0xE0) v=0x80;
+        else if ((s & 0xC0)==0xC0) v=0xFF;
+        else if ((s & 0xC0)==0x80) v=0x00;
+        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+        r._u8[SPU_W(t)] = v;
     }
     return r;
 }
@@ -304,39 +312,36 @@ static inline u128 spu_fsmbi(int32_t imm) {
 }
 
 /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
-/* Generate-controls (cbd/chd) — byte/halfword insertion masks for shufb.
- * Our u128 is HOST-NATIVE little-endian (_u32[0]=SPU word 0 as a value, so
- * _u8[] is byte-swapped WITHIN each word vs SPU big-endian byte order). The
- * SPU semantics (insert a's preferred scalar byte at SPU byte position `pos`)
- * must therefore be mapped: SPU byte position P -> our _u8 index W(P), where
- * W(P) = (P & ~3) | (3 - (P & 3)); and the inserted value (a's preferred byte,
- * SPU byte 3 / preferred halfword SPU bytes 2,3) lives at a._u8[0] / a._u8[0..1]
- * in our layout, so the shufb selectors are 0x00 / 0x00,0x01 (not 0x03 /
- * 0x02,0x03 as in a big-endian array). cwd/cdd copy whole words/dwords so they
- * preserve byte order and need no remap. (Verified vs RPCS3 SPUInterpreter +
- * the spuIdling-write path: the old 0x03/_u8[pos] dropped the inserted value.) */
+/* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
+ * SPU-byte-correct) shufb. Each builds a control in TRUE SPU byte order: the
+ * base selects b's SPU byte t at result SPU byte t (selector 0x10+t), and the
+ * insert positions select a's preferred scalar bytes -- SPU byte 3 for a byte
+ * (selector 0x03), SPU bytes 2,3 for a halfword (0x02,0x03), SPU bytes 0..3 for
+ * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
+ * the right host index. Verified to compose correctly with the fixed shufb for
+ * both cbd-generated and immediate/LS-constant controls. */
 static inline u128 spu_cbd_pos(int pos) {
-    u128 r; for(int i=0;i<16;i++) r._u8[i] = (uint8_t)(0x10|i);
-    r._u8[SPU_W(pos & 0xF)] = 0x00;
+    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+    r._u8[SPU_W(pos & 0xF)] = 0x03;                 /* a's preferred byte = SPU byte 3 */
     return r;
 }
 static inline u128 spu_chd_pos(int pos) {
-    u128 r; for(int i=0;i<16;i++) r._u8[i] = (uint8_t)(0x10|i);
-    int t = (pos & 0xF) & ~1;                 /* SPU halfword byte positions t, t+1 */
-    r._u8[SPU_W(t)]   = 0x01;                  /* high byte of hw = a SPU byte 2 = a._u8[1] */
-    r._u8[SPU_W(t+1)] = 0x00;                  /* low  byte of hw = a SPU byte 3 = a._u8[0] */
+    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+    int p = (pos & 0xF) & ~1;                       /* SPU halfword byte positions p, p+1 */
+    r._u8[SPU_W(p)]   = 0x02;                        /* a SPU byte 2 (hi byte of preferred hw) */
+    r._u8[SPU_W(p+1)] = 0x03;                        /* a SPU byte 3 (lo byte) */
     return r;
 }
 static inline u128 spu_cwd_pos(int pos) {
-    u128 r; for(int i=0;i<16;i++) r._u8[i] = (uint8_t)(0x10|i);
-    int t = (pos & 0xF) & ~3;
-    r._u8[t]=0x00; r._u8[t+1]=0x01; r._u8[t+2]=0x02; r._u8[t+3]=0x03;
+    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+    int p = (pos & 0xF) & ~3;
+    for(int k=0;k<4;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..3 (preferred word) */
     return r;
 }
 static inline u128 spu_cdd_pos(int pos) {
-    u128 r; for(int i=0;i<16;i++) r._u8[i] = (uint8_t)(0x10|i);
-    int t = (pos & 0xF) & ~7;
-    for(int j=0;j<8;j++) r._u8[t+j] = (uint8_t)j;
+    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+    int p = (pos & 0xF) & ~7;
+    for(int k=0;k<8;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..7 (preferred dword) */
     return r;
 }
 static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
