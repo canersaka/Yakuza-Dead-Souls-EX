@@ -280,6 +280,9 @@ static const yz_func_entry* yz_func_from_host(const void* rip)
 static uint32_t g_watch_guest = 0;       /* 0 = disabled */
 static void*    g_watch_host  = nullptr;
 static int      g_watch_log_after = 0;
+static int      g_watch_read  = 0;       /* 1 = read-watch (PAGE_NOACCESS, traps reads) */
+static int      g_watch_hits  = 0;       /* read-watch dumps captured (disarm after N) */
+static unsigned long g_watch_traps = 0;  /* total in-page traps (slowdown safety cap) */
 
 /* Forward decls so the watch handler can name the GUEST function doing the write
  * (defined later in this TU). */
@@ -290,37 +293,42 @@ static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     uintptr_t page = (uintptr_t)g_watch_host & ~(uintptr_t)0xFFF;
+    ULONG_PTR acc = (code == EXCEPTION_ACCESS_VIOLATION &&
+                     ep->ExceptionRecord->NumberParameters >= 2)
+                    ? ep->ExceptionRecord->ExceptionInformation[0] : 2; /* 0=read 1=write */
     if (code == EXCEPTION_ACCESS_VIOLATION &&
         ep->ExceptionRecord->NumberParameters >= 2 &&
-        ep->ExceptionRecord->ExceptionInformation[0] == 1 /*write*/) {
+        (acc == 1 /*write*/ || (g_watch_read && acc == 0 /*read*/))) {
         uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
         if (tgt >= page && tgt < page + 0x1000) {
-            if (tgt == (uintptr_t)g_watch_host) {
+            g_watch_traps++;
+            /* Dump every write of the watched word; for reads (read-watch) cap to
+             * the first N so a tight poll loop doesn't trap forever (we disarm
+             * below once captured). Runs in the FAULTING thread's context, so the
+             * dump names the real accessor + its reliable trampoline-ring chain. */
+            int do_dump = (tgt == (uintptr_t)g_watch_host) &&
+                          (acc == 1 || g_watch_hits < 8);
+            if (do_dump) {
+                if (acc == 0) g_watch_hits++;
                 void* rip = (void*)ep->ContextRecord->Rip;
                 uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
-                uint64_t before;
-                memcpy(&before, g_watch_host, 8);
-                fprintf(stderr, "[watch] WRITE to guest 0x%08X (was 0x%llX) rip rva 0x%llX",
-                        g_watch_guest, (unsigned long long)before,
+                uint64_t cur;
+                memcpy(&cur, g_watch_host, 8);
+                fprintf(stderr, "[watch] %s guest 0x%08X (=0x%llX) rip rva 0x%llX",
+                        acc == 1 ? "WRITE to" : "READ of",
+                        g_watch_guest, (unsigned long long)cur,
                         (unsigned long long)((uintptr_t)rip - mod));
                 if (const yz_func_entry* fe = yz_func_from_host(rip))
                     fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
                             (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
                 fprintf(stderr, " tid=%lu\n", GetCurrentThreadId());
-                /* Name the ACTUAL writing thread: the VEH runs in the context of
-                 * the faulting thread, so yz_thread_current_id() (thread_local
-                 * s_cur_tid) is the WRITER's guest tid -- not necessarily t1.
-                 * Dump ITS live guest PC/GPRs: this names the builder thread and
-                 * the lifted function doing the write, whichever thread it is. */
-                { static int gd = 0; if (gd < 6) { gd++;
-                    uint32_t wtid = yz_thread_current_id();
-                    ppu_context* wctx = (ppu_context*)yz_thread_context(wtid);
-                    if (!wctx) wctx = g_yz_main_ctx;   /* tid 1 = main */
-                    fprintf(stderr, "[watch] writer guest tid=%u\n", wtid);
-                    if (wctx) yz_dump_guest_state(wctx, "watch-writer"); } }
-                /* Caller chain: vm_write32 is generic; the return addresses on
-                 * the stack name who actually wanted this write (consumer /
-                 * lifted PPU / SPU DMA). rva is for the .map; func_ for lifted. */
+                { uint32_t wtid = yz_thread_current_id();
+                  ppu_context* wctx = (ppu_context*)yz_thread_context(wtid);
+                  if (!wctx) wctx = g_yz_main_ctx;   /* tid 1 = main */
+                  fprintf(stderr, "[watch] accessor guest tid=%u\n", wtid);
+                  if (wctx) yz_dump_guest_state(wctx, acc == 1 ? "watch-writer" : "watch-reader"); }
+                /* Caller chain: the host return addresses name who wanted this
+                 * access (consumer / lifted PPU / SPU DMA). rva for the .map. */
                 const uint64_t* sp = (const uint64_t*)ep->ContextRecord->Rsp;
                 int shown = 0;
                 for (int i = 0; i < 48 && shown < 8; i++) {
@@ -337,7 +345,7 @@ static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
                     shown++;
                 }
                 fflush(stderr);
-                g_watch_log_after = 1;   /* log the new value post single-step */
+                if (acc == 1) g_watch_log_after = 1;   /* writes: log new value */
             }
             DWORD old;
             VirtualProtect((void*)page, 0x1000, PAGE_READWRITE, &old);
@@ -354,7 +362,12 @@ static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
             fflush(stderr);
         }
         DWORD old;
-        VirtualProtect((void*)page, 0x1000, PAGE_READONLY, &old);
+        /* Re-arm. Read-watch disarms (PAGE_READWRITE = stop trapping) once it has
+         * captured enough reads, or as a slowdown safety after many in-page traps. */
+        DWORD prot = !g_watch_read ? PAGE_READONLY
+                   : (g_watch_hits >= 8 || g_watch_traps > 4000000ul) ? PAGE_READWRITE
+                                                                      : PAGE_NOACCESS;
+        VirtualProtect((void*)page, 0x1000, prot, &old);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -370,6 +383,23 @@ extern "C" void yz_watch_arm(uint32_t guest_addr)
     VirtualProtect((void*)((uintptr_t)g_watch_host & ~(uintptr_t)0xFFF),
                    0x1000, PAGE_READONLY, &old);
     fprintf(stderr, "[watch] armed write-watch on guest 0x%08X (host %p)\n",
+            guest_addr, g_watch_host);
+}
+
+/* Read-watch: trap READS of guest_addr (PAGE_NOACCESS) so the VEH fires in the
+ * READER's context -> reliable trampoline-ring call chain naming what polls it
+ * (e.g. t1's flip-fence wait). Disarms after capturing a few (see veh). */
+extern "C" void yz_watch_arm_read(uint32_t guest_addr)
+{
+    if (g_watch_guest) return;   /* arm once */
+    g_watch_guest = guest_addr;
+    g_watch_host  = vm_base + guest_addr;
+    g_watch_read  = 1;
+    AddVectoredExceptionHandler(1, yz_watch_veh);
+    DWORD old;
+    VirtualProtect((void*)((uintptr_t)g_watch_host & ~(uintptr_t)0xFFF),
+                   0x1000, PAGE_NOACCESS, &old);
+    fprintf(stderr, "[watch] armed READ-watch on guest 0x%08X (host %p) -- PAGE_NOACCESS\n",
             guest_addr, g_watch_host);
 }
 
@@ -675,6 +705,43 @@ static void yz_dump_main_host_stack(const char* tag)
     ResumeThread(g_yz_main_hthread);
 }
 
+/* TEMP DEBUG: multi-sample host-RIP profiler. Suspends t1 repeatedly and reads
+ * its live host RIP (reliable, unlike the guest back-chain which mis-symbolizes
+ * string data). A tight guest-code spin clusters at a few host RIPs -> the
+ * dominant (func_, offset) names exactly the loop t1 is parked in. */
+static void yz_sample_t1_spin(const char* tag)
+{
+    if (!g_yz_main_hthread) return;
+    uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+    struct { uint32_t addr; uint64_t off; int n; } hist[48]; int hn = 0, taken = 0;
+    for (int s = 0; s < 24; s++) {
+        if (SuspendThread(g_yz_main_hthread) == (DWORD)-1) { Sleep(60); continue; }
+        CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_CONTROL;
+        uint32_t fa = 0xFFFFFFFFu; uint64_t fo = 0;
+        if (GetThreadContext(g_yz_main_hthread, &cx)) {
+            if (const yz_func_entry* fe = yz_func_from_host((void*)cx.Rip)) {
+                fa = fe->addr; fo = (uintptr_t)cx.Rip - (uintptr_t)fe->fn;
+            } else { fo = (uintptr_t)cx.Rip - mod; }
+        }
+        ResumeThread(g_yz_main_hthread);
+        taken++;
+        int idx = -1;
+        for (int i = 0; i < hn; i++) if (hist[i].addr == fa && hist[i].off == fo) { idx = i; break; }
+        if (idx < 0 && hn < 48) { idx = hn++; hist[idx].addr = fa; hist[idx].off = fo; hist[idx].n = 0; }
+        if (idx >= 0) hist[idx].n++;
+        Sleep(60);
+    }
+    fprintf(stderr, "[%s] t1 host-RIP profile (%d samples, host-RIP is RELIABLE):\n", tag, taken);
+    for (int i = 0; i < hn; i++) {
+        if (hist[i].addr == 0xFFFFFFFFu)
+            fprintf(stderr, "    [%2d] rva-only +0x%llX\n", hist[i].n, (unsigned long long)hist[i].off);
+        else
+            fprintf(stderr, "    [%2d] func_%08X +0x%llX\n", hist[i].n, hist[i].addr,
+                    (unsigned long long)hist[i].off);
+    }
+    fflush(stderr);
+}
+
 /* TEMP DEBUG (window bring-up): after the boot has had time to reach its frame
  * loop, dump the main thread's guest call stack so we can see what it spin-waits
  * on. */
@@ -686,6 +753,7 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     Sleep(30000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
                          yz_dump_main_host_stack("watchdog-30s"); }
+    yz_sample_t1_spin("watchdog-30s");
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
                          yz_dump_main_host_stack("watchdog-45s"); }
@@ -693,6 +761,80 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
                          yz_dump_main_host_stack("watchdog-60s"); }
     return 0;
+}
+
+/* RESYNC PROBE (env YZ_RESYNC_PROBE, 2026-06-20): pin WHERE t1 goes after libgcm's
+ * reserve is force-unblocked. When t1 is wedged in the reserve (GET parked behind PUT),
+ * set GET=PUT to clear the ring so the reserve returns, then profile t1's host-RIP to see
+ * whether it reaches the SPURS job-feed (cellSpurs* / the gs_task queue 0x40197180) or
+ * stalls elsewhere. Decides the gs_task solution: break-the-reserve vs a deeper gate. */
+static DWORD WINAPI yz_resync_probe(LPVOID)
+{
+    Sleep(28000);
+    for (int it = 0; it < 6; it++) {
+        uint32_t put = vm_read32(0x10000040u) & ~3u;   /* RSX PUT */
+        uint32_t get = vm_read32(0x10000044u) & ~3u;   /* RSX GET */
+        if (get != put) {
+            vm_write32(0x10000044u, put);              /* GET = PUT -> drain ring, unblock reserve */
+            fprintf(stderr, "[resync-probe] it=%d GET 0x%06X -> PUT 0x%06X (unblock reserve)\n",
+                    it, get, put);
+            fflush(stderr);
+        }
+        Sleep(200);                                    /* let t1 run after the unblock */
+        char tag[40]; sprintf(tag, "post-resync-%d", it);
+        yz_sample_t1_spin(tag);                        /* where did t1 go? */
+    }
+    return 0;
+}
+
+/* RESYNC LOOP (env YZ_RESYNC_LOOP, 2026-06-20): the validated LAYER-1 unblock. t1
+ * (PPU render thread) wedges in libgcm's reserve before building the next frame's
+ * display list; the resync-probe proved that forcing GET=PUT (drain the ring) frees
+ * t1 -> it builds the list + reaches the flip submit -> fence advances (2->3 measured).
+ * This makes it CONTINUOUS: whenever GET is stuck (unchanged ~120ms) with the ring not
+ * drained (GET != PUT), advance GET=PUT to release t1's reserve, so frames keep flowing. */
+static DWORD WINAPI yz_resync_loop(LPVOID)
+{
+    const int aggr = getenv("YZ_GETFOLLOW") != nullptr;   /* pin GET=PUT every tick */
+    Sleep(8000);   /* let the boot reach steady state (frames 1-2 render) first */
+    uint32_t last_get = ~0u; DWORD stuck_since = 0; int n = 0;
+    for (;;) {
+        Sleep(aggr ? 5 : 30);
+        uint32_t fence = vm_read32(0x40C00000u);
+        if (fence < 2u) { last_get = ~0u; continue; }   /* act only at/after the frame-3 wedge */
+        uint32_t put = vm_read32(0x10000040u) & ~3u;
+        uint32_t get = vm_read32(0x10000044u) & ~3u;
+        if (aggr) {                                /* keep GET pinned to PUT continuously */
+            if (get != put) { vm_write32(0x10000044u, put);
+                if (++n <= 60 || (n % 200) == 0)
+                    fprintf(stderr, "[getfollow] #%d fence=%u GET 0x%06X -> PUT 0x%06X\n", n, fence, get, put); }
+            continue;
+        }
+        DWORD now = GetTickCount();
+        if (get != last_get) { last_get = get; stuck_since = now; continue; }
+        if (get != put && (now - stuck_since) > 120u) {
+            vm_write32(0x10000044u, put);          /* GET = PUT: release t1's reserve */
+            last_get = put; stuck_since = now;
+            if (++n <= 400 && (n <= 20 || (n % 25) == 0))
+                fprintf(stderr, "[resync-loop] #%d fence=%u GET 0x%06X -> PUT 0x%06X\n", n, fence, get, put);
+        }
+        /* FRAME-4 wedge dump (GET=PUT but reserve still waiting): read t1's libgcm
+         * reserve frame to get the danger region [SP+0x70,SP+0x74] it waits for, so we
+         * learn the exact GET value that clears it (resolves the io-vs-EA confusion). */
+        else if (get == put && fence >= 3u && (now - stuck_since) > 400u) {
+            extern ppu_context* g_yz_main_ctx;
+            static int dumped = 0;
+            if (!dumped && g_yz_main_ctx) { dumped = 1;
+                uint32_t sp = (uint32_t)g_yz_main_ctx->gpr[1];
+                uint32_t ctr = (uint32_t)g_yz_main_ctx->ctr;
+                fprintf(stderr, "[frame4] t1 SP=0x%08X ctr=0x%08X GET=0x%06X PUT=0x%06X fence=%u\n",
+                        sp, ctr, get, put, fence);
+                for (uint32_t off = 0x60; off <= 0x80; off += 4)
+                    fprintf(stderr, "    [SP+0x%02X]=0x%08X\n", off, vm_read32(sp + off));
+                fflush(stderr);
+            }
+        }
+    }
 }
 
 /* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
@@ -1051,6 +1193,10 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
+    if (getenv("YZ_RESYNC_PROBE"))
+        CreateThread(NULL, 0, yz_resync_probe, NULL, 0, NULL);
+    if (getenv("YZ_RESYNC_LOOP"))
+        CreateThread(NULL, 0, yz_resync_loop, NULL, 0, NULL);
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
