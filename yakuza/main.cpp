@@ -62,6 +62,7 @@ extern "C" uint32_t g_ps3_sdk_version;
  * dispatch. The kernel DMAs the service to LS 0xA00 and branches there. */
 extern "C" void spu_recomp_register(void);
 extern "C" void spu_recomp_register_sysservice(void);
+extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
 /* recomp_prx/gs_task.c (generated) — the game's Edge geometry render task
  * (gs_task.elf, EBOOT SPU img #3 @0x0127A580, LS base 0x3000, entry 0x3050).
  * Registered so spu_indirect_branch runs it once the SPURS kernel dispatches
@@ -1148,6 +1149,11 @@ int main(int argc, char** argv)
     yz_install_imports();
     printf("[boot] installed %u import bridges\n", g_yz_import_count);
     g_ps3_guest_caller = guest_caller;
+
+    /* Read the real title id (+ title/version) from the game's PARAM.SFO so every
+     * title-id-based path (cellGame content/boot/data, cellDiscGame) is correct for
+     * ANY title -- not a hardcoded placeholder (the /dev_hdd0/game/BLES00000 bug). */
+    cellGame_init_from_paramsfo("gamedata/dev_bdvd/PS3_GAME/PARAM.SFO");
 
     /* Main PPU thread stack */
     uint32_t stack_base = vm_stack_allocate(&g_stacks, 1024 * 1024);

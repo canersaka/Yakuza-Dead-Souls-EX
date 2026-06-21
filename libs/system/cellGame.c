@@ -28,7 +28,7 @@
  * Internal state
  * -----------------------------------------------------------------------*/
 
-static char s_title_id[64]  = "BLES00000";
+static char s_title_id[64]  = "BLUS30826";  /* fallback; overridden at boot by cellGame_init_from_paramsfo (reads PARAM.SFO) */
 static char s_title[256]    = "Unknown Title";
 static char s_app_ver[16]   = "01.00";
 
@@ -99,6 +99,90 @@ void cellGame_set_content_path(const char* path)
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
+
+/* ---------------------------------------------------------------------------
+ * PARAM.SFO -> title id (2026-06-21): the ROBUST fix for title-id paths.
+ *
+ * Root cause of the /dev_hdd0/game/BLES00000 bug: s_title_id was a hardcoded
+ * placeholder and cellGame_set_title_id() was never called, so EVERY title-id
+ * path (cellGameContentPermit/BootCheck/DataCheck/web + cellDiscGameGetBootDiscInfo)
+ * used the wrong id. Fix: read the real id from the game's PARAM.SFO once at boot
+ * (main.cpp -> cellGame_init_from_paramsfo) so it's correct for ANY title.
+ *
+ * SFO format is LITTLE-ENDIAN: header @0 (magic "\0PSF", key_table@0x08,
+ * data_table@0x0C, entries@0x10), then entries[0x10 each]: key_off(u16)@0,
+ * fmt(u16)@2, data_len(u32)@4, data_max(u32)@8, data_off(u32)@0xC.
+ * -----------------------------------------------------------------------*/
+static int sfo_read_string(const char* sfo_path, const char* key,
+                           char* out, int out_size)
+{
+    FILE* fp = fopen(sfo_path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz < 0x14 || sz > (1 << 20)) { fclose(fp); return -1; }
+    unsigned char* d = (unsigned char*)malloc((size_t)sz);
+    if (!d) { fclose(fp); return -1; }
+    int ok = (fread(d, 1, (size_t)sz, fp) == (size_t)sz);
+    fclose(fp);
+    if (!ok) { free(d); return -1; }
+
+    int ret = -1;
+    if (d[0]==0x00 && d[1]==0x50 && d[2]==0x53 && d[3]==0x46) {  /* "\0PSF" */
+        #define SFO_RD32(o) ((u32)d[o] | ((u32)d[(o)+1]<<8) | ((u32)d[(o)+2]<<16) | ((u32)d[(o)+3]<<24))
+        #define SFO_RD16(o) ((u16)d[o] | ((u16)d[(o)+1]<<8))
+        u32 key_tab  = SFO_RD32(0x08);
+        u32 data_tab = SFO_RD32(0x0C);
+        u32 n        = SFO_RD32(0x10);
+        for (u32 i = 0; i < n; i++) {
+            u32 e = 0x14 + i * 0x10;
+            if (e + 0x10 > (u32)sz) break;
+            u32 key_off  = SFO_RD16(e + 0x00);
+            u32 data_len = SFO_RD32(e + 0x04);
+            u32 data_off = SFO_RD32(e + 0x0C);
+            if (key_tab + key_off >= (u32)sz) continue;
+            if (strcmp((const char*)(d + key_tab + key_off), key) != 0) continue;
+            u32 src = data_tab + data_off;
+            if (src >= (u32)sz) break;
+            int copy = (int)data_len;
+            if (copy > (int)((u32)sz - src)) copy = (int)((u32)sz - src);
+            if (copy >= out_size) copy = out_size - 1;
+            if (copy < 0) copy = 0;
+            memcpy(out, d + src, (size_t)copy);
+            out[copy] = '\0';
+            ret = 0;
+            break;
+        }
+        #undef SFO_RD32
+        #undef SFO_RD16
+    }
+    free(d);
+    return ret;
+}
+
+/* Read TITLE_ID / TITLE / APP_VER from the game's PARAM.SFO at boot. Call once
+ * from main.cpp before the guest runs. Falls back to the defaults if the SFO
+ * can't be read (keeps the game working without it). */
+void cellGame_init_from_paramsfo(const char* sfo_path)
+{
+    char tmp[256];
+    if (sfo_read_string(sfo_path, "TITLE_ID", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_title_id, tmp, sizeof(s_title_id) - 1);
+        s_title_id[sizeof(s_title_id) - 1] = '\0';
+        printf("[cellGame] title id from PARAM.SFO ('%s'): '%s'\n", sfo_path, s_title_id);
+    } else {
+        printf("[cellGame] PARAM.SFO not read ('%s'); keeping title id '%s'\n",
+               sfo_path, s_title_id);
+    }
+    if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
+    }
+}
+
+/* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
+const char* cellGame_get_title_id(void) { return s_title_id; }
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)

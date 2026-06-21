@@ -319,7 +319,10 @@ s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
         *type = CELL_DISCGAME_TYPE_HDD; /* pretend HDD game */
 
     if (titleId && titleIdSize > 0) {
-        strncpy(titleId, "GAME00000", titleIdSize - 1);
+        /* Use the real title id (from PARAM.SFO at boot) instead of a placeholder. */
+        extern const char* cellGame_get_title_id(void);
+        const char* tid = cellGame_get_title_id();
+        strncpy(titleId, tid && tid[0] ? tid : "GAME00000", titleIdSize - 1);
         titleId[titleIdSize - 1] = '\0';
     }
 
