@@ -533,6 +533,19 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     return event_queue_push(q, &evt);
 }
 
+/* Public helper: resolve an event queue by its ipc_key (as registered at
+ * sys_event_queue_create). Returns the queue_id (1-based) or 0 if none. Used by
+ * cellAudio to route the audio-period notify event to the game's queue. */
+unsigned int sys_event_find_queue_by_key(unsigned long long key)
+{
+    if (key == 0) return 0;
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+        if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key)
+            return (unsigned int)(i + 1);
+    }
+    return 0;
+}
+
 int64_t sys_event_port_send(ppu_context* ctx)
 {
     uint32_t port_id = LV2_ARG_U32(ctx, 0);

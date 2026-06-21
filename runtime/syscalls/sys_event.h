@@ -153,6 +153,9 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
                                uint64_t source, uint64_t data1,
                                uint64_t data2,  uint64_t data3);
 
+/* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
+unsigned int sys_event_find_queue_by_key(unsigned long long key);
+
 #ifdef __cplusplus
 }
 #endif
