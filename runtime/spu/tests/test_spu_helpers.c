@@ -30,8 +30,15 @@ static u128 make128(uint64_t hi, uint64_t lo) {
  * fsmbi, byte permutations). make128 above interprets values according to
  * host endianness, which is fine only for lane-symmetric vectors. */
 static u128 from_bytes(const uint8_t b[16]) {
+    /* Adapted to THIS runtime's u128 convention. Our u128 is host-native
+     * little-endian (_u32[i] = SPU word i as a value), so SPU byte i lives at
+     * _u8[SPU_W(i)], not _u8[i]. Upstream's u128 is a big-endian byte array
+     * (_u8[i] = SPU byte i), which is what these ISA vectors were written for.
+     * Routing the byte vector through SPU_W is the only change needed to make
+     * the byte-layout tests (shufb, cwd/cbd/chd/cdd, byte shifts) evaluate in
+     * our representation; every byte-position op already maps through SPU_W. */
     u128 r;
-    for (int i = 0; i < 16; i++) r._u8[i] = b[i];
+    for (int i = 0; i < 16; i++) r._u8[SPU_W(i)] = b[i];
     return r;
 }
 
