@@ -17,6 +17,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "../../runtime/memory/vm.h"   /* vm_commit, vm_to_host, vm_base */
+
+/* sys_event helpers (C-linkage; defined in runtime/syscalls/sys_event.c).
+ * Declared directly to avoid pulling sys_event.h's C++ guards into this C file. */
+extern int          sys_event_queue_push_by_id(unsigned int qid, unsigned long long src,
+                                               unsigned long long d1, unsigned long long d2,
+                                               unsigned long long d3);
+extern unsigned int sys_event_find_queue_by_key(unsigned long long key);
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -129,6 +137,49 @@ static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 static mutex_t       s_audio_mutex;
+
+/* ---------------------------------------------------------------------------
+ * Guest-VM audio buffers + big-endian I/O (2026-06-21)
+ *
+ * The audio port ring buffer and read-index must live in GUEST VM so the game
+ * gets real guest EAs it can read/write (the old code handed out host calloc
+ * pointers -> the game couldn't use them). Dedicated region at 0x50000000,
+ * outside the sys_memory window (0x40000000-0x50000000) and the stack
+ * (0xD0000000+). Committed on first use; bump-allocated (audio buffers are
+ * never individually freed during a session).
+ * -----------------------------------------------------------------------*/
+#define AUDIO_VM_BASE  0x50000000u
+#define AUDIO_VM_SIZE  0x00400000u   /* 4 MB */
+static u32 s_audio_vm_bump = AUDIO_VM_BASE;
+static int s_audio_vm_ready = 0;
+
+static u32 audio_vm_alloc(u32 size)
+{
+    size = (size + 0x7Fu) & ~0x7Fu;   /* 128-byte align */
+    if (!s_audio_vm_ready) {
+        if (vm_commit(AUDIO_VM_BASE, AUDIO_VM_SIZE) != CELL_OK)
+            return 0;
+        s_audio_vm_ready = 1;
+    }
+    if ((u64)s_audio_vm_bump + size > (u64)AUDIO_VM_BASE + AUDIO_VM_SIZE)
+        return 0;
+    u32 a = s_audio_vm_bump;
+    s_audio_vm_bump += size;
+    return a;
+}
+
+/* Write host->guest in big-endian (the guest is PPC BE). */
+static void audio_be_w32(u32 ea, u32 v)
+{
+    unsigned char* p = (unsigned char*)vm_to_host(ea);
+    p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >>  8); p[3] = (unsigned char)v;
+}
+static void audio_be_w64(u32 ea, u64 v)
+{
+    audio_be_w32(ea,     (u32)(v >> 32));
+    audio_be_w32(ea + 4, (u32)v);
+}
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
@@ -393,8 +444,12 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
-        /* Advance read index */
+        /* Advance read index + publish the block index to the guest (BE u64 at
+         * read_idx_addr) so the game's audio loop sees blocks being consumed and
+         * keeps feeding the next one (matches RPCS3: *index = cur_pos, 0..nBlock-1). */
         port->read_index++;
+        if (port->read_idx_addr)
+            audio_be_w64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -412,13 +467,17 @@ static void audio_mix_one_block(void)
 
 static void audio_notify_event_queues(void)
 {
-    /*
-     * In a full emulator, this would send a sys_event to each registered
-     * event queue so the game knows it can write the next audio block.
-     * Here we just update state; the game-side event queue integration
-     * would be in the sys_event module.
-     */
-    (void)s_notify_queues; /* suppress unused warning */
+    /* Push the audio-period event (data1 = CELL_AUDIO_EVENT_MIX = 0) to each
+     * registered notify queue, so the game's audio loop (blocked on
+     * sys_event_queue_receive) wakes once per block and writes the next one.
+     * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (!s_notify_queues[i].in_use) continue;
+        unsigned int qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
+        if (qid)
+            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+    }
 }
 
 #ifdef _WIN32
@@ -546,10 +605,7 @@ s32 cellAudioQuit(void)
 
     /* Free all port buffers */
     for (int i = 0; i < CELL_AUDIO_PORT_MAX; i++) {
-        if (s_ports[i].buffer) {
-            free(s_ports[i].buffer);
-            s_ports[i].buffer = NULL;
-        }
+        s_ports[i].buffer = NULL;   /* guest-VM bump region; not malloc'd */
         s_ports[i].in_use = 0;
         s_ports[i].running = 0;
     }
@@ -559,21 +615,47 @@ s32 cellAudioQuit(void)
     return CELL_OK;
 }
 
+/* Guest structs are big-endian (PPC); the import bridge hands us a HOST pointer
+ * into guest VM, so multi-byte fields must be byteswapped to host order before
+ * use. (Bug found 2026-06-20: nChannel was read raw -> 0x0800000000000000 instead
+ * of 8 -> CELL_AUDIO_ERROR_PARAM -> the game aborted audio init -> the surround
+ * mixer + the CRI movie pipeline collapsed. RPCS3 reads 8 and proceeds.) */
+static inline u64 ca_be64(u64 v) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#else
+    return __builtin_bswap64(v);
+#endif
+}
+static inline u32 ca_be32(u32 v) {
+#if defined(_MSC_VER)
+    return _byteswap_ulong(v);
+#else
+    return __builtin_bswap32(v);
+#endif
+}
+
 s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 {
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
-           param ? (unsigned long long)param->nChannel : 0ULL,
-           param ? (unsigned long long)param->nBlock : 0ULL);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
     if (!param || !portNum)
         return CELL_AUDIO_ERROR_PARAM;
 
+    /* Byteswap the big-endian guest param into a host-native copy. */
+    CellAudioPortParam hp;
+    hp.nChannel = ca_be64(param->nChannel);
+    hp.nBlock   = ca_be64(param->nBlock);
+    hp.attr     = ca_be64(param->attr);
+    { union { u32 u; float f; } lv; lv.u = ca_be32(*(const u32*)&param->level); hp.level = lv.f; }
+
+    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
+           (unsigned long long)hp.nChannel, (unsigned long long)hp.nBlock);
+
     /* Validate parameters */
-    u64 nch = param->nChannel;
-    u64 nblk = param->nBlock;
+    u64 nch = hp.nChannel;
+    u64 nblk = hp.nBlock;
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
     if (nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 && nblk != CELL_AUDIO_BLOCK_32)
@@ -598,25 +680,27 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     AudioPortSlot* port = &s_ports[found];
     port->in_use  = 1;
     port->running = 0;
-    port->param   = *param;
+    port->param   = hp;          /* host-native (byteswapped) copy */
     port->read_index  = 0;
     port->write_index = 0;
 
-    /* Allocate audio buffer */
+    /* Allocate the audio ring buffer + read-index in GUEST VM, so the game can
+     * read/write them via guest EAs (cellAudioGetPortConfig hands these back). */
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
-    port->buf_size = buf_samples * (u32)sizeof(float);
-    port->buffer = (float*)calloc(buf_samples, sizeof(float));
+    port->buf_size  = buf_samples * (u32)sizeof(float);
+    u32 g_buf  = audio_vm_alloc(port->buf_size);
+    u32 g_ridx = audio_vm_alloc(16);   /* read-index counter (u64) */
 
-    if (!port->buffer) {
+    if (!g_buf || !g_ridx) {
         port->in_use = 0;
         mutex_unlock(&s_audio_mutex);
         return CELL_ENOMEM;
     }
 
-    /* Set guest-visible addresses (using host pointers as placeholder).
-     * In a full emulator these would be allocated from guest VM memory. */
-    port->port_addr    = (u64)(uintptr_t)port->buffer;
-    port->read_idx_addr = (u64)(uintptr_t)&port->read_index;
+    port->buffer        = (float*)vm_to_host(g_buf);  /* host view for the mixer */
+    port->port_addr     = (u64)g_buf;                 /* guest EA for the game    */
+    port->read_idx_addr = (u64)g_ridx;                /* guest EA: read index     */
+    audio_be_w64(g_ridx, 0);                          /* read index starts at 0   */
 
     *portNum = (u32)found;
 
@@ -641,11 +725,8 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    if (s_ports[portNum].buffer) {
-        free(s_ports[portNum].buffer);
-        s_ports[portNum].buffer = NULL;
-    }
-
+    /* Buffer lives in the guest-VM bump region (not malloc'd) -- don't free it. */
+    s_ports[portNum].buffer  = NULL;
     s_ports[portNum].in_use  = 0;
     s_ports[portNum].running = 0;
 
@@ -753,17 +834,24 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 
     AudioPortSlot* port = &s_ports[portNum];
 
-    memset(config, 0, sizeof(CellAudioPortConfig));
-    config->nChannel      = port->param.nChannel;
-    config->nBlock        = port->param.nBlock;
-    config->portSize      = port->buf_size;
-    config->portAddr      = port->port_addr;
-    config->readIndexAddr = port->read_idx_addr;
-
-    if (port->running)
-        config->status = CELL_AUDIO_STATUS_RUN;
-    else
-        config->status = CELL_AUDIO_STATUS_READY;
+    /* Write the guest CellAudioPortConfig (32 bytes, BIG-ENDIAN) at its real PS3
+     * offsets (RPCS3 cellAudio.h): readIndexAddr@0(u32) status@4(u32)
+     * nChannel@8(u64) nBlock@16(u64) portSize@24(u32) portAddr@28(u32).
+     * (The host struct layout differs; write the guest bytes explicitly.) */
+    unsigned char* c = (unsigned char*)config;
+    memset(c, 0, 32);
+    u32 status = port->running ? (u32)CELL_AUDIO_STATUS_RUN
+                               : (u32)CELL_AUDIO_STATUS_READY;
+    #define WBE32(o, val) do { u32 v_ = (u32)(val); \
+        c[(o)+0]=(unsigned char)(v_>>24); c[(o)+1]=(unsigned char)(v_>>16); \
+        c[(o)+2]=(unsigned char)(v_>>8);  c[(o)+3]=(unsigned char)v_; } while(0)
+    WBE32(0,  (u32)port->read_idx_addr);
+    WBE32(4,  status);
+    WBE32(8,  (u32)(port->param.nChannel >> 32)); WBE32(12, (u32)port->param.nChannel);
+    WBE32(16, (u32)(port->param.nBlock   >> 32)); WBE32(20, (u32)port->param.nBlock);
+    WBE32(24, port->buf_size);
+    WBE32(28, (u32)port->port_addr);
+    #undef WBE32
 
     mutex_unlock(&s_audio_mutex);
 
