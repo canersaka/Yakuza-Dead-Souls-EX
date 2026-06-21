@@ -328,7 +328,9 @@ class SPULifter:
             # double-precision (2 doubles/reg) + double compares
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
             "dfceq": "spu_dfceq", "dfcmeq": "spu_dfcmeq",
+            "dfcgt": "spu_dfcgt", "dfcmgt": "spu_dfcmgt",
             "mpyhhu": "spu_mpyhhu",
+            "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",
             "cg": "spu_cg", "bg": "spu_bg",
             "sumb": "spu_sumb",   # sum bytes of each word into the two halfwords
             # Phase 2: register-variable shifts/rotates
@@ -379,7 +381,8 @@ class SPULifter:
             # Phase 3: halfword/byte immediate logic
             "andhi": "spu_andhi", "andbi": "spu_andbi",
             "orhi":  "spu_orhi",  "orbi":  "spu_orbi",
-            "xorhi": "spu_xorhi",
+            "xorhi": "spu_xorhi", "xorbi": "spu_xorbi",
+            "dftsv": "spu_dftsv",
             # RI8 float<->int conversions with scale (i8 in ops[2])
             "cflts": "spu_cflts", "cfltu": "spu_cfltu",
             "csflt": "spu_csflt", "cuflt": "spu_cuflt",
@@ -432,6 +435,9 @@ class SPULifter:
             return f"{g(rt())} = spu_cgx({g(ra())}, {g(rb())}, {g(rt())});"
         # double FMA (dfma/dfms/dfnms/dfnma): 3-register, RT is the accumulator (c).
         if mn in ("dfma", "dfms", "dfnms", "dfnma"):
+            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rt())});"
+        # mpyhha/mpyhhau: high-half multiply accumulated into RT (3-register).
+        if mn in ("mpyhha", "mpyhhau"):
             return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rt())});"
 
         # ---- quadword loads / stores ----
@@ -512,6 +518,14 @@ class SPULifter:
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx); "
                     f"SPU_DRAIN(ctx);")
+        # bisled: set link, branch to RA only if an external event is pending.
+        if mn in ("bisled",):
+            link_rt = insn.raw & 0x7F
+            tgt_reg = _reg(ops[0])
+            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+                    f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -529,6 +543,9 @@ class SPULifter:
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
             return "/* branch hint (ignored) */;"
+        # mtspr: SPU special-purpose-register writes are ignored (RPCS3: SPRs unused)
+        if mn == "mtspr":
+            return "/* mtspr: SPR write ignored */;"
 
         # ---- fallthrough: unsupported ----
         self.unsupported[mn] = self.unsupported.get(mn, 0) + 1
