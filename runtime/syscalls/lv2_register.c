@@ -188,6 +188,13 @@ typedef struct {
      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
      * PPU code blocked on sys_event_queue_receive wakes up. */
     uint32_t event_queue_id;
+    /* SPU->PPU user-event ports: connect_event_all_threads(req, *spup) assigns a
+     * free port from `req`, binds the queue to it, and returns the port in *spup.
+     * spup_queue[port] = the connected event-queue id (0 = unconnected). The SPU's
+     * outbound interrupt mailbox (SPU_WrOutIntrMbox) delivers a class-2 event to
+     * the queue on its port. (2026-06-21 pt29: this was unimplemented -> SPU->PPU
+     * events were silently dropped -> SPURS/CRI coordination stalled.) */
+    uint32_t spup_queue[64];
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -795,6 +802,39 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_thread_group_connect_event_all_threads(group_id, queue_id, req, spup)
+ * (syscall 251). req = bitmask of allowed SPU ports; allocate the first free port
+ * in req, bind the queue to it (per group), and WRITE the chosen port number to the
+ * *spup out-param (u8). The caller (libsre/libmixer) uses that port to identify
+ * SPU-emitted class-2 events. Our prior handler ignored req + never wrote *spup, so
+ * the caller got a garbage port -> SPU<->PPU event routing was broken -> libmixer's
+ * setup never completed (no cellAudioPortStart) and the CRI player stalled.
+ * Matches RPCS3 sys_spu.cpp:sys_spu_thread_group_connect_event_all_threads. */
+static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
+{
+    uint32_t group_id = (uint32_t)ctx->gpr[3];
+    uint32_t queue_id = (uint32_t)ctx->gpr[4];
+    uint64_t req      = ctx->gpr[5];
+    uint32_t spup_ea  = (uint32_t)ctx->gpr[6];   /* out: u8 assigned port */
+    spu_group_t* g = spu_find_group(group_id);
+    if (!g)   { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; return -1; } /* ESRCH  */
+    if (!req) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; return -1; } /* EINVAL */
+    int port = -1;
+    for (int p = 0; p < 64; p++) {
+        if (!(req & (1ull << p))) continue;
+        if (g->spup_queue[p] == 0) { port = p; break; }
+    }
+    if (port < 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000C; return -1; } /* EISCONN */
+    g->spup_queue[port] = queue_id;
+    if (spup_ea) vm_write8(spup_ea, (uint8_t)port);   /* the out-param the caller reads */
+    fprintf(stderr, "[SPU] group_connect_event_all_threads group=0x%X queue=0x%X "
+            "req=0x%llX -> port=%d (spup@0x%X)\n", group_id, queue_id,
+            (unsigned long long)req, port, spup_ea);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
@@ -1151,5 +1191,5 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
