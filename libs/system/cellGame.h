@@ -87,6 +87,13 @@ typedef struct CellGameContentSize {
 /* Set the game's title ID (e.g., "BLUS30443") */
 void cellGame_set_title_id(const char* title_id);
 
+/* Read TITLE_ID/TITLE/APP_VER from the game's PARAM.SFO at boot (robust title id
+ * for all path building). Falls back to defaults if the SFO can't be read. */
+void cellGame_init_from_paramsfo(const char* sfo_path);
+
+/* Central title-id accessor (so other modules don't hardcode placeholders). */
+const char* cellGame_get_title_id(void);
+
 /* Set the game's title string */
 void cellGame_set_title(const char* title);
 
