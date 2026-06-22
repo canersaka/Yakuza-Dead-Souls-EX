@@ -470,6 +470,12 @@ class SPULifter:
         # ---- branches ----
         if mn in ("br", "bra"):
             tgt = self._branch_target(insn)
+            # SELF-LOOP TRAP: `br .` (target == this instruction) is an infinite
+            # hang on real SPU -- a deliberate trap, no forward progress. Emitting
+            # `goto loc_self` busy-spins the host thread forever; stop the SPU
+            # instead (same halt path the lifter emits for a `stop` instruction).
+            if tgt == addr:
+                return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
             return self._uncond_branch(tgt, func)
         if mn in ("brsl", "brasl"):
             # The disassembler drops the link register from brsl operands, so
@@ -477,6 +483,24 @@ class SPULifter:
             link_rt = insn.raw & 0x7F
             tgt = self._branch_target(insn)
             link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
+            # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
+            # infinite loop on real SPU (re-sets the link each pass, never
+            # advances) -- a trap, NOT a call. Emitting a host call recurses
+            # forever -> host stack overflow -> segfault (observed crashing the
+            # boot in cri_audio_00023C58). Set the link, then stop the SPU (same
+            # halt path the lifter emits for a `stop` instruction).
+            if tgt == addr:
+                return f"{link} ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+            # PC-GETTER IDIOM: `brsl rX, .+4` (target == next instruction) just
+            # loads PC+4 into rX for PC-relative addressing / computed jump tables;
+            # it is NOT a real call. Emitting a host call here imbalances the C
+            # call/return nesting -- the "callee" falls through into the rest of
+            # the function and a later `bi $r0` return unwinds to this brsl's frame
+            # instead of the real caller (observed: SPURS taskset LoadElf's return
+            # landed back inside its own clear loop, running it with a stale count).
+            # Treat it as: set the link, then fall through to addr+4.
+            if tgt == addr + 4:
+                return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 # Call, then drain any tail-call the callee left pending so
