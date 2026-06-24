@@ -355,15 +355,19 @@ static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
     mode |= CELL_FS_S_IWUSR; /* assume writable on Windows */
 #endif
 
+    /* CellFsStat is 52 bytes, 4-byte-packed (RPCS3 sys_fs.h CHECK_SIZE_ALIGN(52,4)):
+     * mode@0 uid@4 gid@8 atime@12 mtime@20 ctime@28 size@36 blksize@44 -- the s64
+     * times/sizes are 4-byte aligned (NO pad@12). Prior layout 8-aligned them ->
+     * st_size landed at +40 instead of +36 (garbage file sizes for a guest using
+     * the raw sys_fs syscall; the cellFs *lib* path is separately correct). */
     write_be32(stat_addr + 0,  mode);
     write_be32(stat_addr + 4,  0);  /* uid */
     write_be32(stat_addr + 8,  0);  /* gid */
-    write_be32(stat_addr + 12, 0);  /* pad */
-    write_be64(stat_addr + 16, (uint64_t)st->st_atime);
-    write_be64(stat_addr + 24, (uint64_t)st->st_mtime);
-    write_be64(stat_addr + 32, (uint64_t)st->st_ctime);
-    write_be64(stat_addr + 40, (uint64_t)st->st_size);
-    write_be64(stat_addr + 48, 4096ULL);  /* blksize */
+    write_be64(stat_addr + 12, (uint64_t)st->st_atime);
+    write_be64(stat_addr + 20, (uint64_t)st->st_mtime);
+    write_be64(stat_addr + 28, (uint64_t)st->st_ctime);
+    write_be64(stat_addr + 36, (uint64_t)st->st_size);
+    write_be64(stat_addr + 44, 4096ULL);  /* blksize */
 }
 
 /* ---------------------------------------------------------------------------
