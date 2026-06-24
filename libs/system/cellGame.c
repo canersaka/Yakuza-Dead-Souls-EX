@@ -257,7 +257,12 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);
 
     if (size) {
-        size->hddFreeSizeKB = 1024 * 1024;
+        /* CellGameContentSize is guest big-endian. hddFreeSizeKB must be written BE
+         * (was host-endian -> game read ~4 MB free instead of 1 GB and could refuse).
+         * sizeKB(=NOTCALC 0xFFFFFFFF) and sysSizeKB(=0) are byte-invariant. */
+        unsigned char* p = (unsigned char*)&size->hddFreeSizeKB;
+        u32 v = 1024u * 1024u;
+        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
         size->sizeKB = CELL_GAME_SIZEKB_NOTCALC;
         size->sysSizeKB = 0;
     }

@@ -11,6 +11,7 @@
  */
 
 #include "cellPad.h"
+#include "ps3emu/endian.h"   /* ps3_bswap16/32: CellPadData/Info2 are guest big-endian */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -435,6 +436,11 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
     }
 
+    /* CellPadData is guest big-endian: byte-swap len + every button (else the game
+     * reads byte-swapped buttons/analog). */
+    data->len = (s32)ps3_bswap32((u32)data->len);
+    for (size_t i = 0; i < sizeof(data->button)/sizeof(data->button[0]); i++)
+        data->button[i] = ps3_bswap16(data->button[i]);
     return CELL_OK;
 }
 
@@ -469,6 +475,16 @@ s32 cellPadGetInfo2(CellPadInfo2* info)
         }
     }
     info->now_connect = connected;
+
+    /* CellPadInfo2 is guest big-endian: byte-swap all u32 fields. */
+    info->max_connect = ps3_bswap32(info->max_connect);
+    info->now_connect = ps3_bswap32(info->now_connect);
+    for (size_t i = 0; i < sizeof(info->port_status)/sizeof(info->port_status[0]); i++) {
+        info->port_status[i]       = ps3_bswap32(info->port_status[i]);
+        info->port_setting[i]      = ps3_bswap32(info->port_setting[i]);
+        info->device_capability[i] = ps3_bswap32(info->device_capability[i]);
+        info->device_type[i]       = ps3_bswap32(info->device_type[i]);
+    }
 
     return CELL_OK;
 }
