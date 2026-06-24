@@ -2336,6 +2336,12 @@ extern "C" void yz_rsx_vblank_tick(void)
             vm_write64(ha + 0x00, t);                     /* lastFlipTime */
             vm_write64(RSX_REPORTS + 0x10, 0);            /* flip sema (u128) = 0 */
             vm_write64(RSX_REPORTS + 0x18, 0);
+            /* Faithful flip-completion (replaces the YZ_FLIPADV band-aid's external
+             * fence nudge): advance the counter the game's render throttle
+             * func_00EAC46C polls (`while *(0x40C00000)+2 <= target`). Real RSX
+             * bumps this once per presented flip; we present right here, so bump it
+             * here -- exactly once per retired flip, ordered after present+label-clear. */
+            vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
             flip_ev |= (uint64_t)(0x8u << 1);             /* SYS_RSX_EVENT_FLIP_BASE<<1 */
         }
     }
