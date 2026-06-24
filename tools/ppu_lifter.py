@@ -409,11 +409,16 @@ class PPULifter:
 
         if mn in ("divw", "divw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] / (int32_t)ctx->gpr[{rb}]);"
+            # PPC leaves rD undefined for /0 and INT_MIN/-1; C makes both UB (SIGFPE).
+            # Guard -> 0 (matches RPCS3); the . variant still records CR0 from the result.
+            return (f"ctx->gpr[{rd}] = (int64_t)(int32_t)(((int32_t)ctx->gpr[{rb}] == 0 || "
+                    f"((int32_t)ctx->gpr[{ra}] == (int32_t)0x80000000 && (int32_t)ctx->gpr[{rb}] == -1)) ? 0 : "
+                    f"((int32_t)ctx->gpr[{ra}] / (int32_t)ctx->gpr[{rb}]));")
 
         if mn in ("divwu", "divwu."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{ra}] / (uint32_t)ctx->gpr[{rb}]);"
+            return (f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rb}] == 0 ? 0 : "
+                    f"((uint32_t)ctx->gpr[{ra}] / (uint32_t)ctx->gpr[{rb}]));")
 
         # ------- Logical -------
         if mn == "ori":
@@ -497,11 +502,13 @@ class PPULifter:
 
         if mn in ("slw", "slw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x3F));"
+            # PPC: shift count (bit26 set => >=32) yields 0. Compute in u64 then
+            # truncate so counts 32..63 naturally give 0 (a u32<<>=32 is C-UB).
+            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)(uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("srw", "srw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
+            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)(uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("sraw", "sraw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1011,8 +1018,10 @@ class PPULifter:
 
         if mn == "divd":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"ctx->gpr[{rd}] = (ctx->gpr[{rb}] != 0) ? "
-                    f"(int64_t)ctx->gpr[{ra}] / (int64_t)ctx->gpr[{rb}] : 0;")
+            # Guard /0 and INT64_MIN/-1 (both UB in C) -> 0, as RPCS3 does.
+            return (f"ctx->gpr[{rd}] = ((int64_t)ctx->gpr[{rb}] == 0 || "
+                    f"((int64_t)ctx->gpr[{ra}] == (int64_t)0x8000000000000000ULL && (int64_t)ctx->gpr[{rb}] == -1)) "
+                    f"? 0 : ((int64_t)ctx->gpr[{ra}] / (int64_t)ctx->gpr[{rb}]);")
 
         if mn == "divdu":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1038,10 +1047,12 @@ class PPULifter:
 
         if mn in ("subfe", "subfe."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # XER[CA] = ADC carry-out of (~RA + RB + ca), per RPCS3 add64_flags.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
-                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result <= ctx->gpr[{rb}] && ca) ? (1u << 29) : 0); "
+                    f"uint64_t a = ~ctx->gpr[{ra}], b = ctx->gpr[{rb}]; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         # ------- addc/subfc (carry arithmetic, carry-out only, no carry-in) -------
@@ -1272,16 +1283,22 @@ class PPULifter:
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            # addme = RA + CA - 1 = RA + (~0) + CA; XER[CA] = ADC carry-out.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ctx->gpr[{ra}] + ca - 1; "
-                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result >= ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"uint64_t a = ctx->gpr[{ra}], b = ~0ULL; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfme"):
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            # subfme = ~RA + CA - 1 = ~RA + (~0) + CA; was MISSING the XER[CA] update.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ca - 1; "
+                    f"uint64_t a = ~ctx->gpr[{ra}], b = ~0ULL; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfze"):
