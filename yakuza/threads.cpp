@@ -219,6 +219,7 @@ static DWORD WINAPI thr_proc(LPVOID pv)
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.thread_id = p.tid;   /* lv2 mutex/cond ownership keys on this; 0 caused false EDEADLK */
     ctx.gpr[1]  = p.sp;
     ctx.gpr[3]  = p.arg;
     ctx.gpr[13] = p.r13;
