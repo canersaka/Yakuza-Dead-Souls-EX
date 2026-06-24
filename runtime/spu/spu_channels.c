@@ -287,8 +287,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             extern unsigned long g_spu_getllar_n, g_spu_evstat_rd;
             if (g_spu_getllar_n > 20000000UL) {
                 if (g_spu_evstat_rd < 20)
-                    fprintf(stderr, "[spu-ev] spu=%X RdEventStat steady: status=0x%X mask=0x%X\n",
-                            ctx->spu_id, ctx->event_status, ctx->event_mask);
+                    fprintf(stderr, "[spu-ev] spu=%X RdEventStat steady: status=0x%X mask=0x%X lr_raised=%lu\n",
+                            ctx->spu_id, ctx->event_status, ctx->event_mask, g_spu_lr_raise);
                 g_spu_evstat_rd++;
             }
         }
