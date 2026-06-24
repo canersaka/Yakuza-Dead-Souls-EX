@@ -355,12 +355,22 @@ extern SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx;
  * default -- one predicted-not-taken branch per hop. */
 extern int g_spu_prof_on;
 void spu_prof_hop(void* fn);
+/* Default-boot SPU taskset task launcher (spu_channels.c). On the non-prof path
+ * it intercepts the policy's StartTask hop so cri_audio/gs_task launch without
+ * YZ_SPU_PROF. Cheap: early-out unless the SPU's active image is the policy (2). */
+void spu_task_launch_check(spu_context* ctx, void* fn);
+/* Stop the SPU (spu_channels.c): sets ctx->status and longjmps to the host
+ * thread driver's setjmp target, fully unwinding the lifted call stack. Used by
+ * the lifter for self-loop traps (`br .`/`brsl .`), which hang the SPU forever
+ * on real hardware. Logs under env YZ_HALT_LOG. */
+void spu_halt(spu_context* ctx, int status);
 
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
             g_spu_trampoline_fn = 0;                           \
             if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
+            else spu_task_launch_check((ctx), (void*)_tf);     \
             _tf(ctx);                                          \
         }                                                     \
     } while (0)

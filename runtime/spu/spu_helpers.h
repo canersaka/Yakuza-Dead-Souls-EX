@@ -171,16 +171,20 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
 static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
 
-/* Float<->int conversions with scale (RI8). rpcs3/HW scale-table semantics:
- * scale[x] = 2^(x-155); cflts/cfltu use x=173-i8, csflt/cuflt use x=155-i8. */
-static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+/* Float<->int conversions with scale (RI8). HW/RPCS3 semantics (verified vs
+ * SPUInterpreter.cpp precise CFLTS=ldexp(a,173-i8) + SPUASMJITRecompiler.cpp):
+ *   cflts/cfltu: result = (int)(a * 2^(173-i8))   -- i8=173 is the identity
+ *   csflt/cuflt: result = (float)int * 2^(i8-155) -- i8=155 is the identity
+ * (Prior code applied a spurious -155 table offset -> off by 2^155; canonical
+ * conversions collapsed to ~0. f computed in double so 2^173 doesn't overflow.) */
+static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
-static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
-static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
-    for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
-static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
-    for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
+static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]+c._f32[i]; return r; }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]-c._f32[i]; return r; }

@@ -39,10 +39,19 @@ _Thread_local jmp_buf* g_spu_halt_jmp = 0;
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
 SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx = 0;
 int g_spu_dtrace_spu = -1;   /* spu_id whose dispatch tail to hop-trace after gs_task ELF load (-1=off) */
+int g_yz_codec_dispatch_spu = -1;  /* pt35: spu_id running the codec policy dispatch (armed at codec ELF load) */
 
 void spu_halt(spu_context* ctx, int status)
 {
     ctx->status = (uint32_t)status;
+    /* pt35 (env YZ_HALT_LOG): log SPU halts -- spursTasksetLoadElf/dispatch failures
+     * call spursHalt(spu), which lands here. Shows whether the codec policy SPU halts
+     * after LoadElf (the stuck-running symptom) and at what PC. */
+    { static int hl = -1; if (hl < 0) hl = getenv("YZ_HALT_LOG") ? 1 : 0;
+      if (hl) { static int n = 0; if (n < 40) { n++;
+          fprintf(stderr, "[spu-halt] spu=%X image=%d pc=0x%05X status=%d\n",
+                  ctx->spu_id, ctx->image_id, ctx->pc & SPU_LS_MASK, status);
+          fflush(stderr); } } }
     if (g_spu_halt_jmp)
         longjmp(*g_spu_halt_jmp, 1);
     /* No unwind target (e.g. unit test): fall back to returning. */
@@ -184,7 +193,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 
     switch (channel) {
     case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);       break;
-    case SPU_WrOutIntrMbox:  spu_channel_write(&ctx->ch_out_intr_mbox, v);  break;
+    case SPU_WrOutIntrMbox:
+        /* DIAG (pt29): does the SPU ever raise a class-2 outbound-interrupt event to
+         * the PPU? If so, it must be delivered to the queue connected via
+         * connect_event_all_threads (currently NOT forwarded -> SPU->PPU events
+         * dropped). Log the first few to confirm the path is exercised. */
+        { static unsigned long n = 0;
+          if (n < 40) { n++;
+              fprintf(stderr, "[SPU] WrOutIntrMbox v=0x%08X (event to PPU -- NOT forwarded yet)\n", v);
+              fflush(stderr); } }
+        spu_channel_write(&ctx->ch_out_intr_mbox, v);
+        break;
     case SPU_WrDec:          ctx->decrementer = v;                          break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break;
     case SPU_WrEventAck:     ctx->event_status &= ~v;                       break;
@@ -341,7 +360,11 @@ int g_yz_watch_dlist = 0;        /* YZ_WATCH_DLIST: watch PPU writes to io 0x110
 unsigned long g_yz_dlist_w = 0;  /* cap for the [dlist-w] log */
 uint32_t g_yz_taskset_ea = 0;    /* EA of the gs_task CellSpursTaskset (bitset line); captured from the task_info DMA */
 
-#define SPU_PROF_HSZ   8192            /* fn-pointer hash slots (>> registry) */
+/* fn-pointer hash slots. MUST exceed the total number of lifted SPU functions
+ * across ALL images, else spu_prof_insert()'s open-addressing probe never finds
+ * an empty slot and spins forever. With --seed-all on the policy + task modules
+ * the total reaches ~45k (gs_task ~9k, cri_audio ~32k), so size generously. */
+#define SPU_PROF_HSZ   (1u << 17)      /* 131072 slots */
 static void*    s_p_fn[SPU_PROF_HSZ];
 static uint32_t s_p_addr[SPU_PROF_HSZ];
 
@@ -359,18 +382,19 @@ static unsigned p_hash(void* fn)
 static void spu_prof_insert(uint32_t addr, spu_fn fn)
 {
     unsigned h = p_hash((void*)fn);
-    while (s_p_fn[h]) {
+    /* Guard against a full table: bounded probe so a future overflow degrades
+     * spu_prof_addr_of() (a diagnostic) instead of hanging registration. */
+    for (unsigned probes = 0; probes < SPU_PROF_HSZ; probes++) {
+        if (!s_p_fn[h]) { s_p_fn[h] = (void*)fn; s_p_addr[h] = addr; return; }
         if (s_p_fn[h] == (void*)fn) { s_p_addr[h] = addr; return; }
         h = (h + 1) & (SPU_PROF_HSZ - 1);
     }
-    s_p_fn[h]   = (void*)fn;
-    s_p_addr[h] = addr;
 }
 
 static uint32_t spu_prof_addr_of(void* fn)
 {
     unsigned h = p_hash(fn);
-    while (s_p_fn[h]) {
+    for (unsigned probes = 0; probes < SPU_PROF_HSZ && s_p_fn[h]; probes++) {
         if (s_p_fn[h] == fn) return s_p_addr[h];
         h = (h + 1) & (SPU_PROF_HSZ - 1);
     }
@@ -398,6 +422,232 @@ static void spu_prof_dump(void)
     for (int i = 0; i < g_spu_llar_nea; i++)
         fprintf(stderr, "    ea=0x%08X  x%lu\n", g_spu_llar_eas[i], g_spu_llar_cnt[i]);
     fflush(stderr);
+}
+
+/* Generalized SPU taskset task launch. Invoked when the taskset POLICY module
+ * (image 2) is about to run StartTask (LS 0x1CC0): the dispatch has DMA'd the
+ * selected task's TaskInfo to LS 0x2780 (args@0x2780, elf@0x2790) and set
+ * savedContextLr@0x2C80 = the task entry. Establish the launch ABI (RPCS3
+ * spursTasksetStartTask, cellSpursSpu.cpp:1395) and switch to the task's lifted
+ * IMAGE so the policy's `bi gpr2` transfers into the lifted task code.
+ *
+ * Discriminates the task by its TaskInfo ELF EA (the generic key):
+ *   0x0127A580 -> gs_task   (Edge geometry, image 0)
+ *   0x012B4980 -> cri_audio (SOFDEC/ADX codec, image 3)
+ * Replaces the gs_task-only hardcode (which also required YZ_SPU_PROF). gpr3 is
+ * read from the DMA'd TaskInfo (not hardcoded) so any task's args are correct.
+ * Off-switch: YZ_NOLAUNCH. */
+void spu_task_launch(spu_context* c)
+{
+    /* NOTE: tasks LAUNCH fine without this (the bi $r0 lifter fix), but disabling it
+     * REGRESSES movie frame progress (fence 28->14 measured) -- it still helps the
+     * ongoing dispatch/execution that produces frames, so it stays default-ON.
+     * Off-switch: YZ_NOLAUNCH. */
+    static int nolaunch = -1;
+    if (nolaunch < 0) nolaunch = getenv("YZ_NOLAUNCH") ? 1 : 0;
+    if (nolaunch) return;
+    const unsigned char* ls = c->ls;
+    uint32_t scl = ((uint32_t)ls[0x2C80]<<24)|((uint32_t)ls[0x2C81]<<16)
+                 |((uint32_t)ls[0x2C82]<<8)|ls[0x2C83];      /* savedContextLr = task entry */
+    uint32_t elf = ((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
+                 |((uint32_t)ls[0x2796]<<8)|ls[0x2797];      /* TaskInfo.elf EA (low 32) */
+    elf &= 0xFFFFFFF8u;                                       /* dispatch masks 3 flag bits */
+    int image;
+    if      (elf == 0x0127A580u) image = 0;   /* gs_task  */
+    else if (elf == 0x012B4980u) image = 3;   /* cri_audio codec */
+    else return;                              /* unknown task -- don't launch */
+
+    memset(c->gpr, 0, 128 * sizeof(c->gpr[0]));
+    c->gpr[3] = spu_ls_read128(c, 0x2780u);   /* gpr3 = taskInfo->args (DMA'd to LS) */
+    c->gpr[4]._u32[3] = 0x40197C80u;          /* gpr4 = spurs (validated band-aid layout) */
+    c->gpr[1]._u32[0] = 0x2C30u;              /* sp = taskset context stack */
+    c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry */
+    c->image_id = image;
+    if (!getenv("YZ_NO_MGMT")) {              /* SpursTasksetContext.tasksetMgmtAddr@0x2FB8=0x2700 */
+        c->ls[0x2FB8]=0x00; c->ls[0x2FB9]=0x00; c->ls[0x2FBA]=0x27; c->ls[0x2FBB]=0x00;
+    }
+    { static int n[8] = {0};
+      if (image < 8 && n[image] < 6) { n[image]++;
+        uint32_t tsPtr = ((uint32_t)ls[0x27BC]<<24)|((uint32_t)ls[0x27BD]<<16)
+                       |((uint32_t)ls[0x27BE]<<8)|ls[0x27BF];          /* taskset ptr (low32) @0x27B8 be64 */
+        uint32_t tId   = ((uint32_t)ls[0x27D4]<<24)|((uint32_t)ls[0x27D5]<<16)
+                       |((uint32_t)ls[0x27D6]<<8)|ls[0x27D7];          /* SpursTasksetContext.taskId */
+        fprintf(stderr, "[task-launch] %s entry=0x%04X elf=0x%08X image=%d args=%08X_%08X_%08X_%08X "
+                "| taskset=0x%08X taskId=%u\n",
+                image==3?"cri_audio":"gs_task", scl, elf, image,
+                c->gpr[3]._u32[0], c->gpr[3]._u32[1], c->gpr[3]._u32[2], c->gpr[3]._u32[3], tsPtr, tId);
+        fflush(stderr); } }
+}
+
+/* DEFAULT-boot launch interception (replaces the prof-gated path). Called from
+ * SPU_DRAIN on each trampoline hop when profiling is OFF; cheap early-out unless
+ * this SPU is running the taskset policy (image 2) about to enter StartTask. */
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    if (ctx->image_id != 2) return;
+    /* FIX TEST (env YZ_FIXEXIT): the policy poll (0x2318: bisl LS[0x1E0]) yields via the
+     * kernel-context exitToKernelAddr@LS 0x1E0, which MUST be 0x838 (CELL_SPURS_KERNEL2_
+     * EXIT_ADDR) + selectWorkloadAddr@0x1E4 = 0x290. Reliable trace shows ours is 0xA00 (the
+     * policy ENTRY) so the poll re-enters the policy instead of yielding -> infinite poll,
+     * never reaching the kernel. Force the correct addrs to test if THAT is the blocker. */
+    { static int fe = -1; if (fe < 0) fe = getenv("YZ_FIXEXIT") ? 1 : 0;
+      if (fe) { unsigned char* L = ctx->ls;
+          uint32_t e = ((uint32_t)L[0x1E0]<<24)|((uint32_t)L[0x1E1]<<16)|((uint32_t)L[0x1E2]<<8)|L[0x1E3];
+          if (e != 0x838u) { L[0x1E0]=0;L[0x1E1]=0;L[0x1E2]=0x08;L[0x1E3]=0x38;
+              static int n=0; if(n<8){n++; fprintf(stderr,"[fixexit] LS0x1E0 0x%08X -> 0x838\n", e); fflush(stderr);} }
+          uint32_t s = ((uint32_t)L[0x1E4]<<24)|((uint32_t)L[0x1E5]<<16)|((uint32_t)L[0x1E6]<<8)|L[0x1E7];
+          if (s != 0x290u) { L[0x1E4]=0;L[0x1E5]=0;L[0x1E6]=0x02;L[0x1E7]=0x90; } } }
+    uint32_t a = spu_prof_addr_of(fn);
+    /* THROWAWAY DIAG (env YZ_POLHOP): full control-flow path of the taskset POLICY
+     * (image 2). Locks onto the first image-2 SPU and logs its NON-SEQUENTIAL hops
+     * (real branches, a != prev+4) from entry 0xA00 onward -- shows exactly where the
+     * policy halts/loops before reaching the poll(0x2308)/exitToKernel(0x838)/SELECT_TASK
+     * /StartTask(0x1CC0) chain. Default boot unaffected (env-gated). */
+    { static int ph = -1; if (ph < 0) ph = getenv("YZ_POLHOP") ? 1 : 0;
+      if (ph) { static int lock = -1; if (lock < 0) lock = (int)ctx->spu_id;
+          if ((int)ctx->spu_id == lock) {
+              /* Log EVERY image-2 hop for this SPU (cap 2500): the exact sequential
+               * path so we can see precisely where the policy halts/loops/exits.
+               * Mark key SPURS addrs inline. */
+              static int n = 0;
+              if (n < 2500) { n++;
+                  const char* tag = a==0xA00u?" <ENTRY>":a==0x2308u?" <POLL>":a==0x1CC0u?" <STARTTASK>"
+                                  :a==0x290u?" <SELWKL>":a==0x838u?" <exit?>":a==0x231Cu?" <RESUME>":"";
+                  fprintf(stderr, "[polhop] 0x%04X%s\n", a, tag); fflush(stderr); }
+              /* At the entry flag-check (0x1AD4 ceqi / 0x1AD8 biz), dump the LS copy
+               * of the SPURS header it reads (LS 0x170) vs the live main-mem header
+               * (0x40197CF0) -- shows the flag value + whether the LS copy is stale. */
+              if (a == 0x1AD4u) { static int d = 0; if (d < 20) { d++;
+                  extern uint8_t* vm_base; const uint8_t* L = ctx->ls;
+                  fprintf(stderr, "[polflag] LS0x170:");
+                  for (int i=0;i<16;i++) fprintf(stderr," %02X", L[0x170+i]);
+                  fprintf(stderr, " | MMhdr0x70:");
+                  for (int i=0;i<16;i++) fprintf(stderr," %02X", vm_base[0x40197C80+0x70+i]);
+                  fprintf(stderr, " gpr75=%08X\n", ctx->gpr[75]._u32[0]); fflush(stderr); } }
+          } } }
+    /* pt35e (env YZ_TRACE_CODEC): arm the dispatch trace EARLY -- the pre-LoadElf crash
+     * happens before the ELF-load arming. Detect a policy SPU running the CODEC taskset by
+     * its EA in the SpursTasksetContext (LS 0x27BC == 0x63D22580), so we trace the StartTask
+     * path that crashes before LoadElf. Default boot unaffected (env-gated). */
+    if (g_yz_codec_dispatch_spu < 0) {
+        static int tc = -1; if (tc < 0) tc = getenv("YZ_TRACE_CODEC") ? 1 : 0;
+        if (tc) { const unsigned char* l = ctx->ls;
+            uint32_t tsEA = ((uint32_t)l[0x27BC]<<24)|((uint32_t)l[0x27BD]<<16)
+                          |((uint32_t)l[0x27BE]<<8)|l[0x27BF];
+            if (tsEA == 0x63D22580u) { g_yz_codec_dispatch_spu = (int)ctx->spu_id;
+                fprintf(stderr, "[codec-arm] spu=%X armed at LS 0x%04X (codec taskset present)\n",
+                        ctx->spu_id, a); fflush(stderr); } }
+    }
+    /* pt35 (env YZ_DISP_TRACE): trace the codec policy SPU's dispatch-tail hops
+     * after LoadElf, to see where it diverges from StartTask (0x1CC0). Armed at the
+     * codec ELF load (spu_dma.h sets g_yz_codec_dispatch_spu). */
+    if ((int)ctx->spu_id == g_yz_codec_dispatch_spu) {
+        static int dt = -1; if (dt < 0) dt = getenv("YZ_DISP_TRACE") ? 1 : 0;
+        /* Log only NON-SEQUENTIAL hops (real branches, a != prev+4) to cut the
+         * per-instruction fallthrough noise + avoid the fprintf-per-hop Heisenbug
+         * that slows the memset/DMA loops. Shows the dispatch's control-flow path. */
+        if (dt) { static uint32_t prev = 0; static int n = 0;
+            if (a != prev + 4u && n < 4000) { n++;
+                fprintf(stderr, "[disp] spu=%X LS 0x%04X\n", ctx->spu_id, a); fflush(stderr); }
+            /* pt35b: pin the instruction that produces the garbage clear count.
+             * gpr8 (per-hop = value AFTER the function at `prev` ran). When it first
+             * becomes 0x28730 (the file-cursor count) or 0x3C130 (dest), the function
+             * at `prev` is the assigning instruction -> audit that op vs the SPU ISA. */
+            { static uint32_t pg8 = 0, pg16 = 0; static int w8 = 0, w16 = 0;
+              uint32_t g8 = ctx->gpr[8]._u32[0], g16 = ctx->gpr[16]._u32[0];
+              static int pathlog = 0;
+              if (g8 == 0x28730u && pg8 != 0x28730u && w8 < 4) { w8++; pathlog = 1;
+                  fprintf(stderr, "[watch8] gpr8 0x%08X->0x28730 set at LS 0x%04X (now hop->0x%04X) | gpr4=%08X gpr6=%08X gpr7=%08X\n",
+                          pg8, prev, a, ctx->gpr[4]._u32[0], ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0]); fflush(stderr); }
+              /* pt35b: once gpr8=0x28730, log EVERY hop until the clear loop (0x2238)
+               * is entered -- the exact path by which the clear reuses the stale gpr8. */
+              if (pathlog) { static int pl = 0;
+                  if (pl < 120) { pl++;
+                      fprintf(stderr, "[path] 0x%04X gpr8=%08X\n", a, g8); fflush(stderr); }
+                  if (a == 0x2238u) pathlog = 0; }
+              if (g16 == 0x3C130u && pg16 != 0x3C130u && w16 < 4) { w16++;
+                  fprintf(stderr, "[watch16] gpr16 0x%08X->0x3C130 set at LS 0x%04X (now hop->0x%04X)\n",
+                          pg16, prev, a); fflush(stderr); }
+              pg8 = g8; pg16 = g16; }
+            prev = a;
+            /* pt35: dump the clear-loop count registers at setup (0x2204) -- gpr[8]
+             * (count) should be 128-aligned & reach 0; it iterates 3855x (>1952), so
+             * the count is wrong. gpr[8]=gpr[4]-128+gpr[6]; show gpr[4]/gpr[6] source. */
+            if (a == 0x2204u) { static int rd = 0; if (rd < 4) { rd++;
+                fprintf(stderr, "[clearloop] spu=%X @0x2204 gpr4=%08X_%08X gpr6=%08X_%08X gpr80=%08X gpr82=%08X\n",
+                        ctx->spu_id, ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[3],
+                        ctx->gpr[6]._u32[0], ctx->gpr[6]._u32[3],
+                        ctx->gpr[80]._u32[3], ctx->gpr[82]._u32[3]); fflush(stderr); } }
+            /* observe the loop counter gpr8 + the write ptr gpr16 at the check */
+            if (a == 0x2264u) { static int cn = 0; if (cn < 4) { cn++;
+                fprintf(stderr, "[clearck] gpr8=%08X_%08X gpr16=%08X_%08X\n",
+                        ctx->gpr[8]._u32[0], ctx->gpr[8]._u32[3],
+                        ctx->gpr[16]._u32[0], ctx->gpr[16]._u32[3]); fflush(stderr); } }
+            /* the Duff's-device computed jump (pc=gpr5._u32[0]=0x223C+(gpr6>>2)).
+             * [-1] in the trace => target outside the lifted range. Dump inputs to
+             * find which (gpr6 andi / gpr7 rotmi) is mis-lifted. */
+            if (a == 0x2234u) { static int jn = 0; if (jn < 8) { jn++;
+                fprintf(stderr, "[duff] tgt(gpr5)=%08X gpr6=%08X gpr7=%08X gpr8=%08X_%08X gpr16=%08X\n",
+                        ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0],
+                        ctx->gpr[8]._u32[0], ctx->gpr[8]._u32[3], ctx->gpr[16]._u32[0]); fflush(stderr); } }
+            /* segment-loop index (gpr90) at the loop increment (0x2268): if it reaches
+             * 2, the loop is processing PH[2]=PT_NOTE (should be skipped) -> garbage clear. */
+            if (a == 0x2268u) { static int sn = 0; if (sn < 8) { sn++;
+                fprintf(stderr, "[segidx] gpr90=%u (segments processed)\n", ctx->gpr[90]._u32[0]);
+                fflush(stderr); } }
+            /* p_type extraction check (0x2190 ceqi gpr12,1): dump the p_type our code
+             * read per segment. PH0/PH1=1 (PT_LOAD), PH2 should be 4 (PT_NOTE). If PH2
+             * reads !=4 (esp. 1), the rotqby/ls_read p_type extraction is mislifted. */
+            if (a == 0x2190u) { static int tn = 0; if (tn < 8) { tn++;
+                fprintf(stderr, "[ptype] gpr12(p_type)=%08X gpr80(p_vaddr)=%08X gpr8(p_off)=%08X gpr87(p_memsz)=%08X\n",
+                        ctx->gpr[12]._u32[0], ctx->gpr[80]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[87]._u32[0]);
+                fflush(stderr); } }
+            /* 0x22B4 restores gpr0 from stack (gpr1+0x120) then the epilogue jumps to it.
+             * The trace shows it landing at 0x2218 (the garbage clear). Is gpr0 a corrupted
+             * return addr (=0x2218, stack smashed) or a sane dispatch addr (reached 0x2218
+             * another way)? Dump gpr0 AFTER 0x22B4 runs -- so capture at 0x22B8. */
+            if (a == 0x22B8u) { static int en = 0; if (en < 6) { en++;
+                fprintf(stderr, "[ret] @0x22B8 gpr0(retaddr)=%08X_%08X gpr1(sp)=%08X gpr91=%08X gpr89(highLS)=%08X\n",
+                        ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[3], ctx->gpr[1]._u32[0],
+                        ctx->gpr[91]._u32[0], ctx->gpr[89]._u32[0]); fflush(stderr); } }
+            /* @0x1B6C (just after the no-op'd `hlgti r3,0` at 0x1B68 = LoadElf's
+             * "halt if return!=CELL_OK"): dump gpr3 (LoadElf return code). If !=0,
+             * LoadElf ERRORED and the no-op'd assert is masking it -> the dispatch
+             * runs into garbage. THE key check. */
+            if (a == 0x1B6Cu) { static int ln = 0; if (ln < 6) { ln++;
+                fprintf(stderr, "[loadelf-ret] gpr3(retcode)=%08X_%08X (0=CELL_OK; !=0 => LoadElf FAILED, assert masked)\n",
+                        ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[3]); fflush(stderr); } } }
+    }
+    if (a != 0x1CC0u) return;
+    /* DIAG (pt35): every time the policy reaches StartTask (0x1CC0), log the
+     * TaskInfo ELF + wklCurrentId, so we can see whether dispatch reaches the
+     * launch point for the codec (elf 0x012B4980) or only ever for gs_task. If
+     * this never fires with the codec elf, the gate is UPSTREAM of StartTask
+     * (selection / policy dispatch), NOT the launch -- and NOT contention alone. */
+    { static int st = 0;
+      if (st < 40) { st++;
+        const unsigned char* l = ctx->ls;
+        uint32_t e = (((uint32_t)l[0x2794]<<24)|((uint32_t)l[0x2795]<<16)
+                    |((uint32_t)l[0x2796]<<8)|l[0x2797]) & 0xFFFFFFF8u;
+        uint32_t wcl = ((uint32_t)l[0x1DC]<<24)|((uint32_t)l[0x1DD]<<16)
+                     |((uint32_t)l[0x1DE]<<8)|l[0x1DF];
+        /* SpursTasksetContext @ LS 0x2700: taskset ptr (low32)@0x27BC, taskId@0x27D4.
+         * Shows whether the policy computed the right taskId (0 for the codec) and
+         * whether the task_info DMA brought the codec elf to LS 0x2790. */
+        uint32_t tsp = ((uint32_t)l[0x27BC]<<24)|((uint32_t)l[0x27BD]<<16)|((uint32_t)l[0x27BE]<<8)|l[0x27BF];
+        uint32_t tid = ((uint32_t)l[0x27D4]<<24)|((uint32_t)l[0x27D5]<<16)|((uint32_t)l[0x27D6]<<8)|l[0x27D7];
+        uint32_t a0 = ((uint32_t)l[0x2780]<<24)|((uint32_t)l[0x2781]<<16)|((uint32_t)l[0x2782]<<8)|l[0x2783];
+        fprintf(stderr, "[startTask] spu=%X elf=0x%08X wklCurId=0x%X taskset=0x%08X taskId=%u argsHi=0x%08X\n",
+                ctx->spu_id, e, wcl, tsp, tid, a0);
+        fflush(stderr); } }
+    /* DEFAULT boot path: launch ONLY the cri_audio codec (elf 0x012B4980).
+     * gs_task launching here wedges an SPU and diverges the boot away from the
+     * movie (measured: .cvm stream stops at 0xB800 vs 0x1D800), so gs_task stays
+     * on the YZ_SPU_PROF path. Discriminate by the TaskInfo ELF EA at LS 0x2790. */
+    const unsigned char* ls = ctx->ls;
+    uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
+                  |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
+    if (elf == 0x012B4980u) spu_task_launch(ctx);
 }
 
 void spu_prof_hop(void* fn)
@@ -446,41 +696,12 @@ void spu_prof_hop(void* fn)
             }
         }
     }
-    /* GS_TASK LAUNCH (2026-06-19). StartTask now reaches its launch `bi gpr2`(0x1CC0)
-     * = spu.pc = savedContextLr (RPCS3 spursTasksetStartTask cellSpursSpu.cpp:1409),
-     * but the band-aid coret/helper-return path left the launch registers corrupted,
-     * so gpr2 != 0x3050 and gs_task never runs. The dispatch HAS loaded gs_task
-     * (LoadElf DMA'd its code to LS 0x3000+ and set savedContextLr@0x2C80=0x3050),
-     * so establish the exact launch ABI here (RPCS3 capture: gpr3=taskArgs, gpr4
-     * word3=spurs, gpr2=entry for the `bi gpr2`, gpr5..127=0, sp=0x2c30, image=gs_task)
-     * and let the bi transfer to 0x3050. Off-switch: YZ_NOLAUNCH. */
-    if (a == 0x1CC0u && g_spu_cur_ctx && g_spu_cur_ctx->image_id == 2 && !getenv("YZ_NOLAUNCH")) {
-        spu_context* c = g_spu_cur_ctx;
-        const unsigned char* ls = c->ls;
-        uint32_t scl = ((uint32_t)ls[0x2C80]<<24)|((uint32_t)ls[0x2C81]<<16)
-                     |((uint32_t)ls[0x2C82]<<8)|ls[0x2C83];
-        static int launched = 0;
-        if (scl == 0x3050u && !launched) {
-            launched = 1;
-            memset(c->gpr, 0, 128 * sizeof(c->gpr[0]));
-            c->gpr[3]._u32[0]=0x40197180u; c->gpr[3]._u32[1]=0x40176B10u;
-            c->gpr[3]._u32[2]=0x000067F0u; c->gpr[3]._u32[3]=0;     /* taskArgs */
-            c->gpr[4]._u32[3]=0x40197C80u;                          /* spurs */
-            c->gpr[1]._u32[0]=0x2C30u;                              /* sp */
-            c->gpr[2]._u32[0]=0x3050u;                              /* bi gpr2 -> gs_task entry */
-            c->image_id = 0;                                        /* gs_task image */
-            /* pt18 FIX: the START-path context setup (RPCS3 spursTasksetDispatch
-             * cellSpursSpu.cpp:1787 sets ctxt->tasksetMgmtAddr=0x2700) is skipped by
-             * our bandaid launch, leaving SpursTasksetContext.tasksetMgmtAddr (LS 0x2FB8)
-             * = 0. gs_task 0xB6C0 derefs it as a syscall-handler vtable base
-             * (call *(tasksetMgmtAddr+0xC4) = LS[0x27C4]=syscallAddr) -> base=0 -> bi 0
-             * -> halt. Write the authoritative 0x2700 so gs_task's dispatch resolves.
-             * Off-switch: YZ_NO_MGMT. */
-            if (!getenv("YZ_NO_MGMT")) {
-                c->ls[0x2FB8]=0x00; c->ls[0x2FB9]=0x00; c->ls[0x2FBA]=0x27; c->ls[0x2FBB]=0x00;
-            }
-        }
-    }
+    /* SPU TASKSET TASK LAUNCH. When the policy (image 2) reaches StartTask
+     * (LS 0x1CC0), hand off to the generalized launcher (handles gs_task AND the
+     * cri_audio codec, and also runs on the DEFAULT boot via spu_task_launch_check
+     * -> SPU_DRAIN, so the codec launches without YZ_SPU_PROF). */
+    if (a == 0x1CC0u && g_spu_cur_ctx && g_spu_cur_ctx->image_id == 2)
+        spu_task_launch(g_spu_cur_ctx);
     /* DIAG: the policy's post-select gate at LS 0x2468 polls a byte in the kernel
      * context tempArea (LS 0x100..0x180) and bails unless ==1. Dump that region
      * + the taskset bitmaps so we can see the value it waits on vs expected. */
@@ -566,6 +787,47 @@ static const char* spu_img_class(uint32_t pc)
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* SPURS TASK LAUNCH (image switch). The taskset policy (image 2) launches an
+     * SPU task by running Sony's real spursTasksetStartTask, which ends in
+     * `bi savedContextLr` -> the task entry. That entry is in the task region
+     * (LS >= CELL_SPURS_TASK_TOP 0x3000), OUTSIDE the policy image (0xA00-0x2840).
+     * The lifted StartTask has already set the SPURS task ABI registers; we only
+     * need to switch image_id to the task's lifted image so its code resolves
+     * (else the task runs under image 2 and the first computed branch faults as
+     * an "unknown branch"). Task image is keyed off TaskInfo.elf EA @ LS 0x2794
+     * (same mapping as spu_task_launch): gs_task 0x0127A580 -> image 0,
+     * cri_audio 0x012B4980 -> image 3. */
+    if (ctx->image_id == 2) {
+        uint32_t tpc = ctx->pc & SPU_LS_MASK;
+        if (tpc >= 0x3000u && tpc < 0x40000u) {
+            const unsigned char* ls = ctx->ls;
+            uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
+                           |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
+            int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3 : -1;
+            if (img >= 0) {
+                ctx->image_id = img;
+                static int n = 0; if (n < 8) { n++;
+                    fprintf(stderr, "[task-launch] policy bi savedContextLr -> %s entry=0x%05X image=%d "
+                            "(natural StartTask launch)\n", img == 3 ? "cri_audio" : "gs_task", tpc, img);
+                    fflush(stderr); }
+            }
+        }
+    }
+    /* THROWAWAY DIAG (env YZ_POLTRACE): raw PC path of the taskset POLICY (image 2)
+     * on every indirect branch -- pc, link(gpr0), wklCurrentId(LS 0x1DC). Shows where
+     * the dispatched policy goes and where it yields (vs the oracle: 0xA00 entry ->
+     * 0x2308 pollStatus -> 0x838 exitToKernel/0x290 selectWorkload -> resume 0x231C ->
+     * SELECT_TASK -> LoadElf -> 0x1CC0 StartTask -> bi 0x3050). Non-prof, non-diverging. */
+    { static int pt = -1; if (pt < 0) pt = getenv("YZ_POLTRACE") ? 1 : 0;
+      if (pt && ctx->image_id == 2) {
+          static int n = 0; if (n < 600) { n++;
+              uint32_t lpc = ctx->pc & SPU_LS_MASK;
+              uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+              uint32_t wcl = ((uint32_t)ctx->ls[0x1DC]<<24)|((uint32_t)ctx->ls[0x1DD]<<16)
+                           |((uint32_t)ctx->ls[0x1DE]<<8)|ctx->ls[0x1DF];
+              fprintf(stderr, "[poltrace] pc=0x%05X link=0x%05X wcl=0x%X gpr3=%08X\n",
+                      lpc, link, wcl, ctx->gpr[3]._u32[0]);
+              fflush(stderr); } } }
     /* DIAG (YZ_SPU_PROF): the StartTask divergence probe. After gs_task's ELF
      * loads, the policy splices a target into the LS 0x1E0 resume slot then
      * `bisl`s through it (policy 0x2308: lqa r2,0x1E0; bisl r2). RPCS3's HLE
@@ -700,14 +962,20 @@ void spu_indirect_branch(spu_context* ctx)
              * returns up the C stack to StartTask -> bi savedContextLr=0x3050.
              * gpr3=0 = the clean-yield result the poll reads (gpr80=gpr3, then
              * `if (gpr80==0)` proceeds). Kill-switch: YZ_NORESUME (re-dispatch). */
-            if (lpc == 0x838u && wcl == 2u && link == 0x231Cu) {
+            /* The poll yield is the SAME for every taskset (the policy module at
+             * LS 0xA00 is shared; link 0x231C is its poll resume point). wcl==2
+             * is the gs_task-only restriction; YZ_CORET_GEN drops it so ANY
+             * taskset's poll resumes (the cri_audio codec taskset = wid 3).
+             * Default unchanged (gs_task only) until verified. */
+            static int coret_gen = -1;
+            if (coret_gen < 0) coret_gen = getenv("YZ_CORET_GEN") ? 1 : 0;
+            if (lpc == 0x838u && link == 0x231Cu && (wcl == 2u || coret_gen)) {
                 ctx->gpr[3]._u32[0] = ctx->gpr[3]._u32[1] = 0;
                 ctx->gpr[3]._u32[2] = ctx->gpr[3]._u32[3] = 0;
                 g_spu_trampoline_fn = 0;   /* no chain -> caller resumes at 0x231C */
                 static int rl = 0;
-                if (rl < 32) { rl++;
-                    fprintf(stderr, "[yz-coret] poll yield 0x838 link=0x231C -> "
-                            "return up C stack (skip re-dispatch)\n");
+                if (rl < 64) { rl++;
+                    fprintf(stderr, "[yz-coret] poll yield 0x838 wcl=%u -> resume at 0x231C\n", wcl);
                     fflush(stderr);
                 }
                 return;
@@ -850,6 +1118,61 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
     extern int g_spu_prof_on;
     extern unsigned long g_spu_getllar_n;
     extern uint8_t* vm_base;
+    /* RELIABLE POLICY TRACE (env YZ_SPU_TRACE) -- decoupled from YZ_SPU_PROF (which
+     * force-launches gs_task + diverges off the movie). Traces the taskset POLICY
+     * (image 2) on the DEFAULT movie boot: locks to the first image-2 SPU, arms once
+     * the policy is actually running, logs every instruction PC (exact literal -- no
+     * fn->addr inversion) + a |K/|P marker for the kernel(<0xA00)/policy boundary.
+     * This is the lasting reliable SPU tracer: relift the module with --trace, run
+     * with YZ_SPU_TRACE=1, read scratch/spu_trace.txt. */
+    {
+        static int tmode = -1;
+        if (tmode < 0) tmode = getenv("YZ_SPU_TRACE") ? 1 : 0;
+        if (tmode) {
+            if (ctx->image_id != 2) return;          /* policy only */
+            static int tlock = -1; if (tlock < 0) tlock = (int)ctx->spu_id;
+            if ((int)ctx->spu_id != tlock) return;   /* one SPU, no interleave */
+            if (!s_trace_armed) {
+                s_trace_armed = 1; s_trace_budget = 600000;
+                if (!s_trace_fp) s_trace_fp = fopen("scratch/spu_trace.txt", "w");
+                if (!s_trace_fp) s_trace_fp = stderr;
+                uint32_t wcl = ((uint32_t)ctx->ls[0x1DC]<<24)|((uint32_t)ctx->ls[0x1DD]<<16)
+                             |((uint32_t)ctx->ls[0x1DE]<<8)|ctx->ls[0x1DF];
+                fprintf(s_trace_fp, "# YZ_SPU_TRACE armed spu=%X wklCurrentId=%u\n", ctx->spu_id, wcl);
+            }
+            if (s_trace_budget <= 0) { if (s_trace_fp) fflush(s_trace_fp); return; }
+            s_trace_budget--;
+            uint32_t lp = pc & SPU_LS_MASK;
+            /* dump the clear-loop count regs at setup so we can see the garbage count
+             * + where gpr4 came from (the LS-clear size must be 128-aligned). */
+            if (lp == 0x2318u) {
+                static int p18 = 0; if (p18 < 20) { p18++;
+                const unsigned char* L = ctx->ls;
+                fprintf(s_trace_fp, "%05X |P  gpr2._u32[0]=%08X  rawLS[0x1E0..3]=%02X%02X%02X%02X  rawLS[0x1E4..7]=%02X%02X%02X%02X\n",
+                        lp, ctx->gpr[2]._u32[0], L[0x1E0],L[0x1E1],L[0x1E2],L[0x1E3], L[0x1E4],L[0x1E5],L[0x1E6],L[0x1E7]);
+                } else fprintf(s_trace_fp, "%05X |P\n", lp);
+            } else if (lp == 0x1CB4u) {
+                static int rl = 0; if (rl < 30) { rl++;
+                const unsigned char* L = ctx->ls;
+                #define TSW(o) (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)|((uint32_t)L[(o)+2]<<8)|L[(o)+3])
+                fprintf(s_trace_fp, "%05X |P  taskInfo: args@2780=%08X_%08X elf@2790=%08X_%08X ctxsave@2798=%08X_%08X lspat@27A0=%08X | TS run@2700=%08X rdy@2710=%08X | idx(gpr5)=%08X\n",
+                        lp, TSW(0x2780), TSW(0x2784), TSW(0x2790), TSW(0x2794), TSW(0x2798), TSW(0x279C), TSW(0x27A0),
+                        TSW(0x2700), TSW(0x2710), ctx->gpr[5]._u32[0]);
+                #undef TSW
+                } else fprintf(s_trace_fp, "%05X |P\n", lp);
+            } else if (lp == 0x1CBCu || lp == 0x1CC0u || lp == 0x1C40u || lp == 0x2308u) {
+                static int rl2 = 0; if (rl2 < 40) { rl2++;
+                fprintf(s_trace_fp, "%05X %s  gpr2=%08X gpr3=%08X gpr5=%08X gpr8=%08X_%08X gpr9=%08X\n",
+                        lp, lp < 0xA00u ? "|K" : "|P",
+                        ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[5]._u32[0],
+                        ctx->gpr[8]._u32[0], ctx->gpr[8]._u32[3], ctx->gpr[9]._u32[0]); }
+                else fprintf(s_trace_fp, "%05X %s\n", lp, lp < 0xA00u ? "|K" : "|P");
+            } else {
+                fprintf(s_trace_fp, "%05X %s\n", lp, lp < 0xA00u ? "|K" : "|P");
+            }
+            return;
+        }
+    }
     if (!g_spu_prof_on) return;
     if (ctx->spu_id != 0x2000u) return;          /* one SPU, no interleave */
     if (!s_trace_armed) {

@@ -428,6 +428,15 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_context* sctx = t->sctx;
 
+#ifdef _WIN32
+    /* pt35e: reserve stack so the unhandled-exception filter (yz_crash_handler) can
+     * still RUN on a STACK OVERFLOW. The SPURS dispatch overflows via a brsl call/return
+     * nesting imbalance; without this the process dies silently (no [crash] dump, so the
+     * recursion is invisible). 512 KB is plenty for the handler's trampoline-ring dump,
+     * which reveals the repeating recursion cycle. */
+    { ULONG guarantee = 512 * 1024; SetThreadStackGuarantee(&guarantee); }
+#endif
+
     fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X\n",
             t->tid, sctx->pc);
 
@@ -742,7 +751,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
     if (t->running) {
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000F; /* CELL_ESTAT (was 0x80010003 = ENOSYS) */
         return -1;
     }
     vm_write_be32(status_ea, (uint32_t)t->exit_status);
@@ -824,7 +833,7 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
         if (!(req & (1ull << p))) continue;
         if (g->spup_queue[p] == 0) { port = p; break; }
     }
-    if (port < 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000C; return -1; } /* EISCONN */
+    if (port < 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010015; return -1; } /* CELL_EISCONN (was 0x8001000C = EABORT) */
     g->spup_queue[port] = queue_id;
     if (spup_ea) vm_write8(spup_ea, (uint8_t)port);   /* the out-param the caller reads */
     fprintf(stderr, "[SPU] group_connect_event_all_threads group=0x%X queue=0x%X "
@@ -876,7 +885,7 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EFAULT */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT (was 0x80010002 = EINVAL) */
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
@@ -917,7 +926,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT (was 0x80010002 = EINVAL) */
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
