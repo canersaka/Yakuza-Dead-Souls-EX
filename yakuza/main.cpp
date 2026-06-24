@@ -882,7 +882,13 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
     /* The drained-ring fence-nudge (ROOT 2) is now done faithfully at the real vblank
      * flip-completion (import_overrides.cpp); keep the old forced nudge OFF by default
      * (YZ_THR_NUDGE re-enables it for A/B) so the fence isn't double-advanced. */
-    static int thr_nudge = -1; if (thr_nudge < 0) thr_nudge = getenv("YZ_THR_NUDGE") ? 1 : 0;
+    /* Default ON: the drained-ring fence nudge breaks the residual flip-throttle deadlock
+     * (GET=PUT drained, no pending flip, t1 wedged at the throttle waiting for the fence --
+     * the faithful vblank path CANNOT advance the fence here because nothing is pending, so
+     * only the nudge breaks it). It never double-advances the faithful fence: it fires only
+     * in the drained-no-flip state, which is mutually exclusive with a pending flip.
+     * Off-switch: YZ_NO_THR_NUDGE. */
+    static int thr_nudge = -1; if (thr_nudge < 0) thr_nudge = getenv("YZ_NO_THR_NUDGE") ? 0 : 1;
     for (;;) {
         Sleep(20);
         uint32_t fence = vm_read32(0x40C00000u);
@@ -1363,6 +1369,11 @@ int main(int argc, char** argv)
         return 1;
     }
     vm_stack_alloc_init(&g_stacks);
+
+    /* Arm the YZ_WATCH_EA write-watch BEFORE any guest code runs -- the gcm
+     * device-object corruptor (0x01622200) races _cellGcmInitBody, which is far
+     * too early for the RSX-thread arm to catch. */
+    if (const char* we = getenv("YZ_WATCH_EA")) yz_watch_arm((uint32_t)strtoul(we, nullptr, 16));
 
     uint64_t e_entry = 0;
     if (load_elf(elf_path, &e_entry) != 0)
