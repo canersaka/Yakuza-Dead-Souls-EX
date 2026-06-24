@@ -761,33 +761,6 @@ static DWORD WINAPI yz_bigseg_monitor(LPVOID)
     }
 }
 
-/* FENCE-KICK probe (env YZ_FENCE_KICK, 2026-06-19): read-watch proved t1 spins
- * polling the flip fence 0x40C00000 (stuck at 2); the next flip needs frame-3's
- * commands, which t1 only builds AFTER the throttle releases -> circular wait.
- * When GET is parked (the deadlock), bump the fence so t1's throttle releases,
- * and observe (via YZ_DIAG_PARK word@GET) whether t1 then FILLS io 0x1104D00 and
- * the loop self-sustains. Decides root: self-sustain => our fence advance is
- * under-modelled (real fix = drive it from the FIFO flip/label, not DRIVER_QUEUE);
- * re-deadlock => structural ordering inversion in t1's frame build. */
-static DWORD WINAPI yz_fencekick_monitor(LPVOID)
-{
-    fprintf(stderr, "[fkick] monitor up: bumping flip fence 0x40C00000 while GET is parked\n");
-    uint32_t last_get = ~0u; DWORD stuck_since = 0;
-    for (;;) {
-        uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
-        DWORD now = GetTickCount();
-        if (get != last_get) { last_get = get; stuck_since = now; }
-        else if (now - stuck_since > 150u) {           /* GET parked = the deadlock */
-            uint32_t f = vm_read32(0x40C00000u);
-            vm_write32(0x40C00000u, f + 1u);
-            static int n = 0; if (n < 60) { n++;
-                fprintf(stderr, "[fkick] GET parked at 0x%X -> fence %u -> %u\n", get, f, f + 1u); }
-            stuck_since = now;                          /* re-arm */
-        }
-        Sleep(50);
-    }
-}
-
 /* BUFDESC GEOMETRY DUMP (env YZ_DUMP_BUFDESC, 2026-06-20): resolve libgcm's buffer
  * descriptor (bufdesc = *(libgcm_toc 0x02114000 - 0x7FD8) = *0x0210C028) and dump the
  * segment-geometry fields the reserve func_02103AAC waits on (+0x10 dma-ctrl, +0x14 base,
@@ -1800,8 +1773,6 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
             CreateThread(NULL, 0, yz_rsx_consumer, NULL, 0, NULL);
         if (getenv("YZ_IMM_REL"))        /* force immediate stopper-release (S[0x1C]=0) */
             CreateThread(NULL, 0, yz_bigseg_monitor, NULL, 0, NULL);
-        if (getenv("YZ_FENCE_KICK"))     /* bump flip fence when GET parks (root-diagnostic) */
-            CreateThread(NULL, 0, yz_fencekick_monitor, NULL, 0, NULL);
         if (getenv("YZ_DUMP_BUFDESC"))   /* dump libgcm segment geometry at the deadlock */
             CreateThread(NULL, 0, yz_bufdesc_dump, NULL, 0, NULL);
         if (getenv("YZ_WATCH_DLEA"))     /* direct write-watch on frame-3 display list io 0x1104D00 */
@@ -2343,64 +2314,6 @@ extern "C" void yz_rsx_vblank_tick(void)
              * here -- exactly once per retired flip, ordered after present+label-clear. */
             vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
             flip_ev |= (uint64_t)(0x8u << 1);             /* SYS_RSX_EVENT_FLIP_BASE<<1 */
-        }
-    }
-
-    /* PACING EXPERIMENT (env YZ_FORCE_FLIP): the game throttles its render loop on
-     * the flip-COMPLETION counter @0x40C00000 (t1/libgcm increments it per real
-     * flip; PROVEN 14h: each [vbl] FLIP COMPLETE -> one increment). When the
-     * consumer is parked (it can't reach the in-stream DRIVER_QUEUE/flip command
-     * past a stopper or an unbuilt list) the counter stalls and t1 wedges in its
-     * flip-wait -> it never builds/releases the next frame -> the consumer stays
-     * parked: a mutual-timing deadlock. Force the counter forward when the consumer
-     * is provably parked (GET frozen, committed work pending, counter stalled) so
-     * t1 unblocks and produces the next frame, letting the consumer advance. This
-     * tests whether the flip-throttle is THE gate, and (band-aid) advances the boot
-     * to the next wall. */
-    if (getenv("YZ_FORCE_FLIP")) {
-        static uint32_t lf = ~0u, lget = ~0u; static DWORD lf_t = 0, lget_t = 0;
-        const DWORD now = GetTickCount();
-        const uint32_t fnc = vm_read32(0x40C00000u);
-        const uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
-        const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
-        if (get != lget) { lget = get; lget_t = now; }
-        if (fnc != lf)   { lf  = fnc; lf_t  = now; }
-        if (put != get && (now - lget_t) > 150u && (now - lf_t) > 150u) {
-            vm_write32(0x40C00000u, fnc + 1);
-            lf = fnc + 1; lf_t = now;
-            static int n = 0; if (n < 60) { n++;
-                fprintf(stderr, "[vbl] FORCE-FLIP fence %u->%u (consumer parked GET=0x%X PUT=0x%X)\n",
-                        fnc, fnc + 1, get, put); }
-        }
-    }
-
-    /* EXPERIMENT (env YZ_FORCE_REF, 2026-06-16): t1's ACTUAL render-loop throttle is
-     * func_00EAC46C, which spins `while [[flip_obj+0x398]] + 2 <= target` -- it polls the
-     * counter at [[0x0164FE78]] (flip_obj=0x0164FAE0, a deterministic game-heap object),
-     * NOT the fence @0x40C00000 that YZ_FORCE_FLIP forced (which is why force-flip never
-     * unblocked t1). Probe + force the REAL counter when the consumer is parked, to test
-     * whether advancing it unblocks t1 -> it builds io 0x1104D00 -> reaches the DRAIN
-     * (clears S[0x1C], applies io 0x300000's queued release) -> GET advances. If it just
-     * relocates the wedge, the throttle is GET-circular (deep pacing); if t1 flows, our
-     * runtime is failing to advance the flip/ref-completion counter (a fixable gap). */
-    if (getenv("YZ_FORCE_REF")) {
-        const uint32_t cptr = vm_read32(0x0164FE78u);          /* [flip_obj+0x398] = counter ptr */
-        if (cptr >= 0x10000u && cptr < 0xE0000000u) {
-            const uint32_t cnt = vm_read32(cptr);
-            { static uint32_t lc = 0xFFFFFFFFu; if (cnt != lc) { lc = cnt;
-                fprintf(stderr, "[vbl] ref-counter [0x%08X]=%u\n", cptr, cnt); } }
-            static uint32_t lg = ~0u; static DWORD lg_t = 0;
-            const DWORD now = GetTickCount();
-            const uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
-            const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
-            if (get != lg) { lg = get; lg_t = now; }
-            if (put != get && (now - lg_t) > 150u) {           /* consumer parked >150ms */
-                vm_write32(cptr, cnt + 1);
-                lg_t = now;
-                static int n = 0; if (n < 80) { n++;
-                    fprintf(stderr, "[vbl] FORCE-REF [0x%08X] %u->%u (consumer parked GET=0x%X PUT=0x%X)\n",
-                            cptr, cnt, cnt + 1, get, put); }
-            }
         }
     }
 

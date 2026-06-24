@@ -841,80 +841,6 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     return 0;
 }
 
-/* RESYNC PROBE (env YZ_RESYNC_PROBE, 2026-06-20): pin WHERE t1 goes after libgcm's
- * reserve is force-unblocked. When t1 is wedged in the reserve (GET parked behind PUT),
- * set GET=PUT to clear the ring so the reserve returns, then profile t1's host-RIP to see
- * whether it reaches the SPURS job-feed (cellSpurs* / the gs_task queue 0x40197180) or
- * stalls elsewhere. Decides the gs_task solution: break-the-reserve vs a deeper gate. */
-static DWORD WINAPI yz_resync_probe(LPVOID)
-{
-    Sleep(28000);
-    for (int it = 0; it < 6; it++) {
-        uint32_t put = vm_read32(0x10000040u) & ~3u;   /* RSX PUT */
-        uint32_t get = vm_read32(0x10000044u) & ~3u;   /* RSX GET */
-        if (get != put) {
-            vm_write32(0x10000044u, put);              /* GET = PUT -> drain ring, unblock reserve */
-            fprintf(stderr, "[resync-probe] it=%d GET 0x%06X -> PUT 0x%06X (unblock reserve)\n",
-                    it, get, put);
-            fflush(stderr);
-        }
-        Sleep(200);                                    /* let t1 run after the unblock */
-        char tag[40]; sprintf(tag, "post-resync-%d", it);
-        yz_sample_t1_spin(tag);                        /* where did t1 go? */
-    }
-    return 0;
-}
-
-/* RESYNC LOOP (env YZ_RESYNC_LOOP, 2026-06-20): the validated LAYER-1 unblock. t1
- * (PPU render thread) wedges in libgcm's reserve before building the next frame's
- * display list; the resync-probe proved that forcing GET=PUT (drain the ring) frees
- * t1 -> it builds the list + reaches the flip submit -> fence advances (2->3 measured).
- * This makes it CONTINUOUS: whenever GET is stuck (unchanged ~120ms) with the ring not
- * drained (GET != PUT), advance GET=PUT to release t1's reserve, so frames keep flowing. */
-static DWORD WINAPI yz_resync_loop(LPVOID)
-{
-    const int aggr = getenv("YZ_GETFOLLOW") != nullptr;   /* pin GET=PUT every tick */
-    Sleep(8000);   /* let the boot reach steady state (frames 1-2 render) first */
-    uint32_t last_get = ~0u; DWORD stuck_since = 0; int n = 0;
-    for (;;) {
-        Sleep(aggr ? 5 : 30);
-        uint32_t fence = vm_read32(0x40C00000u);
-        if (fence < 2u) { last_get = ~0u; continue; }   /* act only at/after the frame-3 wedge */
-        uint32_t put = vm_read32(0x10000040u) & ~3u;
-        uint32_t get = vm_read32(0x10000044u) & ~3u;
-        if (aggr) {                                /* keep GET pinned to PUT continuously */
-            if (get != put) { vm_write32(0x10000044u, put);
-                if (++n <= 60 || (n % 200) == 0)
-                    fprintf(stderr, "[getfollow] #%d fence=%u GET 0x%06X -> PUT 0x%06X\n", n, fence, get, put); }
-            continue;
-        }
-        DWORD now = GetTickCount();
-        if (get != last_get) { last_get = get; stuck_since = now; continue; }
-        if (get != put && (now - stuck_since) > 120u) {
-            vm_write32(0x10000044u, put);          /* GET = PUT: release t1's reserve */
-            last_get = put; stuck_since = now;
-            if (++n <= 400 && (n <= 20 || (n % 25) == 0))
-                fprintf(stderr, "[resync-loop] #%d fence=%u GET 0x%06X -> PUT 0x%06X\n", n, fence, get, put);
-        }
-        /* FRAME-4 wedge dump (GET=PUT but reserve still waiting): read t1's libgcm
-         * reserve frame to get the danger region [SP+0x70,SP+0x74] it waits for, so we
-         * learn the exact GET value that clears it (resolves the io-vs-EA confusion). */
-        else if (get == put && fence >= 3u && (now - stuck_since) > 400u) {
-            extern ppu_context* g_yz_main_ctx;
-            static int dumped = 0;
-            if (!dumped && g_yz_main_ctx) { dumped = 1;
-                uint32_t sp = (uint32_t)g_yz_main_ctx->gpr[1];
-                uint32_t ctr = (uint32_t)g_yz_main_ctx->ctr;
-                fprintf(stderr, "[frame4] t1 SP=0x%08X ctr=0x%08X GET=0x%06X PUT=0x%06X fence=%u\n",
-                        sp, ctr, get, put, fence);
-                for (uint32_t off = 0x60; off <= 0x80; off += 4)
-                    fprintf(stderr, "    [SP+0x%02X]=0x%08X\n", off, vm_read32(sp + off));
-                fflush(stderr);
-            }
-        }
-    }
-}
-
 /* Pointers to the MAIN (t1) thread's trampoline ring, captured on the main thread
  * so a separate monitor thread can print t1's recent indirect-call path -- reliable,
  * unlike the nearest-symbol back-chain that misattributes return addresses to data. */
@@ -1567,10 +1493,6 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
-    if (getenv("YZ_RESYNC_PROBE"))
-        CreateThread(NULL, 0, yz_resync_probe, NULL, 0, NULL);
-    if (getenv("YZ_RESYNC_LOOP"))
-        CreateThread(NULL, 0, yz_resync_loop, NULL, 0, NULL);
     /* RSX FIFO flow-control (DEFAULT-ON). Our async consumer catches up and parks GET
      * at the game's jump-to-self stoppers, holding t1's ring segment hostage so t1
      * can't patch the stopper -> deadlock at frame 2. When t1 is reserve-wedged, advance
