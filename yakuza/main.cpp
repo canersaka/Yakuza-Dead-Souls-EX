@@ -951,6 +951,10 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
      * cap), tagged FORCED, with the running total -- its footprint stays visible for the
      * whole run so a movie bug can always be A/B'd against it. */
     DWORD fa_nudge_lg = 0, fa_flip_lg = 0, fa_free_lg = 0;
+    /* The drained-ring fence-nudge (ROOT 2) is now done faithfully at the real vblank
+     * flip-completion (import_overrides.cpp); keep the old forced nudge OFF by default
+     * (YZ_THR_NUDGE re-enables it for A/B) so the fence isn't double-advanced. */
+    static int thr_nudge = -1; if (thr_nudge < 0) thr_nudge = getenv("YZ_THR_NUDGE") ? 1 : 0;
     for (;;) {
         Sleep(20);
         uint32_t fence = vm_read32(0x40C00000u);
@@ -1009,7 +1013,7 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
              * through its own flip throttle, instead of staying latched at the movie wall.
              * Still sound: we only ever nudge when PUT is actively advancing (real work). */
             if (put != thr_put) { thr_put = put; thr_ep0 = now; thr_last_nudge = 0; thr_dead = 0; }
-            if (!thr_dead) {
+            if (!thr_dead && thr_nudge) {
                 if ((now - thr_ep0) <= 1000u) {
                     if (now - thr_last_nudge >= 150u) {
                         uint32_t f = vm_read32(0x40C00000u);
@@ -1152,13 +1156,13 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
             vm_write32(0x10000044u, found);             /* dispatch this frame's flip */
             last_get = found; stuck_since = now; ++n;
             if (now - fa_flip_lg >= 750u) { fa_flip_lg = now;
-                fprintf(stderr, "[flipadv] FORCED GET 0x%06X -> flip@0x%06X (fence=%u PUT 0x%06X) [%d total] -- band-aid\n",
+                fprintf(stderr, "[flowctl] GET 0x%06X -> flip@0x%06X (fence=%u PUT 0x%06X) [%d] -- consumer past stopper; fence advances at real vblank flip\n",
                         get, found, fence, put, n); fflush(stderr); }
         } else {
             vm_write32(0x10000044u, put);               /* free t1 (stale list / no flip) */
             last_get = put; stuck_since = now; ++n;
             if (now - fa_free_lg >= 750u) { fa_free_lg = now;
-                fprintf(stderr, "[flipadv] FORCED GET 0x%06X -> PUT 0x%06X (fence=%u, %s) [%d total] -- band-aid\n",
+                fprintf(stderr, "[flowctl] GET 0x%06X -> PUT 0x%06X (fence=%u, %s) [%d] -- freed t1's ring reserve\n",
                         get, put, fence, in_ring ? "no flip" : "stale-list", n); fflush(stderr); }
         }
     }
@@ -1567,12 +1571,16 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, yz_resync_probe, NULL, 0, NULL);
     if (getenv("YZ_RESYNC_LOOP"))
         CreateThread(NULL, 0, yz_resync_loop, NULL, 0, NULL);
-    if (getenv("YZ_FLIPADV")) {
-        fprintf(stderr, "[flipadv] *** ARMED — band-aid forcing RSX GET past stoppers to fake continuous flips. "
-                        "This is NOT faithful GPU timing; any movie-render bug must be A/B'd with this OFF. ***\n");
-        fflush(stderr);
+    /* RSX FIFO flow-control (DEFAULT-ON). Our async consumer catches up and parks GET
+     * at the game's jump-to-self stoppers, holding t1's ring segment hostage so t1
+     * can't patch the stopper -> deadlock at frame 2. When t1 is reserve-wedged, advance
+     * GET (wrap-aware, never backward) to the next committed flip command so the consumer
+     * dispatches it; the flip fence @0x40C00000 then advances from the REAL vblank
+     * flip-completion (import_overrides.cpp yz_rsx_vblank_tick), NOT a forced nudge.
+     * YZ_NO_FLOWCTL disables it (deadlocks at frame 2 -- proves it's load-bearing);
+     * YZ_THR_NUDGE re-enables the old drained-ring fence force for A/B. */
+    if (!getenv("YZ_NO_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
-    }
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
 
