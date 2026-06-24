@@ -179,6 +179,55 @@ _NO_RT_WRITE = {
 }
 
 
+def _bi_target_reg(insn):
+    """Return the branch-target register of a bi/biz/binz/... insn, or None."""
+    ops = _ops(insn.operands)
+    if insn.mnemonic == "bi" and ops:
+        return _reg(ops[0])
+    if insn.mnemonic in ("biz", "binz", "bihz", "bihnz") and len(ops) >= 2:
+        return _reg(ops[1])
+    return None
+
+
+# RRR (4-operand) SPU ops write their destination in bits 21-27; the low 7 bits
+# (raw & 0x7F) are the RC *source* for these. Every other format writes bits 0-6.
+_RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
+
+def _dest_reg(insn) -> int:
+    """The register an instruction writes (rt), accounting for RRR-format ops
+    whose destination is bits 21-27 rather than the low 7 bits."""
+    if insn.mnemonic in _RRR_DEST_OPS:
+        return (insn.raw >> 21) & 0x7F
+    return insn.raw & 0x7F
+
+
+def compute_bi_r0_jumps(insns, logical_bounds) -> set:
+    """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
+    (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
+    JUMP after reloading r0 from memory -- e.g. the SPURS taskset launch
+    `lqa $r0, savedContextLr(0x2C80) ... bi $r0` jumps to the task entry (0x3050),
+    NOT back to the caller. Mistranslating that as `return;` makes the launch
+    fall through and the dispatcher loop forever (same bug class as the brsl
+    mislifts). Detect it: within each LOGICAL function, a `bi $r0` is a computed
+    jump iff the NEAREST preceding write to r0 is an ABSOLUTE load (lqa/lqr).
+    A genuine return restores the link via a register/stack load (lqd/lqx) or
+    never rewrites r0 -- those stay returns. Returns the set of such bi addrs."""
+    jumps = set()
+    for (s, e) in logical_bounds:
+        fn = sorted((i for i in insns if s <= i.addr < e), key=lambda x: x.addr)
+        for idx, insn in enumerate(fn):
+            if _bi_target_reg(insn) != "0":
+                continue
+            # backward scan for the nearest instruction that writes r0
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0:
+                    if w.mnemonic in ("lqa", "lqr"):
+                        jumps.add(insn.addr)
+                    break  # nearest r0 writer found; classification decided
+    return jumps
+
+
 class SPULifter:
     def __init__(self, trace: bool = False):
         self.functions: list[LiftedFunction] = []
@@ -193,6 +242,10 @@ class SPULifter:
         # taskset policy module both at LS 0xA00) would otherwise emit colliding
         # `spu_func_<addr>` symbols and fail to link. Give each its own prefix.
         self.func_prefix = "spu_func_"
+        # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
+        # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
+        # set => every `bi $r0` is a return (the prior behaviour).
+        self.bi_r0_jump: set[int] = set()
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -524,8 +577,11 @@ class SPULifter:
             tgt_reg = _reg(ops[0])
             # SPU ABI: $r0 is the link register. `bi $r0` is the standard
             # function return — translate to a host return so call/return
-            # discipline matches the C function nesting from brsl.
-            if tgt_reg == "0":
+            # discipline matches the C function nesting from brsl. EXCEPTION:
+            # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
+            # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
+            # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
+            if tgt_reg == "0" and addr not in self.bi_r0_jump:
                 return "return;"
             # Indirect tail branch: set pc and trampoline to the dispatcher,
             # then unwind so an enclosing SPU_DRAIN re-enters (no nesting).
@@ -559,7 +615,7 @@ class SPULifter:
             # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
             # Dispatching to the return address would miss the C frame and
             # land on an unregistered mid-function PC.
-            if tgt_reg == "0":
+            if tgt_reg == "0" and addr not in self.bi_r0_jump:
                 return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
@@ -739,6 +795,11 @@ def main() -> None:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
 
+    # The LOGICAL function bounds (before --seed-all shatters them into one
+    # function per instruction). Used for the bi-$r0 computed-jump analysis,
+    # which must see a whole function to find r0's nearest writer.
+    logical_bounds = list(bounds)
+
     if args.seed_all:
         # Every 4-aligned instruction becomes its own function entry. SPU
         # instructions are fixed 4 bytes, so this covers every possible
@@ -752,6 +813,11 @@ def main() -> None:
     lifter.header_name = args.header_name
     lifter.register_name = args.register_name
     lifter.func_prefix = args.func_prefix
+    lifter.bi_r0_jump = compute_bi_r0_jumps(insns, logical_bounds)
+    if lifter.bi_r0_jump:
+        print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
+              f"(r0 reloaded via lqa/lqr): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
