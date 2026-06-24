@@ -20,6 +20,11 @@
 #include <cstdio>
 #include <cstdlib>
 
+/* ntdll/kernel32 stack-walk (no windows.h here); links via kernel32.lib. */
+extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long FramesToSkip, unsigned long FramesToCapture,
+    void** BackTrace, unsigned long* BackTraceHash);
+
 /* TLS trampoline slot -- the generated code declares this extern and both
  * sets it (direct tail branches) and drains it. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
@@ -71,7 +76,16 @@ static uint32_t yz_guest_of_host(void* hf)
 extern "C" __declspec(thread) void*    g_yz_tramp_ring[256] = {};
 extern "C" __declspec(thread) uint64_t g_yz_tramp_r31[256]  = {};
 extern "C" __declspec(thread) uint64_t g_yz_tramp_r1[256]   = {};
+extern "C" __declspec(thread) uint64_t g_yz_tramp_lr[256]   = {};   /* caller return addr at the hop */
 extern "C" __declspec(thread) unsigned g_yz_tramp_idx      = 0;
+
+/* USLEEP-CALLER CAPTURE (pt26 producer-stop hunt). When g_yz_catch_caller is armed
+ * (by flipadv at the stall), the next time t1 dispatches the usleep helper
+ * func_00E5DB94 we grab the LIVE host backtrace -> the real guest poll-loop chain
+ * (reliable, unlike the flat async stack scan). main.cpp resolves the addrs. */
+extern "C" volatile long g_yz_catch_caller = 0;
+extern "C" void*         g_yz_caller_bt[32] = {};
+extern "C" volatile long g_yz_caller_bt_n  = 0;
 
 extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
@@ -80,6 +94,16 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
     g_yz_tramp_ring[_ri] = tf;
     g_yz_tramp_r31[_ri]  = ctx0->gpr[31];
     g_yz_tramp_r1[_ri]   = ctx0->gpr[1];
+    g_yz_tramp_lr[_ri]   = ctx0->lr;     /* = caller's return addr (names the caller) */
+
+    if (g_yz_catch_caller) {
+        static void* usleep_fn = nullptr;
+        if (!usleep_fn) usleep_fn = (void*)yz_lookup_func(0x00E5DB94u);
+        if (tf == usleep_fn) {
+            g_yz_caller_bt_n = (long)RtlCaptureStackBackTrace(0, 32, g_yz_caller_bt, nullptr);
+            g_yz_catch_caller = 0;
+        }
+    }
 
     /* DIAG (2026-06-16, drain hunt, env YZ_DRAIN_TRACE): persistent counters for the
      * gcm release/defer/drain functions, to settle whether the producer EVER reaches
@@ -139,6 +163,7 @@ unsigned g_yz_last_idx;
 
 /* Defined in import_overrides.cpp (extern "C"); set by YZ_TASK_TRACE below. */
 extern "C" uint32_t g_yz_spurs_taskset;
+extern "C" uint32_t g_yz_codec_taskset;   /* pt35: cri_audio codec taskset (wid 3) */
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
@@ -185,6 +210,95 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                     (unsigned long long)ctx->gpr[6], elf,
                     elf ? vm_read32(elf) : 0, elf ? vm_read32(elf + 4) : 0);
             fflush(stderr);
+        }
+      } }
+
+    /* DIAG (env YZ_TASK_TRACE, pt31): broaden beyond CreateTask2WithBinInfo -- catch
+     * ALL SPURS task/taskset creation so we can see if the cri_audio decode task
+     * (ELF 0x012B4980) is ever created in ANY taskset (e.g. the late wid-3 taskset).
+     * Logs the ELF EA whether it's r5 directly (CreateTask) or inside a struct. */
+    { static int en2 = -1; if (en2 < 0) en2 = getenv("YZ_TASK_TRACE") ? 1 : 0;
+      if (en2) {
+        static const struct { uint32_t opd; const char* nm; } creates[] = {
+            {0x0203162Cu, "CreateTask"}, {0x02031624u, "CreateTaskWithAttr"},
+            {0x02031764u, "CreateTaskset"}, {0x02031784u, "CreateTaskset2"},
+            {0x0203175Cu, "CreateTasksetWithAttr"},
+        };
+        for (unsigned i = 0; i < 5; i++) {
+            uint32_t code = vm_read32(creates[i].opd);
+            if (target == creates[i].opd || (code && target == code)) {
+                uint32_t r5 = (uint32_t)ctx->gpr[5];
+                fprintf(stderr, "[task+] %s r3=0x%llX r4=0x%llX r5=0x%08X r6=0x%llX",
+                        creates[i].nm, (unsigned long long)ctx->gpr[3],
+                        (unsigned long long)ctx->gpr[4], r5, (unsigned long long)ctx->gpr[6]);
+                uint32_t elf_in_attr = 0;
+                if (r5 >= 0x10000u && r5 < 0xE0000000u) {
+                    fprintf(stderr, " attr[");
+                    for (int w = 0; w < 8; w++) { uint32_t v = vm_read32(r5 + (uint32_t)w*4u);
+                        fprintf(stderr, "%s0x%08X", w?" ":"", v);
+                        if (v == 0x012B4980u) elf_in_attr = 1; }
+                    fprintf(stderr, "]");
+                }
+                if (r5 == 0x012B4980u || elf_in_attr) {
+                    fprintf(stderr, "  <== cri_audio CODEC TASK");
+                    g_yz_codec_taskset = (uint32_t)ctx->gpr[3];  /* CreateTaskWithAttr r3 = taskset */
+                    { static int once = 0; if (!once) { once = 1;
+                        fprintf(stderr, "\n[create-fn] CreateTaskWithAttr code=0x%08X CreateTask code=0x%08X CreateTask2 code=0x%08X\n",
+                                vm_read32(0x02031624u), vm_read32(0x0203162Cu), vm_read32(0x0203161Cu)); fflush(stderr); } }
+                    /* pt35: is a valid SPU ELF actually present at the codec eaElf?
+                     * spursTasksetLoadElf DMAs+parses it; if it's missing/garbage,
+                     * LoadElf fails -> spursHalt -> dispatch dies after SELECT (the
+                     * stuck-running symptom). Expect magic 0x7F454C46 ('\x7fELF'). */
+                    uint32_t eaElf = 0x012B4980u;
+                    fprintf(stderr, " | eaElf=0x%08X bytes: %08X %08X %08X (magic %s)",
+                            eaElf, vm_read32(eaElf), vm_read32(eaElf+4u), vm_read32(eaElf+8u),
+                            vm_read32(eaElf) == 0x7F454C46u ? "OK" : "MISSING/BAD");
+                }
+                /* pt35: dump wid3's scheduling fields AT creation. SPURS @ 0x40197C80:
+                 * wklReadyCount1@+0x00, wklCurrentContention@+0x20, wklMaxContention@+0x50
+                 * (each u8[16], BE -> word holds wid0..3). If curCont byte for wid3 is
+                 * already nonzero here, it's a bad INIT; if 0, it goes 1 later (stuck). */
+                { uint32_t sp = 0x40197C80u;
+                  fprintf(stderr, " | SPURS curCont@20=0x%08X rc@00=0x%08X maxC@50=0x%08X",
+                          vm_read32(sp+0x20u), vm_read32(sp+0x00u), vm_read32(sp+0x50u)); }
+                fprintf(stderr, "\n"); fflush(stderr);
+                break;
+            }
+        }
+      } }
+
+    /* DIAG (env YZ_TASK_RET, 2026-06-20 pt27): the CRI codec SPURS task is created
+     * (CreateTask2WithBinInfo) but never dispatches -- the taskset shows enabled=0,
+     * so either the create RETURNS AN ERROR (0x80410902 INVAL / 0x80410911 NULL_PTR)
+     * before allocating, or it succeeds but the enable doesn't land. Capture the
+     * decisive datum: run the real create here (direct-call idiom, like
+     * yz_call_guest_opd) and log its return value + the taskset bitsets right after,
+     * one-shot. Then suppress the normal dispatch (we already executed it). */
+    { static int rc = -1; if (rc < 0) rc = getenv("YZ_TASK_RET") ? 1 : 0;
+      if (rc) {
+        static uint32_t t2c = 0; static int t2ci = 0;
+        if (!t2ci) { t2ci = 1; t2c = vm_read32(0x0203161Cu); }
+        if (t2c && (target == 0x0203161Cu || target == t2c)) {
+            static int once = 0;
+            if (!once) { once = 1;
+                uint32_t ts   = (uint32_t)ctx->gpr[3];   /* taskset2 */
+                uint32_t tidp = (uint32_t)ctx->gpr[4];   /* taskId out ptr */
+                uint32_t enb  = vm_read32(ts + 0x30u);
+                yz_ppu_fn cf = yz_lookup_func(t2c);
+                if (cf) {
+                    ctx->gpr[2] = vm_read32(0x0203161Cu + 4u);   /* libsre TOC */
+                    cf(ctx);
+                    yz_drain_trampolines(ctx);
+                    fprintf(stderr, "[task-ret] CreateTask2 ret=0x%08X taskId=0x%X | "
+                            "enabled %08X->%08X pending_ready=%08X ready=%08X signalled=%08X wid=%u\n",
+                            (uint32_t)ctx->gpr[3], tidp ? vm_read32(tidp) : 0xFFFFFFFFu, enb,
+                            vm_read32(ts + 0x30u), vm_read32(ts + 0x20u),
+                            vm_read32(ts + 0x10u), vm_read32(ts + 0x40u), vm_read32(ts + 0x74u));
+                    fflush(stderr);
+                    g_trampoline_fn = nullptr;
+                    return;
+                }
+            }
         }
       } }
 
@@ -265,7 +379,13 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             return;
         }
         fn = yz_lookup_func(code);
-        if (fn) ctx->gpr[2] = toc;
+        if (fn) {
+            ctx->gpr[2] = toc;
+            /* Same TOC repair as the direct path: a game-range fn reached via an OPD
+             * whose TOC word is 0 would run with r2=0 and fault on its first TOC load. */
+            if (code < 0x02000000u && g_yz_game_toc && ctx->gpr[2] != g_yz_game_toc)
+                ctx->gpr[2] = g_yz_game_toc;
+        }
     }
 
     if (!fn) {

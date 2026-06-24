@@ -59,7 +59,8 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c"
     "${PS3RECOMP_DIR}/recomp_prx/spurs_sysservice.c"
     "${PS3RECOMP_DIR}/recomp_prx/policy_module.c"   # taskset policy module (libsre 0x02023680), loaded to LS 0xA00 over the service
-    "${PS3RECOMP_DIR}/recomp_prx/gs_task.c")   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580
+    "${PS3RECOMP_DIR}/recomp_prx/gs_task.c"   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580
+    "${PS3RECOMP_DIR}/recomp_prx/cri_audio.c")   # SOFDEC/ADX codec task, EBOOT SPU img #7 @0x012B4980 (overlaps gs_task LS -> image 3)
 
 add_executable(yakuza_recomp
     main.cpp

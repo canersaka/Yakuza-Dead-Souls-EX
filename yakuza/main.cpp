@@ -73,6 +73,12 @@ extern "C" void spu_recomp_register_gstask(void);
  * system service -- so they must register under DISTINCT image ids and the
  * runtime switches ctx->image_id by DMA source EA (spu_dma.h). */
 extern "C" void spu_recomp_register_policy(void);
+/* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
+ * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
+ * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
+ * with the cri_audio_ prefix; spu_task_launch switches ctx->image_id by the
+ * TaskInfo ELF EA when the SPURS kernel dispatches the codec taskset (wid 3). */
+extern "C" void cri_audio_register_functions(void);
 extern "C" void spu_begin_image(int image_id);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
@@ -207,6 +213,8 @@ static int load_prx_image(const char* path, uint32_t base)
 
 static vm_stack_alloc g_stacks;
 
+extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp: caller's guest tid */
+
 static void guest_caller(uint32_t opd_addr,
                          uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -216,7 +224,6 @@ static void guest_caller(uint32_t opd_addr,
     if (!cb_stack) {
         cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);
         if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return; }
-        memset(&cb_ctx, 0, sizeof(cb_ctx));
         cb_ctx.gpr[1] = ((uint64_t)cb_stack + 256 * 1024 - 0x100) & ~0xFull;
         /* Null back-chain terminator: an SDK stack-trace walker (e.g. libsre's
          * assertion handler) follows [r1] up until it reads 0. Without this the
@@ -224,6 +231,15 @@ static void guest_caller(uint32_t opd_addr,
          * forever, blowing the stack. Mirrors the main/created-thread setup. */
         vm_write64(cb_ctx.gpr[1], 0);
     }
+    /* Clean context on EVERY invocation: clear all GPR/CR/LR/CTR/XER/FPR + the lwarx
+     * reservation so a previous callback's leftovers don't leak in (a stale non-
+     * volatile reg read before write, or a stale reservation making the next stwcx.
+     * falsely succeed). Preserve only the stack pointer (its back-chain persists in
+     * guest memory) and set thread_id so lv2 mutex ownership isn't keyed on tid 0. */
+    uint64_t cb_sp = cb_ctx.gpr[1];
+    memset(&cb_ctx, 0, sizeof(cb_ctx));
+    cb_ctx.gpr[1] = cb_sp;
+    cb_ctx.thread_id = yz_thread_current_id();
     cb_ctx.gpr[3] = a0;
     cb_ctx.gpr[4] = a1;
     cb_ctx.gpr[5] = a2;
@@ -256,21 +272,69 @@ static DWORD WINAPI yz_vblank_thread(LPVOID)
     return 0;
 }
 
-/* Map a host code address back to the lifted guest function containing it:
- * the table entry whose host fn pointer is the greatest one <= RIP. Lifted
- * functions are laid out back-to-back in the chunk objs, so nearest-below
- * is the containing function (bounded to 16 MB to reject non-lifted RIPs). */
+/* Host-ptr reverse index (built once). The func table is sorted by GUEST addr, but
+ * lifted functions are laid out per chunk object, so mapping a host RIP back to its
+ * function needs a HOST-ptr-sorted view + a binary search with TRUE containment.
+ * Within a chunk functions are back-to-back, so the next entry's host ptr is this
+ * function's end; only at a chunk boundary do we fall back to a span cap. This stops
+ * the old linear scan from mis-attributing a non-lifted RIP (runtime/lib/system code)
+ * to the nearest lifted function with a bogus multi-MB offset (its cap was 16 MB). */
+static const yz_func_entry** g_yz_host_idx = nullptr;
+static unsigned g_yz_host_idx_n = 0;
+
+static int yz_host_idx_cmp(const void* a, const void* b)
+{
+    const yz_func_entry* ea = *(const yz_func_entry* const*)a;
+    const yz_func_entry* eb = *(const yz_func_entry* const*)b;
+    if ((uintptr_t)ea->fn < (uintptr_t)eb->fn) return -1;
+    if ((uintptr_t)ea->fn > (uintptr_t)eb->fn) return 1;
+    return 0;
+}
+
+static void yz_build_host_idx(void)
+{
+    g_yz_host_idx = (const yz_func_entry**)malloc(sizeof(void*) * (g_yz_func_count ? g_yz_func_count : 1));
+    unsigned n = 0;
+    for (unsigned i = 0; i < g_yz_func_count; i++)
+        if (g_yz_func_table[i].fn) g_yz_host_idx[n++] = &g_yz_func_table[i];
+    qsort(g_yz_host_idx, n, sizeof(void*), yz_host_idx_cmp);
+    g_yz_host_idx_n = n;
+}
+
+/* Thread-safe one-time build: yz_func_from_host runs concurrently on the crash VEH,
+ * the watchdog thread, and (when YZ_WATCH_* is armed) the guest-store path, so the
+ * lazy build must not race (two mallocs + a torn read of a half-sorted array). */
+static INIT_ONCE g_yz_host_idx_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK yz_host_idx_init_cb(PINIT_ONCE i, PVOID p, PVOID* c)
+{ (void)i; (void)p; (void)c; yz_build_host_idx(); return TRUE; }
+
 static const yz_func_entry* yz_func_from_host(const void* rip)
 {
-    const yz_func_entry* best = nullptr;
-    for (unsigned i = 0; i < g_yz_func_count; i++) {
-        const void* fn = (const void*)g_yz_func_table[i].fn;
-        if (fn <= rip && (!best || fn > (const void*)best->fn))
-            best = &g_yz_func_table[i];
+    InitOnceExecuteOnce(&g_yz_host_idx_once, yz_host_idx_init_cb, NULL, NULL);
+    if (!g_yz_host_idx_n) return nullptr;
+    unsigned lo = 0, hi = g_yz_host_idx_n;          /* greatest fn <= rip in [lo,hi) */
+    while (lo < hi) {
+        unsigned mid = (lo + hi) >> 1;
+        if ((uintptr_t)g_yz_host_idx[mid]->fn <= (uintptr_t)rip) lo = mid + 1;
+        else hi = mid;
     }
-    if (best && (uintptr_t)rip - (uintptr_t)best->fn > 0x1000000)
-        return nullptr;
+    if (lo == 0) return nullptr;                    /* below all lifted functions */
+    const yz_func_entry* best = g_yz_host_idx[lo - 1];
+    uintptr_t end = (uintptr_t)best->fn + 0x80000;  /* chunk-boundary span cap (512 KB) */
+    if (lo < g_yz_host_idx_n) {                      /* within a chunk: next fn = this fn's end */
+        uintptr_t nxt = (uintptr_t)g_yz_host_idx[lo]->fn;
+        if (nxt < end) end = nxt;
+    }
+    if ((uintptr_t)rip >= end) return nullptr;
     return best;
+}
+
+/* pt35e: exported host-rip -> guest func addr, so the write-watch (shims.cpp) can
+ * stack-walk and name the LIFTED caller (not just vm_write32). 0 = not a lifted fn. */
+extern "C" uint32_t yz_guest_addr_from_host(const void* rip)
+{
+    const yz_func_entry* fe = yz_func_from_host(rip);
+    return fe ? fe->addr : 0u;
 }
 
 /* ---------------------------------------------------------------------------
@@ -851,6 +915,281 @@ static DWORD WINAPI yz_resync_loop(LPVOID)
     }
 }
 
+/* Pointers to the MAIN (t1) thread's trampoline ring, captured on the main thread
+ * so a separate monitor thread can print t1's recent indirect-call path -- reliable,
+ * unlike the nearest-symbol back-chain that misattributes return addresses to data. */
+static void**    g_yz_main_tramp     = nullptr;
+static uint64_t* g_yz_main_tramp_r31 = nullptr;
+static uint64_t* g_yz_main_tramp_lr  = nullptr;
+static unsigned* g_yz_main_tramp_idx = nullptr;
+extern "C" __declspec(thread) uint64_t g_yz_tramp_lr[256];
+/* usleep-caller capture (dispatch.cpp): arm g_yz_catch_caller -> next usleep dispatch
+ * fills g_yz_caller_bt[] with the live host backtrace = the guest poll-loop chain. */
+extern "C" volatile long g_yz_catch_caller;
+extern "C" void*         g_yz_caller_bt[32];
+extern "C" volatile long g_yz_caller_bt_n;
+
+/* FLIP-ADVANCE monitor (env YZ_FLIPADV, 2026-06-20 pt26). The resync loop proved
+ * that forcing GET past t1's wedge frees it to build + flip the NEXT frame -- but a
+ * blind GET=PUT OVERSHOOTS that frame's in-stream flip command (method 0x0004E944),
+ * so the flip is never dispatched and the fence sticks one frame short (measured:
+ * resync gets fence 2->3 then GET=PUT skips frame-4's flip @io 0x50..., fence stays 3).
+ * THIS monitor advances GET to the NEXT flip command instead of past it: when GET is
+ * stuck with committed data ahead, scan [GET,PUT) (wrap-aware) for 0x0004E944 and set
+ * GET there so the consumer dispatches the flip (fence++); if none is committed yet,
+ * fall back to GET=PUT to free t1's reserve so it builds the next frame. Repeating this
+ * walks the fence forward frame-by-frame = continuous flips (LAYER-1 animation). */
+static DWORD WINAPI yz_flip_advance(LPVOID)
+{
+    const uint32_t FIFO_BASE = 0x40400000u;   /* bufdesc+0x14 io base */
+    const uint32_t RING_LO = 0x1000u, RING_HI = 0x800000u;
+    const uint32_t FLIP_CMD = 0x0004E944u;    /* NV DRIVER_QUEUE flip method, count 1 */
+    Sleep(8000);                              /* let frames 1-2 render first */
+    uint32_t last_get = ~0u; DWORD stuck_since = 0; int n = 0;
+    /* INSURANCE (so the band-aid can never silently be "the reason it's not working"):
+     * each intervention type logs a steady heartbeat (rate-limited to 1/750ms, NO hard
+     * cap), tagged FORCED, with the running total -- its footprint stays visible for the
+     * whole run so a movie bug can always be A/B'd against it. */
+    DWORD fa_nudge_lg = 0, fa_flip_lg = 0, fa_free_lg = 0;
+    for (;;) {
+        Sleep(20);
+        uint32_t fence = vm_read32(0x40C00000u);
+        if (fence < 2u) { last_get = ~0u; continue; }
+        uint32_t put = vm_read32(0x10000040u) & ~3u;
+        uint32_t get = vm_read32(0x10000044u) & ~3u;
+        DWORD now = GetTickCount();
+        if (get != last_get) { last_get = get; stuck_since = now; continue; }
+        if ((now - stuck_since) <= 100u) continue;      /* not wedged yet */
+        const int in_ring = (get >= RING_LO && get < RING_HI);
+
+        /* FRAME-4 / drained-ring diagnostic (ROOT 2): GET==PUT means the consumer has
+         * caught up to the committed write head, yet the fence isn't advancing -- t1
+         * wrote the next flip but never committed it (PUT not flushed past it), or the
+         * throttle counter the game polls isn't being updated. One-shot census of every
+         * flip command in the whole ring + the words around PUT/ctx-current so we can
+         * see exactly where the next flip sits relative to PUT. */
+        if (get == put) {
+            /* FRAME-4 / ROOT 2: the ring is drained and PUT points at the next frame's
+             * un-released entry stopper (measured: io 0x50030C = 0x2050030C). t1 wrote it
+             * then wedged in the flip THROTTLE func_00EAC46C, which spins
+             * `while *(*(0x0164FE78)) + 2 <= target` -- a flip-completion counter our
+             * runtime never advances (we update the fence @0x40C00000 + the head flip
+             * flags, but NOT the game-object counter the throttle polls). With Root 1
+             * (the reserve) now cleared by reaching fence 3, FORCE that counter so the
+             * throttle returns -> t1 builds + commits frame 4 (releases the stopper,
+             * advances PUT) -> the consumer (GET!=PUT again) processes it. */
+            /* The ring is genuinely drained: the consumer processed every committed flip
+             * and caught up to t1's write head. If t1 keeps producing, PUT advances and we
+             * resume; if t1 has STOPPED (measured: after the first ~6 movie frames t1 spins
+             * in guest code, only t7/vblank active, ctr stuck at 0xFE00018C -- waiting on an
+             * UPSTREAM producer, not the RSX/throttle), we idle cleanly here. Earlier
+             * band-aids (force the throttle counter / circulate GET around the empty ring)
+             * just re-presented the static ring content (fence oscillated 2<->6) -- removed:
+             * they faked progress. One-shot census so we can see the stop state. */
+            /* DRIVE t1 PAST THE FLIP THROTTLE (func_00EAC46C, verified 2026-06-20 from
+             * t1's stall dump: r31=0x0164FAE0, base=*(r31+0x398)=0x40C00000, target r28=5).
+             * The throttle spins `while *(0x40C00000)+2 <= target` -- its completion
+             * counter IS the flip fence @0x40C00000. Once GET drains (get==put) the fence
+             * is frozen (no committed flip for the consumer to dispatch), but t1 must pass
+             * the throttle to BUILD frame N+1's flip -> circular deadlock. Earlier blind
+             * force of the fence faked progress (re-presented static frames); instead nudge
+             * it by +1 (release ONE frame) and VERIFY t1 actually produced it -- PUT moving
+             * means t1 built a real frame, after which the in_ring scan walks its flip. If
+             * PUT stays frozen for 1s of nudging, t1 has genuinely stopped (upstream stall)
+             * -> latch thr_dead so we stop nudging (don't fake it) and fall through to diag.
+             * A new drain episode is detected by PUT differing from the last (t1 progressed),
+             * which re-arms the nudger; nudges are throttled to ~150ms so the fence isn't
+             * inflated far past target (usually +1 per frame matches submitted++). */
+            static int thr_dead = 0; static uint32_t thr_put = ~0u;
+            static DWORD thr_ep0 = 0, thr_last_nudge = 0;
+            /* RE-ARM on a new drain point (2026-06-20 pt27): PUT differing from the last
+             * episode means t1 made real progress since we latched -- e.g. a PHASE
+             * TRANSITION (the game orderly-tears-down the movie/audio via a shutdown event
+             * and moves on). Clear thr_dead so the nudger resumes driving the next phase
+             * through its own flip throttle, instead of staying latched at the movie wall.
+             * Still sound: we only ever nudge when PUT is actively advancing (real work). */
+            if (put != thr_put) { thr_put = put; thr_ep0 = now; thr_last_nudge = 0; thr_dead = 0; }
+            if (!thr_dead) {
+                if ((now - thr_ep0) <= 1000u) {
+                    if (now - thr_last_nudge >= 150u) {
+                        uint32_t f = vm_read32(0x40C00000u);
+                        vm_write32(0x40C00000u, f + 1u);   /* release throttle for one frame */
+                        thr_last_nudge = now;
+                        ++n;
+                        if (now - fa_nudge_lg >= 750u) { fa_nudge_lg = now;
+                            fprintf(stderr, "[flipadv] FORCED throttle-nudge fence %u->%u (PUT 0x%06X) [%d total] -- band-aid, not real GPU\n",
+                                    f, f + 1u, put, n); fflush(stderr); }
+                    }
+                    continue;
+                }
+                thr_dead = 1;
+                fprintf(stderr, "[flipadv] throttle nudge inert (PUT 0x%06X frozen 1s) -> t1 stopped producing\n", put);
+            }
+            static int dumped = 0;
+            if (!dumped && fence >= 2u && (now - stuck_since) > 1200u) {
+                dumped = 1;
+                extern ppu_context* g_yz_main_ctx;
+                uint32_t t1ctr = g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u;
+                fprintf(stderr, "[flip-diag] DRAINED+t1-stalled: GET=PUT=0x%06X word@PUT=0x%08X t1.ctr=0x%08X\n",
+                        get, vm_read32(FIFO_BASE + put), t1ctr);
+                int fc = 0;
+                for (uint32_t io = RING_LO; io < RING_HI; io += 4u)
+                    if (vm_read32(FIFO_BASE + io) == FLIP_CMD) fc++;
+                fprintf(stderr, "    flip cmds still in ring: %d (consumer caught up; t1 not producing)\n", fc);
+                /* Reliable: t1's trampoline-hop chain (newest first) names the guest
+                 * functions t1 last called -> the poll loop it is stuck in -> the
+                 * upstream producer it waits on. (The back-chain/ctr mis-symbolize.) */
+                extern const yz_func_entry* yz_func_from_guest(uint32_t);
+                if (g_yz_main_tramp && g_yz_main_tramp_idx) {
+                    fprintf(stderr, "    t1 trampoline-hop chain (newest first: TARGET <- CALLER):\n");
+                    unsigned idx = *g_yz_main_tramp_idx;
+                    for (unsigned i = 0; i < 12 && i < idx; i++) {
+                        unsigned slot = (idx - 1 - i) & 255;
+                        const yz_func_entry* fe = yz_func_from_host(g_yz_main_tramp[slot]);
+                        uint32_t lr = g_yz_main_tramp_lr ? (uint32_t)g_yz_main_tramp_lr[slot] : 0u;
+                        const yz_func_entry* cf = yz_func_from_guest(lr);
+                        fprintf(stderr, "      func_%08X <- caller lr=0x%08X %s%08X\n",
+                                fe ? fe->addr : 0xFFFFFFFFu, lr,
+                                cf ? "func_" : "?", cf ? cf->addr : lr);
+                    }
+                }
+                /* The poll loop keeps its CONDITION pointer in a callee-saved register
+                 * (r14-r31, which survive the usleep call) or a stack local. Dump them +
+                 * what they point to so we can spot the flag t1 spins on, then watch it. */
+                if (g_yz_main_ctx) {
+                    fprintf(stderr, "    t1 callee-saved GPRs (+pointees) [r3=0x%08X]:\n",
+                            (uint32_t)g_yz_main_ctx->gpr[3]);
+                    for (int r = 14; r <= 31; r++) {
+                        uint32_t v = (uint32_t)g_yz_main_ctx->gpr[r];
+                        if (v >= 0x10000u && v < 0xE0000000u)
+                            fprintf(stderr, "      r%d=0x%08X -> [0]=0x%08X [4]=0x%08X [8]=0x%08X\n",
+                                    r, v, vm_read32(v), vm_read32(v + 4u), vm_read32(v + 8u));
+                        else
+                            fprintf(stderr, "      r%d=0x%08X\n", r, v);
+                    }
+                    uint32_t sp = (uint32_t)g_yz_main_ctx->gpr[1];
+                    fprintf(stderr, "    t1 stack frame [r1=0x%08X]:\n", sp);
+                    for (uint32_t o = 0; o <= 0x60u && (sp + o) < 0xE0000000u; o += 4u) {
+                        uint32_t w = vm_read32(sp + o);
+                        const char* tag = "";
+                        if (w >= 0x10000u && w < 0xE0000000u) tag = " (ptr)";
+                        fprintf(stderr, "      [sp+0x%02X]=0x%08X%s\n", o, w, tag);
+                    }
+                    /* FLAG DIAGNOSTIC: dump the engine objects on t1's stack (recurring
+                     * across stalls) -- the poll flag t1 spins on is a field in one of
+                     * these. 0x013618B8 / 0x015BF120 are game-range engine objects;
+                     * follow every distinct stack pointer + dump 0x40 bytes. */
+                    uint32_t seen[16]; int ns = 0;
+                    for (uint32_t o = 0; o <= 0x60u; o += 4u) {
+                        uint32_t p = vm_read32(sp + o);
+                        if (p < 0x10000u || p >= 0xE0000000u) continue;
+                        if (IsBadReadPtr(vm_base + p, 0x40u)) continue;   /* skip data misread as a ptr (e.g. "SLLZ") */
+                        int dup = 0; for (int k = 0; k < ns; k++) if (seen[k] == p) dup = 1;
+                        if (dup || ns >= 16) continue; seen[ns++] = p;
+                        fprintf(stderr, "    obj @0x%08X:", p);
+                        for (uint32_t j = 0; j < 0x40u; j += 4u) fprintf(stderr, " %08X", vm_read32(p + j));
+                        fprintf(stderr, "\n");
+                    }
+                    /* ENGINE VTABLE: func_010F35CC and siblings dispatch via the handler
+                     * table at 0x01324BF0 (entries = OPD pointers). Resolve the registered
+                     * handlers -> the one t1 waits in (returns the stuck state 0-6). */
+                    fprintf(stderr, "    engine vtable raw @0x01324BC0..0x01324C40:\n");
+                    for (uint32_t vi = 0; vi < 0x20u; vi++) {
+                        uint32_t a = 0x01324BC0u + vi * 4u;
+                        uint32_t ptr = vm_read32(a);
+                        if (ptr >= 0x10000u && ptr < 0xE0000000u && !IsBadReadPtr(vm_base + ptr, 4u)) {
+                            uint32_t code = vm_read32(ptr);
+                            fprintf(stderr, "      [0x%08X]=0x%08X -> code=0x%08X\n", a, ptr, code);
+                        } else {
+                            fprintf(stderr, "      [0x%08X]=0x%08X\n", a, ptr);
+                        }
+                    }
+                }
+                g_yz_catch_caller = 1;   /* arm: next usleep dispatch captures the live caller chain */
+                fflush(stderr);
+            }
+            /* Resolve the captured live host backtrace -> the guest poll-loop chain. */
+            static int bt_printed = 0;
+            if (dumped && !bt_printed && g_yz_caller_bt_n > 0) {
+                bt_printed = 1;
+                long btn = g_yz_caller_bt_n;
+                fprintf(stderr, "[flip-diag] t1 LIVE caller chain at usleep (%ld frames):\n", btn);
+                uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+                for (long i = 0; i < btn && i < 32; i++) {
+                    void* a = g_yz_caller_bt[i];
+                    const yz_func_entry* fe = yz_func_from_host(a);
+                    if (fe)
+                        fprintf(stderr, "    [%ld] func_%08X +0x%llX\n", i, fe->addr,
+                                (unsigned long long)((uintptr_t)a - (uintptr_t)fe->fn));
+                    else
+                        fprintf(stderr, "    [%ld] rva 0x%llX\n", i,
+                                (unsigned long long)((uintptr_t)a - mod));
+                }
+                fflush(stderr);
+            }
+            continue;
+        }
+
+        /* Wedged with committed data ahead [GET,PUT). If GET is parked IN the ring, scan
+         * forward (wrap-aware) for the next committed flip command and advance GET to it
+         * (dispatch the flip, fence++). If GET is parked OUTSIDE the ring (followed a
+         * stale display-list CALL) or no flip is committed yet, free t1 with GET=PUT so
+         * it builds + commits the next frame. */
+        uint32_t found = 0;
+        if (in_ring) {
+            /* Scan FORWARD from GET for the next committed flip command, but NEVER wrap
+             * into lower segments: when PUT has wrapped below GET, the region [RING_LO,PUT)
+             * holds OLD (already-presented) flip commands from the previous lap -- jumping
+             * GET backward to them re-presents stale frames AND makes t1's reserve see GET
+             * move backward (confusing its danger-region math -> producer stall). So bound
+             * the scan to GET..min(PUT-if-ahead, RING_HI), no wrap. */
+            uint32_t limit = (put > get) ? put : RING_HI;
+            for (uint32_t scan = get; scan < limit; scan += 4) {
+                if (vm_read32(FIFO_BASE + scan) == FLIP_CMD) { found = scan; break; }
+            }
+        }
+        if (found && found != get) {
+            vm_write32(0x10000044u, found);             /* dispatch this frame's flip */
+            last_get = found; stuck_since = now; ++n;
+            if (now - fa_flip_lg >= 750u) { fa_flip_lg = now;
+                fprintf(stderr, "[flipadv] FORCED GET 0x%06X -> flip@0x%06X (fence=%u PUT 0x%06X) [%d total] -- band-aid\n",
+                        get, found, fence, put, n); fflush(stderr); }
+        } else {
+            vm_write32(0x10000044u, put);               /* free t1 (stale list / no flip) */
+            last_get = put; stuck_since = now; ++n;
+            if (now - fa_free_lg >= 750u) { fa_free_lg = now;
+                fprintf(stderr, "[flipadv] FORCED GET 0x%06X -> PUT 0x%06X (fence=%u, %s) [%d total] -- band-aid\n",
+                        get, put, fence, in_ring ? "no flip" : "stale-list", n); fflush(stderr); }
+        }
+    }
+}
+
+/* TASKSET BITSET WATCH (env YZ_TS_WATCH, 2026-06-20 pt27). Once the CRI codec taskset
+ * is captured (g_yz_spurs_taskset, set by dispatch.cpp at CreateTask2), poll its 6 task
+ * bitsets in MAIN memory and log every change with a timestamp. Reveals the created
+ * task's lifecycle -- enabled->ready->running->done (the SPU ran it) vs
+ * enabled->disabled-without-ever-running (the policy rejected it) -- and, cross-checked
+ * with the SPU-side [ts-watch] log, whether any clear comes from the PPU (no SPU entry). */
+extern "C" uint32_t g_yz_spurs_taskset;
+static DWORD WINAPI yz_ts_watch(LPVOID)
+{
+    uint32_t lr=~0u, lrd=~0u, lp=~0u, le=~0u, lsg=~0u, lwt=~0u; DWORD t0 = 0;
+    for (;;) {
+        Sleep(1);
+        uint32_t ts = g_yz_spurs_taskset;
+        if (!ts || !vm_base) continue;
+        if (!t0) t0 = GetTickCount();
+        uint32_t run=vm_read32(ts+0x00u), rdy=vm_read32(ts+0x10u), pr=vm_read32(ts+0x20u);
+        uint32_t en=vm_read32(ts+0x30u), sg=vm_read32(ts+0x40u), wt=vm_read32(ts+0x50u);
+        if (run!=lr||rdy!=lrd||pr!=lp||en!=le||sg!=lsg||wt!=lwt) {
+            fprintf(stderr, "[ts-poll +%lums] running=%08X ready=%08X pready=%08X enabled=%08X "
+                    "signalled=%08X waiting=%08X\n", GetTickCount()-t0, run, rdy, pr, en, sg, wt);
+            fflush(stderr);
+            lr=run; lrd=rdy; lp=pr; le=en; lsg=sg; lwt=wt;
+        }
+    }
+}
+
 /* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
  * Samples the FIFO GET/PUT, the command word at GET, the flip fence, and t1's
  * ctr every ~120ms WITHOUT suspending any thread, and logs ONLY on change -- so
@@ -861,14 +1200,6 @@ static DWORD WINAPI yz_resync_loop(LPVOID)
  * GET freezes at io 0x300000. When the state goes quiet (~2.4s no change) it
  * fires ONE full guest+host dump AT THE STALL EDGE, so the heavy snapshot lands
  * on the park itself instead of an arbitrary 30s later. */
-/* Pointers to the MAIN (t1) thread's trampoline ring, captured on the main
- * thread so the (separate) trace-stall thread can print t1's recent indirect-
- * call path -- reliable, unlike the nearest-symbol back-chain that misattributes
- * return addresses to data/strings (2026-06-14h: func_01114E4C was a string). */
-static void**    g_yz_main_tramp     = nullptr;
-static uint64_t* g_yz_main_tramp_r31 = nullptr;
-static unsigned* g_yz_main_tramp_idx = nullptr;
-
 static DWORD WINAPI yz_rsx_state_trace(LPVOID)
 {
     uint32_t lctr=~0u, lget=~1u, lput=~0u, lcmd=~0u, lfence=~0u, ldepth=~0u, lcend=~0u, lsp=~0u;
@@ -1107,6 +1438,13 @@ int main(int argc, char** argv)
     load_prx_image("recomp_prx/ogrez_shader_ps3.ppu_image.bin", 0x02200000u);
     (void)&yz_watch_arm;   /* write-watch available for debugging; not armed */
 
+    /* FLAG-PRODUCER HUNT (env YZ_WATCH_FLAG): the post-module stall has t1 polling
+     * engine object 0x013618B8 (module-ready flag, +0x18 = 0xFFFFFFFF sentinel). Arm a
+     * write-watch on that field NOW -- before the guest runs -- so the VEH names every
+     * writer (init + any later) with its reliable trampoline-ring; if it's only written
+     * once (to the sentinel) and never again while t1 spins, the producer is missing. */
+    if (getenv("YZ_WATCH_FLAG")) yz_watch_arm(0x013618B8u + 0x18u);
+
     /* Lifted SPU images: register Sony's SPURS kernel (recomp_prx/
      * spurs_kernel2.c) and the system-service workload (spurs_sysservice.c,
      * runs at LS 0xA00) so sys_spu_thread_group_start can run them for real. */
@@ -1117,8 +1455,13 @@ int main(int argc, char** argv)
     spu_begin_image(0); spu_recomp_register();            /* kernel  */
     spu_begin_image(1); spu_recomp_register_sysservice(); /* system service @0xA00 */
     spu_begin_image(2); spu_recomp_register_policy();     /* taskset policy @0xA00 */
+    /* cri_audio (image 3) BEFORE gs_task (image 0): both overlap LS 0x3000+, and
+     * spu_lookup returns the first match -- registering the codec first lets its
+     * image-3 entries win for codec (image 3) lookups over gs_task's image-0
+     * wildcard. gs_task is unaffected on its own (image 0) path. */
+    spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 */
-    printf("[boot] SPU images registered (kernel + service + policy + gs_task)\n");
+    printf("[boot] SPU images registered (kernel + service + policy + cri_audio + gs_task)\n");
 
     /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted
@@ -1165,6 +1508,7 @@ int main(int argc, char** argv)
     yz_threads_init(stack_base, 1024 * 1024);
 
     static ppu_context ctx;   /* zero-initialized */
+    ctx.thread_id = 1;        /* main thread; matches s_cur_tid default (lv2 mutex ownership) */
     ctx.gpr[1] = ((uint64_t)stack_base + 1024 * 1024 - 0x100) & ~0xFull;
     ctx.gpr[2] = entry_toc;
     vm_write64(ctx.gpr[1], 0);   /* null back-chain */
@@ -1223,12 +1567,21 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, yz_resync_probe, NULL, 0, NULL);
     if (getenv("YZ_RESYNC_LOOP"))
         CreateThread(NULL, 0, yz_resync_loop, NULL, 0, NULL);
+    if (getenv("YZ_FLIPADV")) {
+        fprintf(stderr, "[flipadv] *** ARMED — band-aid forcing RSX GET past stoppers to fake continuous flips. "
+                        "This is NOT faithful GPU timing; any movie-render bug must be A/B'd with this OFF. ***\n");
+        fflush(stderr);
+        CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
+    }
+    if (getenv("YZ_TS_WATCH"))
+        CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
     /* Capture this (main/t1) thread's trampoline-ring instance for the stall dump. */
     g_yz_main_tramp     = g_yz_tramp_ring;
     g_yz_main_tramp_r31 = g_yz_tramp_r31;
+    g_yz_main_tramp_lr  = g_yz_tramp_lr;
     g_yz_main_tramp_idx = &g_yz_tramp_idx;
     /* Real handle to this (main/guest) thread, so the watchdog can suspend it
      * and read its HOST rip/stack -- names the host (lifted) function it spins
