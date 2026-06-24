@@ -1080,6 +1080,20 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
 
         const uint32_t ea = yz_rsx_io_to_ea(get);
         if (!ea) {
+            /* GET is stranded on a non-ring value (the boot coin-flip: e.g. 0xFEED0000,
+             * a DMA selector / method-arg word that mis-decoded as a jump after GET was
+             * dropped into a half-finalised segment). RECOVER instead of idling forever:
+             * resync GET to the committed write head (PUT) if PUT is in the ring, so the
+             * consumer resumes from a valid boundary and the flip fence advances. Bad
+             * boots strand GET here; good boots never do -- so this makes the boot
+             * deterministic (6-agent root: the unsynchronised GET writers strand GET). */
+            if ((put & ~3u) != get && yz_rsx_io_to_ea(put & ~3u)) {
+                static int n = 0; if (n < 12) { n++;
+                    fprintf(stderr, "[rsx] GET=0x%08X off-ring -> resync to PUT 0x%08X (recover)\n", get, put); }
+                get = put & ~3u;
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
+                continue;
+            }
             static int warned = 0;
             if (!warned) { warned = 1;
                 fprintf(stderr, "[rsx] GET=0x%08X (PUT=0x%08X) not io-mapped; idling\n", get, put); }
@@ -1186,6 +1200,15 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
                     fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tPARK\n", ft_step++, get, put, cmd); fflush(ft); }
                 rsx_idle(tight);
                 continue;
+            }
+            if (!yz_rsx_io_to_ea(tgt)) {
+                /* The jump target is not in the ring -- GET landed mid-segment on a method
+                 * argument word (e.g. 0xFEED0001) that mis-decodes as a jump. Do NOT strand
+                 * GET on it (the boot coin-flip); resync to PUT to recover at the source. */
+                if ((put & ~3u) != get && yz_rsx_io_to_ea(put & ~3u)) {
+                    get = put & ~3u; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get); continue;
+                }
+                rsx_idle(tight); continue;
             }
             yz_ct_push(get, cmd, tgt, "jmp");
             if (ft) { fprintf(ft, "J\t%u\t0x%06X\t0x%06X\t0x%08X\t0x%06X\n", ft_step++, get, put, cmd, tgt); fflush(ft); }
