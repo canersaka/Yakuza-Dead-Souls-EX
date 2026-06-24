@@ -47,10 +47,12 @@ extern "C" uint8_t* vm_base = nullptr;
  * 32-bit mode. */
 static inline uint8_t* ea(uint64_t addr) { return vm_base + (uint32_t)addr; }
 
-extern "C" uint8_t  vm_read8 (uint64_t addr) { return *ea(addr); }
-extern "C" uint16_t vm_read16(uint64_t addr) { uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
-extern "C" uint32_t vm_read32(uint64_t addr) { uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
-extern "C" uint64_t vm_read64(uint64_t addr) { uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
+static void yz_mem_guard(uint32_t a, unsigned w, int is_write);  /* DIAG (YZ_GUARD), def below */
+
+extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); return *ea(addr); }
+extern "C" uint16_t vm_read16(uint64_t addr) { yz_mem_guard((uint32_t)addr,2,0); uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
+extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
+extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
  * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
@@ -100,10 +102,50 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
         }
     }
 }
-extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { VM_WRITE_COH(addr, &val, 1); }
-extern "C" void vm_write16(uint64_t addr, uint16_t val) { uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); }
-extern "C" void vm_write64(uint64_t addr, uint64_t val) { uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); VM_WRITE_COH(addr, &val, 1); }
+extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); }
+extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+
+/* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
+ * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED
+ * guest-caller chain (host-stack walk -> yz_guest_addr_from_host, the proven
+ * yz_watch_bd pattern), the bad EA, width and direction, then RETURN so the
+ * natural AV fires and the crash handler still runs with the real RIP. Env-gated
+ * because the per-access VirtualQuery is too slow for an always-on path. */
+static void yz_mem_guard(uint32_t a, unsigned w, int is_write) {
+    static int on = -1; if (on < 0) on = getenv("YZ_GUARD") ? 1 : 0;
+    if (!on) return;
+    int bad = 0;
+    if (a < 0x10000u) bad = 1;                          /* null page (cheap; the r2=0 TOC case) */
+    else {
+        /* Full commit check only under YZ_GUARD_FULL -- VirtualQuery per access is
+         * far too slow to reach the movie stage otherwise. */
+        static int full = -1; if (full < 0) full = getenv("YZ_GUARD_FULL") ? 1 : 0;
+        if (full) {
+            uint8_t* hp = vm_base + a;
+            /* per-thread last-good committed region cache: hot loops skip the syscall */
+            static thread_local uintptr_t clo = 1, chi = 0;
+            if ((uintptr_t)hp >= clo && (uintptr_t)hp + w <= chi) { /* cached-OK */ }
+            else {
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQuery(hp, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) bad = 1;
+                else { clo = (uintptr_t)mbi.BaseAddress; chi = clo + mbi.RegionSize; }
+            }
+        }
+    }
+    if (!bad) return;
+    static long seq = 0; if (++seq > 40) return;        /* cap the spam */
+    void* bt[24]; unsigned short got = RtlCaptureStackBackTrace(1, 24, bt, 0);
+    char chain[256]; int ci = 0; chain[0] = 0;
+    for (unsigned k = 0; k < got && ci < 230; k++) {
+        uint32_t g = yz_guest_addr_from_host(bt[k]);
+        if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, " %08X", g);
+    }
+    fprintf(stderr, "[wild] #%ld %-5s EA=0x%08X w=%u tid=%lu guest-callers:%s\n",
+            seq, is_write ? "WRITE" : "READ", a, w, (unsigned long)GetCurrentThreadId(), chain);
+    fflush(stderr);
+}
 
 /* ---------------------------------------------------------------------------
  * LV2 syscall dispatch
