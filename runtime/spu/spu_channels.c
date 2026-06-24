@@ -96,6 +96,19 @@ extern "C" {
 #define SPU_COH_LO 0x40000000u
 #define SPU_COH_HI 0x44000000u
 static unsigned char s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 KB, bit per 128B line */
+
+/* Per-128B-line write GENERATION (mirrors RPCS3 vm::reservation_acquire). Bumped on
+ * every PPU coherence write to a reserved line; GETLLAR snapshots it and LR is
+ * RE-DERIVED at the next GETLLAR by comparison -- so a write that lands while no SPU
+ * reservation is active (the window between PUTLLC and the next GETLLAR) is NOT lost.
+ * This closes the lost-wakeup that made the SPURS codec dispatch a boot coin-flip. */
+static uint32_t s_coh_gen[(SPU_COH_HI - SPU_COH_LO) >> 7];
+uint32_t spu_coh_gen(uint32_t addr)
+{
+    if (addr - SPU_COH_LO >= SPU_COH_HI - SPU_COH_LO) return 0;
+    return s_coh_gen[(addr - SPU_COH_LO) >> 7];
+}
+
 void spu_coh_reserve(uint32_t ea)
 {
     if (ea - SPU_COH_LO >= SPU_COH_HI - SPU_COH_LO) return;
@@ -153,6 +166,8 @@ unsigned long g_spu_lr_raise = 0;   /* diag: LR events delivered (YZ_SPU_PROF) *
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    if (line - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO)
+        s_coh_gen[(line - SPU_COH_LO) >> 7]++;   /* generation bump -- the missed-edge fix */
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         spu_context* c = s_mfc_slots[i].ctx;
         if (!c) continue;

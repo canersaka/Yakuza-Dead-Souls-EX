@@ -256,6 +256,8 @@ static void guest_caller(uint32_t opd_addr,
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #include <dbghelp.h>
 
 /* Host vblank driver. The game's frame loop polls guest state (driver_info
@@ -1333,6 +1335,24 @@ int main(int argc, char** argv)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* Boot determinism: the firmware boot is paced by Sleep()-based polls that quantize
+     * to the ~15.6ms default Windows timer tick (so the SPU/RSX startup races shift
+     * run-to-run), and Windows 11 EcoQoS throttles a BACKGROUNDED process's scheduling
+     * (measured: foreground booted the codec task far more reliably than minimized).
+     * Pin a 1ms timer, raise priority, and opt out of execution-speed throttling so every
+     * boot sees the same scheduling regardless of window focus. */
+    timeBeginPeriod(1);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    {
+        PROCESS_POWER_THROTTLING_STATE pt;
+        memset(&pt, 0, sizeof(pt));
+        pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;  /* opt out of EcoQoS */
+        pt.StateMask   = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
+    }
+
     SymInitialize(GetCurrentProcess(), NULL, TRUE);  /* load yakuza_recomp.pdb */
     SetUnhandledExceptionFilter(yz_crash_handler);
 
