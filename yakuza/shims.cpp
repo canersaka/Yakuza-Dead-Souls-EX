@@ -69,24 +69,33 @@ extern "C" void spu_coh_notify_write(uint32_t addr);
 #define VM_WRITE_COH(addr, src, n) do { \
         yz_watch_bd((uint32_t)(addr), (src), (n)); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
-            spu_lockline_lock(); memcpy(ea(addr), (src), (n)); spu_lockline_unlock(); \
-            spu_coh_notify_write((uint32_t)(addr)); \
+            spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
+            spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
         } else memcpy(ea(addr), (src), (n)); } while (0)
+extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
     static int on = -1; if (on < 0) on = getenv("YZ_WATCH_BD") ? 1 : 0;
     if (!on) return;
     static unsigned long seq = 0; seq++;
-    /* Watch the two coupled fields the workload-add must set together:
-     * wklState1[2] (spurs+0x82) and sysSrvMsgUpdateWorkload (spurs+0xBD). */
     struct { uint32_t a; const char* nm; } tg[] = {
-        {0x40197D02u, "wklState1[2]"}, {0x40197D3Du, "msgUpd@0xBD"},
-        {0x40197D00u, "wklState1[0]"}, {0x40197D01u, "wklState1[1]"},
+        /* pt35e: the codec workload's eligibility (wklSignal1 @ spurs+0x70=0x40197CF0,
+         * readyCount[wid3] @ spurs+0x03=0x40197C83) + the codec taskset's pending_ready
+         * (0x63D22580+0x20=0x63D225A0). The stack-walk names the LIFTED caller (task_start
+         * / SendWorkloadSignal), not vm_write32. */
+        {0x40197CF0u, "wklSignal1"}, {0x40197CF1u, "wklSignal1+1"}, {0x40197C83u, "readyCount[3]"},
+        {0x63D225A0u, "codec.pending_ready"},
     };
     for (auto& t : tg) {
         if (addr <= t.a && t.a < addr + n) {
             uint8_t b = ((const uint8_t*)src)[t.a - addr];
-            fprintf(stderr, "[watch] #%lu %-13s <- 0x%02X (store addr=0x%08X n=%u ra=%p)\n",
-                    seq, t.nm, b, addr, n, _ReturnAddress());
+            void* bt[20]; unsigned short got = RtlCaptureStackBackTrace(1, 20, bt, 0);
+            char chain[256]; int ci = 0; chain[0] = 0;
+            for (unsigned k = 0; k < got && ci < 230; k++) {
+                uint32_t g = yz_guest_addr_from_host(bt[k]);
+                if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, " %08X", g);
+            }
+            fprintf(stderr, "[watch] #%lu %-19s <- 0x%02X (n=%u) guest-callers:%s\n",
+                    seq, t.nm, b, n, chain);
             fflush(stderr);
         }
     }

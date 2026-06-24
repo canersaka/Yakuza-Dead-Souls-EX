@@ -297,6 +297,10 @@ static uint32_t g_rsx_event_port     = 0;   /* RSX event port (libgcm handler) *
  * the taskset ea, so the vblank tick can dump the SPURS workload-ready state
  * (1f dispatch diagnostic). */
 extern "C" { uint32_t g_yz_spurs_taskset = 0; }
+/* pt35: the cri_audio codec taskset (wid 3, e.g. 0x63D22580), captured at
+ * CreateTaskWithAttr so we can dump its task_info[] and check whether the codec
+ * ELF (0x012B4980) actually got written into the taskset (the elf=0 at StartTask). */
+extern "C" { uint32_t g_yz_codec_taskset = 0; }
 
 /* io-offset -> guest EA map, 1 MB granularity (index = io >> 20), built by
  * sys_rsx_context_iomap (replaces the libs cellGcmIoOffsetToAddress the HLE
@@ -1012,6 +1016,14 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
      * so GET leaves t1's recycle region and t1 can build + patch the segment. */
     const int faithskip = getenv("YZ_FAITHSKIP") != nullptr;
     uint32_t fs_stop_get = ~0u; DWORD fs_stop_since = 0;
+    /* FAITHSKIP REPLAY state (2026-06-20 pt26). The wedge-break GET=PUT frees t1's
+     * reserve so t1 finalizes the frame and DRAINS its op-list (fills the placeholder
+     * gaps, patches the segment stoppers 0x20N00000 -> 0x20N00004). But GET=PUT
+     * OVERSHOOTS the drained frame (past the in-stream flip cmd) so the flip never
+     * executes (FAITHSKIP alone = 2 flips). We remember the stopper we skipped; once t1
+     * patches it (apply ran => frame drained) we REWIND GET to it and replay the
+     * now-valid frame (real methods + flip cmd) -> flip completes, fence advances. */
+    uint32_t fs_replay_stopper = 0; int fs_replay_armed = 0; DWORD fs_replay_since = 0;
     /* SKIP-GARBAGE consumer (env YZ_SKIPGARBAGE, 2026-06-20 pt25b): the segment is
      * built with deferred-patch PLACEHOLDERS (op-list journal, applied only on ring-
      * wrap which never comes). Rather than apply the full drain (deep, machinery spread
@@ -1049,6 +1061,38 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
          * steady state; PUT is t1's and bounds us to the committed [GET,PUT). */
         uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
         const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
+
+        /* FAITHSKIP REPLAY (2026-06-20 pt26): a wedge-break GET=PUT armed a replay --
+         * t1 is now free to finalize the frame + drain its op-list. POLL the stopper we
+         * skipped; while it's still the un-released jump-to-self (0x20N00000) the apply
+         * hasn't run yet, so IDLE (let t1 run; don't process the still-placeholder'd
+         * frame). The instant t1 patches it (0x20N00004 or a NOP) the frame is drained:
+         * REWIND GET to the stopper and replay the now-valid frame (real methods + the
+         * in-stream flip cmd) so the flip executes and the flip fence advances. */
+        if (fs_replay_armed) {
+            uint32_t rea = yz_rsx_io_to_ea(fs_replay_stopper);
+            uint32_t rw  = rea ? vm_read32(rea) : 0;
+            if (rea && rw != (0x20000000u | fs_replay_stopper)) {
+                static int rn = 0; if (rn < 16) { rn++;
+                    fprintf(stderr, "[rsx] FAITHSKIP REPLAY: stopper io=0x%X patched 0x%08X "
+                            "(apply ran, %lums) -> rewind GET to replay drained frame\n",
+                            fs_replay_stopper, rw, GetTickCount() - fs_replay_since); }
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, fs_replay_stopper);
+                fs_replay_armed = 0;
+                continue;
+            }
+            /* Give up after a long wait (apply genuinely never runs) -- fall back to the
+             * old skip-forward behaviour so we don't hang the consumer forever. */
+            if (GetTickCount() - fs_replay_since > 4000u) {
+                static int gn = 0; if (gn < 4) { gn++;
+                    fprintf(stderr, "[rsx] FAITHSKIP REPLAY: stopper io=0x%X never patched in 4s "
+                            "(apply did not run) -> abandoning replay\n", fs_replay_stopper); }
+                fs_replay_armed = 0;
+            } else {
+                rsx_idle(tight);
+                continue;
+            }
+        }
 
         /* Coherence: once GET has LEFT (moved to a later main-ring segment than) the
          * segment we entered via a deferred-release, zero that segment's entry stopper
@@ -1127,6 +1171,11 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
                                             vm_read32(e+0x18u), vm_read32(e+0x1Cu)); }
                             }
                             fflush(stderr); } }
+                        /* Arm the replay: remember THIS stopper (start of the frame) so
+                         * that once t1 -- now freed by the GET=PUT below -- finalizes and
+                         * drains the op-list (patches this stopper), we rewind GET here
+                         * and replay the drained frame incl. its flip cmd. */
+                        fs_replay_stopper = get; fs_replay_armed = 1; fs_replay_since = GetTickCount();
                         get = put; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
                         fs_stop_get = ~0u;
                         continue;
@@ -1994,6 +2043,129 @@ extern "C" void yz_rsx_vblank_tick(void)
         }
     }
 
+    /* pt35 VALIDATION (env YZ_FORCE_CODEC): force the cri_audio codec workload
+     * (wid 3) selectable. wid3 is runnable + has priority + readyCount=1, but its
+     * wklCurrentContention[3] is pinned at 1 (== maxContention), so the kernel's
+     * select gate `maxContention > contention` (cellSpursSpu.cpp:331) fails. Clear
+     * contention[3] + pending[3] and (re)assert readyCount[3] each vblank so the
+     * kernel selects wid3 -> policy -> StartTask -> spu_task_launch runs cri_audio.
+     * Validates the lift+launch+decode chain while the proper contention-accounting
+     * fix is pending. Offsets: wklReadyCount1@+0x00, wklCurrentContention@+0x20,
+     * wklPendingContention@+0x30 (u8[16], per-wid). */
+    if (g_yz_spurs_taskset && getenv("YZ_FORCE_CODEC")) {
+        uint32_t sp = vm_read32(g_yz_spurs_taskset + 0x64u);
+        if (sp >= 0x10000u && sp < 0xE0000000u) {
+            vm_write8(sp + 0x23u, 0);   /* wklCurrentContention[3] = 0 */
+            vm_write8(sp + 0x33u, 0);   /* wklPendingContention[3]  = 0 */
+            vm_write8(sp + 0x03u, 1);   /* wklReadyCount1[3]        = 1 */
+            vm_write8(sp + 0x72u, (uint8_t)(vm_read8(sp + 0x72u) | 0x1Fu));
+            vm_write8(sp + 0xBDu, (uint8_t)(vm_read8(sp + 0xBDu) | 0x1Fu));
+            { static unsigned fc=0; if((fc++ & 127u)==0)
+                fprintf(stderr, "[force-codec] sp=0x%08X cleared wklCurCont[3], rc[3]=1\n", sp); }
+        }
+    }
+
+    /* pt35: once the codec taskset exists, dump its enabled-bitset + task_info[].elf
+     * to settle whether CreateTaskWithAttr populated the codec ELF (0x012B4980) or
+     * left task_info empty (-> the elf=0 the policy reads at StartTask). CellSpursTaskset:
+     * enabled@0x30, task_info[128]@0x80 (48 bytes each), TaskInfo.elf EA low32 @+0x14. */
+    /* pt35 FIX (env YZ_FIXRUN): our lifted cellSpursCreateTask wrongly sets the
+     * codec task's `running` bit at creation (RPCS3 sets only enabled + pending_ready;
+     * cellSpurs.cpp:4139/4187). With running set, the policy's SELECT_TASK
+     * (readyButNotRunning = (signalled|ready|pready) & ~running) never picks it, so
+     * the codec is never dispatched (taskId=-1, elf=0 at StartTask). Clear running
+     * for the codec taskset ONCE after creation -- safe because nothing reads that
+     * taskset until wid3 is selected, which this very bit is blocking. */
+    if (g_yz_codec_taskset && getenv("YZ_FIXRUN")) {
+        static int fixed = 0;
+        if (!fixed) {
+            uint32_t ts = g_yz_codec_taskset, run = vm_read32(ts + 0x00u);
+            if (run & 0x80000000u) {
+                vm_write32(ts + 0x00u, run & 0x7FFFFFFFu);   /* clear running[task0] */
+                fixed = 1;
+                fprintf(stderr, "[fixrun] codec taskset 0x%08X running 0x%08X -> 0x%08X\n",
+                        ts, run, run & 0x7FFFFFFFu); fflush(stderr);
+            }
+        }
+    }
+
+    if (g_yz_codec_taskset && getenv("YZ_TASK_TRACE")) {
+        /* pt35e A/B test: the SPURS kernel re-selects a taskset workload iff
+         * wklReadyCount1[wid] != 0 OR wklSignal1 bit for wid is set (cellSpursSpu.cpp:333).
+         * SPURS instance @ 0x40197C80: wklReadyCount1[0x10]@+0x00 (wid3 = low byte of the
+         * +0x00 BE word), wklSignal1 (BE u16)@+0x70 (wid3 bit = 0x8000>>3 = 0x1000). If
+         * either is set in MAIN MEMORY -> the PPU DID make wid3 eligible and the idle SPU
+         * just missed the wake (gate = B). If neither ever sets -> the create never bumps
+         * eligibility (gate = A, the unimplemented readyCount/wklSignal path). */
+        const uint32_t SP = 0x40197C80u;
+        uint32_t rc1 = vm_read32(SP + 0x00u);    /* wklReadyCount1 wid0..3 (BE) */
+        uint32_t sig1w = vm_read32(SP + 0x70u);  /* wklSignal1 (BE u16) in high half */
+        unsigned rcWid3 = rc1 & 0xFFu;
+        unsigned sigWid3 = ((sig1w >> 16) & 0x1000u) ? 1u : 0u;
+        /* pt35e: cellSpursSendWorkloadSignal only sets wklSignal1 if wklState(wid)==RUNNABLE
+         * (cellSpurs.cpp:2805). wklState1[0x10]@SPURS+0x80 (wid3 = low byte of +0x80 word);
+         * RUNNABLE=2. If wid3 never reaches 2, that guard fails -> signal never sent. */
+        uint32_t wkst1 = vm_read32(SP + 0x80u);
+        unsigned stWid3 = wkst1 & 0xFFu;
+        static int runnable = 0;
+        if (!runnable && stWid3 == 2u) { runnable = 1;
+            fprintf(stderr, "[codec-runnable] *** wid3 wklState reached RUNNABLE(2) -- SendWorkloadSignal's state guard would pass ***\n"); fflush(stderr); }
+        static int elig = 0;
+        if (!elig && (rcWid3 || sigWid3)) { elig = 1;
+            fprintf(stderr, "[codec-eligible] *** wid3 readyCount=%u wklSignal=%u -> PPU DID make wid3 eligible (gate = B: idle SPU missed the wake) ***\n",
+                    rcWid3, sigWid3); fflush(stderr); }
+        /* pt35e FIX TEST (env YZ_WKLSIG): the LLE task-creation path sets pending_ready
+         * but never lands SendWorkloadSignal -> wklSignal1[wid3] stays 0 -> the kernel
+         * never selects the codec taskset. Do the one missing step (RPCS3 cellSpurs.cpp:2812:
+         * sig |= 0x8000 >> (wid%16)) once the task is pending. The SPU kernel polls this
+         * line via GETLLAR (YZ_FRC proves it), so no wakeup is needed. If this unblocks the
+         * codec, the workload-signal gap is confirmed as THE root + replaces YZ_FRC/etc. */
+        if (getenv("YZ_WKLSIG") && stWid3 == 2u && !sigWid3 &&
+            vm_read32(g_yz_codec_taskset + 0x20u) != 0) {
+            /* ROOT FIX TEST (pt35e): the codec's task_start->SendWorkloadSignal(wid3) BAILED
+             * because wid3's workload wasn't enabled/RUNNABLE yet when the task was created
+             * (the task is created before the SPU kernel processes the workload-add). RE-SEND
+             * the missed signal now that the guard would pass (wklState[wid3]==RUNNABLE + a
+             * pending task). This is EXACTLY the SendWorkloadSignal that should have fired;
+             * the game's real taskset setup is left intact, so the codec should dispatch
+             * CLEANLY (unlike the earlier inconsistent ready/readyCount force that crashed). */
+            /* The kernel's lifted SELECT acts on readyCount (drove contention before) but
+             * not on wklSignal alone. Set BOTH, coherently, leaving the game's taskset
+             * bitsets INTACT (no pReady/ready manipulation -> the policy's SELECT_TASK runs
+             * normally -> should dispatch cleanly). Re-assert while pending so the workload
+             * stays selectable across the multi-step dispatch. */
+            static int n = 0;
+            if (n < 200) { n++;
+                uint32_t sg = vm_read32(SP + 0x70u);
+                vm_write32(SP + 0x70u, sg | (0x1000u << 16));      /* wklSignal1[wid3] */
+                uint32_t rc = vm_read32(SP + 0x00u);
+                vm_write32(SP + 0x00u, (rc & 0xFFFFFF00u) | 1u);   /* wklReadyCount1[wid3]=1 */
+                if (n == 1) { fprintf(stderr, "[wklsig] RE-SEND signal+readyCount[wid3] (RUNNABLE+pending, bitsets intact)\n"); fflush(stderr); } }
+        }
+        static int cd = 0;
+        if (cd < 30) { cd++;
+            uint32_t ts = g_yz_codec_taskset;
+            uint32_t enabled = vm_read32(ts + 0x30u), wid = vm_read32(ts + 0x74u);
+            /* Full bitset state (CellSpursTaskset): running@0x00 ready@0x10
+             * pending_ready@0x20 enabled@0x30 signalled@0x40 waiting@0x50.
+             * RPCS3 after create+start: enabled+pending_ready set, running/ready=0. */
+            fprintf(stderr, "[codec-ts] ts=0x%08X wid=%u run=0x%08X rdy=0x%08X pReady=0x%08X en=0x%08X sig=0x%08X wait=0x%08X | SPURS rc1=0x%08X sig1=0x%04X cont=0x%08X rcWid3=%u sigWid3=%u",
+                    ts, wid, vm_read32(ts+0x00u), vm_read32(ts+0x10u), vm_read32(ts+0x20u),
+                    enabled, vm_read32(ts+0x40u), vm_read32(ts+0x50u),
+                    rc1, (sig1w >> 16) & 0xFFFFu, vm_read32(SP+0x20u), rcWid3, sigWid3);
+            fprintf(stderr, " wkState1=0x%08X stWid3=%u(2=RUNNABLE)", wkst1, stWid3);
+            /* pt35e ROOT test: CellSpursTaskset.spurs @ +0x60 (be64, EA low word @ +0x64).
+             * task_start does `spurs = taskset->spurs; cellSpursSendWorkloadSignal(spurs,wid)`.
+             * If this isn't 0x40197C80, SendWorkloadSignal gets a bad ptr + bails -> no signal. */
+            fprintf(stderr, " tsSpurs=0x%08X(expect 0x40197C80)", vm_read32(ts + 0x64u));
+            for (int t = 0; t < 4; t++) {
+                uint32_t elf = vm_read32(ts + 0x80u + (uint32_t)t*0x30u + 0x14u);
+                fprintf(stderr, " t%d.elf=0x%08X", t, elf);
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
+
     if (g_yz_spurs_taskset && getenv("YZ_TASK_TRACE")) {
         static unsigned dt = 0;
         if ((dt++ & 63u) == 0) {
@@ -2017,6 +2189,69 @@ extern "C" void yz_rsx_vblank_tick(void)
             uint8_t  wiUid  = (sp>=0x10000u&&sp<0xE0000000u) ? (uint8_t)(vm_read32(wi + 0x14u) >> 24) : 0;
             fprintf(stderr, "[spurs]   wklInfo1[%u]: addr=0x%08X size=0x%X uniqueId=%u%s\n",
                     wid, wiAddr, wiSize, wiUid, wiAddr ? "" : "  <-- NO IMAGE (policy module not registered)");
+            /* pt30c: dump ALL enabled workloads' images -> is the cri_audio SPU codec
+             * (0x012B4980) registered as a workload (=> SPURS-scheduling gate) or absent
+             * (=> criMana never attached it)? Re-dump only when wklEnabled changes. */
+            if (sp>=0x10000u && sp<0xE0000000u) {
+                static uint32_t last_wkle = 0xFFFFFFFFu;
+                uint32_t wkle = vm_read32(sp + 0xB0u);
+                if (wkle != last_wkle) { last_wkle = wkle;
+                    fprintf(stderr, "[spurs] WORKLOADS wklEnabled=0x%08X (seeking cri_audio 0x012B4980):\n", wkle);
+                    for (int w = 0; w < 16; w++) {
+                        if (!(wkle & (1u << (31 - w)))) continue;
+                        uint32_t wii = sp + 0xB00u + (uint32_t)w * 0x20u;
+                        uint32_t a  = vm_read32(wii + 0x04u);
+                        uint32_t sz = vm_read32(wii + 0x10u);
+                        const char* tag = (a == 0x012B4980u) ? "  <== cri_audio CODEC" :
+                                          (a >= 0x012B0000u && a < 0x012F0000u) ? "  <== CRI image range" : "";
+                        fprintf(stderr, "[spurs]   wkl[%2d] image=0x%08X size=0x%X%s\n", w, a, sz, tag);
+                    }
+                    fflush(stderr);
+                }
+            }
+            /* pt33: readyCount + state per enabled workload. The kernel selects by
+             * readyCount; wid 3 (cri_audio taskset) is never selected -> is its
+             * readyCount 0 (never ACTIVATED by the service) or set-but-ignored? */
+            if (sp>=0x10000u && sp<0xE0000000u) {
+                uint32_t wkle2 = vm_read32(sp + 0xB0u);
+                char buf[300]; int o = 0; buf[0] = 0;
+                for (int w = 0; w < 8 && o < 260; w++) {
+                    if (!(wkle2 & (1u << (31 - w)))) continue;
+                    uint8_t rc = (uint8_t)(vm_read32(sp + 0x00u + (uint32_t)(w & ~3)) >> (8*(3-(w&3))));
+                    uint8_t st = (uint8_t)(vm_read32(sp + 0x80u + (uint32_t)(w & ~3)) >> (8*(3-(w&3))));
+                    uint8_t mc = (uint8_t)(vm_read32(sp + 0x50u + (uint32_t)(w & ~3)) >> (8*(3-(w&3))));
+                    o += snprintf(buf+o, sizeof(buf)-o, " wid%d[rc=%u st=%02X maxC=%u]", w, rc, st, mc);
+                }
+                static int rcq = 0;
+                if (rcq < 50) { rcq++; fprintf(stderr, "[spurs] readyCounts:%s\n", buf); fflush(stderr); }
+            }
+            /* pt35 (fresh): dump the SELECTION GATES for EVERY enabled workload, not
+             * just gs_task's wid=2. The codec (wid 3) lives in a DIFFERENT taskset,
+             * so the per-taskset GATES line below never shows it. Read straight from
+             * the shared SPURS struct (sp). Selection (cellSpursSpu.cpp:519) needs:
+             * priority>0 (per-SPU) && maxContention>curContention && readyCount>0. */
+            if (sp>=0x10000u && sp<0xE0000000u) {
+                static int gq = 0;
+                if (gq < 30) { gq++;
+                    uint32_t wkle3 = vm_read32(sp + 0xB0u);
+                    for (int w = 0; w < 8; w++) {
+                        if (!(wkle3 & (1u << (31 - w)))) continue;
+                        uint8_t cc = (uint8_t)(vm_read32(sp+0x20u+(uint32_t)(w&~3)) >> (8*(3-(w&3))));
+                        uint8_t mc = (uint8_t)(vm_read32(sp+0x50u+(uint32_t)(w&~3)) >> (8*(3-(w&3))));
+                        uint8_t st = (uint8_t)(vm_read32(sp+0x80u+(uint32_t)(w&~3)) >> (8*(3-(w&3))));
+                        uint8_t stat=(uint8_t)(vm_read32(sp+0x90u+(uint32_t)(w&~3)) >> (8*(3-(w&3))));
+                        uint8_t rcb = (uint8_t)(vm_read32(sp+0x00u+(uint32_t)(w&~3)) >> (8*(3-(w&3))));
+                        uint32_t wiw = sp + 0xB00u + (uint32_t)w*0x20u;
+                        uint32_t pHi = vm_read32(wiw + 0x18u), pLo = vm_read32(wiw + 0x1Cu);
+                        bool prioNZ = (pHi|pLo) != 0;
+                        bool selectable = prioNZ && (mc > cc) && (rcb > cc);
+                        fprintf(stderr, "[gate] wid%d: rc=%u cur=%u max=%u state=0x%02X status=0x%02X "
+                                "prio=%08X_%08X %s%s\n", w, rcb, cc, mc, st, stat, pHi, pLo,
+                                prioNZ ? "" : "PRIO=0 ", selectable ? "<= SELECTABLE" : "(blocked)");
+                    }
+                    fflush(stderr);
+                }
+            }
             /* The kernel schedules wid only if runnable && priority>0 && maxContention>
              * contention (cellSpursSpu.cpp:519). wklCurrentContention@0x20, wklMaxContention
              * @0x50, wklStatus1@0x90, wklState1@0x80 (all u8[16]); wklInfo1[wid].priority@+0x18
