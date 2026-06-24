@@ -702,9 +702,27 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->read_idx_addr = (u64)g_ridx;                /* guest EA: read index     */
     audio_be_w64(g_ridx, 0);                          /* read index starts at 0   */
 
-    *portNum = (u32)found;
+    /* portNum is a host pointer aliasing guest BE memory -- write big-endian
+     * (was host-endian: the game read a byte-swapped port index). */
+    { unsigned char* pn = (unsigned char*)portNum;
+      pn[0]=(unsigned char)(found>>24); pn[1]=(unsigned char)(found>>16);
+      pn[2]=(unsigned char)(found>>8);  pn[3]=(unsigned char)found; }
+
+    /* CRI-gate TEST (pt30, env YZ_AUDIO_FORCE): the game never calls cellAudioPortStart
+     * (libmixer init never completes). HYPOTHESIS: the criMana player won't decode the
+     * voice until the audio OUTPUT is running (somewhere to drain PCM). Simulate the
+     * missing PortStart (port->running=1) + SetNotifyEventQueue (register the surround
+     * mixer's queue key so our mixing thread feeds it period events). If the player then
+     * decodes + the boot progresses, the audio-output-ready handshake IS the gate. */
+    if (getenv("YZ_AUDIO_FORCE")) {
+        s_ports[found].running = 1;
+        printf("[cellAudio] YZ_AUDIO_FORCE: port %d forced running\n", found);
+    }
 
     mutex_unlock(&s_audio_mutex);
+
+    if (getenv("YZ_AUDIO_FORCE"))
+        cellAudioSetNotifyEventQueue(0x8000CAFE02460300ULL);  /* register mixer queue */
     return CELL_OK;
 }
 

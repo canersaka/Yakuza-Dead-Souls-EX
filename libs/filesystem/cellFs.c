@@ -366,6 +366,18 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
 
     *fd = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
+
+    /* CRI-gate diag (pt29, env YZ_CODEC_WATCH): when the intro voice container opens,
+     * arm a read-watch on the cri_audio codec-registry entry (guest EA 0x135D9E0 ->
+     * SPU image 0x012B4980). Armed HERE (not at boot) to skip the init-time registry
+     * enumeration + let the boot reach the streaming phase at full speed. If 0x135D9E0
+     * is read AFTER this -> the player reaches codec dispatch (the [watch] dump names
+     * the fn); if never -> dispatch is never reached (upstream gate). */
+    if (getenv("YZ_CODEC_WATCH") && (strstr(path, "adv_voice") || strstr(path, ".cvm"))) {
+        extern void yz_watch_arm_read(u32 guest_addr);
+        static int armed = 0;
+        if (!armed) { armed = 1; yz_watch_arm_read(0x0135D9E0u); }
+    }
     return CELL_OK;
 }
 
@@ -397,8 +409,33 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     u64 bytes_read = 0;
 
+    /* CRI-gate diag (pt29): trace reads on stream/movie containers (.cvm/.sfd) so
+     * we can see whether the criMana player ever reads its header + what bytes
+     * come back. RPCS3 reads 208KB of adv_voice_talk.cvm; if we read 0 the player
+     * never requests it (upstream state-machine gate). */
+    const char* p = s_files[fd].path;
+    int is_stream = p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/"));
+    long long off_before = -1;
+    if (is_stream && s_files[fd].host_fp) off_before = (long long)
+#ifdef _MSC_VER
+        _ftelli64(s_files[fd].host_fp);
+#else
+        ftello(s_files[fd].host_fp);
+#endif
+
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
+    }
+
+    if (is_stream) {
+        const unsigned char* b = (const unsigned char*)buf;
+        printf("[cellFs] Read(fd=%d '%s') off=0x%llX nbytes=0x%llX -> 0x%llX  hdr=%02X%02X%02X%02X %02X%02X%02X%02X (%c%c%c%c)\n",
+               fd, p, (unsigned long long)off_before, (unsigned long long)nbytes,
+               (unsigned long long)bytes_read,
+               bytes_read>0?b[0]:0, bytes_read>1?b[1]:0, bytes_read>2?b[2]:0, bytes_read>3?b[3]:0,
+               bytes_read>4?b[4]:0, bytes_read>5?b[5]:0, bytes_read>6?b[6]:0, bytes_read>7?b[7]:0,
+               (bytes_read>0&&b[0]>=32&&b[0]<127)?b[0]:'.', (bytes_read>1&&b[1]>=32&&b[1]<127)?b[1]:'.',
+               (bytes_read>2&&b[2]>=32&&b[2]<127)?b[2]:'.', (bytes_read>3&&b[3]>=32&&b[3]<127)?b[3]:'.');
     }
 
     if (nread)
