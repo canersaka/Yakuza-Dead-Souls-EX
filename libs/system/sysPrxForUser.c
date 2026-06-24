@@ -300,15 +300,10 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
 extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
 #define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
 
-s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
+/* Slot-allocation core: caller MUST hold slot_lock. Inits a host lock for the
+ * lwmutex and writes its 1-based slot id into sleep_queue. */
+static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
-    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
-           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
-
-    if (!lwmutex)
-        return CELL_EFAULT;
-
-    slot_lock();
     u32 idx = s_lwmutex_next;
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
         u32 slot = (idx + i) % MAX_LWMUTEX;
@@ -333,18 +328,53 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
-            slot_unlock();
             return CELL_OK;
         }
     }
-    slot_unlock();
     return CELL_EAGAIN;
+}
+
+s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
+{
+    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
+           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
+
+    if (!lwmutex)
+        return CELL_EFAULT;
+
+    slot_lock();
+    s32 rc = lwmutex_register_locked(lwmutex, attr);
+    slot_unlock();
+    return rc;
+}
+
+/* Lazily register a statically/inline-initialized lwmutex (sleep_queue==0) that
+ * never went through create. DOUBLE-CHECKED under slot_lock: the failing EAs live
+ * in MAIN RAM (e.g. 0x0D0004xx), not the thread stack, so they may be SHARED — two
+ * threads racing the first lock must not allocate two slots or stomp each other. */
+static s32 lwmutex_lazy_register(sys_lwmutex_t_hle* lwmutex)
+{
+    slot_lock();
+    s32 rc = CELL_OK;
+    if (lwmutex->sleep_queue == 0)          /* re-check under lock (TOCTOU-safe) */
+        rc = lwmutex_register_locked(lwmutex, NULL);
+    slot_unlock();
+    return rc;
 }
 
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
     if (!lwmutex) return CELL_EFAULT;
+
+    /* Statically/inline-initialized lwmutex that never passed through create
+     * (PS3 lwmutexes are user-space; the kernel sleep queue is allocated lazily).
+     * Seen on lwmutex arrays at guest 0x0D0004xx that our model otherwise fails
+     * forever with ESRCH. lwmutex_lazy_register is TOCTOU-safe under slot_lock. */
+    if (lwmutex->sleep_queue == 0) {
+        s32 rc = lwmutex_lazy_register(lwmutex);
+        if (rc != CELL_OK) return rc;
+    }
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
@@ -377,6 +407,11 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
     if (!lwmutex) return CELL_EFAULT;
+
+    if (lwmutex->sleep_queue == 0) {   /* lazily register static-init lwmutex (see lock) */
+        s32 rc = lwmutex_lazy_register(lwmutex);
+        if (rc != CELL_OK) return rc;
+    }
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)

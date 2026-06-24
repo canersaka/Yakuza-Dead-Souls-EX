@@ -6,6 +6,7 @@
  */
 
 #include "cellNetCtl.h"
+#include "ps3emu/endian.h"   /* CellNetCtlInfo numeric fields are guest big-endian */
 #include <stdio.h>
 #include <string.h>
 
@@ -135,8 +136,8 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* Report that we have a full IP connection */
-    *state = CELL_NET_CTL_STATE_IPObtained;
+    /* Report that we have a full IP connection (guest big-endian) */
+    *state = (s32)ps3_bswap32((u32)CELL_NET_CTL_STATE_IPObtained);
 
     printf("[cellNetCtl] GetState() -> IPObtained\n");
     return CELL_OK;
@@ -155,7 +156,7 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
     switch (code)
     {
     case CELL_NET_CTL_INFO_DEVICE:
-        info->device = CELL_NET_CTL_DEVICE_WIRED;
+        info->device = ps3_bswap32((u32)CELL_NET_CTL_DEVICE_WIRED);
         break;
 
     case CELL_NET_CTL_INFO_ETHER_ADDR:
@@ -169,15 +170,15 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_MTU:
-        info->mtu = 1500;
+        info->mtu = ps3_bswap32(1500u);
         break;
 
     case CELL_NET_CTL_INFO_LINK:
-        info->link = CELL_NET_CTL_LINK_CONNECTED;
+        info->link = ps3_bswap32((u32)CELL_NET_CTL_LINK_CONNECTED);
         break;
 
     case CELL_NET_CTL_INFO_LINK_TYPE:
-        info->link_type = CELL_NET_CTL_LINK_TYPE_1000BASE_FULL;
+        info->link_type = ps3_bswap32((u32)CELL_NET_CTL_LINK_TYPE_1000BASE_FULL);
         break;
 
     case CELL_NET_CTL_INFO_IP_ADDRESS:
@@ -211,7 +212,7 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_UPNP_CONFIG:
-        info->upnp_config = 1; /* enabled */
+        info->upnp_config = ps3_bswap32(1u); /* enabled */
         break;
 
     default:
