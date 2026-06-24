@@ -77,6 +77,7 @@ typedef struct mfc_engine {
     uint64_t    resv_ea;          /* line EA (128-aligned), 0 = none */
     uint8_t     resv_data[128];
     int         resv_active;
+    uint32_t    resv_gen;         /* line write-generation at GETLLAR (LR re-derivation) */
     uint32_t    atomic_stat;      /* last MFC_RdAtomicStat value */
 } mfc_engine;
 
@@ -455,7 +456,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       fflush(stderr);} }
               } }
             memcpy(mfc->resv_data, line, 128);
-            mfc->resv_ea     = ea & ~127ull;
+            /* LR re-derivation (RPCS3 SPUThread.cpp): if the line's write-generation
+             * advanced since THIS context last reserved it, a cross-processor write was
+             * missed while we held no reservation -> raise SPU_EVENT_LR so the SPURS idle
+             * kernel wakes. Closes the lost-wakeup that made codec dispatch a coin-flip. */
+            { extern uint32_t spu_coh_gen(uint32_t);
+              uint64_t le = ea & ~127ull; uint32_t g = spu_coh_gen((uint32_t)le);
+              if (mfc->resv_ea == le && g != mfc->resv_gen) spu->event_status |= 0x400u;
+              mfc->resv_ea  = le;
+              mfc->resv_gen = g; }
             mfc->resv_active = 1;
             mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
             /* EXPERIMENT (env YZ_LRWAKE): the SPURS idle kernel waits on SPU_EVENT_LR
