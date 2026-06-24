@@ -458,6 +458,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             mfc->resv_ea     = ea & ~127ull;
             mfc->resv_active = 1;
             mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+            /* EXPERIMENT (env YZ_LRWAKE): the SPURS idle kernel waits on SPU_EVENT_LR
+             * for the workload-ready wakeup, but the PPU-side wklSignal/readyCount SET
+             * that should raise it bypasses the coherence path (PROVEN: lr_raised stalls
+             * at 42; the signal IS visible in this snapshot but no LR edge arrives).
+             * Deliver the missed edge: raise LR on a GETLLAR of the SPURS mgmt line that
+             * carries a pending workload signal (wklSignal1 @ +0x70 != 0), so the kernel
+             * re-enters selection + runs the system service (rebuilds wklRunnable1 ->
+             * dispatches the SOFDEC workload). Self-limits: once dispatched the kernel is
+             * busy, not idle-GETLLARing. */
+            { static int lw = -1; if (lw < 0) lw = getenv("YZ_LRWAKE") ? 1 : 0;
+              if (lw && (uint32_t)(ea & ~127ull) == 0x40197C80u
+                  && (line[0x70] | line[0x71])) spu->event_status |= 0x400u; }
             /* THROWAWAY DIAG (env YZ_SIGW): does the SPU kernel's GETLLAR of the SPURS
              * mgmt line ever SEE a nonzero wklSignal1 (offset 0x70)? Unconditional (not
              * gated by the wid3-present sampler) so it can't miss the transient signal. */
