@@ -51,6 +51,12 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
+/* Set by the yakuza glue (import_overrides.cpp) only when YZ_RSX_INLINE is on:
+ * pumps the RSX FIFO drain inside the reserve's sub-ms usleep spin, so GET
+ * advances on the producer's thread while it waits for the RSX (the inline /
+ * synchronous RSX experiment). NULL by default -> behaviour unchanged. */
+extern void (*g_yz_usleep_pump)(void);
+
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
  *
@@ -74,8 +80,31 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             Sleep((DWORD)(usec / 1000));
         }
     } else if (usec > 0) {
-        /* Very short sleep -- yield */
-        SwitchToThread();
+        /* Sub-millisecond sleep. A waitable timer / Sleep rounds up to the
+         * ~0.5-1 ms scheduler quantum, which is far too coarse: the guest relies
+         * on accurate microsecond pacing (e.g. Sony's libgcm segment-recycle
+         * reserve spins on sys_timer_usleep(30) waiting for the RSX GET to advance
+         * -- collapsing that 30us to a single yield lets the producer outrun and
+         * LAP the FIFO consumer -> deadlock). Busy-wait to the precise QPC
+         * deadline, mirroring RPCS3's TSC busy-tail (lv2.cpp wait_timeout,
+         * "Usleep Only"). Critically we SwitchToThread() inside the spin so a
+         * sibling host thread the guest is waiting on (the RSX FIFO consumer
+         * advancing GET) gets the core during the wait -- a pure pause-spin would
+         * pace THIS thread in wall-time but still starve the consumer. */
+        /* Inline RSX drain ONCE per usleep call (YZ_RSX_INLINE) -- the reserve
+         * loops usleep(30), so this advances GET once per reserve iteration.
+         * Pumping inside the busy-wait spin (thousands of iters/30us) was
+         * catastrophically slow. */
+        if (g_yz_usleep_pump) g_yz_usleep_pump();
+        ensure_qpc_init();
+        LARGE_INTEGER qpc_start, qpc_now;
+        QueryPerformanceCounter(&qpc_start);
+        const int64_t qpc_deadline = qpc_start.QuadPart +
+            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        do {
+            SwitchToThread();          /* hand the core to the consumer/other guest threads */
+            QueryPerformanceCounter(&qpc_now);
+        } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
     if (usec > 0) {

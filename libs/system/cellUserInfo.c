@@ -45,16 +45,25 @@ s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUs
 {
     printf("[cellUserInfo] GetList()\n");
 
-    if (listNum)
-        *listNum = 1;
+    /* These out-params are guest big-endian. Writing host-endian made the game
+     * read *listNum = 0x01000000 (16.7M) and could walk off the user array. */
+    if (listNum) {
+        unsigned char* p = (unsigned char*)listNum;
+        p[0]=0; p[1]=0; p[2]=0; p[3]=1;   /* BE 1 */
+    }
 
     if (list) {
         memset(list, 0, sizeof(CellUserInfoUserList));
-        list->userId[0] = EMU_USER_ID;
+        unsigned char* p = (unsigned char*)&list->userId[0];
+        u32 v = (u32)EMU_USER_ID;
+        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
     }
 
-    if (currentUser)
-        *currentUser = EMU_USER_ID;
+    if (currentUser) {
+        unsigned char* p = (unsigned char*)currentUser;
+        u32 v = (u32)EMU_USER_ID;
+        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
+    }
 
     return CELL_OK;
 }

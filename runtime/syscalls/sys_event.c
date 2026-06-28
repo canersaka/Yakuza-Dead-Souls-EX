@@ -165,14 +165,27 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* Mark inactive and WAKE any blocked receivers so they observe !active and
+     * return ESRCH instead of hanging forever on `not_empty` (lost-wakeup /
+     * teardown deadlock). Do it under the per-queue lock so the wake can't race a
+     * receiver entering the wait. Deliberately do NOT Delete/destroy the
+     * CRITICAL_SECTION / condition variable here: a receiver may still be unwinding
+     * out of SleepConditionVariableCS and needs them valid (destroying them under a
+     * live waiter is UB). The slot's primitives are re-Initialized (after a memset)
+     * when the slot is reused by sys_event_queue_create, so leaking them is benign
+     * on this bounded, reused 128-slot table. */
 #ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
+    EnterCriticalSection(&q->lock);
+    q->active = 0;
+    WakeAllConditionVariable(&q->not_empty);
+    LeaveCriticalSection(&q->lock);
 #else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
+    pthread_mutex_lock(&q->lock);
+    q->active = 0;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
 #endif
 
-    q->active = 0;
     evt_table_unlock();
     return CELL_OK;
 }
