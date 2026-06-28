@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_helpers.h"   /* spu_rotqbyi: the real spursTasksetStartTask gpr4 seed */
 #include <stdint.h>
 #include <stdio.h>
 #include <setjmp.h>
@@ -31,6 +32,23 @@
 __declspec(thread) jmp_buf* g_spu_halt_jmp = 0;
 #else
 _Thread_local jmp_buf* g_spu_halt_jmp = 0;
+#endif
+
+/* Host-call-depth guard restart target + stack base. The lifter emits SPU
+ * `brsl`/`bisl` (CALL) as NESTED host calls; a SPURS coroutine/poll yield that
+ * tail-branches away from a CALL without ever returning (e.g. gs_task's idle
+ * poll at LS 0xB6C0) leaks the host frame each iteration -> the 64MB SPU thread
+ * stack overflows (the documented "brsl call/return nesting imbalance"). When
+ * the host stack grows past a safe threshold, spu_indirect_branch longjmps to
+ * g_spu_restart_jmp; the driver (lv2_register.c) re-dispatches from ctx->pc on a
+ * fresh stack. All SPU state is in the heap `ctx`, so it survives -- this bounds
+ * the host stack the way the SPU's own 256KB LS stack bounds it on hardware. */
+#if defined(_MSC_VER)
+__declspec(thread) jmp_buf* g_spu_restart_jmp = 0;
+__declspec(thread) char*    g_spu_stack_base  = 0;
+#else
+_Thread_local jmp_buf* g_spu_restart_jmp = 0;
+_Thread_local char*    g_spu_stack_base  = 0;
 #endif
 
 /* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
@@ -221,7 +239,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         break;
     case SPU_WrDec:          ctx->decrementer = v;                          break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break;
-    case SPU_WrEventAck:     ctx->event_status &= ~v;                       break;
+    case SPU_WrEventAck:
+        /* Lost-wakeup fix: serialize this read-modify-write against the PPU
+         * coherence write (spu_coh_notify_write, |= SPU_EVENT_LR) and the GETLLAR
+         * LR-raise (spu_dma.h), both of which set event_status under
+         * spu_lockline_lock. A bare `&= ~v` here could read event_status, then have
+         * a concurrent `|= 0x400` land, then write back the stale value -> the LR
+         * edge is dropped and the idle SPURS kernel never wakes. */
+        spu_lockline_lock();
+        ctx->event_status &= ~v;
+        spu_lockline_unlock();
+        break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
@@ -472,12 +500,36 @@ void spu_task_launch(spu_context* c)
     else if (elf == 0x012B4980u) image = 3;   /* cri_audio codec */
     else return;                              /* unknown task -- don't launch */
 
+    /* START vs RESUME (RPCS3 spursTasksetDispatch, cellSpursSpu.cpp:1740-1864):
+     * savedContextLr == the ELF entry => a FRESH START (seed the task ABI). Any
+     * other (mid-function) savedContextLr => the task YIELDED (its 0xA70
+     * context-save wrote gpr0->LS 0x2C80, gpr1->0x2C90, gpr80+i->0x2CA0+i*0x10)
+     * and is being RESUMED -> RESTORE that saved non-volatile context instead of
+     * memset-ing it. Memset on resume wipes gpr80-127 (notably gpr81, the codec's
+     * work-object base, set only at the ELF entry 0x3084) -> null vtable bisl at
+     * LS 0x3EB4 -> branch to LS 0 -> halt. The context-save area (0x2C80-0x3000)
+     * sits between the policy (<=0x2840) and the task (>=0x3000), so it persists
+     * in LS across the yield -- restore straight from LS. */
+    uint32_t elf_entry = (image == 0) ? 0x3050u : 0x3070u;   /* gs_task / cri_audio */
+    int resume = (scl != elf_entry);
     memset(c->gpr, 0, 128 * sizeof(c->gpr[0]));
-    c->gpr[3] = spu_ls_read128(c, 0x2780u);   /* gpr3 = taskInfo->args (DMA'd to LS) */
-    c->gpr[4]._u32[3] = 0x40197C80u;          /* gpr4 = spurs (validated band-aid layout) */
-    c->gpr[1]._u32[0] = 0x2C30u;              /* sp = taskset context stack */
-    c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry */
+    if (resume) {
+        c->gpr[0] = spu_ls_read128(c, 0x2C80u);              /* LR / savedContextLr */
+        c->gpr[1] = spu_ls_read128(c, 0x2C90u);              /* SP */
+        for (int i = 0; i < 48; i++)                          /* gpr80..127 (non-volatile) */
+            c->gpr[80 + i] = spu_ls_read128(c, 0x2CA0u + (uint32_t)i * 0x10u);
+        /* gpr3 left 0 on resume (RPCS3 clears it) */
+    } else {
+        c->gpr[3] = spu_ls_read128(c, 0x2780u);              /* gpr3 = taskInfo->args */
+        c->gpr[4] = spu_rotqbyi(spu_ls_read128(c, 0x2760u), 8); /* gpr4 = {spurs,args} */
+        c->gpr[1]._u32[0] = 0x2C30u;                          /* sp = taskset ctx stack */
+    }
+    c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry / resume PC */
     c->image_id = image;
+    { static int rn = 0; if (resume && rn < 6) { rn++;
+        fprintf(stderr, "[task-resume] %s scl=0x%04X restored gpr81=%08X gpr80=%08X\n",
+                image==3?"cri_audio":"gs_task", scl,
+                c->gpr[81]._u32[0], c->gpr[80]._u32[0]); fflush(stderr); } }
     if (!getenv("YZ_NO_MGMT")) {              /* SpursTasksetContext.tasksetMgmtAddr@0x2FB8=0x2700 */
         c->ls[0x2FB8]=0x00; c->ls[0x2FB9]=0x00; c->ls[0x2FBA]=0x27; c->ls[0x2FBB]=0x00;
     }
@@ -802,6 +854,26 @@ static const char* spu_img_class(uint32_t pc)
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* HOST-CALL-DEPTH GUARD (2026-06-27): a never-returning SPU coroutine/poll
+     * yield (gs_task's idle poll, etc.) leaks a host frame per iteration because
+     * the lifter models SPU `brsl`/`bisl` as nested host calls. Once the host
+     * stack passes the threshold, unwind to the driver and re-dispatch from
+     * ctx->pc on a fresh stack (SPU state is all in heap `ctx`). Stack grows
+     * down, so base - sp = depth; 32MB of the 64MB SPU thread stack. Legitimate
+     * SPU recursion is bounded by the 256KB LS, far below this. */
+    if (g_spu_restart_jmp && g_spu_stack_base) {
+        char probe;
+        if ((size_t)(g_spu_stack_base - &probe) > (size_t)(32u * 1024u * 1024u)) {
+            static int n = 0; if (n < 8) { n++;
+                fprintf(stderr, "[spu-restack] host stack ~%zuMB at pc=0x%05X image=%d -> unwind + re-dispatch\n",
+                        (size_t)(g_spu_stack_base - &probe) >> 20,
+                        ctx->pc & SPU_LS_MASK, ctx->image_id);
+                fflush(stderr); }
+            g_spu_trampoline_fn = 0;
+            longjmp(*g_spu_restart_jmp, 1);
+        }
+    }
+
     /* SPURS TASK LAUNCH (image switch). The taskset policy (image 2) launches an
      * SPU task by running Sony's real spursTasksetStartTask, which ends in
      * `bi savedContextLr` -> the task entry. That entry is in the task region
@@ -821,6 +893,23 @@ void spu_indirect_branch(spu_context* ctx)
             int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3 : -1;
             if (img >= 0) {
                 ctx->image_id = img;
+                /* The lifted policy StartTask does NOT propagate the SPURS task-ABI
+                 * registers on this natural-launch path -- measured (pt47): the
+                 * cri_audio task enters with gpr3=0, so its context base is null and
+                 * the first vtable dispatch (`bisl $r31` @LS 0x3EB4) reads a null
+                 * pointer -> branch to LS 0 -> halt. Inject the task ABI the same way
+                 * spu_task_launch does: gpr3 = taskInfo->args (LS 0x2780), gpr4 =
+                 * spurs. Only when gpr3 is actually unset (don't clobber a good value),
+                 * and only for the codec image (gs_task carries its args already). */
+                if (img == 3 && ctx->gpr[3]._u32[0] == 0) {
+                    ctx->gpr[3] = spu_ls_read128(ctx, 0x2780u);
+                    ctx->gpr[4]._u32[3] = 0x40197C80u;
+                    static int gi = 0; if (gi < 4) { gi++;
+                        fprintf(stderr, "[task-abi] injected cri_audio gpr3=%08X_%08X_%08X_%08X\n",
+                                ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
+                                ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3]);
+                        fflush(stderr); }
+                }
                 static int n = 0; if (n < 8) { n++;
                     fprintf(stderr, "[task-launch] policy bi savedContextLr -> %s entry=0x%05X image=%d "
                             "(natural StartTask launch)\n", img == 3 ? "cri_audio" : "gs_task", tpc, img);
@@ -1076,6 +1165,58 @@ void spu_indirect_branch(spu_context* ctx)
         }
         fn(ctx);
         return;
+    }
+    /* REVERSE image-switch (task -> resident SPURS runtime). The forward
+     * policy(2)->task switch above has no mirror: a running SPURS task
+     * (cri_audio image 3, gs_task) calls back into the resident taskset
+     * policy/runtime, which lives at low LS under a DIFFERENT image. The
+     * scoped lookup then misses a perfectly-lifted function and we would halt
+     * on a legitimate cross-image call (measured: cri_audio @0x3070 calls
+     * policy spu_polfunc_00000A70 -> "unknown branch (image 3)" -> codec dies
+     * on its first runtime call -> no ADX decode -> t1 cond-9 livelock).
+     * Resolve faithfully: the SPU LS is ONE shared address space; if EXACTLY
+     * ONE other lifted image owns this LS address, dispatch it and adopt its
+     * image_id (the forward switch restores the task image when the runtime
+     * branches back to LS>=0x3000). Genuine overlap (>1 foreign owner, the
+     * kernel/service/policy 0xA00+ aliasing) stays ambiguous -> falls through
+     * to the halt; a truly missing/garbage target has 0 owners -> also halts,
+     * so real dispatch bugs are not masked. */
+    {
+        uint32_t la = ctx->pc & SPU_LS_MASK;
+        int foreign = 0, foreign_img = 0; spu_fn ffn = 0;
+        for (uint32_t i = 0; i < s_registry_count; i++)
+            if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
+                foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
+            }
+        if (foreign == 1 && ffn) {
+            static int xn = 0;
+            if (xn < 16) { xn++;
+                fprintf(stderr, "[spu-ximg] cross-image call LS 0x%05X: image %d -> %d "
+                        "(resident runtime, adopting)\n", la, ctx->image_id, foreign_img);
+                fflush(stderr); }
+            ctx->image_id = foreign_img;
+            ffn(ctx);
+            return;
+        }
+    }
+    /* CRI-CODEC vtable-dispatch diagnostic (pt47): the cri_audio task halts on a
+     * `bisl $r31` (LS 0x3EB4) where $r31 -- a function pointer read from an LS
+     * struct at gpr33 = base+0x1C -- is 0, so it branches to LS 0. Dump the source:
+     * gpr33 + the LS quadword ls_read128 actually fetched + the base regs.
+     *   quadword all-zero            => the table is empty/un-DMA'd (setup bug)
+     *   non-zero word at gpr33&0xF   => our rotqby/ls_read128 extraction is wrong. */
+    if (ctx->image_id == 3 && (ctx->pc & SPU_LS_MASK) == 0) {
+        static int v = 0;
+        if (v < 4) { v++;
+            uint32_t a33 = ctx->gpr[33]._u32[0] & SPU_LS_MASK;
+            uint32_t qw  = a33 & ~0xFu;        /* the 16B-aligned quadword that was loaded */
+            fprintf(stderr, "[cri-vtbl] target(gpr31)=0x%08X gpr33=0x%05X (off %u) "
+                    "gpr35=0x%08X gpr81=0x%08X | LS[qw 0x%05X]:",
+                    ctx->gpr[31]._u32[0], a33, a33 & 0xFu,
+                    ctx->gpr[35]._u32[0], ctx->gpr[81]._u32[0], qw);
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", ctx->ls[(qw + i) & SPU_LS_MASK]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
     }
     /* TEMP DEBUG (7d): on the first few unknown branches, dump what's at the
      * target LS — distinguishes "real code DMA'd in at runtime" (must lift)
