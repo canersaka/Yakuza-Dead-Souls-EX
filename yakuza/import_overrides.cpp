@@ -1128,12 +1128,41 @@ static int yz_rsx_fifo_step(void)
         const uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
                                               : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
-            /* Jump-to-self stopper: spin in place until the stopper is released.
-             * (A consumer-side +4 patch was tried 2026-06-26 and REVERTED -- it
-             * fired before the producer finalized the segment, derailing GET into
-             * the still-unbuilt display list at io 0x1104D00. The faithful root is
-             * a producer-pacing divergence; the load-bearing yz_flip_advance lever
-             * advances GET past this stopper when t1 is reserve-wedged.) */
+            /* Jump-to-self stopper. FAITHFUL DEFERRED-RELEASE APPLY (2026-06-28;
+             * env YZ_NO_APPLY_REL=1 to disable). ROOT (measured both sides): the
+             * producer JOURNALS a cross-segment stopper-release into its gcm op-list
+             * (tag-0x7F entry, entry[+4]=stopper EA) when S[0x1C]!=0 at the release,
+             * but our build never APPLIES that specific entry to the FIFO word --
+             * flush#11+ only patch the NEW frontier stopper, so the io 0x300000 word
+             * stays 0x20300000 (jump-to-self) and GET parks forever. RPCS3's producer
+             * PATCHES this exact word 0x20300000->0x20300004 (RPCS3.log 4923-4924) and
+             * GET flows. We realize the producer's OWN committed intent: iff
+             *   (a) the op-list holds a tag-0x7F release for THIS stopper EA (the
+             *       producer committed to releasing it), AND
+             *   (b) PUT is just AHEAD of GET in the ring (the body past the stopper is
+             *       BUILT and published),
+             * patch the word to a jump-forward (+4) so GET advances -- byte-identical
+             * end-state to RPCS3's producer-side patch. SELECTIVE (only the journaled
+             * stopper) + PUT-GATED (content built) -- unlike the reverted UNCONDITIONAL
+             * +4 that fired before the producer published and derailed into the unbuilt
+             * list at io 0x1104D00. */
+            static int noapply = -1; if (noapply < 0) noapply = getenv("YZ_NO_APPLY_REL") ? 1 : 0;
+            /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
+             * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
+             * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
+             * wrong size into the wrap arithmetic. */
+            const uint32_t ring  = 0x800000u;
+            const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
+            if (!noapply && ahead != 0u && ahead < (ring >> 1) && yz_gcm_stopper_release_deferred(ea)) {
+                vm_write32(ea, 0x20000000u | ((get + 4u) & 0x1FFFFFFCu));   /* release: self-jump -> jump-forward +4 */
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);     /* GET advances into the committed body */
+                { static int n = 0; if (n < 16) { n++;
+                    fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X) -> GET advances past stopper\n",
+                            get, ahead); } }
+                LeaveCriticalSection(&g_rsx_fifo_lock);
+                return 1;
+            }
+            /* not yet committed (no tag-0x7F entry, or PUT not past) -- spin in place */
             LeaveCriticalSection(&g_rsx_fifo_lock);
             return 0;
         }
