@@ -18,6 +18,8 @@
 #include "yakuza_runner.h"
 
 #include <cstdio>
+#include <chrono>
+#include <cstdlib>
 #include <cstdlib>
 
 /* ntdll/kernel32 stack-walk (no windows.h here); links via kernel32.lib. */
@@ -169,6 +171,51 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     uint32_t target = (uint32_t)ctx->ctr;
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
+
+    /* LAYER-1 RECURSION PROBE (env YZ_RECPROBE, pt48b): the t7 _gcm_intr_thread
+     * host-stack-overflows through the gcm ring; func_00EDC6B0 is bctrl'd on the
+     * path. Watch the GUEST r1 trend across successive bctrl hits to this target:
+     * a MONOTONIC decrease == genuine recursion (each level nests a host frame),
+     * an oscillation == flat loop (overflow is elsewhere). After N hits, dump the
+     * guest back-chain (r1 -> *(r1)=caller SP, saved LR at SP+0x10) = the exact
+     * recursive cycle, captured BEFORE the host stack dies. One-shot. */
+    if (target == 0x00F83AECu && getenv("YZ_RECPROBE")) {
+        static __declspec(thread) uint32_t prev_r1 = 0;
+        static __declspec(thread) uint32_t hits = 0, dec_run = 0;
+        static __declspec(thread) int dumped = 0;
+        uint32_t r1 = (uint32_t)ctx->gpr[1];
+        uint32_t obj = (uint32_t)ctx->gpr[3];
+        hits++;
+        if (prev_r1 && r1 < prev_r1) dec_run++; else dec_run = 0;
+        prev_r1 = r1;
+        if ((hits & 31u) == 1u)
+            fprintf(stderr, "[recprobe] tid=%u hit#%u r1=0x%08X dec_run=%u obj(r3)=0x%08X\n",
+                    yz_thread_current_id(), hits, r1, dec_run, obj);
+        if (!dumped && dec_run >= 80u) {
+            dumped = 1;
+            fprintf(stderr, "[recprobe] *** RUNAWAY recursion on tid=%u: r1 fell %u steps to 0x%08X. "
+                    "obj(r3)=0x%08X\n", yz_thread_current_id(), dec_run, r1, obj);
+            if (obj >= 0x10000u && obj < 0xE0000000u) {
+                fprintf(stderr, "[recprobe] obj dump:");
+                for (uint32_t o = 0; o <= 0x60u; o += 4u) fprintf(stderr, " +%02X=%08X", o, vm_read32(obj + o));
+                fprintf(stderr, "\n");
+                uint32_t l = vm_read32(obj + 0x5Cu);    /* func_00F83A10 reads obj[0x5C] */
+                fprintf(stderr, "[recprobe] obj[0x5C]=0x%08X", l);
+                if (l >= 0x10000u && l < 0xE0000000u)
+                    for (uint32_t o = 0; o <= 0x18u; o += 4u) fprintf(stderr, " *(+%02X)=%08X", o, vm_read32(l + o));
+                fprintf(stderr, "\n");
+            }
+            uint32_t sp = r1;
+            for (int f = 0; f < 24 && sp >= 0x10000u && sp < 0xE0000000u; f++) {
+                uint32_t nxt = vm_read32(sp);
+                uint32_t lr  = (nxt >= 0x10000u && nxt < 0xE0000000u) ? vm_read32(nxt + 0x10u) : 0;
+                fprintf(stderr, "[recprobe]   frame %2d sp=0x%08X savedLR=0x%08X\n", f, sp, lr);
+                if (nxt <= sp) break;
+                sp = nxt;
+            }
+            fflush(stderr);
+        }
+    }
 
     /* DIAG (2026-06-16, drain trigger, env YZ_CB_TRACE): does libgcm fire the game's
      * gcm CONTEXT CALLBACK (gcm_ctx+0xC = OPD 0x01355208 -- the drain lives inside it)
@@ -328,16 +375,23 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         }
     }
 
-    /* SINGLE-SEGMENT override (env YZ_ONESEG, 2026-06-20): libgcm's segment-recycle
-     * reserve (func_02103AAC) wedges when GET is parked outside the ring (in an
-     * unfinalized display list) and the producer must recycle a 1 MB segment. Promote
-     * the FIFO to ONE buffer-spanning segment so the producer writes linearly and never
-     * recycles mid-frame. Returns 1 -> handled, skip the real reserve (don't set the
-     * trampoline = the bctrl returns to the producer with end already extended). */
+
+    /* MEASUREMENT (env YZ_PHASE): GET/PUT at each libgcm segment-recycle reserve
+     * entry (func_02103AAC). Decisive test of whether the producer laps the
+     * consumer: GET should track PUT (gap small / within one segment). If GET
+     * falls a full segment behind over successive reserves, the producer is still
+     * lapping. */
     if (target == 0x02103AACu) {
-        extern int yz_gcm_reserve_oneseg(ppu_context*);
-        static int en = -1; if (en < 0) en = getenv("YZ_ONESEG") ? 1 : 0;
-        if (en && yz_gcm_reserve_oneseg(ctx)) return;
+        static int phase = -1;
+        if (phase < 0) phase = getenv("YZ_PHASE") ? 1 : 0;
+        if (phase) {
+            uint32_t get = vm_read32(0x10000044u) & ~3u;
+            uint32_t put = vm_read32(0x10000040u) & ~3u;
+            static int n = 0;
+            if (n < 240) { n++;
+                fprintf(stderr, "[reserve #%d] GET=0x%06X PUT=0x%06X\n", n, get, put);
+                fflush(stderr); }
+        }
     }
 
     /* Bridges complete entirely on the host, so call directly. */

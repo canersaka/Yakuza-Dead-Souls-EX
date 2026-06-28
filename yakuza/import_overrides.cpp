@@ -761,6 +761,123 @@ static DWORD WINAPI yz_bigseg_monitor(LPVOID)
     }
 }
 
+/* DEFER-DECISION TRACE (env YZ_TRACE_DEFER, 2026-06-24). Pin WHY the game defers a
+ * stopper-release (the LAYER-1 deadlock root) vs releases it immediately. From the
+ * static decode of the inline gcm flush func_00E9BC9C / func_00E9BE4C:
+ *   S = *(game_toc-0x7410)   = gcm-state struct
+ *   C = *(game_toc-0x7414);  P = *C;  ctx_end = P[+0x4]   (current segment end)
+ *   S[+0x1C] = defer latch    S[+0x20] = pending stopper cursor
+ *   S[+0x24] = segment-end recorded WHEN the stopper was placed
+ *   S[+0x00] = op-list write head   S[+0x08] = op-list base   (0x20-byte entries;
+ *              entry[+0]=tag (0x7F=deferred release), entry[+4]=stopper EA)
+ * DECISION (func_00E9BE4C:E9BE58): release is IMMEDIATE iff S[0x24]==ctx_end, else
+ * DEFERRED (cross-segment: the producer crossed a 1 MB boundary between place+release).
+ * This monitor is READ-ONLY (no clamp, unlike YZ_IMM_REL) -- it just records the
+ * decision state so we can see (a) how often defer fires + the S[0x24]/ctx_end values,
+ * (b) whether the op-list backlog of tag-0x7F entries EVER drains (count drops) or only
+ * grows, and (c) ctx_end segment advances. Logs every change + a 1s heartbeat. */
+static DWORD WINAPI yz_defer_trace_mon(LPVOID)
+{
+    fprintf(stderr, "[defer] trace monitor up (READ-ONLY): watching S[0x1C] latch, "
+                    "op-list backlog, S[0x24] vs ctx_end\n");
+    uint32_t last_head = ~0u, last_latch = ~0u, last_end = ~0u, last_pend = ~0u;
+    DWORD last_hb = 0;
+    for (;;) {
+        if (g_yz_game_toc) {
+            uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+            uint32_t C = vm_read32(g_yz_game_toc - 0x7414u);
+            if (S >= 0x10000u && S < 0xE0000000u) {
+                uint32_t latch = vm_read32(S + 0x1Cu);
+                uint32_t pend  = vm_read32(S + 0x20u);
+                uint32_t saved = vm_read32(S + 0x24u);
+                uint32_t base  = vm_read32(S + 0x08u);
+                uint32_t head  = vm_read32(S + 0x00u);
+                uint32_t ctx_end = 0;
+                if (C >= 0x10000u && C < 0xE0000000u) {
+                    uint32_t P = vm_read32(C + 0x0u);
+                    if (P >= 0x10000u && P < 0xE0000000u) ctx_end = vm_read32(P + 0x4u);
+                }
+                /* count un-applied tag-0x7F deferred releases in [base,head) */
+                uint32_t pend7f = 0, nent = 0;
+                if (base >= 0x10000u && base < 0xE0000000u && head >= base && (head - base) <= 0x8000u) {
+                    nent = (head - base) / 0x20u;
+                    for (uint32_t e = base; e < head; e += 0x20u)
+                        if (vm_read32(e + 0x0u) == 0x7Fu) pend7f++;
+                }
+                uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
+                uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
+                DWORD now = GetTickCount();
+
+                if (head != last_head) {
+                    int delta = (last_head==~0u) ? 0 : (int)((int32_t)head - (int32_t)last_head)/0x20;
+                    const char* dir = (last_head!=~0u && head < last_head) ? "  <<< DRAIN (head shrank)" : "";
+                    fprintf(stderr, "[defer] op-list head 0x%08X->0x%08X (%+d entries, %u total, %u pending-0x7F)%s\n",
+                            last_head==~0u?head:last_head, head, delta, nent, pend7f, dir);
+                    last_head = head;
+                }
+                if (pend7f != last_pend) {
+                    if (last_pend != ~0u && pend7f < last_pend)
+                        fprintf(stderr, "[defer] *** BACKLOG DRAINED: pending-0x7F %u -> %u (something applied a release)\n", last_pend, pend7f);
+                    last_pend = pend7f;
+                }
+                if (latch != last_latch) {
+                    fprintf(stderr, "[defer] latch S[0x1C] 0x%08X->0x%08X  (%s)  pend=0x%08X saved_segend=0x%08X ctx_end=0x%08X\n",
+                            last_latch==~0u?latch:last_latch, latch,
+                            latch?"DEFER mode armed":"immediate mode", pend, saved, ctx_end);
+                    last_latch = latch;
+                }
+                if (ctx_end != last_end && ctx_end) {
+                    fprintf(stderr, "[defer] ctx_end (segment) 0x%08X->0x%08X  saved_segend=0x%08X  -> next release: %s\n",
+                            last_end==~0u?ctx_end:last_end, ctx_end, saved,
+                            (saved==ctx_end)?"IMMEDIATE":"DEFER (cross-segment)");
+                    last_end = ctx_end;
+                }
+                if (now - last_hb >= 1000u) { last_hb = now;
+                    fprintf(stderr, "[defer hb] latch=0x%X pend=0x%08X saved_segend=0x%08X ctx_end=0x%08X | op-list ent=%u pend7f=%u | GET=0x%06X PUT=0x%06X\n",
+                            latch, pend, saved, ctx_end, nent, pend7f, get & 0xFFFFFFu, put & 0xFFFFFFu);
+                    fflush(stderr);
+                }
+            }
+        }
+        Sleep(0);
+    }
+}
+
+/* PHASE TIMELINE (env YZ_PHASE, 2026-06-24): high-detail producer+consumer timeline to
+ * catch the working->broken transition. Frames 1-2 work, frame 3 (first ring wrap)
+ * deadlocks; this logs EVERY change to GET/PUT (consumer/commit heads) + the producer's
+ * bufdesc cursor (cur/begin/end) + flip count, timestamped, so we can see the exact step
+ * where "producer ahead of consumer" flips to "phase-locked one segment apart". Pairs with
+ * the reserve-call log (dispatch.cpp, each func_02103AAC) and YZ_FIFO_TRACE (consumer steps). */
+static DWORD WINAPI yz_phase_monitor(LPVOID)
+{
+    fprintf(stderr, "[phase] timeline monitor up (logs every GET/PUT/cursor/flip change)\n");
+    const uint32_t pbd = 0x02114000u - 0x7FD8u;
+    uint32_t lg=~0u, lp=~0u, lc=~0u, lb=~0u, le=~0u, lf=~0u;
+    DWORD t0 = GetTickCount();
+    for (;;) {
+        uint32_t bd  = vm_read32(pbd);
+        uint32_t get = vm_read32(0x10000044u) & ~3u;
+        uint32_t put = vm_read32(0x10000040u) & ~3u;
+        uint32_t cur=0, beg=0, end=0;
+        if (bd >= 0x10000u && bd < 0xE0000000u) {
+            cur = vm_read32(bd + 0x8); beg = vm_read32(bd + 0x0); end = vm_read32(bd + 0x4);
+        }
+        uint32_t fl = vm_read32(0x40C00000u);
+        if (get!=lg || put!=lp || cur!=lc || beg!=lb || end!=le || fl!=lf) {
+            /* seg# of GET vs cur (producer write head) -> the phase gap */
+            int gseg = (int)((get & 0x7FFFFF) >> 20);
+            int cseg = (cur >= 0x40400000u && cur < 0x40C00000u) ? (int)((cur - 0x40400000u) >> 20) : -1;
+            fprintf(stderr, "[phase] t=%5lu GET=%06X(s%d) PUT=%06X | cur=%08X(s%d) beg=%08X end=%08X | flips=%u | gap=%d\n",
+                    GetTickCount()-t0, get, gseg, put, cur, cseg, beg, end, fl,
+                    (cseg>=0)? cseg-gseg : 99);
+            fflush(stderr);
+            lg=get; lp=put; lc=cur; lb=beg; le=end; lf=fl;
+        }
+        Sleep(0);
+    }
+}
+
 /* BUFDESC GEOMETRY DUMP (env YZ_DUMP_BUFDESC, 2026-06-20): resolve libgcm's buffer
  * descriptor (bufdesc = *(libgcm_toc 0x02114000 - 0x7FD8) = *0x0210C028) and dump the
  * segment-geometry fields the reserve func_02103AAC waits on (+0x10 dma-ctrl, +0x14 base,
@@ -926,539 +1043,224 @@ static inline void rsx_idle(int tight)
     }
 }
 
+/* ===========================================================================
+ * Faithful RSX FIFO consumer (clean-room reimplementation of RPCS3's
+ * FIFO_control + rsx::thread::run_FIFO, Emu/RSX/RSXFIFO.cpp). Replaces ~10
+ * sessions of band-aids. Sony's libgcm owns the ring; the guest (t1) produces
+ * commands and advances PUT; this thread is the RSX side that consumes the
+ * committed [GET, PUT) and advances GET.
+ * ===========================================================================*/
+
+/* GET serialization (RPCS3 sys_rsx_mtx analogue). The two writers of the
+ * DMA-control GET register -- this consumer loop and the guest sys_rsx pkg001
+ * (FIFO set get/put) path -- serialize here so a pkg001 set never tears a GET
+ * the consumer is advancing, and the consumer never overwrites a pkg001 set
+ * with a stale-derived GET. Race-safe lazy init via InitOnce. */
+static CRITICAL_SECTION g_rsx_fifo_lock;
+static INIT_ONCE        g_rsx_fifo_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK yz_rsx_fifo_init_cb(PINIT_ONCE, PVOID, PVOID*)
+{
+    InitializeCriticalSection(&g_rsx_fifo_lock);
+    return TRUE;
+}
+static void yz_rsx_fifo_lock_ensure(void)
+{
+    InitOnceExecuteOnce(&g_rsx_fifo_once, yz_rsx_fifo_init_cb, NULL, NULL);
+}
+
+/* Faithful rules (NO heuristics, NO deferred-release, NO GET-forcing):
+ *   - GET re-read every iteration; PUT bounds us to [GET, PUT). get == put =>
+ *     drained: yield and re-poll. GET NEVER reaches or passes PUT.
+ *   - old jump (cmd & 0xE0000003 == 0x20000000) / new jump (cmd & 3 == 1):
+ *     follow. A jump-to-self (target == get) is the producer's stopper: spin in
+ *     place (memwatch) until t1 patches the word; never force past it.
+ *   - call (cmd & 3 == 2): one-level return stack; jump to cmd & 0x1FFFFFFC.
+ *   - return (cmd & 0xFFFF0003 == 0x00020000): pop the return.
+ *   - method packet: count=(cmd>>18)&0x7FF, method=cmd&0x3FFFC,
+ *     noninc=cmd&0x40000000. Require the whole packet committed (PUT covers
+ *     header+args) before dispatching (RPCS3 inc_get waits for PUT per arg).
+ *     Dispatch each arg via yz_rsx_method; an unsatisfied semaphore ACQUIRE
+ *     stalls (leave GET on the packet, retry).
+ *   - off-ring GET / unmapped jump target / malformed word: recover (resync
+ *     GET=PUT, log once, clear the return stack) -- RPCS3 recover_fifo. */
+/* One-level return stack, shared between the async consumer thread and any
+ * inline pump (only ONE drains at a time -- YZ_RSX_INLINE disables the async
+ * thread). Guarded by g_rsx_fifo_lock. */
+static uint32_t g_fifo_ret = ~0u;
+
+/* Process exactly ONE FIFO command at GET (self-locked). Returns 1 if it made
+ * progress (GET advanced / a method dispatched), 0 if idle or stalled (drained,
+ * parked on a stopper, segment not finalised, off-ring, or an unsatisfied
+ * semaphore). The RPCS3 run_FIFO step, factored out of the old consumer loop so
+ * it can run EITHER on the free-running async thread OR inline on the producer
+ * thread (YZ_RSX_INLINE: drain coupled to the producer's PUT flush so it can't lap). */
+static int yz_rsx_fifo_step(void)
+{
+    EnterCriticalSection(&g_rsx_fifo_lock);
+    uint32_t       get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
+    const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
+
+    /* FIFO_EMPTY: ring drained. Never reach/pass PUT. (RPCS3 read(): put==get) */
+    if (get == put) { LeaveCriticalSection(&g_rsx_fifo_lock); return 0; }
+
+    const uint32_t ea = yz_rsx_io_to_ea(get);
+    if (!ea) {
+        const uint32_t pea = yz_rsx_io_to_ea(put);
+        if (put != get && pea) {
+            static int n = 0; if (n < 12) { n++;
+                fprintf(stderr, "[rsx] GET=0x%08X off-ring -> resync to PUT 0x%08X (recover)\n", get, put); }
+            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
+            g_fifo_ret = ~0u;
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 1;
+        }
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "[rsx] GET=0x%08X (PUT=0x%08X) not io-mapped; idling\n", get, put); }
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 0;
+    }
+
+    const uint32_t cmd = vm_read32(ea);
+
+    /* ---- control transfer ---- */
+    if ((cmd & 0xE0000003u) == 0x20000000u || (cmd & 3u) == 1u) {   /* old | new jump */
+        const uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
+                                              : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
+        if (tgt == get) {
+            /* Jump-to-self stopper: spin in place until the stopper is released.
+             * (A consumer-side +4 patch was tried 2026-06-26 and REVERTED -- it
+             * fired before the producer finalized the segment, derailing GET into
+             * the still-unbuilt display list at io 0x1104D00. The faithful root is
+             * a producer-pacing divergence; the load-bearing yz_flip_advance lever
+             * advances GET past this stopper when t1 is reserve-wedged.) */
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 0;
+        }
+        if (!yz_rsx_io_to_ea(tgt)) {
+            const uint32_t pea = yz_rsx_io_to_ea(put);
+            if (put != get && pea) {
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
+                g_fifo_ret = ~0u;
+                LeaveCriticalSection(&g_rsx_fifo_lock);
+                return 1;
+            }
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 0;
+        }
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 1;
+    }
+    if ((cmd & 3u) == 2u) {                                          /* call */
+        const uint32_t ctgt = cmd & 0x1FFFFFFCu;                     /* CALL offset mask */
+        if (!yz_rsx_io_to_ea(ctgt)) {
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 0;
+        }
+        g_fifo_ret = get + 4u;                /* one-level return */
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 1;
+    }
+    if ((cmd & 0xFFFF0003u) == 0x00020000u) {                        /* return */
+        if (g_fifo_ret != ~0u) {
+            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
+            g_fifo_ret = ~0u;
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 1;
+        }
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "[rsx] RETURN without CALL at io=0x%08X; idling\n", get); }
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 0;
+    }
+
+    /* ---- method packet ---- */
+    /* RPCS3 RSX_METHOD_NON_METHOD_CMD_MASK 0xA0030003: after the flow-control
+     * tests, a finalised method has those bits clear. If set, GET reached the
+     * end of finalised commands in this segment -- wait, don't parse data. */
+    if (cmd & 0xA0030003u) {
+        static int w = 0; if (w < 24) { w++;
+            fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
+                    "finalised; waiting for producer\n", cmd, get, put); }
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 0;
+    }
+
+    const uint32_t count   = (cmd >> 18) & 0x7FFu;
+    const uint32_t noninc  = cmd & 0x40000000u;
+    const uint32_t method  = cmd & 0x3FFFCu;
+    const uint32_t pkt_end = get + 4u + count * 4u;
+
+    /* The whole packet (header + count args) must be committed before we
+     * dispatch (RPCS3 inc_get waits for PUT to cover each arg; PUT points one
+     * past the last committed word). Linear within a segment; wrap is handled
+     * by the producer's JUMP. If PUT is mid-packet, wait. */
+    if (count && get < put && pkt_end > put) {
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 0;
+    }
+
+    int stalled = 0;
+    for (uint32_t i = 0; i < count && !stalled; i++) {
+        const uint32_t op_ea = yz_rsx_io_to_ea(get + 4u + i * 4u);
+        if (!op_ea) break;
+        const uint32_t eff = noninc ? method : method + i * 4u;
+        const uint32_t val = vm_read32(op_ea);
+        stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
+    }
+    if (stalled) {
+        /* Leave GET on this packet header and retry (RPCS3: GET un-advanced on
+         * an unsatisfied acquire) so the same method re-issues when ready. */
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return 0;
+    }
+    vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, pkt_end);
+    LeaveCriticalSection(&g_rsx_fifo_lock);
+    return 1;
+}
+
+/* Drain the FIFO inline until it stalls/drains (bounded). Called on the PRODUCER
+ * thread from the PUT-flush hook (vm_write32 -> yz_rsx_inline_on_put) and from the
+ * reserve usleep wait (sys_timer.c via g_yz_usleep_pump) -- the "continuous,
+ * synchronous, NOT async" RSX experiment (YZ_RSX_INLINE). */
+extern "C" void yz_rsx_fifo_pump(void)
+{
+    if (!g_rsx_ctx_ready) return;
+    int budget = 4096, steps = 0;
+    while (budget-- > 0 && yz_rsx_fifo_step()) { steps++; }
+    /* Lightweight liveness: total pump calls + total advanced steps, every 8192 calls. */
+    static long calls = 0, total = 0; total += steps;
+    if ((++calls & 0x1FFFu) == 1u)
+        fprintf(stderr, "[rsx-inline] pump calls=%ld total_steps=%ld (this=%d) GET=0x%08X PUT=0x%08X\n",
+                calls, total, steps,
+                vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET), vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT));
+}
+
+/* PUT-flush hook (vm_write32 on a write to the PUT register 0x10000040). In inline
+ * mode, drain GET up to the just-flushed PUT on the producer's own thread, so GET
+ * tracks PUT and the producer cannot lap the ring between placing and releasing a
+ * stopper. Env-gated; default boot (async consumer) is unchanged. */
+extern "C" void yz_rsx_inline_on_put(void)
+{
+    static int on = -1; if (on < 0) on = getenv("YZ_RSX_INLINE") ? 1 : 0;
+    if (on) yz_rsx_fifo_pump();
+}
+
+/* Registered into sys_timer.c so the reserve's sub-ms usleep wait pumps the FIFO
+ * (GET advances while the producer waits for it -- the faithful "GPU runs while
+ * the CPU waits" coupling). Set only in inline mode. */
+extern "C" { void (*g_yz_usleep_pump)(void) = 0; }
+
 static DWORD WINAPI yz_rsx_consumer(LPVOID)
 {
-    uint32_t fifo_ret    = ~0u;         /* 1-level call stack */
-    uint32_t g_call_entry = ~0u;        /* entry of the current sub (self-loop detect) */
-    /* DEADLOCK-BREAK state: the game RELEASES a stopper by patching it
-     * (func_00E9BC9C@0xE9BE60 writes a NOP; cross-fragment -> JUMP; display-list
-     * self-loop -> RET) and we normally WAIT for that. But the @0x300000-class wall
-     * is a TRUE mutual deadlock (write-watch: the game writes the stopper, then goes
-     * silent -- it parks in the flip-throttle/recycle waiting for the RSX while the
-     * RSX waits for the patch). So if PUT stays FROZEN >80 ms (the game is stuck, not
-     * building) we force the release ourselves, mirroring the patch. A frozen-PUT gate
-     * (not a timer) is essential: forcing mid-build races into un-committed data. */
-    uint32_t stall_put   = ~1u;
-    DWORD    stall_since  = 0;
-    /* COHERENCE-SAFE deferred-release (LAYER 1, 2026-06-15e). When GET enters a
-     * segment via the game's queued stopper-release, we DON'T zero the stopper word
-     * (that satisfies the producer's recycle-wait `while [stopper]!=0` and lets it
-     * reuse/rewrite the segment under us = the corruption we are removing). We hold
-     * the stopper ea here and zero it only once GET has LEFT the segment -- so the
-     * producer can reuse it only after GET demonstrably passed. */
-    uint32_t def_release_ea  = 0;
-    uint32_t def_release_seg = 0;
-    /* FAITHFUL by default (Layer 1, STATUS.md 2026-06-14d): a jump-to-self
-     * stopper is a MEMWATCH -- park GET on it and wait for the game to patch the
-     * word, mirroring real HW (RPCS3 FIFO_control::set_get/read memwatch). The
-     * pre-14d deadlock-break TIMERS force GET past an un-patched stopper, which
-     * corrupts the GET we report to libgcm's recycle/flip flow-control -- the
-     * suspected cause of the handshake deadlocks. YZ_RSX_HEURISTIC=1 restores the
-     * old behavior so the two can be A/B-compared in one build. */
-    const int heur = getenv("YZ_RSX_HEURISTIC") != nullptr;
-    const int tight = getenv("YZ_TIGHT") != nullptr;
-    /* CALL-into-stale guard (2026-06-20): a committed CALL to a per-frame display list
-     * (io 0x1104D00) whose target is NOT yet finalized -- the first word is a non-command
-     * (0xA2000500 stale shader, 0xA0030003 bits set) -- must NOT be followed. Following it
-     * parks GET at io 0x1104D00 which is OUTSIDE the 8 MB ring, wedging libgcm's reserve
-     * (it waits forever for GET to return to ring bounds) -> t1 never finalizes the list.
-     * WAIT at the CALL instead (GET stays in the ring) so the reserve keeps working and t1
-     * can finalize the list, then follow. Faithful: RPCS3's GET never executes stale data. */
-    const int callwait = getenv("YZ_CALLWAIT") != nullptr;
-    /* CALL-skip (2026-06-20, LAYER-1 angle): when a committed CALL targets an unbuilt
-     * (stale, non-command first word) display list, SKIP it -- advance GET past the CALL
-     * and keep processing the main ring -- instead of waiting/following. Rationale: the
-     * deferred-release zooms GET to the CALL before the producer builds the list; parking
-     * there (callwait) makes the producer lap+wedge so it never builds it. Skipping keeps
-     * GET advancing (producer never wedged) at the cost of frame N's geometry, to see if
-     * the loop self-advances (fence climbs, the NEXT frame's list gets built). */
-    const int callskip = getenv("YZ_CALLSKIP") != nullptr;
-    /* FAITHFUL-STOPPER + WRAP-AWARE SKIP (env YZ_FAITHSKIP, 2026-06-20) -- the
-     * RPCS3-grounded LAYER-1 fix. GROUND TRUTH (user RSX-debug, EA 0x40700000 = io
-     * 0x300000): a segment-entry stopper's RELEASED form is 0x20N00004 (a jump fwd
-     * one word to the real method header at io 0xN00004); its NOT-READY form is
-     * 0x20N00000 (jump-to-self). RPCS3's GET never parks on the jump-to-self -- the
-     * producer patches it BEFORE GET arrives. Our deferred-release instead force-
-     * advances past the UNpatched 0x20N00000 into the STALE io 0xN00004 (a leftover
-     * shader-bind arg like 0x01104D02), misreads it as a CALL, and derails into shader
-     * microcode at io 0x1104D00 -> GET freezes -> t1's libgcm reserve wedges -> it
-     * never builds/patches the segment. FIX: (1) at a jump-to-self, WAIT for the word
-     * to become a non-self jump (0x20N00004) -- never read stale io+4; (2) if it stays
-     * a stopper > 120ms (t1 reserve-wedged), advance GET to the NEXT segment boundary
-     * (wrap-aware: ring io 0x1000..0x800000) -- always a jump word, never stale data --
-     * so GET leaves t1's recycle region and t1 can build + patch the segment. */
-    const int faithskip = getenv("YZ_FAITHSKIP") != nullptr;
-    uint32_t fs_stop_get = ~0u; DWORD fs_stop_since = 0;
-    /* FAITHSKIP REPLAY state (2026-06-20 pt26). The wedge-break GET=PUT frees t1's
-     * reserve so t1 finalizes the frame and DRAINS its op-list (fills the placeholder
-     * gaps, patches the segment stoppers 0x20N00000 -> 0x20N00004). But GET=PUT
-     * OVERSHOOTS the drained frame (past the in-stream flip cmd) so the flip never
-     * executes (FAITHSKIP alone = 2 flips). We remember the stopper we skipped; once t1
-     * patches it (apply ran => frame drained) we REWIND GET to it and replay the
-     * now-valid frame (real methods + flip cmd) -> flip completes, fence advances. */
-    uint32_t fs_replay_stopper = 0; int fs_replay_armed = 0; DWORD fs_replay_since = 0;
-    /* SKIP-GARBAGE consumer (env YZ_SKIPGARBAGE, 2026-06-20 pt25b): the segment is
-     * built with deferred-patch PLACEHOLDERS (op-list journal, applied only on ring-
-     * wrap which never comes). Rather than apply the full drain (deep, machinery spread
-     * across many funcs), exploit that our parser RELIABLY flags non-commands (the
-     * 0xA0030003 mask: real methods incl. draws 0x00041808 / flip 0x0004E944 pass it;
-     * every placeholder/data-block fails it). On a jump-to-self stopper OR a non-command
-     * word OR a CALL into a stale list, SKIP one word and re-check (stay within [GET,PUT))
-     * until the next valid command. Walks past the un-drained placeholders to the real
-     * draws + the in-stream flip command -> breaks the deadlock, flips flow. LOSSY (the
-     * deferred-patch values are missing -> some geometry wrong) but it gets us PAST the
-     * LAYER-1 deadlock; the faithful drain refines it later. */
-    const int skipgarbage = getenv("YZ_SKIPGARBAGE") != nullptr;
-    fprintf(stderr, "[rsx] FIFO consumer up: %s%s\n",
-            heur ? "HEURISTIC mode (deadlock-break timers ON)"
-                 : "FAITHFUL mode (memwatch stopper, no GET-forcing heuristics)",
-            tight ? " + TIGHT drain (no Sleep idles)" : "");
-    /* FIFO STEP TRACE (env YZ_FIFO_TRACE=<path>, 2026-06-20): a canonical, machine-
-     * parseable play-by-play of EXACTLY what the consumer does, one line per step:
-     *   M  <midx> <io_get> <method> <value>     -- each dispatched NV method (method &
-     *                                              0x3FFFC, same decode as RPCS3's .rrc)
-     *   J  <step> <io_get> <io_put> <word> <tgt>            -- jump taken
-     *   C  <step> <io_get> <io_put> <word> <ctgt> FOLLOW|SKIP|WAIT  -- call
-     *   R  <step> <io_get> <io_put> <ret>                   -- return
-     *   S  <step> <io_get> <io_put> <word> PARK|ADV         -- jump-to-self stopper
-     * The 'M' stream is directly diffable against RPCS3's working-frame .rrc (emit it
-     * with tools/rrc_methods.py; align with tools/cmp_fifo.py) -> shows precisely where
-     * our executed stream diverges from / stops short of RPCS3's. */
-    const char* ft_path = getenv("YZ_FIFO_TRACE");
-    FILE* ft = ft_path ? fopen(ft_path, "w") : nullptr;
-    uint32_t ft_midx = 0, ft_step = 0, ft_park = ~0u, ft_cwait = ~0u;
-    if (ft) fprintf(ft, "# YZ FIFO TRACE  kinds: M(method) J(jump) C(call) R(ret) S(stopper)\n");
+    yz_rsx_fifo_lock_ensure();
+    fprintf(stderr, "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model)\n");
     for (;;) {
-        if (!g_rsx_ctx_ready) { Sleep(1); continue; }
-        /* Re-read GET and PUT every iteration. We are the only writer of GET in
-         * steady state; PUT is t1's and bounds us to the committed [GET,PUT). */
-        uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
-        const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
-
-        /* FAITHSKIP REPLAY (2026-06-20 pt26): a wedge-break GET=PUT armed a replay --
-         * t1 is now free to finalize the frame + drain its op-list. POLL the stopper we
-         * skipped; while it's still the un-released jump-to-self (0x20N00000) the apply
-         * hasn't run yet, so IDLE (let t1 run; don't process the still-placeholder'd
-         * frame). The instant t1 patches it (0x20N00004 or a NOP) the frame is drained:
-         * REWIND GET to the stopper and replay the now-valid frame (real methods + the
-         * in-stream flip cmd) so the flip executes and the flip fence advances. */
-        if (fs_replay_armed) {
-            uint32_t rea = yz_rsx_io_to_ea(fs_replay_stopper);
-            uint32_t rw  = rea ? vm_read32(rea) : 0;
-            if (rea && rw != (0x20000000u | fs_replay_stopper)) {
-                static int rn = 0; if (rn < 16) { rn++;
-                    fprintf(stderr, "[rsx] FAITHSKIP REPLAY: stopper io=0x%X patched 0x%08X "
-                            "(apply ran, %lums) -> rewind GET to replay drained frame\n",
-                            fs_replay_stopper, rw, GetTickCount() - fs_replay_since); }
-                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, fs_replay_stopper);
-                fs_replay_armed = 0;
-                continue;
-            }
-            /* Give up after a long wait (apply genuinely never runs) -- fall back to the
-             * old skip-forward behaviour so we don't hang the consumer forever. */
-            if (GetTickCount() - fs_replay_since > 4000u) {
-                static int gn = 0; if (gn < 4) { gn++;
-                    fprintf(stderr, "[rsx] FAITHSKIP REPLAY: stopper io=0x%X never patched in 4s "
-                            "(apply did not run) -> abandoning replay\n", fs_replay_stopper); }
-                fs_replay_armed = 0;
-            } else {
-                rsx_idle(tight);
-                continue;
-            }
-        }
-
-        /* Coherence: once GET has LEFT (moved to a later main-ring segment than) the
-         * segment we entered via a deferred-release, zero that segment's entry stopper
-         * -- only now is reuse safe (GET passed it). Skip while GET is inside a called
-         * display list (io >= 0x01000000); it will RET back into the segment. */
-        if (def_release_ea && get < 0x01000000u && (get & ~0xFFFFFu) != def_release_seg) {
-            vm_write32(def_release_ea, 0);
-            def_release_ea = 0;
-        }
-
-        if (get == put) { rsx_idle(tight); continue; }   /* committed boundary: idle */
-
-        const uint32_t ea = yz_rsx_io_to_ea(get);
-        if (!ea) {
-            /* GET is stranded on a non-ring value (the boot coin-flip: e.g. 0xFEED0000,
-             * a DMA selector / method-arg word that mis-decoded as a jump after GET was
-             * dropped into a half-finalised segment). RECOVER instead of idling forever:
-             * resync GET to the committed write head (PUT) if PUT is in the ring, so the
-             * consumer resumes from a valid boundary and the flip fence advances. Bad
-             * boots strand GET here; good boots never do -- so this makes the boot
-             * deterministic (6-agent root: the unsynchronised GET writers strand GET). */
-            if ((put & ~3u) != get && yz_rsx_io_to_ea(put & ~3u)) {
-                static int n = 0; if (n < 12) { n++;
-                    fprintf(stderr, "[rsx] GET=0x%08X off-ring -> resync to PUT 0x%08X (recover)\n", get, put); }
-                get = put & ~3u;
-                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                continue;
-            }
-            static int warned = 0;
-            if (!warned) { warned = 1;
-                fprintf(stderr, "[rsx] GET=0x%08X (PUT=0x%08X) not io-mapped; idling\n", get, put); }
-            rsx_idle(tight);
-            continue;
-        }
-        const uint32_t cmd = vm_read32(ea);
-
-        /* ---- flow control (jump / call / return) ---- */
-        if ((cmd & 0xE0000003u) == 0x20000000u || (cmd & 3u) == 1u) {   /* old|new jump */
-            const uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu) : (cmd & 0x1FFFFFFCu);
-            if (tgt == get) {                          /* jump-to-self stopper */
-                if (skipgarbage) {                     /* skip the un-released stopper word */
-                    if (ft) { fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tGSKIP\n", ft_step++, get, put, cmd); fflush(ft); }
-                    get += 4; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                    continue;
-                }
-                if (faithskip) {
-                    /* Faithful: NEVER advance into stale io+4. Wait for the game to
-                     * patch this word to 0x20N00004 (released); if it stays a stopper
-                     * too long (t1 reserve-wedged), skip to the next segment boundary
-                     * so GET leaves t1's recycle region. */
-                    DWORD now = GetTickCount();
-                    if (get != fs_stop_get) { fs_stop_get = get; fs_stop_since = now; }
-                    if (now - fs_stop_since > 120u && put != get) {
-                        /* t1 reserve/flip-wedged: catch GET up to the committed write
-                         * head (PUT) to free it -- the proven pt24 resync lever, but now
-                         * (a) inside the consumer (no racing monitor) and (b) protected
-                         * by the faithful stopper above, so the next read can't derail
-                         * into stale data the way the bare resync did. */
-                        if (ft) { fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tCATCHUP->0x%06X\n",
-                                          ft_step++, get, put, cmd, put); fflush(ft); }
-                        { static int sk = 0; if (sk < 24) { sk++;
-                            fprintf(stderr, "[rsx] FAITHSKIP: stopper io=0x%X unpatched %lums -> GET=PUT 0x%X\n",
-                                    get, now - fs_stop_since, put); } }
-                        /* ONE-TIME committed-segment dump (is [stopper,PUT) real frame-3
-                         * content with a flip command, or stale?). Decode each word. */
-                        { static int dumped = 0;
-                          if (!dumped && getenv("YZ_DUMP_SEG")) { dumped = 1;
-                            uint32_t lo = get & ~0xFFFFFu, hi = (put > lo && put < lo + 0x100000u) ? put + 0x10u : lo + 0x120u;
-                            fprintf(stderr, "[segdump] committed io 0x%X..0x%X (GET=0x%X PUT=0x%X):\n", lo, hi, get, put);
-                            for (uint32_t o = lo; o < hi; o += 4u) {
-                                uint32_t e2 = yz_rsx_io_to_ea(o); uint32_t w = e2 ? vm_read32(e2) : 0;
-                                const char* k = ((w&0xE0000003u)==0x20000000u)?"JUMP":((w&3u)==1u)?"jmpN":
-                                                ((w&3u)==2u)?"CALL":(w==0x20000u)?"RET ":
-                                                ((w&0xA0030003u)?"DATA":"meth");
-                                fprintf(stderr, "    io 0x%06X = 0x%08X %s m=0x%05X cnt=%u%s\n",
-                                        o, w, k, w&0x3FFFCu, (w>>18)&0x7FFu, o==get?" <-GET":(o==put?" <-PUT":"")); }
-                            /* Dump the gcm op-list entries (full 0x20 bytes each) so we can
-                             * see the VALUE the game's drain would write for each tag-0x7F
-                             * stopper-release (esp. io 0x300000's first-method header). */
-                            if (g_yz_game_toc) {
-                                uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
-                                uint32_t b = (S>=0x10000u&&S<0xE0000000u) ? vm_read32(S+0x08u) : 0;
-                                uint32_t h = (S>=0x10000u&&S<0xE0000000u) ? vm_read32(S+0x00u) : 0;
-                                fprintf(stderr, "[oplist] S=0x%08X base=0x%08X head=0x%08X\n", S, b, h);
-                                int n = 0;
-                                for (uint32_t e = b; b && e < h && n < 32; e += 0x20u, n++) {
-                                    fprintf(stderr, "  [%2d] tag=0x%02X ea=0x%08X  +08=0x%08X +0C=0x%08X +10=0x%08X +14=0x%08X +18=0x%08X +1C=0x%08X\n",
-                                            n, vm_read32(e+0x00u), vm_read32(e+0x04u), vm_read32(e+0x08u),
-                                            vm_read32(e+0x0Cu), vm_read32(e+0x10u), vm_read32(e+0x14u),
-                                            vm_read32(e+0x18u), vm_read32(e+0x1Cu)); }
-                            }
-                            fflush(stderr); } }
-                        /* Arm the replay: remember THIS stopper (start of the frame) so
-                         * that once t1 -- now freed by the GET=PUT below -- finalizes and
-                         * drains the op-list (patches this stopper), we rewind GET here
-                         * and replay the drained frame incl. its flip cmd. */
-                        fs_replay_stopper = get; fs_replay_armed = 1; fs_replay_since = GetTickCount();
-                        get = put; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                        fs_stop_get = ~0u;
-                        continue;
-                    }
-                    if (ft && ft_park != get) { ft_park = get;
-                        fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tWAIT\n", ft_step++, get, put, cmd); fflush(ft); }
-                    rsx_idle(tight);
-                    continue;
-                }
-                /* HLE (default = PURE FAITHFUL): a jump-to-self is a memwatch -- park
-                 * and wait for the game to patch it. Under single-segment HLE gcm the
-                 * game's threads don't wedge (no fragment-recycle), so they release
-                 * their own stoppers and no consumer-side break is needed. The LLE
-                 * band-aids below (op-list deferred-release + frozen-PUT NOP break)
-                 * are gated behind YZ_RSX_HEURISTIC for A/B comparison only. */
-                /* COHERENCE-SAFE deferred-release (LAYER 1, 2026-06-15e -- replaces the
-                 * unsound NOP). The game queues a cross-segment stopper-release into its
-                 * op-list (tag 0x7F) and applies it from its own drain-shepherd, which
-                 * never runs while it is flip-blocked -> GET wedges here. We honour the
-                 * game's OWN queued intent, advancing GET past the stopper but WITHOUT
-                 * zeroing the word (zeroing satisfies the producer's recycle-wait and
-                 * lets it reuse the segment under us). The held stopper is zeroed -- above
-                 * -- once GET leaves the segment. No frozen-PUT NOP-force any more: that
-                 * shoved GET past un-finalised data (exactly the corruption removed here). */
-                if (!getenv("YZ_NO_DEFER") && yz_gcm_stopper_release_deferred(ea)) {
-                    uint32_t seg = get & ~0xFFFFFu;
-                    if (def_release_ea && def_release_seg != seg) vm_write32(def_release_ea, 0);
-                    def_release_ea = ea; def_release_seg = seg;
-                    if (ft) { fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tADV\n", ft_step++, get, put, cmd); fflush(ft); }
-                    get += 4; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                    continue;
-                }
-                (void)stall_put; (void)stall_since;
-                if (ft && ft_park != get) { ft_park = get;
-                    fprintf(ft, "S\t%u\t0x%06X\t0x%06X\t0x%08X\tPARK\n", ft_step++, get, put, cmd); fflush(ft); }
-                rsx_idle(tight);
-                continue;
-            }
-            if (!yz_rsx_io_to_ea(tgt)) {
-                /* The jump target is not in the ring -- GET landed mid-segment on a method
-                 * argument word (e.g. 0xFEED0001) that mis-decodes as a jump. Do NOT strand
-                 * GET on it (the boot coin-flip); resync to PUT to recover at the source. */
-                if ((put & ~3u) != get && yz_rsx_io_to_ea(put & ~3u)) {
-                    get = put & ~3u; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get); continue;
-                }
-                rsx_idle(tight); continue;
-            }
-            yz_ct_push(get, cmd, tgt, "jmp");
-            if (ft) { fprintf(ft, "J\t%u\t0x%06X\t0x%06X\t0x%08X\t0x%06X\n", ft_step++, get, put, cmd, tgt); fflush(ft); }
-            get = tgt;
-            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-            continue;
-        }
-        if ((cmd & 3u) == 2u) {                                          /* call */
-            const uint32_t ctgt = cmd & 0xFFFFFFFCu;
-            /* Self-loop CALL (back to the entry of the sub we are inside) = display-list
-             * "park here" stopper. Wait for the game to patch it to a RET; force the
-             * RET on a frozen-PUT deadlock. Never re-enter (clobbers the 1-level ret). */
-            if (ctgt == g_call_entry && fifo_ret != ~0u) {
-                /* Display-list "park here" self-loop CALL: the game patches it to a
-                 * RET when it finalizes the list. Unlike a main-ring stopper this
-                 * release is NOT pre-queued in the op-list (the game wedges in
-                 * libgcm's reserve -- waiting for GET -- BEFORE it can finalize +
-                 * queue it: the true producer/consumer interlock, blocker #21). We
-                 * have already executed the list's committed content to reach this
-                 * terminator, so once PUT stays frozen >80 ms (producer wedged) force
-                 * the RET the game would write -- the only break for this interlock.
-                 * HLE (default): PURE FAITHFUL -- wait for the game's own RET patch. */
-                if (!heur) { rsx_idle(tight); continue; }
-                if (put != stall_put) { stall_put = put; stall_since = GetTickCount();
-                                        Sleep(1); continue; }
-                if (GetTickCount() - stall_since < 80u) { Sleep(1); continue; }
-                { static int n = 0; if (n < 8) { n++;
-                    fprintf(stderr, "[rsx] interlock-break self-loop io=0x%X -> RET to io=0x%X\n",
-                            get, fifo_ret); } }
-                stall_since = GetTickCount();
-                get = fifo_ret; fifo_ret = ~0u; g_call_entry = ~0u;
-                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                continue;
-            }
-            /* CALL-readiness: the main ring commits the [stopper][CALL display-list]
-             * pair (PUT) BEFORE the game fills the CALLed list in its own io region.
-             * WAIT (don't follow into a not-yet-written / unmapped list = walking
-             * zeros). No skip-on-deadlock: skipping derails into the next un-ready
-             * region; better to stall cleanly here than corrupt the stream. */
-            const uint32_t ctgt_ea = yz_rsx_io_to_ea(ctgt);
-            const uint32_t ctgt_w0 = ctgt_ea ? vm_read32(ctgt_ea) : 0u;
-            const int stale_word = (ctgt_w0 & 0xA0030003u) != 0u;
-            const int ctgt_stale = (callwait || callskip) && stale_word;
-            if ((callskip || skipgarbage) && ctgt_ea && stale_word) {
-                /* SKIP the unbuilt list: advance GET past the CALL, stay in the ring. */
-                if (ft) { fprintf(ft, "C\t%u\t0x%06X\t0x%06X\t0x%08X\t0x%06X\tSKIP\n", ft_step++, get, put, cmd, ctgt); fflush(ft); }
-                get += 4; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                static int sk = 0; if (sk < 16) { sk++;
-                    fprintf(stderr, "[rsx] CALL-SKIP unbuilt list io=0x%X (w0=0x%08X) -> GET=0x%X\n",
-                            ctgt, ctgt_w0, get); }
-                continue;
-            }
-            if (!ctgt_ea || ctgt_w0 == 0u || ctgt_stale) {
-                if (ft && ft_cwait != get) { ft_cwait = get;
-                    fprintf(ft, "C\t%u\t0x%06X\t0x%06X\t0x%08X\t0x%06X\tWAIT\n", ft_step++, get, put, cmd, ctgt); fflush(ft); }
-                static int w = 0; if (w < 8) { w++;
-                    fprintf(stderr, "[rsx] CALL target io=0x%X not ready (ea=0x%08X w0=0x%08X)%s; waiting\n",
-                            ctgt, ctgt_ea, ctgt_w0, ctgt_stale ? " [stale]" : ""); }
-                /* PRODUCER TRACE (env YZ_WATCH_LIST): arm the write-watch on the
-                 * un-written display list's ea so the next write to it reveals the
-                 * producer (tid + guest fn via the watch handler's back-chain dump).
-                 * If it never fires, the producer is fully blocked before touching
-                 * it -> that's the thread to chase. */
-                if (ctgt_ea) { static int armed = 0;
-                    if (!armed && getenv("YZ_WATCH_LIST")) { armed = 1;
-                        fprintf(stderr, "[rsx] arming producer-watch on display-list ea=0x%08X (io 0x%X)\n",
-                                ctgt_ea, ctgt);
-                        yz_watch_arm(ctgt_ea); } }
-                /* ALIGNMENT CHECK: decode the fragment we walked into this CALL
-                 * (io frag-start .. GET+8) ONCE, to tell whether GET is on a real
-                 * packet boundary (the CALL is genuine) or the deadlock-break
-                 * fall-through misaligned us (the "CALL" is a method arg). */
-                { static int fd = 0; if (!fd) { fd = 1;
-                    uint32_t fs = get & ~0xFFFFFu;          /* 1 MB segment start */
-                    fprintf(stderr, "[align] segment dump io 0x%X.. (GET=0x%X):\n", fs, get);
-                    for (uint32_t o = fs; o < fs + 0x200u; o += 4u) {
-                        uint32_t e2 = yz_rsx_io_to_ea(o);
-                        uint32_t wv = e2 ? vm_read32(e2) : 0;
-                        /* faithful classification (RPCS3 RSXFIFO.cpp: RSX_METHOD_NON_METHOD_CMD_MASK
-                         * 0xa0030003 -- a real method has those bits clear; else DATA/flow). */
-                        const char* k = ((wv&0xE0000003u)==0x20000000u)?"JUMP":((wv&3u)==1u)?"jmpN":
-                                        ((wv&3u)==2u)?"CALL":(wv==0x20000u)?"RET ":
-                                        ((wv&0xA0030003u)?"DATA":"meth");
-                        fprintf(stderr, "    io 0x%06X = 0x%08X %s m=0x%X c=%u%s\n",
-                                o, wv, k, wv&0xFFFCu, (wv>>18)&0x7FFu, o==get?"  <-GET":""); }
-                    /* TERMINATOR SCAN: a VALID frame ends in a jump to the next segment
-                     * (0x20?00000) -- find the first flow-control word after GET. If the
-                     * region GET..GET+0x800 is continuous DATA with no flow-control, GET
-                     * overran the frame into stale/uninitialised memory (coherence), not a
-                     * parser misparse on a live frame. */
-                    int found = 0;
-                    for (uint32_t o = get + 4u; o < fs + 0x100000u; o += 4u) {
-                        uint32_t e2 = yz_rsx_io_to_ea(o);
-                        uint32_t wv = e2 ? vm_read32(e2) : 0;
-                        if ((wv&0xE0000003u)==0x20000000u || (wv&3u)==1u || (wv&3u)==2u || wv==0x20000u) {
-                            fprintf(stderr, "    [scan] first flow-control after GET: io 0x%06X = 0x%08X "
-                                    "(+%d bytes)\n", o, wv, (int)(o - get)); found = 1; break; }
-                        if (o >= get + 0x800u) {
-                            fprintf(stderr, "    [scan] NO flow-control in GET..GET+0x800 -> continuous "
-                                    "DATA = GET overran frame into stale memory (coherence, not parse)\n");
-                            found = 1; break; } }
-                    (void)found; } }
-                /* PARSE TRACE: dump the last methods the consumer actually parsed to
-                 * reach this CALL, so we can tell if GET is on a real packet boundary
-                 * (the CALL is genuine -> blocked producer) or a method-count misparse
-                 * landed us mid-packet on an ARG misread as a CALL (a phantom list). */
-                yz_mt_dump(get, cmd);
-                { static int cd = 0; if (!cd) { cd = 1; yz_ct_dump(get, put); } }
-                /* DECISIVE TEST (env YZ_GET_RELIEF): is io 0x15D3134 unbuilt because t1 is
-                 * BLOCKED (out of ring space) before its build, or because it NEVER builds
-                 * it? When t1 is wedged here (PUT frozen >150ms), report the ring fully
-                 * drained (GET=PUT) to free t1's gcm reserve, then watch io 0x15D3134:
-                 *   - if t1 now BUILDS it  -> purely the circular space block (fixable by
-                 *     freeing the ring at the right moment);
-                 *   - if it STAYS empty    -> deeper: t1's control flow never reaches the
-                 *     build, or builds at the wrong address.
-                 * Corrupts the consumer stream (loses position) -- DIAGNOSTIC ONLY. */
-                if (getenv("YZ_GET_RELIEF")) {
-                    static uint32_t rput = ~0u; static DWORD rsince = 0;
-                    if (put != rput) { rput = put; rsince = GetTickCount(); }
-                    else if (GetTickCount() - rsince > 150u) {
-                        static int n = 0; if (n < 40) { n++;
-                            fprintf(stderr, "[rsx] GET-RELIEF: GET=PUT=0x%X to free t1's reserve "
-                                    "(was parked at empty CALL io 0x%X)\n", put, ctgt); }
-                        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
-                        rsince = GetTickCount();
-                        Sleep(1);
-                        continue;
-                    }
-                }
-                rsx_idle(tight);
-                continue;
-            }
-            /* DIAG (2026-06-14h): log the display-list CALL targets the consumer
-             * actually FOLLOWS (the WRITTEN lists) with their ea, so we know the
-             * real per-frame list regions for this run -- then a YZ_WATCH_EA on one
-             * of them catches the BUILDER filling it (the never-written io 0x15D3134
-             * can't be watched; a region the game reuses each frame can). */
-            { static int cl = 0; if (cl < 32) { cl++;
-                fprintf(stderr, "[rsx] follow CALL -> list io 0x%X (ea 0x%08X) from io 0x%X\n",
-                        ctgt, ctgt_ea, get); } }
-            if (ft) { fprintf(ft, "C\t%u\t0x%06X\t0x%06X\t0x%08X\t0x%06X\tFOLLOW\n", ft_step++, get, put, cmd, ctgt); fflush(ft); }
-            fifo_ret = get + 4;
-            g_call_entry = ctgt;
-            yz_ct_push(get, cmd, ctgt, "call");
-            get = ctgt;
-            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-            continue;
-        }
-        if (cmd == 0x00020000u) {                                        /* return */
-            if (fifo_ret != ~0u) {
-                yz_ct_push(get, cmd, fifo_ret, "ret");
-                if (ft) { fprintf(ft, "R\t%u\t0x%06X\t0x%06X\t0x%06X\n", ft_step++, get, put, fifo_ret); fflush(ft); }
-                get = fifo_ret; fifo_ret = ~0u; g_call_entry = ~0u;
-                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                continue;
-            }
-            static int warned = 0;
-            if (!warned) { warned = 1;
-                fprintf(stderr, "[rsx] RETURN without CALL at io=0x%08X; idling\n", get); }
-            rsx_idle(tight);
-            continue;
-        }
-
-        /* ---- method(s) ---- */
-        /* Faithful NV4097 validation (RPCS3 RSXFIFO.cpp RSX_METHOD_NON_METHOD_CMD_MASK
-         * 0xa0030003). After the jump/call/ret checks above, a real method has those
-         * bits clear. If set, the word is NOT a command -- GET reached the end of the
-         * commands the producer has finalised in this segment (the rest is data/stale
-         * being written). WAIT instead of parsing data as a command and drifting.
-         * Coherence-safe: we never zeroed this segment's entry stopper, so the producer
-         * cannot reuse it under us while we wait for it to finish writing. */
-        if (cmd & 0xA0030003u) {
-            if (skipgarbage) {                         /* skip the un-drained placeholder word */
-                if (ft) { fprintf(ft, "G\t%u\t0x%06X\t0x%06X\t0x%08X\tGSKIP\n", ft_step++, get, put, cmd); }
-                get += 4; vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                continue;
-            }
-            static int w = 0; if (w < 24) { w++;
-                fprintf(stderr, "[rsx] non-command word 0x%08X at io=0x%X (PUT=0x%X) -- segment "
-                        "not finalised; waiting for producer\n", cmd, get, put); }
-            /* DIAG (YZ_DIAG_PARK, 2026-06-19): decide LAYER-1 fix A vs B. At the park,
-             * is PUT past GET (producer committed beyond us)? Does the window GET would
-             * execute hold real NV4097 methods, or stay stale -- and does it transition
-             * stale->real over time (finalisation timing)? Re-sampled ~400ms x12. */
-            if (getenv("YZ_DIAG_PARK")) {
-                static uint32_t dp_ea = 0; static DWORD dp_t0 = 0, dp_last = 0; static int dp_n = 0;
-                DWORD now = GetTickCount();
-                if (ea != dp_ea) { dp_ea = ea; dp_t0 = now; dp_last = 0; dp_n = 0; }
-                if (dp_n < 12 && (dp_last == 0 || now - dp_last >= 400u)) {
-                    dp_last = now;
-                    int meth = 0, flow = 0, data = 0; uint32_t first = 0;
-                    for (uint32_t o = get; o < get + 0x200u; o += 4u) {
-                        uint32_t e2 = yz_rsx_io_to_ea(o); if (!e2) break;
-                        uint32_t wv = vm_read32(e2);
-                        if (o == get) first = wv;
-                        if (((wv & 0xE0000003u) == 0x20000000u) || ((wv & 3u) == 1u) ||
-                            ((wv & 3u) == 2u) || (wv == 0x00020000u)) flow++;
-                        else if (wv & 0xA0030003u) data++;
-                        else meth++;
-                    }
-                    fprintf(stderr, "[diag-park] t+%5lums GET=0x%X PUT=0x%X put-get=%d "
-                            "word@GET=0x%08X | window[+0x200]: meth=%d flow=%d stale=%d\n",
-                            now - dp_t0, get, put, (int)(put - get), first, meth, flow, data);
-                    fflush(stderr);
-                    dp_n++;
-                }
-            }
-            /* CIRCULAR-WAIT BREAK TEST (env YZ_DLIST_BREAK, 2026-06-16): the wedge is
-             * a true producer/consumer circle -- t1 wrote this CALLed display list's
-             * HEAD (0xA2000500), then poll-waits (vblank-pump + usleep) for GET to
-             * advance, BEFORE finalising the list; GET is parked HERE on that head.
-             * If we RETURN out of the unfinished list (skip frame N's draws, resume
-             * the rest of the segment = the label/fence writes t1 is waiting on),
-             * does t1's wait clear so it finalises the list + the fence advances past
-             * 2? Decisive test of "breakable circle". Only when inside a CALL and PUT
-             * frozen; loses frame N's draws -- DIAGNOSTIC, not a render fix. */
-            if (getenv("YZ_DLIST_BREAK") && fifo_ret != ~0u && get >= 0x01000000u) {
-                static uint32_t bput = ~0u; static DWORD bsince = 0;
-                if (put != bput) { bput = put; bsince = GetTickCount(); }
-                else if (GetTickCount() - bsince > 250u) {
-                    static int n = 0; if (n < 16) { n++;
-                        fprintf(stderr, "[rsx] DLIST-BREAK: RET out of unfinished list io=0x%X "
-                                "-> io=0x%X (PUT frozen, freeing t1's GET-wait)\n", get, fifo_ret); }
-                    get = fifo_ret; fifo_ret = ~0u; g_call_entry = ~0u;
-                    vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
-                    bsince = GetTickCount();
-                    continue;
-                }
-            }
-            rsx_idle(tight);
-            continue;
-        }
-        const uint32_t count  = (cmd >> 18) & 0x7FFu;
-        const uint32_t noninc = cmd & 0x40000000u;
-        const uint32_t method = cmd & 0x3FFFCu;
-        yz_mt_push(get, cmd, count, method);   /* TEMP DIAG: parse-trace ring */
-        int stalled = 0;
-        for (uint32_t i = 0; i < count && !stalled; i++) {
-            const uint32_t op_ea = yz_rsx_io_to_ea(get + 4 + i * 4);
-            if (!op_ea) break;
-            const uint32_t eff = noninc ? method : method + i * 4;
-            const uint32_t val = vm_read32(op_ea);
-            if (ft) { fprintf(ft, "M\t%u\t0x%06X\t0x%05X\t0x%08X\n", ft_midx++, get, eff & 0x3FFFCu, val);
-                      if ((ft_midx & 0x1FFu) == 0) fflush(ft); }
-            stalled = yz_rsx_method(eff, val);   /* unmasked: byte-identical to prior behavior */
-        }
-        if (stalled) { rsx_idle(tight); continue; }   /* semaphore acquire not yet satisfied */
-        get += 4 + count * 4;
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get);
+        if (!g_rsx_ctx_ready) { SwitchToThread(); continue; }
+        if (!yz_rsx_fifo_step()) SwitchToThread();
     }
     return 0;
 }
@@ -1792,10 +1594,24 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
         started = 1;
         rsx_state_init(&g_rsx_state);
         CreateThread(NULL, 0, yz_window_thread, NULL, 0, NULL);
-        if (!getenv("YZ_NO_CONSUMER"))   /* TEMP: isolate consumer vs libgcm */
+        if (getenv("YZ_RSX_INLINE")) {
+            /* INLINE/SYNCHRONOUS RSX: no free-running async consumer. The FIFO is
+             * drained on the PRODUCER's thread -- on every PUT flush (vm_write32 ->
+             * yz_rsx_inline_on_put) and during the reserve's sub-ms usleep wait
+             * (sys_timer.c -> g_yz_usleep_pump). Couples GET to PUT so the producer
+             * can't lap the ring between placing and releasing a stopper. */
+            yz_rsx_fifo_lock_ensure();
+            g_yz_usleep_pump = yz_rsx_fifo_pump;
+            fprintf(stderr, "[rsx] INLINE mode: async consumer OFF; FIFO drained on producer (flush + reserve usleep)\n");
+        } else if (!getenv("YZ_NO_CONSUMER")) {   /* TEMP: isolate consumer vs libgcm */
             CreateThread(NULL, 0, yz_rsx_consumer, NULL, 0, NULL);
+        }
         if (getenv("YZ_IMM_REL"))        /* force immediate stopper-release (S[0x1C]=0) */
             CreateThread(NULL, 0, yz_bigseg_monitor, NULL, 0, NULL);
+        if (getenv("YZ_TRACE_DEFER"))    /* READ-ONLY: trace the gcm defer decision + op-list drain */
+            CreateThread(NULL, 0, yz_defer_trace_mon, NULL, 0, NULL);
+        if (getenv("YZ_PHASE"))          /* high-detail producer+consumer timeline (working->broken) */
+            CreateThread(NULL, 0, yz_phase_monitor, NULL, 0, NULL);
         if (getenv("YZ_DUMP_BUFDESC"))   /* dump libgcm segment geometry at the deadlock */
             CreateThread(NULL, 0, yz_bufdesc_dump, NULL, 0, NULL);
         if (getenv("YZ_WATCH_DLEA"))     /* direct write-watch on frame-3 display list io 0x1104D00 */
@@ -1872,8 +1688,27 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
 
     switch (pkg) {
     case 0x001: {       /* FIFO: set get/put */
+        /* DIAG (YZ_LOG_FIFOSET, 2026-06-24): does this syscall STOMP the consumer's
+         * live GET (a3 != current GET) and/or is it the (only) PUT writer that makes
+         * PUT bounce? RPCS3 serializes this under sys_rsx_mtx; we don't. */
+        if (getenv("YZ_LOG_FIFOSET")) {
+            uint32_t cur_get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
+            uint32_t cur_put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
+            static int n = 0; if (n < 400) { n++;
+                fprintf(stderr, "[fifoset] pkg001 set GET 0x%06X->0x%06X  PUT 0x%06X->0x%06X%s%s\n",
+                        cur_get & 0xFFFFFF, (uint32_t)a3 & 0xFFFFFF,
+                        cur_put & 0xFFFFFF, (uint32_t)a4 & 0xFFFFFF,
+                        ((uint32_t)a3 != cur_get) ? "  <-- GET STOMP" : "",
+                        ((uint32_t)a4 < cur_put) ? "  <-- PUT RECEDES" : ""); }
+        }
+        /* Serialize the guest GET/PUT set with the consumer's single GET writer
+         * (RPCS3 sys_rsx_mtx) so a pkg001 set can't tear a GET the consumer is
+         * mid-advance, and the consumer can't clobber a fresh pkg001 set. */
+        yz_rsx_fifo_lock_ensure();
+        EnterCriticalSection(&g_rsx_fifo_lock);
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, (uint32_t)a3);
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, (uint32_t)a4);
+        LeaveCriticalSection(&g_rsx_fifo_lock);
         break;
     }
     case 0x100: break;  /* display mode set */
@@ -1988,6 +1823,26 @@ extern "C" void yz_rsx_vblank_tick(void)
                   uint32_t ent = (opd >= 0x10000u && opd < 0x02140000u) ? vm_read32(opd) : 0;
                   fprintf(stderr, "[diag]   slot+0x%02X opd=0x%08X entry=0x%08X\n",
                           offs[i], opd, ent);
+              }
+          }
+          /* LAYER-1 BISECT (env YZ_GCMCTX_BISECT): dump libgcm's PRIVATE context
+           * GCMCTX = *(game_toc-0x5014). func_00EDD15C bctrl's the handler OPDs
+           * at GCMCTX[0x00] (arg [0x04]) and GCMCTX[0x08] (arg [0x0C]); the t7
+           * stack-overflow recursion runs through here. Dump those OPDs + their
+           * code/TOC so we can see whether a handler points back into the
+           * dispatch chain (re-entrant) -- and the predicates +0x10/+0x15C/+0x398. */
+          if (getenv("YZ_GCMCTX_BISECT") && g_yz_game_toc) {
+              uint32_t g = vm_read32(g_yz_game_toc - 0x5014u);
+              fprintf(stderr, "[gcmctx] GCMCTX=0x%08X\n", g);
+              if (g >= 0x10000u && g < 0xE0000000u) {
+                  const uint32_t fo[] = {0x00,0x04,0x08,0x0C,0x10,0x14,0x15C,0x164,0x398};
+                  for (size_t i = 0; i < sizeof(fo)/sizeof(fo[0]); i++) {
+                      uint32_t v = vm_read32(g + fo[i]);
+                      uint32_t code = (v >= 0x10000u && v < 0xE0000000u) ? vm_read32(v) : 0;
+                      uint32_t toc  = (v >= 0x10000u && v < 0xE0000000u) ? vm_read32(v + 4u) : 0;
+                      fprintf(stderr, "[gcmctx]   +0x%03X = 0x%08X  (opd->code=0x%08X toc=0x%08X)\n",
+                              fo[i], v, code, toc);
+                  }
               }
           }
           fflush(stderr);
@@ -2337,6 +2192,35 @@ extern "C" void yz_rsx_vblank_tick(void)
              * here -- exactly once per retired flip, ordered after present+label-clear. */
             vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
             flip_ev |= (uint64_t)(0x8u << 1);             /* SYS_RSX_EVENT_FLIP_BASE<<1 */
+
+            /* LAYER-1 ROOT BISECT (env YZ_GCMCTX_BISECT, pt48). Hypothesis: the
+             * t7 _gcm_intr_thread stack-overflow recursion is the EVENT-DELIVERY
+             * handshake -- libgcm's own private context predicates never clear,
+             * so func_00EDC1F0 (flip-complete <=> GCMCTX+0x10==0) and
+             * func_00EDD15C (re-arm latch, re-dispatches while GCMCTX+0x398==1)
+             * keep re-firing. libgcm clears these ONLY when it fully processes a
+             * FLIP event. Here we zero them ourselves on flip completion: if the
+             * t7 recursion stops, the root is confirmed as the event handshake
+             * (not the FIFO, not a wrong completion EA). GCMCTX = *(game_toc -
+             * 0x5014); expected 0x01654130 -- log it once to re-confirm. */
+            if (getenv("YZ_GCMCTX_BISECT") && g_yz_game_toc) {
+                uint32_t gcmctx = vm_read32(g_yz_game_toc - 0x5014u);
+                static int dumped = 0;
+                if (!dumped) { dumped = 1;
+                    fprintf(stderr, "[gcmctx-late] game_toc=0x%08X GCMCTX=0x%08X (LATE, at flip #1)\n",
+                            g_yz_game_toc, gcmctx);
+                    if (gcmctx >= 0x10000u && gcmctx < 0xE0000000u) {
+                        const uint32_t fo[] = {0x00,0x04,0x08,0x0C,0x10,0x14,0x18,0x28,0x30,0x15C,0x164,0x168,0x398};
+                        for (size_t i = 0; i < sizeof(fo)/sizeof(fo[0]); i++)
+                            fprintf(stderr, "[gcmctx-late]   +0x%03X = 0x%08X\n", fo[i], vm_read32(gcmctx + fo[i]));
+                    }
+                    fflush(stderr);
+                }
+                if (gcmctx >= 0x10000u && gcmctx < 0xE0000000u) {
+                    vm_write32(gcmctx + 0x10u, 0);    /* flip no longer pending */
+                    vm_write32(gcmctx + 0x398u, 0);   /* clear the re-arm latch  */
+                }
+            }
         }
     }
 

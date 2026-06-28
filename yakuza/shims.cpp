@@ -104,7 +104,8 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
 }
 extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); VM_WRITE_COH(addr, &val, 1); }
 extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); }
+extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
 extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
@@ -213,6 +214,34 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * number with args + result so silent failures inside the LLE module
      * are visible. Strip once SPURS init survives. */
     uint32_t num = (uint32_t)ctx->gpr[11];
+
+    /* === YZ_SKIP_VOICE: bypass the CRI voice-readiness gate (the codec decode is
+     * a separate, deep frontier). t1 cond-waits on cond 9 forever, re-checking a
+     * readiness predicate the broken codec never sets. Diagnose the candidate
+     * handles t1 polls; with YZ_SKIP_VOICE set, poke them "ready" so t1 proceeds
+     * and the NEXT wall surfaces. OFF by default; experiment only. === */
+    if (num == 107 && (uint32_t)ctx->gpr[3] == 9 && yz_thread_current_id() == 1) {
+        static long vw = 0; long n = ++vw;
+        uint32_t r31 = (uint32_t)ctx->gpr[31];
+        uint32_t adxm = 0x01613368u, blk = 0x01654294u;   /* ADXM handle / cond block (pt47) */
+        if (n <= 3 || (n % 500) == 0) {
+            fprintf(stderr, "[voice-wait] n=%ld r31=0x%08X [r31+298]=%08X "
+                    "adxm[+294]=%08X [+298]=%08X [+29C]=%08X blk[+00]=%08X [+10]=%08X\n",
+                    n, r31, vm_read32(r31 + 0x298),
+                    vm_read32(adxm + 0x294), vm_read32(adxm + 0x298), vm_read32(adxm + 0x29C),
+                    vm_read32(blk + 0x00), vm_read32(blk + 0x10));
+            fflush(stderr);
+        }
+        if (getenv("YZ_SKIP_VOICE") && n >= 700) {
+            static int once = 0;
+            vm_write32(r31  + 0x298, 0xFFFFFFFFu);   /* innermost-frame predicate candidate */
+            vm_write32(adxm + 0x298, 0xFFFFFFFFu);   /* ADXM handle predicate candidate */
+            vm_write32(blk  + 0x10,  2u);            /* cond-block prime flag -> PLAYING */
+            if (!once) { once = 1;
+                fprintf(stderr, "[voice-skip] forcing readiness from n=%ld (r31=0x%08X)\n", n, r31);
+                fflush(stderr); }
+        }
+    }
 
     /* sys_dbg_* (972, 0x3CC): RPCS3 stubs this as null_func (no-op success);
      * Sony's libgcm calls it on the interrupt path and IGNORES the result, but
