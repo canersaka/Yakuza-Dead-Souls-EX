@@ -35,6 +35,7 @@ typedef struct sys_rwlock_info {
     /* Track exclusive ownership for proper unlock dispatch */
     volatile LONG  readers;
     volatile LONG  writer;
+    uint64_t       writer_tid;   /* owning thread of the write lock (EDEADLK/EPERM) */
 #else
     pthread_rwlock_t rwl;
 #endif

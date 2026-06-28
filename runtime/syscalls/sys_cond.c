@@ -233,9 +233,23 @@ int64_t sys_cond_signal(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Lost-wakeup fix: hold the associated mutex across the wake. sys_cond_wait
+     * releases the mutex and parks on the condvar atomically (SleepConditionVariableCS);
+     * a signal that lands in the window between a waiter releasing the mutex and
+     * registering on the condvar would otherwise be dropped and the waiter hangs.
+     * On Windows the mutex CS is recursive, so this is safe even when the caller
+     * already holds it (the common "signal under the lock" idiom). */
 #ifdef _WIN32
+    sys_mutex_info* m = NULL;
+    if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
+        m = &g_sys_mutexes[c->mutex_id - 1];
+    if (m) EnterCriticalSection(&m->cs);
     WakeConditionVariable(&c->cv);
+    if (m) LeaveCriticalSection(&m->cs);
 #else
+    /* pthreads (secondary platform): the default mutex is non-recursive, so
+     * re-locking it here would deadlock callers that signal while holding it.
+     * Keep the bare signal. */
     pthread_cond_signal(&c->cv);
 #endif
 
@@ -258,8 +272,15 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Lost-wakeup fix (see sys_cond_signal): hold the associated mutex across the
+     * broadcast so a wake can't slip into the waiter's release/park window. */
 #ifdef _WIN32
+    sys_mutex_info* m = NULL;
+    if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
+        m = &g_sys_mutexes[c->mutex_id - 1];
+    if (m) EnterCriticalSection(&m->cs);
     WakeAllConditionVariable(&c->cv);
+    if (m) LeaveCriticalSection(&m->cs);
 #else
     pthread_cond_broadcast(&c->cv);
 #endif

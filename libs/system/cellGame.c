@@ -210,7 +210,11 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
         *attributes = 0;
 
     if (size) {
-        size->hddFreeSizeKB = 1024 * 1024; /* 1GB free */
+        /* hddFreeSizeKB is guest big-endian (see cellGameDataCheck); writing it
+         * host-endian made the game read ~4 MB free instead of 1 GB. */
+        unsigned char* p = (unsigned char*)&size->hddFreeSizeKB;
+        u32 v = 1024u * 1024u; /* 1GB free */
+        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
         size->sizeKB = CELL_GAME_SIZEKB_NOTCALC;
         size->sysSizeKB = 0;
     }
@@ -292,7 +296,9 @@ s32 cellGameGetParamInt(s32 id, s32* value)
         *value = 0;
         break;
     case CELL_GAME_PARAMID_APP_VER:
-        *value = 100; /* 1.00 as integer */
+        /* guest big-endian s32 (other cases write 0, which is byte-invariant) */
+        { unsigned char* p = (unsigned char*)value; u32 v = 100u; /* 1.00 */
+          p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v; }
         break;
     default:
         printf("[cellGame] WARNING: unknown param int id %d\n", id);
@@ -354,7 +360,10 @@ s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
     }
 
     if (size) {
-        size->hddFreeSizeKB = 1024 * 1024;
+        /* hddFreeSizeKB is guest big-endian (see cellGameDataCheck). */
+        unsigned char* p = (unsigned char*)&size->hddFreeSizeKB;
+        u32 v = 1024u * 1024u;
+        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
         size->sizeKB = 0;
         size->sysSizeKB = 0;
     }
