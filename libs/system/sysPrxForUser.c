@@ -401,6 +401,21 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
+    /* DIAG (pt47 LAYER-1 hypothesis): the Win32 CS is RECURSIVE, so the same
+     * thread re-acquiring this lwmutex succeeds instead of blocking. If one
+     * thread's recursive_count climbs unbounded on one lwmutex, that is the gcm
+     * flip-handler recursion -> guest stack overflow (lv2's non-recursive lwmutex
+     * would BLOCK the re-acquire here, capping depth at 1). */
+    if (lwmutex->recursive_count >= 8) {
+        static int lwd = 0;
+        if (lwd < 24) { lwd++;
+            fprintf(stderr, "[lwdepth] guest=0x%08X tid=%lu recursive_count=%d "
+                    "(same-thread re-acquire; lv2 non-recursive would block)\n",
+                    YZ_GUEST_ADDR(lwmutex), (unsigned long)GetCurrentThreadId(),
+                    lwmutex->recursive_count);
+            fflush(stderr);
+        }
+    }
     return CELL_OK;
 }
 

@@ -171,8 +171,13 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
+    /* A thread that already holds the write lock re-acquiring it would deadlock
+     * the (non-recursive) SRWLock. Real lv2 returns CELL_EDEADLK. */
+    if (r->writer && r->writer_tid == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
     AcquireSRWLockExclusive(&r->srw);
     InterlockedExchange(&r->writer, 1);
+    r->writer_tid = ctx->thread_id;
 #else
     pthread_rwlock_wrlock(&r->rwl);
 #endif
@@ -192,9 +197,12 @@ int64_t sys_rwlock_trywlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
+    if (r->writer && r->writer_tid == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
     if (!TryAcquireSRWLockExclusive(&r->srw))
         return (int64_t)(int32_t)CELL_EBUSY;
     InterlockedExchange(&r->writer, 1);
+    r->writer_tid = ctx->thread_id;
 #else
     int rc = pthread_rwlock_trywrlock(&r->rwl);
     if (rc != 0)
@@ -216,6 +224,11 @@ int64_t sys_rwlock_wunlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
+    /* Only the owning thread may write-unlock (releasing an SRWLock not held in
+     * exclusive mode by this thread is UB). Real lv2 returns CELL_EPERM. */
+    if (!r->writer || r->writer_tid != ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EPERM;
+    r->writer_tid = 0;
     InterlockedExchange(&r->writer, 0);
     ReleaseSRWLockExclusive(&r->srw);
 #else
