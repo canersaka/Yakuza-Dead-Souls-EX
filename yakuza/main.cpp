@@ -267,6 +267,26 @@ static void guest_caller(uint32_t opd_addr,
  * context_allocate has set up the driver_info, so starting early is safe. */
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
+    /* PRECISE VBLANK (env YZ_VSYNC_PRECISE, 2026-06-25): RPCS3 drives vblank from a
+     * drift-corrected absolute schedule (post_event_time = start + count*period/rate),
+     * staying locked to ~59.94 Hz. Our old `Sleep(16)` jitters with Windows' ~15.6 ms
+     * timer quantum (effective ~32-62 Hz, drifting under load) -> loose frame pacing.
+     * This sleeps until the ABSOLUTE next-vblank tick and spins the final sub-ms for
+     * precision. Default boot keeps the old behaviour. */
+    static int precise = -1; if (precise < 0) precise = getenv("YZ_VSYNC_PRECISE") ? 1 : 0;
+    if (precise) {
+        LARGE_INTEGER freq, now; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&now);
+        const double period = (double)freq.QuadPart / 59.94;       /* ticks per vblank */
+        double next = (double)now.QuadPart + period;
+        for (;;) {
+            QueryPerformanceCounter(&now);
+            double remain_ms = ((next - (double)now.QuadPart) / (double)freq.QuadPart) * 1000.0;
+            if (remain_ms > 2.0) Sleep((DWORD)(remain_ms - 1.5));
+            do { QueryPerformanceCounter(&now); } while ((double)now.QuadPart < next);  /* spin last bit */
+            next += period;
+            yz_rsx_vblank_tick();
+        }
+    }
     for (;;) {
         Sleep(16);            /* ~62.5 Hz; close enough to PS3 vblank */
         yz_rsx_vblank_tick();
@@ -822,6 +842,40 @@ static void yz_sample_t1_spin(const char* tag)
     fflush(stderr);
 }
 
+/* LAYER-1 DEADLOCK SNAPSHOT (env YZ_L1SNAP, 2026-06-24). Disambiguates the two
+ * remaining root candidates for the FIFO deadlock:
+ *   #2 (libgcm reserve ordering): the reserve func_02103AAC waits while GET is
+ *      INSIDE its recycle window [reserve_lo, reserve_hi] (t1 frame locals at
+ *      r1+0x70 / r1+0x74, io offsets written by func_02103F90). If GET is inside
+ *      the very segment GET sits in, the reserve is recycling an occupied segment.
+ *   #1 (producer never produced the body / gs_task): every guest thread's
+ *      blocked-in-syscall state + whether the SPU/worker threads are idle.
+ * Read-only; fires once at the wedge. */
+static void yz_dump_layer1_snapshot(const char* tag)
+{
+    if (g_yz_main_ctx) {
+        uint32_t r1  = (uint32_t)g_yz_main_ctx->gpr[1];
+        uint32_t rlo = vm_read32(r1 + 0x70);
+        uint32_t rhi = vm_read32(r1 + 0x74);
+        uint32_t get = vm_read32(0x10000044u) & ~3u;
+        uint32_t put = vm_read32(0x10000040u) & ~3u;
+        uint32_t bd  = vm_read32(0x02114000u - 0x7FD8u);   /* bufdesc ptr */
+        uint32_t cur = (bd >= 0x10000u && bd < 0xE0000000u) ? vm_read32(bd + 0x8) : 0;
+        uint32_t beg = (bd >= 0x10000u && bd < 0xE0000000u) ? vm_read32(bd + 0x0) : 0;
+        int get_in = (get >= rlo && get <= rhi);
+        fprintf(stderr, "[%s] L1: t1.r1=0x%08X  RESERVE-WINDOW reserve_lo=0x%06X reserve_hi=0x%06X "
+                "(recycling seg %u)\n", tag, r1, rlo, rhi, (rlo & 0x7FFFFF) >> 20);
+        fprintf(stderr, "[%s] L1: GET=0x%06X (seg %u)  PUT=0x%06X (seg %u)  bufdesc.cur=0x%08X begin=0x%08X\n",
+                tag, get, get >> 20, put, put >> 20, cur, beg);
+        fprintf(stderr, "[%s] L1: GET is %s the reserve window => %s\n", tag,
+                get_in ? "INSIDE" : "OUTSIDE",
+                get_in ? "reserve waits for GET to leave a segment GET occupies (FIFO ordering / #2)"
+                       : "reserve window does NOT contain GET (look upstream: producer never built body / #1)");
+        fflush(stderr);
+    }
+    yz_dump_all_threads(tag);
+}
+
 /* TEMP DEBUG (window bring-up): after the boot has had time to reach its frame
  * loop, dump the main thread's guest call stack so we can see what it spin-waits
  * on. */
@@ -834,6 +888,7 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
                          yz_dump_main_host_stack("watchdog-30s"); }
     yz_sample_t1_spin("watchdog-30s");
+    if (getenv("YZ_L1SNAP")) yz_dump_layer1_snapshot("watchdog-30s");
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
                          yz_dump_main_host_stack("watchdog-45s"); }
@@ -974,6 +1029,31 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
                 for (uint32_t io = RING_LO; io < RING_HI; io += 4u)
                     if (vm_read32(FIFO_BASE + io) == FLIP_CMD) fc++;
                 fprintf(stderr, "    flip cmds still in ring: %d (consumer caught up; t1 not producing)\n", fc);
+                /* DECISIVE (pt48b): PUT-publish off-by-one vs empty-ring boundary.
+                 * Compare the producer WRITE cursor (libgcm bufdesc @0x0210C3FC, cur
+                 * at +0x08 as an ea) to PUT, and locate the awaited SET_REFERENCE
+                 * header (0x00040050) in the ring. If cur>PUT, t1 wrote commands it
+                 * never published (PUT-publish bug); if cur==PUT, the ring is truly
+                 * drained (empty-ring boundary / GET-wrap issue). */
+                {
+                    uint32_t ref  = vm_read32(0x10000048u);
+                    uint32_t bd   = 0x0210C3FCu;
+                    uint32_t cur  = vm_read32(bd + 0x08u);
+                    uint32_t curio = (cur >= FIFO_BASE && cur < FIFO_BASE + 0x800000u) ? (cur - FIFO_BASE) : 0xFFFFFFFFu;
+                    fprintf(stderr, "    REF=0x%08X bufdesc:+00=%08X +04=%08X +08cur=%08X +0C=%08X +14=%08X  cur_io=0x%06X PUT=0x%06X %s\n",
+                            ref, vm_read32(bd), vm_read32(bd+4u), cur, vm_read32(bd+0xCu), vm_read32(bd+0x14u), curio, put,
+                            curio==0xFFFFFFFFu ? "(cur not in ring)" :
+                            curio > put ? "<<< CUR>PUT: t1 wrote past PUT (PUT-publish off-by-one)" :
+                            curio == put ? "<<< CUR==PUT (everything published; empty-ring/GET-wrap)" : "(cur<put)");
+                    fprintf(stderr, "    ring near PUT:");
+                    for (int32_t d = -0x20; d <= 0x40; d += 4) {
+                        uint32_t io = (put + (uint32_t)d) & 0x7FFFFCu;
+                        uint32_t w  = vm_read32(FIFO_BASE + io);
+                        const char* m = (w == 0x00040050u) ? "<SETREF" : ((w & 3u)==1u ? "<jmp" : "");
+                        fprintf(stderr, " %+d:%08X%s", d, w, m);
+                    }
+                    fprintf(stderr, "\n");
+                }
                 /* Reliable: t1's trampoline-hop chain (newest first) names the guest
                  * functions t1 last called -> the poll loop it is stuck in -> the
                  * upstream producer it waits on. (The back-chain/ctr mis-symbolize.) */
@@ -1084,6 +1164,37 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
             uint32_t limit = (put > get) ? put : RING_HI;
             for (uint32_t scan = get; scan < limit; scan += 4) {
                 if (vm_read32(FIFO_BASE + scan) == FLIP_CMD) { found = scan; break; }
+            }
+        }
+        /* pt48b ROOT FIX: force-advancing GET past committed commands SKIPS them.
+         * If we skip a SET_REFERENCE the game busy-waits on (func_00EBBFB4:
+         * while(*(0x10000048)!=N)), t1 deadlocks forever. Before moving GET, APPLY
+         * any SET_REFERENCE in the span we're about to skip, so REF tracks like a
+         * real consumer would. (Measured: the dropped SET_REFERENCE(3) at PUT-8 was
+         * THE wedge -- GET jumped over it, REF stuck at 2, t1 hung on REF!=3.) */
+        /* Apply any SET_REFERENCE in the span the band-aid is about to skip, so REF
+         * tracks (a real consumer writes it). A general "execute every skipped method
+         * packet" was tried and REVERTED -- a linear parse mis-reads vertex/shader DATA
+         * as method headers (observed REF=0x8186C083 garbage), and it bought no extra
+         * progress (same next wall). SET_REFERENCE (count-1, method 0x50) is specific
+         * enough to be data-safe and only writes the bounded REF register. (pt48b: the
+         * dropped SET_REFERENCE was THE wedge -- t1 hung on `while(REF!=N)`.) */
+        {
+            uint32_t adv_target = (found && found != get) ? found : put;
+            if (adv_target > get) {
+                uint32_t refval = 0, refn = 0;
+                for (uint32_t scan = get; scan < adv_target; scan += 4u) {
+                    uint32_t w = vm_read32(FIFO_BASE + scan);
+                    if (!(w & 0xA0030003u) && ((w >> 18) & 0x7FFu) == 1u && (w & 0x3FFFCu) == 0x50u) {
+                        refval = vm_read32(FIFO_BASE + scan + 4u);
+                        vm_write32(0x10000048u, refval);   /* RSX REF register (DMACTL+0x48) */
+                        refn++;
+                    }
+                }
+                if (refn) { static DWORD rlg = 0; if (now - rlg >= 750u) { rlg = now;
+                    fprintf(stderr, "[flowctl] applied %u SET_REFERENCE in [0x%06X,0x%06X) -> REF=0x%08X "
+                            "(would have been dropped -> t1 REF-wait deadlock)\n", refn, get, adv_target, refval);
+                    fflush(stderr); } }
             }
         }
         if (found && found != get) {
@@ -1234,8 +1345,8 @@ extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
-    fprintf(stderr, "\n[crash] exception 0x%08lX at host %p",
-            er->ExceptionCode, er->ExceptionAddress);
+    fprintf(stderr, "\n[crash] exception 0x%08lX on tid=%u (tramp_idx=%u) at host %p",
+            er->ExceptionCode, yz_thread_current_id(), g_yz_tramp_idx, er->ExceptionAddress);
     /* Module-relative RVA: stable across ASLR, resolvable against the
      * linker map (yakuza_recomp.map) without any debug info. */
     fprintf(stderr, " (rva 0x%llX)",
@@ -1268,6 +1379,32 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
             fprintf(stderr, " (guest 0x%08llX)",
                     (unsigned long long)(va - (uint64_t)vm_base));
     }
+    /* Per-thread ground truth: the GLOBAL indirect-target ring is useless here
+     * (dozens of CRI poll threads spam it), so for the main thread walk its OWN
+     * guest back-chain via g_yz_main_ctx -- on a host stack overflow this names
+     * the actual recursion cycle (reads guest mem, cheap on host stack). */
+    if (yz_thread_current_id() == 1u && g_yz_main_ctx)
+        yz_dump_guest_state(g_yz_main_ctx, "crash-t1");
+
+    /* HOST call stack of the FAULTING thread (newest first). For a host-stack
+     * overflow (0xC00000FD) with a SHALLOW guest stack, the recursion is in HOST
+     * code -- this names the repeating host frames (the cycle). Resolve lifted
+     * frames to func_XXXX; runtime/CRT frames show as rva. */
+    {
+        void* frames[80];
+        USHORT nf = RtlCaptureStackBackTrace(0, 80, frames, NULL);
+        uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+        fprintf(stderr, "\n[crash] HOST call stack (%u frames, newest first):", nf);
+        for (USHORT i = 0; i < nf; i++) {
+            const yz_func_entry* fe = yz_func_from_host(frames[i]);
+            if (fe)
+                fprintf(stderr, "\n    func_%08X +0x%llX", fe->addr,
+                        (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)fe->fn));
+            else
+                fprintf(stderr, "\n    rva 0x%llX", (unsigned long long)((uintptr_t)frames[i] - mod));
+        }
+    }
+
     fprintf(stderr, "\n[crash] recent indirect targets:");
     extern uint32_t g_yz_last_targets[16];
     extern unsigned g_yz_last_idx;
@@ -1532,6 +1669,15 @@ int main(int argc, char** argv)
      * flip-completion (import_overrides.cpp yz_rsx_vblank_tick), NOT a forced nudge.
      * YZ_NO_FLOWCTL disables it (deadlocks at frame 2 -- proves it's load-bearing);
      * YZ_THR_NUDGE re-enables the old drained-ring fence force for A/B. */
+    /* RESTORED (2026-06-26): the load-bearing flow-control lever. The faithful
+     * consumer parks GET on the game's jump-to-self stoppers; the producer laps the
+     * ring and DEFERS the cross-segment release into an op-list that is never drained
+     * -> deadlock at fence 2. yz_flip_advance advances GET past the stopper when t1 is
+     * reserve-wedged, restoring the pt28 state that reaches the CRI stack. The faithful
+     * FIFO root is a producer-PACING divergence (verified this session against the
+     * RPCS3 oracle: RPCS3's GET also parks on io 0x300000 but its 60Hz-paced producer
+     * releases immediately; ours laps at host speed). Tracked as a known LAYER-1 issue,
+     * not the boot critical path. YZ_NO_FLOWCTL disables it (-> deadlock at 2). */
     if (!getenv("YZ_NO_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
