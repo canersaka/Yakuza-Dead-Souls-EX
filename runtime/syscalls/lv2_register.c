@@ -397,8 +397,12 @@ int  spu_have_function(uint32_t addr);
 /* per-thread unwind target for SPU halt (spu_channels.c) */
 #if defined(_MSC_VER)
 extern __declspec(thread) jmp_buf* g_spu_halt_jmp;
+extern __declspec(thread) jmp_buf* g_spu_restart_jmp;   /* host-call-depth guard */
+extern __declspec(thread) char*    g_spu_stack_base;
 #else
 extern _Thread_local jmp_buf* g_spu_halt_jmp;
+extern _Thread_local jmp_buf* g_spu_restart_jmp;
+extern _Thread_local char*    g_spu_stack_base;
 #endif
 
 static void spu_deploy_image(spu_context* sctx, uint32_t img_ea)
@@ -441,14 +445,24 @@ static void* spu_exec_thread_proc(void* arg)
             t->tid, sctx->pc);
 
     sctx->status = SPU_STATUS_RUNNING;
-    jmp_buf halt_jb;
+    jmp_buf halt_jb, restart_jb;
+    char stack_base_marker;
     g_spu_halt_jmp = &halt_jb;
+    g_spu_restart_jmp = &restart_jb;     /* host-call-depth guard target */
+    g_spu_stack_base = &stack_base_marker;
     g_spu_trampoline_fn = 0;
     if (setjmp(halt_jb) == 0) {
+        /* Re-entered by the depth-guard longjmp (spu_indirect_branch): unwind the
+         * leaked coroutine/poll frames and re-dispatch from ctx->pc on a fresh
+         * stack. SPU state is in the heap ctx, so it survives the unwind. */
+        (void)setjmp(restart_jb);
+        g_spu_trampoline_fn = 0;
         spu_indirect_branch(sctx);   /* runs until stop; halt longjmps back */
         SPU_DRAIN(sctx);             /* iterate tail-call chains (scheduler loop) */
     }
     g_spu_halt_jmp = 0;
+    g_spu_restart_jmp = 0;
+    g_spu_stack_base = 0;
     g_spu_trampoline_fn = 0;
 
     fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X)\n",
