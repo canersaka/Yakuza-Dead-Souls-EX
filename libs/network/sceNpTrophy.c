@@ -208,8 +208,21 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
 {
     (void)commSign; (void)options;
 
-    if (!s_trophy_initialized)
-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    /* The game's NP-init chain (cellNetCtlInit -> sceNpInit -> sceNpScoreInit ->
+     * sceNpTrophyInit) does not run before CreateContext in our build, so trophy
+     * is left uninitialized and CreateContext returns 0x80551601 NOT_INITIALIZED;
+     * the game then opens a spurious "Trophy error" cellMsgDialog at boot. RPCS3
+     * runs the full chain, trophy succeeds ("config already installed"), and opens
+     * no dialog. Match that observable outcome: auto-initialize on first use rather
+     * than erroring (lenient HLE). NOTE: this only removes the spurious boot dialog;
+     * it is NOT the cause of the LAYER-1 gcm FIFO deadlock -- verified by measurement
+     * that suppressing the dialog leaves the FIFO wedge byte-identical. */
+    if (!s_trophy_initialized) {
+        printf("[sceNpTrophy] CreateContext before Init -> auto-initializing\n");
+        memset(s_contexts, 0, sizeof(s_contexts));
+        memset(s_handles, 0, sizeof(s_handles));
+        s_trophy_initialized = 1;
+    }
 
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
