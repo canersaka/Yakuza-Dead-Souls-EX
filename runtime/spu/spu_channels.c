@@ -714,7 +714,11 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     const unsigned char* ls = ctx->ls;
     uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
                   |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
-    if (elf == 0x012B4980u) spu_task_launch(ctx);
+    /* gs_task (elf 0x0127A580) routed through the SAME driver-drain spu_task_launch
+     * that cri_audio uses (it runs its full body to its yield). Previously gs_task
+     * was gated off here + ran via the nested natural-launch path (spu_indirect_branch),
+     * which unwinds after its prologue. (2026-06-28: SPU task context-switch fix.) */
+    if (elf == 0x012B4980u || elf == 0x0127A580u) spu_task_launch(ctx);
 }
 
 void spu_prof_hop(void* fn)
@@ -824,15 +828,23 @@ void spu_register_function(uint32_t addr, spu_fn fn)
 
 static spu_fn spu_lookup(uint32_t addr, int image_id)
 {
-    /* Linear scan is fine for the small per-image tables. Match the context's
-     * active image; image_id 0 (context or entry) matches any, for back-compat
-     * with single-image contexts. */
-    for (uint32_t i = 0; i < s_registry_count; i++)
-        if (s_registry[i].addr == addr &&
-            (image_id == 0 || s_registry[i].image_id == 0 ||
-             s_registry[i].image_id == image_id))
-            return s_registry[i].fn;
-    return NULL;
+    /* Prefer an EXACT image match so overlapping task images dispatch their OWN
+     * lifted code: gs_task (image 0) and the cri_audio codec (image 3) BOTH load
+     * at LS 0x3000+. The old single-pass "image_id 0 matches any" returned the
+     * FIRST registered function at addr -- cri_audio (registered before gs_task)
+     * -- so gs_task ran the codec's code and its trampoline chain diverged into
+     * cri_audio's region (2026-06-28: the true root of gs_task never producing
+     * geometry). Fall back to a wildcard (registered image 0 = resident runtime,
+     * or an image_id 0 query = single-image/back-compat context) only when no
+     * exact match exists. Linear scan is fine for the small per-image tables. */
+    spu_fn wildcard = NULL;
+    for (uint32_t i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].addr != addr) continue;
+        if (s_registry[i].image_id == image_id) return s_registry[i].fn; /* exact (incl 0==0) */
+        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard)
+            wildcard = s_registry[i].fn;
+    }
+    return wildcard;
 }
 
 /* Does a lifted function exist at this LS address (any image)? Lets the
@@ -914,6 +926,30 @@ void spu_indirect_branch(spu_context* ctx)
                     fprintf(stderr, "[task-launch] policy bi savedContextLr -> %s entry=0x%05X image=%d "
                             "(natural StartTask launch)\n", img == 3 ? "cri_audio" : "gs_task", tpc, img);
                     fflush(stderr); }
+                /* SPURS context-replacement (2026-06-28). The policy's StartTask
+                 * `bi savedContextLr` reaches here DEEP inside the policy's nested
+                 * StartTask-helper SPU_DRAINs (policy 0x1C50 C-calls helper 0x13B0
+                 * with a nested drain). Falling through to the in-line fn(ctx)
+                 * dispatch runs the task prologue on that nested drain; when an
+                 * enclosing helper C-frame returns mid-prologue, the helper loop-back
+                 * (policy_module.c:5884) clobbers the task's trampoline (gs_task:
+                 * 0x305C -> policy 0x1C50 under image 0) and the body never runs.
+                 * cri_audio only survives by reaching its 0xA70 yield before the
+                 * frame pops -- luck of depth. Per the SPURS model the launch is a
+                 * CONTEXT REPLACEMENT: the policy PM frame is gone and the task owns
+                 * the SPU until it yields (LS 0xA70). ctx->pc = task entry and
+                 * image_id is switched, so unwind to the driver (lv2_register.c:458)
+                 * which re-dispatches spu_indirect_branch from ctx->pc on a fresh
+                 * top-level stack -- the task body then drains at the top level (the
+                 * same footing cri_audio's spu_task_launch resume already runs on).
+                 * The policy re-enters on the task's 0xA70 cross-image yield. Env
+                 * kill-switch YZ_NO_LAUNCH_UNWIND. */
+                static int no_unwind = -1;
+                if (no_unwind < 0) no_unwind = getenv("YZ_NO_LAUNCH_UNWIND") ? 1 : 0;
+                if (g_spu_restart_jmp && !no_unwind) {
+                    g_spu_trampoline_fn = 0;
+                    longjmp(*g_spu_restart_jmp, 1);
+                }
             }
         }
     }
