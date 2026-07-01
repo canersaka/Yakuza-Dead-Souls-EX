@@ -1661,23 +1661,19 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
-    /* RSX FIFO flow-control (DEFAULT-ON). Our async consumer catches up and parks GET
-     * at the game's jump-to-self stoppers, holding t1's ring segment hostage so t1
-     * can't patch the stopper -> deadlock at frame 2. When t1 is reserve-wedged, advance
-     * GET (wrap-aware, never backward) to the next committed flip command so the consumer
-     * dispatches it; the flip fence @0x40C00000 then advances from the REAL vblank
-     * flip-completion (import_overrides.cpp yz_rsx_vblank_tick), NOT a forced nudge.
-     * YZ_NO_FLOWCTL disables it (deadlocks at frame 2 -- proves it's load-bearing);
-     * YZ_THR_NUDGE re-enables the old drained-ring fence force for A/B. */
-    /* RESTORED (2026-06-26): the load-bearing flow-control lever. The faithful
-     * consumer parks GET on the game's jump-to-self stoppers; the producer laps the
-     * ring and DEFERS the cross-segment release into an op-list that is never drained
-     * -> deadlock at fence 2. yz_flip_advance advances GET past the stopper when t1 is
-     * reserve-wedged, restoring the pt28 state that reaches the CRI stack. The faithful
-     * FIFO root is a producer-PACING divergence (verified this session against the
-     * RPCS3 oracle: RPCS3's GET also parks on io 0x300000 but its 60Hz-paced producer
-     * releases immediately; ours laps at host speed). Tracked as a known LAYER-1 issue,
-     * not the boot critical path. YZ_NO_FLOWCTL disables it (-> deadlock at 2). */
+    /* RSX FIFO flow-control (DEFAULT-ON). The io 0x300000 jump-to-self DEADLOCK is
+     * SOLVED faithfully by the deferred stopper-release applier (import_overrides.cpp,
+     * commit f8d0386): faithful mode (YZ_NO_FLOWCTL) clears 0x300000 on its own and
+     * reaches the gs_task geometry wall -- it NO LONGER deadlocks at frame 2 (that old
+     * claim is stale, corrected 2026-06-29). This flow-control lever stays default-ON
+     * only to carry the DEFAULT boot PAST the gs_task geometry wall: when t1 is
+     * reserve-wedged it advances GET (wrap-aware, never backward) to the next committed
+     * flip command + re-applies any skipped SET_REFERENCE, and nudges the flip fence
+     * @0x40C00000. These are LOSSY forces RPCS3 never does -- retained only until gs_task
+     * produces its own geometry (the SPU producer handshake). The remaining faithful-mode
+     * block is that gs_task PUT, NOT a FIFO pacing/lapping bug -- the consumer hard-bounds
+     * get==put (cannot lap); the old "producer laps the ring" framing is refuted by the
+     * current traces. YZ_NO_FLOWCTL disables the forcing (-> stops at the gs_task wall). */
     if (!getenv("YZ_NO_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
