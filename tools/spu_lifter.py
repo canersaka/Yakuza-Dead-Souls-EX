@@ -178,6 +178,12 @@ _NO_RT_WRITE = {
     "hgt", "hlgt", "heq", "hgti", "hlgti", "heqi",
 }
 
+# Call ops that write the LINK register. With --trace they self-emit the link's
+# trace_rt BEFORE the nested callee call (so it's logged AT the call PC, like
+# RPCS3's BRSL), so the generic post-loop must NOT also trace them -- that would
+# log the link AFTER the whole callee ran = a false register divergence.
+_LINK_OPS = {"brsl", "brasl", "bisl", "bisled"}
+
 
 def _bi_target_reg(insn):
     """Return the branch-target register of a bi/biz/binz/... insn, or None."""
@@ -272,8 +278,11 @@ class SPULifter:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
                 func.body_lines.append(f"    {c}")
-                if self.trace and insn.mnemonic not in _NO_RT_WRITE:
-                    rt_idx = insn.raw & 0x7F
+                if self.trace and insn.mnemonic not in _NO_RT_WRITE and insn.mnemonic not in _LINK_OPS:
+                    # Use the format-aware dest (RRR ops write bits 21-27, not raw&0x7F),
+                    # else the trace mislabels shufb/selb/mpya/fma/fms/fnms writes and the
+                    # RPCS3 register trace-diff sees false divergences. See _dest_reg().
+                    rt_idx = _dest_reg(insn)
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
             last_insn = insn
 
@@ -535,7 +544,9 @@ class SPULifter:
             # recover it from the raw encoding (rt = bits 25-31 = raw & 0x7F).
             link_rt = insn.raw & 0x7F
             tgt = self._branch_target(insn)
-            link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
+            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
+            if self.trace:
+                link += f" spu_trace_rt(ctx, {link_rt});"   # log the link AT the call PC
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -595,14 +606,16 @@ class SPULifter:
             link_rt = insn.raw & 0x7F            # link reg dropped from operands
             tgt_reg = _reg(ops[0])
             # Indirect call: dispatch, then drain the callee's tail-calls.
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx); "
                     f"SPU_DRAIN(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
             tgt_reg = _reg(ops[0])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
