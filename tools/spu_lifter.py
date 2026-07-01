@@ -524,7 +524,9 @@ class SPULifter:
         if mn == "rdch":
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
-            return f"{g(rt())} = spu_splat_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
+            # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
+            # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
+            return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
             return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"

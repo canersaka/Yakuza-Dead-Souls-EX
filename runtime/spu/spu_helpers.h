@@ -54,6 +54,13 @@ static inline u128 spu_splat_u32(uint32_t v) {
 static inline u128 spu_link(uint32_t addr) {
     u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
+/* Preferred-slot scalar: value in word 0, remaining slots ZERO. CBEA's scalar
+ * channel convention -- rchcnt returns the count this way (RPCS3 measured
+ * r4={1,0,0,0} at gs_task LS 0x655C where the old splat gave {1,1,1,1}).
+ * Same bug class as spu_link. */
+static inline u128 spu_pref_u32(uint32_t v) {
+    u128 r; r._u32[0]=v; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
 static inline u128 spu_splat_u16(uint16_t v) {
     u128 r; for (int i=0;i<8;i++) r._u16[i]=v; return r;
 }
