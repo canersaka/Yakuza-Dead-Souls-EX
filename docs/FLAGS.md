@@ -17,7 +17,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 | Flag | Where | Meaning |
 |---|---|---|
-| `YZ_NO_FLOWCTL` | yakuza/main.cpp ~1666 | Kill-switch for the **flow-control band-aid (default ON)** — 3 lossy forces (GET-skip, fence-nudge, SET_REFERENCE re-apply) that carry the default boot past the gs_task geometry wall. **Retirement condition: gs_task finishes its geometry segment** (the LS-0x44 / LS[0xBD70] frontier). Setting this = faithful mode. |
+| `YZ_NO_FLOWCTL` | yakuza/main.cpp ~1666 | Kill-switch for the **flow-control band-aid (default ON)** — 3 lossy forces (GET-skip, fence-nudge, SET_REFERENCE re-apply) that carry the default boot past the gs_task geometry wall. **Retirement condition: gs_task finishes its geometry segment — MET 2026-07-01/02 (il-decode fix: faithful boot reaches fence 10, no LS-0x44). Retirement test = next session's first action** (STATUS.md). Setting this = faithful mode. |
 | `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~939 | Kill-switch for the throttle nudge (paired with the flow-control band-aid). |
 | `YZ_NO_APPLY_REL` | import_overrides.cpp ~1132 | Kill-switch for the **faithful deferred stopper-release applier (f8d0386)** — the committed LAYER-1 fix. Keep. |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
@@ -42,7 +42,11 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 ## Diagnostics (default OFF; side-effect-free when unset)
 
-Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_IMGLOG`, `YZ_SIGW`,
+Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
+(instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
+keeps its trace tail — added 2026-07-01), `YZ_LSWATCH` (spu_dma.h — any into-LS transfer incl.
+GETLLAR covering gs_task's queue/table LS ranges; REMOVE when the geometry frontier settles),
+`YZ_LSWRITE` (spu_context.h — lifted stores into those ranges; REMOVE likewise), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
 `YZ_TS_WATCH`, `YZ_TASK_TRACE`, `YZ_TASK_RET`, `YZ_CB_TRACE`, `YZ_DRAIN_TRACE`, `YZ_RECPROBE`,
