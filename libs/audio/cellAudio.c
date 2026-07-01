@@ -181,6 +181,38 @@ static void audio_be_w64(u32 ea, u64 v)
     audio_be_w32(ea + 4, (u32)v);
 }
 
+/* Big-endian scalar helpers (guest is PPC BE). Also used by cellAudioPortOpen
+ * to byteswap the guest CellAudioPortParam into host-native order. */
+static inline u64 ca_be64(u64 v) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#else
+    return __builtin_bswap64(v);
+#endif
+}
+static inline u32 ca_be32(u32 v) {
+#if defined(_MSC_VER)
+    return _byteswap_ulong(v);
+#else
+    return __builtin_bswap32(v);
+#endif
+}
+
+/* Read a big-endian 32-bit float sample from the guest port buffer.
+ * The guest (PPC, big-endian) writes float PCM into port->buffer; the host
+ * mixer must byteswap each sample to native order before use (RPCS3 does the
+ * same: its port buffer is typed be_t<f32>*, auto-swapped on read). Reinterpret
+ * via memcpy to avoid strict-aliasing UB. */
+static inline float rd_be_f32(const float* p)
+{
+    u32 w;
+    memcpy(&w, p, sizeof(w));
+    w = ca_be32(w);
+    float f;
+    memcpy(&f, &w, sizeof(f));
+    return f;
+}
+
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
@@ -421,21 +453,21 @@ static void audio_mix_one_block(void)
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
-                left  = src[s * nch + 0] * level;
-                right = src[s * nch + 1] * level;
+                left  = rd_be_f32(&src[s * nch + 0]) * level;
+                right = rd_be_f32(&src[s * nch + 1]) * level;
             } else {
                 /* Mono: duplicate to both channels */
-                left = right = src[s] * level;
+                left = right = rd_be_f32(&src[s]) * level;
             }
 
             /* If 7.1, mix center and other channels into stereo */
             if (nch == 8) {
-                float center = src[s * 8 + 2] * level * 0.707f;
-                float lfe    = src[s * 8 + 3] * level * 0.5f;
-                float rl     = src[s * 8 + 4] * level * 0.5f;
-                float rr     = src[s * 8 + 5] * level * 0.5f;
-                float sl     = src[s * 8 + 6] * level * 0.3f;
-                float sr     = src[s * 8 + 7] * level * 0.3f;
+                float center = rd_be_f32(&src[s * 8 + 2]) * level * 0.707f;
+                float lfe    = rd_be_f32(&src[s * 8 + 3]) * level * 0.5f;
+                float rl     = rd_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                float rr     = rd_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                float sl     = rd_be_f32(&src[s * 8 + 6]) * level * 0.3f;
+                float sr     = rd_be_f32(&src[s * 8 + 7]) * level * 0.3f;
                 left  += center + lfe + rl + sl;
                 right += center + lfe + rr + sr;
             }
@@ -619,21 +651,8 @@ s32 cellAudioQuit(void)
  * into guest VM, so multi-byte fields must be byteswapped to host order before
  * use. (Bug found 2026-06-20: nChannel was read raw -> 0x0800000000000000 instead
  * of 8 -> CELL_AUDIO_ERROR_PARAM -> the game aborted audio init -> the surround
- * mixer + the CRI movie pipeline collapsed. RPCS3 reads 8 and proceeds.) */
-static inline u64 ca_be64(u64 v) {
-#if defined(_MSC_VER)
-    return _byteswap_uint64(v);
-#else
-    return __builtin_bswap64(v);
-#endif
-}
-static inline u32 ca_be32(u32 v) {
-#if defined(_MSC_VER)
-    return _byteswap_ulong(v);
-#else
-    return __builtin_bswap32(v);
-#endif
-}
+ * mixer + the CRI movie pipeline collapsed. RPCS3 reads 8 and proceeds.)
+ * The ca_be64/ca_be32 helpers are defined above (near the mixer). */
 
 s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 {
