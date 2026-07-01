@@ -300,6 +300,14 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
 extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
 #define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
 
+/* Guest structs arrive as raw pointers into big-endian guest RAM (the import
+ * bridges do no marshaling), so multi-byte guest fields must be decoded. */
+static inline u32 guest_be32(u32 v)
+{
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u) |
+           ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+
 /* Slot-allocation core: caller MUST hold slot_lock. Inits a host lock for the
  * lwmutex and writes its 1-based slot id into sleep_queue. */
 static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
@@ -310,7 +318,9 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex
         if (!s_lwmutex[slot].in_use) {
             LwMutexSlot* m = &s_lwmutex[slot];
             m->in_use = 1;
-            m->recursive = (attr && (attr->recursive & SYS_SYNC_RECURSIVE)) ? 1 : 0;
+            /* attr lives in guest memory: decode the BE flags word (a raw host
+             * read of BE 0x10 sees 0x10000000, so the old check never matched). */
+            m->recursive = (attr && (guest_be32(attr->recursive) & SYS_SYNC_RECURSIVE)) ? 1 : 0;
             if (attr)
                 memcpy(m->name, attr->name, 8);
 
@@ -356,8 +366,17 @@ static s32 lwmutex_lazy_register(sys_lwmutex_t_hle* lwmutex)
 {
     slot_lock();
     s32 rc = CELL_OK;
-    if (lwmutex->sleep_queue == 0)          /* re-check under lock (TOCTOU-safe) */
-        rc = lwmutex_register_locked(lwmutex, NULL);
+    if (lwmutex->sleep_queue == 0) {        /* re-check under lock (TOCTOU-safe) */
+        /* The static initializer stored the SYS_SYNC_* flags in the guest struct's
+         * attribute word; capture it BEFORE register_locked memsets the struct,
+         * or a SYS_SYNC_RECURSIVE lwmutex silently registers non-recursive. Kept
+         * raw (guest-BE) -- register_locked decodes it like a create-path attr. */
+        sys_lwmutex_attribute_t a;
+        a.protocol = 0;
+        a.recursive = lwmutex->attribute;
+        memcpy(a.name, "lazylwm", 8);
+        rc = lwmutex_register_locked(lwmutex, &a);
+    }
     slot_unlock();
     return rc;
 }
