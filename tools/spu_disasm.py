@@ -352,7 +352,9 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             target = i18 * 4
             result.operands = f"0x{target & 0xFFFFFFFF:X}"
         elif mne in ("brnz", "brz", "brhnz", "brhz"):
-            target = sign_extend(i16, 16) * 4 + addr
+            # (dead path -- these are RI16, not in RI18_TABLE -- but keep the
+            # arithmetic correct: i16 is already sign-extended, don't re-extend)
+            target = i16 * 4 + addr
             result.operands = f"$r{rt}, 0x{target & 0xFFFFFFFF:X}"
         elif mne == "ila":
             result.operands = f"$r{rt}, 0x{i18:X}"
@@ -380,7 +382,13 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         elif mne in ("hbra", "hbrr"):
             result.operands = f"0x{i16 & 0xFFFF:X}, $r{rt}"
         elif mne == "il":
-            result.operands = f"$r{rt}, {sign_extend(i16, 16)}"
+            # i16 is ALREADY sign-extended (top of spu_decode). Extending it
+            # again mapped every NEGATIVE il immediate to (imm - 0x10000):
+            # Python's -4 & 0x8000 is truthy, so sign_extend(-4,16) = -65540.
+            # Found live in gs_task @LS 0x5008 (il $r17,-4 lifted as -65540 ->
+            # the free-list restock store landed at LS 0x3BDC0 instead of
+            # 0xBDC0 -> allocator popped NULL -> the LS-0x44 crash).
+            result.operands = f"$r{rt}, {i16}"
         elif mne in ("iohl", "ilh", "ilhu"):
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
         elif mne in ("brz", "brnz", "brhz", "brhnz"):
