@@ -922,6 +922,12 @@ extern "C" volatile long g_yz_caller_bt_n;
  * GET there so the consumer dispatches the flip (fence++); if none is committed yet,
  * fall back to GET=PUT to free t1's reserve so it builds the next frame. Repeating this
  * walks the fence forward frame-by-frame = continuous flips (LAYER-1 animation). */
+/* All GET/fence writes below hold the RSX FIFO lock and revalidate the sampled
+ * state under it (audit 2026-07-01: the unlocked writes raced the consumer's
+ * read-decide-write -- GET could be clobbered BACKWARD mid-applier). */
+extern "C" void yz_rsx_fifo_acquire(void);
+extern "C" void yz_rsx_fifo_release(void);
+extern "C" int  yz_rsx_flip_pending_any(void);
 static DWORD WINAPI yz_flip_advance(LPVOID)
 {
     const uint32_t FIFO_BASE = 0x40400000u;   /* bufdesc+0x14 io base */
@@ -1004,14 +1010,25 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
             if (put != thr_put) { thr_put = put; thr_ep0 = now; thr_last_nudge = 0; thr_dead = 0; }
             if (!thr_dead && thr_nudge) {
                 if ((now - thr_ep0) <= 1000u) {
-                    if (now - thr_last_nudge >= 150u) {
-                        uint32_t f = vm_read32(0x40C00000u);
-                        vm_write32(0x40C00000u, f + 1u);   /* release throttle for one frame */
-                        thr_last_nudge = now;
-                        ++n;
-                        if (now - fa_nudge_lg >= 750u) { fa_nudge_lg = now;
-                            fprintf(stderr, "[flipadv] FORCED throttle-nudge fence %u->%u (PUT 0x%06X) [%d total] -- band-aid, not real GPU\n",
-                                    f, f + 1u, put, n); fflush(stderr); }
+                    /* ENFORCE the "mutually exclusive with a pending flip" claim
+                     * (audit 2026-07-01): if a real flip is pending retirement, the
+                     * faithful vblank path will advance the fence -- nudging too
+                     * double-advances it. Fence RMW under the FIFO lock, drained
+                     * state revalidated, so the two writers can't interleave. */
+                    if (now - thr_last_nudge >= 150u && !yz_rsx_flip_pending_any()) {
+                        yz_rsx_fifo_acquire();
+                        uint32_t g2 = vm_read32(0x10000044u) & ~3u;
+                        uint32_t p2 = vm_read32(0x10000040u) & ~3u;
+                        if (g2 == p2 && !yz_rsx_flip_pending_any()) {
+                            uint32_t f = vm_read32(0x40C00000u);
+                            vm_write32(0x40C00000u, f + 1u);   /* release throttle for one frame */
+                            thr_last_nudge = now;
+                            ++n;
+                            if (now - fa_nudge_lg >= 750u) { fa_nudge_lg = now;
+                                fprintf(stderr, "[flipadv] FORCED throttle-nudge fence %u->%u (PUT 0x%06X) [%d total] -- band-aid, not real GPU\n",
+                                        f, f + 1u, put, n); fflush(stderr); }
+                        }
+                        yz_rsx_fifo_release();
                     }
                     continue;
                 }
@@ -1179,6 +1196,19 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
          * progress (same next wall). SET_REFERENCE (count-1, method 0x50) is specific
          * enough to be data-safe and only writes the bounded REF register. (pt48b: the
          * dropped SET_REFERENCE was THE wedge -- t1 hung on `while(REF!=N)`.) */
+        /* REF-apply + GET-advance as ONE atomic step under the FIFO lock (audit
+         * 2026-07-01): unlocked, this raced the consumer/applier's own
+         * read-decide-write on GET -- either side could clobber the other's GET
+         * (including BACKWARD, which stalls t1's reserve math). Revalidate that
+         * GET is still where we sampled it; if the consumer moved it, our wedge
+         * diagnosis is stale -- drop the intervention and re-observe. */
+        yz_rsx_fifo_acquire();
+        uint32_t curget = vm_read32(0x10000044u) & ~3u;
+        if (curget != get) {
+            yz_rsx_fifo_release();
+            last_get = curget; stuck_since = now;
+            continue;
+        }
         {
             uint32_t adv_target = (found && found != get) ? found : put;
             if (adv_target > get) {
@@ -1210,6 +1240,7 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
                 fprintf(stderr, "[flowctl] GET 0x%06X -> PUT 0x%06X (fence=%u, %s) [%d] -- freed t1's ring reserve\n",
                         get, put, fence, in_ring ? "no flip" : "stale-list", n); fflush(stderr); }
         }
+        yz_rsx_fifo_release();
     }
 }
 

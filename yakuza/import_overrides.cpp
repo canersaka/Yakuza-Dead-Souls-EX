@@ -1068,6 +1068,27 @@ static void yz_rsx_fifo_lock_ensure(void)
     InitOnceExecuteOnce(&g_rsx_fifo_once, yz_rsx_fifo_init_cb, NULL, NULL);
 }
 
+/* Exported for the flow-control band-aid (main.cpp yz_flip_advance). Audit
+ * 2026-07-01: the band-aid wrote GET and the fence with NO lock, racing this
+ * consumer's read-decide-write window -- GET could be clobbered BACKWARD
+ * (producer-stall hazard) and the fence could double-advance vs the faithful
+ * vblank path. All GET/fence writers must hold g_rsx_fifo_lock. */
+extern "C" void yz_rsx_fifo_acquire(void)
+{
+    yz_rsx_fifo_lock_ensure();
+    EnterCriticalSection(&g_rsx_fifo_lock);
+}
+extern "C" void yz_rsx_fifo_release(void)
+{
+    LeaveCriticalSection(&g_rsx_fifo_lock);
+}
+extern "C" int yz_rsx_flip_pending_any(void)
+{
+    for (int h = 0; h < 8; ++h)
+        if (g_rsx_flip_pending[h]) return 1;
+    return 0;
+}
+
 /* Faithful rules (NO heuristics, NO deferred-release, NO GET-forcing):
  *   - GET re-read every iteration; PUT bounds us to [GET, PUT). get == put =>
  *     drained: yield and re-poll. GET NEVER reaches or passes PUT.
