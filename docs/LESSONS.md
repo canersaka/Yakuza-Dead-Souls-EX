@@ -49,8 +49,16 @@ session runs on Fable, Opus, or anything else.
     class). Proven repeatedly: cellSysutil, cellVideoOut, cellFs, cellAudio.
 11. **SPU quadword semantics.** Preferred-slot/word-order and byte-position bugs (shufb,
     cbd/chd/cwd/cdd, fsmb/gbb, quadword shifts, RRR operand order, link-register
-    preferred-word) are THE recurring SPU lift class. Verify against CBEA + the trace-diff
-    harness (`docs/TRACEDIFF.md`), not by eyeball.
+    preferred-word, rchcnt preferred-slot) are THE recurring SPU lift class. Verify against
+    CBEA + the trace-diff harness (`docs/TRACEDIFF.md`), not by eyeball.
+11b. **Immediate-field decode: never sign-extend twice.** Extract-and-extend ONCE at field
+    decode; an operand formatter re-extending an already-negative Python int silently maps
+    imm → imm−2^n (Python `-4 & 0x8000` is truthy). This was the `il` bug that held the
+    geometry wall for ~12 sessions (2026-07-01): every negative `il` in every SPU module
+    lifted as imm−0x10000 — positives fine, so the boot mostly worked. When ONE constant in
+    a trace disagrees with the raw encoding, decode the raw word by hand before trusting
+    either tool (the disassembler and the lifter shared the bug, so they agreed with each
+    other and both lied).
 12. **Symbolization lies.** Crash/watchdog `func_…` names are wrong for runtime/HLE faults
     (no PDB; helpers not in the func table) — resolve RVAs against `yakuza_recomp.map`.
     PPU back-chain walkers can mis-symbolize string data as functions.
