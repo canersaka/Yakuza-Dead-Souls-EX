@@ -46,6 +46,14 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 static inline u128 spu_splat_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=v; r._u32[2]=v; r._u32[3]=v; return r;
 }
+/* Link register value for brsl/bisl/bisled: the SPU writes the return address
+ * into the PREFERRED word (word 0) and ZEROS the other three slots (matches
+ * RPCS3 v128::from32r, SPUInterpreter.cpp BRSL). Splatting it (the old bug)
+ * corrupts any code that saves/reloads/operates on the full 128-bit link --
+ * caught by the SPU trace-diff vs RPCS3 (gs_task lqd r0 @LS 0x3028). */
+static inline u128 spu_link(uint32_t addr) {
+    u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
 static inline u128 spu_splat_u16(uint16_t v) {
     u128 r; for (int i=0;i<8;i++) r._u16[i]=v; return r;
 }
