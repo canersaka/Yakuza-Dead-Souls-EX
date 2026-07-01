@@ -1005,43 +1005,6 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "\n"); fflush(stderr);
         }
     }
-    /* EXPERIMENT (env YZ_FORCE_START): the policy fully loads gs_task and sets
-     * savedContextLr (LS 0x2C80 = entry 0x3050) but skips the StartTask `bi r0`
-     * to the entry, returning to the kernel (pc=0x838) instead. When the policy
-     * spu reaches that return with gs_task loaded, force the SPURS task-start ABI
-     * (oracle cellSpursSpu.cpp:1395 spursTasksetStartTask: gpr3=taskArgs, gpr4 hi=
-     * spurs, gpr2/5..127=0) and jump to the entry under the gs_task image -- to
-     * drive the downstream pipeline (gs_task -> geometry @ io 0x1104D00 -> frame)
-     * while the StartTask divergence is pinned for a proper fix. */
-    if (getenv("YZ_FORCE_START") && (ctx->pc & SPU_LS_MASK) == 0x838u) {
-        const unsigned char* ls = ctx->ls;
-        uint32_t entry = ((uint32_t)ls[0x2C80] << 24) | ((uint32_t)ls[0x2C81] << 16)
-                       | ((uint32_t)ls[0x2C82] << 8) | ls[0x2C83];
-        static int launched = 0;
-        if (entry == 0x3050u && !launched) {
-            launched = 1;
-            memset(ctx->gpr, 0, 128 * sizeof(ctx->gpr[0]));
-            /* The LS-derived ABI was WRONG (2026-06-18 capture): our LS 0x2780 held
-             * 41F00080_40C00100_00800100 (op-list base, not taskArgs) and LS 0x2C90 held
-             * 0x3FFF0 (kernel-stack top) -- because our spursTasksetStartTask never runs to
-             * completion to populate them. Use the EXACT register state RPCS3 launches gs_task
-             * with (SPU debugger, pxd::CellSpursKernel2, PC=0x3050): these EAs are deterministic
-             * (spurs is at 0x40197c80 in both). If gs_task now produces geometry, the launch
-             * path is proven and the remaining work is sourcing these args from the taskset. */
-            ctx->gpr[3]._u32[0] = 0x40197180u;   /* taskArgs (RPCS3 r3) */
-            ctx->gpr[3]._u32[1] = 0x40176B10u;
-            ctx->gpr[3]._u32[2] = 0x000067F0u;
-            ctx->gpr[3]._u32[3] = 0x00000000u;
-            ctx->gpr[4]._u32[3] = 0x40197C80u;   /* gpr4 word3 = spurs addr (RPCS3 r4) */
-            uint32_t sp = 0x2C30u;               /* RPCS3 sp (taskset context stack) */
-            ctx->gpr[1]._u32[0] = sp;
-            ctx->image_id = 0;                                /* gs_task image */
-            ctx->pc = 0x3050u;
-            fprintf(stderr, "[force-start] gs_task @0x3050 (RPCS3 ABI) sp=0x%05X gpr3=%08X_%08X_%08X_%08X\n",
-                    sp, ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3]);
-            fflush(stderr);
-        }
-    }
     /* === SPURS taskset policy kernel<->workload RESUME (the gs_task launch fix) ===
      *
      * The policy's cellSpursModulePollStatus (0x2308) yields to the kernel at
