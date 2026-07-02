@@ -99,6 +99,12 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
 /* NID: 0x7EECFF1D */
 s32 cellAudioPortGetStatus(u32 portNum, u32* status);
 
+/* NID: 0xE4046AFE — block tag of slot blockNo (libmixer pacing) */
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
+
+/* NID: 0xFF3626FD(?) — us timestamp of block `tag` (libmixer pacing) */
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
+
 /* NID: 0x3EEFAF96 */
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 
