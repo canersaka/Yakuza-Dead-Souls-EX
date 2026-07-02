@@ -43,6 +43,12 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 ## Diagnostics (default OFF; side-effect-free when unset)
 
+**Permanent generic probes (2026-07-02 — prefer these over new hardcoded ones):**
+`YZ_PEEK=ea1,ea2,...` (main.cpp: change-triggered 4-word dumps of up to 16 hex guest EAs,
+VirtualQuery-guarded — moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
+(dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses —
+direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt).
+
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
 keeps its trace tail — added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
