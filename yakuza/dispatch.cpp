@@ -172,6 +172,34 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     uint32_t target = (uint32_t)ctx->ctr;
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
 
+    /* GENERIC indirect-call hook (env YZ_HOOK, 2026-07-02): comma-separated hex
+     * guest code/OPD addresses (up to 8); logs args + lr on every bctrl to a
+     * match. Replaces per-question recompiled probes like YZ_SIGCALL below.
+     * LIMITATION: only sees INDIRECT calls (bctrl / function-table dispatch);
+     * direct `bl` targets inside one lift never reach this dispatcher.
+     * Example: YZ_HOOK=020125D8,020169D0  (names: scratch/libsre_lle_map.txt) */
+    { static int hn = -1; static uint32_t hk[8];
+      if (hn < 0) { hn = 0;
+          const char* s = getenv("YZ_HOOK");
+          while (s && *s && hn < 8) {
+              char* end = NULL;
+              unsigned long v = strtoul(s, &end, 16);
+              if (end == s) break;
+              hk[hn++] = (uint32_t)v;
+              s = (*end == ',') ? end + 1 : end;
+              if (*s == '\0') break;
+          } }
+      for (int i = 0; i < hn; i++) {
+          if (target == hk[i]) {
+              static int n = 0; if (n < 60) { n++;
+                  fprintf(stderr, "[hook] 0x%08X(r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX) lr=0x%llX\n",
+                          target, (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                          (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6],
+                          (unsigned long long)ctx->lr);
+                  fflush(stderr); }
+              break;
+          }
+      } }
     /* SPURS task-signal call watch (env YZ_SIGCALL, 2026-07-02, diag — REMOVE
      * when the voice frontier closes): all 6 SPU tasks park in WAIT_SIGNAL and
      * the tasksets' `signalled` bitmaps never set — does the PPU EVER call the

@@ -1252,6 +1252,47 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
  * enabled->disabled-without-ever-running (the policy rejected it) -- and, cross-checked
  * with the SPU-side [ts-watch] log, whether any clear comes from the PPU (no SPU entry). */
 extern "C" uint32_t g_yz_spurs_taskset;
+/* GENERIC guest-memory peek (env YZ_PEEK, 2026-07-02): comma-separated hex EAs
+ * (up to 16), each dumped as 4 words on CHANGE, VirtualQuery-guarded. Replaces
+ * the recompile-a-peek-array-per-question loop that cost a rebuild cycle every
+ * time a new address became interesting. Example:
+ *   YZ_PEEK=63D61400,63D61600,40197C80 */
+static DWORD WINAPI yz_peek_thread(LPVOID)
+{
+    uint32_t ea[16]; int n = 0;
+    { const char* s = getenv("YZ_PEEK");
+      while (s && *s && n < 16) {
+          char* end = NULL;
+          unsigned long v = strtoul(s, &end, 16);
+          if (end == s) break;
+          ea[n++] = (uint32_t)v;
+          s = (*end == ',') ? end + 1 : end;
+          if (*s == '\0') break;
+      } }
+    if (!n) return 0;
+    fprintf(stderr, "[peek] watching %d address(es)\n", n);
+    uint32_t last[16][4]; memset(last, 0xFF, sizeof(last));
+    DWORD t0 = 0;
+    for (;;) {
+        Sleep(1);
+        if (!vm_base) continue;
+        if (!t0) t0 = GetTickCount();
+        for (int k = 0; k < n; k++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(vm_base + ea[k], &mbi, sizeof(mbi))
+                || mbi.State != MEM_COMMIT) continue;
+            uint32_t v[4];
+            for (int j = 0; j < 4; j++) v[j] = vm_read32(ea[k] + (uint32_t)j * 4u);
+            if (memcmp(v, last[k], sizeof(v)) != 0) {
+                fprintf(stderr, "[peek +%lums @%08X] %08X %08X %08X %08X\n",
+                        GetTickCount()-t0, ea[k], v[0], v[1], v[2], v[3]);
+                fflush(stderr);
+                memcpy(last[k], v, sizeof(v));
+            }
+        }
+    }
+}
+
 static DWORD WINAPI yz_ts_watch(LPVOID)
 {
     /* Watch BOTH live tasksets (2026-07-02): the CRI codec taskset (wid 3) and
@@ -1746,6 +1787,8 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
+    if (getenv("YZ_PEEK"))
+        CreateThread(NULL, 0, yz_peek_thread, NULL, 0, NULL);
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
