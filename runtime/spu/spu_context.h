@@ -237,6 +237,21 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+    /* Queue-line-copy write watch (env YZ_QLINE, 2026-07-02, diag — REMOVE with
+     * the voice frontier): the codec's SpursQueue push commits {front=1,...}
+     * where front must stay 0; log every lifted store to the GETLLAR line copy
+     * at LS 0x80 (image 3) with pc + value to name the word-0 corruptor. */
+    { static int qw = -1;
+      extern char* getenv(const char*);
+      if (qw < 0) qw = getenv("YZ_QLINE") ? 1 : 0;
+      if (qw && lsa == 0x80u && ctx->image_id == 3) {
+          static int qn = 0;
+          if (qn < 40) { qn++;
+              fprintf(stderr, "[qline] pc=0x%05X LS80 <= %08X %08X %08X %08X\n",
+                      ctx->pc, val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
+              fflush(stderr);
+          }
+      } }
     uint8_t* p = &ctx->ls[lsa];
     for (int i = 0; i < 4; i++) {
         uint32_t w = val._u32[i];
