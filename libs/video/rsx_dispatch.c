@@ -1,0 +1,304 @@
+/*
+ * ps3recomp - NV4097 method dispatcher (Track B / LAYER 2)
+ *
+ * See rsx_dispatch.h for the design and the clean-room source list.
+ *
+ * Register/method facts used here (envytools rnndb nv30-40_3d + Mesa nv30
+ * + psdevwiki; RPCS3 consulted as a read-only semantics oracle):
+ *
+ *   0x0194 DMA_COLOR0, 0x018C DMA_COLOR1, 0x01B4/0x01B8 DMA_COLOR2/3,
+ *   0x0198 DMA_ZETA                DMA handle 0xFEED0000 = RSX local memory,
+ *                                  0xFEED0001 = main (IO-mapped) memory
+ *   0x0200 RT_HORIZ  x[0:15] w[16:31]      0x0204 RT_VERT y/h
+ *   0x0208 RT_FORMAT color[0:4] depth[5:7] type[8:11] aa[12:15]
+ *   0x020C/021C/0280/0284 COLOR0-3_PITCH   0x0210/0218/0288/028C COLOR0-3_OFFSET
+ *   0x0214 ZETA_OFFSET   0x022C ZETA_PITCH   0x0220 RT_ENABLE
+ *   0x0A00 VIEWPORT_HORIZ x/w   0x0A04 VIEWPORT_VERT y/h
+ *   0x0A20..0x0A2C VIEWPORT_TRANSLATE[4]  0x0A30..0x0A3C VIEWPORT_SCALE[4]
+ *   0x0B80..0x0BFC VP_UPLOAD_INST window (load ptr auto-advances per vec4)
+ *   0x1680+i*4 VTXBUF_OFFSET[i]  bit31 = location, [0:30] = offset
+ *   0x1738 VERTEX_DATA_BASE_OFFSET  0x173C VB_ELEMENT_BASE
+ *   0x1740+i*4 VTXFMT[i] type[0:3] size[4:7] stride[8:15] frequency[16:31]
+ *   0x1808 VERTEX_BEGIN_END  arg = primitive, 0 = end
+ *   0x1814 VB_VERTEX_BATCH   first[0:23] (count-1)[24:31]
+ *   0x181C IDXBUF_OFFSET     0x1820 IDXBUF_FORMAT location[0:3] type[4:11]
+ *   0x1824 VB_INDEX_BATCH    first[0:23] (count-1)[24:31]
+ *   0x1D8C CLEAR_DEPTH_VALUE  0x1D90 CLEAR_COLOR_VALUE (A8R8G8B8)
+ *   0x1D94 CLEAR_BUFFERS     Z=0x01 S=0x02 R=0x10 G=0x20 B=0x40 A=0x80
+ *   0x1E9C VP_UPLOAD_FROM_ID (transform program load pointer)
+ *   0x1EFC VP_UPLOAD_CONST_ID (transform constant load pointer; NOT
+ *          auto-advancing — every burst re-reads it)
+ *   0x1F00..0x1F7C VP_UPLOAD_CONST window: word i -> slot load + i/4, lane i%4
+ *   0xE944 gcm driver-queue flip (established empirically from this title)
+ */
+
+#include "rsx_dispatch.h"
+
+#include <string.h>
+
+#define M_DMA_COLOR1            0x018C
+#define M_DMA_COLOR0            0x0194
+#define M_DMA_ZETA              0x0198
+#define M_DMA_COLOR2            0x01B4
+#define M_DMA_COLOR3            0x01B8
+#define M_RT_HORIZ              0x0200
+#define M_RT_VERT               0x0204
+#define M_RT_FORMAT             0x0208
+#define M_COLOR0_PITCH          0x020C
+#define M_COLOR0_OFFSET         0x0210
+#define M_ZETA_OFFSET           0x0214
+#define M_COLOR1_OFFSET         0x0218
+#define M_COLOR1_PITCH          0x021C
+#define M_RT_ENABLE             0x0220
+#define M_ZETA_PITCH            0x022C
+#define M_COLOR2_PITCH          0x0280
+#define M_COLOR3_PITCH          0x0284
+#define M_COLOR2_OFFSET         0x0288
+#define M_COLOR3_OFFSET         0x028C
+#define M_VIEWPORT_HORIZ        0x0A00
+#define M_VIEWPORT_VERT         0x0A04
+#define M_VIEWPORT_TRANSLATE    0x0A20
+#define M_VIEWPORT_SCALE        0x0A30
+#define M_VP_UPLOAD_INST        0x0B80
+#define M_VTXBUF_OFFSET         0x1680
+#define M_VERTEX_DATA_BASE      0x1738
+#define M_VB_ELEMENT_BASE       0x173C
+#define M_VTXFMT                0x1740
+#define M_VERTEX_BEGIN_END      0x1808
+#define M_VB_VERTEX_BATCH       0x1814
+#define M_IDXBUF_OFFSET         0x181C
+#define M_IDXBUF_FORMAT         0x1820
+#define M_VB_INDEX_BATCH        0x1824
+#define M_CLEAR_DEPTH_VALUE     0x1D8C
+#define M_CLEAR_COLOR_VALUE     0x1D90
+#define M_CLEAR_BUFFERS         0x1D94
+#define M_VP_UPLOAD_FROM_ID     0x1E9C
+#define M_VP_UPLOAD_CONST_ID    0x1EFC
+#define M_VP_UPLOAD_CONST       0x1F00
+#define M_GCM_DRIVER_FLIP       0xE944
+
+#define DMA_HANDLE_LOCAL        0xFEED0000u
+#define DMA_HANDLE_MAIN         0xFEED0001u
+
+static u32 dma_to_location(u32 handle)
+{
+    return handle == DMA_HANDLE_MAIN ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+}
+
+static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
+{
+    for (u32 i = 0; i < count; i++)
+        rsx->klass[(method >> 2) + i] = klass;
+}
+
+void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
+{
+    memset(rsx, 0, sizeof(*rsx));
+    if (sink)
+        rsx->sink = *sink;
+
+    /* Execution methods */
+    mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
+
+    /* State the getters decode */
+    mark_class(rsx, M_DMA_COLOR1,        1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_DMA_COLOR0,        2, RSX_DSP_CLASS_STATE); /* +ZETA */
+    mark_class(rsx, M_DMA_COLOR2,        2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_RT_HORIZ,         12, RSX_DSP_CLASS_STATE); /* 0x200..0x22C */
+    mark_class(rsx, M_COLOR2_PITCH,      4, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VIEWPORT_HORIZ,    2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VIEWPORT_TRANSLATE, 8, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VTXBUF_OFFSET,    16, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VERTEX_DATA_BASE,  2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VTXFMT,           16, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_IDXBUF_OFFSET,     2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_CLEAR_DEPTH_VALUE, 2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VP_UPLOAD_FROM_ID, 1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VP_UPLOAD_CONST_ID, 1, RSX_DSP_CLASS_STATE);
+}
+
+void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
+{
+    if (count > RSX_DSP_NUM_REGS)
+        count = RSX_DSP_NUM_REGS;
+    memcpy(rsx->regs, regs, count * sizeof(u32));
+}
+
+void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
+{
+    if (count > RSX_DSP_VP_WORDS)
+        count = RSX_DSP_VP_WORDS;
+    memcpy(rsx->vp, words, count * sizeof(u32));
+}
+
+void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+{
+    method &= 0xFFFFC;
+    const u32 idx = method >> 2;
+    rsx->seen[idx]++;
+    rsx->regs[idx] = arg;
+
+    /* Transform program upload window: word goes to instruction slot
+     * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
+     * vec4 (hardware auto-increment, confirmed against the RPCS3 oracle). */
+    if (method >= M_VP_UPLOAD_INST && method < M_VP_UPLOAD_INST + 32 * 4) {
+        const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
+        u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        const u32 pos = *load * 4 + lane;
+        if (pos < RSX_DSP_VP_WORDS)
+            rsx->vp[pos] = arg;
+        if (lane == 3)
+            (*load)++;
+        return;
+    }
+
+    /* Transform constant upload window: word i of the burst writes
+     * constants[VP_UPLOAD_CONST_ID + i/4][i%4]; the load pointer does NOT
+     * advance. */
+    if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
+        const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
+        const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
+        if (slot < RSX_DSP_NUM_CONSTANTS)
+            rsx->constants[slot][word & 3] = arg;
+        return;
+    }
+
+    switch (method) {
+    case M_CLEAR_BUFFERS:
+        if (rsx->sink.clear)
+            rsx->sink.clear(rsx->sink.user, rsx, arg);
+        break;
+
+    case M_VERTEX_BEGIN_END:
+        if (arg) {
+            rsx->in_begin_end = 1;
+            rsx->current_primitive = arg;
+            if (rsx->sink.begin)
+                rsx->sink.begin(rsx->sink.user, rsx, arg);
+        } else {
+            rsx->in_begin_end = 0;
+            if (rsx->sink.end)
+                rsx->sink.end(rsx->sink.user, rsx);
+        }
+        break;
+
+    case M_VB_VERTEX_BATCH:
+        if (rsx->sink.draw_arrays)
+            rsx->sink.draw_arrays(rsx->sink.user, rsx,
+                                  arg & 0xFFFFFF, (arg >> 24) + 1);
+        break;
+
+    case M_VB_INDEX_BATCH:
+        if (rsx->sink.draw_index_array)
+            rsx->sink.draw_index_array(rsx->sink.user, rsx,
+                                       arg & 0xFFFFFF, (arg >> 24) + 1);
+        break;
+
+    case M_GCM_DRIVER_FLIP:
+        if (rsx->sink.flip)
+            rsx->sink.flip(rsx->sink.user, rsx, arg);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ---- getters ----------------------------------------------------------- */
+
+u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)
+{
+    return rsx_dsp_reg(rsx, M_CLEAR_COLOR_VALUE);
+}
+
+u32 rsx_dsp_clear_zstencil(const rsx_dispatch* rsx)
+{
+    return rsx_dsp_reg(rsx, M_CLEAR_DEPTH_VALUE);
+}
+
+void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
+{
+    const u32 fmt = rsx_dsp_reg(rsx, M_RT_FORMAT);
+    out->color_format = fmt & 0x1F;
+    out->depth_format = (fmt >> 5) & 7;
+    out->raster_type  = (fmt >> 8) & 0xF;
+
+    const u32 h = rsx_dsp_reg(rsx, M_RT_HORIZ);
+    const u32 v = rsx_dsp_reg(rsx, M_RT_VERT);
+    out->clip_x = h & 0xFFFF;
+    out->clip_w = h >> 16;
+    out->clip_y = v & 0xFFFF;
+    out->clip_h = v >> 16;
+
+    out->color_offset[0] = rsx_dsp_reg(rsx, M_COLOR0_OFFSET);
+    out->color_offset[1] = rsx_dsp_reg(rsx, M_COLOR1_OFFSET);
+    out->color_offset[2] = rsx_dsp_reg(rsx, M_COLOR2_OFFSET);
+    out->color_offset[3] = rsx_dsp_reg(rsx, M_COLOR3_OFFSET);
+    out->color_pitch[0]  = rsx_dsp_reg(rsx, M_COLOR0_PITCH);
+    out->color_pitch[1]  = rsx_dsp_reg(rsx, M_COLOR1_PITCH);
+    out->color_pitch[2]  = rsx_dsp_reg(rsx, M_COLOR2_PITCH);
+    out->color_pitch[3]  = rsx_dsp_reg(rsx, M_COLOR3_PITCH);
+    out->color_location[0] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR0));
+    out->color_location[1] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR1));
+    out->color_location[2] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR2));
+    out->color_location[3] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR3));
+    out->color_target  = rsx_dsp_reg(rsx, M_RT_ENABLE);
+    out->zeta_offset   = rsx_dsp_reg(rsx, M_ZETA_OFFSET);
+    out->zeta_pitch    = rsx_dsp_reg(rsx, M_ZETA_PITCH);
+    out->zeta_location = dma_to_location(rsx_dsp_reg(rsx, M_DMA_ZETA));
+}
+
+void rsx_dsp_get_viewport(const rsx_dispatch* rsx, rsx_dsp_viewport* out)
+{
+    const u32 h = rsx_dsp_reg(rsx, M_VIEWPORT_HORIZ);
+    const u32 v = rsx_dsp_reg(rsx, M_VIEWPORT_VERT);
+    out->x = h & 0xFFFF;
+    out->w = h >> 16;
+    out->y = v & 0xFFFF;
+    out->h = v >> 16;
+    for (u32 i = 0; i < 4; i++) {
+        const u32 t = rsx_dsp_reg(rsx, M_VIEWPORT_TRANSLATE + i * 4);
+        const u32 s = rsx_dsp_reg(rsx, M_VIEWPORT_SCALE + i * 4);
+        memcpy(&out->translate[i], &t, 4);
+        memcpy(&out->scale[i], &s, 4);
+    }
+}
+
+void rsx_dsp_get_vertex_attr(const rsx_dispatch* rsx, u32 index, rsx_dsp_vertex_attr* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (index >= RSX_DSP_NUM_VERTEX_ATTR)
+        return;
+    const u32 fmt = rsx_dsp_reg(rsx, M_VTXFMT + index * 4);
+    const u32 off = rsx_dsp_reg(rsx, M_VTXBUF_OFFSET + index * 4);
+    out->type      = fmt & 7;
+    out->size      = (fmt >> 4) & 0xF;
+    out->stride    = (fmt >> 8) & 0xFF;
+    out->frequency = fmt >> 16;
+    out->offset    = off & 0x7FFFFFFF;
+    out->location  = off >> 31;
+}
+
+u32 rsx_dsp_vertex_data_base_offset(const rsx_dispatch* rsx)
+{
+    return rsx_dsp_reg(rsx, M_VERTEX_DATA_BASE);
+}
+
+u32 rsx_dsp_vertex_data_base_index(const rsx_dispatch* rsx)
+{
+    return rsx_dsp_reg(rsx, M_VB_ELEMENT_BASE);
+}
+
+void rsx_dsp_get_index_array(const rsx_dispatch* rsx, rsx_dsp_index_array* out)
+{
+    out->offset   = rsx_dsp_reg(rsx, M_IDXBUF_OFFSET);
+    const u32 fmt = rsx_dsp_reg(rsx, M_IDXBUF_FORMAT);
+    out->location = fmt & 0xF;               /* location index directly     */
+    out->is_u32   = ((fmt >> 4) & 0xFF) == 0; /* type 0 = u32, 1 = u16      */
+}
