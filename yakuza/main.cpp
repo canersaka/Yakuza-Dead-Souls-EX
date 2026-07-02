@@ -79,6 +79,7 @@ extern "C" void spu_recomp_register_policy(void);
  * with the cri_audio_ prefix; spu_task_launch switches ctx->image_id by the
  * TaskInfo ELF EA when the SPURS kernel dispatches the codec taskset (wid 3). */
 extern "C" void cri_audio_register_functions(void);
+extern "C" void wkl4_register_functions(void);
 extern "C" void spu_begin_image(int image_id);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
@@ -1253,19 +1254,35 @@ static DWORD WINAPI yz_flip_advance(LPVOID)
 extern "C" uint32_t g_yz_spurs_taskset;
 static DWORD WINAPI yz_ts_watch(LPVOID)
 {
-    uint32_t lr=~0u, lrd=~0u, lp=~0u, le=~0u, lsg=~0u, lwt=~0u; DWORD t0 = 0;
+    /* Watch BOTH live tasksets (2026-07-02): the CRI codec taskset (wid 3) and
+     * the 4-task worker pool (wid 4), plus whatever g_yz_spurs_taskset points
+     * at. Change-triggered dump of the six task bitmaps -- shows whether the
+     * PPU ever sets `signalled` for the WAIT_SIGNAL-parked tasks and whether
+     * the kernel moves them waiting->ready->running. */
+    static const uint32_t fixed[2] = { 0x63D22580u, 0x42425F00u };
+    uint32_t last[3][6]; memset(last, 0xFF, sizeof(last));
+    DWORD t0 = 0;
     for (;;) {
         Sleep(1);
-        uint32_t ts = g_yz_spurs_taskset;
-        if (!ts || !vm_base) continue;
+        if (!vm_base) continue;
         if (!t0) t0 = GetTickCount();
-        uint32_t run=vm_read32(ts+0x00u), rdy=vm_read32(ts+0x10u), pr=vm_read32(ts+0x20u);
-        uint32_t en=vm_read32(ts+0x30u), sg=vm_read32(ts+0x40u), wt=vm_read32(ts+0x50u);
-        if (run!=lr||rdy!=lrd||pr!=lp||en!=le||sg!=lsg||wt!=lwt) {
-            fprintf(stderr, "[ts-poll +%lums] running=%08X ready=%08X pready=%08X enabled=%08X "
-                    "signalled=%08X waiting=%08X\n", GetTickCount()-t0, run, rdy, pr, en, sg, wt);
-            fflush(stderr);
-            lr=run; lrd=rdy; lp=pr; le=en; lsg=sg; lwt=wt;
+        for (int k = 0; k < 3; k++) {
+            uint32_t ts = (k < 2) ? fixed[k] : g_yz_spurs_taskset;
+            if (!ts || (k == 2 && (ts == fixed[0] || ts == fixed[1]))) continue;
+            /* the fixed taskset EAs are allocated by the game mid-boot; reading
+             * reserved-but-uncommitted guest memory faults the host */
+            { MEMORY_BASIC_INFORMATION mbi;
+              if (!VirtualQuery(vm_base + ts, &mbi, sizeof(mbi))
+                  || mbi.State != MEM_COMMIT) continue; }
+            uint32_t v[6];
+            for (int j = 0; j < 6; j++) v[j] = vm_read32(ts + (uint32_t)j * 0x10u);
+            if (memcmp(v, last[k], sizeof(v)) != 0) {
+                fprintf(stderr, "[ts-poll +%lums ts=%08X] running=%08X ready=%08X pready=%08X "
+                        "enabled=%08X signalled=%08X waiting=%08X\n",
+                        GetTickCount()-t0, ts, v[0], v[1], v[2], v[3], v[4], v[5]);
+                fflush(stderr);
+                memcpy(last[k], v, sizeof(v));
+            }
         }
     }
 }
@@ -1589,8 +1606,9 @@ int main(int argc, char** argv)
      * image-3 entries win for codec (image 3) lookups over gs_task's image-0
      * wildcard. gs_task is unaffected on its own (image 0) path. */
     spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
+    spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 */
-    printf("[boot] SPU images registered (kernel + service + policy + cri_audio + gs_task)\n");
+    printf("[boot] SPU images registered (kernel + service + policy + cri_audio + gs_task + wkl4)\n");
 
     /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted
