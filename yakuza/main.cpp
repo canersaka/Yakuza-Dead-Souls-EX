@@ -1259,6 +1259,15 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
      * at. Change-triggered dump of the six task bitmaps -- shows whether the
      * PPU ever sets `signalled` for the WAIT_SIGNAL-parked tasks and whether
      * the kernel moves them waiting->ready->running. */
+    /* Codec init-status peeks (2026-07-02, rides with YZ_TS_WATCH): the codec
+     * task's entire init writes exactly two blocks -- a 4-byte status at
+     * 0x63D11CA0 and 0x20 bytes at 0x63D616A0 (measured, YZ_CODEC_PUT). Dump
+     * them on change so we can see the value + whether the PPU voice layer
+     * ever updates/consumes them. */
+    static const uint32_t peek[4] = { 0x63D11CA0u, 0x63D616A0u,
+                                      0x63D11C80u,   /* ptr stored next to the sync mutex */
+                                      0x63D11E58u }; /* second ptr — candidate queue blocks */
+    uint32_t lastpeek[4][4]; memset(lastpeek, 0xFF, sizeof(lastpeek));
     static const uint32_t fixed[2] = { 0x63D22580u, 0x42425F00u };
     uint32_t last[3][6]; memset(last, 0xFF, sizeof(last));
     DWORD t0 = 0;
@@ -1266,6 +1275,19 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
         Sleep(1);
         if (!vm_base) continue;
         if (!t0) t0 = GetTickCount();
+        for (int k = 0; k < 4; k++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(vm_base + peek[k], &mbi, sizeof(mbi))
+                || mbi.State != MEM_COMMIT) continue;
+            uint32_t v[4];
+            for (int j = 0; j < 4; j++) v[j] = vm_read32(peek[k] + (uint32_t)j * 4u);
+            if (memcmp(v, lastpeek[k], sizeof(v)) != 0) {
+                fprintf(stderr, "[codec-peek +%lums @%08X] %08X %08X %08X %08X\n",
+                        GetTickCount()-t0, peek[k], v[0], v[1], v[2], v[3]);
+                fflush(stderr);
+                memcpy(lastpeek[k], v, sizeof(v));
+            }
+        }
         for (int k = 0; k < 3; k++) {
             uint32_t ts = (k < 2) ? fixed[k] : g_yz_spurs_taskset;
             if (!ts || (k == 2 && (ts == fixed[0] || ts == fixed[1]))) continue;
