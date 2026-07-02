@@ -20,8 +20,10 @@ interleaves "apply memory block" records at the positions the capture demands.
 
 Output: <out>.rxs, little-endian, layout (see libs/video/tests/replay_main.c):
 
-  header   : magic "RXS1", u32 version, u32 n_blocks, u32 n_records,
+  header   : magic "RXS1", u32 version (2), u32 n_blocks, u32 n_records,
              u32 reg_words, u32 vp_words, u32 display_w, u32 display_h
+  display  : u32 buffer count, then 8 * { u32 w, u32 h, u32 pitch, u32 offset }
+             (the gcm display buffer table; flip's argument indexes it)
   regs     : reg_words   * u32   initial NV4097 register file (method = i*4)
   vp       : vp_words    * u32   initial transform program words
   blocks   : n_blocks    * { u32 location, u32 offset, u32 size, u32 data_off }
@@ -199,16 +201,21 @@ def main():
 
     records, hist = expand_stream(commands, block_index_of)
 
-    disp_w = disp_h = 0
+    disp_w = disp_h = disp_count = 0
+    disp_bufs = [(0, 0, 0, 0)] * 8
     if display:
-        bufs, count = display[0]
-        if count:
+        bufs, disp_count = display[0]
+        disp_bufs = [tuple(b) for b in bufs]
+        if disp_count:
             disp_w, disp_h = bufs[0][0], bufs[0][1]
 
     with open(args.out, "wb") as f:
         f.write(b"RXS1")
-        f.write(struct.pack("<7I", 1, len(table), len(records),
+        f.write(struct.pack("<7I", 2, len(table), len(records),
                             len(regs), len(vp), disp_w, disp_h))
+        f.write(struct.pack("<I", disp_count))
+        for b in disp_bufs:
+            f.write(struct.pack("<4I", *b))
         f.write(struct.pack("<%dI" % len(regs), *regs))
         f.write(struct.pack("<%dI" % len(vp), *vp))
         for location, offset, size, doff in table:
