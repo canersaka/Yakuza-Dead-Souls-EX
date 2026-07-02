@@ -703,20 +703,84 @@ static void yz_mt_dump(uint32_t parkget, uint32_t parkcmd) {
  * stopper, the body IS committed and the game HAS committed to releasing it, so
  * applying the deferred release the moment GET reaches the stopper is faithful to
  * the game's own intent (the accurate form of the 14c timer heuristic).
- * Returns true iff stopper_ea is queued for release in the op-list. */
-static bool yz_gcm_stopper_release_deferred(uint32_t stopper_ea)
+ * NOTE (2026-07-02): a "live-stopper guard" (refuse when stopper_ea == S[0x20])
+ * was tried here and REFUTED 0/4 -- at GET-park + PUT-ahead the PUT position
+ * already proves the guarded content is built, so releasing even the current
+ * S[0x20] instance is correct (t1 releases it at its next flush anyway; the
+ * early release only skips the wait). The match itself lives in
+ * yz_gcm_stopper_release_entry below (returns the entry address so the
+ * retirement sweep knows how far consumption has proven progress). */
+
+/* ============================================================================
+ * JOURNAL RETIREMENT SWEEP (2026-07-02) -- the faithful consumption contract.
+ *
+ * MEASURED (instrumented RPCS3 [jrnl-dma]/[jrnl-tags], STATUS session 3): on
+ * real HW the EDGE SPU task (gs_task) consumes the gcm journal and ZEROES each
+ * entry's tag word; the producer polls chunk-head tags == 0 before reusing a
+ * journal chunk, i.e. the tags are the game's GPU-PROGRESS LEDGER. Every
+ * stand-in that zeroed tags AHEAD of actual FIFO consumption (eager, pending-
+ * set, lag-by-one -- 0/8, 0/8, 0/4 boot loops) made the game believe work had
+ * retired that our GET had not consumed, and it recycled ring segments under
+ * GET (torn-content non-command wedges). The faithful rule that survives:
+ * ZERO AN ENTRY ONLY WHEN GET HAS PROVABLY CONSUMED PAST IT. GET applying the
+ * deferred release of entry A (it parked on A's stopper with PUT ahead) is
+ * that proof for entries BEHIND the released region -- NOTE the caveat: the
+ * journal orders a segment's patch entries BEFORE its entry-stopper release,
+ * so "through A" retires patches for content GET is only ENTERING (a
+ * suspected over-retirement; could not be cleanly validated 2026-07-02
+ * because the watchdog instrumentation invalidated the loops). OPT-IN
+ * (YZ_JRNL=1) until it can be measured against a clean baseline; the REAL
+ * fix in flight is restoring the actual consumer (gs_task residency,
+ * trace-diff -- STATUS session 3). Data/sublist payloads (tags 4/8/9/D/10)
+ * are EDGE content-generation, not flow -- they stay unapplied until the
+ * real consumer era. ===================================================== */
+static uint32_t g_jrnl_retire_cursor = 0;
+
+static void yz_jrnl_retire_through(uint32_t entry_addr)
 {
-    if (!g_yz_game_toc) return false;
+    static int on = -1;
+    if (on < 0) on = getenv("YZ_JRNL") ? 1 : 0;
+    if (!on || !g_yz_game_toc) return;
+    const uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+    if (S < 0x10000u || S >= 0xE0000000u) return;
+    const uint32_t base = vm_read32(S + 0x08u);
+    const uint32_t aend = vm_read32(S + 0x0Cu);
+    if (base < 0x10000u || aend <= base || aend - base > 0x1000000u) return;
+    if (entry_addr < base || entry_addr >= aend) return;
+    uint32_t cur = g_jrnl_retire_cursor;
+    if (cur < base || cur >= aend) cur = base;
+    /* linear walk with arena wrap; hard cap for safety */
+    unsigned zeroed = 0, guardn = 0;
+    while (guardn++ < 0x20000u) {
+        if (vm_read32(cur) != 0u) { vm_write32(cur, 0u); zeroed++; }
+        const int done = (cur == entry_addr);
+        cur += 0x20u;
+        if (cur >= aend) cur = base;
+        if (done) break;
+    }
+    g_jrnl_retire_cursor = cur;
+    { static unsigned total = 0, logged = 0; total += zeroed;
+      if (logged < 12 && zeroed) { logged++;
+          fprintf(stderr, "[jrnl] retired %u entries through 0x%08X (%u total)\n",
+                  zeroed, entry_addr, total); } }
+}
+
+/* Locate the journal entry for a deferred release (same match as
+ * yz_gcm_stopper_release_deferred but returns the ENTRY ADDRESS so the
+ * retirement sweep knows how far GET's consumption has proven progress). */
+static uint32_t yz_gcm_stopper_release_entry(uint32_t stopper_ea)
+{
+    if (!g_yz_game_toc) return 0;
     uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
-    if (S < 0x10000u || S >= 0xE0000000u) return false;
+    if (S < 0x10000u || S >= 0xE0000000u) return 0;
     uint32_t base = vm_read32(S + 0x08u);
     uint32_t head = vm_read32(S + 0x00u);
-    if (base < 0x10000u || base >= 0xE0000000u) return false;
-    if (head < base || (head - base) > 0x4000u) return false;   /* sane, un-wrapped */
+    if (base < 0x10000u || base >= 0xE0000000u) return 0;
+    if (head < base || (head - base) > 0x1000000u) return 0;
     for (uint32_t e = base; e < head; e += 0x20u)
         if (vm_read32(e + 0x00u) == 0x7Fu && vm_read32(e + 0x04u) == stopper_ea)
-            return true;
-    return false;
+            return e;
+    return 0;
 }
 
 /* SINGLE-SEGMENT regime (env YZ_BIG_SEG, 2026-06-16): pin ctx->end (gcm_ctx+4) to the
@@ -1174,9 +1238,16 @@ static int yz_rsx_fifo_step(void)
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
-            if (!noapply && ahead != 0u && ahead < (ring >> 1) && yz_gcm_stopper_release_deferred(ea)) {
+            const uint32_t rel_entry = (!noapply && ahead != 0u && ahead < (ring >> 1))
+                                           ? yz_gcm_stopper_release_entry(ea) : 0u;
+            if (rel_entry) {
                 vm_write32(ea, 0x20000000u | ((get + 4u) & 0x1FFFFFFCu));   /* release: self-jump -> jump-forward +4 */
                 vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);     /* GET advances into the committed body */
+                /* Faithful consumption mark: GET consuming past this stopper
+                 * proves everything journaled up to its release entry retired
+                 * -- zero those tags (the game's GPU-progress ledger; see
+                 * yz_jrnl_retire_through). */
+                yz_jrnl_retire_through(rel_entry);
                 { static int n = 0; if (n < 16) { n++;
                     fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X) -> GET advances past stopper\n",
                             get, ahead); } }
