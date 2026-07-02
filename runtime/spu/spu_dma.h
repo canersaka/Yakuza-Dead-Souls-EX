@@ -78,6 +78,9 @@ typedef struct mfc_engine {
     uint8_t     resv_data[128];
     int         resv_active;
     uint32_t    resv_gen;         /* line write-generation at GETLLAR (LR re-derivation) */
+    uint32_t    resv_poll_n;      /* consecutive same-line GETLLARs with an unchanged
+                                   * write-generation = an idle reservation poll loop;
+                                   * drives the host-yield backoff (see MFC_GETLLAR_CMD) */
     uint32_t    atomic_stat;      /* last MFC_RdAtomicStat value */
 } mfc_engine;
 
@@ -85,6 +88,9 @@ typedef struct mfc_engine {
  * SPU host threads (defined in spu_channels.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+/* Host-core yield for SPU idle-poll loops (defined in spu_channels.c):
+ * level 0 = cpu pause, level 1 = scheduler yield. */
+void spu_idle_yield(int level);
 
 /* External: pointer to host mapping of PS3 main memory.
  * Must be set by the VM manager before any DMA. */
@@ -518,6 +524,34 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             { extern uint32_t spu_coh_gen(uint32_t);
               uint64_t le = ea & ~127ull; uint32_t g = spu_coh_gen((uint32_t)le);
               if (mfc->resv_ea == le && g != mfc->resv_gen) spu->event_status |= 0x400u;
+              /* IDLE-POLL BACKOFF (2026-07-03; kill-switch YZ_NO_SPUBACKOFF).
+               * The SPURS kernels poll their management lines with GETLLAR at
+               * full host speed -- measured 5 SPU threads x ~97% of a core --
+               * and EVERY poll takes the process-wide lock-line spinlock, so
+               * the PPU threads' atomics contend against five spinning cores
+               * and boot pacing collapses (the post-voice asset phase made
+               * less progress in 900 s than a lucky run made in 300 s).
+               * Faithful: polling continues; but when the SAME line is re-read
+               * and its write-generation has not moved, yield the host core
+               * with escalation. Any observed change (or a different line)
+               * resets the ladder, so reaction latency to real writes stays
+               * one poll deep. */
+              if (mfc->resv_ea == le && g == mfc->resv_gen) {
+                  mfc->resv_poll_n++;
+                  static int nb = -1;
+                  if (nb < 0) nb = getenv("YZ_NO_SPUBACKOFF") ? 1 : 0;
+                  /* Rung 3 (real sleep) only after ~seconds of continuous
+                   * idleness: at yield pacing 1M unchanged polls is a long
+                   * quiet stretch. A 16k threshold measurably taxed boot
+                   * pacing (each wake costs up to ~15 ms at default timer
+                   * resolution, and the boot is a chain of idle-then-
+                   * handshake moments). */
+                  if (!nb && mfc->resv_poll_n > 16)
+                      spu_idle_yield(mfc->resv_poll_n > (1u << 20) ? 2
+                                   : mfc->resv_poll_n > 256       ? 1 : 0);
+              } else {
+                  mfc->resv_poll_n = 0;
+              }
               mfc->resv_ea  = le;
               mfc->resv_gen = g; }
             mfc->resv_active = 1;
