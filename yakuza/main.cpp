@@ -1776,17 +1776,24 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
-    /* RSX FIFO flow-control band-aid -- RETIRED (default OFF, 2026-07-02). Its
-     * retirement condition was "gs_task finishes its geometry segment"; that
-     * landed with the il-decode fix (tools/spu_disasm.py, fe04191): the faithful
-     * boot clears the geometry wall on its own (fence 3 -> 10, no LS-0x44), and
-     * the 60s milestone vector with the band-aid OFF is IDENTICAL to the
-     * band-aid-ON golden except flowctl_forces itself. The forces are LOSSY
-     * (GET-skip past committed commands, fence nudge, SET_REFERENCE re-apply --
-     * things RPCS3 never does), so running them when unneeded only risks
-     * divergence. Opt back in with YZ_FLOWCTL=1 for A/B archaeology; delete
-     * outright once a few more sessions pass without needing it. */
-    if (getenv("YZ_FLOWCTL"))
+    /* RSX FIFO flow-control band-aid -- UN-RETIRED (default ON, 2026-07-03;
+     * kill-switch YZ_NO_FLOWCTL). The 2026-07-02 retirement was validated on
+     * ONE lucky 60s window; the underlying LAYER-1 race persists: when the
+     * consumer's GET wins the race against the game's deferred patch drain,
+     * it parks inside an un-patched display list (measured: GET=io 0x11001EC
+     * at a stopper NOT in the deferred-release journal, fence frozen at 7)
+     * and t1 wedges in the libgcm reserve (ctr=0x02103AAC, usleep poll) ->
+     * the whole CRI/codec init downstream never runs. The SPU_RET fix +
+     * idle-poll backoff shifted the interleaving so the bad mode hit ~1/2 of
+     * boots (was ~1/6); with the lever back ON the codec-launch reproducer
+     * is 4/4 GOOD at +18-23 s (scratch/fc1-4). The forces stay LOSSY and
+     * RPCS3-unfaithful -- NEW RETIREMENT CONDITION: the stopper-release
+     * applier respects full journal order (apply the tag-0x04/0x08/0x09 data
+     * patches and tag-0x10 sublists that precede a release before opening
+     * the gate), or the deeper root of GET entering an unfinished display
+     * list is fixed. See the 2026-07-03 STATUS handoff + the pt25b/pt26
+     * archive ("route (a): locate + invoke the data-patch applier"). */
+    if (!getenv("YZ_NO_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
