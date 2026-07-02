@@ -44,9 +44,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
-keeps its trace tail — added 2026-07-01), `YZ_LSWATCH` (spu_dma.h — any into-LS transfer incl.
-GETLLAR covering gs_task's queue/table LS ranges; REMOVE when the geometry frontier settles),
-`YZ_LSWRITE` (spu_context.h — lifted stores into those ranges; REMOVE likewise), `YZ_IMGLOG`, `YZ_SIGW`,
+keeps its trace tail — added 2026-07-01), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
 `YZ_TS_WATCH`, `YZ_TASK_TRACE`, `YZ_TASK_RET`, `YZ_CB_TRACE`, `YZ_DRAIN_TRACE`, `YZ_RECPROBE`,
@@ -55,8 +53,9 @@ GETLLAR covering gs_task's queue/table LS ranges; REMOVE when the geometry front
 `YZ_WATCH_300`, `YZ_WATCH_FENCE`, `YZ_WATCH_EA`, `YZ_WATCH_READ`, `YZ_WATCH_DLIST`,
 `YZ_WATCH_FLAG`, `YZ_WATCH_BD`, `YZ_L1SNAP`, `YZ_GCMCTX_BISECT`, `YZ_GUARD`, `YZ_GUARD_FULL`,
 `YZ_GUEST_ADDR`, `YZ_ARG`, `YZ_VSYNC_PRECISE`, `YZ_THROTTLE_DIAG` (sys_timer.c — REVERT
-before commit per STATUS), `YZ_GEO_PROBE` / `YZ_GEO_SKIPNULL` (spu_channels.c — UNCOMMITTED
-probes from the 2026-07-01 geometry session; REVERT before commit).
+before commit per STATUS). (Removed 2026-07-02 with the geometry root fixed: `YZ_GEO_PROBE`,
+`YZ_GEO_SKIPNULL`, `YZ_LSWATCH`, `YZ_LSWRITE` — stripped from the code; re-derive fresh
+probes if a new LS-provenance question comes up rather than resurrecting these ranges.)
 
 ## RETIRED / refuted (do not re-enable; delete when convenient)
 
