@@ -498,6 +498,7 @@ void spu_task_launch(spu_context* c)
     int image;
     if      (elf == 0x0127A580u) image = 0;   /* gs_task  */
     else if (elf == 0x012B4980u) image = 3;   /* cri_audio codec */
+    else if (elf == 0x01284200u) image = 4;   /* wkl4 worker pool */
     else return;                              /* unknown task -- don't launch */
 
     /* START vs RESUME (RPCS3 spursTasksetDispatch, cellSpursSpu.cpp:1740-1864):
@@ -514,6 +515,37 @@ void spu_task_launch(spu_context* c)
     int resume = (scl != elf_entry);
     memset(c->gpr, 0, 128 * sizeof(c->gpr[0]));
     if (resume) {
+        /* FAITHFUL CONTEXT RESTORE FROM MAIN MEMORY (RPCS3 cellSpursSpu.cpp
+         * spursTasksetDispatch, resume path :1832): the yield SAVED the task
+         * context to the taskInfo's context-save EA (be64 @LS 0x2798, low 7
+         * bits = allocLsBlocks): the register block [LS 0x2C80,0x3000) at
+         * EA+0, the ls_pattern-selected 2 KB LS blocks at EA+0x400 (pattern
+         * @LS 0x27A0, MSB-first bit i = block i, task area starts block 6 =
+         * LS 0x3000). Restoring from LOCAL LS only worked when the task
+         * resumed on the SAME SPU it yielded on; SPURS migrates tasks freely
+         * (MEASURED 2026-07-02: cri_audio yielded on one SPU, startTask
+         * resumed it on another -> local restore read garbage -> gpr81=0 ->
+         * the bisl @LS 0x3EB4 null-vtable branch to LS 0 -> kernel group
+         * death -> Sony's spurs_handler_entry assert; not on real HW).
+         * Idempotent if Sony's lifted policy already restored: same bytes. */
+        {
+            const unsigned char* ti = c->ls + 0x2798u;
+            uint64_t css = ((uint64_t)ti[0]<<56)|((uint64_t)ti[1]<<48)
+                         |((uint64_t)ti[2]<<40)|((uint64_t)ti[3]<<32)
+                         |((uint64_t)ti[4]<<24)|((uint64_t)ti[5]<<16)
+                         |((uint64_t)ti[6]<<8)|ti[7];
+            uint32_t ea = (uint32_t)(css & ~0x7Full);
+            if (ea) {
+                extern uint8_t* vm_base;
+                memcpy(c->ls + 0x2C80u, vm_base + ea, 0x380u);
+                const unsigned char* lp = c->ls + 0x27A0u;
+                for (int i = 6; i < 128; i++)
+                    if (lp[i >> 3] & (0x80u >> (i & 7)))
+                        memcpy(c->ls + 0x3000u + (uint32_t)(i - 6) * 0x800u,
+                               vm_base + ea + 0x400u + (uint32_t)(i - 6) * 0x800u,
+                               0x800u);
+            }
+        }
         c->gpr[0] = spu_ls_read128(c, 0x2C80u);              /* LR / savedContextLr */
         c->gpr[1] = spu_ls_read128(c, 0x2C90u);              /* SP */
         for (int i = 0; i < 48; i++)                          /* gpr80..127 (non-volatile) */
@@ -534,6 +566,7 @@ void spu_task_launch(spu_context* c)
          * RESUME must NOT zero (LS persists across yields by design). */
         if (image == 0)      memset(c->ls + 0xBC30u,  0, 0x330D0u - 0x30u);
         else if (image == 3) memset(c->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
+        else if (image == 4) memset(c->ls + 0xB400u,  0, 0x32170u);
     }
     c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry / resume PC */
     c->image_id = image;
@@ -725,11 +758,22 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     const unsigned char* ls = ctx->ls;
     uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
                   |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
-    /* gs_task (elf 0x0127A580) routed through the SAME driver-drain spu_task_launch
-     * that cri_audio uses (it runs its full body to its yield). Previously gs_task
-     * was gated off here + ran via the nested natural-launch path (spu_indirect_branch),
-     * which unwinds after its prologue. (2026-06-28: SPU task context-switch fix.) */
-    if (elf == 0x012B4980u || elf == 0x0127A580u) spu_task_launch(ctx);
+    /* RETIRED DEFAULT-OFF (2026-07-02, opt back in with YZ_STARTTASK_HOOK=1):
+     * LS 0x1CC0 is NOT StartTask -- the policy ELF disasm shows it is the
+     * taskset-SYSCALL switch (`bi $r2` with the case jump-table at 0x1CC4:
+     * 0=EXIT 0x1CD8, 1=YIELD 0x1D34, 2=WAIT_SIGNAL 0x1D80...; RPCS3
+     * spursTasksetProcessSyscall matches case-for-case). This hook therefore
+     * hijacked EVERY taskset syscall of the matched elfs into an immediate
+     * re-launch: a WAIT_SIGNAL became a bogus instant "resume" (measured: the
+     * codec's wait at scl=0x2095C relaunched with a zeroed/garbage context ->
+     * the bisl @0x3EB4 null-vtable crash), and Sony's save-task-context
+     * (case handlers) never ran -- the context-save EA stayed all-zero while
+     * gs_task's NATURAL-path yields saved fine (PUT 0x380 -> ctxsave EA).
+     * With the hook off, the real case handlers + dispatch run lifted, and
+     * task entries/resumes are caught by the natural-launch interception in
+     * spu_indirect_branch (bi savedContextLr, pc>=0x3000 under image 2). */
+    { static int sth = -1; if (sth < 0) sth = getenv("YZ_STARTTASK_HOOK") ? 1 : 0;
+      if (sth && (elf == 0x012B4980u || elf == 0x0127A580u)) spu_task_launch(ctx); }
 }
 
 void spu_prof_hop(void* fn)
@@ -778,12 +822,12 @@ void spu_prof_hop(void* fn)
             }
         }
     }
-    /* SPU TASKSET TASK LAUNCH. When the policy (image 2) reaches StartTask
-     * (LS 0x1CC0), hand off to the generalized launcher (handles gs_task AND the
-     * cri_audio codec, and also runs on the DEFAULT boot via spu_task_launch_check
-     * -> SPU_DRAIN, so the codec launches without YZ_SPU_PROF). */
-    if (a == 0x1CC0u && g_spu_cur_ctx && g_spu_cur_ctx->image_id == 2)
-        spu_task_launch(g_spu_cur_ctx);
+    /* RETIRED DEFAULT-OFF (2026-07-02): LS 0x1CC0 is the taskset-SYSCALL switch,
+     * not StartTask -- see spu_task_launch_check. YZ_STARTTASK_HOOK=1 re-enables
+     * the legacy hijack for A/B. */
+    { static int sth = -1; if (sth < 0) sth = getenv("YZ_STARTTASK_HOOK") ? 1 : 0;
+      if (sth && a == 0x1CC0u && g_spu_cur_ctx && g_spu_cur_ctx->image_id == 2)
+        spu_task_launch(g_spu_cur_ctx); }
     /* DIAG: the policy's post-select gate at LS 0x2468 polls a byte in the kernel
      * context tempArea (LS 0x100..0x180) and bails unless ==1. Dump that region
      * + the taskset bitmaps so we can see the value it waits on vs expected. */
@@ -875,6 +919,12 @@ static const char* spu_img_class(uint32_t pc)
     return "?";
 }
 
+/* Event-armed tracing (YZ_SPU_TRACE_EVARM, 2026-07-02): when set alongside
+ * YZ_SPU_TRACE, arming is HELD until an event site sets this flag (currently
+ * the 0xA70 taskset-syscall probe below) — so the budget captures the code of
+ * interest instead of boot-time dispatch-loop noise. */
+int g_spu_trace_evarm = 0;
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* HOST-CALL-DEPTH GUARD (2026-06-27): a never-returning SPU coroutine/poll
@@ -913,7 +963,8 @@ void spu_indirect_branch(spu_context* ctx)
             const unsigned char* ls = ctx->ls;
             uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
                            |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
-            int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3 : -1;
+            int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3
+                    : (elf == 0x01284200u) ? 4 : -1;
             if (img >= 0) {
                 ctx->image_id = img;
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
@@ -928,6 +979,8 @@ void spu_indirect_branch(spu_context* ctx)
                     memset(ctx->ls + 0xBC30u, 0, 0x330D0u - 0x30u);
                 else if (img == 3 && tpc == 0x3070u)
                     memset(ctx->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
+                else if (img == 4 && tpc == 0x3050u)   /* wkl4: seg va 0xB400 filesz 0 memsz 0x32170 = all BSS */
+                    memset(ctx->ls + 0xB400u, 0, 0x32170u);
                 /* The lifted policy StartTask does NOT propagate the SPURS task-ABI
                  * registers on this natural-launch path -- measured (pt47): the
                  * cri_audio task enters with gpr3=0, so its context base is null and
@@ -936,7 +989,11 @@ void spu_indirect_branch(spu_context* ctx)
                  * spu_task_launch does: gpr3 = taskInfo->args (LS 0x2780), gpr4 =
                  * spurs. Only when gpr3 is actually unset (don't clobber a good value),
                  * and only for the codec image (gs_task carries its args already). */
-                if (img == 3 && ctx->gpr[3]._u32[0] == 0) {
+                /* (2026-07-02: FRESH entry only — tpc==0x3070. On a dispatch
+                 * RESUME, r3 carries the taskset-syscall result to the resumed
+                 * task (RPCS3 spursTasksetSyscallEntry:1366); injecting args
+                 * there would clobber it.) */
+                if (img == 3 && tpc == 0x3070u && ctx->gpr[3]._u32[0] == 0) {
                     ctx->gpr[3] = spu_ls_read128(ctx, 0x2780u);
                     ctx->gpr[4]._u32[3] = 0x40197C80u;
                     static int gi = 0; if (gi < 4) { gi++;
@@ -1216,6 +1273,33 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[spu-ximg] cross-image call LS 0x%05X: image %d -> %d "
                         "(resident runtime, adopting)\n", la, ctx->image_id, foreign_img);
                 fflush(stderr); }
+            /* TASKSET-SYSCALL probe (env YZ_CTXSAVE_WATCH, 2026-07-02, diag —
+             * REMOVE when settled): at the task->policy 0xA70 syscall entry, log
+             * the syscall + pre-evaluate the three bail checks Sony's
+             * save-task-context performs (RPCS3 spursTasketSaveTaskContext
+             * :1690-1712) — cri_audio's wait-yield never produces the save PUT
+             * that gs_task's does; this names the failing check (or clears all
+             * three, pointing at a lift bug in the save code itself). */
+            { static int scw = -1; if (scw < 0) scw = getenv("YZ_CTXSAVE_WATCH") ? 1 : 0;
+              if (scw && la == 0xA70u && foreign_img == 2) {
+                  const unsigned char* l = ctx->ls;
+                  uint64_t css = 0; for (int k = 0; k < 8; k++) css = (css << 8) | l[0x2798 + k];
+                  uint32_t alloc = (uint32_t)(css & 0x7Fu);
+                  int lsblk = 0, stackok = 1, firstmiss = -1;
+                  uint32_t sp = ctx->gpr[1]._u32[0];
+                  for (int i = 0; i < 128; i++)
+                      if (l[0x27A0 + (i >> 3)] & (0x80u >> (i & 7))) lsblk++;
+                  for (int i = (int)(sp >> 11); i < 128; i++)
+                      if (!(l[0x27A0 + (i >> 3)] & (0x80u >> (i & 7)))) { stackok = 0; firstmiss = i; break; }
+                  static int sn = 0; if (sn < 12) { sn++;
+                      fprintf(stderr, "[tsyscall] spu=%X num=0x%X args=0x%08X | css=0x%016llX (ea=0x%08X alloc=%u) "
+                              "lsblk=%d sp=0x%05X | bail: css0=%d blk>alloc=%d stackmiss=%d(blk %d)\n",
+                              ctx->spu_id, ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                              (unsigned long long)css, (uint32_t)(css & ~0x7Full), alloc,
+                              lsblk, sp, css == 0, lsblk > (int)alloc, !stackok, firstmiss);
+                      fflush(stderr); }
+                  g_spu_trace_evarm = 1;   /* release event-armed tracing at the syscall */
+              } }
             ctx->image_id = foreign_img;
             ffn(ctx);
             return;
@@ -1316,8 +1400,20 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
               if (timg < 0) { const char* e = getenv("YZ_SPU_TRACE_IMG");
                               timg = e ? (int)strtol(e, 0, 0) : 2; }
               if (ctx->image_id != timg) return; }   /* env-selected image (default 2) */
-            static int tlock = -1; if (tlock < 0) tlock = (int)ctx->spu_id;
-            if ((int)ctx->spu_id != tlock) return;   /* one SPU, no interleave */
+            { static int evarm = -1;
+              if (evarm < 0) evarm = getenv("YZ_SPU_TRACE_EVARM") ? 1 : 0;
+              extern int g_spu_trace_evarm;
+              if (evarm && !g_spu_trace_evarm) return; }   /* hold for the event site */
+            /* One SPU, no interleave. Default: lock to the FIRST SPU seen running
+             * the traced image. YZ_SPU_TRACE_SPU=<id> targets a specific SPU
+             * instead (e.g. 0x2002) -- needed when several SPUs run the same
+             * image and the interesting one isn't first (the cri_audio
+             * startTask instance vs the healthy natural-launch instance). */
+            static int tlock = -1;
+            if (tlock < 0) { const char* e = getenv("YZ_SPU_TRACE_SPU");
+                             tlock = e ? (int)strtol(e, 0, 0) : -2; }
+            if (tlock == -2) tlock = (int)ctx->spu_id;
+            if ((int)ctx->spu_id != tlock) return;
             if (!s_trace_armed) {
                 s_trace_armed = 1;
                 { const char* n = getenv("YZ_SPU_TRACE_N");   /* instruction budget */
