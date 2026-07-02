@@ -22,6 +22,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_NO_APPLY_REL` | import_overrides.cpp ~1132 | Kill-switch for the **faithful deferred stopper-release applier (f8d0386)** — the committed LAYER-1 fix. Keep. |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
 | `YZ_NORESUME` | spu_channels.c ~1026 | Kill-switch for the SPURS yield/resume context-switch path. Keep. |
+| `YZ_STARTTASK_HOOK` | spu_channels.c (spu_task_launch_check + prof path) | **RETIRED-to-opt-in 2026-07-02**: re-enables the legacy "LS 0x1CC0 = StartTask" launch hijack for A/B. LS 0x1CC0 is actually the taskset-SYSCALL switch (`bi $r2`, jump table at 0x1CC4); the hijack turned every WAIT_SIGNAL/YIELD of the matched elfs into a bogus instant relaunch and skipped Sony's context save. Default OFF = Sony's case handlers + dispatch run lifted. Delete after quiet sessions. |
 
 ## Config (memory-map overrides — stable)
 
@@ -44,7 +45,12 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
-keeps its trace tail — added 2026-07-01), `YZ_IMGLOG`, `YZ_SIGW`,
+keeps its trace tail — added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
+SPU id instead of first-seen — added 2026-07-02), `YZ_SPU_TRACE_EVARM` (hold trace arming
+until an event site fires — currently the 0xA70 taskset-syscall probe; added 2026-07-02),
+`YZ_CTXSAVE_WATCH` (DMA + syscall-entry watch on the task context-save protocol: logs
+transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA70 syscall —
+added 2026-07-02, REMOVE when the codec frontier closes), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
 `YZ_TS_WATCH`, `YZ_TASK_TRACE`, `YZ_TASK_RET`, `YZ_CB_TRACE`, `YZ_DRAIN_TRACE`, `YZ_RECPROBE`,

@@ -344,6 +344,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* Task context-save provenance (env YZ_CTXSAVE_WATCH, 2026-07-02): the SPURS
+     * taskset yield must PUT the register block LS [0x2C80,0x3000) to the
+     * taskInfo context-save EA (RPCS3 spursTasketSaveTaskContext); our resumes
+     * read ZEROS there. Log every OUT-OF-LS transfer from that block (who saves,
+     * where to) + any transfer touching it. Diag-only; REMOVE when settled. */
+    { static int cw = -1; if (cw < 0) cw = getenv("YZ_CTXSAVE_WATCH") ? 1 : 0;
+      if (cw && cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD
+             && cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD) {
+          /* atomics excluded: the kernel lock-line (lsa 0x2D80) spams the window */
+          uint32_t l0 = lsa & SPU_LS_MASK, l1 = l0 + size;
+          if (l0 < 0x3000u && l1 > 0x2C80u) {
+              static int cwn = 0;
+              if (cwn < 200) { cwn++;
+                  fprintf(stderr, "[ctxsave] spu=%X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X\n",
+                          spu->spu_id, cmd, l0, (unsigned long long)ea, size);
+                  fflush(stderr);
+              }
+          }
+      } }
     if (g_spu_prof_on && cmd == MFC_GET_CMD          /* regular GET only (NOT GETLLAR 0xD0) */
             && ((((lsa & SPU_LS_MASK) >= 0x2780u) && ((lsa & SPU_LS_MASK) < 0xC000u))
                 || ((uint32_t)ea >= 0x01200000u && (uint32_t)ea < 0x01300000u))) {
