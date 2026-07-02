@@ -171,6 +171,15 @@ typedef struct spu_context {
     uint32_t mfc_tag_mask;
     uint32_t mfc_tag_status;
 
+    /* Live lifted host-call frames above this context's dispatch loop.
+     * Incremented/decremented by the lifted brsl/bisl call emissions around
+     * the nested host call; reset to 0 at the host-thread driver's setjmp
+     * re-entry points (all longjmp unwinds land there: task launch/resume
+     * context replacement, the host-call-depth restack guard, halt). Read by
+     * SPU_RET (`bi $r0`): host_depth == 0 means the SPU-logical caller has no
+     * live host frame, so a C return cannot reach it. */
+    uint32_t host_depth;
+
 } spu_context;
 
 /* ---------------------------------------------------------------------------
@@ -379,6 +388,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn);
  * the lifter for self-loop traps (`br .`/`brsl .`), which hang the SPU forever
  * on real hardware. Logs under env YZ_HALT_LOG. */
 void spu_halt(spu_context* ctx, int status);
+/* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
+ * function in the context's active image and runs it. Referenced by SPU_RET. */
+void spu_indirect_branch(spu_context* ctx);
 
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
@@ -388,6 +400,29 @@ void spu_halt(spu_context* ctx, int status);
             else spu_task_launch_check((ctx), (void*)_tf);     \
             _tf(ctx);                                          \
         }                                                     \
+    } while (0)
+
+/* Depth-aware SPU link return (`bi $r0` / conditional `biz $r0` family).
+ * $r0 is the ABI link register; the lifter models a matched brsl/bisl call as
+ * a nested host C call, so the common return is a host `return` (cheap, keeps
+ * loops iterative). That is only sound while the SPU-logical caller's host
+ * frame is live. Two runtime mechanisms legally destroy those frames under a
+ * still-running SPU: a cross-context task RESUME (yield -> context saved to
+ * main memory -> re-dispatched later on a fresh top-level stack, possibly on
+ * another SPU) and the host-call-depth restack unwind. After either, a bare
+ * `return` surfaces at a dispatch drain that treats it as end-of-execution
+ * (measured 2026-07-03: the CRI codec's resumed queue-pop died at its final
+ * `bi $r0`, LS 0x20A40 -> [SPU] tid=0x2002 stopped, r0=0xA388 discarded).
+ * host_depth counts the live lifted call frames: 0 => no frame can satisfy
+ * this return -> dispatch to the link register instead, faithful to CBEA
+ * `bi` semantics (branch to word 0 of RA; RPCS3 SPUThread BI does the same).
+ * ctx->pc is set unconditionally so the continuation is always visible to
+ * the dispatch machinery. */
+#define SPU_RET(ctx) do {                                      \
+        (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
+        if ((ctx)->host_depth == 0)                            \
+            g_spu_trampoline_fn = spu_indirect_branch;         \
+        return;                                                \
     } while (0)
 
 #ifdef __cplusplus
