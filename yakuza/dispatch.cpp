@@ -172,6 +172,28 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     uint32_t target = (uint32_t)ctx->ctr;
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
 
+    /* SPURS task-signal call watch (env YZ_SIGCALL, 2026-07-02, diag — REMOVE
+     * when the voice frontier closes): all 6 SPU tasks park in WAIT_SIGNAL and
+     * the tasksets' `signalled` bitmaps never set — does the PPU EVER call the
+     * signal/queue-push family? Match both the LLE code addrs
+     * (scratch/libsre_lle_map.txt) and their export OPD addrs (a bctrl may
+     * carry either before the OPD fallback resolves). */
+    { static int sw = -1; if (sw < 0) sw = getenv("YZ_SIGCALL") ? 1 : 0;
+      if (sw) {
+          const char* nm =
+              (target == 0x020125D8u || target == 0x02031634u) ? "_cellSpursSendSignal" :
+              (target == 0x020169D0u || target == 0x0203181Cu) ? "cellSpursQueuePushBody" :
+              (target == 0x020171B8u)                          ? "_cellSpursLFQueuePushBody" :
+              (target == 0x02016CFCu || target == 0x02031824u) ? "cellSpursQueuePopBody" : 0;
+          if (nm) {
+              static int n = 0; if (n < 40) { n++;
+                  fprintf(stderr, "[sigcall] %s(r3=0x%llX r4=0x%llX r5=0x%llX) lr=0x%llX\n",
+                          nm, (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                          (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->lr);
+                  fflush(stderr); }
+          }
+      } }
+
     /* LAYER-1 RECURSION PROBE (env YZ_RECPROBE, pt48b): the t7 _gcm_intr_thread
      * host-stack-overflows through the gcm ring; func_00EDC6B0 is bctrl'd on the
      * path. Watch the GUEST r1 trend across successive bctrl hits to this target:
