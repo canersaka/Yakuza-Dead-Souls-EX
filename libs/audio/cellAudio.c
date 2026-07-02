@@ -124,6 +124,7 @@ typedef struct {
 } AudioPortSlot;
 
 static int            s_audio_initialized = 0;
+static u64            s_audio_start_us = 0;      /* us anchor for GetPortTimestamp */
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
 
 /* Event queue notification */
@@ -621,6 +622,11 @@ s32 cellAudioInit(void)
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
 
+#ifdef _WIN32
+    { LARGE_INTEGER f, c;
+      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+      s_audio_start_us = (u64)((c.QuadPart * 1000000LL) / f.QuadPart); }
+#endif
     s_audio_initialized = 1;
     return CELL_OK;
 }
@@ -903,14 +909,76 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
     if (portNum >= CELL_AUDIO_PORT_MAX || !status)
         return CELL_AUDIO_ERROR_PARAM;
 
-    if (!s_ports[portNum].in_use) {
-        *status = CELL_AUDIO_STATUS_CLOSE;
-    } else if (s_ports[portNum].running) {
-        *status = CELL_AUDIO_STATUS_RUN;
-    } else {
-        *status = CELL_AUDIO_STATUS_READY;
+    {   /* out-param is a raw guest pointer: write guest-BE (audit 2026-07-01) */
+        u32 v = !s_ports[portNum].in_use ? (u32)CELL_AUDIO_STATUS_CLOSE
+              : s_ports[portNum].running ? (u32)CELL_AUDIO_STATUS_RUN
+                                         : (u32)CELL_AUDIO_STATUS_READY;
+        unsigned char* c = (unsigned char*)status;
+        c[0] = (unsigned char)(v >> 24); c[1] = (unsigned char)(v >> 16);
+        c[2] = (unsigned char)(v >> 8);  c[3] = (unsigned char)v;
     }
 
+    return CELL_OK;
+}
+
+/* Block tag of slot blockNo (RPCS3 cellAudio.cpp cellAudioGetPortBlockTag:
+ * tag = global_counter + blockNo - cur_pos). Our read_index is the monotonic
+ * global counter and read_index % nBlock the current slot, so the tag of slot
+ * blockNo in the current lap is read_index - cur_pos + blockNo. libmixer's
+ * sur-mixer pump paces itself with this + GetPortTimestamp; the ENOSYS stub
+ * starved the mixer (2026-07-02). Out-param written guest-BE (endianness
+ * class, LESSONS #10). */
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+{
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+
+    if (!tag)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    AudioPortSlot* port = &s_ports[portNum];
+    u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
+    if (blockNo >= nblk) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PARAM;
+    }
+    u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    mutex_unlock(&s_audio_mutex);
+
+    unsigned char* c = (unsigned char*)tag;
+    for (int i = 0; i < 8; i++)
+        c[i] = (unsigned char)(t >> (56 - i * 8));
+    return CELL_OK;
+}
+
+/* Microsecond timestamp at which block `tag` was mixed (RPCS3: start_time +
+ * tag * 256 * 1000000 / 48000). Anchored to the mixer's own block clock:
+ * one block = 256 samples @48kHz = 16000/3 us. */
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+{
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+
+    if (!stamp)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    unsigned char* c = (unsigned char*)stamp;
+    for (int i = 0; i < 8; i++)
+        c[i] = (unsigned char)(t >> (56 - i * 8));
     return CELL_OK;
 }
 
