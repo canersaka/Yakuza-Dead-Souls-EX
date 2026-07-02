@@ -121,12 +121,18 @@ SOURCE_PREAMBLE = """\
 #ifdef _MSC_VER
 #include <intrin.h>
 static inline int __builtin_clz(unsigned int x) {
+    /* BSR is undefined for x==0; PowerPC cntlzw(0) is DEFINED as 32. The
+     * unguarded form returned garbage for zero inputs (measured: Sony's
+     * cellSpursQueuePushBody computes its send-signal gate as cntlzw(pending)
+     * >> 5 -- garbage made the gate 0 and the task signal was never sent). */
     unsigned long idx;
+    if (!x) return 32;
     _BitScanReverse(&idx, x);
     return 31 - (int)idx;
 }
 static inline int __builtin_clzll(unsigned long long x) {
     unsigned long idx;
+    if (!x) return 64;
     _BitScanReverse64(&idx, x);
     return 63 - (int)idx;
 }
@@ -479,8 +485,15 @@ class PPULifter:
             return f"ctx->gpr[{ra}] = (int64_t)(int32_t)ctx->gpr[{rs}];"
 
         if mn in ("cntlzw", "cntlzw."):
+            # cntlzw(0) is DEFINED as 32 on PowerPC; raw __builtin_clz(0) is UB
+            # (x86 BSR garbage). Guard like cntlzd below (the 64-bit form had
+            # the guard; the 32-bit one didn't -- measured live: Sony's
+            # cellSpursQueuePushBody gates its task SendSignal on
+            # cntlzw(pending)>>5, and the garbage result silently dropped
+            # every SPURS queue wakeup signal).
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = __builtin_clz((uint32_t)ctx->gpr[{rs}]);"
+            return (f"ctx->gpr[{ra}] = ((uint32_t)ctx->gpr[{rs}]) ? "
+                    f"__builtin_clz((uint32_t)ctx->gpr[{rs}]) : 32;")
 
         if mn in ("cntlzd", "cntlzd."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
