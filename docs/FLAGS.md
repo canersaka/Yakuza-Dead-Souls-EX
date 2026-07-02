@@ -17,8 +17,8 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 | Flag | Where | Meaning |
 |---|---|---|
-| `YZ_NO_FLOWCTL` | yakuza/main.cpp ~1666 | Kill-switch for the **flow-control band-aid (default ON)** — 3 lossy forces (GET-skip, fence-nudge, SET_REFERENCE re-apply) that carry the default boot past the gs_task geometry wall. **Retirement condition: gs_task finishes its geometry segment — MET 2026-07-01/02 (il-decode fix: faithful boot reaches fence 10, no LS-0x44). Retirement test = next session's first action** (STATUS.md). Setting this = faithful mode. |
-| `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~939 | Kill-switch for the throttle nudge (paired with the flow-control band-aid). |
+| ~~`YZ_NO_FLOWCTL`~~ → `YZ_FLOWCTL` | yakuza/main.cpp ~1695 | **RETIRED 2026-07-02** — the flow-control band-aid is now **default OFF** (its retirement condition, gs_task finishing its geometry segment, was met by the il-decode fix; the 60s milestone vector without it is identical). `YZ_FLOWCTL=1` opts back in for A/B archaeology; `YZ_NO_FLOWCTL` no longer exists. Delete the code after a few quiet sessions. |
+| `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~951 | Kill-switch for the throttle nudge — lives INSIDE the (now opt-in) yz_flip_advance thread, so it's inert unless `YZ_FLOWCTL=1`. Retires with the band-aid code. |
 | `YZ_NO_APPLY_REL` | import_overrides.cpp ~1132 | Kill-switch for the **faithful deferred stopper-release applier (f8d0386)** — the committed LAYER-1 fix. Keep. |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
 | `YZ_NORESUME` | spu_channels.c ~1026 | Kill-switch for the SPURS yield/resume context-switch path. Keep. |

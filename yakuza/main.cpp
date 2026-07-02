@@ -1692,20 +1692,17 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
-    /* RSX FIFO flow-control (DEFAULT-ON). The io 0x300000 jump-to-self DEADLOCK is
-     * SOLVED faithfully by the deferred stopper-release applier (import_overrides.cpp,
-     * commit f8d0386): faithful mode (YZ_NO_FLOWCTL) clears 0x300000 on its own and
-     * reaches the gs_task geometry wall -- it NO LONGER deadlocks at frame 2 (that old
-     * claim is stale, corrected 2026-06-29). This flow-control lever stays default-ON
-     * only to carry the DEFAULT boot PAST the gs_task geometry wall: when t1 is
-     * reserve-wedged it advances GET (wrap-aware, never backward) to the next committed
-     * flip command + re-applies any skipped SET_REFERENCE, and nudges the flip fence
-     * @0x40C00000. These are LOSSY forces RPCS3 never does -- retained only until gs_task
-     * produces its own geometry (the SPU producer handshake). The remaining faithful-mode
-     * block is that gs_task PUT, NOT a FIFO pacing/lapping bug -- the consumer hard-bounds
-     * get==put (cannot lap); the old "producer laps the ring" framing is refuted by the
-     * current traces. YZ_NO_FLOWCTL disables the forcing (-> stops at the gs_task wall). */
-    if (!getenv("YZ_NO_FLOWCTL"))
+    /* RSX FIFO flow-control band-aid -- RETIRED (default OFF, 2026-07-02). Its
+     * retirement condition was "gs_task finishes its geometry segment"; that
+     * landed with the il-decode fix (tools/spu_disasm.py, fe04191): the faithful
+     * boot clears the geometry wall on its own (fence 3 -> 10, no LS-0x44), and
+     * the 60s milestone vector with the band-aid OFF is IDENTICAL to the
+     * band-aid-ON golden except flowctl_forces itself. The forces are LOSSY
+     * (GET-skip past committed commands, fence nudge, SET_REFERENCE re-apply --
+     * things RPCS3 never does), so running them when unneeded only risks
+     * divergence. Opt back in with YZ_FLOWCTL=1 for A/B archaeology; delete
+     * outright once a few more sessions pass without needing it. */
+    if (getenv("YZ_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
