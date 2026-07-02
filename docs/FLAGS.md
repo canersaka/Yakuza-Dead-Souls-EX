@@ -20,6 +20,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_NO_FLOWCTL` | yakuza/main.cpp ~1779 | **UN-RETIRED 2026-07-03 (default ON again)** — the 07-02 retirement was validated on one lucky 60s window. The LAYER-1 race persists: GET occasionally wins against the game's deferred patch drain, parks in an un-patched display list, t1 wedges in the libgcm reserve, and the whole CRI/codec init never runs (~1/2 of boots after the SPU_RET+backoff timing shift; codec-launch reproducer 4/4 GOOD with the lever ON). **NEW retirement condition:** the stopper-release applier respects full journal order (data patches + sublists applied before the release), or the GET-enters-unfinished-list root is fixed. |
 | `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~951 | Kill-switch for the throttle nudge — lives INSIDE the (now opt-in) yz_flip_advance thread, so it's inert unless `YZ_FLOWCTL=1`. Retires with the band-aid code. |
 | `YZ_NO_APPLY_REL` | import_overrides.cpp ~1132 | Kill-switch for the **faithful deferred stopper-release applier (f8d0386)** — the committed LAYER-1 fix. Keep. |
+| `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** — when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED: the 2026-07-02 validation loops were invalidated by watchdog instrumentation (see YZ_L1SNAP note), and the sweep has a suspected over-retirement (journal orders a segment's patches BEFORE its entry-stopper release). Do not default-ON before a clean baseline comparison; the REAL fix in flight = gs_task residency (trace-diff). Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries — it re-reads its own entries). |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
 | `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause → scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5×~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. |
 | `YZ_NORESUME` | spu_channels.c ~1026 | Kill-switch for the SPURS yield/resume context-switch path. Keep. |
@@ -72,7 +73,12 @@ scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG
 `YZ_PHASE`, `YZ_FIFO_TRACE`, `YZ_TRACE_RSX`, `YZ_TRACE_DEFER`, `YZ_LOG_FIFOSET`,
 `YZ_DUMP_BUFDESC`, `YZ_DUMP_SEG`, `YZ_WATCH_LIST`, `YZ_WATCH_DLEA`, `YZ_WATCH_OPLIST`,
 `YZ_WATCH_300`, `YZ_WATCH_FENCE`, `YZ_WATCH_EA`, `YZ_WATCH_READ`, `YZ_WATCH_DLIST`,
-`YZ_WATCH_FLAG`, `YZ_WATCH_BD`, `YZ_L1SNAP`, `YZ_GCMCTX_BISECT`, `YZ_GUARD`, `YZ_GUARD_FULL`,
+`YZ_WATCH_FLAG`, `YZ_WATCH_BD`, `YZ_L1SNAP` (**gates ALL invasive watchdog dumps** — the
+all-threads snapshot's serial thread-suspend + stack walks take 60+ s and froze the guest
++30s→+90s when made always-on 2026-07-02, invalidating four validation loops; even the
+t1-only host-stack/spin dumps suspend t1 in the PortStart window and flipped a ~3/4 baseline
+to 0/3 — a diagnostic must never perturb the system it measures), `YZ_GCMCTX_BISECT`,
+`YZ_GUARD`, `YZ_GUARD_FULL`,
 `YZ_GUEST_ADDR`, `YZ_ARG`, `YZ_VSYNC_PRECISE`, `YZ_THROTTLE_DIAG` (sys_timer.c — REVERT
 before commit per STATUS). (Removed 2026-07-02 with the geometry root fixed: `YZ_GEO_PROBE`,
 `YZ_GEO_SKIPNULL`, `YZ_LSWATCH`, `YZ_LSWRITE` — stripped from the code; re-derive fresh

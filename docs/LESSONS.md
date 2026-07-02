@@ -32,6 +32,14 @@ session runs on Fable, Opus, or anything else.
    capped logs hiding late events, /OPT:ICF folding (profiler misattribution), service/policy
    LS overlap (disambiguate by image id), thread-spam global ring buffers (misattribution),
    trace windows that exclude the code that writes the register you're diffing.
+6b. **A diagnostic must never perturb the system it measures — and check WHICH probes are
+   live before trusting a pass/fail loop.** 2026-07-02: an always-on watchdog thread-dump
+   (serial suspends + 60 s stack walks) froze the guest from +30 s and silently turned FOUR
+   8-boot validation loops into garbage verdicts (a design was "refuted 0/8" that was never
+   actually measured); after fixing that, even the brief t1-suspend dumps flipped a ~3/4
+   baseline to 0/3. Rules: invasive dumps stay env-gated OFF; when a validation loop's rate
+   shifts vs an earlier baseline, FIRST diff the two builds' active instrumentation, not the
+   fix under test; re-baseline after ANY runtime rebuild before judging the change.
 7. **Check the oracle FIRST, and check the right layer.** RPCS3 source + a real BLUS30826 run
    log + an instrumentable RPCS3 build are all in the map (STATUS.md). "RPCS3 HLEs/stubs X"
    claims are usually FALSE — check the `Loaded module: X.sprx` log lines; RPCS3 LLE-loads
