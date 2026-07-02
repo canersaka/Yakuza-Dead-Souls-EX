@@ -227,14 +227,47 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     switch (channel) {
     case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);       break;
     case SPU_WrOutIntrMbox:
-        /* DIAG (pt29): does the SPU ever raise a class-2 outbound-interrupt event to
-         * the PPU? If so, it must be delivered to the queue connected via
-         * connect_event_all_threads (currently NOT forwarded -> SPU->PPU events
-         * dropped). Log the first few to confirm the path is exercised. */
-        { static unsigned long n = 0;
-          if (n < 40) { n++;
-              fprintf(stderr, "[SPU] WrOutIntrMbox v=0x%08X (event to PPU -- NOT forwarded yet)\n", v);
-              fflush(stderr); } }
+        /* sys_spu_thread_send_event / throw_event delivery (2026-07-02; closes
+         * the pt29 "NOT forwarded yet" gap). RPCS3 SPUThread.cpp
+         * SPU_WrOutIntrMbox: code = v>>24; code<64 = send_event (acks CELL_OK
+         * into the SPU InMbox), 64..127 = throw_event (no ack); both pop data
+         * from the OutMbox (written just before) and deliver
+         * {SYS_SPU_THREAD_EVENT_USER_KEY, spu_id, (spup<<32)|(v&0xFFFFFF), data}
+         * to the event queue bound to the group's port (connect_event_all_
+         * threads / cellSpursQueueAttachLv2EventQueue). MEASURED need: Sony's
+         * SPU-side SpursQueue push wakes a BLOCKING PPU popper (t1 parked in
+         * sys_event_queue_receive inside cellSpursQueuePopBody) by throwing on
+         * the queue's attached port (v=0x53000000 -> port 0x13) -- dropping it
+         * left the CRI voice-init response unconsumed forever. */
+        { uint32_t code = v >> 24;
+          if (code < 128 && ctx->ch_out_mbox.count) {
+              uint32_t spup = code & 63;
+              extern uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup);
+              extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
+                                                    uint64_t d1, uint64_t d2, uint64_t d3);
+              uint32_t qid = spu_group_spup_queue(ctx->spu_group_id, spup);
+              if (qid) {
+                  uint32_t data = spu_channel_read(&ctx->ch_out_mbox);
+                  int rc = sys_event_queue_push_by_id(qid,
+                              0xFFFFFFFF53505501ULL /* SYS_SPU_THREAD_EVENT_USER_KEY */,
+                              ctx->spu_id,
+                              ((uint64_t)spup << 32) | (v & 0xFFFFFFu),
+                              data);
+                  if (code < 64)                       /* send_event acks the SPU */
+                      spu_channel_write(&ctx->ch_in_mbox, 0 /* CELL_OK */);
+                  { static unsigned long n = 0;
+                    if (n < 24) { n++;
+                        fprintf(stderr, "[SPU] %s spup=%u data0=0x%X data1=0x%X -> queue %u (rc=%d)\n",
+                                code < 64 ? "send_event" : "throw_event",
+                                spup, v & 0xFFFFFFu, data, qid, rc);
+                        fflush(stderr); } }
+                  break;
+              }
+          }
+          { static unsigned long n = 0;
+            if (n < 12) { n++;
+                fprintf(stderr, "[SPU] WrOutIntrMbox v=0x%08X (no bound queue -- buffered)\n", v);
+                fflush(stderr); } } }
         spu_channel_write(&ctx->ch_out_intr_mbox, v);
         break;
     case SPU_WrDec:          ctx->decrementer = v;                          break;
@@ -1411,9 +1444,9 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
              * startTask instance vs the healthy natural-launch instance). */
             static int tlock = -1;
             if (tlock < 0) { const char* e = getenv("YZ_SPU_TRACE_SPU");
-                             tlock = e ? (int)strtol(e, 0, 0) : -2; }
+                             tlock = e ? ((e[0]=='a') ? -3 : (int)strtol(e, 0, 0)) : -2; }
             if (tlock == -2) tlock = (int)ctx->spu_id;
-            if ((int)ctx->spu_id != tlock) return;
+            if (tlock != -3 && (int)ctx->spu_id != tlock) return;  /* "any" = -3 */
             if (!s_trace_armed) {
                 s_trace_armed = 1;
                 { const char* n = getenv("YZ_SPU_TRACE_N");   /* instruction budget */
@@ -1426,7 +1459,9 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
                 setvbuf(s_trace_fp, NULL, _IONBF, 0);
                 uint32_t wcl = ((uint32_t)ctx->ls[0x1DC]<<24)|((uint32_t)ctx->ls[0x1DD]<<16)
                              |((uint32_t)ctx->ls[0x1DE]<<8)|ctx->ls[0x1DF];
-                s_trace_spuid = (uint32_t)ctx->spu_id;   /* pair rt-lines to this SPU */
+                { const char* e = getenv("YZ_SPU_TRACE_SPU");
+                  s_trace_spuid = (e && e[0] == 'a') ? 0xFFFFFFFFu   /* any */
+                                : (uint32_t)ctx->spu_id; }  /* pair rt-lines to this SPU */
                 s_trace_img   = (int)ctx->image_id;       /* ...and this image */
                 fprintf(s_trace_fp, "# YZ_SPU_TRACE armed spu=%X img=%d wklCurrentId=%u budget=%ld\n",
                         ctx->spu_id, ctx->image_id, wcl, s_trace_budget);
@@ -1490,7 +1525,7 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
 void spu_trace_rt(spu_context* ctx, uint32_t rt)
 {
     if (!s_trace_armed || s_trace_budget <= 0 || !s_trace_fp) return;
-    if (ctx->spu_id != s_trace_spuid) return;
+    if (s_trace_spuid != 0xFFFFFFFFu && ctx->spu_id != s_trace_spuid) return;
     if (s_trace_img >= 0 && (int)ctx->image_id != s_trace_img) return;
     u128 v = ctx->gpr[rt & 0x7F];
     fprintf(s_trace_fp, "  r%-3u %016llX %016llX\n",

@@ -212,6 +212,16 @@ static spu_group_t* spu_find_group(uint32_t id)
     return NULL;
 }
 
+/* Event queue bound to an SPU->PPU user-event port of a group (0 = none).
+ * Used by spu_wrch(SPU_WrOutIntrMbox) to deliver sys_spu_thread_send_event /
+ * throw_event class-2 events (the pt29 "NOT forwarded yet" gap). */
+uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
+{
+    spu_group_t* g = spu_find_group(group_id);
+    if (!g || spup >= 64) return 0;
+    return g->spup_queue[spup];
+}
+
 static spu_group_t* spu_alloc_group(void)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
