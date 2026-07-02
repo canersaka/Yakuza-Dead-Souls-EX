@@ -14,6 +14,10 @@
 
 #include "spu_dma.h"
 #include "spu_helpers.h"   /* spu_rotqbyi: the real spursTasksetStartTask gpr4 seed */
+/* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
+ * image id / entry / BSS spans. Generated into recomp_prx like the lifted
+ * kernels the build already requires. */
+#include "../../recomp_prx/spu_image_table.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <setjmp.h>
@@ -411,7 +415,10 @@ typedef struct {
     int      image_id;   /* which recompiled image this function belongs to */
 } spu_reg_entry;
 
-#define SPU_FN_REGISTRY_MAX 65536
+/* All 10 EBOOT task images + kernel/service/policy total ~150k lifted
+ * functions (cri_audio alone is 35k); the old 64k cap silently dropped
+ * whoever registered last. ~3 MB at 262144 -- cheap. */
+#define SPU_FN_REGISTRY_MAX 262144
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
 
@@ -528,11 +535,9 @@ void spu_task_launch(spu_context* c)
     uint32_t elf = ((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
                  |((uint32_t)ls[0x2796]<<8)|ls[0x2797];      /* TaskInfo.elf EA (low 32) */
     elf &= 0xFFFFFFF8u;                                       /* dispatch masks 3 flag bits */
-    int image;
-    if      (elf == 0x0127A580u) image = 0;   /* gs_task  */
-    else if (elf == 0x012B4980u) image = 3;   /* cri_audio codec */
-    else if (elf == 0x01284200u) image = 4;   /* wkl4 worker pool */
-    else return;                              /* unknown task -- don't launch */
+    const spu_image_desc* imd = spu_image_for_elf(elf);
+    if (!imd) return;                         /* unknown task -- don't launch */
+    int image = imd->image_id;
 
     /* START vs RESUME (RPCS3 spursTasksetDispatch, cellSpursSpu.cpp:1740-1864):
      * savedContextLr == the ELF entry => a FRESH START (seed the task ABI). Any
@@ -544,7 +549,10 @@ void spu_task_launch(spu_context* c)
      * LS 0x3EB4 -> branch to LS 0 -> halt. The context-save area (0x2C80-0x3000)
      * sits between the policy (<=0x2840) and the task (>=0x3000), so it persists
      * in LS across the yield -- restore straight from LS. */
-    uint32_t elf_entry = (image == 0) ? 0x3050u : 0x3070u;   /* gs_task / cri_audio */
+    /* (2026-07-02: entry from the generated image table -- the old ternary
+     * assumed 0x3070 for every non-gs_task image, misclassifying a fresh wkl4
+     * launch, entry 0x3050, as a resume on this A/B path.) */
+    uint32_t elf_entry = imd->entry;
     int resume = (scl != elf_entry);
     memset(c->gpr, 0, 128 * sizeof(c->gpr[0]));
     if (resume) {
@@ -588,18 +596,13 @@ void spu_task_launch(spu_context* c)
         c->gpr[3] = spu_ls_read128(c, 0x2780u);              /* gpr3 = taskInfo->args */
         c->gpr[4] = spu_rotqbyi(spu_ls_read128(c, 0x2760u), 8); /* gpr4 = {spurs,args} */
         c->gpr[1]._u32[0] = 0x2C30u;                          /* sp = taskset ctx stack */
-        /* FRESH START: zero the task image's BSS ([filesz,memsz) of its data
-         * segment), per the ELF contract Sony's LoadElf honors -- our image
-         * deploy copies only filesz, leaving whatever a prior image/dispatch
-         * wrote in the BSS span. (2026-07-01: kept as contract-correct; the
-         * geometry-wall root itself was the il immediate mis-decode, see
-         * tools/spu_disasm.py.) Bounds from the raw SPU ELFs (scratch/spu_imgs):
-         * gs_task    seg va 0xBC00  filesz 0x30    memsz 0x330D0
-         * cri_audio  seg va 0x25800 filesz 0x5E30  memsz 0x16930
-         * RESUME must NOT zero (LS persists across yields by design). */
-        if (image == 0)      memset(c->ls + 0xBC30u,  0, 0x330D0u - 0x30u);
-        else if (image == 3) memset(c->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
-        else if (image == 4) memset(c->ls + 0xB400u,  0, 0x32170u);
+        /* FRESH START: zero the task image's BSS ([filesz,memsz) spans), per
+         * the ELF contract Sony's LoadElf honors -- our image deploy copies
+         * only filesz, leaving whatever a prior image/dispatch wrote in the
+         * BSS span. Spans come from the generated image table (auto-derived
+         * from the ELF headers; reproduces the old hand-derived bounds
+         * byte-exactly). RESUME must NOT zero (LS persists across yields). */
+        spu_image_zero_bss(c->ls, imd);
     }
     c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry / resume PC */
     c->image_id = image;
@@ -910,6 +913,17 @@ void spu_register_function(uint32_t addr, spu_fn fn)
         s_registry[s_registry_count].fn = fn;
         s_registry[s_registry_count].image_id = s_reg_image;
         s_registry_count++;
+    } else {
+        /* NEVER silent: an overflow drops whole images (whoever registers
+         * last) and the boot degrades mysteriously -- exactly what happened
+         * when the 2026-07-02 batch lift pushed the total past the old 64k
+         * cap and gs_task (registered last) vanished. */
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "[SPU] FATAL: function registry FULL (%u) -- raise "
+                    "SPU_FN_REGISTRY_MAX; later images are DROPPED\n",
+                    s_registry_count);
+            fflush(stderr); }
     }
     spu_prof_insert(addr, fn);
 }
@@ -996,24 +1010,19 @@ void spu_indirect_branch(spu_context* ctx)
             const unsigned char* ls = ctx->ls;
             uint32_t elf = (((uint32_t)ls[0x2794]<<24)|((uint32_t)ls[0x2795]<<16)
                            |((uint32_t)ls[0x2796]<<8)|ls[0x2797]) & 0xFFFFFFF8u;
-            int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3
-                    : (elf == 0x01284200u) ? 4 : -1;
+            const spu_image_desc* imd = spu_image_for_elf(elf);
+            int img = imd ? imd->image_id : -1;
             if (img >= 0) {
                 ctx->image_id = img;
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
-                 * zero the task image's BSS ([filesz,memsz) of its data segment),
-                 * per the ELF contract Sony's LoadElf honors -- our image deploy
-                 * copies only filesz, leaving prior-image bytes in the BSS span.
-                 * (2026-07-01: contract-correct keeper; the geometry-wall root
-                 * itself was the il immediate mis-decode, tools/spu_disasm.py.)
-                 * Bounds from the raw SPU ELFs (scratch/spu_imgs). Resume paths
-                 * must NOT zero (LS persists across yields by design). */
-                if (img == 0 && tpc == 0x3050u)
-                    memset(ctx->ls + 0xBC30u, 0, 0x330D0u - 0x30u);
-                else if (img == 3 && tpc == 0x3070u)
-                    memset(ctx->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
-                else if (img == 4 && tpc == 0x3050u)   /* wkl4: seg va 0xB400 filesz 0 memsz 0x32170 = all BSS */
-                    memset(ctx->ls + 0xB400u, 0, 0x32170u);
+                 * zero the task image's BSS ([filesz,memsz) spans), per the ELF
+                 * contract Sony's LoadElf honors -- our image deploy copies only
+                 * filesz, leaving prior-image bytes in the BSS span. Spans and
+                 * entries come from the generated image table (auto-derived from
+                 * the ELF headers). Resume paths must NOT zero (LS persists
+                 * across yields by design). */
+                if (tpc == imd->entry)
+                    spu_image_zero_bss(ctx->ls, imd);
                 /* The lifted policy StartTask does NOT propagate the SPURS task-ABI
                  * registers on this natural-launch path -- measured (pt47): the
                  * cri_audio task enters with gpr3=0, so its context base is null and
@@ -1037,7 +1046,7 @@ void spu_indirect_branch(spu_context* ctx)
                 }
                 static int n = 0; if (n < 8) { n++;
                     fprintf(stderr, "[task-launch] policy bi savedContextLr -> %s entry=0x%05X image=%d "
-                            "(natural StartTask launch)\n", img == 3 ? "cri_audio" : "gs_task", tpc, img);
+                            "(natural StartTask launch)\n", imd->name, tpc, img);
                     fflush(stderr); }
                 /* SPURS context-replacement (2026-06-28). The policy's StartTask
                  * `bi savedContextLr` reaches here DEEP inside the policy's nested
@@ -1296,10 +1305,22 @@ void spu_indirect_branch(spu_context* ctx)
     {
         uint32_t la = ctx->pc & SPU_LS_MASK;
         int foreign = 0, foreign_img = 0; spu_fn ffn = 0;
+        int pol_seen = 0; spu_fn pol_fn = 0;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
+                if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
             }
+        /* With ALL EBOOT task images registered (2026-07-02 batch lift), a
+         * low-LS address can have several foreign owners (spuimg6 loads at LS
+         * 0xF0 and shadows the policy region), which broke the exactly-one
+         * rule and killed the task->policy 0xA70 syscall adoption. Faithful
+         * disambiguation: a TASK image calling into the resident-runtime
+         * region (< CELL_SPURS_TASK_TOP 0x3000) is calling the taskset POLICY
+         * -- that is what is resident under a running task by protocol. */
+        if (foreign > 1 && pol_seen && la < 0x3000u && ctx->image_id != 2) {
+            foreign = 1; foreign_img = 2; ffn = pol_fn;
+        }
         if (foreign == 1 && ffn) {
             static int xn = 0;
             if (xn < 16) { xn++;
