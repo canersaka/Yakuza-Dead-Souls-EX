@@ -46,13 +46,17 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
 keeps its trace tail — added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
-SPU id instead of first-seen — added 2026-07-02), `YZ_SPU_TRACE_EVARM` (hold trace arming
-until an event site fires — currently the 0xA70 taskset-syscall probe; added 2026-07-02),
+SPU id instead of first-seen; `any` disables the SPU filter for PC and rt lines — added
+2026-07-02), `YZ_SPU_TRACE_EVARM` (hold trace arming until an event site fires — the 0xA70
+taskset-syscall probe or the CRI request-queue GETLLAR in spu_dma.h; added 2026-07-02),
+`YZ_QLINE` (spu_context.h: log lifted image-3 stores to the GETLLAR line copy at LS 0x80 —
+2026-07-02, REMOVE with the frontier),
 `YZ_CTXSAVE_WATCH` (DMA + syscall-entry watch on the task context-save protocol: logs
 transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA70 syscall —
-added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs
-from task images 3/4 — the codec/pool output writes; NOTE it excludes PUTLLC, so queue
-header atomics are invisible — 2026-07-02, REMOVE with the frontier), `YZ_SIGCALL`
+added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs +
+line atomics with pc from task images 3/4; dumps the LS line for atomics on the CRI queues;
+its request-line GETLLAR releases YZ_SPU_TRACE_EVARM — 2026-07-02, REMOVE with the
+frontier), `YZ_SIGCALL`
 (dispatch.cpp: log indirect calls into the libsre LLE signal/queue family, addresses in
 scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
