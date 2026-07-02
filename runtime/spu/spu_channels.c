@@ -523,6 +523,17 @@ void spu_task_launch(spu_context* c)
         c->gpr[3] = spu_ls_read128(c, 0x2780u);              /* gpr3 = taskInfo->args */
         c->gpr[4] = spu_rotqbyi(spu_ls_read128(c, 0x2760u), 8); /* gpr4 = {spurs,args} */
         c->gpr[1]._u32[0] = 0x2C30u;                          /* sp = taskset ctx stack */
+        /* FRESH START: zero the task image's BSS ([filesz,memsz) of its data
+         * segment), per the ELF contract Sony's LoadElf honors -- our image
+         * deploy copies only filesz, leaving whatever a prior image/dispatch
+         * wrote in the BSS span. (2026-07-01: kept as contract-correct; the
+         * geometry-wall root itself was the il immediate mis-decode, see
+         * tools/spu_disasm.py.) Bounds from the raw SPU ELFs (scratch/spu_imgs):
+         * gs_task    seg va 0xBC00  filesz 0x30    memsz 0x330D0
+         * cri_audio  seg va 0x25800 filesz 0x5E30  memsz 0x16930
+         * RESUME must NOT zero (LS persists across yields by design). */
+        if (image == 0)      memset(c->ls + 0xBC30u,  0, 0x330D0u - 0x30u);
+        else if (image == 3) memset(c->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
     }
     c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry / resume PC */
     c->image_id = image;
@@ -905,6 +916,18 @@ void spu_indirect_branch(spu_context* ctx)
             int img = (elf == 0x0127A580u) ? 0 : (elf == 0x012B4980u) ? 3 : -1;
             if (img >= 0) {
                 ctx->image_id = img;
+                /* FRESH START (branch target == ELF entry, not a mid-body resume):
+                 * zero the task image's BSS ([filesz,memsz) of its data segment),
+                 * per the ELF contract Sony's LoadElf honors -- our image deploy
+                 * copies only filesz, leaving prior-image bytes in the BSS span.
+                 * (2026-07-01: contract-correct keeper; the geometry-wall root
+                 * itself was the il immediate mis-decode, tools/spu_disasm.py.)
+                 * Bounds from the raw SPU ELFs (scratch/spu_imgs). Resume paths
+                 * must NOT zero (LS persists across yields by design). */
+                if (img == 0 && tpc == 0x3050u)
+                    memset(ctx->ls + 0xBC30u, 0, 0x330D0u - 0x30u);
+                else if (img == 3 && tpc == 0x3070u)
+                    memset(ctx->ls + 0x2B630u, 0, 0x16930u - 0x5E30u);
                 /* The lifted policy StartTask does NOT propagate the SPURS task-ABI
                  * registers on this natural-launch path -- measured (pt47): the
                  * cri_audio task enters with gpr3=0, so its context base is null and
@@ -1260,6 +1283,11 @@ static FILE* s_trace_fp = NULL;
  * per-instruction trace of 5 SPUs spinning millions/sec is unusable. */
 static int   s_trace_armed  = 0;
 static long  s_trace_budget = 0;
+/* Which SPU/image spu_trace_rt should emit for. Defaults match the legacy prof
+ * path (spu 0x2000, any image); the YZ_SPU_TRACE arm below locks them to the
+ * traced SPU+image so register lines pair with the (image-gated) PC lines. */
+static uint32_t s_trace_spuid = 0x2000u;
+static int      s_trace_img   = -1;
 
 void spu_trace_init(const char* path)
 {
@@ -1284,18 +1312,36 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
         static int tmode = -1;
         if (tmode < 0) tmode = getenv("YZ_SPU_TRACE") ? 1 : 0;
         if (tmode) {
-            if (ctx->image_id != 2) return;          /* policy only */
+            { static int timg = -1;
+              if (timg < 0) { const char* e = getenv("YZ_SPU_TRACE_IMG");
+                              timg = e ? (int)strtol(e, 0, 0) : 2; }
+              if (ctx->image_id != timg) return; }   /* env-selected image (default 2) */
             static int tlock = -1; if (tlock < 0) tlock = (int)ctx->spu_id;
             if ((int)ctx->spu_id != tlock) return;   /* one SPU, no interleave */
             if (!s_trace_armed) {
-                s_trace_armed = 1; s_trace_budget = 600000;
+                s_trace_armed = 1;
+                { const char* n = getenv("YZ_SPU_TRACE_N");   /* instruction budget */
+                  s_trace_budget = n ? strtol(n, 0, 0) : 600000; }
                 if (!s_trace_fp) s_trace_fp = fopen("scratch/spu_trace.txt", "w");
                 if (!s_trace_fp) s_trace_fp = stderr;
+                /* Unbuffered: the traced SPU can halt (crash) with the tail of the
+                 * trace -- the approach into the fault -- stuck in the stdio buffer
+                 * when the host process is killed. Fidelity over speed here. */
+                setvbuf(s_trace_fp, NULL, _IONBF, 0);
                 uint32_t wcl = ((uint32_t)ctx->ls[0x1DC]<<24)|((uint32_t)ctx->ls[0x1DD]<<16)
                              |((uint32_t)ctx->ls[0x1DE]<<8)|ctx->ls[0x1DF];
-                fprintf(s_trace_fp, "# YZ_SPU_TRACE armed spu=%X wklCurrentId=%u\n", ctx->spu_id, wcl);
+                s_trace_spuid = (uint32_t)ctx->spu_id;   /* pair rt-lines to this SPU */
+                s_trace_img   = (int)ctx->image_id;       /* ...and this image */
+                fprintf(s_trace_fp, "# YZ_SPU_TRACE armed spu=%X img=%d wklCurrentId=%u budget=%ld\n",
+                        ctx->spu_id, ctx->image_id, wcl, s_trace_budget);
             }
-            if (s_trace_budget <= 0) { if (s_trace_fp) fflush(s_trace_fp); return; }
+            if (s_trace_budget <= 0) {
+                if (s_trace_budget == 0) {
+                    fprintf(s_trace_fp, "# trace budget exhausted\n");
+                    s_trace_budget = -1;
+                }
+                return;
+            }
             s_trace_budget--;
             uint32_t lp = pc & SPU_LS_MASK;
             /* dump the clear-loop count regs at setup so we can see the garbage count
@@ -1348,7 +1394,8 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
 void spu_trace_rt(spu_context* ctx, uint32_t rt)
 {
     if (!s_trace_armed || s_trace_budget <= 0 || !s_trace_fp) return;
-    if (ctx->spu_id != 0x2000u) return;
+    if (ctx->spu_id != s_trace_spuid) return;
+    if (s_trace_img >= 0 && (int)ctx->image_id != s_trace_img) return;
     u128 v = ctx->gpr[rt & 0x7F];
     fprintf(s_trace_fp, "  r%-3u %016llX %016llX\n",
             (unsigned)(rt & 0x7F),
