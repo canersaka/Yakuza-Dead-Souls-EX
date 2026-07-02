@@ -1,0 +1,10 @@
+﻿exited_early=no
+exceptions=0
+unknown_branch=0
+esrch_fails=0
+distinct_imports=48
+deepest_import=sys_lwmutex_trylock
+reached_audio=YES
+applier_fires=True
+flowctl_forces=False
+vblank_alive=True

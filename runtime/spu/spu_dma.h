@@ -344,6 +344,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* Codec/pool output watch (env YZ_CODEC_PUT, 2026-07-02, diag — REMOVE when
+     * the voice-init frontier closes): log every PUT-class DMA issued while a
+     * TASK image (3 = cri_audio, 4 = the wid-4 pool) is active — the tasks'
+     * init runs are expected to write an init-complete status the PPU-side CRI
+     * layer polls before it will issue decode work / task signals. Names the
+     * status EAs (or proves the init never notifies). */
+    { static int cp = -1; if (cp < 0) cp = getenv("YZ_CODEC_PUT") ? 1 : 0;
+      if (cp && (spu->image_id == 3 || spu->image_id == 4)
+             && mfc_is_put(cmd) && cmd != MFC_PUTLLC_CMD && cmd != MFC_PUTLLUC_CMD
+             && cmd != MFC_PUTQLLUC_CMD) {
+          static int cpn = 0;
+          if (cpn < 80) { cpn++;
+              fprintf(stderr, "[codec-put] spu=%X img=%d cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X\n",
+                      spu->spu_id, spu->image_id, cmd, lsa & SPU_LS_MASK,
+                      (unsigned long long)ea, size);
+              fflush(stderr);
+          }
+      } }
     /* Task context-save provenance (env YZ_CTXSAVE_WATCH, 2026-07-02): the SPURS
      * taskset yield must PUT the register block LS [0x2C80,0x3000) to the
      * taskInfo context-save EA (RPCS3 spursTasketSaveTaskContext); our resumes
