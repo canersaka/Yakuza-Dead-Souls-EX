@@ -887,16 +887,25 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
      * post-load stall (shaders open ~by 30s). Identical stacks across samples
      * => t1 is parked; that names the guest function it spin-waits in. */
     Sleep(30000);
+    /* THE INVASIVE DUMPS ARE YZ_L1SNAP-GATED (2026-07-02, twice-burned): the
+     * all-threads snapshot suspends every guest thread serially and its
+     * host-stack walks take 60+ SECONDS (froze the guest +30s->+90s and
+     * invalidated four 8-boot validation loops); even the t1-only host-stack
+     * + spin sampler (active again since the g_yz_main_hthread fix -- they
+     * had been silently no-opping on a never-assigned handle) suspend t1
+     * repeatedly right in the PortStart window and flipped a ~3/4-good
+     * baseline to 0/3. A diagnostic must never perturb the system it
+     * measures; the read-only guest-state dump below is the only default. */
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
-                         yz_dump_main_host_stack("watchdog-30s"); }
-    yz_sample_t1_spin("watchdog-30s");
-    if (getenv("YZ_L1SNAP")) yz_dump_layer1_snapshot("watchdog-30s");
+                         if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-30s"); }
+    if (getenv("YZ_L1SNAP")) { yz_sample_t1_spin("watchdog-30s");
+                               yz_dump_layer1_snapshot("watchdog-30s"); }
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
-                         yz_dump_main_host_stack("watchdog-45s"); }
+                         if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-45s"); }
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
-                         yz_dump_main_host_stack("watchdog-60s"); }
+                         if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-60s"); }
     return 0;
 }
 
@@ -1802,6 +1811,11 @@ int main(int argc, char** argv)
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
+    /* Real thread handle for the watchdog's host-stack/spin dumps of t1
+     * (was declared but never assigned -- every t1 host-RIP dump silently
+     * no-opped; the wedge captures lacked t1 attribution). */
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                    &g_yz_main_hthread, 0, FALSE, DUPLICATE_SAME_ACCESS);
     /* Capture this (main/t1) thread's trampoline-ring instance for the stall dump. */
     g_yz_main_tramp     = g_yz_tramp_ring;
     g_yz_main_tramp_r31 = g_yz_tramp_r31;
