@@ -90,11 +90,45 @@ static atomic_flag s_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)
 {
     while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire))
-        ;
+        SPU_CPU_RELAX();   /* don't saturate the cache line while spinning */
 }
 void spu_lockline_unlock(void)
 {
     atomic_flag_clear_explicit(&s_lockline, memory_order_release);
+}
+
+/* Host-core yield for SPU idle-poll loops (the spu_dma.h GETLLAR backoff;
+ * kill-switch YZ_NO_SPUBACKOFF lives at the call site). level 0 = cpu pause
+ * (stay hot, just stop hammering the lock-line lock at full rate); level 1 =
+ * hand the core to the OS scheduler for a quantum (still hot when cores are
+ * idle -- SwitchToThread returns immediately with no waiter); level 2 = a
+ * real 1 ms sleep, the only rung that actually idles the core (laptop
+ * heat/throttling; up to ~15 ms wall with the default timer resolution --
+ * acceptable reaction latency for an SPU that has been idle this long).
+ * Measured before the backoff: five SPURS kernel SPUs each burned ~97% of a
+ * host core in their GETLLAR poll loops, and boot pacing collapsed under the
+ * lock-line contention (see STATUS 2026-07-03); pacing recovered with the
+ * pause/yield rungs alone (lock RATE, not occupancy, was the poison). */
+#if defined(_WIN32)
+__declspec(dllimport) int __stdcall SwitchToThread(void);
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+#else
+#include <sched.h>
+#include <unistd.h>
+#endif
+void spu_idle_yield(int level)
+{
+    if (level == 0) {
+        SPU_CPU_RELAX(); SPU_CPU_RELAX(); SPU_CPU_RELAX(); SPU_CPU_RELAX();
+        return;
+    }
+#if defined(_WIN32)
+    if (level >= 2) Sleep(1);
+    else SwitchToThread();
+#else
+    if (level >= 2) usleep(1000);
+    else sched_yield();
+#endif
 }
 
 #ifdef __cplusplus
