@@ -571,7 +571,12 @@ class SPULifter:
                 self.call_targets.add(tgt)
                 # Call, then drain any tail-call the callee left pending so
                 # cross-function loops run iteratively (constant host stack).
-                return f"{link} {self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx);"
+                # host_depth brackets the nested host call so SPU_RET can tell
+                # a live lifted frame from one consumed by a resume/restack
+                # unwind (see SPU_RET in spu_context.h).
+                return (f"{link} ctx->host_depth++; "
+                        f"{self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx); "
+                        f"ctx->host_depth--;")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -589,13 +594,18 @@ class SPULifter:
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
             # SPU ABI: $r0 is the link register. `bi $r0` is the standard
-            # function return — translate to a host return so call/return
-            # discipline matches the C function nesting from brsl. EXCEPTION:
-            # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
-            # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
-            # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
+            # function return — SPU_RET keeps the host return while a matching
+            # lifted brsl/bisl frame is live (ctx->host_depth > 0) and falls
+            # back to dispatching to r0 when none is (a cross-context task
+            # resume or the restack unwind consumed the caller's host frame;
+            # a bare `return` there hands control to the dispatch drain and
+            # kills the SPU's thread of control — the LS 0x20A40 codec death,
+            # 2026-07-03). EXCEPTION: when r0 was reloaded from memory
+            # (lqa/lqr) it is a COMPUTED TAIL JUMP (e.g. the SPURS task launch
+            # `lqa $r0,savedContextLr; bi $r0`), flagged by
+            # compute_bi_r0_jumps() — emit the unconditional indirect dispatch.
             if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return "return;"
+                return "SPU_RET(ctx);"
             # Indirect tail branch: set pc and trampoline to the dispatcher,
             # then unwind so an enclosing SPU_DRAIN re-enters (no nesting).
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
@@ -608,10 +618,12 @@ class SPULifter:
             link_rt = insn.raw & 0x7F            # link reg dropped from operands
             tgt_reg = _reg(ops[0])
             # Indirect call: dispatch, then drain the callee's tail-calls.
+            # host_depth brackets the nested call (see the brsl emission).
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx); "
-                    f"SPU_DRAIN(ctx);")
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+                    f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
+                    f"ctx->host_depth--;")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
@@ -626,12 +638,11 @@ class SPULifter:
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
             tgt_reg = _reg(ops[1])
             # $r0 is the link register: a conditional branch to it is a
-            # conditional function return — emit a host return so it composes
-            # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
-            # Dispatching to the return address would miss the C frame and
-            # land on an unregistered mid-function PC.
+            # conditional function return — SPU_RET (mirrors the `bi $r0` case
+            # above: host return while a lifted call frame is live, dispatch
+            # to r0 when the frame was consumed by a resume/restack unwind).
             if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return f"if ({cond}) return;"
+                return f"if ({cond}) SPU_RET(ctx);"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 

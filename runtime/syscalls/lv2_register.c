@@ -467,6 +467,10 @@ static void* spu_exec_thread_proc(void* arg)
          * stack. SPU state is in the heap ctx, so it survives the unwind. */
         (void)setjmp(restart_jb);
         g_spu_trampoline_fn = 0;
+        sctx->host_depth = 0;        /* the longjmp destroyed every lifted call
+                                      * frame: re-sync SPU_RET's depth counter
+                                      * so unbalanced `bi $r0` returns dispatch
+                                      * to r0 instead of C-returning here */
         spu_indirect_branch(sctx);   /* runs until stop; halt longjmps back */
         SPU_DRAIN(sctx);             /* iterate tail-call chains (scheduler loop) */
     }
