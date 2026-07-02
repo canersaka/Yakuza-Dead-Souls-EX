@@ -61,7 +61,8 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/policy_module.c"   # taskset policy module (libsre 0x02023680), loaded to LS 0xA00 over the service
     "${PS3RECOMP_DIR}/recomp_prx/gs_task.c"   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580
     "${PS3RECOMP_DIR}/recomp_prx/cri_audio.c"   # SOFDEC/ADX codec task, EBOOT SPU img #7 @0x012B4980 (overlaps gs_task LS -> image 3)
-    "${PS3RECOMP_DIR}/recomp_prx/wkl4_task.c")  # 4-task worker pool, EBOOT SPU img #5 @0x01284200 (wid 4; overlaps LS 0x3000 -> image 4)
+    "${PS3RECOMP_DIR}/recomp_prx/wkl4_task.c"   # 4-task worker pool, EBOOT SPU img #5 @0x01284200 (wid 4; overlaps LS 0x3000 -> image 4)
+    "${PS3RECOMP_DIR}/recomp_prx/spuimg_*.c")   # remaining EBOOT task images, batch-lifted by tools/gen_spu_images.py (image ids 5+; see recomp_prx/spu_image_table.h)
 
 add_executable(yakuza_recomp
     main.cpp
