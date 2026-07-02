@@ -80,6 +80,7 @@ extern "C" void spu_recomp_register_policy(void);
  * TaskInfo ELF EA when the SPURS kernel dispatches the codec taskset (wid 3). */
 extern "C" void cri_audio_register_functions(void);
 extern "C" void wkl4_register_functions(void);
+#include "../recomp_prx/spu_image_table.h"   /* generated: remaining EBOOT images + registry */
 extern "C" void spu_begin_image(int image_id);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
@@ -1670,8 +1671,10 @@ int main(int argc, char** argv)
      * wildcard. gs_task is unaffected on its own (image 0) path. */
     spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
     spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
-    spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 */
-    printf("[boot] SPU images registered (kernel + service + policy + cri_audio + gs_task + wkl4)\n");
+    spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
+    spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
+    printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
+           SPU_IMAGE_COUNT);
 
     /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted
