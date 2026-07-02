@@ -366,16 +366,28 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t){_imm(ops[1])} << 16);"
 
         if mn == "addi":
+            # Full 64-bit add (same reasoning as `add`: the 32-bit truncation
+            # breaks genuine 64-bit arithmetic; conformance suite 2026-07-02).
+            # EAs stay identical (guest addresses are < 2^31, and the memory
+            # helpers mask to 32 bits anyway).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + (uint64_t)(int64_t){_imm(ops[2])};"
 
         if mn == "addis":
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + ((uint32_t){_imm(ops[2])} << 16));"
+            return (f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + "
+                    f"(uint64_t)(int64_t)(int32_t)((uint32_t){_imm(ops[2])} << 16);")
 
         if mn == "addic" or mn == "addic.":
+            # Full 64-bit add (same reasoning as `add` below) AND record XER[CA]
+            # -- addic/subfic are the D-form members of the carry family; they
+            # NEVER set CA before (conformance suite 2026-07-02), so any
+            # adde/subfe consuming their carry computed garbage.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return (f"{{ uint64_t _s = ctx->gpr[{ra}] + (uint64_t)(int64_t){_imm(ops[2])}; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((_s < ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = _s; }}")
 
         if mn in ("add", "add.", "addo", "addo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -390,20 +402,35 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = ctx->gpr[{rb}] - ctx->gpr[{ra}];"
 
         if mn == "subfic":
+            # 64-bit ~RA + imm + 1 with XER[CA] (PowerISA; CA was never set).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)({_imm(ops[2])} - (int32_t)ctx->gpr[{ra}]);"
+            return (f"{{ uint64_t _na = ~ctx->gpr[{ra}]; "
+                    f"uint64_t _t = _na + (uint64_t)(int64_t){_imm(ops[2])}; "
+                    f"uint64_t _s = _t + 1; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"(((_t < _na) || (_s == 0)) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = _s; }}")
 
         if mn in ("neg", "neg."):
+            # Full 64-bit negate (the 32-bit truncation zeroed neg of any value
+            # with a clear low word, e.g. 0x8000000000000000 -> 0).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(-(int32_t)ctx->gpr[{ra}]);"
+            return f"ctx->gpr[{rd}] = (uint64_t)0 - ctx->gpr[{ra}];"
 
         if mn == "mulli":
+            # PowerISA: RT = low 64 of RA * EXTS(SI) -- a full 64-bit product.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * {_imm(ops[2])});"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * "
+                    f"(int64_t){_imm(ops[2])});")
 
         if mn in ("mullw", "mullw."):
+            # PowerISA: RT = the FULL 64-bit signed product of the low words.
+            # The old (int64_t)(int32_t) truncation replaced the high word with
+            # a sign copy, silently breaking every 32x32->64 idiom (fixed-point
+            # audio/geometry math; conformance suite 2026-07-02).
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * (int32_t)ctx->gpr[{rb}]);"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)(int32_t)ctx->gpr[{ra}] * "
+                    f"(int64_t)(int32_t)ctx->gpr[{rb}]);")
 
         if mn in ("mulhw", "mulhw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -464,6 +491,11 @@ class PPULifter:
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] | ctx->gpr[{rb}]);"
 
+        if mn in ("eqv", "eqv."):
+            # XNOR (was an unhandled TODO; conformance suite 2026-07-02).
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] ^ ctx->gpr[{rb}]);"
+
         if mn in ("andc", "andc."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ctx->gpr[{rs}] & ~ctx->gpr[{rb}];"
@@ -517,11 +549,14 @@ class PPULifter:
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             # PPC: shift count (bit26 set => >=32) yields 0. Compute in u64 then
             # truncate so counts 32..63 naturally give 0 (a u32<<>=32 is C-UB).
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)(uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x3F));"
+            # Result is ZERO-extended (PowerISA: the mask clears the high word;
+            # the old sign-extension put garbage in bits 32-63).
+            return f"ctx->gpr[{ra}] = (uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("srw", "srw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)(uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
+            # Zero-extended like slw (srw of a bit31-set value was sign-extended).
+            return f"ctx->gpr[{ra}] = (uint32_t)((uint64_t)(uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("sraw", "sraw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
