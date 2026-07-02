@@ -1265,9 +1265,8 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
      * them on change so we can see the value + whether the PPU voice layer
      * ever updates/consumes them. */
     static const uint32_t peek[6] = { 0x63D61400u, 0x63D61410u,   /* CRI request CellSpursQueue hdr (PPU pushes) */
-                                      0x63D61600u, 0x63D61610u,   /* CRI response CellSpursQueue hdr (PPU pops empty) */
-                                      0x63D616A0u,                /* codec init 0x20-byte write */
-                                      0x63D11C80u };              /* CRI server desc block */
+                                      0x63D61460u, 0x63D61420u,   /* req queue +0x60 (taskset EA — SendSignal gate) + waiter byte +0x20 */
+                                      0x63D61600u, 0x63D61610u }; /* CRI response CellSpursQueue hdr */
     uint32_t lastpeek[6][4]; memset(lastpeek, 0xFF, sizeof(lastpeek));
     static const uint32_t fixed[2] = { 0x63D22580u, 0x42425F00u };
     uint32_t last[3][6]; memset(last, 0xFF, sizeof(last));

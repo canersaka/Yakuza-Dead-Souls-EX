@@ -352,13 +352,31 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * status EAs (or proves the init never notifies). */
     { static int cp = -1; if (cp < 0) cp = getenv("YZ_CODEC_PUT") ? 1 : 0;
       if (cp && (spu->image_id == 3 || spu->image_id == 4)
-             && mfc_is_put(cmd) && cmd != MFC_PUTLLC_CMD && cmd != MFC_PUTLLUC_CMD
-             && cmd != MFC_PUTQLLUC_CMD) {
+             && (mfc_is_put(cmd) || cmd == MFC_GETLLAR_CMD)) {
+          /* 2026-07-02b: atomics now INCLUDED (the queue-header PUTLLC was
+           * invisible before) + the submitting pc — names the push function.
+           * For line atomics on the response-queue line, dump the first 16
+           * bytes of the LS source (the front/back words being committed). */
           static int cpn = 0;
-          if (cpn < 80) { cpn++;
-              fprintf(stderr, "[codec-put] spu=%X img=%d cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X\n",
-                      spu->spu_id, spu->image_id, cmd, lsa & SPU_LS_MASK,
-                      (unsigned long long)ea, size);
+          if (cpn < 120) { cpn++;
+              fprintf(stderr, "[codec-put] spu=%X img=%d pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X",
+                      spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                      lsa & SPU_LS_MASK, (unsigned long long)ea, size);
+              if ((cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD || cmd == MFC_GETLLAR_CMD)
+                  && (((uint32_t)ea & ~0x7Fu) == 0x63D61600u
+                      || ((uint32_t)ea & ~0x7Fu) == 0x63D61400u)) {
+                  const uint8_t* l = &spu->ls[lsa & SPU_LS_MASK];
+                  fprintf(stderr, "  LS[0..15]:");
+                  for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", l[i]);
+                  if (cmd == MFC_GETLLAR_CMD
+                      && ((uint32_t)ea & ~0x7Fu) == 0x63D61400u) {
+                      /* release event-armed tracing at the REQUEST-queue pop
+                       * (the resumed codec locks front then compute-loops) */
+                      extern int g_spu_trace_evarm;
+                      g_spu_trace_evarm = 1;
+                  }
+              }
+              fprintf(stderr, "\n");
               fflush(stderr);
           }
       } }
