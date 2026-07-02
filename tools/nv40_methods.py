@@ -157,7 +157,9 @@ ARRAYS = [
     (0x0A20, 4, 0x04, "VIEWPORT_TRANSLATE"),  # x,y,z,w
     (0x0A30, 4, 0x04, "VIEWPORT_SCALE"),      # x,y,z,w
     (0x0B00, 4, 0x04, "TEX_FILTER_OPT"),
-    (0x0B80, 4, 0x04, "VP_UPLOAD_INST"),
+    # FIFO auto-increment upload window: 32 words (8 instr words x 4) per
+    # command burst; the window itself spans 0xB80..0xBFC
+    (0x0B80, 32, 0x04, "VP_UPLOAD_INST"),
     (0x1480, 32, 0x04, "POLYGON_STIPPLE_PATTERN"),
     (0x1500, 16, 0x10, "VTX_ATTR_3F"),
     (0x1680, 16, 0x04, "VTXBUF_OFFSET"),
@@ -170,7 +172,8 @@ ARRAYS = [
     (0x1A00, 8, 0x20, "TEX_UNIT"),          # OFFSET/FORMAT/WRAP/ENABLE/SWIZZLE/FILTER/NPOT/BORDER
     (0x1C00, 16, 0x10, "VTX_ATTR_4F"),
     (0x1E40, 16, 0x04, "VTX_ATTR_1F"),
-    (0x1F00, 4, 0x04, "VP_UPLOAD_CONST"),
+    # FIFO auto-increment upload window: 32 words (8 vec4s) per command burst
+    (0x1F00, 32, 0x04, "VP_UPLOAD_CONST"),
 ]
 
 TEX_UNIT_FIELDS = ["TEX_OFFSET", "TEX_FORMAT", "TEX_WRAP", "TEX_ENABLE",
