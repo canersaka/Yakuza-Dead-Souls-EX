@@ -58,7 +58,8 @@ if (-not $DiffOnly) {
 
   Stage "3/5  Run faithful, trace image $TraceImg -> $OursTrace  (kills after $RunSeconds s)"
   if (Test-Path $OursTrace) { Remove-Item $OursTrace -Force }
-  $env:YZ_NO_FLOWCTL = '1'; $env:YZ_SPU_TRACE = '1'; $env:YZ_SPU_TRACE_IMG = "$TraceImg"
+  # (faithful mode is the DEFAULT since the band-aid retirement 2026-07-02; no env needed)
+  $env:YZ_SPU_TRACE = '1'; $env:YZ_SPU_TRACE_IMG = "$TraceImg"
   $p = Start-Process -FilePath ".\yakuza\build\yakuza_recomp.exe" -ArgumentList "game\EBOOT.elf" `
         -PassThru -WindowStyle Hidden -RedirectStandardError "scratch\diverge_run.err" `
         -RedirectStandardOutput "scratch\diverge_run.out"
