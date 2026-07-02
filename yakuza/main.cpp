@@ -1264,10 +1264,11 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
      * 0x63D11CA0 and 0x20 bytes at 0x63D616A0 (measured, YZ_CODEC_PUT). Dump
      * them on change so we can see the value + whether the PPU voice layer
      * ever updates/consumes them. */
-    static const uint32_t peek[4] = { 0x63D11CA0u, 0x63D616A0u,
-                                      0x63D11C80u,   /* ptr stored next to the sync mutex */
-                                      0x63D11E58u }; /* second ptr — candidate queue blocks */
-    uint32_t lastpeek[4][4]; memset(lastpeek, 0xFF, sizeof(lastpeek));
+    static const uint32_t peek[6] = { 0x63D61400u, 0x63D61410u,   /* CRI request CellSpursQueue hdr (PPU pushes) */
+                                      0x63D61600u, 0x63D61610u,   /* CRI response CellSpursQueue hdr (PPU pops empty) */
+                                      0x63D616A0u,                /* codec init 0x20-byte write */
+                                      0x63D11C80u };              /* CRI server desc block */
+    uint32_t lastpeek[6][4]; memset(lastpeek, 0xFF, sizeof(lastpeek));
     static const uint32_t fixed[2] = { 0x63D22580u, 0x42425F00u };
     uint32_t last[3][6]; memset(last, 0xFF, sizeof(last));
     DWORD t0 = 0;
@@ -1275,7 +1276,7 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
         Sleep(1);
         if (!vm_base) continue;
         if (!t0) t0 = GetTickCount();
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < 6; k++) {
             MEMORY_BASIC_INFORMATION mbi;
             if (!VirtualQuery(vm_base + peek[k], &mbi, sizeof(mbi))
                 || mbi.State != MEM_COMMIT) continue;
