@@ -50,7 +50,11 @@ SPU id instead of first-seen — added 2026-07-02), `YZ_SPU_TRACE_EVARM` (hold t
 until an event site fires — currently the 0xA70 taskset-syscall probe; added 2026-07-02),
 `YZ_CTXSAVE_WATCH` (DMA + syscall-entry watch on the task context-save protocol: logs
 transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA70 syscall —
-added 2026-07-02, REMOVE when the codec frontier closes), `YZ_IMGLOG`, `YZ_SIGW`,
+added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs
+from task images 3/4 — the codec/pool output writes; NOTE it excludes PUTLLC, so queue
+header atomics are invisible — 2026-07-02, REMOVE with the frontier), `YZ_SIGCALL`
+(dispatch.cpp: log indirect calls into the libsre LLE signal/queue family, addresses in
+scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
 `YZ_TS_WATCH`, `YZ_TASK_TRACE`, `YZ_TASK_RET`, `YZ_CB_TRACE`, `YZ_DRAIN_TRACE`, `YZ_RECPROBE`,
