@@ -202,6 +202,14 @@ static void apply_block(const rxs_stream* s, u32 index)
 #define SRV_TABLE_SIZE   16      /* descriptors per draw table              */
 #define SRV_RING_TABLES  4096
 
+/* B1: sampler heap. [0] is the default linear-clamp fallback; distinct
+ * decoded sampler states are interned after it. Each draw fills a
+ * 16-descriptor table (s0..s15) in a parallel shader-visible ring. */
+#define SMP_DEFAULT      0
+#define SMP_CACHE_SLOTS  MAX_TEXTURES
+#define SMP_TABLE_SIZE   16
+#define SMP_RING_TABLES  SRV_RING_TABLES
+
 /* Per-draw constant block for translated shaders: 512 vec4 transform
  * constants + viewport-derived position scale/offset (see VP decompiler). */
 #define CB_BLOCK_BYTES   ((512 + 2) * 16)
@@ -242,6 +250,22 @@ typedef struct {
     ID3D12Resource*            readback;
     u32                        width, height, rb_pitch;
 
+    /* B1: shared depth-stencil target (one D32_FLOAT_S8 buffer bound with
+     * every color surface; depth test/write honor the captured state) */
+    ID3D12DescriptorHeap*      dsv_heap;
+    ID3D12Resource*            depth;
+    int                        depth_cleared;   /* per-frame clear latch      */
+
+    /* B1: dynamic sampler heap (per-unit filter/wrap/LOD from the capture).
+     * Samplers are interned by their decoded key; a per-draw table of 16
+     * sampler descriptors mirrors the SRV table ring. */
+    ID3D12DescriptorHeap*      smp_cpu_heap;   /* interned sampler cache      */
+    ID3D12DescriptorHeap*      smp_heap;       /* shader-visible ring         */
+    u32                        smp_step;
+    u32                        smp_ring_used;
+    u32                        smp_keys[MAX_TEXTURES];
+    u32                        n_samplers;
+
     ID3D12DescriptorHeap*      srv_cpu_heap; /* CPU-only cache descriptors   */
     ID3D12DescriptorHeap*      srv_heap;   /* shader-visible table ring      */
     u32                        srv_step;
@@ -275,6 +299,8 @@ static gpu_t g;
 
 static void srv_write(u32 slot, ID3D12Resource* tex);
 static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h);
+static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t);
+static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot);
 
 static int gpu_init(u32 width, u32 height, int use_hw)
 {
@@ -367,6 +393,61 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         return -1;
     g.srv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    /* B1: sampler heaps (CPU cache + shader-visible ring) mirroring the SRVs */
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC shd = {0};
+        shd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        shd.NumDescriptors = SMP_CACHE_SLOTS + 1;   /* +1 default fallback   */
+        shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_cpu_heap)))
+            return -1;
+        shd.NumDescriptors = SMP_RING_TABLES * SMP_TABLE_SIZE;
+        shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_heap)))
+            return -1;
+        g.smp_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        /* default sampler at cache slot 0: linear/clamp, full mip range */
+        D3D12_SAMPLER_DESC def = {0};
+        def.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        def.AddressU = def.AddressV = def.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        def.MaxLOD = D3D12_FLOAT32_MAX;
+        def.MaxAnisotropy = 1;
+        g.dev->lpVtbl->CreateSampler(g.dev, &def, smp_cpu(SMP_DEFAULT));
+    }
+
+    /* B1: shared depth-stencil target + DSV heap (D32_FLOAT_S8) */
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC dhd = {0};
+        dhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dhd.NumDescriptors = 1;
+        if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &dhd, &IID_ID3D12DescriptorHeap, (void**)&g.dsv_heap)))
+            return -1;
+        D3D12_HEAP_PROPERTIES dhp = {0};
+        dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC drd = {0};
+        drd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        drd.Width = width;
+        drd.Height = height;
+        drd.DepthOrArraySize = 1;
+        drd.MipLevels = 1;
+        drd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        drd.SampleDesc.Count = 1;
+        drd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE dcv = {0};
+        dcv.Format = drd.Format;
+        dcv.DepthStencil.Depth = 1.0f;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &dhp, D3D12_HEAP_FLAG_NONE, &drd,
+                                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, &dcv,
+                                                          &IID_ID3D12Resource, (void**)&g.depth))) {
+            printf("[gpu] depth buffer create failed; depth test disabled\n");
+            g.depth = NULL;
+        } else {
+            D3D12_CPU_DESCRIPTOR_HANDLE dh;
+            g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dh);
+            g.dev->lpVtbl->CreateDepthStencilView(g.dev, g.depth, NULL, dh);
+        }
+    }
+
     /* per-draw constant ring for the translated shaders */
     bd.Width = CB_RING_BYTES;
     if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
@@ -414,12 +495,17 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     if (FAILED(hr)) return -1;
 
     /* translated-shader root signature: b0 root CBV (VS constants+viewport),
-     * one 16-descriptor SRV table t0..t15 (PS), 16 static linear samplers */
+     * one 16-descriptor SRV table t0..t15 (PS), one 16-descriptor dynamic
+     * sampler table s0..s15 (PS). B1: samplers are per-unit descriptors that
+     * carry the captured filter/wrap/LOD, not baked static samplers. */
     {
         D3D12_DESCRIPTOR_RANGE xrange = {0};
         xrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         xrange.NumDescriptors = SRV_TABLE_SIZE;
-        D3D12_ROOT_PARAMETER xp[2] = {0};
+        D3D12_DESCRIPTOR_RANGE srange = {0};
+        srange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        srange.NumDescriptors = SMP_TABLE_SIZE;
+        D3D12_ROOT_PARAMETER xp[3] = {0};
         xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         xp[0].Descriptor.ShaderRegister = 0;
         xp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -427,16 +513,15 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         xp[1].DescriptorTable.NumDescriptorRanges = 1;
         xp[1].DescriptorTable.pDescriptorRanges = &xrange;
         xp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_STATIC_SAMPLER_DESC xsmp[16];
-        for (u32 i = 0; i < 16; i++) {
-            xsmp[i] = smp;
-            xsmp[i].ShaderRegister = i;
-        }
+        xp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        xp[2].DescriptorTable.NumDescriptorRanges = 1;
+        xp[2].DescriptorTable.pDescriptorRanges = &srange;
+        xp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC xrsd = {0};
-        xrsd.NumParameters = 2;
+        xrsd.NumParameters = 3;
         xrsd.pParameters = xp;
-        xrsd.NumStaticSamplers = 16;
-        xrsd.pStaticSamplers = xsmp;
+        xrsd.NumStaticSamplers = 0;
+        xrsd.pStaticSamplers = NULL;
         xrsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ID3DBlob* xsig = NULL;
         if (FAILED(D3D12SerializeRootSignature(&xrsd, D3D_ROOT_SIGNATURE_VERSION_1, &xsig, &err))) {
@@ -591,6 +676,53 @@ static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
     return h;
 }
 
+/* ---- B1 sampler heap (parallels the SRV heap/ring) -------------------- */
+
+static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    g.smp_cpu_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.smp_cpu_heap, &h);
+    h.ptr += (size_t)slot * g.smp_step;
+    return h;
+}
+
+/* Intern a decoded sampler by key; return its CPU-cache slot. */
+static u32 sampler_slot(const rsx_dsp_texture* t, u32 key)
+{
+    for (u32 i = 0; i < g.n_samplers; i++)
+        if (g.smp_keys[i] == key)
+            return 1 + i;                 /* slot 0 = default fallback       */
+    if (g.n_samplers >= SMP_CACHE_SLOTS)
+        return SMP_DEFAULT;
+    D3D12_SAMPLER_DESC sd = decode_sampler(t);
+    const u32 slot = 1 + g.n_samplers;
+    g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
+    g.smp_keys[g.n_samplers++] = key;
+    return slot;
+}
+
+/* Fill the next 16-descriptor sampler table from cache slots; return GPU handle. */
+static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE])
+{
+    if (g.smp_ring_used >= SMP_RING_TABLES)
+        g.smp_ring_used = 0;
+    const u32 base = g.smp_ring_used++ * SMP_TABLE_SIZE;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dst;
+    g.smp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.smp_heap, &dst);
+    dst.ptr += (size_t)base * g.smp_step;
+    for (u32 i = 0; i < SMP_TABLE_SIZE; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE d = dst;
+        d.ptr += (size_t)i * g.smp_step;
+        g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, d, smp_cpu(slots[i]),
+                                             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE h;
+    g.smp_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.smp_heap, &h);
+    h.ptr += (u64)base * g.smp_step;
+    return h;
+}
+
 /* Create an immutable texture from CPU-prepared data: stage the rows in the
  * persistently-mapped upload arena, record the copy on the open list, and
  * leave the resource in PIXEL_SHADER_RESOURCE state. `rows`/`row_bytes`
@@ -652,6 +784,73 @@ static ID3D12Resource* create_texture_ex(DXGI_FORMAT fmt, u32 w, u32 h,
 static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
 {
     return create_texture_ex(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, rgba, w * 4, h);
+}
+
+/* B1: one mip level's CPU-side layout (top level at index 0). */
+typedef struct {
+    u32       w, h;         /* level dimensions (texels)                    */
+    const u8* data;         /* CPU source                                   */
+    u32       row_bytes;    /* bytes per source row (block row for BC)      */
+    u32       rows;         /* source row count (block rows for BC)         */
+} tex_level_t;
+
+/* Create an immutable MipLevels=n texture and upload every level. Each level
+ * is staged into the upload arena at its own 256-aligned pitch and copied to
+ * its subresource. Leaves the resource in PIXEL_SHADER_RESOURCE state. */
+static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
+{
+    if (n == 0)
+        return NULL;
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = lv[0].w;
+    rd.Height = lv[0].h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = (u16)n;
+    rd.Format = fmt;
+    rd.SampleDesc.Count = 1;
+    ID3D12Resource* tex = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                      &IID_ID3D12Resource, (void**)&tex))) {
+        printf("[gpu] mipped texture create failed (%ux%u x%u)\n", lv[0].w, lv[0].h, n);
+        return NULL;
+    }
+    for (u32 m = 0; m < n; m++) {
+        const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
+        const u32 start = (g.upload_used + 511) & ~511u;
+        if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) {
+            printf("[gpu] upload arena full at mip %u\n", m);
+            break;
+        }
+        for (u32 y = 0; y < lv[m].rows; y++)
+            memcpy(g.upload_mapped + start + (size_t)y * pitch,
+                   lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
+        D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+        src.pResource = g.upload;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = start;
+        src.PlacedFootprint.Footprint.Format = fmt;
+        src.PlacedFootprint.Footprint.Width = lv[m].w;
+        src.PlacedFootprint.Footprint.Height = lv[m].h;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = pitch;
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m;
+        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+        g.upload_used = start + pitch * lv[m].rows;
+    }
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = tex;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    return tex;
 }
 
 /* Find or create the render target for a (location, color offset) pair. */
@@ -869,6 +1068,238 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
     d[3] = remap_comp(s, remap, 0);             /* A */
 }
 
+/* ---------------------------------------------------------------------------
+ * B1: NV4097 render / sampler state -> D3D12
+ *
+ * The register file already holds every state method the capture wrote; here
+ * we decode the ones that gate the pixel result and translate them to D3D12
+ * pipeline / sampler descriptors. Method numbers come from tools/nv40_methods.py
+ * (envytools rnndb nv30-40_3d). The gcm enum values (blend factor/equation,
+ * comparison func, texture filter/wrap) are hardware ISA facts documented in
+ * envytools rnndb + the Mesa nv30 driver + psdevwiki; RPCS3 was consulted only
+ * as a read-only fact oracle for the bitfield positions (no code copied).
+ * -----------------------------------------------------------------------*/
+
+/* Method offsets (byte address >> 0; used with rsx_dsp_reg's word index) */
+#define M_ALPHA_TEST_ENABLE  0x0304
+#define M_ALPHA_FUNC         0x0308
+#define M_ALPHA_REF          0x030C
+#define M_BLEND_ENABLE       0x0310
+#define M_BLEND_SFACTOR      0x0314   /* rgb[0:15] a[16:31]                  */
+#define M_BLEND_DFACTOR      0x0318
+#define M_BLEND_EQUATION     0x0320   /* rgb[0:15] a[16:31]                  */
+#define M_DEPTH_FUNC         0x0A6C
+#define M_DEPTH_WRITE        0x0A70
+#define M_DEPTH_TEST_ENABLE  0x0A74
+#define M_CULL_FACE          0x1830   /* 0x404=FRONT 0x405=BACK 0x408=F&B    */
+#define M_FRONT_FACE         0x1834   /* 0x900=CW 0x901=CCW                  */
+#define M_CULL_FACE_ENABLE   0x183C
+
+/* gcm comparison func (0x200..0x207) -> D3D12_COMPARISON_FUNC (1..8) */
+static D3D12_COMPARISON_FUNC gcm_cmp(u32 f)
+{
+    switch (f) {
+    case 0x0200: return D3D12_COMPARISON_FUNC_NEVER;
+    case 0x0201: return D3D12_COMPARISON_FUNC_LESS;
+    case 0x0202: return D3D12_COMPARISON_FUNC_EQUAL;
+    case 0x0203: return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    case 0x0204: return D3D12_COMPARISON_FUNC_GREATER;
+    case 0x0205: return D3D12_COMPARISON_FUNC_NOT_EQUAL;
+    case 0x0206: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    case 0x0207: default: return D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+}
+
+/* gcm blend factor -> D3D12_BLEND (color form; the *_alpha row picks the
+ * alpha-channel equivalents where D3D12 distinguishes them) */
+static D3D12_BLEND gcm_blend_factor(u32 f, int alpha)
+{
+    switch (f) {
+    case 0x0000: return D3D12_BLEND_ZERO;
+    case 0x0001: return D3D12_BLEND_ONE;
+    case 0x0300: return alpha ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_SRC_COLOR;
+    case 0x0301: return alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
+    case 0x0302: return D3D12_BLEND_SRC_ALPHA;
+    case 0x0303: return D3D12_BLEND_INV_SRC_ALPHA;
+    case 0x0304: return D3D12_BLEND_DEST_ALPHA;
+    case 0x0305: return D3D12_BLEND_INV_DEST_ALPHA;
+    case 0x0306: return alpha ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_DEST_COLOR;
+    case 0x0307: return alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
+    case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
+    case 0x8001: return alpha ? D3D12_BLEND_BLEND_FACTOR : D3D12_BLEND_BLEND_FACTOR;   /* constant color */
+    case 0x8002: return D3D12_BLEND_INV_BLEND_FACTOR;
+    case 0x8003: return D3D12_BLEND_BLEND_FACTOR;   /* constant alpha (D3D12: single factor) */
+    case 0x8004: return D3D12_BLEND_INV_BLEND_FACTOR;
+    default:     return alpha ? D3D12_BLEND_ONE : D3D12_BLEND_ONE;
+    }
+}
+
+/* gcm blend equation -> D3D12_BLEND_OP */
+static D3D12_BLEND_OP gcm_blend_op(u32 e)
+{
+    switch (e) {
+    case 0x8006: return D3D12_BLEND_OP_ADD;             /* FUNC_ADD          */
+    case 0x8007: return D3D12_BLEND_OP_MIN;             /* MIN               */
+    case 0x8008: return D3D12_BLEND_OP_MAX;             /* MAX               */
+    case 0x800A: return D3D12_BLEND_OP_SUBTRACT;        /* FUNC_SUBTRACT     */
+    case 0x800B: return D3D12_BLEND_OP_REV_SUBTRACT;    /* FUNC_REV_SUBTRACT */
+    default:     return D3D12_BLEND_OP_ADD;
+    }
+}
+
+/* B1 state-group kill switches (env: set to "0" to disable a group).
+ * Default all ON; used to bisect regressions and as documented flags. */
+static int g_b1_blend = 1, g_b1_depth = 1, g_b1_cull = 1, g_b1_samp = 1;
+
+static void b1_read_env(void)
+{
+    char* e;
+    if ((e = getenv("YZ_B1_BLEND")) && e[0] == '0') g_b1_blend = 0;
+    if ((e = getenv("YZ_B1_DEPTH")) && e[0] == '0') g_b1_depth = 0;
+    if ((e = getenv("YZ_B1_CULL"))  && e[0] == '0') g_b1_cull  = 0;
+    if ((e = getenv("YZ_B1_SAMP"))  && e[0] == '0') g_b1_samp  = 0;
+}
+
+/* Decoded render state that folds into the PSO (and thus the PSO cache key) */
+typedef struct {
+    u32 blend_enable;
+    u32 sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
+    u32 depth_test, depth_write;
+    u32 depth_func;
+    u32 cull_enable, cull_face, front_face;
+} render_state_t;
+
+static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
+{
+    memset(rs, 0, sizeof(*rs));
+    rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
+    const u32 sf = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
+    const u32 df = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
+    const u32 eq = rsx_dsp_reg(rsx, M_BLEND_EQUATION);
+    rs->sf_rgb = sf & 0xFFFF; rs->sf_a = sf >> 16;
+    rs->df_rgb = df & 0xFFFF; rs->df_a = df >> 16;
+    rs->eq_rgb = eq & 0xFFFF; rs->eq_a = eq >> 16;
+    rs->depth_test  = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE) & 1;
+    rs->depth_write = rsx_dsp_reg(rsx, M_DEPTH_WRITE) & 1;
+    rs->depth_func  = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
+    rs->cull_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE) & 1;
+    rs->cull_face   = rsx_dsp_reg(rsx, M_CULL_FACE);
+    rs->front_face  = rsx_dsp_reg(rsx, M_FRONT_FACE);
+}
+
+/* Populate a D3D12 PSO descriptor's blend/depth/raster/DSV fields from rs.
+ * Depth is only enabled if the shared depth buffer exists. */
+static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+                               const render_state_t* rs)
+{
+    D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
+    b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (rs->blend_enable && g_b1_blend) {
+        b->BlendEnable   = TRUE;
+        b->SrcBlend      = gcm_blend_factor(rs->sf_rgb, 0);
+        b->DestBlend     = gcm_blend_factor(rs->df_rgb, 0);
+        b->BlendOp       = gcm_blend_op(rs->eq_rgb);
+        b->SrcBlendAlpha = gcm_blend_factor(rs->sf_a, 1);
+        b->DestBlendAlpha= gcm_blend_factor(rs->df_a, 1);
+        b->BlendOpAlpha  = gcm_blend_op(rs->eq_a);
+    }
+
+    pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    /* RSX front face: 0x900 = CW, 0x901 = CCW. D3D12 flips winding vs GL
+     * because our viewport epilogue negates Y (window-y-down -> NDC-y-up),
+     * so a CCW-front guest surface presents as CW-front here. Match RPCS3's
+     * d3d convention: FrontCounterClockwise = (front_face == CW). */
+    if (rs->cull_enable && rs->cull_face && g_b1_cull) {
+        const u32 f = rs->cull_face;
+        pd->RasterizerState.CullMode = (f == 0x0404) ? D3D12_CULL_MODE_FRONT
+                                     : (f == 0x0405) ? D3D12_CULL_MODE_BACK
+                                                     : D3D12_CULL_MODE_NONE; /* FRONT_AND_BACK */
+    } else {
+        pd->RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
+    /* RSX front-face 0x900=CW, 0x901=CCW. Our viewport epilogue negates Y,
+     * which mirrors every triangle and reverses its apparent winding, so the
+     * front sense must be taken straight from the guest value (a CCW-front
+     * guest triangle presents as the front we keep here). Empirically this
+     * matches the capture's back-face-culled character geometry. */
+    pd->RasterizerState.FrontCounterClockwise = (rs->front_face == 0x0901);
+
+    if (g.depth && g_b1_depth) {
+        pd->DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        pd->DepthStencilState.DepthEnable = rs->depth_test ? TRUE : FALSE;
+        pd->DepthStencilState.DepthWriteMask =
+            rs->depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+        pd->DepthStencilState.DepthFunc = gcm_cmp(rs->depth_func);
+        pd->DepthStencilState.StencilEnable = FALSE;
+    }
+}
+
+/* ---- sampler state (TEX_FILTER / TEX_ADDRESS / TEX_CONTROL0) ----------- */
+
+/* gcm texture wrap -> D3D12 address mode */
+static D3D12_TEXTURE_ADDRESS_MODE gcm_wrap(u32 w)
+{
+    switch (w & 0xF) {
+    case 1: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;         /* WRAP (repeat) */
+    case 2: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case 3: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* CLAMP_TO_EDGE */
+    case 4: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    case 5: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* CLAMP (to border, approx edge) */
+    case 6: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    case 7:
+    case 8: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    }
+}
+
+/* Build a D3D12 sampler desc from the texture's filter/wrap/control0 words.
+ * Filter word: min = [16:18], mag = [24:26] (gcm: 1=NEAREST 2=LINEAR,
+ * mip variants 3..6). Control0: min_lod = [19:30] max_lod = [7:18], both
+ * 4.8 fixed point (RPCS3 decode_fxp<4,8>). */
+static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
+{
+    D3D12_SAMPLER_DESC sd = {0};
+    const u32 minf = (t->filter >> 16) & 0x7;
+    const u32 magf = (t->filter >> 24) & 0x7;
+
+    /* min-filter mip mode: 1/2 = base level only (POINT mip), 3/4 = nearest
+     * mip (POINT mip), 5/6 = linear mix between mips (LINEAR mip). Whether
+     * the in-mip minification is point or linear: NEAREST_* (1,3,5) = point,
+     * LINEAR_* (2,4,6) = linear. */
+    const int min_linear = (minf == 2 || minf == 4 || minf == 6);
+    const int mag_linear = (magf == 2);
+    const int mip_linear = (minf == 5 || minf == 6);
+    const int mip_present = (minf >= 3);
+
+    D3D12_FILTER_TYPE mnf = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    D3D12_FILTER_TYPE mgf = mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    D3D12_FILTER_TYPE mpf = mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+
+    sd.AddressU = gcm_wrap(t->wrap);
+    sd.AddressV = gcm_wrap(t->wrap >> 8);
+    sd.AddressW = gcm_wrap(t->wrap >> 16);
+
+    /* 4.8 fixed-point LOD clamps from control0 */
+    const u32 max_lod_fx = (t->control0 >> 7)  & 0xFFF;
+    const u32 min_lod_fx = (t->control0 >> 19) & 0xFFF;
+    sd.MinLOD = (float)min_lod_fx / 256.0f;
+    sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
+    if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
+    sd.MaxAnisotropy = 1;
+    return sd;
+}
+
+/* A compact key so identical decoded samplers share one descriptor. */
+static u32 sampler_key(const rsx_dsp_texture* t)
+{
+    const u32 minf = (t->filter >> 16) & 0x7;
+    const u32 magf = (t->filter >> 24) & 0x7;
+    const u32 wrap = t->wrap & 0xFFFFFF;
+    const u32 lod  = (t->control0 >> 7) & 0x1FFFFF;  /* min+max LOD fields   */
+    return (minf) | (magf << 3) | ((wrap & 0xFFF) << 6) | (lod << 18);
+}
+
 /* Find (or decode and cache) the SRV slot for a guest texture descriptor.
  * Returns SRV_WHITE when the texture cannot be decoded. Guest memory is
  * read at first use; later block re-applies over the same memory are not
@@ -904,23 +1335,44 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2 || t->cubemap)
             break;
 
+        /* B1: mip chain. The format field's mip-count (t->mipmaps) says how
+         * many levels the guest packed after level 0; each level halves the
+         * dimensions (min 1) and is stored consecutively. When there is only
+         * one level this collapses to the stage-3 single-level path. */
+        u32 n_mips = t->mipmaps ? t->mipmaps : 1;
+        if (n_mips > 14) n_mips = 14;
+
         if (base_fmt == RSX_TEX_FMT_DXT1 || base_fmt == RSX_TEX_FMT_DXT23 ||
             base_fmt == RSX_TEX_FMT_DXT45) {
             /* S3TC blocks are byte-ordered identically on RSX and D3D12:
              * pass through as BC1/BC2/BC3 (no remap; the capture's DXT
-             * textures all use the identity crossbar) */
+             * textures all use the identity crossbar). Levels are packed
+             * back to back; BC data is never swizzled. */
             const DXGI_FORMAT dxgi = base_fmt == RSX_TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
                                    : base_fmt == RSX_TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
                                                                    : DXGI_FORMAT_BC3_UNORM;
             const u32 block = base_fmt == RSX_TEX_FMT_DXT1 ? 8 : 16;
-            const u32 bw = (w + 3) / 4, bh = (h + 3) / 4;
-            if ((u64)t->offset + (u64)bw * block * bh > ARENA_SIZE)
-                break;
             const u8* src = guest_ptr(t->location, t->offset);
             if (!src)
                 break;
-            e->tex = create_texture_ex(dxgi, (w + 3) & ~3u, (h + 3) & ~3u,
-                                       src, bw * block, bh);
+            tex_level_t lv[14];
+            u32 mw = w, mh = h, off = 0, n = 0;
+            for (u32 m = 0; m < n_mips && mw >= 1 && mh >= 1; m++) {
+                const u32 bw = (mw + 3) / 4, bh = (mh + 3) / 4;
+                if ((u64)t->offset + off + (u64)bw * block * bh > ARENA_SIZE)
+                    break;
+                lv[n].w = (mw + 3) & ~3u;
+                lv[n].h = (mh + 3) & ~3u;
+                lv[n].data = src + off;
+                lv[n].row_bytes = bw * block;
+                lv[n].rows = bh;
+                n++;
+                off += bw * block * bh;
+                if (mw == 1 && mh == 1) break;
+                mw = mw > 1 ? mw >> 1 : 1;
+                mh = mh > 1 ? mh >> 1 : 1;
+            }
+            e->tex = create_texture_mipped(dxgi, lv, n);
             break;
         }
 
@@ -935,29 +1387,50 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         }
         if (!texel_sz)
             break;
-        const u32 pitch = linear ? (t->pitch ? t->pitch : w * texel_sz) : w * texel_sz;
         if (!linear && ((w & (w - 1)) || (h & (h - 1))))
             break;                              /* swizzled implies po2 */
-        if ((u64)t->offset + (u64)pitch * h > ARENA_SIZE)
-            break;
         const u8* src = guest_ptr(t->location, t->offset);
         if (!src)
             break;
 
-        u8* rgba = malloc((size_t)w * h * 4);
-        if (!rgba)
-            break;
-        const u32 lw = log2_u32(w), lh = log2_u32(h);
-        for (u32 y = 0; y < h; y++) {
-            for (u32 x = 0; x < w; x++) {
-                const u8* p = linear
-                    ? src + (size_t)y * pitch + (size_t)x * texel_sz
-                    : src + (size_t)morton_index(x, y, lw, lh) * texel_sz;
-                decode_texel(base_fmt, p, remap, rgba + ((size_t)y * w + x) * 4);
+        /* Decode each mip level to RGBA8. Linear levels use the level-0 pitch
+         * for the base and packed w*texel for reduced levels (the guest can
+         * only supply a custom pitch for level 0); swizzled levels are Morton
+         * ordered at that level's own dimensions. */
+        u8* rgba[14] = {0};
+        tex_level_t lv[14];
+        u32 mw = w, mh = h, off = 0, n = 0;
+        int oom = 0;
+        for (u32 m = 0; m < n_mips && mw >= 1 && mh >= 1; m++) {
+            const u32 mpitch = (m == 0 && linear && t->pitch) ? t->pitch : mw * texel_sz;
+            if ((u64)t->offset + off + (u64)mpitch * mh > ARENA_SIZE)
+                break;
+            rgba[n] = malloc((size_t)mw * mh * 4);
+            if (!rgba[n]) { oom = 1; break; }
+            const u32 lw = log2_u32(mw), lh = log2_u32(mh);
+            const u8* lsrc = src + off;
+            for (u32 y = 0; y < mh; y++) {
+                for (u32 x = 0; x < mw; x++) {
+                    const u8* p = linear
+                        ? lsrc + (size_t)y * mpitch + (size_t)x * texel_sz
+                        : lsrc + (size_t)morton_index(x, y, lw, lh) * texel_sz;
+                    decode_texel(base_fmt, p, remap, rgba[n] + ((size_t)y * mw + x) * 4);
+                }
             }
+            lv[n].w = mw; lv[n].h = mh;
+            lv[n].data = rgba[n];
+            lv[n].row_bytes = mw * 4;
+            lv[n].rows = mh;
+            n++;
+            off += mpitch * mh;
+            if (mw == 1 && mh == 1) break;
+            mw = mw > 1 ? mw >> 1 : 1;
+            mh = mh > 1 ? mh >> 1 : 1;
         }
-        e->tex = create_texture_rgba(rgba, w, h);
-        free(rgba);
+        if (!oom && n)
+            e->tex = create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, lv, n);
+        for (u32 m = 0; m < n; m++)
+            free(rgba[m]);
     } while (0);
 
     if (e->tex)
@@ -965,6 +1438,11 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     else
         printf("[gpu] tex fallback: off=0x%X fmt=0x%02X %ux%u pitch=%u %s\n",
                t->offset, t->format, w, h, t->pitch, linear ? "linear" : "swizzled");
+    if (getenv("YZ_B1_TEXLOG"))
+        printf("[texlog] off=0x%X fmt=0x%02X %ux%u mips=%u filter minf=%u magf=%u %s\n",
+               t->offset, t->format, w, h, t->mipmaps,
+               (t->filter >> 16) & 7, (t->filter >> 24) & 7,
+               e->tex ? "ok" : "FALLBACK");
     const u32 slot = e->tex ? SRV_TEXTURE_BASE + g.n_textures : SRV_WHITE;
     g.n_textures++;
     return slot;
@@ -1006,8 +1484,10 @@ static void dump_text(const char* stem, u64 key, const char* ext, const void* da
     }
 }
 
-/* Compile the translated pair into a PSO (NULL on any failure). */
-static ID3D12PipelineState* build_translated_pso(const char* vs_hlsl, const char* ps_hlsl, u64 key)
+/* Compile the translated pair into a PSO (NULL on any failure). The captured
+ * blend/depth/cull render state (B1) is folded into the descriptor here. */
+static ID3D12PipelineState* build_translated_pso(const char* vs_hlsl, const char* ps_hlsl,
+                                                 u64 key, const render_state_t* rs)
 {
     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
     if (FAILED(D3DCompile(vs_hlsl, strlen(vs_hlsl), "xvs", NULL, NULL, "main",
@@ -1040,9 +1520,7 @@ static ID3D12PipelineState* build_translated_pso(const char* vs_hlsl, const char
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
     pd.InputLayout.pInputElementDescs = il;
     pd.InputLayout.NumElements = 16;
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    apply_render_state(&pd, rs);            /* B1: blend/depth/cull from capture */
     pd.SampleMask = 0xFFFFFFFFu;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
@@ -1089,6 +1567,10 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
 
     u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
     key = fnv1a(fp_uc, fp_size, key);
+    /* B1: the PSO bakes the render state, so it must be part of the cache key */
+    render_state_t rs;
+    decode_render_state(rsx, &rs);
+    key = fnv1a(&rs, sizeof(rs), key);
 
     for (u32 i = 0; i < g.n_psos; i++)
         if (g.psos[i].key == key)
@@ -1104,7 +1586,7 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
     const int fi = rsx_fp_decompile(fp_uc, fp_size, ps_hlsl, sizeof(ps_hlsl));
     if (vi > 0 && fi > 0)
-        pso = build_translated_pso(vs_hlsl, ps_hlsl, key);
+        pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
         printf("[xlat] decompile failed (vp=%d fp=%d) key=%016llx\n", vi, fi,
                (unsigned long long)key);
@@ -1455,10 +1937,13 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
      * offset) wins over guest memory: the capture's memory blocks hold
      * stale (pre-frame) contents for render targets. */
     u32 slots[SRV_TABLE_SIZE];
+    u32 smp_slots[SMP_TABLE_SIZE];      /* B1: per-unit sampler cache slots  */
     u32 surf_used[SRV_TABLE_SIZE];
     u32 n_surf_used = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
         slots[u] = SRV_WHITE;
+    for (u32 u = 0; u < SMP_TABLE_SIZE; u++)
+        smp_slots[u] = SMP_DEFAULT;
     rsx_dsp_texture t0;
     rsx_dsp_get_texture(rsx, 0, &t0);
     const u32 n_units = xpso ? SRV_TABLE_SIZE : 1;
@@ -1467,6 +1952,9 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         rsx_dsp_get_texture(rsx, u, &t);
         if (!t.enabled)
             continue;
+        /* B1: honor this unit's captured filter/wrap/LOD */
+        if (g_b1_samp)
+            smp_slots[u] = sampler_slot(&t, sampler_key(&t));
         int sampled_surface = -1;
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (g.surfaces[i].location == t.location &&
@@ -1496,10 +1984,15 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         const float* p0 = tri[0].a[0];
         rsx_dsp_surface sf;
         rsx_dsp_get_surface(rsx, &sf);
-        printf("[draw %2u] prim=%u verts=%u surf=0x%X %s v0=(%.2f %.2f %.2f)\n",
+        render_state_t drs;
+        decode_render_state(rsx, &drs);
+        printf("[draw %2u] prim=%u verts=%u surf=0x%X %s v0=(%.2f %.2f %.2f)"
+               " cull(en=%u face=0x%X front=0x%X) blend=%u depth(t=%u w=%u f=0x%X)\n",
                c->draw_count, prim, n_tri, sf.color_offset[0],
                xpso ? "XLAT" : (have_mvp ? "fb-mvp" : "fb-vp"),
-               p0[0], p0[1], p0[2]);
+               p0[0], p0[1], p0[2],
+               drs.cull_enable, drs.cull_face, drs.front_face,
+               drs.blend_enable, drs.depth_test, drs.depth_write, drs.depth_func);
     }
 
     /* transition every sampled surface RT -> SRV around the draw */
@@ -1513,11 +2006,26 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
     }
 
+    /* B1: bind the shared depth target with the color RT so depth-test/write
+     * state has somewhere to act; clear it once per frame to the far plane. */
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = surface_rtv(target);
-    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
-    ID3D12DescriptorHeap* heaps[] = {g.srv_heap};
-    g.list->lpVtbl->SetDescriptorHeaps(g.list, 1, heaps);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+    int have_dsv = 0;
+    if (g.depth) {
+        g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dsv);
+        have_dsv = 1;
+        if (!g.depth_cleared) {
+            g.list->lpVtbl->ClearDepthStencilView(
+                g.list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                1.0f, 0, 0, NULL);
+            g.depth_cleared = 1;
+        }
+    }
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, have_dsv ? &dsv : NULL);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    const D3D12_GPU_DESCRIPTOR_HANDLE smp_tbl = sampler_table(smp_slots);
 
     D3D12_VIEWPORT dvp = {0, 0, (float)g.width, (float)g.height, 0.0f, 1.0f};
     if (xpso) {
@@ -1556,6 +2064,7 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         g.list->lpVtbl->SetGraphicsRootConstantBufferView(
             g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+        g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, smp_tbl); /* B1 samplers */
         g.cb_used += CB_BLOCK_ALIGNED;
         dvp.Width = W;
         dvp.Height = H;
@@ -1618,6 +2127,7 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
         }
     }
     c->frame_no++;
+    g.depth_cleared = 0;    /* B1: re-clear depth for the next frame */
 }
 
 /* ---------------------------------------------------------------------------
@@ -1692,6 +2202,9 @@ int main(int argc, char** argv)
                " [--dump-shaders dir]\n", argv[0]);
         return 2;
     }
+    b1_read_env();
+    printf("[b1] state: blend=%d depth=%d cull=%d samp=%d\n",
+           g_b1_blend, g_b1_depth, g_b1_cull, g_b1_samp);
 
     rxs_stream s = {0};
     if (rxs_load(path, &s))
