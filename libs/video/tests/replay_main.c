@@ -839,6 +839,12 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
         s[3] = (u8)((v & 0x1F) * 255 / 31);
         break;
     }
+    case RSX_TEX_FMT_DEPTH24_D8:
+        /* D24S8 sampled as a color: broadcast the depth (top byte of the
+         * BE word's 24-bit depth field) — 8-bit approximation */
+        s[0] = 255;
+        s[1] = s[2] = s[3] = p[0];
+        break;
     default:                                    /* A8R8G8B8 */
         s[0] = p[0];
         s[1] = p[1];
@@ -912,7 +918,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         case RSX_TEX_FMT_B8:       texel_sz = 1; break;
         case RSX_TEX_FMT_A4R4G4B4:
         case RSX_TEX_FMT_A1R5G5B5: texel_sz = 2; break;
-        case RSX_TEX_FMT_A8R8G8B8: texel_sz = 4; break;
+        case RSX_TEX_FMT_A8R8G8B8:
+        case RSX_TEX_FMT_DEPTH24_D8: texel_sz = 4; break;
         default:                   texel_sz = 0; break;
         }
         if (!texel_sz)
