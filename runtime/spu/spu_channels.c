@@ -1446,17 +1446,21 @@ void spu_indirect_branch(spu_context* ctx)
      * taskset args/spurs in gpr4 (SPURS task-start ABI, cellSpursSpu.cpp:1395).
      * Log its indirect branches (uncapped by the 160-entry [spu-ib] cap) so we
      * can see the arg it launched with and where it spins. */
-    if (g_spu_prof_on && (ctx->pc & SPU_LS_MASK) >= 0x3000u
-            && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
+    /* 2026-07-03 s8: launch-arg capture — ENTRY branch only (pc 0x3050, the
+     * `bi savedContextLr` task launch) so the cap survives to the pxd freeze
+     * window; every task launch logs exactly once. Own lean flag (YZ_TASKARG)
+     * because YZ_SPU_PROF's per-branch overhead crawls the whole boot. */
+    { static int ta = -1; if (ta < 0) ta = getenv("YZ_TASKARG") ? 1 : 0;
+    if ((g_spu_prof_on || ta) && (ctx->pc & SPU_LS_MASK) == 0x3050u) {
         static int gst = 0;
-        if (gst < 60) { gst++;
+        if (gst < 400) { gst++;
             fprintf(stderr, "[gstask] ib pc=0x%05X arg(gpr3)=%08X_%08X_%08X_%08X "
                     "gpr4=%08X_%08X_%08X_%08X lr=0x%05X\n", ctx->pc & SPU_LS_MASK,
                     ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
                     ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1], ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3],
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         }
-    }
+    } }
     /* STARTTASK HELPER RETURN (2026-06-19). The taskset StartTask C-calls the
      * GUID-trace+poll helper at 0x1C50 (`spu_polfunc_000013B0(ctx); SPU_DRAIN`).
      * The helper ends `bi gpr7`(0x14CC), but gpr7 was clobbered to the trace LSA
