@@ -206,6 +206,21 @@ static inline const u32* rsx_dsp_constant(const rsx_dispatch* rsx, u32 slot)
     return rsx->constants[slot < RSX_DSP_NUM_CONSTANTS ? slot : 0];
 }
 
+/* Fragment program: SHADER_PROGRAM register (offset | dma-context in [1:0],
+ * 1 = local, 2 = main). Returns the byte offset, *location gets RSX_LOCATION_*. */
+u32 rsx_dsp_fragment_program(const rsx_dispatch* rsx, u32* location);
+
+/* SHADER_CONTROL raw word (register count, fp16-output flag, ...) */
+u32 rsx_dsp_shader_control(const rsx_dispatch* rsx);
+
+/* Transform program execution start slot (VP_START_FROM_ID) */
+u32 rsx_dsp_vp_start(const rsx_dispatch* rsx);
+
+/* Per-attribute immediate/default value (VTX_ATTR_4F register block):
+ * what a disabled vertex attribute reads as. Falls back to (0,0,0,1) when
+ * the register block was never written. */
+void rsx_dsp_vertex_default(const rsx_dispatch* rsx, u32 index, float out[4]);
+
 #ifdef __cplusplus
 }
 #endif
