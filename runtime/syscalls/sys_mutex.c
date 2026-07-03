@@ -316,8 +316,12 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
+    /* Audit sec.6 error-code fidelity (2026-07-03, user-confirmed): RPCS3
+     * sys_mutex.cpp:123 returns CELL_EPERM for a non-owner unlock, not the
+     * made-up CELL_EMUTEX_NOT_OWNED (0x80010120, error_codes.h:61) -- guest
+     * code that branches on EPERM (the real lv2 contract) mis-branched. */
     if (m->owner_tid != caller_tid) {
-        return (int64_t)(int32_t)CELL_EMUTEX_NOT_OWNED;
+        return (int64_t)(int32_t)CELL_EPERM;
     }
 
     m->lock_count--;

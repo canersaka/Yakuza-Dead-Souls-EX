@@ -7,6 +7,11 @@
 #include "../memory/vm.h"
 #include <string.h>
 
+#ifdef _WIN32
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")   /* timeBeginPeriod (audit item 6) */
+#endif
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
@@ -21,6 +26,23 @@ static void ensure_qpc_init(void)
     if (!s_qpc_init) {
         QueryPerformanceFrequency(&s_qpc_freq);
         s_qpc_init = 1;
+    }
+}
+
+/* Audit item 6 (2026-07-03, user-confirmed): pin the system timer resolution
+ * to 1ms the first time this module actually uses a waitable timer, so
+ * sys_timer_usleep's precision doesn't depend on yakuza/main.cpp having
+ * already called timeBeginPeriod(1) (main.cpp:1659 does this too, for
+ * scheduler-wide effect, but this module should be correct standalone --
+ * e.g. for a non-yakuza runtime consumer of ps3recomp_runtime). Idempotent
+ * one-shot; timeBeginPeriod is a process-wide, refcounted request so a
+ * second call from main.cpp is harmless. */
+static int s_time_period_init = 0;
+static void ensure_time_period_init(void)
+{
+    if (!s_time_period_init) {
+        timeBeginPeriod(1);
+        s_time_period_init = 1;
     }
 }
 #endif
@@ -98,9 +120,23 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     uint64_t usec = LV2_ARG_U64(ctx, 0);
 
 #ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
+    ensure_time_period_init();
+
+    /* Use high-resolution sleep via waitable timer for better precision.
+     * Audit item 6 (2026-07-03, user-confirmed): prefer
+     * CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+     * (Win10 1803+) -- it gives sub-millisecond timer resolution without
+     * needing the process-wide timeBeginPeriod(1) hack for THIS wait.
+     * Falls back to the plain CreateWaitableTimerW path (what this file
+     * used before) on older systems where the HIGH_RESOLUTION flag is
+     * rejected (CreateWaitableTimerExW returns NULL -- pre-1803 Windows 10,
+     * or Windows 7/8.x). */
     if (usec >= 1000) {
-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!timer) {
+            timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        }
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */

@@ -82,6 +82,39 @@ typedef struct mfc_engine {
                                    * write-generation = an idle reservation poll loop;
                                    * drives the host-yield backoff (see MFC_GETLLAR_CMD) */
     uint32_t    atomic_stat;      /* last MFC_RdAtomicStat value */
+
+    /* ---- Appended 2026-07-03: DMA-list stall-and-notify (F11/P6). ----
+     * CBEA v1.02 lists a stall-and-notify list element (bit 15 of the
+     * element's size-and-flags halfword, "b" in RPCS3's naming) as a request
+     * to SUSPEND list processing after that element completes, raise the Sn
+     * event (event bit 0x2), and wait for a matching MFC_WrListStallAck
+     * before continuing (Section 7.6.3 list-command description +
+     * Section 9.12: Sn = MFC list command stall-and-notify tag event, page-
+     * cited alongside F10 in specaudit_spu.md). RPCS3 SPUThread.cpp:3300-3320
+     * confirms the exact resume contract we mirror: on hitting a stalled
+     * element it records {tag (OR 0x80 = stalled), the EA of the NEXT
+     * element, the LS cursor, and the remaining list byte count} and returns
+     * without processing the rest; MFC_WrListStallAck (SPUThread.cpp:6280-
+     * 6298) takes a TAG NUMBER (not an element index), clears that tag's
+     * stall bit, and re-submits the remainder from the saved cursor.
+     * ch_stall_stat (RdListStallStat, SPUThread.cpp:5298/3313) is a per-TAG
+     * BITMASK (`rotl(1, tag)`), not an element index -- CBEA leaves the
+     * stalled-tag reporting format to note "which tag group('s) commands
+     * stalled"; we follow RPCS3's concrete, spec-consistent bitmask
+     * encoding rather than inventing our own.
+     *
+     * One in-flight stall per tag (32 tags) is enough to be faithful: real
+     * hardware processes the MFC queue in order per tag group, so a second
+     * list on the SAME tag cannot be issued by well-formed guest code before
+     * the first stall is acked (our synchronous engine also has no queue
+     * depth beyond 1 in-flight list transfer at a time). */
+    uint32_t    stall_mask;                     /* bit T set = tag T list transfer is stalled */
+    uint32_t    stall_list_lsa[32];              /* LS address of the (unread) list, per tag */
+    uint64_t    stall_ea_base[32];               /* ea_base passed to mfc_do_list_transfer, per tag */
+    uint32_t    stall_next_elem[32];             /* index of the NEXT (unprocessed) list element */
+    uint32_t    stall_num_elements[32];          /* total element count of the list, per tag */
+    uint32_t    stall_cur_lsa[32];               /* LS landing cursor to resume writing/reading at */
+    uint32_t    stall_base_cmd[32];              /* base GET/PUT command (list bit already stripped) */
 } mfc_engine;
 
 /* Single process-wide lock serializing lock-line transactions across all
@@ -261,23 +294,35 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     return 0;
 }
 
-/*
- * Execute a DMA list command (scatter/gather).
- * The list resides in the SPU's local store at `lsa`.
- * Each list element describes a (size, EA) pair for a sub-transfer.
- */
-static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
-                                        uint64_t ea_base, uint32_t list_size,
-                                        uint32_t cmd)
-{
-    /* list_size is in bytes; each element is 8 bytes */
-    uint32_t num_elements = list_size / 8;
-    uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
-    /* The LS landing accumulates across elements but the staging MFC_LSA register
-     * must NOT be permanently mutated -- use a local cursor (RPCS3 SPUThread.cpp). */
-    uint32_t cur_lsa = spu->mfc_lsa;
+/* SPU_EVENT_SN (stall-and-notify tag event), CBEA v1.02 Section 9.12 event bit
+ * table (page-cited alongside F10 in specaudit_spu.md: "Sn = 0x2"). Raised the
+ * first time ANY tag transitions into the stalled set (RPCS3 SPUThread.cpp:
+ * 3308-3311: `if (!ch_stall_stat.get_count()) set_events(SPU_EVENT_SN);` --
+ * i.e. edge-triggered on 0->nonzero stall_mask, not re-raised per stalled tag). */
+#define SPU_EVENT_SN 0x2u
 
-    for (uint32_t i = 0; i < num_elements; i++) {
+/*
+ * Execute a DMA list command (scatter/gather), starting at element `start_elem`
+ * of a list of `num_elements` total (both 0 unless resuming a previously
+ * stalled list -- see mfc_channel_write's MFC_WrListStallAck case below).
+ * The list resides in the SPU's local store at `list_lsa`; `cur_lsa` is the
+ * running LS landing cursor (the caller's mfc_lsa on a fresh start, or the
+ * saved cursor on resume). `base_cmd` is the GET/PUT opcode with the list bit
+ * already stripped.
+ *
+ * Returns 0 on normal completion, 1 if the list stalled on a stall-and-notify
+ * element (F11/P6: CBEA list commands + Section 9.12 Sn event; RPCS3
+ * SPUThread.cpp:3300-3320's resume contract, mirrored via mfc->stall_*[tag]
+ * rather than a re-queued mfc_cmd since our DMA is synchronous), or a
+ * negative mfc_do_transfer error.
+ */
+static inline int mfc_do_list_transfer_from(mfc_engine* mfc, spu_context* spu,
+                                             uint32_t tag, uint32_t list_lsa,
+                                             uint64_t ea_base, uint32_t base_cmd,
+                                             uint32_t start_elem, uint32_t num_elements,
+                                             uint32_t cur_lsa)
+{
+    for (uint32_t i = start_elem; i < num_elements; i++) {
         uint32_t elem_lsa = (list_lsa + i * 8) & SPU_LS_MASK;
 
         /* Read list element from local store (big-endian):
@@ -297,12 +342,45 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
         cur_lsa += (xfer_size + 15u) & ~15u;
 
         if (stall_notify) {
-            /* In a full emulator we would raise a stall-and-notify event.
-             * For recompiled code, we just continue. */
+            /* Suspend the list AFTER this element (the transfer above already
+             * ran -- CBEA: the stalling element's OWN transfer completes; only
+             * the REST of the list is held). Record enough to resume from
+             * element i+1 on MFC_WrListStallAck, and raise Sn (edge-triggered
+             * on the first tag to stall, matching RPCS3). */
+            uint32_t bit = 1u << (tag & 0x1Fu);
+            if (!mfc->stall_mask)
+                spu->event_status |= SPU_EVENT_SN;
+            mfc->stall_mask |= bit;
+            mfc->stall_list_lsa[tag]     = list_lsa;
+            mfc->stall_ea_base[tag]      = ea_base;
+            mfc->stall_next_elem[tag]    = i + 1u;
+            mfc->stall_num_elements[tag] = num_elements;
+            mfc->stall_cur_lsa[tag]      = cur_lsa;
+            mfc->stall_base_cmd[tag]     = base_cmd;
+            return 1;   /* stalled -- caller must NOT mark the tag completed */
         }
     }
 
     return 0;
+}
+
+/* Back-compat entry point: a fresh (non-resuming) list transfer. Kept so the
+ * existing mfc_submit call site reads the same as before; routes through
+ * mfc_do_list_transfer_from starting at element 0. */
+static inline int mfc_do_list_transfer(mfc_engine* mfc, spu_context* spu,
+                                        uint32_t tag, uint32_t list_lsa,
+                                        uint64_t ea_base, uint32_t list_size,
+                                        uint32_t cmd)
+{
+    /* list_size is in bytes; each element is 8 bytes */
+    uint32_t num_elements = list_size / 8;
+    uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
+    /* The LS landing accumulates across elements but the staging MFC_LSA register
+     * must NOT be permanently mutated -- use a local cursor (RPCS3 SPUThread.cpp). */
+    uint32_t cur_lsa = spu->mfc_lsa;
+
+    return mfc_do_list_transfer_from(mfc, spu, tag, list_lsa, ea_base, base_cmd,
+                                      0, num_elements, cur_lsa);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1111,15 +1189,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 
     /* Execute the transfer */
     if (mfc_is_list(cmd)) {
-        rc = mfc_do_list_transfer(spu, lsa, ea, size, cmd);
+        rc = mfc_do_list_transfer(mfc, spu, tag, lsa, ea, size, cmd);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
     }
 
-    /* Mark tag as completed */
-    mfc->tag_completed |= (1u << tag);
+    /* Mark tag as completed -- EXCEPT when the list stalled (rc==1, F11/P6):
+     * the transfer is genuinely incomplete until MFC_WrListStallAck resumes
+     * and finishes it, so RdTagStat/WrTagUpdate must not report this tag done
+     * yet (CBEA: a stalled list is not "completed", it is paused). */
+    if (rc != 1)
+        mfc->tag_completed |= (1u << tag);
 
-    return rc;
+    return (rc == 1) ? 0 : rc;   /* stall is not a transfer error */
 }
 
 /* ---------------------------------------------------------------------------
@@ -1198,7 +1280,37 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
         break;
     case MFC_WrListStallAck:
-        /* Acknowledge stall -- no-op in synchronous mode */
+        /* F11/P6 (CBEA v1.02 list commands + RPCS3 SPUThread.cpp:6280-6298):
+         * the written value's low 5 bits select a TAG (not an element index --
+         * matches RdListStallStat's per-tag bitmask below), whose stalled list
+         * transfer resumes from the next unprocessed element. Our DMA model is
+         * synchronous, so "resume" means finish the rest of the list right
+         * here rather than re-queuing an async command like RPCS3 does; the
+         * guest-visible contract (RdTagStat only reports the tag completed
+         * once the WHOLE list -- including the part after the stall point --
+         * has transferred) is preserved either way. An ack for a tag that
+         * isn't currently stalled is a no-op (nothing to resume), matching
+         * RPCS3's `if (ch_stall_mask & tag_mask)` guard. */
+        {
+            uint32_t t = value & 0x1Fu;
+            uint32_t bit = 1u << t;
+            if (mfc->stall_mask & bit) {
+                mfc->stall_mask &= ~bit;
+                int rc = mfc_do_list_transfer_from(mfc, spu, t,
+                             mfc->stall_list_lsa[t], mfc->stall_ea_base[t],
+                             mfc->stall_base_cmd[t], mfc->stall_next_elem[t],
+                             mfc->stall_num_elements[t], mfc->stall_cur_lsa[t]);
+                /* rc==1: the resumed remainder hit ANOTHER stall-and-notify
+                 * element -- mfc_do_list_transfer_from already re-recorded
+                 * mfc->stall_*[t] and re-set the stall bit + Sn event for
+                 * this tag, so the tag correctly stays incomplete. Only a
+                 * clean finish (rc==0) marks the tag's DMA as done -- this is
+                 * the same "list truly complete" gate mfc_submit applies to a
+                 * fresh (non-resumed) list. */
+                if (rc == 0)
+                    mfc->tag_completed |= bit;
+            }
+        }
         break;
     default:
         break;
@@ -1214,7 +1326,15 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
     case MFC_RdListStallStat:
-        return 0; /* no stalls in synchronous mode */
+        /* F11/P6 (CBEA v1.02 Section 7.5.3/7.6.3 list commands +
+         * Section 9.12 event table; RPCS3 SPUThread.cpp:5298
+         * `case MFC_RdListStallStat: return ch_stall_stat.get_count();`,
+         * :3313 `ch_stall_stat.set_value(rotl(1,tag) | ...)`): a per-tag
+         * bitmask of which tag groups' list transfers are currently
+         * stalled, not an element index. Zero when nothing is stalled --
+         * an un-stalled list therefore reads back exactly as before this
+         * change (F11's "behaves exactly as today" requirement). */
+        return mfc->stall_mask;
     case MFC_RdAtomicStat:
         return mfc->atomic_stat;
     default:
