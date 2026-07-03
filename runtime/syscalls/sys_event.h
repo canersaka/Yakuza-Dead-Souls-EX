@@ -45,6 +45,9 @@ typedef struct sys_event_t {
 #define SYS_PPU_QUEUE   1
 #define SYS_SPU_QUEUE   2
 
+/* sys_event_queue_destroy mode (audit sec.5 item 4; RPCS3 sys_event.h:21) */
+#define SYS_EVENT_QUEUE_DESTROY_FORCE  1
+
 typedef struct sys_event_queue_info {
     int      active;
     uint32_t protocol;
@@ -58,6 +61,14 @@ typedef struct sys_event_queue_info {
     int          head;
     int          tail;
     int          count;
+    /* Count of threads currently parked in sys_event_queue_receive on this
+     * queue (audit sec.5 item 4: destroy needs this to decide EBUSY vs
+     * proceeding). Modified only under `lock`. */
+    int          waiters;
+    /* Set by sys_event_queue_destroy(mode=FORCE) so parked receivers wake
+     * and return CELL_ECANCELED instead of CELL_ESRCH (RPCS3
+     * sys_event.cpp:273 forced-destroy path). */
+    int          force_destroyed;
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;

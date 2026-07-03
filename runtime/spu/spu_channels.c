@@ -14,6 +14,7 @@
 
 #include "spu_dma.h"
 #include "spu_helpers.h"   /* spu_rotqbyi: the real spursTasksetStartTask gpr4 seed */
+#include "../../include/ps3emu/error_codes.h"   /* CELL_EBUSY: send_event ack mapping */
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
@@ -291,8 +292,23 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                               ctx->spu_id,
                               ((uint64_t)spup << 32) | (v & 0xFFFFFFu),
                               data);
+                  /* runtime_cbea_audit.md sys_event slice item 1 (this file,
+                   * originally L294-295): the ack MUST reflect the push result,
+                   * not a hardcoded CELL_OK -- RPCS3 SPUThread.cpp:6052
+                   * (`atomic_storage<u32>::release(ch_in_mbox.values..., res)`)
+                   * writes the queue->send() RESULT into the SPU's InMbox for
+                   * sys_spu_thread_send_event, not a fixed success code, so a
+                   * full/dead destination queue is visible to the guest instead
+                   * of being silently reported as delivered. Our push helper's
+                   * only failure mode past this point (qid already resolved to
+                   * a live queue by spu_group_spup_queue above) is a full ring
+                   * buffer (sys_event.c event_queue_push returns -1 there) --
+                   * this file's OWN existing convention for that same -1 (see
+                   * sys_event_port_send, sys_event.c:642-643) is CELL_EBUSY, so
+                   * reuse it rather than inventing a new mapping. */
                   if (code < 64)                       /* send_event acks the SPU */
-                      spu_channel_write(&ctx->ch_in_mbox, 0 /* CELL_OK */);
+                      spu_channel_write(&ctx->ch_in_mbox,
+                          rc == 0 ? 0u /* CELL_OK */ : (uint32_t)(int32_t)CELL_EBUSY);
                   { static unsigned long n = 0;
                     if (n < 24) { n++;
                         fprintf(stderr, "[SPU] %s spup=%u data0=0x%X data1=0x%X -> queue %u (rc=%d)\n",
@@ -333,7 +349,30 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                 fflush(stderr); } } }
         spu_channel_write(&ctx->ch_out_intr_mbox, v);
         break;
-    case SPU_WrDec:          ctx->decrementer = v;                          break;
+    case SPU_WrDec:
+        /* Decrementer write (CBEA v1.02 Section 9.7 p145-146; F9/F21). Re-anchors
+         * the count: the written value becomes the new count and the guest
+         * timebase at this instant becomes the new zero point, mirroring RPCS3
+         * SPUThread.cpp:6309-6310 (`ch_dec_start_timestamp = get_timebased_time();
+         * ch_dec_value = value;`). Also re-arms counting if a prior WrEventAck
+         * had frozen it (CBEA Section 9.11.2 p158's ack-while-Tm-disabled stop
+         * rule, see SPU_WrEventAck below) -- "the decrementer... starts... when a
+         * wrch instruction targets SPU_WrDec" (p145).
+         *
+         * NOT implemented here: the decrementer EVENT (status bit 0x20, Tm, on an
+         * MSb 0->1 transition -- CBEA Section 9.12.5 p166), including the
+         * immediate-signal case where the written value's own MSb is already 1
+         * while the previous count's MSb was 0. Zero measured `wrch SPU_WrDec`
+         * sites exist in any lifted image today (F21) and only 1 WrEventMask + 1
+         * WrEventAck site total, so no guest code currently arms/consumes Tm --
+         * this is a documented remaining gap (specaudit_spu.md F9), not silently
+         * dropped: implementing the edge-detector would require persisting the
+         * pre-write MSb across writes/reads with no live case to validate it
+         * against, so it is left for when a real Tm consumer is measured. */
+        ctx->dec_value    = v;
+        ctx->dec_start_tb = ppu_timebase_now();
+        ctx->dec_running  = 1;
+        break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break;
     case SPU_WrEventAck:
         /* Lost-wakeup fix: serialize this read-modify-write against the PPU
@@ -345,6 +384,16 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         spu_lockline_lock();
         ctx->event_status &= ~v;
         spu_lockline_unlock();
+        /* Decrementer stop rule (CBEA v1.02 Section 9.11.2 p158 implementation
+         * note): acking the Tm event (bit 0x20) while Tm is DISABLED in the
+         * event mask stops the decrementer ("must stop... regardless of the
+         * status of the SPU decrementer event"; must NOT stop if Tm is enabled
+         * at ack time). F9's fix sketch. Freeze is inert today (no measured
+         * WrEventAck site ever acks 0x20 -- only 1 WrEventMask + 1 WrEventAck
+         * site total per F9/F21's live-exposure sweep) but is implemented
+         * faithfully since it composes for free with the SPU_WrDec re-arm above. */
+        if ((v & 0x20u) && !(ctx->event_mask & 0x20u))
+            ctx->dec_running = 0;
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
@@ -408,7 +457,25 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
-    case SPU_RdDec:         v = ctx->decrementer;                       break;
+    case SPU_RdDec:
+        /* Decrementer read (CBEA v1.02 Section 9.7 p146; F9/F21). Nonblocking;
+         * "successive reads can return the same value" (p146) -- true here too
+         * when called back-to-back within the same guest timebase tick.
+         * Overflow-safe: elapsed ticks can exceed dec_value (the count wraps
+         * past 0, which is architecturally correct -- it is a free-running
+         * counter), so the subtraction is done in 32-bit wrapping arithmetic
+         * exactly like a real 32-bit decrementer register. When dec_running is
+         * 0 (frozen by WrEventAck while Tm was disabled, CBEA Section 9.11.2
+         * p158) the count does not advance -- mirrors RPCS3's
+         * `is_dec_frozen ? 0 : (get_timebased_time() - ch_dec_start_timestamp)`
+         * (SPUThread.cpp:5183). */
+        {
+            uint64_t elapsed = ctx->dec_running
+                              ? (ppu_timebase_now() - ctx->dec_start_tb)
+                              : 0;
+            v = ctx->dec_value - (uint32_t)elapsed;
+        }
+        break;
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:
         /* NOTE: HW stalls here until an enabled event is pending; a hard block
@@ -417,7 +484,14 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
          * LR bit raised by spu_coh_notify_write is still visible to this read so
          * the polling service can pick it up. Revisit blocking once the idle
          * reservation line is confirmed to match what the PPU writes. */
-        v = *(volatile uint32_t*)&ctx->event_status;
+        /* F10 (CBEA v1.02 Section 9.11.1 p153): "Reading the SPU Read Event
+         * Status Channel... returns the value of the SPU Pending Event
+         * Register logically ANDed with the value in the SPU Write Event Mask
+         * Channel". The lifter's bisled emission already tests
+         * `(event_status & event_mask)` (spu_lifter.py) -- this makes the
+         * runtime channel-read path consistent with that, so code that masks
+         * an event to defer it does not still observe it here. */
+        v = (*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask;
         /* DIAG (YZ_SPU_PROF): does the service reach the event-wait path in
          * STEADY STATE? If RdEventStat fires after 20M GETLLARs, the LR-event
          * (Loop A) is live and worth implementing; if never, the spin is the
@@ -452,6 +526,16 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
         if (n < 50) { n++; fprintf(stderr, "[gst-ch] rchcnt ch%u pc=0x%05X\n", channel, ctx->pc & SPU_LS_MASK); }
     }
     switch (channel) {
+    case SPU_RdEventStat:
+        /* F10 (CBEA v1.02 Section 9.11.1 p153): "If no enabled events have
+         * occurred, a rchcnt... returns zeros" -- i.e. rchcnt(0) must be
+         * (pending & mask) ? 1 : 0, matching the same masking SPU_RdEventStat's
+         * read now applies (see spu_rdch above) and what the lifter's bisled
+         * emission already assumes. Zero measured rchcnt(ch0) sites in the
+         * current lifted images (specaudit_spu.md F10/F22's live sweep), so
+         * this closes a real spec gap without a currently-exercised regression
+         * risk. */
+        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) ? 1u : 0u;
     case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
@@ -459,6 +543,19 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify2:   return ctx->ch_sig_notify[1].count;
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
     case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
+    case MFC_RdListStallStat:
+        /* F11/P6: nonzero (readable) iff at least one tag is currently
+         * stalled, mirroring RPCS3 SPUThread.cpp:5298
+         * (`case MFC_RdListStallStat: return ch_stall_stat.get_count();`,
+         * where get_count() on the underlying channel is the popcount of
+         * stalled tags -- collapsed here to the architected 0/1 rchcnt
+         * result, matching every other channel's rchcnt encoding in this
+         * function). An un-stalled list therefore reads the same 0 it
+         * always would have (this channel was never in the old default-1
+         * path -- MFC_RdListStallStat had no rchcnt case before this change
+         * and fell through to the generic `default: return 1`, which was
+         * spec-wrong for the common "nothing stalled" case). */
+        return mfc_for(ctx)->stall_mask ? 1u : 0u;
     default:                 return 1;  /* default: channel ready */
     }
 }

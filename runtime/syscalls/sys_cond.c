@@ -179,6 +179,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (!m->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Audit item 1c (2026-07-03, user-confirmed; RPCS3 sys_cond.cpp:416-419,
+     * 479-481): the caller must currently own the associated mutex. lv2
+     * returns CELL_EPERM otherwise instead of touching the mutex/CS state --
+     * a non-owner caller releasing/re-acquiring a CS it never entered is UB
+     * on Win32 and corrupts whatever the real owner had saved. */
+    uint64_t caller_tid = ctx->thread_id;
+    if (m->owner_tid != caller_tid) {
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+
     /* The caller must hold the associated mutex. We need to release it
      * atomically with the wait and re-acquire it on wake. */
 
@@ -192,7 +202,14 @@ int64_t sys_cond_wait(ppu_context* ctx)
             fflush(stderr); }
     }
 
-    /* Save and clear ownership info */
+    /* Save and fully clear ownership info. Audit item 1c (RPCS3
+     * sys_cond.cpp:448 lock_count.exchange(0), :587 lock_count.release()):
+     * a recursive mutex held N times must release ALL N host-CS entries
+     * before parking, not just one -- SleepConditionVariableCS only leaves
+     * the CS ONCE, so a recursive holder (lock_count > 1) previously left
+     * the CS held N-1 times after "releasing" it, permanently blocking every
+     * other thread's EnterCriticalSection. Loop the Leave to match every
+     * guest-side Enter recorded by sys_mutex_lock/trylock (sys_mutex.c). */
     uint64_t saved_owner = m->owner_tid;
     int saved_count = m->lock_count;
     m->owner_tid = 0;
@@ -202,7 +219,21 @@ int64_t sys_cond_wait(ppu_context* ctx)
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
 
+    /* Release the extra N-1 recursion levels before the single implicit
+     * release SleepConditionVariableCS performs. */
+    for (int i = 1; i < saved_count; i++) {
+        LeaveCriticalSection(&m->cs);
+    }
+
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
+
+    /* Re-acquire the extra N-1 recursion levels so the host CS enter count
+     * matches saved_count again (EnterCriticalSection by the current thread
+     * is recursive and won't block -- SleepConditionVariableCS already
+     * re-entered once on wake). */
+    for (int i = 1; i < saved_count; i++) {
+        EnterCriticalSection(&m->cs);
+    }
 
     /* Restore ownership */
     m->owner_tid = saved_owner;
@@ -221,8 +252,25 @@ int64_t sys_cond_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
+    /* Same recursive-release requirement as the Win32 path above: pthread's
+     * PTHREAD_MUTEX_RECURSIVE mutex (sys_mutex.c) tracks its own internal
+     * recursion count, but pthread_cond_[timed]wait only performs ONE
+     * unlock/relock regardless of that count (POSIX). Drop the extra N-1
+     * levels ourselves so the mutex is genuinely free while parked. */
+    for (int i = 1; i < saved_count; i++) {
+        pthread_mutex_unlock(&m->mtx);
+    }
+
     if (timeout_us == 0) {
         pthread_cond_wait(&c->cv, &m->mtx);
+
+        for (int i = 1; i < saved_count; i++) {
+            pthread_mutex_lock(&m->mtx);
+        }
+
+        /* Restore ownership */
+        m->owner_tid = saved_owner;
+        m->lock_count = saved_count;
     } else {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -234,6 +282,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
         int rc = pthread_cond_timedwait(&c->cv, &m->mtx, &ts);
 
+        for (int i = 1; i < saved_count; i++) {
+            pthread_mutex_lock(&m->mtx);
+        }
+
         /* Restore ownership */
         m->owner_tid = saved_owner;
         m->lock_count = saved_count;
@@ -243,10 +295,6 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
         return CELL_OK;
     }
-
-    /* Restore ownership */
-    m->owner_tid = saved_owner;
-    m->lock_count = saved_count;
 #endif
 
     return CELL_OK;
