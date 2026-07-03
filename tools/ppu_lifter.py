@@ -1632,12 +1632,10 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])  # Note: vmaddfp operand order is vD, vA, vC, vB
             vc = int(ops[3][1:])
-            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
-                    f"float* a = (float*)&ctx->vr[{va}]; "
-                    f"float* b = (float*)&ctx->vr[{vb}]; "
-                    f"float* c = (float*)&ctx->vr[{vc}]; "
-                    f"d[0]=a[0]*c[0]+b[0]; d[1]=a[1]*c[1]+b[1]; "
-                    f"d[2]=a[2]*c[2]+b[2]; d[3]=a[3]*c[3]+b[3]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; "
+                    f"void* b=&ctx->vr[{vb}]; void* c=&ctx->vr[{vc}]; float r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=vrf(a,i)*vrf(c,i)+vrf(b,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vnmsubfp":
             # Vector Negative Multiply-Subtract: vD = -(vA * vC - vB) = vB - vA*vC
@@ -1645,31 +1643,29 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
-                    f"float* a = (float*)&ctx->vr[{va}]; "
-                    f"float* b = (float*)&ctx->vr[{vb}]; "
-                    f"float* c = (float*)&ctx->vr[{vc}]; "
-                    f"d[0]=b[0]-a[0]*c[0]; d[1]=b[1]-a[1]*c[1]; "
-                    f"d[2]=b[2]-a[2]*c[2]; d[3]=b[3]-a[3]*c[3]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; "
+                    f"void* b=&ctx->vr[{vb}]; void* c=&ctx->vr[{vc}]; float r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=vrf(b,i)-vrf(a,i)*vrf(c,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vaddfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]+b[0]; d[1]=a[1]+b[1]; d[2]=a[2]+b[2]; d[3]=a[3]+b[3]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=vrf(a,i)+vrf(b,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vsubfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]-b[0]; d[1]=a[1]-b[1]; d[2]=a[2]-b[2]; d[3]=a[3]-b[3]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=vrf(a,i)-vrf(b,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vmulfp":
             # Not a real PPC instruction but some disassemblers emit it
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]*b[0]; d[1]=a[1]*b[1]; d[2]=a[2]*b[2]; d[3]=a[3]*b[3]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=vrf(a,i)*vrf(b,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # VMX select (vsel) — bitwise select: vD = (vA & ~vC) | (vB & vC)
         if mn == "vsel":
@@ -1683,27 +1679,25 @@ class PPULifter:
                     f"uint64_t* c=(uint64_t*)&ctx->vr[{vc}]; "
                     f"d[0]=(a[0]&~c[0])|(b[0]&c[0]); d[1]=(a[1]&~c[1])|(b[1]&c[1]); }}")
 
-        # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
-        if mn.startswith("vcmpeqfp"):
+        # VMX FP compare (vcmpeqfp/gefp/gtfp), lane values read big-endian.
+        # Dot forms (Rc=1) update CR6 per AltiVec PEM Table 2-3 / vcmpeqfp page:
+        # CR6 = all_true || 0 || all_false || 0 (nibble bit LT=8 = all lanes
+        # true, EQ=2 = all lanes false), written into CR field 6 (bits 4-7). NaN
+        # lanes compare false via C (matching PEM: a NaN operand => result 0).
+        # (Ordered together with the S2-1 endianness fix: CR6 needs the correct
+        # per-lane values, so it must land in the same pass.)
+        vcmpfp_family = {"vcmpeqfp": "==", "vcmpgefp": ">=", "vcmpgtfp": ">"}
+        base_fp = mn.rstrip(".")
+        if base_fp in vcmpfp_family:
+            cmpop = vcmpfp_family[base_fp]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]==b[0]?~0u:0; d[1]=a[1]==b[1]?~0u:0; "
-                    f"d[2]=a[2]==b[2]?~0u:0; d[3]=a[3]==b[3]?~0u:0; }}")
-
-        if mn.startswith("vcmpgefp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]>=b[0]?~0u:0; d[1]=a[1]>=b[1]?~0u:0; "
-                    f"d[2]=a[2]>=b[2]?~0u:0; d[3]=a[3]>=b[3]?~0u:0; }}")
-
-        if mn.startswith("vcmpgtfp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]>b[0]?~0u:0; d[1]=a[1]>b[1]?~0u:0; "
-                    f"d[2]=a[2]>b[2]?~0u:0; d[3]=a[3]>b[3]?~0u:0; }}")
+            body = (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int t=0; for(int i=0;i<4;i++){{ uint32_t r=(vrf(a,i){cmpop}vrf(b,i))?~0u:0u; "
+                    f"vstw(d,i,r); t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (" uint32_t c6=(t==4?8u:0u)|(t==0?2u:0u); "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # VMX shift (vsldoi) — shift left double by octet immediate
         if mn == "vsldoi":
@@ -1722,24 +1716,34 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"int32_t* c=(int32_t*)&ctx->vr[{vc}]; "
-                    f"int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=c[i]+(int32_t)a[i*2]*(int32_t)b[i*2]+(int32_t)a[i*2+1]*(int32_t)b[i*2+1]; }}")
+            return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"void* c=&ctx->vr[{vc}]; void* d=&ctx->vr[{vd}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)vrw(c,i)"
+                    f"+(int32_t)(int16_t)vrh(a,i*2)*(int32_t)(int16_t)vrh(b,i*2)"
+                    f"+(int32_t)(int16_t)vrh(a,i*2+1)*(int32_t)(int16_t)vrh(b,i*2+1); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
 
-        # VMX integer compare
-        if mn.startswith("vcmpequh"):
+        # VMX integer compare (lane values read big-endian; dot forms add CR6
+        # per finding 4 -- see the vcmpgt_family tail below for the same math).
+        if mn.rstrip(".") == "vcmpequh":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<8;i++) d[i]=a[i]==b[i]?(uint16_t)~0:0; }}")
+            body = (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int t=0; for(int i=0;i<8;i++){{ uint16_t r=vrh(a,i)==vrh(b,i)?(uint16_t)~0:0; "
+                    f"vsth(d,i,r); t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (" uint32_t c6=(t==8?8u:0u)|(t==0?2u:0u); "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
-        if mn.startswith("vcmpequw"):
+        if mn.rstrip(".") == "vcmpequw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+            body = (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int t=0; for(int i=0;i<4;i++){{ uint32_t r=vrw(a,i)==vrw(b,i)?~0u:0u; "
+                    f"vstw(d,i,r); t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (" uint32_t c6=(t==4?8u:0u)|(t==0?2u:0u); "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # Vector compare greater-than, signed/unsigned, byte/half/word.
         # Unhandled until 2026-07-03 (fell to the TODO catch-all = silently
@@ -1747,20 +1751,35 @@ class PPULifter:
         # "instruction layer complete" audit predated the gap-rescue function
         # growth that exposed these). Dot forms set CR6 per AltiVec PEM:
         # bit0 (LT, 8) = all lanes true, bit2 (EQ, 2) = all lanes false.
+        # (name, elements, width-in-bytes, signed). Lane VALUES read big-endian
+        # (S2-1 fix): byte width needs no swap (vr.b[]), half/word go through the
+        # vrh/vrw accessors and back through vsth/vstw. CR6 math (654edfb) kept.
         vcmpgt_family = {
-            "vcmpgtsb": ("int8_t",   16), "vcmpgtsh": ("int16_t",  8),
-            "vcmpgtsw": ("int32_t",   4),
-            "vcmpgtub": ("uint8_t",  16), "vcmpgtuh": ("uint16_t", 8),
-            "vcmpgtuw": ("uint32_t",  4),
+            "vcmpgtsb": (16, 1, 1), "vcmpgtsh": (8, 2, 1), "vcmpgtsw": (4, 4, 1),
+            "vcmpgtub": (16, 1, 0), "vcmpgtuh": (8, 2, 0), "vcmpgtuw": (4, 4, 0),
         }
         base_mn = mn.rstrip(".")
         if base_mn in vcmpgt_family:
-            ety, n = vcmpgt_family[base_mn]
-            uty = ety.replace("int", "uint") if not ety.startswith("u") else ety
+            n, w, signed = vcmpgt_family[base_mn]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            body = (f"{{ {ety}* a=({ety}*)&ctx->vr[{va}]; {ety}* b=({ety}*)&ctx->vr[{vb}]; "
-                    f"{uty}* d=({uty}*)&ctx->vr[{vd}]; int t=0; "
-                    f"for(int i=0;i<{n};i++){{ {uty} r=a[i]>b[i]?({uty})~({uty})0:0; d[i]=r; t+=r?1:0; }}")
+            if w == 1:
+                sty, uty = "int8_t", "uint8_t"
+                get_a = f"(({sty})a->b[i])" if signed else f"a->b[i]"
+                get_b = f"(({sty})b->b[i])" if signed else f"b->b[i]"
+                setd = "d->b[i]=r"
+            elif w == 2:
+                sty, uty = "int16_t", "uint16_t"
+                get_a = f"(({sty})vrh(a,i))" if signed else f"vrh(a,i)"
+                get_b = f"(({sty})vrh(b,i))" if signed else f"vrh(b,i)"
+                setd = "vsth(d,i,r)"
+            else:
+                sty, uty = "int32_t", "uint32_t"
+                get_a = f"(({sty})vrw(a,i))" if signed else f"vrw(a,i)"
+                get_b = f"(({sty})vrw(b,i))" if signed else f"vrw(b,i)"
+                setd = "vstw(d,i,r)"
+            body = (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int t=0; for(int i=0;i<{n};i++){{ {uty} r={get_a}>{get_b}?({uty})~({uty})0:0; "
+                    f"{setd}; t+=r?1:0; }}")
             if mn.endswith("."):
                 body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
                          f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
@@ -1783,12 +1802,23 @@ class PPULifter:
             "vminsb":  None, "vminsh": None, "vminsw": None,
         }
 
-        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm", "vand"):
+        # Byte add/sub and the 64-bit-wide vand are lane-order-agnostic (raw
+        # bytes / bitwise) => storage cast is correct. The halfword/word add/sub
+        # forms reinterpret multi-byte lanes and must read/write big-endian
+        # (S2-1): route them through the vrh/vrw accessors.
+        if mn in ("vaddubm", "vsububm", "vand"):
             ty, cnt, op = vmx_int_binop[mn]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
                     f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<{cnt};i++) d[i]=a[i]{op}b[i]; }}")
+
+        if mn in ("vadduhm", "vsubuhm", "vadduwm", "vsubuwm"):
+            _, cnt, op = vmx_int_binop[mn]
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            g, s = ("vrh", "vsth") if cnt == 8 else ("vrw", "vstw")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<{cnt};i++) {s}(d,i,(uint32_t)({g}(a,i){op}{g}(b,i))); }}")
 
         if mn == "vandc":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -1804,7 +1834,9 @@ class PPULifter:
                     f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
                     f"d[0]=~(a[0]|b[0]); d[1]=~(a[1]|b[1]); }}")
 
-        # Integer min/max
+        # Integer min/max. Byte lanes are order-agnostic (raw vr.b[]); the
+        # halfword/word forms reinterpret multi-byte lanes and read/write
+        # big-endian (S2-1) via the vrh/vrw accessors.
         for prefix in ("vmax", "vmin"):
             for suffix, ty, cnt, signed in [("ub","uint8_t",16,0),("uh","uint16_t",8,0),
                                              ("uw","uint32_t",4,0),("sb","int8_t",16,1),
@@ -1813,17 +1845,23 @@ class PPULifter:
                 if mn == iname:
                     vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
                     cmp = ">" if prefix == "vmax" else "<"
-                    return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
-                            f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
-                            f"for(int i=0;i<{cnt};i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+                    if cnt == 16:
+                        return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
+                                f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
+                                f"for(int i=0;i<{cnt};i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+                    g, s = ("vrh", "vsth") if cnt == 8 else ("vrw", "vstw")
+                    cast = ty  # int16_t/uint16_t/int32_t/uint32_t
+                    return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                            f"for(int i=0;i<{cnt};i++){{ {cast} av=({cast}){g}(a,i); {cast} bv=({cast}){g}(b,i); "
+                            f"{s}(d,i,(uint32_t)(av{cmp}bv?av:bv)); }} }}")
 
-        # Float min/max
+        # Float min/max (lane values big-endian, S2-1)
         if mn == "vmaxfp" or mn == "vminfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             cmp = ">" if mn == "vmaxfp" else "<"
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++){{ float av=vrf(a,i),bv=vrf(b,i); r[i]=av{cmp}bv?av:bv; }} "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
         if mn in ("vspltisb", "vspltish", "vspltisw"):
@@ -1832,45 +1870,49 @@ class PPULifter:
             # Sign extend 5-bit to appropriate type
             if simm > 15: simm -= 32
             if mn == "vspltisb":
-                return (f"{{ memset(&ctx->vr[{vd}], (uint8_t){simm}, 16); }}")
+                return (f"{{ memset(&ctx->vr[{vd}], (uint8_t)(int8_t){simm}, 16); }}")
             elif mn == "vspltish":
-                return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; "
-                        f"for(int i=0;i<8;i++) d[i]={simm}; }}")
+                # each halfword lane = sign-extended imm, stored big-endian (S2-1)
+                return (f"{{ void* d=&ctx->vr[{vd}]; "
+                        f"for(int i=0;i<8;i++) vsth(d,i,(uint16_t)(int16_t)({simm})); }}")
             else:
-                return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
-                        f"for(int i=0;i<4;i++) d[i]={simm}; }}")
+                return (f"{{ void* d=&ctx->vr[{vd}]; "
+                        f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)(int32_t)({simm})); }}")
 
-        # Merge (vmrghb/h/w, vmrglb/h/w) — interleave elements
-        if mn.startswith("vmrg"):
+        # Merge (vmrghb/h/w, vmrglb/h/w) — interleave elements. Mnemonic layout
+        # is vmrg + {h|l}(high/low half) + {b|h|w}(element width). The old code
+        # keyed width off `"h" in mn[4:]`, which mis-fired for vmrghw/vmrglw
+        # ("hw"/"lw" both contain 'h') => they were merged as HALFWORDS. Element
+        # width is the LAST char, high/low is mn[4]. This is a pure element
+        # (byte) permutation so no endianness bswap is needed (raw storage copy).
+        if mn.startswith("vmrg") and len(mn) >= 6 and mn[5] in "bhw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            high = "h" in mn[4:5]
-            if "b" in mn[4:]:
-                ty, cnt = "uint8_t", 16
-            elif "h" in mn[4:]:
-                ty, cnt = "uint16_t", 8
-            else:
-                ty, cnt = "uint32_t", 4
+            high = (mn[4] == "h")
+            ty, cnt = {"b": ("uint8_t", 16), "h": ("uint16_t", 8), "w": ("uint32_t", 4)}[mn[5]]
             half = cnt // 2
             off = 0 if high else half
             return (f"{{ {ty} tmp[{cnt}]; {ty}* a=({ty}*)&ctx->vr[{va}]; {ty}* b=({ty}*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<{half};i++) {{ tmp[i*2]=a[{off}+i]; tmp[i*2+1]=b[{off}+i]; }} "
                     f"memcpy(&ctx->vr[{vd}], tmp, 16); }}")
 
-        # Float reciprocal estimate / reciprocal sqrt estimate
+        # Float reciprocal estimate / reciprocal sqrt estimate (lanes big-endian, S2-1)
         if mn == "vrefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=1.0f/b[i]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=1.0f/vrf(b,i); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vrsqrtefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=1.0f/sqrtf(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=floorf(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # The other three VMX round-to-FP-integer forms (audit 5b; PEM: vrfin
         # = round to nearest, vrfiz = toward zero, vrfip = toward +inf). Same
@@ -1878,8 +1920,9 @@ class PPULifter:
         if mn in ("vrfin", "vrfiz", "vrfip"):
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             fn = {"vrfin": "nearbyintf", "vrfiz": "truncf", "vrfip": "ceilf"}[mn]
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]={fn}(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # 2^x / log2(x) estimates (audit 5a; PEM 6-42/6-43, xo 0x18A/0x1CA;
         # RPCS3 PPUOpcodes.h:274,280). exp2f/log2f exceed the spec's 1/32
@@ -1887,52 +1930,65 @@ class PPULifter:
         if mn in ("vexptefp", "vlogefp"):
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             fn = "exp2f" if mn == "vexptefp" else "log2f"
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]={fn}(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
-        # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
+        # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int).
+        # Word lanes read/written big-endian (S2-1).
         if mn == "vcfsx" or mn == "vcfux":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
-            src_ty = "int32_t" if mn == "vcfsx" else "uint32_t"
+            cast = "(int32_t)" if mn == "vcfsx" else ""
             scale = f" / {1 << uimm}.0f" if uimm > 0 else ""
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=(float)b[i]{scale}; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; float r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(float)({cast}vrw(b,i)){scale}; "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # PEM vctsxs/vctuxs: SATURATE out-of-range (audit S2-3 class: the
         # plain cast was UB and sign-flipped positive overflow); NaN => 0.
+        # Word lanes read/written big-endian (S2-1).
         if mn == "vctsxs" or mn == "vctuxs":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
             scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
             if mn == "vctsxs":
-                return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                        f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; "
-                        f"d[i] = (v!=v) ? 0 : (v>=2147483647.0f) ? 2147483647 : "
-                        f"(v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v; }} }}")
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; "
-                    f"d[i] = (v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
-                    f"(v<=0.0f) ? 0u : (uint32_t)v; }} }}")
+                return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                        f"for(int i=0;i<4;i++){{ float v=vrf(b,i){scale}; "
+                        f"int32_t r = (v!=v) ? 0 : (v>=2147483647.0f) ? 2147483647 : "
+                        f"(v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v; vstw(d,i,(uint32_t)r); }} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{ float v=vrf(b,i){scale}; "
+                    f"uint32_t r = (v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
+                    f"(v<=0.0f) ? 0u : (uint32_t)v; vstw(d,i,r); }} }}")
 
-        # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
-        # PEM vcmpbfp: a NaN operand lane sets BOTH bounds bits (out of
-        # bounds); the C compares mapped NaN to 0 = "in bounds" (audit 4b).
-        if mn.startswith("vcmpbfp"):
+        # vcmpbfp[.] — bounds compare. Result bit0 (0x80000000) = a>b out high,
+        # bit1 (0x40000000) = a<-b out low; NaN operand => BOTH bits set (PEM,
+        # audit 4b). Word lanes big-endian (S2-1). Dot form (finding 4): CR6 bit
+        # 26 (nibble EQ=2) = all lanes in bounds (all result lanes==0); bit 24
+        # (LT=8) always 0 for vcmpbfp (PEM Table 2-3).
+        if mn.rstrip(".") == "vcmpbfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
-                    f"if(a[i]!=a[i] || b[i]!=b[i]) r=0xC0000000u; else {{ "
-                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; }} d[i]=r; }} }}")
+            body = (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int allin=1; for(int i=0;i<4;i++) {{ float av=vrf(a,i),bv=vrf(b,i); uint32_t r=0; "
+                    f"if(av!=av || bv!=bv) r=0xC0000000u; else {{ "
+                    f"if(av>bv) r|=0x80000000u; if(av<-bv) r|=0x40000000u; }} vstw(d,i,r); if(r) allin=0; }}")
+            if mn.endswith("."):
+                body += (" uint32_t c6=allin?2u:0u; "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # ------- Additional VMX integer instructions -------
-        # Byte compare equal
-        if mn.startswith("vcmpequb"):
+        # Byte compare equal (byte lanes are order-agnostic; dot form adds CR6).
+        if mn.rstrip(".") == "vcmpequb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<16;i++) d[i]=a[i]==b[i]?0xFFu:0u; }}")
+            body = (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
+                    f"for(int i=0;i<16;i++){{ uint8_t r=a[i]==b[i]?0xFFu:0u; d[i]=r; t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (" uint32_t c6=(t==16?8u:0u)|(t==0?2u:0u); "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # Saturating add
         if mn == "vaddsbs":
@@ -1940,30 +1996,28 @@ class PPULifter:
             return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
                     f"int8_t* b=(int8_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<16;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int8_t)(r>127?127:r<-128?-128:r);}} }}")
+        # Halfword/word saturating add reinterpret multi-byte lanes => read/write
+        # big-endian (S2-1). (Byte forms vaddsbs/vsububs stay raw vr.b[].)
         if mn == "vadduhs":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{uint32_t r=(uint32_t)a[i]+(uint32_t)b[i]; d[i]=(uint16_t)(r>65535u?65535u:r);}} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{uint32_t r=(uint32_t)vrh(a,i)+(uint32_t)vrh(b,i); vsth(d,i,(uint16_t)(r>65535u?65535u:r));}} }}")
         if mn == "vaddshs":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int16_t)(r>32767?32767:r<-32768?-32768:r);}} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)(int16_t)vrh(a,i)+(int32_t)(int16_t)vrh(b,i); vsth(d,i,(uint16_t)(int16_t)(r>32767?32767:r<-32768?-32768:r));}} }}")
         if mn == "vadduws":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint64_t r=(uint64_t)a[i]+(uint64_t)b[i]; d[i]=(uint32_t)(r>0xFFFFFFFFu?0xFFFFFFFFu:r);}} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{uint64_t r=(uint64_t)vrw(a,i)+(uint64_t)vrw(b,i); vstw(d,i,(uint32_t)(r>0xFFFFFFFFu?0xFFFFFFFFu:r));}} }}")
 
         # Subtract saturate
         if mn == "vsubsws":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
-                    f"int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)a[i]-(int64_t)b[i]; d[i]=(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)(int32_t)vrw(a,i)-(int64_t)(int32_t)vrw(b,i); vstw(d,i,(uint32_t)(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r));}} }}")
 
-        if mn == "vsububs":  # subtract unsigned byte, saturate to [0,255]
+        if mn == "vsububs":  # subtract unsigned byte, saturate to [0,255] (byte lanes, no swap)
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
@@ -1972,23 +2026,25 @@ class PPULifter:
         if mn == "vsum2sws":
             # AltiVec PEM: d.word1 = SAT_s32(a.w0 + a.w1 + b.w1);
             #              d.word3 = SAT_s32(a.w2 + a.w3 + b.w3); d.word0 = d.word2 = 0.
-            # (word index = BE element, matching the VMX handlers above.) temp
-            # buffer so vD may alias vA/vB.
+            # Word index = BE element (= storage index); lane VALUES read/written
+            # big-endian (S2-1). temp array so vD may alias vA/vB.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* a=(int32_t*)&ctx->vr[{va}]; int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
-                    f"int64_t s0=(int64_t)a[0]+a[1]+b[1]; int64_t s1=(int64_t)a[2]+a[3]+b[3]; "
+            return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; "
+                    f"int64_t s0=(int64_t)(int32_t)vrw(a,0)+(int32_t)vrw(a,1)+(int32_t)vrw(b,1); "
+                    f"int64_t s1=(int64_t)(int32_t)vrw(a,2)+(int32_t)vrw(a,3)+(int32_t)vrw(b,3); "
                     f"int32_t r[4]={{0,0,0,0}}; "
                     f"r[1]=(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
                     f"r[3]=(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
-                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
 
         if mn == "vupkhsh":
             # Unpack high signed halfword: sign-extend the high 4 halfwords
-            # (BE elements 0-3) to 4 words. temp so vD may alias vB.
+            # (BE elements 0-3, storage indices 0-3) to 4 words. Lane values
+            # read/written big-endian (S2-1). temp so vD may alias vB.
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
-            return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
-                    f"for(int i=0;i<4;i++) r[i]=(int32_t)b[i]; "
-                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+            return (f"{{ void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)(int16_t)vrh(b,i); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
 
         # Shifts and rotates
         if mn == "vslb":
@@ -1996,53 +2052,49 @@ class PPULifter:
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<16;i++) d[i]=(uint8_t)(a[i]<<(b[i]&7u)); }}")
+        # Word-lane shifts/rotates read/write big-endian (S2-1). Per-element
+        # shift count uses the low bits of each vB word (PEM: mod 32).
         if mn == "vslw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]<<(b[i]&31u); }}")
-        if mn == "vsrw":  # vector shift right word (logical), per-element count = b[i] & 31
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"uint32_t r[4]; for(int i=0;i<4;i++) r[i]=vrw(a,i)<<(vrw(b,i)&31u); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,r[i]); }}")
+        if mn == "vsrw":  # vector shift right word (logical), per-element count = vB word & 31
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
-        if mn == "vrlb":
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"uint32_t r[4]; for(int i=0;i<4;i++) r[i]=vrw(a,i)>>(vrw(b,i)&31u); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,r[i]); }}")
+        if mn == "vrlb":  # byte lanes: order-agnostic (raw vr.b[])
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<16;i++){{uint8_t s=b[i]&7u; d[i]=(a[i]<<s)|(a[i]>>(8u-s));}} }}")
+                    f"for(int i=0;i<16;i++){{uint8_t s=b[i]&7u; d[i]=s?((a[i]<<s)|(a[i]>>(8u-s))):a[i];}} }}")
         if mn == "vrlw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint32_t s=b[i]&31u; d[i]=(a[i]<<s)|(a[i]>>(32u-s));}} }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"uint32_t r[4]; for(int i=0;i<4;i++){{uint32_t av=vrw(a,i),s=vrw(b,i)&31u; r[i]=s?((av<<s)|(av>>(32u-s))):av;}} "
+                    f"for(int i=0;i<4;i++) vstw(d,i,r[i]); }}")
         if mn == "vsraw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"uint32_t r[4]; for(int i=0;i<4;i++) r[i]=(uint32_t)((int32_t)vrw(a,i)>>(vrw(b,i)&31u)); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,r[i]); }}")
 
         # (vmaxsw handled above by the generic vmax/vmin loop)
 
-        # Integer multiply (odd/even halfword)
-        if mn == "vmulouh":
+        # Integer multiply (odd/even halfword). Even = BE halfword elements
+        # 0,2,4,6; odd = 1,3,5,7 (= storage indices). Result words 0-3. Lane
+        # VALUES read/written big-endian (S2-1).
+        if mn == "vmulouh" or mn == "vmuleuh":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(uint32_t)a[1]*(uint32_t)b[1]; d[1]=(uint32_t)a[3]*(uint32_t)b[3]; "
-                    f"d[2]=(uint32_t)a[5]*(uint32_t)b[5]; d[3]=(uint32_t)a[7]*(uint32_t)b[7]; }}")
-        if mn == "vmuleuh":
+            off = 1 if mn == "vmulouh" else 0
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)vrh(a,2*i+{off})*(uint32_t)vrh(b,2*i+{off})); }}")
+        if mn == "vmulosh" or mn == "vmulesh":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(uint32_t)a[0]*(uint32_t)b[0]; d[1]=(uint32_t)a[2]*(uint32_t)b[2]; "
-                    f"d[2]=(uint32_t)a[4]*(uint32_t)b[4]; d[3]=(uint32_t)a[6]*(uint32_t)b[6]; }}")
-        if mn == "vmulosh":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(int32_t)a[1]*(int32_t)b[1]; d[1]=(int32_t)a[3]*(int32_t)b[3]; "
-                    f"d[2]=(int32_t)a[5]*(int32_t)b[5]; d[3]=(int32_t)a[7]*(int32_t)b[7]; }}")
+            off = 1 if mn == "vmulosh" else 0
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)((int32_t)(int16_t)vrh(a,2*i+{off})*(int32_t)(int16_t)vrh(b,2*i+{off}))); }}")
 
         # Average unsigned byte
         if mn == "vavgub":
@@ -2064,40 +2116,48 @@ class PPULifter:
             return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
                     f"uint16_t v=b[{uimm}]; for(int i=0;i<8;i++) d[i]=v; }}")
 
-        # Pack signed halfword signed saturate
+        # Pack signed halfword signed saturate. Source halfword VALUES read
+        # big-endian (S2-1); the result is written as single bytes (no swap) to
+        # BE byte positions 0-15 (a's lanes -> 0-7, b's -> 8-15). temp so vD may
+        # alias vA/vB.
         if mn == "vpkshss":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
-                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
+            return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(a,i); r[i]=(uint8_t)(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(b,i); r[8+i]=(uint8_t)(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # Pack signed halfword UNSIGNED saturate (audit S2-6; PEM: clamp each
         # signed halfword to [0,255]). Same lane layout as vpkshss above.
         if mn == "vpkshus":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(uint8_t)(v>255?255:v<0?0:v);}} "
-                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(uint8_t)(v>255?255:v<0?0:v);}} }}")
+            return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(a,i); r[i]=(uint8_t)(v>255?255:v<0?0:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(b,i); r[8+i]=(uint8_t)(v>255?255:v<0?0:v);}} "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # Even/odd unsigned-byte multiplies (audit S2-6; PEM vmuleub/vmuloub).
-        # Lane indexing matches the vmulosh convention in this file (host-order
-        # sub-lanes: "even" = lower storage index of each pair).
+        # Source BYTES are order-agnostic (raw vr.b[]): even = byte elements
+        # 0,2,4,... (storage indices), odd = 1,3,5,...; the uint16 result lanes
+        # (0-7) are written big-endian (S2-1). temp so vD may alias vA/vB.
         if mn == "vmuleub" or mn == "vmuloub":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             off = 0 if mn == "vmuleub" else 1
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++) d[i]=(uint16_t)a[2*i+{off}]*(uint16_t)b[2*i+{off}]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; uint16_t r[8]; "
+                    f"for(int i=0;i<8;i++) r[i]=(uint16_t)a[2*i+{off}]*(uint16_t)b[2*i+{off}]; "
+                    f"for(int i=0;i<8;i++) vsth(d,i,r[i]); }}")
 
-        # vmsummbm (VA-form, 4 operands)
+        # vmsummbm (VA-form, 4 operands). Source BYTES order-agnostic; the s32
+        # accumulator vC and s32 result vD read/written big-endian (S2-1). temp
+        # so vD may alias vC.
         if mn == "vmsummbm":
             vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; int32_t* cc=(int32_t*)&ctx->vr[{vc}]; "
-                    f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
-                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
+            return (f"{{ void* d=&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; void* c=&ctx->vr[{vc}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+(int32_t)vrw(c,i); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
 
         # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
 
@@ -2413,6 +2473,43 @@ class PPULifter:
         lines.append("    *xer = (*xer & ~(1u << 29)) | (ca << 29);")
         lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
+        lines.append("")
+        # ---- VMX lane-endianness accessors (audit S2-1 / docs/PPU_VMX_ENDIANNESS.md) ----
+        # ctx->vr holds RAW big-endian bytes (lvx/stvx do a plain memcpy: guest
+        # memory byte 0 == vr.b[0], the MSB, matching AltiVec PEM Fig. 1-3 and
+        # 1.3.2.1: an aligned quadword load places EA's byte into byte element 0).
+        # BE element k of a typed view therefore lives at STORAGE INDEX k, but a
+        # little-endian host reads the multi-byte value byte-reversed. These
+        # accessors read/write element k (index k) with the per-width byte swap,
+        # so a handler's lane math sees the correct BE-ordered scalar value while
+        # byte-granular ops (vperm/lvsl/vsldoi/lvlx/merge/pack) keep using vr.b[]
+        # untouched. Bytes need no swap. Convention: "element k at index k".
+        lines.append("/* VMX big-endian lane accessors (raw-BE storage; see docs/PPU_VMX_ENDIANNESS.md) */")
+        lines.append("#if defined(_MSC_VER)")
+        lines.append("#define VR_BSWAP16(x) _byteswap_ushort(x)")
+        lines.append("#define VR_BSWAP32(x) _byteswap_ulong(x)")
+        lines.append("#define VR_BSWAP64(x) _byteswap_uint64(x)")
+        lines.append("#elif defined(__GNUC__) || defined(__clang__)")
+        lines.append("#define VR_BSWAP16(x) __builtin_bswap16(x)")
+        lines.append("#define VR_BSWAP32(x) __builtin_bswap32(x)")
+        lines.append("#define VR_BSWAP64(x) __builtin_bswap64(x)")
+        lines.append("#else")
+        lines.append("static inline uint16_t VR_BSWAP16(uint16_t v){return (uint16_t)((v>>8)|(v<<8));}")
+        lines.append("static inline uint32_t VR_BSWAP32(uint32_t v){v=((v&0x00FF00FFu)<<8)|((v&0xFF00FF00u)>>8);return (v<<16)|(v>>16);}")
+        lines.append("static inline uint64_t VR_BSWAP64(uint64_t v){v=((v&0x00FF00FF00FF00FFull)<<8)|((v&0xFF00FF00FF00FF00ull)>>8);v=((v&0x0000FFFF0000FFFFull)<<16)|((v&0xFFFF0000FFFF0000ull)>>16);return (v<<32)|(v>>32);}")
+        lines.append("#endif")
+        # Accessors take a raw pointer to the 16-byte lane storage (void*), so
+        # they are agnostic to whether ctx->vr is typed ppu_vr (generated header)
+        # or u128 (runtime ppu_context.h) -- both are the same 16 raw BE bytes.
+        # BE element k of width W lives at byte offset k*W (= storage index k).
+        lines.append("static inline uint16_t vrh(const void* v, int i) { uint16_t r; memcpy(&r,(const uint8_t*)v+i*2,2); return VR_BSWAP16(r); }")
+        lines.append("static inline uint32_t vrw(const void* v, int i) { uint32_t r; memcpy(&r,(const uint8_t*)v+i*4,4); return VR_BSWAP32(r); }")
+        lines.append("static inline uint64_t vrd(const void* v, int i) { uint64_t r; memcpy(&r,(const uint8_t*)v+i*8,8); return VR_BSWAP64(r); }")
+        lines.append("static inline void vsth(void* v, int i, uint16_t x) { uint16_t r=VR_BSWAP16(x); memcpy((uint8_t*)v+i*2,&r,2); }")
+        lines.append("static inline void vstw(void* v, int i, uint32_t x) { uint32_t r=VR_BSWAP32(x); memcpy((uint8_t*)v+i*4,&r,4); }")
+        lines.append("static inline void vstd(void* v, int i, uint64_t x) { uint64_t r=VR_BSWAP64(x); memcpy((uint8_t*)v+i*8,&r,8); }")
+        lines.append("static inline float vrf(const void* v, int i) { uint32_t u=vrw(v,i); float f; memcpy(&f,&u,4); return f; }")
+        lines.append("static inline void vstf(void* v, int i, float f) { uint32_t u; memcpy(&u,&f,4); vstw(v,i,u); }")
         lines.append("")
         return lines
 
