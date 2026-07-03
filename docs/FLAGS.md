@@ -71,7 +71,10 @@ journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
 every 4096th; also [jrnl-cur] = the consumer's walking-cursor GETLLARs caught by LSA
 0x37780 at any EA, and an event-arm release for YZ_SPU_TRACE_EVARM at the journal-head
-GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_GSPUT`
+GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_COND_TRACE`
+(sys_cond.c + sys_mutex.c: logs WAIT-enter/exit pairs and any SIGNAL that blocks acquiring
+the mutex CS on low-id conds, plus recursive-trylock re-entries — the boot-stall hunt's
+sync-layer x-ray; 2026-07-02, retire with the stall frontier), `YZ_GSPUT`
 (spu_dma.h: logs every put-class DMA issued under SPU image 0 with pc+ea+size — the probe
 that proved gs_task's back half applies journal patches (plain PUTs, pc 0xB60C) and issues
 FENCED stopper-release PUTs (pc 0x5F00); 2026-07-02, retire with `YZ_JRNL_WATCH`), `YZ_SIGCALL`

@@ -31,6 +31,19 @@ typedef struct {
     int in_use;
     int recursive;
     char name[8];
+    /* Destroy/recreate churn safety (2026-07-02, the ~1/5 boot-stall root):
+     * the game destroys+recreates some lwmutexes PER FILE during the asset
+     * sweep (guest 0x01655C98), concurrently with other threads locking them.
+     * cs_init: the host CS is initialized ONCE per slot and NEVER deleted or
+     * re-initialized (Delete/re-Init while another thread sits in Enter is
+     * UB that corrupts the CS -- the measured random forever-blocks).
+     * gen: bumped on destroy; lockers revalidate {in_use, gen} AFTER Enter
+     * and back out with ESRCH if the lwmutex died/recycled under them.
+     * owner_tid: lets destroy refuse (EBUSY) whenever the lwmutex is held,
+     * including held by the destroyer itself. */
+    int cs_init;
+    u32 gen;
+    unsigned long owner_tid;
 #ifdef _WIN32
     CRITICAL_SECTION cs;
 #else
@@ -77,6 +90,9 @@ void sys_lwmutex_reset_all(void)
 
 typedef struct {
     int in_use;
+    int cv_init;    /* CV initialized ONCE per slot, never re-init/destroyed
+                     * (re-init or destroy with a stale waiter parked is UB;
+                     * same churn-safety scheme as LwMutexSlot, 2026-07-02) */
     u32 lwmutex_id; /* index into s_lwmutex */
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
@@ -318,21 +334,27 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex
         if (!s_lwmutex[slot].in_use) {
             LwMutexSlot* m = &s_lwmutex[slot];
             m->in_use = 1;
+            m->owner_tid = 0;
             /* attr lives in guest memory: decode the BE flags word (a raw host
              * read of BE 0x10 sees 0x10000000, so the old check never matched). */
             m->recursive = (attr && (guest_be32(attr->recursive) & SYS_SYNC_RECURSIVE)) ? 1 : 0;
             if (attr)
                 memcpy(m->name, attr->name, 8);
 
+            /* Init the host lock ONCE per slot lifetime; recycled slots reuse
+             * the live CS (re-Init over a CS another thread may still be
+             * blocked on is UB -- see the struct comment). */
 #ifdef _WIN32
-            InitializeCriticalSection(&m->cs);
+            if (!m->cs_init) { InitializeCriticalSection(&m->cs); m->cs_init = 1; }
 #else
-            pthread_mutexattr_t mattr;
-            pthread_mutexattr_init(&mattr);
-            if (m->recursive)
+            if (!m->cs_init) {
+                pthread_mutexattr_t mattr;
+                pthread_mutexattr_init(&mattr);
                 pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
-            pthread_mutex_init(&m->mtx, &mattr);
-            pthread_mutexattr_destroy(&mattr);
+                pthread_mutex_init(&m->mtx, &mattr);
+                pthread_mutexattr_destroy(&mattr);
+                m->cs_init = 1;
+            }
 #endif
 
             memset(lwmutex, 0, sizeof(*lwmutex));
@@ -411,6 +433,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 #endif
         return CELL_ESRCH;
     }
+    u32 gen_snap = s_lwmutex[slot].gen;
 
 #ifdef _WIN32
     EnterCriticalSection(&s_lwmutex[slot].cs);
@@ -418,6 +441,26 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     pthread_mutex_lock(&s_lwmutex[slot].mtx);
 #endif
 
+    /* Revalidate AFTER acquiring: the lwmutex may have been destroyed (and
+     * the slot even recycled for a different lwmutex) while we were blocked
+     * in Enter. Real lv2 returns ESRCH to a locker of a destroyed lwmutex. */
+    if (!s_lwmutex[slot].in_use || s_lwmutex[slot].gen != gen_snap) {
+#ifdef _WIN32
+        LeaveCriticalSection(&s_lwmutex[slot].cs);
+#else
+        pthread_mutex_unlock(&s_lwmutex[slot].mtx);
+#endif
+        { static int n = 0; if (n < 40) { n++;
+            fprintf(stderr, "[lwm] lock lost race with destroy guest=0x%08X slot=%u -> ESRCH\n",
+                    YZ_GUEST_ADDR(lwmutex), slot); fflush(stderr); } }
+        return CELL_ESRCH;
+    }
+
+#ifdef _WIN32
+    s_lwmutex[slot].owner_tid = (unsigned long)GetCurrentThreadId();
+#else
+    s_lwmutex[slot].owner_tid = (unsigned long)(uintptr_t)pthread_self();
+#endif
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
     /* DIAG (pt47 LAYER-1 hypothesis): the Win32 CS is RECURSIVE, so the same
@@ -450,6 +493,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
         return CELL_ESRCH;
+    u32 gen_snap = s_lwmutex[slot].gen;
 
 #ifdef _WIN32
     if (!TryEnterCriticalSection(&s_lwmutex[slot].cs))
@@ -459,6 +503,21 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
         return CELL_EBUSY;
 #endif
 
+    /* Destroyed/recycled while we raced in (see sys_lwmutex_lock). */
+    if (!s_lwmutex[slot].in_use || s_lwmutex[slot].gen != gen_snap) {
+#ifdef _WIN32
+        LeaveCriticalSection(&s_lwmutex[slot].cs);
+#else
+        pthread_mutex_unlock(&s_lwmutex[slot].mtx);
+#endif
+        return CELL_ESRCH;
+    }
+
+#ifdef _WIN32
+    s_lwmutex[slot].owner_tid = (unsigned long)GetCurrentThreadId();
+#else
+    s_lwmutex[slot].owner_tid = (unsigned long)(uintptr_t)pthread_self();
+#endif
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
     return CELL_OK;
@@ -473,8 +532,10 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
         return CELL_ESRCH;
 
     lwmutex->recursive_count--;
-    if (lwmutex->recursive_count == 0)
+    if (lwmutex->recursive_count == 0) {
         lwmutex->lock_var = 0;
+        s_lwmutex[slot].owner_tid = 0;   /* full release: destroy may proceed */
+    }
 
 #ifdef _WIN32
     LeaveCriticalSection(&s_lwmutex[slot].cs);
@@ -496,29 +557,50 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 
     if (!lwmutex) return CELL_EFAULT;
 
+    slot_lock();   /* serialize vs create's slot recycling */
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+        slot_unlock();
         printf("[sysPrxForUser] sys_lwmutex_destroy -> ESRCH\n");
         return CELL_ESRCH;   /* already destroyed / never created */
     }
 
     /* lv2 refuses to destroy a held lwmutex (CELL_EBUSY) - games rely on
      * this when tearing down a heap another thread is still allocating
-     * from: the EBUSY keeps the lock (and the heap) alive. */
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+     * from: the EBUSY keeps the lock (and the heap) alive. owner_tid covers
+     * ALL holders including the destroyer itself (the old TryEnter check
+     * passed for a self-held recursive CS and then DELETED a held lock). */
+    if (s_lwmutex[slot].owner_tid != 0) {
+        slot_unlock();
         printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
         return CELL_EBUSY;
     }
-    LeaveCriticalSection(&s_lwmutex[slot].cs);
-    DeleteCriticalSection(&s_lwmutex[slot].cs);
-#else
-    if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
+#ifdef _WIN32
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        /* a locker is mid-Enter (pre-owner-write) */
+        slot_unlock();
+        printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
         return CELL_EBUSY;
-    pthread_mutex_unlock(&s_lwmutex[slot].mtx);
-    pthread_mutex_destroy(&s_lwmutex[slot].mtx);
-#endif
+    }
+    /* Mark dead WHILE holding the CS, so any locker blocked in Enter wakes
+     * into the revalidation path and backs out with ESRCH. The CS itself is
+     * NEVER deleted: a concurrent locker may still be sitting in Enter, and
+     * DeleteCriticalSection under it is UB (the 2026-07-02 ~1/5 boot-stall
+     * root -- random forever-blocks at whatever lock next contended). The
+     * slot's CS stays initialized and is reused by the next create. */
     s_lwmutex[slot].in_use = 0;
+    s_lwmutex[slot].gen++;
+    LeaveCriticalSection(&s_lwmutex[slot].cs);
+#else
+    if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0) {
+        slot_unlock();
+        return CELL_EBUSY;
+    }
+    s_lwmutex[slot].in_use = 0;
+    s_lwmutex[slot].gen++;
+    pthread_mutex_unlock(&s_lwmutex[slot].mtx);
+#endif
+    slot_unlock();
 
     memset(lwmutex, 0, sizeof(*lwmutex));
     printf("[sysPrxForUser] sys_lwmutex_destroy -> OK\n");
@@ -548,9 +630,9 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
             c->lwmutex_id = lwmutex->sleep_queue - 1;
 
 #ifdef _WIN32
-            InitializeConditionVariable(&c->cv);
+            if (!c->cv_init) { InitializeConditionVariable(&c->cv); c->cv_init = 1; }
 #else
-            pthread_cond_init(&c->cv, NULL);
+            if (!c->cv_init) { pthread_cond_init(&c->cv, NULL); c->cv_init = 1; }
 #endif
 
             lwcond->lwcond_queue = slot + 1;
@@ -609,9 +691,13 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 
 #ifdef _WIN32
     DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
-    if (!SleepConditionVariableCS(&s_lwcond[cslot].cv,
-                                   &s_lwmutex[mslot].cs, ms))
-    {
+    BOOL cw_ok = SleepConditionVariableCS(&s_lwcond[cslot].cv,
+                                          &s_lwmutex[mslot].cs, ms);
+    /* The CS is re-acquired on BOTH outcomes; re-mark ownership so a
+     * concurrent lwmutex_destroy keeps refusing (EBUSY) through the
+     * caller's post-wake critical section. */
+    s_lwmutex[mslot].owner_tid = (unsigned long)GetCurrentThreadId();
+    if (!cw_ok) {
         if (GetLastError() == ERROR_TIMEOUT)
             return CELL_ETIMEDOUT;
         return CELL_EFAULT;
@@ -644,13 +730,14 @@ s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
 
     if (!lwcond) return CELL_EFAULT;
 
+    slot_lock();
     u32 slot = lwcond->lwcond_queue - 1;
     if (slot < MAX_LWCOND && s_lwcond[slot].in_use) {
-#ifndef _WIN32
-        pthread_cond_destroy(&s_lwcond[slot].cv);
-#endif
+        /* The CV object itself is kept initialized for slot reuse: destroying
+         * it with a stale waiter parked is UB (churn-safety, 2026-07-02). */
         s_lwcond[slot].in_use = 0;
     }
+    slot_unlock();
 
     memset(lwcond, 0, sizeof(*lwcond));
     return CELL_OK;
