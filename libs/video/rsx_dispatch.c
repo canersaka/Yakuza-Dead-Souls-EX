@@ -318,7 +318,8 @@ void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out
     out->format    = (fmt >> 8) & 0xFF;
     out->mipmaps   = fmt >> 16;
     out->wrap      = rsx_dsp_reg(rsx, base + 0x08);
-    out->enabled   = rsx_dsp_reg(rsx, base + 0x0C) >> 31;
+    out->control0  = rsx_dsp_reg(rsx, base + 0x0C);
+    out->enabled   = out->control0 >> 31;
     out->remap     = rsx_dsp_reg(rsx, base + 0x10);
     out->filter    = rsx_dsp_reg(rsx, base + 0x14);
     const u32 rect = rsx_dsp_reg(rsx, base + 0x18);

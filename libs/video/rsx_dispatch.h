@@ -193,9 +193,10 @@ typedef struct rsx_dsp_texture {
     u32 width, height;   /* from TEX_NPOT_SIZE (image rect)                 */
     u32 pitch;           /* bytes per row (TEX_SIZE1 [0:19]); 0 for po2     */
     u32 depth;           /* TEX_SIZE1 [20:31]                               */
-    u32 wrap;            /* raw wrap/gamma word                             */
+    u32 wrap;            /* raw TEX_ADDRESS word (wrap s/t/r, anisobias)    */
     u32 remap;           /* raw component-remap (swizzle) word              */
-    u32 filter;          /* raw min/mag filter word                         */
+    u32 filter;          /* raw min/mag filter word (TEX_FILTER)            */
+    u32 control0;        /* raw TEX_CONTROL0 word (enable[31], LOD fields)  */
     u32 border_color;
 } rsx_dsp_texture;
 void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out);
