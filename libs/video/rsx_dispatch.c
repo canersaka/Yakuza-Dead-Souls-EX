@@ -17,6 +17,13 @@
  *   0x0A20..0x0A2C VIEWPORT_TRANSLATE[4]  0x0A30..0x0A3C VIEWPORT_SCALE[4]
  *   0x0B80..0x0BFC VP_UPLOAD_INST window (load ptr auto-advances per vec4)
  *   0x1680+i*4 VTXBUF_OFFSET[i]  bit31 = location, [0:30] = offset
+ *   0x1840+i*4 TEX_SIZE1[i] (control3) pitch[0:19] depth[20:31]
+ *   0x1A00+i*0x20 fragment texture unit i (16 units, 8 words each):
+ *     +0x00 TEX_OFFSET   +0x04 TEX_FORMAT dma[0:1] (1 = local, 2 = main)
+ *                          cube[2] border[3] dims[4:7] fmt[8:15] mips[16:19]
+ *     +0x08 TEX_WRAP     +0x0C TEX_ENABLE (control0, enable = bit 31)
+ *     +0x10 TEX_SWIZZLE (component remap)  +0x14 TEX_FILTER
+ *     +0x18 TEX_NPOT_SIZE height[0:15] width[16:31]  +0x1C TEX_BORDER_COLOR
  *   0x1738 VERTEX_DATA_BASE_OFFSET  0x173C VB_ELEMENT_BASE
  *   0x1740+i*4 VTXFMT[i] type[0:3] size[4:7] stride[8:15] frequency[16:31]
  *   0x1808 VERTEX_BEGIN_END  arg = primitive, 0 = end
@@ -69,6 +76,8 @@
 #define M_IDXBUF_OFFSET         0x181C
 #define M_IDXBUF_FORMAT         0x1820
 #define M_VB_INDEX_BATCH        0x1824
+#define M_TEX_SIZE1             0x1840  /* + unit * 4  (control3)           */
+#define M_TEX_OFFSET            0x1A00  /* + unit * 0x20 (8-word unit block) */
 #define M_CLEAR_DEPTH_VALUE     0x1D8C
 #define M_CLEAR_COLOR_VALUE     0x1D90
 #define M_CLEAR_BUFFERS         0x1D94
@@ -118,6 +127,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_VERTEX_DATA_BASE,  2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VTXFMT,           16, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_IDXBUF_OFFSET,     2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_TEX_SIZE1,        16, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_TEX_OFFSET, RSX_DSP_NUM_TEXTURES * 8, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_CLEAR_DEPTH_VALUE, 2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_UPLOAD_FROM_ID, 1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_UPLOAD_CONST_ID, 1, RSX_DSP_CLASS_STATE);
@@ -283,6 +294,32 @@ void rsx_dsp_get_vertex_attr(const rsx_dispatch* rsx, u32 index, rsx_dsp_vertex_
     out->frequency = fmt >> 16;
     out->offset    = off & 0x7FFFFFFF;
     out->location  = off >> 31;
+}
+
+void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (unit >= RSX_DSP_NUM_TEXTURES)
+        return;
+    const u32 base = M_TEX_OFFSET + unit * 0x20;
+    const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
+    out->offset    = rsx_dsp_reg(rsx, base);
+    out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+    out->cubemap   = (fmt >> 2) & 1;
+    out->dimension = (fmt >> 4) & 0xF;
+    out->format    = (fmt >> 8) & 0xFF;
+    out->mipmaps   = fmt >> 16;
+    out->wrap      = rsx_dsp_reg(rsx, base + 0x08);
+    out->enabled   = rsx_dsp_reg(rsx, base + 0x0C) >> 31;
+    out->remap     = rsx_dsp_reg(rsx, base + 0x10);
+    out->filter    = rsx_dsp_reg(rsx, base + 0x14);
+    const u32 rect = rsx_dsp_reg(rsx, base + 0x18);
+    out->width     = rect >> 16;
+    out->height    = rect & 0xFFFF;
+    out->border_color = rsx_dsp_reg(rsx, base + 0x1C);
+    const u32 sz1  = rsx_dsp_reg(rsx, M_TEX_SIZE1 + unit * 4);
+    out->pitch     = sz1 & 0xFFFFF;
+    out->depth     = sz1 >> 20;
 }
 
 u32 rsx_dsp_vertex_data_base_offset(const rsx_dispatch* rsx)
