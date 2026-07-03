@@ -76,15 +76,33 @@ pack/unpack (PK*/UP*), DDX/DDY beyond XY, DST/LIT/DP2A/TXD/TXB, branching
 (IF/LOOP/REP/CAL/RET), conditional writes (COND_WRITE_ENABLE), fp16 precision
 differences (H registers are treated as full-precision float4).
 
-### Integration TODO (not done this increment)
-1. Wire `rsx_fp_decompile()` into the D3D12 backend: hash the bytecode at
-   `fragment_program_addr`, decompile once, compile with `D3DCompile`, cache
-   the PS blob, and fold the shader identity into the `PsoKey` so the PSO
-   cache builds a pipeline per (shader × blend × depth).
+Masked stores broadcast the result to `float4` first
+(`{ float4 _v = (rhs); dst.wz = _v.wz; }`) so a non-prefix write mask picks
+the CORRESPONDING result components — a plain `dst.w = rhs` would HLSL-
+truncate a vector rhs to `.x`, which is not what NV40 does.
+
+### Integration status (Track B stage 4, 2026-07-03)
+1. **DONE (capture replay).** `libs/video/tests/replay_main.c` hashes the
+   bytecode at SHADER_PROGRAM's (location, offset) at draw time (FNV-1a over
+   the walked program, inline constants included, combined with the vertex
+   program hash), decompiles once, D3DCompiles, and caches a PSO per shader
+   pair; failures fall back to the fixed stage-3 pipeline. The live D3D12
+   backend (`rsx_d3d12_backend.c`) is still on the placeholder path.
 2. **DONE.** Interpolated inputs COL0/COL1/FOG/TEXCOORD0..7 (+ WPOS via
-   SV_POSITION) are plumbed through the passthrough VS + 12-element input
-   layout; `input_expr` maps INPUT_SRC accordingly. TC8/TC9/FACING still → 0.
-   Caveat: passthrough-VP model (raw attributes forwarded; the vertex program
-   is not translated).
-3. Upload fragment-program constants to a constant buffer (the inline CONST
-   slots) and bind textures (depends on `d3d12_bind_texture`, still a stub).
+   SV_POSITION) come from the translated vertex program's VSOutput (identical
+   semantics both sides). TC8/TC9/FACING still → 0.
+3. **DONE (inline constants + textures).** Inline CONST slots are emitted as
+   HLSL literals (re-hashed each draw, so cellGcm ucode patching is caught);
+   all 16 fragment texture units are bound per draw through a shader-visible
+   descriptor-table ring (render-target-as-texture wins over guest memory).
+   Per-unit wrap/filter state is NOT yet applied (16 static linear-clamp
+   samplers).
+
+### Readable constant names (deferred)
+The game's shader containers (`data/shader/sh_ogrez_ps3.par`,
+`sh_ptc_ps3.par`) do embed cgc parameter-name strings (`c_light_vec`,
+`c_ps_user`, `diffuse`, `constant`, ...), but the .par payloads are
+SLLZ-compressed, so a raw strings-pass yields garbled fragments only.
+Mapping names to vp_c[] slots needs a PAR + SLLZ extractor and the CGB
+parameter table — deferred (cosmetic; would turn `vp_c[58]` into
+`c_mvp`-style identifiers in the emitted HLSL).
