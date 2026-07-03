@@ -81,6 +81,13 @@ extern "C" void spu_recomp_register_policy(void);
  * entry-7 shader-stream gate). Own image id: the reverse image-switch adopts it
  * at the call and re-adopts the policy on its bi $r0 return. */
 extern "C" void spu_recomp_register_tsexit(void);
+/* recomp_prx/job_module.c (generated) — Sony's SPURS JOB-CHAIN policy module
+ * (libsre ea 0x0202A180, 0x3E80 bytes, loaded to LS 0xA00 like the taskset
+ * policy). The game's pxd streaming layer runs a jobchain (wid 1, object
+ * 0x4019C880) whose jobs signal the IWL event flag t1 blocks on after the
+ * asset sweep; without this lift the kernel dispatched the jobchain into the
+ * SERVICE image's code (wrong image) -> wild EA-0 lock-line atomics. */
+extern "C" void spu_recomp_register_jobmod(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -1716,6 +1723,7 @@ int main(int argc, char** argv)
     spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
     spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
+    spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);

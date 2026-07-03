@@ -1225,7 +1225,13 @@ void spu_indirect_branch(spu_context* ctx)
          * LS 0xA00+) can't leak in. RPCS3 (pt11) does this via the kernel<->workload
          * context switch (reaches ResumeTask 0xB60). */
         static int off = -1; if (off < 0) off = getenv("YZ_NORESUME") ? 1 : 0;
-        if (!off && ctx->image_id == 2) {
+        /* image 13 = the JOB policy module (jobchain, wid 1) -- it shares the
+         * kernel2 poll/exit convention (bisl 0x838, poll link 0x231C). Without
+         * the clean coroutine return its idle poll-yields hit the destructive
+         * fresh-redispatch path and the workload rotation DIES ~+5 s (measured
+         * 2026-07-03 jobfix1: last [spu-img] switch at line 1953 of 860k, all
+         * tasksets starved). Image-2 semantics unchanged. */
+        if (!off && (ctx->image_id == 2 || ctx->image_id == 13)) {
             uint32_t lpc = ctx->pc & SPU_LS_MASK;
             uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             uint32_t wcl = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16)
@@ -1253,7 +1259,8 @@ void spu_indirect_branch(spu_context* ctx)
              * Default unchanged (gs_task only) until verified. */
             static int coret_gen = -1;
             if (coret_gen < 0) coret_gen = getenv("YZ_CORET_GEN") ? 1 : 0;
-            if (lpc == 0x838u && link == 0x231Cu && (wcl == 2u || coret_gen)) {
+            if (lpc == 0x838u && link == 0x231Cu
+                    && (wcl == 2u || ctx->image_id == 13 || coret_gen)) {
                 ctx->gpr[3]._u32[0] = ctx->gpr[3]._u32[1] = 0;
                 ctx->gpr[3]._u32[2] = ctx->gpr[3]._u32[3] = 0;
                 g_spu_trampoline_fn = 0;   /* no chain -> caller resumes at 0x231C */
