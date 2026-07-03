@@ -340,11 +340,16 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
             char m[5];
             dest_mask(w0, m);
 
+            /* Broadcast the result to float4 first so the write-mask picks
+             * the CORRESPONDING components: `dst.w = rhs` would HLSL-truncate
+             * a vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
+             * results (DPx/RCP/...) replicate, which is also the hardware
+             * behavior. */
             char line[800];
-            const char* sat_pre = (w0 & FP_OUT_SAT) ? "saturate(" : "";
-            const char* sat_post = (w0 & FP_OUT_SAT) ? ")" : "";
-            snprintf(line, sizeof(line), "    %s[%u].%s = %s%s%s;\n",
-                     dst_half ? "h" : "r", dst_idx, m, sat_pre, rhs, sat_post);
+            const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+            snprintf(line, sizeof(line),
+                     "    { float4 _v = (float4)(%s);%s %s[%u].%s = _v.%s; }\n",
+                     rhs, sat, dst_half ? "h" : "r", dst_idx, m, m);
             out_puts(&o, line);
 
             if (!dst_half && dst_idx == 0) wrote_r0 = 1;
