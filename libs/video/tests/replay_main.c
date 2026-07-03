@@ -23,6 +23,17 @@
  *            anything else falls back to a 1x1 white). The pixel shader
  *            modulates the sample by the vertex color (diffuse defaults
  *            to white), matching the capture's no-blend composite draw.
+ *   stage 4: NV40 shader translation. The active transform program (from
+ *            VP_START_FROM_ID) and fragment program (guest memory at
+ *            SHADER_PROGRAM) are decompiled to HLSL (../rsx_vp_decompiler.c,
+ *            ../rsx_fp_decompiler.c), D3DCompiled and cached as PSOs keyed
+ *            on the combined ucode hash. Vertices carry all 16 attributes
+ *            (CPU-fetched, disabled attrs read their VTX_ATTR_4F default),
+ *            512 transform constants + the RSX viewport transform ride a
+ *            per-draw CBV ring, and all 16 texture units bind through a
+ *            16-descriptor SRV table ring. Untranslatable pairs fall back
+ *            to the stage-3 fixed pipeline. Still ignored: blending, depth
+ *            test, per-unit samplers, VP condition codes / flow control.
  *
  * Build (see build_replay.cmd):
  *   cl /std:c17 /O2 /I..\..\..\include replay_main.c ..\rsx_dispatch.c
