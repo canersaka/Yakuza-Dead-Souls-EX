@@ -302,6 +302,31 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   break;
               }
           }
+          /* sys_event_flag set_bit protocol (codes 128 strict / 192 impatient
+           * -- RPCS3 SPUThread.cpp :6090-6160): the SPU sets bit (v&0xFFFFFF)
+           * of the lv2 EVENT FLAG whose id it wrote to OutMbox just before.
+           * MEASURED need (2026-07-03): Sony's SPURS taskset EXIT HANDLER
+           * (libsre blob at LS 0x10000) fires code 192 as its task-exit
+           * completion doorbell -- dropping it left the pxd job layer
+           * thinking its service task never finished (the entry-7 shader-
+           * stream gate). Strict form acks the setter's return code into the
+           * SPU InMbox; impatient form doesn't ack. */
+          if ((code == 128 || code == 192) && ctx->ch_out_mbox.count) {
+              extern int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat);
+              uint32_t bit  = v & 0xFFFFFFu;
+              uint32_t fid  = spu_channel_read(&ctx->ch_out_mbox);
+              int64_t rc = (bit < 64)
+                  ? sys_event_flag_set_by_id(fid, 1ull << bit)
+                  : (int64_t)(int32_t)0x80010002 /* CELL_EINVAL */;
+              if (code == 128)
+                  spu_channel_write(&ctx->ch_in_mbox, (uint32_t)rc);
+              { static unsigned long n = 0;
+                if (n < 24) { n++;
+                    fprintf(stderr, "[SPU] eflag_set_bit%s id=%u bit=%u (rc=0x%X)\n",
+                            code == 192 ? "_impatient" : "", fid, bit, (uint32_t)rc);
+                    fflush(stderr); } }
+              break;
+          }
           { static unsigned long n = 0;
             if (n < 12) { n++;
                 fprintf(stderr, "[SPU] WrOutIntrMbox v=0x%08X (no bound queue -- buffered)\n", v);
@@ -1354,6 +1379,26 @@ void spu_indirect_branch(spu_context* ctx)
          * -- that is what is resident under a running task by protocol. */
         if (foreign > 1 && pol_seen && la < 0x3000u && ctx->image_id != 2) {
             foreign = 1; foreign_img = 2; ffn = pol_fn;
+        }
+        /* Taskset EXIT-HANDLER overlay disambiguation: on a task's EXIT
+         * syscall Sony's policy DMAs the libsre exit blob (ea 0x02025500,
+         * 0x680 B) to LS 0x10000 and calls it (RPCS3 spursTasksetOnTaskExit,
+         * cellSpursSpu.cpp:1669/1673). Big EBOOT task images (spuimg6/9) own
+         * static code at 0x10000 too, so the exactly-one rule is ambiguous
+         * there. Disambiguate by CONTENT: if the bytes RESIDENT at LS 0x10000
+         * are the exit blob's (the DMA that just loaded them is the ground
+         * truth), the call is the exit-handler invocation -> image 12. A task
+         * image running its OWN 0x10000 code never reaches this scan (exact
+         * image match dispatches first). */
+        if (foreign > 1 && la >= 0x10000u && la < 0x10680u) {
+            extern uint8_t* vm_base;
+            if (memcmp(ctx->ls + 0x10000u, vm_base + 0x02025500u, 16) == 0) {
+                for (uint32_t i = 0; i < s_registry_count; i++)
+                    if (s_registry[i].addr == la && s_registry[i].image_id == 12) {
+                        foreign = 1; foreign_img = 12; ffn = s_registry[i].fn;
+                        break;
+                    }
+            }
         }
         if (foreign == 1 && ffn) {
             static int xn = 0;

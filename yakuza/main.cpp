@@ -73,6 +73,14 @@ extern "C" void spu_recomp_register_gstask(void);
  * system service -- so they must register under DISTINCT image ids and the
  * runtime switches ctx->image_id by DMA source EA (spu_dma.h). */
 extern "C" void spu_recomp_register_policy(void);
+/* recomp_prx/ts_exit.c (generated) — Sony's SPURS taskset EXIT-HANDLER blob
+ * (libsre ea 0x02025500, 0x680 bytes). On a task's EXIT syscall the policy DMAs
+ * it to LS 0x10000 and calls it (r3=taskset, r4=taskId, r5=exitCode, r6=args --
+ * RPCS3 spursTasksetOnTaskExit, cellSpursSpu.cpp:1669). Until it was lifted,
+ * every task exit died as "unknown branch LS 0x10000" (image 5's exit = the
+ * entry-7 shader-stream gate). Own image id: the reverse image-switch adopts it
+ * at the call and re-adopts the policy on its bi $r0 return. */
+extern "C" void spu_recomp_register_tsexit(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -1707,6 +1715,7 @@ int main(int argc, char** argv)
     spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
     spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
+    spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);

@@ -139,6 +139,8 @@ int64_t sys_event_flag_destroy(ppu_context* ctx);
 int64_t sys_event_flag_wait(ppu_context* ctx);
 int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);
+/* Internal by-id setter (also the SPU WrOutIntrMbox set_bit doorbell path). */
+int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat);
 int64_t sys_event_flag_clear(ppu_context* ctx);
 int64_t sys_event_flag_get(ppu_context* ctx);
 
