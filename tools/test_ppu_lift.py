@@ -28,6 +28,7 @@ need a vm stub harness).
 import argparse
 import os
 import random
+import struct
 import subprocess
 import sys
 
@@ -72,6 +73,16 @@ def cmp_form(xo, bf, l, ra, rb):
 
 def cmpi_form(op, bf, l, ra, imm):
     return (op << 26) | (bf << 23) | (l << 21) | (ra << 16) | (imm & 0xFFFF)
+
+# FP tranche encoders (Book I ch. 4; op63 = double/X-forms, op59 = single A-forms)
+def fp_x(opcd, frd, fra, frb, xo, rc=0):        # fctiw/fctiwz/fctid/fctidz/frsp
+    return (opcd << 26) | (frd << 21) | (fra << 16) | (frb << 11) | (xo << 1) | rc
+
+def fp_a(opcd, frd, fra, frb, frc, xo, rc=0):   # fadds/fsubs/fmuls/fdivs/fmadds/fsqrts
+    return (opcd << 26) | (frd << 21) | (fra << 16) | (frb << 11) | (frc << 6) | (xo << 1) | rc
+
+def fcmpu_form(bf, fra, frb):
+    return (63 << 26) | (bf << 23) | (fra << 16) | (frb << 11)
 
 # ---------------------------------------------------------------------------
 # PowerISA reference semantics (independent of the lifter). 64-bit registers;
@@ -222,10 +233,21 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # FP tranche additions: in_fprs {idx: 64-bit pattern}, exp_fprs [(idx, pattern, mask)]
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
+         in_fprs=None, exp_fprs=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                      in_fprs=in_fprs or {}, exp_fprs=exp_fprs or []))
+
+def dbits(x):
+    """64-bit pattern of a Python float as an IEEE double."""
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+def fbits_rounded(x):
+    """64-bit double pattern of x after rounding to single precision."""
+    return dbits(struct.unpack("<f", struct.pack("<f", x))[0])
 
 def pairs(n=6):
     ps = []
@@ -405,6 +427,74 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- FP tranche (2026-07-03: audit S2-2/S2-3/S2-4 landed) --------------
+    F = 1, 2, 3   # frd, fra, frb
+    NAN = dbits(float("nan"))
+
+    # fcmpu: Book I 4.6.8 -- NaN operand => FU (nibble bit 0). check_cr masks
+    # SO out, so the FU cases assert LT/GT/EQ all CLEAR (the old bug set EQ).
+    for name, a, b, nib in [
+        ("lt", 1.0, 2.0, 8), ("gt", 2.0, 1.0, 4), ("eq", 1.5, 1.5, 2),
+        ("nan-a", None, 1.0, 1), ("nan-b", 1.0, None, 1), ("nan-both", None, None, 1),
+    ]:
+        pa = NAN if a is None else dbits(a)
+        pb = NAN if b is None else dbits(b)
+        case(f"fcmpu {name}", fcmpu_form(0, F[1], F[2]), {},
+             [], exp_cr=(nib, 28), in_fprs={F[1]: pa, F[2]: pb})
+
+    # fctiwz/fctiw: saturation + rounding (S2-3). fctiw uses nearest-even.
+    LOW32 = 0x00000000FFFFFFFF
+    for name, v, zexp, nexp in [
+        ("2.5", 2.5, 2, 2),                 # nearest-even: 2.5 -> 2
+        ("1.5", 1.5, 1, 2),                 # nearest-even: 1.5 -> 2
+        ("-2.5", -2.5, -2 & 0xFFFFFFFF, -2 & 0xFFFFFFFF),
+        ("3e9", 3e9, 0x7FFFFFFF, 0x7FFFFFFF),      # positive SATURATES (old: sign-flip)
+        ("-3e9", -3e9, 0x80000000, 0x80000000),
+        ("nan", None, 0x80000000, 0x80000000),
+    ]:
+        pv = NAN if v is None else dbits(v)
+        case(f"fctiwz {name}", fp_x(63, F[0], 0, F[2], 15), {},
+             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], zexp, LOW32)])
+        case(f"fctiw {name}", fp_x(63, F[0], 0, F[2], 14), {},
+             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], nexp, LOW32)])
+
+    for name, v, zexp in [
+        ("2.5", 2.5, 2), ("1e19", 1e19, 0x7FFFFFFFFFFFFFFF),
+        ("-1e19", -1e19, 0x8000000000000000), ("nan", None, 0x8000000000000000),
+    ]:
+        pv = NAN if v is None else dbits(v)
+        case(f"fctidz {name}", fp_x(63, F[0], 0, F[2], 815), {},
+             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], zexp, MASK64)])
+
+    # Single-precision rounding (S2-4): the double intermediate must round to
+    # single. Inputs chosen so double != float(double).
+    sp_cases = [
+        ("fadds", 21, 1.0, 2.0 ** -30, 1.0 + 2.0 ** -30),
+        ("fsubs", 20, 1.0, -(2.0 ** -30), 1.0 + 2.0 ** -30),
+        ("fmuls", 25, 1.0 + 2.0 ** -12, 1.0 + 2.0 ** -12, (1.0 + 2.0 ** -12) ** 2),
+        ("fdivs", 18, 1.0, 3.0, 1.0 / 3.0),
+    ]
+    for name, xo, a, b, dres in sp_cases:
+        if name == "fmuls":   # A-form: frc holds the multiplier
+            word = fp_a(59, F[0], F[1], 0, F[2], xo)
+        else:
+            word = fp_a(59, F[0], F[1], F[2], 0, xo)
+        case(f"{name} rounds-to-single", word, {},
+             [], in_fprs={F[1]: dbits(a), F[2]: dbits(b)},
+             exp_fprs=[(F[0], fbits_rounded(dres), MASK64)])
+
+    # fmadds: (a*c)+b rounded to single
+    a, c, b = 1.0 + 2.0 ** -12, 1.0 + 2.0 ** -12, 2.0 ** -30
+    case("fmadds rounds-to-single", fp_a(59, 4, F[1], F[2], 5, 29), {},
+         [], in_fprs={F[1]: dbits(a), F[2]: dbits(b), 5: dbits(c)},
+         exp_fprs=[(4, fbits_rounded(a * c + b), MASK64)])
+
+    # Store-with-update RA writeback (S2-7): stwux/sthux/stbux (needs vm stub)
+    for name, xo in [("stwux", 183), ("sthux", 439), ("stbux", 247)]:
+        case(f"{name} RA update", x_logic(xo, R[0], R[1], R[2]),
+             {R[0]: 0x11223344AABBCCDD, R[1]: 0x100, R[2]: 0x24},
+             [(R[1], 0x124, MASK64)])
+
 build_cases()
 
 # ---------------------------------------------------------------------------
@@ -445,6 +535,30 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
         printf("FAIL %s: CR nibble@%d = %X want %X\\n", name, shift, got, nib); g_fail++;
     } else g_pass++;
 }
+static void check_fpr(const char* name, int reg, double got_d, uint64_t want, uint64_t mask) {
+    uint64_t got; memcpy(&got, &got_d, 8);
+    if ((got & mask) != (want & mask)) {
+        printf("FAIL %s: f%d = 0x%016llX want 0x%016llX (mask 0x%016llX)\\n",
+               name, reg, (unsigned long long)got, (unsigned long long)want,
+               (unsigned long long)mask);
+        g_fail++;
+    } else g_pass++;
+}
+/* vm stubs over a 64 KB scratch page (memory-op cases mask EAs into it).
+ * The preamble declares these extern "C"; only the emissions actually used
+ * by cases need to resolve, but the whole accessor set is provided. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+extern "C" uint8_t* vm_base = g_vm_stub;   /* stvlx-class emissions use it raw */
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" uint8_t  vm_read8 (uint64_t a) { return g_vm_stub[VMOFF(a)]; }
+extern "C" uint16_t vm_read16(uint64_t a) { uint16_t v; memcpy(&v, g_vm_stub + VMOFF(a), 2); return _byteswap_ushort(v); }
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
+extern "C" void vm_write8 (uint64_t a, uint8_t  v) { g_vm_stub[VMOFF(a)] = v; }
+extern "C" void vm_write16(uint64_t a, uint16_t v) { v = _byteswap_ushort(v); memcpy(g_vm_stub + VMOFF(a), &v, 2); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v);  memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -468,12 +582,18 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
         out.append("      memset(ctx, 0, sizeof(*ctx));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
+        for reg, pat in c["in_fprs"].items():
+            out.append(f"      {{ uint64_t t = 0x{pat:016X}ULL; "
+                       f"memcpy(&ctx->fpr[{reg}], &t, 8); }}")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for reg, pat, mask in c["exp_fprs"]:
+            body.append(f'        check_fpr("{nm}", {reg}, ctx->fpr[{reg}], '
+                        f"0x{pat:016X}ULL, 0x{mask:016X}ULL);")
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
