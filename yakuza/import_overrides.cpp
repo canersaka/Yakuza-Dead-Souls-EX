@@ -1213,32 +1213,30 @@ static int yz_rsx_fifo_step(void)
         const uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
                                               : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
-            /* Jump-to-self stopper. FAITHFUL DEFERRED-RELEASE APPLY (2026-06-28;
-             * env YZ_NO_APPLY_REL=1 to disable). ROOT (measured both sides): the
-             * producer JOURNALS a cross-segment stopper-release into its gcm op-list
-             * (tag-0x7F entry, entry[+4]=stopper EA) when S[0x1C]!=0 at the release,
-             * but our build never APPLIES that specific entry to the FIFO word --
-             * flush#11+ only patch the NEW frontier stopper, so the io 0x300000 word
-             * stays 0x20300000 (jump-to-self) and GET parks forever. RPCS3's producer
-             * PATCHES this exact word 0x20300000->0x20300004 (RPCS3.log 4923-4924) and
-             * GET flows. We realize the producer's OWN committed intent: iff
-             *   (a) the op-list holds a tag-0x7F release for THIS stopper EA (the
-             *       producer committed to releasing it), AND
-             *   (b) PUT is just AHEAD of GET in the ring (the body past the stopper is
-             *       BUILT and published),
-             * patch the word to a jump-forward (+4) so GET advances -- byte-identical
-             * end-state to RPCS3's producer-side patch. SELECTIVE (only the journaled
-             * stopper) + PUT-GATED (content built) -- unlike the reverted UNCONDITIONAL
-             * +4 that fired before the producer published and derailed into the unbuilt
-             * list at io 0x1104D00. */
-            static int noapply = -1; if (noapply < 0) noapply = getenv("YZ_NO_APPLY_REL") ? 1 : 0;
+            /* Jump-to-self stopper. DEFERRED-RELEASE APPLY -- RETIRED (default
+             * OFF 2026-07-02, layer-1 root-cause session; opt back in with
+             * YZ_APPLY_REL=1 for A/B). This stand-in was built (2026-06-28)
+             * when nothing released journaled stoppers because the REAL
+             * consumer couldn't run. Post il/SPU_RET/backoff fixes, gs_task
+             * (EDGE) demonstrably does the whole job itself: applies the
+             * tag-0x04/08/09/10 patches (plain PUTs, LS pc 0xB60C) THEN
+             * releases the stopper with a FENCED 4-byte PUT (pc 0x5F00) --
+             * measured via the [gs-put] probe; with this path off, GET never
+             * once met an unpatched stopper across 12 boots. Leaving it ON
+             * races Sony's consumer: it releases WITHOUT the preceding
+             * patches, handing GET unpatched content -- 3/3 applier-on boots
+             * wedged t1 at ~+6 s at an identical site; 0/12 with it off.
+             * Evidence: scratch/{bad1,cfgA*,cfgB*,val*}.err. The default is
+             * now a faithful memwatch: spin at the stopper until the real
+             * consumer patches it. Delete after quiet sessions. */
+            static int apply = -1; if (apply < 0) apply = getenv("YZ_APPLY_REL") ? 1 : 0;
             /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
              * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
              * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
-            const uint32_t rel_entry = (!noapply && ahead != 0u && ahead < (ring >> 1))
+            const uint32_t rel_entry = (apply && ahead != 0u && ahead < (ring >> 1))
                                            ? yz_gcm_stopper_release_entry(ea) : 0u;
             if (rel_entry) {
                 vm_write32(ea, 0x20000000u | ((get + 4u) & 0x1FFFFFFCu));   /* release: self-jump -> jump-forward +4 */

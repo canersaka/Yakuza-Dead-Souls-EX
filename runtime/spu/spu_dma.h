@@ -386,6 +386,78 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* Journal consumption watch (env YZ_JRNL_WATCH, 2026-07-02, diag — the
+     * LAYER-1 discriminator probe): does OUR gs_task ever touch the gcm
+     * journal HEAD lines (buffer A = 0x41F00080, B = 0x42100080) after its
+     * initial batch, and does ANY SPU ever PUT into the 2 MB journal arena
+     * (= the tag-zero/retire signal the RPCS3 oracle shows)? never-polls =>
+     * park/exit or per-append wakeup bug; polls-and-ignores => the emptiness
+     * test miscomputes on the dumped line content. REMOVE when the journal
+     * consumer frontier closes. */
+    { static int jw = -1; if (jw < 0) jw = getenv("YZ_JRNL_WATCH") ? 1 : 0;
+      if (jw) {
+          uint32_t jea   = (uint32_t)(ea & ~0x80000000ull);   /* atomics may tag bit 31 */
+          uint32_t jline = jea & ~127u;
+          int atomic = (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+                        cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD);
+          uint32_t jsz = atomic ? 128u : size;
+          int head = (jline == 0x41F00080u || jline == 0x42100080u);
+          int put  = (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                      cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)
+                     && jea < 0x42110000u && jea + jsz > 0x41F00000u;
+          /* the consumer's journal-cursor polls stage through LS 0x37780 —
+           * catching them by LSA (any EA) shows the walking cursor AND
+           * proves the consumer is still alive late in the run */
+          int curs = (cmd == MFC_GETLLAR_CMD && (lsa & SPU_LS_MASK) == 0x37780u);
+          if (curs && !head) {
+              static unsigned long cn = 0; cn++;
+              if (cn <= 40 || (cn & 0x3FFu) == 0) {
+                  fprintf(stderr, "[jrnl-cur] n=%lu spu=%X pc=0x%05X ea=0x%08X\n",
+                          cn, spu->spu_id, spu->pc & SPU_LS_MASK, jea);
+                  fflush(stderr);
+              }
+          }
+          if (head && cmd == MFC_GETLLAR_CMD && jline == 0x41F00080u) {
+              /* release event-armed tracing (YZ_SPU_TRACE_EVARM) at the
+               * consumer's journal-head poll — captures the consume/park
+               * decision path that follows the read */
+              extern int g_spu_trace_evarm;
+              g_spu_trace_evarm = 1;
+          }
+          if (head || put) {
+              static unsigned long jn = 0; jn++;
+              if (jn <= 80 || (jn & 0xFFFu) == 0) {
+                  fprintf(stderr, "[jrnl] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X",
+                          jn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                          lsa & SPU_LS_MASK, jea, size);
+                  if (head) {
+                      const uint8_t* m = vm_base + jline;
+                      fprintf(stderr, "  line[0..31]:");
+                      for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", m[i]);
+                  }
+                  fprintf(stderr, "\n"); fflush(stderr);
+              }
+          }
+      } }
+    /* gs_task ring-apply watch (env YZ_GSPUT, 2026-07-02, diag — the matrix
+     * discriminator for the journal back half): does gs_task ever PUT the
+     * journal patches into the command ring / io memory (or its geometry
+     * output)? Logs every put-class DMA issued under image 0 with pc+ea+size;
+     * no EA filter — classify offline by pc (retire pcs 0x63EC/0x6424/0x645C;
+     * ctx saves lsa 0x2C80-0x3000; kernel lock-line PUTLLCs by their mgmt
+     * EAs). REMOVE with the journal-consumer frontier. */
+    { static int gp = -1; if (gp < 0) gp = getenv("YZ_GSPUT") ? 1 : 0;
+      if (gp && spu->image_id == 0
+             && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                 cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
+          static unsigned long gpn = 0; gpn++;
+          if (gpn <= 100 || (gpn & 0x3FFu) == 0) {
+              fprintf(stderr, "[gs-put] n=%lu spu=%X pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X\n",
+                      gpn, spu->spu_id, spu->pc & SPU_LS_MASK, cmd,
+                      lsa & SPU_LS_MASK, (unsigned long long)(ea & ~0x80000000ull), size);
+              fflush(stderr);
+          }
+      } }
     /* Task context-save provenance (env YZ_CTXSAVE_WATCH, 2026-07-02): the SPURS
      * taskset yield must PUT the register block LS [0x2C80,0x3000) to the
      * taskInfo context-save EA (RPCS3 spursTasketSaveTaskContext); our resumes
