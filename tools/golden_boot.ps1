@@ -26,12 +26,26 @@ $exe = ".\yakuza\build\yakuza_recomp.exe"
 if (-not (Test-Path $exe)) { Write-Error "build first: $exe missing"; exit 2 }
 
 Write-Host "[golden] booting $Seconds s ..."
-$p = Start-Process -FilePath $exe -ArgumentList "game\EBOOT.elf" `
-        -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden `
-        -RedirectStandardError $Log -RedirectStandardOutput "$Log.out"
+# NATIVE stderr/stdout redirection via cmd (kernel file handles) -- PowerShell's
+# -RedirectStandardError pipe pump backs up under print volume and serializes
+# every guest thread on the CRT stderr lock (LESSONS 6c; boot_until.ps1 carries
+# the same fix). Measured 2026-07-03: golden under the pump showed the OLD crawl
+# profile (reached_audio=no at 90 s, deepest=cellFsClose) twice in a row while
+# native-redirect boots hit PortStart at +3 s 4/4 -- the harness was measuring
+# its own launch plumbing.
+$cmdline = "yakuza\build\yakuza_recomp.exe game\EBOOT.elf 2>`"$Log`" 1>`"$Log.out`""
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdline `
+        -WorkingDirectory (Get-Location) -WindowStyle Hidden | Out-Null
+$p = $null
+for ($w = 0; $w -lt 50 -and -not $p; $w++) {
+    Start-Sleep -Milliseconds 100
+    $p = Get-Process yakuza_recomp -ErrorAction SilentlyContinue |
+         Sort-Object StartTime -Descending | Select-Object -First 1
+}
+if (-not $p) { Write-Error "[golden] guest process never appeared"; exit 2 }
 Start-Sleep -Seconds $Seconds
 $exited = $p.HasExited
-if (-not $exited) { Stop-Process -Id $p.Id -Force -Confirm:$false }
+if (-not $exited) { try { Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction Stop } catch {} }
 
 $e = Get-Content $Log
 # ---- milestone vector ------------------------------------------------------
