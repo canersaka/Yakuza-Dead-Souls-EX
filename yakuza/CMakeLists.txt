@@ -64,7 +64,9 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/wkl4_task.c"   # 4-task worker pool, EBOOT SPU img #5 @0x01284200 (wid 4; overlaps LS 0x3000 -> image 4)
     "${PS3RECOMP_DIR}/recomp_prx/spuimg_*.c"   # remaining EBOOT task images, batch-lifted by tools/gen_spu_images.py (image ids 5+; see recomp_prx/spu_image_table.h)
     "${PS3RECOMP_DIR}/recomp_prx/ts_exit.c"   # SPURS taskset exit-handler overlay (libsre 0x02025500 -> LS 0x10000, image 12)
-    "${PS3RECOMP_DIR}/recomp_prx/job_module.c")   # SPURS jobchain policy module (libsre 0x0202A180 -> LS 0xA00, image 13)
+    "${PS3RECOMP_DIR}/recomp_prx/job_module.c"   # SPURS jobchain policy module (libsre 0x0202A180 -> LS 0xA00, image 13)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_a.c"   # jobchain bulk-worker JOB binary (EBOOT 0x01254500 -> ~LS 0x4C00, image 14)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b.c")   # jobchain notify JOB binary (EBOOT 0x01275A00 -> ~LS 0xE400, image 15)
 
 add_executable(yakuza_recomp
     main.cpp

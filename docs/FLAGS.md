@@ -72,8 +72,10 @@ frontier), `YZ_OVL`
 (spu_dma.h: the entry-7 gate probe — [ovl] logs code-sized GETs into LS ≥0x10000 per image
 (the image-5 runtime overlay load's source EA + size; image-5 sources also dumped to
 scratch\ovl_&lt;ea&gt;_&lt;lsa&gt;.bin, first 16) and [job-rd] logs GET/GETLLAR reads of the published
-shader-stream job block [0x40197100,0x40197400) to name the consumer — added 2026-07-03,
-REMOVE when the entry-7 frontier closes), `YZ_JRNL_WATCH`
+shader-stream job block [0x40197100,0x40197400) to name the consumer, and [job-bin] logs
+image-13 (job module) code-sized GETs past its own end = runtime-loaded JOB BINARIES
+(source EA + LS base, the next lift target) — added 2026-07-03,
+REMOVE when the jobchain frontier closes), `YZ_JRNL_WATCH`
 (spu_dma.h: the LAYER-1 consumer discriminator — logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then

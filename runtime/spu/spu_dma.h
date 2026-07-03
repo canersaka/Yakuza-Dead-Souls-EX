@@ -214,6 +214,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     spu->image_id = img;
                 }
             }
+            /* SPURS jobchain JOB-BINARY loads (2026-07-03). The job module
+             * (image 13) DMAs each descriptor's eaBinary blob into free LS past
+             * its own end and branches there. Both binaries the game's pxd
+             * jobchain uses are EBOOT-static (measured live: the 14-way bulk
+             * worker + the event-flag notify job, descriptor decode in
+             * STATUS.md 2026-07-03 session 7); they are lifted as images 14/15.
+             * Record the LS base per context so spu_indirect_branch can switch
+             * to the right lifted image when the module branches into the blob.
+             * Chunked GETs (max 0x4000/transfer) only match on the FIRST
+             * chunk's ea == eaBinary; continuation chunks don't re-record.
+             * NOT image-gated: a mid-cycle kernel adoption can leave the
+             * module's SPU on image 0 (measured, first jobval boot) and the
+             * descriptor eaBinary values are unique keys on their own. */
+            if ((lsa & SPU_LS_MASK) >= 0x4880u) {
+                switch ((uint32_t)ea) {
+                case 0x01254500u: spu->job_bin_base[0] = lsa & SPU_LS_MASK; break; /* image 14 */
+                case 0x01275A00u: spu->job_bin_base[1] = lsa & SPU_LS_MASK; break; /* image 15 */
+                default: break;
+                }
+            }
         } else if (mfc_is_put(cmd)) {
             /* PUT: local store -> main memory */
             /* pt35e (env YZ_PUT_WATCH): the policy SPU (image 2) wild-writing into the GAME
@@ -609,10 +629,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         if ((uint32_t)(ea & ~127ull) < 0x10000u) {
             static int nn = 0;
             if (nn < 8) { nn++;
-                fprintf(stderr, "[dma-null] ATOMIC cmd=0x%02X spu=%X img=%d pc=0x%05X lsa=0x%05X ea=0x%08llX gpr0=%08X gpr1=%08X\n",
+                fprintf(stderr, "[dma-null] ATOMIC cmd=0x%02X spu=%X img=%d pc=0x%05X lsa=0x%05X ea=0x%08llX gpr0=%08X gpr1=%08X jobbase=%05X/%05X\n",
                         cmd, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
                         lsa & SPU_LS_MASK, (unsigned long long)ea,
-                        spu->gpr[0]._u32[0], spu->gpr[1]._u32[0]);
+                        spu->gpr[0]._u32[0], spu->gpr[1]._u32[0],
+                        spu->job_bin_base[0], spu->job_bin_base[1]);
                 fflush(stderr);
             }
         }
