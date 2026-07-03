@@ -37,6 +37,9 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/misc/*.c"
     "libs/hardware/*.c"
 )
+# Exclude test/replay harnesses (e.g. libs/video/tests/* from the Track B
+# capture-replay work): they have their own main() and standalone includes.
+list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES

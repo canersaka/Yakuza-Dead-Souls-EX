@@ -458,6 +458,62 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* Overlay + job-consumer watch (env YZ_OVL, 2026-07-03, diag — the entry-7
+     * gate): (A) log code-sized GETs into HIGH LS (>=0x10000) per image — the
+     * image-5 runtime overlay load names its SOURCE EA + size (needed both to
+     * dump/lift the blob and for the reverse image-switch registration); for
+     * image 5 also dump the source bytes to scratch\ovl_<ea>.bin. (B) log any
+     * GET-class/atomic read of the published shader-stream job block
+     * [0x40197100,0x40197400) — whoever reads it is the consumer (leading
+     * suspect: image 5, dead at the overlay wall). REMOVE when the entry-7
+     * frontier closes. */
+    { static int ov = -1; if (ov < 0) ov = getenv("YZ_OVL") ? 1 : 0;
+      if (ov) {
+          uint32_t oea = (uint32_t)(ea & ~0x80000000ull);
+          /* (A) overlay-class loads: per-image print cap so early gs_task
+           * data GETs can't exhaust the budget before image 5 dispatches */
+          if (mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
+                  && (lsa & SPU_LS_MASK) >= 0x10000u && size >= 0x200u) {
+              static int ovn[16] = {0};
+              int ii = (spu->image_id >= 0 && spu->image_id < 16) ? spu->image_id : 15;
+              /* the taskset exit-blob always lands at exactly LS 0x10000
+               * (RPCS3 spursTasksetOnTaskExit :1673 memcpy dst) — log those
+               * UNCAPPED and dump the source bytes; everything else per-image
+               * capped context */
+              int exitblob = ((lsa & SPU_LS_MASK) == 0x10000u);
+              if (exitblob || ovn[ii] < 40) { if (!exitblob) ovn[ii]++;
+                  fprintf(stderr, "[ovl] spu=%X img=%d pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X%s%s\n",
+                          spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                          lsa & SPU_LS_MASK, oea, size,
+                          mfc_is_list(cmd) ? " LIST" : "",
+                          exitblob ? " EXITBLOB" : "");
+                  fflush(stderr);
+              }
+              if (exitblob && !mfc_is_list(cmd)) {
+                  static int dumps = 0;
+                  if (dumps < 16) { dumps++;
+                      char fn[128];
+                      snprintf(fn, sizeof fn, "scratch\\ovl_%08X_%05X.bin", oea, lsa & SPU_LS_MASK);
+                      FILE* f = fopen(fn, "wb");
+                      if (f) { fwrite(vm_base + oea, 1, size, f); fclose(f); }
+                  }
+              }
+          }
+          /* (B) job-block reads (0x40197180 job published at freeze time) */
+          uint32_t oline = oea & ~127u;
+          uint32_t osz = (cmd == MFC_GETLLAR_CMD) ? 128u : size;
+          if ((mfc_is_get(cmd) || cmd == MFC_GETLLAR_CMD)
+                  && oea < 0x40197400u && oea + osz > 0x40197100u) {
+              static unsigned long on = 0; on++;
+              if (on <= 80 || (on & 0x3FFu) == 0) {
+                  fprintf(stderr, "[job-rd] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
+                          on, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                          lsa & SPU_LS_MASK, oea, size);
+                  fflush(stderr);
+              }
+          }
+          (void)oline;
+      } }
     /* Task context-save provenance (env YZ_CTXSAVE_WATCH, 2026-07-02): the SPURS
      * taskset yield must PUT the register block LS [0x2C80,0x3000) to the
      * taskInfo context-save EA (RPCS3 spursTasketSaveTaskContext); our resumes
