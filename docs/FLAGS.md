@@ -68,7 +68,12 @@ transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA7
 added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs +
 line atomics with pc from task images 3/4; dumps the LS line for atomics on the CRI queues;
 its request-line GETLLAR releases YZ_SPU_TRACE_EVARM — 2026-07-02, REMOVE with the
-frontier), `YZ_JRNL_WATCH`
+frontier), `YZ_OVL`
+(spu_dma.h: the entry-7 gate probe — [ovl] logs code-sized GETs into LS ≥0x10000 per image
+(the image-5 runtime overlay load's source EA + size; image-5 sources also dumped to
+scratch\ovl_&lt;ea&gt;_&lt;lsa&gt;.bin, first 16) and [job-rd] logs GET/GETLLAR reads of the published
+shader-stream job block [0x40197100,0x40197400) to name the consumer — added 2026-07-03,
+REMOVE when the entry-7 frontier closes), `YZ_JRNL_WATCH`
 (spu_dma.h: the LAYER-1 consumer discriminator — logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then

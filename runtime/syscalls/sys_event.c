@@ -864,11 +864,13 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
     return CELL_OK;
 }
 
-int64_t sys_event_flag_set(ppu_context* ctx)
+/* Internal by-id setter: shared by the PPU syscall and the SPU
+ * WrOutIntrMbox set_bit protocol (codes 128/192 -- RPCS3 SPUThread.cpp
+ * :6090-6160: an SPU sets an lv2 event-flag bit by writing the flag id to
+ * OutMbox and (0x80|0xC0)<<24 | bit to OutIntrMbox; Sony's SPURS taskset
+ * exit handler uses the impatient form as its completion doorbell). */
+int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat)
 {
-    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
-    uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
-
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -889,6 +891,14 @@ int64_t sys_event_flag_set(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+int64_t sys_event_flag_set(ppu_context* ctx)
+{
+    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
+    uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+
+    return sys_event_flag_set_by_id(flag_id, bitpat);
 }
 
 int64_t sys_event_flag_clear(ppu_context* ctx)
