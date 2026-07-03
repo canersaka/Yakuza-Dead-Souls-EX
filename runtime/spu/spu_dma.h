@@ -706,11 +706,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               static unsigned long wn = 0; wn++;
               if (wn <= 200 || (wn & 0x3FFu) == 0) {
                   const uint8_t* pl = spu->ls + (lsa & SPU_LS_MASK & ~15u);
-                  fprintf(stderr, "[job-wr] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X size=0x%X "
-                          "pay=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                  fprintf(stderr, "[job-wr] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X size=0x%X\n"
+                          "        pay+00=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n"
+                          "        pay+10=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n"
+                          "        pay+20=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                           wn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd, oea, size,
                           pl[0],pl[1],pl[2],pl[3], pl[4],pl[5],pl[6],pl[7],
-                          pl[8],pl[9],pl[10],pl[11], pl[12],pl[13],pl[14],pl[15]);
+                          pl[8],pl[9],pl[10],pl[11], pl[12],pl[13],pl[14],pl[15],
+                          pl[16],pl[17],pl[18],pl[19], pl[20],pl[21],pl[22],pl[23],
+                          pl[24],pl[25],pl[26],pl[27], pl[28],pl[29],pl[30],pl[31],
+                          pl[32],pl[33],pl[34],pl[35], pl[36],pl[37],pl[38],pl[39],
+                          pl[40],pl[41],pl[42],pl[43], pl[44],pl[45],pl[46],pl[47]);
                   fflush(stderr);
               }
           }

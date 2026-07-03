@@ -2529,10 +2529,43 @@ extern "C" void yz_ovr_sys_spu_image_close(ppu_context* ctx)
  * r3..r10, 9th arg onward at r1+0x70). Floats in prototype-less calls are
  * mirrored into the GPR image, so %f can reinterpret the GPR bits.
  * -----------------------------------------------------------------------*/
+/* Copy a guest string into `tmp` without letting the host CRT touch
+ * unmapped memory. A guest %s arg can point into an uncommitted region of
+ * the 4 GB vm reservation (measured 2026-07-03: t10's _sys_printf died in
+ * libucrt walking such a string -- the recurring silent long-boot death,
+ * import thunk 372, crash rva resolving past CRT `remove`). Probes
+ * committed-ness per page; stops at NUL, cap, or the first unreadable
+ * page. Returns tmp (always NUL-terminated). */
+static const char* yz_guest_str_safe(uint32_t ea, char* tmp, size_t cap)
+{
+    size_t o = 0;
+    const uint8_t* p = (const uint8_t*)(vm_base + ea);
+    uintptr_t page = 0;   /* last page verified committed+readable */
+    while (o + 1 < cap) {
+        uintptr_t cur = (uintptr_t)(p + o) & ~(uintptr_t)0xFFF;
+        if (cur != page) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((const void*)cur, &mbi, sizeof(mbi)) ||
+                mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                if (o == 0) { snprintf(tmp, cap, "(badptr:%08X)", ea); return tmp; }
+                break;
+            }
+            page = cur;
+        }
+        uint8_t c = p[o];
+        if (!c) break;
+        tmp[o++] = (char)c;
+    }
+    tmp[o] = 0;
+    return tmp;
+}
+
 static int yz_format_guest(char* out, size_t outsz, ppu_context* ctx,
                            uint32_t fmt_ea, int first_vararg /* 0 = r3 */)
 {
-    const char* f = (const char*)(vm_base + fmt_ea);
+    char ftmp[1024];   /* format walked byte-by-byte -- same badptr class */
+    const char* f = yz_guest_str_safe(fmt_ea, ftmp, sizeof(ftmp));
     size_t o = 0;
     int ai = first_vararg;
 
@@ -2577,9 +2610,12 @@ static int yz_format_guest(char* out, size_t outsz, ppu_context* ctx,
         case 's': {
             a = YZ_ARG(ai++);
             /* guard: a %s arg below the loaded image range is not a string
-             * pointer (mis-indexed vararg or genuine garbage) */
+             * pointer (mis-indexed vararg or genuine garbage); anything else
+             * goes through the page-probing copy so an EA into uncommitted
+             * vm space can't fault the host CRT (the t10 silent-death class). */
+            char stmp[448];
             const char* s = ((uint32_t)a >= 0x10000u)
-                          ? (const char*)(vm_base + (uint32_t)a)
+                          ? yz_guest_str_safe((uint32_t)a, stmp, sizeof(stmp))
                           : (a ? "(badptr)" : "(null)");
             spec[sl++] = 's'; spec[sl] = 0;
             snprintf(piece, sizeof(piece), spec, s);
