@@ -676,20 +676,46 @@ static void yz_dump_host_stack_of(HANDLE h, const char* tag)
     if (GetThreadContext(h, &cx)) {
         uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
         void* rip = (void*)cx.Rip;
-        fprintf(stderr, "[%s] HOST rip rva 0x%llX", tag,
-                (unsigned long long)((uintptr_t)rip - mod));
-        if (const yz_func_entry* fe = yz_func_from_host(rip))
-            fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
-                    (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
+        /* An rip OUTSIDE our module = the thread is parked in a HOST wait
+         * (ntdll/kernelbase) reached through an import bridge or runtime
+         * helper -- exactly the waits the lv2 syscall recorder cannot see
+         * (sys_lwmutex_lock, cellFs HLE, EnterCriticalSection...). Say so
+         * instead of printing a meaningless cross-module "rva". */
+        HMODULE rmod = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)rip, &rmod);
+        if ((uintptr_t)rmod == mod) {
+            fprintf(stderr, "[%s] HOST rip rva 0x%llX", tag,
+                    (unsigned long long)((uintptr_t)rip - mod));
+            if (const yz_func_entry* fe = yz_func_from_host(rip))
+                fprintf(stderr, " (func_%08X +0x%llX)", fe->addr,
+                        (unsigned long long)((uintptr_t)rip - (uintptr_t)fe->fn));
+        } else {
+            wchar_t mn[64] = L"?";
+            if (rmod) { GetModuleFileNameW(rmod, mn, 64); mn[63] = 0; }
+            fprintf(stderr, "[%s] HOST rip 0x%llX in %ls (host wait via import "
+                    "bridge/runtime -- read the stack chain)", tag,
+                    (unsigned long long)(uintptr_t)rip, mn);
+        }
         fprintf(stderr, "\n[%s] HOST stack chain:", tag);
         const uint64_t* sp = (const uint64_t*)cx.Rsp;
-        int shown = 0;
-        for (int i = 0; i < 800 && shown < 14; i++) {
+        int shown = 0, raw_shown = 0;
+        for (int i = 0; i < 1600 && shown < 14; i++) {
             if (IsBadReadPtr((void*)(sp + i), 8)) break;
             uint64_t v = sp[i];
             if (v < mod || v > mod + 0x40000000ull) continue;
             const yz_func_entry* fe = yz_func_from_host((void*)v);
-            if (!fe) continue;
+            if (!fe) {
+                /* in-module but not a lifted fn: our runtime/libs code --
+                 * print the raw rva so it resolves offline vs the .map */
+                if (raw_shown < 6) { raw_shown++;
+                    fprintf(stderr, "\n    [+0x%03X] rva 0x%llX (runtime -- "
+                            "resolve vs yakuza_recomp.map)", i * 8,
+                            (unsigned long long)(v - mod));
+                }
+                continue;
+            }
             fprintf(stderr, "\n    [+0x%03X] func_%08X +0x%llX", i * 8, fe->addr,
                     (unsigned long long)(v - (uintptr_t)fe->fn));
             shown++;
@@ -1799,6 +1825,22 @@ int main(int argc, char** argv)
      * val*}.err + the [gs-put]/[jrnl] probes. Delete after quiet sessions. */
     if (getenv("YZ_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
+    /* On-demand all-threads dump (env YZ_DUMP_AT=<seconds>, 2026-07-02 diag):
+     * fires yz_dump_all_threads once at +N s regardless of watchdog state --
+     * for reading a HEALTHY-but-parked boot (e.g. the post-font.par frontier
+     * park at ~+250 s) where the wedge watchdog never triggers. The run is
+     * observed at a chosen instant; don't use dump-armed runs for pass/fail
+     * rates (LESSONS 6b). */
+    if (const char* da = getenv("YZ_DUMP_AT")) {
+        static int dump_at_s = atoi(da);
+        if (dump_at_s > 0)
+            CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+                Sleep((DWORD)dump_at_s * 1000);
+                fprintf(stderr, "[dump-at] +%ds on-demand snapshot:\n", dump_at_s);
+                yz_dump_all_threads("dump-at");
+                return 0;
+            }, NULL, 0, NULL);
+    }
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
     if (getenv("YZ_PEEK"))
