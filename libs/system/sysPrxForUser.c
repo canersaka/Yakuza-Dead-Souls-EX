@@ -94,10 +94,26 @@ typedef struct {
                      * (re-init or destroy with a stale waiter parked is UB;
                      * same churn-safety scheme as LwMutexSlot, 2026-07-02) */
     u32 lwmutex_id; /* index into s_lwmutex */
+    /* Rendezvous state (2026-07-03 s8, the E5 lost-wake root): real lv2's
+     * waiter COMMITS (under the lwmutex) before releasing it, and a signal
+     * aimed at a committed waiter is held by the kernel even if the waiter
+     * hasn't parked yet. A bare Win32 CV drops that signal (edge-triggered)
+     * — measured: the CRI stream pump's completion signal (guest 0xE54B78 →
+     * sys_lwcond_signal) fired into the commit window and the E5 pipeline
+     * slept forever = the SEGA-logo boot freeze. `committed`/`pending` under
+     * the internal sig lock reproduce lv2's semantics exactly: held signal
+     * for committed waiters, faithful discard when none. The signaler NEVER
+     * touches the guest lwmutex (the 3f1377c hold-and-wait lesson). */
+    int committed;  /* waiters that entered wait, not yet returned */
+    int pending;    /* signals held for committed waiters */
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
+    CRITICAL_SECTION sig_cs;
+    int sig_cs_init;
 #else
     pthread_cond_t cv;
+    pthread_mutex_t sig_mtx;
+    int sig_mtx_init;
 #endif
 } LwCondSlot;
 
@@ -631,9 +647,13 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
 
 #ifdef _WIN32
             if (!c->cv_init) { InitializeConditionVariable(&c->cv); c->cv_init = 1; }
+            if (!c->sig_cs_init) { InitializeCriticalSection(&c->sig_cs); c->sig_cs_init = 1; }
 #else
             if (!c->cv_init) { pthread_cond_init(&c->cv, NULL); c->cv_init = 1; }
+            if (!c->sig_mtx_init) { pthread_mutex_init(&c->sig_mtx, NULL); c->sig_mtx_init = 1; }
 #endif
+            c->committed = 0;
+            c->pending = 0;
 
             lwcond->lwcond_queue = slot + 1;
             s_lwcond_next = (slot + 1) % MAX_LWCOND;
@@ -653,10 +673,23 @@ s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
     if (slot >= MAX_LWCOND || !s_lwcond[slot].in_use)
         return CELL_ESRCH;
 
+    /* Rendezvous semantics (see LwCondSlot): a signal is HELD for a committed
+     * waiter (even one not yet parked in the CV) and discarded when no
+     * committed waiter remains unserved — exactly lv2's behavior. */
 #ifdef _WIN32
-    WakeConditionVariable(&s_lwcond[slot].cv);
+    EnterCriticalSection(&s_lwcond[slot].sig_cs);
+    if (s_lwcond[slot].committed > s_lwcond[slot].pending) {
+        s_lwcond[slot].pending++;
+        WakeConditionVariable(&s_lwcond[slot].cv);
+    }
+    LeaveCriticalSection(&s_lwcond[slot].sig_cs);
 #else
-    pthread_cond_signal(&s_lwcond[slot].cv);
+    pthread_mutex_lock(&s_lwcond[slot].sig_mtx);
+    if (s_lwcond[slot].committed > s_lwcond[slot].pending) {
+        s_lwcond[slot].pending++;
+        pthread_cond_signal(&s_lwcond[slot].cv);
+    }
+    pthread_mutex_unlock(&s_lwcond[slot].sig_mtx);
 #endif
     return CELL_OK;
 }
@@ -670,9 +703,15 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
         return CELL_ESRCH;
 
 #ifdef _WIN32
+    EnterCriticalSection(&s_lwcond[slot].sig_cs);
+    s_lwcond[slot].pending = s_lwcond[slot].committed;
     WakeAllConditionVariable(&s_lwcond[slot].cv);
+    LeaveCriticalSection(&s_lwcond[slot].sig_cs);
 #else
+    pthread_mutex_lock(&s_lwcond[slot].sig_mtx);
+    s_lwcond[slot].pending = s_lwcond[slot].committed;
     pthread_cond_broadcast(&s_lwcond[slot].cv);
+    pthread_mutex_unlock(&s_lwcond[slot].sig_mtx);
 #endif
     return CELL_OK;
 }
@@ -689,22 +728,56 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     if (mslot >= MAX_LWMUTEX || !s_lwmutex[mslot].in_use)
         return CELL_ESRCH;
 
+    /* Rendezvous protocol (see LwCondSlot): COMMIT under the internal sig
+     * lock BEFORE releasing the guest lwmutex — after this instant a signal
+     * cannot be lost (it lands in `pending`). Then release the guest mutex,
+     * park on the CV against the sig lock, and on wake consume one pending.
+     * The guest mutex is re-acquired before returning (lwcond_wait's
+     * contract), with the same bookkeeping as lock/unlock. */
+    s32 rc_out = CELL_OK;
 #ifdef _WIN32
-    DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
-    BOOL cw_ok = SleepConditionVariableCS(&s_lwcond[cslot].cv,
-                                          &s_lwmutex[mslot].cs, ms);
-    /* The CS is re-acquired on BOTH outcomes; re-mark ownership so a
-     * concurrent lwmutex_destroy keeps refusing (EBUSY) through the
-     * caller's post-wake critical section. */
-    s_lwmutex[mslot].owner_tid = (unsigned long)GetCurrentThreadId();
-    if (!cw_ok) {
-        if (GetLastError() == ERROR_TIMEOUT)
-            return CELL_ETIMEDOUT;
-        return CELL_EFAULT;
+    EnterCriticalSection(&s_lwcond[cslot].sig_cs);
+    s_lwcond[cslot].committed++;
+
+    /* release ONE level of the guest lwmutex (mirror sys_lwmutex_unlock) */
+    s_lwmutex[mslot].owner_tid = 0;
+    LeaveCriticalSection(&s_lwmutex[mslot].cs);
+
+    DWORD deadline_ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
+    ULONGLONG t0 = GetTickCount64();
+    while (s_lwcond[cslot].pending == 0) {
+        DWORD ms = deadline_ms;
+        if (deadline_ms != INFINITE) {
+            ULONGLONG spent = GetTickCount64() - t0;
+            if (spent >= deadline_ms) { rc_out = CELL_ETIMEDOUT; break; }
+            ms = (DWORD)(deadline_ms - spent);
+        }
+        if (!SleepConditionVariableCS(&s_lwcond[cslot].cv,
+                                      &s_lwcond[cslot].sig_cs, ms)) {
+            if (GetLastError() == ERROR_TIMEOUT) {
+                if (s_lwcond[cslot].pending == 0) { rc_out = CELL_ETIMEDOUT; break; }
+            } else if (s_lwcond[cslot].pending == 0) {
+                rc_out = CELL_EFAULT; break;
+            }
+        }
     }
+    if (rc_out == CELL_OK)
+        s_lwcond[cslot].pending--;
+    s_lwcond[cslot].committed--;
+    LeaveCriticalSection(&s_lwcond[cslot].sig_cs);
+
+    /* re-acquire the guest lwmutex (mirror sys_lwmutex_lock) */
+    EnterCriticalSection(&s_lwmutex[mslot].cs);
+    s_lwmutex[mslot].owner_tid = (unsigned long)GetCurrentThreadId();
 #else
+    pthread_mutex_lock(&s_lwcond[cslot].sig_mtx);
+    s_lwcond[cslot].committed++;
+    s_lwmutex[mslot].owner_tid = 0;
+    pthread_mutex_unlock(&s_lwmutex[mslot].mtx);
+
     if (timeout == 0) {
-        pthread_cond_wait(&s_lwcond[cslot].cv, &s_lwmutex[mslot].mtx);
+        while (s_lwcond[cslot].pending == 0)
+            pthread_cond_wait(&s_lwcond[cslot].cv, &s_lwcond[cslot].sig_mtx);
     } else {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -714,14 +787,25 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        int rc = pthread_cond_timedwait(&s_lwcond[cslot].cv,
-                                         &s_lwmutex[mslot].mtx, &ts);
-        if (rc == 110 /* ETIMEDOUT */)
-            return CELL_ETIMEDOUT;
+        while (s_lwcond[cslot].pending == 0) {
+            int rc = pthread_cond_timedwait(&s_lwcond[cslot].cv,
+                                            &s_lwcond[cslot].sig_mtx, &ts);
+            if (rc == 110 /* ETIMEDOUT */ && s_lwcond[cslot].pending == 0) {
+                rc_out = CELL_ETIMEDOUT;
+                break;
+            }
+        }
     }
+    if (rc_out == CELL_OK)
+        s_lwcond[cslot].pending--;
+    s_lwcond[cslot].committed--;
+    pthread_mutex_unlock(&s_lwcond[cslot].sig_mtx);
+
+    pthread_mutex_lock(&s_lwmutex[mslot].mtx);
+    s_lwmutex[mslot].owner_tid = (unsigned long)(uintptr_t)pthread_self();
 #endif
 
-    return CELL_OK;
+    return rc_out;
 }
 
 s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
