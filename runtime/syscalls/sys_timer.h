@@ -28,6 +28,10 @@ extern "C" {
 /* PS3 timebase frequency */
 #define PS3_TIMEBASE_FREQ  79800000ULL
 
+/* The guest mftb/mftbu clock: one global monotonic counter, host time scaled
+ * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
+uint64_t ppu_timebase_now(void);
+
 #define SYS_TIMER_MAX  64
 
 typedef struct sys_timer_info {

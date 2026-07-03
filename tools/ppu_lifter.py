@@ -117,6 +117,14 @@ SOURCE_PREAMBLE = """\
 #include <string.h>
 #include <math.h>
 
+/* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
+ * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
+#ifdef __cplusplus
+extern "C" uint64_t ppu_timebase_now(void);
+#else
+extern uint64_t ppu_timebase_now(void);
+#endif
+
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1304,15 +1312,21 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = (int64_t)(int16_t)vm_read16(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Move from time base -------
+        # THE guest clock. The old emission was a per-call-site static that
+        # advanced 16667 ticks PER READ -- not time: every site had a private
+        # counter that only moved when polled. Guest timing math (the CRI ADXM
+        # VV pacer that schedules the whole media/async-FS stack, throttles,
+        # profilers) computed garbage from it; found 2026-07-03 as the root of
+        # the shader-build stall (pacer period stretched ~108x, starving the
+        # async-file pump). Real semantics: one global monotonic timebase at
+        # 79.8 MHz (runtime ppu_timebase_now).
         if mn == "mftb":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = tb; }}")
+            return f"ctx->gpr[{rd}] = ppu_timebase_now();"
 
         if mn == "mftbu":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = (tb >> 32); }}")
+            return f"ctx->gpr[{rd}] = (ppu_timebase_now() >> 32);"
 
         # ------- Cache/sync ops (safe to no-op) -------
         # dcbz zeros a 128-byte cache line — MUST be implemented, not no-oped!
@@ -1601,6 +1615,31 @@ class PPULifter:
             return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+
+        # Vector compare greater-than, signed/unsigned, byte/half/word.
+        # Unhandled until 2026-07-03 (fell to the TODO catch-all = silently
+        # skipped; found by the post-relift TODO audit — the 2026-06-12
+        # "instruction layer complete" audit predated the gap-rescue function
+        # growth that exposed these). Dot forms set CR6 per AltiVec PEM:
+        # bit0 (LT, 8) = all lanes true, bit2 (EQ, 2) = all lanes false.
+        vcmpgt_family = {
+            "vcmpgtsb": ("int8_t",   16), "vcmpgtsh": ("int16_t",  8),
+            "vcmpgtsw": ("int32_t",   4),
+            "vcmpgtub": ("uint8_t",  16), "vcmpgtuh": ("uint16_t", 8),
+            "vcmpgtuw": ("uint32_t",  4),
+        }
+        base_mn = mn.rstrip(".")
+        if base_mn in vcmpgt_family:
+            ety, n = vcmpgt_family[base_mn]
+            uty = ety.replace("int", "uint") if not ety.startswith("u") else ety
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            body = (f"{{ {ety}* a=({ety}*)&ctx->vr[{va}]; {ety}* b=({ety}*)&ctx->vr[{vb}]; "
+                    f"{uty}* d=({uty}*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<{n};i++){{ {uty} r=a[i]>b[i]?({uty})~({uty})0:0; d[i]=r; t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
+                         f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # ------- VMX integer arithmetic (generated from disasm decode table) -------
         # These are simple per-element operations on vector registers.
