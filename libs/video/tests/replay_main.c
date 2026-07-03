@@ -19,10 +19,10 @@
  *            offset) matches a surface this replay already rendered, the
  *            surface's RT is bound as the SRV (render-to-texture chains,
  *            incl. the final composite draw); otherwise the texture is
- *            decoded from guest memory (linear/swizzled A8R8G8B8 and
- *            A4R4G4B4, DXT1/DXT45 pass through as BC1/BC3). The pixel
- *            shader modulates the sample by the vertex color (diffuse
- *            defaults to white), matching the capture's no-blend composite.
+ *            decoded from guest memory (linear + swizzled A8R8G8B8, B8;
+ *            anything else falls back to a 1x1 white). The pixel shader
+ *            modulates the sample by the vertex color (diffuse defaults
+ *            to white), matching the capture's no-blend composite draw.
  *
  * Build (see build_replay.cmd):
  *   cl /std:c17 /O2 /I..\..\..\include replay_main.c ..\rsx_dispatch.c
@@ -186,7 +186,7 @@ typedef struct {
 } surface_t;
 
 typedef struct {
-    u32             location, offset, format, width, height, pitch;
+    u32             location, offset, format, width, height, pitch, remap;
     ID3D12Resource* tex;        /* NULL = undecodable, use the white slot */
 } texcache_t;
 
@@ -226,6 +226,9 @@ typedef struct {
 } gpu_t;
 
 static gpu_t g;
+
+static void srv_write(u32 slot, ID3D12Resource* tex);
+static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h);
 
 static int gpu_init(u32 width, u32 height, int use_hw)
 {
@@ -429,6 +432,14 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     ps->lpVtbl->Release(ps);
     ps_tex->lpVtbl->Release(ps_tex);
 
+    /* 1x1 white fallback texture at SRV slot 0: draws whose unit-0 texture
+     * cannot be resolved modulate by white, i.e. degrade to vertex color */
+    static const u8 white[4] = {255, 255, 255, 255};
+    g.white_tex = create_texture_rgba(white, 1, 1);
+    if (!g.white_tex)
+        return -1;
+    srv_write(SRV_WHITE, g.white_tex);
+
     /* open the list for the first frame */
     D3D12_VIEWPORT vp = {0, 0, (float)width, (float)height, 0.0f, 1.0f};
     D3D12_RECT sc = {0, 0, (LONG)width, (LONG)height};
@@ -443,6 +454,85 @@ static D3D12_CPU_DESCRIPTOR_HANDLE surface_rtv(u32 idx)
     g.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.rtv_heap, &h);
     h.ptr += (size_t)idx * g.rtv_step;
     return h;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu(u32 slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE h;
+    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &h);
+    h.ptr += (u64)slot * g.srv_step;
+    return h;
+}
+
+static void srv_write(u32 slot, ID3D12Resource* tex)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &h);
+    h.ptr += (size_t)slot * g.srv_step;
+    g.dev->lpVtbl->CreateShaderResourceView(g.dev, tex, NULL, h);
+}
+
+/* Create an immutable texture from CPU-prepared data: stage the rows in the
+ * persistently-mapped upload arena, record the copy on the open list, and
+ * leave the resource in PIXEL_SHADER_RESOURCE state. `rows`/`row_bytes`
+ * describe the CPU layout (for BC formats: block rows of 4 texel lines). */
+static ID3D12Resource* create_texture_ex(DXGI_FORMAT fmt, u32 w, u32 h,
+                                         const u8* data, u32 row_bytes, u32 rows)
+{
+    const u32 pitch = (row_bytes + 255) & ~255u; /* D3D12 placed-footprint row alignment */
+    const u32 start = (g.upload_used + 511) & ~511u;
+    if ((u64)start + (u64)pitch * rows > UPLOAD_SIZE) {
+        printf("[gpu] texture upload arena full\n");
+        return NULL;
+    }
+    for (u32 y = 0; y < rows; y++)
+        memcpy(g.upload_mapped + start + (size_t)y * pitch, data + (size_t)y * row_bytes, row_bytes);
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = fmt;
+    rd.SampleDesc.Count = 1;
+    ID3D12Resource* tex = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                      &IID_ID3D12Resource, (void**)&tex))) {
+        printf("[gpu] texture create failed (%ux%u)\n", w, h);
+        return NULL;
+    }
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = g.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = start;
+    src.PlacedFootprint.Footprint.Format = fmt;
+    src.PlacedFootprint.Footprint.Width = w;
+    src.PlacedFootprint.Footprint.Height = h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitch;
+    dst.pResource = tex;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = tex;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    g.upload_used = start + pitch * rows;
+    return tex;
+}
+
+static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
+{
+    return create_texture_ex(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, rgba, w * 4, h);
 }
 
 /* Find or create the render target for a (location, color offset) pair. */
@@ -481,6 +571,7 @@ static u32 surface_get(u32 location, u32 offset)
     s->location = location;
     s->offset = offset;
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex, NULL, surface_rtv(g.n_surfaces));
+    srv_write(SRV_SURFACE_BASE + g.n_surfaces, s->tex);
     return g.n_surfaces++;
 }
 
@@ -565,6 +656,178 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
     g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     g.vb_used = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest texture decode + cache
+ *
+ * Decodes NV40 fragment textures out of the capture's guest memory into
+ * RGBA8 D3D12 textures. Linear (LN) images use the TEX_SIZE1 pitch;
+ * non-linear power-of-two images are stored "swizzled" = Morton/Z-order
+ * with the X coordinate in the even bit positions and the excess bits of
+ * the longer dimension appended above the interleave (public layout, see
+ * docs/PSDEVWIKI_REFS.md and Mesa's nvfx swizzle helpers).
+ * -----------------------------------------------------------------------*/
+
+static u32 log2_u32(u32 v)
+{
+    u32 n = 0;
+    while (v > 1) { v >>= 1; n++; }
+    return n;
+}
+
+/* Texel index of (x, y) inside a swizzled w x h (powers of two) image. */
+static u32 morton_index(u32 x, u32 y, u32 log2w, u32 log2h)
+{
+    u32 idx = 0, shift = 0;
+    while (log2w || log2h) {
+        if (log2w) { idx |= (x & 1) << shift; x >>= 1; shift++; log2w--; }
+        if (log2h) { idx |= (y & 1) << shift; y >>= 1; shift++; log2h--; }
+    }
+    return idx;
+}
+
+/* Decode one uncompressed texel to RGBA8 through the TEX_SWIZZLE remap
+ * crossbar. Source components are indexed in gcm order A=0 R=1 G=2 B=3
+ * (an A8R8G8B8 texel is a big-endian AARRGGBB word, i.e. bytes A,R,G,B);
+ * the remap word's 2-bit fields select the source for out A/R/G/B from
+ * bits [1:0]/[3:2]/[5:4]/[7:6]. Identity is 0xE4. The capture's CRI movie
+ * frame uses 0x93 (RGBA byte order sampled through the ARGB format). */
+static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
+{
+    u8 s[4];
+    switch (base_fmt) {
+    case RSX_TEX_FMT_B8:
+        s[0] = 255;
+        s[1] = s[2] = s[3] = p[0];
+        break;
+    case RSX_TEX_FMT_A4R4G4B4: {                /* BE 16-bit ARGB nibbles */
+        const u16 v = (u16)((p[0] << 8) | p[1]);
+        s[0] = (u8)(((v >> 12) & 0xF) * 17);
+        s[1] = (u8)(((v >> 8) & 0xF) * 17);
+        s[2] = (u8)(((v >> 4) & 0xF) * 17);
+        s[3] = (u8)((v & 0xF) * 17);
+        break;
+    }
+    case RSX_TEX_FMT_A1R5G5B5: {
+        const u16 v = (u16)((p[0] << 8) | p[1]);
+        s[0] = (v & 0x8000) ? 255 : 0;
+        s[1] = (u8)(((v >> 10) & 0x1F) * 255 / 31);
+        s[2] = (u8)(((v >> 5) & 0x1F) * 255 / 31);
+        s[3] = (u8)((v & 0x1F) * 255 / 31);
+        break;
+    }
+    default:                                    /* A8R8G8B8 */
+        s[0] = p[0];
+        s[1] = p[1];
+        s[2] = p[2];
+        s[3] = p[3];
+        break;
+    }
+    d[0] = s[(remap >> 2) & 3];                 /* R */
+    d[1] = s[(remap >> 4) & 3];                 /* G */
+    d[2] = s[(remap >> 6) & 3];                 /* B */
+    d[3] = s[remap & 3];                        /* A */
+}
+
+/* Find (or decode and cache) the SRV slot for a guest texture descriptor.
+ * Returns SRV_WHITE when the texture cannot be decoded. Guest memory is
+ * read at first use; later block re-applies over the same memory are not
+ * tracked (one decode per distinct descriptor). */
+static u32 texture_srv_slot(const rsx_dsp_texture* t)
+{
+    const u32 remap = t->remap & 0xFF;
+    for (u32 i = 0; i < g.n_textures; i++) {
+        const texcache_t* e = &g.textures[i];
+        if (e->location == t->location && e->offset == t->offset &&
+            e->format == t->format && e->width == t->width &&
+            e->height == t->height && e->pitch == t->pitch && e->remap == remap)
+            return e->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+    }
+    if (g.n_textures >= MAX_TEXTURES) {
+        printf("[gpu] texture cache full\n");
+        return SRV_WHITE;
+    }
+    texcache_t* e = &g.textures[g.n_textures];
+    e->location = t->location;
+    e->offset = t->offset;
+    e->format = t->format;
+    e->width = t->width;
+    e->height = t->height;
+    e->pitch = t->pitch;
+    e->remap = remap;
+    e->tex = NULL;
+
+    const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+    const int linear = (t->format & RSX_TEX_FMT_LINEAR) != 0;
+    const u32 w = t->width, h = t->height;
+    do {
+        if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2 || t->cubemap)
+            break;
+
+        if (base_fmt == RSX_TEX_FMT_DXT1 || base_fmt == RSX_TEX_FMT_DXT23 ||
+            base_fmt == RSX_TEX_FMT_DXT45) {
+            /* S3TC blocks are byte-ordered identically on RSX and D3D12:
+             * pass through as BC1/BC2/BC3 (no remap; the capture's DXT
+             * textures all use the identity crossbar) */
+            const DXGI_FORMAT dxgi = base_fmt == RSX_TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+                                   : base_fmt == RSX_TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
+                                                                   : DXGI_FORMAT_BC3_UNORM;
+            const u32 block = base_fmt == RSX_TEX_FMT_DXT1 ? 8 : 16;
+            const u32 bw = (w + 3) / 4, bh = (h + 3) / 4;
+            if ((u64)t->offset + (u64)bw * block * bh > ARENA_SIZE)
+                break;
+            const u8* src = guest_ptr(t->location, t->offset);
+            if (!src)
+                break;
+            e->tex = create_texture_ex(dxgi, (w + 3) & ~3u, (h + 3) & ~3u,
+                                       src, bw * block, bh);
+            break;
+        }
+
+        u32 texel_sz;
+        switch (base_fmt) {
+        case RSX_TEX_FMT_B8:       texel_sz = 1; break;
+        case RSX_TEX_FMT_A4R4G4B4:
+        case RSX_TEX_FMT_A1R5G5B5: texel_sz = 2; break;
+        case RSX_TEX_FMT_A8R8G8B8: texel_sz = 4; break;
+        default:                   texel_sz = 0; break;
+        }
+        if (!texel_sz)
+            break;
+        const u32 pitch = linear ? (t->pitch ? t->pitch : w * texel_sz) : w * texel_sz;
+        if (!linear && ((w & (w - 1)) || (h & (h - 1))))
+            break;                              /* swizzled implies po2 */
+        if ((u64)t->offset + (u64)pitch * h > ARENA_SIZE)
+            break;
+        const u8* src = guest_ptr(t->location, t->offset);
+        if (!src)
+            break;
+
+        u8* rgba = malloc((size_t)w * h * 4);
+        if (!rgba)
+            break;
+        const u32 lw = log2_u32(w), lh = log2_u32(h);
+        for (u32 y = 0; y < h; y++) {
+            for (u32 x = 0; x < w; x++) {
+                const u8* p = linear
+                    ? src + (size_t)y * pitch + (size_t)x * texel_sz
+                    : src + (size_t)morton_index(x, y, lw, lh) * texel_sz;
+                decode_texel(base_fmt, p, remap, rgba + ((size_t)y * w + x) * 4);
+            }
+        }
+        e->tex = create_texture_rgba(rgba, w, h);
+        free(rgba);
+    } while (0);
+
+    if (e->tex)
+        srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
+    else
+        printf("[gpu] tex fallback: off=0x%X fmt=0x%02X %ux%u pitch=%u %s\n",
+               t->offset, t->format, w, h, t->pitch, linear ? "linear" : "swizzled");
+    const u32 slot = e->tex ? SRV_TEXTURE_BASE + g.n_textures : SRV_WHITE;
+    g.n_textures++;
+    return slot;
 }
 
 /* ---------------------------------------------------------------------------
@@ -893,11 +1156,50 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                v0->x, v0->y, v0->z, cx, cy, cz, cw);
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = surface_rtv(current_surface(rsx));
+    /* stage 3: resolve the unit-0 texture. A previously-rendered surface at
+     * the same (location, offset) wins over guest memory: the capture's
+     * memory blocks hold stale (pre-frame) contents for render targets. */
+    const u32 target = current_surface(rsx);
+    u32 srv_slot = SRV_WHITE;
+    int sampled_surface = -1;
+    rsx_dsp_texture t0;
+    rsx_dsp_get_texture(rsx, 0, &t0);
+    if (t0.enabled) {
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (g.surfaces[i].location == t0.location &&
+                g.surfaces[i].offset == t0.offset && i != target) {
+                sampled_surface = (int)i;
+                srv_slot = SRV_SURFACE_BASE + i;
+                break;
+            }
+        }
+        if (sampled_surface < 0)
+            srv_slot = texture_srv_slot(&t0);
+    }
+
+    if (c->draw_count < 40 && srv_slot != SRV_WHITE)
+        printf("          tex0 <- %s 0x%X (%ux%u fmt=0x%02X)\n",
+               sampled_surface >= 0 ? "surface" : "guest", t0.offset,
+               t0.width, t0.height, t0.format & 0xFF);
+
+    D3D12_RESOURCE_BARRIER bar = {0};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (sampled_surface >= 0) {
+        bar.Transition.pResource = g.surfaces[sampled_surface].tex;
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = surface_rtv(target);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
-    g.list->lpVtbl->SetPipelineState(g.list, g.pso_tri);
+    g.list->lpVtbl->SetPipelineState(g.list, t0.enabled ? g.pso_tex : g.pso_tri);
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig);
     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 16, cols, 0);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 1, heaps);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, srv_gpu(srv_slot));
     D3D12_VERTEX_BUFFER_VIEW vbv;
     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
     vbv.StrideInBytes = VERT_STRIDE;
@@ -905,6 +1207,12 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+
+    if (sampled_surface >= 0) {
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+    }
 
     g.vb_used += n_tri * VERT_STRIDE;
     c->draw_count++;
