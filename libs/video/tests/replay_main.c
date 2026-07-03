@@ -15,6 +15,14 @@
  *            program execution yet: positions pass through the RSX viewport
  *            scale/translate INVERSE only when they look like clip-space
  *            output is unavailable; see fetch_draw() comments.
+ *   stage 3: texturing on unit 0. When the bound texture's (location,
+ *            offset) matches a surface this replay already rendered, the
+ *            surface's RT is bound as the SRV (render-to-texture chains,
+ *            incl. the final composite draw); otherwise the texture is
+ *            decoded from guest memory (linear/swizzled A8R8G8B8 and
+ *            A4R4G4B4, DXT1/DXT45 pass through as BC1/BC3). The pixel
+ *            shader modulates the sample by the vertex color (diffuse
+ *            defaults to white), matching the capture's no-blend composite.
  *
  * Build (see build_replay.cmd):
  *   cl /std:c17 /O2 /I..\..\..\include replay_main.c ..\rsx_dispatch.c
@@ -153,7 +161,7 @@ static void apply_block(const rxs_stream* s, u32 index)
  * -----------------------------------------------------------------------*/
 
 #define MAX_VERTS   (256 * 1024)
-#define VERT_STRIDE 28          /* float3 pos + float4 color */
+#define VERT_STRIDE 36          /* float3 pos + float4 color + float2 uv */
 
 /* The capture renders through many offscreen surfaces (render-to-texture
  * passes) before one final composite draw into the scanout buffer. Model
@@ -161,10 +169,26 @@ static void apply_block(const rxs_stream* s, u32 index)
  * flip picks the display buffer's surface for readback. */
 #define MAX_SURFACES 64
 
+/* Uploaded-texture cache (guest textures decoded once, keyed on the
+ * descriptor; block re-applies over texture memory are NOT tracked) */
+#define MAX_TEXTURES 128
+#define UPLOAD_SIZE  (64u * 1024 * 1024)
+
+/* SRV heap layout: [0] 1x1 white fallback, [1..] surfaces, then uploads */
+#define SRV_WHITE        0
+#define SRV_SURFACE_BASE 1
+#define SRV_TEXTURE_BASE (SRV_SURFACE_BASE + MAX_SURFACES)
+#define SRV_HEAP_SLOTS   (SRV_TEXTURE_BASE + MAX_TEXTURES)
+
 typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;
 } surface_t;
+
+typedef struct {
+    u32             location, offset, format, width, height, pitch;
+    ID3D12Resource* tex;        /* NULL = undecodable, use the white slot */
+} texcache_t;
 
 typedef struct {
     ID3D12Device*              dev;
@@ -182,8 +206,18 @@ typedef struct {
     ID3D12Resource*            readback;
     u32                        width, height, rb_pitch;
 
+    ID3D12DescriptorHeap*      srv_heap;   /* shader-visible, SRV_HEAP_SLOTS */
+    u32                        srv_step;
+    ID3D12Resource*            white_tex;
+    texcache_t                 textures[MAX_TEXTURES];
+    u32                        n_textures;
+    ID3D12Resource*            upload;     /* linear texture-upload arena    */
+    u8*                        upload_mapped;
+    u32                        upload_used;
+
     ID3D12RootSignature*       rootsig;
     ID3D12PipelineState*       pso_tri;
+    ID3D12PipelineState*       pso_tex;
     ID3D12PipelineState*       pso_line;
 
     ID3D12Resource*            vb;
@@ -264,14 +298,47 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     D3D12_RANGE rr = {0, 0};
     g.vb->lpVtbl->Map(g.vb, 0, &rr, (void**)&g.vb_mapped);
 
-    /* root signature: 16 root constants = 4x4 transform at b0 */
-    D3D12_ROOT_PARAMETER rp = {0};
-    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp.Constants.Num32BitValues = 16;
-    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    /* texture-upload arena (persistently mapped; regions handed out once) */
+    bd.Width = UPLOAD_SIZE;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                                      &IID_ID3D12Resource, (void**)&g.upload)))
+        return -1;
+    g.upload->lpVtbl->Map(g.upload, 0, &rr, (void**)&g.upload_mapped);
+
+    /* shader-visible SRV heap: white fallback + surfaces + uploaded textures */
+    hd.NumDescriptors = SRV_HEAP_SLOTS;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.srv_heap)))
+        return -1;
+    g.srv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    /* root signature: 16 root constants = 4x4 transform at b0 (VS),
+     * one SRV table at t0 (PS), one static linear-clamp sampler at s0 */
+    D3D12_DESCRIPTOR_RANGE range = {0};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {0};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 16;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable.NumDescriptorRanges = 1;
+    rp[1].DescriptorTable.pDescriptorRanges = &range;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC smp = {0};
+    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-    rsd.NumParameters = 1;
-    rsd.pParameters = &rp;
+    rsd.NumParameters = 2;
+    rsd.pParameters = rp;
+    rsd.NumStaticSamplers = 1;
+    rsd.pStaticSamplers = &smp;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ID3DBlob* sig = NULL;
     ID3DBlob* err = NULL;
@@ -285,22 +352,29 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     sig->lpVtbl->Release(sig);
     if (FAILED(hr)) return -1;
 
-    /* pass-through vertex-color shaders; transform columns arrive at b0 */
+    /* pass-through shaders; transform columns arrive at b0. The textured
+     * pixel shader modulates by the vertex color (white when no diffuse). */
     static const char vs_src[] =
         "cbuffer cb : register(b0) { float4 c0, c1, c2, c3; };\n"
-        "struct I { float3 p : POSITION; float4 c : COLOR; };\n"
-        "struct O { float4 p : SV_POSITION; float4 c : COLOR; };\n"
+        "struct I { float3 p : POSITION; float4 c : COLOR; float2 t : TEXCOORD; };\n"
+        "struct O { float4 p : SV_POSITION; float4 c : COLOR; float2 t : TEXCOORD; };\n"
         "O main(I i) {\n"
         "  O o;\n"
         "  float4 p = float4(i.p, 1.0);\n"
         "  o.p = c0 * p.x + c1 * p.y + c2 * p.z + c3 * p.w;\n"
         "  o.c = i.c;\n"
+        "  o.t = i.t;\n"
         "  return o;\n"
         "}\n";
     static const char ps_src[] =
-        "struct I { float4 p : SV_POSITION; float4 c : COLOR; };\n"
+        "struct I { float4 p : SV_POSITION; float4 c : COLOR; float2 t : TEXCOORD; };\n"
         "float4 main(I i) : SV_TARGET { return i.c; }\n";
-    ID3DBlob *vs = NULL, *ps = NULL;
+    static const char ps_tex_src[] =
+        "Texture2D tex0 : register(t0);\n"
+        "SamplerState smp0 : register(s0);\n"
+        "struct I { float4 p : SV_POSITION; float4 c : COLOR; float2 t : TEXCOORD; };\n"
+        "float4 main(I i) : SV_TARGET { return tex0.Sample(smp0, i.t) * i.c; }\n";
+    ID3DBlob *vs = NULL, *ps = NULL, *ps_tex = NULL;
     if (FAILED(D3DCompile(vs_src, sizeof(vs_src) - 1, "vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vs, &err))) {
         printf("vs: %s\n", err ? (char*)err->lpVtbl->GetBufferPointer(err) : "?");
         return -1;
@@ -309,11 +383,17 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         printf("ps: %s\n", err ? (char*)err->lpVtbl->GetBufferPointer(err) : "?");
         return -1;
     }
+    if (FAILED(D3DCompile(ps_tex_src, sizeof(ps_tex_src) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ps_tex, &err))) {
+        printf("ps_tex: %s\n", err ? (char*)err->lpVtbl->GetBufferPointer(err) : "?");
+        return -1;
+    }
 
     D3D12_INPUT_ELEMENT_DESC il[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
@@ -323,7 +403,7 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
     pd.InputLayout.pInputElementDescs = il;
-    pd.InputLayout.NumElements = 2;
+    pd.InputLayout.NumElements = 3;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -335,11 +415,19 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState,
                                                     (void**)&g.pso_tri);
     if (FAILED(hr)) { printf("pso tri failed 0x%08lX\n", hr); return -1; }
+    pd.PS.pShaderBytecode = ps_tex->lpVtbl->GetBufferPointer(ps_tex);
+    pd.PS.BytecodeLength = ps_tex->lpVtbl->GetBufferSize(ps_tex);
+    hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState,
+                                                    (void**)&g.pso_tex);
+    if (FAILED(hr)) { printf("pso tex failed 0x%08lX\n", hr); return -1; }
+    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+    pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
     g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState,
                                                (void**)&g.pso_line);
     vs->lpVtbl->Release(vs);
     ps->lpVtbl->Release(ps);
+    ps_tex->lpVtbl->Release(ps_tex);
 
     /* open the list for the first frame */
     D3D12_VIEWPORT vp = {0, 0, (float)width, (float)height, 0.0f, 1.0f};
@@ -483,7 +571,7 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
  * Dispatcher sink: clears + draw accumulation
  * -----------------------------------------------------------------------*/
 
-typedef struct { float x, y, z, r, g2, b, a; } vtx_t;
+typedef struct { float x, y, z, r, g2, b, a, u, v; } vtx_t;
 
 /* RSX primitive ids (gcm public constants) */
 #define PRIM_TRIANGLES      5
@@ -610,7 +698,7 @@ static void sink_begin(void* user, const rsx_dispatch* rsx, u32 prim)
     c->fetch_ok = 1;
 }
 
-static void push_vert(sink_ctx* c, const float pos[4], const float col[4])
+static void push_vert(sink_ctx* c, const float pos[4], const float col[4], const float uv[4])
 {
     if (c->n_verts >= c->cap_verts) {
         c->cap_verts = c->cap_verts ? c->cap_verts * 2 : 4096;
@@ -624,6 +712,8 @@ static void push_vert(sink_ctx* c, const float pos[4], const float col[4])
     v->g2 = col[1];
     v->b = col[2];
     v->a = col[3];
+    v->u = uv[0];
+    v->v = uv[1];
 }
 
 static void sink_draw_arrays(void* user, const rsx_dispatch* rsx, u32 first, u32 count)
@@ -650,7 +740,7 @@ static void sink_draw_index_array(void* user, const rsx_dispatch* rsx, u32 first
 
 static void fetch_one(sink_ctx* c, const rsx_dispatch* rsx, u32 base, u32 vert)
 {
-    float pos[4], col[4];
+    float pos[4], col[4], uv[4];
     if (!fetch_attr(rsx, 0, base, vert, pos)) {
         c->fetch_ok = 0;
         return;
@@ -658,7 +748,10 @@ static void fetch_one(sink_ctx* c, const rsx_dispatch* rsx, u32 base, u32 vert)
     if (!fetch_attr(rsx, 3, base, vert, col)) {
         col[0] = col[1] = col[2] = col[3] = 1.0f; /* no diffuse: white */
     }
-    push_vert(c, pos, col);
+    if (!fetch_attr(rsx, 8, base, vert, uv)) {   /* attr 8 = texcoord0 */
+        uv[0] = uv[1] = 0.0f;
+    }
+    push_vert(c, pos, col, uv);
 }
 
 /* Fetch every accumulated batch's vertices (called at END, once the draw's
