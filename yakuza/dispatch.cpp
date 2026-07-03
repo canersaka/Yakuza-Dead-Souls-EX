@@ -371,11 +371,19 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * decisive datum: run the real create here (direct-call idiom, like
      * yz_call_guest_opd) and log its return value + the taskset bitsets right after,
      * one-shot. Then suppress the normal dispatch (we already executed it). */
-    { static int rc = -1; if (rc < 0) rc = getenv("YZ_TASK_RET") ? 1 : 0;
+    { static int rc = -1; static uint32_t rc_ts = 0;
+      if (rc < 0) { const char* e = getenv("YZ_TASK_RET"); rc = e ? 1 : 0;
+          /* 2026-07-03 s7: optional hex TASKSET filter (YZ_TASK_RET=40199D00)
+           * so the one-shot fires on the FAILING create (the pxd IO-service
+           * retry loop), not the first successful shader-phase one. "1" or
+           * any non-hex value = fire on the first call as before. */
+          if (e) { char* end = NULL; unsigned long v = strtoul(e, &end, 16);
+                   if (end != e && v > 0xFFFFu) rc_ts = (uint32_t)v; } }
       if (rc) {
         static uint32_t t2c = 0; static int t2ci = 0;
         if (!t2ci) { t2ci = 1; t2c = vm_read32(0x0203161Cu); }
-        if (t2c && (target == 0x0203161Cu || target == t2c)) {
+        if (t2c && (target == 0x0203161Cu || target == t2c)
+                && (!rc_ts || (uint32_t)ctx->gpr[3] == rc_ts)) {
             static int once = 0;
             if (!once) { once = 1;
                 uint32_t ts   = (uint32_t)ctx->gpr[3];   /* taskset2 */

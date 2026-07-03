@@ -268,35 +268,20 @@ int64_t sys_cond_signal(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Lost-wakeup fix: hold the associated mutex across the wake. sys_cond_wait
-     * releases the mutex and parks on the condvar atomically (SleepConditionVariableCS);
-     * a signal that lands in the window between a waiter releasing the mutex and
-     * registering on the condvar would otherwise be dropped and the waiter hangs.
-     * On Windows the mutex CS is recursive, so this is safe even when the caller
-     * already holds it (the common "signal under the lock" idiom). */
+    /* FAITHFUL lv2 semantics (2026-07-03, user-confirmed audit fix 1a): real
+     * sys_cond_signal NEVER acquires the guest mutex -- the kernel's own lock
+     * protects wake delivery (RPCS3 sys_cond.cpp). The former "lost-wakeup fix"
+     * here (acquire the mutex CS around the wake) introduced HOLD-AND-WAIT: a
+     * signaler stalled behind any long mutex hold, delaying/misordering wakes
+     * -- the prime suspect for the pre-PortStart mixer race (t10 EQ-4
+     * ETIMEDOUT, ate 4/10 boots on 2026-07-03). The condvar race it guarded
+     * against (signal landing between a waiter's release and park) is
+     * PERMITTED lv2 behavior: guest code that needs the guarantee signals
+     * while holding the mutex itself, and SleepConditionVariableCS makes the
+     * waiter's release+park atomic for exactly that idiom. */
 #ifdef _WIN32
-    sys_mutex_info* m = NULL;
-    if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
-        m = &g_sys_mutexes[c->mutex_id - 1];
-    if (m) {
-        if (!TryEnterCriticalSection(&m->cs)) {
-            if (cond_trace_on() && cond_id <= 16) {
-                static long n = 0;
-                if (n < 400) { n++;
-                    fprintf(stderr, "[cond] t%u SIGNAL cond=%u BLOCKED-ON mutex=%u owner=t%u cnt=%d\n",
-                            yz_thread_current_id(), cond_id, (uint32_t)c->mutex_id,
-                            (uint32_t)m->owner_tid, m->lock_count);
-                    fflush(stderr); }
-            }
-            EnterCriticalSection(&m->cs);
-        }
-    }
     WakeConditionVariable(&c->cv);
-    if (m) LeaveCriticalSection(&m->cs);
 #else
-    /* pthreads (secondary platform): the default mutex is non-recursive, so
-     * re-locking it here would deadlock callers that signal while holding it.
-     * Keep the bare signal. */
     pthread_cond_signal(&c->cv);
 #endif
 
@@ -319,27 +304,10 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Lost-wakeup fix (see sys_cond_signal): hold the associated mutex across the
-     * broadcast so a wake can't slip into the waiter's release/park window. */
+    /* FAITHFUL lv2 semantics (2026-07-03, see sys_cond_signal above): bare
+     * broadcast, never touch the guest mutex on the signal path. */
 #ifdef _WIN32
-    sys_mutex_info* m = NULL;
-    if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
-        m = &g_sys_mutexes[c->mutex_id - 1];
-    if (m) {
-        if (!TryEnterCriticalSection(&m->cs)) {
-            if (cond_trace_on() && cond_id <= 16) {
-                static long n = 0;
-                if (n < 400) { n++;
-                    fprintf(stderr, "[cond] t%u SIGNAL_ALL cond=%u BLOCKED-ON mutex=%u owner=t%u cnt=%d\n",
-                            yz_thread_current_id(), cond_id, (uint32_t)c->mutex_id,
-                            (uint32_t)m->owner_tid, m->lock_count);
-                    fflush(stderr); }
-            }
-            EnterCriticalSection(&m->cs);
-        }
-    }
     WakeAllConditionVariable(&c->cv);
-    if (m) LeaveCriticalSection(&m->cs);
 #else
     pthread_cond_broadcast(&c->cv);
 #endif
