@@ -335,7 +335,19 @@ static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.
  * at the *lower* storage address). Same caveat as the mpy family. */
 static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
-static inline u128 spu_xswd(u128 a) { u128 r; for(int i=0;i<2;i++) r._s64[i] = (int32_t)a._s32[2*i]; return r; }
+/* xswd (ISA v1.2 p96): per doubleword, sign-extend the word in the RIGHT
+ * slot -- the value stays in the right word, the sign fill goes in the left.
+ * The old `_s64[i] = (int32_t)_s32[2*i]` was wrong on BOTH counts in our lane
+ * convention (sourced the left word AND placed value/sign swapped); caught
+ * RED by tools/test_spu_lift.py 2026-07-03 (61 live sites incl. the codec). */
+static inline u128 spu_xswd(u128 a) {
+    u128 r;
+    for (int i = 0; i < 2; i++) {
+        r._u32[2*i]   = (a._s32[2*i+1] < 0) ? 0xFFFFFFFFu : 0u;
+        r._u32[2*i+1] = a._u32[2*i+1];
+    }
+    return r;
+}
 
 /* ---- Phase 3: OR across ---- */
 static inline u128 spu_orx(u128 a) {
