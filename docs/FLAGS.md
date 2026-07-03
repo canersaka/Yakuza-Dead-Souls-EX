@@ -53,7 +53,10 @@ for the invasive sub-dumps; don't use dump-armed runs for pass/fail rates);
 `YZ_PEEK=ea1,ea2,...` (main.cpp: change-triggered 4-word dumps of up to 16 hex guest EAs,
 VirtualQuery-guarded — moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
 (dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses —
-direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt).
+direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt);
+`YZ_TASKARG` (spu_channels.c, 2026-07-03 s8: log every SPURS task launch — the pc-0x3050
+entry branch — with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
+only launch args are needed — PROF's per-branch overhead crawls the whole boot).
 
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
