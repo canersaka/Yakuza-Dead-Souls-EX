@@ -27,6 +27,7 @@ SPR_NAMES = {
     19: "DAR",
     22: "DEC",
     25: "SDR1",
+    256: "VRSAVE",   # audit 2b: was printed as bare spr256
     26: "SRR0",
     27: "SRR1",
     268: "TBL",
@@ -791,6 +792,24 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "ldbrx"
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
+        # Cell unaligned vector STORES (audit 5d: were op31_x647/x679 -> lifted
+        # as TODO no-ops = silent memory non-writes in real vector routines).
+        if xo_full == 647:  # stvlx (Store Vector Left Indexed)
+            result.mnemonic = "stvlx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 679:  # stvrx (Store Vector Right Indexed)
+            result.mnemonic = "stvrx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 903:  # stvlxl
+            result.mnemonic = "stvlxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 935:  # stvrxl
+            result.mnemonic = "stvrxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
 
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
@@ -836,6 +855,9 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             40: "fneg", 72: "fmr", 264: "fabs", 136: "fnabs",
             64: "mcrfs",
             583: "mffs", 711: "mtfsf",
+            # audit S2-10: FPSCR bit ops previously fell through to `.word`
+            # (invisible). FPSCR is unmodeled; the lifter no-ops these visibly.
+            70: "mtfsb0", 38: "mtfsb1", 134: "mtfsfi",
         }
         if xo_full in fp_x:
             mne = fp_x[xo_full]
@@ -940,6 +962,14 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
             714: "vrfim",  # round to FP integer toward -inf (floor)
+            # audit 5a/5b (were vmx_x394/458/522/586/650 TODOs): estimates +
+            # the other three round-to-FP-integer forms (PEM 6-42/6-43;
+            # RPCS3 PPUOpcodes.h:274,280)
+            394: "vexptefp",  # 2^x estimate
+            458: "vlogefp",   # log2(x) estimate
+            522: "vrfin",     # round to nearest
+            586: "vrfiz",     # round toward zero
+            650: "vrfip",     # round toward +inf
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",

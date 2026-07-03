@@ -125,6 +125,42 @@ extern "C" uint64_t ppu_timebase_now(void);
 extern uint64_t ppu_timebase_now(void);
 #endif
 
+/* PPU reservation atomics (lwarx/stwcx/ldarx/stdcx): value-verified CAS
+ * commits provided by the runtime (yakuza/shims.cpp) -- see the lifter's
+ * atomic-emission comment. The store forms set CR0 themselves. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint64_t ppu_res_lwarx(ppu_context* ctx, uint64_t addr);
+uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t addr);
+void     ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val);
+void     ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val);
+#ifdef __cplusplus
+}
+#endif
+
+/* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
+ * overflow => max, negative => min, NaN => min) and honor the rounding mode
+ * (rn=1: FPSCR default round-to-nearest-even via nearbyint; rn=0: the z
+ * forms truncate). Plain C casts are UB here and sign-flip positive
+ * overflow on x86. */
+static inline uint32_t ppu_f2i32(double v, int rn)
+{
+    if (v != v) return 0x80000000u;
+    double r = rn ? nearbyint(v) : trunc(v);
+    if (r >= 2147483647.0)  return 0x7FFFFFFFu;
+    if (r <= -2147483648.0) return 0x80000000u;
+    return (uint32_t)(int32_t)r;
+}
+static inline uint64_t ppu_f2i64(double v, int rn)
+{
+    if (v != v) return 0x8000000000000000ULL;
+    double r = rn ? nearbyint(v) : trunc(v);
+    if (r >= 9223372036854775807.0)  return 0x7FFFFFFFFFFFFFFFULL;
+    if (r <= -9223372036854775808.0) return 0x8000000000000000ULL;
+    return (uint64_t)(int64_t)r;
+}
+
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -702,15 +738,27 @@ class PPULifter:
                 return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp});"
 
         # ------- Indexed Stores -------
+        # audit S2-7: the ux (update) forms were in this plain-store map, so
+        # their RA update never happened (the dedicated stwux handler below
+        # was shadowed dead code). Book I: store-with-update writes RA <- EA.
+        # Zero live sites today (64-bit ABI uses stdux) -- landmine removal.
         idx_store_map = {
             "stbx": "vm_write8", "sthx": "vm_write16", "stwx": "vm_write32", "stdx": "vm_write64",
-            "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
         }
         if mn in idx_store_map:
             helper = idx_store_map[mn]
             rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
+
+        idx_store_update_map = {
+            "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
+        }
+        if mn in idx_store_update_map:
+            helper = idx_store_update_map[mn]
+            rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                    f"{helper}(ea, ctx->gpr[{rs_i}]); ctx->gpr[{ra_i}] = ea; }}")
 
         # ------- Indexed FP Loads/Stores -------
         if mn in ("lfsx", "lfdx"):
@@ -903,6 +951,15 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
+        # VRSAVE (audit 2b): exactly one mfspr/mtspr pair in the EBOOT, a
+        # save/restore around vector code. Nothing models per-thread VRSAVE;
+        # a benign 0-read + discarded write keeps the pair coherent.
+        if mn == "mfspr" and ops and ops[-1].upper() == "VRSAVE":
+            rd_i = _reg_idx(ops[0])
+            return f"ctx->gpr[{rd_i}] = 0; /* VRSAVE unmodeled (audit 2b) */"
+        if mn == "mtspr" and ops and ops[0].upper() == "VRSAVE":
+            return "/* mtspr VRSAVE: unmodeled (audit 2b) */;"
+
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
         if mn == "mtcrf":
@@ -966,6 +1023,14 @@ class PPULifter:
             fra = _reg_idx(ops[1])
             frb = _reg_idx(ops[2])
             op_c = fp_binary[mn_base]
+            # Book I 4.6.5: the single forms (fadds/fsubs/fmuls/fdivs) round
+            # the result to single precision; keeping the double intermediate
+            # diverges from real HW (breaks exact-compare/convergence idioms
+            # and oracle comparability). Audit S2-4 (~24k sites), oracle
+            # RPCS3 FADDS = f32(a+b).
+            if mn_base.endswith("s"):
+                return (f"ctx->fpr[{frd}] = (double)(float)"
+                        f"(ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]);")
             return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}];"
 
         if mn_base in ("fmr",):
@@ -988,39 +1053,62 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = -fabs(ctx->fpr[{frb}]);"
 
+        # S2-4: single fused forms round to single (see fp_binary comment).
         if mn_base in ("fmadd", "fmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}];"
+            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fmsub", "fmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}];"
+            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fnmadd", "fnmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]);"
+            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}])"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fnmsub", "fnmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]);"
+            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}])"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("frsp",):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
 
+        # Book I v2.02 4.6.7 float->int: SATURATE (>max => max, <min => min,
+        # NaN => min) and fctiw/fctid round per FPSCR[RN] (default nearest-
+        # even) where the z forms truncate. The old plain C casts were UB on
+        # NaN/inf/overflow (MSVC: 0x80000000 for everything -- positive
+        # overflow SIGN-FLIPPED) and fctiw truncated. Audit S2-3 (3,582
+        # sites), oracle RPCS3 PPUInterpreter fctiw fixup. Helpers in the
+        # preamble (ppu_f2i32/ppu_f2i64; nearbyint = host default rounding =
+        # nearest-even, matching the FPSCR default this title never changes).
         if mn_base in ("fctiw", "fctiwz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return (f"{{ int32_t iv = (int32_t)ctx->fpr[{frb}]; uint64_t tmp; "
+            rn = 0 if mn_base.endswith("z") else 1
+            return (f"{{ uint32_t iv = ppu_f2i32(ctx->fpr[{frb}], {rn}); uint64_t tmp; "
                     f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
-                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | (uint32_t)iv; "
+                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | iv; "
                     f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
 
         if mn_base in ("fctid", "fctidz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return (f"{{ int64_t iv = (int64_t)ctx->fpr[{frb}]; "
+            rn = 0 if mn_base.endswith("z") else 1
+            return (f"{{ uint64_t iv = ppu_f2i64(ctx->fpr[{frb}], {rn}); "
                     f"memcpy(&ctx->fpr[{frd}], &iv, 8); }}")
 
         if mn_base in ("fcfid",):
@@ -1032,16 +1120,22 @@ class PPULifter:
         if mn_base == "fsqrt" or mn_base == "fsqrts":
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
 
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base == "frsqrtes":
+                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
             return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base == "fres":
+                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = 1.0 / ctx->fpr[{frb}];"
 
         if mn_base == "fsel":
@@ -1049,6 +1143,10 @@ class PPULifter:
             return f"ctx->fpr[{frd}] = (ctx->fpr[{fra}] >= 0.0) ? ctx->fpr[{frc}] : ctx->fpr[{frb}];"
 
         # ------- FP compare -------
+        # Book I v2.02 4.6.8: either operand NaN => c = 0b0001 (FU/unordered).
+        # The old emission mapped NaN to EQ(2), so every cror-composed >=/<=
+        # after fcmpu took the wrong arm on NaN-poisoned floats (7,975 sites;
+        # audit S2-2, oracle RPCS3 ppu_set_fpcc).
         if mn_base == "fcmpu" or mn_base == "fcmpo":
             if ops[0].startswith("cr"):
                 bf = int(ops[0][2:])
@@ -1060,7 +1158,7 @@ class PPULifter:
                 frb = _reg_idx(ops[1])
             shift = (7 - bf) * 4
             return (f"{{ double a = ctx->fpr[{fra}]; double b = ctx->fpr[{frb}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = (a != a || b != b) ? 1 : (a < b) ? 8 : (a > b) ? 4 : 2; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- 64-bit multiply / divide -------
@@ -1208,16 +1306,19 @@ class PPULifter:
         if mn == "mtfsf":
             return f"/* mtfsf: FPSCR update — ignored for now */;"
 
+        # FPSCR bit ops (audit S2-10: previously undecoded => invisible
+        # `.word`). FPSCR is unmodeled; visible named no-ops.
+        if mn.rstrip(".") in ("mtfsb0", "mtfsb1", "mtfsfi"):
+            return f"/* {mn} {insn.operands}: FPSCR bit update — FPSCR unmodeled */;"
+
         # ------- Store/load with update indexed -------
         if mn == "stdux":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"vm_write64(ea, ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
 
-        if mn == "stwux":
-            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
+        # (stwux is handled by idx_store_update_map above -- the old dedicated
+        # handler here was shadowed dead code, audit S2-7.)
 
         if mn == "ldux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1230,37 +1331,35 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = vm_read32(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Atomic load/store with reservation -------
+        # REAL reservation semantics (2026-07-03, CBEA-audit P1). The old
+        # inline emission was an ADDRESS-ONLY per-thread check followed by a
+        # PLAIN store: any concurrent writer (another PPU thread, an SPU
+        # PUTLLC) between lwarx and stwcx was silently reverted -- a lost-
+        # update race that scaled with line traffic. Measured killing Sony's
+        # PPU-side SendWorkloadSignal readyCount CAS on the hot SPURS mgmt
+        # line (the image-5 taskset was never selected). The runtime helpers
+        # (yakuza/shims.cpp ppu_res_*) implement value-verified CAS commits,
+        # serialized with the SPU lock-line for coherence-set lines, and set
+        # CR0 themselves.
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_res_lwarx(ctx, ea); }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "  # CR0 = 0
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"ppu_res_stwcx(ctx, ea, (uint32_t)ctx->gpr[{rs}]); }}")
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_res_ldarx(ctx, ea); }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write64(ea, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"ppu_res_stdcx(ctx, ea, ctx->gpr[{rs}]); }}")
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
@@ -1423,6 +1522,32 @@ class PPULifter:
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
                     f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
+
+        # Cell unaligned vector STORES -- the mirrors of lvlx/lvrx (audit 5d:
+        # previously undecoded => silent NO-OP stores, a memory-corruption
+        # class; the classic pair writes one unaligned quadword via
+        # stvlx(low part)+stvrx(high part)). stvlx stores vS bytes [0 ..
+        # 15-(EA&15)] to [EA .. align_up-1]; stvrx stores the TOP (EA&15)
+        # bytes of vS to [EA&~15 .. EA-1]. Raw-byte convention as the loads.
+        if mn in ("stvlx", "stvlxl"):
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = sh; i < 16; i++) m[i] = s[i - sh]; }}")
+
+        if mn in ("stvrx", "stvrxl"):
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = 0; i < sh; i++) m[i] = s[16u - sh + i]; }}")
 
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -1747,6 +1872,24 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
 
+        # The other three VMX round-to-FP-integer forms (audit 5b; PEM: vrfin
+        # = round to nearest, vrfiz = toward zero, vrfip = toward +inf). Same
+        # shape as vrfim; decode entries added alongside (xo 0x20A/0x24A/0x28A).
+        if mn in ("vrfin", "vrfiz", "vrfip"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = {"vrfin": "nearbyintf", "vrfiz": "truncf", "vrfip": "ceilf"}[mn]
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
+
+        # 2^x / log2(x) estimates (audit 5a; PEM 6-42/6-43, xo 0x18A/0x1CA;
+        # RPCS3 PPUOpcodes.h:274,280). exp2f/log2f exceed the spec's 1/32
+        # relative-error bound, conforming.
+        if mn in ("vexptefp", "vlogefp"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = "exp2f" if mn == "vexptefp" else "log2f"
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
+
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
@@ -1756,21 +1899,32 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=(float)b[i]{scale}; }}")
 
+        # PEM vctsxs/vctuxs: SATURATE out-of-range (audit S2-3 class: the
+        # plain cast was UB and sign-flipped positive overflow); NaN => 0.
         if mn == "vctsxs" or mn == "vctuxs":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
-            dst_ty = "int32_t" if mn == "vctsxs" else "uint32_t"
             scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
-            return (f"{{ {dst_ty}* d=({dst_ty}*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=({dst_ty})(b[i]{scale}); }}")
+            if mn == "vctsxs":
+                return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                        f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; "
+                        f"d[i] = (v!=v) ? 0 : (v>=2147483647.0f) ? 2147483647 : "
+                        f"(v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v; }} }}")
+            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; "
+                    f"d[i] = (v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
+                    f"(v<=0.0f) ? 0u : (uint32_t)v; }} }}")
 
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
+        # PEM vcmpbfp: a NaN operand lane sets BOTH bounds bits (out of
+        # bounds); the C compares mapped NaN to 0 = "in bounds" (audit 4b).
         if mn.startswith("vcmpbfp"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
-                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; d[i]=r; }} }}")
+                    f"if(a[i]!=a[i] || b[i]!=b[i]) r=0xC0000000u; else {{ "
+                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; }} d[i]=r; }} }}")
 
         # ------- Additional VMX integer instructions -------
         # Byte compare equal
@@ -1918,6 +2072,25 @@ class PPULifter:
                     f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
                     f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
 
+        # Pack signed halfword UNSIGNED saturate (audit S2-6; PEM: clamp each
+        # signed halfword to [0,255]). Same lane layout as vpkshss above.
+        if mn == "vpkshus":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(uint8_t)(v>255?255:v<0?0:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(uint8_t)(v>255?255:v<0?0:v);}} }}")
+
+        # Even/odd unsigned-byte multiplies (audit S2-6; PEM vmuleub/vmuloub).
+        # Lane indexing matches the vmulosh convention in this file (host-order
+        # sub-lanes: "even" = lower storage index of each pair).
+        if mn == "vmuleub" or mn == "vmuloub":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            off = 0 if mn == "vmuleub" else 1
+            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++) d[i]=(uint16_t)a[2*i+{off}]*(uint16_t)b[2*i+{off}]; }}")
+
         # vmsummbm (VA-form, 4 operands)
         if mn == "vmsummbm":
             vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
@@ -1963,7 +2136,19 @@ class PPULifter:
             "dz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) == 0)",
         }
 
-        return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
+        if mn in cond_map:
+            return cond_map[mn]
+
+        # Combined CTR+CR forms (audit S2-8: bdnzeq/bdnzne/... previously fell
+        # to the always-taken `1` WITHOUT decrementing CTR). Book I 2.4.1 BO:
+        # decrement CTR, branch if (ctr-cond) AND (cr-cond). Census shows all
+        # current in-range hits are data, so this is landmine removal.
+        for ctr_mn, ctr_cond in (("dnz", cond_map["dnz"]), ("dz", cond_map["dz"])):
+            if mn.startswith(ctr_mn) and mn[len(ctr_mn):] in cond_map:
+                cr_cond = cond_map[mn[len(ctr_mn):]]
+                return f"({ctr_cond} && {cr_cond})"
+
+        return f"/* cond: {mnemonic} */ 1"
 
     # ------------------------------------------------------------------ #
     # Code-coverage contract
