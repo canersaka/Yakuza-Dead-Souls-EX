@@ -4,7 +4,7 @@ A Yakuza: Dead Souls recompilation effort — a native PC port of the PS3 game, 
 
 Work on this project began 6/9/26, on the 15th anniversary of the original release of Yakuza: Dead Souls (RGG: Of The End) on PS3.
 
-> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet). This repo carries my fixes to those tools plus the Yakuza-specific port; the general, game-agnostic fixes get sent back upstream.
+> All credit for the original SDK, runtime, and HLE library work goes to [sp00nznet](https://github.com/sp00nznet). This repo carries my fixes specifici to the Yakuza-specific port; the general, game-agnostic fixes get sent back upstream through the (https://github.com/canersaka/ps3recomp-yakuzadeadsouls) repo
 
 
 Found and fixed various issues in the original ps3recomp tools. With it's help a lot of progress has been made. The game now builds and boots a long way in.
