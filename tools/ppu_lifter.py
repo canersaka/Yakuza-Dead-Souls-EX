@@ -1764,9 +1764,9 @@ class PPULifter:
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             if w == 1:
                 sty, uty = "int8_t", "uint8_t"
-                get_a = f"(({sty})a->b[i])" if signed else f"a->b[i]"
-                get_b = f"(({sty})b->b[i])" if signed else f"b->b[i]"
-                setd = "d->b[i]=r"
+                get_a = f"(({sty})((const uint8_t*)a)[i])" if signed else f"((const uint8_t*)a)[i]"
+                get_b = f"(({sty})((const uint8_t*)b)[i])" if signed else f"((const uint8_t*)b)[i]"
+                setd = "((uint8_t*)d)[i]=r"
             elif w == 2:
                 sty, uty = "int16_t", "uint16_t"
                 get_a = f"(({sty})vrh(a,i))" if signed else f"vrh(a,i)"
