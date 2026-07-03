@@ -6,6 +6,7 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -253,8 +254,30 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    /* Recursive re-entry */
+    /* Recursive re-entry. MUST still acquire the host primitive: unlock
+     * calls LeaveCriticalSection unconditionally per guest unlock, so every
+     * guest lock (including recursive re-entry) must Enter exactly once or
+     * the Enter/Leave pairing breaks — the old fast path here bumped
+     * lock_count WITHOUT entering, so the paired unlock released the CS
+     * while the guest still held the mutex, and the final unlock called
+     * Leave on a non-held CS (UB, corrupts the CS — random forever-blocks
+     * on later Enters; found 2026-07-02 hunting the ~1/5 CRI boot stall).
+     * EnterCriticalSection by the current owner is recursive and never
+     * blocks, so this is safe and cheap. */
     if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+#ifdef _WIN32
+        { static int tr = -1; if (tr < 0) tr = getenv("YZ_COND_TRACE") ? 1 : 0;
+          if (tr) { static long n = 0; if (n < 200) { n++;
+              fprintf(stderr, "[mtx] t%u RECURSIVE trylock re-entry mutex=%u count=%d\n",
+                      (uint32_t)caller_tid, mutex_id, m->lock_count);
+              fflush(stderr); } } }
+        EnterCriticalSection(&m->cs);
+#else
+        /* pthreads: the default mutex is non-recursive; owner re-lock would
+         * deadlock. The pthread path needs PTHREAD_MUTEX_RECURSIVE mutexes
+         * for guest-recursive locks — pre-existing gap, Windows is the
+         * shipping platform. */
+#endif
         m->lock_count++;
         return CELL_OK;
     }

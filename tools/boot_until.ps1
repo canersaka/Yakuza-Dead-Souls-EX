@@ -39,10 +39,14 @@ try {
         Start-Sleep -Milliseconds 400
         if ($p.HasExited) { Write-Host "[boot_until] process exited at +$([int]$sw.Elapsed.TotalSeconds)s"; break }
         if ($Pattern -eq '') { continue }
-        # incremental scan: only lines added since the last poll
+        # Incremental scan of lines added since the last poll. HOLD BACK the
+        # final line: it may be mid-flush (no trailing newline yet), and a
+        # partial line that fails the match must be re-read next tick, not
+        # skipped forever (2026-07-02: this exact race silently misclassified
+        # five matched boots as NO MATCH).
         $lines = @(Get-Content $err -ErrorAction SilentlyContinue)
-        if ($lines.Count -gt $lastLine) {
-            for ($i = $lastLine; $i -lt $lines.Count; $i++) {
+        if ($lines.Count -gt $lastLine + 1) {
+            for ($i = $lastLine; $i -lt $lines.Count - 1; $i++) {
                 if ($lines[$i] -match $Pattern) {
                     $hits++
                     if ($hits -ge $After) {
@@ -56,12 +60,33 @@ try {
                     }
                 }
             }
-            $lastLine = $lines.Count
+            if (-not $matched) { $lastLine = $lines.Count - 1 }
         }
         if ($matched) { break }
     }
 } finally {
     if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+}
+
+if (-not $matched -and $Pattern -ne '') {
+    # Final authoritative pass over the settled file (the incremental scanner
+    # can never have seen the very tail; the process is dead now, so the file
+    # is complete).
+    Start-Sleep -Milliseconds 200
+    $lines = @(Get-Content $err -ErrorAction SilentlyContinue)
+    for ($i = $lastLine; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match $Pattern) {
+            $hits++
+            if ($hits -ge $After) {
+                Write-Host "[boot_until] MATCH #$hits on final pass (line $($i+1)) -- matched before kill:"
+                $lo = [Math]::Max(0, $i - 1)
+                $hi = [Math]::Min($lines.Count - 1, $i + $Context)
+                $lines[$lo..$hi] | ForEach-Object { Write-Host "    $_" }
+                $matched = $true
+                break
+            }
+        }
+    }
 }
 
 if (-not $matched -and $Pattern -ne '') {
