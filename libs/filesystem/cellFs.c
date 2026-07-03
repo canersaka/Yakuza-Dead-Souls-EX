@@ -414,7 +414,13 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
      * come back. RPCS3 reads 208KB of adv_voice_talk.cvm; if we read 0 the player
      * never requests it (upstream state-machine gate). */
     const char* p = s_files[fd].path;
-    int is_stream = p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/"));
+    /* YZ_FS_TRACE (2026-07-03 s8, diag — the pxd spurious-completion probe):
+     * log EVERY read/lseek/fstat, not just stream containers; the boundary
+     * streams read an archive fd whose path misses the is_stream filters. */
+    static int fs_trace = -1;
+    if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
+    int is_stream = fs_trace ||
+        (p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/")));
     long long off_before = -1;
     if (is_stream && s_files[fd].host_fp) off_before = (long long)
 #ifdef _MSC_VER
@@ -484,6 +490,12 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
         fseeko(s_files[fd].host_fp, (off_t)offset, host_whence);
         s64 cur = (s64)ftello(s_files[fd].host_fp);
 #endif
+        { static int fs_trace = -1;
+          if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
+          if (fs_trace)
+              printf("[cellFs] Lseek(fd=%d '%s') off=0x%llX whence=%d -> pos=0x%llX\n",
+                     fd, s_files[fd].path ? s_files[fd].path : "?",
+                     (unsigned long long)offset, whence, (unsigned long long)cur); }
         if (pos)
             *pos = ps3_bswap64((u64)cur);
     } else {
@@ -509,6 +521,12 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
         int file_no = _fileno(s_files[fd].host_fp);
         HOST_STAT_T hst;
         if (HOST_FSTAT(file_no, &hst) == 0) {
+            { static int fs_trace = -1;
+              if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
+              if (fs_trace)
+                  printf("[cellFs] Fstat(fd=%d '%s') -> st_size=0x%llX\n",
+                         fd, s_files[fd].path ? s_files[fd].path : "?",
+                         (unsigned long long)hst.st_size); }
             fill_cellfs_stat(sb, &hst);
             return CELL_OK;
         }
