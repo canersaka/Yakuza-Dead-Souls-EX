@@ -27,8 +27,24 @@ $err = Join-Path $root "scratch\$Tag.err"
 $out = Join-Path $root "scratch\$Tag.out"
 foreach ($f in @($err, $out)) { if (Test-Path $f) { Clear-Content $f } }
 
-$p = Start-Process -FilePath ".\yakuza\build\yakuza_recomp.exe" -ArgumentList "game\EBOOT.elf" `
-        -PassThru -WindowStyle Hidden -RedirectStandardError $err -RedirectStandardOutput $out
+# NATIVE stderr/stdout redirection via cmd (kernel-level file handles).
+# PowerShell's -RedirectStandardError pumps the pipe through .NET on its own
+# schedule; under print-heavy boots the pipe fills, every guest thread then
+# SERIALIZES on the CRT stderr lock (measured 2026-07-03: t1 blocked 48 s
+# inside one fprintf; the whole vsync ecosystem throttled to ~3 Hz and a
+# "shader-build crawl" was entirely this artifact). cmd's 2> is a plain file
+# handle -- writers never block on a reader.
+$cmdline = "yakuza\build\yakuza_recomp.exe game\EBOOT.elf 2>`"$err`" 1>`"$out`""
+$shell = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdline `
+        -PassThru -WindowStyle Hidden
+# Track the real guest process (cmd's child) for liveness + kill.
+$p = $null
+for ($w = 0; $w -lt 50 -and -not $p; $w++) {
+    Start-Sleep -Milliseconds 100
+    $p = Get-Process yakuza_recomp -ErrorAction SilentlyContinue |
+         Sort-Object StartTime -Descending | Select-Object -First 1
+}
+if (-not $p) { Write-Host "[boot_until] guest process never appeared"; exit 2 }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $matched = $false
