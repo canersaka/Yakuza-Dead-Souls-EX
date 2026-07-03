@@ -530,6 +530,53 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   fflush(stderr);
               }
           }
+          /* (D) job-world DMA I/O pattern (2026-07-03 s7): every DMA issued
+           * while a jobchain image (13/14/15) is active -- shows whether the
+           * job's INPUT ever loads and whether any OUTPUT PUT is issued at all
+           * (measured: all job output buffers stay zero across every batch).
+           * pc >= 0x4C00 = job code, pc < 0x4880 = module code (image_id can
+           * be stale across C-returns; pc is the discriminator). REMOVE with
+           * the frontier. */
+          if (spu->image_id >= 13 && spu->image_id <= 15
+                  && cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD && cmd != MFC_PUTLLUC_CMD) {
+              static int jio = 0;
+              if (jio < 240) { jio++;
+                  fprintf(stderr, "[job-io] spu=%X img=%d pc=0x%05X %s%s ea=0x%08X lsa=0x%05X size=0x%X\n",
+                          spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                          mfc_is_get(cmd) ? "GET" : "PUT", mfc_is_list(cmd) ? "L" : "",
+                          oea, lsa & SPU_LS_MASK, size);
+                  fflush(stderr);
+              }
+          }
+          /* (C) jobchain COMMAND/DESCRIPTOR fetches (2026-07-03 s7, the parked-
+           * SYNC frontier): fetches (incl. GETLLAR -- the interpreter reads
+           * the command line atomically) from the command stream
+           * [0x4019CA80,0x4019CD00) and the descriptor arena
+           * [0x401AC000,0x401AE000). CHANGE-TRIGGERED, not capped: the parked
+           * module polls the same line forever -- print only when the fetched
+           * value differs from the last print for that ea (8-slot cache), so
+           * the log shows every DISTINCT command the module decodes across the
+           * whole boot. REMOVE with the jobchain frontier. */
+          if (mfc_is_get(cmd) && size <= 0x100u
+                  && ((oea >= 0x4019CA80u && oea < 0x4019CD00u)
+                      || (oea >= 0x401AC000u && oea < 0x401AE000u))) {
+              static uint32_t jc_ea[8]; static uint64_t jc_val[8]; static int jc_n = 0;
+              const uint8_t* s = vm_base + oea;
+              uint64_t v = 0; for (int i = 0; i < 8; i++) v = (v << 8) | s[i];
+              int slot = -1;
+              for (int i = 0; i < 8; i++) if (jc_ea[i] == oea) { slot = i; break; }
+              if (slot < 0) { slot = jc_n & 7; jc_n++; jc_ea[slot] = oea; jc_val[slot] = ~v; }
+              if (jc_val[slot] != v) {
+                  jc_val[slot] = v;
+                  static int jcn = 0;
+                  if (jcn < 400) { jcn++;
+                      fprintf(stderr, "[job-cmd] spu=%X img=%d pc=0x%05X ea=0x%08X size=0x%X cmd=0x%02X val=%016llX\n",
+                              spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              oea, size, cmd, (unsigned long long)v);
+                      fflush(stderr);
+                  }
+              }
+          }
           if (mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
                   && (lsa & SPU_LS_MASK) >= 0x10000u && size >= 0x200u) {
               static int ovn[16] = {0};
@@ -634,9 +681,63 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                         lsa & SPU_LS_MASK, (unsigned long long)ea,
                         spu->gpr[0]._u32[0], spu->gpr[1]._u32[0],
                         spu->job_bin_base[0], spu->job_bin_base[1]);
+                /* The known instance (gs_task journal cursor, pc 0x638C): the
+                 * cursor EA is loaded from the work object at *(r3+0x10) --
+                 * dump the object and the taskInfo quads IN this print (the
+                 * unguarded memcpy AVs right after; nothing later runs). */
+                {
+                    uint32_t r3 = spu->gpr[3]._u32[0] & SPU_LS_MASK;
+                    fprintf(stderr, "[dma-null]   gpr2=%08X gpr3=%08X gpr4=%08X gpr5=%08X\n",
+                            spu->gpr[2]._u32[0], spu->gpr[3]._u32[0],
+                            spu->gpr[4]._u32[0], spu->gpr[5]._u32[0]);
+                    /* r80/r81 = the SAVED object pointers through the gs_task
+                     * flush chain (0x7B08 ori r80,r3); zero here with a live
+                     * chain object in memory = the ctx-restore lost the high
+                     * nonvolatile registers on a yield resume. */
+                    fprintf(stderr, "[dma-null]   gpr80=%08X gpr81=%08X gpr82=%08X gpr126=%08X gpr127=%08X\n",
+                            spu->gpr[80]._u32[0], spu->gpr[81]._u32[0],
+                            spu->gpr[82]._u32[0], spu->gpr[126]._u32[0], spu->gpr[127]._u32[0]);
+                    for (int q = 0; q < 4; q++) {
+                        const uint8_t* p = &spu->ls[(r3 + q*16) & SPU_LS_MASK];
+                        fprintf(stderr, "[dma-null]   obj+0x%02X:", q*16);
+                        for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", p[i]);
+                        fprintf(stderr, "\n");
+                    }
+                    const uint8_t* ti = &spu->ls[0x2780u];
+                    fprintf(stderr, "[dma-null]   taskInfo 0x2780:");
+                    for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ti[i]);
+                    fprintf(stderr, "\n");
+                }
                 fflush(stderr);
             }
         }
+        /* jobchain header-CAS watch (2026-07-03 s7, parked-SYNC frontier;
+         * YZ_OVL, REMOVE with the frontier): every PUTLLC commit on the
+         * CellSpursJobChain line 0x4019C880 -- pc + the +0x20..0x2F bytes
+         * (the submit/complete counters suspected 4-apart at the park). */
+        { static int jh = -1; if (jh < 0) jh = getenv("YZ_OVL") ? 1 : 0;
+          if (jh && cmd == MFC_PUTLLC_CMD && ((uint32_t)ea & ~127u) == 0x4019C880u) {
+              /* CHANGE-TRIGGERED: the idle grab/release cycle toggles only the
+               * latch byte +0x29 -- mask it out and print only when pc or the
+               * counter bytes actually change, so the trace spans the boot. */
+              const uint8_t* l = &spu->ls[lsa & SPU_LS_MASK & ~127u];
+              uint64_t pcw = 0; for (int i = 0; i < 8; i++) pcw = (pcw << 8) | l[i];
+              uint64_t cw = 0; for (int i = 0x20; i < 0x30; i++)
+                  if (i != 0x29) cw = (cw << 8) ^ l[i];
+              static uint64_t last_pc = ~0ull, last_cw = ~0ull;
+              if (pcw != last_pc || cw != last_cw) {
+                  last_pc = pcw; last_cw = cw;
+                  static int jn = 0;
+                  if (jn < 400) { jn++;
+                      fprintf(stderr, "[job-cas] spu=%X img=%d pc=0x%05X pc0-7=%016llX +20=%02X%02X%02X%02X%02X%02X%02X%02X %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                              spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              (unsigned long long)pcw,
+                              l[0x20],l[0x21],l[0x22],l[0x23],l[0x24],l[0x25],l[0x26],l[0x27],
+                              l[0x28],l[0x29],l[0x2A],l[0x2B],l[0x2C],l[0x2D],l[0x2E],l[0x2F]);
+                      fflush(stderr);
+                  }
+              }
+          } }
         uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
         spu_lockline_lock();
