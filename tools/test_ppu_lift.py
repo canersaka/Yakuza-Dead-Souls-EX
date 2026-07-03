@@ -235,6 +235,65 @@ E64 += [rng.getrandbits(64) for _ in range(4)]
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
              # FP tranche additions: in_fprs {idx: 64-bit pattern}, exp_fprs [(idx, pattern, mask)]
 
+# ---------------------------------------------------------------------------
+# VMX (AltiVec) endianness canary tranche (audit S2-1 / finding 4).
+#
+# ctx->vr holds RAW big-endian bytes (lvx/stvx do a plain memcpy). Register-only
+# tests can't catch lane byte-reversal because the bug is symmetric under a
+# consistent-but-wrong convention; a MEMORY round-trip does: we write a known
+# 16-byte big-endian vector into the vm stub, lvx it, run the op, stvx the
+# result back, and compare the emitted bytes against a Python reference that
+# treats memory as big-endian throughout. If a handler read/wrote a lane
+# little-endian, the output bytes differ. Each canary is a *sequence* of real
+# lifted instructions (loads -> op -> store), so it validates the actual
+# lvx/op/stvx emissions end-to-end.
+#
+# vm layout in the driver's 64 KB stub: input vectors at 0x100, 0x110, 0x120,
+# result at 0x200. GPRs: r10=0x100(vA), r11=0x110(vB), r12=0x120(vC),
+# r13=0x200(result). All quadword-aligned.
+
+VCASES = []  # dicts: name, prog [insn words], vin {addr: bytes16}, vout {addr: bytes16}, exp_cr(nibble,pos)|None
+
+def vx_form(xo, vd, va, vb):
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | xo
+
+def vxr_form(xo10, vd, va, vb, rc=0):    # VXR compares: Rc at bit 10 (of low 11)
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | (rc << 10) | xo10
+
+def va_form(xo6, vd, va, vb, vc):        # VA-form: vmaddfp/vnmsubfp/vmsum*/vperm/vsel/vsldoi
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | (vc << 6) | xo6
+
+def lvx_word(vd, ra, rb):   return xo_form(103, vd, ra, rb)   # op31 xo 103
+def stvx_word(vs, ra, rb):  return xo_form(231, vs, ra, rb)   # op31 xo 231
+
+# big-endian byte pack/unpack helpers for reference vectors
+def be_bytes_w(words):      # 4 x 32-bit BE -> 16 bytes
+    return b"".join(struct.pack(">I", w & MASK32) for w in words)
+def be_bytes_h(halfs):      # 8 x 16-bit BE -> 16 bytes
+    return b"".join(struct.pack(">H", h & 0xFFFF) for h in halfs)
+def be_bytes_f(flts):       # 4 x float BE -> 16 bytes
+    return b"".join(struct.pack(">f", f) for f in flts)
+def words_of(b):  return list(struct.unpack(">4I", b))
+def halfs_of(b):  return list(struct.unpack(">8H", b))
+def bytes_of(b):  return list(b)
+def floats_of(b): return list(struct.unpack(">4f", b))
+
+A_ADDR, B_ADDR, C_ADDR, R_ADDR = 0x100, 0x110, 0x120, 0x200
+
+def vcase(name, prog, vin, vout, exp_cr=None):
+    VCASES.append(dict(name=name, prog=prog, vin=vin, vout=vout, exp_cr=exp_cr))
+
+def _bin_vcase(name, xo, ain, bin_, result_bytes, form="vx", exp_cr=None, rc=0):
+    """One vA op vB -> vD canary: lvx v0,r10; lvx v1,r11; op v2,v0,v1;
+    stvx v2,r13. ain/bin_ are 16-byte big-endian input vectors."""
+    if form == "vx":
+        opw = vx_form(xo, 2, 0, 1)
+    else:  # vxr (compares, optional Rc)
+        opw = vxr_form(xo, 2, 0, 1, rc)
+    prog = [lvx_word(0, 0, 10), lvx_word(1, 0, 11), opw, stvx_word(2, 0, 13)]
+    vcase(name, prog, {A_ADDR: ain, B_ADDR: bin_},
+          {R_ADDR: result_bytes}, exp_cr=exp_cr)
+
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
          in_fprs=None, exp_fprs=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
@@ -497,6 +556,194 @@ def build_cases():
 
 build_cases()
 
+def _sat_s32(x):  return 0x7FFFFFFF if x > 0x7FFFFFFF else (-0x80000000 if x < -0x80000000 else x)
+
+def build_vcases():
+    # Distinct big-endian input vectors with asymmetric bytes so a lane
+    # byte-reversal changes the numeric result. Word views deliberately have
+    # every byte distinct within a lane.
+    AW = [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10]
+    BW = [0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20]
+    A16 = be_bytes_w(AW); B16 = be_bytes_w(BW)
+    aw, bw = words_of(A16), words_of(B16)
+    ah, bh = halfs_of(A16), halfs_of(B16)
+
+    # ---- integer add/sub, word (vadduwm / vsubuwm) ----
+    _bin_vcase("vadduwm canary", 128, A16, B16,
+               be_bytes_w([(aw[i] + bw[i]) & MASK32 for i in range(4)]))
+    _bin_vcase("vsubuwm canary", 1152, A16, B16,
+               be_bytes_w([(aw[i] - bw[i]) & MASK32 for i in range(4)]))
+    # ---- integer add/sub, halfword (vadduhm / vsubuhm) ----
+    _bin_vcase("vadduhm canary", 64, A16, B16,
+               be_bytes_h([(ah[i] + bh[i]) & 0xFFFF for i in range(8)]))
+    _bin_vcase("vsubuhm canary", 1088, A16, B16,
+               be_bytes_h([(ah[i] - bh[i]) & 0xFFFF for i in range(8)]))
+    # ---- min/max word/half (byte-reversal would pick the wrong element) ----
+    _bin_vcase("vmaxuw canary", 130, A16, B16,
+               be_bytes_w([max(aw[i], bw[i]) for i in range(4)]))
+    _bin_vcase("vminuh canary", 578, A16, B16,
+               be_bytes_h([min(ah[i], bh[i]) for i in range(8)]))
+    def s32(x): return x - (1 << 32) if x >> 31 else x
+    _bin_vcase("vmaxsw canary", 386, A16, B16,
+               be_bytes_w([(max(s32(aw[i]), s32(bw[i]))) & MASK32 for i in range(4)]))
+
+    # ---- FP add/sub/mul-add/min/max ----
+    FA = [1.5, -2.25, 100.0, -0.5]; FB = [0.5, 4.0, -50.0, 8.0]
+    FAb = be_bytes_f(FA); FBb = be_bytes_f(FB)
+    fa, fb = floats_of(FAb), floats_of(FBb)
+    _bin_vcase("vaddfp canary", 10, FAb, FBb,
+               be_bytes_f([fa[i] + fb[i] for i in range(4)]))
+    _bin_vcase("vsubfp canary", 74, FAb, FBb,
+               be_bytes_f([fa[i] - fb[i] for i in range(4)]))
+    _bin_vcase("vmaxfp canary", 1034, FAb, FBb,
+               be_bytes_f([max(fa[i], fb[i]) for i in range(4)]))
+    _bin_vcase("vminfp canary", 1098, FAb, FBb,
+               be_bytes_f([min(fa[i], fb[i]) for i in range(4)]))
+    # vmaddfp: VA-form vD=vA*vC+vB (operand order vD,vA,vC,vB). Three loads.
+    FC = [2.0, 0.5, 1.0, -1.0]; FCb = be_bytes_f(FC); fc = floats_of(FCb)
+    prog = [lvx_word(0, 0, 10), lvx_word(1, 0, 11), lvx_word(3, 0, 12),
+            va_form(46, 2, 0, 1, 3), stvx_word(2, 0, 13)]  # vmaddfp v2,v0,v3(=vC r12),v1(=vB r11)
+    # careful: encoding is vmaddfp vD,vA,vC,vB => fields vA=v0, vC(frc)=?, vB=?
+    # va_form(xo, vd, va, vb, vc): bits vA, vB, vC(bit6). vmaddfp semantics use
+    # vA*vC+vB. Put vA=v0(r10), vC=v3(r12), vB=v1(r11).
+    prog = [lvx_word(0, 0, 10), lvx_word(1, 0, 11), lvx_word(3, 0, 12),
+            va_form(46, 2, 0, 1, 3), stvx_word(2, 0, 13)]
+    res = be_bytes_f([struct.unpack(">f", struct.pack(">f", fa[i] * fc[i] + fb[i]))[0] for i in range(4)])
+    vcase("vmaddfp canary", prog, {A_ADDR: FAb, B_ADDR: FBb, C_ADDR: FCb},
+          {R_ADDR: res})
+
+    # ---- FP compares + CR6 dot forms (finding 4) ----
+    # vcmpeqfp.: choose vectors with a mix so CR6 = mixed (nibble 0).
+    EQa = be_bytes_f([1.0, 2.0, 3.0, 4.0]); EQb = be_bytes_f([1.0, 9.0, 3.0, 9.0])
+    ea, eb = floats_of(EQa), floats_of(EQb)
+    _bin_vcase("vcmpeqfp. mixed", 198, EQa, EQb,
+               be_bytes_w([0xFFFFFFFF if ea[i] == eb[i] else 0 for i in range(4)]),
+               form="vxr", rc=1, exp_cr=(0, 4))   # mixed -> nibble 0 at CR6 (bits 4-7)
+    ALLa = be_bytes_f([1.0, 2.0, 3.0, 4.0])
+    _bin_vcase("vcmpeqfp. all-true", 198, ALLa, ALLa,
+               be_bytes_w([0xFFFFFFFF] * 4), form="vxr", rc=1, exp_cr=(8, 4))
+    NEa = be_bytes_f([1.0, 2.0, 3.0, 4.0]); NEb = be_bytes_f([5.0, 6.0, 7.0, 8.0])
+    _bin_vcase("vcmpeqfp. all-false", 198, NEa, NEb,
+               be_bytes_w([0] * 4), form="vxr", rc=1, exp_cr=(2, 4))
+    # vcmpgefp. all-true (a>=b for all)
+    GEa = be_bytes_f([5.0, 6.0, 7.0, 8.0]); GEb = be_bytes_f([1.0, 6.0, 3.0, 4.0])
+    ga, gb = floats_of(GEa), floats_of(GEb)
+    _bin_vcase("vcmpgefp. all-true", 454, GEa, GEb,
+               be_bytes_w([0xFFFFFFFF if ga[i] >= gb[i] else 0 for i in range(4)]),
+               form="vxr", rc=1, exp_cr=(8, 4))
+    # vcmpbfp.: all in-bounds (|a|<=|b|) => CR6 nibble 2; result lanes 0.
+    Ba = be_bytes_f([1.0, -2.0, 3.0, -4.0]); Bb = be_bytes_f([2.0, 3.0, 4.0, 5.0])
+    _bin_vcase("vcmpbfp. all-in-bounds", 966, Ba, Bb,
+               be_bytes_w([0, 0, 0, 0]), form="vxr", rc=1, exp_cr=(2, 4))
+    # vcmpbfp. one out-of-bounds (a>b) => bit0 set that lane; CR6 nibble 0.
+    Bc = be_bytes_f([9.0, -2.0, 3.0, -4.0])
+    _bin_vcase("vcmpbfp. one-oob", 966, Bc, Bb,
+               be_bytes_w([0x80000000, 0, 0, 0]), form="vxr", rc=1, exp_cr=(0, 4))
+
+    # ---- integer compares + CR6 dot ----
+    _bin_vcase("vcmpequw. all-false", 134, A16, B16,
+               be_bytes_w([0xFFFFFFFF if aw[i] == bw[i] else 0 for i in range(4)]),
+               form="vxr", rc=1, exp_cr=(2, 4))
+    _bin_vcase("vcmpequw. all-true", 134, A16, A16,
+               be_bytes_w([0xFFFFFFFF] * 4), form="vxr", rc=1, exp_cr=(8, 4))
+    # vcmpgtsw. signed: pick so half true -> mixed nibble 0; validates the
+    # big-endian lane read (a byte-reversal would flip the comparison).
+    GTa = be_bytes_w([5, 0xFFFFFFFF, 100, 1])   # {5, -1, 100, 1}
+    GTb = be_bytes_w([2, 3, 100, 0xFFFFFFF0])   # {2, 3, 100, -16}
+    gta = [s32(x) for x in words_of(GTa)]; gtb = [s32(x) for x in words_of(GTb)]
+    _bin_vcase("vcmpgtsw. mixed", 902, GTa, GTb,
+               be_bytes_w([0xFFFFFFFF if gta[i] > gtb[i] else 0 for i in range(4)]),
+               form="vxr", rc=1, exp_cr=(0, 4))
+    # vcmpgtsh. signed halfword (validates half-lane BE read)
+    def s16(x): return x - (1 << 16) if x >> 15 else x
+    HTa = be_bytes_h([1, 0xFFFF, 100, 5, 0x7FFF, 0x8000, 0, 3])
+    HTb = be_bytes_h([2, 0xFFFE, 100, 4, 0, 0, 0, 3])
+    hta = [s16(x) for x in halfs_of(HTa)]; htb = [s16(x) for x in halfs_of(HTb)]
+    _bin_vcase("vcmpgtsh. mixed", 838, HTa, HTb,
+               be_bytes_h([0xFFFF if hta[i] > htb[i] else 0 for i in range(8)]),
+               form="vxr", rc=1, exp_cr=(0, 4))
+
+    # ---- splat-immediate (word/halfword lanes) ----
+    # vspltisw v2, -8 : all four words = 0xFFFFFFF8. vD,SIMM (SIMM in vA field).
+    def vspltis_word(xo, vd, simm5):
+        return (4 << 26) | (vd << 21) | ((simm5 & 0x1F) << 16) | (0 << 11) | xo
+    prog = [vspltis_word(908, 2, -8 & 0x1F), stvx_word(2, 0, 13)]
+    vcase("vspltisw canary", prog, {}, {R_ADDR: be_bytes_w([0xFFFFFFF8] * 4)})
+    prog = [vspltis_word(844, 2, -8 & 0x1F), stvx_word(2, 0, 13)]  # vspltish
+    vcase("vspltish canary", prog, {}, {R_ADDR: be_bytes_h([0xFFF8] * 8)})
+
+    # ---- even/odd halfword multiply ----
+    MA = be_bytes_h([2, 3, 4, 5, 6, 7, 8, 9]); MB = be_bytes_h([10, 11, 12, 13, 14, 15, 16, 17])
+    ma, mb2 = halfs_of(MA), halfs_of(MB)
+    # disasm XOs: vmulouh=72 (odd), vmuleuh=584 (even), vmulosh=328 (odd signed)
+    _bin_vcase("vmulouh canary", 72, MA, MB,
+               be_bytes_w([ma[2*i+1] * mb2[2*i+1] for i in range(4)]))
+    _bin_vcase("vmuleuh canary", 584, MA, MB,
+               be_bytes_w([ma[2*i] * mb2[2*i] for i in range(4)]))
+    _bin_vcase("vmulosh canary", 328, MA, MB,
+               be_bytes_w([(s16(ma[2*i+1]) * s16(mb2[2*i+1])) & MASK32 for i in range(4)]))
+
+    # ---- int<->float convert ----
+    IV = be_bytes_w([1, 0xFFFFFFFF, 256, 0x7FFFFFFF])   # signed {1,-1,256,maxint}
+    iv = [s32(x) for x in words_of(IV)]
+    # vcfsx v2, v0, 0 : UIMM in vB field. vD, vB, UIMM. Encode UIMM(=0) in vA slot.
+    def vcfx_word(xo, vd, uimm, vb):
+        return (4 << 26) | (vd << 21) | ((uimm & 0x1F) << 16) | (vb << 11) | xo
+    prog = [lvx_word(0, 0, 10), vcfx_word(842, 2, 0, 0), stvx_word(2, 0, 13)]  # vcfsx
+    vcase("vcfsx canary", prog, {A_ADDR: IV},
+          {R_ADDR: be_bytes_f([float(iv[i]) for i in range(4)])})
+    # vctsxs v2, v0, 0 (float->int saturate). Feed values incl. overflow + NaN.
+    FV = be_bytes_f([2.7, -3.9, 1e30, float("nan")])
+    prog = [lvx_word(0, 0, 10), vcfx_word(970, 2, 0, 0), stvx_word(2, 0, 13)]  # vctsxs
+    def sat_cvt(v):
+        if v != v: return 0
+        if v >= 2147483647.0: return 0x7FFFFFFF
+        if v <= -2147483648.0: return 0x80000000
+        return int(v) & MASK32
+    vfv = floats_of(FV)
+    vcase("vctsxs canary", prog, {A_ADDR: FV},
+          {R_ADDR: be_bytes_w([sat_cvt(vfv[i]) for i in range(4)])})
+
+    # ---- pack / unpack ----
+    # vpkshus: signed halfword -> unsigned byte saturate. a lanes -> bytes 0-7.
+    PA = be_bytes_h([0, 300, 0xFFFF, 100, 200, 0x8000, 255, 256])   # signed
+    PB = be_bytes_h([1, 2, 3, 4, 5, 6, 7, 8])
+    pa = [s16(x) for x in halfs_of(PA)]; pb = [s16(x) for x in halfs_of(PB)]
+    def clampu8(v): return 255 if v > 255 else (0 if v < 0 else v)
+    res = bytes([clampu8(pa[i]) for i in range(8)] + [clampu8(pb[i]) for i in range(8)])
+    _bin_vcase("vpkshus canary", 270, PA, PB, res)
+    # vupkhsh: sign-extend high 4 halfwords -> 4 words.
+    UA = be_bytes_h([0xFFFF, 0x7FFF, 0x8000, 1, 5, 6, 7, 8])
+    ua = halfs_of(UA)
+    prog = [lvx_word(0, 0, 10), vx_form(590, 2, 0, 0), stvx_word(2, 0, 13)]  # vupkhsh vD,vB (xo 590)
+    vcase("vupkhsh canary", prog, {A_ADDR: UA},
+          {R_ADDR: be_bytes_w([s16(ua[i]) & MASK32 for i in range(4)])})
+
+    # ---- word shifts ----
+    SA = be_bytes_w([0x00000001, 0x80000000, 0x0000000F, 0xF0000000])
+    SB = be_bytes_w([4, 1, 8, 4])
+    sa, sb = words_of(SA), words_of(SB)
+    _bin_vcase("vslw canary", 388, SA, SB,
+               be_bytes_w([(sa[i] << (sb[i] & 31)) & MASK32 for i in range(4)]))
+    _bin_vcase("vsraw canary", 900, SA, SB,
+               be_bytes_w([(s32(sa[i]) >> (sb[i] & 31)) & MASK32 for i in range(4)]))
+
+    # ---- byte-order-agnostic sanity: vperm/vsldoi/vmrghw must be UNCHANGED by
+    # the endianness work (pure byte permutations). ----
+    # vsldoi v2,v0,v1,4  (shift the 32-byte concat left by 4 => bytes 4..19)
+    def vsldoi_word(vd, va, vb, shb):
+        return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | ((shb & 0xF) << 6) | 44
+    concat = A16 + B16
+    prog = [lvx_word(0, 0, 10), lvx_word(1, 0, 11), vsldoi_word(2, 0, 1, 4), stvx_word(2, 0, 13)]
+    vcase("vsldoi byte-sanity", prog, {A_ADDR: A16, B_ADDR: B16},
+          {R_ADDR: concat[4:20]})
+    # vmrghw: high words interleaved {a0,b0,a1,b1}
+    _bin_vcase("vmrghw byte-sanity", 140, A16, B16,
+               be_bytes_w([aw[0], bw[0], aw[1], bw[1]]))
+
+build_cases()
+build_vcases()
+
 # ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
@@ -543,6 +790,21 @@ static void check_fpr(const char* name, int reg, double got_d, uint64_t want, ui
                (unsigned long long)mask);
         g_fail++;
     } else g_pass++;
+}
+/* VMX canary: compare 16 result bytes (big-endian memory) against reference. */
+static void check_bytes(const char* name, const uint8_t* got, const uint8_t* want) {
+    for (int i = 0; i < 16; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: result bytes differ at [%d]: got", name, i);
+            for (int j = 0; j < 16; j++) printf(" %02X", got[j]);
+            printf(" want");
+            for (int j = 0; j < 16; j++) printf(" %02X", want[j]);
+            printf("\\n");
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
 }
 /* vm stubs over a 64 KB scratch page (memory-op cases mask EAs into it).
  * The preamble declares these extern "C"; only the emissions actually used
@@ -610,6 +872,47 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
         else:
             out.extend(body)
         out.append("    }")
+
+    # --- VMX endianness canary tranche (memory round-trips) ---
+    for vi, vc in enumerate(VCASES):
+        # Lift each program word; skip the whole case if any word is unhandled.
+        lifted = []
+        skip = False
+        for k, word in enumerate(vc["prog"]):
+            insn = ppu_disasm.decode(word, 0x20000 + (vi * 16 + k) * 4)
+            code = lifter._translate(insn, dummy)
+            if code.startswith("/*"):
+                print(f"UNHANDLED by lifter in VMX case {vc['name']!r}: "
+                      f"{insn.mnemonic} {insn.operands} -> {code[:50]} -- case skipped")
+                skip = True
+                break
+            lifted.append((insn, code))
+        if skip:
+            n_encoding_skipped += 1
+            continue
+        nm = vc["name"].replace('"', "'")
+        out.append(f'    {{ /* vcase {vi}: {nm} */')
+        out.append("      memset(ctx, 0, sizeof(*ctx));")
+        out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
+        # base pointers: r10=A, r11=B, r12=C, r13=result
+        out.append(f"      ctx->gpr[10] = 0x{A_ADDR:X}ULL; ctx->gpr[11] = 0x{B_ADDR:X}ULL;")
+        out.append(f"      ctx->gpr[12] = 0x{C_ADDR:X}ULL; ctx->gpr[13] = 0x{R_ADDR:X}ULL;")
+        for addr, blob in vc["vin"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _in[16] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + 0x{addr:X}, _in, 16); }}")
+        for insn, code in lifted:
+            out.append(f"      /* {insn.mnemonic} {insn.operands} */")
+            out.append(f"      {code}")
+        for addr, blob in vc["vout"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _want[16] = {{ {byts} }}; "
+                       f'check_bytes("{nm}", g_vm_stub + 0x{addr:X}, _want); }}')
+        if vc["exp_cr"] is not None:
+            nib, shift = vc["exp_cr"]
+            out.append(f'      check_cr("{nm}", ctx->cr, {nib}, {shift});')
+        out.append("    }")
+
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
