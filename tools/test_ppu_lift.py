@@ -662,6 +662,18 @@ def build_vcases():
     _bin_vcase("vcmpgtsh. mixed", 838, HTa, HTb,
                be_bytes_h([0xFFFF if hta[i] > htb[i] else 0 for i in range(8)]),
                form="vxr", rc=1, exp_cr=(0, 4))
+    # vcmpgt[su]b byte lanes (regression guard: the s8 VMX batch left
+    # union-member access on the now-void* locals in the w==1 branch --
+    # caught only at relift compile because no byte-form case existed)
+    def s8v(x): return x - (1 << 8) if x >> 7 else x
+    BTa = bytes([1, 0xFF, 100, 5, 0x7F, 0x80, 0, 3, 9, 0xFE, 2, 2, 0x81, 0x40, 0xC0, 0])
+    BTb = bytes([2, 0xFE, 100, 4, 0, 0, 0, 3, 8, 0xFF, 3, 1, 0x80, 0x41, 0xBF, 0])
+    _bin_vcase("vcmpgtsb mixed", 774, BTa, BTb,
+               bytes([0xFF if s8v(BTa[i]) > s8v(BTb[i]) else 0 for i in range(16)]),
+               form="vxr", rc=0)
+    _bin_vcase("vcmpgtub. mixed", 518, BTa, BTb,
+               bytes([0xFF if BTa[i] > BTb[i] else 0 for i in range(16)]),
+               form="vxr", rc=1, exp_cr=(0, 4))
 
     # ---- splat-immediate (word/halfword lanes) ----
     # vspltisw v2, -8 : all four words = 0xFFFFFFF8. vD,SIMM (SIMM in vA field).
