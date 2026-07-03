@@ -32,6 +32,7 @@ extern "C" {
 /* Protocol types */
 #define SYS_SYNC_FIFO            0x1
 #define SYS_SYNC_PRIORITY        0x2
+#define SYS_SYNC_RETRY            0x4  /* lwmutex-only protocol (RPCS3 sys_sync.h:18); audit sec.6 lwmutex slow path */
 #define SYS_SYNC_PRIORITY_INHERIT 0x3
 
 /* Mutex flags */

@@ -172,6 +172,11 @@ typedef struct {
      * common pattern where the PPU writes job state into LS, the SPU runs
      * and writes results back to LS, then PPU reads them. */
     uint8_t*            local_store;
+    /* SPU run-control configuration (sc-187 sys_spu_thread_set_spu_cfg):
+     * bit 0 = SNR1 in OR mode, bit 1 = SNR2 in OR mode (CBE Registers v1.5
+     * SPU_Cfg; default 0 = overwrite mode for both). Read by sc-184
+     * write_snr below. */
+    uint64_t            spu_cfg;
 } spu_thread_t;
 
 typedef struct {
@@ -702,10 +707,21 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
      * event with type-specific data; we collapse to a "group stopped" tag
      * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
-     * blocked in sys_event_queue_receive on this queue wakes up here. */
+     * blocked in sys_event_queue_receive on this queue wakes up here.
+     *
+     * Audit sec.5 item 5 (2026-07-03, user-confirmed): the event `source`
+     * must be the real SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY, not the raw
+     * group_id -- RPCS3 sys_spu.h:42/311 + sys_spu.cpp:1266
+     * (group->send_run_event() on group start/stop) sends via `ep_run`
+     * with source = SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY
+     * (0xFFFFFFFF53505500, sys_spu.h:42). Receivers that switch on source
+     * (rather than trusting whichever queue fired) got the bare group_id,
+     * which collides with the guest's own generic tag namespace. SPURS
+     * uses the (correct) user-key path instead of this group-event path,
+     * so the practical impact is low -- flagged low priority in the audit. */
     if (g->event_queue_id) {
         sys_event_queue_push_by_id(g->event_queue_id,
-                                   (uint64_t)g->id,
+                                   0xFFFFFFFF53505500ull, /* SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY */
                                    (uint64_t)(int64_t)g->exit_status,
                                    (uint64_t)g->cause,
                                    0);
@@ -989,6 +1005,68 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_thread_write_snr (sc-184): tid, number (0/1), value.
+ * Writes an SPU Signal Notification Register. CBE Registers v1.5
+ * (SPU_Sig_Notify_1/2): in OR mode (SPU_Cfg bit 0/1, sc-187) the value is
+ * ORed into the pending register; in overwrite mode (default) it replaces
+ * it. The SPU reads via RdSigNotify1/2 (read-and-clear; channel count = 1
+ * while a value is pending). Was a silent no-op stub until 2026-07-03
+ * (CBEA audit P8) -- every lv2-side signal was dropped.
+ * NOTE: the SNR-write SPU event edge (CBEA event facility S1/S2 bits) is
+ * not raised here -- consistent with the rest of the channel model (audit
+ * F10, its own queued fix). */
+static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t num = (uint32_t)ctx->gpr[4];
+    uint32_t val = (uint32_t)ctx->gpr[5];
+    if (num > 1) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EINVAL */
+        return -1;
+    }
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    if (t->sctx) {
+        spu_channel* ch = &t->sctx->ch_sig_notify[num];
+        int or_mode = (t->spu_cfg >> num) & 1;
+        if (or_mode && ch->count)
+            ch->value |= val;
+        else
+            spu_channel_write(ch, val);
+        { static int n = 0; if (n < 12) { n++;
+            fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
+                    tid, num + 1, val, or_mode ? "OR" : "overwrite");
+            fflush(stderr); } }
+    }
+    /* No live SPU context (thread never started as lifted code): accept and
+     * drop, like real lv2 writing a problem-state register of a stopped SPU. */
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_set_spu_cfg (sc-187): tid, value (bits 0-1 = SNR1/SNR2 OR
+ * mode). Was entirely absent from the syscall table (CBEA audit P8). */
+static int64_t sys_spu_thread_set_spu_cfg_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint64_t val = (uint64_t)ctx->gpr[4];
+    if (val & ~3ull) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EINVAL */
+        return -1;
+    }
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        return -1;
+    }
+    t->spu_cfg = val;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 /* Public: get the local-store buffer for a SPU thread (for use by
  * PPU-fallback handlers). Allocates on demand. */
 uint8_t* spu_thread_get_local_store(uint32_t tid)
@@ -1165,6 +1243,442 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
     return rc;
 }
 
+/* ---------------------------------------------------------------------------
+ * lwmutex / lwcond KERNEL SLOW-PATH syscalls (sc 95-99, 111-117)
+ *
+ * Audit sec.6 (2026-07-03, user-confirmed): these numbers were defined in
+ * lv2_syscall_table.h but never registered -- a lw primitive that needs to
+ * fall through to the kernel (contended lock beyond the userspace fast
+ * path, or a lwcond wait) would have hit the unimplemented-syscall handler.
+ * MEASURED latent: 0 hits so far, because the actual guest entry point for
+ * this game is sysPrxForUser::sys_lwmutex_* / sys_lwcond_* (a library
+ * function bridge, import_bridges_gen.cpp), which is HLE'd in full in
+ * libs/system/sysPrxForUser.c and does its own userspace fast-path +
+ * blocking without ever executing the raw `sc N` instructions below. These
+ * exist for completeness/robustness (any code path that DOES issue the raw
+ * syscall, e.g. a differently-linked SDK routine) and are independent
+ * kernel objects distinct from that HLE's tables.
+ *
+ * Faithful subset of the RPCS3 contract (sys_lwmutex.cpp / sys_lwcond.cpp):
+ * create validates protocol; destroy refuses EBUSY while held; lock/trylock/
+ * unlock implement ordinary (non-fast-path) mutex semantics; lwcond wait
+ * atomically releases the associated lwmutex and reacquires it on wake,
+ * mirroring sys_cond_wait's now-corrected recursive-release handling
+ * (audit item 1c) since a lwmutex can equally be SYS_SYNC_RECURSIVE
+ * (has no separate "unlock2"/targeted-signal fast paths -- those are
+ * userspace-only optimizations with no guest-visible kernel-object state
+ * here). Signal/signal_all simply wake waiters; RPCS3's targeted
+ * ppu_thread_id signal (_sys_lwcond_signal's 3rd arg) is honored on a
+ * best-effort basis by ID equality since we don't have RPCS3's PPU sleep
+ * queue -- broadcasting a superset of the intended wake target is safe
+ * (spurious wakes retry their condition, same as sys_cond).
+ * -----------------------------------------------------------------------*/
+
+#define MAX_LW_KERNEL_MUTEX  256
+#define MAX_LW_KERNEL_COND   256
+
+typedef struct {
+    int      in_use;
+    uint32_t protocol;
+    int      recursive;      /* SYS_SYNC_RECURSIVE control->attribute bit (best-effort: caller-tracked) */
+    uint64_t owner_tid;
+    int      lock_count;
+#ifdef _WIN32
+    CRITICAL_SECTION cs;
+#else
+    pthread_mutex_t mtx;
+#endif
+} lw_kernel_mutex_t;
+
+typedef struct {
+    int      in_use;
+    uint32_t lwmutex_id;     /* 1-based index into s_lw_mutexes */
+#ifdef _WIN32
+    CONDITION_VARIABLE cv;
+#else
+    pthread_cond_t cv;
+#endif
+} lw_kernel_cond_t;
+
+static lw_kernel_mutex_t s_lw_mutexes[MAX_LW_KERNEL_MUTEX];
+static lw_kernel_cond_t  s_lw_conds[MAX_LW_KERNEL_COND];
+
+#ifdef _WIN32
+static CRITICAL_SECTION s_lw_table_lock;
+static int              s_lw_table_lock_init = 0;
+#else
+static pthread_mutex_t  s_lw_table_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static void lw_table_lock(void)
+{
+#ifdef _WIN32
+    if (!s_lw_table_lock_init) {
+        InitializeCriticalSection(&s_lw_table_lock);
+        s_lw_table_lock_init = 1;
+    }
+    EnterCriticalSection(&s_lw_table_lock);
+#else
+    pthread_mutex_lock(&s_lw_table_lock);
+#endif
+}
+
+static void lw_table_unlock(void)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&s_lw_table_lock);
+#else
+    pthread_mutex_unlock(&s_lw_table_lock);
+#endif
+}
+
+/* _sys_lwmutex_create(lwmutex_id*, protocol, control_ptr, has_name, name) */
+static int64_t sys_lwmutex_create_syscall(ppu_context* ctx)
+{
+    uint32_t id_out_ea = (uint32_t)ctx->gpr[3];
+    uint32_t protocol  = (uint32_t)ctx->gpr[4];
+    /* control_ptr (gpr[5]), has_name (gpr[6]), name (gpr[7]) -- unused: the
+     * kernel object doesn't touch the guest control struct (userspace owns
+     * the fast-path fields; see file header). */
+
+    if (protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_RETRY && protocol != SYS_SYNC_PRIORITY) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+
+    lw_table_lock();
+    int slot = -1;
+    for (int i = 0; i < MAX_LW_KERNEL_MUTEX; i++) {
+        if (!s_lw_mutexes[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) {
+        lw_table_unlock();
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[slot];
+    memset(m, 0, sizeof(*m));
+    m->in_use   = 1;
+    m->protocol = protocol;
+#ifdef _WIN32
+    InitializeCriticalSection(&m->cs);
+#else
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m->mtx, &mattr);
+    pthread_mutexattr_destroy(&mattr);
+#endif
+    lw_table_unlock();
+
+    vm_write_be32(id_out_ea, (uint32_t)(slot + 1));
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwmutex_destroy(lwmutex_id) */
+static int64_t sys_lwmutex_destroy_syscall(ppu_context* ctx)
+{
+    uint32_t id = (uint32_t)ctx->gpr[3];
+    if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[id - 1];
+    if (!m->in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (m->lock_count != 0) {
+        /* RPCS3 sys_lwmutex.cpp: refuses to destroy a held lwmutex. */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+#ifdef _WIN32
+    DeleteCriticalSection(&m->cs);
+#else
+    pthread_mutex_destroy(&m->mtx);
+#endif
+    m->in_use = 0;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwmutex_lock(lwmutex_id, timeout_usec) */
+static int64_t sys_lwmutex_lock_syscall(ppu_context* ctx)
+{
+    uint32_t id      = (uint32_t)ctx->gpr[3];
+    uint64_t timeout = ctx->gpr[4];
+    if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[id - 1];
+    if (!m->in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    uint64_t caller_tid = ctx->thread_id;
+#ifdef _WIN32
+    if (timeout == 0) {
+        EnterCriticalSection(&m->cs);
+    } else {
+        DWORD timeout_ms = (DWORD)(timeout / 1000);
+        if (timeout_ms == 0) timeout_ms = 1;
+        DWORD start = GetTickCount();
+        while (!TryEnterCriticalSection(&m->cs)) {
+            if (GetTickCount() - start >= timeout_ms) {
+                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT;
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            }
+            Sleep(1);
+        }
+    }
+#else
+    if (timeout == 0) {
+        pthread_mutex_lock(&m->mtx);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += (time_t)(timeout / 1000000);
+        ts.tv_nsec += (long)((timeout % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_mutex_timedlock(&m->mtx, &ts) != 0) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT;
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        }
+    }
+#endif
+    m->owner_tid = caller_tid;
+    m->lock_count++;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwmutex_trylock(lwmutex_id) */
+static int64_t sys_lwmutex_trylock_syscall(ppu_context* ctx)
+{
+    uint32_t id = (uint32_t)ctx->gpr[3];
+    if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[id - 1];
+    if (!m->in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+#ifdef _WIN32
+    if (!TryEnterCriticalSection(&m->cs)) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+#else
+    if (pthread_mutex_trylock(&m->mtx) != 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+#endif
+    m->owner_tid = ctx->thread_id;
+    m->lock_count++;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwmutex_unlock(lwmutex_id) */
+static int64_t sys_lwmutex_unlock_syscall(ppu_context* ctx)
+{
+    uint32_t id = (uint32_t)ctx->gpr[3];
+    if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[id - 1];
+    if (!m->in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (m->owner_tid != ctx->thread_id) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EPERM;
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+    m->lock_count--;
+    if (m->lock_count == 0) m->owner_tid = 0;
+#ifdef _WIN32
+    LeaveCriticalSection(&m->cs);
+#else
+    pthread_mutex_unlock(&m->mtx);
+#endif
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwcond_create(lwcond_id*, lwmutex_id, control_ptr, name) */
+static int64_t sys_lwcond_create_syscall(ppu_context* ctx)
+{
+    uint32_t id_out_ea = (uint32_t)ctx->gpr[3];
+    uint32_t lwmutex_id = (uint32_t)ctx->gpr[4];
+
+    if (lwmutex_id == 0 || lwmutex_id > MAX_LW_KERNEL_MUTEX || !s_lw_mutexes[lwmutex_id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    lw_table_lock();
+    int slot = -1;
+    for (int i = 0; i < MAX_LW_KERNEL_COND; i++) {
+        if (!s_lw_conds[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) {
+        lw_table_unlock();
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    lw_kernel_cond_t* c = &s_lw_conds[slot];
+    memset(c, 0, sizeof(*c));
+    c->in_use     = 1;
+    c->lwmutex_id = lwmutex_id;
+#ifdef _WIN32
+    InitializeConditionVariable(&c->cv);
+#else
+    pthread_cond_init(&c->cv, NULL);
+#endif
+    lw_table_unlock();
+
+    vm_write_be32(id_out_ea, (uint32_t)(slot + 1));
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwcond_destroy(lwcond_id) */
+static int64_t sys_lwcond_destroy_syscall(ppu_context* ctx)
+{
+    uint32_t id = (uint32_t)ctx->gpr[3];
+    if (id == 0 || id > MAX_LW_KERNEL_COND || !s_lw_conds[id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+#ifndef _WIN32
+    pthread_cond_destroy(&s_lw_conds[id - 1].cv);
+#endif
+    s_lw_conds[id - 1].in_use = 0;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwcond_queue_wait(lwcond_id, lwmutex_id, timeout_usec) -- syscall 113.
+ * Mirrors sys_cond_wait's corrected recursive-release handling (audit item
+ * 1c): release ALL of the caller's recursion levels on the associated
+ * lwmutex before parking, restore the saved count on wake. */
+static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
+{
+    uint32_t cond_id    = (uint32_t)ctx->gpr[3];
+    uint32_t lwmutex_id = (uint32_t)ctx->gpr[4];
+    uint64_t timeout    = ctx->gpr[5];
+
+    if (cond_id == 0 || cond_id > MAX_LW_KERNEL_COND || !s_lw_conds[cond_id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_cond_t* c = &s_lw_conds[cond_id - 1];
+    if (lwmutex_id == 0 || lwmutex_id > MAX_LW_KERNEL_MUTEX || !s_lw_mutexes[lwmutex_id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    lw_kernel_mutex_t* m = &s_lw_mutexes[lwmutex_id - 1];
+
+    if (m->owner_tid != ctx->thread_id) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EPERM;
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+
+    uint64_t saved_owner = m->owner_tid;
+    int saved_count = m->lock_count;
+    m->owner_tid = 0;
+    m->lock_count = 0;
+
+#ifdef _WIN32
+    DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
+    if (ms == 0 && timeout > 0) ms = 1;
+
+    for (int i = 1; i < saved_count; i++) LeaveCriticalSection(&m->cs);
+    BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
+    for (int i = 1; i < saved_count; i++) EnterCriticalSection(&m->cs);
+
+    m->owner_tid = saved_owner;
+    m->lock_count = saved_count;
+
+    if (!ok && GetLastError() == ERROR_TIMEOUT) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT;
+        return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
+#else
+    for (int i = 1; i < saved_count; i++) pthread_mutex_unlock(&m->mtx);
+
+    int rc;
+    if (timeout == 0) {
+        rc = pthread_cond_wait(&c->cv, &m->mtx);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += (time_t)(timeout / 1000000);
+        ts.tv_nsec += (long)((timeout % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        rc = pthread_cond_timedwait(&c->cv, &m->mtx, &ts);
+    }
+
+    for (int i = 1; i < saved_count; i++) pthread_mutex_lock(&m->mtx);
+
+    m->owner_tid = saved_owner;
+    m->lock_count = saved_count;
+
+    if (rc == ETIMEDOUT) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT;
+        return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
+#endif
+
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwcond_signal(lwcond_id, lwmutex_id, ppu_thread_id, mode) -- syscall
+ * 115. We don't have RPCS3's PPU sleep queue to target one specific thread
+ * id, so this broadcasts like signal_all; every waiter re-checks its own
+ * condition on wake (same tolerance as a spurious wakeup), which is safe. */
+static int64_t sys_lwcond_signal_syscall(ppu_context* ctx)
+{
+    uint32_t cond_id = (uint32_t)ctx->gpr[3];
+    if (cond_id == 0 || cond_id > MAX_LW_KERNEL_COND || !s_lw_conds[cond_id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+#ifdef _WIN32
+    WakeAllConditionVariable(&s_lw_conds[cond_id - 1].cv);
+#else
+    pthread_cond_broadcast(&s_lw_conds[cond_id - 1].cv);
+#endif
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* _sys_lwcond_signal_all(lwcond_id, lwmutex_id, mode) -- syscall 116 */
+static int64_t sys_lwcond_signal_all_syscall(ppu_context* ctx)
+{
+    uint32_t cond_id = (uint32_t)ctx->gpr[3];
+    if (cond_id == 0 || cond_id > MAX_LW_KERNEL_COND || !s_lw_conds[cond_id - 1].in_use) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+#ifdef _WIN32
+    WakeAllConditionVariable(&s_lw_conds[cond_id - 1].cv);
+#else
+    pthread_cond_broadcast(&s_lw_conds[cond_id - 1].cv);
+#endif
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
@@ -1178,6 +1692,22 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     sys_cond_init(tbl);
     sys_semaphore_init(tbl);
     sys_rwlock_init(tbl);
+
+    /* lwmutex/lwcond KERNEL SLOW-PATH (audit sec.6, 2026-07-03,
+     * user-confirmed): previously defined in lv2_syscall_table.h but never
+     * registered -- see the handler block above for why they're latent
+     * (the game's actual entry point is the sysPrxForUser HLE library,
+     * not these raw syscalls) and the faithful-subset contract notes. */
+    lv2_syscall_register(tbl, SYS_LWMUTEX_CREATE,   sys_lwmutex_create_syscall);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_DESTROY,  sys_lwmutex_destroy_syscall);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_LOCK,     sys_lwmutex_lock_syscall);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_UNLOCK,   sys_lwmutex_unlock_syscall);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_TRYLOCK,  sys_lwmutex_trylock_syscall);
+    lv2_syscall_register(tbl, SYS_LWCOND_CREATE,     sys_lwcond_create_syscall);
+    lv2_syscall_register(tbl, SYS_LWCOND_DESTROY,    sys_lwcond_destroy_syscall);
+    lv2_syscall_register(tbl, SYS_LWCOND_WAIT,       sys_lwcond_wait_syscall);
+    lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL,     sys_lwcond_signal_syscall);
+    lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL_ALL, sys_lwcond_signal_all_syscall);
 
     /* Timer and time (registered before events so event handlers
      * override the conflicting syscall numbers 141, 142, 145) */
@@ -1225,7 +1755,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_read_ls_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_write_snr_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,     sys_spu_thread_set_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);

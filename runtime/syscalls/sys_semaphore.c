@@ -279,11 +279,15 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Audit sec.6 error-code fidelity (2026-07-03, user-confirmed): RPCS3
+     * sys_semaphore.cpp post() returns CELL_EBUSY (not_an_error) when the
+     * post would exceed max_val (a fetch_op failure on the atomic), not
+     * CELL_EINVAL. */
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
         LeaveCriticalSection(&s->value_lock);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
     LeaveCriticalSection(&s->value_lock);
@@ -293,7 +297,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
     /* Wake waiters */

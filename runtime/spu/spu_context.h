@@ -187,7 +187,45 @@ typedef struct spu_context {
      * live host frame, so a C return cannot reach it. */
     uint32_t host_depth;
 
+    /* ---- Fields below this line were appended 2026-07-03 (SPU-runtime slice:
+     * decrementer, DMA-list stall-and-notify). Struct layout rule: APPEND ONLY --
+     * lifted code and any generated mirror depend on the offsets of the fields
+     * above, so nothing above this comment may move or change size. ---- */
+
+    /* Decrementer (CBEA v1.02 Section 9.7 p145-146; RPCS3 SPUThread.cpp:1313-1315).
+     * The decrementer is a free-running 32-bit down counter at the PPE timebase
+     * rate (79.8 MHz on PS3) that STARTS COUNTING AT SPU THREAD CREATION, not at
+     * the first `wrch SPU_WrDec` -- confirmed live-exposure fact (specaudit_spu.md
+     * F21): all 13 measured `rdch SPU_RdDec` sites in the lifted images have ZERO
+     * matching `wrch SPU_WrDec` sites, so a WrDec-triggered-only model would leave
+     * every read frozen forever. dec_running is set at spu_context_init() (mirrors
+     * RPCS3's cpu_init/thread-constructor start) and again on any `wrch SPU_WrDec`
+     * (CBEA p145: "the decrementer... starts... when a wrch instruction targets
+     * SPU_WrDec"). dec_start_tb is the guest timebase (ppu_timebase_now(), the
+     * same 79.8 MHz clock as the PPU decrementer/mftb -- CBEA Section 9.7 ties the
+     * SPU decrementer to "the same rate as the PPE decrementer") sampled at the
+     * moment dec_value was last set; SpuRdDec computes
+     * `dec_value - (ppu_timebase_now() - dec_start_tb)` (see spu_channels.c
+     * SPU_RdDec / SPU_WrDec). dec_running (0 = frozen) models CBEA Section
+     * 9.11.2 p158's ack-while-masked stop rule (WrEventAck of the Tm bit while
+     * Tm is disabled in the event mask stops the count; re-armed by the next
+     * WrDec). Decrementer
+     * EVENT generation (Tm, status bit 0x20, MSb 0->1 edge, CBEA Section 9.12.5
+     * p166) is intentionally NOT implemented -- see the note at SPU_RdDec in
+     * spu_channels.c; this is a documented remaining gap, not an oversight. */
+    uint64_t dec_start_tb;   /* guest timebase (ppu_timebase_now()) at the last WrDec/thread-start */
+    uint32_t dec_value;      /* value written (or the POR initial value at thread start) */
+    int      dec_running;    /* 0 = frozen (stopped by ack-while-masked, CBEA p158 Section 9.11.2) */
+
 } spu_context;
+
+/* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
+ * clock the PPU decrementer/mftb use -- CBEA v1.02 Section 9.7 p145 ties the
+ * SPU decrementer to this rate ("run at the same rate as the PPE
+ * decrementer"). Declared here (not spu_dma.h) since spu_context_init needs
+ * it to start the decrementer at thread creation (RPCS3 SPUThread.cpp:1313,
+ * F21's fix). */
+uint64_t ppu_timebase_now(void);
 
 /* ---------------------------------------------------------------------------
  * Initialization
@@ -197,6 +235,18 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     memset(ctx, 0, sizeof(*ctx));
     ctx->spu_id = spu_id;
     ctx->status = SPU_STATUS_STOPPED;
+
+    /* Decrementer starts running at SPU thread creation, not at the first
+     * WrDec (F21; RPCS3 SPUThread.cpp:1313-1315 cpu_init starts
+     * ch_dec_start_timestamp/ch_dec_value here unconditionally). POR initial
+     * value: RPCS3 sets ch_dec_value=0 unless SYS_SPU_THREAD_OPTION_DEC_SYNC_TB_
+     * ENABLE was requested at thread creation (ch_dec_value = ~(u32)start_ts) --
+     * that option is a per-thread create flag our sys_spu_thread_create path
+     * does not currently plumb through, so we take the POR-default branch
+     * (value 0) here, matching the common case. */
+    ctx->dec_value     = 0;
+    ctx->dec_start_tb  = ppu_timebase_now();
+    ctx->dec_running   = 1;
 }
 
 /* ---------------------------------------------------------------------------

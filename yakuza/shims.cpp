@@ -62,6 +62,7 @@ extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0);
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
+extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp; the mgmt-CAS diag */
 /* DIAG (env YZ_WATCH_BD): catch any PPU store covering spurs+0xBD
  * (sysSrvMsgUpdateWorkload @ 0x40197D3D) to find who writes the bad 0xE0. */
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
@@ -102,6 +103,114 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
         }
     }
 }
+/* ---------------------------------------------------------------------------
+ * PPU reservation atomics (lwarx/stwcx/ldarx/stdcx) -- the REAL semantics.
+ *
+ * The old lifter emission was an address-only per-thread reservation with a
+ * PLAIN store on "success": any concurrent writer (another PPU thread, or an
+ * SPU PUTLLC on the same word) between lwarx and stwcx was silently reverted
+ * -- a lost-update race whose probability scales with traffic on the line.
+ * MEASURED 2026-07-03 (CBEA audit P1 + the wid-0 frontier): Sony's PPU-side
+ * SendWorkloadSignal CAS loop on the hot SPURS mgmt line 0x40197C80 lost its
+ * readyCount update to the four SPU kernels hammering that line, so the
+ * image-5 IO-service taskset was never selected and the asset pipeline froze.
+ *
+ * Real rule (PowerISA Book II): stwcx. succeeds only if the reservation is
+ * intact, and ANY other processor's store to the granule kills it. We model
+ * that value-based: remember the raw word at lwarx, commit at stwcx only if
+ * it is still byte-identical (x86 lock cmpxchg). For lines in the SPU
+ * lock-line coherence set, commit under spu_lockline_lock and notify -- the
+ * same serialization vm_write32 uses -- so a PPU commit can never land inside
+ * an SPU PUTLLC's memcmp/memcpy window (and vice versa), and reserved SPUs
+ * get their lost-reservation event. ABA on a 32/64-bit word is acceptable
+ * for the lock/CAS idioms lv2-era code uses (same model as ppu_memory.h's
+ * reference helpers and other recompilers).
+ *
+ * reserve_addr doubles as the valid flag (0 = none), matching the old
+ * emission's convention and the generated ppu_context mirror. */
+extern "C" uint64_t ppu_res_lwarx(ppu_context* ctx, uint64_t addr)
+{
+    uint32_t raw;
+    memcpy(&raw, ea(addr), 4);            /* x86 aligned load = acquire */
+    ctx->reserve_addr  = (uint32_t)addr;
+    ctx->reserve_value = raw;             /* raw guest-BE word */
+    return (uint64_t)ps3_bswap32(raw);
+}
+
+extern "C" uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t addr)
+{
+    uint64_t raw;
+    memcpy(&raw, ea(addr), 8);
+    ctx->reserve_addr  = (uint32_t)addr;
+    ctx->reserve_value = raw;
+    return ps3_bswap64(raw);
+}
+
+extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
+{
+    int ok = 0;
+    if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
+        uint32_t expected = (uint32_t)ctx->reserve_value;   /* raw BE */
+        uint32_t desired  = ps3_bswap32(val);
+        volatile long* p  = (volatile long*)ea(addr);
+        if (spu_coh_is_reserved((uint32_t)addr)) {
+            spu_lockline_lock();
+            if (*(volatile uint32_t*)p == expected) {
+                *(volatile uint32_t*)p = desired;
+                spu_coh_notify_write((uint32_t)addr);
+                ok = 1;
+            }
+            spu_lockline_unlock();
+        } else {
+            ok = (_InterlockedCompareExchange(p, (long)desired, (long)expected)
+                  == (long)expected);
+        }
+        /* DIAG (env YZ_MGMT_CAS, 2026-07-03 wid-0 fork a/c discriminator —
+         * REMOVE with the pxd-dispatch frontier): every PPU stwcx on the
+         * SPURS mgmt line, with old/new/ok. If readyCount commits land here
+         * but wid 0 never dispatches, the bug moved to the kernel select's
+         * wid-0 path; if no commit ever targets readyCount[0], the signal
+         * path bails before its CAS. */
+        { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
+          if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
+              static long n = 0;
+              if (n < 200) { n++;
+                  fprintf(stderr, "[mgmt-cas] t%u addr=0x%08X old=%08X new=%08X %s\n",
+                          yz_thread_current_id(), (uint32_t)addr,
+                          ps3_bswap32(expected), val, ok ? "OK" : "FAIL");
+                  fflush(stderr); } } }
+    }
+    ctx->reserve_addr = 0;
+    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
+                 :  (ctx->cr & ~(0xFu << 28));
+}
+
+extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
+{
+    int ok = 0;
+    if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
+        uint64_t expected = ctx->reserve_value;
+        uint64_t desired  = ps3_bswap64(val);
+        volatile long long* p = (volatile long long*)ea(addr);
+        if (spu_coh_is_reserved((uint32_t)addr)) {
+            spu_lockline_lock();
+            if (*(volatile uint64_t*)p == expected) {
+                *(volatile uint64_t*)p = desired;
+                spu_coh_notify_write((uint32_t)addr);
+                ok = 1;
+            }
+            spu_lockline_unlock();
+        } else {
+            ok = (_InterlockedCompareExchange64(p, (long long)desired,
+                                                (long long)expected)
+                  == (long long)expected);
+        }
+    }
+    ctx->reserve_addr = 0;
+    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
+                 :  (ctx->cr & ~(0xFu << 28));
+}
+
 extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); VM_WRITE_COH(addr, &val, 1); }
 extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */

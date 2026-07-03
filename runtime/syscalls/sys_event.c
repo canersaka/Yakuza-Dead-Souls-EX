@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (audit sec.5 item 3, queue-create validation) */
 #include "../memory/vm.h"
 #include <string.h>
 
@@ -88,8 +89,45 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     uint64_t key         = LV2_ARG_U64(ctx, 2);
     int32_t  size        = LV2_ARG_S32(ctx, 3);
 
+    /* Audit sec.5 item 3 (2026-07-03, user-confirmed; RPCS3
+     * sys_event.cpp:229-247): size must be in [1,127] -- EINVAL, not a
+     * silent clamp to the max. Protocol/type are read from the attribute
+     * struct up front (before any slot is allocated, matching RPCS3's
+     * validate-then-create order) and must be one of the documented values,
+     * else EINVAL. */
     if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
-        size = SYS_EVENT_QUEUE_BUF_MAX;
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    uint32_t protocol = SYS_SYNC_FIFO;
+    uint32_t qtype     = SYS_PPU_QUEUE;
+    uint8_t  name_buf[8];
+    memset(name_buf, 0, sizeof(name_buf));
+
+    if (attr_addr != 0) {
+        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
+        uint32_t proto_be;
+        memcpy(&proto_be, attr_raw, 4);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
+                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
+#endif
+        protocol = proto_be;
+
+        uint32_t type_be;
+        memcpy(&type_be, attr_raw + 4, 4);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+        type_be = ((type_be >> 24) & 0xFF) | ((type_be >> 8) & 0xFF00) |
+                  ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
+#endif
+        qtype = type_be;
+
+        memcpy(name_buf, attr_raw + 8, 8);
+    }
+
+    if (protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    if (qtype != SYS_PPU_QUEUE && qtype != SYS_SPU_QUEUE)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
     evt_table_lock();
 
@@ -110,28 +148,9 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->head     = 0;
     q->tail     = 0;
     q->count    = 0;
-    q->type     = SYS_PPU_QUEUE;
-
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        uint32_t proto_be;
-        memcpy(&proto_be, attr_raw, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-#endif
-        q->protocol = proto_be;
-
-        uint32_t type_be;
-        memcpy(&type_be, attr_raw + 4, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        type_be = ((type_be >> 24) & 0xFF) | ((type_be >> 8) & 0xFF00) |
-                  ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
-#endif
-        q->type = (int32_t)type_be;
-
-        memcpy(q->name, attr_raw + 8, 8);
-    }
+    q->protocol = protocol;
+    q->type     = (int32_t)qtype;
+    memcpy(q->name, name_buf, 8);
 
 #ifdef _WIN32
     InitializeCriticalSection(&q->lock);
@@ -153,9 +172,15 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 int64_t sys_event_queue_destroy(ppu_context* ctx)
 {
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
+    int32_t  mode      = LV2_ARG_S32(ctx, 1);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* Audit sec.5 item 4 (2026-07-03, user-confirmed; RPCS3
+     * sys_event.cpp:273): mode must be 0 or SYS_EVENT_QUEUE_DESTROY_FORCE. */
+    if (mode && mode != SYS_EVENT_QUEUE_DESTROY_FORCE)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
     evt_table_lock();
 
@@ -166,22 +191,42 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     }
 
     /* Mark inactive and WAKE any blocked receivers so they observe !active and
-     * return ESRCH instead of hanging forever on `not_empty` (lost-wakeup /
-     * teardown deadlock). Do it under the per-queue lock so the wake can't race a
-     * receiver entering the wait. Deliberately do NOT Delete/destroy the
-     * CRITICAL_SECTION / condition variable here: a receiver may still be unwinding
-     * out of SleepConditionVariableCS and needs them valid (destroying them under a
-     * live waiter is UB). The slot's primitives are re-Initialized (after a memset)
-     * when the slot is reused by sys_event_queue_create, so leaking them is benign
-     * on this bounded, reused 128-slot table. */
+     * return ESRCH (or ECANCELED under FORCE, see below) instead of hanging
+     * forever on `not_empty` (lost-wakeup / teardown deadlock). Do it under
+     * the per-queue lock so the wake can't race a receiver entering the wait.
+     * Deliberately do NOT Delete/destroy the CRITICAL_SECTION / condition
+     * variable here: a receiver may still be unwinding out of
+     * SleepConditionVariableCS and needs them valid (destroying them under a
+     * live waiter is UB). The slot's primitives are re-Initialized (after a
+     * memset) when the slot is reused by sys_event_queue_create, so leaking
+     * them is benign on this bounded, reused 128-slot table.
+     *
+     * Audit sec.5 item 4: without FORCE, a queue with parked waiters must
+     * fail with CELL_EBUSY and NOT be torn down (RPCS3 sys_event.cpp:273
+     * checks `!mode && head` on the internal wait queue -- our `waiters`
+     * counter is the equivalent). With FORCE, waiters are woken and made to
+     * observe force_destroyed so they return CELL_ECANCELED instead of the
+     * generic CELL_ESRCH. */
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
+    if (!mode && q->waiters > 0) {
+        LeaveCriticalSection(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     q->active = 0;
+    if (mode == SYS_EVENT_QUEUE_DESTROY_FORCE) q->force_destroyed = 1;
     WakeAllConditionVariable(&q->not_empty);
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
+    if (!mode && q->waiters > 0) {
+        pthread_mutex_unlock(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     q->active = 0;
+    if (mode == SYS_EVENT_QUEUE_DESTROY_FORCE) q->force_destroyed = 1;
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
 #endif
@@ -212,6 +257,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
+    q->waiters++;   /* audit sec.5 item 4: destroy's EBUSY check needs this */
 
     if (timeout_us == 0) {
         while (q->count == 0 && q->active) {
@@ -223,6 +269,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
+                    q->waiters--;
                     LeaveCriticalSection(&q->lock);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
@@ -230,9 +277,16 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    q->waiters--;
+
     if (!q->active || q->count == 0) {
+        /* Audit sec.5 item 4: a FORCE destroy wakes waiters with
+         * CELL_ECANCELED (RPCS3 sys_event.cpp:377/388); a plain teardown
+         * that raced ahead of this waiter still reports CELL_ESRCH. */
+        int64_t rc = q->force_destroyed ? (int64_t)(int32_t)CELL_ECANCELED
+                                         : (int64_t)(int32_t)CELL_ESRCH;
         LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return rc;
     }
 
     sys_event_t evt = q->buffer[q->head];
@@ -242,6 +296,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
+    q->waiters++;
 
     if (timeout_us == 0) {
         while (q->count == 0 && q->active) {
@@ -259,15 +314,20 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
+                q->waiters--;
                 pthread_mutex_unlock(&q->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
     }
 
+    q->waiters--;
+
     if (!q->active || q->count == 0) {
+        int64_t rc = q->force_destroyed ? (int64_t)(int32_t)CELL_ECANCELED
+                                         : (int64_t)(int32_t)CELL_ESRCH;
         pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return rc;
     }
 
     sys_event_t evt = q->buffer[q->head];
@@ -584,8 +644,16 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Audit sec.5 item 2 (2026-07-03, user-confirmed; RPCS3
+     * sys_event.cpp:789): an unnamed port (name == 0, the common case --
+     * sys_event_port_create's `name` arg is usually 0 and assigned only by
+     * callers wanting a fixed identity) must synthesize its source as
+     * (pid << 32) | port_id, not send a bare 0. Our process always reports
+     * pid 1 (sys_process_getpid, lv2_register.c). Receivers that switch on
+     * `source` (rather than blindly trusting whichever port fired) got 0
+     * from every unnamed port and could not tell them apart. */
     sys_event_t evt;
-    evt.source = p->name;
+    evt.source = p->name ? p->name : ((uint64_t)1 << 32) | (uint64_t)port_id;
     evt.data1  = data1;
     evt.data2  = data2;
     evt.data3  = data3;

@@ -86,6 +86,7 @@ if(WIN32)
         xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        winmm       # timeBeginPeriod (runtime/syscalls/sys_timer.c, audit item 6)
     )
 endif()
 
