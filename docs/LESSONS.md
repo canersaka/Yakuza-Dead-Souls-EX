@@ -40,6 +40,18 @@ session runs on Fable, Opus, or anything else.
    baseline to 0/3. Rules: invasive dumps stay env-gated OFF; when a validation loop's rate
    shifts vs an earlier baseline, FIRST diff the two builds' active instrumentation, not the
    fix under test; re-baseline after ANY runtime rebuild before judging the change.
+6c. **The observability floor is itself an instrument — and writers must never block.**
+   2026-07-03: the always-on per-syscall stderr prints, piped through PowerShell's
+   redirect pump, backed up under volume; every guest thread then serialized on the CRT
+   stderr lock (t1 measured blocked 48 s inside one fprintf). A whole "3 Hz vsync
+   ecosystem" pathology, a 17-second "shader-build crawl", and likely the parked ~1/5
+   "boot stall" were artifacts of the logging path. Rules: launch tools use NATIVE
+   (kernel-handle) redirection, never a userspace pipe pump; any print a guest thread
+   can reach must be nonblocking or volume-bounded; keep a QUIET-baseline boot as a
+   standing control; when a rate seems impossibly slow, FIRST compare against a
+   quiet run. Corollary: page-guard write-watches (YZ_WATCH_EA) guard the whole 4 KB
+   page — never aim one at an address sharing a page with hot lock lines (the SPURS
+   mgmt page): it single-steps every atomic and wrecks the run.
 7. **Check the oracle FIRST, and check the right layer.** RPCS3 source + a real BLUS30826 run
    log + an instrumentable RPCS3 build are all in the map (STATUS.md). "RPCS3 HLEs/stubs X"
    claims are usually FALSE — check the `Loaded module: X.sprx` log lines; RPCS3 LLE-loads
