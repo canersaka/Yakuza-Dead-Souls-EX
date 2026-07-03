@@ -5,6 +5,22 @@
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Cond-layer trace (env YZ_COND_TRACE, 2026-07-02 diag — the CRI boot-stall
+ * hunt): logs waits/signals on low-id conds (the CRI dialog/vsync/mixer set)
+ * with the guest tid + the associated mutex owner at call time, and flags any
+ * signal that BLOCKS acquiring the mutex CS. Real lv2 sys_cond_signal never
+ * blocks on the mutex, so every BLOCKED-ON line names a hold-and-wait pair
+ * our signal-under-CS emulation introduced. REMOVE when the stall closes. */
+static int cond_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("YZ_COND_TRACE"); on = (e && *e) ? 1 : 0; }
+    return on;
+}
+extern uint32_t yz_thread_current_id(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -166,6 +182,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
     /* The caller must hold the associated mutex. We need to release it
      * atomically with the wait and re-acquire it on wake. */
 
+    int ct = cond_trace_on() && cond_id <= 16;
+    if (ct) {
+        static long n = 0;
+        if (n < 4000) { n++;
+            fprintf(stderr, "[cond] t%u WAIT-enter cond=%u mutex=%u owner=t%u cnt=%d\n",
+                    yz_thread_current_id(), cond_id, mutex_id,
+                    (uint32_t)m->owner_tid, m->lock_count);
+            fflush(stderr); }
+    }
+
     /* Save and clear ownership info */
     uint64_t saved_owner = m->owner_tid;
     int saved_count = m->lock_count;
@@ -181,6 +207,15 @@ int64_t sys_cond_wait(ppu_context* ctx)
     /* Restore ownership */
     m->owner_tid = saved_owner;
     m->lock_count = saved_count;
+
+    if (ct) {
+        static long n2 = 0;
+        if (n2 < 4000) { n2++;
+            fprintf(stderr, "[cond] t%u WAIT-exit cond=%u %s\n",
+                    yz_thread_current_id(), cond_id,
+                    (!ok && GetLastError() == ERROR_TIMEOUT) ? "TIMEOUT" : "ok");
+            fflush(stderr); }
+    }
 
     if (!ok && GetLastError() == ERROR_TIMEOUT) {
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
@@ -243,7 +278,19 @@ int64_t sys_cond_signal(ppu_context* ctx)
     sys_mutex_info* m = NULL;
     if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
         m = &g_sys_mutexes[c->mutex_id - 1];
-    if (m) EnterCriticalSection(&m->cs);
+    if (m) {
+        if (!TryEnterCriticalSection(&m->cs)) {
+            if (cond_trace_on() && cond_id <= 16) {
+                static long n = 0;
+                if (n < 400) { n++;
+                    fprintf(stderr, "[cond] t%u SIGNAL cond=%u BLOCKED-ON mutex=%u owner=t%u cnt=%d\n",
+                            yz_thread_current_id(), cond_id, (uint32_t)c->mutex_id,
+                            (uint32_t)m->owner_tid, m->lock_count);
+                    fflush(stderr); }
+            }
+            EnterCriticalSection(&m->cs);
+        }
+    }
     WakeConditionVariable(&c->cv);
     if (m) LeaveCriticalSection(&m->cs);
 #else
@@ -278,7 +325,19 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     sys_mutex_info* m = NULL;
     if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && g_sys_mutexes[c->mutex_id - 1].active)
         m = &g_sys_mutexes[c->mutex_id - 1];
-    if (m) EnterCriticalSection(&m->cs);
+    if (m) {
+        if (!TryEnterCriticalSection(&m->cs)) {
+            if (cond_trace_on() && cond_id <= 16) {
+                static long n = 0;
+                if (n < 400) { n++;
+                    fprintf(stderr, "[cond] t%u SIGNAL_ALL cond=%u BLOCKED-ON mutex=%u owner=t%u cnt=%d\n",
+                            yz_thread_current_id(), cond_id, (uint32_t)c->mutex_id,
+                            (uint32_t)m->owner_tid, m->lock_count);
+                    fflush(stderr); }
+            }
+            EnterCriticalSection(&m->cs);
+        }
+    }
     WakeAllConditionVariable(&c->cv);
     if (m) LeaveCriticalSection(&m->cs);
 #else
