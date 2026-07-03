@@ -695,6 +695,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   fflush(stderr);
               }
           }
+          /* (B2) job-block WRITES (2026-07-03 s8, same YZ_OVL gate — REMOVE with the
+           * pxd frontier): every SPU PUT/PUTLLC touching the job block names who
+           * writes done/result/state. The failing cycle shows done=size appearing
+           * with NO result record — if no [job-wr] lands at that instant, the
+           * writer was the PPU, not the task. First 16 bytes of the payload
+           * inline (the done word rides +0x04). */
+          if ((mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD)
+                  && oea < 0x40197400u && oea + osz > 0x40197100u) {
+              static unsigned long wn = 0; wn++;
+              if (wn <= 200 || (wn & 0x3FFu) == 0) {
+                  const uint8_t* pl = spu->ls + (lsa & SPU_LS_MASK & ~15u);
+                  fprintf(stderr, "[job-wr] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X size=0x%X "
+                          "pay=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                          wn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd, oea, size,
+                          pl[0],pl[1],pl[2],pl[3], pl[4],pl[5],pl[6],pl[7],
+                          pl[8],pl[9],pl[10],pl[11], pl[12],pl[13],pl[14],pl[15]);
+                  fflush(stderr);
+              }
+          }
           (void)oline;
       } }
     /* Task context-save provenance (env YZ_CTXSAVE_WATCH, 2026-07-02): the SPURS
@@ -841,6 +860,29 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       static int n = 0; if (n < 80) { n++;
                           fprintf(stderr, "[sigseen] GETLLAR wklSignal1=0x%04X seen=%lu getllar_n=%lu\n",
                                   sig, seen, g_spu_getllar_n); fflush(stderr); } } } }
+            /* DIAG (env YZ_TS_PEEK, 2026-07-03 the wid-0 policy fork — RETIRE with
+             * the pxd-dispatch frontier): change-triggered snapshot of the pxd
+             * taskset bitset line (0x40199D00) at every GETLLAR. Word0 of each
+             * bitset (task 0 = bit 0x80000000): running@0x00 ready@0x10
+             * pending_ready@0x20 enabled@0x30 signalled@0x40 waiting@0x50.
+             * Late-window read: img 2 sees pend=0x80000000 yet never launches
+             * => the policy's SELECT_TASK lift; bitsets stay all-zero while the
+             * PPU create-CAS commits => lost write / reservation visibility. */
+            { static int tp = -1; if (tp < 0) tp = getenv("YZ_TS_PEEK") ? 1 : 0;
+              if (tp && (ea & ~127ull) == 0x40199D00ull) {
+                  uint32_t w[6]; int k;
+                  for (k = 0; k < 6; k++)
+                      w[k] = ((uint32_t)line[k*0x10] << 24) | ((uint32_t)line[k*0x10+1] << 16)
+                           | ((uint32_t)line[k*0x10+2] << 8) | line[k*0x10+3];
+                  static uint32_t lw[6] = {0xEE,0xEE,0xEE,0xEE,0xEE,0xEE};
+                  static int tn = 0;
+                  if (memcmp(w, lw, sizeof w) != 0 && tn < 240) { tn++;
+                      memcpy(lw, w, sizeof w);
+                      fprintf(stderr, "[ts-peek] spu=%X img=%d pc=0x%05X run=%08X rdy=%08X "
+                              "pend=%08X enb=%08X sig=%08X wait=%08X\n",
+                              spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              w[0], w[1], w[2], w[3], w[4], w[5]);
+                      fflush(stderr); } } }
             /* CONFIRMATION EXPERIMENT (env YZ_FRC): force wklReadyCount1[2]=1 (the
              * gs_task taskset, wid=2) in the SPURS mgmt line so the kernel select's
              * `readyCount > contention` gate passes. Proves whether readyCount is

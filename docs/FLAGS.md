@@ -82,7 +82,13 @@ ea, incl. GETLLAR — shows every DISTINCT command the module decodes), [job-cas
 header PUTLLC commits with pc + the +0x20..0x2F mask bytes (change-triggered, grab latch
 +0x29 masked out); the always-on [dma-null] EA-0 atomic diag now also dumps gpr2-5,
 gpr80-82/126/127, the r3 object quads and the taskInfo quads — all REMOVE with the
-jobchain/pxd-dispatch frontier), `YZ_JRNL_WATCH`
+jobchain/pxd-dispatch frontier), `YZ_TS_PEEK`
+(spu_dma.h GETLLAR: change-triggered snapshot of the pxd taskset bitset line 0x40199D00 —
+[ts-peek] prints word0 of running/ready/pending_ready/enabled/signalled/waiting with the
+reader's img+pc. The wid-0 policy fork discriminator: img 2 sees pend=0x80000000 yet never
+launches ⇒ the policy's SELECT_TASK lift; bitsets all-zero while the PPU create-CAS commits
+⇒ lost write/visibility — added 2026-07-03 s8, REMOVE with the pxd-dispatch frontier),
+`YZ_JRNL_WATCH`
 (spu_dma.h: the LAYER-1 consumer discriminator — logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
