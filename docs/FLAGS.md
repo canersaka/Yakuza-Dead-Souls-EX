@@ -47,6 +47,9 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 ## Diagnostics (default OFF; side-effect-free when unset)
 
 **Permanent generic probes (2026-07-02 — prefer these over new hardcoded ones):**
+`YZ_DUMP_AT=<seconds>` (main.cpp: fire yz_dump_all_threads ONCE at +N s regardless of
+watchdog state — reads a healthy-but-parked boot at a chosen instant; pair with YZ_L1SNAP
+for the invasive sub-dumps; don't use dump-armed runs for pass/fail rates);
 `YZ_PEEK=ea1,ea2,...` (main.cpp: change-triggered 4-word dumps of up to 16 hex guest EAs,
 VirtualQuery-guarded — moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
 (dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses —

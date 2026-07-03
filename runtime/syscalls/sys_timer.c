@@ -25,6 +25,37 @@ static void ensure_qpc_init(void)
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * PPU timebase (mftb/mftbu) -- THE guest clock.
+ *
+ * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
+ * anchored at first use. The old lifter emission was a per-call-site
+ * static that advanced 16667 ticks PER READ -- not a clock at all: every
+ * guest timing loop (the CRI ADXM VV pacer that schedules the whole media
+ * stack, throttles, profilers) computed garbage from it. Found 2026-07-03:
+ * the pacer's period stretched ~108x, starving the async-FS pump and
+ * wedging the shader build. Overflow-safe split multiply (rem < qpf, so
+ * rem * 79.8e6 < ~8e14 << 2^63).
+ * -----------------------------------------------------------------------*/
+uint64_t ppu_timebase_now(void)
+{
+#ifdef _WIN32
+    static LONGLONG t0 = 0;
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
+    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
+           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+#endif
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
