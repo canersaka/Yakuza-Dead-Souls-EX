@@ -404,6 +404,10 @@ class SPULifter:
             # Phase 3: rotate-and-mask (register-variable)
             "rotm": "spu_rotm", "rotma": "spu_rotma",
             "rothm": "spu_rothm", "rothma": "spu_rothma",
+            # ISA v1.2 p145: the assembler mnemonic is rotmah (was only mapped
+            # under the rothma alias -- register form fell to the TODO
+            # catch-all; caught RED by test_spu_lift.py 2026-07-03)
+            "rotmah": "spu_rothma",
             "rotqmbi": "spu_rotqmbi", "rotqmby": "spu_rotqmby",
             "rotqmbybi": "spu_rotqmbybi",
             # Phase 3: indexed constant generators (insertion masks)
