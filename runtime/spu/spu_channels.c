@@ -1569,6 +1569,18 @@ void spu_indirect_branch(spu_context* ctx)
              * three, pointing at a lift bug in the save code itself). */
             { static int scw = -1; if (scw < 0) scw = getenv("YZ_CTXSAVE_WATCH") ? 1 : 0;
               if (scw && la == 0xA70u && foreign_img == 2) {
+                  /* 2026-07-03 s8 pxd fork: the IO-service task (caller img 5)
+                   * launches then instantly exits instead of parking in
+                   * WAIT_SIGNAL — this names its actual request code per cycle
+                   * (codes: -1 POLL_SIGNAL 0 DESTROY 1 YIELD 2 WAIT_SIGNAL
+                   * 3 POLL 4 WAIT_WKL_FLAG 5 SELECT_TASK, SPURS_TASKSET.md).
+                   * REMOVE with the pxd-dispatch frontier. */
+                  { static int s5 = 0;
+                    if (ctx->image_id == 5 && s5 < 40) { s5++;
+                        fprintf(stderr, "[tsyscall-pxd] spu=%X num=0x%X r4=0x%08X r5=0x%08X sp=0x%05X\n",
+                                ctx->spu_id, ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                                ctx->gpr[5]._u32[0], ctx->gpr[1]._u32[0]);
+                        fflush(stderr); } }
                   const unsigned char* l = ctx->ls;
                   uint64_t css = 0; for (int k = 0; k < 8; k++) css = (css << 8) | l[0x2798 + k];
                   uint32_t alloc = (uint32_t)(css & 0x7Fu);
