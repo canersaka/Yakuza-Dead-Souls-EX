@@ -31,9 +31,12 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
  *   out      : caller buffer for generated HLSL (NUL-terminated).
  *   out_size : size of out in bytes.
  * Returns instruction count (>=0), or -1 on error (null args / overflow).
- * Emits `VSOutput main(VSInput input)` writing SV_Position + color/texcoord
- * varyings. Semantics are best-effort (compiles cleanly); exact output routing
- * and rare ops are approximate pending a pixel-level diff vs RPCS3. */
+ * Emits `VSOutput main(VSInput input)`: 16 float4 inputs (ATTR0..15), a
+ * `cbuffer VPConst : register(b0)` with 512 vec4 constants + vp_posscale/
+ * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
+ * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
+ * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
+ * Not modeled: condition-code tests, flow control (BRA/CAL/...), TXL. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
