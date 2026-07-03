@@ -382,8 +382,32 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       if (rc) {
         static uint32_t t2c = 0; static int t2ci = 0;
         if (!t2ci) { t2ci = 1; t2c = vm_read32(0x0203161Cu); }
+        /* Filtered mode (YZ_TASK_RET=<taskset hex>): NON-INVASIVE per-call
+         * snapshot of the sendWorkloadSignal guard inputs at the create's
+         * instant (2026-07-03: the signal's rc is DISCARDED by Sony's helper
+         * 0x2010C6C -- a guard bail is invisible in the create's rc, and the
+         * one-shot inline capture only ever saw the FIRST, healthy create).
+         * Guards per libsre 0x200A750: wklEnabled bit (spurs+0xB0),
+         * wklState1[wid]==2 (spurs+0x80+wid), spurs+0xD6C==0, wid<max. */
         if (t2c && (target == 0x0203161Cu || target == t2c)
-                && (!rc_ts || (uint32_t)ctx->gpr[3] == rc_ts)) {
+                && rc_ts && (uint32_t)ctx->gpr[3] == rc_ts) {
+            static int n = 0;
+            if (n < 40) { n++;
+                uint32_t ts    = rc_ts;
+                uint32_t spurs = vm_read32(ts + 0x64u);
+                uint32_t wid   = vm_read32(ts + 0x74u);
+                uint32_t st    = (wid < 16u) ? vm_read8(spurs + 0x80u + wid) : 0xFFu;
+                fprintf(stderr, "[task-crt] #%d ts=%08X spurs=%08X wid=%u state=%02X "
+                        "enabled=%08X sig=%08X d6c=%08X | pend=%08X enb=%08X run=%08X\n",
+                        n, ts, spurs, wid, st,
+                        vm_read32(spurs + 0xB0u), vm_read32(spurs + 0x70u),
+                        vm_read32(spurs + 0xD6Cu),
+                        vm_read32(ts + 0x20u), vm_read32(ts + 0x30u), vm_read32(ts + 0x00u));
+                fflush(stderr);
+            }
+            /* fall through: DO NOT run the create inline -- normal dispatch */
+        }
+        else if (t2c && (target == 0x0203161Cu || target == t2c) && !rc_ts) {
             static int once = 0;
             if (!once) { once = 1;
                 uint32_t ts   = (uint32_t)ctx->gpr[3];   /* taskset2 */
