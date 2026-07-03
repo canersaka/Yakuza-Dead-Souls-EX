@@ -60,9 +60,17 @@ if (-not $DiffOnly) {
   if (Test-Path $OursTrace) { Remove-Item $OursTrace -Force }
   # (faithful mode is the DEFAULT since the band-aid retirement 2026-07-02; no env needed)
   $env:YZ_SPU_TRACE = '1'; $env:YZ_SPU_TRACE_IMG = "$TraceImg"
-  $p = Start-Process -FilePath ".\yakuza\build\yakuza_recomp.exe" -ArgumentList "game\EBOOT.elf" `
-        -PassThru -WindowStyle Hidden -RedirectStandardError "scratch\diverge_run.err" `
-        -RedirectStandardOutput "scratch\diverge_run.out"
+  # NATIVE redirection (LESSONS 6c): the PS pipe pump serializes guest threads
+  # on the CRT stderr lock under print volume -- same fix as boot_until/golden.
+  $cmdline = "yakuza\build\yakuza_recomp.exe game\EBOOT.elf 2>`"scratch\diverge_run.err`" 1>`"scratch\diverge_run.out`""
+  Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdline -WindowStyle Hidden | Out-Null
+  $p = $null
+  for ($w = 0; $w -lt 50 -and -not $p; $w++) {
+    Start-Sleep -Milliseconds 100
+    $p = Get-Process yakuza_recomp -ErrorAction SilentlyContinue |
+         Sort-Object StartTime -Descending | Select-Object -First 1
+  }
+  if (-not $p) { throw "guest process never appeared" }
   # Wait until the bounded trace stops growing (budget filled) or the timeout.
   $last = -1; $stable = 0
   for ($t = 0; $t -lt $RunSeconds; $t++) {
