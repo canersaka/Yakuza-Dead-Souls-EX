@@ -178,7 +178,30 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * spu_indirect_branch resolves by the DMA SOURCE EA. (image ids match
              * main.cpp: 1=service, 2=policy @0x02023680.) */
             if (lsa == 0xA00u && size >= 0x400u) {
-                int img = ((uint32_t)ea == 0x02023680u) ? 2 : 1;
+                /* Workload-module image keying by DMA source EA. EXPLICIT map --
+                 * the old `ea==policy ? 2 : 1` binary silently ran any OTHER
+                 * workload module as SERVICE code (bit us 2026-07-03: the game's
+                 * jobchain (wid 1) loads Sony's JOB policy module 0x0202A180 and
+                 * executed service garbage -> wild EA-0 atomics). Unknown module
+                 * EAs stay on the old fallback but WARN loudly: that is the
+                 * "unlifted libsre blob" class (service/policy/job/ts_exit so
+                 * far) and each one costs a session to find quietly. */
+                int img;
+                switch ((uint32_t)ea) {
+                case 0x02021480u: img = 1;  break;   /* system service        */
+                case 0x02023680u: img = 2;  break;   /* taskset policy module */
+                case 0x0202A180u: img = 13; break;   /* JOB policy module     */
+                default:
+                    img = 1;
+                    { static int uw = 0;
+                      if (uw < 8) { uw++;
+                          fprintf(stderr, "[SPU] WARN: UNKNOWN workload module ea=0x%08X size=0x%X "
+                                  "loaded to LS 0xA00 -- running as SERVICE image; if this SPU "
+                                  "misbehaves, lift this blob (see CHEATSHEET SPU-module relift)\n",
+                                  (uint32_t)ea, size);
+                          fflush(stderr); } }
+                    break;
+                }
                 if (spu->image_id != img) {
                     extern int g_spu_prof_on;
                     /* THROWAWAY DIAG (env YZ_IMGLOG, non-prof): log every kernel->workload
@@ -472,6 +495,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           uint32_t oea = (uint32_t)(ea & ~0x80000000ull);
           /* (A) overlay-class loads: per-image print cap so early gs_task
            * data GETs can't exhaust the budget before image 5 dispatches */
+          /* image 13 = the JOB module: log ALL its code-sized GETs anywhere
+           * past its own end (0x4880) -- job BINARIES load per-descriptor at
+           * runtime (the third runtime-loaded-SPU-code instance after the
+           * exit blob + the job module itself); their source EA + LS base is
+           * what a lift needs. */
+          if (spu->image_id == 13 && mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
+                  && (lsa & SPU_LS_MASK) >= 0x4880u && size >= 0x100u) {
+              static int jbn = 0;
+              if (jbn < 60) { jbn++;
+                  fprintf(stderr, "[job-bin] spu=%X pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X%s\n",
+                          spu->spu_id, spu->pc & SPU_LS_MASK, cmd,
+                          lsa & SPU_LS_MASK, oea, size, mfc_is_list(cmd) ? " LIST" : "");
+                  fflush(stderr);
+              }
+          }
           if (mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
                   && (lsa & SPU_LS_MASK) >= 0x10000u && size >= 0x200u) {
               static int ovn[16] = {0};
@@ -563,6 +601,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * keep bit 31. Verified live: base reads 0x40197C80, masked EA hits the
          * real instance and the SPURS CAS handshake then advances. */
         ea &= ~0x80000000ull;
+        /* DIAG (2026-07-03, the post-gate crash): a lock-line atomic against the
+         * NULL page is a fatal host AV in the unguarded 128-byte copies below.
+         * Print the issuer's identity BEFORE the fault so the crash names its
+         * own root (who computed a zero EA), then proceed -- the fault itself
+         * stays visible; don't mask the symptom. */
+        if ((uint32_t)(ea & ~127ull) < 0x10000u) {
+            static int nn = 0;
+            if (nn < 8) { nn++;
+                fprintf(stderr, "[dma-null] ATOMIC cmd=0x%02X spu=%X img=%d pc=0x%05X lsa=0x%05X ea=0x%08llX gpr0=%08X gpr1=%08X\n",
+                        cmd, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                        lsa & SPU_LS_MASK, (unsigned long long)ea,
+                        spu->gpr[0]._u32[0], spu->gpr[1]._u32[0]);
+                fflush(stderr);
+            }
+        }
         uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
         spu_lockline_lock();
