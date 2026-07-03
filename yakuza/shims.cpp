@@ -173,11 +173,18 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
          * path bails before its CAS. */
         { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
           if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
-              static long n = 0;
-              if (n < 200) { n++;
-                  fprintf(stderr, "[mgmt-cas] t%u addr=0x%08X old=%08X new=%08X %s\n",
-                          yz_thread_current_id(), (uint32_t)addr,
-                          ps3_bswap32(expected), val, ok ? "OK" : "FAIL");
+              /* wid-0 wklSignal bit (0x80000000 at +0x70 = 0x40197CF0) is the
+               * IO-service wake -- log it UNCAPPED (rare; the per-word caps hid
+               * it behind wid-1/3/4 signal noise, 2026-07-03). Everything else
+               * per-word capped. */
+              uint32_t w0sig = (((uint32_t)addr) == 0x40197CF0u)
+                               && (val & 0x80000000u) && !(ps3_bswap32(expected) & 0x80000000u);
+              static long n[32] = {0};
+              int slot = ((uint32_t)addr >> 2) & 31;
+              if (w0sig || n[slot] < 24) { if (!w0sig) n[slot]++;
+                  fprintf(stderr, "[mgmt-cas]%s t%u addr=0x%08X old=%08X new=%08X %s\n",
+                          w0sig ? " WID0-SIGNAL" : "", yz_thread_current_id(),
+                          (uint32_t)addr, ps3_bswap32(expected), val, ok ? "OK" : "FAIL");
                   fflush(stderr); } } }
     }
     ctx->reserve_addr = 0;
