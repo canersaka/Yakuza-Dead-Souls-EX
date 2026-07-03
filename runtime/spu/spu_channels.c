@@ -1134,6 +1134,48 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
+    /* SPURS JOBCHAIN job dispatch (2026-07-03, images 14/15). The job module
+     * (image 13) loads each descriptor's binary into free LS past its own end
+     * (module spans LS [0xA00,0x4880)) and `bisl`s to its entry. The DMA
+     * recorder (spu_dma.h) captured WHERE each known binary is resident in
+     * this context; switch to that lifted image so the job's code resolves.
+     * Spans are the measured descriptor sizeBinary values (jobA 0x9540 = the
+     * 14-way bulk worker, jobB 0x14C0 = the event-flag notify job). */
+    {
+        static const uint32_t job_span[2] = { 0x9540u, 0x14C0u };
+        uint32_t jpc = ctx->pc & SPU_LS_MASK;
+        int family = (ctx->image_id >= 13 && ctx->image_id <= 15);
+        int jimg = -1;
+        if (family && jpc >= 0xA00u && jpc < 0x4880u) {
+            jimg = 13;                       /* back into the resident module */
+        } else {
+            for (int i = 0; i < 2; i++)
+                if (ctx->job_bin_base[i]
+                        && jpc >= ctx->job_bin_base[i]
+                        && jpc <  ctx->job_bin_base[i] + job_span[i])
+                    { jimg = 14 + i; break; }
+            /* A span hit from OUTSIDE the jobchain family: an SPU that lost
+             * its image to a mid-cycle kernel adoption (module code runs as
+             * straight-line C, so a stale image_id only surfaces at the next
+             * computed branch = the job entry; measured as the LS-0 death
+             * under image 0, first jobval boot). Content-verify before
+             * switching: the resident job module at LS 0xA00 is the ground
+             * truth that this LS really is a jobchain world. */
+            if (jimg > 0 && !family) {
+                extern uint8_t* vm_base;
+                if (memcmp(ctx->ls + 0xA00u, vm_base + 0x0202A180u, 16) != 0)
+                    jimg = -1;
+            }
+        }
+        if (jimg > 0 && jimg != ctx->image_id) {
+            static int jl = 0; if (jl < 16) { jl++;
+                fprintf(stderr, "[job-launch] spu=%X image %d -> %d at LS 0x%05X (lr=0x%05X)\n",
+                        ctx->spu_id, ctx->image_id, jimg, jpc,
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                fflush(stderr); }
+            ctx->image_id = jimg;
+        }
+    }
     /* THROWAWAY DIAG (env YZ_POLTRACE): raw PC path of the taskset POLICY (image 2)
      * on every indirect branch -- pc, link(gpr0), wklCurrentId(LS 0x1DC). Shows where
      * the dispatched policy goes and where it yields (vs the oracle: 0xA00 entry ->
@@ -1372,8 +1414,16 @@ void spu_indirect_branch(spu_context* ctx)
         uint32_t la = ctx->pc & SPU_LS_MASK;
         int foreign = 0, foreign_img = 0; spu_fn ffn = 0;
         int pol_seen = 0; spu_fn pol_fn = 0;
+        /* The jobchain job binaries (images 14/15) are only ever entered from
+         * the job module via the recorded-DMA switch above -- exclude them as
+         * foreign owners for every other context so their addresses can't
+         * push a previously exactly-one adoption into ambiguity. */
+        int from_jobworld = (ctx->image_id >= 13 && ctx->image_id <= 15);
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
+                if (!from_jobworld
+                        && (s_registry[i].image_id == 14 || s_registry[i].image_id == 15))
+                    continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
             }

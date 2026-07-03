@@ -88,6 +88,15 @@ extern "C" void spu_recomp_register_tsexit(void);
  * asset sweep; without this lift the kernel dispatched the jobchain into the
  * SERVICE image's code (wrong image) -> wild EA-0 lock-line atomics. */
 extern "C" void spu_recomp_register_jobmod(void);
+/* recomp_prx/job_bin_{a,b}.c (generated) — the game's two jobchain JOB BINARIES
+ * (runtime-loaded per-descriptor SPU code; both EBOOT-static, extracted by
+ * eaBinary). A = the 14-way bulk worker (EBOOT 0x01254500, 0x9540 B, loads at
+ * ~LS 0x4C00); B = the completion job that sets the IWL event flag 0x4019C680
+ * bit 0x8000 t1 waits on (EBOOT 0x01275A00, 0x14C0 B, loads at ~LS 0xE400).
+ * Dispatch: mfc_do_transfer records where each binary lands per context;
+ * spu_indirect_branch switches image 13 <-> 14/15 on those spans. */
+extern "C" void spu_recomp_register_jobbin_a(void);
+extern "C" void spu_recomp_register_jobbin_b(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -1724,6 +1733,8 @@ int main(int argc, char** argv)
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
     spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
     spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
+    spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, loads ~LS 0x4C00) */
+    spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, loads ~LS 0xE400) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);

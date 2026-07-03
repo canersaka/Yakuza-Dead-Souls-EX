@@ -144,6 +144,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
+    /* SPURS jobchain: LS bases of the job BINARIES the job module (image 13)
+     * has DMA'd in for the current dispatch, recorded by mfc_do_transfer from
+     * the known descriptor eaBinary values (index = image_id - 14; 0 = not
+     * loaded). spu_indirect_branch keys the module->job image switch on these
+     * -- the DMA is the ground truth for what is resident where. */
+    uint32_t job_bin_base[2];
+
     /* Decrementer (a free-running down counter) */
     uint32_t decrementer;
 
