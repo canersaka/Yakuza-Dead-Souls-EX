@@ -17,10 +17,11 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
 | Flag | Where | Meaning |
 |---|---|---|
-| `YZ_NO_FLOWCTL` | yakuza/main.cpp ~1779 | **UN-RETIRED 2026-07-03 (default ON again)** — the 07-02 retirement was validated on one lucky 60s window. The LAYER-1 race persists: GET occasionally wins against the game's deferred patch drain, parks in an un-patched display list, t1 wedges in the libgcm reserve, and the whole CRI/codec init never runs (~1/2 of boots after the SPU_RET+backoff timing shift; codec-launch reproducer 4/4 GOOD with the lever ON). **NEW retirement condition:** the stopper-release applier respects full journal order (data patches + sublists applied before the release), or the GET-enters-unfinished-list root is fixed. |
+| `YZ_FLOWCTL` | yakuza/main.cpp ~1788 | **RETIRED AGAIN 2026-07-02 (default OFF; this flag opts back IN for A/B).** The race the lever covered is root-caused: OUR deferred-release applier raced Sony's real journal consumer (see `YZ_APPLY_REL`). With both off, 12/12 boots show zero type-1 wedges (state-classified, not lucky-window: 2 slow-but-healthy under compile load; 1 instance of the separate pre-existing late audio race). Evidence scratch/{bad1,cfgA*,cfgB*,val*}.err. Delete with `YZ_APPLY_REL` after quiet sessions. |
+| `YZ_APPLY_REL` | import_overrides.cpp ~1216 | **RETIRED 2026-07-02 (default OFF; opts the old deferred-release applier back IN for A/B).** The applier (f8d0386) was correct scaffolding while the real consumer couldn't run; post il/SPU_RET/backoff, gs_task does the whole journal job itself (measured [gs-put]: patch PUTs pc 0xB60C, FENCED release PUTs pc 0x5F00; GET never met an unpatched stopper in 12 applier-off boots). Leaving it on RACES Sony's consumer — releases land without the preceding patches: 3/3 applier-on boots wedged t1 at ~+6 s, 0/12 off. Default = faithful memwatch spin at stoppers. Delete with `YZ_FLOWCTL` after quiet sessions. |
 | `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~951 | Kill-switch for the throttle nudge — lives INSIDE the (now opt-in) yz_flip_advance thread, so it's inert unless `YZ_FLOWCTL=1`. Retires with the band-aid code. |
-| `YZ_NO_APPLY_REL` | import_overrides.cpp ~1132 | Kill-switch for the **faithful deferred stopper-release applier (f8d0386)** — the committed LAYER-1 fix. Keep. |
-| `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** — when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED: the 2026-07-02 validation loops were invalidated by watchdog instrumentation (see YZ_L1SNAP note), and the sweep has a suspected over-retirement (journal orders a segment's patches BEFORE its entry-stopper release). Do not default-ON before a clean baseline comparison; the REAL fix in flight = gs_task residency (trace-diff). Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries — it re-reads its own entries). |
+| `YZ_NO_APPLY_REL` | (gone) | **Flag retired 2026-07-02** — the applier it disabled is now default-OFF; the polarity inverted into `YZ_APPLY_REL` (see above). |
+| `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** — when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED and now MOOT (2026-07-02 late): reachable only via the retired `YZ_APPLY_REL` path, and the real consumer (gs_task) both applies and retires the journal itself — delete with the applier. Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries — it re-reads its own entries). |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
 | `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause → scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5×~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. |
 | `YZ_NORESUME` | spu_channels.c ~1026 | Kill-switch for the SPURS yield/resume context-switch path. Keep. |
@@ -64,7 +65,16 @@ transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA7
 added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs +
 line atomics with pc from task images 3/4; dumps the LS line for atomics on the CRI queues;
 its request-line GETLLAR releases YZ_SPU_TRACE_EVARM — 2026-07-02, REMOVE with the
-frontier), `YZ_SIGCALL`
+frontier), `YZ_JRNL_WATCH`
+(spu_dma.h: the LAYER-1 consumer discriminator — logs every DMA/atomic touching the gcm
+journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
+every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
+every 4096th; also [jrnl-cur] = the consumer's walking-cursor GETLLARs caught by LSA
+0x37780 at any EA, and an event-arm release for YZ_SPU_TRACE_EVARM at the journal-head
+GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_GSPUT`
+(spu_dma.h: logs every put-class DMA issued under SPU image 0 with pc+ea+size — the probe
+that proved gs_task's back half applies journal patches (plain PUTs, pc 0xB60C) and issues
+FENCED stopper-release PUTs (pc 0x5F00); 2026-07-02, retire with `YZ_JRNL_WATCH`), `YZ_SIGCALL`
 (dispatch.cpp: log indirect calls into the libsre LLE signal/queue family, addresses in
 scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,

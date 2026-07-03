@@ -1785,24 +1785,19 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
-    /* RSX FIFO flow-control band-aid -- UN-RETIRED (default ON, 2026-07-03;
-     * kill-switch YZ_NO_FLOWCTL). The 2026-07-02 retirement was validated on
-     * ONE lucky 60s window; the underlying LAYER-1 race persists: when the
-     * consumer's GET wins the race against the game's deferred patch drain,
-     * it parks inside an un-patched display list (measured: GET=io 0x11001EC
-     * at a stopper NOT in the deferred-release journal, fence frozen at 7)
-     * and t1 wedges in the libgcm reserve (ctr=0x02103AAC, usleep poll) ->
-     * the whole CRI/codec init downstream never runs. The SPU_RET fix +
-     * idle-poll backoff shifted the interleaving so the bad mode hit ~1/2 of
-     * boots (was ~1/6); with the lever back ON the codec-launch reproducer
-     * is 4/4 GOOD at +18-23 s (scratch/fc1-4). The forces stay LOSSY and
-     * RPCS3-unfaithful -- NEW RETIREMENT CONDITION: the stopper-release
-     * applier respects full journal order (apply the tag-0x04/0x08/0x09 data
-     * patches and tag-0x10 sublists that precede a release before opening
-     * the gate), or the deeper root of GET entering an unfinished display
-     * list is fixed. See the 2026-07-03 STATUS handoff + the pt25b/pt26
-     * archive ("route (a): locate + invoke the data-patch applier"). */
-    if (!getenv("YZ_NO_FLOWCTL"))
+    /* RSX FIFO flow-control band-aid -- RETIRED AGAIN (default OFF,
+     * 2026-07-02 layer-1 root-cause session; opt back in with YZ_FLOWCTL=1).
+     * The race it covered is root-caused: OUR deferred-release applier
+     * (import_overrides.cpp) raced Sony's real journal consumer -- gs_task
+     * applies the data/CALL patches (plain PUTs, LS pc 0xB60C) and releases
+     * stoppers with FENCED 4-byte PUTs (pc 0x5F00) itself; the applier's
+     * release-without-patches handed GET unpatched content and wedged t1 at
+     * ~+6 s (3/3 applier-on boots, identical site). With BOTH the applier
+     * and this lever off, 12/12 boots show zero such wedges (2 slow-but-
+     * healthy under compile load; val6 = the pre-existing late audio race,
+     * present on default config too). Evidence: scratch/{bad1,cfgA*,cfgB*,
+     * val*}.err + the [gs-put]/[jrnl] probes. Delete after quiet sessions. */
+    if (getenv("YZ_FLOWCTL"))
         CreateThread(NULL, 0, yz_flip_advance, NULL, 0, NULL);
     if (getenv("YZ_TS_WATCH"))
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);

@@ -3,5 +3,5 @@ exceptions=0
 unknown_branch_gt1=no
 esrch_fails=0
 reached_audio=YES
-applier_fires=True
+applier_fires=False
 vblank_alive=True
