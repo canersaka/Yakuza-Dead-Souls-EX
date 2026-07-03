@@ -34,6 +34,22 @@ extern "C" {
 #define RSX_DSP_VP_WORDS        (RSX_DSP_VP_INSTR * 4)
 #define RSX_DSP_NUM_CONSTANTS   512              /* vec4 transform constants */
 #define RSX_DSP_NUM_VERTEX_ATTR 16
+#define RSX_DSP_NUM_TEXTURES    16               /* fragment texture units   */
+
+/* rsx_dsp_texture.format values (gcm public format byte, incl. the LN/UN
+ * modifier bits: 0x20 = linear/no-swizzle, 0x40 = unnormalized coords) */
+#define RSX_TEX_FMT_B8              0x81
+#define RSX_TEX_FMT_A1R5G5B5        0x82
+#define RSX_TEX_FMT_A4R4G4B4        0x83
+#define RSX_TEX_FMT_R5G6B5          0x84
+#define RSX_TEX_FMT_A8R8G8B8        0x85
+#define RSX_TEX_FMT_DXT1            0x86
+#define RSX_TEX_FMT_DXT23           0x87
+#define RSX_TEX_FMT_DXT45           0x88
+#define RSX_TEX_FMT_DEPTH24_D8      0x90
+#define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
+#define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
+#define RSX_TEX_FMT_BASE_MASK       0x9F         /* format sans modifiers    */
 
 /* rsx_dsp_vertex_attr.type values (NV4097 vertex array format field) */
 #define RSX_VTX_TYPE_SNORM16    1
@@ -164,11 +180,46 @@ typedef struct rsx_dsp_index_array {
 } rsx_dsp_index_array;
 void rsx_dsp_get_index_array(const rsx_dispatch* rsx, rsx_dsp_index_array* out);
 
+/* Fragment texture unit state (TEX_OFFSET/FORMAT/WRAP/ENABLE/SWIZZLE/FILTER/
+ * NPOT_SIZE at 0x1A00 + unit*0x20, pitch from TEX_SIZE1 at 0x1840 + unit*4) */
+typedef struct rsx_dsp_texture {
+    u32 enabled;         /* TEX_ENABLE (control0) bit 31                    */
+    u32 offset;          /* byte offset into location's address space       */
+    u32 location;        /* RSX_LOCATION_* (from the format DMA selector)   */
+    u32 format;          /* RSX_TEX_FMT_* byte incl. LN/UN modifier bits    */
+    u32 dimension;       /* 1/2/3 = 1D/2D/3D                                */
+    u32 cubemap;
+    u32 mipmaps;         /* level count                                     */
+    u32 width, height;   /* from TEX_NPOT_SIZE (image rect)                 */
+    u32 pitch;           /* bytes per row (TEX_SIZE1 [0:19]); 0 for po2     */
+    u32 depth;           /* TEX_SIZE1 [20:31]                               */
+    u32 wrap;            /* raw wrap/gamma word                             */
+    u32 remap;           /* raw component-remap (swizzle) word              */
+    u32 filter;          /* raw min/mag filter word                         */
+    u32 border_color;
+} rsx_dsp_texture;
+void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out);
+
 /* Transform constants as floats (vec4 slot) */
 static inline const u32* rsx_dsp_constant(const rsx_dispatch* rsx, u32 slot)
 {
     return rsx->constants[slot < RSX_DSP_NUM_CONSTANTS ? slot : 0];
 }
+
+/* Fragment program: SHADER_PROGRAM register (offset | dma-context in [1:0],
+ * 1 = local, 2 = main). Returns the byte offset, *location gets RSX_LOCATION_*. */
+u32 rsx_dsp_fragment_program(const rsx_dispatch* rsx, u32* location);
+
+/* SHADER_CONTROL raw word (register count, fp16-output flag, ...) */
+u32 rsx_dsp_shader_control(const rsx_dispatch* rsx);
+
+/* Transform program execution start slot (VP_START_FROM_ID) */
+u32 rsx_dsp_vp_start(const rsx_dispatch* rsx);
+
+/* Per-attribute immediate/default value (VTX_ATTR_4F register block):
+ * what a disabled vertex attribute reads as. Falls back to (0,0,0,1) when
+ * the register block was never written. */
+void rsx_dsp_vertex_default(const rsx_dispatch* rsx, u32 index, float out[4]);
 
 #ifdef __cplusplus
 }
