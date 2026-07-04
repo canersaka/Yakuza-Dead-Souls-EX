@@ -140,18 +140,6 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* [dtor] YZ_DTOR_TRACE diag (2026-07-03 s9): real lv2 refuses to destroy a
-     * semaphore with waiters (EBUSY; RPCS3 sys_semaphore.cpp:91) — we don't
-     * track waiters on Win32, so log id/value only. RETIRE with the frontier. */
-    {
-        extern int yz_dtor_trace_on(void);
-        extern uint32_t yz_thread_current_id(void);
-        if (yz_dtor_trace_on()) {
-            fprintf(stderr, "[dtor] sem_destroy id=%u tid=%u name=%.8s value=%d max=%d\n",
-                    sem_id, yz_thread_current_id(), s->name, s->value, s->max_value);
-        }
-    }
-
 #ifdef _WIN32
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
