@@ -364,6 +364,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
     }
 
+    /* [t1-spin] (clean binary): t1 spins signaling cond-4 forever at the movie
+     * gate. Log the caller (lr) + working regs to locate its loop + the object
+     * it polls, so we can force it forward. YZ_T1SPIN to enable. */
+    if (getenv("YZ_T1SPIN") && num == 108 && (uint32_t)ctx->gpr[3] == 4 &&
+        yz_thread_current_id() == 1) {
+        static long n = 0; if (++n <= 24) {
+            fprintf(stderr, "[t1-spin] #%ld lr=0x%08X r4=0x%llX r5=0x%08X r30=0x%08X r31=0x%08X\n",
+                    n, (uint32_t)ctx->lr, (unsigned long long)ctx->gpr[4],
+                    (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
+            fflush(stderr);
+        }
+    }
+
     /* sys_dbg_* (972, 0x3CC): RPCS3 stubs this as null_func (no-op success);
      * Sony's libgcm calls it on the interrupt path and IGNORES the result, but
      * our default ENOSYS spams the log. Match the oracle: succeed silently. */

@@ -60,6 +60,11 @@ direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt);
 entry branch — with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
 only launch args are needed — PROF's per-branch overhead crawls the whole boot).
 
+`YZ_T1SPIN` (yakuza/shims.cpp): logs t1's caller + working regs when it signals
+cond-4 at the CRI movie gate (the clean-binary spin loop) — used 2026-07-04 to show t1 is
+deep in the CRI player's server loop with an empty work queue (lr=0, trampoline-dispatched;
+so no single poke — the movie needs real decode output to advance). REMOVE with the CRI frontier.
+
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
 keeps its trace tail — added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
