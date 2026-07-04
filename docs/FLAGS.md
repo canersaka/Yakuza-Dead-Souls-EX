@@ -98,13 +98,7 @@ journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
 every 4096th; also [jrnl-cur] = the consumer's walking-cursor GETLLARs caught by LSA
 0x37780 at any EA, and an event-arm release for YZ_SPU_TRACE_EVARM at the journal-head
-GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_DTOR_TRACE`
-(sys_mutex.c/sys_cond.c/sys_semaphore.c destroy paths: [dtor] logs every kernel
-mutex/cond/sem destroy with id+tid+name and the verdict REAL lv2 would have returned —
-LV2-EBUSY for owned mutex / cond-with-committed-waiters, LV2-EPERM for mutex with attached
-conds; our destroys always succeed = the missing busy-object contract (RPCS3
-sys_mutex.cpp:118, sys_cond.cpp:133, sys_semaphore.cpp:91). 2026-07-03 s9, the
-acitm-boundary hunt — retire with the frontier or when the contract fix lands), `YZ_COND_TRACE`
+GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_COND_TRACE`
 (sys_cond.c + sys_mutex.c: logs WAIT-enter/exit pairs and any SIGNAL that blocks acquiring
 the mutex CS on low-id conds, plus recursive-trylock re-entries — the boot-stall hunt's
 sync-layer x-ray; 2026-07-02, retire with the stall frontier), `YZ_GSPUT`

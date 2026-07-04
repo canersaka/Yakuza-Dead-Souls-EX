@@ -160,20 +160,6 @@ int64_t sys_cond_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* [dtor] YZ_DTOR_TRACE diag (2026-07-03 s9): real lv2 refuses to destroy a
-     * cond with waiters (EBUSY; RPCS3 sys_cond.cpp:133) — we destroy anyway
-     * and recycle the slot, orphaning any committed waiter. Log the verdict
-     * real lv2 would have given. RETIRE with the frontier. */
-    {
-        extern int yz_dtor_trace_on(void);
-        if (yz_dtor_trace_on()) {
-            fprintf(stderr, "[dtor] cond_destroy id=%u tid=%u name=%.8s mutex=%u committed=%d pending=%d verdict=%s\n",
-                    cond_id, yz_thread_current_id(), c->name, c->mutex_id,
-                    c->committed, c->pending,
-                    c->committed > 0 ? "LV2-EBUSY" : "OK");
-        }
-    }
-
 #ifndef _WIN32
     pthread_cond_destroy(&c->cv);
 #endif

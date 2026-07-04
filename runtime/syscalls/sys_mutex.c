@@ -3,20 +3,10 @@
  */
 
 #include "sys_mutex.h"
-#include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-/* [dtor] trace flag (YZ_DTOR_TRACE) — see sys_mutex_destroy. */
-extern uint32_t yz_thread_current_id(void);
-int yz_dtor_trace_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("YZ_DTOR_TRACE"); on = (e && *e) ? 1 : 0; }
-    return on;
-}
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -166,26 +156,6 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
     if (!m->active) {
         mtx_table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    /* [dtor] YZ_DTOR_TRACE diag (2026-07-03 s9, acitm-boundary hunt): real lv2
-     * refuses destroy on a busy object (owner -> EBUSY, attached conds ->
-     * EPERM; RPCS3 sys_mutex.cpp:118). We destroy unconditionally, so log the
-     * verdict real lv2 would have given. RETIRE with the frontier. */
-    if (yz_dtor_trace_on()) {
-        const char* verdict = "OK";
-        if (m->owner_tid != 0) verdict = "LV2-EBUSY";
-        else {
-            for (int i = 0; i < SYS_COND_MAX; i++) {
-                if (g_sys_conds[i].active && g_sys_conds[i].mutex_id == mutex_id) {
-                    verdict = "LV2-EPERM";
-                    break;
-                }
-            }
-        }
-        fprintf(stderr, "[dtor] mutex_destroy id=%u tid=%u name=%.8s owner=%llu lockcnt=%d verdict=%s\n",
-                mutex_id, yz_thread_current_id(), m->name,
-                (unsigned long long)m->owner_tid, m->lock_count, verdict);
     }
 
 #ifdef _WIN32
