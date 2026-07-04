@@ -104,12 +104,7 @@ mutex/cond/sem destroy with id+tid+name and the verdict REAL lv2 would have retu
 LV2-EBUSY for owned mutex / cond-with-committed-waiters, LV2-EPERM for mutex with attached
 conds; our destroys always succeed = the missing busy-object contract (RPCS3
 sys_mutex.cpp:118, sys_cond.cpp:133, sys_semaphore.cpp:91). 2026-07-03 s9, the
-acitm-boundary hunt — retire with the frontier or when the contract fix lands), `YZ_STALLKICK`
-(main.cpp yz_stallkick_thread + yz_cond_kick_all/yz_sem_kick: a TEST watchdog that after a delay
-periodically wakes every committed cond waiter + posts sem-1/2 to probe whether the acitm freeze
-is a recoverable lost-wake — it is NOT: 2026-07-04 s9 result = hard structural deadlock, no advance,
-FREEZE_CLAIM_LEDGER V56-57. Value = "1" or "delay_ms,period_ms,cap". Diagnostic only, default OFF;
-retire with the frontier), `YZ_COND_TRACE`
+acitm-boundary hunt — retire with the frontier or when the contract fix lands), `YZ_COND_TRACE`
 (sys_cond.c + sys_mutex.c: logs WAIT-enter/exit pairs and any SIGNAL that blocks acquiring
 the mutex CS on low-id conds, plus recursive-trylock re-entries — the boot-stall hunt's
 sync-layer x-ray; 2026-07-02, retire with the stall frontier), `YZ_GSPUT`
@@ -117,17 +112,8 @@ sync-layer x-ray; 2026-07-02, retire with the stall frontier), `YZ_GSPUT`
 that proved gs_task's back half applies journal patches (plain PUTs, pc 0xB60C) and issues
 FENCED stopper-release PUTs (pc 0x5F00); 2026-07-02, retire with `YZ_JRNL_WATCH`), `YZ_SIGCALL`
 (dispatch.cpp: log indirect calls into the libsre LLE signal/queue family, addresses in
-scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`
-(spu_dma.h: SPURS mgmt-line wklSignal1 GETLLAR-seen / PUTLLC-cleared watch, per wid via the
-`0x8000>>wid` bit convention. 2026-07-03 s10: `[sig-seen]` was uncapped-per-poll and `[sig-chg]`'s
-80-line cap both saturated by ~log-line 6700 of a ~59000-line boot — blind for the entire
-post-acitm freeze window. Fixed: `[sig-seen]` is now change-triggered (was every-poll-while-
-nonzero) and both caps raised to 4000 with a running `#total` counter so exhaustion is visible.
-Result (acitm-freeze hunt): wid0's bit (0x8000) is seen+cleared almost 1:1 (107 seen / 104
-cleared) through the last WID0-SIGNAL CAS, then BOTH stop dead at the same log line — no
-edge-drop on this doorbell. wid3's bit (0x1000) keeps toggling >2200 times deep into the same
-post-park window, proving the SPU-side coherence/LR path is generically healthy. REMOVE with the
-frontier or fold into a permanent per-wid probe if kept.), `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
+scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
+`YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
 `YZ_TS_WATCH`, `YZ_TASK_TRACE`, `YZ_TASK_RET`, `YZ_CB_TRACE`, `YZ_DRAIN_TRACE`, `YZ_RECPROBE`,
 `YZ_PHASE`, `YZ_FIFO_TRACE`, `YZ_TRACE_RSX`, `YZ_TRACE_DEFER`, `YZ_LOG_FIFOSET`,

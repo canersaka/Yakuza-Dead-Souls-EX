@@ -428,31 +428,6 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* YZ_STALLKICK diag helper (s9, 2026-07-04): wake every committed cond waiter
- * without a ppu_context -- emulates real HW's ~100ms periodic cri_dlg retry
- * clock (RPCS3 driver oracle B1, scratch/rpcs3_driver_oracle.md) to TEST
- * whether the pxd disc-decompress freeze is a recoverable lost-wake vs a hard
- * data deadlock. Spurious cond wakes are always legal (waiters re-check their
- * predicate). Returns the number of conds pulsed. TEST-ONLY, env-gated. */
-int yz_cond_kick_all(void)
-{
-    int n = 0;
-    for (int i = 0; i < SYS_COND_MAX; i++) {
-        sys_cond_info* c = &g_sys_conds[i];
-        if (!c->active) continue;
-#ifdef _WIN32
-        EnterCriticalSection(&c->sig_cs);
-        if (c->committed > c->pending) { c->pending = c->committed; WakeAllConditionVariable(&c->cv); n++; }
-        LeaveCriticalSection(&c->sig_cs);
-#else
-        pthread_mutex_lock(&c->sig_mtx);
-        if (c->committed > c->pending) { c->pending = c->committed; pthread_cond_broadcast(&c->cv); n++; }
-        pthread_mutex_unlock(&c->sig_mtx);
-#endif
-    }
-    return n;
-}
-
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/

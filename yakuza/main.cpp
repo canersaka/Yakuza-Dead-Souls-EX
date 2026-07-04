@@ -959,43 +959,6 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     return 0;
 }
 
-/* STALL-KICK test watchdog (env YZ_STALLKICK, s9 2026-07-04). The pxd disc-
- * decompress pipeline deadlocks at the acitm0039.par boundary as an emergent
- * multi-thread livelock (7-agent hunt: every component individually faithful;
- * scratch/FREEZE_CLAIM_LEDGER.md S9). RPCS3 (B1 oracle) drives cri_dlg on a
- * ~100ms periodic retry clock; our build parks on a (possibly lost) one-shot
- * wake. This thread periodically re-pulses the pipeline's cond/sem waits to
- * TEST whether the freeze is a recoverable lost-wake (boot advances past
- * acitm0039 -> new .par loads / wegun0120) or a hard data deadlock (no change).
- * NOT a shipping fix -- a diagnostic; retire once the mechanism is known. */
-extern "C" int yz_cond_kick_all(void);
-extern "C" int yz_sem_kick(int sem_id, int cap);
-static DWORD WINAPI yz_stallkick_thread(LPVOID)
-{
-    /* Parse an optional start-delay / period / sem-cap from the env value:
-     * "1" -> defaults; "delay,period,cap" overrides (all ms except cap). */
-    int delay_ms = 18000, period_ms = 150, cap = 4;
-    if (const char* v = getenv("YZ_STALLKICK")) {
-        int a=0,b=0,c=0; int nf = sscanf(v, "%d,%d,%d", &a,&b,&c);
-        if (nf >= 1 && a > 1) delay_ms = a;
-        if (nf >= 2 && b > 0) period_ms = b;
-        if (nf >= 3 && c > 0) cap = c;
-    }
-    Sleep(delay_ms);
-    fprintf(stderr, "[stallkick] START delay=%dms period=%dms cap=%d\n", delay_ms, period_ms, cap);
-    fflush(stderr);
-    for (int pulse = 1; ; pulse++) {
-        Sleep(period_ms);
-        int nc = yz_cond_kick_all();
-        int ns = yz_sem_kick(2, cap) + yz_sem_kick(1, cap);
-        if (pulse <= 2000 && (pulse % 8 == 1)) {
-            fprintf(stderr, "[stallkick] pulse %d conds=%d sems=%d\n", pulse, nc, ns);
-            fflush(stderr);
-        }
-    }
-    return 0;
-}
-
 /* Pointers to the MAIN (t1) thread's trampoline ring, captured on the main thread
  * so a separate monitor thread can print t1's recent indirect-call path -- reliable,
  * unlike the nearest-symbol back-chain that misattributes return addresses to data. */
@@ -1871,8 +1834,6 @@ int main(int argc, char** argv)
     /* Stall watchdog: dumps the main thread's guest call stack if the boot
      * parks (TEMP DEBUG: diagnosing the post-shader-open stall). */
     CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL);
-    if (getenv("YZ_STALLKICK"))
-        CreateThread(NULL, 0, yz_stallkick_thread, NULL, 0, NULL);
     /* High-frequency RSX state tracer (TEMP DEBUG): compact GET/PUT/fence/ctr
      * timeline + a full dump at the stall edge. Env-gated so default runs stay
      * clean; on for the deadlock investigation. */
