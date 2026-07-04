@@ -295,10 +295,10 @@ def _bin_vcase(name, xo, ain, bin_, result_bytes, form="vx", exp_cr=None, rc=0):
           {R_ADDR: result_bytes}, exp_cr=exp_cr)
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_fprs=None, exp_fprs=None):
+         in_fprs=None, exp_fprs=None, in_cr=0):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
-                      in_fprs=in_fprs or {}, exp_fprs=exp_fprs or []))
+                      in_fprs=in_fprs or {}, exp_fprs=exp_fprs or [], in_cr=in_cr))
 
 def dbits(x):
     """64-bit pattern of a Python float as an IEEE double."""
@@ -757,6 +757,35 @@ build_cases()
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# CR-logical ops (opcode 19). REGRESSION for the crnor/crnand disasm swap
+# (2026-07-04): ppu_disasm.py had opcodes 33/225 mapped to crnand/crnor
+# (should be crnor/crnand), and there was ZERO coverage, so 987 mis-lifted
+# sites (inverted NAND<->NOR logic) went undetected through 11 audits. These
+# cases set CR bit 4 = 1 and CR bit 8 = 0 (differing inputs, so AND/OR/NAND/NOR
+# all give distinct results) and land the result bit in the CR0 nibble.
+# ---------------------------------------------------------------------------
+def _cr_word(xo, bt, ba, bb):
+    return (19 << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (xo << 1)
+
+_CR_IN = 1 << 27   # host bit 27 => CR bit 4 = 1 (ba); CR bit 8 = 0 (bb)
+for _nm, _xo, _res in [("crand", 257, 0), ("cror", 449, 1), ("crxor", 193, 1),
+                       ("crnand", 225, 1), ("crnor", 33, 0), ("creqv", 289, 0),
+                       ("crandc", 129, 1), ("crorc", 417, 1)]:
+    # bt=0 -> host bit 31 -> top bit of the CR0 nibble (shift 28).
+    case(f"{_nm} bt0 a=1 b=0", _cr_word(_xo, 0, 4, 8),
+         {}, [], in_cr=_CR_IN, exp_cr=(0x8 if _res else 0x0, 28))
+
+# Hard disassembler-table guard: the cases above only SKIP (mnemonic mismatch)
+# on a swap, so assert the table directly -- a re-swap of crnor/crnand (or any
+# CR-logical opcode) is a clean, loud failure, not a silent skip.
+for _nm, _xo in [("crnor", 33), ("crnand", 225), ("crand", 257), ("cror", 449),
+                 ("crxor", 193), ("creqv", 289), ("crandc", 129), ("crorc", 417)]:
+    _got = ppu_disasm.decode(_cr_word(_xo, 0, 4, 8), 0).mnemonic
+    assert _got == _nm, (f"DISASM TABLE BUG (ppu_disasm.py cr_ops): CR-logical opcode "
+                         f"{_xo} decodes as {_got!r}, must be {_nm!r} (PowerISA / RPCS3 "
+                         f"PPUOpcodes.h). The crnor/crnand swap cost sessions 5-9.")
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -854,6 +883,8 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c.get("in_cr"):
+            out.append(f"      ctx->cr = 0x{c['in_cr']:08X}U;")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         for reg, pat in c["in_fprs"].items():
