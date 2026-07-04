@@ -182,9 +182,14 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
               static long n[32] = {0};
               int slot = ((uint32_t)addr >> 2) & 31;
               if (w0sig || n[slot] < 24) { if (!w0sig) n[slot]++;
-                  fprintf(stderr, "[mgmt-cas]%s t%u addr=0x%08X old=%08X new=%08X %s\n",
+                  /* host retaddr = the generated function containing the stwcx
+                   * (guest lr is 0 on this path -- bctr chains don't write it);
+                   * resolve via the linker map (2026-07-03 late: localizes OUR
+                   * doorbell's function; the publish-vs-signal branch is above it). */
+                  fprintf(stderr, "[mgmt-cas]%s t%u addr=0x%08X old=%08X new=%08X %s lr=0x%08X host=%p\n",
                           w0sig ? " WID0-SIGNAL" : "", yz_thread_current_id(),
-                          (uint32_t)addr, ps3_bswap32(expected), val, ok ? "OK" : "FAIL");
+                          (uint32_t)addr, ps3_bswap32(expected), val, ok ? "OK" : "FAIL",
+                          (uint32_t)ctx->lr, _ReturnAddress());
                   fflush(stderr); } } }
     }
     ctx->reserve_addr = 0;

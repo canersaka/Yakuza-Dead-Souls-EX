@@ -319,10 +319,15 @@ static void ensure_parent_dirs(const char* path)
  * File operations
  * -----------------------------------------------------------------------*/
 
+/* guest thread id for trace attribution (2026-07-03 late: which thread does
+ * which I/O — cri_dlg vs the async workers vs t1) */
+extern uint32_t yz_thread_current_id(void);
+
 /* NID: 0x718BF5F8 */
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size)
 {
-    printf("[cellFs] Open(path='%s', flags=0x%X)\n", path ? path : "<null>", flags);
+    printf("[cellFs] t%u Open(path='%s', flags=0x%X)\n",
+           yz_thread_current_id(), path ? path : "<null>", flags);
 
     if (!path || !fd)
         return CELL_EFAULT;
@@ -435,7 +440,8 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     if (is_stream) {
         const unsigned char* b = (const unsigned char*)buf;
-        printf("[cellFs] Read(fd=%d '%s') off=0x%llX nbytes=0x%llX -> 0x%llX  hdr=%02X%02X%02X%02X %02X%02X%02X%02X (%c%c%c%c)\n",
+        printf("[cellFs] t%u Read(fd=%d '%s') off=0x%llX nbytes=0x%llX -> 0x%llX  hdr=%02X%02X%02X%02X %02X%02X%02X%02X (%c%c%c%c)\n",
+               yz_thread_current_id(),
                fd, p, (unsigned long long)off_before, (unsigned long long)nbytes,
                (unsigned long long)bytes_read,
                bytes_read>0?b[0]:0, bytes_read>1?b[1]:0, bytes_read>2?b[2]:0, bytes_read>3?b[3]:0,
