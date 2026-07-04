@@ -91,6 +91,31 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# FFmpeg (host movie decode: CRI Sofdec .sfd = MPEG-1 video + ADX audio).
+# Optional: compiled into libs/codec/movie_ffmpeg.c only when the FFmpeg dev
+# libs are present. Defaults to the in-repo RPCS3 3rdparty copy; override with
+# -DYZ_FFMPEG_DIR=<dir>. Without it, movie_ffmpeg.c stays a no-op stub so the
+# runtime always links.  DLLs (avcodec/avformat/avutil/swscale) must be on PATH
+# or beside the exe at run time.
+# ---------------------------------------------------------------------------
+if(NOT YZ_FFMPEG_DIR)
+    set(YZ_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3/3rdparty/ffmpeg")
+endif()
+if(WIN32 AND EXISTS "${YZ_FFMPEG_DIR}/include/libavcodec/avcodec.h")
+    message(STATUS "ps3recomp: FFmpeg movie decode ENABLED (${YZ_FFMPEG_DIR})")
+    target_compile_definitions(ps3recomp_runtime PRIVATE HAVE_FFMPEG=1)
+    target_include_directories(ps3recomp_runtime PRIVATE "${YZ_FFMPEG_DIR}/include")
+    target_link_libraries(ps3recomp_runtime PRIVATE
+        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avformat.lib"
+        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avcodec.lib"
+        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avutil.lib"
+        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/swscale.lib"
+        secur32)
+else()
+    message(STATUS "ps3recomp: FFmpeg not found (${YZ_FFMPEG_DIR}) -- movie decode stubbed")
+endif()
+
+# ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

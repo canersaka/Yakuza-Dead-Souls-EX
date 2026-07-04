@@ -91,6 +91,19 @@ target_include_directories(yakuza_recomp PRIVATE
 # user32/gdi32: the null RSX backend opens a Win32 window + GDI present
 target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp user32 gdi32)
 
+# FFmpeg (host movie decode) creates a load-time DLL dependency on the exe.
+# Copy the runtime DLLs next to it from an in-repo RPCS3 install, if present.
+# Harmless no-op when FFmpeg wasn't linked (movie support stubbed).
+file(GLOB _yz_ff_dlls
+    "${PS3RECOMP_DIR}/rpcs3-v*/avcodec-*.dll"  "${PS3RECOMP_DIR}/rpcs3-v*/avformat-*.dll"
+    "${PS3RECOMP_DIR}/rpcs3-v*/avutil-*.dll"   "${PS3RECOMP_DIR}/rpcs3-v*/swscale-*.dll"
+    "${PS3RECOMP_DIR}/rpcs3-v*/swresample-*.dll")
+if(_yz_ff_dlls)
+    add_custom_command(TARGET yakuza_recomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_yz_ff_dlls} $<TARGET_FILE_DIR:yakuza_recomp>
+        COMMENT "Copying FFmpeg DLLs next to yakuza_recomp")
+endif()
+
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
         /W3 /wd4100 /wd4244 /wd4267
