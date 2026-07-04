@@ -19,6 +19,7 @@
 #include "ps3emu/error_codes.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
+#include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
 
 #include <cstdio>
 #include <cstring>
@@ -417,6 +418,44 @@ static DWORD WINAPI yz_window_thread(LPVOID)
             fprintf(stderr, "[rsx] live-draw init FAILED (%d) -> falling back to null present\n", r);
         }
     }
+
+    /* YZ_MOVIE_TEST=<path.sfd>: standalone proof of the host movie path -- decode
+     * the movie with FFmpeg and present it straight to the D3D12 window (movie
+     * mode gates the guest's draws off). Not the game hook; just proves
+     * decode -> present in-process. */
+    const char* mvpath = getenv("YZ_MOVIE_TEST");
+    if (mvpath && *mvpath && rsx_live_draw_enabled()) {
+        MoviePlayer* mv = movie_open(mvpath);
+        if (mv) {
+            const uint32_t w = (uint32_t)movie_width(mv), h = (uint32_t)movie_height(mv);
+            int fps = (int)(movie_framerate(mv) + 0.5); if (fps <= 0) fps = 30;
+            const DWORD frame_ms = (DWORD)(1000 / fps);
+            fprintf(stderr, "[movie] YZ_MOVIE_TEST playing %s (%ux%u @ %dfps)\n", mvpath, w, h, fps);
+            rsx_live_draw_set_movie_mode(1);
+            int n = 0;
+            for (;;) {
+                const uint8_t* rgba = movie_next_rgba(mv, nullptr);
+                if (!rgba) break;                          /* end of stream */
+                rsx_live_draw_present_rgba(rgba, w, h);
+                if (n == 30) {   /* dump one presented frame as proof (RGB PPM) */
+                    FILE* f = fopen("scratch/movie_runtime.ppm", "wb");
+                    if (f) { fprintf(f, "P6\n%u %u\n255\n", w, h);
+                        for (uint32_t i = 0; i < w * h; i++) fwrite(rgba + i * 4, 1, 3, f);
+                        fclose(f); fprintf(stderr, "[movie] wrote scratch/movie_runtime.ppm (frame 30)\n"); }
+                }
+                if (rsx_null_backend_pump_messages() < 0) break;
+                Sleep(frame_ms);
+                n++;
+            }
+            fprintf(stderr, "[movie] done (%d frames presented)\n", n);
+            movie_close(mv);
+            rsx_live_draw_set_movie_mode(0);
+        } else {
+            fprintf(stderr, "[movie] movie_open('%s') failed (ffmpeg_available=%d)\n",
+                    mvpath, movie_ffmpeg_available());
+        }
+    }
+
     for (;;) {
         if (rsx_null_backend_pump_messages() < 0)
             break;            /* window closed */

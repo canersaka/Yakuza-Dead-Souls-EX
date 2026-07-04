@@ -31,6 +31,8 @@ void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
 void rsx_live_draw_seed_transform_program(const u32* w, u32 n) { (void)w; (void)n; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_present(u32 b) { (void)b; }
+void rsx_live_draw_set_movie_mode(int on) { (void)on; }
+void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
 void rsx_live_draw_shutdown(void) {}
 
 #else /* _WIN32 */
@@ -884,6 +886,11 @@ static void fetch_batches(void)
  * clears?). Reported per presented frame in rsx_live_draw_present. */
 static u32 g_ld_draws = 0, g_ld_clears = 0, g_ld_frames = 0;
 
+/* Movie mode: while a host-decoded movie owns the window (rsx_live_draw_present_rgba),
+ * ignore the guest's method stream so its draws don't record into g.list concurrently
+ * with the movie present (they run on different threads). */
+static volatile int g_ld_movie_mode = 0;
+
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
 { (void)u; (void)r; g_ld_draws++; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
@@ -1262,8 +1269,54 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
 
 void rsx_live_draw_method(u32 method, u32 arg)
 {
-    if (!g.ready) return;
+    if (!g.ready || g_ld_movie_mode) return;
     rsx_dispatch_method(&g.rsx, method, arg);
+}
+
+void rsx_live_draw_set_movie_mode(int on) { g_ld_movie_mode = on ? 1 : 0; }
+
+/* Present a host-decoded RGBA8 frame to the window: copy it straight into the
+ * swap-chain backbuffer (both R8G8B8A8_UNORM at the swap size) and Present.
+ * The frame is clamped to the backbuffer size. Call from a single thread with
+ * movie mode on (so guest draws don't touch g.list). */
+void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+{
+    if (!g.ready || !rgba) return;
+    if (w > g.width)  w = g.width;
+    if (h > g.height) h = g.height;
+    const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
+    if ((UINT64)pitch * h > UPLOAD_SIZE) return;
+    for (u32 y = 0; y < h; y++)
+        memcpy(g.upload_mapped + (size_t)y * pitch, rgba + (size_t)y * w * 4, (size_t)w * 4);
+
+    const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+    ID3D12Resource* bb = g.backbuf[bbi];
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = bb;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+    src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = 0;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width = w;
+    src.PlacedFootprint.Footprint.Height = h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    ld_flush();
+    g.swap->lpVtbl->Present(g.swap, 1, 0);
 }
 
 /* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
