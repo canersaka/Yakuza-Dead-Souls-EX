@@ -45,6 +45,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_TIGHT` | import_overrides.cpp ~1032 | Tight-poll consumer (tested-negative as a fix). |
 | `YZ_AUDIO_FORCE` | libs/audio/cellAudio.c ~730 | Force audio port behavior. |
 | `YZ_SKIP_VOICE` | yakuza/shims.cpp ~218 | Skip the CRI intro-voice path — useful as a RECON probe past the movie gate, not a shipping path. |
+| `YZ_MOVIE_TEST` | yakuza/import_overrides.cpp (yz_window_thread) | `=<path.sfd>`: standalone proof of the host movie path — decode the .sfd with FFmpeg (libs/codec/movie_ffmpeg.c) and present it straight to the D3D12 window via `rsx_live_draw_present_rgba` (movie mode gates the guest's draws off). Verified 2026-07-04: plays hd_sega_logo_us1012.sfd end-to-end, 100 frames, no crash. NOT the game hook — just proves decode→present in-process. Needs YZ_RSX_DRAW on. |
 
 ## Diagnostics (default OFF; side-effect-free when unset)
 

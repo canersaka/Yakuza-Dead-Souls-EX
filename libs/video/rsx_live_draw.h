@@ -66,6 +66,14 @@ void rsx_live_draw_method(u32 method, u32 arg);
 /* Present the given display buffer id (called from the flip path). */
 void rsx_live_draw_present(u32 buffer_id);
 
+/* Movie playback: while on, the guest method stream is ignored so a host-decoded
+ * movie can own the window without the guest's draws racing g.list. */
+void rsx_live_draw_set_movie_mode(int on);
+
+/* Present a host-decoded RGBA8 frame (w*h*4, row pitch w*4) straight to the
+ * swap-chain backbuffer. Call from one thread with movie mode on. */
+void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
+
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
 
