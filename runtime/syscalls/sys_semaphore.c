@@ -322,6 +322,30 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* YZ_STALLKICK diag helper (s9, 2026-07-04): release one token to a semaphore
+ * (waking a blocked waiter) if its value is below `cap` -- bounded so it can't
+ * accumulate. Used by the stall-kick watchdog to TEST whether re-driving the
+ * pxd pipeline's t1->E5-worker handoff (sem-2) unsticks the disc-decompress
+ * freeze (a lost-wake) vs not (a hard data deadlock). Returns 1 if it posted.
+ * TEST-ONLY, env-gated. */
+int yz_sem_kick(int sem_id, int cap)
+{
+    if (sem_id < 1 || sem_id > SYS_SEMAPHORE_MAX) return 0;
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active) return 0;
+    int did = 0;
+#ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    if (s->value < cap && s->value + 1 <= s->max_value) { s->value++; ReleaseSemaphore(s->sem_handle, 1, NULL); did = 1; }
+    LeaveCriticalSection(&s->value_lock);
+#else
+    pthread_mutex_lock(&s->mtx);
+    if (s->value < cap && s->value + 1 <= s->max_value) { s->value++; pthread_cond_signal(&s->cv); did = 1; }
+    pthread_mutex_unlock(&s->mtx);
+#endif
+    return did;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_semaphore_get_value
  *
