@@ -512,8 +512,20 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
     u32 gen_snap = s_lwmutex[slot].gen;
 
 #ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs))
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        /* DIAG (2026-07-03 late, the EBUSY-record hunt — REMOVE with the
+         * frontier): this is the only SILENT CELL_EBUSY in the runtime; if
+         * CRI's submit path eats one of these as a hard failure, this print
+         * names the moment (capped: contention EBUSY is normal elsewhere). */
+        { extern uint32_t yz_thread_current_id(void);
+          static long n = 0;
+          if (n < 200) { n++;
+              fprintf(stderr, "[lwm-trylock-EBUSY] t%u guest=0x%08X slot=%u holder=%lu\n",
+                      yz_thread_current_id(), YZ_GUEST_ADDR(lwmutex), slot,
+                      s_lwmutex[slot].owner_tid);
+              fflush(stderr); } }
         return CELL_EBUSY;
+    }
 #else
     if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
         return CELL_EBUSY;
