@@ -33,6 +33,15 @@ void rsx_null_backend_shutdown(void);
  * window was closed. */
 int rsx_null_backend_pump_messages(void);
 
+/* The window handle (HWND cast to void*), so a GPU backend can bind a swap
+ * chain to the existing present window. NULL before init. */
+void* rsx_null_backend_get_hwnd(void);
+
+/* Suppress the GDI clear-color present + WM_PAINT fill. A GPU backend (Track B
+ * live draw) that owns a flip-model swap chain on this HWND calls this with 1
+ * so the two don't fight over the window surface. Default: not suppressed. */
+void rsx_null_backend_suppress_present(int on);
+
 #ifdef __cplusplus
 }
 #endif

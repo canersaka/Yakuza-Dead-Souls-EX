@@ -874,11 +874,15 @@ static void fetch_batches(void)
 #define PRIM_TRIANGLE_FAN    6
 #define PRIM_QUADS           7
 
+/* Live-draw activity counters (verification: is real geometry flowing, or only
+ * clears?). Reported per presented frame in rsx_live_draw_present. */
+static u32 g_ld_draws = 0, g_ld_clears = 0, g_ld_frames = 0;
+
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
+{ (void)u; (void)r; g_ld_draws++; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
 static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; if (dc.n_idx < 256) { dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++; } }
+{ (void)u; (void)r; g_ld_draws++; if (dc.n_idx < 256) { dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++; } }
 
 static void sink_end(void* user, const rsx_dispatch* r)
 {
@@ -1026,6 +1030,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
+    g_ld_clears++;
     const u32 target = current_surface();
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
@@ -1240,6 +1245,70 @@ void rsx_live_draw_method(u32 method, u32 arg)
     rsx_dispatch_method(&g.rsx, method, arg);
 }
 
+/* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
+ * and write a binary PPM. Self-contained -- creates + releases its own readback
+ * buffer, so no init/struct changes. Uses g.list which ld_flush leaves open. */
+static void ld_dump_surface_ppm(const char* path)
+{
+    const u32 target = current_surface();
+    ID3D12Resource* rt = g.surfaces[target].tex;
+    if (!rt) return;
+    const u32 pitch = (g.width * 4 + 255) & ~255u;              /* 256-align */
+    const UINT64 rb_size = (UINT64)pitch * g.height;
+
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = rb_size;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* rb = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)))
+        return;
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = rt;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = g.width;
+    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    ld_flush();                                    /* copy completes on the GPU */
+
+    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
+    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", g.width, g.height);
+            for (u32 y = 0; y < g.height; y++) {
+                const u8* row = px + (SIZE_T)y * pitch;
+                for (u32 x = 0; x < g.width; x++) fwrite(row + x * 4, 1, 3, f);  /* RGBA->RGB */
+            }
+            fclose(f);
+            fprintf(stderr, "[live-draw] wrote %s\n", path);
+        }
+        D3D12_RANGE wr = {0, 0};
+        rb->lpVtbl->Unmap(rb, 0, &wr);
+    }
+    rb->lpVtbl->Release(rb);
+}
+
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -1275,6 +1344,16 @@ void rsx_live_draw_present(u32 buffer_id)
 
     ld_flush();
     g.swap->lpVtbl->Present(g.swap, 1, 0);
+
+    g_ld_frames++;
+    if (g_ld_frames <= 32)
+        fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
+                g_ld_frames, g_ld_draws, g_ld_clears);
+    if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
+        char path[256];
+        snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
+        ld_dump_surface_ppm(path);
+    }
 
     /* new frame: reset per-frame ring cursors */
     g.vb_used = 0; g.cb_used = 0;

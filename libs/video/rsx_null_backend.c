@@ -40,6 +40,10 @@ typedef struct {
 
 static NullBackendState s_state;
 
+/* When a GPU backend (Track B live draw) owns a flip-model swap chain on our
+ * HWND, GDI painting corrupts the swap-chain surface -- suppress both. */
+static int s_present_suppressed = 0;
+
 /* ---------------------------------------------------------------------------
  * Win32 window procedure
  * -----------------------------------------------------------------------*/
@@ -60,25 +64,29 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        /* Fill with current clear color */
-        HBRUSH brush = CreateSolidBrush(s_state.clear_color);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, brush);
-        DeleteObject(brush);
+        /* When a GPU backend owns the surface, validate the paint but draw
+         * nothing so GDI does not overwrite the flip-model swap chain. */
+        if (!s_present_suppressed) {
+            /* Fill with current clear color */
+            HBRUSH brush = CreateSolidBrush(s_state.clear_color);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, brush);
+            DeleteObject(brush);
 
-        /* Draw debug overlay text */
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        char buf[128];
-        snprintf(buf, sizeof(buf), "ps3recomp null backend | %u FPS | frame %llu",
-                 s_state.fps, (unsigned long long)s_state.frame_count);
-        TextOutA(hdc, 10, 10, buf, (int)strlen(buf));
+            /* Draw debug overlay text */
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(255, 255, 255));
+            char buf[128];
+            snprintf(buf, sizeof(buf), "ps3recomp null backend | %u FPS | frame %llu",
+                     s_state.fps, (unsigned long long)s_state.frame_count);
+            TextOutA(hdc, 10, 10, buf, (int)strlen(buf));
 
-        char buf2[64];
-        snprintf(buf2, sizeof(buf2), "Clear: #%06X",
-                 (unsigned)(s_state.clear_color & 0xFFFFFF));
-        TextOutA(hdc, 10, 30, buf2, (int)strlen(buf2));
+            char buf2[64];
+            snprintf(buf2, sizeof(buf2), "Clear: #%06X",
+                     (unsigned)(s_state.clear_color & 0xFFFFFF));
+            TextOutA(hdc, 10, 30, buf2, (int)strlen(buf2));
+        }
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -136,6 +144,9 @@ static void null_present(void* ud, u32 buffer_id)
 {
     (void)ud;
     (void)buffer_id;
+
+    if (s_present_suppressed)
+        return;                 /* GPU backend owns presentation */
 
     /* Trigger a repaint */
     if (s_state.hwnd)
@@ -287,6 +298,16 @@ int rsx_null_backend_pump_messages(void)
     return s_state.window_closed ? -1 : 0;
 }
 
+void* rsx_null_backend_get_hwnd(void)
+{
+    return (void*)s_state.hwnd;
+}
+
+void rsx_null_backend_suppress_present(int on)
+{
+    s_present_suppressed = on;
+}
+
 #else /* !_WIN32 */
 
 /* Stub for non-Windows platforms — TODO: SDL2 or X11 backend */
@@ -304,5 +325,8 @@ int rsx_null_backend_pump_messages(void)
 {
     return 0;
 }
+
+void* rsx_null_backend_get_hwnd(void) { return 0; }
+void  rsx_null_backend_suppress_present(int on) { (void)on; }
 
 #endif /* _WIN32 */
