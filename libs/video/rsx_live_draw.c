@@ -78,7 +78,11 @@ void rsx_live_draw_shutdown(void) {}
 #define SMP_DEFAULT      0
 #define SMP_CACHE_SLOTS  MAX_TEXTURES
 #define SMP_TABLE_SIZE   16
-#define SMP_RING_TABLES  SRV_RING_TABLES
+/* A shader-visible SAMPLER heap is hard-capped at 2048 descriptors by D3D12
+ * (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE). SMP_RING_TABLES*SMP_TABLE_SIZE
+ * must stay <= 2048, else CreateDescriptorHeap fails -> NULL heap -> crash in
+ * sampler_table. 128*16 = 2048 = the max (= up to 128 sampler tables/frame). */
+#define SMP_RING_TABLES  128
 
 #define CB_BLOCK_BYTES   ((512 + 2) * 16)
 #define CB_BLOCK_ALIGNED ((CB_BLOCK_BYTES + 255) & ~255u)
@@ -868,11 +872,13 @@ static void fetch_batches(void)
         }
 }
 
-/* primitive ids (mirror rsx_primitives.h) */
-#define PRIM_TRIANGLES       4
-#define PRIM_TRIANGLE_STRIP  5
-#define PRIM_TRIANGLE_FAN    6
-#define PRIM_QUADS           7
+/* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
+ * matches the replay harness). These were off by one (4/5/6/7), which dropped
+ * EVERY quad/triangle draw through the switch's default: return -> black. */
+#define PRIM_TRIANGLES       5
+#define PRIM_TRIANGLE_STRIP  6
+#define PRIM_TRIANGLE_FAN    7
+#define PRIM_QUADS           8
 
 /* Live-draw activity counters (verification: is real geometry flowing, or only
  * clears?). Reported per presented frame in rsx_live_draw_present. */
@@ -889,6 +895,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     (void)user; (void)r;
     const u32 prim = g.rsx.current_primitive;
     fetch_batches();
+    if (getenv("YZ_RSX_DUMP")) { static int dn = 0; if (dn < 60) { dn++;
+        fprintf(stderr, "[ld-draw] prim=%u n_verts=%u fetch_ok=%d\n",
+                prim, dc.n_verts, dc.fetch_ok); } }
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     vtx_t* tri = NULL; u32 n_tri = 0;
@@ -926,6 +935,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     ID3D12PipelineState* pso = get_pso();
+    if (getenv("YZ_RSX_DUMP")) { static int pn = 0; if (pn < 60) { pn++;
+        fprintf(stderr, "[ld-draw] -> n_tri=%u pso=%s\n", n_tri, pso ? "OK" : "NULL"); } }
     if (!pso || g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
@@ -1178,6 +1189,16 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_heap);
     g.smp_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    /* Fail init (fall back to null present) rather than crash later if any
+     * shader-visible/CPU descriptor heap didn't create -- e.g. an over-limit
+     * sampler heap would return NULL here and fault in sampler_table. */
+    if (!g.srv_cpu_heap || !g.srv_heap || !g.smp_cpu_heap || !g.smp_heap) {
+        fprintf(stderr, "[live-draw] descriptor heap alloc failed "
+                "(srv_cpu=%p srv=%p smp_cpu=%p smp=%p)\n",
+                (void*)g.srv_cpu_heap, (void*)g.srv_heap,
+                (void*)g.smp_cpu_heap, (void*)g.smp_heap);
+        return -1;
+    }
     {
         D3D12_SAMPLER_DESC def = {0};
         def.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1248,10 +1269,8 @@ void rsx_live_draw_method(u32 method, u32 arg)
 /* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
  * and write a binary PPM. Self-contained -- creates + releases its own readback
  * buffer, so no init/struct changes. Uses g.list which ld_flush leaves open. */
-static void ld_dump_surface_ppm(const char* path)
+static void ld_dump_surface_ppm(const char* path, ID3D12Resource* rt)
 {
-    const u32 target = current_surface();
-    ID3D12Resource* rt = g.surfaces[target].tex;
     if (!rt) return;
     const u32 pitch = (g.width * 4 + 255) & ~255u;              /* 256-align */
     const UINT64 rb_size = (UINT64)pitch * g.height;
@@ -1350,9 +1369,18 @@ void rsx_live_draw_present(u32 buffer_id)
         fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
                 g_ld_frames, g_ld_draws, g_ld_clears);
     if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
-        char path[256];
-        snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
-        ld_dump_surface_ppm(path);
+        const u32 cur = current_surface();
+        fprintf(stderr, "[live-draw] frame %u: n_surfaces=%u presented=surf%u(loc=%u off=0x%X)\n",
+                g_ld_frames, g.n_surfaces, cur,
+                g.surfaces[cur].location, g.surfaces[cur].offset);
+        /* Dump EVERY surface (not just the presented one) so content sitting in
+         * an offscreen RT that we're not presenting is visible. */
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            char path[256];
+            snprintf(path, sizeof(path), "scratch\\ld_f%02u_surf%u_off%X.ppm",
+                     g_ld_frames, i, g.surfaces[i].offset);
+            ld_dump_surface_ppm(path, g.surfaces[i].tex);
+        }
     }
 
     /* new frame: reset per-frame ring cursors */
