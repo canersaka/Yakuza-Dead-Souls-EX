@@ -902,9 +902,6 @@ static void sink_end(void* user, const rsx_dispatch* r)
     (void)user; (void)r;
     const u32 prim = g.rsx.current_primitive;
     fetch_batches();
-    if (getenv("YZ_RSX_DUMP")) { static int dn = 0; if (dn < 60) { dn++;
-        fprintf(stderr, "[ld-draw] prim=%u n_verts=%u fetch_ok=%d\n",
-                prim, dc.n_verts, dc.fetch_ok); } }
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     vtx_t* tri = NULL; u32 n_tri = 0;
@@ -942,8 +939,6 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     ID3D12PipelineState* pso = get_pso();
-    if (getenv("YZ_RSX_DUMP")) { static int pn = 0; if (pn < 60) { pn++;
-        fprintf(stderr, "[ld-draw] -> n_tri=%u pso=%s\n", n_tri, pso ? "OK" : "NULL"); } }
     if (!pso || g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
@@ -1422,18 +1417,11 @@ void rsx_live_draw_present(u32 buffer_id)
         fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
                 g_ld_frames, g_ld_draws, g_ld_clears);
     if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
+        /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
-        fprintf(stderr, "[live-draw] frame %u: n_surfaces=%u presented=surf%u(loc=%u off=0x%X)\n",
-                g_ld_frames, g.n_surfaces, cur,
-                g.surfaces[cur].location, g.surfaces[cur].offset);
-        /* Dump EVERY surface (not just the presented one) so content sitting in
-         * an offscreen RT that we're not presenting is visible. */
-        for (u32 i = 0; i < g.n_surfaces; i++) {
-            char path[256];
-            snprintf(path, sizeof(path), "scratch\\ld_f%02u_surf%u_off%X.ppm",
-                     g_ld_frames, i, g.surfaces[i].offset);
-            ld_dump_surface_ppm(path, g.surfaces[i].tex);
-        }
+        char path[256];
+        snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
+        ld_dump_surface_ppm(path, g.surfaces[cur].tex);
     }
 
     /* new frame: reset per-frame ring cursors */
