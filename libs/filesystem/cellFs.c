@@ -7,6 +7,9 @@
 
 #include "cellFs.h"
 #include "ps3emu/endian.h"
+#include "ps3emu/guest_call.h"
+#include "../../runtime/ppu/ppu_memory.h"
+#include "adx_decode.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -450,10 +453,283 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
                (bytes_read>2&&b[2]>=32&&b[2]<127)?b[2]:'.', (bytes_read>3&&b[3]>=32&&b[3]<127)?b[3]:'.');
     }
 
+    /* ADX HLE (env YZ_ADX_HLE, 2026-07-04): clean-room host decode of the CRI
+     * intro-voice ADX stream, bypassing the LLE cri_audio SPU codec (measured
+     * dead-on-arrival for many sessions -- launches, never advances the ADXM
+     * progress fields; docs/LESSONS.md #14 sanctions HLE for pure codec data
+     * transforms). Bypass ONLY the decode; everything else (file read, CRI
+     * player state machine, SPURS dispatch) stays real/LLE. See
+     * yz_adx_hle_on_read() below for the accumulation/decode/publish logic. */
+    if (bytes_read > 0 && p && (strstr(p, "adv_voice") || strstr(p, ".cvm")) &&
+        getenv("YZ_ADX_HLE")) {
+        extern void yz_adx_hle_on_read(long long file_off, const void* data, u64 len);
+        yz_adx_hle_on_read(off_before, buf, bytes_read);
+    }
+
+    /* YZ_ADX_RELEASE_TEST (2026-07-04, decisive control-flow experiment):
+     * YZ_ADX_HLE is measured INERT on the real intro-voice stream (it's AHX/
+     * MPEG Layer II, not ADX -- adx_open() correctly rejects it, so the
+     * ADXM-advance + SPURS-release calls below never fire). Before spending a
+     * session writing an AHX/MPEG decoder, test the cheap, separable question:
+     * if those two calls DID fire (with fabricated/silent progress, zero real
+     * PCM), does t1 actually leave its func_02015C2C SPURS poll at all? This
+     * isolates "is the SPURS-release lever even the right one" from "can we
+     * decode AHX" -- unconditional on decode success, gated on its own
+     * flag (independent of YZ_ADX_HLE) so the two experiments don't conflate.
+     * Fires on every stream read past the container header (matches the real
+     * per-block cadence loosely; exact rate doesn't matter for this test). */
+    if (bytes_read > 0 && p && (strstr(p, "adv_voice") || strstr(p, ".cvm")) &&
+        getenv("YZ_ADX_RELEASE_TEST")) {
+        extern void yz_adx_release_test_tick(void);
+        yz_adx_release_test_tick();
+    }
+
     if (nread)
         *nread = ps3_bswap64(bytes_read);
 
     return CELL_OK;
+}
+
+/* ===========================================================================
+ * ADX HLE (env YZ_ADX_HLE) -- clean-room CRI ADX decode + ADXM/SPURS release
+ *
+ * The intro voice container (adv_voice_talk.cvm) is a CVM archive: CVMH
+ * header @0, ZONE table @0x800, a real ISO9660 volume descriptor at @0x9800
+ * (CD001, shifted +0x1800 vs a standard ISO -- confirmed 2026-07-04 by
+ * parsing the PVD root directory record: LBA 20, and walking its entries).
+ * pt29's "raw ADX bytestream 0xB800..0x27800" was the byte RANGE the game's
+ * *directory-parse* reads covered, NOT a fixed ADX-header offset -- there is
+ * no valid ADX header in that range (verified: the only 0x8000 byte pairs in
+ * it are coincidental, e.g. offset 0xBF8F decodes to impossible fields --
+ * bitdepth 172, channels 110). **ROOT DISCOVERY (2026-07-04): the root
+ * directory's actual audio entries are named `*.AHX;1` (e.g.
+ * AKIYAMA_01_100_005.AHX), not .ADX.** AHX is a DIFFERENT CRI codec: the
+ * on-disk header (0x8000 magic, copyright_offset field) matches ADX's
+ * container shape, but encoding_type=0x11 (not 2/3) and the payload right
+ * after the copyright tag is an MPEG-1 Layer II frame (confirmed: bytes
+ * `FF F5 E0 C0...` = an MPEG audio sync word, not ADPCM nibbles) -- publicly
+ * documented as CRI's low-bitrate voice format (ADX header + MPEG-2 Layer II
+ * audio). adx_open() correctly returns NULL for this stream (encoding_type
+ * check rejects it) rather than silently misdecoding garbage; this HLE path
+ * is consequently INERT on the real intro-voice stream until an AHX (MPEG
+ * Layer II) decoder is written -- a different, larger effort than ADX
+ * ADPCM. See the session report for the full chain of evidence.
+ *
+ * The game streams the container via ordinary cellFsRead calls (already
+ * logged above); this hook mirrors every byte read into a host-side shadow
+ * of the file (by absolute file offset, so out-of-order/re-reads still land
+ * correctly), looks for the ADX 0x8000 magic + a valid encoding_type once
+ * enough of the stream has arrived, and decodes every whole block that
+ * becomes available. Decoded PCM's sole job here is to ADVANCE PROGRESS the
+ * CRI player can observe -- the ADXM object's progress fields (+294/+298/
+ * +29C @ 0x01613368, same fields yakuza/shims.cpp's YZ_SKIP_VOICE probe
+ * already reads) and, per-decode-batch, an attempt to release t1's SPURS
+ * event-flag poll (func_02015C2C / cellSpursEventFlagWait @ 0x02015F74,
+ * object measured at guest EA 0x63D61720 -- see
+ * yz_adx_hle_release_spurs_waiter() for the exact mechanism + its caveats).
+ * NONE of this SPURS/ADXM machinery has been exercised end-to-end yet
+ * (nothing ever decodes on the real stream) -- it is verified only against
+ * the standalone adx_decode selftest (scratch/adx_selftest.c) and a clean
+ * build/link, not against a live boot.
+ * =========================================================================*/
+#include "ps3emu/ps3types.h"
+
+#define ADX_SHADOW_CAP        (512u * 1024u)   /* generous vs the measured ~112-208KB stream */
+#define ADX_ADXM_EA           0x01613368u      /* pt47: ADXM progress-field object */
+#define ADX_ADXM_PROGRESS_OFF 0x294u            /* +294/+298/+29C: 3 progress words (pt47 probe) */
+#define ADX_SPURS_EVENTFLAG_EA 0x63D61720u     /* measured (session 10): t1's poll target in func_02015C2C */
+#define ADX_SPURS_EVENTFLAG_SET_FN 0x02016010u /* libsre cellSpursEventFlagSet(eventFlag,bits) -- scratch/libsre_lle_map.txt */
+
+static unsigned char s_adx_shadow[ADX_SHADOW_CAP];
+static u64            s_adx_shadow_hi;     /* highest byte offset written + 1 */
+static int             s_adx_have_header;
+static AdxDecoder*      s_adx_dec;
+static u32              s_adx_next_decode_off;  /* next block-aligned offset to decode */
+static u32              s_adx_pcm_frames_total;  /* running decode progress, for ADXM fields */
+
+/* Call the guest cellSpursEventFlagSet(eventFlag_ea, bits) directly as a host
+ * function (yz_lookup_func resolves 0x02016010 -> the lifted libsre body).
+ * This function is a self-contained lwarx/stwcx bitmask update over its
+ * r3/r4 args + the stack (no r2/TOC-relative loads observed in the lift --
+ * verified by reading recomp_prx/libsre_recomp_000.cpp around func_02016010),
+ * so a synthetic one-shot context is safe, mirroring the pattern main.cpp's
+ * guest_caller() and dispatch.cpp's yz_mwply_probe_dispatch() already use to
+ * invoke isolated libsre/game leaf functions without a full OPD/TOC setup.
+ * UNPROVEN which bits t1's cellSpursEventFlagWait(bits=r5 at the call site)
+ * actually waits on -- we log that value (once) and set ALL bits (~0u) as
+ * the conservative "release every waiter" signal; the boot test measures
+ * whether this is the right lever. */
+/* CRASH FIX (2026-07-04, found by the YZ_ADX_RELEASE_TEST boot): func_02016010
+ * is NOT a stack-free leaf -- its prologue pushes a REAL frame through
+ * ctx->gpr[1] (saves gpr[18..31] to [gpr[1]+0xA0..0x108], then
+ * gpr[1] += -0x110). The first synthetic-context attempt zeroed gpr[1], so
+ * the prologue wrote guest EA (0 - 0x110) = 0xFFFFFFF0-ish (observed fault:
+ * "writing host addr ... guest 0xFFFFFEF0") -> immediate access violation on
+ * tid=11 (0xC0000005), crash log showed func_02016010 +0x1AC in the call
+ * chain right above the fault. Fix: give the synthetic context a REAL guest
+ * stack (lazily allocated once via vm_stack_allocate, same mechanism
+ * yakuza/main.cpp's guest_caller() uses for HLE->guest calls), not a
+ * zero-filled scratch buffer. */
+#include "../../runtime/memory/vm.h"
+
+static void yz_adx_hle_release_spurs_waiter(void)
+{
+    extern void* yz_lookup_func(u32 guest_addr);
+    typedef void (*yz_ppu_fn)(void* ctx);
+    static void* fn_cache = (void*)-1;   /* -1 = not yet looked up */
+    if (fn_cache == (void*)-1) {
+        fn_cache = (void*)yz_lookup_func(ADX_SPURS_EVENTFLAG_SET_FN);
+        if (!fn_cache)
+            printf("[adx-hle] cellSpursEventFlagSet (0x%08X) not in the function table -- "
+                   "cannot release t1's SPURS poll; ADXM progress will still advance.\n",
+                   ADX_SPURS_EVENTFLAG_SET_FN);
+    }
+    if (!fn_cache) return;
+
+    /* Lazily allocate a dedicated guest stack for this synthetic call (once
+     * per process -- this helper is only ever called from HLE/host threads,
+     * not from a guest PPU thread's own stack, so a single static stack is
+     * safe: calls here are not reentrant with each other in practice, and
+     * even if they were, each call fully unwinds before returning). Same
+     * null-back-chain-terminator precaution as main.cpp's guest_caller(),
+     * in case something in the callee ever walks the stack. */
+    static u32 call_stack_top;
+    if (!call_stack_top) {
+        static vm_stack_alloc sa;
+        static int sa_init = 0;
+        if (!sa_init) { sa_init = 1; vm_stack_alloc_init(&sa); }
+        u32 base = vm_stack_allocate(&sa, 64 * 1024);
+        if (!base) {
+            printf("[adx-hle] guest stack alloc failed -- cannot call cellSpursEventFlagSet\n");
+            return;
+        }
+        call_stack_top = (base + 64 * 1024 - 0x100) & ~0xFu;
+        vm_write32(call_stack_top, 0);       /* null back-chain terminator (low word) */
+        vm_write32(call_stack_top + 4, 0);   /* (high word, in case a walker reads 64-bit) */
+    }
+
+    /* Minimal synthetic ppu_context: gpr[1] = real guest stack, gpr[3]/gpr[4]
+     * = args; everything else zeroed so no stale reservation/CR state leaks
+     * in (same caution as main.cpp's guest_caller). */
+    unsigned char ctx_buf[4096];
+    memset(ctx_buf, 0, sizeof(ctx_buf));
+    /* ppu_context's exact layout is owned by ppu_recomp.h/ppu_context.h and
+     * differs between the recompiled-code view and the runtime view (see the
+     * NOTE at the top of yakuza/shims.cpp); gpr[] is first in both, so a
+     * uint64_t[] alias at offset 0 reaches gpr[1]/gpr[3]/gpr[4] safely
+     * regardless of which layout this TU's linked object uses, without
+     * needing to include either ppu_context header here (cellFs.c is a
+     * plain HLE module). */
+    uint64_t* gpr = (uint64_t*)ctx_buf;
+    gpr[1] = call_stack_top;
+    gpr[3] = ADX_SPURS_EVENTFLAG_EA;
+    gpr[4] = ~0u;   /* bits: release-all (conservative; see caveat above) */
+
+    ((yz_ppu_fn)fn_cache)((void*)ctx_buf);
+
+    static int logged = 0;
+    if (!logged) { logged = 1;
+        printf("[adx-hle] called cellSpursEventFlagSet(ea=0x%08X, bits=0xFFFFFFFF)\n",
+               ADX_SPURS_EVENTFLAG_EA);
+    }
+}
+
+/* Advance the ADXM object's progress fields so the CRI player's readiness
+ * predicate (whatever it polls -- unconfirmed exact semantics, pt47) sees
+ * forward motion proportional to real decoded audio, not a one-shot force. */
+static void yz_adx_hle_advance_adxm(u32 pcm_frames_total)
+{
+    vm_write32(ADX_ADXM_EA + ADX_ADXM_PROGRESS_OFF + 0, pcm_frames_total);       /* +294 */
+    vm_write32(ADX_ADXM_EA + ADX_ADXM_PROGRESS_OFF + 4, pcm_frames_total);       /* +298 */
+    vm_write32(ADX_ADXM_EA + ADX_ADXM_PROGRESS_OFF + 8, 0xFFFFFFFFu);            /* +29C: "ready" sentinel, same value YZ_SKIP_VOICE forces */
+}
+
+void yz_adx_hle_on_read(long long file_off, const void* data, u64 len)
+{
+    if (file_off < 0 || len == 0) return;
+    u64 end = (u64)file_off + len;
+    if (end > ADX_SHADOW_CAP) end = ADX_SHADOW_CAP;   /* clamp -- generous cap, see above */
+    if ((u64)file_off >= end) return;
+
+    memcpy(s_adx_shadow + (u64)file_off, data, end - (u64)file_off);
+    if (end > s_adx_shadow_hi) s_adx_shadow_hi = end;
+
+    if (!s_adx_dec) {
+        /* Scan the shadow for the ADX 0x8000 magic (pt29 measured it landing
+         * around byte 0xB800 in this container, but scan generously in case
+         * of container-layout drift rather than hardcoding that offset). */
+        for (u32 off = 0; off + 20 <= s_adx_shadow_hi && off < ADX_SHADOW_CAP - 20; off++) {
+            if (s_adx_shadow[off] == 0x80 && s_adx_shadow[off + 1] == 0x00) {
+                AdxDecoder* d = adx_open(s_adx_shadow + off, s_adx_shadow_hi - off);
+                if (d) {
+                    s_adx_dec = d;
+                    s_adx_next_decode_off = off + adx_data_offset(d);
+                    s_adx_have_header = 1;
+                    printf("[adx-hle] ADX header found at shadow offset 0x%X: ch=%d rate=%d "
+                           "block=%u data_off=%u total_samples=%u\n",
+                           off, adx_channels(d), adx_sample_rate(d), adx_block_size(d),
+                           adx_data_offset(d), adx_total_samples(d));
+                    break;
+                }
+            }
+        }
+        if (!s_adx_dec) return;
+    }
+
+    /* Decode every whole block now available in the shadow. */
+    u32 block_bytes = adx_block_size(s_adx_dec) * (u32)adx_channels(s_adx_dec);
+    if (block_bytes == 0) return;
+    int16_t pcm[256];
+    int decoded_any = 0;
+    while (s_adx_next_decode_off + block_bytes <= s_adx_shadow_hi) {
+        int n = adx_decode_block(s_adx_dec, s_adx_shadow, s_adx_shadow_hi,
+                                  s_adx_next_decode_off, pcm,
+                                  (int)(sizeof(pcm) / sizeof(pcm[0]) / adx_channels(s_adx_dec)));
+        if (n < 0) break;   /* truncated/misaligned -- wait for more bytes */
+        s_adx_next_decode_off += block_bytes;
+        s_adx_pcm_frames_total += (u32)n;
+        decoded_any = 1;
+    }
+
+    if (decoded_any) {
+        yz_adx_hle_advance_adxm(s_adx_pcm_frames_total);
+        yz_adx_hle_release_spurs_waiter();
+
+        static long batches = 0;
+        if (++batches <= 20 || (batches % 100) == 0)
+            printf("[adx-hle] decoded batch #%ld: total_pcm_frames=%u next_off=0x%X shadow_hi=0x%llX\n",
+                   batches, s_adx_pcm_frames_total, s_adx_next_decode_off,
+                   (unsigned long long)s_adx_shadow_hi);
+    }
+}
+
+/* ===========================================================================
+ * YZ_ADX_RELEASE_TEST (2026-07-04) -- decisive control-flow experiment
+ *
+ * Question: is cellSpursEventFlagSet(0x63D61720,~0) + advancing the ADXM
+ * progress fields (0x01613368+0x294/+298/+29C) EVEN THE RIGHT LEVER to move
+ * t1 out of its func_02015C2C SPURS poll? Fully separable from "can we decode
+ * AHX" -- fires the same two calls YZ_ADX_HLE would have fired on a real
+ * decode, but unconditionally (no header parse, no real PCM: fabricated,
+ * monotonically increasing "blocks decoded" progress only). A silent/zero-
+ * data release is fine for this test; we are testing the control-flow signal,
+ * not audio correctness. Independent flag from YZ_ADX_HLE so the two
+ * experiments (decode-format-correctness vs release-mechanism-correctness)
+ * don't get conflated in one boot's results.
+ * =========================================================================*/
+void yz_adx_release_test_tick(void)
+{
+    static u32 fake_progress = 0;
+    fake_progress++;   /* monotonic increasing "N blocks decoded" stand-in */
+
+    yz_adx_hle_advance_adxm(fake_progress);
+    yz_adx_hle_release_spurs_waiter();
+
+    static long ticks = 0;
+    if (++ticks <= 20 || (ticks % 100) == 0)
+        printf("[adx-release-test] tick #%ld: fake_progress=%u (ADXM advanced + "
+               "cellSpursEventFlagSet fired on 0x%08X)\n",
+               ticks, fake_progress, ADX_SPURS_EVENTFLAG_EA);
 }
 
 /* NID: 0x1E9B6714 */
