@@ -130,13 +130,24 @@ static void null_end_frame(void* ud)
     (void)ud;
     s_state.frame_count++;
 
-    /* Compute FPS every second */
+    /* Real FPS: frames counted in the last ~1 s window. */
+    static u64 frames_at_mark = 0;
     ULONGLONG now = GetTickCount64();
     if (now - s_state.last_fps_time >= 1000) {
-        /* Simple: just use frame_count delta. For first second, estimate. */
-        s_state.fps = (u32)(s_state.frame_count -
-                           (s_state.frame_count > 60 ? s_state.frame_count - 60 : 0));
+        s_state.fps = (u32)(s_state.frame_count - frames_at_mark);
+        frames_at_mark = s_state.frame_count;
         s_state.last_fps_time = now;
+    }
+
+    /* Flip count + FPS live in the window title so they show even when the GPU
+     * backend (Track B) owns the surface and the GDI overlay is suppressed. */
+    if (s_state.hwnd) {
+        char title[192];
+        snprintf(title, sizeof(title),
+                 "Yakuza: Dead Souls (ps3recomp)  |  %s  |  flips %llu  |  %u FPS",
+                 s_present_suppressed ? "Track B (D3D12)" : "null (GDI)",
+                 (unsigned long long)s_state.frame_count, s_state.fps);
+        SetWindowTextA(s_state.hwnd, title);
     }
 }
 
