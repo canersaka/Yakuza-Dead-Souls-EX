@@ -757,6 +757,69 @@ build_cases()
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# VMX vector-op SEMANTIC tranche (2026-07-04): the suite tested VMX endianness
+# canaries but never the high-frequency vector ops' semantics. These are the
+# untested, byte-order-sensitive, historically-buggy class (the VMX opcode
+# scramble; the lane-endianness batch) and they sit on the render critical
+# path. Each case round-trips through g_vm_stub (lvx inputs -> op -> stvx) and
+# byte-checks the result against reference semantics. XOs verified vs RPCS3
+# PPUOpcodes.h (VADDFP 0xa, VPERM 0x2b, VSLDOI 0x2c, VMADDFP 0x2e, VSUBFP 0x4a,
+# VSPLTW 0x28c, VCFSX 0x34a, VSPLTISW 0x38c).
+# ---------------------------------------------------------------------------
+def _tri_vcase(name, xo6, a, b, c, result_bytes):   # vD=v3, vA=v0, vB=v1, vC=v2
+    opw = va_form(xo6, 3, 0, 1, 2)
+    prog = [lvx_word(0,0,10), lvx_word(1,0,11), lvx_word(2,0,12), opw, stvx_word(3,0,13)]
+    vcase(name, prog, {A_ADDR:a, B_ADDR:b, C_ADDR:c}, {R_ADDR:result_bytes})
+
+def _s5(v): return v - 32 if (v & 0x10) else v      # sign-extend 5-bit immediate
+
+_VA = be_bytes_w([0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F])
+_VB = be_bytes_w([0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F])
+
+# vperm: index bytes span the 32-byte (vA:vB) source, incl. cross-boundary + wrap
+_PC = bytes([0,15,16,31, 5,20,1,30, 0x23&0x1F,0x38&0x1F,10,25, 3,18,7,22])
+_SRC = _VA + _VB
+_tri_vcase("vperm bytes", 0x2b, _VA, _VB, _PC,
+           bytes(_SRC[_PC[i] & 0x1F] for i in range(16)))
+
+# vsldoi SHB octets: high 16 bytes of (vA:vB) << SHB*8
+for _shb in (0, 5, 15):
+    _op = va_form(0x2c, 3, 0, 1, _shb)
+    vcase(f"vsldoi shb={_shb}",
+          [lvx_word(0,0,10), lvx_word(1,0,11), _op, stvx_word(3,0,13)],
+          {A_ADDR:_VA, B_ADDR:_VB}, {R_ADDR:(_VA+_VB)[_shb:_shb+16]})
+
+# vspltw: splat word UIMM of vB across all four words
+for _u in (0, 2, 3):
+    _w = words_of(_VB)[_u]
+    vcase(f"vspltw w={_u}",
+          [lvx_word(1,0,11), vx_form(0x28c, 3, _u, 1), stvx_word(3,0,13)],
+          {B_ADDR:_VB}, {R_ADDR:be_bytes_w([_w]*4)})
+
+# vspltisw: splat sign-extended 5-bit immediate as 32-bit
+for _s in (1, 15, 16, 31):    # 16 and 31 are negative after sign-extend
+    _v = _s5(_s) & MASK32
+    vcase(f"vspltisw simm={_s}",
+          [vx_form(0x38c, 3, _s, 0), stvx_word(3,0,13)],
+          {}, {R_ADDR:be_bytes_w([_v]*4)})
+
+# vaddfp / vsubfp: per-lane single-precision (values exact in single -> no rounding noise)
+_FA = be_bytes_f([1.5, -2.0, 3.25, 100.0]); _FB = be_bytes_f([0.5, 2.0, 0.75, -4.0])
+_bin_vcase("vaddfp", 0xa, _FA, _FB, be_bytes_f([2.0, 0.0, 4.0, 96.0]))
+_bin_vcase("vsubfp", 0x4a, _FA, _FB, be_bytes_f([1.0, -4.0, 2.5, 104.0]))
+
+# vmaddfp: vD = vA*vC + vB  (guards the operand order -- a classic FMA bug)
+_FC = be_bytes_f([2.0, -1.0, 4.0, 0.5])
+_tri_vcase("vmaddfp A*C+B", 0x2e, _FA, _FB, _FC, be_bytes_f([3.5, 4.0, 13.75, 46.0]))
+
+# vcfsx: float(signed word) / 2^UIMM
+_IV = be_bytes_w([8, (-16) & MASK32, 100, (-4) & MASK32])
+for _u in (0, 2):
+    vcase(f"vcfsx u={_u}",
+          [lvx_word(1,0,11), vx_form(0x34a, 3, _u, 1), stvx_word(3,0,13)],
+          {B_ADDR:_IV}, {R_ADDR:be_bytes_f([float(s32(w))/(1<<_u) for w in words_of(_IV)])})
+
+# ---------------------------------------------------------------------------
 # CR-logical ops (opcode 19). REGRESSION for the crnor/crnand disasm swap
 # (2026-07-04): ppu_disasm.py had opcodes 33/225 mapped to crnand/crnor
 # (should be crnor/crnand), and there was ZERO coverage, so 987 mis-lifted
