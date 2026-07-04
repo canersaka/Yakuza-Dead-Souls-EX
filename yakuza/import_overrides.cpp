@@ -18,6 +18,7 @@
 
 #include "ps3emu/error_codes.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
+#include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 
 #include <cstdio>
 #include <cstring>
@@ -375,15 +376,46 @@ static uint32_t      g_rsx_queued_head = 1;   /* head of the last GCM_DRIVER_QUE
  * State init happens at context_allocate. */
 static rsx_state g_rsx_state;
 
+/* Track B live-draw guest-memory resolver: map an RSX (location, offset) to a
+ * host pointer into the guest address space. location 0 = RSX local VRAM (the
+ * gcm local carve), 1 = main memory via the gcm io map -- mirrors the DMA cases
+ * in yz_rsx_sem_addr. Returns NULL for out-of-range/unmapped regions. */
+static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
+                                       u32 min_bytes)
+{
+    (void)user; (void)min_bytes;
+    uint32_t ea;
+    if (location == 0) {                         /* RSX local VRAM */
+        if (offset >= YZ_GCM_LOCAL_SIZE) return nullptr;
+        ea = YZ_GCM_LOCAL_BASE + offset;
+    } else {                                     /* main memory via io map */
+        ea = yz_rsx_io_to_ea(offset);
+        if (!ea) return nullptr;
+    }
+    return (const u8*)(vm_base + ea);
+}
+
 /* Dedicated window thread. A Win32 window must be created AND message-pumped on
  * the same thread, so it lives here rather than on the main/consumer threads.
  * rsx_null_backend_init() opens the window and registers the null backend (GDI
- * clear-color present); the consumer + flip path then drive it. */
+ * clear-color present); the consumer + flip path then drive it. When YZ_RSX_DRAW
+ * is set, Track B's live NV4097->D3D12 engine binds a swap chain to that same
+ * HWND and takes over presentation (the null GDI present is suppressed). */
 static DWORD WINAPI yz_window_thread(LPVOID)
 {
     if (rsx_null_backend_init(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {
         fprintf(stderr, "[rsx] window init failed\n");
         return 1;
+    }
+    if (rsx_live_draw_enabled()) {
+        int r = rsx_live_draw_init(rsx_null_backend_get_hwnd(), 1280, 720,
+                                   yz_rsx_live_guest_ptr, nullptr);
+        if (r == 0) {
+            rsx_null_backend_suppress_present(1);
+            fprintf(stderr, "[rsx] live-draw engine up (D3D12); null GDI present suppressed\n");
+        } else {
+            fprintf(stderr, "[rsx] live-draw init FAILED (%d) -> falling back to null present\n", r);
+        }
     }
     for (;;) {
         if (rsx_null_backend_pump_messages() < 0)
@@ -469,6 +501,12 @@ static uint32_t yz_rsx_blit_size_out = 0x00010001;
 
 static int yz_rsx_method(uint32_t method, uint32_t arg)
 {
+    /* Track B live draw: mirror the full method stream into the NV4097->D3D12
+     * engine (no-op unless YZ_RSX_DRAW + init succeeded). It accumulates
+     * clears/state/geometry and self-presents on the 0xE944 flip method. This
+     * runs before the plumbing below so the engine also sees the flip. */
+    rsx_live_draw_method(method, arg);
+
     if (method >= 0xA400 && method < 0xAB00) {     /* NV308A_COLOR window */
         uint32_t index = (method - 0xA400) >> 2;
         uint32_t out_x = yz_rsx_blit_size_out & 0xFFFFu;
