@@ -252,7 +252,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         bb = bits(insn, 16, 20)
         cr_ops = {
             257: "crand", 449: "cror", 193: "crxor",
-            33: "crnand", 225: "crnor", 289: "creqv",
+            33: "crnor", 225: "crnand", 289: "creqv",
             129: "crandc", 417: "crorc",
             0: "mcrf",
         }
