@@ -85,6 +85,7 @@ target_include_directories(yakuza_recomp PRIVATE
     "${PS3RECOMP_DIR}/include"
     "${PS3RECOMP_DIR}/runtime/spu"
     "${PS3RECOMP_DIR}/libs/video"   # rsx_commands.h / rsx_null_backend.h
+    "${PS3RECOMP_DIR}/libs/codec"   # movie_ffmpeg.h (host movie decode)
 )
 
 # dbghelp: crash-handler symbol resolution (SymFromAddr against the PDB)
