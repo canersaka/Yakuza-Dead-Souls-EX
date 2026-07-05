@@ -455,9 +455,9 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     /* ADX HLE (env YZ_ADX_HLE, 2026-07-04): clean-room host decode of the CRI
      * intro-voice ADX stream, bypassing the LLE cri_audio SPU codec (measured
-     * dead-on-arrival for many sessions -- launches, never advances the ADXM
-     * progress fields; docs/LESSONS.md #14 sanctions HLE for pure codec data
-     * transforms). Bypass ONLY the decode; everything else (file read, CRI
+     * dead-on-arrival over many debugging rounds -- launches, never advances
+     * the ADXM progress fields; pure codec data transforms may be HLE'd).
+     * Bypass ONLY the decode; everything else (file read, CRI
      * player state machine, SPURS dispatch) stays real/LLE. See
      * yz_adx_hle_on_read() below for the accumulation/decode/publish logic. */
     if (bytes_read > 0 && p && (strstr(p, "adv_voice") || strstr(p, ".cvm")) &&
@@ -537,7 +537,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 #define ADX_SHADOW_CAP        (512u * 1024u)   /* generous vs the measured ~112-208KB stream */
 #define ADX_ADXM_EA           0x01613368u      /* pt47: ADXM progress-field object */
 #define ADX_ADXM_PROGRESS_OFF 0x294u            /* +294/+298/+29C: 3 progress words (pt47 probe) */
-#define ADX_SPURS_EVENTFLAG_EA 0x63D61720u     /* measured (session 10): t1's poll target in func_02015C2C */
+#define ADX_SPURS_EVENTFLAG_EA 0x63D61720u     /* measured: t1's poll target in func_02015C2C */
 #define ADX_SPURS_EVENTFLAG_SET_FN 0x02016010u /* libsre cellSpursEventFlagSet(eventFlag,bits) -- scratch/libsre_lle_map.txt */
 
 static unsigned char s_adx_shadow[ADX_SHADOW_CAP];

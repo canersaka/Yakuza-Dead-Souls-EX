@@ -28,8 +28,8 @@ if (-not (Test-Path $exe)) { Write-Error "build first: $exe missing"; exit 2 }
 Write-Host "[golden] booting $Seconds s ..."
 # NATIVE stderr/stdout redirection via cmd (kernel file handles) -- PowerShell's
 # -RedirectStandardError pipe pump backs up under print volume and serializes
-# every guest thread on the CRT stderr lock (LESSONS 6c; boot_until.ps1 carries
-# the same fix). Measured 2026-07-03: golden under the pump showed the OLD crawl
+# every guest thread on the CRT stderr lock (boot_until.ps1 carries the same
+# fix). Measured 2026-07-03: golden under the pump showed the OLD crawl
 # profile (reached_audio=no at 90 s, deepest=cellFsClose) twice in a row while
 # native-redirect boots hit PortStart at +3 s 4/4 -- the harness was measuring
 # its own launch plumbing.

@@ -60,8 +60,8 @@ if (-not $DiffOnly) {
   if (Test-Path $OursTrace) { Remove-Item $OursTrace -Force }
   # (faithful mode is the DEFAULT since the band-aid retirement 2026-07-02; no env needed)
   $env:YZ_SPU_TRACE = '1'; $env:YZ_SPU_TRACE_IMG = "$TraceImg"
-  # NATIVE redirection (LESSONS 6c): the PS pipe pump serializes guest threads
-  # on the CRT stderr lock under print volume -- same fix as boot_until/golden.
+  # NATIVE redirection: the PS pipe pump serializes guest threads on the CRT
+  # stderr lock under print volume -- same fix as boot_until/golden.
   $cmdline = "yakuza\build\yakuza_recomp.exe game\EBOOT.elf 2>`"scratch\diverge_run.err`" 1>`"scratch\diverge_run.out`""
   Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdline -WindowStyle Hidden | Out-Null
   $p = $null

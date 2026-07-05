@@ -1,9 +1,9 @@
 #!/usr/bin/env py -3
 """eventdiff.py - OS-boundary file-event differ: our boot log vs RPCS3.log.
 
-Purpose (docs/TOOLING_WORKORDER.md, section T2): generalize the diff that
-pinned the s13 frontier (RPCS3 opens all_csb.par, we don't) into a reusable
-tool. Aligns our boot's file-event stream (per guest thread id, e.g. "t11")
+Purpose: generalize the diff that pinned an earlier boot frontier (RPCS3
+opens all_csb.par, we don't) into a reusable tool. Aligns our boot's
+file-event stream (per guest thread id, e.g. "t11")
 against RPCS3.log's per-thread sys_fs event stream (per thread NAME, e.g.
 "cri_dlg") and reports the first point where the two sequences disagree.
 
@@ -11,8 +11,8 @@ v1 scope: file events only (open, and close if a close log exists on our
 side). Reads are parsed too (for optional filtering / future stretch) but
 are NOT part of the v1 alignment sequence.
 
-Close-log check (per the workorder: "check libs/filesystem/cellFs.c for the
-close log format; if absent, opens only"): libs/filesystem/cellFs.c's
+Close-log check (checked libs/filesystem/cellFs.c for the close log format;
+falls back to opens only if absent): libs/filesystem/cellFs.c's
 cellFsClose (~line 393-395) prints only
     [cellFs] Close(fd=%d)
 i.e. NO PATH and NO THREAD ID on close. So on our side, close events are
@@ -25,7 +25,7 @@ occupying that slot). RPCS3.log's sys_fs_close(fd=N) is resolved the same
 way against a per-thread-name fd table (RPCS3 logs are already are
 thread-scoped: "Thread (cri_dlg)").
 
-Input formats (verbatim; see docs/TOOLING_WORKORDER.md "Input formats"):
+Input formats (verbatim):
 
 Ours (scratch/*.out), open:
     [cellFs] t11 Open(path='/dev_bdvd/.../adv_voice_talk.cvm', flags=0x0)
@@ -323,8 +323,7 @@ def format_event(ev, side_label):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="OS-boundary file-event differ: our boot log vs RPCS3.log "
-                     "(docs/TOOLING_WORKORDER.md T2).")
+        description="OS-boundary file-event differ: our boot log vs RPCS3.log.")
     ap.add_argument("--ours", required=True, help="our boot stdout (scratch/*.out)")
     ap.add_argument("--ref", required=True, help="RPCS3.log")
     ap.add_argument("--map", default="",

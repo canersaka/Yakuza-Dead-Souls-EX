@@ -3,14 +3,14 @@
 ## Why (one paragraph)
 
 Silent SPU mislifts + wrong-image dispatch were the project's dominant historical cost
-(~15 sessions: RRR operand order, cbd/chd byte order, brhz halfword, shufb positions, the
+(RRR operand order, cbd/chd byte order, brhz halfword, shufb positions, the
 spu_link splat, the image-0 wildcard). An in-process interpreter kills the class: it executes
 any image correctly on first contact (Sofdec = EBOOT SPU image #9 is still ahead), lockstep-
 diffs against the lifted code without the instrumented-RPCS3 cycle, and instantly classifies
 anomalies as lift-bug vs runtime-bug. RPCS3's interpreter CANNOT be embedded (GPLv2 vs MIT +
 clean-room); it stays the external semantic oracle via `tools/tracediff.py`.
 
-## What exists (this session)
+## What exists (current state)
 
 - `tools/gen_spu_interp.py` — GENERATES the decoder from `tools/spu_disasm.py` by probing all
   2048 op11 slots of the real Python decode path. The debugged tables + priority order stay
@@ -26,7 +26,7 @@ clean-room); it stays the external semantic oracle via `tools/tracediff.py`.
   - `spu_interp_selftest()` — decode vectors cross-checked against the Python decoder
     (already caught one bad vector at authoring time: 0x33800280 = lqr, not brsl).
 
-## Implementation order (next SPU session)
+## Implementation order
 
 1. **Tranche 1 — the gs_task working set.** Run `tools/tracediff.py` op-frequency over
    `scratch/spu_trace.txt` to rank ops by actual use; implement loads/stores (lqd/stqd/

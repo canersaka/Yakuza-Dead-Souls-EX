@@ -15,8 +15,8 @@
  *
  * STATUS: decoder + trace are live; the semantic switch in spu_interp_step is
  * intentionally unimplemented (returns SPU_INTERP_UNIMPL). Semantics land
- * incrementally next session, verified per-op against CBEA + the tracediff
- * harness (docs/TRACEDIFF.md). Do NOT wire this into dispatch until then.
+ * incrementally, verified per-op against CBEA + the tracediff harness
+ * (docs/TRACEDIFF.md). Do NOT wire this into dispatch until then.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -106,7 +106,7 @@ int spu_interp_step(uint8_t* ls, void* regs, uint32_t* pc)
         return SPU_INTERP_BADOP;
 
     switch (d.op) {
-    /* Semantics land here incrementally (next session): start with the
+    /* Semantics land here incrementally: start with the
      * loads/stores + integer ALU the tracediff harness exercises, verify each
      * op in lockstep against the lifted gs_task run before adding the next
      * tranche. CBEA is the authority; RPCS3 is a read-only cross-check. */

@@ -4,7 +4,7 @@
  * The game's intro/cutscene movies are CRI Sofdec: MPEG-1 video (a CRI
  * non-standard variant) + CRI ADX audio in an MPEG program stream. Our LLE
  * path (cri_mpvps3spurs SPU decoder) stalls, so we HLE the decode host-side
- * (doctrine-permitted: a codec is a pure data transform -- docs/LESSONS.md #14).
+ * (doctrine-permitted: a codec is a pure data transform).
  *
  * FFmpeg's mpeg2video decoder decodes the Sofdec MPEG-1 correctly (proven
  * against hd_sega_logo_us1012.sfd / advertise.sfd). Built against the FFmpeg

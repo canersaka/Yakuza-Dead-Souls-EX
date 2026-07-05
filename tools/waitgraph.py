@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""waitgraph.py - stall-shape analyzer for ps3recomp boot .err logs (T1).
+"""waitgraph.py - stall-shape analyzer for ps3recomp boot .err logs.
 
 One command that turns a boot .err log (or several) into the wait-graph
-picture that s11-s13 assembled by hand: who waits on what, who signals what,
-who is starved.
+picture that used to be assembled by hand across several debugging rounds:
+who waits on what, who signals what, who is starved.
 
 Usage:
     py -3 tools\\waitgraph.py <file.err> [file2.err ...] [--tail N] [--min-count N]
 
-Input format (see docs/TOOLING_WORKORDER.md "Input formats", verified
-2026-07-05): our boot stderr emits one line per LV2 syscall of interest,
+Input format (verified 2026-07-05): our boot stderr emits one line per LV2
+syscall of interest,
 written by yakuza/shims.cpp's syscall trampoline (yakuza/shims.cpp:614-623,
 the `fprintf(stderr, "[LV2%s t%u] sc %u (r3=... ...) -> 0x...")` call):
 
@@ -25,14 +25,13 @@ no cross-file interleaving by timestamp since these logs carry none).
 Syscall number -> name map
 ---------------------------
 Derived from the runtime's OWN lv2 dispatcher, NOT the cheat-sheet numbers
-(per docs/TOOLING_WORKORDER.md's instruction to re-derive from source).
-Source of truth: runtime/syscalls/lv2_syscall_table.h (the #define block,
-lines 29-230) -- this is the header lv2_syscall_dispatch() (line 278) and
-every HLE module actually #include and register against, so it is the
-authoritative number->name table for this codebase (cross-checked against
+(re-derived from source rather than trusted from notes). Source of truth:
+runtime/syscalls/lv2_syscall_table.h (the #define block, lines 29-230) --
+this is the header lv2_syscall_dispatch() (line 278) and every HLE module
+actually #include and register against, so it is the authoritative
+number->name table for this codebase (cross-checked against
 yakuza/shims.cpp:616's "[LV2%s t%u] sc %u" trace line, which prints these
-same raw numbers). MEASURED: the "working map" numbers quoted in
-docs/TOOLING_WORKORDER.md's Input-formats section (92/94/102/103/104/107/
+same raw numbers). MEASURED: the working-map numbers (92/94/102/103/104/107/
 108/109/130) match this header exactly.
 """
 

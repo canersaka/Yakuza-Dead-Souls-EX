@@ -45,7 +45,8 @@ static bool addr_readable(uint32_t a)
  *   func_00F4D0A8 = mwPlyIsNextFrmReady (the poll gate t1 spins on)
  *   func_00F4DA90 = mwPlyGetFrm         (decoded video frame)
  *   func_00F48E48 = mwPlyGetAudioPcmData_PS3 (audio PCM pull)
- * Diagnostic-only; gated OFF by default (LESSONS #13). Also implements
+ * Diagnostic-only; gated OFF by default (band-aid hygiene: env-gated,
+ * default-off, kill-switched). Also implements
  * YZ_MWPLY_FORCEREADY (separate flag, default OFF): skip the real
  * IsNextFrmReady call and force ctx->gpr[3]=1, to see whether the player then
  * advances into calling the getters at all.
@@ -72,7 +73,7 @@ static const char* yz_mwply_name(uint32_t target)
 }
 
 /* Volume-bounded gate shared by all three probe sites: first 40 calls, then
- * 1-in-500 (LESSONS #6c -- a tight poll must not flood/serialize the guest). */
+ * 1-in-500 (a tight poll must not flood/serialize the guest). */
 static bool yz_mwply_should_log(long* counter)
 {
     long c = ++(*counter);
@@ -210,8 +211,8 @@ extern "C" volatile long g_yz_caller_bt_n  = 0;
  * shared by every guest thread, so it's useless once other threads (t7/t10/
  * t13-24) keep calling indirectly while t1 alone goes quiet -- their hits
  * drown t1's. These are written ONLY when yz_thread_current_id()==1 (one
- * branch, no lock, no suspend -- LESSONS #6b: a diagnostic must never
- * perturb the thread it measures) and read by a low-rate timer thread in
+ * branch, no lock, no suspend -- a diagnostic must never perturb the thread
+ * it measures) and read by a low-rate timer thread in
  * main.cpp. g_yz_t1_sample_seq increments on every t1 hop, so the printer
  * can tell "moved since last read" from "still parked at the same site". */
 extern "C" volatile uint32_t g_yz_t1_last_target = 0;   /* ctr at t1's last bctr(l) */
@@ -410,7 +411,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       } }
 
     /* SPURS event-flag WAIT/SET watch (env YZ_EVFLAG_WATCH, 2026-07-04, diag —
-     * REMOVE when the t1-wedge frontier closes). Session 10 measured t1 parked
+     * REMOVE when the t1-wedge frontier closes). Measured t1 parked
      * forever in func_02015C2C (cellSpursEventFlagWait's poll body, entered via
      * func_02015F74) and the release test on object 0x63D61720 did NOT wake it
      * (scratch/adx_release_test2.err) -- so either the object, the waited
@@ -481,7 +482,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                    * Reuses the crash handler's yz_dump_guest_state walker
                    * (extern from main.cpp) -- only for ea==0x4019C680 (the
                    * measured wedge object) and only the first few hits, to keep
-                   * output bounded (LESSONS #6/#13). */
+                   * output bounded (must not perturb the guest and must stay
+                   * env-gated/default-off). */
                   { static int bt = -1; if (bt < 0) bt = getenv("YZ_EVFLAG_BT") ? 1 : 0;
                     static long btn = 0;
                     if (bt && ea == 0x4019C680u && btn < 5) {
@@ -502,7 +504,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       } }
 
     /* SPURS event-flag FORCE (env YZ_EVFLAG_FORCE, 2026-07-04, DIAGNOSTIC ONLY --
-     * see docs/FLAGS.md; NOT a shipping fix, LESSONS #13). Purpose: t1 deadlocks
+     * see docs/FLAGS.md; NOT a shipping fix, must stay env-gated and
+     * default-off with a kill-switch). Purpose: t1 deadlocks
      * forever in cellSpursEventFlagWait on IWL object ea=0x4019C680, waiting for
      * mask 0x1; the owning SPU workload never signals it. This forces the wait
      * to succeed so we can observe what boot wall comes NEXT.

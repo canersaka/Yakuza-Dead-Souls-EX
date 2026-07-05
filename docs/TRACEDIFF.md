@@ -137,11 +137,11 @@ OK, no encoding swap). `tools/tracediff.py --align-pc 3050` aligned + diffed the
    dispatch, before trusting a compute-diff.
 
 RESULT: within [0x3000,0x8000) both engines ran IDENTICAL control flow for ~1310 instructions, then split
-at 0x65EC — with register data diverging earlier. Consistent with nq_agent1's "our build takes extra
-produce passes" (reprocessing a drained SRC state -> different data at the same PCs). Pinning the single
+at 0x65EC — with register data diverging earlier. Consistent with the "our build takes extra
+produce passes" theory (reprocessing a drained SRC state -> different data at the same PCs). Pinning the single
 mis-lifted op needs gotcha #2 fixed (so the register-diff is trustworthy) + gotcha #3 (aligned inputs).
 
-### Driver: `tools/ppu_diverge.ps1` (s14/T6, 2026-07-05)
+### Driver: `tools/ppu_diverge.ps1` (2026-07-05)
 
 One command wraps the two-sided PPU setup above (mirrors `tools/diverge.ps1` on the SPU side):
 
@@ -154,7 +154,7 @@ One command wraps the two-sided PPU setup above (mirrors `tools/diverge.ps1` on 
   `YZ_PPU_TRACE_N=<-N, default 2000000>`); `-Flags 'K=V;K=V'` sets any extra env vars
   (e.g. `YZ_VMGUARD=1`) before launch.
 - Without `-SkipBoot`: launches `yakuza\build\yakuza_recomp.exe game\EBOOT.elf` with NATIVE
-  `cmd`-level stderr/stdout redirection (LESSONS 6c — avoids the CRT-stderr-lock
+  `cmd`-level stderr/stdout redirection (avoids the CRT-stderr-lock
   serialization artifact under print volume), watches `scratch\ppu_trace.txt` until its size
   holds steady for `-StableSecs` (default 60s) or `-TimeoutSecs` elapses (default 20 min),
   then kills the process.
@@ -178,7 +178,7 @@ exit 0.
 ## Hardening (2026-07-01/02) — the pass that found the il-decode root
 
 Three harness fixes landed; together they took the diff from "27 artifact findings" to the ONE
-real bug (the `il` negative-immediate double sign-extension, spu_disasm.py — see STATUS.md):
+real bug (the `il` negative-immediate double sign-extension, spu_disasm.py):
 
 1. **Crash-safe tracer.** `YZ_SPU_TRACE` output is now UNBUFFERED and the budget is env
    `YZ_SPU_TRACE_N` (default 600k) with a `# trace budget exhausted` end-marker. Before: a
@@ -197,7 +197,7 @@ real bug (the `il` negative-immediate double sign-extension, spu_disasm.py — s
 
 Also note (word-decomposition trap): in OUR trace `rN <hi64>:<lo64>` prints `_u64[0]:_u64[1]`
 on a little-endian host, so SPU word0 (preferred) = the LOW 32 bits of the FIRST number.
-Reading `r5=4:35` as {w0=0,w1=4,...} inverted a session's conclusion (STATUS step 9).
+Reading `r5=4:35` as {w0=0,w1=4,...} once inverted a whole day's conclusion.
 
 ## Scope / status
 

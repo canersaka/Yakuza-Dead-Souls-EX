@@ -1,6 +1,6 @@
 # ps3recomp - tests/sync_stress
 #
-# Deterministic lv2 sync-primitive stress suite (docs/TOOLING_WORKORDER.md T10).
+# Deterministic lv2 sync-primitive stress suite.
 # Standalone project: its OWN build dir, never yakuza\build.
 #
 # Build (chain in ONE command -- Launch-VsDevShell is blocked in this harness;

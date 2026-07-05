@@ -1324,7 +1324,7 @@ void spu_indirect_branch(spu_context* ctx)
               fprintf(stderr, "[poltrace] pc=0x%05X link=0x%05X wcl=0x%X gpr3=%08X\n",
                       lpc, link, wcl, ctx->gpr[3]._u32[0]);
               fflush(stderr); } } }
-    /* DIAG (env YZ_WID0_REQ, session 12 task 1 -- wid0 vs wid2 request-path
+    /* DIAG (env YZ_WID0_REQ -- wid0 vs wid2 request-path
      * comparison, RETIRE with the wid0-dispatch frontier): the policy's
      * syscall re-entry is LS 0xA70 (module entry -- saves LR@0x2C80/SP@0x2C90,
      * the taskset-syscall handler every task/self dispatch funnels through;

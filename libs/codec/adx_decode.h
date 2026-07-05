@@ -6,9 +6,9 @@
  * e.g. the "ADX File Format" community notes and hcs64's public documentation
  * of the codec's header + block layout). This implementation is written from
  * that PUBLIC SPEC only -- no code was read from or copied out of vgmstream,
- * FFmpeg, or any GPL/proprietary source (docs/LESSONS.md #14/#15: codec data
- * transforms may be HLE'd; clean-room only, RPCS3/vgmstream/FFmpeg are
- * read-only oracles for semantics, never a copy source).
+ * FFmpeg, or any GPL/proprietary source (codec data transforms may be
+ * HLE'd; clean-room only, RPCS3/vgmstream/FFmpeg are read-only oracles for
+ * semantics, never a copy source).
  *
  * Scope: standard (type 2/3) ADX, 4-bit ADPCM, mono or multi-channel,
  * fixed prediction coefficients derived from the header's highpass cutoff
