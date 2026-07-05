@@ -6,6 +6,23 @@
 #include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (audit sec.5 item 3, queue-create validation) */
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* t1-unblock diagnostic (env YZ_T1_UNBLOCK, 2026-07-04, DIAGNOSTIC ONLY --
+ * see docs/FLAGS.md; NOT a shipping fix, LESSONS #13). Companion to the
+ * sys_semaphore.c lever of the same name -- see that file for the rationale.
+ * Makes t1's sys_event_queue_receive return immediately (CELL_OK, zeroed
+ * event regs) instead of parking when the queue is empty, so t1 can barrel
+ * through its whole SPURS-wait chain to scope how deep it goes. REMOVE with
+ * the t1-wedge frontier. */
+static int t1_unblock_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("YZ_T1_UNBLOCK"); on = (e && *e) ? 1 : 0; }
+    return on;
+}
+extern uint32_t yz_thread_current_id(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -254,6 +271,38 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* YZ_T1_UNBLOCK: if t1 would block here (queue empty), return CELL_OK
+     * immediately with a zeroed event instead of parking. Cap logging at
+     * ~100 lines but let the forcing continue unbounded. */
+    if (t1_unblock_on() && yz_thread_current_id() == 1) {
+        int would_block;
+#ifdef _WIN32
+        EnterCriticalSection(&q->lock);
+        would_block = (q->count == 0);
+        LeaveCriticalSection(&q->lock);
+#else
+        pthread_mutex_lock(&q->lock);
+        would_block = (q->count == 0);
+        pthread_mutex_unlock(&q->lock);
+#endif
+        if (would_block) {
+            static long n = 0; long c = ++n;
+            if (c <= 100) {
+                fprintf(stderr, "[t1-unblock] eq_recv q=%u forced\n", queue_id);
+                fflush(stderr);
+            }
+            ctx->gpr[4] = 0;
+            ctx->gpr[5] = 0;
+            ctx->gpr[6] = 0;
+            ctx->gpr[7] = 0;
+            if (event_addr != 0) {
+                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+            }
+            return CELL_OK;
+        }
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);

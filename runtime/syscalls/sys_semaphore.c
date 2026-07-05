@@ -5,6 +5,23 @@
 #include "sys_semaphore.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* t1-unblock diagnostic (env YZ_T1_UNBLOCK, 2026-07-04, DIAGNOSTIC ONLY --
+ * see docs/FLAGS.md; NOT a shipping fix, LESSONS #13). Purpose: t1 is stuck
+ * in a CHAIN of SPURS waits, each blocked on a producer signal that never
+ * arrives. This scopes how deep the chain goes by making t1's blocking waits
+ * in this phase return immediately instead of parking, so t1 can barrel
+ * forward through the whole chain. Heavy hammer, may break correctness --
+ * env-gated OFF, diagnosis only. REMOVE with the t1-wedge frontier. */
+static int t1_unblock_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("YZ_T1_UNBLOCK"); on = (e && *e) ? 1 : 0; }
+    return on;
+}
+extern uint32_t yz_thread_current_id(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -170,6 +187,30 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* YZ_T1_UNBLOCK: if t1 would block here (value <= 0), return CELL_OK
+     * immediately instead of parking. Cap logging at ~100 lines but let the
+     * forcing continue unbounded (per the diagnostic's request). */
+    if (t1_unblock_on() && yz_thread_current_id() == 1) {
+        int would_block;
+#ifdef _WIN32
+        EnterCriticalSection(&s->value_lock);
+        would_block = (s->value <= 0);
+        LeaveCriticalSection(&s->value_lock);
+#else
+        pthread_mutex_lock(&s->mtx);
+        would_block = (s->value <= 0);
+        pthread_mutex_unlock(&s->mtx);
+#endif
+        if (would_block) {
+            static long n = 0; long c = ++n;
+            if (c <= 100) {
+                fprintf(stderr, "[t1-unblock] sem_wait id=%u forced\n", sem_id);
+                fflush(stderr);
+            }
+            return CELL_OK;
+        }
+    }
 
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
