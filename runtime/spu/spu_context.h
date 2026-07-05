@@ -134,6 +134,13 @@ typedef struct spu_context {
     #define SPU_STATUS_WAITING_CHANNEL  0x8
     #define SPU_STATUS_SINGLE_STEP  0x10
 
+    /* 14-bit stop-and-signal code from the last stop/stopd (insn bits 18:31,
+     * & 0x3FFF; stopd is fixed at 0x3FFF). Set by lifted stop/stopd codegen so
+     * lv2 can dispatch the SYS_SPU_THREAD_STOP_* protocol (0x101 GROUP_EXIT /
+     * 0x102 THREAD_EXIT pop the OutMbox for the guest-written exit status,
+     * 0x110 RECEIVE_EVENT, ...). CBEA v1.02 p97 SPU_Status.StopCode. specaudit F18. */
+    uint32_t stop_code;
+
     /* SPU thread identification */
     uint32_t spu_id;
     uint32_t spu_group_id;
