@@ -3,6 +3,7 @@
  */
 
 #include "sys_cond.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -234,9 +235,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
 
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
-    if (ms == 0 && timeout_us > 0) ms = 1;
 
-    /* RENDEZVOUS (2026-07-03 s8, see sys_cond.h): COMMIT under the internal
+    /* RENDEZVOUS (2026-07-03, see sys_cond.h): COMMIT under the internal
      * sig lock BEFORE releasing the guest mutex — from this instant a signal
      * lands in `pending` and cannot be lost, matching lv2's wait-entry
      * enqueue. Then fully release the guest mutex (ALL N recursion levels),
@@ -250,16 +250,30 @@ int64_t sys_cond_wait(ppu_context* ctx)
     }
 
     BOOL ok = TRUE;
-    ULONGLONG t0 = GetTickCount64();
-    while (c->pending == 0) {
-        DWORD slice = ms;
-        if (ms != INFINITE) {
-            ULONGLONG spent = GetTickCount64() - t0;
-            if (spent >= ms) { ok = FALSE; break; }
-            slice = (DWORD)(ms - spent);
+    if (timeout_us > 0 && timeout_us < 1000) {
+        /* Sub-ms timed wait: safe to poll (rather than park on the CV) because
+         * a signal COMMITS to c->pending under sig_cs — it cannot be lost
+         * while we yield. A floored-to-1ms CV wait would round up to the OS
+         * timer tick and inflate micro-timeouts ~50x. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (c->pending == 0) {
+            if (lv2_deadline_passed(deadline)) { ok = FALSE; break; }
+            LeaveCriticalSection(&c->sig_cs);
+            SwitchToThread();
+            EnterCriticalSection(&c->sig_cs);
         }
-        if (!SleepConditionVariableCS(&c->cv, &c->sig_cs, slice)) {
-            if (GetLastError() == ERROR_TIMEOUT && c->pending == 0) { ok = FALSE; break; }
+    } else {
+        ULONGLONG t0 = GetTickCount64();
+        while (c->pending == 0) {
+            DWORD slice = ms;
+            if (ms != INFINITE) {
+                ULONGLONG spent = GetTickCount64() - t0;
+                if (spent >= ms) { ok = FALSE; break; }
+                slice = (DWORD)(ms - spent);
+            }
+            if (!SleepConditionVariableCS(&c->cv, &c->sig_cs, slice)) {
+                if (GetLastError() == ERROR_TIMEOUT && c->pending == 0) { ok = FALSE; break; }
+            }
         }
     }
     if (ok)

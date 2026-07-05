@@ -4,13 +4,15 @@
 
 #include "sys_event.h"
 #include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (audit sec.5 item 3, queue-create validation) */
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 /* t1-unblock diagnostic (env YZ_T1_UNBLOCK, 2026-07-04, DIAGNOSTIC ONLY --
- * see docs/FLAGS.md; NOT a shipping fix, LESSONS #13). Companion to the
+ * see docs/FLAGS.md; NOT a shipping fix, must stay env-gated and default-off
+ * with a kill-switch per the project's band-aid hygiene rule). Companion to the
  * sys_semaphore.c lever of the same name -- see that file for the rationale.
  * Makes t1's sys_event_queue_receive return immediately (CELL_OK, zeroed
  * event regs) instead of parking when the queue is empty, so t1 can barrel
@@ -312,9 +314,25 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
+    } else if (timeout_us < 1000) {
+        /* Sub-ms timed receive: a 1 ms SleepConditionVariableCS rounds up to
+         * the OS timer tick, inflating per-frame micro-polls (games poll event
+         * queues with timeouts as small as 30 us) by orders of magnitude.
+         * Poll the predicate to a QPC deadline, yielding with the lock
+         * dropped so senders can post. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (q->count == 0 && q->active) {
+            if (lv2_deadline_passed(deadline)) {
+                q->waiters--;
+                LeaveCriticalSection(&q->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            }
+            LeaveCriticalSection(&q->lock);
+            SwitchToThread();
+            EnterCriticalSection(&q->lock);
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
         while (q->count == 0 && q->active) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
@@ -845,9 +863,26 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
+    } else if (timeout_us < 1000) {
+        /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
+         * floored-to-1ms condvar wait (see sys_event_queue_receive above). */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            if (lv2_deadline_passed(deadline)) {
+                /* Write current pattern even on timeout */
+                if (result_addr != 0) {
+                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                    *out = bswap64(f->pattern);
+                }
+                LeaveCriticalSection(&f->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            }
+            LeaveCriticalSection(&f->lock);
+            SwitchToThread();
+            EnterCriticalSection(&f->lock);
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
