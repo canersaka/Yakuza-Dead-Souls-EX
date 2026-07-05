@@ -153,10 +153,9 @@ static void from_host_sockaddr(sys_net_sockaddr* dst, const struct sockaddr_in* 
  * Network init / shutdown
  * -----------------------------------------------------------------------*/
 
-int32_t sys_net_initialize_network_ex(uint32_t mem_container, uint32_t flags)
+int32_t sys_net_initialize_network_ex(void* param)
 {
-    (void)mem_container;
-    (void)flags;
+    (void)param;
 
     if (s_net_initialized) {
         printf("[sys_net] Already initialized\n");

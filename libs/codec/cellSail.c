@@ -164,17 +164,17 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
     return (s32)CELL_SAIL_ERROR_NOT_FOUND;
 }
 
-s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index)
+s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index;
+    (void)index; (void)adapter;
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
 }
 
-s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index)
+s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index;
+    (void)index; (void)adapter;
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
@@ -195,13 +195,14 @@ s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle)
     return (s_players[handle].state == CELL_SAIL_PLAYER_STATE_PAUSE) ? 1 : 0;
 }
 
-s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode)
+s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command)
 {
-    (void)repeatMode;
+    (void)command;
     printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    /* Real ABI returns the (now-set) repeat mode in r3, not an error code. */
+    return repeatMode;
 }
 
 /* ---------------------------------------------------------------------------
@@ -220,11 +221,13 @@ typedef struct {
 static SailDescriptor s_descs[MAX_DESCRIPTORS];
 
 s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
-                                     s32 streamType, void* arg,
+                                     s32 streamType, void* mediaInfo,
+                                     char* uri,
                                      CellSailDescriptorHandle* desc)
 {
-    (void)arg;
-    printf("[cellSail] CreateDescriptor(player=%u, type=%d)\n", handle, streamType);
+    (void)mediaInfo;
+    printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
+           streamType, uri ? uri : "null");
     if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
@@ -314,14 +317,13 @@ s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLe
 /* Memory allocator */
 
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     void* (*allocFunc)(void*, u32, u32),
-                                     void  (*freeFunc)(void*, u32, void*),
-                                     void* arg)
+                                     CellSailMemAllocatorFuncs* pFuncs)
 {
     printf("[cellSail] MemAllocatorInitialize()\n");
     if (!allocator) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    allocator->alloc = allocFunc;
-    allocator->free = freeFunc;
-    allocator->arg = arg;
+    if (pFuncs) {
+        allocator->alloc = (void* (*)(void*, u32, u32))pFuncs->pAlloc;
+        allocator->free = (void (*)(void*, u32, void*))pFuncs->pFree;
+    }
     return CELL_OK;
 }

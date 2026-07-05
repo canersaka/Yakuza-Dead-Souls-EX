@@ -166,14 +166,13 @@ s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime)
     return CELL_OK;
 }
 
-s32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader, u32* muxRate)
+u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader)
 {
-    if (!reader || !muxRate)
-        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+    if (!reader)
+        return 0;
 
     const u8* base = (const u8*)reader->pamfAddr;
-    *muxRate = be32(base + PAMF_OFF_MUX_RATE);
-    return CELL_OK;
+    return be32(base + PAMF_OFF_MUX_RATE);
 }
 
 /* ---------------------------------------------------------------------------

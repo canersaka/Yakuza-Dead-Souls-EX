@@ -54,7 +54,7 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
 s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
                            const u8* src, u32 srcSize, u32* written);
 s32 cellHttpUtilUnescapeUri(u8* out, u32 outSize,
-                             const char* src, u32 srcSize, u32* written);
+                             const char* src, u32* required);
 
 /* ---------------------------------------------------------------------------
  * Header helpers

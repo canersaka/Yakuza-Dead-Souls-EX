@@ -118,7 +118,7 @@ s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
                               u32 pamfSize, u32 attribute);
 s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTime);
 s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime);
-s32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader, u32* muxRate);
+u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader);
 
 /* Stream queries */
 s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader);

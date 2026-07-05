@@ -260,9 +260,9 @@ static int http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
  * API implementations
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpInit(u32 poolSize)
+s32 cellHttpInit(void* pool, u32 poolSize)
 {
-    printf("[cellHttp] Init(poolSize=%u)\n", poolSize);
+    printf("[cellHttp] Init(pool=%p, poolSize=%u)\n", pool, poolSize);
 
     if (s_http_initialized)
         return CELL_HTTP_ERROR_ALREADY_INITIALIZED;
@@ -368,8 +368,8 @@ s32 cellHttpDestroyClient(CellHttpClientId clientId)
     return CELL_OK;
 }
 
-s32 cellHttpCreateTransaction(CellHttpClientId clientId, const char* method,
-                              const CellHttpUri* uri, CellHttpTransId* transId)
+s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientId,
+                              const char* method, const CellHttpUri* uri)
 {
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;

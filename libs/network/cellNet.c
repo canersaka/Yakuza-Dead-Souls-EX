@@ -52,7 +52,7 @@ s32 cellNetInitialize(void)
         return (s32)CELL_NET_ERROR_ALREADY_INITIALIZED;
 
     if (!s_net_pool_initialized)
-        sys_net_initialize_network_ex(0);
+        sys_net_initialize_network_ex(NULL);
 
     memset(s_resolvers, 0, sizeof(s_resolvers));
     s_net_initialized = 1;

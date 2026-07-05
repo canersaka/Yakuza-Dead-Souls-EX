@@ -121,7 +121,7 @@ typedef struct sys_net_hostent {
  * -----------------------------------------------------------------------*/
 
 /* Network init/shutdown */
-int32_t sys_net_initialize_network_ex(uint32_t mem_container, uint32_t flags);
+int32_t sys_net_initialize_network_ex(void* param);
 int32_t sys_net_finalize_network(void);
 
 /* BSD socket API */

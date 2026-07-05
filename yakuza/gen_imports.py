@@ -431,7 +431,11 @@ def main():
                     # extern decl takes 8 args; pad with raw gprs (x64 ABI
                     # ignores extras beyond what the callee reads)
                     args += gprs[len(args):8]
-                    if "*" in ret:
+                    is_void_ret = re.match(r"^void\b", ret) is not None
+                    if is_void_ret:
+                        retexpr = ""
+                        retclose = ""
+                    elif "*" in ret:
                         retexpr = "yz_gp((u64)"
                         retclose = ")"
                     elif re.search(r"\b(u64|uint64_t|s64|int64_t)\b", ret):
@@ -441,14 +445,22 @@ def main():
                         retexpr = "(uint64_t)(int64_t)(int32_t)"
                         retclose = ""
                 else:
+                    is_void_ret = False
                     args = gprs
                     retexpr = "(uint64_t)(int64_t)(int32_t)"
                     retclose = ""
                 lines.append(f"static void {ident}(ppu_context* ctx) {{")
                 lines.append(f"    static int logged = 0;")
                 lines.append(f'    if (!logged) {{ logged = 1; fprintf(stderr, "[import] call {name}\\n"); }}')
-                lines.append(f"    ctx->gpr[3] = {retexpr}{name}(")
-                lines.append("        " + ", ".join(args) + f"){retclose};")
+                if is_void_ret:
+                    # void-returning guest function: no r3 value to marshal back;
+                    # leave ctx->gpr[3] whatever it already was (CELL_OK convention
+                    # doesn't apply -- callers of a void SDK function don't read r3).
+                    lines.append(f"    {name}(")
+                    lines.append("        " + ", ".join(args) + ");")
+                else:
+                    lines.append(f"    ctx->gpr[3] = {retexpr}{name}(")
+                    lines.append("        " + ", ".join(args) + f"){retclose};")
                 lines.append("}")
         else:
             label = name if name else f"0x{nid:08X}"
