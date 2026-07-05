@@ -926,8 +926,8 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
  * global counter and read_index % nBlock the current slot, so the tag of slot
  * blockNo in the current lap is read_index - cur_pos + blockNo. libmixer's
  * sur-mixer pump paces itself with this + GetPortTimestamp; the ENOSYS stub
- * starved the mixer (2026-07-02). Out-param written guest-BE (endianness
- * class, LESSONS #10). */
+ * starved the mixer (2026-07-02). Out-param written guest-BE (guest is
+ * big-endian; every HLE write of a multi-byte out-param must match). */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
 {
     if (!s_audio_initialized)

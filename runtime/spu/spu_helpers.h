@@ -445,7 +445,7 @@ static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ floa
  * use the interpreter as an oracle for these two instructions; only the
  * ASMJIT or LLVM recompiler paths implement real hardware semantics.
  *
- * ---- Closed-form verification of the exponent fields (this session) ----
+ * ---- Closed-form verification of the exponent fields ----
  * The two 256-entry *exponent* LUTs (SPUThread.cpp lines 59-77, 87-105) were
  * checked by exhaustive Python cross-check (all 256 entries each) against:
  *   frest:   rexp = (exp==0) ? 0xFF : ( (253-exp)>0 ? (253-exp) : 0 )
@@ -464,7 +464,7 @@ static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ floa
  * ARE reproduced verbatim below (hardware facts, not GPL'd code -- only the
  * numeric constants are taken; all surrounding C is original).
  *
- * ---- Pipeline validation (hand/script-verified this session, not fuzzed --
+ * ---- Pipeline validation (hand/script-verified, not fuzzed --
  * frest/frsqest ISA specs are error-bound-only, so single-instruction fuzzing
  * has no ground truth; the PIPELINE has one) ----
  * Reciprocal pipeline (ISA p.215): FREST y0,x / FI y1,x,y0 /
@@ -538,7 +538,7 @@ static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ floa
  * confirmed wrong the same way old spu_fi was, and independently matches
  * RPCS3's interpreter-stub bug (see ORACLE TRAP above), which is presumably
  * how it entered this codebase (an early port likely used the interpreter as
- * its reference before this session's ASMJIT-recompiler cross-check).
+ * its reference before a later ASMJIT-recompiler cross-check).
  */
 
 /* ---- hardware lookup tables (RPCS3 SPUThread.cpp:51-57, 79-85) ----

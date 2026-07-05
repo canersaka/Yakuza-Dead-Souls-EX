@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""PPU lift-structure census + relift regression diff (s14 fleet, T8).
+"""PPU lift-structure census + relift regression diff.
 
-Purpose (docs/TOOLING_WORKORDER.md, section T8): the structure bug class (map
-gaps, stubbed jump-table dispatchers, fall-throughs, unresolved indirect
-targets -- boot blockers #6/#8/#14/#19b were THIS class) has no static sweep.
-This tool runs three census passes over the CURRENT relift output and the
-static function map, then diffs the totals against a saved baseline so a NEW
-structure anomaly is flagged the day a relift creates it.
+Purpose: the structure bug class (map gaps, stubbed jump-table dispatchers,
+fall-throughs, unresolved indirect targets -- boot blockers #6/#8/#14/#19b
+were THIS class) has no static sweep. This tool runs three census passes
+over the CURRENT relift output and the static function map, then diffs the
+totals against a saved baseline so a NEW structure anomaly is flagged the
+day a relift creates it.
 
-NOTE (spec correction, verified on disk 2026-07-05): the workorder text names
-a single `recomp/ppu_recomp.c`. That file does not exist -- the lifter emits
-20 chunk files `recomp/ppu_recomp_000.cpp .. ppu_recomp_019.cpp` (see
+NOTE (spec correction, verified on disk 2026-07-05): a single
+`recomp/ppu_recomp.c` was assumed. That file does not exist -- the lifter
+emits 20 chunk files `recomp/ppu_recomp_000.cpp .. ppu_recomp_019.cpp` (see
 ppu_lifter.py's write_source_files / the stale-.c cleanup at its main(),
 ~line 3037-3048). This tool globs `recomp/ppu_recomp_*.cpp` instead. recomp/
 is READ-ONLY here -- never edited.

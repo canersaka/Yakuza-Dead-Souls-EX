@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SPU decode cross-check: tools/spu_disasm.py vs RPCS3's SPUDisAsm used as an
-OUTPUT-ONLY oracle (T9 of docs/TOOLING_WORKORDER.md).
+OUTPUT-ONLY oracle.
 
 Clean-room posture: RPCS3 is GPLv2. The oracle is a tiny standalone dump
 harness that lives ENTIRELY inside the rpcs3clone tree
@@ -27,7 +27,7 @@ ELF-wrapped SPU binary produced by the lift pipeline). For each image:
      (spu_dump_tool.exe <bytes> --base <vaddr>) -> "oracle" mnemonic per
      offset, parsed back out of its stdout.
   4. Normalize both to mnemonic-only (v1 scope; operand normalization is a
-     stretch goal, matching T4's disasm_audit.py precedent) via a whitelist
+     stretch goal, matching disasm_audit.py's precedent) via a whitelist
      alias table (known made-up RPCS3 mnemonics: "mr" for ori/shlqbyi with a
      zero immediate -- verified by reading SPUDisAsm.h's SHLQBYI/ORI bodies,
      see the ALIAS_WHITELIST comment below -- plus the C-bit-conditional
@@ -36,8 +36,8 @@ ELF-wrapped SPU binary produced by the lift pipeline). For each image:
      (ours_mnemonic, oracle_mnemonic) pair, descending count, with sample
      addresses; report whitelisted pairs separately as INFO.
 
-Exit code: 0 always (this is a report tool, like T4's disasm_audit.py); the
-CALLER (the s14 acceptance run / a human) judges the residual count.
+Exit code: 0 always (this is a report tool, like disasm_audit.py); the
+CALLER (an acceptance run / a human) judges the residual count.
 """
 
 import argparse
@@ -55,8 +55,8 @@ from spu_disasm import spu_decode  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Oracle harness location (lives entirely in the rpcs3clone tree; never
-# copied here -- see docs/TOOLING_WORKORDER.md T9 and the harness's own
-# main.cpp for the clean-room rationale).
+# copied here -- see the harness's own main.cpp for the clean-room
+# rationale).
 # ---------------------------------------------------------------------------
 DEFAULT_ORACLE_EXE = (
     r"C:\Users\csaka\Downloads\rpcs3clone\rpcs3\build\bin\Release-x64\spu_dump_tool.exe"
@@ -73,8 +73,8 @@ PF_X = 0x1  # ELF program header "executable" flag bit
 #     Both are RPCS3's own "made-up mnemonic: as MR on PPU" comment --
 #     value-conditional (immediate == 0) aliasing our decoder does not do.
 #     v1 whitelists the mnemonic PAIR unconditionally (does not re-check the
-#     immediate); this is a deliberate v1 simplification, matching T4's
-#     "mnemonic-only in v1" scope.
+#     immediate); this is a deliberate v1 simplification, matching the
+#     "mnemonic-only in v1" scope used elsewhere in this audit family.
 #   - SPUDisAsm.h SYNC():     "DisAsm(op.c ? \"syncc\" : \"sync\")"      (~line 240)
 #   - SPUDisAsm.h HBR():      "DisAsm(op.c ? \"hbrp\" : \"hbr\", ...)"   (~line 419)
 #     Our decoder (tools/spu_disasm.py) always emits the C=0 name; these
@@ -95,9 +95,9 @@ def find_oracle_exe(explicit: str | None) -> str:
     if not os.path.isfile(path):
         raise SystemExit(
             f"error: oracle harness not found at '{path}'.\n"
-            "Build it first (see docs/TOOLING_WORKORDER.md T9): the harness "
-            "project is tools/spu_dump_tool.vcxproj under the rpcs3clone "
-            "tree; build with msbuild against that .vcxproj "
+            "Build it first: the harness project is "
+            "tools/spu_dump_tool.vcxproj under the rpcs3clone tree; build "
+            "with msbuild against that .vcxproj "
             "(/p:SolutionDir=<rpcs3clone>\\rpcs3\\)."
         )
     return path

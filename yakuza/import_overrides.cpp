@@ -791,7 +791,7 @@ static void yz_mt_dump(uint32_t parkget, uint32_t parkcmd) {
 /* ============================================================================
  * JOURNAL RETIREMENT SWEEP (2026-07-02) -- the faithful consumption contract.
  *
- * MEASURED (instrumented RPCS3 [jrnl-dma]/[jrnl-tags], STATUS session 3): on
+ * MEASURED (instrumented RPCS3 [jrnl-dma]/[jrnl-tags]): on
  * real HW the EDGE SPU task (gs_task) consumes the gcm journal and ZEROES each
  * entry's tag word; the producer polls chunk-head tags == 0 before reusing a
  * journal chunk, i.e. the tags are the game's GPU-PROGRESS LEDGER. Every
@@ -808,7 +808,7 @@ static void yz_mt_dump(uint32_t parkget, uint32_t parkcmd) {
  * because the watchdog instrumentation invalidated the loops). OPT-IN
  * (YZ_JRNL=1) until it can be measured against a clean baseline; the REAL
  * fix in flight is restoring the actual consumer (gs_task residency,
- * trace-diff -- STATUS session 3). Data/sublist payloads (tags 4/8/9/D/10)
+ * trace-diff). Data/sublist payloads (tags 4/8/9/D/10)
  * are EDGE content-generation, not flow -- they stay unapplied until the
  * real consumer era. ===================================================== */
 static uint32_t g_jrnl_retire_cursor = 0;

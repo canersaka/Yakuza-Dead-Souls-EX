@@ -2,13 +2,13 @@
 """
 endian_audit.py -- HLE out-param endianness heuristic auditor (INFO-level).
 
-Purpose (docs/TOOLING_WORKORDER.md T13): the endianness/packing bug class
-(project blockers #11/#16/#18/#19d) has so far been swept manually, module by
-module, as code gets exercised. This is a STATIC heuristic pass: it ranks
-suspects, it does not prove bugs. Expect noise -- false positives are handled
-via tools/endian_audit_whitelist.txt, not by making the heuristic "smarter".
+Purpose: the endianness/packing bug class (project blockers #11/#16/#18/#19d)
+has so far been swept manually, module by module, as code gets exercised.
+This is a STATIC heuristic pass: it ranks suspects, it does not prove bugs.
+Expect noise -- false positives are handled via
+tools/endian_audit_whitelist.txt, not by making the heuristic "smarter".
 
-Heuristic (deliberately simple, see workorder T13 spec):
+Heuristic (deliberately simple):
   For each exported (non-static, file-scope) function defined in libs/**/*.c
   whose signature has at least one pointer out-param of scalar or struct type
   (u16*/u32*/u64*/SomeStruct* -- NOT char*/void*/const-qualified-only), flag it
@@ -19,21 +19,21 @@ Heuristic (deliberately simple, see workorder T13 spec):
 This is a heuristic, not a data-flow analysis:
   - It does not verify the bswap/vm_write call actually touches the SAME
     out-param (any bswap/vm_write call anywhere in the function silences the
-    flag for the whole function). That is intentional simplicity per the
-    workorder -- it trades false negatives for a MUCH simpler, auditable rule.
+    flag for the whole function). That is intentional simplicity -- it
+    trades false negatives for a MUCH simpler, auditable rule.
   - It does not track typedef chains beyond a small built-in scalar list plus
     a "looks like a PS3-struct-pointer" fallback (Capitalized* or CellFoo*).
   - const-qualified pointers (`const Foo* out`) are never flagged: they are
     almost always [in] params by SDK convention.
   - char*/void*/FILE*/function-pointer params are excluded: too often byte
-    buffers or host-only handles (the workorder explicitly calls these out as
-    known false-positive classes to whitelist).
+    buffers or host-only handles (known false-positive classes to
+    whitelist).
 
 Usage:
     py -3 tools\\endian_audit.py [--libs-root libs] [--whitelist tools\\endian_audit_whitelist.txt]
                                  [--module MODNAME] [--verbose] [--top N]
 
-Always exits 0 -- this is an advisory sweep, never a CI gate (per spec).
+Always exits 0 -- this is an advisory sweep, never a CI gate.
 """
 
 import argparse
@@ -55,9 +55,9 @@ PRIORITY_BUCKETS = [
     ("sysutil", ["sysutil", "sysmodule", "sys_interrupt", "userinfo"]),
 ]
 
-# Bswap / vm_write call families that silence a flag (workorder T13 + verified
-# 2026-07-05 against libs/filesystem/cellFs.c and runtime/ppu/ppu_memory.h --
-# the only two helper families used in this codebase for guest-endian stores).
+# Bswap / vm_write call families that silence a flag (verified 2026-07-05
+# against libs/filesystem/cellFs.c and runtime/ppu/ppu_memory.h -- the only
+# two helper families used in this codebase for guest-endian stores).
 SILENCING_CALL_RE = re.compile(r"\b(?:ps3_bswap(?:16|32|64)|vm_write(?:8|16|32|64))\s*\(")
 
 # Built-in scalar out-param types we always recognize (host-endian-native

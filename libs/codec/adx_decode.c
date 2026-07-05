@@ -1,6 +1,6 @@
 /*
  * ps3recomp - clean-room CRI ADX decoder implementation.
- * See adx_decode.h for provenance/scope notes (docs/LESSONS.md #14/#15).
+ * See adx_decode.h for provenance/scope notes.
  *
  * ADX STREAM LAYOUT (public format, "type 2" fixed-coefficient ADPCM):
  *

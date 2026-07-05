@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-*/
 cmake-build-*/
 out/
 
@@ -84,6 +85,12 @@ RSX ISA Documentation Search.md
 SUMMARY.md
 STATUS.md
 docs/archive/
+docs/LESSONS.md
+docs/DONT_RECHASE.md
+docs/TOOLING_WORKORDER.md
+docs/LAYER1_SESSION_2026-06-25.md
+docs/PSDEVWIKI_REFS.md
+tools/lint_handoff.py
 CHEATSHEET.md
 CLAUDE.md
 AGENTS.md

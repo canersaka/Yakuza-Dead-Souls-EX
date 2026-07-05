@@ -230,7 +230,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       if (uw < 8) { uw++;
                           fprintf(stderr, "[SPU] WARN: UNKNOWN workload module ea=0x%08X size=0x%X "
                                   "loaded to LS 0xA00 -- running as SERVICE image; if this SPU "
-                                  "misbehaves, lift this blob (see CHEATSHEET SPU-module relift)\n",
+                                  "misbehaves, lift this blob (relift the SPU module)\n",
                                   (uint32_t)ea, size);
                           fflush(stderr); } }
                     break;
@@ -251,8 +251,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * (image 13) DMAs each descriptor's eaBinary blob into free LS past
              * its own end and branches there. Both binaries the game's pxd
              * jobchain uses are EBOOT-static (measured live: the 14-way bulk
-             * worker + the event-flag notify job, descriptor decode in
-             * STATUS.md 2026-07-03 session 7); they are lifted as images 14/15.
+             * worker + the event-flag notify job); they are lifted as images 14/15.
              * Record the LS base per context so spu_indirect_branch can switch
              * to the right lifted image when the module branches into the blob.
              * Chunked GETs (max 0x4000/transfer) only match on the FIRST
@@ -912,21 +911,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   line[0x33] = 0; ls_ptr[0x33] = 0;   /* wklPendingContention[3] = 0 */
                   line[0x03] = 1; ls_ptr[0x03] = 1;   /* wklReadyCount1[3]        = 1 */
               } }
-            /* SESSION 11 TASK 1 FORCING EXPERIMENT (env YZ_FORCE_WID0, 2026-07-04,
-             * DIAGNOSTIC ONLY -- LESSONS #13 band-aid hygiene, kill-switched off by
-             * default, never the shipped fix). Mirrors YZ_FRC's mechanism (direct
-             * mutation of the GETLLAR'd SPURS mgmt line so the write survives the
-             * kernel's own PUTLLC/CAS) but targets wid0 instead of wid2: force
-             * wklReadyCount1[0] (line/ls +0x00) to 1 and set the wklSignal1 bit0
-             * (line/ls +0x70 bit 0x8000) EVERY time the kernel GETLLARs the mgmt
-             * line, so wid0's SELECT gate
+            /* TASK 1 FORCING EXPERIMENT (env YZ_FORCE_WID0, 2026-07-04,
+             * DIAGNOSTIC ONLY -- band-aid hygiene: env-gated, default-OFF,
+             * kill-switched off by default, never the shipped fix). Mirrors
+             * YZ_FRC's mechanism (direct mutation of the GETLLAR'd SPURS mgmt
+             * line so the write survives the kernel's own PUTLLC/CAS) but
+             * targets wid0 instead of wid2: force wklReadyCount1[0]
+             * (line/ls +0x00) to 1 and set the wklSignal1 bit0 (line/ls +0x70
+             * bit 0x8000) EVERY time the kernel GETLLARs the mgmt line, so
+             * wid0's SELECT gate
              *   run && prio>0 && maxContention>realContention && (signal||readyCount>realContention)
              * (spu_dma.h sel0 above) is forced true continuously -- not a one-shot,
              * because the kernel's own PUTLLC can clear a consumed signal bit and
              * we need wid0 selectable across the whole boot to see whether its
-             * workload ever runs and fires the port-17 heartbeat doorbell (STATUS.md
-             * SESSION 11). Does NOT touch maxContention/priority/run (those are
-             * measured already-set per STATUS.md; only the missing OR-term is
+             * workload ever runs and fires the port-17 heartbeat doorbell
+             * (measured already set). Does NOT touch maxContention/priority/run
+             * (those are measured already-set; only the missing OR-term is
              * supplied). Report MEASURED effect; if wid0 forcing doesn't move t1,
              * retest with YZ_FORCE_WID1 (below) instead -- whichever produces the
              * heartbeat is the confirmed producer. */
@@ -1142,8 +1142,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     /* TASK 1 (2026-07-04): SAME select-gate for wid0/wid1 -- the
                      * heartbeat-workload candidates. The existing probe above only
                      * ever computed wid2/wid3, so we were BLIND to why wid0/wid1
-                     * (run-bits ARE set per wklRun1 0xC000->0xE000, STATUS.md SESSION 11)
-                     * never get SELECTed. Offsets mirror wid2/wid3 exactly, shifted to
+                     * (run-bits ARE set per wklRun1 0xC000->0xE000, measured) never
+                     * get SELECTed. Offsets mirror wid2/wid3 exactly, shifted to
                      * bit/byte index 0 and 1:
                      *   wid0: rc@line[0x00] curCont@line[0x20] maxCont@line[0x50]
                      *         sig@(line[0x70..71]&0x8000) run@(wrun1&0x8000) prio@k[0x1A0] locCont@k[0x180]
@@ -1151,7 +1151,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                      *         sig@(line[0x70..71]&0x4000) run@(wrun1&0x4000) prio@k[0x1A1] locCont@k[0x181]
                      * wid1 = the pxd jobchain taskset (main.cpp:86); wid0 = the
                      * remaining SPURS-managed workload cluster (candidate heartbeat
-                     * owner per SESSION 11's 0x4019C680 = mgmt+0x4A00 finding). */
+                     * owner per the 0x4019C680 = mgmt+0x4A00 finding). */
                     unsigned rc0 = line[0x00], curcont0 = line[0x20], maxc0 = line[0x50] & 0x0F;
                     unsigned loccont0 = k[0x180] & 0x0F;
                     unsigned realcont0 = (curcont0 - loccont0) & 0x0F;

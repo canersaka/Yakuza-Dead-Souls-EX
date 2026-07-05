@@ -8,7 +8,7 @@
  *   - shims.cpp includes the RUNTIME headers instead (runtime ppu_context).
  *     The two struct layouts agree for gpr/fpr/vr/cr/lr/ctr (offsets 0..1047),
  *     which is all the lv2 syscall handlers touch in practice; the tail
- *     fields diverge (see STATUS.md "context layout" note).
+ *     fields diverge.
  * This header therefore only forward-declares ppu_context.
  */
 #pragma once

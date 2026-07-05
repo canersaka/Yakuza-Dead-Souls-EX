@@ -91,7 +91,7 @@ def _read_token(data, pos):
 def load_ppm(path):
     """Return (width, height, bytes) where bytes is a flat w*h*3 RGB buffer.
     Transparently reads a .gz-compressed PPM (goldens/ stores large PPMs
-    zipped per the workorder's >2MB rule) -- gzip's own magic (0x1f 0x8b) is
+    zipped when they exceed 2MB) -- gzip's own magic (0x1f 0x8b) is
     checked first so plain PPMs need no ".gz" suffix convention."""
     with open(path, "rb") as f:
         head = f.read(2)

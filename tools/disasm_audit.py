@@ -1,11 +1,10 @@
 #!/usr/bin/env py -3
 """disasm_audit.py - PPU decoder cross-check: tools/ppu_disasm.py vs Capstone.
 
-Purpose (docs/TOOLING_WORKORDER.md, section T4): catch the crnand/crnor bug
-class (decode-table swaps/scrambles -- the most expensive bug class in
-project history, see docs/LESSONS.md and the crnand-crnor-disasm-swap memory
-note) EXHAUSTIVELY, in one run, by decoding every 4-byte word of the game's
-executable segments with two independent decoders and diffing the mnemonics.
+Purpose: catch the crnand/crnor bug class (decode-table swaps/scrambles --
+the most expensive bug class in project history) EXHAUSTIVELY, in one run,
+by decoding every 4-byte word of the game's executable segments with two
+independent decoders and diffing the mnemonics.
 
 Decoders:
   (a) ours   -- tools/ppu_disasm.py's decode()
@@ -16,8 +15,8 @@ capstone`). It must NEVER be imported by runtime/lifter code -- this script
 is the only place in the repo that touches it, and it degrades to a one-line
 install hint if the import fails (never a crash or a silent skip).
 
-Scope (v1): MNEMONIC comparison only. Operand normalization is v2 (noted in
-the workorder). Known alias classes -- where Capstone's *simplified* PowerPC
+Scope (v1): MNEMONIC comparison only. Operand normalization is a planned v2.
+Known alias classes -- where Capstone's *simplified* PowerPC
 mnemonic legitimately differs from our *canonical* mnemonic for the exact
 same encoding -- are handled via an explicit WHITELIST table below, each
 entry MEASURED against a hand-built encoding + both decoders (see the
@@ -27,9 +26,7 @@ as INFO, never counted as mismatches.
 Usage:
     py -3 tools\\disasm_audit.py game\\EBOOT.elf [--limit N] [--top N]
                                  [--dump-mismatches FILE]
-    py -3 tools\\disasm_audit.py --self-test        (seeded-bug harness, see
-                                                      docs/TOOLING_WORKORDER.md
-                                                      T4 acceptance item 2)
+    py -3 tools\\disasm_audit.py --self-test        (seeded-bug harness)
 
 Exit code: 0 if residual (non-whitelisted) mismatch count is 0, else 1.
 Always runs to completion and prints the full report either way -- the exit
@@ -51,8 +48,7 @@ def _capstone_or_die():
     """Import capstone or exit with a one-line install hint.
 
     Capstone is sanctioned as an OPTIONAL dev-only dependency for THIS
-    script only (docs/TOOLING_WORKORDER.md T4). It must never be added to
-    runtime/lifter requirements.
+    script only. It must never be added to runtime/lifter requirements.
     """
     try:
         import capstone
@@ -443,14 +439,13 @@ def print_report(total, mismatch_counter, whitelist_counter,
 
 
 # ---------------------------------------------------------------------------
-# Seeded self-test (T4 acceptance item: seeded-bug self-test)
+# Seeded self-test (acceptance item: seeded-bug self-test)
 #
 # This NEVER touches the real tools/ppu_disasm.py. It builds a corrupted
 # COPY of decode() in-process (monkeypatching a local copy's dispatch, not
 # the imported module) by wrapping decode_ours() with a mnemonic swap
 # table, exactly emulating "swap two mnemonics" the way the historical
-# crnand/crnor bug did (see docs/LESSONS.md and the
-# crnand-crnor-disasm-swap memory note).
+# crnand/crnor bug did.
 # ---------------------------------------------------------------------------
 
 SELF_TEST_SWAP = {"crnor": "crnand", "crnand": "crnor"}

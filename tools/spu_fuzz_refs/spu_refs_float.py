@@ -176,7 +176,7 @@ register("fnms", "rrr", ref_fnms, op4=0xD, subtle=True, no_nan=True)
 #   y          = ldexpf(ra & 0x7FFFF, -19)
 #   result     = base - step * y
 #
-# PRECISION NOTE (found + fixed during this session's fuzz-green pass): the
+# PRECISION NOTE (found + fixed during a fuzz-green pass): the
 # C computes `step`, `y`, and `step * y` as `float` (ldexpf + a float
 # multiply) at EVERY intermediate step, so a tiny step/y product can
 # underflow to exactly +0.0f in float32 before the final subtraction --
