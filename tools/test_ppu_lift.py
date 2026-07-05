@@ -34,10 +34,23 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+
+# Seeded-bug self-test hook (T7 acceptance #1/#2): point the suite at a TEMP
+# COPY of ppu_disasm.py/ppu_lifter.py (e.g. a mutated decoder/lifter dropped
+# in the session scratchpad) without ever forking this file. Unset (the
+# default) imports from tools/ exactly as before -- zero behavior change.
+_OVERRIDE_DIR = os.environ.get("YZ_TEST_TOOLS_DIR")
 sys.path.insert(0, TOOLS)
+if _OVERRIDE_DIR:
+    sys.path.insert(0, _OVERRIDE_DIR)   # must win over TOOLS -- inserted LAST
 
 import ppu_disasm                    # noqa: E402
 from ppu_lifter import PPULifter, LiftedFunction   # noqa: E402
+
+if _OVERRIDE_DIR:
+    print(f"[test_ppu_lift] YZ_TEST_TOOLS_DIR override active: "
+          f"ppu_disasm={ppu_disasm.__file__} ppu_lifter loaded from override dir "
+          f"if present there", file=sys.stderr)
 
 MASK64 = (1 << 64) - 1
 MASK32 = (1 << 32) - 1
@@ -96,6 +109,19 @@ def sxw(v): return s32(v) & MASK64          # sign-extend low word to 64
 def ref_add(a, b):        return (a + b) & MASK64, None
 def ref_addc(a, b):       s = a + b; return s & MASK64, s >> 64
 def ref_adde(a, b, ca):   s = a + b + ca; return s & MASK64, s >> 64
+def ov64(a, b, result):
+    """Signed 64-bit overflow of a 64-bit sum, per RPCS3 ADDE/SUBFE's
+    ppu_ov_set: operands share a sign bit AND the result's sign bit differs
+    (rpcs3/Emu/Cell/PPUInterpreter.cpp ADDE/SUBFE -- semantics only)."""
+    sa, sb, sr = (a >> 63) & 1, (b >> 63) & 1, (result >> 63) & 1
+    return 1 if (sa == sb and sa != sr) else 0
+def ref_addeo(a, b, ca):
+    v, cout = ref_adde(a, b, ca)
+    return v, cout, ov64(a, b, v)
+def ref_subfeo(a, b, ca):
+    na = (~a) & MASK64
+    v, cout = ref_subfe(a, b, ca)
+    return v, cout, ov64(na, b, v)
 def ref_addme(a, ca):     s = a + MASK64 + ca; return s & MASK64, s >> 64
 def ref_addze(a, ca):     s = a + ca; return s & MASK64, s >> 64
 def ref_subf(a, b):       return (b - a) & MASK64, None
@@ -180,6 +206,17 @@ def ref_logic(op, a, b):
     f = {"and": a & b, "or": a | b, "xor": a ^ b, "nand": ~(a & b),
          "nor": ~(a | b), "andc": a & ~b, "orc": a | ~b, "eqv": ~(a ^ b)}[op]
     return f & MASK64, None
+
+# CR-field logical ops, generalized over arbitrary bt/ba/bb bit indices (host
+# CR bit 0 = MSB) -- the fuzz tranche for the crnand/crnor bug class (T7
+# mandatory). PowerISA v2.03 Book I ch. 2.5.2 / Sec 3.3.11.
+def ref_cr_op(op, cr, bt, ba, bb):
+    a = (cr >> (31 - ba)) & 1
+    b = (cr >> (31 - bb)) & 1
+    r = {"crand": a & b, "cror": a | b, "crxor": a ^ b,
+         "crnand": 1 - (a & b), "crnor": 1 - (a | b), "creqv": 1 - (a ^ b),
+         "crandc": a & (1 - b), "crorc": a | (1 - b)}[op]
+    return (cr & ~(1 << (31 - bt)) | (r << (31 - bt))) & MASK32, r
 
 def ref_addi(a, imm):  return (a + imm) & MASK64, None
 def ref_addic(a, imm): s = a + (imm & MASK64); return s & MASK64, s >> 64
@@ -295,10 +332,11 @@ def _bin_vcase(name, xo, ain, bin_, result_bytes, form="vx", exp_cr=None, rc=0):
           {R_ADDR: result_bytes}, exp_cr=exp_cr)
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_fprs=None, exp_fprs=None, in_cr=0):
+         in_fprs=None, exp_fprs=None, in_cr=0, exp_ov=None, exp_so=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
-                      in_fprs=in_fprs or {}, exp_fprs=exp_fprs or [], in_cr=in_cr))
+                      in_fprs=in_fprs or {}, exp_fprs=exp_fprs or [], in_cr=in_cr,
+                      exp_ov=exp_ov, exp_so=exp_so))
 
 def dbits(x):
     """64-bit pattern of a Python float as an IEEE double."""
@@ -345,6 +383,47 @@ def build_cases():
                      xo_form(xo, R[0], R[1], R[2]),
                      {R[1]: a, R[2]: b}, [(R[0], v, mask)],
                      in_ca=ca, exp_ca=(cout if sets_ca else None))
+
+    # --- addeo/subfeo: XER[OV]/XER[SO] on the OE-form of adde/subfe -------
+    # (PowerISA_V2.03_Final_Public.pdf p.60/p.36; cross-checked against
+    # RPCS3's ADDE/SUBFE ppu_ov_set -- semantics only, no code copied.)
+    ov_ops = [("addeo", 138, ref_addeo), ("subfeo", 136, ref_subfeo)]
+    # (a, b, ca) tuples span pos+pos and neg+neg 64-bit overflow, a small
+    # no-overflow sum, and a ca-dependent tip-over case. Each pair's expected
+    # OV/SO is computed HERE by ref_addeo/ref_subfeo (an independent Python
+    # implementation of the same two's-complement overflow rule), not
+    # hand-asserted per pair, so the set only needs to span the OV=1/OV=0
+    # space -- it doesn't need every pair to land a specific op's OV bit.
+    ov_pairs = [
+        (0x7FFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF, 0),
+        (0x8000000000000000, 0x8000000000000000, 0),
+        (0x7FFFFFFFFFFFFFFF, 0x0000000000000001, 0),
+        (1, 2, 0),
+        (0x7FFFFFFFFFFFFFFF, 0, 1),
+        (0x8000000000000000, 0x7FFFFFFFFFFFFFFF, 1),
+    ]
+    for name, xo, ref in ov_ops:
+        for a, b, ca in ov_pairs:
+            v, cout, ov = ref(a, b, ca)
+            case(f"{name} a={a:#x} b={b:#x} ca={ca}",
+                 xo_form(xo, R[0], R[1], R[2], oe=1),
+                 {R[1]: a, R[2]: b}, [(R[0], v, MASK64)],
+                 in_ca=ca, exp_ca=cout, exp_ov=ov, exp_so=ov)
+
+    # --- mulhwo/mulhwuo: reserved-OE-bit encodings of mulhw/mulhwu ---------
+    # PowerISA has no architected OE form for the high-word multiplies (only
+    # mullw/mulld get one). ppu_disasm.py's shared OE-suffix logic can still
+    # emit "mulhwo"/"mulhwuo" for XO=75/11 with OE=1 set (a reserved encoding,
+    # decoded the same way as the mullw/mulld family it shares a table with).
+    # The lifter must treat it exactly like the plain form: same result, and
+    # critically NO XER write (OV/SO must stay whatever they were before).
+    for name, xo, ref in [("mulhwo", 75, ref_mulhw), ("mulhwuo", 11, ref_mulhwu)]:
+        for a, b in pairs():
+            v, _ = ref(a, b)
+            case(f"{name} a={a:#x} b={b:#x}",
+                 xo_form(xo, R[0], R[1], R[2], oe=1),
+                 {R[1]: a, R[2]: b}, [(R[0], v, MASK32)],
+                 exp_ov=0, exp_so=0)   # OE bit ignored: OV/SO must NOT be set
 
     for name, xo, ref in [("addme", 234, ref_addme), ("addze", 202, ref_addze),
                           ("subfme", 232, ref_subfme), ("subfze", 200, ref_subfze)]:
@@ -730,6 +809,34 @@ def build_vcases():
     prog = [lvx_word(0, 0, 10), vx_form(590, 2, 0, 0), stvx_word(2, 0, 13)]  # vupkhsh vD,vB (xo 590)
     vcase("vupkhsh canary", prog, {A_ADDR: UA},
           {R_ADDR: be_bytes_w([s16(ua[i]) & MASK32 for i in range(4)])})
+    # vupklsh: sign-extend LOW 4 halfwords (storage idx 4-7) -> 4 words.
+    # Reuse UA/ua (mixed pos/neg lanes: 0x7FFF, 0x8000, 1, 5, 6, 7, 8 at low
+    # idx 4-7 = {5,6,7,8}, all positive -- add a case with a negative lane
+    # in the low half too so the sign-extension direction is unambiguous.
+    prog = [lvx_word(0, 0, 10), vx_form(718, 2, 0, 0), stvx_word(2, 0, 13)]  # vupklsh vD,vB (xo 718)
+    vcase("vupklsh canary (positive low lanes)", prog, {A_ADDR: UA},
+          {R_ADDR: be_bytes_w([s16(ua[4 + i]) & MASK32 for i in range(4)])})
+    UA2 = be_bytes_h([1, 2, 3, 4, 0xFFFF, 0x7FFF, 0x8000, 42])
+    ua2 = halfs_of(UA2)
+    prog = [lvx_word(0, 0, 10), vx_form(718, 2, 0, 0), stvx_word(2, 0, 13)]
+    vcase("vupklsh canary (mixed sign low lanes)", prog, {A_ADDR: UA2},
+          {R_ADDR: be_bytes_w([s16(ua2[4 + i]) & MASK32 for i in range(4)])})
+
+    # vupkhsb: sign-extend HIGH 8 signed bytes (storage idx 0-7) -> 8 halfwords.
+    # Mixed positive/negative/boundary byte lanes across the whole 16-byte
+    # vector so both halves (high used, low ignored) are distinguishable.
+    UB = bytes([0x7F, 0x80, 0xFF, 1, 5, 6, 100, 200,      # high 8 (used)
+                9, 10, 11, 12, 13, 14, 15, 16])            # low 8 (ignored)
+    prog = [lvx_word(0, 0, 10), vx_form(526, 2, 0, 0), stvx_word(2, 0, 13)]  # vupkhsb vD,vB (xo 526)
+    vcase("vupkhsb canary", prog, {A_ADDR: UB},
+          {R_ADDR: be_bytes_h([s8v(UB[i]) & 0xFFFF for i in range(8)])})
+
+    # vupklsb: sign-extend LOW 8 signed bytes (storage idx 8-15) -> 8 halfwords.
+    UB2 = bytes([1, 2, 3, 4, 5, 6, 7, 8,                       # high 8 (ignored)
+                 0x7F, 0x80, 0xFF, 100, 200, 0, 0x81, 0x7E])   # low 8 (used, mixed sign)
+    prog = [lvx_word(0, 0, 10), vx_form(654, 2, 0, 0), stvx_word(2, 0, 13)]  # vupklsb vD,vB (xo 654)
+    vcase("vupklsb canary", prog, {A_ADDR: UB2},
+          {R_ADDR: be_bytes_h([s8v(UB2[8 + i]) & 0xFFFF for i in range(8)])})
 
     # ---- word shifts ----
     SA = be_bytes_w([0x00000001, 0x80000000, 0x0000000F, 0xF0000000])
@@ -820,6 +927,32 @@ for _u in (0, 2):
           {B_ADDR:_IV}, {R_ADDR:be_bytes_f([float(s32(w))/(1<<_u) for w in words_of(_IV)])})
 
 # ---------------------------------------------------------------------------
+# lmw / stmw (opcodes 46/47, PowerISA_V2.03_Final_Public.pdf p.72, Book I
+# section 3.3.5). Both were previously unimplemented (lifter fell through to
+# the `/* TODO: lmw ... */` catch-all). Round-trip through the SAME vm stub
+# used by lwz/stw: for lmw, memory -> GPRs r28..r31 -> stw each back out for a
+# byte-exact check; for stmw, lwz each GPR in -> stmw all four out. r28..r31
+# keep clear of the r10-r13 base-pointer GPRs the vcase harness reserves.
+# ---------------------------------------------------------------------------
+_MW_DATA = be_bytes_w([0x11223344, 0xAABBCCDD, 0x00000001, 0xFFFFFFFF])
+
+vcase("lmw r28,0(r10) then stw back",
+      [d_form(46, 28, 10, 0),          # lmw r28, 0(r10)
+       d_form(36, 28, 13, 0),          # stw r28, 0(r13)
+       d_form(36, 29, 13, 4),          # stw r29, 4(r13)
+       d_form(36, 30, 13, 8),          # stw r30, 8(r13)
+       d_form(36, 31, 13, 12)],        # stw r31, 12(r13)
+      {A_ADDR: _MW_DATA}, {R_ADDR: _MW_DATA})
+
+vcase("stmw r28,0(r13) after lwz",
+      [d_form(32, 28, 10, 0),          # lwz r28, 0(r10)
+       d_form(32, 29, 10, 4),          # lwz r29, 4(r10)
+       d_form(32, 30, 10, 8),          # lwz r30, 8(r10)
+       d_form(32, 31, 10, 12),         # lwz r31, 12(r10)
+       d_form(47, 28, 13, 0)],         # stmw r28, 0(r13)
+      {A_ADDR: _MW_DATA}, {R_ADDR: _MW_DATA})
+
+# ---------------------------------------------------------------------------
 # CR-logical ops (opcode 19). REGRESSION for the crnor/crnand disasm swap
 # (2026-07-04): ppu_disasm.py had opcodes 33/225 mapped to crnand/crnor
 # (should be crnor/crnand), and there was ZERO coverage, so 987 mis-lifted
@@ -849,10 +982,269 @@ for _nm, _xo in [("crnor", 33), ("crnand", 225), ("crand", 257), ("cror", 449),
                          f"PPUOpcodes.h). The crnor/crnand swap cost sessions 5-9.")
 
 # ---------------------------------------------------------------------------
-# C driver generation
+# T7: semantic fuzzer mode. Generates N deterministic cases per covered family
+# on top of the SAME encoders/refs/case() infra above -- not a new harness.
+# Cases land in FUZZ_CASES (module CASES is untouched, so the default
+# no-flag run stays byte-identical). Failure output reuses check_reg/
+# check_ca/check_cr, which already print the encoded case name; the fuzz
+# case names embed the ENCODED WORD hex + decoded mnemonic/operands so a
+# FAIL line alone is enough to file a report without rerunning (spec: T7).
 # ---------------------------------------------------------------------------
 
-def emit_c(path):
+FUZZ_CASES = []
+
+# Edge-biased operand pool (T7 spec): zeros/all-ones/signed-boundary/word-
+# split values, shared by every family below.
+_EDGE_POOL = [
+    0, 1, -1 & MASK64, 2,
+    0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+    0x7FFFFFFFFFFFFFFF, 0x8000000000000000, MASK64,
+    0x7FFF, 0x8000, 0xFFFF,                       # halfword sign boundary
+    0x7F, 0x80, 0xFF,                             # byte sign boundary
+    0x00000000FFFFFFFF,                           # low word set, high clear
+    0xFFFFFFFF00000000,                           # high word set, low clear
+    0x100000000,
+]
+
+def _fuzz_operand(rng, bits=64):
+    """One edge-biased-or-uniform operand, masked to `bits`."""
+    if rng.random() < 0.5:
+        v = rng.choice(_EDGE_POOL)
+    else:
+        v = rng.getrandbits(64)
+    return v & (MASK64 if bits == 64 else MASK32)
+
+def _fuzz_case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None,
+               may_trap=False, in_cr=0, insn=None, exp_crbit=None):
+    """Like case() but appends to FUZZ_CASES and stamps the name with the
+    encoded word hex + decoded mnemonic/operands (T7: failure output must
+    include these without rerunning). exp_crbit=(bit_index, want_bit) is a
+    single-CR-bit assertion for arbitrary bt (the static suite's check_cr
+    only asserts a fixed 4-bit nibble at bt=0/28, which doesn't generalize
+    to fuzzed bt)."""
+    if insn is None:
+        insn = ppu_disasm.decode(word, 0)
+    # emit_c's shared encoding-check compares name.split()[0].rstrip(".") against
+    # the decoded mnemonic (also rstripped of "."): lead the tag with the ACTUAL
+    # decoded mnemonic (not the family label) so oe=1 (.../ "o" suffix) and rc=1
+    # ("." suffix) variants -- which the static suite never generates -- don't
+    # false-positive as an "ENCODING mismatch" and get silently skipped.
+    tagged = f"{insn.mnemonic} [{name}] word=0x{word:08X} operands={insn.operands}"
+    FUZZ_CASES.append(dict(name=tagged, word=word, in_regs=in_regs, expects=expects,
+                           in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                           in_fprs={}, exp_fprs=[], in_cr=in_cr, exp_crbit=exp_crbit))
+
+def build_fuzz_cases(n, seed):
+    """Populate FUZZ_CASES. n = generated cases per covered family."""
+    rng = random.Random(seed)
+    R = 3, 4, 5   # rt, ra, rb -- same fixed slots the static suite uses
+
+    # --- XO-form arithmetic + carry/overflow family (ref_* already exist) --
+    xo_ops = [
+        ("add", 266, lambda a, b, ca: ref_add(a, b)),
+        ("subf", 40, lambda a, b, ca: ref_subf(a, b)),
+        ("addc", 10, lambda a, b, ca: ref_addc(a, b)),
+        ("subfc", 8, lambda a, b, ca: ref_subfc(a, b)),
+        ("adde", 138, lambda a, b, ca: ref_adde(a, b, ca)),
+        ("subfe", 136, lambda a, b, ca: ref_subfe(a, b, ca)),
+        ("mullw", 235, lambda a, b, ca: ref_mullw(a, b)),
+        ("mulld", 233, lambda a, b, ca: ref_mulld(a, b)),
+        ("mulhw", 75, lambda a, b, ca: ref_mulhw(a, b)),
+        ("mulhwu", 11, lambda a, b, ca: ref_mulhwu(a, b)),
+        ("mulhd", 73, lambda a, b, ca: ref_mulhd(a, b)),
+        ("mulhdu", 9, lambda a, b, ca: ref_mulhdu(a, b)),
+    ]
+    for name, xo, ref in xo_ops:
+        uses_ca = name in ("adde", "subfe")
+        sets_ca = name in ("addc", "subfc", "adde", "subfe")
+        is_32bit_result = name in ("mulhw", "mulhwu")   # placed in RT SIGN-EXTENDED
+        for i in range(n):
+            a, b = _fuzz_operand(rng), _fuzz_operand(rng)
+            ca = rng.randint(0, 1) if uses_ca else None
+            oe = rng.randint(0, 1)
+            rc = rng.randint(0, 1)
+            v, cout = ref(a, b, ca or 0)
+            mask = MASK32 if is_32bit_result else MASK64
+            word = xo_form(xo, R[0], R[1], R[2], oe=oe, rc=0)  # rc handled via CR0 check below
+            exp_cr = None
+            if rc:
+                # CR0 (Rc=1) reflects the full 64-bit RT as this lifter emits it:
+                # mulhw/mulhwu sign-extend their 32-bit result into RT (ppu_lifter.py
+                # "mulhw"/"mulhwu" handlers), so the nibble must be derived from the
+                # SIGN-EXTENDED value, not a raw 32-bit-masked compare (a fuzz-harness
+                # bug caught by dogfooding this exact sweep -- s32(v) sign-extends,
+                # everything else in this XO family is already a real 64-bit result).
+                cr_v = sxw(v) if is_32bit_result else v
+                nib = 8 if s64(cr_v) < 0 else (4 if s64(cr_v) > 0 else 2)
+                word = xo_form(xo, R[0], R[1], R[2], oe=oe, rc=1)
+                exp_cr = (nib, 28)
+            _fuzz_case(f"{name} a={a:#x} b={b:#x} ca={ca} oe={oe} rc={rc}", word,
+                       {R[1]: a, R[2]: b}, [(R[0], v, mask)],
+                       in_ca=ca, exp_ca=(cout if sets_ca else None), exp_cr=exp_cr)
+
+    for name, xo, ref in [("addme", 234, ref_addme), ("addze", 202, ref_addze),
+                          ("subfme", 232, ref_subfme), ("subfze", 200, ref_subfze)]:
+        for i in range(n):
+            a = _fuzz_operand(rng)
+            ca = rng.randint(0, 1)
+            v, cout = ref(a, ca)
+            _fuzz_case(f"{name} a={a:#x} ca={ca}", xo_form(xo, R[0], R[1], 0),
+                       {R[1]: a}, [(R[0], v, MASK64)], in_ca=ca, exp_ca=cout)
+
+    for i in range(n):
+        a = _fuzz_operand(rng)
+        v, _ = ref_neg(a)
+        _fuzz_case(f"neg a={a:#x}", xo_form(104, R[0], R[1], 0), {R[1]: a}, [(R[0], v, MASK64)])
+
+    # --- X-form logicals / extends / counts --------------------------------
+    for name, xo in [("and", 28), ("or", 444), ("xor", 316), ("nand", 476),
+                     ("nor", 124), ("andc", 60), ("orc", 412), ("eqv", 284)]:
+        for i in range(n):
+            a, b = _fuzz_operand(rng), _fuzz_operand(rng)
+            v, _ = ref_logic(name, a, b)
+            _fuzz_case(f"{name} a={a:#x} b={b:#x}", x_logic(xo, R[0], R[1], R[2]),
+                       {R[0]: a, R[2]: b}, [(R[1], v, MASK64)])
+
+    # sign-extension forms (the il double-sign-extension class analog)
+    for name, xo, ref in [("extsb", 954, ref_extsb), ("extsh", 922, ref_extsh),
+                          ("extsw", 986, ref_extsw),
+                          ("cntlzw", 26, ref_cntlzw), ("cntlzd", 58, ref_cntlzd)]:
+        for i in range(n):
+            a = _fuzz_operand(rng)
+            v, _ = ref(a)
+            _fuzz_case(f"{name} a={a:#x}", x_logic(xo, R[0], R[1], 0),
+                       {R[0]: a}, [(R[1], v, MASK64)])
+
+    # D-form immediates (the il class analog: signed 16-bit imm, single
+    # sign-extension only -- a double sign-extension bug shows up here).
+    for i in range(n):
+        a = _fuzz_operand(rng)
+        imm = rng.randint(-0x8000, 0x7FFF)
+        v, _ = ref_addi(a, imm)
+        _fuzz_case(f"addi a={a:#x} imm={imm}", d_form(14, R[0], R[1], imm),
+                   {R[1]: a}, [(R[0], v, MASK64)])
+        v, _ = ref_addi(a, imm << 16)
+        _fuzz_case(f"addis a={a:#x} imm={imm}", d_form(15, R[0], R[1], imm),
+                   {R[1]: a}, [(R[0], v, MASK64)])
+        v, ca = ref_addic(a, imm if imm >= 0 else (imm & MASK64))
+        _fuzz_case(f"addic a={a:#x} imm={imm}", d_form(12, R[0], R[1], imm),
+                   {R[1]: a}, [(R[0], v, MASK64)], exp_ca=ca)
+        v, ca = ref_subfic(a, imm if imm >= 0 else (imm & MASK64))
+        _fuzz_case(f"subfic a={a:#x} imm={imm}", d_form(8, R[0], R[1], imm),
+                   {R[1]: a}, [(R[0], v, MASK64)], exp_ca=ca)
+        v, _ = ref_mulli(a, imm)
+        _fuzz_case(f"mulli a={a:#x} imm={imm}", d_form(7, R[0], R[1], imm),
+                   {R[1]: a}, [(R[0], v, MASK64)])
+
+    # --- 32/64-bit rotates -----------------------------------------------
+    for i in range(n):
+        a = _fuzz_operand(rng, 32)
+        sh, mb, me = rng.randint(0, 31), rng.randint(0, 31), rng.randint(0, 31)
+        v, _ = ref_rlwinm(a, sh, mb, me)
+        _fuzz_case(f"rlwinm a={a:#x} sh={sh} mb={mb} me={me}",
+                   m_form(21, R[0], R[1], sh, mb, me), {R[0]: a}, [(R[1], v, MASK32)])
+        r0 = _fuzz_operand(rng, 32)
+        v2, _ = ref_rlwimi(r0, a, sh, mb, me)
+        _fuzz_case(f"rlwimi a={a:#x} sh={sh} mb={mb} me={me}",
+                   m_form(20, R[0], R[1], sh, mb, me),
+                   {R[0]: a, R[1]: r0}, [(R[1], v2, MASK32)])
+
+    for i in range(n):
+        a = _fuzz_operand(rng, 64)
+        sh = rng.randint(0, 63)
+        mbe = rng.randint(0, 63)
+        v, _ = ref_rldicl(a, sh, mbe)
+        _fuzz_case(f"rldicl a={a:#x} sh={sh} mb={mbe}", md_form(0, R[0], R[1], sh, mbe),
+                   {R[0]: a}, [(R[1], v, MASK64)])
+        v, _ = ref_rldicr(a, sh, mbe)
+        _fuzz_case(f"rldicr a={a:#x} sh={sh} me={mbe}", md_form(1, R[0], R[1], sh, mbe),
+                   {R[0]: a}, [(R[1], v, MASK64)])
+        sh2 = rng.randint(0, 63)
+        mb = rng.randint(0, 63 - sh2)
+        r0 = _fuzz_operand(rng, 64)
+        v3, _ = ref_rldimi(r0, a, sh2, mb)
+        _fuzz_case(f"rldimi a={a:#x} sh={sh2} mb={mb}", md_form(3, R[0], R[1], sh2, mb),
+                   {R[0]: a, R[1]: r0}, [(R[1], v3, MASK64)])
+
+    # --- 32/64-bit shifts ----------------------------------------------------
+    for name, xo, ref in [("slw", 24, ref_slw), ("srw", 536, ref_srw),
+                          ("sld", 27, ref_sld), ("srd", 539, ref_srd)]:
+        bits = 32 if name in ("slw", "srw") else 64
+        for i in range(n):
+            a = _fuzz_operand(rng, bits)
+            nmax = 63 if bits == 32 else 127
+            nshift = rng.choice([0, 1, bits - 1, bits, bits + 1, nmax]) if rng.random() < 0.5 \
+                else rng.randint(0, nmax)
+            v, _ = ref(a, nshift)
+            _fuzz_case(f"{name} a={a:#x} n={nshift}", x_logic(xo, R[0], R[1], R[2]),
+                       {R[0]: a, R[2]: nshift}, [(R[1], v, MASK64)])
+
+    for i in range(n):
+        a = _fuzz_operand(rng, 32)
+        sh = rng.randint(0, 31)
+        v, ca = ref_srawi(a, sh)
+        _fuzz_case(f"srawi a={a:#x} sh={sh}",
+                   (31 << 26) | (R[0] << 21) | (R[1] << 16) | (sh << 11) | (824 << 1),
+                   {R[0]: a}, [(R[1], v, MASK64)], exp_ca=ca)
+        nshift = rng.choice([0, 1, 31, 32, 40, 63])
+        v, ca = ref_sraw(a, nshift)
+        _fuzz_case(f"sraw a={a:#x} n={nshift}", x_logic(792, R[0], R[1], R[2]),
+                   {R[0]: a, R[2]: nshift}, [(R[1], v, MASK64)], exp_ca=ca)
+    for i in range(n):
+        a = _fuzz_operand(rng, 64)
+        sh = rng.randint(0, 63)
+        v, ca = ref_sradi(a, sh)
+        _fuzz_case(f"sradi a={a:#x} sh={sh}", xs_sradi(R[0], R[1], sh),
+                   {R[0]: a}, [(R[1], v, MASK64)], exp_ca=ca)
+
+    # --- compares (bf/l randomized; cr0..cr7) --------------------------------
+    for i in range(n):
+        a, b = _fuzz_operand(rng), _fuzz_operand(rng)
+        bf = rng.randint(0, 7)
+        shift = 28 - bf * 4
+        _fuzz_case(f"cmpd bf={bf} a={a:#x} b={b:#x}", cmp_form(0, bf, 1, R[1], R[2]),
+                   {R[1]: a, R[2]: b}, [], exp_cr=(cr_nibble_signed(a, b), shift))
+        _fuzz_case(f"cmpw bf={bf} a={a:#x} b={b:#x}", cmp_form(0, bf, 0, R[1], R[2]),
+                   {R[1]: a, R[2]: b}, [], exp_cr=(cr_nibble_signed32(a, b), shift))
+        _fuzz_case(f"cmpld bf={bf} a={a:#x} b={b:#x}", cmp_form(32, bf, 1, R[1], R[2]),
+                   {R[1]: a, R[2]: b}, [], exp_cr=(cr_nibble_unsigned(a, b, 64), shift))
+        _fuzz_case(f"cmplw bf={bf} a={a:#x} b={b:#x}", cmp_form(32, bf, 0, R[1], R[2]),
+                   {R[1]: a, R[2]: b}, [], exp_cr=(cr_nibble_unsigned(a, b, 32), shift))
+
+    # --- CR-field logic: crand/crnand/cror/crnor/crxor/creqv/crandc/crorc ---
+    # (the crnand class -- MANDATORY per T7). Randomize bt/ba/bb bit indices
+    # AND the input CR pattern so every operand combination (0,0)/(0,1)/(1,0)/
+    # (1,1) gets covered, not just the one fixed pattern the static suite uses.
+    _CR_XO = {"crand": 257, "cror": 449, "crxor": 193, "crnand": 225,
+              "crnor": 33, "creqv": 289, "crandc": 129, "crorc": 417}
+    for name, xo in _CR_XO.items():
+        for i in range(n):
+            bt = rng.randint(0, 31)
+            ba = rng.randint(0, 31)
+            bb = rng.randint(0, 31)
+            while bb == ba:
+                bb = rng.randint(0, 31)
+            cr_in = rng.getrandbits(32)
+            # force the (ba,bb) bit pair to cover all four combinations across
+            # the sweep instead of whatever random bits happened to land there
+            want_a, want_b = (i // 1) % 2, (i // 2) % 2
+            cr_in = (cr_in & ~(1 << (31 - ba)) & ~(1 << (31 - bb)) & MASK32)
+            cr_in |= (want_a << (31 - ba)) | (want_b << (31 - bb))
+            _new_cr, rbit = ref_cr_op(name, cr_in, bt, ba, bb)
+            _fuzz_case(f"{name} bt={bt} ba={ba} bb={bb} a={want_a} b={want_b} cr_in=0x{cr_in:08X}",
+                       _cr_word(xo, bt, ba, bb), {}, [],
+                       in_cr=cr_in, exp_crbit=(bt, rbit))
+
+    return FUZZ_CASES
+
+def emit_c(path, cases=None, vcases=None):
+    """Generate the C conformance driver. cases/vcases default to the static
+    suite's CASES/VCASES (default no-flag run, byte-identical to before this
+    parameter existed); --fuzz passes FUZZ_CASES/[] instead."""
+    if cases is None:
+        cases = CASES
+    if vcases is None:
+        vcases = VCASES
     lifter = PPULifter()
     dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
     pre = lifter._preamble_lines()
@@ -879,11 +1271,31 @@ static void check_ca(const char* name, uint32_t xer, int want) {
     if (got != want) { printf("FAIL %s: XER[CA] = %d want %d\\n", name, got, want); g_fail++; }
     else g_pass++;
 }
+static void check_ov(const char* name, uint32_t xer, int want) {
+    int got = (xer >> 30) & 1;
+    if (got != want) { printf("FAIL %s: XER[OV] = %d want %d\\n", name, got, want); g_fail++; }
+    else g_pass++;
+}
+static void check_so(const char* name, uint32_t xer, int want) {
+    int got = (xer >> 31) & 1;
+    if (got != want) { printf("FAIL %s: XER[SO] = %d want %d\\n", name, got, want); g_fail++; }
+    else g_pass++;
+}
 static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
     int got = (cr >> shift) & 0xF;
     /* only LT/GT/EQ (top 3 bits of the nibble); SO passthrough not asserted */
     if ((got & 0xE) != (nib & 0xE)) {
         printf("FAIL %s: CR nibble@%d = %X want %X\\n", name, shift, got, nib); g_fail++;
+    } else g_pass++;
+}
+/* Single-CR-bit check (T7 fuzz: CR-logical ops with arbitrary bt can't use
+ * check_cr's fixed nibble/shift convention). bit = host CR bit index (0=MSB). */
+static void check_crbit(const char* name, uint32_t cr, int bit, int want) {
+    int got = (cr >> (31 - bit)) & 1;
+    if (got != want) {
+        printf("FAIL %s: CR bit %d = %d want %d (full CR=0x%08X)\\n",
+               name, bit, got, want, cr);
+        g_fail++;
     } else g_pass++;
 }
 static void check_fpr(const char* name, int reg, double got_d, uint64_t want, uint64_t mask) {
@@ -929,7 +1341,7 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
     n_encoding_skipped = 0
-    for i, c in enumerate(CASES):
+    for i, c in enumerate(cases):
         insn = ppu_disasm.decode(c["word"], 0x10000 + i * 4)
         exp_mn = c["name"].split()[0].rstrip(".")
         got_mn = insn.mnemonic.rstrip(".")
@@ -964,9 +1376,16 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
                         f"0x{pat:016X}ULL, 0x{mask:016X}ULL);")
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
+        if c.get("exp_ov") is not None:
+            body.append(f'        check_ov("{nm}", ctx->xer, {int(bool(c["exp_ov"]))});')
+        if c.get("exp_so") is not None:
+            body.append(f'        check_so("{nm}", ctx->xer, {int(bool(c["exp_so"]))});')
         if c["exp_cr"] is not None:
             nib, shift = c["exp_cr"]
             body.append(f'        check_cr("{nm}", ctx->cr, {nib}, {shift});')
+        if c.get("exp_crbit") is not None:
+            bit, want = c["exp_crbit"]
+            body.append(f'        check_crbit("{nm}", ctx->cr, {bit}, {want});')
         if c["may_trap"]:
             out.append("      __try {")
             out.extend(body)
@@ -980,7 +1399,7 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
         out.append("    }")
 
     # --- VMX endianness canary tranche (memory round-trips) ---
-    for vi, vc in enumerate(VCASES):
+    for vi, vc in enumerate(vcases):
         # Lift each program word; skip the whole case if any word is unhandled.
         lifted = []
         skip = False
@@ -1027,25 +1446,16 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
 """)
     with open(path, "w") as f:
         f.write("\n".join(out))
-    print(f"wrote {path}: {len(CASES) - n_encoding_skipped} cases "
+    print(f"wrote {path}: {len(cases) - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
 # ---------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--emit", action="store_true", help="only write the C file")
-    args = ap.parse_args()
-
-    cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
-    epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")
-    emit_c(cpath)
-    if args.emit:
-        return
-
+def _compile_and_run(cpath, epath, log, tag):
+    """Shared compile+run+report path for both the static suite and --fuzz.
+    Returns the process returncode (0 = all checks passed)."""
     vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-    bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
-    log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
+    bat = os.path.join(ROOT, "scratch", f"{tag}_run.bat")
     with open(bat, "w") as f:
         f.write("@echo off\n")
         f.write(f'call "{vcvars}" >nul 2>nul\n')
@@ -1065,7 +1475,42 @@ def main():
             print(ln)
     if r.returncode == 2:
         print("COMPILE FAILED -- see", log)
-    sys.exit(0 if r.returncode == 0 else 1)
+    return r.returncode
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--emit", action="store_true", help="only write the C file")
+    ap.add_argument("--fuzz", nargs="?", const=200, default=None, type=int,
+                     help="semantic fuzzer mode: N generated cases per covered "
+                          "family (default 200) instead of the static suite")
+    ap.add_argument("--seed", type=int, default=0,
+                     help="fuzz PRNG seed (deterministic; default 0)")
+    args = ap.parse_args()
+
+    if args.fuzz is not None:
+        print(f"[test_ppu_lift] --fuzz mode: N={args.fuzz} seed={args.seed}")
+        build_fuzz_cases(args.fuzz, args.seed)
+        print(f"[test_ppu_lift] generated {len(FUZZ_CASES)} fuzz cases")
+        cpath = os.path.join(ROOT, "scratch", "ppu_fuzz.cpp")
+        epath = os.path.join(ROOT, "scratch", "ppu_fuzz.exe")
+        log = os.path.join(ROOT, "scratch", "ppu_fuzz.log")
+        emit_c(cpath, cases=FUZZ_CASES, vcases=[])
+        if args.emit:
+            return
+        rc = _compile_and_run(cpath, epath, log, "ppu_fuzz")
+        print(f"[test_ppu_lift] --fuzz seed={args.seed} N={args.fuzz}: "
+              f"{'GREEN' if rc == 0 else 'FAILURES FOUND'}")
+        sys.exit(0 if rc == 0 else 1)
+
+    cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
+    epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")
+    emit_c(cpath)
+    if args.emit:
+        return
+
+    log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
+    rc = _compile_and_run(cpath, epath, log, "ppu_conformance")
+    sys.exit(0 if rc == 0 else 1)
 
 if __name__ == "__main__":
     main()
