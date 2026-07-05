@@ -26,6 +26,7 @@
 
 #include "../include/ps3emu/endian.h"
 #include "../include/ps3emu/guest_call.h"
+#include "../runtime/memory/vm.h"
 #include "yakuza_runner.h"
 
 #include <cstring>
@@ -48,11 +49,15 @@ extern "C" uint8_t* vm_base = nullptr;
 static inline uint8_t* ea(uint64_t addr) { return vm_base + (uint32_t)addr; }
 
 static void yz_mem_guard(uint32_t a, unsigned w, int is_write);  /* DIAG (YZ_GUARD), def below */
+/* DIAG (env YZ_VMGUARD / YZ_VMGUARD_SURVIVE): returns 1 if `a` is OUTSIDE every
+ * committed guest region (wild), def below. Named-caller logger + optional
+ * survive (skip the deref) for the intermittent mixer/CRI wild-read crash. */
+static int yz_vmguard_check(uint32_t a, unsigned w, int is_write);
 
-extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); return *ea(addr); }
-extern "C" uint16_t vm_read16(uint64_t addr) { yz_mem_guard((uint32_t)addr,2,0); uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
-extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
-extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
+extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
+extern "C" uint16_t vm_read16(uint64_t addr) { yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
+extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
+extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
  * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
@@ -87,6 +92,36 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
          * / SendWorkloadSignal), not vm_write32. */
         {0x40197CF0u, "wklSignal1"}, {0x40197CF1u, "wklSignal1+1"}, {0x40197C83u, "readyCount[3]"},
         {0x63D225A0u, "codec.pending_ready"},
+        /* 2026-07-05: the pxd/wid0 dispatch root — who bumps wid0's workload readyCount
+         * (@0x40197C80+0) + wklSignal1 bit0, vs the WORKING wid2/gs_task (@+0x02)? */
+        {0x40197C80u, "readyCount[0]=wid0"}, {0x40197C82u, "readyCount[2]=wid2"},
+        /* 2026-07-05 (YZ_SWS_WATCH task): the pxd TASKSET's own bitset words, one
+         * level upstream of cellSpursSendWorkloadSignal. Layout per
+         * docs/SPURS_TASKSET.md (CellSpursTaskset, base 0x40199D00): running@0x00,
+         * ready@0x10, pending_ready@0x20, enabled@0x30, signalled@0x40, waiting@0x50
+         * (each a 4xu32 bitset, one bit per taskId, task 0's bit = MSB of word0).
+         * Does _spurs::task_start / cellSpursCreateTask ever flip pending_ready/
+         * enabled for THIS taskset (the thing that must precede any
+         * SendWorkloadSignal(wid0) call), or does it stay all-zero all boot? */
+        {0x40199D00u, "pxd.running[0]"},
+        {0x40199D20u, "pxd.pending_ready[0]"},
+        {0x40199D30u, "pxd.enabled[0]"},
+        {0x40199D40u, "pxd.signalled[0]"},
+        {0x40199D74u, "pxd.wid"},
+        /* 2026-07-05: the CRI voice-readiness predicate fields (adxm 0x01613368
+         * +294/+298/+29C, all measured 0 at the gate). Does the voice-decode
+         * PRODUCER ever write them (→ what value = the ready predicate), or are
+         * they never written (→ producer never runs)? Names the writer's caller. */
+        {0x016135FCu, "adxm+294"},
+        {0x01613600u, "adxm+298"},
+        {0x01613604u, "adxm+29C"},
+        /* 2026-07-05: cri_dlg (ctrl=0x01661470) dispatcher. The producer registers a
+         * callback at ctrl+0x40 but never sets the pending-flag ctrl+0x4=1, so cri_dlg
+         * never runs it. Watch the flag (+4) AND the callback field (+40): the +40 writer
+         * IS the producer — its caller chain names the fn; check if it also writes +4=1
+         * (missing/mis-lifted store = the bug). */
+        {0x01661474u, "cridlg.workflag+4"},
+        {0x016614B0u, "cridlg.callback+40"},
     };
     for (auto& t : tg) {
         if (addr <= t.a && t.a < addr + n) {
@@ -97,12 +132,82 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
                 uint32_t g = yz_guest_addr_from_host(bt[k]);
                 if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, " %08X", g);
             }
-            fprintf(stderr, "[watch] #%lu %-19s <- 0x%02X (n=%u) guest-callers:%s\n",
-                    seq, t.nm, b, n, chain);
+            /* 2026-07-05: also print the full write span (up to 8B) as hex --
+             * a single byte can't tell us e.g. WHICH wid got stamped into
+             * taskset+0x74 (be_t<u32>), only that byte0 changed. */
+            char full[24]; int fi = 0; unsigned fn = n < 8 ? n : 8;
+            for (unsigned k = 0; k < fn; k++)
+                fi += snprintf(full + fi, sizeof(full) - (size_t)fi, "%02X", ((const uint8_t*)src)[k]);
+            fprintf(stderr, "[watch] #%lu %-19s <- 0x%02X (n=%u full=%s) guest-callers:%s\n",
+                    seq, t.nm, b, n, full, chain);
             fflush(stderr);
         }
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * PPU differential trace (docs/TRACEDIFF.md). Emitted by the --trace lifter
+ * build before EVERY instruction. Gated to ONE thread (env YZ_PPU_TRACE +
+ * YZ_PPU_TRACE_TID, default 1 -- set 11 for cri_dlg) so the log isn't a
+ * multi-thread interleave; optionally armed on the first hit of a start PC
+ * (YZ_PPU_TRACE_ARM=0xADDR) to scope to a window; bounded (YZ_PPU_TRACE_N,
+ * default 3M). One PC per line (hex) -> scratch/ppu_trace.txt, the exact
+ * format tools/tracediff.py + the RPCS3 emitter both use. ctx is ignored
+ * (PC-only). Inert in the normal (non-trace) build -- the calls aren't emitted.
+ * -----------------------------------------------------------------------*/
+extern "C" void ppu_trace_pc(void* ctxv, uint32_t pc) {
+    /* DIAG (env YZ_ARM_PC=0xADDR): step-1b producer catcher. On the --trace build
+     * ppu_trace_pc runs before EVERY instr on EVERY thread, so this catches WHICH
+     * thread executes a target PC (the cri_dlg enqueue func_00F00580 @ 0xF00580),
+     * printing tid + r3(ctrl)/r5(arg=request record) + the request's BE pos/len
+     * (rec+0x10 / rec+0x18, my producer-driver decode) + the guest caller chain.
+     * Answers "who arms cri_dlg's work flag 0x01661474" WITHOUT a page-guard, and
+     * shows whether the stream position advances across the ~51 arms then stalls.
+     * Zero cost when unset. Retire once the producer stall is rooted. */
+    {
+        static int armc = -1; static uint32_t armpc2 = 0;
+        if (armc < 0) { const char* e = getenv("YZ_ARM_PC");
+                        armpc2 = e ? (uint32_t)strtoul(e, 0, 0) : 0u; armc = armpc2 ? 1 : 0; }
+        if (armc && pc == armpc2) {
+            static unsigned long an = 0;
+            if (an < 120) { an++;
+                uint64_t* gg = (uint64_t*)ctxv;   /* gpr[] is offset 0 of ppu_context */
+                uint32_t ctrl = (uint32_t)gg[3], arg = (uint32_t)gg[5];
+                unsigned long long posv = (unsigned long long)vm_read64(arg + 0x10);
+                unsigned long long lenv = (unsigned long long)vm_read64(arg + 0x18);
+                void* bt[20]; unsigned short got = RtlCaptureStackBackTrace(1, 20, bt, 0);
+                char chain[256]; int ci = 0; chain[0] = 0;
+                for (unsigned k = 0; k < got && ci < 230; k++) {
+                    uint32_t gpc = yz_guest_addr_from_host(bt[k]);
+                    if (gpc) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, " %08X", gpc);
+                }
+                fprintf(stderr, "[arm-pc] #%lu pc=%08X tid=%u r3=%08X r5=%08X pos=%llX len=%llX callers:%s\n",
+                        an, pc, yz_thread_current_id(), ctrl, arg, posv, lenv, chain);
+                fflush(stderr);
+            }
+        }
+    }
+    static int mode = -1;
+    if (mode < 0) mode = getenv("YZ_PPU_TRACE") ? 1 : 0;
+    if (!mode) return;
+    static int ttid = -2;
+    if (ttid == -2) { const char* e = getenv("YZ_PPU_TRACE_TID"); ttid = e ? (int)strtol(e, 0, 0) : 1; }
+    if ((int)yz_thread_current_id() != ttid) return;
+    static int armed = -1; static uint32_t armpc = 0;
+    if (armed < 0) { const char* a = getenv("YZ_PPU_TRACE_ARM");
+                     armpc = a ? (uint32_t)strtoul(a, 0, 0) : 0u; armed = armpc ? 0 : 1; }
+    if (!armed) { if (pc != armpc) return; armed = 1; }
+    static FILE* fp = nullptr; static long budget = -1;
+    if (!fp) { fp = fopen("scratch/ppu_trace.txt", "w"); if (!fp) fp = stderr;
+               setvbuf(fp, nullptr, _IONBF, 0);   /* unbuffered: last line survives a kill,
+                                                   * so the real block point (not a stale flushed
+                                                   * PC) is visible. */
+               const char* n = getenv("YZ_PPU_TRACE_N"); budget = n ? strtol(n, 0, 0) : 3000000; }
+    if (budget <= 0) return;
+    fprintf(fp, "%08X\n", pc);
+    if (--budget == 0) fflush(fp);
+}
+
 /* ---------------------------------------------------------------------------
  * PPU reservation atomics (lwarx/stwcx/ldarx/stdcx) -- the REAL semantics.
  *
@@ -223,11 +328,11 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                  :  (ctx->cr & ~(0xFu << 28));
 }
 
-extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); VM_WRITE_COH(addr, &val, 1); }
-extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
+extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
+extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
-extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
+extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED
@@ -267,6 +372,79 @@ static void yz_mem_guard(uint32_t a, unsigned w, int is_write) {
     fprintf(stderr, "[wild] #%ld %-5s EA=0x%08X w=%u tid=%lu guest-callers:%s\n",
             seq, is_write ? "WRITE" : "READ", a, w, (unsigned long)GetCurrentThreadId(), chain);
     fflush(stderr);
+}
+
+/* DIAG (env YZ_VMGUARD / YZ_VMGUARD_SURVIVE): named-caller diagnostic for the
+ * intermittent 0xC0000005 on the mixer/CRI thread startup (~32 frames in):
+ * a lifted guest fn vm_read*'s a WILD pointer (~535 MB, outside every
+ * committed guest region) and ea(addr) derefs it with no bounds check,
+ * hitting uncommitted VM. The crash handler can't name the caller (trampoline
+ * hop: cia=0 lr=0), so this resolves the REAL host-stack RIPs to guest func
+ * addrs via yz_guest_addr_from_host (the yz_watch_bd/yz_mem_guard pattern) --
+ * cheap range check only (no VirtualQuery) so it can stay on for a full boot.
+ * Returns 1 ("wild, don't touch it") only when YZ_VMGUARD_SURVIVE is also set;
+ * otherwise returns 0 after logging so the natural path (and any YZ_GUARD AV)
+ * is unaffected. Diagnostic-only (LESSONS #13) -- NOT a shipping fix; the
+ * real bug is whatever hands the lifted code this address in the first
+ * place (lift/race bug TBD from the logged caller).
+ *
+ * MEASURED 2026-07-04: vm.h's 4 static regions are NOT the full committed
+ * set -- several syscall handlers / libs vm_commit() or VirtualAlloc() their
+ * OWN windows outside vm.h: sys_memory.c commits [0x40000000,0x50000000) in
+ * full up front (SYS_MEM_ALLOC_BASE/END), cellAudio.c commits
+ * [0x50000000,0x50400000) (AUDIO_VM_BASE/SIZE), sys_vm.c bump-commits INSIDE
+ * [0x60000000,0x70000000) (SYS_VM_REGION_BASE/END) per sys_vm_memory_map
+ * call, and import_overrides.cpp VirtualAlloc's the GCM local (RSX video)
+ * memory at [0xC0000000,0xC0000000+0x0F900000) (YZ_GCM_LOCAL_BASE/SIZE,
+ * yakuza_runner.h). First pass of this guard treated all of those as wild
+ * and false-positived TWICE: a dlmalloc chunk-list walk (func_00071894)
+ * legitimately touching a sys_vm_memory_map'd heap at boot (20/20 hits, sys_vm
+ * region, well before frame 1, no crash), and a GCM-local zero-init/copy loop
+ * (func_00FBE68C/00EAD4B4/00E80B34 chain) touching 0xC0000000 (20/20 hits,
+ * same). Widen the known-good set to match; the sys_vm sub-range is
+ * approximated as the whole reserved window (not just the bump pointer)
+ * since that's still tighter than "anything goes" and avoids a cross-TU
+ * dependency on sys_vm.c's bump-pointer state. */
+#define YZ_VMGUARD_SYS_MEM_BASE   0x40000000u
+#define YZ_VMGUARD_SYS_MEM_END    0x50000000u
+#define YZ_VMGUARD_AUDIO_VM_BASE  0x50000000u
+#define YZ_VMGUARD_AUDIO_VM_SIZE  0x00400000u
+#define YZ_VMGUARD_SYS_VM_BASE    0x60000000u
+#define YZ_VMGUARD_SYS_VM_END     0x70000000u
+#define YZ_VMGUARD_GCM_LOCAL_BASE 0xC0000000u
+#define YZ_VMGUARD_GCM_LOCAL_SIZE 0x0F900000u
+static int yz_vmguard_check(uint32_t a, unsigned w, int is_write) {
+    static int on = -1; if (on < 0) on = getenv("YZ_VMGUARD") ? 1 : 0;
+    if (!on) return 0;
+    /* Committed-region check mirrors vm_is_valid_addr (runtime/memory/vm.h)
+     * PLUS the syscall-handler/libs bump windows above -- anything outside
+     * all of those is uncommitted (PAGE_NOACCESS from the 4 GB MEM_RESERVE)
+     * and a deref there is the wild-pointer fault. */
+    int valid =
+        (a >= VM_MAIN_MEM_BASE && a < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) ||
+        (a >= VM_STACK_BASE    && a < VM_STACK_BASE    + VM_STACK_REGION)  ||
+        (a >= VM_SPU_BASE      && a < VM_SPU_BASE      + 8 * VM_SPU_WINDOW_SIZE) ||
+        (a >= VM_RSX_BASE      && a < VM_RSX_BASE      + VM_RSX_SIZE) ||
+        (a >= YZ_VMGUARD_SYS_MEM_BASE  && a < YZ_VMGUARD_SYS_MEM_END) ||
+        (a >= YZ_VMGUARD_AUDIO_VM_BASE && a < YZ_VMGUARD_AUDIO_VM_BASE + YZ_VMGUARD_AUDIO_VM_SIZE) ||
+        (a >= YZ_VMGUARD_SYS_VM_BASE   && a < YZ_VMGUARD_SYS_VM_END) ||
+        (a >= YZ_VMGUARD_GCM_LOCAL_BASE && a < YZ_VMGUARD_GCM_LOCAL_BASE + YZ_VMGUARD_GCM_LOCAL_SIZE);
+    if (valid) return 0;
+    static int survive = -1; if (survive < 0) survive = getenv("YZ_VMGUARD_SURVIVE") ? 1 : 0;
+    static long seq = 0; long n = ++seq;
+    if (n <= 20) {                                       /* volume-cap the spam */
+        void* bt[24]; unsigned short got = RtlCaptureStackBackTrace(1, 24, bt, 0);
+        char chain[256]; int ci = 0; chain[0] = 0;
+        for (unsigned k = 0; k < got && ci < 230; k++) {
+            uint32_t g = yz_guest_addr_from_host(bt[k]);
+            if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, " %08X", g);
+        }
+        fprintf(stderr, "[vmguard] %-5s wild addr=0x%08X w=%u tid=%lu%s guest-callers:%s\n",
+                is_write ? "WRITE" : "READ", a, w, (unsigned long)GetCurrentThreadId(),
+                survive ? " SURVIVED" : "", chain);
+        fflush(stderr);
+    }
+    return survive;
 }
 
 /* ---------------------------------------------------------------------------
@@ -374,6 +552,53 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     n, (uint32_t)ctx->lr, (unsigned long long)ctx->gpr[4],
                     (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
             fflush(stderr);
+        }
+    }
+
+    /* [cri_dlg] (YZ_CRIDLG, 2026-07-05): cri_dlg (tid 11/12) is the CRI asset-load
+     * dispatcher. Its processor func_00F00208 runs callback [ctrl+0x40](arg [ctrl+0x44])
+     * ONLY when work-flag [ctrl+0x4]!=0. RPCS3's cri_dlg loads scenario.bin -> player_pos.bin
+     * -> ... -> all_csb.par -> movie; ours opens scenario.bin then stalls. Log the control-block
+     * state at each cond_wait: is work EVER queued (flag/callback set) or does the producer stop
+     * feeding it after the first asset? Forks the fix (producer bug vs callback bug). */
+    if (getenv("YZ_CRIDLG") && num == 107 &&
+        (yz_thread_current_id() == 11 || yz_thread_current_id() == 12)) {
+        static long n = 0; long m = ++n;
+        uint32_t r31 = (uint32_t)ctx->gpr[31];
+        if (m <= 12 || (m % 250) == 0) {
+            fprintf(stderr, "[cri_dlg] #%ld tid=%u cond_wait ctrl=0x%08X workflag[+4]=0x%X "
+                    "cb[+40]=0x%08X arg[+44]=0x%08X run[+50]=0x%X cond[+14]=0x%X\n",
+                    m, yz_thread_current_id(), r31, vm_read32(r31 + 0x4), vm_read32(r31 + 0x40),
+                    vm_read32(r31 + 0x44), vm_read32(r31 + 0x50), vm_read32(r31 + 0x14));
+            fflush(stderr);
+        }
+    }
+
+    /* === YZ_SKIP_VOICE (re-keyed 2026-07-05): the real t1 movie-gate spin is
+     * cond_signal(4), NOT cond_wait(9) (which fires only ~1-4x). The CRI voice
+     * codec (ADX/HCA in adv_voice_talk.cvm) never decodes → the voice-readiness
+     * predicate stays 0 → t1 spins here forever. Experiment: force the candidate
+     * readiness fields on this spin (after init settles) to see if t1 advances
+     * past the voice gate and the NEXT wall surfaces. OFF by default. === */
+    if (getenv("YZ_SKIP_VOICE") && num == 108 && (uint32_t)ctx->gpr[3] == 4 &&
+        yz_thread_current_id() == 1) {
+        static long sn = 0; long n = ++sn;
+        const uint32_t adxm = 0x01613368u, blk = 0x01654294u;
+        /* NB (2026-07-05): t1 does cond_signal(4) only ~95x total then blocks in
+         * sema_wait(4) — a producer/consumer handshake, NOT a tight spin. Threshold
+         * kept low so the force arms; but the adxm predicate is likely checked at a
+         * DIFFERENT hook point, so pin the exact readiness field before trusting a
+         * negative result here (see STATUS "ROOT GATE"). */
+        if (n >= 40) {
+            /* poke every watched voice-readiness candidate to a plausible "ready" */
+            vm_write32(adxm + 0x294, 0x00000001u);
+            vm_write32(adxm + 0x298, 0xFFFFFFFFu);
+            vm_write32(adxm + 0x29C, 0x00000001u);
+            vm_write32(blk  + 0x10,  2u);            /* cond-block state -> PLAYING */
+            static int once = 0; if (!once) { once = 1;
+                fprintf(stderr, "[voice-skip] forcing voice-ready at cond_signal(4) spin n=%ld "
+                        "(adxm+294/+298/+29C, blk+10)\n", n);
+                fflush(stderr); }
         }
     }
 
