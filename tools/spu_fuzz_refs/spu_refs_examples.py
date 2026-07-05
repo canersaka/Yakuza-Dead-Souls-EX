@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SPU fuzz reference plug-in -- WORKED EXAMPLES (il, a, shufb).
 
-This is the TEMPLATE a Phase-2 family agent copies to
+This is the TEMPLATE to copy when adding a new family file as
 tools/spu_fuzz_refs/spu_refs_<group>.py.
 tools/test_spu_lift.py --fuzz auto-discovers every
 tools/spu_fuzz_refs/spu_refs_*.py, imports it, and calls its module-level

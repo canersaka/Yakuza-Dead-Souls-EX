@@ -90,6 +90,11 @@ docs/DONT_RECHASE.md
 docs/TOOLING_WORKORDER.md
 docs/LAYER1_SESSION_2026-06-25.md
 docs/PSDEVWIKI_REFS.md
+docs/PPU_VMX_ENDIANNESS.md
+docs/RSX_LAYER1.md
+docs/SPU_INTERP_PLAN.md
+docs/SPURS_TASKSET.md
+docs/TRACEDIFF.md
 tools/lint_handoff.py
 CHEATSHEET.md
 CLAUDE.md

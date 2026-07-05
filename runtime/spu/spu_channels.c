@@ -1328,7 +1328,7 @@ void spu_indirect_branch(spu_context* ctx)
      * comparison, RETIRE with the wid0-dispatch frontier): the policy's
      * syscall re-entry is LS 0xA70 (module entry -- saves LR@0x2C80/SP@0x2C90,
      * the taskset-syscall handler every task/self dispatch funnels through;
-     * SPURS_TASKSET.md "0xA70 = syscall handler"). On EVERY re-entry to 0xA70
+     * LS 0xA70 = the taskset syscall handler). On EVERY re-entry to 0xA70
      * under image 2, dump: the RESIDENT taskset EA this policy instance has
      * loaded (LS 0x27B8 taskset bptr, low32 @0x27BC -- same field [task-launch]
      * already decodes), the request code (gpr3.word0 -- the ABI arg
@@ -1663,7 +1663,7 @@ void spu_indirect_branch(spu_context* ctx)
                    * launches then instantly exits instead of parking in
                    * WAIT_SIGNAL — this names its actual request code per cycle
                    * (codes: -1 POLL_SIGNAL 0 DESTROY 1 YIELD 2 WAIT_SIGNAL
-                   * 3 POLL 4 WAIT_WKL_FLAG 5 SELECT_TASK, SPURS_TASKSET.md).
+                   * 3 POLL 4 WAIT_WKL_FLAG 5 SELECT_TASK).
                    * REMOVE with the pxd-dispatch frontier. */
                   { static int s5 = 0;
                     if (ctx->image_id == 5 && s5 < 40) { s5++;

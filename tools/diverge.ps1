@@ -5,7 +5,7 @@
   + diffs against the CACHED RPCS3 reference trace + prints the first divergence
   AND the lifted C at that PC. Fix that instruction, run it again.
 
-  The RPCS3 reference trace is captured ONCE (docs/TRACEDIFF.md) and reused every
+  The RPCS3 reference trace is captured ONCE (an instrumented interpreter-mode run) and reused every
   loop -- only OUR side rebuilds, so each iteration is one relift + one ninja.
 
   Usage:

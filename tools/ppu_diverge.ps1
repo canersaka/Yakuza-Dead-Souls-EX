@@ -1,8 +1,8 @@
 <#
   ppu_diverge.ps1 -- one command to find the next PPU lift divergence vs RPCS3.
 
-  Mirrors tools\diverge.ps1 (the SPU-side driver) for the PPU trace-diff
-  (docs/TRACEDIFF.md SS PPU). Two paths:
+  Mirrors tools\diverge.ps1 (the SPU-side driver) for the PPU trace-diff.
+  Two paths:
 
     - Without -SkipBoot: arm YZ_PPU_TRACE* env vars, launch the game with
       NATIVE stderr/stdout redirection (avoids the CRT stderr serialization
@@ -15,9 +15,10 @@
   --both truncated to +-30 lines, so the report lands with disasm context in
   one command.
 
-  The RPCS3-side reference capture is manual for v1 (docs/TRACEDIFF.md SS PPU
-  "capture steps"); if -Ref is missing or doesn't exist, this script prints a
-  pointer to that doc section and stops -- it does not attempt to capture one.
+  The RPCS3-side reference capture is manual for v1 (an instrumented
+  interpreter-mode RPCS3 run, aligned to the same arm PC and tid); if -Ref is
+  missing or doesn't exist, this script says so and stops, it does not
+  attempt to capture one.
 
   Usage:
     .\tools\ppu_diverge.ps1 -Tid 11 -Arm 0xF00E80 -Ref scratch\rpcs3_ppu_trace3.txt
@@ -51,11 +52,10 @@ if ($AlignPc -eq '') { $AlignPc = $Arm.TrimStart('0', 'x', 'X') }
 if ($AlignPc -eq '') { $AlignPc = $Arm }
 $armHex = $Arm -replace '^0[xX]', ''
 
-# -Ref is required for the diff step; point at the capture doc rather than
-# guessing a default (v1: RPCS3-side capture stays manual).
+# -Ref is required for the diff step (v1: RPCS3-side capture stays manual).
 if ($Ref -eq '' -or -not (Test-Path $Ref)) {
   Write-Host "`n[ppu_diverge] No usable -Ref reference trace given (got: '$Ref')." -ForegroundColor Yellow
-  Write-Host "Capture one first -- see docs\TRACEDIFF.md SS PPU, 'capture steps'" -ForegroundColor Yellow
+  Write-Host "Capture one first, from an instrumented interpreter-mode RPCS3 run" -ForegroundColor Yellow
   Write-Host "(RPCS3 interpreter-mode instrumentation, aligned to the same arm PC/tid)." -ForegroundColor Yellow
   exit 2
 }
