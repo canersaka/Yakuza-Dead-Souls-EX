@@ -1,0 +1,12 @@
+# hle_abi_audit whitelist
+#
+# Format: function_name : free-text reason
+#
+# Each line suppresses ALL mismatch findings for that one function name.
+# Add an entry only after confirming (by reading both sides) that the
+# apparent mismatch is benign -- e.g. a deliberate, harmless simplification
+# that does not change observable guest behavior. Do NOT add an entry just
+# to silence a finding you haven't investigated; that defeats the tool.
+#
+# (kept intentionally sparse -- see the audit report for what was actually
+# investigated and why nothing is listed here yet)
