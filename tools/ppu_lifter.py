@@ -303,6 +303,10 @@ class PPULifter:
         # declaration but no no-op stub, so the linker binds the real function
         # instead of erroring on a duplicate definition.
         self.extern_funcs: set[int] = set()
+        # Trace mode (--trace): emit ppu_trace_pc(ctx, PC) before every instruction
+        # for the PPU differential trace-diff (docs/TRACEDIFF.md). Off by default;
+        # a trace-enabled build is kept aside (the emission bloats every function).
+        self.trace: bool = False
         # Function-table symbol name; a second lifted object in the same link
         # must use a different name than the default.
         self.table_name: str = "function_table"
@@ -348,6 +352,13 @@ class PPULifter:
             # Label
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+
+            # --trace: log the PC about to execute (control-flow trace for the
+            # PPU differential trace-diff). Emitted AFTER the label so a branch
+            # target's PC is logged when reached. PC-only for now (compute-value
+            # trace = ppu_trace_rt is a later phase).
+            if self.trace:
+                func.body_lines.append(f"    ppu_trace_pc(ctx, 0x{insn.addr:X});")
 
             c_line = self._translate(insn, func)
             if c_line:
@@ -467,20 +478,39 @@ class PPULifter:
             return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * "
                     f"(int64_t){_imm(ops[2])});")
 
-        if mn in ("mullw", "mullw."):
+        if mn in ("mullw", "mullw.", "mullwo", "mullwo."):
             # PowerISA: RT = the FULL 64-bit signed product of the low words.
             # The old (int64_t)(int32_t) truncation replaced the high word with
             # a sign copy, silently breaking every 32x32->64 idiom (fixed-point
             # audio/geometry math; conformance suite 2026-07-02).
+            # OE=1 (mullwo[.]): PowerISA_V2.03_Final_Public.pdf p.60/p.36 (XER
+            # bit 33) -- OV=1 iff the 32x32 signed product does not fit in 32
+            # bits; setting OV=1 also sets SO (sticky) and never clears SO.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)(int32_t)ctx->gpr[{ra}] * "
-                    f"(int64_t)(int32_t)ctx->gpr[{rb}]);")
+            prod = (f"((int64_t)(int32_t)ctx->gpr[{ra}] * (int64_t)(int32_t)ctx->gpr[{rb}])")
+            if mn.startswith("mullwo"):
+                return (f"{{ int64_t _p = {prod}; "
+                        f"uint32_t _ov = (_p != (int64_t)(int32_t)_p) ? 1u : 0u; "
+                        f"ctx->xer = (ctx->xer & ~(1u << 30)) | (_ov << 30); "
+                        f"if (_ov) ctx->xer |= (1u << 31); "
+                        f"ctx->gpr[{rd}] = (uint64_t)_p; }}")
+            return f"ctx->gpr[{rd}] = (uint64_t){prod};"
 
-        if mn in ("mulhw", "mulhw."):
+        # mulhwo/mulhwuo: PowerISA has NO architected OE form for the high-word
+        # multiplies (only mullw/mulld get an OE variant -- PowerISA
+        # V2.03 Book I sec 3.3.8/3.3.9 tables list mulhw/mulhwu with OE fixed
+        # at 0; XO=75/11 with OE=1 is a reserved encoding, most likely
+        # data-in-.text rather than a real instruction). ppu_disasm.py's
+        # generic xo_arith_3op OE-suffix logic (shared with mullw/mulld,
+        # which DO have OE forms) can still emit the mnemonic "mulhwo"/
+        # "mulhwuo" for such a reserved encoding, so accept it here and lift
+        # it identically to the plain form -- no XER write, since OE=1 is
+        # architecturally meaningless for this opcode.
+        if mn in ("mulhw", "mulhw.", "mulhwo", "mulhwo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((int64_t)(int32_t)ctx->gpr[{ra}] * (int64_t)(int32_t)ctx->gpr[{rb}] >> 32));"
 
-        if mn in ("mulhwu", "mulhwu."):
+        if mn in ("mulhwu", "mulhwu.", "mulhwuo", "mulhwuo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[{ra}] * (uint64_t)(uint32_t)ctx->gpr[{rb}] >> 32));"
 
@@ -706,6 +736,41 @@ class PPULifter:
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
                 return line
+            return f"/* {mn} unhandled operands: {insn.operands} */;"
+
+        # ------- Load/Store Multiple Word -------
+        # PowerISA_V2.03_Final_Public.pdf p.72 (Book I, section 3.3.5):
+        #   lmw RT,D(RA):  b = (RA=0) ? 0 : GPR[RA]; EA = b + EXTS(D);
+        #                  for r = RT..31: GPR(r) = 0x0..0 || MEM(EA,4); EA += 4
+        #     (n = 32-RT words load into the LOW-order 32 bits of GPRs RT..31,
+        #     high-order 32 bits zeroed -- same zero-extending 32-bit guest
+        #     load as lwz/vm_read32, just repeated for each register.)
+        #   stmw RS,D(RA): same EA; for r = RS..31: MEM(EA,4) = GPR(r)[32:63]; EA += 4
+        #     (store the low-order 32 bits of each GPR, same as stw/vm_write32.)
+        # rA must not be in the loaded/stored range per the ISA (invalid form
+        # otherwise) -- lifted straight per this task's spec, no guard needed.
+        if mn == "lmw":
+            rd_i = int(_reg_idx(ops[0]))
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                for i, r in enumerate(range(rd_i, 32)):
+                    off = f" + {i * 4}" if i else ""
+                    stmts.append(f" ctx->gpr[{r}] = vm_read32(_ea{off});")
+                stmts.append(" }")
+                return "".join(stmts)
+            return f"/* {mn} unhandled operands: {insn.operands} */;"
+
+        if mn == "stmw":
+            rs_i = int(_reg_idx(ops[0]))
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                for i, r in enumerate(range(rs_i, 32)):
+                    off = f" + {i * 4}" if i else ""
+                    stmts.append(f" vm_write32(_ea{off}, (uint32_t)ctx->gpr[{r}]);")
+                stmts.append(" }")
+                return "".join(stmts)
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
         # ------- Indexed Loads -------
@@ -1162,13 +1227,26 @@ class PPULifter:
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- 64-bit multiply / divide -------
-        if mn == "mulld":
+        # (mullw/mullw. handled earlier with the mullwo/mullwo. group -- that
+        # match comes first in this if-chain, so a second `mn == "mullw"`
+        # clause here would be dead/unreachable code; T7 fuzz sweep flagged
+        # it as shadowed and it has been removed.)
+        if mn in ("mulld", "mulld.", "mulldo", "mulldo."):
+            # PowerISA_V2.03_Final_Public.pdf p.60/p.36: OE=1 (mulldo[.]) sets
+            # OV=1 iff the true 128-bit signed product does not fit in 64 bits
+            # (i.e. the high 64 bits are not just the sign-extension of the
+            # low 64). Use _mul128/ppc_mulhd (already emitted for mulhd) to
+            # get the exact high half without signed-multiply-overflow UB.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)ctx->gpr[{ra}] * (int64_t)ctx->gpr[{rb}];"
-
-        if mn == "mullw":
-            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * (int32_t)ctx->gpr[{rb}]);"
+            if mn.startswith("mulldo"):
+                return (f"{{ int64_t _a = (int64_t)ctx->gpr[{ra}], _b = (int64_t)ctx->gpr[{rb}]; "
+                        f"uint64_t _lo = (uint64_t)_a * (uint64_t)_b; "
+                        f"int64_t _hi = ppc_mulhd(_a, _b); "
+                        f"uint32_t _ov = (_hi != ((int64_t)_lo >> 63)) ? 1u : 0u; "
+                        f"ctx->xer = (ctx->xer & ~(1u << 30)) | (_ov << 30); "
+                        f"if (_ov) ctx->xer |= (1u << 31); "
+                        f"ctx->gpr[{rd}] = _lo; }}")
+            return f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * (int64_t)ctx->gpr[{rb}]);"
 
         if mn == "divd":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1183,12 +1261,25 @@ class PPULifter:
                     f"ctx->gpr[{ra}] / ctx->gpr[{rb}] : 0;")
 
         # ------- Add/subtract extended (with carry) -------
-        if mn in ("adde", "adde."):
+        # addeo[.]: PowerISA_V2.03_Final_Public.pdf p.60/p.36 -- OE=1 sets
+        # XER[OV] = signed overflow of RA+RB+CA (64-bit), XER[SO] sticky-ORs
+        # with OV, matching RPCS3's ADDE (add64_flags + ppu_ov_set: same-sign
+        # operands, result sign differs -- rpcs3/Emu/Cell/PPUInterpreter.cpp
+        # ADDE/ppu_ov_set, semantics only, no code copied). CA logic unchanged.
+        if mn in ("adde", "adde.", "addeo", "addeo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ov_block = ""
+            if mn.startswith("addeo"):
+                ov_block = (
+                    f"uint32_t _ov = (((ctx->gpr[{ra}] ^ ctx->gpr[{rb}]) & 0x8000000000000000ULL) == 0 && "
+                    f"((ctx->gpr[{ra}] ^ result) & 0x8000000000000000ULL) != 0) ? 1u : 0u; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 30)) | (_ov << 30); "
+                    f"if (_ov) ctx->xer |= (1u << 31); ")
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
                     f"uint64_t result = ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
                     f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
                     f"((result < ctx->gpr[{ra}] || (ca && result == ctx->gpr[{ra}])) ? (1u << 29) : 0); "
+                    f"{ov_block}"
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn in ("addze", "addze."):
@@ -1199,14 +1290,27 @@ class PPULifter:
                     f"((result < ctx->gpr[{ra}]) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
-        if mn in ("subfe", "subfe."):
+        if mn in ("subfe", "subfe.", "subfeo", "subfeo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             # XER[CA] = ADC carry-out of (~RA + RB + ca), per RPCS3 add64_flags.
+            # subfeo[.]: PowerISA p.60/p.36 -- OE=1 sets XER[OV] = signed
+            # overflow of the same (~RA + RB + ca) sum (operands are ~RA and
+            # RB, exactly as SUBFE's own add64_flags call uses them; RPCS3's
+            # SUBFE ppu_ov_set: (~RA)[63]==RB[63] && (~RA)[63]!=result[63] --
+            # semantics only, no code copied). CA logic unchanged.
+            ov_block = ""
+            if mn.startswith("subfeo"):
+                ov_block = (
+                    f"uint32_t _ov = ((a ^ b) & 0x8000000000000000ULL) == 0 && "
+                    f"((a ^ result) & 0x8000000000000000ULL) != 0 ? 1u : 0u; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 30)) | (_ov << 30); "
+                    f"if (_ov) ctx->xer |= (1u << 31); ")
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
                     f"uint64_t a = ~ctx->gpr[{ra}], b = ctx->gpr[{rb}]; "
                     f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
                     f"uint64_t result = s1 + ca; co |= (result < s1); "
                     f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
+                    f"{ov_block}"
                     f"ctx->gpr[{rd}] = result; }}")
 
         # ------- addc/subfc (carry arithmetic, carry-out only, no carry-in) -------
@@ -2046,6 +2150,39 @@ class PPULifter:
                     f"for(int i=0;i<4;i++) r[i]=(int32_t)(int16_t)vrh(b,i); "
                     f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
 
+        if mn == "vupklsh":
+            # Unpack low signed halfword (AltiVec PEM 6-176, sec Fig 6-147):
+            # sign-extend the LOW 4 halfwords (BE elements 4-7, storage
+            # indices 4-7) to 4 words in vD (storage indices 0-3), same
+            # order. Mirror of vupkhsh over the low half. ops[-1] for vB
+            # (not ops[1] -- the operand-audit landmine noted for fsqrt).
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ void* b=&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)(int16_t)vrh(b,4+i); "
+                    f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)r[i]); }}")
+
+        if mn == "vupkhsb":
+            # Unpack high signed byte (AltiVec PEM 6-172, Fig 6-143):
+            # sign-extend the HIGH 8 signed bytes (storage indices 0-7) to
+            # 8 signed halfwords in vD (storage indices 0-7), same order.
+            # Bytes have no endianness (raw index == storage offset); only
+            # the halfword destination needs the BE lane helper (vsth).
+            # temp array so vD may alias vB. ops[-1] for vB.
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; int16_t r[8]; "
+                    f"for(int i=0;i<8;i++) r[i]=(int16_t)(int8_t)b[i]; "
+                    f"for(int i=0;i<8;i++) vsth(d,i,(uint16_t)r[i]); }}")
+
+        if mn == "vupklsb":
+            # Unpack low signed byte (AltiVec PEM 6-175, Fig 6-146):
+            # sign-extend the LOW 8 signed bytes (storage indices 8-15) to
+            # 8 signed halfwords in vD (storage indices 0-7), same order.
+            # Mirror of vupkhsb over the low half. ops[-1] for vB.
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; void* d=&ctx->vr[{vd}]; int16_t r[8]; "
+                    f"for(int i=0;i<8;i++) r[i]=(int16_t)(int8_t)b[8+i]; "
+                    f"for(int i=0;i<8;i++) vsth(d,i,(uint16_t)r[i]); }}")
+
         # Shifts and rotates
         if mn == "vslb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2400,6 +2537,12 @@ class PPULifter:
         self-contained)."""
         lines = [SOURCE_PREAMBLE.replace("{header_name}", self.header_name)]
 
+        # --trace: the runtime provides ppu_trace_pc (defined in the game project,
+        # extern "C"). ctx is passed but ignored (PC-only trace uses the PC arg +
+        # the current thread id), so a void* param avoids coupling to ppu_context.
+        if self.trace:
+            lines.append('extern "C" void ppu_trace_pc(void* ctx, uint32_t pc);')
+
         # Emit helper macros
         lines.append("/* Rotate helpers */")
         lines.append("static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {")
@@ -2717,16 +2860,18 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
 _WORKER_STATE: dict = {}
 
 
-def _worker_init(segs, big_endian, name_map):
+def _worker_init(segs, big_endian, name_map, trace=False):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
+    _WORKER_STATE["trace"] = trace
 
 
 def _worker_lift(task):
     idx0, bounds = task
     lifter = PPULifter()
     lifter.name_map = _WORKER_STATE["names"]
+    lifter.trace = _WORKER_STATE.get("trace", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -2755,7 +2900,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     done = 0
     t0 = time.time()
     with mp.Pool(processes=jobs, initializer=_worker_init,
-                 initargs=(segs, big_endian, lifter.name_map)) as pool:
+                 initargs=(segs, big_endian, lifter.name_map, lifter.trace)) as pool:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
             lifter.call_targets |= ct
@@ -2783,6 +2928,10 @@ def main() -> None:
     parser.add_argument("--base", type=lambda x: int(x, 0), default=0,
                         help="Base address (for raw binary)")
     parser.add_argument("--little-endian", action="store_true")
+    parser.add_argument("--trace", action="store_true",
+                        help="Emit ppu_trace_pc(ctx, PC) before every instruction for the "
+                             "PPU differential trace-diff (docs/TRACEDIFF.md). Produces a "
+                             "trace-enabled build; keep it aside (bloats every function).")
     parser.add_argument("--functions", metavar="FILE",
                         help="JSON file with function list [{start, end}, ...]")
     parser.add_argument("--names", metavar="FILE", default=None,
@@ -2945,6 +3094,7 @@ def main() -> None:
     lifter.set_code_ranges(func_bounds)
     lifter.table_name = args.table_name
     lifter.header_name = args.header_name
+    lifter.trace = args.trace
     if args.extern_funcs:
         decl_pat = re.compile(r"^void func_([0-9A-Fa-f]{8})\(ppu_context\* ctx\);",
                               re.M)
