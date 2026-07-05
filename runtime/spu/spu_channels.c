@@ -266,6 +266,42 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     switch (channel) {
     case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);       break;
     case SPU_WrOutIntrMbox:
+        /* DIAG (env YZ_INTRMBOX_LOG, 2026-07-04 -- pure diagnosis, log every
+         * class-2 doorbell write UNCONDITIONALLY before any routing decision,
+         * answering: does the SPU ever target port 17 / queue 2 (t1's SPURS
+         * event-flag queue, measured via group_connect_event_all_threads
+         * group=0x1000 queue=0x2 -> port=17), and if so is it routed or
+         * dropped. Decodes the same bit layout the routing code below uses
+         * (RPCS3 SPUThread.cpp:5969-6090: code = v>>24; code<64 send_event,
+         * 64..127 throw_event, 128/192 sys_event_flag set_bit); peeks
+         * ch_out_mbox without popping it (spu_group_spup_queue is pure/
+         * read-only, safe to call speculatively here even for codes the
+         * routing logic below won't treat as a queue doorbell). */
+        { static int intrmbox_log = -1;
+          if (intrmbox_log < 0) intrmbox_log = getenv("YZ_INTRMBOX_LOG") ? 1 : 0;
+          if (intrmbox_log) {
+              static unsigned long n = 0;
+              if (n < 200) {
+                  n++;
+                  uint32_t dcode = v >> 24;
+                  uint32_t dspup = dcode & 63;
+                  extern uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup);
+                  uint32_t dqid = (dcode < 128) ? spu_group_spup_queue(ctx->spu_group_id, dspup) : 0;
+                  const char* path;
+                  if (dcode < 128)
+                      path = dqid ? (dcode < 64 ? "send_event(routed)" : "throw_event(routed)")
+                                   : "DROPPED(no queue bound to port)";
+                  else if (dcode == 128 || dcode == 192)
+                      path = "eflag_set_bit";
+                  else
+                      path = "unrouted(buffered)";
+                  fprintf(stderr,
+                      "[intrmbox-log] #%lu spu_id=0x%X group=0x%X v=0x%08X code=%u "
+                      "port(spup)=%u -> queue=%u path=%s\n",
+                      n, ctx->spu_id, ctx->spu_group_id, v, dcode, dspup, dqid, path);
+                  fflush(stderr);
+              }
+          } }
         /* sys_spu_thread_send_event / throw_event delivery (2026-07-02; closes
          * the pt29 "NOT forwarded yet" gap). RPCS3 SPUThread.cpp
          * SPU_WrOutIntrMbox: code = v>>24; code<64 = send_event (acks CELL_OK
@@ -1288,6 +1324,56 @@ void spu_indirect_branch(spu_context* ctx)
               fprintf(stderr, "[poltrace] pc=0x%05X link=0x%05X wcl=0x%X gpr3=%08X\n",
                       lpc, link, wcl, ctx->gpr[3]._u32[0]);
               fflush(stderr); } } }
+    /* DIAG (env YZ_WID0_REQ, session 12 task 1 -- wid0 vs wid2 request-path
+     * comparison, RETIRE with the wid0-dispatch frontier): the policy's
+     * syscall re-entry is LS 0xA70 (module entry -- saves LR@0x2C80/SP@0x2C90,
+     * the taskset-syscall handler every task/self dispatch funnels through;
+     * SPURS_TASKSET.md "0xA70 = syscall handler"). On EVERY re-entry to 0xA70
+     * under image 2, dump: the RESIDENT taskset EA this policy instance has
+     * loaded (LS 0x27B8 taskset bptr, low32 @0x27BC -- same field [task-launch]
+     * already decodes), the request code (gpr3.word0 -- the ABI arg
+     * spursTasksetProcessRequest's `s32 request` per cellSpursSpu.cpp:1413),
+     * and the 6 taskset bitset words from the LOCAL COPY the policy just
+     * operated on (tempAreaTaskset @ LS 0x2700, cellSpurs.h:1237 layout,
+     * word0 of each = task 0's bit at 0x80000000): running@2700 ready@2710
+     * pending_ready@2720 enabled@2730 signalled@2740 waiting@2750. Filtered to
+     * the wid0/pxd taskset (0x40199D00) and wid2/gs_task taskset (captured via
+     * g_yz_taskset_ea) for a side-by-side compare -- does wid0 ever issue
+     * SELECT_TASK(5), and if not, what code does it loop on. */
+    { static int wr = -1; if (wr < 0) wr = getenv("YZ_WID0_REQ") ? 1 : 0;
+      if (wr && ctx->image_id == 2 && (ctx->pc & SPU_LS_MASK) == 0xA70u) {
+          const unsigned char* l = ctx->ls;
+          uint32_t tsPtr = ((uint32_t)l[0x27BC]<<24)|((uint32_t)l[0x27BD]<<16)
+                         |((uint32_t)l[0x27BE]<<8)|l[0x27BF];
+          extern uint32_t g_yz_taskset_ea;
+          int is_wid0 = (tsPtr == 0x40199D00u);
+          int is_wid2 = (g_yz_taskset_ea && tsPtr == g_yz_taskset_ea);
+          /* bring-up: unconditional hit counter + first-32 any-taskset dump,
+             so a zero-match run can distinguish "0xA70 never reached under
+             image 2" from "reached, but tsPtr never matches either taskset" */
+          { static unsigned long any = 0; any++;
+            static int an = 0; if (an < 32) { an++;
+                fprintf(stderr, "[wid0-req-any] spu=%X req=%d taskset=0x%08X g_yz_taskset_ea=0x%08X hitnum=%lu\n",
+                        ctx->spu_id, ctx->gpr[3]._s32[0], tsPtr, g_yz_taskset_ea, any);
+                fflush(stderr); } }
+          if (is_wid0 || is_wid2) {
+              uint32_t run  = ((uint32_t)l[0x2700]<<24)|((uint32_t)l[0x2701]<<16)|((uint32_t)l[0x2702]<<8)|l[0x2703];
+              uint32_t rdy  = ((uint32_t)l[0x2710]<<24)|((uint32_t)l[0x2711]<<16)|((uint32_t)l[0x2712]<<8)|l[0x2713];
+              uint32_t pend = ((uint32_t)l[0x2720]<<24)|((uint32_t)l[0x2721]<<16)|((uint32_t)l[0x2722]<<8)|l[0x2723];
+              uint32_t enb  = ((uint32_t)l[0x2730]<<24)|((uint32_t)l[0x2731]<<16)|((uint32_t)l[0x2732]<<8)|l[0x2733];
+              uint32_t sig  = ((uint32_t)l[0x2740]<<24)|((uint32_t)l[0x2741]<<16)|((uint32_t)l[0x2742]<<8)|l[0x2743];
+              uint32_t wait = ((uint32_t)l[0x2750]<<24)|((uint32_t)l[0x2751]<<16)|((uint32_t)l[0x2752]<<8)|l[0x2753];
+              static int n0 = 0, n2 = 0;
+              int* cnt = is_wid0 ? &n0 : &n2;
+              if (*cnt < 60) { (*cnt)++;
+                  fprintf(stderr, "[wid0-req] %s spu=%X req=%d(0x%X) taskset=0x%08X "
+                          "run=%08X rdy=%08X pend=%08X enb=%08X sig=%08X wait=%08X\n",
+                          is_wid0 ? "wid0" : "wid2",
+                          ctx->spu_id, ctx->gpr[3]._s32[0], ctx->gpr[3]._u32[0], tsPtr,
+                          run, rdy, pend, enb, sig, wait);
+                  fflush(stderr); }
+          }
+      } }
     /* DIAG (YZ_SPU_PROF): the StartTask divergence probe. After gs_task's ELF
      * loads, the policy splices a target into the LS 0x1E0 resume slot then
      * `bisl`s through it (policy 0x2308: lqa r2,0x1E0; bisl r2). RPCS3's HLE
