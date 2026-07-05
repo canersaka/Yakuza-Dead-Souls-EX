@@ -1,0 +1,23 @@
+# endian_audit_whitelist.txt
+#
+# Function names (one per line) that tools/endian_audit.py should NOT flag,
+# even though the heuristic's local-function-body rule fires on them.
+# Format: `function_name<whitespace>one-line reason`. '#'-comment and blank
+# lines are ignored. Matched by exact function name (not module-qualified) --
+# if a name collides across modules with different correctness, split the
+# heuristic rather than fight the collision here.
+#
+# Seeded 2026-07-05 (s14 T13 build) by triaging the FIRST unfiltered run
+# (290 raw suspects across 104 files) for the two false-positive classes the
+# workorder calls out: (a) already-audited modules whose bswap call lives in
+# a HELPER function, invisible to this tool's single-function-body rule; and
+# (b) host-only internal structs that never cross the guest vm-memory
+# boundary. Real per-field endianness bugs (e.g. cellFontOpenFontFile's
+# font->handle/scale_x, cellFsUtilGetFileSize's *size, cellRtc's tick
+# structs) were LEFT AS SUSPECTS on purpose -- they match the shape of bugs
+# already fixed elsewhere in sibling functions (cellFsRead's
+# `*nread = ps3_bswap64(...)`) and are exactly what T13 exists to surface.
+
+cellFsFstat	already-audited: calls fill_cellfs_stat() -> cellfs_stat_to_be() (libs/filesystem/cellFs.c:167,155) which DOES ps3_bswap32/64 every CellFsStat field; the swap call is one indirection away from this function's own body, outside this tool's single-function-body scope (documented limitation).
+cellFsStat	same helper-indirection class as cellFsFstat (calls fill_cellfs_stat() only; verified correct via cellfs_stat_to_be()).
+rsx_dsp_fragment_program	host-only internal RSX-dispatch accessor (libs/video/rsx_dispatch.c); `location` out-param is filled from register state and consumed only by libs/video/rsx_live_draw.c's local host variable `fp_loc` -- never written to or read from guest vm memory, so guest-endianness does not apply.
