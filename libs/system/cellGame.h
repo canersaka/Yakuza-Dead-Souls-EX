@@ -80,6 +80,15 @@ typedef struct CellGameContentSize {
     s32 sysSizeKB;
 } CellGameContentSize;
 
+/* Mirrors RPCS3's CellGameSetInitParams (input to cellGameCreateGameData). */
+typedef struct CellGameSetInitParams {
+    char title[128];
+    char titleId[10];
+    char reserved0[2];
+    char version[6];
+    char reserved1[66];
+} CellGameSetInitParams;
+
 /* ---------------------------------------------------------------------------
  * Configuration (call before game boots)
  * -----------------------------------------------------------------------*/
@@ -115,7 +124,8 @@ s32 cellGameGetParamInt(s32 id, s32* value);
 
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
 
-s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName);
+s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                            char* tmp_usrdirPath);
 
 s32 cellGameDeleteGameData(const char* dirName);
 

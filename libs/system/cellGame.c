@@ -340,9 +340,13 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
     return CELL_OK;
 }
 
-s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
+s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                            char* tmp_usrdirPath)
 {
     printf("[cellGame] CreateGameData()\n");
+
+    if (!init)
+        return CELL_GAME_ERROR_PARAM;
 
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, s_title_id);
@@ -354,18 +358,14 @@ s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
-    if (dirName) {
-        strncpy(dirName, s_title_id, CELL_GAME_PATH_MAX - 1);
-        dirName[CELL_GAME_PATH_MAX - 1] = '\0';
+    if (tmp_contentInfoPath) {
+        strncpy(tmp_contentInfoPath, path, CELL_GAME_PATH_MAX - 1);
+        tmp_contentInfoPath[CELL_GAME_PATH_MAX - 1] = '\0';
     }
 
-    if (size) {
-        /* hddFreeSizeKB is guest big-endian (see cellGameDataCheck). */
-        unsigned char* p = (unsigned char*)&size->hddFreeSizeKB;
-        u32 v = 1024u * 1024u;
-        p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v;
-        size->sizeKB = 0;
-        size->sysSizeKB = 0;
+    if (tmp_usrdirPath) {
+        strncpy(tmp_usrdirPath, usrdir, CELL_GAME_PATH_MAX - 1);
+        tmp_usrdirPath[CELL_GAME_PATH_MAX - 1] = '\0';
     }
 
     return CELL_OK;

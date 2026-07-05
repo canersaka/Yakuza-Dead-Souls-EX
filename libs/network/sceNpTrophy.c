@@ -296,9 +296,11 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
 
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
+                               SceNpTrophyStatusCallback statusCb,
+                               void* callbackArg,
                                u64 options)
 {
-    (void)options;
+    (void)statusCb; (void)callbackArg; (void)options;
 
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;

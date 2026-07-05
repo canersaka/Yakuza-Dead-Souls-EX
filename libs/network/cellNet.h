@@ -38,10 +38,10 @@ typedef struct CellNetCtlInitParam {
 
 /* Core network init/term */
 s32 cellNetCtlInit(void);
-s32 cellNetCtlTerm(void);
+void cellNetCtlTerm(void);
 
 /* Network pool management */
-s32 sys_net_initialize_network_ex(u32 poolSize);
+s32 sys_net_initialize_network_ex(void* param);
 s32 sys_net_finalize_network(void);
 
 /* Cell network init (high-level) */

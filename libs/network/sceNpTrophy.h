@@ -120,8 +120,15 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context);
 s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle);
 s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
 
+/* statusCb is a guest callback pointer (raw); callbackArg is opaque userdata
+ * (raw guest value -- see gen_imports.py's param_marshal naming convention). */
+typedef s32 (*SceNpTrophyStatusCallback)(SceNpTrophyContext context, s32 status,
+                                          s32 completed, s32 total, void* callbackArg);
+
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
+                               SceNpTrophyStatusCallback statusCb,
+                               void* callbackArg,
                                u64 options);
 
 s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,

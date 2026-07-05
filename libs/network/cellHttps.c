@@ -42,42 +42,26 @@ static int https_alloc(void)
  * API
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpsInit(const CellHttpsConfig* config, CellHttpsHandle* handle)
+s32 cellHttpsInit(u32 caCertNum, const CellHttpsData* caList)
 {
-    printf("[cellHttps] Init()\n");
+    (void)caCertNum; (void)caList;
+    printf("[cellHttps] Init(caCertNum=%u)\n", caCertNum);
 
-    if (!handle) return (s32)CELL_HTTPS_ERROR_INVALID_ARGUMENT;
+    if (s_https_initialized)
+        return (s32)CELL_HTTPS_ERROR_ALREADY_INITIALIZED;
 
-    int slot = https_alloc();
-    if (slot < 0) return (s32)CELL_HTTPS_ERROR_OUT_OF_MEMORY;
-
-    s_slots[slot].in_use = 1;
-    s_slots[slot].hasCACert = 0;
-    s_slots[slot].hasClientCert = 0;
-
-    if (config) {
-        s_slots[slot].sslVersion = config->sslVersion;
-        s_slots[slot].verifyPeer = config->verifyPeer;
-        s_slots[slot].verifyHost = config->verifyHost;
-    } else {
-        s_slots[slot].sslVersion = CELL_HTTPS_SSLVERSION_TLSV1;
-        s_slots[slot].verifyPeer = 1;
-        s_slots[slot].verifyHost = 1;
-    }
-
-    *handle = (CellHttpsHandle)slot;
     s_https_initialized = 1;
     return CELL_OK;
 }
 
-s32 cellHttpsEnd(CellHttpsHandle handle)
+s32 cellHttpsEnd(void)
 {
-    printf("[cellHttps] End(%u)\n", handle);
+    printf("[cellHttps] End()\n");
 
-    if (handle >= HTTPS_MAX_HANDLES || !s_slots[handle].in_use)
-        return (s32)CELL_HTTPS_ERROR_INVALID_ARGUMENT;
+    if (!s_https_initialized)
+        return (s32)CELL_HTTPS_ERROR_NOT_INITIALIZED;
 
-    memset(&s_slots[handle], 0, sizeof(HttpsSlot));
+    s_https_initialized = 0;
     return CELL_OK;
 }
 

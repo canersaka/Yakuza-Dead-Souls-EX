@@ -56,9 +56,15 @@ typedef struct CellHttpsCertInfo {
     u64 notAfter;
 } CellHttpsCertInfo;
 
+/* Mirrors RPCS3's CellHttpsData: one CA-cert blob {ptr, size} in a caList array. */
+typedef struct CellHttpsData {
+    char* ptr;
+    u32   size;
+} CellHttpsData;
+
 /* Functions */
-s32 cellHttpsInit(const CellHttpsConfig* config, CellHttpsHandle* handle);
-s32 cellHttpsEnd(CellHttpsHandle handle);
+s32 cellHttpsInit(u32 caCertNum, const CellHttpsData* caList);
+s32 cellHttpsEnd(void);
 
 s32 cellHttpsSetCACert(CellHttpsHandle handle, const void* cert,
                        u32 certSize, u32 certType);
