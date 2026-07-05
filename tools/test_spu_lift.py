@@ -58,7 +58,10 @@ required before any relift that touches spu_lifter.py / spu_disasm.py.
 """
 
 import argparse
+import glob
+import importlib
 import os
+import random
 import re
 import struct
 import subprocess
@@ -103,6 +106,14 @@ def enc_ri18(op7, rt, i18):
 def enc_rrr(op4, rt, ra, rb, rc):
     # SPU ISA RRR: op(4) | RT(7, dest) | RB(7) | RA(7) | RC(7), MSB->LSB.
     return (op4 << 28) | (rt << 21) | (rb << 14) | (ra << 7) | rc
+
+def enc_ri8(op10, rt, ra, i8):
+    # RI8 (float<->int scale conversions cflts/cfltu/csflt/cuflt): a 10-bit
+    # opcode at bits 31:22, an 8-bit immediate at bits 21:14, RA at 13:7, RT
+    # at 6:0 (see tools/spu_disasm.py's op10/ri8_table decode). Distinct from
+    # enc_ri10 (8-bit opcode + 10-bit immediate) -- same field COUNT, swapped
+    # widths, so it needs its own encoder.
+    return (op10 << 22) | ((i8 & 0xFF) << 14) | (ra << 7) | rt
 
 # ---------------------------------------------------------------------------
 # Reference lane utilities: registers are lists of 4 u32 SPU words
@@ -883,7 +894,12 @@ def run_suite():
         f.write("@echo off\n")
         f.write(f'call "{vcvars}" >nul 2>nul\n')
         f.write(f'cd /d "{ROOT}"\n')
-        f.write(f'cl /nologo /O1 /W3 /std:c17 /I {OUTDIR} /I runtime\\spu '
+        # /bigobj: a large --fuzz N x all-families run (e.g. 200 x 152
+        # mnemonics = 30k+ cases in one translation unit) can exceed the
+        # default COFF object section-table limit (MSVC C1128). /bigobj
+        # lifts that limit with no semantic effect on the compiled code --
+        # safe to always pass.
+        f.write(f'cl /nologo /O1 /W3 /std:c17 /bigobj /I {OUTDIR} /I runtime\\spu '
                 f'/Fo{OUTDIR}\\ /Fe:{exe} '
                 f'{OUTDIR}\\spu_conf_driver.c {OUTDIR}\\spu_recomp.c '
                 f'> "{log}" 2>&1\n')
@@ -919,7 +935,11 @@ def summarize(kept, skipped, log_text, verbose):
     print()
     print(f'{"family":<14}{"cases":>6}{"pass":>6}{"fail":>6}  notes')
     tot_pass = tot_fail = 0
-    for fam in FAMILIES:
+    # Family order from the kept cases (dedup, insertion-ordered). For the
+    # static suite this equals FAMILIES; for --fuzz it is the per-mnemonic
+    # FUZZ_FAMILIES set, so the table populates either way.
+    fam_order = list(dict.fromkeys(c["family"] for c in kept))
+    for fam in fam_order:
         fam_cases = [c for c in kept if c["family"] == fam]
         n = len(fam_cases)
         nf = sum(1 for c in fam_cases if (fam, c["name"]) in fails)
@@ -940,15 +960,398 @@ def summarize(kept, skipped, log_text, verbose):
     return tot_fail
 
 
+# ===========================================================================
+# SPU FUZZ REF-FUNCTION CONTRACT + generative --fuzz mode.
+#
+# The static suite above hand-writes one dict per (mnemonic, input-vector). The
+# fuzzer, mirroring tools/test_ppu_lift.py's --fuzz design, instead draws N
+# edge-biased operand sets per registered mnemonic, encodes each with the SAME
+# enc_* encoders (so an encoding slip reports as ENCODING, never as a false
+# lifter failure), and reuses the SAME lift_and_emit / emit_driver / run_suite
+# machinery -- it is not a second harness. Only the case source differs: the
+# fuzzer builds FUZZ_CASES (module CASES stays untouched, so a plain no-flag run
+# is byte-identical to before this section existed).
+#
+# ---------------------------------------------------------------------------
+# THE REF-FUNCTION CONTRACT (verbatim -- Phase-2 agents follow this exactly)
+# ---------------------------------------------------------------------------
+#
+# 1. u128 REPRESENTATION. A register value is a Python list of 4 uint32 SPU
+#    WORDS: [w0, w1, w2, w3], index 0 = SPU word 0 = the PREFERRED SLOT. This is
+#    IDENTICALLY ctx->gpr[r]._u32[i] in runtime/spu (see spu_context.h /
+#    ps3types.h u128 union). Word 0 is the MOST-SIGNIFICANT (big-endian leftmost)
+#    32 bits of the 128-bit architectural quadword; word 3 is least-significant.
+#      - Byte view: to_b(v) returns 16 ints, BIG-ENDIAN, byte 0 first. Byte 0 =
+#        bits 24..31 of word 0 (the quadword's most-significant byte). from_b()
+#        is its inverse. NEVER cast to host byte order -- always go through
+#        to_b/from_b for byte ops (shufb/cbd/gbb/...), to_h/from_h for halfword
+#        ops. This byte order is why the whole SPU bug class exists; get it via
+#        these helpers and it is correct by construction.
+#      - Quadword view: to_q(v) packs the 4 words MSB-first into one 128-bit
+#        Python int (word 0 in bits 96..127); from_q() unpacks. Use for whole-
+#        quadword bit/byte rotates.
+#
+# 2. WRITING A REF. A ref is a pure Python function of the operand VALUES; it
+#    computes the architectural result straight from the ISA v1.2 RTL and
+#    returns a 4-word list [w0,w1,w2,w3]. It must NOT reference the lifter,
+#    helpers, or ctx -- it is the independent oracle the lifter is checked
+#    against. Immediates arrive ALREADY SIGN-EXTENDED to the Python int the ISA
+#    field holds (e.g. il's I16 arrives in [-32768,32767]; ri10's imm in
+#    [-512,511]); mask/re-expand inside the ref exactly as the RTL does.
+#
+# 3. HOW A REF REGISTERS. Put refs in a NEW file
+#    tools/spu_fuzz_refs/spu_refs_<group>.py (one per family). At module top:
+#        from spu_refs_api import register, to_b, from_b, to_h, from_h, sext, M32
+#    then for each mnemonic call, at import time:
+#        register("<mnemonic>", "<form>", <ref_fn>, op11=0x0C0)   # opcode kwarg
+#    `form` fixes BOTH the encoding and the ref signature (see FUZZ_FORMS below):
+#        "rr1"  ref(a)        one source reg          enc_rr(op11,...)
+#        "rr"   ref(a, b)     two source regs         enc_rr(op11,...)
+#        "rrt"  ref(a, b, t)  two srcs + RT-as-input  enc_rr(op11,...)
+#        "ri7"  ref(a, i7)    src + 7-bit imm         enc_ri7(op11,...)
+#        "ri10" ref(a, imm)   src + signed 10-bit     enc_ri10(op8,...)
+#        "ri16" ref(i16)      imm only                enc_ri16(op9,...)
+#        "ri16t" ref(t, i16)  imm + RT-as-input       enc_ri16(op9,...)
+#        "ri18" ref(i18)      imm only                enc_ri18(op7,...)
+#        "rrr"  ref(a, b, c)  three source regs       enc_rrr(op4,...)
+#        "ri8"  ref(a, i8)    src + 8-bit unsigned imm enc_ri8(op10,...)
+#               (RI8 float<->int scale conversions cflts/cfltu/csflt/cuflt;
+#               10-bit opcode + 8-bit immediate -- distinct field widths from
+#               ri10's 8-bit-opcode + 10-bit-immediate, needs its own opcode
+#               kwarg `op10`)
+#    Pass the matching opcode kwarg (op11 / op8 / op9 / op7 / op4 / op10).
+#    Optional kwargs: imm_pool=[...] (explicit immediate draw list),
+#    subtle=True (marks the family byte-order/quadword/preferred-slot
+#    sensitive -- informational), no_nan=True (this ref interprets a
+#    register operand as an IEEE float and there is no single well-defined
+#    result once any operand is a NaN -- real hardware/compilers may emit
+#    any valid NaN payload, or the runtime's C code may hit undefined
+#    behavior casting a NaN to an integer; no_nan scrubs NaN bit patterns
+#    out of every register draw for that mnemonic so each generated case
+#    stays a well-defined, bit-exact comparison. Used by the float family.)
+#    The three worked examples live in
+#    tools/spu_fuzz_refs/spu_refs_examples.py; copy it.
+#
+# 4. RUNNING THE HARNESS ON JUST YOUR GROUP. The fuzzer auto-discovers every
+#    tools/spu_fuzz_refs/spu_refs_*.py. To fuzz only your family while
+#    iterating:
+#        py -3 tools\test_spu_lift.py --fuzz 200 --seed 0 --refs spu_refs_myfam
+#    (--refs takes one or more module basenames, no .py; omit it to load ALL
+#    plug-ins). Add --emit to stop after writing C. A GREEN line + exit 0 means
+#    every generated case matched the ref. To reproduce a specific FAIL, the
+#    case name embeds the encoded word hex + decoded mnemonic/operands, and the
+#    run is fully deterministic in (N, seed).
+# ===========================================================================
+
+FUZZ_CASES = []
+FUZZ_FAMILIES = []          # mnemonic order = registration order
+
+# Edge-biased operand DRAWS for a full 4-word SPU register. Each entry is a
+# 4-word list. Covers: zero, all-ones, per-lane sign boundaries (word/half/byte),
+# per-byte-lane ramp 00..0F (the identity byte pattern shufb/genctl hinge on),
+# a reverse byte ramp, preferred-slot-only values (junk elsewhere -- catches a
+# helper reading the wrong slot), and quadword-boundary bit patterns.
+_ZERO   = [0, 0, 0, 0]
+_ONES   = [M32, M32, M32, M32]
+_RAMP   = [0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F]   # bytes 00..0F
+_RAMPR  = [0x1F1E1D1C, 0x1B1A1918, 0x17161514, 0x13121110]   # reverse (10..1F)
+_WSIGN  = [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00000001]
+_HSIGN  = [0x7FFF8000, 0x0001FFFF, 0x80007FFF, 0xFFFF0000]
+_BSIGN  = [0x7F80FF00, 0x017FFE80, 0x00FF017F, 0x8081007F]
+_QHI    = [0x80000000, 0, 0, 0]                              # quadword MSB only
+_QLO    = [0, 0, 0, 0x00000001]                              # quadword LSB only
+_MID    = [0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000]   # word-boundary split
+_EDGE_VECS = [_ZERO, _ONES, _RAMP, _RAMPR, _WSIGN, _HSIGN, _BSIGN,
+              _QHI, _QLO, _MID]
+
+# Preferred-slot-only draws: an interesting value in word 0, DISTINCT junk in
+# words 1..3, so any ref/helper that (wrongly) reads a non-preferred slot for a
+# count/selector diverges. Word-0 values span the count regimes shift/rotate/
+# genctl families care about (0, small, byte/quadword boundaries, all-ones).
+_PREF_W0 = [0x00000000, 0x00000001, 0x00000003, 0x00000005, 0x00000007,
+            0x00000008, 0x0000000F, 0x00000010, 0x0000001F, 0x00000020,
+            0x0000007F, 0x00000080, 0x000000FF, 0x0000FFFF, 0xFFFFFFFF,
+            0x00000088, 0x00008001]
+_PREF_JUNK = (0xDEAD0001, 0xBEEF0002, 0xF00D0003)
+
+
+def _mask_nan_word(w):
+    """If a uint32 word's bits decode as an IEEE-754 float32 NaN (exponent
+    all-1s, mantissa nonzero), clear the low mantissa bit so it becomes a
+    well-defined +/-inf instead (single-precision float family: fa/fs/fm/
+    fma/fms/fnms and the ri8 float<->int scale converts cflts/cfltu)."""
+    if (w & 0x7F800000) == 0x7F800000 and (w & 0x007FFFFF) != 0:
+        return w & 0xFF800000            # keep sign+exponent, zero mantissa -> +/-inf
+    return w
+
+
+def _mask_nan_dword(hi, lo):
+    """Like _mask_nan_word but for a big-endian IEEE-754 DOUBLE spanning two
+    adjacent SPU words (hi = word 2i, lo = word 2i+1 -- see spu_refs_float.py
+    _d()/_dw()): if the 64-bit reassembly is a NaN (11-bit exponent all-1s,
+    52-bit mantissa nonzero), clear the low mantissa word to force +/-inf."""
+    exp = (hi >> 20) & 0x7FF
+    mant_hi = hi & 0xFFFFF
+    if exp == 0x7FF and (mant_hi != 0 or lo != 0):
+        return hi & 0xFFF00000, 0        # keep sign+exponent, zero mantissa -> +/-inf
+    return hi, lo
+
+
+def _fuzz_reg_no_nan(rng):
+    """Like _fuzz_reg, but scrubs any word whose bits would decode as a
+    float32 NaN (see _mask_nan_word), AND scrubs any adjacent word-pair that
+    would decode as a float64/double NaN (see _mask_nan_dword) -- covers both
+    the single-precision float family (fa/fs/fm/fma/fms/fnms, the ri8 scale
+    converts) and the double-precision family (dfa/dfs/dfm/dfma/dfms/dfnms/
+    dfnma, fesd, frds), which reinterpret the SAME 4-word draw at different
+    granularities. Use for any ref that interprets a register operand as a
+    float and cannot define a NaN-input expectation without either emitting
+    an arbitrary (implementation-defined) NaN payload or hitting outright
+    undefined behavior."""
+    words = [_mask_nan_word(w) for w in _fuzz_reg(rng)]
+    out = list(words)
+    for i in (0, 1):
+        hi, lo = _mask_nan_dword(out[2 * i], out[2 * i + 1])
+        out[2 * i], out[2 * i + 1] = hi, lo
+    return out
+
+
+def _fuzz_reg(rng):
+    """One edge-biased-or-uniform 4-word register draw."""
+    r = rng.random()
+    if r < 0.35:
+        return list(rng.choice(_EDGE_VECS))
+    if r < 0.55:
+        # preferred-slot-only: interesting word 0, distinct junk elsewhere.
+        return [rng.choice(_PREF_W0), *_PREF_JUNK]
+    if r < 0.70:
+        # per-lane mix of edge words (independent sign boundaries per lane).
+        pool = [0, M32, 0x7FFFFFFF, 0x80000000, 0x7FFF8000, 0x0000FFFF,
+                0x7F80FF00, 0x00000001, 0xFFFF0000, 0x80000001]
+        return [rng.choice(pool) for _ in range(4)]
+    return [rng.getrandbits(32) for _ in range(4)]
+
+
+def _fuzz_imm(rng, form, imm_pool):
+    """One immediate draw for an immediate-form family. Edge-biased over the
+    sign boundaries of the field width, then optionally an explicit pool."""
+    if imm_pool is not None and rng.random() < 0.6:
+        return rng.choice(imm_pool)
+    if form == "ri7":                          # 7-bit unsigned field 0..127
+        return rng.choice([0, 1, 4, 7, 8, 15, 16, 31, 63, 0x70, 0x7F,
+                           rng.randint(0, 0x7F)])
+    if form == "ri8":                          # 8-bit unsigned field 0..255
+        return rng.choice([0, 1, 127, 128, 155, 173, 254, 255,
+                           rng.randint(0, 0xFF)])
+    if form == "ri10":                         # signed 10-bit -512..511
+        return rng.choice([0, 1, -1, 255, -256, 511, -512,
+                           rng.randint(-512, 511)])
+    if form == "ri16":                         # signed 16-bit -32768..32767
+        return rng.choice([0, 1, -1, -4, 0x7FFF, -0x8000, 0x0101, 0x8000,
+                           rng.randint(-0x8000, 0x7FFF)])
+    if form == "ri18":                         # unsigned 18-bit 0..0x3FFFF
+        return rng.choice([0, 1, 0x12345, 0x3FFFF, rng.randint(0, 0x3FFFF)])
+    return rng.randint(-0x8000, 0x7FFF)
+
+
+def _fuzz_add(mn, word, ref_regs, exp, note=None):
+    """Append one fuzz case (same dict shape lift_and_emit/emit_driver need).
+    Round-trips the encoded word through spu_decode so an encoding mistake is
+    flagged as ENCODING (matching the static add()); the decoded mnemonic/
+    operands are stamped into the name so a FAIL line is self-contained."""
+    if mn not in FUZZ_FAMILIES:
+        FUZZ_FAMILIES.append(mn)
+    insn = spu_disasm.spu_decode(word, 0)
+    enc_err = None
+    if insn.mnemonic != mn:
+        enc_err = f"decoded as '{insn.mnemonic} {insn.operands}' (wanted {mn})"
+    exp = [w & M32 for w in exp]
+    canary = CANARY if exp != CANARY else [0x3C3C3C3C] * 4
+    # Name embeds the seeded input VALUES so every generated case is uniquely
+    # named (immediate-form families all encode to the same word, and the fixed
+    # RA/RB slots make the operand string identical too -- without the inputs
+    # the summary can't key distinct failures). A FAIL line is thus fully self-
+    # contained: encoded word + decoded operands + the exact input registers.
+    ins = " ".join(f"r{r}=" + ".".join(f"{w:08X}" for w in v)
+                   for r, v in sorted(ref_regs.items()))
+    idx = len(FUZZ_CASES)
+    name = f"#{idx} {mn} word=0x{word:08X} ops=[{insn.operands}] in[{ins}]"
+    FUZZ_CASES.append(dict(family=mn, name=name, word=word, mn=mn,
+                           in_regs={r: [w & M32 for w in v]
+                                    for r, v in ref_regs.items()},
+                           expect=exp, canary=canary, note=note,
+                           enc_err=enc_err, todo=False, addr=None))
+
+
+REFS_DIR = os.path.join(TOOLS, "spu_fuzz_refs")
+
+
+def discover_refs(only=None):
+    """Import every tools/spu_fuzz_refs/spu_refs_*.py (or only the named
+    basenames) and return the populated REGISTRY. Plug-ins register at
+    import time. This is a STANDING gate directory (not scratch/): the ref
+    files are the fuzzer's permanent oracle set, versioned alongside the
+    harness they check."""
+    if REFS_DIR not in sys.path:
+        sys.path.insert(0, REFS_DIR)
+    import spu_refs_api                       # noqa: E402  (registry lives here)
+    importlib.reload(spu_refs_api)            # fresh REGISTRY per run
+    spu_refs_api.REGISTRY.clear()
+    if only:
+        mods = [m if m.endswith(".py") else m + ".py" for m in only]
+        paths = [os.path.join(REFS_DIR, m) for m in mods]
+    else:
+        paths = sorted(glob.glob(os.path.join(REFS_DIR, "spu_refs_*.py")))
+        paths = [p for p in paths if os.path.basename(p) != "spu_refs_api.py"]
+    for p in paths:
+        base = os.path.splitext(os.path.basename(p))[0]
+        if base == "spu_refs_api":
+            continue
+        if base in sys.modules:
+            importlib.reload(sys.modules[base])
+        else:
+            importlib.import_module(base)
+    return spu_refs_api.REGISTRY
+
+
+def build_fuzz_cases(n, seed, registry):
+    """Populate FUZZ_CASES: n edge-biased cases per registered mnemonic."""
+    rng = random.Random(seed)
+    for mn, spec in registry.items():
+        form, ref, opts = spec["form"], spec["ref"], spec["opts"]
+        imm_pool = opts.get("imm_pool")
+        note = "SUBTLE (byte-order/quadword/preferred-slot)" if opts.get("subtle") else None
+        # no_nan=True: this mnemonic's ref interprets a register operand as
+        # an IEEE float and there is no single well-defined result once ANY
+        # operand is a NaN -- real hardware/compilers are free to produce
+        # any valid NaN payload (arithmetic ops) or invoke C-level UB
+        # (float->int casts), so a fabricated expectation would risk a false
+        # FAIL against a different, equally-valid NaN outcome. Draw
+        # NaN-scrubbed registers instead so every generated case is a
+        # genuinely well-defined (finite or +-inf) comparison. Used by the
+        # float family (tools/spu_fuzz_refs/spu_refs_float.py) for both its
+        # ri8 (cflts/cfltu int-cast) and rr/rrt/rrr (fa/fs/fm/fma/...
+        # arithmetic) mnemonics.
+        draw = _fuzz_reg_no_nan if opts.get("no_nan") else _fuzz_reg
+        for _ in range(n):
+            if form == "rr1":
+                a = draw(rng)
+                w = enc_rr(opts["op11"], RT, RA)
+                _fuzz_add(mn, w, {RA: a}, ref(a), note)
+            elif form == "rr":
+                a, b = draw(rng), draw(rng)
+                w = enc_rr(opts["op11"], RT, RA, RB)
+                _fuzz_add(mn, w, {RA: a, RB: b}, ref(a, b), note)
+            elif form == "rrt":
+                a, b, t = draw(rng), draw(rng), draw(rng)
+                w = enc_rr(opts["op11"], RT, RA, RB)
+                _fuzz_add(mn, w, {RA: a, RB: b, RT: t}, ref(a, b, t), note)
+            elif form == "ri7":
+                a = draw(rng)
+                i7 = _fuzz_imm(rng, form, imm_pool) & 0x7F
+                w = enc_ri7(opts["op11"], RT, RA, i7)
+                _fuzz_add(mn, w, {RA: a}, ref(a, i7), note)
+            elif form == "ri10":
+                a = _fuzz_reg(rng)
+                imm = _fuzz_imm(rng, form, imm_pool)
+                w = enc_ri10(opts["op8"], RT, RA, imm)
+                _fuzz_add(mn, w, {RA: a}, ref(a, imm), note)
+            elif form == "ri8":
+                # ri8 is exclusively the float<->int scale-convert family
+                # (cflts/cfltu read RA as a float and cast to an integer --
+                # a NaN RA is undefined behavior in C). Its refs register
+                # with no_nan=True, so `draw` is already _fuzz_reg_no_nan.
+                a = draw(rng)
+                i8 = _fuzz_imm(rng, form, imm_pool) & 0xFF
+                w = enc_ri8(opts["op10"], RT, RA, i8)
+                _fuzz_add(mn, w, {RA: a}, ref(a, i8), note)
+            elif form == "ri16":
+                i16 = _fuzz_imm(rng, form, imm_pool)
+                w = enc_ri16(opts["op9"], RT, i16)
+                _fuzz_add(mn, w, {}, ref(i16), note)
+            elif form == "ri16t":
+                t = _fuzz_reg(rng)
+                i16 = _fuzz_imm(rng, form, imm_pool)
+                w = enc_ri16(opts["op9"], RT, i16)
+                _fuzz_add(mn, w, {RT: t}, ref(t, i16), note)
+            elif form == "ri18":
+                i18 = _fuzz_imm(rng, form, imm_pool) & 0x3FFFF
+                w = enc_ri18(opts["op7"], RT, i18)
+                _fuzz_add(mn, w, {}, ref(i18), note)
+            elif form == "rrr":
+                a, b, c = draw(rng), draw(rng), draw(rng)
+                w = enc_rrr(opts["op4"], RT, RA, RB, RC)
+                _fuzz_add(mn, w, {RA: a, RB: b, RC: c}, ref(a, b, c), note)
+            else:
+                raise ValueError(f"{mn}: unknown ref form {form!r}")
+    return FUZZ_CASES
+
+
+def run_fuzz(n, seed, only, emit_only, verbose):
+    reg = discover_refs(only)
+    if not reg:
+        where = f" (looked for {only})" if only else \
+                " (no tools/spu_fuzz_refs/spu_refs_*.py found)"
+        print(f"[spu-fuzz] no refs registered{where} -- nothing to fuzz")
+        return 1
+    print(f"[spu-fuzz] N={n} seed={seed} refs={sorted(reg)}")
+    build_fuzz_cases(n, seed, reg)
+    kept, skipped = [], 0
+    for c in FUZZ_CASES:
+        if c["enc_err"]:
+            print(f'ENCODING [{c["family"]}] {c["name"]}: {c["enc_err"]} '
+                  f'-- case skipped')
+            skipped += 1
+        else:
+            kept.append(c)
+    lifter = lift_and_emit(kept)
+    emit_driver(kept)
+    n_todo = sum(1 for c in kept if c["todo"])
+    print(f"[spu-fuzz] generated {len(kept)} cases "
+          f"({skipped} encoding-skipped, {n_todo} lifted as TODO no-op)")
+    if lifter.unsupported:
+        print(f"  lifter TODO mnemonics: {', '.join(sorted(lifter.unsupported))}")
+    if emit_only:
+        return 0
+    rc, log_text = run_suite()
+    if rc == 2:
+        print("COMPILE FAILED -- see", os.path.join(OUTDIR, "spu_conformance.log"))
+        for ln in log_text.splitlines():
+            if "error" in ln.lower():
+                print(ln)
+        return 2
+    n_fail = summarize(kept, skipped, log_text, verbose)
+    green = (n_fail == 0)
+    print(f"[spu-fuzz] seed={seed} N={n}: "
+          f"{'GREEN' if green else 'FAILURES FOUND'}")
+    return 0 if green else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--emit", action="store_true",
                     help="only generate the blob + lifted C + driver")
     ap.add_argument("--verbose", action="store_true",
                     help="print PASS lines too")
+    ap.add_argument("--fuzz", nargs="?", const=200, default=None, type=int,
+                    help="generative fuzz mode: N edge-biased cases per "
+                         "registered mnemonic (default 200) instead of the "
+                         "static suite; refs come from "
+                         "tools/spu_fuzz_refs/spu_refs_*.py")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="fuzz PRNG seed (deterministic; default 0)")
+    ap.add_argument("--refs", nargs="+", default=None,
+                    help="fuzz only these ref-module basenames (no .py); "
+                         "omit to load every "
+                         "tools/spu_fuzz_refs/spu_refs_*.py")
     args = ap.parse_args()
 
     os.makedirs(OUTDIR, exist_ok=True)
+
+    if args.fuzz is not None:
+        sys.exit(run_fuzz(args.fuzz, args.seed, args.refs,
+                          args.emit, args.verbose))
+
     build_cases()
 
     kept, skipped = [], 0
