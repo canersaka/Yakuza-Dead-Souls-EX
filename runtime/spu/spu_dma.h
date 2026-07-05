@@ -912,6 +912,47 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   line[0x33] = 0; ls_ptr[0x33] = 0;   /* wklPendingContention[3] = 0 */
                   line[0x03] = 1; ls_ptr[0x03] = 1;   /* wklReadyCount1[3]        = 1 */
               } }
+            /* SESSION 11 TASK 1 FORCING EXPERIMENT (env YZ_FORCE_WID0, 2026-07-04,
+             * DIAGNOSTIC ONLY -- LESSONS #13 band-aid hygiene, kill-switched off by
+             * default, never the shipped fix). Mirrors YZ_FRC's mechanism (direct
+             * mutation of the GETLLAR'd SPURS mgmt line so the write survives the
+             * kernel's own PUTLLC/CAS) but targets wid0 instead of wid2: force
+             * wklReadyCount1[0] (line/ls +0x00) to 1 and set the wklSignal1 bit0
+             * (line/ls +0x70 bit 0x8000) EVERY time the kernel GETLLARs the mgmt
+             * line, so wid0's SELECT gate
+             *   run && prio>0 && maxContention>realContention && (signal||readyCount>realContention)
+             * (spu_dma.h sel0 above) is forced true continuously -- not a one-shot,
+             * because the kernel's own PUTLLC can clear a consumed signal bit and
+             * we need wid0 selectable across the whole boot to see whether its
+             * workload ever runs and fires the port-17 heartbeat doorbell (STATUS.md
+             * SESSION 11). Does NOT touch maxContention/priority/run (those are
+             * measured already-set per STATUS.md; only the missing OR-term is
+             * supplied). Report MEASURED effect; if wid0 forcing doesn't move t1,
+             * retest with YZ_FORCE_WID1 (below) instead -- whichever produces the
+             * heartbeat is the confirmed producer. */
+            { static int fw0 = -1; if (fw0 < 0) fw0 = getenv("YZ_FORCE_WID0") ? 1 : 0;
+              if (fw0 && (ea & ~127ull) == 0x40197C80ull) {
+                  line[0x00] = 1; ls_ptr[0x00] = 1;         /* wklReadyCount1[0] = 1 */
+                  line[0x70] |= 0x80; ls_ptr[0x70] |= 0x80; /* wklSignal1 bit0 (0x8000) */
+                  extern int g_spu_prof_on;
+                  if (g_spu_prof_on || getenv("YZ_WID01")) {
+                      static int n = 0; if (n < 8) { n++;
+                          fprintf(stderr, "[force-wid0] forced rc0=1 sig0 @mgmt 0x40197C80\n");
+                          fflush(stderr); } }
+              } }
+            /* Same mechanism, wid1 (the pxd jobchain taskset, main.cpp:86) --
+             * fallback probe if YZ_FORCE_WID0 does not produce the port-17
+             * heartbeat. wklReadyCount1[1]=line[0x01], wklSignal1 bit1=0x4000. */
+            { static int fw1 = -1; if (fw1 < 0) fw1 = getenv("YZ_FORCE_WID1") ? 1 : 0;
+              if (fw1 && (ea & ~127ull) == 0x40197C80ull) {
+                  line[0x01] = 1; ls_ptr[0x01] = 1;         /* wklReadyCount1[1] = 1 */
+                  line[0x70] |= 0x40; ls_ptr[0x70] |= 0x40; /* wklSignal1 bit1 (0x4000) */
+                  extern int g_spu_prof_on;
+                  if (g_spu_prof_on || getenv("YZ_WID01")) {
+                      static int n = 0; if (n < 8) { n++;
+                          fprintf(stderr, "[force-wid1] forced rc1=1 sig1 @mgmt 0x40197C80\n");
+                          fflush(stderr); } }
+              } }
             /* BOOTSTRAP (env YZ_CLEARRUN): gs_task (task 0) is stuck `running`
              * (taskset running@0x00 bit 0x80) but never launched, so SELECT_TASK
              * (readyButNotRunning = ready & ~running) can't re-select it and the
@@ -1098,6 +1139,37 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     unsigned sig3 = ((((unsigned)line[0x70] << 8) | line[0x71]) & (0x8000u >> 3)) ? 1 : 0;
                     unsigned prio3 = k[0x1A3] & 0x0F, run3 = (wrun1 & 0x1000) ? 1 : 0;
                     int sel3 = run3 && prio3 > 0 && maxc3 > realcont3 && (sig3 || rc3 > realcont3);
+                    /* TASK 1 (2026-07-04): SAME select-gate for wid0/wid1 -- the
+                     * heartbeat-workload candidates. The existing probe above only
+                     * ever computed wid2/wid3, so we were BLIND to why wid0/wid1
+                     * (run-bits ARE set per wklRun1 0xC000->0xE000, STATUS.md SESSION 11)
+                     * never get SELECTed. Offsets mirror wid2/wid3 exactly, shifted to
+                     * bit/byte index 0 and 1:
+                     *   wid0: rc@line[0x00] curCont@line[0x20] maxCont@line[0x50]
+                     *         sig@(line[0x70..71]&0x8000) run@(wrun1&0x8000) prio@k[0x1A0] locCont@k[0x180]
+                     *   wid1: rc@line[0x01] curCont@line[0x21] maxCont@line[0x51]
+                     *         sig@(line[0x70..71]&0x4000) run@(wrun1&0x4000) prio@k[0x1A1] locCont@k[0x181]
+                     * wid1 = the pxd jobchain taskset (main.cpp:86); wid0 = the
+                     * remaining SPURS-managed workload cluster (candidate heartbeat
+                     * owner per SESSION 11's 0x4019C680 = mgmt+0x4A00 finding). */
+                    unsigned rc0 = line[0x00], curcont0 = line[0x20], maxc0 = line[0x50] & 0x0F;
+                    unsigned loccont0 = k[0x180] & 0x0F;
+                    unsigned realcont0 = (curcont0 - loccont0) & 0x0F;
+                    unsigned pend0 = (unsigned)((line[0x30] - k[0x190]) & 0x0F);
+                    if (wclId != 0) realcont0 = (realcont0 + pend0) & 0x0F;
+                    unsigned sig0 = ((((unsigned)line[0x70] << 8) | line[0x71]) & (0x8000u >> 0)) ? 1 : 0;
+                    unsigned prio0 = k[0x1A0] & 0x0F, run0 = (wrun1 & 0x8000) ? 1 : 0;
+                    int sel0 = run0 && prio0 > 0 && maxc0 > realcont0 && (sig0 || rc0 > realcont0);
+                    unsigned rc1 = line[0x01], curcont1 = line[0x21], maxc1 = line[0x51] & 0x0F;
+                    unsigned loccont1 = k[0x181] & 0x0F;
+                    unsigned realcont1 = (curcont1 - loccont1) & 0x0F;
+                    unsigned pend1 = (unsigned)((line[0x31] - k[0x191]) & 0x0F);
+                    if (wclId != 1) realcont1 = (realcont1 + pend1) & 0x0F;
+                    unsigned sig1 = ((((unsigned)line[0x70] << 8) | line[0x71]) & (0x8000u >> 1)) ? 1 : 0;
+                    unsigned prio1 = k[0x1A1] & 0x0F, run1 = (wrun1 & 0x4000) ? 1 : 0;
+                    int sel1 = run1 && prio1 > 0 && maxc1 > realcont1 && (sig1 || rc1 > realcont1);
+                    static int wid01_on = -1;
+                    if (wid01_on < 0) wid01_on = (g_spu_prof_on || getenv("YZ_WID01")) ? 1 : 0;
                     fprintf(stderr, "[spu-ls] spu=%X n%u wklCur=0x%X wklRun1=0x%04X idle=%u "
                             "| state1[0..3]=%02X%02X%02X%02X msgUpd=0x%02X msg72=0x%02X "
                             "| wid2: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d "
@@ -1106,7 +1178,60 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                             w[0],w[1],w[2],w[3], w[0x3D], line[0x72],
                             run2, prio2, maxc2, curcont2, loccont2, realcont2, rc2, sig2, sel,
                             run3, prio3, maxc3, curcont3, loccont3, realcont3, rc3, sig3, sel3);
+                    if (wid01_on) {
+                        fprintf(stderr, "[spu-ls01] spu=%X n%u wklCur=0x%X wklRun1=0x%04X "
+                                "| wid0: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d "
+                                "| wid1: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d\n",
+                                spu->spu_id, spuNum, wclId, wrun1,
+                                run0, prio0, maxc0, curcont0, loccont0, realcont0, rc0, sig0, sel0,
+                                run1, prio1, maxc1, curcont1, loccont1, realcont1, rc1, sig1, sel1);
+                    }
                     fflush(stderr);
+                }
+            }
+            /* TASK 1 follow-up (2026-07-04): the [spu-ls01] print above shares
+             * the wid2/wid3 probe's g_spu_lsdump_n<800 cap and its wid3-present/
+             * sig-set trigger, both tuned for wid2/wid3 -- it starves out BEFORE
+             * t1's actual event-flag wedge (measured: cap exhausted ~line 9354,
+             * t1 parks at [evflag-wait] ~line 10933 of a 26k-line boot). Add an
+             * INDEPENDENT, uncapped low-rate sampler so we see wid0/wid1's
+             * SELECT gate in the STEADY STATE after t1 is already stuck --
+             * that's the state that matters for the fix (does it ever change?). */
+            if (ls_dump_on && (ea & ~127ull) == 0x40197C80ull) {
+                static int wid01_on2 = -1;
+                if (wid01_on2 < 0) wid01_on2 = (g_spu_prof_on || getenv("YZ_WID01")) ? 1 : 0;
+                if (wid01_on2) {
+                    extern unsigned long g_spu_getllar_n;
+                    static unsigned long n01 = 0;
+                    /* one sample per ~500k mgmt-line GETLLARs per SPU context (this
+                     * line is polled at host speed by every idle SPURS kernel) --
+                     * frequent enough to catch a late transition, rare enough not
+                     * to flood a multi-minute boot. */
+                    if ((g_spu_getllar_n % 500000UL) == 0) {
+                        n01++;
+                        const uint8_t* k = spu->ls;
+                        uint32_t spuNum = ((uint32_t)k[0x1C8]<<24)|((uint32_t)k[0x1C9]<<16)|((uint32_t)k[0x1CA]<<8)|k[0x1CB];
+                        uint16_t wrun1  = (uint16_t)(((uint16_t)k[0x1EC]<<8)|k[0x1ED]);
+                        unsigned rc0 = line[0x00], curcont0 = line[0x20], maxc0 = line[0x50] & 0x0F;
+                        unsigned loccont0 = k[0x180] & 0x0F;
+                        unsigned realcont0 = (curcont0 - loccont0) & 0x0F;
+                        unsigned sig0 = ((((unsigned)line[0x70] << 8) | line[0x71]) & 0x8000u) ? 1 : 0;
+                        unsigned prio0 = k[0x1A0] & 0x0F, run0 = (wrun1 & 0x8000) ? 1 : 0;
+                        int sel0 = run0 && prio0 > 0 && maxc0 > realcont0 && (sig0 || rc0 > realcont0);
+                        unsigned rc1 = line[0x01], curcont1 = line[0x21], maxc1 = line[0x51] & 0x0F;
+                        unsigned loccont1 = k[0x181] & 0x0F;
+                        unsigned realcont1 = (curcont1 - loccont1) & 0x0F;
+                        unsigned sig1 = ((((unsigned)line[0x70] << 8) | line[0x71]) & 0x4000u) ? 1 : 0;
+                        unsigned prio1 = k[0x1A1] & 0x0F, run1 = (wrun1 & 0x4000) ? 1 : 0;
+                        int sel1 = run1 && prio1 > 0 && maxc1 > realcont1 && (sig1 || rc1 > realcont1);
+                        fprintf(stderr, "[spu-ls01-slow] #%lu spu=%X n%u wklRun1=0x%04X "
+                                "| wid0: run=%u prio=%u maxc=%u real=%u rc=%u sig=%u SELECT=%d "
+                                "| wid1: run=%u prio=%u maxc=%u real=%u rc=%u sig=%u SELECT=%d\n",
+                                n01, spu->spu_id, spuNum, wrun1,
+                                run0, prio0, maxc0, realcont0, rc0, sig0, sel0,
+                                run1, prio1, maxc1, realcont1, rc1, sig1, sel1);
+                        fflush(stderr);
+                    }
                 }
             }
             break; }
