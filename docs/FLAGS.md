@@ -77,7 +77,7 @@ the `--trace` lifter build only — inert in a normal build):**
 `YZ_PPU_TRACE=1` (enable) + `YZ_PPU_TRACE_TID=<n>` (gate to one guest tid, default 1) +
 `YZ_PPU_TRACE_ARM=0xADDR` (start logging on the first hit of this PC, default = from start) +
 `YZ_PPU_TRACE_N=<count>` (budget, default 3M) → one hex PC/line to scratch/ppu_trace.txt (the
-format tools/tracediff.py + the RPCS3 emitter both use; docs/TRACEDIFF.md §PPU; driver
+format tools/tracediff.py + the RPCS3 emitter both use; driver
 tools/ppu_diverge.ps1).
 `YZ_ARM_PC=0xADDR` (shims.cpp `ppu_trace_pc`, added 2026-07-05, diag) — on the --trace build
 ONLY: when ANY thread executes the target PC, prints `[arm-pc] #N pc=... tid=... r3=... r5=...
@@ -128,8 +128,8 @@ ever calls Set on it. REMOVE with the t1-wedge frontier.
 `YZ_EVFLAG_LIFECYCLE` (yakuza/dispatch.cpp, `ps3_indirect_call`, 2026-07-04, diagnosis
 task): logs the CREATE/ATTACH/DETACH side of the SPURS event-flag lifecycle --
 `func_02015758` (`_cellSpursEventFlagInitialize`: object ea=r3, taskset/spurs ptr=r4,
-direction=r5; also reads `*(taskset+0x74)` = the owning wid per SPURS_TASKSET.md's
-`taskset+0x74=wid` field, or reports `taskset==NULL` = the IWL case),
+direction=r5; also reads `*(taskset+0x74)` = the owning wid (the CellSpursTaskset
+wid field), or reports `taskset==NULL` = the IWL case),
 `func_020158C4` (`cellSpursEventFlagAttachLv2EventQueue`: object ea=r3, its type byte
 at ea+0xE, and the raw word at ea+0x74), `func_02015AA4`
 (`cellSpursEventFlagDetachLv2EventQueue`: object ea=r3). Companion to

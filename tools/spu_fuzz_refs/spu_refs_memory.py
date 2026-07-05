@@ -53,7 +53,7 @@ the LS accessors (runtime/spu/spu_context.h spu_ls_read128/write128):
   (RI10 that seeds RT), and RI10's own forms (ri10) seed only RA and hand RT
   the driver's private CANARY -- which the ref cannot name (the canary guard
   flips it if the ref tries). So stqd's RT-preservation is NOT expressible in
-  this harness without editing it (forbidden for this agent). stqd is
+  this harness without editing the harness itself. stqd is
   therefore left UNREGISTERED and reported as a coverage gap, not fuzzed as a
   false-green. (lqd, its load twin, IS registered -- loads need no RT seed.)
 

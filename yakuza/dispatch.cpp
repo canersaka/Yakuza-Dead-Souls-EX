@@ -572,7 +572,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      *     direction=r5, clearMode=r6, ...=r7): gpr29=r3(ea), gpr30=r4(taskset/spurs ptr),
      *     gpr31=r5(direction: 0=clears via CAS same as Set, else compared -- this is
      *     CELL_SPURS_EVENT_FLAG_CLEAR_AUTO/MANUAL), gpr27=r6, gpr28=r7. It reads
-     *     *(r4+0x74) at loc_02015830 -- SPURS_TASKSET.md documents taskset+0x74 = wid,
+     *     *(r4+0x74) at loc_02015830 -- taskset+0x74 = the owning wid field,
      *     so THIS is how we read off the owning wid when r4 is a taskset (not NULL/IWL).
      *     Writes mode/type bytes to ea+0xC/0xD/0xE/0xF (ea+0xE done at loc_0201586C:
      *     type = (r27<1) ? ... ; the direction-derived type constant).
