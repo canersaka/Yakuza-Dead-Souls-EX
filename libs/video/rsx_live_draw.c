@@ -1270,6 +1270,8 @@ void rsx_live_draw_method(u32 method, u32 arg)
 
 void rsx_live_draw_set_movie_mode(int on) { g_ld_movie_mode = on ? 1 : 0; }
 
+u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
+
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
  * swap-chain backbuffer (both R8G8B8A8_UNORM at the swap size) and Present.
  * The frame is clamped to the backbuffer size. Call from a single thread with
@@ -1413,7 +1415,10 @@ void rsx_live_draw_present(u32 buffer_id)
     g.swap->lpVtbl->Present(g.swap, 1, 0);
 
     g_ld_frames++;
-    if (g_ld_frames <= 32)
+    /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
+     * making the TRUE frame count measurable from the log. (The old hard cap
+     * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
+    if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
         fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
                 g_ld_frames, g_ld_draws, g_ld_clears);
     if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
