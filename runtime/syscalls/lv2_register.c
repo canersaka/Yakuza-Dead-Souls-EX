@@ -484,11 +484,29 @@ static void* spu_exec_thread_proc(void* arg)
     g_spu_stack_base = 0;
     g_spu_trampoline_fn = 0;
 
-    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X)\n",
-            t->tid, sctx->status, sctx->pc);
+    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X)\n",
+            t->tid, sctx->status, sctx->pc, sctx->stop_code);
     fflush(stderr);
 
-    t->exit_status = 0;
+    /* F18: surface the real SPU exit status instead of hardcoding 0. The SPU-side
+     * sys_spu_thread_exit ABI writes the status to SPU_WrOutMbox, then executes
+     * stop 0x102 (THREAD_EXIT); lv2 pops that mailbox value as the exit status.
+     * The 14-bit stop code (sctx->stop_code) is only the dispatch selector, NOT
+     * the status itself (CBEA p97 SPU_Status.StopCode). 0x102 THREAD_EXIT ->
+     * this thread's status; 0x101 GROUP_EXIT -> the group's status. specaudit F18. */
+    if (sctx->status == SPU_STATUS_STOPPED_BY_STOP &&
+        sctx->stop_code == 0x102u /* THREAD_EXIT */ && sctx->ch_out_mbox.count) {
+        t->exit_status = (int32_t)sctx->ch_out_mbox.value;   /* guest-written status */
+        sctx->ch_out_mbox.count = 0;
+    } else if (sctx->status == SPU_STATUS_STOPPED_BY_STOP &&
+               sctx->stop_code == 0x101u /* GROUP_EXIT */ && sctx->ch_out_mbox.count) {
+        spu_group_t* grp = spu_find_group(t->group_id);
+        if (grp) grp->exit_status = (int32_t)sctx->ch_out_mbox.value;
+        sctx->ch_out_mbox.count = 0;
+        t->exit_status = 0;
+    } else {
+        t->exit_status = 0;   /* no exit-protocol stop: unchanged from prior behavior */
+    }
 #ifdef _WIN32
     t->running = 0;
     SetEvent(t->finish_event);

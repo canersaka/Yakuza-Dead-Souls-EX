@@ -344,7 +344,9 @@ class SPULifter:
             # mode / exception flags), so this is a no-op (matches spu_fscrrd=0).
             return "/* fscrwr (FPSCR not modelled) */;"
         if mn == "stop":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            # F18: capture the 14-bit stop code (disasm emits it as ops[0]) so the
+            # driver can dispatch the stop-and-signal protocol (thread/group exit).
+            return f"ctx->stop_code = {_imm(ops[0])}; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -371,7 +373,8 @@ class SPULifter:
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
             return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
         if mn == "stopd":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            # stopd's stop code is architecturally fixed at 0x3FFF (CBEA p97).
+            return "ctx->stop_code = 0x3FFF; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
