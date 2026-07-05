@@ -141,6 +141,40 @@ at 0x65EC — with register data diverging earlier. Consistent with nq_agent1's 
 produce passes" (reprocessing a drained SRC state -> different data at the same PCs). Pinning the single
 mis-lifted op needs gotcha #2 fixed (so the register-diff is trustworthy) + gotcha #3 (aligned inputs).
 
+### Driver: `tools/ppu_diverge.ps1` (s14/T6, 2026-07-05)
+
+One command wraps the two-sided PPU setup above (mirrors `tools/diverge.ps1` on the SPU side):
+
+```powershell
+.\tools\ppu_diverge.ps1 -Tid 11 -Arm 0xF00E80 -Ref scratch\rpcs3_ppu_trace3.txt
+.\tools\ppu_diverge.ps1 -Tid 11 -Arm 0xF00E80 -SkipBoot -Ref scratch\rpcs3_ppu_trace3.txt
+```
+
+- `-Tid`/`-Arm` set `YZ_PPU_TRACE_TID`/`YZ_PPU_TRACE_ARM` (plus `YZ_PPU_TRACE=1` and
+  `YZ_PPU_TRACE_N=<-N, default 2000000>`); `-Flags 'K=V;K=V'` sets any extra env vars
+  (e.g. `YZ_VMGUARD=1`) before launch.
+- Without `-SkipBoot`: launches `yakuza\build\yakuza_recomp.exe game\EBOOT.elf` with NATIVE
+  `cmd`-level stderr/stdout redirection (LESSONS 6c — avoids the CRT-stderr-lock
+  serialization artifact under print volume), watches `scratch\ppu_trace.txt` until its size
+  holds steady for `-StableSecs` (default 60s) or `-TimeoutSecs` elapses (default 20 min),
+  then kills the process.
+- With `-SkipBoot`: reuses the existing `scratch\ppu_trace.txt` untouched — no launch.
+- Either path then runs `py -3 tools\tracediff.py scratch\ppu_trace.txt <-Ref> --align-pc
+  <-AlignPc, defaults to -Arm> --pc-only --pc-range <-PcRange, default 10000:1310768>` and
+  prints its output verbatim. NOTE `tracediff.py` parses `--pc-range` as **hex**.
+- On divergence: extracts the divergent PC from either message shape tracediff.py emits
+  (`compute diverged at PC 0x...` or `PC diverged: ours=0x...`) and runs
+  `py -3 tools\show_func.py <pc> --both --max 60` (~±30 lines of context) so the report lands
+  with disassembly in the same command. Exit code 1 on divergence, 0 on agreement, 2 if
+  `-Ref` is missing/nonexistent (in which case it just points back at this section's capture
+  steps — the RPCS3-side capture stays a manual, one-time step in v1) or if `-SkipBoot` is
+  given without an existing trace.
+
+Acceptance (2026-07-05, MEASURED): `.\tools\ppu_diverge.ps1 -Tid 11 -Arm 0xF00E80 -SkipBoot
+-Ref scratch\rpcs3_ppu_trace3.txt` reproduces the known result in one command — `ours: 11110
+events`, `ref : 263870 events`, `No divergence over the compared window. Traces AGREE.`,
+exit 0.
+
 ## Hardening (2026-07-01/02) — the pass that found the il-decode root
 
 Three harness fixes landed; together they took the diff from "27 artifact findings" to the ONE

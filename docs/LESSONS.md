@@ -57,8 +57,11 @@ session runs on Fable, Opus, or anything else.
    claims are usually FALSE — check the `Loaded module: X.sprx` log lines; RPCS3 LLE-loads
    libsre/libgcm_sys/libfs/libsysmodule for this game. The `.rrc` capture is a FLATTENED
    method stream: valid LAYER-2 oracle, WRONG for LAYER-1 pacing questions.
-8. **Search the archive before proposing.** `docs/archive/STATUS_ARCHIVE_2026-06.md` holds
-   every tested-negative ("don't retry") ledger. Re-proposing a refuted fix costs a session.
+8. **Grep `docs/DONT_RECHASE.md` before proposing — then the archives.** DONT_RECHASE.md is
+   the canonical one-line refuted-claims ledger (added 2026-07-05); the full receipts and
+   older tested-negative ledgers are in `docs/archive/STATUS_ARCHIVE_*.md`. Re-proposing a
+   refuted fix costs a session. When a theory is refuted by measurement, ADD the entry in the
+   same change.
 9. **On compaction-resume, reconcile first.** A compaction summary can be stale: diff it
    against STATUS.md + `git log` before doing anything, or you'll redo committed work.
 
@@ -105,6 +108,24 @@ session runs on Fable, Opus, or anything else.
 18. **Keep the handoff docs current as part of every change** (STATUS.md, SUMMARY.md,
     checklist PDF, FLAGS.md when flags change, CHEATSHEET.md when workflows change). A stale
     handoff is a bug. STATUS.md has a ~60 KB cap — displace old handoffs into the archive.
+
+21. **Evidence must survive the session: exact paths, live probes, uncapped metrics.**
+    The 2026-07-05 audit of sessions 11–12 found: FIVE handoff citations naming evidence
+    files that don't exist (the claims were then unverifiable); a "never called" negative
+    with no proof the probe was armed; and a "stalls at frame ~32" metric whose log was
+    hard-capped at 32 (the "ceiling" WAS the cap). Rules: (a) before writing a handoff,
+    `dir` every evidence file you cite — cite the EXACT existing path; (b) every probe
+    prints a liveness banner at arm time, so zero hits provably means "never fired", not
+    "probe dead" — a negative without a liveness banner is PLAUSIBLE, never MEASURED;
+    (c) before using any counter/log as a metric, check it for caps/sampling windows
+    (LESSONS #6's class) — a metric that cannot exceed X cannot measure a ceiling at X;
+    (d) a PC-only trace-diff proves CONTROL-FLOW equivalence, not value equivalence —
+    label it that way.
+22. **Planning claims obey the same measured-vs-inferred bar as debugging claims.** Never
+    declare a milestone "gated ONLY on X" — and never tighten timeline bands — off an
+    INFERRED last wall. Require a measured wait-graph edge (who blocks on whom, shown by
+    probe or oracle diff) first. The 2026-07-04 "watchable in days, only movie wiring left"
+    estimate died in one day because mwPly was never even called.
 
 ## Environment traps (verified)
 
