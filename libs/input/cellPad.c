@@ -145,11 +145,14 @@ static void pad_poll_xinput(void)
 
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks */
+        /* Analog sticks. PS3 Y is inverted vs XInput (up = 0): reflect about 128
+         * (256 - x), NOT 255 - x — the latter turns a centered stick into 127,
+         * whose bits (0x7F) alias SELECT+START in the digital mask. Safe because
+         * pad_xinput_stick_to_u8 returns 128 +/- 127 (never 0), so no u8 wrap. */
         s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ly = (u8)(255 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE)); /* Y inverted */
+        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
         s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(255 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -401,9 +404,12 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     data->button[0] = (u16)len;
     data->button[1] = 0; /* reserved */
 
-    /* Digital buttons */
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = hs->buttons;
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0; /* PS button etc. */
+    /* Digital buttons: hs->buttons packs DIGITAL1 (SELECT..LEFT, bits 0-7) and
+     * DIGITAL2 (L2..SQUARE, bits 8-15) into one 16-bit mask; the guest reads them
+     * as two separate words. Writing the whole mask into DIGITAL1 with DIGITAL2=0
+     * left every face button and both shoulder pairs dead. */
+    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
+    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
 
     /* Analog sticks */
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
