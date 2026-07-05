@@ -842,7 +842,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
             elif xo_5 == 23:  # fsel
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
-            elif xo_5 in (26, 24):  # frsqrte / fre: frd, frb
+            elif xo_5 in (26, 24, 22):  # frsqrte / fre / fsqrt(s): frd, frb (frA reserved=0)
                 result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
@@ -898,7 +898,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}"
             elif xo_5 in (29, 28, 31, 30):
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
-            elif xo_5 in (24, 26):  # fres / frsqrtes: frd, frb
+            elif xo_5 in (24, 26, 22):  # fres / frsqrtes / fsqrts: frd, frb (frA reserved=0)
                 result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
@@ -996,10 +996,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
 
-            # Splat immediate (vspltis*) — the non-immediate vspltb/h/w are
-            # handled separately below with the UIMM operand form. Their correct
-            # XOs are 524/588/652 (were wrongly 1098/1162/1226 here).
-            780: "vspltisb", 844: "vspltish", 908: "vspltisw",
+            # (vspltisb/h/w moved to the SIMM handler below the UIMM block — their
+            # vA field (bits 11-15) is a 5-bit SIGNED immediate, not a register.)
 
             # Merge
             12: "vmrghb", 76: "vmrghh", 140: "vmrghw",
@@ -1049,6 +1047,15 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         if xo_full in vmx_uimm:
             result.mnemonic = vmx_uimm[xo_full]
             result.operands = f"v{vd}, v{vb}, {va}"
+            return result
+
+        # vspltis* : vD, SIMM — the vA field (bits 11-15) is a 5-bit SIGNED
+        # immediate (-16..15), NOT a register (unlike vspltb/h/w's UIMM index).
+        vmx_simm = {780: "vspltisb", 844: "vspltish", 908: "vspltisw"}
+        if xo_full in vmx_simm:
+            result.mnemonic = vmx_simm[xo_full]
+            simm = va - 32 if va >= 16 else va
+            result.operands = f"v{vd}, {simm}"
             return result
 
         # lvx / stvx (X-form under opcode 31 actually, but some are opcd 4)
