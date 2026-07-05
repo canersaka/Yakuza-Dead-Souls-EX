@@ -5,8 +5,8 @@
   (docs/TRACEDIFF.md SS PPU). Two paths:
 
     - Without -SkipBoot: arm YZ_PPU_TRACE* env vars, launch the game with
-      NATIVE stderr/stdout redirection (LESSONS 6c -- avoids the CRT stderr
-      serialization artifact under print volume), watch scratch\ppu_trace.txt
+      NATIVE stderr/stdout redirection (avoids the CRT stderr serialization
+      artifact under print volume), watch scratch\ppu_trace.txt
       until its size is stable for 60s (or a 20-min timeout), kill the game.
     - With -SkipBoot: use the existing scratch\ppu_trace.txt as-is (no boot).
 
@@ -52,7 +52,7 @@ if ($AlignPc -eq '') { $AlignPc = $Arm }
 $armHex = $Arm -replace '^0[xX]', ''
 
 # -Ref is required for the diff step; point at the capture doc rather than
-# guessing a default (v1: RPCS3-side capture stays manual, per the workorder).
+# guessing a default (v1: RPCS3-side capture stays manual).
 if ($Ref -eq '' -or -not (Test-Path $Ref)) {
   Write-Host "`n[ppu_diverge] No usable -Ref reference trace given (got: '$Ref')." -ForegroundColor Yellow
   Write-Host "Capture one first -- see docs\TRACEDIFF.md SS PPU, 'capture steps'" -ForegroundColor Yellow
@@ -69,7 +69,7 @@ if (-not $SkipBoot) {
   $env:YZ_PPU_TRACE_N   = "$N"
 
   # -Flags 'A=1;B=2' -> set each as an env var (house convention: semicolon-
-  # separated KEY=VALUE pairs, same shape as the workorder's CLI example).
+  # separated KEY=VALUE pairs).
   if ($Flags -ne '') {
     foreach ($kv in ($Flags -split ';')) {
       if ($kv -match '^\s*([^=]+)=(.*)$') {
@@ -82,7 +82,7 @@ if (-not $SkipBoot) {
 
   if (Test-Path $OursTrace) { Remove-Item $OursTrace -Force }
   $errLog = 'scratch\ppu_diverge_run.err'; $outLog = 'scratch\ppu_diverge_run.out'
-  # NATIVE redirection (LESSONS 6c): cmd's 2>/1> are plain kernel file handles;
+  # NATIVE redirection: cmd's 2>/1> are plain kernel file handles;
   # PowerShell's -RedirectStandardError pumps a .NET pipe that serializes every
   # guest thread on the CRT stderr lock under print volume -- same fix as
   # boot_until.ps1 / diverge.ps1.

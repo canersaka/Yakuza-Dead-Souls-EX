@@ -531,19 +531,19 @@ extern "C" void yz_watch_arm_read(uint32_t guest_addr)
 }
 
 /* ---------------------------------------------------------------------------
- * T3 (docs/TOOLING_WORKORDER.md): YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven
- * multi-address write-watch, NO REBUILD required per question (unlike the
- * yz_watch_bd compile-time tg[] array in shims.cpp, which costs an edit+relink
- * every time a new EA is interesting). REUSES the page-guard/VEH mechanism
- * above (yz_watch_veh's PAGE_READONLY-trap-then-single-step protocol) rather
- * than inventing a second one -- this is a parallel array-based VEH because
- * the existing yz_watch_arm() is a single-slot design (g_watch_guest) already
- * claimed by YZ_WATCH_EA/YZ_WATCH_FLAG; up to 16 independent slots here.
- * Zero code runs when YZ_WATCH_WR is unset (checked once at init, guard at
- * the call site in main()). LESSONS #6c: a page-guard traps the WHOLE 4 KB
- * page, so a watched page shared with a hot SPURS-mgmt lock line
- * (0x40197xxx class) single-steps every atomic on it and can wreck the run --
- * warn loudly but still arm (the spec calls for a warning, not a refusal).
+ * YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven multi-address write-watch, NO
+ * REBUILD required per question (unlike the yz_watch_bd compile-time tg[]
+ * array in shims.cpp, which costs an edit+relink every time a new EA is
+ * interesting). REUSES the page-guard/VEH mechanism above (yz_watch_veh's
+ * PAGE_READONLY-trap-then-single-step protocol) rather than inventing a
+ * second one -- this is a parallel array-based VEH because the existing
+ * yz_watch_arm() is a single-slot design (g_watch_guest) already claimed by
+ * YZ_WATCH_EA/YZ_WATCH_FLAG; up to 16 independent slots here. Zero code runs
+ * when YZ_WATCH_WR is unset (checked once at init, guard at the call site in
+ * main()). A page-guard traps the WHOLE 4 KB page, so a watched page shared
+ * with a hot SPURS-mgmt lock line (0x40197xxx class) single-steps every
+ * atomic on it and can wreck the run -- warn loudly but still arm (the spec
+ * calls for a warning, not a refusal).
  * -----------------------------------------------------------------------*/
 #define YZ_WATCH_WR_MAX 16
 static uint32_t g_wwr_ea[YZ_WATCH_WR_MAX];
@@ -640,7 +640,7 @@ static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
  * after vm_init() (same placement rationale as YZ_WATCH_EA: some watched EAs
  * can be written very early, before the "natural" per-subsystem arm point).
  * Env unset -> this function isn't even called (guard at the call site) --
- * LESSONS 6b, zero perturbation when off. */
+ * a diagnostic must never perturb the system it measures; zero perturbation when off. */
 extern "C" void yz_watch_wr_init(void)
 {
     const char* s = getenv("YZ_WATCH_WR");
@@ -659,13 +659,13 @@ extern "C" void yz_watch_wr_init(void)
         g_wwr_old[g_wwr_n]  = cur;
         g_wwr_n++;
         fprintf(stderr, "[watch-wr] armed ea=0x%08X page=0x%08X\n", ea, (uint32_t)page);
-        /* LESSONS #6c: a page-guard traps the WHOLE 4 KB page. Warn loudly if
+        /* A page-guard traps the WHOLE 4 KB page. Warn loudly if
          * this page overlaps the known-hot SPURS mgmt page class, but arm it
          * anyway (spec: warn, don't refuse) -- caller owns the tradeoff. */
         if ((page & 0xFFFFF000u) == 0x40197000u) {
             fprintf(stderr, "[watch-wr] WARNING: ea=0x%08X is on the hot SPURS-mgmt page "
                     "0x40197xxx -- this page-guard single-steps EVERY access to the whole "
-                    "4KB page (LESSONS #6c) and can badly slow or wedge the run.\n", ea);
+                    "4KB page and can badly slow or wedge the run.\n", ea);
         }
         fflush(stderr);
         s = (*end == ',') ? end + 1 : end;
@@ -1566,12 +1566,13 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
  * sem-4-rendezvous-then-silent-spin finding (scratch/_verify_af.err ~line
  * 7009): t1 issues zero further lv2 syscalls after that point, so the
  * lv2-wait recorder (yz_wait_get) reports it as "running guest code" forever
- * -- we need to know WHERE. Per LESSONS #6b/#6c, do NOT suspend t1 or walk
+ * -- we need to know WHERE. A diagnostic must never suspend or perturb the
+ * thread it measures, so do NOT suspend t1 or walk
  * its host stack (YZ_L1SNAP's dumps already proved that corrupts exactly
  * this kind of measurement). Instead, read the plain globals dispatch.cpp
  * writes on t1's own indirect-call/trampoline-hop path (g_yz_t1_last_target/
  * _lr/_sample_seq) from a low-rate (2s) timer thread -- no lock, no pause,
- * bounded volume (LESSONS #6c). If g_yz_t1_sample_seq stops incrementing
+ * bounded volume. If g_yz_t1_sample_seq stops incrementing
  * between two reads, t1 has stopped taking indirect calls/trampoline hops
  * entirely (a tight direct-branch loop with no bctr/tail-branch in it);
  * otherwise the printed target/lr pins the poll site directly. */
@@ -1872,10 +1873,10 @@ int main(int argc, char** argv)
      * too early for the RSX-thread arm to catch. */
     if (const char* we = getenv("YZ_WATCH_EA")) yz_watch_arm((uint32_t)strtoul(we, nullptr, 16));
 
-    /* T3 (docs/TOOLING_WORKORDER.md): YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven
-     * multi-address write-watch, no rebuild per question. yz_watch_wr_init()
-     * itself is a single getenv()+return when the flag is unset (LESSONS 6b:
-     * zero perturbation when off), so the call is unconditional here, same as
+    /* YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven multi-address write-watch,
+     * no rebuild per question. yz_watch_wr_init() itself is a single
+     * getenv()+return when the flag is unset (zero perturbation when off),
+     * so the call is unconditional here, same as
      * YZ_WATCH_EA's arm above. */
     yz_watch_wr_init();
 
@@ -2059,7 +2060,7 @@ int main(int argc, char** argv)
      * for reading a HEALTHY-but-parked boot (e.g. the post-font.par frontier
      * park at ~+250 s) where the wedge watchdog never triggers. The run is
      * observed at a chosen instant; don't use dump-armed runs for pass/fail
-     * rates (LESSONS 6b). */
+     * rates (must not perturb the thread it measures). */
     if (const char* da = getenv("YZ_DUMP_AT")) {
         static int dump_at_s = atoi(da);
         if (dump_at_s > 0)

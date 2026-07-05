@@ -1,7 +1,7 @@
 /*
  * ps3recomp - tests/sync_stress/main.c
  *
- * Deterministic lv2 sync-primitive stress suite (docs/TOOLING_WORKORDER.md T10).
+ * Deterministic lv2 sync-primitive stress suite.
  * Exercises runtime/syscalls/sys_mutex.c, sys_cond.c, sys_semaphore.c,
  * sys_event.c directly (as C functions taking a ppu_context*), on Win32
  * threads, with NO dependency on the yakuza runner or the recompiled game.

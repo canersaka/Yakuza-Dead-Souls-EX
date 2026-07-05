@@ -384,7 +384,8 @@ static void yz_mem_guard(uint32_t a, unsigned w, int is_write) {
  * cheap range check only (no VirtualQuery) so it can stay on for a full boot.
  * Returns 1 ("wild, don't touch it") only when YZ_VMGUARD_SURVIVE is also set;
  * otherwise returns 0 after logging so the natural path (and any YZ_GUARD AV)
- * is unaffected. Diagnostic-only (LESSONS #13) -- NOT a shipping fix; the
+ * is unaffected. Diagnostic-only (env-gated, default-off, kill-switched --
+ * band-aid hygiene) -- NOT a shipping fix; the
  * real bug is whatever hands the lifted code this address in the first
  * place (lift/race bug TBD from the logged caller).
  *

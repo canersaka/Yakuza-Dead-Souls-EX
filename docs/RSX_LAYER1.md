@@ -6,9 +6,8 @@ structurally-correct **untextured** window with no deadlocks. (LAYER 2 = NV4097�
 dispatch + NV40 shader translation, after Layer 1 renders.)
 
 The RSX is hardware — there's no firmware to lift — so it must be **modeled, not LLE'd**
-(reimplemented clean-room, NOT copied from RPCS3/GPL). See [[rsx-must-be-modeled-not-lled]].
-Tags: **[V]** verified/measured, **[I]** inferred. Companion to `STATUS.md` (live state) and the
-blocker ledger in `SUMMARY.md` (#19–#21). Last updated 2026-06-19 (pt20).
+(reimplemented clean-room, NOT copied from RPCS3/GPL).
+Tags: **[V]** verified/measured, **[I]** inferred. Last updated 2026-06-19 (pt20).
 
 ---
 
@@ -43,7 +42,7 @@ gcm flip throttle `func_00EAC46C`, whose completion counter **IS the flip fence 
 <= target`). FIX (main.cpp): in the `get==put` branch, nudge the fence +1 to release one frame, VERIFY t1 produced it
 (PUT advances), latch off when PUT stays frozen 1s (real upstream stall). RESULT: **3/3 runs reach the full CRI stack
 (7–9 flips, 23 threads)** + default boot unchanged. The pt26 win below is the same mechanism, now reliable; next gate
-is the CRI middleware (STATUS.md pt27).
+is the CRI middleware.
 
 ## TL;DR — where LAYER 1 stood (pt26 — 🎉 FRAME-3 WALL BROKEN)
 
@@ -57,7 +56,7 @@ dispatches the flip (fence++). pt24's resync OVERSHOT each flip; the scan proces
 throttle counter is the fence `0x40C00000`. **NEW FRONTIER (non-RSX):** after ~5 frames t1 STOPS
 producing — it's in a `sys_timer_usleep` poll loop (`func_00E5DB94` from r31=0xD0100730) waiting on a
 NON-RSX condition (GET-circulate / throttle-force / reserve-free all proven inert; no media-decode
-calls). Next: find that poll's condition (the upstream producer). Full detail: STATUS.md pt26.
+calls). Next: find that poll's condition (the upstream producer).
 
 ## TL;DR — where LAYER 1 stood (pt25b, SUPERSEDED by pt26 above — the drain was NOT needed)
 
@@ -73,7 +72,7 @@ frees Root 1 (reserve) → t1 reaches Root 2 (flip throttle `func_00EAC46C`); we
 (0 draws, 393 setup methods byte-match RPCS3). RPCS3 ground truth: released stopper = `0x20300004`
 (jump fwd 1), patched before its GET arrives. **NEXT: apply the op-list drain** — invoke the game's
 own drainer (`func_00E9B7C0` reserve/recycle + the not-yet-located data-patch applier) or replicate it,
-or force the throttle now that Root 1 is cleared (full detail: STATUS.md pt25b). Tooling: `YZ_FIFO_TRACE`,
+or force the throttle now that Root 1 is cleared. Tooling: `YZ_FIFO_TRACE`,
 `tools/rrc_methods.py`, `tools/cmp_fifo.py`, `YZ_FAITHSKIP`, `YZ_DUMP_SEG`.
 
 ## TL;DR — where LAYER 1 stood (pt20, superseded by pt25b above)
@@ -84,7 +83,7 @@ GET-advance, while the RSX consumer parks on that unfinalized list — so GET ne
 flip fence stays frozen at 2, and the render thread spins. We built a faithful, coherence-safe
 consumer + the flip lifecycle and cracked the `@0x300000` stopper wall; the remaining gap is
 **how RPCS3's RSX keeps GET advancing through deferred stoppers** (it uses the same plain reads we
-do). A multi-session detour suspected gs_task (the SPU geometry task) was the missing producer —
+do). A long detour suspected gs_task (the SPU geometry task) was the missing producer —
 **that's now resolved (gs_task is healthy but downstream/starved, pt19–20), so the gate is
 squarely back here.**
 
@@ -106,7 +105,7 @@ squarely back here.**
 - Found the deadlock: the game's gcm cmd buffer uses **jump-to-self STOPPERS** at every commit and
   releases the previous one; a **cross-fragment release** (commit spanned a gcm ring recycle) is
   **DEFERRED into the game's gcm op-list and never drained** (the game wedges on the flip fence
-  that needs the very frame whose stopper is deferred). See [[gcm-stopper-patch-mechanism]].
+  that needs the very frame whose stopper is deferred).
 - **Built a clean-room faithful FIFO consumer** (Layer-1: ring-aware GET/PUT, NV4097 NON_METHOD
   validation `0xa0030003`) — isolates the wall to the GAME's gcm stopper-release, NOT the RSX. [V]
 - **06-14e-FIX: `@0x300000` wall CRACKED ACCURATELY (#21 part 1 DEAD).** When GET parks on a
@@ -135,7 +134,7 @@ squarely back here.**
 
 ### 2026-06-16 — banked + RPCS3 install added; config insight
 - User added the full working RPCS3 (`rpcs3-v0.0.41-...`): a real **RSX capture (.rrc)**, decrypted
-  firmware PRX, the working `config_BLUS30826.yml`. See [[rpcs3-full-install-resource]].
+  firmware PRX, the working `config_BLUS30826.yml`.
 - **Key config insight:** RPCS3 renders this game with **FIFO Fetch = Fast + reservation access =
   false = PLAIN reads, NO reservation** — *exactly our consumer's approach*. ⇒ reservation/coherence
   is a DEAD END; **our architecture is right; the gap is the FIFO PROCESSING LOGIC + PPU↔RSX
@@ -145,7 +144,7 @@ squarely back here.**
 - **Hypothesis (06-16b):** the render deadlock is a SYMPTOM of a **stubbed SPU geometry task
   (gs_task)** that never fills the display list — not an RSX-coherence bug. Pivoted to SPU work.
 - Drove gs_task from "never launches" → launches → **halt FIXED** (pt19: `tasksetMgmtAddr=0x2700`).
-  See [[spurs-taskset-dispatch-reference]] / `docs/SPURS_TASKSET.md`.
+  See `docs/SPURS_TASKSET.md`.
 - **OUTCOME (pt20): the detour resolved the SPU side but it's DOWNSTREAM.** gs_task is healthy but
   STARVED — its job queue (0x40197180) is empty because the **producer (render thread) is stuck in
   the LAYER-1 flip wait before it posts any job**. So the gate is back to LAYER 1, now with the SPU
@@ -269,7 +268,7 @@ producer-finalization problem, NOT a consumer bug.
 - At the stall t1 is **alive in game logic** (sc 90 lwmutex / _sys_memcpy / sc 82/94), not spinning
   in libgcm — it just never does the next gcm flush that would release the io 0x300000 stopper.
 
-**Ruled out this session (do NOT retry without new evidence):**
+**Ruled out (do NOT retry without new evidence):**
 - Deferred consumer → GET derails into the unbuilt display list io 0x1104D00 (out of ring range).
 - Faithful consumer (YZ_NO_DEFER) → GET correctly parks on io 0x300000 but the stopper is never released.
 - Force immediate release `S[0x1C]=0` (YZ_IMM_REL), both consumer modes → no effect (t1 never reaches
@@ -353,9 +352,9 @@ first. **Don't retry (twice-confirmed): consumer rebuild for pacing; runtime pok
 
 ## 2026-06-20 pt24: 🎉 WALL BREACHED — frame 3 RENDERS + FLIPS (fence 2→3). Mechanism proven; LAYER 1 = a small chain of handshakes (~2 roots), NOT per-frame.
 
-**THE WIN [V]:** `YZ_RESYNC_LOOP=1` → 3 flips, fence=3 (scratch/resyncloop2.txt). First progress past frame 2 in ~10 sessions.
+**THE WIN [V]:** `YZ_RESYNC_LOOP=1` → 3 flips, fence=3 (scratch/resyncloop2.txt). First progress past frame 2 in weeks.
 
-**MECHANISM — proven by autonomous multi-angle crack (see STATUS.md pt24 for the full angle log):**
+**MECHANISM — proven by testing every candidate angle in turn:**
 - **t1 (PPU render thread) builds the per-frame display lists itself, via memcpy** — page-watch on the
   WORKING list io 0x1100100 caught `accessor guest tid=1` + 64-bit stores (scratch/prodwatch.txt).
   pt9's "0 PPU writes" was a vm_write32-only blind spot. (gs_task ruled out for the movie, pt23.)
@@ -376,7 +375,7 @@ first. **Don't retry (twice-confirmed): consumer rebuild for pacing; runtime pok
 flip timing — in faithful mode it deadlocks (parks at the stopper), in default it band-aids (deferred-
 release zooms GET into unbuilt lists). The real fix is faithful STOPPER/RING handling, not method decode.
 
-**NEXT SESSION — FIRST ACTIONS (the ~2-root fix, not per-frame):**
+**NEXT ACTIONS (the ~2-root fix, not per-frame):**
 1. **ROOT 1 done right:** make the consumer not hold t1 hostage at stoppers — generalize the resync lever
    (advance GET past the stopper / out of t1's reserve segment when t1 is reserve-blocked) **wrap-aware**
    (the crude GET=PUT fights the wrap: GET pulled backward when PUT wraps). The lever is proven; do it

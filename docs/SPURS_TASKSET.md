@@ -3,7 +3,7 @@
 Durable reference so we don't re-derive this. Sourced from RPCS3 source (the readable
 twin of the libsre SPU code we run), our lifted `recomp_prx/`, and measured build cycles.
 Tags: **[V]** = verified (measured this build, or read directly from source); **[I]** =
-inferred (consistent, not yet directly measured). Companion to `STATUS.md` (live state).
+inferred (consistent, not yet directly measured).
 
 Last updated 2026-06-19 (pt20).
 
@@ -12,7 +12,7 @@ Last updated 2026-06-19 (pt20).
 ## TL;DR — current state
 
 - **[V] The SPU/SPURS side is healthy.** gs_task launches (LS entry `0x3050`), runs its
-  main event loop, and polls its job queue correctly. The 11+ session "gs_task halt" wall
+  main event loop, and polls its job queue correctly. The long-standing "gs_task halt" wall
   is **fixed** (see Fix below).
 - **[V] gs_task is STARVED, not broken.** Its geometry job queue (EA `0x40197180`) is empty;
   the PPU render thread (t1) writes nothing (0 writes to both the job queue and the
