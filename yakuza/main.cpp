@@ -17,6 +17,7 @@
 #include "yakuza_runner.h"
 #include "../runtime/memory/vm.h"
 #include "../include/ps3emu/guest_call.h"
+#include "../include/ps3emu/endian.h"   /* ps3_bswap32 -- YZ_WATCH_WR old/new dump */
 
 #include <cstdio>
 #include <cstdlib>
@@ -400,7 +401,7 @@ static unsigned long g_watch_traps = 0;  /* total in-page traps (slowdown safety
 /* Forward decls so the watch handler can name the GUEST function doing the write
  * (defined later in this TU). */
 extern ppu_context* g_yz_main_ctx;
-static void yz_dump_guest_state(const ppu_context* gc, const char* tag);
+void yz_dump_guest_state(const ppu_context* gc, const char* tag);
 /* Trampoline-hop ring (defined in dispatch.cpp) -- the reliable caller chain the
  * watch handler uses (the host back-chain mis-symbolizes memcpy/data-lr paths). */
 extern "C" __declspec(thread) void*    g_yz_tramp_ring[256];
@@ -529,6 +530,157 @@ extern "C" void yz_watch_arm_read(uint32_t guest_addr)
             guest_addr, g_watch_host);
 }
 
+/* ---------------------------------------------------------------------------
+ * T3 (docs/TOOLING_WORKORDER.md): YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven
+ * multi-address write-watch, NO REBUILD required per question (unlike the
+ * yz_watch_bd compile-time tg[] array in shims.cpp, which costs an edit+relink
+ * every time a new EA is interesting). REUSES the page-guard/VEH mechanism
+ * above (yz_watch_veh's PAGE_READONLY-trap-then-single-step protocol) rather
+ * than inventing a second one -- this is a parallel array-based VEH because
+ * the existing yz_watch_arm() is a single-slot design (g_watch_guest) already
+ * claimed by YZ_WATCH_EA/YZ_WATCH_FLAG; up to 16 independent slots here.
+ * Zero code runs when YZ_WATCH_WR is unset (checked once at init, guard at
+ * the call site in main()). LESSONS #6c: a page-guard traps the WHOLE 4 KB
+ * page, so a watched page shared with a hot SPURS-mgmt lock line
+ * (0x40197xxx class) single-steps every atomic on it and can wreck the run --
+ * warn loudly but still arm (the spec calls for a warning, not a refusal).
+ * -----------------------------------------------------------------------*/
+#define YZ_WATCH_WR_MAX 16
+static uint32_t g_wwr_ea[YZ_WATCH_WR_MAX];
+static uint8_t* g_wwr_host[YZ_WATCH_WR_MAX];
+static uint32_t g_wwr_page[YZ_WATCH_WR_MAX];      /* page base (host) per slot */
+static uint32_t g_wwr_old[YZ_WATCH_WR_MAX];       /* last-seen guest-BE dword, for old/new */
+static int      g_wwr_n = 0;
+static unsigned long g_wwr_otherhits = 0;         /* same-page-other-dword counter (all slots) */
+
+static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        if (ep->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+        ULONG_PTR acc = ep->ExceptionRecord->ExceptionInformation[0];  /* 0=read 1=write */
+        uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        uintptr_t page = tgt & ~(uintptr_t)0xFFF;
+        int onpage = 0;
+        for (int i = 0; i < g_wwr_n; i++) if ((uintptr_t)g_wwr_page[i] == page) { onpage = 1; break; }
+        if (!onpage) return EXCEPTION_CONTINUE_SEARCH;   /* not one of our pages */
+        (void)acc;   /* PAGE_READONLY only traps writes; reads pass through untouched */
+        /* We can't know from the fault alone which bytes changed (x86 doesn't
+         * report access width here), so let the write commit, single-step
+         * once, then diff every watched EA on this page against its last-seen
+         * value in the SINGLE_STEP handler below. */
+        DWORD old;
+        VirtualProtect((void*)page, 0x1000, PAGE_READWRITE, &old);
+        ep->ContextRecord->EFlags |= 0x100;   /* trap flag -> single-step after this insn */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* EXCEPTION_SINGLE_STEP: the write just committed. Diff every watched EA
+     * (cheap: <=16 slots) and log any whose dword changed; count writes that
+     * landed on a watched PAGE but not a watched DWORD, reported per 4096. */
+    int any_watched_changed = 0;
+    for (int i = 0; i < g_wwr_n; i++) {
+        uint32_t cur;
+        memcpy(&cur, g_wwr_host[i], 4);
+        if (cur != g_wwr_old[i]) {
+            any_watched_changed = 1;
+            uint32_t old_be = ps3_bswap32(g_wwr_old[i]);
+            uint32_t new_be = ps3_bswap32(cur);
+            g_wwr_old[i] = cur;
+            uint32_t wtid = yz_thread_current_id();
+            void* bt[24];
+            unsigned short got = RtlCaptureStackBackTrace(1, 24, bt, 0);
+            char chain[300]; int ci = 0; chain[0] = 0;
+            for (unsigned k = 0; k < got && ci < 260; k++) {
+                uint32_t g = yz_guest_addr_from_host(bt[k]);
+                if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci, "%s0x%08X",
+                                       ci ? "<-" : "", g);
+            }
+            fprintf(stderr, "[watch-wr] tid=%u ea=0x%08X old=0x%08X new=0x%08X bt: %s\n",
+                    wtid, g_wwr_ea[i], old_be, new_be, chain);
+            /* Trampoline-ring fallback/supplement (reliable across memcpy/data-lr
+             * hops the host back-chain mis-symbolizes -- same rationale as the
+             * existing yz_watch_veh). */
+            fprintf(stderr, "[watch-wr]   tramp-ring (newest first):");
+            for (unsigned k = 0; k < 10 && k < g_yz_tramp_idx; k++) {
+                unsigned slot2 = (g_yz_tramp_idx - 1 - k) & 255;
+                uint32_t g2 = yz_guest_addr_from_host(g_yz_tramp_ring[slot2]);
+                if (g2) fprintf(stderr, " 0x%08X", g2);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+    if (!any_watched_changed) {
+        /* A write landed on a watched page but touched none of our exact
+         * watched dwords (e.g. an adjacent field in the same 4 KB page).
+         * Count silently; report once per 4096 (spec: "count same-page-
+         * other-dword writes silently, report per 4096"). */
+        if ((++g_wwr_otherhits % 4096) == 0) {
+            fprintf(stderr, "[watch-wr] %lu same-page-other-dword writes so far\n",
+                    g_wwr_otherhits);
+            fflush(stderr);
+        }
+    }
+    /* Re-arm every watched page as PAGE_READONLY (traps the next write). */
+    for (int i = 0; i < g_wwr_n; i++) {
+        bool done_before = false;
+        for (int j = 0; j < i; j++) if (g_wwr_page[j] == g_wwr_page[i]) { done_before = true; break; }
+        if (done_before) continue;
+        DWORD old;
+        VirtualProtect((void*)(uintptr_t)g_wwr_page[i], 0x1000, PAGE_READONLY, &old);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/* Parse YZ_WATCH_WR and arm the page guards. Called once from main(), right
+ * after vm_init() (same placement rationale as YZ_WATCH_EA: some watched EAs
+ * can be written very early, before the "natural" per-subsystem arm point).
+ * Env unset -> this function isn't even called (guard at the call site) --
+ * LESSONS 6b, zero perturbation when off. */
+extern "C" void yz_watch_wr_init(void)
+{
+    const char* s = getenv("YZ_WATCH_WR");
+    if (!s || !*s) return;
+    while (*s && g_wwr_n < YZ_WATCH_WR_MAX) {
+        char* end = nullptr;
+        unsigned long v = strtoul(s, &end, 16);
+        if (end == s) break;
+        uint32_t ea = (uint32_t)v;
+        uint8_t* host = vm_base + ea;
+        uintptr_t page = (uintptr_t)host & ~(uintptr_t)0xFFF;
+        g_wwr_ea[g_wwr_n]   = ea;
+        g_wwr_host[g_wwr_n] = host;
+        g_wwr_page[g_wwr_n] = (uint32_t)page;
+        uint32_t cur; memcpy(&cur, host, 4);
+        g_wwr_old[g_wwr_n]  = cur;
+        g_wwr_n++;
+        fprintf(stderr, "[watch-wr] armed ea=0x%08X page=0x%08X\n", ea, (uint32_t)page);
+        /* LESSONS #6c: a page-guard traps the WHOLE 4 KB page. Warn loudly if
+         * this page overlaps the known-hot SPURS mgmt page class, but arm it
+         * anyway (spec: warn, don't refuse) -- caller owns the tradeoff. */
+        if ((page & 0xFFFFF000u) == 0x40197000u) {
+            fprintf(stderr, "[watch-wr] WARNING: ea=0x%08X is on the hot SPURS-mgmt page "
+                    "0x40197xxx -- this page-guard single-steps EVERY access to the whole "
+                    "4KB page (LESSONS #6c) and can badly slow or wedge the run.\n", ea);
+        }
+        fflush(stderr);
+        s = (*end == ',') ? end + 1 : end;
+    }
+    if (g_wwr_n == 0) return;
+    AddVectoredExceptionHandler(1, yz_watch_wr_veh);
+    for (int i = 0; i < g_wwr_n; i++) {
+        bool done_before = false;
+        for (int j = 0; j < i; j++) if (g_wwr_page[j] == g_wwr_page[i]) { done_before = true; break; }
+        if (done_before) continue;
+        DWORD old;
+        VirtualProtect((void*)(uintptr_t)g_wwr_page[i], 0x1000, PAGE_READONLY, &old);
+    }
+}
+
 /* Map a guest code address back to its lifted function: the table entry whose
  * guest addr is the greatest one <= the address (the table is sorted by addr).
  * Used to symbolize back-chain return addresses in the crash handler. */
@@ -550,7 +702,7 @@ static const yz_func_entry* yz_func_from_guest(uint32_t addr)
 
 /* Dump guest registers + walk the PPC64 back-chain (per-frame code pointers +
  * total depth). Shared by the crash handler and the stall watchdog. */
-static void yz_dump_guest_state(const ppu_context* gc, const char* tag)
+void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 {
     if (!gc) return;
     fprintf(stderr, "\n[%s] guest cia=0x%08X lr=0x%08X ctr=0x%08X r1=0x%08X",
@@ -1410,6 +1562,43 @@ static DWORD WINAPI yz_ts_watch(LPVOID)
     }
 }
 
+/* T1-ONLY non-suspending PC/LR sampler (env YZ_T1SAMPLE, 2026-07-04). The
+ * sem-4-rendezvous-then-silent-spin finding (scratch/_verify_af.err ~line
+ * 7009): t1 issues zero further lv2 syscalls after that point, so the
+ * lv2-wait recorder (yz_wait_get) reports it as "running guest code" forever
+ * -- we need to know WHERE. Per LESSONS #6b/#6c, do NOT suspend t1 or walk
+ * its host stack (YZ_L1SNAP's dumps already proved that corrupts exactly
+ * this kind of measurement). Instead, read the plain globals dispatch.cpp
+ * writes on t1's own indirect-call/trampoline-hop path (g_yz_t1_last_target/
+ * _lr/_sample_seq) from a low-rate (2s) timer thread -- no lock, no pause,
+ * bounded volume (LESSONS #6c). If g_yz_t1_sample_seq stops incrementing
+ * between two reads, t1 has stopped taking indirect calls/trampoline hops
+ * entirely (a tight direct-branch loop with no bctr/tail-branch in it);
+ * otherwise the printed target/lr pins the poll site directly. */
+extern "C" volatile uint32_t g_yz_t1_last_target;
+extern "C" volatile uint32_t g_yz_t1_last_lr;
+extern "C" volatile long     g_yz_t1_sample_seq;
+static DWORD WINAPI yz_t1_sample_thread(LPVOID)
+{
+    long lseq = -1;
+    for (;;) {
+        Sleep(2000);
+        long seq = g_yz_t1_sample_seq;
+        uint32_t tgt = g_yz_t1_last_target;
+        uint32_t lr  = g_yz_t1_last_lr;
+        const yz_func_entry* ft = yz_func_from_guest(tgt);
+        const yz_func_entry* fl = yz_func_from_guest(lr);
+        char tgt_sym[48] = "", lr_sym[48] = "";
+        if (ft) snprintf(tgt_sym, sizeof tgt_sym, " (func_%08X+0x%X)", ft->addr, tgt - ft->addr);
+        if (fl) snprintf(lr_sym,  sizeof lr_sym,  " (func_%08X+0x%X)", fl->addr, lr  - fl->addr);
+        fprintf(stderr, "[t1sample] seq=%ld (%s since last read) target=0x%08X%s lr=0x%08X%s\n",
+                seq, (seq == lseq) ? "UNCHANGED" : "moved", tgt, tgt_sym, lr, lr_sym);
+        fflush(stderr);
+        lseq = seq;
+    }
+    return 0;
+}
+
 /* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
  * Samples the FIFO GET/PUT, the command word at GET, the flip fence, and t1's
  * ctr every ~120ms WITHOUT suspending any thread, and logs ONLY on change -- so
@@ -1683,6 +1872,13 @@ int main(int argc, char** argv)
      * too early for the RSX-thread arm to catch. */
     if (const char* we = getenv("YZ_WATCH_EA")) yz_watch_arm((uint32_t)strtoul(we, nullptr, 16));
 
+    /* T3 (docs/TOOLING_WORKORDER.md): YZ_WATCH_WR=hexEA[,hexEA...] -- env-driven
+     * multi-address write-watch, no rebuild per question. yz_watch_wr_init()
+     * itself is a single getenv()+return when the flag is unset (LESSONS 6b:
+     * zero perturbation when off), so the call is unconditional here, same as
+     * YZ_WATCH_EA's arm above. */
+    yz_watch_wr_init();
+
     uint64_t e_entry = 0;
     if (load_elf(elf_path, &e_entry) != 0)
         return 1;
@@ -1839,6 +2035,11 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
+    /* Non-suspending t1 PC/LR sampler (env YZ_T1SAMPLE, 2026-07-04) -- see the
+     * comment above yz_t1_sample_thread. Pins the exact poll site for a
+     * silent (no-syscall) t1 stall without perturbing the thread. */
+    if (getenv("YZ_T1SAMPLE"))
+        CreateThread(NULL, 0, yz_t1_sample_thread, NULL, 0, NULL);
     /* RSX FIFO flow-control band-aid -- RETIRED AGAIN (default OFF,
      * 2026-07-02 layer-1 root-cause session; opt back in with YZ_FLOWCTL=1).
      * The race it covered is root-caused: OUR deferred-release applier
