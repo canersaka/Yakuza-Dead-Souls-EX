@@ -38,7 +38,7 @@ s32 cellSslInit(void* pool, u32 poolSize);
 s32 cellSslEnd(void);
 
 /* Certificate management */
-s32 cellSslCertificateLoader(u32 flags);
+s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required);
 s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize);
 s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize);
 s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time);

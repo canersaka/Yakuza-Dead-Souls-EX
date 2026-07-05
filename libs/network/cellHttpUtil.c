@@ -221,30 +221,40 @@ s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
 }
 
 s32 cellHttpUtilUnescapeUri(u8* out, u32 outSize,
-                             const char* src, u32 srcSize, u32* written)
+                             const char* src, u32* required)
 {
-    if (!out || !src)
+    if (!src)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
+    if (!out && !required)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
 
+    u32 srcSize = (u32)strlen(src);
     u32 pos = 0;
     for (u32 i = 0; i < srcSize; i++) {
-        if (pos >= outSize)
+        if (out && pos >= outSize)
             return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
 
+        u8 decoded;
         if (src[i] == '%' && i + 2 < srcSize) {
             int hi = hex_digit(src[i + 1]);
             int lo = hex_digit(src[i + 2]);
             if (hi >= 0 && lo >= 0) {
-                out[pos++] = (u8)((hi << 4) | lo);
+                decoded = (u8)((hi << 4) | lo);
                 i += 2;
-                continue;
+            } else {
+                decoded = (u8)src[i];
             }
+        } else {
+            decoded = (u8)src[i];
         }
-        out[pos++] = (u8)src[i];
+
+        if (out)
+            out[pos] = decoded;
+        pos++;
     }
 
-    if (written)
-        *written = pos;
+    if (required)
+        *required = pos;
 
     return CELL_OK;
 }

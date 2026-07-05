@@ -93,18 +93,19 @@ s32 cellSailPlayerGetStreamNum(CellSailPlayerHandle handle, u32* streamNum);
 s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
                                   CellSailStreamInfo* info);
 
-s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index);
-s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index);
+s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter);
+s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter);
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle);
 s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle);
-s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode);
+s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command);
 
 /* Descriptor management (for multi-stream sources) */
 typedef u32 CellSailDescriptorHandle;
 
 s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
-                                     s32 streamType, void* arg,
+                                     s32 streamType, void* mediaInfo,
+                                     char* uri,
                                      CellSailDescriptorHandle* desc);
 s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
                                       CellSailDescriptorHandle desc);
@@ -128,10 +129,18 @@ typedef struct CellSailMemAllocator {
     void* arg;
 } CellSailMemAllocator;
 
+/* Mirrors RPCS3's CellSailMemAllocatorFuncs: a guest struct of two callback
+ * pointers, passed as one pointer arg (not two separate function pointers). */
+typedef struct CellSailMemAllocatorFuncs {
+    void* pAlloc;
+    void* pFree;
+} CellSailMemAllocatorFuncs;
+
+/* Named pFuncs (not "callbacks") so the import-bridge generator's naming
+ * heuristic (gen_imports.py param_marshal) treats this as a real guest
+ * struct pointer needing host-pointer translation, not a raw callback value. */
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     void* (*allocFunc)(void*, u32, u32),
-                                     void  (*freeFunc)(void*, u32, void*),
-                                     void* arg);
+                                     CellSailMemAllocatorFuncs* pFuncs);
 
 #ifdef __cplusplus
 }

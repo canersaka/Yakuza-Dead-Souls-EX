@@ -151,7 +151,7 @@ typedef void (*cellNetCtlHandler)(s32 prev_state, s32 new_state,
  * -----------------------------------------------------------------------*/
 
 s32 cellNetCtlInit(void);
-s32 cellNetCtlTerm(void);
+void cellNetCtlTerm(void);
 
 s32 cellNetCtlGetState(s32* state);
 s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info);

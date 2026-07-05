@@ -53,10 +53,12 @@ s32 cellSslEnd(void)
     return CELL_OK;
 }
 
-s32 cellSslCertificateLoader(u32 flags)
+s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required)
 {
-    (void)flags;
-    printf("[cellSsl] CertificateLoader(flags=0x%X)\n", flags);
+    (void)buffer; (void)size;
+    printf("[cellSsl] CertificateLoader(flags=0x%llX)\n", (unsigned long long)flags);
+    if (required)
+        *required = 0;
     return CELL_OK;
 }
 

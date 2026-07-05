@@ -82,14 +82,14 @@ typedef struct CellHttpUri {
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpInit(u32 poolSize);
+s32 cellHttpInit(void* pool, u32 poolSize);
 s32 cellHttpEnd(void);
 
 s32 cellHttpCreateClient(CellHttpClientId* clientId);
 s32 cellHttpDestroyClient(CellHttpClientId clientId);
 
-s32 cellHttpCreateTransaction(CellHttpClientId clientId, const char* method,
-                              const CellHttpUri* uri, CellHttpTransId* transId);
+s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientId,
+                              const char* method, const CellHttpUri* uri);
 s32 cellHttpDestroyTransaction(CellHttpTransId transId);
 
 s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,

@@ -116,16 +116,12 @@ s32 cellNetCtlInit(void)
     return CELL_OK;
 }
 
-s32 cellNetCtlTerm(void)
+void cellNetCtlTerm(void)
 {
     printf("[cellNetCtl] Term()\n");
 
-    if (!s_netctl_initialized)
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
-
     memset(s_handlers, 0, sizeof(s_handlers));
     s_netctl_initialized = 0;
-    return CELL_OK;
 }
 
 s32 cellNetCtlGetState(s32* state)
