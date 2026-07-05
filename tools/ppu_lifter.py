@@ -304,7 +304,7 @@ class PPULifter:
         # instead of erroring on a duplicate definition.
         self.extern_funcs: set[int] = set()
         # Trace mode (--trace): emit ppu_trace_pc(ctx, PC) before every instruction
-        # for the PPU differential trace-diff (docs/TRACEDIFF.md). Off by default;
+        # for the PPU differential trace-diff (tools/tracediff.py). Off by default;
         # a trace-enabled build is kept aside (the emission bloats every function).
         self.trace: bool = False
         # Function-table symbol name; a second lifted object in the same link
@@ -2617,7 +2617,7 @@ class PPULifter:
         lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
-        # ---- VMX lane-endianness accessors (audit S2-1 / docs/PPU_VMX_ENDIANNESS.md) ----
+        # ---- VMX lane-endianness accessors ----
         # ctx->vr holds RAW big-endian bytes (lvx/stvx do a plain memcpy: guest
         # memory byte 0 == vr.b[0], the MSB, matching AltiVec PEM Fig. 1-3 and
         # 1.3.2.1: an aligned quadword load places EA's byte into byte element 0).
@@ -2627,7 +2627,7 @@ class PPULifter:
         # so a handler's lane math sees the correct BE-ordered scalar value while
         # byte-granular ops (vperm/lvsl/vsldoi/lvlx/merge/pack) keep using vr.b[]
         # untouched. Bytes need no swap. Convention: "element k at index k".
-        lines.append("/* VMX big-endian lane accessors (raw-BE storage; see docs/PPU_VMX_ENDIANNESS.md) */")
+        lines.append("/* VMX big-endian lane accessors (raw-BE storage; element k at index k) */")
         lines.append("#if defined(_MSC_VER)")
         lines.append("#define VR_BSWAP16(x) _byteswap_ushort(x)")
         lines.append("#define VR_BSWAP32(x) _byteswap_ulong(x)")
@@ -2930,7 +2930,7 @@ def main() -> None:
     parser.add_argument("--little-endian", action="store_true")
     parser.add_argument("--trace", action="store_true",
                         help="Emit ppu_trace_pc(ctx, PC) before every instruction for the "
-                             "PPU differential trace-diff (docs/TRACEDIFF.md). Produces a "
+                             "PPU differential trace-diff (tools/tracediff.py). Produces a "
                              "trace-enabled build; keep it aside (bloats every function).")
     parser.add_argument("--functions", metavar="FILE",
                         help="JSON file with function list [{start, end}, ...]")

@@ -1,6 +1,6 @@
 /* SPU interpreter (2026-07-01 reassessment, item 3a) — SCAFFOLD.
  *
- * Purpose (docs/SPU_INTERP_PLAN.md):
+ * Purpose:
  *   1. in-process ORACLE: run an SPU image instruction-by-instruction and
  *      lockstep-diff against the lifted code, classifying every SPU anomaly
  *      as lift-bug vs runtime-bug on the spot (no instrumented-RPCS3 cycle);
@@ -16,7 +16,7 @@
  * STATUS: decoder + trace are live; the semantic switch in spu_interp_step is
  * intentionally unimplemented (returns SPU_INTERP_UNIMPL). Semantics land
  * incrementally, verified per-op against CBEA + the tracediff harness
- * (docs/TRACEDIFF.md). Do NOT wire this into dispatch until then.
+ * (tools/tracediff.py). Do NOT wire this into dispatch until then.
  */
 #include <stdint.h>
 #include <stdio.h>

@@ -96,8 +96,8 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
          * (@0x40197C80+0) + wklSignal1 bit0, vs the WORKING wid2/gs_task (@+0x02)? */
         {0x40197C80u, "readyCount[0]=wid0"}, {0x40197C82u, "readyCount[2]=wid2"},
         /* 2026-07-05 (YZ_SWS_WATCH task): the pxd TASKSET's own bitset words, one
-         * level upstream of cellSpursSendWorkloadSignal. Layout per
-         * docs/SPURS_TASKSET.md (CellSpursTaskset, base 0x40199D00): running@0x00,
+         * level upstream of cellSpursSendWorkloadSignal. CellSpursTaskset layout
+         * (base 0x40199D00): running@0x00,
          * ready@0x10, pending_ready@0x20, enabled@0x30, signalled@0x40, waiting@0x50
          * (each a 4xu32 bitset, one bit per taskId, task 0's bit = MSB of word0).
          * Does _spurs::task_start / cellSpursCreateTask ever flip pending_ready/
@@ -146,7 +146,7 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
 }
 
 /* ---------------------------------------------------------------------------
- * PPU differential trace (docs/TRACEDIFF.md). Emitted by the --trace lifter
+ * PPU differential trace (tools/tracediff.py). Emitted by the --trace lifter
  * build before EVERY instruction. Gated to ONE thread (env YZ_PPU_TRACE +
  * YZ_PPU_TRACE_TID, default 1 -- set 11 for cri_dlg) so the log isn't a
  * multi-thread interleave; optionally armed on the first hit of a start PC

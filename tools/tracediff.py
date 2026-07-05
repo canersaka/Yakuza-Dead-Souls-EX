@@ -13,7 +13,7 @@ bug up to that point in one pass, instead of one boot-wall at a time.
 
 Engine-agnostic: it diffs any trace in the format below, so the SAME tool covers
 SPU images (128-bit regs, two hex words) and PPU threads (64-bit GPRs, one word;
-FPR/CR/LR/... by name). See docs/SPU_TRACEDIFF.md for the emitters + runbook.
+FPR/CR/LR/... by name). Drivers: tools/diverge.ps1 (SPU) and tools/ppu_diverge.ps1 (PPU).
 
 TRACE FORMAT (both engines emit this)
     <PC hex>                         one line per retired instruction (PC about to run)

@@ -973,7 +973,7 @@ def summarize(kept, skipped, log_text, verbose):
 # is byte-identical to before this section existed).
 #
 # ---------------------------------------------------------------------------
-# THE REF-FUNCTION CONTRACT (verbatim -- Phase-2 agents follow this exactly)
+# THE REF-FUNCTION CONTRACT (every family file follows this exactly)
 # ---------------------------------------------------------------------------
 #
 # 1. u128 REPRESENTATION. A register value is a Python list of 4 uint32 SPU
