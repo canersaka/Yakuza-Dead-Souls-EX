@@ -38,6 +38,122 @@ static bool addr_readable(uint32_t a)
            (a >= 0xD0000000u && a < 0xE0000000u);
 }
 
+/* ===========================================================================
+ * mwPly (CRI Sofdec player) dynamic-ABI probe (env YZ_MWPLY_PROBE, 2026-07-04)
+ * See scratch/MWPLY_RESOLVE.md for the resolution recipe. Three resolved
+ * addresses, all reached only via indirect (bctr) dispatch:
+ *   func_00F4D0A8 = mwPlyIsNextFrmReady (the poll gate t1 spins on)
+ *   func_00F4DA90 = mwPlyGetFrm         (decoded video frame)
+ *   func_00F48E48 = mwPlyGetAudioPcmData_PS3 (audio PCM pull)
+ * Diagnostic-only; gated OFF by default (LESSONS #13). Also implements
+ * YZ_MWPLY_FORCEREADY (separate flag, default OFF): skip the real
+ * IsNextFrmReady call and force ctx->gpr[3]=1, to see whether the player then
+ * advances into calling the getters at all.
+ * =========================================================================*/
+#define YZ_MWPLY_ISREADY   0x00F4D0A8u
+#define YZ_MWPLY_GETFRM    0x00F4DA90u
+#define YZ_MWPLY_GETAUDIO  0x00F48E48u
+
+static bool yz_mwply_probe_target(uint32_t target)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("YZ_MWPLY_PROBE") ? 1 : 0;
+    if (!en) return false;
+    return target == YZ_MWPLY_ISREADY || target == YZ_MWPLY_GETFRM ||
+           target == YZ_MWPLY_GETAUDIO;
+}
+
+static const char* yz_mwply_name(uint32_t target)
+{
+    if (target == YZ_MWPLY_ISREADY)  return "mwPlyIsNextFrmReady";
+    if (target == YZ_MWPLY_GETFRM)   return "mwPlyGetFrm";
+    if (target == YZ_MWPLY_GETAUDIO) return "mwPlyGetAudioPcmData_PS3";
+    return "?";
+}
+
+/* Volume-bounded gate shared by all three probe sites: first 40 calls, then
+ * 1-in-500 (LESSONS #6c -- a tight poll must not flood/serialize the guest). */
+static bool yz_mwply_should_log(long* counter)
+{
+    long c = ++(*counter);
+    return c <= 40 || (c % 500) == 0;
+}
+
+/* Dump `len` bytes at guest EA `ea` as hex words, guest-BE (as the game wrote
+ * them), guarded by addr_readable so a garbage pointer can't fault the probe. */
+static void yz_mwply_dump_buf(const char* tag, uint32_t ea, uint32_t len)
+{
+    if (!ea) { fprintf(stderr, "  %s=NULL\n", tag); return; }
+    if (!addr_readable(ea)) {
+        fprintf(stderr, "  %s=0x%08X (UNREADABLE, skipped)\n", tag, ea);
+        return;
+    }
+    fprintf(stderr, "  %s=0x%08X:", tag, ea);
+    for (uint32_t o = 0; o < len; o += 4)
+        fprintf(stderr, " %08X", vm_read32(ea + o));
+    fprintf(stderr, "\n");
+}
+
+extern "C" void yz_drain_trampolines(ppu_context* ctx);
+
+/* Entry point called from ps3_indirect_call for the three probe targets
+ * instead of the normal g_trampoline_fn hand-off. We call the real function
+ * SYNCHRONOUSLY here (rather than via the trampoline slot) so we can log its
+ * return value and out-params right after -- safe because these are leaf-ish
+ * CRI player calls, not long tail-chains that would grow the host stack. */
+static void yz_mwply_probe_dispatch(uint32_t target, yz_ppu_fn fn, ppu_context* ctx)
+{
+    static long counters[3] = {0, 0, 0};
+    int idx = (target == YZ_MWPLY_ISREADY) ? 0 : (target == YZ_MWPLY_GETFRM) ? 1 : 2;
+    bool log_this = yz_mwply_should_log(&counters[idx]);
+    const char* nm = yz_mwply_name(target);
+    unsigned tid = yz_thread_current_id();
+
+    uint64_t r3 = ctx->gpr[3], r4 = ctx->gpr[4], r5 = ctx->gpr[5];
+    uint64_t r6 = ctx->gpr[6], r7 = ctx->gpr[7], r8 = ctx->gpr[8];
+
+    if (log_this) {
+        fprintf(stderr, "[mwply] %s tid=%u r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX r7=0x%llX r8=0x%llX\n",
+                nm, tid, (unsigned long long)r3, (unsigned long long)r4,
+                (unsigned long long)r5, (unsigned long long)r6,
+                (unsigned long long)r7, (unsigned long long)r8);
+        fflush(stderr);
+    }
+
+    static int force_ready = -1;
+    if (force_ready < 0) force_ready = getenv("YZ_MWPLY_FORCEREADY") ? 1 : 0;
+
+    if (target == YZ_MWPLY_ISREADY && force_ready) {
+        /* Skip the real poll test; force "ready" (nonzero) so we can see
+         * whether the player advances to calling the getters at all. */
+        ctx->gpr[3] = 1;
+        if (log_this) {
+            fprintf(stderr, "  [FORCEREADY] skipped real call, forced ret=1\n");
+            fflush(stderr);
+        }
+    } else {
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+    }
+
+    if (log_this) {
+        fprintf(stderr, "  -> ret ctx->gpr[3]=0x%llX\n", (unsigned long long)ctx->gpr[3]);
+        if (target == YZ_MWPLY_GETFRM) {
+            /* r4 = small out-struct (init'd to -1 sentinel per static read);
+             * r5 = ~0xA8-byte out-struct memset to 0 then filled. */
+            yz_mwply_dump_buf("r4(small-struct)", (uint32_t)r4, 0x20);
+            yz_mwply_dump_buf("r5(frame-struct,0xA8)", (uint32_t)r5, 0xA8);
+        } else if (target == YZ_MWPLY_GETAUDIO) {
+            /* r4/r5/r6 = the out pointers per the static ABI read (count/ptr
+             * fields observed at entry); dump ~0x40 bytes at each candidate. */
+            yz_mwply_dump_buf("r4", (uint32_t)r4, 0x40);
+            yz_mwply_dump_buf("r5", (uint32_t)r5, 0x40);
+            yz_mwply_dump_buf("r6", (uint32_t)r6, 0x40);
+        }
+        fflush(stderr);
+    }
+}
+
 extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
 {
     unsigned lo = 0, hi = g_yz_func_count;
@@ -89,6 +205,19 @@ extern "C" volatile long g_yz_catch_caller = 0;
 extern "C" void*         g_yz_caller_bt[32] = {};
 extern "C" volatile long g_yz_caller_bt_n  = 0;
 
+/* T1-ONLY non-suspending PC/LR sampler (env YZ_T1SAMPLE, 2026-07-04, the
+ * sem-4-rendezvous-then-silent-spin frontier). g_yz_last_targets below is
+ * shared by every guest thread, so it's useless once other threads (t7/t10/
+ * t13-24) keep calling indirectly while t1 alone goes quiet -- their hits
+ * drown t1's. These are written ONLY when yz_thread_current_id()==1 (one
+ * branch, no lock, no suspend -- LESSONS #6b: a diagnostic must never
+ * perturb the thread it measures) and read by a low-rate timer thread in
+ * main.cpp. g_yz_t1_sample_seq increments on every t1 hop, so the printer
+ * can tell "moved since last read" from "still parked at the same site". */
+extern "C" volatile uint32_t g_yz_t1_last_target = 0;   /* ctr at t1's last bctr(l) */
+extern "C" volatile uint32_t g_yz_t1_last_lr     = 0;   /* lr at t1's last trampoline hop */
+extern "C" volatile long     g_yz_t1_sample_seq  = 0;
+
 extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
     ppu_context* ctx0 = (ppu_context*)ctxv;
@@ -97,6 +226,17 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
     g_yz_tramp_r31[_ri]  = ctx0->gpr[31];
     g_yz_tramp_r1[_ri]   = ctx0->gpr[1];
     g_yz_tramp_lr[_ri]   = ctx0->lr;     /* = caller's return addr (names the caller) */
+
+    /* YZ_T1SAMPLE (see globals above): covers the same-chunk direct-tail-branch
+     * hop (g_trampoline_fn = func_X; return;) which ps3_indirect_call never
+     * sees. tf is a host fn ptr here, not a guest addr -- resolve is left to
+     * the printer/tools (yz_guest_of_host runs in this TU). */
+    if (yz_thread_current_id() == 1) {
+        uint32_t g = yz_guest_of_host(tf);
+        if (g) g_yz_t1_last_target = g;
+        g_yz_t1_last_lr = (uint32_t)ctx0->lr;
+        g_yz_t1_sample_seq++;
+    }
 
     if (g_yz_catch_caller) {
         static void* usleep_fn = nullptr;
@@ -125,6 +265,35 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
                 fprintf(stderr, "[drain] func_%08X hit #%ld tid=%u\n", a[i], c[i], yz_thread_current_id());
         }
       } }
+
+    /* mwPly PROBE, entry-args-only path (env YZ_MWPLY_PROBE, 2026-07-04): this
+     * trampoline hop covers BOTH the bctr-indirect case (already fully wrapped
+     * in ps3_indirect_call, which returns before setting g_trampoline_fn for
+     * these targets, so it does NOT reach here) and the same-chunk direct
+     * tail-branch case (e.g. func_00F48E48, reached via
+     * `g_trampoline_fn = func_00F48E48; return;` inside another lifted
+     * function's fallthrough -- ps3_indirect_call never runs for that path).
+     * DRAIN_TRAMPOLINE captures the callee into a local before this guard runs
+     * and calls it unconditionally right after, so we cannot wrap the return
+     * here without editing generated code -- entry args only. */
+    { static int en3 = -1; if (en3 < 0) en3 = getenv("YZ_MWPLY_PROBE") ? 1 : 0;
+      if (en3) {
+        static void* mwfn[3]; static long c3[3]; static int init3 = 0;
+        if (!init3) { init3 = 1;
+            mwfn[0] = (void*)yz_lookup_func(0x00F4D0A8u);   /* mwPlyIsNextFrmReady */
+            mwfn[1] = (void*)yz_lookup_func(0x00F4DA90u);   /* mwPlyGetFrm */
+            mwfn[2] = (void*)yz_lookup_func(0x00F48E48u); } /* mwPlyGetAudioPcmData_PS3 */
+        static const char* mwnm[3] = { "mwPlyIsNextFrmReady", "mwPlyGetFrm", "mwPlyGetAudioPcmData_PS3" };
+        for (int i = 0; i < 3; i++) if (tf == mwfn[i] && mwfn[i]) {
+            long c = ++c3[i];
+            if (c <= 40 || (c % 500) == 0)
+                fprintf(stderr, "[mwply-tramp] %s (direct-tail-branch hop) tid=%u r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX\n",
+                        mwnm[i], yz_thread_current_id(),
+                        (unsigned long long)ctx0->gpr[3], (unsigned long long)ctx0->gpr[4],
+                        (unsigned long long)ctx0->gpr[5], (unsigned long long)ctx0->gpr[6]);
+        }
+      } }
+
     ppu_context* ctx = (ppu_context*)ctxv;
     if (!g_yz_game_toc || ctx->gpr[2] == g_yz_game_toc) return;
     uint32_t g = yz_guest_of_host(tf);
@@ -167,10 +336,28 @@ unsigned g_yz_last_idx;
 extern "C" uint32_t g_yz_spurs_taskset;
 extern "C" uint32_t g_yz_codec_taskset;   /* pt35: cri_audio codec taskset (wid 3) */
 
+/* Defined in main.cpp with plain C++ linkage (shared by the crash handler and
+ * the stall watchdog). Declared here at FILE SCOPE, outside any extern "C"
+ * context -- a local `extern` forward-decl nested inside ps3_indirect_call
+ * (itself `extern "C"`) gets C linkage in MSVC and fails to link against the
+ * C++-mangled definition. */
+void yz_dump_guest_state(const ppu_context* gc, const char* tag);
+
+/* Public helper from runtime/syscalls/sys_event.c (declared here rather than
+ * pulling in sys_event.h, matching this file's existing forward-decl style
+ * for cross-module calls). Used only by the YZ_EVFLAG_FORCE fallback below. */
+extern "C" int sys_event_queue_push_by_id(uint32_t queue_id,
+                                           uint64_t source, uint64_t data1,
+                                           uint64_t data2,  uint64_t data3);
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     uint32_t target = (uint32_t)ctx->ctr;
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
+    if (yz_thread_current_id() == 1) {
+        g_yz_t1_last_target = target;
+        g_yz_t1_sample_seq++;
+    }
 
     /* GENERIC indirect-call hook (env YZ_HOOK, 2026-07-02): comma-separated hex
      * guest code/OPD addresses (up to 8); logs args + lr on every bctrl to a
@@ -219,6 +406,214 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                           nm, (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                           (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->lr);
                   fflush(stderr); }
+          }
+      } }
+
+    /* SPURS event-flag WAIT/SET watch (env YZ_EVFLAG_WATCH, 2026-07-04, diag —
+     * REMOVE when the t1-wedge frontier closes). Session 10 measured t1 parked
+     * forever in func_02015C2C (cellSpursEventFlagWait's poll body, entered via
+     * func_02015F74) and the release test on object 0x63D61720 did NOT wake it
+     * (scratch/adx_release_test2.err) -- so either the object, the waited
+     * bitmask, or both are the wrong guess. This logs the REAL wait args t1
+     * passes to func_02015F74 (object EA / mode / bitmask / the object's
+     * current flag-bits at entry) and every cellSpursEventFlagSet call's
+     * (object EA, set-bits, calling tid) so we can see whether a producer ever
+     * targets t1's real object at all.
+     *
+     * ABI (read from the lifted bodies, recomp_prx/libsre_recomp_000.cpp):
+     *   func_02015F74(eventFlag ea=r3, mode=r4, mask=r5) -- entry is a
+     *     3-instruction trampoline (`gpr6=1; goto func_02015C2C`) that tail-
+     *     hops into the real poll body func_02015C2C with the SAME r3/r4/r5
+     *     (r3->r11/r9, r4->r31, r5 compared against 1 at loc_02015C88) and an
+     *     implicit "wait" flag (r6=1) distinguishing it from the non-waiting
+     *     entry func_02015F7C (r6=0, same body). The object's mode/type byte
+     *     lives at [ea+0xE]; the CAS'd flag-bits FIELD is the 8-byte word at
+     *     ea+0x0 itself (loc_02015CC4: gpr29 = (uint32_t)gpr9, and gpr9==gpr3
+     *     ==the object ea unmodified -- the ldarx/stdcx pair at loc_02015D18/
+     *     loc_02015D2C operates on *(u64*)ea, NOT ea+8). Log a 64-bit read at
+     *     ea+0 as "current bits" (this also matches func_02016010's own CAS
+     *     loop below, same ea+0 word).
+     *   func_02016010(eventFlag ea=r3, bits=r4) -- cellSpursEventFlagSet; its
+     *     ldarx/stdcx CAS loop (loc_020160F4/loc_020161E4) targets gpr27 =
+     *     (uint32_t)gpr9 = (uint32_t)gpr3 = the SAME ea+0 word, confirming the
+     *     two functions share one object layout. Confirmed against
+     *     scratch/libsre_lle_map.txt (both names) and the ADX_SPURS_EVENTFLAG_*
+     *     defines in libs/filesystem/cellFs.c (which independently arrived at
+     *     the same two addresses). */
+    { static int ew = -1; if (ew < 0) ew = getenv("YZ_EVFLAG_WATCH") ? 1 : 0;
+      if (ew) {
+          /* addr_readable() above only covers main-mem [0x10000,0x10000000) and
+           * the stack region [0xD0000000,0xE0000000) -- it does NOT know about
+           * the sys_memory-allocate heap (observed live at 0x40000000+, e.g.
+           * "[sys_memory] allocate -> 0x40000000" early in every boot log),
+           * which vm.h commits on demand (vm_commit, ppu/memory/vm.h ~157) and
+           * is real, backed, readable guest memory. A local, WIDER guard here
+           * (not touching the shared addr_readable, which other probes rely on
+           * for its narrower main-mem/stack-only semantics) avoids a false
+           * "EA UNREADABLE" on a perfectly valid SPURS-heap object. */
+          auto evflag_ea_ok = [](uint32_t a) {
+              return (a >= 0x00010000u && a < 0xE0000000u);
+          };
+          if (target == 0x02015F74u && yz_thread_current_id() == 1) {
+              static long n = 0; long c = ++n;
+              if (c <= 10 || (c % 97) == 0) {
+                  uint32_t ea   = (uint32_t)ctx->gpr[3];
+                  uint32_t mode = (uint32_t)ctx->gpr[4];
+                  uint32_t mask = (uint32_t)ctx->gpr[5];
+                  bool ok = evflag_ea_ok(ea);
+                  uint64_t bits = ok ? vm_read64(ea) : ~0ull;
+                  uint32_t type = ok ? vm_read8(ea + 0xEu) : 0xFFu;
+                  fprintf(stderr, "[evflag-wait] #%ld tid=1 ea=0x%08X mode=0x%X mask=0x%08X "
+                          "cur_bits=0x%016llX type@0xE=0x%02X %s lr=0x%08llX\n",
+                          c, ea, mode, mask, (unsigned long long)bits, type,
+                          ok ? "" : "(EA UNREADABLE)",
+                          (unsigned long long)ctx->lr);
+                  fflush(stderr);
+
+                  /* YZ_EVFLAG_BT (2026-07-04, diag -- DIAGNOSIS TASK, remove with
+                   * the t1-wedge frontier): the immediate ctx->lr here is 0 (this
+                   * hook fires INSIDE the trampoline hop func_02015F74 -> the real
+                   * poll body func_02015C2C, and the trampoline is reached via
+                   * bctr, not bl -- so ctx->lr is whatever the trampoline itself
+                   * had, not the GAME caller). Walk the guest PPC64 back-chain
+                   * (r1 -> *(r1)=caller sp, saved LR at sp+0x10 per frame) to
+                   * name the real game function(s) that called into this wait.
+                   * Reuses the crash handler's yz_dump_guest_state walker
+                   * (extern from main.cpp) -- only for ea==0x4019C680 (the
+                   * measured wedge object) and only the first few hits, to keep
+                   * output bounded (LESSONS #6/#13). */
+                  { static int bt = -1; if (bt < 0) bt = getenv("YZ_EVFLAG_BT") ? 1 : 0;
+                    static long btn = 0;
+                    if (bt && ea == 0x4019C680u && btn < 5) {
+                        btn++;
+                        yz_dump_guest_state(ctx, "evflag-bt");
+                    } }
+              }
+          } else if (target == 0x02016010u) {
+              static long n = 0; long c = ++n;
+              if (c <= 10 || (c % 97) == 0) {
+                  uint32_t ea  = (uint32_t)ctx->gpr[3];
+                  uint32_t set = (uint32_t)ctx->gpr[4];
+                  fprintf(stderr, "[evflag-set] #%ld tid=%u ea=0x%08X set_bits=0x%08X lr=0x%08llX\n",
+                          c, yz_thread_current_id(), ea, set, (unsigned long long)ctx->lr);
+                  fflush(stderr);
+              }
+          }
+      } }
+
+    /* SPURS event-flag FORCE (env YZ_EVFLAG_FORCE, 2026-07-04, DIAGNOSTIC ONLY --
+     * see docs/FLAGS.md; NOT a shipping fix, LESSONS #13). Purpose: t1 deadlocks
+     * forever in cellSpursEventFlagWait on IWL object ea=0x4019C680, waiting for
+     * mask 0x1; the owning SPU workload never signals it. This forces the wait
+     * to succeed so we can observe what boot wall comes NEXT.
+     *
+     * Injection point: func_02015F74's entry (target==0x02015F74u), i.e. BEFORE
+     * the trampoline hops into the real poll body func_02015C2C. func_02015C2C's
+     * CAS loop (loc_02015D18/loc_02015D2C) operates on the FULL 64-bit word at
+     * ea+0x0 (ldarx/stdcx, not a narrower access), and extracts the `events`
+     * struct field (CellSpursEventFlag, RPCS3 cellSpurs.h:890, be_t<u16> at
+     * ea+0x00) as the TOP 16 bits of that 64-bit big-endian word: loc_02015D48
+     * does `ppc_rldicl(gpr9, 48, 48)` = rotate-left-48 (=rotate-right-16) then
+     * keep bits[48:63], which un-rotates the original bits[0:15] into the low
+     * 16 bits -- i.e. `(bits >> 48) & 0xFFFF` in a host uint64_t holding the
+     * BE-loaded word. So writing the guest BE u16 at ea+0x0 (vm_write16, which
+     * does the host->guest byteswap itself) is exactly the field the CAS
+     * fast-path re-checks; no need to touch ea+0x2 (a different sub-field also
+     * covered by the same 8-byte CAS but unrelated to the mask test at
+     * loc_02015D48/loc_02015D7C).
+     *
+     * We fire this on EVERY entry (not gated to first-N like the watch above)
+     * since t1 may re-wait after this one is satisfied and hit a sibling
+     * event-flag -- each such wait must also be force-satisfied to keep
+     * scoping how far the boot advances. Scoped to ea==0x4019C680 only (the
+     * ONE measured wedge object; do not generalize to "always satisfy any
+     * wait", which would erase the very information this experiment wants). */
+    { static int ef = -1; if (ef < 0) ef = getenv("YZ_EVFLAG_FORCE") ? 1 : 0;
+      if (ef && target == 0x02015F74u && yz_thread_current_id() == 1) {
+          uint32_t ea = (uint32_t)ctx->gpr[3];
+          if (ea == 0x4019C680u) {
+              vm_write16(ea + 0x0u, 0x0001u);
+              static long n = 0; long c = ++n;
+              if (c <= 20 || (c % 97) == 0) {
+                  fprintf(stderr, "[evflag-force] #%ld tid=1 ea=0x%08X wrote events=0x0001 "
+                          "(pre-CAS force) lr=0x%08llX\n",
+                          c, ea, (unsigned long long)ctx->lr);
+                  fflush(stderr);
+              }
+
+              /* Fallback (env YZ_EVFLAG_FORCE, same flag): if the CAS write above
+               * did NOT stop t1 from parking (i.e. the poll body already read the
+               * old bits before this hook ran, or it fell through into the
+               * blocking sys_event_queue_receive at syscall 0x82 -- see
+               * func_02015C2C loc_02015E3C/loc_02015ECC), also push the event
+               * queue directly so a receiver blocked in the syscall wakes up.
+               * eventQueueId lives at ea+0x7C (RPCS3 cellSpurs.h:915,
+               * be_t<u32>); read it guest-endian via vm_read32. source/data*
+               * are dummy nonzero payload -- the CAS-based wait re-checks the
+               * bits itself on wake, it doesn't trust the event payload. */
+              uint32_t qid = vm_read32(ea + 0x7Cu);
+              if (qid != 0) {
+                  sys_event_queue_push_by_id(qid, 0x4556464Cu /*"EVFL"*/, 1, 0, 0);
+              }
+          }
+      } }
+
+    /* SPURS event-flag LIFECYCLE watch (env YZ_EVFLAG_LIFECYCLE, 2026-07-04, diag --
+     * DIAGNOSIS TASK, remove with the t1-wedge frontier). Complements YZ_EVFLAG_WATCH
+     * (which only sees Wait/Set). This hooks the CREATE/ATTACH side so we can name the
+     * workload (wid) that OWNS a given event-flag object -- the producer-chain
+     * question for the t1 wedge on ea=0x4019C680.
+     *
+     * ABI (read from the lifted bodies, recomp_prx/libsre_recomp_000.cpp):
+     *   func_02015758 = _cellSpursEventFlagInitialize(eventFlag ea=r3, taskset/spurs=r4,
+     *     direction=r5, clearMode=r6, ...=r7): gpr29=r3(ea), gpr30=r4(taskset/spurs ptr),
+     *     gpr31=r5(direction: 0=clears via CAS same as Set, else compared -- this is
+     *     CELL_SPURS_EVENT_FLAG_CLEAR_AUTO/MANUAL), gpr27=r6, gpr28=r7. It reads
+     *     *(r4+0x74) at loc_02015830 -- SPURS_TASKSET.md documents taskset+0x74 = wid,
+     *     so THIS is how we read off the owning wid when r4 is a taskset (not NULL/IWL).
+     *     Writes mode/type bytes to ea+0xC/0xD/0xE/0xF (ea+0xE done at loc_0201586C:
+     *     type = (r27<1) ? ... ; the direction-derived type constant).
+     *   func_020158C4 = cellSpursEventFlagAttachLv2EventQueue(eventFlag ea=r3): gpr30=r3;
+     *     reads ea+0xE (mode/type byte) and, on the isIwl path (type==3, loc_02015978+),
+     *     reads ea+0x74 as an EA and calls through it (func_0200B244) -- so ea+0x74 on an
+     *     ATTACHED flag is a live pointer/id, not a static wid; only USEFUL at INIT time
+     *     (before attach rewrites it) do we get taskset+0x74=wid. Log both the INIT-time
+     *     wid-read and the ATTACH-time ea+0xE type byte + ea+0x74 raw word so we can tell
+     *     isIwl (type==3, taskset==NULL passed to Initialize) from taskset-owned (type!=3,
+     *     wid = *(taskset+0x74)). */
+    { static int el = -1; if (el < 0) el = getenv("YZ_EVFLAG_LIFECYCLE") ? 1 : 0;
+      if (el) {
+          auto ok = [](uint32_t a) { return (a >= 0x00010000u && a < 0xE0000000u); };
+          if (target == 0x02015758u) {
+              static long n = 0; long c = ++n;
+              uint32_t ea      = (uint32_t)ctx->gpr[3];
+              uint32_t taskset = (uint32_t)ctx->gpr[4];
+              uint32_t dir     = (uint32_t)ctx->gpr[5];
+              bool tsOk = ok(taskset);
+              uint32_t wid = (tsOk && taskset != 0) ? vm_read32(taskset + 0x74u) : 0xFFFFFFFFu;
+              fprintf(stderr, "[evflag-init] #%ld tid=%u ea=0x%08X taskset=0x%08X dir=0x%X "
+                      "%s wid(taskset+0x74)=%s0x%08X lr=0x%08llX\n",
+                      c, yz_thread_current_id(), ea, taskset, dir,
+                      (taskset == 0) ? "(NULL taskset => IWL)" : "",
+                      (taskset == 0) ? "N/A=" : "",
+                      wid, (unsigned long long)ctx->lr);
+              fflush(stderr);
+          } else if (target == 0x020158C4u) {
+              static long n = 0; long c = ++n;
+              uint32_t ea = (uint32_t)ctx->gpr[3];
+              bool eaOk = ok(ea);
+              uint32_t type = eaOk ? vm_read8(ea + 0xEu) : 0xFFu;
+              uint32_t f74  = eaOk ? vm_read32(ea + 0x74u) : 0xFFFFFFFFu;
+              fprintf(stderr, "[evflag-attach] #%ld tid=%u ea=0x%08X type@0xE=0x%02X "
+                      "raw@0x74=0x%08X lr=0x%08llX\n",
+                      c, yz_thread_current_id(), ea, type, f74, (unsigned long long)ctx->lr);
+              fflush(stderr);
+          } else if (target == 0x02015AA4u) {
+              static long n = 0; long c = ++n;
+              uint32_t ea = (uint32_t)ctx->gpr[3];
+              fprintf(stderr, "[evflag-detach] #%ld tid=%u ea=0x%08X lr=0x%08llX\n",
+                      c, yz_thread_current_id(), ea, (unsigned long long)ctx->lr);
+              fflush(stderr);
           }
       } }
 
@@ -533,6 +928,22 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                 (unsigned long long)ctx->gpr[2],
                 (unsigned long long)ctx->gpr[3]);
         exit(2);
+    }
+
+    /* DYNAMIC PROBE (env YZ_MWPLY_PROBE, 2026-07-04): live-ABI instrumentation
+     * for the CRI Sofdec mwPly player (see scratch/MWPLY_RESOLVE.md). Covers
+     * the genuinely-indirect (bctr through the function table) call path with
+     * FULL entry+exit+out-param logging. NOTE: at least one of the three
+     * (func_00F48E48) is ALSO reached via a same-chunk direct tail-branch
+     * (`g_trampoline_fn = func_00F48E48; return;` inside another lifted
+     * function) which never reaches ps3_indirect_call at all -- that path is
+     * covered separately (entry-args-only) in yz_tramp_guard below, since the
+     * DRAIN_TRAMPOLINE macro captures the callee into a local before any hook
+     * runs and calls it unconditionally, so a post-call wrapper can't be
+     * spliced in there without editing generated code. */
+    if (yz_mwply_probe_target(target)) {
+        yz_mwply_probe_dispatch(target, fn, ctx);
+        return;
     }
 
     g_trampoline_fn = (void (*)(void*))fn;
