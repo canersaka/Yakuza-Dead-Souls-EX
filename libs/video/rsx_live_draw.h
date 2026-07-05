@@ -74,6 +74,12 @@ void rsx_live_draw_set_movie_mode(int on);
  * swap-chain backbuffer. Call from one thread with movie mode on. */
 void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
 
+/* Count of REAL game frames the live-draw engine has presented (the game's own
+ * 0xE944 flips carrying accumulated draws) -- distinct from the null backend's
+ * per-vblank "flips" present count, which keeps ticking even when t1 has stalled
+ * and stopped producing. Cheap; safe to poll from the title path. */
+u32  rsx_live_draw_get_frames(void);
+
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
 

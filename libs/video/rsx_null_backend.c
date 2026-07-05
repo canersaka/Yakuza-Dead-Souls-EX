@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Real game-frame counter from the Track B live-draw engine (rsx_live_draw.c).
+ * Lets the title show frames-actually-rendered next to the raw flip/present
+ * count, so a stall (frames frozen while flips keep climbing) is visible. */
+extern u32 rsx_live_draw_get_frames(void);
+
 #ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -144,9 +149,10 @@ static void null_end_frame(void* ud)
     if (s_state.hwnd) {
         char title[192];
         snprintf(title, sizeof(title),
-                 "Yakuza: Dead Souls (ps3recomp)  |  %s  |  flips %llu  |  %u FPS",
+                 "Yakuza: Dead Souls (ps3recomp)  |  %s  |  flips %llu  |  frames %u  |  %u FPS",
                  s_present_suppressed ? "Track B (D3D12)" : "null (GDI)",
-                 (unsigned long long)s_state.frame_count, s_state.fps);
+                 (unsigned long long)s_state.frame_count,
+                 rsx_live_draw_get_frames(), s_state.fps);
         SetWindowTextA(s_state.hwnd, title);
     }
 }
