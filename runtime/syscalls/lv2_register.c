@@ -1441,15 +1441,17 @@ static int64_t sys_lwmutex_lock_syscall(ppu_context* ctx)
     if (timeout == 0) {
         EnterCriticalSection(&m->cs);
     } else {
-        DWORD timeout_ms = (DWORD)(timeout / 1000);
-        if (timeout_ms == 0) timeout_ms = 1;
-        DWORD start = GetTickCount();
+        /* Timed lock to a QPC deadline (same fix as sys_mutex_lock: the old
+         * GetTickCount/Sleep(1) loop overshot sub-ms timeouts by the ~15.6 ms
+         * timer tick). */
+        int64_t deadline = lv2_usec_deadline(timeout);
         while (!TryEnterCriticalSection(&m->cs)) {
-            if (GetTickCount() - start >= timeout_ms) {
+            if (lv2_deadline_passed(deadline)) {
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT;
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
-            Sleep(1);
+            if (timeout < 1000) SwitchToThread();
+            else                Sleep(1);
         }
     }
 #else

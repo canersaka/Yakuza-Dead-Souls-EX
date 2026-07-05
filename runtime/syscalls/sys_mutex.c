@@ -3,6 +3,7 @@
  */
 
 #include "sys_mutex.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -200,16 +201,18 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         /* Infinite wait */
         EnterCriticalSection(&m->cs);
     } else {
-        /* Timed lock via TryEnterCriticalSection + spin/sleep */
-        DWORD timeout_ms = (DWORD)(timeout_us / 1000);
-        if (timeout_ms == 0) timeout_ms = 1;
-        DWORD start = GetTickCount();
+        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
+         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
+         * and slept a full tick per retry, overshooting sub-ms timeouts by
+         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
+         * holder can run; Sleep(1) only for waits long enough to absorb it. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
-            DWORD elapsed = GetTickCount() - start;
-            if (elapsed >= timeout_ms) {
+            if (lv2_deadline_passed(deadline)) {
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
-            Sleep(1);
+            if (timeout_us < 1000) SwitchToThread();
+            else                   Sleep(1);
         }
     }
 #else
