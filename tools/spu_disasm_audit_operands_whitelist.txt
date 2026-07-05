@@ -1,0 +1,83 @@
+# Whitelist for tools/spu_disasm_audit_operands.py
+# One "mnemonic:reason" per line. '#' comments and blank lines ignored.
+# Conservative by design -- never whitelist a real register-index or
+# immediate-VALUE mismatch, especially on il/ila/ilh/ilhu/ai/ahi.
+#
+# Every entry below was individually traced through BOTH tools/spu_lifter.py
+# (which mnemonic dispatch table consumes the operand, and how) AND the
+# consuming runtime/spu/spu_helpers.h helper, to confirm the divergence is
+# format/display-only with PROVEN-ZERO codegen impact -- not merely "looks
+# benign". See the 2026-07-05 operand-audit session notes for the full
+# derivation; short form per entry below.
+
+# --- RI7 sign-extension (roti/rotmi/rotmai/rothi/rothmi/rotmahi/shli/shlhi/
+# rotqbii/rotqmbii/shlqbii/rotqbyi/rotqmbyi/shlqbyi/cbd/chd/cwd/cdd):
+# tools/spu_disasm.py's ri7_table (~line 493-520) extracts the 7-bit
+# immediate UNSIGNED (i7 = rb field, 0-127); RPCS3's SPUDisAsm.h uses
+# op.si7 (SIGNED, -64..63) for every one of these. This is a REAL,
+# class-wide decode bug (confirmed: the 7-bit unsigned value differs from
+# the signed one by exactly 128 whenever bit 6 is set) -- but PROVEN
+# codegen-inert: every runtime/spu/spu_helpers.h consumer masks the
+# resulting shift/rotate-amount or byte-position with a power-of-two <= 64
+# (0x1F, 0x3F, 0x0F, 0x07, or the cbd/chd/cwd/cdd `pos & 0xF` after a plain
+# `+i7` add) before use, and 128 is a multiple of every such mask -- so
+# ours(unsigned) and oracle(signed) always reduce to the identical
+# post-mask value (verified exhaustively for all 128 possible 7-bit
+# patterns against 0x1F/0x3F masks, session scratchpad). Reported as a
+# disassembler completeness/display bug in the operand-audit findings;
+# NOT whitelisted blanket-wide here since it IS a real value divergence --
+# left OUT of this file deliberately so the tool keeps reporting it
+# (matches "never whitelist a real value mismatch" instruction); this
+# comment documents the impact analysis for the report/reviewer instead.
+
+# --- andbi/xorbi/orbi (byte-immediate logic): tools/spu_disasm.py prints
+# the raw SIGNED 10-bit RI10 value (sign_extend, -512..511); RPCS3 prints
+# static_cast<u8>(op.si10) (unsigned byte, 0..255). tools/spu_lifter.py
+# passes the literal token straight through _imm() into
+# spu_andbi/spu_orbi/spu_xorbi(u128, int32_t imm), which immediately do
+# `(uint8_t)imm` internally (runtime/spu/spu_helpers.h ~line 453-456) --
+# any signed vs unsigned C integer literal that denotes the same 8-bit
+# two's-complement pattern truncates identically. PROVEN benign.
+andbi:byte-immediate truncates to uint8_t in spu_andbi() regardless of C literal sign; see runtime/spu/spu_helpers.h ~453
+xorbi:byte-immediate truncates to uint8_t in spu_xorbi() regardless of C literal sign; see runtime/spu/spu_helpers.h ~244
+orbi:byte-immediate truncates to uint8_t in spu_orbi() regardless of C literal sign; see runtime/spu/spu_helpers.h ~455
+
+# --- Unary RR ops missing from spu_disasm.py's "Single-operand" exception
+# list (~line 482): xsbh, xshw, xswd, frest, frsqest, gbb, fsmh, fesd,
+# frds, fscrwr all fall through to the generic 3-register RR default
+# (rt, ra, rb) and print a spurious extra "$r{rb}" operand that the real
+# ISA encoding does not have (verified against SPUDisAsm.h: each is
+# DisAsm(mnemonic, rt, ra) only, no rb). tools/spu_lifter.py's rr_un
+# dispatch table (~line 421-434) only ever calls rt()=ops[0] and
+# ra()=ops[1] for this class -- the bogus ops[2] token is never read.
+# fscrwr is handled separately as an unconditional FPSCR no-op (~line 342)
+# and never reads any operand. PROVEN benign (display-only).
+xsbh:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+xshw:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+xswd:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+frest:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+frsqest:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+gbb:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+fsmh:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+fesd:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+frds:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
+fscrwr:fscrwr is an unconditional FPSCR no-op in spu_lifter.py (~line 342); no operand ever read
+fscrrd:spurious "ra" operand (real ISA has none; SPUDisAsm FSCRRD takes rt only) computed via spu_fscrrd(ra) but the arg is (void)-discarded and always returns zero (runtime/spu/spu_helpers.h ~286) -- read has no side effects, PROVEN benign
+iret:extra rt/rb operands never real (real ISA: iret takes no GPR operand, jumps to fixed SRR0); spu_lifter.py's iret codegen (~line 618) reads zero operands -- PROVEN benign
+
+# --- nop: SPU ISA's "rt" field on a NOP-class instruction is architecturally
+# a don't-care padding slot (RPCS3 prints it anyway as "r127"); ours prints
+# no operand. spu_lifter.py's nop handler (~line 338) is an unconditional
+# "/* nop */;" that reads nothing. PROVEN benign.
+nop:don't-care padding field; spu_lifter.py's nop handler reads no operand (~line 338)
+
+# NOTE: brsl/brasl/bisl (missing link-register operand) and stop (missing
+# 14-bit stop/signal code operand) and hbr/hbra/hbrr (wrong field layout
+# entirely) are DELIBERATELY NOT whitelisted here even though they are also
+# proven codegen-inert (spu_lifter.py recovers the link register from
+# insn.raw directly for brsl/brasl/bisl, ~line 549/622; stop's codegen
+# never reads the code, ~line 346; hbr/hbra/hbrr are unconditionally
+# dropped as a no-op, ~line 654) -- these are real disassembler
+# COMPLETENESS bugs worth fixing for readability/future-proofing even
+# though today's codegen doesn't depend on the missing operand, so they
+# stay visible in the residual report rather than being suppressed.

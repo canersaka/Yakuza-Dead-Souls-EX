@@ -1,0 +1,173 @@
+# disasm_audit_operands_whitelist.txt
+#
+# Known-benign OPERAND-FORMAT (not value) differences between
+# tools/ppu_disasm.py and Capstone, for mnemonics where the two decoders
+# already agree (mnemonic-mismatches are tools/disasm_audit.py's job, not
+# this file's). One mnemonic per line:
+#
+#   mnemonic | one-line reason (state how it was MEASURED)
+#
+# A mnemonic listed here has ALL its divergences reported as INFO instead
+# of counting toward the REAL residual. Be conservative: add an entry only
+# after triaging real sample addresses from a run and confirming by hand
+# (re-derive the raw encoding) that the divergence is a pure textual/
+# format difference, never a genuine register-index or immediate-VALUE
+# difference. Blank lines and lines starting with '#' are ignored.
+#
+# Every entry below was triaged against a real 200,000-word prefix run of
+# game/EBOOT.elf (2026-07-05) with hand re-derivation of the raw encoding
+# AND a read of the corresponding tools/ppu_lifter.py handler to confirm
+# the LIFTED C code is unaffected (not just that the divergence looks
+# cosmetic) -- see disasm_audit_operands_whitelist.txt entries' reasons.
+
+# --- FP load/store register-class prefix (r vs f) -------------------------
+# ours prints the FPR destination/source with an "r" prefix (reusing the
+# same rd/ra field-decode path as integer load/stores); Capstone correctly
+# prints "f". MEASURED: numeric index always matches (e.g. 0x0001144C
+# "lfd r31,0x98(r1)" vs "lfd f31,0x98(r1)" -- same index 31, only the
+# class letter differs). LIFT-SAFE: tools/ppu_lifter.py's _reg_idx() regex
+# is `[rfv](\d+)` -- it strips whichever of r/f/v prefixes the disasm
+# printed and keeps only the numeric index, so the lifted C
+# (ctx->fpr[N] = ...) is correct regardless of the printed letter. Pure
+# disassembly-TEXT bug (cosmetic to a human reading `show_func.py --asm`
+# output), zero lift impact.
+lfs | FPR shown as rN instead of fN (see block comment above); _reg_idx accepts r/f/v, lift unaffected
+lfsu | same class as lfs
+lfd | same class as lfs
+lfdu | same class as lfs
+stfs | same class as lfs
+stfsu | same class as lfs
+stfd | same class as lfs
+stfdu | same class as lfs
+lfsx | same class as lfs (X-form load, same rd-field reuse)
+lfdx | same class as lfs
+stfsx | same class as lfs
+stfdx | same class as lfs
+stfiwx | same class as lfs (stores FPR frs's low word, same prefix bug)
+lfsux | same class as lfs, BUT ppu_lifter.py has NO handler for lfsux/lfdux/stfsux/stfdux at all (only the non-update lfsx/lfdx/stfsx/stfdx X-form are handled; see tools/ppu_lifter.py:775) -- a separate, PRE-EXISTING gap, so the prefix bug is currently inert for this one site (1 in the whole binary); noted as a landmine for whoever implements the X-form-update FP variants
+
+# --- vmaddfp / vnmsubfp operand order -------------------------------------
+# ours prints "vD, vA, vB, vC" (raw bit-position order: va=bits11-15,
+# vb=bits16-20, vc=bits21-25); the conventional PowerPC disassembly
+# convention (Capstone, and RPCS3's PPUDisAsm.cpp VMADDFP/VNMSUBFP calling
+# DisAsm_V4(..., op.vd, op.va, op.vc, op.vb) -- semantics-only citation,
+# no code copied) prints "vD, vA, vC, vB" instead (VC=multiplicand printed
+# before VB=addend). MEASURED at 0x00014C3C: raw fields vd=2,va=3,vb=31,
+# vc=2 (bit positions) -- ours prints "v2,v3,v31,v2" (va,vb,vc order),
+# capstone prints "v2,v3,v2,v31" (va,vc,vb order); same four register
+# indices, reordered last two. LIFT-SAFE: tools/ppu_lifter.py's vmaddfp/
+# vnmsubfp handlers read ops[2] into a local it calls "vb" and ops[3] into
+# a local it calls "vc" (the handler's own inline comment claims "operand
+# order is vD,vA,vC,vB" but its variable NAMES are actually bound to
+# ops[2]/ops[3] positionally, i.e. to our disasm's raw vB/vC fields) and
+# then computes r=a*c+b (vmaddfp) / r=b-a*c (vnmsubfp) using those two
+# locals in the roles that match the ACTUAL architectural VB(addend)/
+# VC(multiplicand) held in those raw fields -- so the emitted C is
+# formula-correct. Confirmed by independent re-derivation of both
+# operand-order convention AND the lifter's index-to-role mapping;
+# nothing here changes VALUES, only which of the two orderings each
+# printer chooses to display in the (v2,v3) trailing pair.
+vmaddfp | operand-order convention (vD,vA,vB,vC vs vD,vA,vC,vB); lifter reads ops[2]/ops[3] with roles matching our disasm's actual field layout, lift correct
+vnmsubfp | same class as vmaddfp
+
+# --- addis / lis immediate display (unsigned hex vs signed decimal) -------
+# ours prints the raw 16-bit UI field as unsigned hex (e.g. "0x8889");
+# Capstone sign-extends it into the 32-bit-context signed decimal/hex
+# convention (e.g. "-0x7777"). MEASURED: 0x8889 - 0x10000 == -0x7777
+# exactly (same bit pattern, different display convention) at real site
+# 0x00012578. LIFT-SAFE: tools/ppu_lifter.py's lis/addis handlers do
+# `(uint32_t)UI << 16` then cast to (int32_t) then (int64_t) -- shifting
+# the UNSIGNED 16-bit field left by 16 and THEN sign-extending the 32-bit
+# result from bit 31 is mathematically identical to sign-extending UI
+# from bit 15 first and then shifting (verified both give the same
+# int64 value for a representative negative case, -2004287488). Pure
+# unsigned-vs-signed display convention, zero lift impact.
+addis | unsigned-hex vs signed-decimal display of the same UI field; lifter shift-then-sign-extend is equivalent to sign-extend-then-shift
+lis | same class as addis
+
+# --- vrefp / vrsqrtefp extra bogus vA operand -----------------------------
+# these are 2-operand unary ops (vD, vB only; the VA field, bits 11-15, is
+# architecturally unused/reserved and always 0 in valid encodings) but
+# fall through tools/ppu_disasm.py's generic 3-operand vmx_vx table
+# formatter ("vD, vA, vB"), so ours prints a spurious extra v0 operand
+# (e.g. "vrefp v11, v0, v8" instead of "vrefp v11, v8"). MEASURED:
+# 0x000248DC, VA field = 0 in every sampled site. LIFT-SAFE:
+# tools/ppu_lifter.py's vrefp/vrsqrtefp/vrfim handlers deliberately read
+# `ops[-1]` (the LAST operand, with an inline comment noting exactly this
+# quirk: "vB = last operand (vmx_vx emits vD, vA, vB)"), so the real vB
+# is correctly extracted regardless of the bogus leading vA. Zero lift
+# impact -- contrast with `fsqrt` below, which does NOT have this
+# protection and IS a real bug.
+vrefp | extra bogus reserved-vA operand from the generic vmx_vx table; lifter uses ops[-1], lift unaffected
+vrsqrtefp | same class as vrefp
+vrfin | same class as vrefp; tools/ppu_lifter.py:1931-1936 also uses ops[-1] (vrfin/vrfiz/vrfip share one handler)
+vrfip | same class as vrfin (shares the vrfin/vrfiz/vrfip handler, ops[-1])
+vrfiz | same class as vrfin (shares the vrfin/vrfiz/vrfip handler, ops[-1])
+vrfim | same class as vrefp; tools/ppu_lifter.py:1922-1926 also uses ops[-1] (dedicated vrfim handler, same idiom)
+vexptefp | same class as vrefp; tools/ppu_lifter.py:1941-1946 also uses ops[-1] (vexptefp/vlogefp share one handler)
+vlogefp | same class as vexptefp (shares the vexptefp/vlogefp handler, ops[-1])
+vupkhsh | same class as vrefp; tools/ppu_lifter.py:2051-2058 also uses ops[-1]
+vupklsb | same disasm-format bug class as vrefp (extra bogus vA), BUT ppu_lifter.py has NO handler for vupklsb at all (falls to the generic TODO catch-all, which never reads ops) -- a separate, PRE-EXISTING gap unrelated to this operand-format bug; noted here only as a landmine so a future vupklsb implementation copies the ops[-1] idiom, not a fixed ops[1]/ops[2] index (the mistake fsqrt made)
+vupkhsb | same as vupklsb (no lifter handler; landmine note applies)
+vupklsh | same as vupklsb (no lifter handler; landmine note applies)
+
+# --- Capstone-side quirk: bd=0 conditional branches (target field==0) ----
+# Capstone's PPC backend omits the branch-target operand entirely when
+# the raw BD field (bits 16-29) is exactly 0, for BOTH PC-relative forms
+# (AA=0: architectural target = PC+0 = the instruction's own address) and
+# absolute forms (AA=1: architectural target = literal 0). MEASURED at 9
+# PC-relative sites (bge/bdz/blt/bdnz, e.g. 0x00023220 = word 0x40A00000)
+# and 12 absolute+LK sites (bgela/bdzla, e.g. 0x01241820 "bgela 0x0" vs
+# capstone "bgela "). Ours always prints the explicit (correct) target
+# value; Capstone prints nothing. This is handled as a GENERAL STRUCTURAL
+# RULE in disasm_audit_operands.py's operands_equal() (see
+# _capstone_dropped_zero_branch_target), not a per-mnemonic whitelist
+# entry, since the affected mnemonic set spans every b<cond>[l][a]
+# combination and a literal list would be incomplete/fragile. No entry
+# needed here; this comment documents why bge/bdz/blt/bdnz/bgela/bdzla/etc
+# do NOT appear in the whitelist counters despite the divergence being
+# benign -- the general rule suppresses it before whitelist lookup even
+# runs. Likely gap-rescue mis-scanned DATA words at these specific
+# BD==0 sites regardless (same reasoning as tools/disasm_audit.py's
+# tdi/twi rule-3 note), but the alias relationship is real either way.
+
+# --- sc LEV field not decoded ----------------------------------------------
+# ours never extracts/prints the 7-bit LEV field (bits 20-26) of `sc`;
+# Capstone does (e.g. "sc 0x4c"). MEASURED: exactly 1 site in the
+# 200,000-word sample (0x00026CA0). LIFT-SAFE: tools/ppu_lifter.py's `sc`
+# handler is a bare mnemonic dispatch (`if mn == "sc": return
+# "lv2_syscall(ctx);"`) that never reads ops at all -- LEV is unused by
+# the lift regardless. Minor decode-completeness gap, zero lift impact,
+# zero boot relevance (this project's ABI carries the syscall number in a
+# GPR per LV2 convention, not in LEV).
+sc | LEV field (bits 20-26) not decoded/printed; lifter's sc handler ignores operands entirely, zero lift impact
+
+# --- mftb TBR value not printed --------------------------------------------
+# ours prints only "rD" for mftb; Capstone additionally shows the TBR
+# constant as a second operand ("mftb r3, 0x10c" -- 0x10c==268==TBR for
+# the lower half). MEASURED: 0x00E5EEF4. No information is actually lost:
+# the mnemonic itself already distinguishes mftb (TBR=268) from mftbu
+# (TBR=269) -- see tools/ppu_disasm.py:696-706. LIFT-SAFE:
+# tools/ppu_lifter.py's mftb/mftbu handlers dispatch purely on mnemonic
+# and only read ops[0] (rd); the (unprinted) TBR operand is never
+# consulted.
+mftb | TBR constant (268) not printed as a second operand; mnemonic alone already disambiguates from mftbu, lifter never reads it
+
+# --- mtspr/mfspr SPR display: friendly name vs raw hex ---------------------
+# ours has a curated SPR_NAMES table (VRSAVE, LR, CTR, XER, ...) and falls
+# back to "spr{decimal N}" for anything not in the table; Capstone always
+# prints the raw SPR number in hex. MEASURED: 0x00FBD518 "mtspr VRSAVE,
+# r0" (ours) vs "mtspr 0x100, r0" (capstone) -- 0x100==256==VRSAVE;
+# 0x011425E0 "mtspr spr916, r26" vs "mtspr 0x394, r26" -- 0x394==916,
+# same value, decimal-in-a-fallback-name-string vs hex. LIFT-SAFE: the
+# ONLY mtspr/mfspr SPR the lifter special-cases is VRSAVE, matched by
+# testing the operand STRING equals "VRSAVE" (tools/ppu_lifter.py:968-972)
+# -- this still fires correctly since ours' SPR_NAMES table does contain
+# 256->"VRSAVE" (confirmed: the one real VRSAVE site round-trips). Every
+# other SPR (spr916/835/832 in the sample) falls through to the same
+# unhandled path regardless of which decoder's naming convention is used
+# -- a separate, pre-existing decode/lift gap (not something this
+# operand-value divergence changes), not a new bug introduced by the
+# display convention.
+mtspr | SPR shown as a curated friendly name (or spr{dec} fallback) vs Capstone's raw hex; same numeric SPR either way, lifter's only special-case (VRSAVE) still matches
+mfspr | same class as mtspr; MEASURED 0x00FBD3D4 "mfspr r0, VRSAVE" vs "mfspr r0, 0x100" (the VRSAVE round-trip pair's read side); lifter's VRSAVE special-case matches ops[-1]=="VRSAVE" (tools/ppu_lifter.py:968), unaffected
