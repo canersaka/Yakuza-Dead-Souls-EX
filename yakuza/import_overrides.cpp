@@ -377,6 +377,75 @@ static uint32_t      g_rsx_queued_head = 1;   /* head of the last GCM_DRIVER_QUE
  * State init happens at context_allocate. */
 static rsx_state g_rsx_state;
 
+/* ===========================================================================
+ * YZ_FLIPTRACE (s21, flip-label stall diagnosis -- STATUS 1a). Uncapped,
+ * sequence-stamped event log of the flip-label lifecycle: every arm / clear /
+ * acquire / queue event touching the flip semaphore (label 0x10200010 =
+ * RSX_REPORTS+0x10) or the HW flip credit (device+0x30), plus a value-
+ * transition WATCHER thread that catches writers OUTSIDE the instrumented
+ * paths (a plain guest store to the label would otherwise be invisible).
+ * All events share one seq counter + QPC clock so cross-thread ORDER is
+ * recoverable from the log. Diagnostic only, default OFF.
+ * =========================================================================*/
+#include <stdarg.h>
+static int yz_ft_flag = -1;
+static inline int yz_ft_on(void)
+{
+    if (yz_ft_flag < 0) yz_ft_flag = getenv("YZ_FLIPTRACE") ? 1 : 0;
+    return yz_ft_flag;
+}
+static volatile LONG g_ft_seq = 0;
+static double        g_ft_qpf = 0.0;
+static LONGLONG      g_ft_t0  = 0;
+static void yz_ft(const char* fmt, ...)
+{
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (!g_ft_qpf) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        g_ft_qpf = (double)f.QuadPart; g_ft_t0 = now.QuadPart;
+    }
+    double ms = (double)(now.QuadPart - g_ft_t0) * 1000.0 / g_ft_qpf;
+    char buf[256];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "[ft] #%ld t=%.3f tid=%lu %s\n",
+            InterlockedIncrement(&g_ft_seq), ms, GetCurrentThreadId(), buf);
+}
+/* Label-value watcher: ~ms-grain poll of the flip label; logs every value
+ * transition, so an arm/clear from ANY writer (including one no instrumented
+ * path covers) appears in the same seq/timestamp stream. Sub-ms pulses can
+ * alias between polls -- instrumented writers still log their own events. */
+static DWORD WINAPI yz_ft_watch_thread(LPVOID)
+{
+    uint32_t last = vm_read32(RSX_REPORTS + 0x10);
+    yz_ft("WATCHER ARMED label@0x%08X initial=0x%08X", RSX_REPORTS + 0x10, last);
+    for (;;) {
+        for (int i = 0; i < 64; i++) {
+            uint32_t v = vm_read32(RSX_REPORTS + 0x10);
+            if (v != last) {
+                yz_ft("label 0x%08X -> 0x%08X (watcher) pending=[%ld %ld] qhead=%u",
+                      last, v, g_rsx_flip_pending[0], g_rsx_flip_pending[1],
+                      g_rsx_queued_head);
+                last = v;
+            }
+            YieldProcessor();
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+static void yz_ft_start(void)   /* called from the vblank tick (ctx is up) */
+{
+    static int started = 0;
+    if (!started && yz_ft_on()) {
+        started = 1;
+        yz_ft("ARMED (YZ_FLIPTRACE): label=0x%08X devcredit=0x%08X",
+              RSX_REPORTS + 0x10, RSX_DEVICE_ADDR + 0x30);
+        CreateThread(NULL, 0, yz_ft_watch_thread, NULL, 0, NULL);
+    }
+}
+
 /* Track B live-draw guest-memory resolver: map an RSX (location, offset) to a
  * host pointer into the guest address space. location 0 = RSX local VRAM (the
  * gcm local carve), 1 = main memory via the gcm io map -- mirrors the DMA cases
@@ -582,6 +651,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         g_rsx_queued_head = head;
         { static int n = 0; if (n < 8) { n++;
             fprintf(stderr, "[rsx] DRIVER_QUEUE head=%u buf=%u (flip queued)\n", head, arg); } }
+        if (yz_ft_on()) yz_ft("QUEUE head=%u buf=%u", head, arg);
         return 0;
     }
 
@@ -637,6 +707,18 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             fprintf(stderr, "[sem] ACQUIRE off=0x%X addr=0x%08X want=0x%08X have=0x%08X %s\n",
                     yz_rsx_sem_off_406e, addr, arg, addr?vm_read32(addr):0,
                     (addr && vm_read32(addr)!=arg)?"STALL":"pass"); } }
+        /* fliptrace: log the flip-protocol acquires (label / HW credit) on every
+         * pass and on stall-episode ENTRY (retries of the same stalled acquire
+         * are suppressed so the log stays readable). */
+        if (yz_ft_on() &&
+            (addr == RSX_REPORTS + 0x10 || addr == RSX_DEVICE_ADDR + 0x30)) {
+            uint32_t have = vm_read32(addr);
+            int ok = (have == arg);
+            static uint32_t fla = 0; static int flr = -1;
+            if (addr != fla || ok != flr) { fla = addr; flr = ok;
+                yz_ft("ACQ addr=0x%08X want=0x%08X have=0x%08X %s",
+                      addr, arg, have, ok ? "pass" : "STALL-enter"); }
+        }
         if (addr && vm_read32(addr) != arg)
             return 1;                             /* not yet satisfied: stall, retry later */
         break;
@@ -648,14 +730,23 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         { static int sl=0; if (sl<60){ sl++;
             fprintf(stderr, "[sem] RELEASE off=0x%X addr=0x%08X val=0x%08X\n",
                     yz_rsx_sem_off_406e, addr, arg); } }
+        if (yz_ft_on() &&
+            (addr == RSX_REPORTS + 0x10 || addr == RSX_DEVICE_ADDR + 0x30))
+            yz_ft("REL addr=0x%08X val=0x%08X qhead=%u pending[qh]=%ld",
+                  addr, arg, g_rsx_queued_head,
+                  g_rsx_flip_pending[g_rsx_queued_head & 7u]);
         if (addr)
             yz_rsx_w32(addr, arg);
         /* A release of the flip semaphore (label+0x10) to the pending marker is
          * the "flip submitted" signal -- arm the queued head so the next vblank
          * presents it and clears the label. Arming here (after the 0xFFFFFFFF
          * write) keeps the vblank clear strictly ordered after the dirty. */
-        if (addr == RSX_REPORTS + 0x10 && arg != 0)
-            InterlockedExchange(&g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+        if (addr == RSX_REPORTS + 0x10 && arg != 0) {
+            LONG prev = InterlockedExchange(
+                &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+            if (yz_ft_on())
+                yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
+        }
         break;
     case 0x1A4:                                   /* NV4097 SET_CONTEXT_DMA_SEMAPHORE */
         yz_rsx_sem_dma_4097 = arg;
@@ -1659,6 +1750,8 @@ extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
  * entry points take the gcm CONTEXT as arg0 (r3), the buffer id in r4. */
 extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 {
+    if (yz_ft_on()) yz_ft("HLE-SetFlipCommand buf=%u (label clear!)",
+                          (uint32_t)ctx->gpr[4]);
     yz_rsx_present((uint32_t)ctx->gpr[4]);
     vm_write32(RSX_REPORTS + 0x10, 0);             /* flip label -> done */
     ctx->gpr[3] = 0;
@@ -1666,6 +1759,8 @@ extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 
 extern "C" void yz_ovr__cellGcmSetFlipCommandWithWaitLabel(ppu_context* ctx)
 {
+    if (yz_ft_on()) yz_ft("HLE-SetFlipCommandWithWaitLabel buf=%u (label clear!)",
+                          (uint32_t)ctx->gpr[4]);
     yz_rsx_present((uint32_t)ctx->gpr[4]);
     vm_write32(RSX_REPORTS + ((uint32_t)ctx->gpr[5] & 0xFFu) * 0x10u, (uint32_t)ctx->gpr[6]);
     vm_write32(RSX_REPORTS + 0x10, 0);
@@ -1907,6 +2002,13 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
                         ((uint32_t)a3 != cur_get) ? "  <-- GET STOMP" : "",
                         ((uint32_t)a4 < cur_put) ? "  <-- PUT RECEDES" : ""); }
         }
+        if (yz_ft_on()) {
+            uint32_t cg = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
+            uint32_t cp = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
+            yz_ft("FIFOSET GET 0x%06X->0x%06X PUT 0x%06X->0x%06X",
+                  cg & 0xFFFFFF, (uint32_t)a3 & 0xFFFFFF,
+                  cp & 0xFFFFFF, (uint32_t)a4 & 0xFFFFFF);
+        }
         /* Serialize the guest GET/PUT set with the consumer's single GET writer
          * (RPCS3 sys_rsx_mtx) so a pkg001 set can't tear a GET the consumer is
          * mid-advance, and the consumer can't clobber a fresh pkg001 set. */
@@ -1936,6 +2038,9 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
         /* Mark the flip pending; the vblank tick publishes the done bit so it
          * survives the game's cellGcmResetFlipStatus ordering. */
         InterlockedExchange(&g_rsx_flip_pending[head], 1);
+        if (yz_ft_on())
+            yz_ft("SYSFLIP head=%u buf=%u a4=0x%llX (arm pending[%u], no label write)",
+                  head, flip_idx, (unsigned long long)a4, head);
         break;
     }
     case 0x103: {       /* Display queue */
@@ -1944,6 +2049,8 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
         vm_write32(ha + 0x14, (uint32_t)a4);   /* lastQueuedBufferId */
         vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x40000000u
                               | (1u << ((uint32_t)a4 & 31)));
+        if (yz_ft_on())
+            yz_ft("SYSQUEUE head=%u buf=%u (no arm)", head, (uint32_t)a4);
         break;
     }
     case 0x104: {       /* Display buffer registration */
@@ -1961,6 +2068,9 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
         uint32_t head = (uint32_t)a3 & 7;
         uint32_t ha = yz_rsx_head_addr(head);
         vm_write32(ha + 0x08, (vm_read32(ha + 0x08) & (uint32_t)a4) | (uint32_t)a5);
+        if (yz_ft_on())
+            yz_ft("RESETSTATUS head=%u and=0x%X or=0x%X", head,
+                  (uint32_t)a4, (uint32_t)a5);
         break;
     }
     case 0xFEC: {       /* flip event notification (mark done immediately) */
@@ -1968,6 +2078,7 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
         uint32_t ha = yz_rsx_head_addr(head);
         vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x80000000u);
         vm_write64(ha + 0x00, (uint64_t)GetTickCount() * 1000);  /* lastFlipTime */
+        if (yz_ft_on()) yz_ft("FEC head=%u (done bit)", head);
         break;
     }
     case 0xFED: break;  /* vblank command (our yz_rsx_vblank_tick drives vblank) */
@@ -2009,6 +2120,7 @@ extern "C" int64_t yz_sys_rsx_attribute(ppu_context* ctx) { return 0; }
 extern "C" void yz_rsx_vblank_tick(void)
 {
     if (!g_rsx_ctx_ready) return;
+    yz_ft_start();   /* YZ_FLIPTRACE arm banner + label watcher (no-op if off) */
 
     /* DIAG (one-time, vblank-dispatch hunt): dump Sony's libgcm vblank/flip
      * handler table once the game has registered a handler. The lifted intr-
@@ -2063,6 +2175,33 @@ extern "C" void yz_rsx_vblank_tick(void)
           fprintf(stderr, "[vbl] tick=%u pending=[%ld %ld] label@0x10200010=0x%08X qhead=%u\n",
                   vt, g_rsx_flip_pending[0], g_rsx_flip_pending[1],
                   vm_read32(RSX_REPORTS + 0x10), g_rsx_queued_head); }
+
+    /* YZ_FLIPTRACE add-on (s21, the phase-2 consumer park): if GET has been
+     * FROZEN for ~4 s with PUT ahead (unconsumed commands), dump the FIFO words
+     * around GET once per freeze episode -- classifies the silent park (stopper
+     * jump-to-self vs CALL vs method packet) that no existing log catches
+     * (boot 4: GET=0x4C24 PUT=0x18EF8 frozen, zero consumer prints). */
+    if (yz_ft_on()) {
+        static uint32_t pg = 0xFFFFFFFFu; static unsigned frozen = 0;
+        static uint32_t dumped_at = 0xFFFFFFFFu;
+        uint32_t get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & 0xFFFFFF;
+        uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & 0xFFFFFF;
+        if (get == pg && get != put) frozen++; else { frozen = 0; pg = get; }
+        if (frozen == 256 && dumped_at != get) {   /* ~4 s at 62.5 Hz */
+            dumped_at = get;
+            yz_ft("FIFOPARK GET=0x%06X PUT=0x%06X frozen ~4s; words around GET:",
+                  get, put);
+            for (int32_t off = -0x20; off <= 0x3C; off += 4) {
+                uint32_t io = get + (uint32_t)off;
+                if ((int32_t)(get + off) < 0) continue;
+                uint32_t ea = yz_rsx_io_to_ea(io);
+                fprintf(stderr, "[ft]   io 0x%06X = %08X%s\n",
+                        io, ea ? vm_read32(ea) : 0xDEADDEAD,
+                        io == get ? "  <-- GET" : "");
+            }
+            fflush(stderr);
+        }
+    }
 
     /* SPURS DISPATCH DIAG (env YZ_TASK_TRACE, 2026-06-16b): once the game has
      * created its render task, dump the SPURS instance's workload-ready state so
@@ -2385,12 +2524,16 @@ extern "C" void yz_rsx_vblank_tick(void)
             uint32_t buf = vm_read32(ha + 0x14);          /* lastQueuedBufferId */
             { static int n = 0; if (n < 12) { n++;
                 fprintf(stderr, "[vbl] FLIP COMPLETE head=%d buf=%u -> clear label@0x10200010\n", h, buf); } }
+            if (yz_ft_on())
+                yz_ft("VBL-RETIRE head=%d buf=%u label-before=0x%08X",
+                      h, buf, vm_read32(RSX_REPORTS + 0x10));
             yz_rsx_present(buf);
             vm_write32(ha + 0x10, buf);                   /* flipBufferId */
             vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x80000000u); /* flip done */
             vm_write64(ha + 0x00, t);                     /* lastFlipTime */
             vm_write64(RSX_REPORTS + 0x10, 0);            /* flip sema (u128) = 0 */
             vm_write64(RSX_REPORTS + 0x18, 0);
+            if (yz_ft_on()) yz_ft("VBL-CLEAR label=0 head=%d", h);
             /* Faithful flip-completion (replaces the YZ_FLIPADV band-aid's external
              * fence nudge): advance the counter the game's render throttle
              * func_00EAC46C polls (`while *(0x40C00000)+2 <= target`). Real RSX
