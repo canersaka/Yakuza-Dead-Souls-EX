@@ -1290,6 +1290,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                         fflush(stderr);
                     }
                 }
+                /* DIAG (env YZ_JGUARD, 2026-07-08, uncapped): SPU-side commits to the
+                 * CRI jobchain's CellSpursJobGuard line 0x4019C700 (ncount0 at +0,
+                 * ncount1 at +4). cellSpursJobGuardNotify decrements ncount0 and the
+                 * LAST notify re-runs the jobchain; measured only ONE notify per boot
+                 * on the PPU side, so count SPU-side notifies here (call-path
+                 * independent: this sees the CAS itself). */
+                { static int jg = -1;
+                  if (jg < 0) { jg = getenv("YZ_JGUARD") ? 1 : 0;
+                      if (jg) { fprintf(stderr, "[jguard] spu probe armed\n"); fflush(stderr); } }
+                  if (jg && (ea & ~127ull) == 0x4019C700ull) {
+                      const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
+                      fprintf(stderr, "[jguard-spu] spu=%X pc=0x%05X ncount0 %02X%02X%02X%02X->"
+                              "%02X%02X%02X%02X ncount1=%02X%02X%02X%02X\n",
+                              spu->spu_id, spu->pc,
+                              b[0],b[1],b[2],b[3], a[0],a[1],a[2],a[3],
+                              a[4],a[5],a[6],a[7]);
+                      fflush(stderr);
+                  } }
                 /* THROWAWAY DIAG (env YZ_SIGW): on a committing PUTLLC of the mgmt line,
                  * did the SPU kernel CLEAR a wklSignal1 bit (consume it without dispatch)? */
                 { static int sigw = -1; if (sigw < 0) sigw = getenv("YZ_SIGW") ? 1 : 0;
