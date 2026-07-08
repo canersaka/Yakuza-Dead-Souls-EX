@@ -574,6 +574,43 @@ def collect_opd_seeds(elf, exec_ranges: list[tuple[int, int]],
     return seeds
 
 
+def load_external_seeds(paths, exec_ranges) -> set[int]:
+    """Load function-start addresses from external analyzer exports (Ghidra /
+    IDA functions.json). Accepts a list of dicts (any of addr/start/address/ea,
+    hex string or int) or a bare list of addresses. Import thunks are skipped;
+    only 4-aligned addresses inside an executable range are kept.
+    """
+    import json as _json
+
+    def in_exec(a):
+        return any(lo <= a < hi for lo, hi in exec_ranges)
+
+    def norm(v):
+        try:
+            return int(v, 16) if isinstance(v, str) else int(v)
+        except (TypeError, ValueError):
+            return None
+
+    out: set[int] = set()
+    for path in paths:
+        try:
+            data = _json.loads(open(path, encoding="utf-8").read())
+        except (OSError, _json.JSONDecodeError) as exc:
+            _note(f"seed-json: cannot read {path}: {exc}")
+            continue
+        items = data if isinstance(data, list) else data.get("functions", [])
+        for it in items:
+            if isinstance(it, dict):
+                if it.get("thunk"):
+                    continue
+                a = norm(it.get("addr", it.get("start", it.get("address", it.get("ea")))))
+            else:
+                a = norm(it)
+            if a is not None and a % 4 == 0 and in_exec(a):
+                out.add(a)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -596,6 +633,11 @@ def main() -> None:
                         help="Minimum function size in bytes (default: 8)")
     parser.add_argument("--no-opd", action="store_true",
                         help="Skip .opd descriptor seeding (ELF inputs)")
+    parser.add_argument("--seed-json", metavar="FILE", action="append", default=None,
+                        help="Ingest external function starts as extra seeds "
+                             "(Ghidra/IDA functions.json). Repeatable. Closes the "
+                             "recall gap by trusting an independent disassembler's "
+                             "call-graph-recovered starts that .opd/prologue miss.")
     parser.add_argument("--output", "-o", metavar="FILE",
                         help="Write function list to JSON file (for use with ppu_lifter)")
     args = parser.parse_args()
@@ -644,6 +686,13 @@ def main() -> None:
     if not all_insns:
         print("No instructions to analyse.", file=sys.stderr)
         sys.exit(1)
+
+    if args.seed_json:
+        ext = load_external_seeds(args.seed_json, exec_ranges)
+        new = ext - seeds
+        seeds |= ext
+        _note(f"external seeds: +{len(new)} new starts from "
+              f"{len(args.seed_json)} file(s) ({len(ext)} in range)")
 
     _note(f"disassembled {len(all_insns)} instructions across "
           f"{len(exec_ranges)} executable segment(s)")
