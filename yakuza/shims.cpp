@@ -745,6 +745,40 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
     }
 
+    /* YZ_T1POLL (s21, the phase-2 park): t1's terminal spin is func_00EB3238's
+     * throttle `while (*counter < target) usleep(30)` (0xEB3340-58: r29=[r30],
+     * counter=[r29], target=r31). On each t1 usleep, dump the polled counter
+     * chain + the FIFO GET/PUT/REF + the flip counter 0x40C00000, rate-limited
+     * ~1/s, so the starved counter (and who should bump it) is named directly.
+     * ARMED banner printed on first hit (probe-liveness rule). */
+    {
+        static int t1poll = -1;
+        if (t1poll < 0) t1poll = getenv("YZ_T1POLL") ? 1 : 0;
+        if (t1poll && num == 141 && yz_thread_current_id() == 1) {
+            static ULONGLONG last = 0;
+            ULONGLONG now = GetTickCount64();
+            if (now - last >= 1000) {
+                last = now;
+                uint32_t r30 = (uint32_t)ctx->gpr[30], r31 = (uint32_t)ctx->gpr[31];
+                uint32_t r29 = (r30 >= 0x10000u && r30 < 0xE0000000u) ? vm_read32(r30) : 0;
+                uint32_t cnt = (r29 >= 0x10000u && r29 < 0xE0000000u) ? vm_read32(r29) : 0;
+                static int armed = 0;
+                if (!armed) { armed = 1;
+                    fprintf(stderr, "[t1poll] ARMED (YZ_T1POLL): t1 sc141 throttle probe live\n"); }
+                fprintf(stderr, "[t1poll] usleep=%llu lr=0x%08llX ptr[r30=0x%08X]=0x%08X "
+                        "counter[0x%08X]=0x%08X target(r31)=0x%08X | GET=0x%06X PUT=0x%06X "
+                        "REF=0x%08X flipcnt=0x%08X\n",
+                        (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->lr,
+                        r30, r29, r29, cnt, r31,
+                        vm_read32(0x10000044u) & 0xFFFFFF,   /* RSX_DMA_CONTROL GET */
+                        vm_read32(0x10000040u) & 0xFFFFFF,   /* PUT */
+                        vm_read32(0x10000048u),              /* REF */
+                        vm_read32(0x40C00000u));
+                fflush(stderr);
+            }
+        }
+    }
+
     static unsigned char seen[1100];
     int first = (num < sizeof(seen)) && !seen[num];
     /* SPU-management family: log every call (SPURS bring-up), not just the
