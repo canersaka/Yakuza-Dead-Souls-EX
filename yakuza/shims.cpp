@@ -325,7 +325,10 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                * the CRI-phase re-arm frequency of wid1 (bit 0x4000) is measurable
                * past the 24-line slot cap that blinds the census above. Pure
                * fprintf, no state mutation; it does NOT force any gate. */
-              { static int wsa = -1; if (wsa < 0) wsa = getenv("YZ_WIDSIG_ALL") ? 1 : 0;
+              { static int wsa = -1;
+                if (wsa < 0) { wsa = getenv("YZ_WIDSIG_ALL") ? 1 : 0;
+                    if (wsa) { fprintf(stderr, "[widsig] armed (BT=%d)\n",
+                                       getenv("YZ_WIDSIG_BT") ? 1 : 0); fflush(stderr); } }
                 if (wsa && ((uint32_t)addr) == 0x40197CF0u) {
                     uint32_t oldv = ps3_bswap32(expected);
                     uint32_t raised = (uint32_t)val & ~oldv;   /* bits newly set */
