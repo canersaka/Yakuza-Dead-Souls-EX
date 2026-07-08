@@ -37,6 +37,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+/* Guest back-chain walker (defined in main.cpp, C++ linkage). Declared at file
+ * scope: a block-scope declaration inside an extern "C" function would inherit
+ * C linkage and fail to link against the mangled definition. */
+void yz_dump_guest_state(const ppu_context* gc, const char* tag);
+
 /* ---------------------------------------------------------------------------
  * Guest memory base + accessors (big-endian guest, LE host)
  * -----------------------------------------------------------------------*/
@@ -337,6 +342,19 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                                 yz_thread_current_id(), raised, oldv, (uint32_t)val,
                                 cw0, cw1, cw2, cw3, cw4);
                         fflush(stderr);
+                        /* DIAG (env YZ_WIDSIG_BT, 2026-07-08): the wid1 (CRI jobchain)
+                         * signal bit is raised exactly ONCE per boot and the raw lr
+                         * captured near the raise proved to be a DATA pointer (the
+                         * 0x01622200 device object), not the kicker. Walk the guest
+                         * back-chain at the raise instead (the crash handler's
+                         * walker) to name the real producer call chain. First few
+                         * wid1 raises only; env-gated, observation only. */
+                        { static int wbt = -1;
+                          if (wbt < 0) wbt = getenv("YZ_WIDSIG_BT") ? 1 : 0;
+                          static long wbtn = 0;
+                          if (wbt && (raised & 0x40000000u) && wbtn < 4) { wbtn++;
+                              yz_dump_guest_state(ctx, "widsig-bt");
+                          } }
                     }
                 } }
               static long n[32] = {0};

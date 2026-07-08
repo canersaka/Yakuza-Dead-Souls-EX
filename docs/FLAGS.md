@@ -353,6 +353,12 @@ counts (`[widsig]` lines) — built to measure the CRI-phase re-arm frequency of
 `YZ_MGMT_CAS`'s per-word cap. This measured the current frontier fact: the guest producer raises
 wid1's bit exactly ONCE per boot (vs continuous re-kicks in RPCS3). Purely observational.
 
+`YZ_WIDSIG_BT` (yakuza/shims.cpp, inside the `YZ_WIDSIG_ALL` block, 2026-07-08): on a wid1 (bit
+0x4000) raise, walk the guest PPC64 back-chain via the crash handler's `yz_dump_guest_state`
+(first 4 raises only) to NAME the producer call chain that kicks the CRI jobchain. Built because
+the raw lr captured near the raise turned out to be a DATA pointer (the 0x01622200 device object),
+not the kicker. Requires `YZ_WIDSIG_ALL=1`. Retire with the producer frontier.
+
 `YZ_F484_PROBE` (yakuza/shims.cpp, `ppu_trace_pc`, 2026-07-05, needs a `--trace` relift): at
 `func_00F00484` entry on the main thread, prints the CRI request object's work-flag fields
 (`P`, `V`, `P->[0x4]`, `P->[0x48]`, `P->[0x14]`) so the work-flag state is a DIRECT value
