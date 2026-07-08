@@ -240,6 +240,11 @@ class SPULifter:
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
+        # brsl/brasl whose target could not be resolved and lifted as a no-op
+        # (a MISCOMPILE: the call is silently dropped). Warned loudly in the
+        # summary — 18 silent no-op calls in job_bin_b were the 2026-07-08
+        # round-1 early-exit.
+        self.unresolved_calls: list[int] = []
         self.trace = trace
         self.header_name = "spu_recomp.h"   # what emit_source #includes
         self.register_name = "spu_recomp_register"  # global init fn name
@@ -312,8 +317,16 @@ class SPULifter:
         mn = insn.mnemonic
         ops = _ops(insn.operands)
         tok = None
-        if mn in ("br", "brsl", "bra", "brasl") and ops:
+        if mn in ("br", "bra") and ops:
             tok = ops[0]
+        elif mn in ("brsl", "brasl") and ops:
+            # The s15 disasm fix (T9) added the link register to brsl/brasl
+            # operands ("brsl $r0, 0x5488"); the target is the LAST operand.
+            # ops[0] was correct only for the pre-fix format and silently
+            # returned None afterwards, lifting EVERY brsl call as a no-op
+            # (caught 2026-07-08: jobB's 18 dropped calls = the round-1
+            # early-exit). ops[-1] handles both formats.
+            tok = ops[-1]
         elif mn in _COND_BR and ops:
             tok = ops[-1]
         if tok and tok.startswith("0x"):
@@ -584,6 +597,7 @@ class SPULifter:
                 return (f"{link} ctx->host_depth++; "
                         f"{self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx); "
                         f"ctx->host_depth--;")
+            self.unresolved_calls.append(addr)
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -867,6 +881,11 @@ def main() -> None:
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
     print(f"  {len(lifter.call_targets)} call target(s)")
+    if lifter.unresolved_calls:
+        print(f"  WARNING: {len(lifter.unresolved_calls)} brsl/brasl call(s) with "
+              f"UNRESOLVED targets lifted as NO-OPS (dropped calls = miscompile!): "
+              + ", ".join(f"0x{a:X}" for a in lifter.unresolved_calls[:12])
+              + (" ..." if len(lifter.unresolved_calls) > 12 else ""))
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
         print(f"  {total} unsupported instruction(s) across "
