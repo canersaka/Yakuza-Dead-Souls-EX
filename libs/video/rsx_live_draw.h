@@ -63,6 +63,11 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
+/* Block until the GPU finishes all queued draws (RSX SET_REFERENCE / sync
+ * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only
+ * after the GPU has really caught up. */
+void rsx_live_draw_flush(void);
+
 /* Present the given display buffer id (called from the flip path). */
 void rsx_live_draw_present(u32 buffer_id);
 
