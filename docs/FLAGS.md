@@ -353,6 +353,14 @@ counts (`[widsig]` lines) — built to measure the CRI-phase re-arm frequency of
 `YZ_MGMT_CAS`'s per-word cap. This measured the current frontier fact: the guest producer raises
 wid1's bit exactly ONCE per boot (vs continuous re-kicks in RPCS3). Purely observational.
 
+`YZ_JGUARD` (yakuza/shims.cpp `ppu_res_stwcx`/`ppu_res_stdcx` + runtime/spu/spu_dma.h PUTLLC,
+2026-07-08, uncapped, armed banners): census of every CAS commit to the CRI jobchain's
+CellSpursJobGuard line 0x4019C700 (ncount0 at +0, ncount1 at +4), all three commit paths (PPU 4B,
+PPU 8B, SPU PUTLLC). Counts JobGuardNotify at the store itself, so call path does not matter.
+Verdict obtained 2026-07-08: the PPU producer notifies ONCE (threshold ncount1=1), the SPU chain
+auto-resets and waits correctly; the wall = the producer never notifying again. Retire with the
+producer frontier.
+
 `YZ_WIDSIG_BT` (yakuza/shims.cpp, inside the `YZ_WIDSIG_ALL` block, 2026-07-08): on a wid1 (bit
 0x4000) raise, walk the guest PPC64 back-chain via the crash handler's `yz_dump_guest_state`
 (first 4 raises only) to NAME the producer call chain that kicks the CRI jobchain. Built because
