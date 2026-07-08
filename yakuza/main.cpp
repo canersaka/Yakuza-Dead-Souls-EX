@@ -98,6 +98,17 @@ extern "C" void spu_recomp_register_jobmod(void);
  * spu_indirect_branch switches image 13 <-> 14/15 on those spans. */
 extern "C" void spu_recomp_register_jobbin_a(void);
 extern "C" void spu_recomp_register_jobbin_b(void);
+/* Alternate-slot lifts (2026-07-08): the jobchain loads its job binaries into
+ * descriptor-assigned LS slots — MEASURED round-1 loads jobB (0x01275A00) at
+ * LS 0x4C00 (scratch/idboot.err: jobbase B=0x04C00, resident head bytes
+ * 43 49 4E = jobB's), while the original lifts are fixed-base (A@0x4C00,
+ * B@0xE400). Each binary is therefore lifted at BOTH slot bases and both
+ * registrations share the binary's image id (spans don't collide within an
+ * image). Without these, spu_lookup's image-0 wildcard silently substituted
+ * gs_task's code at the job site and the notify job never ran (the spup17/
+ * event-flag wall, DONT_RECHASE #23). */
+extern "C" void spu_recomp_register_jobbin_a_e400(void);
+extern "C" void spu_recomp_register_jobbin_b_4c00(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -1930,8 +1941,10 @@ int main(int argc, char** argv)
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
     spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
     spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
-    spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, loads ~LS 0x4C00) */
-    spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, loads ~LS 0xE400) */
+    spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, slot base 0x4C00) */
+    spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
+    spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, slot base 0xE400) */
+    spu_recomp_register_jobbin_b_4c00();                  /*   ...same binary lifted at the other slot base 0x4C00 (same image) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);

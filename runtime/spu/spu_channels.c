@@ -1132,11 +1132,34 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
      * or an image_id 0 query = single-image/back-compat context) only when no
      * exact match exists. Linear scan is fine for the small per-image tables. */
     spu_fn wildcard = NULL;
+    int wildcard_img = -1;
     for (uint32_t i = 0; i < s_registry_count; i++) {
         if (s_registry[i].addr != addr) continue;
         if (s_registry[i].image_id == image_id) return s_registry[i].fn; /* exact (incl 0==0) */
-        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard)
+        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard) {
             wildcard = s_registry[i].fn;
+            wildcard_img = s_registry[i].image_id;
+        }
+    }
+    /* Jobchain-family wildcard guard (2026-07-08). A query from images 13-15
+     * at a JOB-SPAN address (>= 0x4880, past the module's end; kernel-yield
+     * targets are all below 0xA00 and stay wildcard-served by design) that
+     * misses its exact image would run ANOTHER image's code at the job site —
+     * measured: the round-1 notify job (jobB loaded at LS 0x4C00) dispatched
+     * gs_task's spu_func_00004C00 via this fallback and the job never did its
+     * real work (the spup17 wall). Fail LOUD (NULL -> unknown-branch halt)
+     * instead; the job binaries are now lifted at both observed slot bases so
+     * a legitimate dispatch always has an exact match. Kill-switch:
+     * YZ_JOB_WILDCARD_OK=1 restores the old silent substitution. */
+    if (image_id >= 13 && image_id <= 15 && addr >= 0x4880u && wildcard) {
+        static int ok = -1;
+        if (ok < 0) ok = getenv("YZ_JOB_WILDCARD_OK") ? 1 : 0;
+        static int wl = 0; if (wl < 32) { wl++;
+            fprintf(stderr, "[job-wildcard] query img=%d addr=0x%05X exact-miss; wildcard img=%d %s\n",
+                    image_id, addr, wildcard_img,
+                    ok ? "SERVED (YZ_JOB_WILDCARD_OK)" : "REFUSED (would run wrong image's code)");
+            fflush(stderr); }
+        if (!ok) return NULL;
     }
     return wildcard;
 }
@@ -1305,10 +1328,34 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[job-launch] spu=%X image %d -> %d at LS 0x%05X (lr=0x%05X)\n",
                         ctx->spu_id, ctx->image_id, jimg, jpc,
                         ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                /* Identity forensics (2026-07-08): the recorded per-context binary
+                 * bases + the RESIDENT head bytes at the branch target, so the log
+                 * proves WHICH binary is loaded there (jobA head 43F79802..., jobB
+                 * head 43494E02..., from the EBOOT at 0x01254500/0x01275A00). */
+                fprintf(stderr, "[job-launch]   jobbase A=0x%05X B=0x%05X ls@0x%05X:",
+                        ctx->job_bin_base[0], ctx->job_bin_base[1], jpc);
+                for (int bi = 0; bi < 16; bi++)
+                    fprintf(stderr, " %02X", ctx->ls[(jpc + bi) & SPU_LS_MASK]);
+                fprintf(stderr, "\n");
                 fflush(stderr); }
             ctx->image_id = jimg;
         }
     }
+    /* DIAG (env YZ_JOBTRACE, 2026-07-08, capped): computed-branch trail of the
+     * jobchain JOB binaries (images 14/15) — pc, link, r3 — the coarse round-1
+     * execution path of jobA/jobB now that the dual-base dispatch fix runs
+     * their real code. Shows how deep the job gets and through which exit it
+     * returns to the module without setting the IWL flag. */
+    { static int jt = -1;
+      if (jt < 0) { jt = getenv("YZ_JOBTRACE") ? 1 : 0;
+          if (jt) { fprintf(stderr, "[jobtrace] armed\n"); fflush(stderr); } }
+      if (jt && (ctx->image_id == 14 || ctx->image_id == 15)) {
+          static int jn = 0; if (jn < 400) { jn++;
+              fprintf(stderr, "[jobtrace] spu=%X img=%d -> 0x%05X lr=0x%05X r3=%08X_%08X\n",
+                      ctx->spu_id, ctx->image_id, ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                      ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1]);
+              fflush(stderr); } } }
     /* THROWAWAY DIAG (env YZ_POLTRACE): raw PC path of the taskset POLICY (image 2)
      * on every indirect branch -- pc, link(gpr0), wklCurrentId(LS 0x1DC). Shows where
      * the dispatched policy goes and where it yields (vs the oracle: 0xA00 entry ->
