@@ -677,10 +677,9 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "sthbrx"
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
-        if xo_full == 827:  # lhaux (Load Halfword Algebraic with Update Indexed)
-            result.mnemonic = "lhaux"
-            result.operands = f"r{rd}, r{ra}, r{rb}"
-            return result
+        # NOTE: XO 827 is sradi with shift >= 32 (handled in the x_shift block
+        # above, which returns early). The real lhaux is XO 375, already
+        # decoded in the x_ldst table.
 
         # --- Load/store algebraic ---
         if xo_full == 341:  # lwax (Load Word Algebraic Indexed)
