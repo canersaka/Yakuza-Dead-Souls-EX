@@ -311,25 +311,19 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
          * but wid 0 never dispatches, the bug moved to the kernel select's
          * wid-0 path; if no commit ever targets readyCount[0], the signal
          * path bails before its CAS. */
-        { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
-          if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
-              /* wid-0 wklSignal bit (0x80000000 at +0x70 = 0x40197CF0) is the
-               * IO-service wake -- log it UNCAPPED (rare; the per-word caps hid
-               * it behind wid-1/3/4 signal noise, 2026-07-03). Everything else
-               * per-word capped. */
-              uint32_t w0sig = (((uint32_t)addr) == 0x40197CF0u)
-                               && (val & 0x80000000u) && !(ps3_bswap32(expected) & 0x80000000u);
-              /* OBSERVATIONAL (env YZ_WIDSIG_ALL, 2026-07-06): UNCAPPED census of
-               * every PPU commit that RAISES a wid signal bit on the wklSignal1
-               * word (0x40197CF0), broken out per-wid, with a running count so
-               * the CRI-phase re-arm frequency of wid1 (bit 0x4000) is measurable
-               * past the 24-line slot cap that blinds the census above. Pure
-               * fprintf, no state mutation; it does NOT force any gate. */
-              { static int wsa = -1;
-                if (wsa < 0) { wsa = getenv("YZ_WIDSIG_ALL") ? 1 : 0;
-                    if (wsa) { fprintf(stderr, "[widsig] armed (BT=%d)\n",
-                                       getenv("YZ_WIDSIG_BT") ? 1 : 0); fflush(stderr); } }
-                if (wsa && ((uint32_t)addr) == 0x40197CF0u) {
+        /* OBSERVATIONAL (env YZ_WIDSIG_ALL, 2026-07-06; made INDEPENDENT of
+         * YZ_MGMT_CAS 2026-07-08 -- it was nested inside that gate, so setting
+         * only YZ_WIDSIG_ALL silently armed nothing): UNCAPPED census of every
+         * PPU commit that RAISES a wid signal bit on the wklSignal1 word
+         * (0x40197CF0), broken out per-wid, with a running count so the
+         * CRI-phase re-arm frequency of wid1 (bit 0x4000) is measurable past
+         * the mgmt-cas per-word cap. Pure fprintf, no state mutation; it does
+         * NOT force any gate. */
+        { static int wsa = -1;
+          if (wsa < 0) { wsa = getenv("YZ_WIDSIG_ALL") ? 1 : 0;
+              if (wsa) { fprintf(stderr, "[widsig] armed (BT=%d)\n",
+                                 getenv("YZ_WIDSIG_BT") ? 1 : 0); fflush(stderr); } }
+          if (wsa && ((uint32_t)addr) == 0x40197CF0u) {
                     uint32_t oldv = ps3_bswap32(expected);
                     uint32_t raised = (uint32_t)val & ~oldv;   /* bits newly set */
                     /* wklSignal1 is the high 16 bits; per-wid bit = 0x8000>>wid */
@@ -359,7 +353,15 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                               yz_dump_guest_state(ctx, "widsig-bt");
                           } }
                     }
-                } }
+          } }
+        { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
+          if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
+              /* wid-0 wklSignal bit (0x80000000 at +0x70 = 0x40197CF0) is the
+               * IO-service wake -- log it UNCAPPED (rare; the per-word caps hid
+               * it behind wid-1/3/4 signal noise, 2026-07-03). Everything else
+               * per-word capped. */
+              uint32_t w0sig = (((uint32_t)addr) == 0x40197CF0u)
+                               && (val & 0x80000000u) && !(ps3_bswap32(expected) & 0x80000000u);
               static long n[32] = {0};
               int slot = ((uint32_t)addr >> 2) & 31;
               if (w0sig || n[slot] < 24) { if (!w0sig) n[slot]++;
