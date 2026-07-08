@@ -354,6 +354,22 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           } }
                     }
           } }
+        /* DIAG (env YZ_JGUARD, 2026-07-08, uncapped): PPU 4-byte CAS commits to the
+         * CRI jobchain's CellSpursJobGuard line 0x4019C700. Counts JobGuardNotify's
+         * ncount0 decrement at the store itself, so direct bl callers the YZ_HOOK
+         * indirect-call logger cannot see are still counted. ncount0/1 printed are
+         * the POST-commit words. */
+        { static int jg = -1;
+          if (jg < 0) { jg = getenv("YZ_JGUARD") ? 1 : 0;
+              if (jg) { fprintf(stderr, "[jguard] ppu probe armed\n"); fflush(stderr); } }
+          if (jg && (((uint32_t)addr) & ~127u) == 0x4019C700u) {
+              fprintf(stderr, "[jguard-ppu] t%u addr=0x%08X old=%08X new=%08X %s "
+                      "ncount0=%08X ncount1=%08X\n",
+                      yz_thread_current_id(), (uint32_t)addr,
+                      ps3_bswap32(expected), (uint32_t)val, ok ? "OK" : "FAIL",
+                      vm_read32(0x4019C700u), vm_read32(0x4019C704u));
+              fflush(stderr);
+          } }
         { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
           if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
               /* wid-0 wklSignal bit (0x80000000 at +0x70 = 0x40197CF0) is the
@@ -409,6 +425,16 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
          * store must be wrong" theory built on that label is refuted; this probe
          * exists to keep the width question measurable, not because 8-byte
          * traffic is expected. */
+        /* DIAG (env YZ_JGUARD): 8-byte CAS commits to the JobGuard line, same
+         * census as the 4-byte path above (libsre may use ldarx/stdcx here). */
+        { static int jg8 = -1; if (jg8 < 0) jg8 = getenv("YZ_JGUARD") ? 1 : 0;
+          if (jg8 && (((uint32_t)addr) & ~127u) == 0x4019C700u) {
+              fprintf(stderr, "[jguard-ppu8] t%u addr=0x%08X old=%016llX new=%016llX %s\n",
+                      yz_thread_current_id(), (uint32_t)addr,
+                      (unsigned long long)ps3_bswap64(expected), (unsigned long long)val,
+                      ok ? "OK" : "FAIL");
+              fflush(stderr);
+          } }
         { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
           if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
               static long n8 = 0; long c = ++n8;
