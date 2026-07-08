@@ -686,6 +686,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                               oea, size, cmd, (unsigned long long)v);
                       fflush(stderr);
                   }
+              } else {
+                  /* s21: SAME-VALUE refetches were invisible (change-triggered
+                   * dedup) -- ambiguous between "module never dispatched" and
+                   * "module polls an unchanged command word". Log every 64th
+                   * same-value refetch per slot so a live poll shows up. */
+                  static uint32_t jc_re[8];
+                  if ((++jc_re[slot] & 63u) == 1u) {
+                      fprintf(stderr, "[job-cmd-re] spu=%X img=%d pc=0x%05X ea=0x%08X refetch#%u val=%016llX (unchanged)\n",
+                              spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              oea, jc_re[slot], (unsigned long long)v);
+                      fflush(stderr);
+                  }
               }
           }
           if (mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD

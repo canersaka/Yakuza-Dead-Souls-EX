@@ -709,9 +709,12 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                     (addr && vm_read32(addr)!=arg)?"STALL":"pass"); } }
         /* fliptrace: log the flip-protocol acquires (label / HW credit) on every
          * pass and on stall-episode ENTRY (retries of the same stalled acquire
-         * are suppressed so the log stays readable). */
+         * are suppressed so the log stays readable). s21 widened: ANY label-area
+         * acquire (0x102000xx) -- the movie phase gates its stream on a decode-
+         * sync label at +0xFE0 (boot 9/12 terminal state). */
         if (yz_ft_on() &&
-            (addr == RSX_REPORTS + 0x10 || addr == RSX_DEVICE_ADDR + 0x30)) {
+            ((addr >= RSX_REPORTS && addr < RSX_REPORTS + 0x1000u) ||
+             addr == RSX_DEVICE_ADDR + 0x30)) {
             uint32_t have = vm_read32(addr);
             int ok = (have == arg);
             static uint32_t fla = 0; static int flr = -1;
@@ -731,7 +734,8 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             fprintf(stderr, "[sem] RELEASE off=0x%X addr=0x%08X val=0x%08X\n",
                     yz_rsx_sem_off_406e, addr, arg); } }
         if (yz_ft_on() &&
-            (addr == RSX_REPORTS + 0x10 || addr == RSX_DEVICE_ADDR + 0x30))
+            ((addr >= RSX_REPORTS && addr < RSX_REPORTS + 0x1000u) ||
+             addr == RSX_DEVICE_ADDR + 0x30))
             yz_ft("REL addr=0x%08X val=0x%08X qhead=%u pending[qh]=%ld",
                   addr, arg, g_rsx_queued_head,
                   g_rsx_flip_pending[g_rsx_queued_head & 7u]);
@@ -760,6 +764,8 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             fprintf(stderr, "[sem] BE_RELEASE off=0x%X addr=0x%08X val=0x%08X(arg=0x%08X)\n",
                     yz_rsx_sem_off_4097, addr,
                     (arg & 0xFF00FF00u)|((arg&0xFFu)<<16)|((arg>>16)&0xFFu), arg); } }
+        if (yz_ft_on() && addr >= RSX_REPORTS && addr < RSX_REPORTS + 0x1000u)
+            yz_ft("BE-REL addr=0x%08X arg=0x%08X", addr, arg);
         if (addr)
             yz_rsx_w32(addr, (arg & 0xFF00FF00u) |
                              ((arg & 0xFFu) << 16) | ((arg >> 16) & 0xFFu));
@@ -1408,13 +1414,31 @@ static int yz_rsx_fifo_step(void)
              * now a faithful memwatch: spin at the stopper until the real
              * consumer patches it. Delete after quiet sessions. */
             static int apply = -1; if (apply < 0) apply = getenv("YZ_APPLY_REL") ? 1 : 0;
+            /* YZ_PARK_REL (s21, the movie-phase deadlock triangle -- full map in
+             * scratch/stopper_drain_re.md): at the logo->movie boundary a commit
+             * crosses a segment recycle, so the game DEFERS this stopper's
+             * release into its tag-0x7F op-list; the drain that would execute it
+             * runs only after t1's flip throttle passes -- but the throttled
+             * flips sit BEHIND this stopper. Permanent triangle. gs_task is
+             * measured idle here (no geometry -> no journal work), so the June
+             * race partner (double-apply during the geometry stream, the reason
+             * YZ_APPLY_REL was retired) cannot exist. This narrow variant
+             * applies the game's OWN journaled release ONLY after parking on
+             * the SAME stopper for 3 s with PUT ahead -- a state that is
+             * otherwise a permanent deadlock. Opt-in for A/B validation. */
+            static int prel = -1;
+            if (prel < 0) { prel = getenv("YZ_PARK_REL") ? 1 : 0;
+                if (prel) fprintf(stderr, "[park-rel] ARMED (YZ_PARK_REL): deadlock-only deferred-release apply, 3s threshold\n"); }
+            static uint32_t park_ea = 0; static ULONGLONG park_t0 = 0;
+            if (ea != park_ea) { park_ea = ea; park_t0 = GetTickCount64(); }
+            const int parked3s = prel && (GetTickCount64() - park_t0 > 3000);
             /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
              * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
              * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
-            const uint32_t rel_entry = (apply && ahead != 0u && ahead < (ring >> 1))
+            const uint32_t rel_entry = ((apply || parked3s) && ahead != 0u && ahead < (ring >> 1))
                                            ? yz_gcm_stopper_release_entry(ea) : 0u;
             if (rel_entry) {
                 vm_write32(ea, 0x20000000u | ((get + 4u) & 0x1FFFFFFCu));   /* release: self-jump -> jump-forward +4 */
@@ -1425,10 +1449,18 @@ static int yz_rsx_fifo_step(void)
                  * yz_jrnl_retire_through). */
                 yz_jrnl_retire_through(rel_entry);
                 { static int n = 0; if (n < 16) { n++;
-                    fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X) -> GET advances past stopper\n",
-                            get, ahead); } }
+                    fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X)%s -> GET advances past stopper\n",
+                            get, ahead, parked3s ? " [park-rel 3s]" : ""); } }
                 LeaveCriticalSection(&g_rsx_fifo_lock);
                 return 1;
+            }
+            if (parked3s) {   /* parked past threshold but NO journal entry: say so once per EA
+                               * (discriminates "deferred entry exists" from "immediate release
+                               * never executed" -- decides lever vs segment-pin, per the RE map) */
+                static uint32_t said = 0;
+                if (said != ea) { said = ea;
+                    fprintf(stderr, "[park-rel] parked >3s @io 0x%06X (PUT ahead 0x%X) but NO tag-0x7F journal entry matches\n",
+                            get, ahead); fflush(stderr); }
             }
             /* not yet committed (no tag-0x7F entry, or PUT not past) -- spin in place */
             LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -2175,6 +2207,38 @@ extern "C" void yz_rsx_vblank_tick(void)
           fprintf(stderr, "[vbl] tick=%u pending=[%ld %ld] label@0x10200010=0x%08X qhead=%u\n",
                   vt, g_rsx_flip_pending[0], g_rsx_flip_pending[1],
                   vm_read32(RSX_REPORTS + 0x10), g_rsx_queued_head); }
+
+    /* YZ_JOBPEEK (s21): change-triggered hexdump of the CRI jobchain command
+     * stream (0x4019CA80-CB40) + the chain header (0x4019C880-8C0), so the
+     * producer's round-N command WRITES are visible independently of the SPU
+     * side's fetches -- discriminates "t1 never wrote round 3" from "chain
+     * never fetched round 3". Checked once per vblank tick, dumps on change. */
+    { static int jp = -1;
+      if (jp < 0) { jp = getenv("YZ_JOBPEEK") ? 1 : 0;
+          if (jp) fprintf(stderr, "[jobpeek] ARMED (YZ_JOBPEEK): watching 0x4019CA80-CB40 + hdr 0x4019C880\n"); }
+      if (jp) {
+          static uint64_t lasth = 0;
+          uint64_t h = 1469598103934665603ull;   /* FNV-1a over both regions */
+          for (uint32_t a = 0x4019CA80u; a < 0x4019CB40u; a += 4)
+              { h ^= vm_read32(a); h *= 1099511628211ull; }
+          for (uint32_t a = 0x4019C880u; a < 0x4019C8C0u; a += 4)
+              { h ^= vm_read32(a); h *= 1099511628211ull; }
+          if (h != lasth) {
+              lasth = h;
+              fprintf(stderr, "[jobpeek] hdr 0x4019C880:");
+              for (uint32_t a = 0x4019C880u; a < 0x4019C8C0u; a += 4)
+                  fprintf(stderr, " %08X", vm_read32(a));
+              fprintf(stderr, "\n");
+              for (uint32_t row = 0x4019CA80u; row < 0x4019CB40u; row += 0x20) {
+                  fprintf(stderr, "[jobpeek] cmd 0x%08X:", row);
+                  for (uint32_t a = row; a < row + 0x20; a += 4)
+                      fprintf(stderr, " %08X", vm_read32(a));
+                  fprintf(stderr, "\n");
+              }
+              fflush(stderr);
+          }
+      }
+    }
 
     /* YZ_FLIPTRACE add-on (s21, the phase-2 consumer park): if GET has been
      * FROZEN for ~4 s with PUT ahead (unconsumed commands), dump the FIFO words
