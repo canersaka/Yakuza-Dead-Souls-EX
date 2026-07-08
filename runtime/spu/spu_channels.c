@@ -1120,27 +1120,14 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     spu_prof_insert(addr, fn);
 }
 
-static spu_fn spu_lookup(uint32_t addr, int image_id)
+/* Shared exact/wildcard decision, applied identically after either the sorted
+ * index binary search or the O(n) fallback scan below have found (a) an exact
+ * (addr,image_id) hit -- returned immediately by the caller before this is
+ * even reached -- or (b) the best wildcard candidate. Kept as one function so
+ * the guard's behavior can't drift between the fast and fallback paths. */
+static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
+                                          spu_fn wildcard, int wildcard_img)
 {
-    /* Prefer an EXACT image match so overlapping task images dispatch their OWN
-     * lifted code: gs_task (image 0) and the cri_audio codec (image 3) BOTH load
-     * at LS 0x3000+. The old single-pass "image_id 0 matches any" returned the
-     * FIRST registered function at addr -- cri_audio (registered before gs_task)
-     * -- so gs_task ran the codec's code and its trampoline chain diverged into
-     * cri_audio's region (2026-06-28: the true root of gs_task never producing
-     * geometry). Fall back to a wildcard (registered image 0 = resident runtime,
-     * or an image_id 0 query = single-image/back-compat context) only when no
-     * exact match exists. Linear scan is fine for the small per-image tables. */
-    spu_fn wildcard = NULL;
-    int wildcard_img = -1;
-    for (uint32_t i = 0; i < s_registry_count; i++) {
-        if (s_registry[i].addr != addr) continue;
-        if (s_registry[i].image_id == image_id) return s_registry[i].fn; /* exact (incl 0==0) */
-        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard) {
-            wildcard = s_registry[i].fn;
-            wildcard_img = s_registry[i].image_id;
-        }
-    }
     /* Jobchain-family wildcard guard (2026-07-08). A query from images 13-15
      * at a JOB-SPAN address (>= 0x4880, past the module's end; kernel-yield
      * targets are all below 0xA00 and stay wildcard-served by design) that
@@ -1162,6 +1149,129 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
         if (!ok) return NULL;
     }
     return wildcard;
+}
+
+/* ===========================================================================
+ * spu_lookup fast index (SPU-SPEED item 1). The registry holds O(10^5)
+ * entries and every SPU computed branch (bi/bisl/brasl-return) queries it --
+ * with ~150k+ functions registered, the plain forward scan was the hottest
+ * O(n) cost in the whole dispatch loop. Replace it with a copy of the
+ * registry sorted by addr (ties broken by original registration order, so
+ * the exact/wildcard tie-break below matches the old scan byte-for-byte),
+ * binary-searched to the first entry with a matching addr, then scanned
+ * across just the (small, bounded by how many images alias that LS address)
+ * run of same-addr entries -- O(log n + k) instead of O(n).
+ *
+ * Registration is append-only and, in this runtime, 100% complete (all
+ * spu_begin_image()/spu_recomp_register*() calls in main()) before any SPU
+ * host thread starts calling spu_lookup (threads are spawned later, from
+ * sys_spu_thread_group_start) -- so the index only ever needs to be built
+ * ONCE, with no reader racing the build. It's built lazily on the first
+ * lookup after registration (rather than eagerly per spu_register_function
+ * call) so the O(n log n) sort cost is paid once, not once per registration
+ * in a ~150k-call registration burst.
+ *
+ * Thread safety: builds are serialized by a spinlock (same atomic_flag
+ * pattern as spu_lockline above); the built array is published through an
+ * atomic pointer + count so a lookup on another thread either sees the
+ * fully-built index or the prior (possibly NULL) one, never a partial write.
+ * A rebuilt index is never freed (only ever superseded) -- registration is
+ * rare (once at boot in practice) and a stale reader could still be scanning
+ * it, so the bounded, one-time leak is the safe trade against a use-after-
+ * free. If a build ever fails (OOM), spu_lookup transparently falls back to
+ * the original O(n) scan, so correctness never depends on the index. */
+typedef struct {
+    uint32_t addr;
+    uint32_t order;    /* original registration index; preserves the old
+                        * linear scan's "first registered wins" tie-break */
+    spu_fn   fn;
+    int      image_id;
+} spu_idx_entry;
+
+static int spu_idx_cmp(const void* pa, const void* pb)
+{
+    const spu_idx_entry* a = (const spu_idx_entry*)pa;
+    const spu_idx_entry* b = (const spu_idx_entry*)pb;
+    if (a->addr != b->addr) return (a->addr < b->addr) ? -1 : 1;
+    return (a->order < b->order) ? -1 : (a->order > b->order ? 1 : 0);
+}
+
+static atomic_flag              s_index_build_lock = ATOMIC_FLAG_INIT;
+static _Atomic(spu_idx_entry*)  s_index = 0;         /* published sorted snapshot */
+static _Atomic(uint32_t)        s_index_count = 0;   /* entries in that snapshot */
+static uint32_t                 s_index_built_from = 0; /* lock-protected */
+
+static void spu_lookup_rebuild_index(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_index_build_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+    uint32_t n = s_registry_count;
+    if (n != s_index_built_from) {
+        spu_idx_entry* idx = (spu_idx_entry*)malloc((n ? (size_t)n : 1) * sizeof(spu_idx_entry));
+        if (idx) {
+            for (uint32_t i = 0; i < n; i++) {
+                idx[i].addr = s_registry[i].addr;
+                idx[i].fn = s_registry[i].fn;
+                idx[i].image_id = s_registry[i].image_id;
+                idx[i].order = i;
+            }
+            qsort(idx, n, sizeof(spu_idx_entry), spu_idx_cmp);
+            /* Publish count BEFORE the pointer isn't safe (a reader could load
+             * the new pointer with the old count); publish the pointer LAST
+             * with a release store so a reader that observes the new pointer
+             * also observes fully-initialized entries and the matching count
+             * (read together below, count first, pointer second, matching
+             * this store order in reverse -- see spu_lookup). */
+            atomic_store_explicit(&s_index_count, n, memory_order_relaxed);
+            atomic_store_explicit(&s_index, idx, memory_order_release);
+            s_index_built_from = n;
+        }
+        /* malloc failure: leave whatever was previously published (possibly
+         * NULL) in place -- spu_lookup's fallback path covers this. */
+    }
+    atomic_flag_clear_explicit(&s_index_build_lock, memory_order_release);
+}
+
+static spu_fn spu_lookup(uint32_t addr, int image_id)
+{
+    spu_idx_entry* idx = atomic_load_explicit(&s_index, memory_order_acquire);
+    uint32_t idx_n = atomic_load_explicit(&s_index_count, memory_order_acquire);
+    if (!idx || idx_n != s_registry_count) {
+        spu_lookup_rebuild_index();
+        idx = atomic_load_explicit(&s_index, memory_order_acquire);
+        idx_n = atomic_load_explicit(&s_index_count, memory_order_acquire);
+    }
+    if (idx && idx_n == s_registry_count) {
+        /* Binary search: first index with addr >= target. */
+        uint32_t lo = 0, hi = idx_n;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (idx[mid].addr < addr) lo = mid + 1; else hi = mid;
+        }
+        spu_fn wildcard = NULL;
+        int wildcard_img = -1;
+        for (uint32_t i = lo; i < idx_n && idx[i].addr == addr; i++) {
+            if (idx[i].image_id == image_id) return idx[i].fn; /* exact (incl 0==0) */
+            if ((idx[i].image_id == 0 || image_id == 0) && !wildcard) {
+                wildcard = idx[i].fn;
+                wildcard_img = idx[i].image_id;
+            }
+        }
+        return spu_lookup_apply_job_guard(addr, image_id, wildcard, wildcard_img);
+    }
+    /* Fallback (index unavailable, e.g. OOM on the very first build): the
+     * original O(n) scan. Correctness never depends on the index existing. */
+    spu_fn wildcard = NULL;
+    int wildcard_img = -1;
+    for (uint32_t i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].addr != addr) continue;
+        if (s_registry[i].image_id == image_id) return s_registry[i].fn; /* exact (incl 0==0) */
+        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard) {
+            wildcard = s_registry[i].fn;
+            wildcard_img = s_registry[i].image_id;
+        }
+    }
+    return spu_lookup_apply_job_guard(addr, image_id, wildcard, wildcard_img);
 }
 
 /* Does a lifted function exist at this LS address (any image)? Lets the

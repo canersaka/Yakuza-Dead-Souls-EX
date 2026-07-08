@@ -454,8 +454,26 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
 extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
 extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
-extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+/* YZ_JOBSTREAM_WATCH (s21): confirm the func_00E5F248 clobber hypothesis
+ * (scratch/jobchain_pointer_re.md) -- log every store to the jobchain command
+ * slots 1/2 (0x4019CA88/90) with the WRITER's guest address. Cheap: two
+ * compares behind a cached flag, on hits only. */
+static inline void yz_jobstream_watch(uint32_t a, uint64_t val, unsigned w, const void* retaddr)
+{
+    static int on = -1;
+    if (on < 0) { on = getenv("YZ_JOBSTREAM_WATCH") ? 1 : 0;
+        if (on) fprintf(stderr, "[jsw] ARMED (YZ_JOBSTREAM_WATCH): 0x4019CA88/0x4019CA90 store watch\n"); }
+    if (!on) return;
+    if ((a + w > 0x4019CA80u && a < 0x4019CB40u) ||     /* jobchain cmd stream */
+        (a + w > 0x10200FE0u && a < 0x10200FF0u)) {     /* movie decode-sync label */
+        uint32_t caller = yz_guest_addr_from_host(retaddr);
+        fprintf(stderr, "[jsw] tid=%u store%u ea=0x%08X val=0x%016llX caller=0x%08X\n",
+                yz_thread_current_id(), w * 8, a, (unsigned long long)val, caller);
+        fflush(stderr);
+    }
+}
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
+extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED
@@ -781,6 +799,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 
     static unsigned char seen[1100];
     int first = (num < sizeof(seen)) && !seen[num];
+    /* YZ_LV2_LOG (SPU-SPEED item 2): the spu_range/intr clauses below log
+     * EVERY matching syscall, not just the first -- and spu_range's window
+     * (num 82..200) covers the whole SPURS management-syscall family, so it
+     * fires at high rate during SPU activity (a hot unconditional stderr
+     * write). Default OFF: only the cheap one-per-syscall-number `first`
+     * print survives. `=1` restores the full original always-on behavior
+     * (both clauses), unchanged, for A/B / deep syscall tracing. */
+    static int lv2_log_full = -1;
+    if (lv2_log_full < 0) lv2_log_full = getenv("YZ_LV2_LOG") ? 1 : 0;
     /* SPU-management family: log every call (SPURS bring-up), not just the
      * first — except the usleep-class noise. */
     int spu_range = (num >= 82 && num <= 200 && num != 141 && num != 145 &&
@@ -800,7 +827,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
     yz_wait_exit();
 
-    if (first || spu_range || intr) {
+    if (first || (lv2_log_full && (spu_range || intr))) {
         seen[num] = 1;
         fprintf(stderr, "[LV2%s t%u] sc %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)"
                 " -> 0x%llX\n", first ? ":first" : "",
