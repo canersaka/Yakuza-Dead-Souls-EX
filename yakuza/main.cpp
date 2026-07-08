@@ -305,6 +305,21 @@ static void guest_caller(uint32_t opd_addr,
  * context_allocate has set up the driver_info, so starting early is safe. */
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
+    /* YZ_VBL_DIV=N (s21, H4 discriminator): divide the vblank rate by N so a
+     * ~5-7 FPS boot sees ~2 vblanks/frame (what a 30fps title expects) instead
+     * of 8-12. A/B lever for the flip-label stall: if the stall vanishes or
+     * moves far later under the throttle, the wall is timing-coupled (H4);
+     * unchanged = protocol-shape hypotheses stay in front. Slows every guest
+     * clock derived from vblank -- diagnostic only, default 1 (off). */
+    static int vdiv = 0;
+    if (!vdiv) {
+        const char* d = getenv("YZ_VBL_DIV");
+        vdiv = d ? atoi(d) : 1;
+        if (vdiv < 1) vdiv = 1; if (vdiv > 16) vdiv = 16;
+        if (vdiv > 1)
+            fprintf(stderr, "[vbl] YZ_VBL_DIV=%d ARMED: vblank ~%.1f Hz\n",
+                    vdiv, 62.5 / vdiv);
+    }
     /* PRECISE VBLANK (env YZ_VSYNC_PRECISE, 2026-06-25): RPCS3 drives vblank from a
      * drift-corrected absolute schedule (post_event_time = start + count*period/rate),
      * staying locked to ~59.94 Hz. Our old `Sleep(16)` jitters with Windows' ~15.6 ms
@@ -314,7 +329,7 @@ static DWORD WINAPI yz_vblank_thread(LPVOID)
     static int precise = -1; if (precise < 0) precise = getenv("YZ_VSYNC_PRECISE") ? 1 : 0;
     if (precise) {
         LARGE_INTEGER freq, now; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&now);
-        const double period = (double)freq.QuadPart / 59.94;       /* ticks per vblank */
+        const double period = (double)freq.QuadPart * vdiv / 59.94;  /* ticks per vblank */
         double next = (double)now.QuadPart + period;
         for (;;) {
             QueryPerformanceCounter(&now);
@@ -326,7 +341,7 @@ static DWORD WINAPI yz_vblank_thread(LPVOID)
         }
     }
     for (;;) {
-        Sleep(16);            /* ~62.5 Hz; close enough to PS3 vblank */
+        Sleep(16 * vdiv);     /* ~62.5 Hz (default); /N under YZ_VBL_DIV */
         yz_rsx_vblank_tick();
     }
     return 0;
