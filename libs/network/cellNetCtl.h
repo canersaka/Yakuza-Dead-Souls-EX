@@ -93,6 +93,14 @@ extern "C" {
 /* Max handler callbacks */
 #define CELL_NET_CTL_HANDLER_MAX            3
 
+/* Net-start ("connect to PSN") dialog completion is signalled through the
+ * cellSysutil callback queue with these status codes (delivered as the
+ * `status` argument). Values verified against RPCS3
+ * (rpcs3/rpcs3/Emu/Cell/Modules/cellNetCtl.h). */
+#define CELL_SYSUTIL_NET_CTL_NETSTART_LOADED    0x0801
+#define CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED  0x0802
+#define CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED  0x0803
+
 /* ---------------------------------------------------------------------------
  * Structures
  * -----------------------------------------------------------------------*/
@@ -142,6 +150,17 @@ typedef struct CellNetCtlNatInfo {
     u32 upnp_status;
 } CellNetCtlNatInfo;
 
+typedef struct CellNetCtlNetStartDialogParam {
+    u32 size;   /* caller-set: sizeof(struct) */
+    s32 type;   /* dialog type */
+    u32 cid;    /* context id (unused) */
+} CellNetCtlNetStartDialogParam;
+
+typedef struct CellNetCtlNetStartDialogResult {
+    u32 size;   /* caller-set: sizeof(struct) */
+    s32 result; /* 0 = connected, negative = error/abort */
+} CellNetCtlNetStartDialogResult;
+
 /* Event handler callback */
 typedef void (*cellNetCtlHandler)(s32 prev_state, s32 new_state,
                                   s32 event, s32 error_code, void* arg);
@@ -159,6 +178,12 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo);
 
 s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid);
 s32 cellNetCtlDelHandler(s32 hid);
+
+/* Net-start ("connect to PSN") dialog. We have no PSN session to show a
+ * dialog for and already report a full wired connection (see GetState
+ * above), so this reports an immediate successful connect. */
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param);
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 
 #ifdef __cplusplus
 }
