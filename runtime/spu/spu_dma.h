@@ -205,6 +205,40 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_get(cmd)) {
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            /* DIAG (env YZ_JOBDESC, 2026-07-08, capped): payload dump of every
+             * GET from the CRI jobchain object area (0x4019xxxx) — the jobchain
+             * header/commands/JOB DESCRIPTORS the module stages before calling
+             * a job. Round-1 jobB (dual-base fix) runs its REAL code but
+             * early-exits without attempting the flag PUTLLC (fixboot3: jobtrace
+             * armed, flagcas armed, 0 attempts) — so the deciding values are in
+             * these staged bytes. Guest EAs match RPCS3; the rpcs3clone twin
+             * probe dumps the same GETs for a byte diff. */
+            { static int jd = -1;
+              if (jd < 0) { jd = getenv("YZ_JOBDESC") ? 1 : 0;
+                  if (jd) { fprintf(stderr, "[jobdesc] armed\n"); fflush(stderr); } }
+              if (jd && size <= 0x400u
+                     /* jobchain-family SPUs only, ANY source ea: the JOB
+                      * DESCRIPTOR lives in game memory (its EA is the command
+                      * value), not in the 0x4019xxxx object area. Skip the
+                      * kernel workload-info lines (stale-image polls at
+                      * 0x40198xxx) that would eat the cap. */
+                     && spu->image_id >= 13 && spu->image_id <= 15
+                     && !((uint32_t)ea >= 0x40198000u && (uint32_t)ea < 0x40199000u)) {
+                  static int jdn = 0;
+                  if (jdn < 200) { jdn++;
+                      /* single buffered write: multi-fprintf dumps get torn by
+                       * other threads' stderr lines mid-payload */
+                      char jb[512]; int jp;
+                      unsigned dl = size < 64u ? size : 64u;
+                      jp = snprintf(jb, sizeof jb, "[jobdesc] spu=%X img=%d pc=0x%05X GET "
+                              "ea=0x%08X lsa=0x%05X size=0x%X:", spu->spu_id, spu->image_id,
+                              spu->pc & SPU_LS_MASK, (uint32_t)ea, lsa, size);
+                      for (unsigned di = 0; di < dl && jp < (int)sizeof jb - 4; di++)
+                          jp += snprintf(jb + jp, sizeof jb - jp, "%s%02X",
+                                         (di & 3) ? "" : " ", ls_ptr[di]);
+                      fprintf(stderr, "%s\n", jb); fflush(stderr);
+                  }
+              } }
             /* SPURS workload dispatch: the kernel DMAs the selected workload's code
              * to LS 0xA00, then branches there. The system service and the taskset
              * POLICY module both live at LS 0xA00, so pick which lifted image
@@ -1251,6 +1285,30 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     memcmp(line, mfc->resv_data, 128) == 0) g_spu_mgmt_put_ok++;
                 else g_spu_mgmt_put_fail++;
             }
+            /* DIAG (env YZ_FLAGCAS, 2026-07-08, uncapped): every SPU PUTLLC
+             * ATTEMPT on the IWL event-flag line 0x4019C680 (the flag t1's
+             * cellSpursEventFlagWait polls, bit 0x1). The jobchain's notify job
+             * (jobB) is supposed to set the flag bit here each round; with the
+             * dual-base dispatch fix jobB's real code runs but the flag never
+             * sets — this distinguishes "jobB never attempts the write"
+             * (early-exit on descriptor data -> PPU-side value hunt) from
+             * "attempts it and the CAS fails/mis-writes" (our reservation or
+             * lift layer). Logs attempts BEFORE the success test, with verdict. */
+            { static int fc = -1;
+              if (fc < 0) { fc = getenv("YZ_FLAGCAS") ? 1 : 0;
+                  if (fc) { fprintf(stderr, "[flagcas] spu probe armed\n"); fflush(stderr); } }
+              if (fc && (ea & ~127ull) == 0x4019C680ull) {
+                  int ok = mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
+                           memcmp(line, mfc->resv_data, 128) == 0;
+                  const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
+                  fprintf(stderr, "[flagcas] spu=%X img=%d pc=0x%05X %s bits %02X%02X%02X%02X"
+                          "%02X%02X%02X%02X->%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                          spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                          ok ? "COMMIT" : "FAIL",
+                          b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+                          a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
+                  fflush(stderr);
+              } }
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                 memcmp(line, mfc->resv_data, 128) == 0) {
                 /* DIAG (YZ_SPU_PROF): on a successful CAS of the SPURS mgmt
