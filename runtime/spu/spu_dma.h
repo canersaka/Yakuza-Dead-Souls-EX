@@ -1026,16 +1026,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               mfc->resv_gen = g; }
             mfc->resv_active = 1;
             mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
-            /* EXPERIMENT (env YZ_LRWAKE): the SPURS idle kernel waits on SPU_EVENT_LR
-             * for the workload-ready wakeup, but the PPU-side wklSignal/readyCount SET
-             * that should raise it bypasses the coherence path (PROVEN: lr_raised stalls
-             * at 42; the signal IS visible in this snapshot but no LR edge arrives).
-             * Deliver the missed edge: raise LR on a GETLLAR of the SPURS mgmt line that
-             * carries a pending workload signal (wklSignal1 @ +0x70 != 0), so the kernel
+            /* LOST-WAKEUP FIX (2026-07-05; DEFAULT ON, kill-switch YZ_NO_LRWAKE). ROOT
+             * (MEASURED, confirmed two independent ways): the SPURS idle
+             * kernel backs off (host-yield) between GETLLAR polls of its management line;
+             * the PPU-side wklSignal/readyCount SET that submits a workload does NOT raise
+             * the backed-off SPU's SPU_EVENT_LR (that write bypasses the coherence
+             * write-generation path), so the transient signal lands in a poll gap and the
+             * kernel never re-enters selection -> the workload that throws the port-17
+             * heartbeat (SPU LS 0x05D10, the wake t1's cellSpursEventFlagWait on
+             * 0x4019C680 bit0 depends on) is never dispatched -> the boot livelocks. Both
+             * disabling the backoff (YZ_NO_SPUBACKOFF, SPU polls hot and catches the
+             * transient) and this edge-delivery make the boot progress into rendering
+             * (~560 set_render_target, stable). This keeps the backoff's perf and delivers
+             * the edge faithfully: on a GETLLAR of the mgmt line that still carries a
+             * pending workload signal (wklSignal1 @ +0x70 != 0), raise LR so the kernel
              * re-enters selection + runs the system service (rebuilds wklRunnable1 ->
-             * dispatches the SOFDEC workload). Self-limits: once dispatched the kernel is
-             * busy, not idle-GETLLARing. */
-            { static int lw = -1; if (lw < 0) lw = getenv("YZ_LRWAKE") ? 1 : 0;
+             * dispatches the workload). This is the HW edge our emulation dropped, not a
+             * game-logic force; it self-limits (once dispatched the kernel is busy, not
+             * idle-GETLLARing). */
+            { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
               if (lw && (uint32_t)(ea & ~127ull) == 0x40197C80u
                   && (line[0x70] | line[0x71])) spu->event_status |= 0x400u; }
             /* THROWAWAY DIAG (env YZ_SIGW): does the SPU kernel's GETLLAR of the SPURS
