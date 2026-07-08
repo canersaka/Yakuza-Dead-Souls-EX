@@ -187,6 +187,31 @@ extern "C" void ppu_trace_pc(void* ctxv, uint32_t pc) {
             }
         }
     }
+    /* DIAG (env YZ_F484_PROBE): confirm the func_00F00484 completion-notifier
+     * divergence found by the producer trace-diff (2026-07-05). At entry r3=P
+     * (the request object *(obj+0x440)), r4=V (the request id *(obj+0x444)). The
+     * PC-only diff showed ours branch F004D4->F004B4 (P->[0x4]==0, skip
+     * sys_cond_signal) where RPCS3 goes F004D4->F004D8 (P->[0x4]!=0, signals
+     * cri_dlg). Printing P->[0x4] + P->[0x48] makes that a DIRECT value
+     * measurement, not a PC inference. Retire once the notifier root is fixed. */
+    {
+        static int p484 = -1;
+        if (p484 < 0) p484 = getenv("YZ_F484_PROBE") ? 1 : 0;
+        if (p484 && pc == 0xF00484u && (int)yz_thread_current_id() == 1) {
+            static unsigned long pn = 0;
+            if (pn < 400) { pn++;
+                uint64_t* gg = (uint64_t*)ctxv;
+                uint32_t P = (uint32_t)gg[3], V = (uint32_t)gg[4];
+                uint32_t p0  = P ? vm_read32(P + 0x00) : 0;
+                uint32_t p4  = P ? vm_read32(P + 0x04) : 0;
+                uint32_t p48 = P ? vm_read32(P + 0x48) : 0;
+                uint32_t p14 = P ? vm_read32(P + 0x14) : 0;
+                fprintf(stderr, "[f484] #%lu P=%08X V=%08X P0=%08X P4=%08X P48=%08X match48=%d P14=%08X\n",
+                        pn, P, V, p0, p4, p48, (int)(p48 == V), p14);
+                fflush(stderr);
+            }
+        }
+    }
     static int mode = -1;
     if (mode < 0) mode = getenv("YZ_PPU_TRACE") ? 1 : 0;
     if (!mode) return;
@@ -199,13 +224,18 @@ extern "C" void ppu_trace_pc(void* ctxv, uint32_t pc) {
     if (!armed) { if (pc != armpc) return; armed = 1; }
     static FILE* fp = nullptr; static long budget = -1;
     if (!fp) { fp = fopen("scratch/ppu_trace.txt", "w"); if (!fp) fp = stderr;
-               setvbuf(fp, nullptr, _IONBF, 0);   /* unbuffered: last line survives a kill,
-                                                   * so the real block point (not a stale flushed
-                                                   * PC) is visible. */
+               setvbuf(fp, nullptr, _IOFBF, 1 << 20);  /* 1 MB buffered. The per-line write()
+                                                   * of the old _IONBF path was the dominant
+                                                   * tracer slowdown; buffered + a periodic
+                                                   * fflush keeps the traced thread near
+                                                   * untraced speed (needed so the RPCS3 and
+                                                   * our-side traces reach the same phase) while
+                                                   * bounding a kill's tail loss to <256K lines.
+                                                   * Self-terminates + flushes at budget==0. */
                const char* n = getenv("YZ_PPU_TRACE_N"); budget = n ? strtol(n, 0, 0) : 3000000; }
     if (budget <= 0) return;
     fprintf(fp, "%08X\n", pc);
-    if (--budget == 0) fflush(fp);
+    if (--budget == 0 || (budget & 0x3FFFF) == 0) fflush(fp);
 }
 
 /* ---------------------------------------------------------------------------
@@ -284,6 +314,31 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                * per-word capped. */
               uint32_t w0sig = (((uint32_t)addr) == 0x40197CF0u)
                                && (val & 0x80000000u) && !(ps3_bswap32(expected) & 0x80000000u);
+              /* OBSERVATIONAL (env YZ_WIDSIG_ALL, 2026-07-06): UNCAPPED census of
+               * every PPU commit that RAISES a wid signal bit on the wklSignal1
+               * word (0x40197CF0), broken out per-wid, with a running count so
+               * the CRI-phase re-arm frequency of wid1 (bit 0x4000) is measurable
+               * past the 24-line slot cap that blinds the census above. Pure
+               * fprintf, no state mutation; it does NOT force any gate. */
+              { static int wsa = -1; if (wsa < 0) wsa = getenv("YZ_WIDSIG_ALL") ? 1 : 0;
+                if (wsa && ((uint32_t)addr) == 0x40197CF0u) {
+                    uint32_t oldv = ps3_bswap32(expected);
+                    uint32_t raised = (uint32_t)val & ~oldv;   /* bits newly set */
+                    /* wklSignal1 is the high 16 bits; per-wid bit = 0x8000>>wid */
+                    static unsigned long cw0=0,cw1=0,cw2=0,cw3=0,cw4=0;
+                    if (raised & 0x80000000u) cw0++;
+                    if (raised & 0x40000000u) cw1++;
+                    if (raised & 0x20000000u) cw2++;
+                    if (raised & 0x10000000u) cw3++;
+                    if (raised & 0x08000000u) cw4++;
+                    if (raised & 0xFF000000u) {
+                        fprintf(stderr, "[widsig] t%u raise=%08X old=%08X new=%08X "
+                                "counts w0=%lu w1=%lu w2=%lu w3=%lu w4=%lu\n",
+                                yz_thread_current_id(), raised, oldv, (uint32_t)val,
+                                cw0, cw1, cw2, cw3, cw4);
+                        fflush(stderr);
+                    }
+                } }
               static long n[32] = {0};
               int slot = ((uint32_t)addr >> 2) & 31;
               if (w0sig || n[slot] < 24) { if (!w0sig) n[slot]++;
@@ -322,6 +377,25 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                                                 (long long)expected)
                   == (long long)expected);
         }
+        /* DIAG (YZ_MGMT_CAS, 8-byte path): count 8-byte mgmt-line CAS too, so
+         * the census is complete across both commit widths; tid identifies
+         * which thread pumps the line. NOTE the follow-up verdict (2026-07-06):
+         * the mixer heartbeat IS a 4-byte stwcx on both sides. RPCS3's log
+         * labels every reservation store "STCX8" (a shared diagnostic template
+         * that dumps an 8-byte granule for u32 and u64 alike), so an "our 4-byte
+         * store must be wrong" theory built on that label is refuted; this probe
+         * exists to keep the width question measurable, not because 8-byte
+         * traffic is expected. */
+        { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
+          if (mc && (((uint32_t)addr) & ~127u) == 0x40197C80u) {
+              static long n8 = 0; long c = ++n8;
+              if (c <= 40 || (c % 997) == 0) {
+                  fprintf(stderr, "[mgmt-cas8] t%u addr=0x%08X old=%016llX new=%016llX %s (8B #%ld)\n",
+                          yz_thread_current_id(), (uint32_t)addr,
+                          (unsigned long long)ps3_bswap64(expected),
+                          (unsigned long long)val, ok ? "OK" : "FAIL", c);
+                  fflush(stderr);
+              } } }
     }
     ctx->reserve_addr = 0;
     ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
