@@ -32,6 +32,7 @@ typedef struct sys_mem_alloc_info {
     uint32_t addr;
     uint32_t size;
     int32_t  container_id;  /* 0 = main pool */
+    uint32_t page_size;     /* 0x100000 (1M) or 0x10000 (64K), from the alloc flags */
 } sys_mem_alloc_info;
 
 /* Container */
@@ -58,6 +59,7 @@ extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer *
 int64_t sys_memory_allocate(ppu_context* ctx);
 int64_t sys_memory_free(ppu_context* ctx);
 int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
+int64_t sys_memory_get_page_attribute(ppu_context* ctx);
 int64_t sys_memory_container_create(ppu_context* ctx);
 int64_t sys_memory_container_destroy(ppu_context* ctx);
 int64_t sys_memory_container_get_size(ppu_context* ctx);

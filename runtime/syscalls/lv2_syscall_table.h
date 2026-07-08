@@ -135,7 +135,7 @@ extern "C" {
 #define SYS_MEMORY_ALLOCATE             348
 #define SYS_MEMORY_FREE                 349
 #define SYS_MEMORY_ALLOCATE_FROM_CONTAINER 350
-#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   358
+#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h) */
 #define SYS_MEMORY_GET_USER_MEMORY_SIZE 352
 #define SYS_MEMORY_CONTAINER_CREATE     353
 #define SYS_MEMORY_CONTAINER_DESTROY    354
