@@ -76,6 +76,17 @@ unrouted/buffered). Cap 200. Answers whether the SPU ever targets port 17 / queu
 SPURS event-flag queue). Side-effect-free when unset. REMOVE once the t1-wedge frontier is
 resolved.
 
+`YZ_LV2_LOG` (yakuza/shims.cpp, the LV2 syscall dispatch wrapper ~line 770, SPU-SPEED
+workpackage item 2, diag): gates the two always-on `[LV2 ...]` stderr clauses that log
+EVERY matching syscall, not just its first occurrence -- `spu_range` (syscall numbers
+82..200, the whole SPURS management-syscall family; hot during SPU/SPURS activity) and
+`intr` (every syscall from thread t7, the gcm interrupt thread). Default OFF: only the
+cheap one-per-syscall-number `first` print fires (unchanged, always on). `=1` restores
+the full original always-on behavior for both clauses, byte-for-byte, for A/B or deep
+syscall tracing. `yz_wait_enter`/`yz_wait_exit` (the stall-dump bookkeeping) are NOT
+gated -- they run unconditionally regardless of this flag, same as before. Permanent
+(prefer this over re-adding unconditional syscall prints); keep.
+
 **PPU differential trace group (shims.cpp `ppu_trace_pc`, emitted before EVERY instruction by
 the `--trace` lifter build only â€” inert in a normal build):**
 `YZ_PPU_TRACE=1` (enable) + `YZ_PPU_TRACE_TID=<n>` (gate to one guest tid, default 1) +
@@ -426,3 +437,26 @@ full and 1/5 vblank rate -- the logo phase is frame-counted content ending natur
 the whole flip-wall framing) refuted, DONT_RECHASE #28.** Kept as a general-purpose pacing
 lever for future timing A/Bs. Slows every vblank-derived guest clock; diagnostic only,
 never load-bearing. Prints an ARMED banner when N>1.
+
+`YZ_PARK_REL` (yakuza/import_overrides.cpp, stopper handler, 2026-07-09 s21): **lever, validated,
+candidate default-ON.** Narrow deadlock-only variant of the retired YZ_APPLY_REL: applies the
+game's OWN journaled tag-0x7F stopper release only after the consumer has parked on the SAME
+self-jump stopper for 3 s with PUT ahead. Fixes the movie-boundary deferral deadlock (a commit
+crossing a segment recycle defers the release; the drain lives behind t1's flip throttle which
+waits on flips behind the very stopper -- scratch/stopper_drain_re.md). The June race partner
+(gs_task double-apply during geometry) cannot exist in the parked state. MEASURED: 16 applies
+per boot across 4 boots, zero entry-mismatches, zero June-style early wedges (park-rel fires
+only past the 3 s threshold; normal logo-phase deferrals resolve through it cleanly too).
+Promote to default-ON after a quiet multi-boot stretch; kill-switch stays the env polarity.
+
+`YZ_JOBSTREAM_WATCH` (yakuza/shims.cpp vm_write32/64, 2026-07-09 s21): **diag, default OFF.**
+Logs every PPU store to the CRI jobchain command stream (0x4019CA80-CB40) and the movie
+decode-sync label family (0x10200FE0-FF0) with value + lifted-caller guest address
+(yz_guest_addr_from_host). Two compares behind a cached flag on the hot write path when armed.
+Decoded the full per-round producer choreography (DONT_RECHASE #29). ARMED banner on first use.
+
+`YZ_JOBPEEK` (yakuza/import_overrides.cpp vblank tick, 2026-07-09 s21): **diag, default OFF.**
+Change-triggered (FNV-hash) hexdump of the jobchain command stream 0x4019CA80-CB40 + chain
+header 0x4019C880-8C0, once per vblank tick. The producer-side twin of the SPU-side [job-cmd]
+probe; with [job-cmd-re] (same-value refetch counter, spu_dma.h, always on with YZ_OVL) it
+discriminates "producer never wrote" from "module never fetched". ARMED banner on first use.
