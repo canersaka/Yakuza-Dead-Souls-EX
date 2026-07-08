@@ -23,6 +23,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_NO_APPLY_REL` | (gone) | **Flag retired 2026-07-02** — the applier it disabled is now default-OFF; the polarity inverted into `YZ_APPLY_REL` (see above). |
 | `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** — when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED and now MOOT (2026-07-02 late): reachable only via the retired `YZ_APPLY_REL` path, and the real consumer (gs_task) both applies and retires the journal itself — delete with the applier. Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries — it re-reads its own entries). |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
+| `YZ_JOB_WILDCARD_OK` | spu_channels.c (spu_lookup) | **Kill-switch for the jobchain-family wildcard REFUSAL (2026-07-08, guard DEFAULT ON).** ROOT (MEASURED, scratch/idboot.err + 3 prior boots): the jobchain loads its job binaries into descriptor-assigned LS slots (round-1 loads jobB/0x01275A00 at LS 0x4C00 — head bytes 43 49 4E verified resident) but the job lifts were fixed-base, so `spu_lookup`'s image-0 wildcard silently served **gs_task's** `spu_func_00004C00` at the job site — the notify job never ran, the IWL event flag never set, zero spup17 (the s19 wall, DONT_RECHASE #23). Fix = each job binary lifted at BOTH slot bases (A@0x4C00+0xE400, B@0xE400+0x4C00, registered under the same image ids) + refuse cross-image wildcard for images 13-15 at job-span addresses (>=0x4880) so an unknown base fails loud instead of running wrong code. `=1` restores the old silent substitution for A/B. Kernel-yield wildcards (addr <0xA00) unaffected. |
 | `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause → scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5×~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. Note: setting this (disable backoff) ALSO breaks the SPURS dispatch livelock (SPU polls hot, catches the transient workload signal) — it was the discovery lever for `YZ_NO_LRWAKE`'s fix. |
 | `YZ_NO_LRWAKE` | spu_dma.h (GETLLAR mgmt line) | **Kill-switch for the SPURS dispatch LOST-WAKEUP FIX (2026-07-05, DEFAULT ON).** ROOT (MEASURED): the backed-off SPURS kernel misses the PPU-side wklSignal/readyCount workload-submit (that write doesn't raise the kernel's SPU_EVENT_LR — it bypasses the coherence write-generation path), so the transient signal lands in a poll gap and the workload that the main thread's `cellSpursEventFlagWait` on 0x4019C680 bit0 depends on is never dispatched → boot livelocks (the long-standing dispatch gate). The fix delivers the missed HW edge: on a GETLLAR of the mgmt line 0x40197C80 that still carries a pending wklSignal1 (+0x70 != 0), raise LR so the kernel re-enters selection + dispatches. Faithful (re-derives a dropped cross-processor wakeup, not a game-logic force; self-limits once dispatched). `=1` disables for A/B. MEASURED: default boot now progresses into rendering (~520-560 set_render_target, stable, no crash) where before it livelocked. |
 | `YZ_RSX_DRAW` | libs/video/rsx_live_draw.c (`rsx_live_draw_enabled`) | **Kill-switch for the Track B live NV4097 draw path (2026-07-03, Track B stage 5 B2).** Default ON; `=0` makes the live-draw engine inert so the runtime keeps its existing (null/clear-color) present. The engine is the validated capture-replay D3D12 pipeline (rsx_dispatch + NV40 VP/FP decompilers + PSO/sampler/mip engine) driven by the live FIFO consumer. **WIRED 2026-07-04** into yakuza/import_overrides.cpp: `rsx_live_draw_method(method,arg)` fed at the top of `yz_rsx_method` (full stream), engine self-presents on the 0xE944 flip; `rsx_live_draw_init` runs on the window thread bound to the null backend's HWND (`rsx_null_backend_get_hwnd`) and suppresses the null GDI present on success (`rsx_null_backend_suppress_present`). Boot-verified: `[rsx] live-draw engine up (D3D12)`, 12 flips presented, zero crashes. |
@@ -360,6 +361,25 @@ PPU 8B, SPU PUTLLC). Counts JobGuardNotify at the store itself, so call path doe
 Verdict obtained 2026-07-08: the PPU producer notifies ONCE (threshold ncount1=1), the SPU chain
 auto-resets and waits correctly; the wall = the producer never notifying again. Retire with the
 producer frontier.
+
+`YZ_JOBTRACE` (runtime/spu/spu_channels.c `spu_indirect_branch`, 2026-07-08, capped 400, armed
+banner): computed-branch trail of the jobchain JOB binaries (images 14/15) — pc, link, r3 per
+dispatch. Verdict obtained same day: round-1 jobB enters 0x4C00 with the correct job ABI
+(r3=0x4940), returns to the module, module polls kernel (0x290) and exits (0x838). Retire with
+the jobchain frontier.
+
+`YZ_FLAGCAS` (runtime/spu/spu_dma.h PUTLLC path, 2026-07-08, uncapped, armed banner): every SPU
+PUTLLC ATTEMPT on the IWL event-flag line 0x4019C680 (the flag t1 waits on, bit 0x1), logged
+BEFORE the success test with a COMMIT/FAIL verdict + old→new bits. Verdict obtained same day:
+ZERO attempts the whole boot — round-1 jobB never reaches its flag-set stretch (RPCS3's
+jobB@slot0 PUTLLCs it at LS pc 0x520C) ⇒ early-exit on staged input data. Retire with the
+jobchain frontier.
+
+`YZ_JOBDESC` (runtime/spu/spu_dma.h GET path, 2026-07-08, capped 96, armed banner): payload hex
+dump (first 64 B) of every SPU GET from the CRI jobchain object area [0x40190000,0x401A0000),
+size ≤ 0x400 — the header/command/JOB-DESCRIPTOR bytes the module stages before calling a job.
+Twin probe added to rpcs3clone (same format) for a byte diff; guest EAs are identical. Retire
+with the jobchain frontier.
 
 `YZ_WIDSIG_BT` (yakuza/shims.cpp, inside the `YZ_WIDSIG_ALL` block, 2026-07-08): on a wid1 (bit
 0x4000) raise, walk the guest PPC64 back-chain via the crash handler's `yz_dump_guest_state`

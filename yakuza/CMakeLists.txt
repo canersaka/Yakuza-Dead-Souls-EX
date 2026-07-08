@@ -66,7 +66,9 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/ts_exit.c"   # SPURS taskset exit-handler overlay (libsre 0x02025500 -> LS 0x10000, image 12)
     "${PS3RECOMP_DIR}/recomp_prx/job_module.c"   # SPURS jobchain policy module (libsre 0x0202A180 -> LS 0xA00, image 13)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_a.c"   # jobchain bulk-worker JOB binary (EBOOT 0x01254500 -> ~LS 0x4C00, image 14)
-    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b.c")   # jobchain notify JOB binary (EBOOT 0x01275A00 -> ~LS 0xE400, image 15)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b.c"   # jobchain notify JOB binary (EBOOT 0x01275A00 -> ~LS 0xE400, image 15)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_a_e400.c"   # jobA lifted at the ALTERNATE slot base 0xE400 (jobs are relocatable; measured 2026-07-08)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_4c00.c")   # jobB lifted at the ALTERNATE slot base 0x4C00 (round-1 loads jobB there; measured 2026-07-08)
 
 add_executable(yakuza_recomp
     main.cpp
