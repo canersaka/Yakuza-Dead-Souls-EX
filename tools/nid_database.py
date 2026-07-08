@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 
@@ -435,9 +436,52 @@ class NIDDatabase:
         return nid
 
     def load_builtins(self) -> None:
-        """Populate with the built-in function list."""
+        """Populate with the curated built-in list, then auto-augment with every
+        function the repo actually implements (best-effort, keeps the resolver in
+        sync with the code without a generated file to drift)."""
         for module, name in _BUILTIN_FUNCTIONS:
             self.add(module, name)
+        try:
+            self.load_implemented()
+        except OSError:                            # repo not present / unreadable
+            pass
+
+    def load_implemented(self, repo_root: str | None = None) -> int:
+        """Add every exported-looking (cell*/sys*/sce*) function DEFINED in the
+        repo's libs/ and runtime/ C sources, with its NID computed from the name.
+        This keeps the resolver aligned with what the toolkit actually
+        implements (mirrors the candidate-name scan gen_imports.py already runs
+        for import binding; this is the equivalent for direct NIDDatabase
+        lookups, e.g. show_func.py / disasm annotation).
+
+        Returns the number of definitions scanned. Best-effort: silently does
+        nothing if the source tree isn't found.
+        """
+        import glob
+
+        if repo_root is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Non-static, top-level definitions of exported-looking functions.
+        # Matches gen_imports.py's "defined" scan (one-line signatures only).
+        def_re = re.compile(
+            r"^(?!static)[A-Za-z_][\w \t\*]*?\b(_?(?:cell|sys|sce)\w+)\s*\([^;]*?\)\s*\{",
+            re.M)
+        count = 0
+        for sub in ("libs", "runtime"):
+            top = os.path.join(repo_root, sub)
+            if not os.path.isdir(top):
+                continue
+            for path in glob.glob(os.path.join(top, "**", "*.c"), recursive=True) + \
+                        glob.glob(os.path.join(top, "**", "*.cpp"), recursive=True):
+                try:
+                    txt = open(path, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                module = os.path.splitext(os.path.basename(path))[0]
+                for m in def_re.finditer(txt):
+                    self.add(module, m.group(1))
+                    count += 1
+        return count
 
     def load_json(self, path: str) -> int:
         """Load entries from a JSON file. Returns count loaded.
