@@ -817,6 +817,18 @@ s32 cellAudioPortStop(u32 portNum)
     return CELL_OK;
 }
 
+/* Surmixer synchronization (mirrors RPCS3 AudioSetNotifyEventQueue,
+ * cellAudio.cpp:1671-1719 + the merged #18857 fix). The CRI surmixer's notify
+ * queue (key c_mxr000) is CREATED by the _cellsurMixerMain thread; RPCS3 BLOCKS
+ * the registration until that queue exists so the surmixer init cannot race
+ * ahead of its own thread (RPCS3 issue #18852). Gated by YZ_SURMIXER_SYNC. */
+extern void yz_for_each_thread(void (*cb)(unsigned int tid, const char* name, void* handle));
+static volatile int s_surmixer_thread_seen;
+static void surmixer_name_cb(unsigned int tid, const char* name, void* handle)
+{ (void)tid; (void)handle; if (name && strcmp(name, "_cellsurMixerMain") == 0) s_surmixer_thread_seen = 1; }
+static int has_sur_mixer_thread(void)
+{ s_surmixer_thread_seen = 0; yz_for_each_thread(surmixer_name_cb); return s_surmixer_thread_seen; }
+
 s32 cellAudioSetNotifyEventQueue(u64 key)
 {
     printf("[cellAudio] SetNotifyEventQueue(key=0x%llX)\n",
@@ -824,6 +836,24 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
+
+    { static int surmix_sync = -1;
+      if (surmix_sync < 0) surmix_sync = getenv("YZ_SURMIXER_SYNC") ? 1 : 0;
+      const unsigned long long c_mxr000 = 0x8000CAFE02460300ULL;
+      if (surmix_sync && (key == c_mxr000 || key == 0) && has_sur_mixer_thread()) {
+          int found = 0;
+          for (int count = 0; count < 100; count++) {
+              if (sys_event_find_queue_by_key(c_mxr000)) { found = 1; break; }
+#ifdef _WIN32
+              Sleep(50);
+#else
+              usleep(50000);
+#endif
+          }
+          if (key == 0 && found) key = c_mxr000;   /* correct key (#18857) */
+          printf("[cellAudio] surmixer-sync: c_mxr000 queue %s after wait\n",
+                 found ? "found" : "TIMEOUT");
+      } }
 
     mutex_lock(&s_audio_mutex);
 

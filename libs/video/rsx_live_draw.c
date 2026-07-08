@@ -30,6 +30,7 @@ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void*
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
 void rsx_live_draw_seed_transform_program(const u32* w, u32 n) { (void)w; (void)n; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
@@ -455,6 +456,14 @@ static void ld_flush(void)
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.upload_used = 0;
 }
+
+/* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
+ * has finished all queued draws (mirrors RPCS3 nv406e::set_reference's sync(),
+ * RSXThread.cpp), so the game's REF poll advances only after the GPU has really
+ * caught up. Without it our async consumer writes REF instantly and races ahead
+ * of real GPU time (measured: ours skips the fence wait RPCS3 performs). Gated
+ * at the call site by YZ_RSX_FENCE_SYNC. */
+void rsx_live_draw_flush(void) { if (g.ready) ld_flush(); }
 
 /* ---------------------------------------------------------------------------
  * texture upload (single-level + mip)

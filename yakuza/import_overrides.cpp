@@ -610,6 +610,16 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     }
     switch (method) {
     case 0x050:                                   /* NV406E SET_REFERENCE */
+        /* FAITHFUL FENCE TIMING (env YZ_RSX_FENCE_SYNC, opt-in A/B). RPCS3's
+         * nv406e::set_reference calls sync() -- flush + wait for the GPU pipeline
+         * -- BEFORE writing REF, so the game's REF poll blocks until the GPU has
+         * really caught up. Our async consumer otherwise writes REF instantly and
+         * races ahead of real GPU time (measured via the PPU trace-diff at
+         * func_00EBBFB4: ours skips the fence wait RPCS3 performs). Flush the
+         * D3D12 backend (a real GPU fence wait) first to pace the consumer to
+         * actual GPU completion, matching RPCS3. */
+        { static int fs = -1; if (fs < 0) fs = getenv("YZ_RSX_FENCE_SYNC") ? 1 : 0;
+          if (fs) { extern void rsx_live_draw_flush(void); rsx_live_draw_flush(); } }
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_REF, arg);
         break;
     case 0x060:                                   /* NV406E SET_CONTEXT_DMA_SEMAPHORE */
