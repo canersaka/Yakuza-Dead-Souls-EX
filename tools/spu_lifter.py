@@ -636,8 +636,14 @@ class SPULifter:
             return ("ctx->pc = ctx->srr0; "
                     "g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
-            link_rt = insn.raw & 0x7F            # link reg dropped from operands
-            tgt_reg = _reg(ops[0])
+            link_rt = insn.raw & 0x7F
+            # Same interface break as brsl: the disasm fix added the link
+            # register to bisl operand text ("bisl $r0, $r11"), so the TARGET
+            # register moved to the LAST operand. ops[0] was correct only for
+            # the pre-fix single-operand format; post-fix it grabbed the LINK
+            # register, so the emitted call dispatched to link (= addr+4) and
+            # the callee was silently skipped. ops[-1] handles both formats.
+            tgt_reg = _reg(ops[-1])
             # Indirect call: dispatch, then drain the callee's tail-calls.
             # host_depth brackets the nested call (see the brsl emission).
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
@@ -648,7 +654,7 @@ class SPULifter:
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
-            tgt_reg = _reg(ops[0])
+            tgt_reg = _reg(ops[-1])   # last operand = target (see bisl above)
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
