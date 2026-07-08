@@ -164,6 +164,9 @@ static inline uint64_t ppu_f2i64(double v, int rn)
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
+/* clang-cl defines _MSC_VER but provides __builtin_clz/clzll natively, so
+ * redefining them is a hard error there -- only polyfill for real MSVC. */
+#ifndef __clang__
 static inline int __builtin_clz(unsigned int x) {
     /* BSR is undefined for x==0; PowerPC cntlzw(0) is DEFINED as 32. The
      * unguarded form returned garbage for zero inputs (measured: Sony's
@@ -180,6 +183,7 @@ static inline int __builtin_clzll(unsigned long long x) {
     _BitScanReverse64(&idx, x);
     return 63 - (int)idx;
 }
+#endif
 static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
     int64_t hi;
     _mul128(a, b, &hi);
