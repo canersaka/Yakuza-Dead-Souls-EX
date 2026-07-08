@@ -139,3 +139,24 @@ gamedata/
 # RPCS3 full install (binaries + firmware PRX + game data + RSX captures) — oracle resource only; never commit (GPL binaries, firmware, multi-GB)
 rpcs3-v0.0.41-19452-e379fba9_win64_msvc/
 rpcs3-*/
+
+# In-repo oracle / reference resources (local only, never commit; rpcs3/ is GPL source)
+rpcs3/
+refs/
+*.rrc
+*.rrc.gz
+*.tty
+NV_fragment_program*.txt
+NV_vertex_program*.txt
+altivec.txt
+
+# Local working data, evidence, and goldens
+scratch/
+scratchpad/
+goldens/
+functions_old.json
+functions_gapfill.json
+*.png
+build_*.txt
+lift_*.txt
+nul
