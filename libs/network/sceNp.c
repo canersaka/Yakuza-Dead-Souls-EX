@@ -186,3 +186,104 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
     printf("[sceNp] GetMyLanguages() -> English\n");
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * NP Manager (sign-in state)
+ *
+ * We run permanently offline: GetStatus reports OFFLINE so games gate their
+ * online flows on it and skip them cleanly, matching how a real signed-out
+ * console behaves. The identity/ticket getters mirror RPCS3's offline
+ * early-return exactly (see sceNp.h for the citation).
+ * -----------------------------------------------------------------------*/
+
+static SceNpManagerCallback s_npmgr_cb     = NULL;
+static void*                s_npmgr_cb_arg = NULL;
+
+s32 sceNpManagerGetStatus(s32* status)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!status)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    *status = SCE_NP_MANAGER_STATUS_OFFLINE;
+    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!callback)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* Stored for bookkeeping only; we never transition online so (matching
+     * RPCS3) the callback is never actually invoked. */
+    s_npmgr_cb     = callback;
+    s_npmgr_cb_arg = arg;
+    printf("[sceNp] ManagerRegisterCallback()\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetNpId(SceNpId* npId)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!npId)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 returns OFFLINE here without filling npId when signed out. */
+    printf("[sceNp] ManagerGetNpId() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize)
+{
+    (void)buffer;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!bufferSize)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* Not gated on sign-in state on real hardware/RPCS3: the ticket cache is
+     * simply empty offline, so report a zero-length ticket either way. */
+    *bufferSize = 0;
+    printf("[sceNp] ManagerGetTicket() -> empty (offline)\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!isRestricted || !age)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 returns OFFLINE here without filling either output when signed out. */
+    printf("[sceNp] ManagerGetContentRatingFlag() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpManagerRequestTicket2(const SceNpId* npId, const void* version, const char* serviceId,
+                                const void* cookie, u32 cookieSize, const char* entitlementId,
+                                u32 consumedCount)
+{
+    (void)version; (void)cookie; (void)entitlementId; (void)consumedCount;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 returns OFFLINE here (before issuing the ticket request) when signed out. */
+    printf("[sceNp] ManagerRequestTicket2() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}

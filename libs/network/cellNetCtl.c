@@ -7,6 +7,7 @@
 
 #include "cellNetCtl.h"
 #include "ps3emu/endian.h"   /* CellNetCtlInfo numeric fields are guest big-endian */
+#include "cellSysutil.h"     /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include <stdio.h>
 #include <string.h>
 
@@ -275,5 +276,52 @@ s32 cellNetCtlDelHandler(s32 hid)
     s_handlers[hid].arg     = NULL;
 
     printf("[cellNetCtl] DelHandler(hid=%d)\n", hid);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-start ("connect to PSN") dialog
+ *
+ * Real hardware shows a system dialog and reports progress asynchronously
+ * through the cellSysutil callback queue (LOADED -> FINISHED), after which
+ * the game calls UnloadAsync to read the result (RPCS3
+ * cellNetCtl.cpp cellNetCtlNetStartDialogLoadAsync/UnloadAsync). We have no
+ * PSN session to show a dialog for, and cellNetCtlGetState() above already
+ * reports a full wired connection (IPObtained), so LoadAsync immediately
+ * posts LOADED + FINISHED to every registered sysutil callback slot (the
+ * game may have registered on any of them) and UnloadAsync reports a
+ * successful connect.
+ * -----------------------------------------------------------------------*/
+
+static void netctl_netstart_broadcast(u32 status)
+{
+    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; slot++)
+        cellSysutilQueueEvent(slot, status, 0);
+}
+
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
+{
+    if (!s_netctl_initialized)
+        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
+
+    if (!param)
+        return CELL_NET_CTL_ERROR_INVALID_ADDR;
+
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect (offline)\n");
+    netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
+    netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
+    return CELL_OK;
+}
+
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
+{
+    if (!s_netctl_initialized)
+        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
+
+    if (result)
+        result->result = (s32)ps3_bswap32(0u); /* 0 = connected (guest big-endian) */
+
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

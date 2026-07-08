@@ -38,6 +38,7 @@ extern "C" {
 #define SCE_NP_COMMUNICATION_ID_MAX_LENGTH      9
 #define SCE_NP_COMMUNICATION_PASSPHRASE_SIZE    128
 #define SCE_NP_COMMUNICATION_SIGNATURE_SIZE     160
+#define SCE_NP_COOKIE_MAX_SIZE                  1024
 
 /* Country codes */
 #define SCE_NP_LANG_ENGLISH                     1
@@ -92,6 +93,32 @@ typedef struct SceNpMyLanguages {
     u32 language2;
     u32 language3;
 } SceNpMyLanguages;
+
+/* --- NP Manager (sign-in state). We run permanently offline (no live PSN
+ * session): GetStatus reports OFFLINE so games cleanly skip online flows
+ * instead of blocking on sign-in, and the identity/ticket getters mirror
+ * RPCS3's offline branch (Emu/Cell/Modules/sceNp.cpp), which early-returns
+ * SCE_NP_ERROR_OFFLINE without touching its output params whenever
+ * np_handler::get_psn_status() == OFFLINE. The status enum value below (-1)
+ * matches RPCS3 exactly; the SCE_NP_ERROR_* codes above are this repo's own
+ * existing numbering (kept for consistency with the rest of this file's
+ * error paths, not Sony's real 0x8002aaXX values). --- */
+#define SCE_NP_MANAGER_STATUS_OFFLINE          (-1)
+#define SCE_NP_MANAGER_STATUS_GETTING_TICKET    0
+#define SCE_NP_MANAGER_STATUS_GETTING_PROFILE   1
+#define SCE_NP_MANAGER_STATUS_LOGGING_IN        2
+#define SCE_NP_MANAGER_STATUS_ONLINE            3
+
+typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
+
+s32 sceNpManagerGetStatus(s32* status);
+s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
+s32 sceNpManagerGetNpId(SceNpId* npId);
+s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize);
+s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age);
+s32 sceNpManagerRequestTicket2(const SceNpId* npId, const void* version, const char* serviceId,
+                                const void* cookie, u32 cookieSize, const char* entitlementId,
+                                u32 consumedCount);
 
 /* ---------------------------------------------------------------------------
  * Functions

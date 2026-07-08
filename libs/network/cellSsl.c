@@ -6,6 +6,7 @@
  */
 
 #include "cellSsl.h"
+#include "ps3emu/endian.h"   /* ps3_bswap32/64, out-params are guest big-endian */
 #include <stdio.h>
 #include <string.h>
 
@@ -58,7 +59,7 @@ s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required)
     (void)buffer; (void)size;
     printf("[cellSsl] CertificateLoader(flags=0x%llX)\n", (unsigned long long)flags);
     if (required)
-        *required = 0;
+        *required = ps3_bswap32(0u);  /* out-param is guest memory, write big-endian */
     return CELL_OK;
 }
 
@@ -76,7 +77,7 @@ s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize
         serial[1] = 0x00;
         serial[2] = 0x00;
         serial[3] = 0x01;
-        *serialSize = 4;
+        *serialSize = ps3_bswap32(4u);  /* out-param is guest memory, write big-endian */
     }
     return CELL_OK;
 }
@@ -88,7 +89,7 @@ s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize)
     printf("[cellSsl] CertGetPublicKey()\n");
 
     if (keySize)
-        *keySize = 0;
+        *keySize = ps3_bswap32(0u);  /* out-param is guest memory, write big-endian */
 
     return CELL_OK;
 }
@@ -97,7 +98,7 @@ s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time)
 {
     (void)certId;
     if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = 0;
+    *time = ps3_bswap64(0ull);  /* out-param is guest memory, write big-endian */
     return CELL_OK;
 }
 
@@ -105,7 +106,7 @@ s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time)
 {
     (void)certId;
     if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = 0xFFFFFFFFFFFFFFFFULL;
+    *time = ps3_bswap64(0xFFFFFFFFFFFFFFFFULL);  /* out-param is guest memory, write big-endian */
     return CELL_OK;
 }
 
