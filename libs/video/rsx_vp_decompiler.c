@@ -212,6 +212,16 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
             case 0x14: snprintf(rhs,sizeof rhs,"(float4)((%s)!=(%s))",A,B); break; /* SNE */
             case 0x15: snprintf(rhs,sizeof rhs,"float4(1,1,1,1)"); break;      /* STR */
             case 0x16: snprintf(rhs,sizeof rhs,"sign(%s)",A); break;           /* SSG */
+            case 0x19: /* TXL: vertex texture fetch. No vertex-texture binding
+                * exists yet (rsx_dispatch decodes no vertex-texture registers
+                * and the VS root sig exposes no SRV table), so we cannot sample
+                * the real texture. Emit a DEFINED value instead of leaving the
+                * destination register carrying whatever it held before: the one
+                * VP in this capture that uses TXL feeds the result into the
+                * skinning temps r0..r3, and leaving them stale exploded the mesh
+                * into spikes. A defined result collapses the mesh to a base pose
+                * rather than scattering it. TODO: real vertex texture sampling. */
+                snprintf(rhs,sizeof rhs,"float4(0,0,0,0)"); break;
             case 0x0D: /* ARL: address register load, rounds down */
                 if (vmx|vmy|vmz|vmw) {
                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);

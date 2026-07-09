@@ -89,6 +89,38 @@
 #define M_VP_UPLOAD_CONST_ID    0x1EFC
 #define M_VP_UPLOAD_CONST       0x1F00
 #define M_GCM_DRIVER_FLIP       0xE944
+/* Primitive restart: a sentinel index value that breaks a TRIANGLE_STRIP/
+ * FAN mid-draw with no connecting triangle (RPCS3 oracle: gcm_enums.h
+ * NV4097_SET_RESTART_INDEX_ENABLE/NV4097_SET_RESTART_INDEX; semantics in
+ * rsx_methods.h restart_index_enabled()/restart_index() -- enabled only
+ * when the enable bit is set AND, for 16-bit index buffers, the configured
+ * value fits in 16 bits). */
+#define M_RESTART_INDEX_ENABLE  0x1DAC
+#define M_RESTART_INDEX         0x1DB0
+
+/* Render state consumed directly by the replay harness's PSO builder
+ * (rsx_dsp_reg reads straight out of the register file, so these already
+ * took effect before being classified here; this fixes the coverage report
+ * to match reality instead of showing them as TODO). Addresses from
+ * tools/nv40_methods.py (envytools rnndb). */
+#define M_ALPHA_FUNC_ENABLE     0x0304
+#define M_ALPHA_FUNC_FUNC       0x0308
+#define M_ALPHA_FUNC_REF        0x030C
+#define M_BLEND_FUNC_ENABLE     0x0310
+#define M_BLEND_FUNC_SRC        0x0314
+#define M_BLEND_FUNC_DST        0x0318
+#define M_COLOR_MASK            0x0324
+#define M_MRT_COLOR_MASK        0x0370
+#define M_DEPTH_FUNC            0x0A6C
+#define M_DEPTH_WRITE_ENABLE    0x0A70
+#define M_DEPTH_TEST_ENABLE     0x0A74
+#define M_CULL_FACE             0x1830
+#define M_FRONT_FACE            0x1834
+#define M_CULL_FACE_ENABLE      0x183C
+#define M_VTX_CACHE_INVALIDATE  0x1714
+#define M_NV4097_NOP            0x0100
+#define M_VP_ATTRIB_EN          0x1FF0
+#define M_VP_RESULT_EN          0x1FF4
 
 #define DMA_HANDLE_LOCAL        0xFEED0000u
 #define DMA_HANDLE_MAIN         0xFEED0001u
@@ -135,11 +167,35 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_TEX_OFFSET, RSX_DSP_NUM_TEXTURES * 8, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_CLEAR_DEPTH_VALUE, 2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_UPLOAD_FROM_ID, 1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_RESTART_INDEX_ENABLE, 2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_UPLOAD_CONST_ID, 1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_FP_ACTIVE_PROGRAM, 1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_FP_CONTROL,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_START_FROM_ID,  1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VTX_ATTR_4F,      64, RSX_DSP_CLASS_STATE);
+
+    /* Alpha test / blend / color-mask / depth / cull: rsx_dsp_reg reads these
+     * straight from the register file (replay_main.c's decode_render_state,
+     * color-mask application), so they were already live; this only corrects
+     * the coverage report. */
+    mark_class(rsx, M_ALPHA_FUNC_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ..FUNC_REF */
+    mark_class(rsx, M_BLEND_FUNC_ENABLE, 5, RSX_DSP_CLASS_STATE); /* ..BLEND_EQUATION */
+    mark_class(rsx, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_DEPTH_FUNC,        3, RSX_DSP_CLASS_STATE); /* ..TEST_ENABLE */
+    mark_class(rsx, M_CULL_FACE,         1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_FRONT_FACE,        1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_CULL_FACE_ENABLE,  1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VP_ATTRIB_EN,      1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_VP_RESULT_EN,      1, RSX_DSP_CLASS_STATE);
+
+    /* Explicit no-ops: the vertex cache invalidate hint and the reserved
+     * NOP method carry no state the replay harness needs (there is no CPU
+     * vertex cache to invalidate; every draw re-fetches from guest memory
+     * each time). Classifying them EXEC removes them from the TODO count
+     * without pretending they do anything. */
+    mark_class(rsx, M_VTX_CACHE_INVALIDATE, 1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_NV4097_NOP,           1, RSX_DSP_CLASS_EXEC);
 }
 
 void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
@@ -357,6 +413,23 @@ u32 rsx_dsp_shader_control(const rsx_dispatch* rsx)
 u32 rsx_dsp_vp_start(const rsx_dispatch* rsx)
 {
     return rsx_dsp_reg(rsx, M_VP_START_FROM_ID);
+}
+
+int rsx_dsp_restart_index_enabled(const rsx_dispatch* rsx, int index_is_u32)
+{
+    if (!rsx_dsp_reg(rsx, M_RESTART_INDEX_ENABLE))
+        return 0;
+    /* RPCS3 oracle (rsx_methods.h restart_index_enabled()): a 16-bit index
+     * buffer disables restart entirely if the configured sentinel doesn't
+     * fit in 16 bits, rather than truncating it. */
+    if (!index_is_u32 && rsx_dsp_reg(rsx, M_RESTART_INDEX) > 0xFFFFu)
+        return 0;
+    return 1;
+}
+
+u32 rsx_dsp_restart_index(const rsx_dispatch* rsx)
+{
+    return rsx_dsp_reg(rsx, M_RESTART_INDEX);
 }
 
 void rsx_dsp_vertex_default(const rsx_dispatch* rsx, u32 index, float out[4])
