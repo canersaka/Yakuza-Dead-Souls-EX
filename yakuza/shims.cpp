@@ -352,6 +352,41 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           if (wbt && (raised & 0x40000000u) && wbtn < 4) { wbtn++;
                               yz_dump_guest_state(ctx, "widsig-bt");
                           } }
+                        /* DIAG (s22 opener, 2026-07-08): wid4 = the pxd GPU-frame pool
+                         * (image 4, elf 0x01284200) = the 0xFE0 decode-sync publisher
+                         * (DONT_RECHASE #29). t1 raises its signal but image 4 never
+                         * DMAs; dump the SELECT-gate fields AT the raise so the failing
+                         * gate (readyCount/contention/state/prio/enabled) is measured,
+                         * not inferred — the wid3/wid1 precedents each failed a
+                         * different one. PPU reads off the mgmt base 0x40197C80
+                         * (pt35 field map: rc@+0x00 cont@+0x20 pend@+0x30 maxc@+0x50
+                         * state@+0x80 status@+0x90 enabled@+0xB0, wklInfo1[w].prio
+                         * @+0xB00+w*0x20+0x18; byte lane = wid). Backtrace dump on the
+                         * first raises rides YZ_WIDSIG_BT to name the kicker. */
+                        if (raised & 0x08000000u) {
+                            const uint32_t mg = 0x40197C80u;
+                            uint32_t rc4  = (vm_read32(mg + 0x04u) >> 24) & 0xFFu;
+                            uint32_t cc4  = (vm_read32(mg + 0x24u) >> 24) & 0xFFu;
+                            uint32_t pd4  = (vm_read32(mg + 0x34u) >> 24) & 0xFFu;
+                            uint32_t mc4  = (vm_read32(mg + 0x54u) >> 24) & 0xFFu;
+                            uint32_t st4  = (vm_read32(mg + 0x84u) >> 24) & 0xFFu;
+                            uint32_t sta4 = (vm_read32(mg + 0x94u) >> 24) & 0xFFu;
+                            uint32_t en   = vm_read32(mg + 0xB0u);
+                            uint32_t pHi  = vm_read32(mg + 0xB00u + 4u*0x20u + 0x18u);
+                            uint32_t pLo  = vm_read32(mg + 0xB00u + 4u*0x20u + 0x1Cu);
+                            fprintf(stderr, "[wid4gate] t%u AT-RAISE rc=%u cont=%u pend=%u "
+                                    "maxc=%u state=0x%02X status=0x%02X enabled=%d "
+                                    "prio=%08X_%08X\n",
+                                    yz_thread_current_id(), rc4, cc4, pd4, mc4, st4, sta4,
+                                    (en & (1u << (31 - 4))) ? 1 : 0, pHi, pLo);
+                            fflush(stderr);
+                            { static int wbt4 = -1;
+                              if (wbt4 < 0) wbt4 = getenv("YZ_WIDSIG_BT") ? 1 : 0;
+                              static long wbtn4 = 0;
+                              if (wbt4 && wbtn4 < 3) { wbtn4++;
+                                  yz_dump_guest_state(ctx, "wid4-bt");
+                              } }
+                        }
                     }
           } }
         /* DIAG (env YZ_JGUARD, 2026-07-08, uncapped): PPU 4-byte CAS commits to the
@@ -368,6 +403,25 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                       yz_thread_current_id(), (uint32_t)addr,
                       ps3_bswap32(expected), (uint32_t)val, ok ? "OK" : "FAIL",
                       vm_read32(0x4019C700u), vm_read32(0x4019C704u));
+              fflush(stderr);
+          } }
+        /* DIAG (env YZ_W4TS, 2026-07-08 s22): PPU 4-byte CAS commits to the wid4
+         * pool TASKSET bitset line 0x42450E00 (running@+0x00 ready@+0x10
+         * pending_ready@+0x20 enabled@+0x30 signalled@+0x40 waiting@+0x50,
+         * docs/SPURS_TASKSET.md). The pool's 5 tasks park in WAIT_SIGNAL after
+         * init (measured wid4boot1/ftboot14); a game work submission =
+         * _cellSpursSendSignal setting a signalled bit HERE, then the wid4
+         * wklSignal raise. Zero post-init hits while t1 sits in the
+         * func_00EB3238 throttle = the submit site never executes = the
+         * bootstrap circle is code-ordered, not a pacing race. Uncapped. */
+        { static int w4 = -1;
+          if (w4 < 0) { w4 = getenv("YZ_W4TS") ? 1 : 0;
+              if (w4) { fprintf(stderr, "[w4ts] ppu probe armed (taskset 0x42450E00)\n"); fflush(stderr); } }
+          if (w4 && (((uint32_t)addr) & ~127u) == 0x42450E00u) {
+              fprintf(stderr, "[w4ts-ppu] t%u addr=0x%08X (+0x%02X) old=%08X new=%08X %s\n",
+                      yz_thread_current_id(), (uint32_t)addr,
+                      (uint32_t)addr & 0x7Fu,
+                      ps3_bswap32(expected), (uint32_t)val, ok ? "OK" : "FAIL");
               fflush(stderr);
           } }
         { static int mc = -1; if (mc < 0) mc = getenv("YZ_MGMT_CAS") ? 1 : 0;
@@ -431,6 +485,18 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
           if (jg8 && (((uint32_t)addr) & ~127u) == 0x4019C700u) {
               fprintf(stderr, "[jguard-ppu8] t%u addr=0x%08X old=%016llX new=%016llX %s\n",
                       yz_thread_current_id(), (uint32_t)addr,
+                      (unsigned long long)ps3_bswap64(expected), (unsigned long long)val,
+                      ok ? "OK" : "FAIL");
+              fflush(stderr);
+          } }
+        /* DIAG (env YZ_W4TS, 8-byte path): same wid4-pool taskset bitset census
+         * as the 4-byte block above (libsre task APIs use ldarx/stdcx on the
+         * u128 bitsets). */
+        { static int w48 = -1; if (w48 < 0) w48 = getenv("YZ_W4TS") ? 1 : 0;
+          if (w48 && (((uint32_t)addr) & ~127u) == 0x42450E00u) {
+              fprintf(stderr, "[w4ts-ppu8] t%u addr=0x%08X (+0x%02X) old=%016llX new=%016llX %s\n",
+                      yz_thread_current_id(), (uint32_t)addr,
+                      (uint32_t)addr & 0x7Fu,
                       (unsigned long long)ps3_bswap64(expected), (unsigned long long)val,
                       ok ? "OK" : "FAIL");
               fflush(stderr);
