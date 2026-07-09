@@ -224,6 +224,16 @@ typedef struct spu_context {
     uint32_t dec_value;      /* value written (or the POR initial value at thread start) */
     int      dec_running;    /* 0 = frozen (stopped by ack-while-masked, CBEA p158 Section 9.11.2) */
 
+    /* Which workload-module image is RESIDENT at LS 0xA00 in this context
+     * (1=service, 2=taskset policy, 13=job module), recorded by the DMA layer
+     * at the kernel's module load (spu_dma.h LS-0xA00 switch). Ground truth
+     * for dispatch: the bracket restore (spu_img_restore) can undo a DMA-time
+     * image_id switch when the kernel loads the module inside a subroutine
+     * that returns before the dispatch branch, so spu_indirect_branch
+     * re-adopts this recorded image at every pc==0xA00 entry. 0 = nothing
+     * recorded yet (s24 adopt-on-serve model, ledger #51). */
+    int32_t  module_img_a00;
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
@@ -455,6 +465,16 @@ void spu_halt(spu_context* ctx, int status);
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the context's active image and runs it. Referenced by SPU_RET. */
 void spu_indirect_branch(spu_context* ctx);
+
+/* Restore-on-host-return (s24 adopt-on-serve image model, ledger #51): the
+ * lifted brsl/bisl call brackets save image_id in a call-site local and hand
+ * it back here after the nested call + drain complete, so an image adopted
+ * inside the callee (dispatcher wildcard serve, foreign-resident adoption,
+ * tail-chain hops) cannot leak into the caller's continuation. The host C
+ * stack of these locals IS the shadow image stack. Persistent switches the
+ * restore would undo (the LS-0xA00 workload-module DMA) are re-applied at
+ * dispatch time from ctx->module_img_a00. Kill-switch: YZ_NO_IMGSTACK. */
+void spu_img_restore(spu_context* ctx, int32_t saved_img);
 
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
