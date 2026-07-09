@@ -161,6 +161,48 @@ static inline uint64_t ppu_f2i64(double v, int rn)
     return (uint64_t)(int64_t)r;
 }
 
+/* Host x86 FP hardware (SSE2) produces a QNaN with the sign bit SET
+ * (0xFFF8_0000_0000_0000) for operations that generate a fresh NaN (e.g.
+ * Inf-Inf, 0*Inf, 0/0); PowerISA Book I 4.3.3 (PowerISA_V2.03_Final_Public.pdf
+ * p.117, manual p.95) mandates sign bit 0 for a GENERATED QNaN result
+ * (0x7FF8_0000_0000_0000). Canonicalize post-hoc on the arithmetic result
+ * rather than special-casing every NaN-producing operand combination --
+ * applied only when the result IS a NaN, so the non-NaN fast path costs one
+ * comparison. NOTE: this does not preserve an operand NaN's own sign/payload
+ * through fadd/fsub/fmul/fdiv/fmadd (PowerISA p.141/manual p.119: a
+ * propagated QNaN operand keeps its own sign bit) -- Yakuza's float paths
+ * don't depend on NaN payload semantics, so the simpler blanket
+ * canonicalization is the s24-agreed fix (STATUS.md s24 queue item 2). */
+static inline double ppu_fp_canon_nan(double v)
+{
+    if (v != v) {
+        uint64_t qnan = 0x7FF8000000000000ULL;
+        memcpy(&v, &qnan, 8);
+    }
+    return v;
+}
+
+/* frsp (Round to Single-Precision): a NaN operand passes through with its
+ * sign and payload PRESERVED, only the quiet bit forced on (SNaN -> QNaN;
+ * PowerISA Book I 4.6.6.2/4.3.3, p.117/141, manual p.95/119: "SNaNs that are
+ * converted to QNaNs ... retain the sign bit of the SNaN" -- an already-quiet
+ * QNaN passes through unchanged since the bit is already 1). Deliberately
+ * NOT a plain `(float)v` cast on the NaN path: C's float-narrowing
+ * conversion of a NaN is only obliged to produce *some* NaN, not preserve a
+ * specific payload/sign, so it can silently rewrite the bit pattern.
+ * Operating on the raw bits sidesteps that. */
+static inline double ppu_frsp(double v)
+{
+    if (v != v) {
+        uint64_t bits;
+        memcpy(&bits, &v, 8);
+        bits |= (1ULL << 51);   /* force the quiet bit; sign/payload untouched */
+        memcpy(&v, &bits, 8);
+        return v;
+    }
+    return (double)(float)v;
+}
+
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1029,6 +1071,22 @@ class PPULifter:
         if mn == "mtspr" and ops and ops[0].upper() == "VRSAVE":
             return "/* mtspr VRSAVE: unmodeled (audit 2b) */;"
 
+        # XER (s24 queue item 1): explicit mfspr rD,XER / mtspr XER,rS. The
+        # CA/OV/SO flags are already computed correctly by every
+        # carry/overflow-setting op (adde, subfe, mulldo, ...) into ctx->xer
+        # -- only the explicit READBACK/WRITEBACK via mfspr/mtspr was
+        # unhandled (fell to the generic TODO catch-all). Book I 2.3.1:
+        # mfspr zero-extends the 32-bit XER into the 64-bit GPR; mtspr takes
+        # the low-order 32 bits of the GPR. ctx->xer already IS that 32-bit
+        # register image (SO/OV/CA at bits 31/30/29, byte-count field at
+        # bits 0-6), so both directions are a straight copy -- no remapping.
+        if mn == "mfspr" and ops and ops[-1].upper() == "XER":
+            rd_i = _reg_idx(ops[0])
+            return f"ctx->gpr[{rd_i}] = ctx->xer;"
+        if mn == "mtspr" and ops and ops[0].upper() == "XER":
+            rs_i = _reg_idx(ops[-1])
+            return f"ctx->xer = (uint32_t)ctx->gpr[{rs_i}];"
+
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
         if mn == "mtcrf":
@@ -1097,10 +1155,13 @@ class PPULifter:
             # diverges from real HW (breaks exact-compare/convergence idioms
             # and oracle comparability). Audit S2-4 (~24k sites), oracle
             # RPCS3 FADDS = f32(a+b).
+            # s24 queue item 2: canonicalize a NaN result to PPC's default
+            # QNaN sign convention (see ppu_fp_canon_nan in the preamble).
             if mn_base.endswith("s"):
-                return (f"ctx->fpr[{frd}] = (double)(float)"
-                        f"(ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]);")
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}];"
+                return (f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)(float)"
+                        f"(ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]));")
+            return (f"ctx->fpr[{frd}] = ppu_fp_canon_nan("
+                    f"ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]);")
 
         if mn_base in ("fmr",):
             frd = _reg_idx(ops[0])
@@ -1122,39 +1183,62 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = -fabs(ctx->fpr[{frb}]);"
 
-        # S2-4: single fused forms round to single (see fp_binary comment).
+        # s24 queue item 3: true fused multiply-add via C99 fma()/fmaf().
+        # A plain `a*c + b` in C rounds TWICE -- once for the multiply, once
+        # for the add -- which can differ from real fused hardware by up to
+        # 1 ULP (classic double-rounding). PowerISA Book I 4.6.6.3
+        # fnmadd/fnmsub (p.141, manual p.119) is explicit that the fused
+        # product+accumulate is rounded to the target precision ONCE, and
+        # only THEN negated for the fnmadd/fnmsub forms -- fma()'s single
+        # rounding models the architected mul-add; the negation is applied
+        # to its already-rounded result, matching "rounded ... then
+        # negated". The single-precision variants call fmaf() on
+        # (float)-cast operands so the fused rounding lands directly on
+        # single precision, instead of a double fma rounded a second time by
+        # a narrowing cast (the same double-rounding problem, one level up).
+        # Results run through ppu_fp_canon_nan (queue item 2).
         if mn_base in ("fmadd", "fmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]"
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
+                expr = (f"fmaf((float)ctx->fpr[{fra}], (float)ctx->fpr[{frc}], "
+                        f"(float)ctx->fpr[{frb}])")
+            else:
+                expr = f"fma(ctx->fpr[{fra}], ctx->fpr[{frc}], ctx->fpr[{frb}])"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)({expr}));"
 
         if mn_base in ("fmsub", "fmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]"
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
+                expr = (f"fmaf((float)ctx->fpr[{fra}], (float)ctx->fpr[{frc}], "
+                        f"-(float)ctx->fpr[{frb}])")
+            else:
+                expr = f"fma(ctx->fpr[{fra}], ctx->fpr[{frc}], -ctx->fpr[{frb}])"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)({expr}));"
 
         if mn_base in ("fnmadd", "fnmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}])"
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
+                expr = (f"-fmaf((float)ctx->fpr[{fra}], (float)ctx->fpr[{frc}], "
+                        f"(float)ctx->fpr[{frb}])")
+            else:
+                expr = f"-fma(ctx->fpr[{fra}], ctx->fpr[{frc}], ctx->fpr[{frb}])"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)({expr}));"
 
         if mn_base in ("fnmsub", "fnmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}])"
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
+                expr = (f"-fmaf((float)ctx->fpr[{fra}], (float)ctx->fpr[{frc}], "
+                        f"-(float)ctx->fpr[{frb}])")
+            else:
+                expr = f"-fma(ctx->fpr[{fra}], ctx->fpr[{frc}], -ctx->fpr[{frb}])"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)({expr}));"
 
+        # s24 queue item 4: NaN passthrough + quieting without a narrowing
+        # cast on the NaN path (see ppu_frsp in the preamble).
         if mn_base in ("frsp",):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
+            return f"ctx->fpr[{frd}] = ppu_frsp(ctx->fpr[{frb}]);"
 
         # Book I v2.02 4.6.7 float->int: SATURATE (>max => max, <min => min,
         # NaN => min) and fctiw/fctid round per FPSCR[RN] (default nearest-

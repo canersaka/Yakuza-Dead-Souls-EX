@@ -26,6 +26,7 @@ need a vm stub harness).
 """
 
 import argparse
+import math
 import os
 import random
 import struct
@@ -626,6 +627,94 @@ def build_cases():
     case("fmadds rounds-to-single", fp_a(59, 4, F[1], F[2], 5, 29), {},
          [], in_fprs={F[1]: dbits(a), F[2]: dbits(b), 5: dbits(c)},
          exp_fprs=[(4, fbits_rounded(a * c + b), MASK64)])
+
+    # --- s24 lifter fix batch (2026-07-09): XER mfspr/mtspr, FP NaN
+    # canonicalization, fma()-based fused multiply-add, frsp NaN handling.
+    # ---------------------------------------------------------------------
+
+    # mfspr rD,XER / mtspr XER,rS. ctx->xer is the flags register every
+    # carry/overflow op already writes (CA=bit29, OV=bit30, SO=bit31); these
+    # prove the explicit SPR read/write path -- previously an unhandled TODO
+    # no-op that silently returned/discarded 0 -- round-trips it instead.
+    XER_SPR = 1
+
+    def xfx_form(xo, rt, spr):
+        # XFX-form SPR field is bit-swapped (low 5 bits of the encoded field
+        # hold the SPR's high 5 bits and vice versa) -- see ppu_disasm.py's
+        # mfspr/mtspr decode (spr = ((raw&0x1F)<<5) | ((raw>>5)&0x1F)).
+        spr_raw = ((spr & 0x1F) << 5) | ((spr >> 5) & 0x1F)
+        return (31 << 26) | (rt << 21) | (spr_raw << 11) | (xo << 1)
+
+    # "XER read after a carry-setting op": in_ca seeds ctx->xer with CA=1
+    # exactly as a prior adde/subfe/addc/etc. would have left it (the same
+    # carry-seeding idiom the xo_ops/ov_ops cases above use), so this
+    # exercises mfspr reading back a real prior op's flag state, zero-
+    # extended into the full 64-bit GPR.
+    case("mfspr XER after CA-setting op", xfx_form(339, R[0], XER_SPR),
+         {}, [(R[0], 1 << 29, MASK64)], in_ca=1)
+
+    # mtspr XER,rS: CA/OV/SO all set via the GPR's low 32 bits; garbage in
+    # the untouched high 32 bits must not leak into the 32-bit ctx->xer.
+    case("mtspr XER sets CA/OV/SO", xfx_form(467, R[1], XER_SPR),
+         {R[1]: 0xDEADBEEFE0000000}, [], exp_ca=1, exp_ov=1, exp_so=1)
+
+    # FP NaN canonicalization: host x64 SSE2 arithmetic produces a QNaN with
+    # the sign bit SET (0xFFF8_..) for these two classic "generated NaN"
+    # cases -- MEASURED via a scratch MSVC probe on this toolchain: both
+    # inf+(-inf) and 0*inf emit exactly 0xFFF8000000000000. PowerISA Book I
+    # 4.3.3 (PowerISA_V2.03_Final_Public.pdf p.117, manual p.95) mandates
+    # sign 0 for a QNaN generated as an operation's own result
+    # (0x7FF8_0000_0000_0000). Double-precision forms (opcode 63) exercise
+    # ppu_fp_canon_nan on the exact op family the divergence came from.
+    PINF = dbits(float("inf"))
+    NINF = dbits(float("-inf"))
+    PZERO = dbits(0.0)
+    QNAN_CANON = 0x7FF8000000000000
+    case("fadd inf+(-inf) canon NaN", fp_a(63, F[0], F[1], F[2], 0, 21),
+         {}, [], in_fprs={F[1]: PINF, F[2]: NINF},
+         exp_fprs=[(F[0], QNAN_CANON, MASK64)])
+    case("fmul 0*inf canon NaN", fp_a(63, F[0], F[1], 0, F[2], 25),
+         {}, [], in_fprs={F[1]: PZERO, F[2]: PINF},
+         exp_fprs=[(F[0], QNAN_CANON, MASK64)])
+
+    # fma() fused single-rounding: a case where a plain `a*c + b` in double
+    # rounds TWICE (once implicitly for the product, once for the add) and
+    # differs from the true fused result by 1 ULP -- the classic double-
+    # rounding construction. The expected value is computed two independent
+    # ways and cross-checked here at suite-build time: Python's math.fma
+    # (3.13+, itself independent of this repo) AND a one-off MSVC `fma()`
+    # probe compiled with this project's exact toolchain (scratch, not
+    # committed) -- both agreed: naive=0x3CA0000000000000,
+    # fused=0x3C90000000000000.
+    _fma_a = struct.unpack("<d", struct.pack("<Q", 0x3FF0000002000000))[0]
+    _fma_c = struct.unpack("<d", struct.pack("<Q", 0x3FEFFFFFFC000000))[0]
+    _fma_b = struct.unpack("<d", struct.pack("<Q", 0xBFEFFFFFFFFFFFFF))[0]
+    _fma_naive = _fma_a * _fma_c + _fma_b
+    _fma_fused = math.fma(_fma_a, _fma_c, _fma_b)
+    assert dbits(_fma_naive) == 0x3CA0000000000000, "fma test fixture drifted (naive)"
+    assert dbits(_fma_fused) == 0x3C90000000000000, "fma test fixture drifted (fused)"
+    case("fmadd fused differs from naive double-round",
+         fp_a(63, 4, F[1], F[2], 5, 29), {}, [],
+         in_fprs={F[1]: dbits(_fma_a), F[2]: dbits(_fma_b), 5: dbits(_fma_c)},
+         exp_fprs=[(4, dbits(_fma_fused), MASK64)])
+
+    # frsp NaN passthrough + quieting: sign/payload preserved, only the
+    # quiet bit (mantissa MSB, bit 51) forced on. PowerISA Book I
+    # 4.6.6.2/4.3.3 (p.117/141, manual p.95/119): "SNaNs that are converted
+    # to QNaNs ... retain the sign bit of the SNaN"; an already-quiet QNaN
+    # passes through unchanged since the bit is already 1.
+    SNAN_NEG = 0xFFF4000000000000          # sign=1, quiet bit clear, payload 0x4...
+    SNAN_NEG_QUIETED = 0xFFFC000000000000  # same, quiet bit forced on
+    QNAN_NEG = 0xFFFC000000000000          # already quiet -- unchanged
+    case("frsp SNaN quiets, keeps sign+payload", fp_x(63, F[0], 0, F[2], 12),
+         {}, [], in_fprs={F[2]: SNAN_NEG}, exp_fprs=[(F[0], SNAN_NEG_QUIETED, MASK64)])
+    case("frsp QNaN passthrough unchanged", fp_x(63, F[0], 0, F[2], 12),
+         {}, [], in_fprs={F[2]: QNAN_NEG}, exp_fprs=[(F[0], QNAN_NEG, MASK64)])
+    # Regression: a normal (non-NaN) value must still round to single --
+    # the fast path in ppu_frsp is unaffected by the NaN branch added above.
+    case("frsp normal value rounds to single", fp_x(63, F[0], 0, F[2], 12),
+         {}, [], in_fprs={F[2]: dbits(1.0 + 2.0 ** -30)},
+         exp_fprs=[(F[0], fbits_rounded(1.0 + 2.0 ** -30), MASK64)])
 
     # Store-with-update RA writeback (S2-7): stwux/sthux/stbux (needs vm stub)
     for name, xo in [("stwux", 183), ("sthux", 439), ("stbux", 247)]:
