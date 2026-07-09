@@ -62,7 +62,14 @@ for the invasive sub-dumps; don't use dump-armed runs for pass/fail rates);
 `YZ_PEEK=ea1,ea2,...` (main.cpp: change-triggered 4-word dumps of up to 16 hex guest EAs,
 VirtualQuery-guarded â€” moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
 (dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses â€”
-direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt);
+direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt. **Updated
+2026-07-09 s23:** now prints an armed banner listing every hooked address at first dispatch
+(probe-liveness rule); note the OPD-vs-code-address trap â€” a guest function has TWO
+addresses (its code entry and its OPD/function-descriptor slot) and indirect callers may
+dispatch through either, so hook BOTH or a live target reads as dead. s23boot12 measured
+`0x00DDDA6C` receiving ZERO indirect calls by either address while the round driver ran,
+i.e. it is reached some other way (direct `bl` or a different dispatch table entry), not
+proof the function is unused.);
 `YZ_TASKARG` (spu_channels.c, 2026-07-03: log every SPURS task launch â€” the pc-0x3050
 entry branch â€” with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
 only launch args are needed â€” PROF's per-branch overhead crawls the whole boot).
@@ -515,3 +522,70 @@ host-side bulk writers (HLE _sys_memset/_sys_memcpy, file-read memcpys) write gu
 without bumping the generation, so general serving is unsound until those paths sweep the
 coherence bitmap (the queued follow-up). MEASURED with the whitelist: logo ~4-6 fps -> 8.5 fps,
 t_PortStart 116-180 s -> ~96-102 s, flywheel + park-rel behavior unchanged (boots 14-16 A/B).
+
+## s23 conformance-sweep flags (2026-07-09)
+
+`YZ_NO_SPUDEC` (runtime/syscalls/lv2_register.c `group_start`, 2026-07-09 s23, kill-switch,
+default OFF = decrementer starts): disables the SPU decrementer start at thread creation -- the
+s23 conformance fix for a frozen decrementer (every `rdch SPU_RdDec` read 0 forever, every SPU
+thread since creation). Prints an armed `[spudec]` banner. Faithful mechanism, not a force; the
+switch exists only for A/B regression isolation.
+
+`YZ_NO_TIMER1SHOT` (runtime/syscalls/sys_timer.c `sys_timer_start`, 2026-07-09 s23, kill-switch,
+default OFF = one-shot timers work per spec): restores the old `period==0` -> EINVAL behavior.
+Prints an armed `[timer1shot]` banner. s23boot12 verdict: this title never calls
+`sys_timer_start` during the boot window -- the fix is spec-correctness, not a boot unblocker
+(DONT_RECHASE #37).
+
+`YZ_NO_MEMACCT` (runtime/syscalls/sys_memory.c, 2026-07-09 s23, kill-switch, default OFF =
+accounting matches real hardware): disables user-memory accounting (ELF footprint + `sys_vm`
+psize charges). Prints an armed `[sys_memory]` banner. Default (flag unset) = accounting stays
+on and `get_user_memory_size` matches real hardware (RPCS3.log oracle).
+
+`YZ_NO_TIMEANCHOR` (runtime/syscalls/sys_timer.c + yakuza/import_overrides.cpp, 2026-07-09 s23,
+kill-switch, default OFF = anchored clocks): restores the old epoch behavior (`current_time`
+computed from the QPC origin, `system_time` leaking host uptime). Prints an armed `[yz_time]`
+banner. Default (flag unset) = wall-clock-anchored `current_time` + process-start-anchored
+`system_time`.
+
+`YZ_NO_QEV` (yakuza/import_overrides.cpp `sys_rsx` 0x103 case, reached via the 0xE940 method
+bridge, 2026-07-09 s23, kill-switch, default OFF = mechanism ON): disables display-queue event
+delivery. Prints an armed `[qev]` banner. s23boot12 verdict: the game never registers the queue
+handler bit (handlers 0x04/0x86, qbit 0x40), so delivery is benign-idle every boot; kept for
+faithfulness, not because it is load-bearing.
+
+`YZ_CNTGATE` (yakuza/import_overrides.cpp vblank tick, 2026-07-09 s23, diag): the audio
+round-driver count-gate probe -- resolves G via `game_toc`, prints the count EA once, then
+prints on every change of the count / round-counter / guard fields.
+
+## s24 frontier flags (2026-07-09 late — the main-loop wedge session)
+
+`YZ_PARK_REL` **UPDATED s24: now two-tier.** The 3 s deadlock-only deferred-release apply
+(s21) gains a FAST tier: fires at 250 ms parked IF t1 has made ZERO dispatch hops since the
+park began (`g_yz_t1_sample_seq` witness — the journal drain runs on t1, so a hop-frozen t1
+provably isn't coming) AND the release exists in the game's tag-0x7F journal (unchanged
+precondition — we only ever deliver the game's own queued write). The 3 s tier remains as the
+unconditional fallback. Rationale: the movie-boundary backlog is 16 consecutive stoppers
+(MEASURED scratch/s24pr1.err); at 3 s each the lever spent ~48 s/boot politely confirming
+already-witnessed deadlocks. Apply log now records tier + parked-ms + t1seq + fence word.
+`YZ_PARKREL_FAST_MS=<n>` tunes the fast threshold; `0` disables the fast tier (3 s only —
+the A/B control). STATUS: candidate default-ON pending the s24fast/s24slow/s24off matrix.
+
+`YZ_UPDCB` (yakuza/dispatch.cpp `ps3_indirect_call`, 2026-07-09 s24, diag, default OFF):
+logs every bctrl t1 issues with lr inside the master update handler func_00D1E838
+[0xD1E838,0xD1FC38). ⚠ MEASURED USELESS AS BUILT: our lifter never materializes ctx->lr at
+bctrl (same class as the bl no-lr — s19's "lr=0 on bctr chains"), so the lr-range filter
+matches nothing (armed banner + 0 hits, scratch/s24cb1.err). Kept as the anchor for a
+flag-scoped rewrite (set a marker in the chain probe at D1E838 entry instead); do not trust
+its zero.
+
+**Chain-entry probes (NOT a flag — a scripted recomp patch):** `py -3
+scratch/patch_chain_probes.py` injects `yz_chain_probe(ctx, addr)` at the entry of the
+main-loop chain functions (entry 00DDDA6C / main loop 000D0CD8 / master update 00D1E838 /
+round driver 00A9F8AC / job writer 00E5F094) in the recomp chunks; `--revert` removes them.
+The ONLY instrument that sees direct-`bl` entries (saved-LR walks are impossible in our
+runtime: `bl` never sets ctx->lr; tramp guard sees only tail-branch hops; YZ_HOOK only
+bctrl). Census prints on probe hits (5 s tick) AND from the watchdog every 60 s
+(`watchdog-<n>m` tags, LESSONS #6d). Re-apply after any relift; runtime handler
+`yz_chain_probe` lives in yakuza/main.cpp and is always compiled in (inert without the
+patch).

@@ -356,6 +356,19 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           if (wbt && (raised & 0x40000000u) && wbtn < 4) { wbtn++;
                               yz_dump_guest_state(ctx, "widsig-bt");
                           } }
+                        /* DIAG (s24, 2026-07-09): wid2 = the gs_task/EDGE taskset — the
+                         * gcm journal's real consumer (patches + fenced releases +
+                         * tag-zeroing). MEASURED s24fast: w2 raised ONCE per boot while
+                         * w3/w4 got 1500/260 — the starvation behind the stopper-
+                         * backlog deadlock class. Dump the raiser's state on the first
+                         * raises (rides YZ_WIDSIG_BT) to name the kick path, s22
+                         * wid4-playbook style. */
+                        { static int wbt2 = -1;
+                          if (wbt2 < 0) wbt2 = getenv("YZ_WIDSIG_BT") ? 1 : 0;
+                          static long wbtn2 = 0;
+                          if (wbt2 && (raised & 0x20000000u) && wbtn2 < 3) { wbtn2++;
+                              yz_dump_guest_state(ctx, "wid2-bt");
+                          } }
                         /* DIAG (s22 opener, 2026-07-08): wid4 = the pxd GPU-frame pool
                          * (image 4, elf 0x01284200) = the 0xFE0 decode-sync publisher
                          * (DONT_RECHASE #29). t1 raises its signal but image 4 never
