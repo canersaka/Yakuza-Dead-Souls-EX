@@ -460,3 +460,16 @@ Change-triggered (FNV-hash) hexdump of the jobchain command stream 0x4019CA80-CB
 header 0x4019C880-8C0, once per vblank tick. The producer-side twin of the SPU-side [job-cmd]
 probe; with [job-cmd-re] (same-value refetch counter, spu_dma.h, always on with YZ_OVL) it
 discriminates "producer never wrote" from "module never fetched". ARMED banner on first use.
+
+`YZ_NO_LLFAST` (runtime/spu/spu_dma.h GETLLAR, 2026-07-09 s21): **kill-switch for the LOCK-FREE
+GETLLAR IDLE POLL (default ON, whitelisted).** The profiled dominant boot cost (5 SPURS kernels
+x ~a core spinning through the process-wide lock-line lock, scratch/asset_window_profile.md):
+when a context re-GETLLARs the SAME line and its write generation is unchanged, the cached
+reservation copy is served lock-free. Companion coherence hardening (kept even with the switch
+off): PUTLLC commits now bump the generation + kill peer reservations (CBEA reservation-lost),
+and plain SPU PUTs into reserved lines notify. WHITELISTED to the SPURS mgmt line 0x40197C80
+only: boot 14 measured a general cached-serve losing t1's flywheel start (zero audio rounds) --
+host-side bulk writers (HLE _sys_memset/_sys_memcpy, file-read memcpys) write guest memory
+without bumping the generation, so general serving is unsound until those paths sweep the
+coherence bitmap (the queued follow-up). MEASURED with the whitelist: logo ~4-6 fps -> 8.5 fps,
+t_PortStart 116-180 s -> ~96-102 s, flywheel + park-rel behavior unchanged (boots 14-16 A/B).

@@ -311,6 +311,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     fprintf(stderr, "[put-wild] spu=%X pc=0x%05X PUT ea=0x%08X size=0x%X lsa=0x%05X (policy -> GAME region)\n",
                             spu->spu_id, spu->pc & SPU_LS_MASK, (uint32_t)ea, size, lsa); fflush(stderr); } } }
             memcpy(ea_ptr, ls_ptr, size);
+            /* s21 (lock-free GETLLAR prerequisite): a plain PUT into a line any
+             * SPU has ever reserved must bump the coherence generation (same
+             * rule as the PPU's VM_WRITE_COH), else a peer's cached-copy fast
+             * path could serve stale data. Rare relative to GETLLAR polls; the
+             * notify runs under the lock-line lock like every other caller. */
+            if (size != 0) {
+                extern int  spu_coh_is_reserved(uint32_t);
+                extern void spu_coh_notify_write(uint32_t);
+                extern void spu_lockline_lock(void);
+                extern void spu_lockline_unlock(void);
+                uint32_t a0 = (uint32_t)ea & ~127u;
+                uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) {
+                        spu_lockline_lock();
+                        spu_coh_notify_write(a);
+                        spu_lockline_unlock();
+                    }
+                    if (a == a1) break;
+                }
+            }
         }
 #ifdef _WIN32
     } __except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION */
@@ -888,6 +909,55 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           } }
         uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
+        /* s21 SPEED (workpackage item 3; profiled 2026-07-09: five SPURS kernels
+         * x ~a full core each spinning THROUGH the process-wide lock-line lock =
+         * the boot's dominant CPU cost, scratch/asset_window_profile.md).
+         * LOCK-FREE GETLLAR IDLE POLL: when this context re-GETLLARs the SAME
+         * line and the line's write GENERATION has not moved, the cached
+         * reservation copy still equals memory -- every writer bumps the
+         * generation (PPU VM_WRITE_COH/stwcx/stdcx always did; SPU PUTLLC
+         * commits and plain PUTs into reserved lines bump as of this change) --
+         * so serve the cached copy without the lock. Reaction latency to a real
+         * write stays one generation-check deep; LRWAKE edge semantics are
+         * identical (cached copy == memory while the generation holds). A peer's
+         * notify bumps the generation BEFORE clearing resv_active, so a stale
+         * resv_active read here still fails the generation check. Kill-switch
+         * YZ_NO_LLFAST restores the locked path for A/B. */
+        if (cmd == MFC_GETLLAR_CMD) {
+            static int llfast = -1;
+            if (llfast < 0) llfast = getenv("YZ_NO_LLFAST") ? 0 : 1;
+            uint64_t le = ea & ~127ull;
+            extern uint32_t spu_coh_gen(uint32_t);
+            /* WHITELIST (s21 boot-14 regression): host-side bulk writers (HLE
+             * _sys_memset/_sys_memcpy, file reads) write guest memory WITHOUT
+             * bumping the generation, so a general cached-serve can go stale
+             * (boot 14: zero audio rounds -- t1's flywheel start lost). Until
+             * those paths sweep the coherence bitmap, serve cache-fast ONLY for
+             * the SPURS management line 0x40197C80 -- the measured hot poll
+             * (5 kernels spinning; scratch/asset_window_profile.md) whose
+             * writers are all CAS/VM_WRITE_COH paths (the one _sys_memset of a
+             * control line, guard 0x4019C700 at init, predates any kernel
+             * reservation). */
+            if (llfast && le == 0x40197C80ull && mfc->resv_active && mfc->resv_ea == le
+                && spu_coh_gen((uint32_t)le) == mfc->resv_gen) {
+                extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
+                g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
+                memcpy(ls_ptr, mfc->resv_data, 128);
+                mfc->resv_poll_n++;
+                { static int nb = -1;
+                  if (nb < 0) nb = getenv("YZ_NO_SPUBACKOFF") ? 1 : 0;
+                  if (!nb && mfc->resv_poll_n > 16)
+                      spu_idle_yield(mfc->resv_poll_n > (1u << 20) ? 2
+                                   : mfc->resv_poll_n > 256       ? 1 : 0); }
+                { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
+                  if (lw && (uint32_t)le == 0x40197C80u
+                      && (mfc->resv_data[0x70] | mfc->resv_data[0x71]))
+                      spu->event_status |= 0x400u; }
+                mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+                mfc->tag_completed |= (1u << tag);
+                return 0;
+            }
+        }
         spu_lockline_lock();
         switch (cmd) {
         case MFC_GETLLAR_CMD: {
@@ -1387,6 +1457,16 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       if (sb != sa) { static int n = 0; if (n < 80) { n++;
                           fprintf(stderr, "[sig-chg] PUTLLC mgmt wklSignal1 0x%04X -> 0x%04X\n", sb, sa); fflush(stderr); } } } }
                 memcpy(line, ls_ptr, 128);
+                /* s21: a committing PUTLLC is a line WRITE -- bump the coherence
+                 * generation and kill PEER reservations (CBEA reservation-lost;
+                 * required for the lock-free GETLLAR fast path: a peer polling
+                 * its cached copy must observe this commit). Clear OUR
+                 * reservation first so the notify loop does not raise a
+                 * spurious self-LR (HW: a successful PUTLLC consumes the
+                 * reservation, it does not "lose" it). Already under the lock. */
+                mfc->resv_active = 0;
+                { extern void spu_coh_notify_write(uint32_t);
+                  spu_coh_notify_write((uint32_t)(ea & ~127ull)); }
                 mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
             } else {
                 mfc->atomic_stat = MFC_PUTLLC_FAILURE;
