@@ -1148,6 +1148,25 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
             fflush(stderr); }
         if (!ok) return NULL;
     }
+    /* Kernel-context wildcard guard (s24). Contexts running the SPURS kernel
+     * (image 16, adopted at group start) must resolve ONLY against the
+     * kernel's own registrations — a kernel-era wild branch that fell to the
+     * image-0 wildcard executed gs_task's code and mis-attributed the
+     * tid-0x2004 death class for weeks (ledger #34/#49). Legitimate kernel
+     * exits (workload dispatch at 0xA00, task launch, job slots) all SWITCH
+     * image_id before entering foreign code, so a kernel-tagged query that
+     * misses exact is a bug by definition. Fail loud; kill-switch
+     * YZ_KERN_WILDCARD_OK restores the old masking. */
+    if (image_id == 16 && wildcard) {
+        static int kok = -1;
+        if (kok < 0) kok = getenv("YZ_KERN_WILDCARD_OK") ? 1 : 0;
+        static int kl = 0; if (kl < 32) { kl++;
+            fprintf(stderr, "[kern-wildcard] KERNEL ctx query addr=0x%05X exact-miss; wildcard img=%d %s\n",
+                    addr, wildcard_img,
+                    kok ? "SERVED (YZ_KERN_WILDCARD_OK)" : "REFUSED (wild kernel branch, failing loud)");
+            fflush(stderr); }
+        if (!kok) return NULL;
+    }
     return wildcard;
 }
 
@@ -1252,7 +1271,11 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
         int wildcard_img = -1;
         for (uint32_t i = lo; i < idx_n && idx[i].addr == addr; i++) {
             if (idx[i].image_id == image_id) return idx[i].fn; /* exact (incl 0==0) */
-            if ((idx[i].image_id == 0 || image_id == 0) && !wildcard) {
+            /* s24: kernel entries (16) are universal servers -- every context
+             * may branch INTO the resident scheduler (workload exits at 0x290/
+             * 0x838). The kern-guard below still refuses img-0 substitution FOR
+             * kernel contexts. */
+            if ((idx[i].image_id == 0 || idx[i].image_id == 16 || image_id == 0) && !wildcard) {
                 wildcard = idx[i].fn;
                 wildcard_img = idx[i].image_id;
             }
@@ -1266,7 +1289,7 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
     for (uint32_t i = 0; i < s_registry_count; i++) {
         if (s_registry[i].addr != addr) continue;
         if (s_registry[i].image_id == image_id) return s_registry[i].fn; /* exact (incl 0==0) */
-        if ((s_registry[i].image_id == 0 || image_id == 0) && !wildcard) {
+        if ((s_registry[i].image_id == 0 || s_registry[i].image_id == 16 || image_id == 0) && !wildcard) {
             wildcard = s_registry[i].fn;
             wildcard_img = s_registry[i].image_id;
         }
@@ -1894,11 +1917,17 @@ void spu_indirect_branch(spu_context* ctx)
              * executed the `bi` -- resolve the RVA against yakuza_recomp.map
              * (crash-symbolization workflow, LESSONS #12). spu_id names the
              * victim thread. */
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_WIN32)
             { void* ra = _ReturnAddress();
+              /* print the module-relative RVA too: raw pointers are useless
+               * post-mortem under ASLR (learned from s24dw.err's dead catch). */
+              extern void* __stdcall GetModuleHandleA(const char*);
+              uintptr_t mod = (uintptr_t)GetModuleHandleA(0);
               fprintf(stderr, "[SPU] unknown-branch SOURCE: spu=%X host_ra=%p "
-                      "(resolve RVA vs yakuza_recomp.map)\n",
-                      ctx->spu_id, ra); }
+                      "rva=0x%llX (map preferred base 0x140000000: symbol at "
+                      "0x140000000+rva in yakuza_recomp.map)\n",
+                      ctx->spu_id, ra,
+                      (unsigned long long)((uintptr_t)ra - mod)); }
 #endif
             fflush(stderr);
         }
