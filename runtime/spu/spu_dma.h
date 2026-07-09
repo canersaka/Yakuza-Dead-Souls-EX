@@ -633,6 +633,36 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* Decode-sync gate-label watch (env YZ_FE0_WATCH, 2026-07-08 s22 — ⚡ item ③,
+     * DONT_RECHASE #29): the movie-phase FIFO parks on SEMAPHORE_ACQUIRE of label
+     * 0x10200FE0==1, published in RPCS3 by an SPU workload at LS pc 0x0AB70 (wkl4,
+     * image 4, the monotonic per-round counter). Our PPU-side watch measured ZERO
+     * writes; this closes the OTHER path — any SPU DMA (regular PUT or atomic)
+     * touching the label word names the writer (spu/img/pc) + the value. Uncapped
+     * (the oracle cadence is ~30 Hz), armed banner, observation only. */
+    { static int fe0 = -1;
+      if (fe0 < 0) { fe0 = getenv("YZ_FE0_WATCH") ? 1 : 0;
+          if (fe0) { fprintf(stderr, "[fe0] watch armed (0x10200FE0 SPU PUT path)\n"); fflush(stderr); } }
+      if (fe0) {
+          uint32_t fea = (uint32_t)(ea & ~0x80000000ull);
+          int fatomic = (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+                         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD);
+          uint32_t fsz = fatomic ? 128u : size;
+          uint32_t fbase = fatomic ? (fea & ~127u) : fea;
+          int fput = (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                      cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)
+                     && fbase < 0x10200FE4u && fbase + fsz > 0x10200FE0u;
+          if (fput) {
+              static unsigned long fn = 0; fn++;
+              uint32_t off = (fbase <= 0x10200FE0u) ? 0x10200FE0u - fbase : 0u;
+              const uint8_t* pl = spu->ls + ((lsa & SPU_LS_MASK) + (fatomic ? off & 127u : off));
+              fprintf(stderr, "[fe0] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X "
+                      "size=0x%X val=%02X%02X%02X%02X\n",
+                      fn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                      fea, size, pl[0], pl[1], pl[2], pl[3]);
+              fflush(stderr);
+          }
+      } }
     /* Overlay + job-consumer watch (env YZ_OVL, 2026-07-03, diag — the entry-7
      * gate): (A) log code-sized GETs into HIGH LS (>=0x10000) per image — the
      * image-5 runtime overlay load names its SOURCE EA + size (needed both to
@@ -1359,6 +1389,40 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     }
                 }
             }
+            /* DIAG (env YZ_WID4, s22 2026-07-08): steady-state SELECT-gate sampler
+             * for wid4 (the pxd GPU-frame pool, image 4 = the 0xFE0 decode-sync
+             * publisher, DONT_RECHASE #29). INDEPENDENT of the ls_dump/prof gates
+             * so it runs on a plain diagnostic boot. Offsets mirror
+             * [spu-ls01-slow] shifted to index 4: rc@line[0x04] curCont@line[0x24]
+             * maxCont@line[0x54] sig bit 0x0800 run bit 0x0800 prio@k[0x1A4]
+             * locCont@k[0x184]. The sig field also answers whether the kernel
+             * ever CONSUMES t1's wid4 raise (sig stuck 1 = never seen/acted;
+             * sig 0 after a raise = consumed but not dispatched). Observation
+             * only, no state mutation. */
+            { static int w4 = -1;
+              if (w4 < 0) { w4 = getenv("YZ_WID4") ? 1 : 0;
+                  if (w4) { fprintf(stderr, "[spu-ls4] armed\n"); fflush(stderr); } }
+              if (w4 && (ea & ~127ull) == 0x40197C80ull) {
+                  extern unsigned long g_spu_getllar_n;
+                  static unsigned long n4 = 0;
+                  if ((g_spu_getllar_n % 500000UL) == 0) {
+                      n4++;
+                      const uint8_t* k = spu->ls;
+                      uint32_t spuNum4 = ((uint32_t)k[0x1C8]<<24)|((uint32_t)k[0x1C9]<<16)|((uint32_t)k[0x1CA]<<8)|k[0x1CB];
+                      uint16_t wrun1_4 = (uint16_t)(((uint16_t)k[0x1EC]<<8)|k[0x1ED]);
+                      unsigned rc4 = line[0x04], curcont4 = line[0x24], maxc4 = line[0x54] & 0x0F;
+                      unsigned loccont4 = k[0x184] & 0x0F;
+                      unsigned realcont4 = (curcont4 - loccont4) & 0x0F;
+                      unsigned sig4 = ((((unsigned)line[0x70] << 8) | line[0x71]) & 0x0800u) ? 1 : 0;
+                      unsigned prio4 = k[0x1A4] & 0x0F, run4 = (wrun1_4 & 0x0800) ? 1 : 0;
+                      int sel4 = run4 && prio4 > 0 && maxc4 > realcont4 && (sig4 || rc4 > realcont4);
+                      fprintf(stderr, "[spu-ls4] #%lu spu=%X n%u wklRun1=0x%04X "
+                              "| wid4: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d\n",
+                              n4, spu->spu_id, spuNum4, wrun1_4,
+                              run4, prio4, maxc4, curcont4, loccont4, realcont4, rc4, sig4, sel4);
+                      fflush(stderr);
+                  }
+              } }
             break; }
         case MFC_PUTLLC_CMD:
             if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
@@ -1389,6 +1453,31 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                           ok ? "COMMIT" : "FAIL",
                           b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
                           a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
+                  fflush(stderr);
+              } }
+            /* DIAG (env YZ_W4TS, SPU side, 2026-07-08 s22): every SPU PUTLLC on the
+             * wid4 pool taskset bitset line 0x42450E00 — the pool tasks' own state
+             * transitions (running/waiting/signalled, docs/SPURS_TASKSET.md) with
+             * the first 0x60 bytes' diff summarized as changed offsets. Companion
+             * to the PPU-side [w4ts-ppu] census in shims.cpp. Uncapped. */
+            { static int w4s = -1;
+              if (w4s < 0) { w4s = getenv("YZ_W4TS") ? 1 : 0;
+                  if (w4s) { fprintf(stderr, "[w4ts] spu probe armed\n"); fflush(stderr); } }
+              if (w4s && (ea & ~127ull) == 0x42450E00ull) {
+                  int ok = mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
+                           memcmp(line, mfc->resv_data, 128) == 0;
+                  const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
+                  char diff[128]; int o = 0; diff[0] = 0;
+                  for (int i = 0; i < 0x60 && o < 100; i += 4) {
+                      if (memcmp(b + i, a + i, 4)) {
+                          o += snprintf(diff + o, sizeof(diff) - o,
+                                        " +%02X:%02X%02X%02X%02X->%02X%02X%02X%02X", i,
+                                        b[i],b[i+1],b[i+2],b[i+3], a[i],a[i+1],a[i+2],a[i+3]);
+                      }
+                  }
+                  fprintf(stderr, "[w4ts-spu] spu=%X img=%d pc=0x%05X %s%s\n",
+                          spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                          ok ? "COMMIT" : "FAIL", o ? diff : " (no bitset change)");
                   fflush(stderr);
               } }
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
