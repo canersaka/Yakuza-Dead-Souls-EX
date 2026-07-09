@@ -783,6 +783,108 @@ extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
     }
 }
 
+/* ---- s24 defer-gate watcher (2026-07-09, env YZ_DEFERWATCH) ---------------
+ * The gcm flush decides defer-vs-immediate stopper release at ONE compare
+ * (S[0x24] vs the buffer-descriptor end, pc ~0xE9BE4C — stopper_drain_re.md).
+ * Ours takes DEFER 16x consecutively at the movie boundary (deadlock class);
+ * RPCS3's boundary parks zero times. HYPOTHESIS ONLY — this watcher measures
+ * the gate's actual inputs at each decision instead of assuming: on every
+ * journal-head advance (S[0] += 0x20 = a defer happened) dump the new entry,
+ * the compared values, and ring state. Defers are rare (~16/boot): uncapped. */
+static DWORD WINAPI yz_deferwatch_thread(LPVOID)
+{
+    fprintf(stderr, "[deferwatch] ARMED: journal-head advance watcher (1ms poll)\n");
+    fflush(stderr);
+    uint32_t last_head = 0;
+    for (;;) {
+        Sleep(1);
+        if (!g_yz_game_toc || !vm_base) continue;
+        const uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+        if (S < 0x10000u || S >= 0xE0000000u) continue;
+        const uint32_t head = vm_read32(S + 0x00u);
+        if (head == last_head) continue;
+        const uint32_t prev = last_head;
+        last_head = head;
+        if (!prev) continue;                      /* first observation: baseline only */
+        /* dump every new entry [prev, head) plus the gate inputs */
+        const uint32_t ptr14 = vm_read32(g_yz_game_toc - 0x7414u);
+        const uint32_t bd    = (ptr14 >= 0x10000u && ptr14 < 0xE0000000u)
+                                   ? vm_read32(ptr14) : 0;
+        fprintf(stderr, "[deferwatch] head 0x%08X->0x%08X | S1C=0x%08X S20=0x%08X "
+                "S24=0x%08X | bufdesc=0x%08X end[+4]=0x%08X cur[+8]=0x%08X | "
+                "PUT=0x%08X GET=0x%08X\n",
+                prev, head,
+                vm_read32(S + 0x1Cu), vm_read32(S + 0x20u), vm_read32(S + 0x24u),
+                bd,
+                bd ? vm_read32(bd + 4u) : 0, bd ? vm_read32(bd + 8u) : 0,
+                vm_read32(0x10000040u), vm_read32(0x10000044u));
+        for (uint32_t e = prev; e != head && (e - prev) < 0x400u; e += 0x20u)
+            fprintf(stderr, "[deferwatch]   entry@0x%08X tag=0x%02X ea=0x%08X\n",
+                    e, vm_read32(e + 0x00u), vm_read32(e + 0x04u));
+        fflush(stderr);
+    }
+    return 0;
+}
+
+/* ---- s24 late: 0x7F LOOKAHEAD DRAIN (env-gated via the lever) --------------
+ * The park-triggered lever costs one park + threshold wait per stopper while
+ * the journal holds ~41x more pending releases than the lever ever applies
+ * (2,632 vs 64, scratch/s24dw_journal.md) — the measured seconds-per-flip
+ * grind. This applies each tag-0x7F release AS SOON AS it is journaled,
+ * provided PUT is ring-ahead of the stopper (the game has committed the body
+ * past it — the same faithfulness argument the June review accepted for the
+ * park-triggered form, applied earlier). The release VALUE is the game's own
+ * semantics per the s24 drain RE (scratch/s24_drain_re.md, DISASM-VERIFIED):
+ * the immediate-apply branch writes literal 0 to the stopper word. Journal
+ * TAG WORDS ARE LEFT UNTOUCHED (eager tag-zeroing measured harmful 2026-07-02;
+ * the consumption-proof retire stays park-side). Kill-switch YZ_NO_LOOKAHEAD.
+ * Runs whenever YZ_PARK_REL is armed. */
+static DWORD WINAPI yz_lookahead_thread(LPVOID)
+{
+    fprintf(stderr, "[lookahead] ARMED: journal 0x7F lookahead drain (1ms poll)\n");
+    fflush(stderr);
+    uint32_t cursor = 0;                       /* last journal entry examined */
+    unsigned long applied = 0;
+    for (;;) {
+        Sleep(1);
+        if (!g_yz_game_toc || !vm_base) continue;
+        const uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+        if (S < 0x10000u || S >= 0xE0000000u) continue;
+        const uint32_t base = vm_read32(S + 0x08u);
+        const uint32_t head = vm_read32(S + 0x00u);
+        if (base < 0x10000u || head < base || head - base > 0x1000000u) continue;
+        if (cursor < base || cursor > head) cursor = base;
+        const uint32_t put = vm_read32(0x10000040u);
+        const uint32_t get = vm_read32(0x10000044u);
+        const uint32_t ring = 0x800000u;
+        for (; cursor < head; cursor += 0x20u) {
+            if (vm_read32(cursor + 0x00u) != 0x7Fu) continue;
+            const uint32_t stopper_ea = vm_read32(cursor + 0x04u);
+            if (stopper_ea < 0x40400000u || stopper_ea >= 0x40C00000u) continue;
+            const uint32_t stopper_io = stopper_ea - 0x40400000u;
+            /* only when the committed body extends past the stopper:
+             * ring-distance from GET must place the stopper strictly inside
+             * [GET, PUT) — the same PUT-ahead condition the lever uses. */
+            const uint32_t ahead_put = (put - stopper_io + ring) % ring;
+            const uint32_t ahead_get = (stopper_io - get + ring) % ring;
+            if (ahead_put == 0u || ahead_put >= (ring >> 1)) continue;
+            if (ahead_get >= (ring >> 1)) continue;
+            const uint32_t w = vm_read32(stopper_ea);
+            if ((w & 0xE0000003u) == 0x20000000u &&
+                (w & 0x1FFFFFFCu) == stopper_io) {      /* still a live self-jump */
+                vm_write32(stopper_ea, 0u);             /* the game's own release value */
+                applied++;
+                if (applied <= 24 || (applied & 0x3Fu) == 0) {
+                    fprintf(stderr, "[lookahead] applied #%lu @io 0x%06X (GET=0x%06X PUT=0x%06X)\n",
+                            applied, stopper_io, get, put);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 {
     if (!gc) return;
@@ -2039,7 +2141,13 @@ int main(int argc, char** argv)
      * taskset policy) are disambiguated by ctx->image_id (set on DMA dispatch,
      * spu_dma.h). Kernel (LS 0x290..) and gs_task (LS 0x3000) don't overlap, so
      * image 0 (matches any) is fine for them. */
-    spu_begin_image(0); spu_recomp_register();            /* kernel  */
+    /* s24: the kernel gets its OWN image id (16) instead of sharing 0 with
+     * gs_task — the id-0 collision let wild kernel-era branches resolve into
+     * gs_task's lift and mis-attributed every tid-0x2004 death (ledger
+     * #34/#49; adoption-trace analysis). Group-start now adopts 16 for every
+     * thread (lv2_register.c); spu_lookup refuses wildcard service for
+     * kernel contexts (kill-switch YZ_KERN_WILDCARD_OK). */
+    spu_begin_image(16); spu_recomp_register();           /* kernel  */
     spu_begin_image(1); spu_recomp_register_sysservice(); /* system service @0xA00 */
     spu_begin_image(2); spu_recomp_register_policy();     /* taskset policy @0xA00 */
     /* cri_audio (image 3) BEFORE gs_task (image 0): both overlap LS 0x3000+, and
@@ -2154,6 +2262,13 @@ int main(int argc, char** argv)
     /* Stall watchdog: dumps the main thread's guest call stack if the boot
      * parks (TEMP DEBUG: diagnosing the post-shader-open stall). */
     CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL);
+    if (getenv("YZ_DEFERWATCH"))
+        CreateThread(NULL, 0, yz_deferwatch_thread, NULL, 0, NULL);
+    /* s24: lookahead REFUTED on its first boot (DONT_RECHASE #50 — reproduced
+     * the June eager-applier wedge: releases without the preceding patch
+     * entries hand GET torn content). Explicit opt-in only. */
+    if (getenv("YZ_LOOKAHEAD"))
+        CreateThread(NULL, 0, yz_lookahead_thread, NULL, 0, NULL);
     /* High-frequency RSX state tracer (TEMP DEBUG): compact GET/PUT/fence/ctr
      * timeline + a full dump at the stall edge. Env-gated so default runs stay
      * clean; on for the deadlock investigation. */

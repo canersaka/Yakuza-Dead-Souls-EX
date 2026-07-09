@@ -591,6 +591,14 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 memset(sctx, 0, sizeof(*sctx));
                 sctx->spu_id       = t->tid;
                 sctx->spu_group_id = id;
+                /* s24: every group thread starts IN the SPURS kernel — adopt
+                 * the kernel's own image id explicitly. The old default 0
+                 * collided with gs_task's registration (image 0 = the
+                 * wildcard), so a wild kernel-era branch resolved into
+                 * gs_task's dense lift and the tid-0x2004 deaths were
+                 * mis-attributed (adoption-trace analysis, ledger #34/#49).
+                 * 16 = kernel image, registered in yakuza/main.cpp. */
+                sctx->image_id     = 16;
                 if (t->img_ea) spu_deploy_image(sctx, t->img_ea);
                 /* args captured at thread_initialize -> gpr[3..6]
                  * preferred DW (lane 0 = high word, lane 1 = low word) */

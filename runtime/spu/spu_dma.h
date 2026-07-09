@@ -302,6 +302,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
         } else if (mfc_is_put(cmd)) {
             /* PUT: local store -> main memory */
+            /* s24 (YZ_JOBPUT site 2 of 3): the plain-put EXECUTOR — the first
+             * probe site missed the flag CAS that provably fires 23x/boot
+             * (instrument-coverage rule); cover every execution path. */
+            { static int jp2 = -1; if (jp2 < 0) { jp2 = getenv("YZ_JOBPUT") ? 1 : 0;
+                  if (jp2) { fprintf(stderr, "[job-put2] ARMED: plain-put executor site live\n"); fflush(stderr); } }
+              if (jp2 && spu->image_id >= 13 && spu->image_id <= 15) {
+                  static unsigned long j2n = 0; j2n++;
+                  if (j2n <= 200 || (j2n & 0xFFu) == 0) {
+                      fprintf(stderr, "[job-put2] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08llX size=0x%X\n",
+                              j2n, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                              (unsigned long long)(ea & ~0x80000000ull), size);
+                      fflush(stderr);
+                  }
+              } }
             /* pt35e (env YZ_PUT_WATCH): the policy SPU (image 2) wild-writing into the GAME
              * data region (below the SPURS structs @0x40000000) is the corruption that makes
              * the PPU mixer recurse. Log the SPU PC + EA + size to trace it to the bad op. */
@@ -621,6 +635,26 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * no EA filter — classify offline by pc (retire pcs 0x63EC/0x6424/0x645C;
      * ctx saves lsa 0x2C80-0x3000; kernel lock-line PUTLLCs by their mgmt
      * EAs). REMOVE with the journal-consumer frontier. */
+    /* s24 late (env YZ_JOBPUT): jobB's journal half. The RPCS3 oracle showed
+     * the slot-0x4C00 job (OUR image 15) performing the gcm journal
+     * application + stopper releases (LS pc 0x5EB8 = base+0x12B8) during the
+     * SAME jobB-only round era our boots run — while our jobB only ever does
+     * its audio half (flag+spup17). Log every put-class DMA from images
+     * 13/14/15 with pc, so "our jobB never writes the ring/journal" becomes
+     * MEASURED, not inferred (DONT_RECHASE #46). Volume-bounded like gs-put. */
+    { static int jp = -1; if (jp < 0) { jp = getenv("YZ_JOBPUT") ? 1 : 0;
+          if (jp) { fprintf(stderr, "[job-put] ARMED: image-13/14/15 put-class DMA watch live\n"); fflush(stderr); } }
+      if (jp && (spu->image_id >= 13 && spu->image_id <= 15)
+             && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                 cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
+          static unsigned long jpn = 0; jpn++;
+          if (jpn <= 200 || (jpn & 0xFFu) == 0) {
+              fprintf(stderr, "[job-put] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X\n",
+                      jpn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd,
+                      lsa & SPU_LS_MASK, (unsigned long long)(ea & ~0x80000000ull), size);
+              fflush(stderr);
+          }
+      } }
     { static int gp = -1; if (gp < 0) { gp = getenv("YZ_GSPUT") ? 1 : 0;
           if (gp) { fprintf(stderr, "[gs-put] ARMED: image-0 put-class DMA watch live\n"); fflush(stderr); } }
       if (gp && spu->image_id == 0
@@ -1426,6 +1460,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               } }
             break; }
         case MFC_PUTLLC_CMD:
+            /* s24 (YZ_JOBPUT site 3 of 3): the atomic lockline executor — the
+             * path the jobB flag CAS actually takes (site 1 saw zero of its
+             * 23 measured commits). Same census, tagged. */
+            { static int jp3 = -1; if (jp3 < 0) { jp3 = getenv("YZ_JOBPUT") ? 1 : 0;
+                  if (jp3) { fprintf(stderr, "[job-put3] ARMED: PUTLLC lockline site live\n"); fflush(stderr); } }
+              if (jp3 && spu->image_id >= 13 && spu->image_id <= 15) {
+                  static unsigned long j3n = 0; j3n++;
+                  if (j3n <= 200 || (j3n & 0xFFu) == 0) {
+                      fprintf(stderr, "[job-put3] n=%lu spu=%X img=%d pc=0x%05X ea=0x%08llX\n",
+                              j3n, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              (unsigned long long)(ea & ~0x80000000ull));
+                      fflush(stderr);
+                  }
+              } }
             if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
                 extern unsigned long g_spu_mgmt_put_ok, g_spu_mgmt_put_fail;
                 if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
