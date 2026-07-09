@@ -636,8 +636,62 @@ static uint32_t yz_rsx_blit_size_out = 0x00010001;
 
 extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined below */
 
+/* Lossless user-interrupt delivery (s25, the round-25 stall root — the FIFTH
+ * dropped-guest-notification instance after 0xEB00/0xE920/flip/0x103).
+ * MEASURED (scratch/s25ride.err): the game COALESCES its ucmd cause counter
+ * (deliveries 1-21 sequential, then one method carrying cause=25 — the
+ * SDK-documented rapid-user-command coalescing), and that single coalesced
+ * send hit a momentarily FULL RSX event queue: sys_event_port_send returned
+ * 0x8001000A (EBUSY) and our fire-and-forget path LOST it. The handler never
+ * saw cause 25, the wid4 pool never published rounds 22-25, and the stream
+ * parked forever on NV406E SEMAPHORE_ACQUIRE want=25 — WITHOUT the 0x2004
+ * death (refutes ledger #49's prime-mover attribution). lv1 keeps ONE pending
+ * cause register and re-delivers when the queue drains; model that: latch the
+ * undelivered cause, retry from the consumer loop (userCmdParam already
+ * carries the latest arg, so a retry delivers correct coalesced state).
+ * Consumer-thread-only state, no locking. Kill-switch YZ_NO_UCMD_RETRY. */
+static uint32_t g_ucmd_pending = 0;     /* 0 = none; else latched cause arg */
+static int      g_ucmd_have_pending = 0;
+
+static int64_t yz_ucmd_send(uint32_t arg)
+{
+    (void)arg;   /* the cause travels via driverInfo.userCmdParam; the event
+                  * carries only the USER_CMD bit */
+    ppu_context sc; memset(&sc, 0, sizeof(sc));
+    sc.gpr[3] = g_rsx_event_port;
+    sc.gpr[5] = 0x80ull;                              /* SYS_RSX_EVENT_USER_CMD */
+    return sys_event_port_send(&sc);
+}
+
+static void yz_ucmd_retry_pending(void)
+{
+    if (!g_ucmd_have_pending || !g_rsx_event_port) return;
+    int64_t r = yz_ucmd_send(g_ucmd_pending);
+    if (r == 0) {
+        fprintf(stderr, "[ucmd] RETRY delivered latched cause=0x%08X (queue drained)\n",
+                g_ucmd_pending);
+        fflush(stderr);
+        g_ucmd_have_pending = 0;
+    } else {
+        /* still full — keep the latch; log sparsely so a permanently-wedged
+         * intr thread is visible without flooding */
+        static unsigned long rn = 0; rn++;
+        if ((rn & 0x3FFFu) == 1) {
+            fprintf(stderr, "[ucmd] retry still failing cause=0x%08X r=0x%llX (n=%lu)\n",
+                    g_ucmd_pending, (unsigned long long)(uint64_t)r, rn);
+            fflush(stderr);
+        }
+    }
+}
+
 static int yz_rsx_method(uint32_t method, uint32_t arg)
 {
+    /* Deliver any latched (queue-full) user-interrupt before consuming more
+     * of the stream — one predicted-not-taken branch when idle. */
+    static int no_ucmd_retry = -1;
+    if (no_ucmd_retry < 0) no_ucmd_retry = getenv("YZ_NO_UCMD_RETRY") ? 1 : 0;
+    if (g_ucmd_have_pending && !no_ucmd_retry) yz_ucmd_retry_pending();
+
     /* GCM_FLIP_HEAD arm banner on the consumer's FIRST method, not the first
      * 0xE920 hit: a "0xE920 never seen" negative is only MEASURED if the log
      * proves the probe ran (docs/LESSONS.md, the s22 honesty rules). */
@@ -775,10 +829,22 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         if (nu) break;
         vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
         if (g_rsx_event_port) {
-            ppu_context sc; memset(&sc, 0, sizeof(sc));
-            sc.gpr[3] = g_rsx_event_port;
-            sc.gpr[5] = 0x80ull;                          /* SYS_RSX_EVENT_USER_CMD */
-            int64_t r = sys_event_port_send(&sc);
+            /* A newer cause supersedes any latched one (lv1 coalescing: ONE
+             * pending cause register, latest wins; userCmdParam above already
+             * carries it). */
+            int64_t r = yz_ucmd_send(arg);
+            if (r != 0) {
+                static int no_retry = -1;
+                if (no_retry < 0) no_retry = getenv("YZ_NO_UCMD_RETRY") ? 1 : 0;
+                if (!no_retry) {
+                    g_ucmd_pending = arg;
+                    g_ucmd_have_pending = 1;
+                    fprintf(stderr, "[ucmd] send FAILED r=0x%llX cause=0x%08X -> LATCHED "
+                            "for retry (queue full; lossless delivery, s25 fix)\n",
+                            (unsigned long long)(uint64_t)r, arg);
+                    fflush(stderr);
+                }
+            }
             static unsigned long un = 0; un++;
             if (un <= 40 || (un & 0xFFu) == 0) {
                 fprintf(stderr, "[ucmd] n=%lu cause=0x%08X handlers=0x%08X send=%lld\n",
