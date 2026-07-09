@@ -477,6 +477,15 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
+        /* s23 conformance fix: ZERO the consumed block. Spec: "When the
+         * AudioServer reads audio data from the ring buffer, it clears the
+         * content of the blocks it finished reading" (libaudio overview);
+         * RPCS3 memsets the consumed block before advancing (cellAudio.cpp
+         * reset_ports pattern). Besides fidelity (a stalled producer must go
+         * SILENT, not loop stale PCM), block-clearing is a documented
+         * consumption signal a producer can poll -- frontier-relevant. */
+        memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+
         /* Advance read index + publish the block index to the guest (BE u64 at
          * read_idx_addr) so the game's audio loop sees blocks being consumed and
          * keeps feeding the next one (matches RPCS3: *index = cur_pos, 0..nBlock-1). */

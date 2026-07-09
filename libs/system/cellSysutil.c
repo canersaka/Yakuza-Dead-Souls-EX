@@ -282,18 +282,27 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
-s32 cellSysCacheMount(char* cachePath)
+s32 cellSysCacheMount(char* param)
 {
-    printf("[cellSysutil] SysCacheMount()\n");
+    /* s23 conformance fix: the argument is a CellSysCacheParam STRUCT
+     * (RPCS3 cellSysutil.h: char cacheId[32]; char getCachePath[1055+1];
+     * void* reserved), not a flat string buffer. The old code overwrote the
+     * game's cacheId INPUT field (offset 0) with our mount path and never
+     * wrote getCachePath (offset 32) -- guest memory corruption on a path
+     * reached every boot (s23boot1.err:7821). Read cacheId, write the
+     * mount path into getCachePath, leave cacheId untouched. */
+    char* cache_id      = param;            /* in: caller's cache name  */
+    char* get_cache_path = param + 32;      /* out: mounted path, 1055B */
 
-    if (!cachePath)
+    if (!param)
         return CELL_EINVAL;
 
-    /* Provide a temp directory path */
+    printf("[cellSysutil] SysCacheMount(cacheId='%.32s')\n", cache_id);
+
     strncpy(s_cache_path, "/dev_hdd1/caches", CELL_SYSCACHE_PATH_MAX - 1);
     s_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
-    strncpy(cachePath, s_cache_path, CELL_SYSCACHE_PATH_MAX - 1);
-    cachePath[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
+    strncpy(get_cache_path, s_cache_path, CELL_SYSCACHE_PATH_MAX - 1);
+    get_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
     s_cache_mounted = 1;
 
     return CELL_OK;
