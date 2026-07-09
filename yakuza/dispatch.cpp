@@ -219,9 +219,22 @@ extern "C" volatile uint32_t g_yz_t1_last_target = 0;   /* ctr at t1's last bctr
 extern "C" volatile uint32_t g_yz_t1_last_lr     = 0;   /* lr at t1's last trampoline hop */
 extern "C" volatile long     g_yz_t1_sample_seq  = 0;
 
+/* s21 HOP CENSUS: size the emission-rework payoff before building it. Every
+ * trampoline hop passes this guard; only register-target (bctr-class) calls
+ * pass ps3_indirect_call. total - indirect = hops whose target was STATICALLY
+ * KNOWN at lift time and trampolined purely for stack discipline -- the
+ * fraction the switch/goto + direct-call emission eliminates. Printed once
+ * per 10M hops. Counters are per-process, racy-increment tolerable (census). */
+extern "C" unsigned long long g_yz_hops_total = 0, g_yz_hops_indirect = 0;
+
 extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
     ppu_context* ctx0 = (ppu_context*)ctxv;
+    if ((++g_yz_hops_total & 0x9FFFFFull) == 0) /* ~every 10.5M */
+        fprintf(stderr, "[hops] total=%llu indirect=%llu static=%llu (%.1f%% static)\n",
+                g_yz_hops_total, g_yz_hops_indirect,
+                g_yz_hops_total - g_yz_hops_indirect,
+                100.0 * (double)(g_yz_hops_total - g_yz_hops_indirect) / (double)g_yz_hops_total);
     unsigned _ri = g_yz_tramp_idx++ & 255;
     g_yz_tramp_ring[_ri] = tf;
     g_yz_tramp_r31[_ri]  = ctx0->gpr[31];
@@ -232,12 +245,18 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
      * hop (g_trampoline_fn = func_X; return;) which ps3_indirect_call never
      * sees. tf is a host fn ptr here, not a guest addr -- resolve is left to
      * the printer/tools (yz_guest_of_host runs in this TU). */
-    if (yz_thread_current_id() == 1) {
+    /* s21 PERF: this block exists only to feed the YZ_T1SAMPLE diagnostic, but
+     * it ran UNGATED -- and yz_guest_of_host is a LINEAR SCAN over all ~57k
+     * lifted functions, executed on EVERY t1 trampoline hop. Profiled as the
+     * main thread's dominant cost (yz_tramp_guard+0xA5,
+     * scratch/hot_threads_id.md). Gate it on the flag it serves. */
+    { static int t1s = -1; if (t1s < 0) t1s = getenv("YZ_T1SAMPLE") ? 1 : 0;
+      if (t1s && yz_thread_current_id() == 1) {
         uint32_t g = yz_guest_of_host(tf);
         if (g) g_yz_t1_last_target = g;
         g_yz_t1_last_lr = (uint32_t)ctx0->lr;
         g_yz_t1_sample_seq++;
-    }
+    } }
 
     if (g_yz_catch_caller) {
         static void* usleep_fn = nullptr;
@@ -353,6 +372,7 @@ extern "C" int sys_event_queue_push_by_id(uint32_t queue_id,
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    g_yz_hops_indirect++;                     /* s21 hop census (see yz_tramp_guard) */
     uint32_t target = (uint32_t)ctx->ctr;
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
     if (yz_thread_current_id() == 1) {
