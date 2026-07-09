@@ -66,7 +66,7 @@ int main(void)
         put_word(prog + 4, T_INPUT | SWZ_IDENT);                       /* src0 = INPUT */
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
-        int n = rsx_fp_decompile(prog, sizeof(prog), hlsl, sizeof(hlsl));
+        int n = rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         printf("-- test1 MOV: %d instr\n", n);
         check("mov_dest",  hlsl, "r[0].xyzw =");
         check("mov_input", hlsl, "input.col");
@@ -81,7 +81,7 @@ int main(void)
         put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT);
         put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
         put_word(prog + 12, 0);
-        rsx_fp_decompile(prog, sizeof(prog), hlsl, sizeof(hlsl));
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         check("mul_mask", hlsl, "r[1].xy =");
         check("mul_expr", hlsl, "(r[0]).xyzw) * ((r[0]).xyzw)");
     }
@@ -97,7 +97,7 @@ int main(void)
         put_float(prog + 20, 0.25f);
         put_float(prog + 24, 0.0f);
         put_float(prog + 28, 1.0f);
-        int n = rsx_fp_decompile(prog, sizeof(prog), hlsl, sizeof(hlsl));
+        int n = rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         printf("-- test3 MAD: %d instr\n", n);
         check("mad_sat",   hlsl, "saturate(");
         check("mad_const", hlsl, "float4(0.5,0.25,0,1)");
@@ -110,7 +110,7 @@ int main(void)
         put_word(prog + 4, T_INPUT | SWZ_IDENT);
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
-        rsx_fp_decompile(prog, sizeof(prog), hlsl, sizeof(hlsl));
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         check("tex_sample", hlsl, "rsx_tex[3].Sample(rsx_samp[3]");
     }
 
@@ -121,7 +121,7 @@ int main(void)
         put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u<<17) | (1u<<29)); /* neg+abs */
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
-        rsx_fp_decompile(prog, sizeof(prog), hlsl, sizeof(hlsl));
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         check("neg_abs", hlsl, "-(abs((r[1]).xyzw))");
     }
 

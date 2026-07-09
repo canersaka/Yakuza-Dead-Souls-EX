@@ -770,8 +770,20 @@ static ID3D12PipelineState* get_pso(void)
     fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
     if (!fp_uc) return NULL;
 
+    /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
+     * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
+     * AUTO heuristic returned stale fp32 scratch for h0-writing materials);
+     * fold the deciding bit into the cache key so a program reused under a
+     * different export mode gets its own PSO. Kill-switch YZ_FP_CTRL_AUTO=1
+     * restores the old heuristic for the A/B. */
+    static int ctrl_auto = -1;
+    if (ctrl_auto < 0) ctrl_auto = getenv("YZ_FP_CTRL_AUTO") ? 1 : 0;
+    const u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
+
     u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
     key = fnv1a(fp_uc, fp_size, key);
+    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+    key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     render_state_t rs; decode_render_state(&rs);
     key = fnv1a(&rs, sizeof(rs), key);
 
@@ -783,7 +795,7 @@ static ID3D12PipelineState* get_pso(void)
     static char ps_hlsl[256 * 1024];
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
-    const int fi = rsx_fp_decompile(fp_uc, fp_size, ps_hlsl, sizeof(ps_hlsl));
+    const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
     if (vi > 0 && fi > 0) pso = build_pso(vs_hlsl, ps_hlsl, &rs);
 
     g.psos[g.n_psos].key = key;

@@ -205,7 +205,12 @@ static void dest_mask(u32 op0, char* m)
     m[n] = '\0';
 }
 
-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+/* CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS: when set, fragment output is fp32
+ * (color = r0); when clear, output is fp16 (color = h0). Matches RPCS3
+ * FragmentProgramDecompiler::BuildCode (gcm_enums.h). */
+#define FP_CTRL_32BIT_EXPORTS 0x40u
+
+int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size == 0) return -1;
 
@@ -359,11 +364,26 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         if (w0 & FP_END) break;
     }
 
-    /* Fragment color output: r0 (full precision) preferred, else h0. */
-    if (wrote_r0 || !wrote_h0)
+    /* Fragment color output register selection. The NV40 hardware picks the
+     * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from
+     * whichever temp happened to be written: fp32-export programs output r0,
+     * fp16-export programs (the default) output h0 (RPCS3
+     * FragmentProgramDecompiler::BuildCode). Many real material/lighting
+     * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
+     * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
+     * intermediate, producing flat/constant surfaces. */
+    if (ctrl == RSX_FP_CTRL_AUTO) {
+        /* No control word (standalone tests): legacy heuristic. */
+        if (wrote_r0 || !wrote_h0)
+            out_puts(&o, "    return r[0];\n}\n");
+        else
+            out_puts(&o, "    return h[0];\n}\n");
+    } else if (ctrl & FP_CTRL_32BIT_EXPORTS) {
         out_puts(&o, "    return r[0];\n}\n");
-    else
+    } else {
         out_puts(&o, "    return h[0];\n}\n");
+    }
+    (void)wrote_r0; (void)wrote_h0;
 
     if (!o.ok) return -1;
     return count;

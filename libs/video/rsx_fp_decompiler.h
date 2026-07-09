@@ -40,8 +40,16 @@ u32 rsx_fp_read_word(const u8* p);
  *
  * Texture sampling and full input plumbing are partial — see the doc's
  * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
- * the shader still compiles. */
-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+ * the shader still compiles.
+ *
+ *   ctrl : the NV4097_SET_SHADER_CONTROL word (reg 0x1D60) for this program.
+ *          Bit 0x40 (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) selects the
+ *          fragment-output register set: clear => fp16 output (color = h0),
+ *          set => fp32 output (color = r0). Pass RSX_FP_CTRL_AUTO when no
+ *          control word is available (standalone tests) to fall back to the
+ *          legacy "whichever of r0/h0 was written" heuristic. */
+#define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */

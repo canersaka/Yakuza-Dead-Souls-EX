@@ -46,6 +46,7 @@ extern "C" {
 #define RSX_TEX_FMT_DXT1            0x86
 #define RSX_TEX_FMT_DXT23           0x87
 #define RSX_TEX_FMT_DXT45           0x88
+#define RSX_TEX_FMT_G8B8            0x8B
 #define RSX_TEX_FMT_DEPTH24_D8      0x90
 #define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
 #define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
@@ -216,6 +217,15 @@ u32 rsx_dsp_shader_control(const rsx_dispatch* rsx);
 
 /* Transform program execution start slot (VP_START_FROM_ID) */
 u32 rsx_dsp_vp_start(const rsx_dispatch* rsx);
+
+/* Primitive restart (NV4097_SET_RESTART_INDEX_ENABLE/_INDEX): a sentinel
+ * index value that ends the current TRIANGLE_STRIP/FAN run with NO
+ * connecting triangle to whatever comes next. index_is_u32 selects which
+ * width rule applies (RPCS3 oracle: rsx_methods.h restart_index_enabled()
+ * disables restart for 16-bit index buffers if the configured value
+ * doesn't fit in 16 bits). */
+int rsx_dsp_restart_index_enabled(const rsx_dispatch* rsx, int index_is_u32);
+u32 rsx_dsp_restart_index(const rsx_dispatch* rsx);
 
 /* Per-attribute immediate/default value (VTX_ATTR_4F register block):
  * what a disabled vertex attribute reads as. Falls back to (0,0,0,1) when
