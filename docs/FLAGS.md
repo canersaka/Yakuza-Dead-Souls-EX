@@ -47,7 +47,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_RSX_FENCE_SYNC` | import_overrides.cpp (yz_rsx_method NV406E_SET_REFERENCE) + libs/video/rsx_live_draw.c (`rsx_live_draw_flush`) | **RSX fence-timing fidelity A/B (2026-07-06, opt-in, default OFF).** On NV406E_SET_REFERENCE, flush + wait the D3D12 backend (a real GPU fence, `ld_flush`) BEFORE writing REF, mirroring RPCS3 `nv406e::set_reference`'s `sync()`. Rationale (MEASURED via the PPU trace-diff at func_00EBBFB4, ours vs RPCS3 armed at 0xEB3238): our async consumer writes REF instantly and races ahead of real GPU time, so the game's REF poll (usleep-30 loop) skips the wait RPCS3 performs; this paces the consumer to actual GPU completion. A/B verdict (2026-07-06): INERT on the boot stall (the CRI-phase re-lock persists with it on); kept opt-in as a fidelity lever for later pacing work. |
 | `YZ_SURMIXER_SYNC` | libs/audio/cellAudio.c (`cellAudioSetNotifyEventQueue`) | **CRI surmixer notify-queue sync A/B (2026-07-06, opt-in, default OFF).** Mirrors RPCS3 `AudioSetNotifyEventQueue` (cellAudio.cpp:1671-1719 + merged fix #18857): when the surmixer registers its notify queue (key `c_mxr000`=0x8000CAFE02460300 or 0) and a `_cellsurMixerMain` thread exists, BLOCK (poll up to 100x50ms) until that thread has created the `c_mxr000` lv2 event queue, then correct key==0 -> c_mxr000. RPCS3 issue #18852 (cellSurMixer NULL-deref/hang on SEGA AM2/CRI titles) hinges on this. MEASURED CONTEXT: our boot reaches the CRI audio phase at ~200s (mixer tid=10 + cri_dlg/CriSr t9-t25), the c_mxr000 queue IS created and SetNotifyEventQueue IS called (via YZ_AUDIO_FORCE), but ours registers with no wait. A/B verdict (2026-07-06): FIRES (`surmixer-sync: c_mxr000 queue found after wait`) but INERT on the stall â€” the wall is the CRI SPU job chain a layer below; kept opt-in. NOTE requires >=250s boots to reach the CRI phase. |
 | `YZ_TIGHT` | import_overrides.cpp ~1032 | Tight-poll consumer (tested-negative as a fix). |
-| `YZ_AUDIO_FORCE` | libs/audio/cellAudio.c ~730 | Force audio port behavior. |
+| `YZ_AUDIO_FORCE` | libs/audio/cellAudio.c ~730 | **OBSOLETE s23 (2026-07-09, DONT_RECHASE #36): drop from the baseline.** pt30-era force (port running at open + hardcoded mixer-queue registration); s23boot4 measured the game calling cellAudioPortStart + SetNotifyEventQueue ITSELF, wall unchanged without it. |
 | `YZ_SKIP_VOICE` | yakuza/shims.cpp ~218 | Skip the CRI intro-voice path â€” useful as a RECON probe past the movie gate, not a shipping path. |
 | `YZ_MOVIE_TEST` | yakuza/import_overrides.cpp (yz_window_thread) | `=<path.sfd>`: standalone proof of the host movie path â€” decode the .sfd with FFmpeg (libs/codec/movie_ffmpeg.c) and present it straight to the D3D12 window via `rsx_live_draw_present_rgba` (movie mode gates the guest's draws off). Verified 2026-07-04: plays hd_sega_logo_us1012.sfd end-to-end, 100 frames, no crash. NOT the game hook â€” just proves decodeâ†’present in-process. Needs YZ_RSX_DRAW on. |
 | `YZ_ADX_RELEASE_TEST` | libs/filesystem/cellFs.c (`yz_adx_release_test_tick`) | **2026-07-04, decisive control-flow experiment (default OFF), independent of `YZ_ADX_HLE`.** Fires the SAME two calls a real ADX decode batch would (`yz_adx_hle_advance_adxm` + `yz_adx_hle_release_spurs_waiter`, i.e. advance ADXM `0x01613368+0x294/+298/+29C` to a fabricated monotonic "N blocks decoded" value, then call the guest's real `cellSpursEventFlagSet` on `0x63D61720` with all bits set) UNCONDITIONALLY on every `.cvm`/voice-stream `cellFsRead`, with NO real decode (silent/zero PCM â€” tests the control-flow release only, not audio). Purpose: settle whether the SPURS-release lever is even the right one BEFORE building an AHX/MPEG-Layer-II decoder (YZ_ADX_HLE was measured inert on the real stream â€” it's AHX not ADX). REMOVE once the SPURS-release question is settled either way. |
@@ -406,6 +406,29 @@ root fix for the phase-2 bootstrap deadlock. The consumer, on GCM_SET_USER_COMMA
 the EBOOT's only _cellSpursSendSignal path (the wid4 pool pump). Prints `[ucmd]` first 40 +
 every 256th. Faithful mechanism (RPCS3 rsx_methods.cpp:68, sys_rsx.cpp:931), not a force —
 the switch exists only for A/B regression isolation; retire it after a quiet stretch.
+
+`YZ_NO_FLIPHEAD` (yakuza/import_overrides.cpp `yz_rsx_method` 0xE920/0xE924, 2026-07-08 s23,
+kill-switch, default OFF = mechanism ON, armed banner `[fliphead] armed` on the consumer's first
+method): disables the GCM_FLIP_HEAD IMMEDIATE-flip dispatch. The consumer routes method
+0xE920+head*4 to our existing `yz_sys_rsx_context_attribute` pkg-0x102 display-flip case (the
+cellGcmSetFlipImmediate path RPCS3 binds via rsx_methods.cpp:1729 `gcm::driver_flip` →
+sys_rsx.cpp:574-627: arg bit31 = grab-queued-buffer, else display-buffer offset). Closes the
+top-ranked gap of the s22 RSX method-coverage audit (scratch/rsx_method_coverage_audit.md, same
+silently-dropped-method class as 0xEB00, blocker #20 3rd instance). Prints `[fliphead]` first 16
++ every 1024th — the banner + zero hits is the MEASURED answer to the audit's open "is 0xE920
+live during boot?" question. Faithful mechanism, not a force; retire after a quiet stretch.
+**s23 A/B verdict (DONT_RECHASE #35): the method is EARLY-PHASE ONLY (16..1023 hits/boot,
+head=1 arg=0x8000010F); the audio wall is identical with it on/off. The fix stays as driver
+contract, not as a boot unblocker.**
+
+`YZ_NO_SEMARM` (yakuza/import_overrides.cpp SEMAPHORE_RELEASE handler, 2026-07-09 s23,
+kill-switch, default OFF = heuristic stays ON, armed banner `[semarm] armed` on first flip-label
+release): disables the sema-release flip-ARM COMPENSATING HEURISTIC (a nonzero release to the
+flip label label+0x10 arms g_rsx_flip_pending). RPCS3's nv406e::semaphore_release does NOT arm
+flips — the real trigger is the driver methods; while the heuristic stays on, any non-flip label
+write manufactures a phantom flip (uncommanded present + 0x40C00000 throttle bump + FLIP event).
+Retirement path: implement the FAITHFUL arm in the QUEUE handler (0xE940/pkg-0x103, mirroring
+RPCS3's on_frame_end) first, A/B this switch, then flip the default. NOT yet A/B'd.
 
 `YZ_WID4` (runtime/spu/spu_dma.h GETLLAR path, 2026-07-08 s22, armed banner `[spu-ls4] armed`):
 uncapped low-rate (every 500k mgmt GETLLARs) steady-state sampler of wid4's SELECT gate —
