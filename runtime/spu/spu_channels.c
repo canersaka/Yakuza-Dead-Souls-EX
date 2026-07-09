@@ -1886,6 +1886,20 @@ void spu_indirect_branch(spu_context* ctx)
                     ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1]);
             for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[(a + i) & SPU_LS_MASK]);
             fprintf(stderr, "\n");
+            /* s24 SOURCE ATTRIBUTION (the 0x2004 phantom-death race, DONT_RECHASE
+             * #34, measured load-bearing in scratch/s24ride2.err: the dead kernel
+             * thread beheads the wid4 round publisher at ~round 24 and the whole
+             * boot wedges on SEMAPHORE_ACQUIRE). The TARGET (0) never named the
+             * bug; the host return address is inside the lifted SPU function that
+             * executed the `bi` -- resolve the RVA against yakuza_recomp.map
+             * (crash-symbolization workflow, LESSONS #12). spu_id names the
+             * victim thread. */
+#if defined(_MSC_VER)
+            { void* ra = _ReturnAddress();
+              fprintf(stderr, "[SPU] unknown-branch SOURCE: spu=%X host_ra=%p "
+                      "(resolve RVA vs yakuza_recomp.map)\n",
+                      ctx->spu_id, ra); }
+#endif
             fflush(stderr);
         }
     }

@@ -728,6 +728,61 @@ static const yz_func_entry* yz_func_from_guest(uint32_t addr)
 
 /* Dump guest registers + walk the PPC64 back-chain (per-frame code pointers +
  * total depth). Shared by the crash handler and the stall watchdog. */
+/* ---- s24 round-driver chain probe (2026-07-09) --------------------------
+ * scratch/patch_chain_probes.py injects `yz_chain_probe(ctx, 0xADDR)` at the
+ * ENTRY of the tick-chain functions in the recomp chunks (oracle chain:
+ * func_00DDDA6C -> 00DDDB3C -> 000D0CD8 -> 00D1E838 -> round driver 00A9F8AC,
+ * plus the job writer 00E5F094 as the known-live control). This is the ONLY
+ * instrument that sees direct-`bl` entries: the lifter's bl is a plain C call
+ * (no ctx->lr write -> no saved-LR walk) and the tramp guard sees only
+ * tail-branch hops. Volume-bounded: 4 first-hits per site + one census line
+ * per 5 s (LESSONS #6c); racy counters tolerable (census). The first-hit
+ * banner + the control site make zero-hit negatives MEASURED (LESSONS #21b). */
+static unsigned g_yz_chain_addrs[16];
+static volatile long long g_yz_chain_counts[16];
+
+/* Independent census printer (LESSONS #6d: the in-probe census goes silent the
+ * moment the probed functions stop running — exactly when the counters matter
+ * most). Called from the probe's 5 s tick AND from the watchdog periodically. */
+void yz_chain_census_dump(const char* tag)
+{
+    fprintf(stderr, "[chain] census(%s) t=%llums:", tag,
+            (unsigned long long)GetTickCount64());
+    for (int k = 0; k < 16 && g_yz_chain_addrs[k]; k++)
+        fprintf(stderr, " 0x%08X=%lld", g_yz_chain_addrs[k],
+                (long long)g_yz_chain_counts[k]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
+{
+    unsigned* as = g_yz_chain_addrs;
+    volatile long long* ns = g_yz_chain_counts;
+    static int banner = 0;
+    static unsigned long long lastms = 0;
+    ppu_context* ctx = (ppu_context*)ctxv;
+    int i = 0;
+    for (; i < 15 && as[i] && as[i] != addr; i++) {}
+    if (!as[i]) as[i] = addr;
+    long long n = ++ns[i];
+    if (!banner) {
+        banner = 1;
+        fprintf(stderr, "[chainprobe] ARMED (first hit 0x%08X tid=%u)\n",
+                addr, yz_thread_current_id());
+    }
+    if (n <= 4)
+        fprintf(stderr, "[chain] 0x%08X hit#%lld tid=%u r3=0x%llX r4=0x%llX r5=0x%llX\n",
+                addr, n, yz_thread_current_id(),
+                (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                (unsigned long long)ctx->gpr[5]);
+    unsigned long long now = GetTickCount64();
+    if (now - lastms >= 5000) {
+        lastms = now;
+        yz_chain_census_dump("probe");
+    }
+}
+
 void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 {
     if (!gc) return;
@@ -764,6 +819,35 @@ void yz_dump_guest_state(const ppu_context* gc, const char* tag)
         sp = back;
     }
     fprintf(stderr, "\n[%s] back-chain total frames: %d\n", tag, total);
+
+    /* VALIDATED chain (2026-07-09 s24): saved-LR walk matching the RPCS3 oracle
+     * walker (bc 8-aligned + climbing, LR at bc+0x10, 4-aligned, in a code range
+     * INCLUDING firmware 0x02xxxxxx -- the scan above filtered libsre frames out
+     * entirely and mis-symbolized frame data, LESSONS #12). One line, oracle
+     * format, so ours-vs-RPCS3 chains diff cleanly. */
+    {
+        fprintf(stderr, "[%s] validated chain (saved-LR walk):", tag);
+        uint32_t cur = (uint32_t)gc->gpr[1];
+        int printed = 0;
+        for (int d = 0; d < 64 && printed < 24; d++) {
+            if (cur < 0x10000u || (cur & 7) ||
+                (vm_base && IsBadReadPtr(vm_base + cur, 8))) break;
+            uint32_t back = (uint32_t)vm_read64(cur);
+            if ((back & 7) || back <= cur || back - cur > 0x100000u) break;
+            if (vm_base && IsBadReadPtr(vm_base + back + 0x10, 8)) break;
+            uint32_t slr = (uint32_t)vm_read64(back + 0x10);
+            int in_game = (slr >= EXE_LO && slr < EXE_HI);
+            int in_fw   = (slr >= 0x02000000u && slr < 0x02400000u);
+            if (!(slr & 3u) && (in_game || in_fw)) {
+                fprintf(stderr, " 0x%08X", slr);
+                if (const yz_func_entry* fe = yz_func_from_guest(slr))
+                    fprintf(stderr, "(f%08X+0x%X)", fe->addr, slr - fe->addr);
+                printed++;
+            }
+            cur = back;
+        }
+        fprintf(stderr, " [frames=%d]\n", printed);
+    }
 
     /* TEMP DEBUG (flip stall): dump memory at the pointer-like registers + the
      * known gcm sync locations, so we can see exactly which value the parked
@@ -1134,6 +1218,17 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-60s"); }
+    /* s24: keep sampling forever (read-only dumps only). The fixed 30/45/60 s
+     * schedule missed every late wedge — e.g. the iteration-4 wedge at ~207 s
+     * had no dump. Every 60 s: t1 guest state + the chain-probe census (the
+     * in-probe census goes silent exactly when t1 wedges, LESSONS #6d). */
+    for (int mins = 2; ; mins++) {
+        Sleep(60000);
+        char tag[32];
+        snprintf(tag, sizeof tag, "watchdog-%dm", mins);
+        if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, tag);
+        yz_chain_census_dump(tag);
+    }
     return 0;
 }
 

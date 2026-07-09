@@ -621,7 +621,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * no EA filter — classify offline by pc (retire pcs 0x63EC/0x6424/0x645C;
      * ctx saves lsa 0x2C80-0x3000; kernel lock-line PUTLLCs by their mgmt
      * EAs). REMOVE with the journal-consumer frontier. */
-    { static int gp = -1; if (gp < 0) gp = getenv("YZ_GSPUT") ? 1 : 0;
+    { static int gp = -1; if (gp < 0) { gp = getenv("YZ_GSPUT") ? 1 : 0;
+          if (gp) { fprintf(stderr, "[gs-put] ARMED: image-0 put-class DMA watch live\n"); fflush(stderr); } }
       if (gp && spu->image_id == 0
              && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
                  cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
