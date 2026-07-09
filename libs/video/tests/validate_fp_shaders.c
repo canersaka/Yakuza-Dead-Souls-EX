@@ -96,7 +96,7 @@ int main(int argc, char** argv)
         if (size == 0) { no_end++; size = (u32)n; }
         tally_opcodes(filebuf, size);
 
-        int instrs = rsx_fp_decompile(filebuf, size, hlsl, sizeof(hlsl));
+        int instrs = rsx_fp_decompile(filebuf, size, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         if (instrs < 0) { decode_err++; continue; }
 
         /* Scan for unhandled-opcode markers the decompiler emits. */

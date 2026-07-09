@@ -56,6 +56,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -187,8 +188,13 @@ static void apply_block(const rxs_stream* s, u32 index)
 #define MAX_SURFACES 64
 
 /* Uploaded-texture cache (guest textures decoded once, keyed on the
- * descriptor; block re-applies over texture memory are NOT tracked) */
-#define MAX_TEXTURES 128
+ * descriptor; block re-applies over texture memory are NOT tracked).
+ * One capture frame references well over the old 128-entry cap; once the
+ * cache filled, every further distinct texture fell back to the white slot
+ * (visible as flat-white UI panels and untextured composites). Sized to
+ * hold a whole frame's texture set. The cache heap is CPU-side (non
+ * shader-visible) so its descriptor count is unconstrained. */
+#define MAX_TEXTURES 4096
 #define UPLOAD_SIZE  (64u * 1024 * 1024)
 
 /* CPU-side SRV cache heap layout: [0] 1x1 white fallback, [1..] surfaces,
@@ -222,6 +228,7 @@ static void apply_block(const rxs_stream* s, u32 index)
 typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;
+    u32             draw_hits;   /* draws that targeted this surface this run */
 } surface_t;
 
 typedef struct {
@@ -232,6 +239,11 @@ typedef struct {
 typedef struct {
     u64                  key;   /* combined VP+FP ucode hash                */
     ID3D12PipelineState* pso;   /* NULL = translation failed, use fallback  */
+    int                  skinned; /* [skin] diag: vp_c[467] literal seen in
+                                    * the decompiled HLSL (4-bone skinning
+                                    * scale-const pattern), cached so a PSO
+                                    * cache HIT can still be tagged without
+                                    * re-decompiling every draw            */
 } psocache_t;
 
 typedef struct {
@@ -976,6 +988,39 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
     g.vb_used = 0;
     g.cb_used = 0;
     g.srv_ring_used = 0;
+    g.upload_used = 0;   /* copies completed; recycle the staging arena */
+}
+
+/* Mid-frame flush: execute the accumulated command list, wait for the GPU,
+ * then reopen it and recycle the per-flush ring buffers (vertex buffer,
+ * constant ring, SRV table ring). Render/depth surfaces are committed
+ * resources that keep their contents across the flush, and the clears
+ * already recorded have executed, so this is transparent to the frame being
+ * built. Used when the vertex upload buffer would overflow so that a capture
+ * with more geometry than one buffer-full can still draw every batch. */
+static u32 g_flush_count;
+static void gpu_flush(void)
+{
+    g.list->lpVtbl->Close(g.list);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    gpu_wait();
+
+    g.alloc->lpVtbl->Reset(g.alloc);
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    D3D12_VIEWPORT vp = {0, 0, (float)g.width, (float)g.height, 0.0f, 1.0f};
+    D3D12_RECT sc = {0, 0, (LONG)g.width, (LONG)g.height};
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    g.vb_used = 0;
+    g.cb_used = 0;
+    g.srv_ring_used = 0;
+    /* All texture-upload copies recorded before this flush have completed on
+     * the GPU (gpu_wait above), so the staging arena can be recycled. Without
+     * this the bump arena overflows once a frame references more texture bytes
+     * than the arena holds. */
+    g.upload_used = 0;
+    g_flush_count++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1049,6 +1094,23 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
         s[3] = (u8)((v & 0x1F) * 255 / 31);
         break;
     }
+    case RSX_TEX_FMT_R5G6B5: {                  /* BE 16-bit 565, no alpha */
+        const u16 v = (u16)((p[0] << 8) | p[1]);
+        s[0] = 255;
+        s[1] = (u8)(((v >> 11) & 0x1F) * 255 / 31);
+        s[2] = (u8)(((v >> 5)  & 0x3F) * 255 / 63);
+        s[3] = (u8)((v & 0x1F) * 255 / 31);
+        break;
+    }
+    case RSX_TEX_FMT_G8B8:                       /* two 8-bit channels G,B */
+        /* NV40 G8B8: MSB-first byte pair = G (p[0]), B (p[1]); no native R
+         * (replicate G so grayscale/identity reads are sane), opaque alpha.
+         * The crossbar remap word then selects the shader-visible channels. */
+        s[0] = 255;
+        s[1] = p[0];
+        s[2] = p[0];
+        s[3] = p[1];
+        break;
     case RSX_TEX_FMT_DEPTH24_D8:
         /* D24S8 sampled as a color: broadcast the depth (top byte of the
          * BE word's 24-bit depth field) — 8-bit approximation */
@@ -1094,6 +1156,9 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 #define M_CULL_FACE          0x1830   /* 0x404=FRONT 0x405=BACK 0x408=F&B    */
 #define M_FRONT_FACE         0x1834   /* 0x900=CW 0x901=CCW                  */
 #define M_CULL_FACE_ENABLE   0x183C
+#define M_COLOR_MASK         0x0324   /* per-channel byte mask (nv40_3d.xml.h:
+                                        * B=[0:7] G=[8:15] R=[16:23] A=[24:31],
+                                        * Mesa/nouveau nv40 3D engine, MIT/X11) */
 
 /* gcm comparison func (0x200..0x207) -> D3D12_COMPARISON_FUNC (1..8) */
 static D3D12_COMPARISON_FUNC gcm_cmp(u32 f)
@@ -1167,6 +1232,7 @@ typedef struct {
     u32 depth_test, depth_write;
     u32 depth_func;
     u32 cull_enable, cull_face, front_face;
+    u32 color_mask;
 } render_state_t;
 
 static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
@@ -1185,6 +1251,11 @@ static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
     rs->cull_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE) & 1;
     rs->cull_face   = rsx_dsp_reg(rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(rsx, M_FRONT_FACE);
+    /* RSX/nv40 default (register never written) is all channels enabled;
+     * the capture confirms this (no COLOR_MASK write before the earliest
+     * draws still show correct channel output). */
+    const u32 cm = rsx_dsp_reg(rsx, M_COLOR_MASK);
+    rs->color_mask = cm ? cm : 0xFFFFFFFFu;
 }
 
 /* Populate a D3D12 PSO descriptor's blend/depth/raster/DSV fields from rs.
@@ -1193,7 +1264,13 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
                                const render_state_t* rs)
 {
     D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
-    b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    /* nv40_3d COLOR_MASK byte layout (Mesa/nouveau nv40_3d.xml.h, MIT/X11):
+     * B=[0:7] G=[8:15] R=[16:23] A=[24:31]; any nonzero byte = channel on. */
+    b->RenderTargetWriteMask =
+        (((rs->color_mask       ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_BLUE  : 0) |
+        (((rs->color_mask >>  8 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
+        (((rs->color_mask >> 16 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_RED   : 0) |
+        (((rs->color_mask >> 24 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0);
     if (rs->blend_enable && g_b1_blend) {
         b->BlendEnable   = TRUE;
         b->SrcBlend      = gcm_blend_factor(rs->sf_rgb, 0);
@@ -1315,7 +1392,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             return e->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
     }
     if (g.n_textures >= MAX_TEXTURES) {
-        printf("[gpu] texture cache full\n");
+        static int warned = 0;
+        if (!warned) { printf("[gpu] texture cache full (%u), further textures white\n", MAX_TEXTURES); warned = 1; }
         return SRV_WHITE;
     }
     texcache_t* e = &g.textures[g.n_textures];
@@ -1380,7 +1458,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         switch (base_fmt) {
         case RSX_TEX_FMT_B8:       texel_sz = 1; break;
         case RSX_TEX_FMT_A4R4G4B4:
-        case RSX_TEX_FMT_A1R5G5B5: texel_sz = 2; break;
+        case RSX_TEX_FMT_A1R5G5B5:
+        case RSX_TEX_FMT_R5G6B5:
+        case RSX_TEX_FMT_G8B8:     texel_sz = 2; break;
         case RSX_TEX_FMT_A8R8G8B8:
         case RSX_TEX_FMT_DEPTH24_D8: texel_sz = 4; break;
         default:                   texel_sz = 0; break;
@@ -1436,8 +1516,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     if (e->tex)
         srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
     else
-        printf("[gpu] tex fallback: off=0x%X fmt=0x%02X %ux%u pitch=%u %s\n",
-               t->offset, t->format, w, h, t->pitch, linear ? "linear" : "swizzled");
+        printf("[gpu] tex fallback: off=0x%X fmt=0x%02X %ux%u pitch=%u %s dim=%u cube=%u mips=%u loc=%u\n",
+               t->offset, t->format, w, h, t->pitch, linear ? "linear" : "swizzled",
+               t->dimension, t->cubemap, t->mipmaps, t->location);
     if (getenv("YZ_B1_TEXLOG"))
         printf("[texlog] off=0x%X fmt=0x%02X %ux%u mips=%u filter minf=%u magf=%u %s\n",
                t->offset, t->format, w, h, t->mipmaps,
@@ -1540,9 +1621,17 @@ static ID3D12PipelineState* build_translated_pso(const char* vs_hlsl, const char
 }
 
 /* Resolve (and cache) the PSO for the currently-bound VP+FP pair.
- * Returns NULL when either program can't be translated (use the fallback). */
-static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
+ * Returns NULL when either program can't be translated (use the fallback).
+ * [skin] diag: *out_key gets the PSO cache key (vp key/hash for the log),
+ * *out_skinned gets whether the active VP's decompiled HLSL contains the
+ * literal "vp_c[467]" (the 4-bone linear-blend skinning scale constant
+ * read, see scratch/s24_replay_fixes.md "The remaining defect"). Both
+ * out-params are set on every path, including the early-return misses. */
+static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out_key, int* out_skinned)
 {
+    if (out_key) *out_key = 0;
+    if (out_skinned) *out_skinned = 0;
+
     /* active transform program */
     const u32 start = rsx_dsp_vp_start(rsx);
     if (start >= RSX_DSP_VP_INSTR)
@@ -1565,16 +1654,27 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
     if (!fp_size)
         return NULL;
 
+    /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
+     * SHADER_CONTROL word; fold the deciding bit into the cache key so a
+     * program reused under a different export mode gets its own PSO. */
+    const u32 fp_ctrl = rsx_dsp_shader_control(rsx);
+
     u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
     key = fnv1a(fp_uc, fp_size, key);
+    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+    key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     /* B1: the PSO bakes the render state, so it must be part of the cache key */
     render_state_t rs;
     decode_render_state(rsx, &rs);
     key = fnv1a(&rs, sizeof(rs), key);
 
+    if (out_key) *out_key = key;
+
     for (u32 i = 0; i < g.n_psos; i++)
-        if (g.psos[i].key == key)
+        if (g.psos[i].key == key) {
+            if (out_skinned) *out_skinned = g.psos[i].skinned;
             return g.psos[i].pso;
+        }
     if (g.n_psos >= MAX_PSOS) {
         printf("[xlat] PSO cache full\n");
         return NULL;
@@ -1584,12 +1684,28 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
     static char ps_hlsl[256 * 1024];
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
-    const int fi = rsx_fp_decompile(fp_uc, fp_size, ps_hlsl, sizeof(ps_hlsl));
+    const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
         printf("[xlat] decompile failed (vp=%d fp=%d) key=%016llx\n", vi, fi,
                (unsigned long long)key);
+
+    /* [skin] diag, CORRECTED (see scratch/s25_skin_diag.md): the original
+     * "vp_c[467]" literal-string heuristic was a false-positive magnet —
+     * cross-checking the shader corpus (scratch/shd_dump2/) showed 201
+     * VPs read constant 467 for all sorts of unrelated per-object scale/
+     * bias math, of which only 72 are real 4-bone skinning (matching the
+     * prior session's count exactly). The reliable signature is the
+     * INDEXED constant read itself: rsx_vp_decompile emits
+     * "vp_c[(NNNu + a0.x) & 511u]" only for index_const=1 sources (the
+     * a0-relative bone-matrix fetch); a plain "vp_c[467]" is emitted for
+     * an ordinary unindexed constant read and proves nothing about
+     * skinning. Every one of the 72 true indexed-read VPs also happens to
+     * read vp_c[467] elsewhere (0 false negatives measured), so this is a
+     * strict tightening, not a different population. */
+    const int is_skinned = (vi > 0) && strstr(vs_hlsl, "& 511u") != NULL;
+    if (out_skinned) *out_skinned = is_skinned;
 
     if (g_dump_dir) {
         dump_text("vp", key, "hlsl", vs_hlsl, (u32)strlen(vs_hlsl));
@@ -1601,6 +1717,7 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx)
 
     g.psos[g.n_psos].key = key;
     g.psos[g.n_psos].pso = pso;
+    g.psos[g.n_psos].skinned = is_skinned;
     g.n_psos++;
     if (pso) {
         g_xlat_ok++;
@@ -1644,6 +1761,31 @@ typedef struct {
     u32    n_verts;
     u32    cap_verts;
     int    fetch_ok;
+
+    /* Primitive-restart cut points (root cause, session s25c): a guest
+     * index equal to the RSX restart sentinel (NV4097_SET_RESTART_INDEX,
+     * confirmed measured = 0xFFFF for this capture's 16-bit index buffers)
+     * ends the current TRIANGLE_STRIP/FAN run with NO connecting triangle.
+     * fetch_batches() records the c->n_verts position at each restart
+     * occurrence instead of pushing a phantom vertex; sink_end()'s
+     * STRIP/FAN expansion must not bridge across a cut. */
+    u32    cuts[520];
+    u32    n_cuts;
+
+    /* [skin] diag: the guest vertex index of the first vertex fetched this
+     * batch (pre-attribute-conversion), so sink_end can independently
+     * re-fetch ATTR7's raw bytes for the exact vertex that landed in
+     * tri[0] (see fetch_one()). */
+    u32    dbg_first_vert;
+    int    dbg_first_vert_valid;
+
+    /* s25c: parallel record of the resolved guest vertex index for every
+     * pushed vertex this draw (whichever of array-sequential or
+     * index-buffer-decoded "vert" fetch_one() was called with), so a
+     * RSX_LOG_DRAW draw can name exactly which guest index produced an
+     * anomalous (e.g. all-zero) position. Capped; only filled when logging
+     * this draw (see fetch_one()). */
+    u32    dbg_vert_index[8192];
 
     const rxs_stream* stream;
 } sink_ctx;
@@ -1706,8 +1848,24 @@ static int fetch_attr(const rsx_dispatch* rsx, u32 index, u32 base_offset,
             out[c] = (float)v;
             break;
         }
+        case RSX_VTX_TYPE_CMP32: {
+            /* CELL_GCM_VERTEX_CMP: one BE 32-bit word packs three signed-
+             * normalized fields X:[0..10] Y:[11..21] Z:[10..31] (11/11/10),
+             * each normalized by its max positive magnitude (1023,1023,511).
+             * Always 3 components regardless of a.size; commonly a normal. */
+            const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) |
+                          ((u32)p[2] << 8) | (u32)p[3];
+            s32 x = (s32)(w & 0x7FF);        if (x & 0x400) x -= 0x800;
+            s32 y = (s32)((w >> 11) & 0x7FF); if (y & 0x400) y -= 0x800;
+            s32 z = (s32)((w >> 22) & 0x3FF); if (z & 0x200) z -= 0x400;
+            out[0] = (float)x / 1023.0f;
+            out[1] = (float)y / 1023.0f;
+            out[2] = (float)z / 511.0f;
+            out[3] = 1.0f;
+            return 1;                        /* consumed all components */
+        }
         default:
-            return 0; /* cmp32 etc: unhandled */
+            return 0; /* unhandled type */
         }
     }
     return 1;
@@ -1742,14 +1900,23 @@ static void sink_begin(void* user, const rsx_dispatch* rsx, u32 prim)
     c->n_arr = c->n_idx = 0;
     c->n_verts = 0;
     c->fetch_ok = 1;
+    c->dbg_first_vert_valid = 0;
+    c->n_cuts = 0;
 }
 
-static void push_vert(sink_ctx* c, const vtx_t* v)
+/* Forward decl: defined further down (env-parsed RSX_LOG_DRAW list); needed
+ * here so fetch_one() can record the resolved guest index per vertex only
+ * for draws actually being logged. */
+static int log_draw_index(u32 draw_index);
+
+static void push_vert(sink_ctx* c, const vtx_t* v, u32 vert_index)
 {
     if (c->n_verts >= c->cap_verts) {
         c->cap_verts = c->cap_verts ? c->cap_verts * 2 : 4096;
         c->verts = realloc(c->verts, c->cap_verts * sizeof(vtx_t));
     }
+    if (c->n_verts < 8192 && log_draw_index(c->draw_count))
+        c->dbg_vert_index[c->n_verts] = vert_index;
     c->verts[c->n_verts++] = *v;
 }
 
@@ -1777,6 +1944,10 @@ static void sink_draw_index_array(void* user, const rsx_dispatch* rsx, u32 first
 
 static void fetch_one(sink_ctx* c, const rsx_dispatch* rsx, u32 base, u32 vert)
 {
+    if (!c->dbg_first_vert_valid) {
+        c->dbg_first_vert = vert;
+        c->dbg_first_vert_valid = 1;
+    }
     vtx_t v;
     for (u32 i = 0; i < 16; i++) {
         rsx_dsp_vertex_attr a;
@@ -1797,7 +1968,7 @@ static void fetch_one(sink_ctx* c, const rsx_dispatch* rsx, u32 base, u32 vert)
             v.a[3][0] = v.a[3][1] = v.a[3][2] = 1.0f;
         }
     }
-    push_vert(c, &v);
+    push_vert(c, &v, vert);
 }
 
 /* Fetch every accumulated batch's vertices (called at END, once the draw's
@@ -1815,6 +1986,25 @@ static void fetch_batches(sink_ctx* c, const rsx_dispatch* rsx)
         return;
     rsx_dsp_index_array ia;
     rsx_dsp_get_index_array(rsx, &ia);
+    /* Root cause (session s25c, oracle: RPCS3 Emu/RSX/RSXThread.cpp's
+     * calculate_required_range() -- "if (value == restart) { continue; }" --
+     * and Emu/RSX/rsx_methods.h restart_index_enabled()/restart_index()):
+     * a raw index equal to the configured restart sentinel is a primitive-
+     * restart marker, not a real vertex reference. Measured this session
+     * (scratch/s25_skin_diag.md): every exploded-mesh draw on surf 0xE40000
+     * has exactly one such index (raw 65535, i.e. 0xFFFF, matching a 16-bit
+     * index buffer's default sentinel) landing mid-strip; fetching it as a
+     * real vertex reads whatever guest memory sits at "vertex 65535" (here,
+     * a region that happens to decode to position (0,0,0)), and the harness
+     * previously stitched it into the strip like any other vertex --
+     * fanning several long triangles out from that phantom point. */
+    /* Kill switch for quick A/B (diagnosing a wall-fracturing regression
+     * observed alongside the spike fix this session). */
+    static int s_no_restart = -1;
+    if (s_no_restart < 0)
+        s_no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+    const int restart_en = !s_no_restart && rsx_dsp_restart_index_enabled(rsx, ia.is_u32);
+    const u32 restart_val = rsx_dsp_restart_index(rsx);
     for (u32 r = 0; r < c->n_idx && c->fetch_ok; r++) {
         for (u32 i = 0; i < c->idx[r].count && c->fetch_ok; i++) {
             const u32 esz = ia.is_u32 ? 4 : 2;
@@ -1826,9 +2016,102 @@ static void fetch_batches(sink_ctx* c, const rsx_dispatch* rsx)
             const u32 index = ia.is_u32
                 ? (((u32)ip[0] << 24) | ((u32)ip[1] << 16) | ((u32)ip[2] << 8) | ip[3])
                 : (u32)((ip[0] << 8) | ip[1]);
+            if (restart_en && index == restart_val) {
+                if (c->n_cuts < 520)
+                    c->cuts[c->n_cuts++] = c->n_verts;
+                continue;
+            }
             fetch_one(c, rsx, base, base_index + index);
         }
     }
+}
+
+/* [skin] attribution probe (coordinator follow-up, session s25b): RSX_SKIP_DRAW
+ * = comma-separated list of draw indices (the same "[draw N]"/"[skin] draw N"
+ * numbering already printed) to drop from sink_end() entirely — no vertex
+ * buffer write, no PSO bind, no DrawInstanced — so the composite/surface
+ * dumps can be pixel-compared against a baseline run to test "does removing
+ * this ONE draw remove the spiky mesh". Parsed once; prints an armed banner
+ * (LESSONS #21: a negative result needs a live probe, not a silent no-op). */
+static int skip_draw_index(u32 draw_index)
+{
+    static int inited = 0;
+    static u32 list[4096];
+    static u32 n = 0;
+    if (!inited) {
+        inited = 1;
+        const char* env = getenv("RSX_SKIP_DRAW");
+        if (env && env[0]) {
+            static char buf[65536];
+            strncpy(buf, env, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            /* tokens are either a plain index or an "A-B" inclusive range,
+             * so a whole surface's draw span can be dropped in one probe */
+            char* tok = strtok(buf, ",");
+            while (tok && n < 4096) {
+                char* dash = strchr(tok, '-');
+                if (dash) {
+                    *dash = '\0';
+                    u32 lo = (u32)strtoul(tok, NULL, 10);
+                    u32 hi = (u32)strtoul(dash + 1, NULL, 10);
+                    for (u32 v = lo; v <= hi && n < 4096; v++)
+                        list[n++] = v;
+                } else {
+                    list[n++] = (u32)strtoul(tok, NULL, 10);
+                }
+                tok = strtok(NULL, ",");
+            }
+            printf("[replay] RSX_SKIP_DRAW ARMED: %u draw(s) will be dropped from sink_end"
+                   " (first few:", n);
+            for (u32 i = 0; i < n && i < 10; i++)
+                printf(" %u", list[i]);
+            printf("%s)\n", n > 10 ? " ..." : "");
+        }
+    }
+    for (u32 i = 0; i < n; i++)
+        if (list[i] == draw_index)
+            return 1;
+    return 0;
+}
+
+/* RSX_LOG_DRAW = comma/range list of draw indices (same numbering as
+ * RSX_SKIP_DRAW) to force the full per-draw diagnostic block (state
+ * dump + texture list) regardless of the is_skinned classification or the
+ * draw_count<40 cap — for comparing one named draw's full state (e.g. a
+ * bisection-identified culprit) against a healthy draw sharing the same VP. */
+static int log_draw_index(u32 draw_index)
+{
+    static int inited = 0;
+    static u32 list[4096];
+    static u32 n = 0;
+    if (!inited) {
+        inited = 1;
+        const char* env = getenv("RSX_LOG_DRAW");
+        if (env && env[0]) {
+            static char buf[65536];
+            strncpy(buf, env, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            char* tok = strtok(buf, ",");
+            while (tok && n < 4096) {
+                char* dash = strchr(tok, '-');
+                if (dash) {
+                    *dash = '\0';
+                    u32 lo = (u32)strtoul(tok, NULL, 10);
+                    u32 hi = (u32)strtoul(dash + 1, NULL, 10);
+                    for (u32 v = lo; v <= hi && n < 4096; v++)
+                        list[n++] = v;
+                } else {
+                    list[n++] = (u32)strtoul(tok, NULL, 10);
+                }
+                tok = strtok(NULL, ",");
+            }
+            printf("[replay] RSX_LOG_DRAW ARMED: %u draw(s) will be force-logged\n", n);
+        }
+    }
+    for (u32 i = 0; i < n; i++)
+        if (list[i] == draw_index)
+            return 1;
+    return 0;
 }
 
 /* Expand the accumulated primitive to a triangle/line list and record a draw. */
@@ -1843,6 +2126,168 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         return;
     }
 
+    /* RSX_LOG_DRAW extra: scan every fetched vertex's ATTR0 (position) for
+     * this draw and print the bounding box + any outlier beyond a generous
+     * scene-scale radius, and any NaN/Inf. Tests the "one bad vertex in a
+     * long strip/fan scatters into a spike" hypothesis directly, independent
+     * of the skinning-constant path — a strip shares vertices between
+     * adjacent triangles, so a single corrupted position fans out into
+     * several long degenerate triangles exactly like the observed spikes. */
+    if (log_draw_index(c->draw_count)) {
+        float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+        u32 n_outlier = 0, n_nan = 0;
+        int first_outlier = -1;
+        for (u32 vi = 0; vi < c->n_verts; vi++) {
+            const float* p = c->verts[vi].a[0];
+            int bad = 0;
+            for (int k = 0; k < 3; k++) {
+                if (p[k] != p[k]) { bad = 1; n_nan++; } /* NaN */
+                else {
+                    if (p[k] < mn[k]) mn[k] = p[k];
+                    if (p[k] > mx[k]) mx[k] = p[k];
+                    if (p[k] > 500.0f || p[k] < -500.0f) bad = 1;
+                }
+            }
+            if (bad) {
+                n_outlier++;
+                if (first_outlier < 0) {
+                    first_outlier = (int)vi;
+                    printf("       [posscan] first outlier vertex #%u pos=(%.3f %.3f %.3f)\n",
+                           vi, p[0], p[1], p[2]);
+                }
+            }
+        }
+        printf("       [posscan] draw %u: %u verts, ATTR0 bbox min=(%.3f %.3f %.3f)"
+               " max=(%.3f %.3f %.3f), %u outlier(s) (|coord|>500), %u NaN\n",
+               c->draw_count, c->n_verts, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2],
+               n_outlier, n_nan);
+        /* Batch structure: does this draw accumulate MULTIPLE separate
+         * DRAW_ARRAYS/DRAW_INDEX_ARRAY (first,count) ranges into one
+         * BEGIN/END? If so, our PRIM_TRIANGLE_STRIP CPU expansion below
+         * treats the CONCATENATION as a single continuous strip, which
+         * would synthesize a bogus connecting triangle between the end of
+         * range N and the start of range N+1 whenever real hardware treats
+         * each accumulated range as an independent strip restart. */
+        {
+            rsx_dsp_index_array dbg_ia = {0};
+            if (c->n_idx)
+                rsx_dsp_get_index_array(rsx, &dbg_ia);
+            printf("       [batches] draw %u: n_arr=%u n_idx=%u n_cuts(restart)=%u"
+                   " idx_is_u32=%u restart_en=%u restart_val=%u\n",
+                   c->draw_count, c->n_arr, c->n_idx, c->n_cuts, dbg_ia.is_u32,
+                   c->n_idx ? rsx_dsp_restart_index_enabled(rsx, dbg_ia.is_u32) : 0,
+                   rsx_dsp_restart_index(rsx));
+        }
+        for (u32 bi = 0; bi < c->n_arr; bi++)
+            printf("         arr[%u] first=%u count=%u (ends at %u)\n",
+                   bi, c->arr[bi].first, c->arr[bi].count, c->arr[bi].first + c->arr[bi].count);
+        for (u32 bi = 0; bi < c->n_idx; bi++)
+            printf("         idx[%u] first=%u count=%u (ends at %u)\n",
+                   bi, c->idx[bi].first, c->idx[bi].count, c->idx[bi].first + c->idx[bi].count);
+        for (u32 ci = 0; ci < c->n_cuts; ci++)
+            printf("         cut[%u] at local vertex %u\n", ci, c->cuts[ci]);
+        /* Position jump AT each batch boundary in fetch (concatenation)
+         * order: arr[] batches are fetched first, then idx[] batches
+         * (fetch_batches()). A genuine continuous strip has small
+         * vertex-to-vertex distances throughout; a real restart point
+         * (which our concatenation does NOT insert a break for) should
+         * show as an anomalously large jump exactly at a batch boundary. */
+        {
+            u32 cum = 0;
+            int is_first = 1;
+            for (u32 bi = 0; bi < c->n_arr; bi++) {
+                cum += c->arr[bi].count;
+                if (!is_first || bi > 0) { /* boundary before this batch */ }
+                is_first = 0;
+                if (cum < c->n_verts && cum > 0) {
+                    const float* a = c->verts[cum - 1].a[0];
+                    const float* b = c->verts[cum].a[0];
+                    float d = sqrtf((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]));
+                    printf("         [boundary] after arr[%u] (local idx %u->%u): "
+                           "pos (%.3f %.3f %.3f) -> (%.3f %.3f %.3f) dist=%.3f\n",
+                           bi, cum - 1, cum, a[0], a[1], a[2], b[0], b[1], b[2], d);
+                }
+            }
+            for (u32 bi = 0; bi < c->n_idx; bi++) {
+                cum += c->idx[bi].count;
+                if (cum < c->n_verts && cum > 0) {
+                    const float* a = c->verts[cum - 1].a[0];
+                    const float* b = c->verts[cum].a[0];
+                    float d = sqrtf((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]));
+                    printf("         [boundary] after idx[%u] (local idx %u->%u): "
+                           "pos (%.3f %.3f %.3f) -> (%.3f %.3f %.3f) dist=%.3f\n",
+                           bi, cum - 1, cum, a[0], a[1], a[2], b[0], b[1], b[2], d);
+                }
+            }
+        }
+        /* Full internal scan: the batch-boundary fix (256-index chunking,
+         * likely just the DRAW_INDEX_ARRAY method's 8-bit count-field limit,
+         * not a real restart) did not remove the spike on rebuild+rerun --
+         * so look for the true largest consecutive-vertex jump ANYWHERE in
+         * the fetched run, not just at the two chunk seams. */
+        {
+            float worst = -1.0f;
+            u32 worst_i = 0;
+            for (u32 i = 0; i + 1 < c->n_verts; i++) {
+                const float* a = c->verts[i].a[0];
+                const float* b = c->verts[i + 1].a[0];
+                float d = sqrtf((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]));
+                if (d > worst) { worst = d; worst_i = i; }
+            }
+            if (worst >= 0.0f) {
+                const float* a = c->verts[worst_i].a[0];
+                const float* b = c->verts[worst_i + 1].a[0];
+                const int have_idx = worst_i + 1 < 8192;
+                printf("       [maxjump] draw %u: largest consecutive-vertex jump at local %u->%u"
+                       " (guest idx %u->%u):"
+                       " pos (%.3f %.3f %.3f) -> (%.3f %.3f %.3f) dist=%.3f\n",
+                       c->draw_count, worst_i, worst_i + 1,
+                       have_idx ? c->dbg_vert_index[worst_i] : 0xFFFFFFFFu,
+                       have_idx ? c->dbg_vert_index[worst_i + 1] : 0xFFFFFFFFu,
+                       a[0], a[1], a[2], b[0], b[1], b[2], worst);
+            }
+        }
+    }
+
+    /* Segment boundaries for the adjacency-dependent primitives below
+     * (STRIP/FAN): built from primitive-restart cut points recorded by
+     * fetch_batches() (c->cuts), NOT from DRAW_ARRAYS/DRAW_INDEX_ARRAY
+     * batch-call boundaries. An earlier version of this fix segmented on
+     * batch-call boundaries instead (RSX/NV40 hardware does distinguish
+     * disjoint primitives like TRIANGLES/QUADS from adjacency-dependent
+     * STRIP/FAN -- see RPCS3's Emu/RSX/Common/BufferUtils.cpp
+     * is_primitive_disjointed() -- and RPCS3's own draw_clause::append()
+     * does insert a primitive_restart_barrier at contiguous same-primitive
+     * batch seams); that version was built, rebuilt, and re-rendered this
+     * session and did NOT remove the visible spikes, refuting batch-call
+     * boundaries as the (or a sufficient) cut signal for THIS capture --
+     * likely because the observed 3-batch-per-draw pattern (variable,256,
+     * variable counts) is just DRAW_INDEX_ARRAY's 8-bit count-field
+     * encoding limit (256 = max per method call), not a genuine RPCS3-side
+     * FIFO-flattened multi-begin-end merge. The actual, measured root
+     * (confirmed by rebuilding with this fix and re-rendering, see
+     * scratch/s25_skin_diag.md): every exploded-mesh draw on surf 0xE40000
+     * contains a raw index of 65535 (0xFFFF) buried INSIDE one of those
+     * chunks -- the primitive-restart sentinel -- which fetch_batches()
+     * now detects and cuts on instead of fetching a phantom vertex. */
+    u32 seg_start[521], seg_count[521];
+    u32 n_seg = 0;
+    {
+        u32 prev = 0;
+        for (u32 ci = 0; ci < c->n_cuts && n_seg < 521; ci++) {
+            const u32 cut = c->cuts[ci];
+            seg_start[n_seg] = prev;
+            seg_count[n_seg] = cut > prev ? cut - prev : 0;
+            n_seg++;
+            prev = cut;
+        }
+        if (n_seg < 521) {
+            seg_start[n_seg] = prev;
+            seg_count[n_seg] = c->n_verts > prev ? c->n_verts - prev : 0;
+            n_seg++;
+        }
+    }
+
     /* CPU-expand to a triangle list */
     vtx_t* tri = NULL;
     u32 n_tri = 0;
@@ -1851,27 +2296,71 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         tri = c->verts;
         n_tri = c->n_verts - c->n_verts % 3;
         break;
-    case PRIM_TRIANGLE_STRIP:
+    case PRIM_TRIANGLE_STRIP: {
         if (c->n_verts < 3) return;
-        n_tri = (c->n_verts - 2) * 3;
+        u32 total = 0;
+        for (u32 s = 0; s < n_seg; s++)
+            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        if (!total) return;
+        n_tri = total;
         tri = malloc(n_tri * sizeof(vtx_t));
-        for (u32 i = 0; i + 2 < c->n_verts; i++) {
-            /* strip winding alternates; cull is off, keep it simple */
-            tri[i * 3 + 0] = c->verts[i];
-            tri[i * 3 + 1] = c->verts[i + 1];
-            tri[i * 3 + 2] = c->verts[i + 2];
+        u32 w = 0;
+        for (u32 s = 0; s < n_seg; s++) {
+            const u32 base = seg_start[s], cnt = seg_count[s];
+            if (cnt < 3) continue;
+            /* Strip winding alternates every other triangle to keep face
+             * orientation consistent (root cause, session s25d, coordinator
+             * hypothesis -- confirmed live: YZ_B1_CULL=0 A/B made the
+             * checkerboard vanish completely). Cull is very much NOT
+             * always off (RasterizerState.CullMode is a real, enabled
+             * D3D12 state whenever the guest's cull_enable/cull_face regs
+             * say so, gated by g_b1_cull -- default ON), so the previous
+             * "cull is off, keep it simple" comment was simply wrong,
+             * predating this session. Local `i` already resets to 0 at the
+             * start of every per-segment loop (a fresh C variable each `s`
+             * iteration), so parity is automatically reset at every
+             * primitive-restart cut with no extra bookkeeping needed --
+             * the bug was purely "never flips odd triangles", not a stale
+             * cross-segment parity counter. */
+            for (u32 i = 0; i + 2 < cnt; i++) {
+                if (i & 1) {
+                    tri[w * 3 + 0] = c->verts[base + i + 1];
+                    tri[w * 3 + 1] = c->verts[base + i];
+                    tri[w * 3 + 2] = c->verts[base + i + 2];
+                } else {
+                    tri[w * 3 + 0] = c->verts[base + i];
+                    tri[w * 3 + 1] = c->verts[base + i + 1];
+                    tri[w * 3 + 2] = c->verts[base + i + 2];
+                }
+                w++;
+            }
         }
         break;
-    case PRIM_TRIANGLE_FAN:
+    }
+    case PRIM_TRIANGLE_FAN: {
         if (c->n_verts < 3) return;
-        n_tri = (c->n_verts - 2) * 3;
+        u32 total = 0;
+        for (u32 s = 0; s < n_seg; s++)
+            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        if (!total) return;
+        n_tri = total;
         tri = malloc(n_tri * sizeof(vtx_t));
-        for (u32 i = 1; i + 1 < c->n_verts; i++) {
-            tri[(i - 1) * 3 + 0] = c->verts[0];
-            tri[(i - 1) * 3 + 1] = c->verts[i];
-            tri[(i - 1) * 3 + 2] = c->verts[i + 1];
+        u32 w = 0;
+        for (u32 s = 0; s < n_seg; s++) {
+            const u32 base = seg_start[s], cnt = seg_count[s];
+            if (cnt < 3) continue;
+            /* each segment fans from ITS OWN first vertex, not a global
+             * one -- a restart resets the fan's center, same as the strip
+             * case resets adjacency */
+            for (u32 i = 1; i + 1 < cnt; i++) {
+                tri[w * 3 + 0] = c->verts[base];
+                tri[w * 3 + 1] = c->verts[base + i];
+                tri[w * 3 + 2] = c->verts[base + i + 1];
+                w++;
+            }
         }
         break;
+    }
     case PRIM_QUADS: {
         const u32 quads = c->n_verts / 4;
         if (!quads) return;
@@ -1891,16 +2380,36 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         return;
     }
 
-    if (g.vb_used + n_tri * VERT_STRIDE > MAX_VERTS * VERT_STRIDE) {
-        printf("[replay] vertex buffer full, dropping draw (%u verts)\n", n_tri);
+    /* RSX_SKIP_DRAW attribution probe: drop this draw entirely (no VB write,
+     * no PSO, no DrawInstanced) but still consume its draw_count slot so
+     * every OTHER draw keeps the exact same index as the baseline run —
+     * that's what makes the before/after pixel-compare valid. */
+    if (skip_draw_index(c->draw_count)) {
+        printf("[replay] SKIP draw %u (RSX_SKIP_DRAW)\n", c->draw_count);
+        c->draw_count++;
         if (tri != c->verts) free(tri);
         return;
+    }
+
+    if ((u64)g.vb_used + (u64)n_tri * VERT_STRIDE > (u64)MAX_VERTS * VERT_STRIDE) {
+        if ((u64)n_tri * VERT_STRIDE > (u64)MAX_VERTS * VERT_STRIDE) {
+            /* A single batch larger than the whole buffer cannot be drawn
+             * without growing MAX_VERTS; drop it and report. */
+            printf("[replay] draw exceeds vertex buffer capacity, dropping"
+                   " (%u verts > %u cap)\n", n_tri, MAX_VERTS);
+            if (tri != c->verts) free(tri);
+            return;
+        }
+        /* Recycle the buffer: flush what we have, then keep recording. */
+        gpu_flush();
     }
 
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     /* Stage 4: translate the active VP+FP pair; NULL -> fixed fallback. */
-    ID3D12PipelineState* xpso = get_translated_pso(rsx);
+    u64 dbg_vp_key = 0;
+    int dbg_is_skinned = 0;
+    ID3D12PipelineState* xpso = get_translated_pso(rsx, &dbg_vp_key, &dbg_is_skinned);
     if (xpso && g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
         printf("[xlat] constant ring full, draw falls back\n");
         xpso = NULL;
@@ -1931,6 +2440,94 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     }
 
     const u32 target = current_surface(rsx);
+
+    /* [skin] diag (scratch/s24_replay_fixes.md "The remaining defect"):
+     * every draw whose VP was detected as 4-bone linear-blend skinning
+     * (get_translated_pso's vp_c[467] literal test) gets an UNCAPPED log
+     * line naming: draw index, target surface address, VP key/hash,
+     * vp_c[467].x (the a0.x bone-index scale const), vp_c[112/113/114].xyzw
+     * (candidate bone-matrix rows at the a0.x==0 base), ATTR7's declared
+     * format, and ATTR7's raw guest bytes + CPU-decoded value for the first
+     * vertex actually fetched this draw (c->dbg_first_vert). Suspects from
+     * the diagnostic plan: (a) bone rows 112.. never uploaded/wrong,
+     * (b) vp_c[467].x wrong, (c) ATTR7 type/stride decoded wrong.
+     *
+     * Session s25c (coordinator bisection follow-up): also fires for any
+     * draw named in RSX_LOG_DRAW, tagged "[state]" instead of "[skin]" when
+     * the draw isn't classified skinned, and extended with primitive/vertex
+     * count + c115 so a bisection-identified culprit draw's full state can
+     * be dumped and compared against a healthy draw sharing the same VP,
+     * regardless of the draw_count<40 cap or skin classification. */
+    const int dbg_force_log = log_draw_index(c->draw_count);
+    if (dbg_is_skinned || dbg_force_log) {
+        union { u32 u; float f; } c467x, c112[4], c113[4], c114[4], c115[4];
+        union { u32 u; float f; } c108[4], c109[4], c110[4], c111[4];
+        c467x.u = rsx_dsp_constant(rsx, 467)[0];
+        for (u32 k = 0; k < 4; k++) {
+            c112[k].u = rsx_dsp_constant(rsx, 112)[k];
+            c113[k].u = rsx_dsp_constant(rsx, 113)[k];
+            c114[k].u = rsx_dsp_constant(rsx, 114)[k];
+            c115[k].u = rsx_dsp_constant(rsx, 115)[k];
+            /* c108-111: NOT part of the skinning suspect list, but this
+             * specific draw's own VP source (scratch/shd_dump2/
+             * vp_e2884931033b0e65.hlsl:46-96) shows the clip-space position
+             * is dot(dot(v[0], c112..114), c108..111) -- i.e. object-space
+             * position first goes through 112-114 (measured identity here,
+             * consistent with the false-positive-VP finding earlier this
+             * session) and THEN through 108-111 as a second, separate
+             * matrix before reaching o[0]/SV_Position. 108-111 is the real
+             * suspect for THIS draw, not 112-115. */
+            c108[k].u = rsx_dsp_constant(rsx, 108)[k];
+            c109[k].u = rsx_dsp_constant(rsx, 109)[k];
+            c110[k].u = rsx_dsp_constant(rsx, 110)[k];
+            c111[k].u = rsx_dsp_constant(rsx, 111)[k];
+        }
+        if (dbg_force_log)
+            printf("       c108=(%.4f %.4f %.4f %.4f) c109=(%.4f %.4f %.4f %.4f)"
+                   " c110=(%.4f %.4f %.4f %.4f) c111=(%.4f %.4f %.4f %.4f)\n",
+                   c108[0].f, c108[1].f, c108[2].f, c108[3].f,
+                   c109[0].f, c109[1].f, c109[2].f, c109[3].f,
+                   c110[0].f, c110[1].f, c110[2].f, c110[3].f,
+                   c111[0].f, c111[1].f, c111[2].f, c111[3].f);
+
+        rsx_dsp_vertex_attr a7;
+        rsx_dsp_get_vertex_attr(rsx, 7, &a7);
+        static const char* type_names[8] = {
+            "none", "SNORM16", "FLOAT", "HALF", "UNORM8", "SINT16", "CMP32", "UINT8"
+        };
+        const char* a7_type_name = a7.type < 8 ? type_names[a7.type] : "?";
+
+        const u32 base_off = rsx_dsp_vertex_data_base_offset(rsx);
+        const u32 addr7 = base_off + a7.offset +
+            (c->dbg_first_vert_valid ? c->dbg_first_vert : 0) * a7.stride;
+        const u8* p7 = guest_ptr(a7.location, addr7);
+        char raw_hex[3 * 16 + 1] = {0};
+        if (p7 && addr7 <= ARENA_SIZE - 16) {
+            const u32 n_raw = 16; /* fixed safety-bound dump, independent of decoded type/size */
+            for (u32 k = 0; k < n_raw; k++)
+                snprintf(raw_hex + k * 3, 4, "%02X ", p7[k]);
+        } else {
+            snprintf(raw_hex, sizeof(raw_hex), "<unmapped/near-end loc=%u addr=0x%X>", a7.location, addr7);
+        }
+
+        const char* tag = dbg_is_skinned ? "[skin]" : "[state]";
+        printf("%s draw %u prim=%u verts=%u surf=0x%X vp_key=%016llx"
+               " c467.x=%.6f(0x%08X)"
+               " c112=(%.4f %.4f %.4f %.4f) c113=(%.4f %.4f %.4f %.4f)"
+               " c114=(%.4f %.4f %.4f %.4f) c115=(%.4f %.4f %.4f %.4f)\n",
+               tag, c->draw_count, prim, n_tri, g.surfaces[target].offset,
+               (unsigned long long)dbg_vp_key,
+               c467x.f, c467x.u,
+               c112[0].f, c112[1].f, c112[2].f, c112[3].f,
+               c113[0].f, c113[1].f, c113[2].f, c113[3].f,
+               c114[0].f, c114[1].f, c114[2].f, c114[3].f,
+               c115[0].f, c115[1].f, c115[2].f, c115[3].f);
+        printf("       ATTR7: type=%u(%s) size=%u stride=%u loc=%u offset=0x%X"
+               " vert_idx=%u raw@0x%X=[ %s] decoded=(%.4f %.4f %.4f %.4f)\n",
+               a7.type, a7_type_name, a7.size, a7.stride, a7.location, a7.offset,
+               c->dbg_first_vert_valid ? c->dbg_first_vert : 0, addr7, raw_hex,
+               tri[0].a[7][0], tri[0].a[7][1], tri[0].a[7][2], tri[0].a[7][3]);
+    }
 
     /* Resolve the fragment texture units into a 16-slot table (fallback
      * only uses t0). A previously-rendered surface at the same (location,
@@ -1974,13 +2571,17 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         } else {
             slots[u] = texture_srv_slot(&t);
         }
-        if (c->draw_count < 40 && slots[u] != SRV_WHITE)
-            printf("          tex%u <- %s 0x%X (%ux%u fmt=0x%02X)\n", u,
+        const int dbg_target =
+            (target < g.n_surfaces && g.surfaces[target].offset == 0x3C0000);
+        if ((c->draw_count < 40 || dbg_target || dbg_force_log) && t.enabled)
+            printf("          tex%u <- %s 0x%X (%ux%u fmt=0x%02X)%s\n", u,
                    sampled_surface >= 0 ? "surface" : "guest", t.offset,
-                   t.width, t.height, t.format & 0xFF);
+                   t.width, t.height, t.format & 0xFF,
+                   slots[u] == SRV_WHITE ? " [WHITE-FALLBACK]" : "");
     }
 
-    if (c->draw_count < 40) {
+    if (c->draw_count < 40 || dbg_force_log ||
+        (target < g.n_surfaces && g.surfaces[target].offset == 0x3C0000)) {
         const float* p0 = tri[0].a[0];
         rsx_dsp_surface sf;
         rsx_dsp_get_surface(rsx, &sf);
@@ -2052,7 +2653,7 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         memcpy(dst, rsx->constants, RSX_DSP_NUM_CONSTANTS * 16);
         memcpy(dst + 512 * 16, xf, sizeof(xf));
 
-        if (c->draw_count < 40)
+        if (c->draw_count < 40 || dbg_force_log)
             printf("          vp=(%u,%u %ux%u) scale=(%.2f %.2f %.4f)"
                    " trans=(%.2f %.2f %.4f) clip=%ux%u\n",
                    vp.x, vp.y, vp.w, vp.h, vp.scale[0], vp.scale[1], vp.scale[2],
@@ -2093,6 +2694,8 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     }
 
     g.vb_used += n_tri * VERT_STRIDE;
+    if (target < g.n_surfaces)
+        g.surfaces[target].draw_hits++;
     c->draw_count++;
     c->drawn_verts += n_tri;
     if (tri != c->verts)
@@ -2108,9 +2711,16 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
     const u32 scan_offset = buf < s->disp_count ? s->disp[buf].offset : 0;
 
     printf("[replay] flip(buffer %u @0x%X) -> frame %u"
-           " (%u clears, %u draws [%u translated], %u verts, %u surfaces)\n",
+           " (%u clears, %u draws [%u translated], %u verts, %u surfaces, %u flushes)\n",
            buf, scan_offset, c->frame_no,
-           c->clear_count, c->draw_count, c->draws_xlat, c->drawn_verts, g.n_surfaces);
+           c->clear_count, c->draw_count, c->draws_xlat, c->drawn_verts,
+           g.n_surfaces, g_flush_count);
+    printf("[replay]   textures decoded: %u / %u cap\n", g.n_textures, MAX_TEXTURES);
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        printf("[replay]   surf 0x%07X loc=%u draws=%u%s\n",
+               g.surfaces[i].offset, g.surfaces[i].location,
+               g.surfaces[i].draw_hits,
+               g.surfaces[i].offset == scan_offset ? "  <- SCANOUT" : "");
 
     char path[MAX_PATH];
     const u32 si = surface_get(RSX_LOCATION_LOCAL, scan_offset);
