@@ -269,6 +269,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           fflush(stderr); } }
                     break;
                 }
+                /* Residency record (s24 image model): dispatch re-adopts this
+                 * at every pc==0xA00 entry, surviving host-return bracket
+                 * restores between the load and the dispatch branch. */
+                spu->module_img_a00 = img;
                 if (spu->image_id != img) {
                     extern int g_spu_prof_on;
                     /* THROWAWAY DIAG (env YZ_IMGLOG, non-prof): log every kernel->workload

@@ -1251,8 +1251,13 @@ static void spu_lookup_rebuild_index(void)
     atomic_flag_clear_explicit(&s_index_build_lock, memory_order_release);
 }
 
-static spu_fn spu_lookup(uint32_t addr, int image_id)
+/* serve_img (may be NULL): which image's registration actually served the
+ * lookup — image_id itself on an exact hit, the wildcard owner's id on a
+ * substituted serve. Feeds adopt-on-serve in spu_indirect_branch (s24 image
+ * model, ledger #51) so the context is tagged with the code it truly runs. */
+static spu_fn spu_lookup(uint32_t addr, int image_id, int* serve_img)
 {
+    if (serve_img) *serve_img = image_id;
     spu_idx_entry* idx = atomic_load_explicit(&s_index, memory_order_acquire);
     uint32_t idx_n = atomic_load_explicit(&s_index_count, memory_order_acquire);
     if (!idx || idx_n != s_registry_count) {
@@ -1280,6 +1285,7 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
                 wildcard_img = idx[i].image_id;
             }
         }
+        if (serve_img && wildcard) *serve_img = wildcard_img;
         return spu_lookup_apply_job_guard(addr, image_id, wildcard, wildcard_img);
     }
     /* Fallback (index unavailable, e.g. OOM on the very first build): the
@@ -1294,6 +1300,7 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
             wildcard_img = s_registry[i].image_id;
         }
     }
+    if (serve_img && wildcard) *serve_img = wildcard_img;
     return spu_lookup_apply_job_guard(addr, image_id, wildcard, wildcard_img);
 }
 
@@ -1301,7 +1308,47 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
  * lv2 layer decide between real SPU execution and PPU fallbacks. */
 int spu_have_function(uint32_t addr)
 {
-    return spu_lookup(addr, 0) != NULL;
+    return spu_lookup(addr, 0, NULL) != NULL;
+}
+
+/* ===========================================================================
+ * Restore-on-host-return (s24 adopt-on-serve image model, ledger #51).
+ *
+ * The lifted brsl/bisl emissions bracket every nested host call with
+ *     { int32_t _si = ctx->image_id;  <call + SPU_DRAIN + depth-->;
+ *       spu_img_restore(ctx, _si); }
+ * so any image adopted INSIDE the call (dispatcher serve, foreign-resident
+ * adoption, drain tail-chain hops) is scoped to the call and cannot leak
+ * into the caller's continuation — the failure mode that let kernel-era
+ * contexts wander to image 0 and mis-attribute the tid-0x2004 death for
+ * weeks (ledger #34/#49/#51). The ledger-#51 trap (a returning bisl into
+ * kernel 0x290 leaving the policy mislabeled 16 for the kern-guard to
+ * false-kill) is exactly what this closes: the return restores the caller's
+ * image unconditionally. Persistent switches that must survive a return are
+ * re-applied at dispatch time (module_img_a00 residency; job_bin_base spans;
+ * task-launch keying) — dispatch-time residency, not return-time state, is
+ * the ground truth. longjmp unwinds (restack/halt/task-launch replacement)
+ * discard the bracket locals with their frames; those paths set image_id
+ * explicitly. Kill-switch: YZ_NO_IMGSTACK=1 reverts to the old sticky-image
+ * behavior. */
+void spu_img_restore(spu_context* ctx, int32_t saved_img)
+{
+    static int off = -1;
+    if (off < 0) {
+        off = getenv("YZ_NO_IMGSTACK") ? 1 : 0;
+        fprintf(stderr, "[img-ret] %s: restore-on-host-return image model %s\n",
+                off ? "OFF (YZ_NO_IMGSTACK)" : "ARMED",
+                off ? "disabled" : "live");
+        fflush(stderr);
+    }
+    if (off) return;
+    if (ctx->image_id != saved_img) {
+        static int rl = 0; if (rl < 24) { rl++;
+            fprintf(stderr, "[img-ret] spu=%X host-return restore image %d -> %d (pc=0x%05X)\n",
+                    ctx->spu_id, ctx->image_id, saved_img, ctx->pc & SPU_LS_MASK);
+            fflush(stderr); }
+        ctx->image_id = saved_img;
+    }
 }
 
 /* Classify an LS address by which lifted SPURS image owns it (diagnostic). */
@@ -1340,6 +1387,23 @@ void spu_indirect_branch(spu_context* ctx)
             g_spu_trampoline_fn = 0;
             longjmp(*g_spu_restart_jmp, 1);
         }
+    }
+
+    /* RESIDENCY RE-ADOPTION at the workload-module entry (s24 image model).
+     * The DMA layer records which module image is resident at LS 0xA00
+     * (module_img_a00, spu_dma.h); the kernel may perform that load inside a
+     * subroutine whose host-return bracket restores the kernel image before
+     * the dispatch branch, so the DMA-time image_id switch alone is not
+     * durable. The module ENTRY is unambiguous: whoever branches to 0xA00 is
+     * entering the resident module — adopt its recorded image here, keeping
+     * every image-keyed heuristic below (coret, resume, diags) working. */
+    if ((ctx->pc & SPU_LS_MASK) == 0xA00u && ctx->module_img_a00 > 0
+            && ctx->image_id != ctx->module_img_a00) {
+        static int ra = 0; if (ra < 16) { ra++;
+            fprintf(stderr, "[img-res] spu=%X entry 0xA00: image %d -> %d (resident module)\n",
+                    ctx->spu_id, ctx->image_id, ctx->module_img_a00);
+            fflush(stderr); }
+        ctx->image_id = ctx->module_img_a00;
     }
 
     /* SPURS TASK LAUNCH (image switch). The taskset policy (image 2) launches an
@@ -1745,8 +1809,28 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr); }
         return;
     }
-    spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
+    int serve_img = ctx->image_id;
+    spu_fn fn = spu_lookup(ctx->pc, ctx->image_id, &serve_img);
     if (fn) {
+        /* ADOPT-ON-SERVE (s24 image model, ledger #51): tag the context with
+         * the image whose registration actually serves this dispatch (kernel
+         * universal serves, image-0 wildcards), so attribution is true while
+         * the foreign code runs — a wild branch inside kernel-served code now
+         * reports image 16, not whatever the context last wore. Safe because
+         * the caller's bracket (spu_img_restore) restores its image on the
+         * host return; without the brackets this adoption would be the
+         * ledger-#51 mislabel trap, so it shares the YZ_NO_IMGSTACK switch. */
+        if (serve_img != ctx->image_id) {
+            static int noadopt = -1;
+            if (noadopt < 0) noadopt = getenv("YZ_NO_IMGSTACK") ? 1 : 0;
+            if (!noadopt) {
+                static int al = 0; if (al < 16) { al++;
+                    fprintf(stderr, "[img-serve] spu=%X 0x%05X served by image %d (ctx was %d)\n",
+                            ctx->spu_id, ctx->pc & SPU_LS_MASK, serve_img, ctx->image_id);
+                    fflush(stderr); }
+                ctx->image_id = serve_img;
+            }
+        }
         /* DIAG (YZ_SPU_PROF): trace the cross-image dispatch cycle. The SPURS
          * scheduler loop indirect-branches between the kernel, system service
          * and (unexpectedly) the geometry task -- log target + apparent caller
@@ -1822,6 +1906,26 @@ void spu_indirect_branch(spu_context* ctx)
                         foreign = 1; foreign_img = 12; ffn = s_registry[i].fn;
                         break;
                     }
+            }
+        }
+        /* Kernel-context refusal (s24, closes the kern-guard bypass): a
+         * KERNEL-tagged context (image 16) whose branch missed every kernel
+         * registration must not silently adopt another image's code here —
+         * this adopter was the unlogged "later something sets 0" leg of the
+         * tid-0x2004 wander (ledger #51). Legitimate kernel-era transfers
+         * into foreign code all go through explicit switches (module entry
+         * residency, task launch, job spans) BEFORE the branch; a kernel
+         * query landing here is a wild branch by definition — fall through
+         * to the loud halt. Shares the kern-guard kill-switch. */
+        if (foreign == 1 && ffn && ctx->image_id == 16) {
+            static int kok = -1;
+            if (kok < 0) kok = getenv("YZ_KERN_WILDCARD_OK") ? 1 : 0;
+            if (!kok) {
+                static int kf = 0; if (kf < 16) { kf++;
+                    fprintf(stderr, "[spu-ximg] KERNEL ctx branch LS 0x%05X owned only by image %d "
+                            "REFUSED (wild kernel branch, failing loud)\n", la, foreign_img);
+                    fflush(stderr); }
+                foreign = 0; ffn = 0;
             }
         }
         if (foreign == 1 && ffn) {
