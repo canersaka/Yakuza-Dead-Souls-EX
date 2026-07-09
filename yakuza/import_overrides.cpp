@@ -679,6 +679,43 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         break;
     }
     switch (method) {
+    case 0xEB00:                                  /* GCM_SET_USER_COMMAND (user interrupt) */
+    case 0xEB04: {
+        /* s22 ROOT FIX (2026-07-08): the RSX USER INTERRUPT — the mechanism the
+         * game uses to pump its wid4 SPU decode pool. The game registers
+         * func_00E7DB10 (the ONLY _cellSpursSendSignal path in the EBOOT) via
+         * cellGcmSetUserHandler (handlers bit 0x80, measured 0x86 live), then
+         * queues THIS method in the frame stream; the consumer must deliver it
+         * to Sony's _gcm_intr_thread, which calls the handler with the cause
+         * arg. We silently dropped it — the pool starved and the movie-boundary
+         * bootstrap deadlocked on the 0xFE0 decode label (DONT_RECHASE #29/#31).
+         * Oracle: RPCS3 gcm_enums.h:821 (0xEB00 "User interrupt"),
+         * rsx_methods.cpp:68/1728 (user_command, bound over 0xEB00-0xEB04),
+         * sys_rsx.cpp:931 case 0xFEF (userCmdParam=arg + send_event
+         * SYS_RSX_EVENT_USER_CMD=1<<7), sys_rsx.h:46 (userCmdParam @ +0x12CC).
+         * Same delivery path as our vblank/flip events. Kill-switch YZ_NO_UCMD. */
+        static int nu = -1; if (nu < 0) { nu = getenv("YZ_NO_UCMD") ? 1 : 0;
+            fprintf(stderr, "[ucmd] armed (user-interrupt dispatch %s)\n",
+                    nu ? "DISABLED by YZ_NO_UCMD" : "on"); fflush(stderr); }
+        if (nu) break;
+        vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
+        if (g_rsx_event_port) {
+            ppu_context sc; memset(&sc, 0, sizeof(sc));
+            sc.gpr[3] = g_rsx_event_port;
+            sc.gpr[5] = 0x80ull;                          /* SYS_RSX_EVENT_USER_CMD */
+            int64_t r = sys_event_port_send(&sc);
+            static unsigned long un = 0; un++;
+            if (un <= 40 || (un & 0xFFu) == 0) {
+                fprintf(stderr, "[ucmd] n=%lu cause=0x%08X handlers=0x%08X send=%lld\n",
+                        un, arg, vm_read32(RSX_DRIVER_INFO + 0x12C0), (long long)r);
+                fflush(stderr);
+            }
+        } else {
+            static int w = 0; if (w < 4) { w++;
+                fprintf(stderr, "[ucmd] DROPPED cause=0x%08X (no event port yet)\n", arg);
+                fflush(stderr); }
+        }
+        break; }
     case 0x050:                                   /* NV406E SET_REFERENCE */
         /* FAITHFUL FENCE TIMING (env YZ_RSX_FENCE_SYNC, opt-in A/B). RPCS3's
          * nv406e::set_reference calls sync() -- flush + wait for the GPU pipeline

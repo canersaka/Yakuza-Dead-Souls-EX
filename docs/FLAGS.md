@@ -398,6 +398,25 @@ with the jobchain frontier.
 the raw lr captured near the raise turned out to be a DATA pointer (the 0x01622200 device object),
 not the kicker. Requires `YZ_WIDSIG_ALL=1`. Retire with the producer frontier.
 
+`YZ_NO_UCMD` (yakuza/import_overrides.cpp `yz_rsx_method` case 0xEB00/0xEB04, 2026-07-08 s22,
+kill-switch, default OFF = mechanism ON): disables the RSX USER-INTERRUPT dispatch — the s22
+root fix for the phase-2 bootstrap deadlock. The consumer, on GCM_SET_USER_COMMAND (method
+0xEB00/0xEB04), writes driverInfo.userCmdParam (+0x12CC) and posts SYS_RSX_EVENT_USER_CMD
+(0x80) to the gcm intr thread, which calls the game's registered user handler func_00E7DB10 =
+the EBOOT's only _cellSpursSendSignal path (the wid4 pool pump). Prints `[ucmd]` first 40 +
+every 256th. Faithful mechanism (RPCS3 rsx_methods.cpp:68, sys_rsx.cpp:931), not a force —
+the switch exists only for A/B regression isolation; retire it after a quiet stretch.
+
+`YZ_WID4` (runtime/spu/spu_dma.h GETLLAR path, 2026-07-08 s22, armed banner `[spu-ls4] armed`):
+uncapped low-rate (every 500k mgmt GETLLARs) steady-state sampler of wid4's SELECT gate —
+run/prio/maxc/cont/rc/sig/SELECT, offsets mirroring `[spu-ls01-slow]` at index 4. wid4 = the pxd
+GPU-frame pool (image 4, elf 0x01284200) = the 0xFE0 decode-sync publisher (DONT_RECHASE #29);
+t1 raises its signal at the transition but image 4 never DMAs. The `sig` field discriminates
+"kernel never consumes the raise" (stuck 1) from "consumed but not dispatched" (drops to 0).
+Companion: an unconditional `[wid4gate]` AT-RAISE field dump inside the `YZ_WIDSIG_ALL` block
+(yakuza/shims.cpp) reading rc/cont/pend/maxc/state/status/enabled/prio at the raise commit, plus
+a first-3-raises guest backtrace riding `YZ_WIDSIG_BT` (`wid4-bt`). Retire with the wid4 frontier.
+
 `YZ_F484_PROBE` (yakuza/shims.cpp, `ppu_trace_pc`, 2026-07-05, needs a `--trace` relift): at
 `func_00F00484` entry on the main thread, prints the CRI request object's work-flag fields
 (`P`, `V`, `P->[0x4]`, `P->[0x48]`, `P->[0x14]`) so the work-flag state is a DIRECT value
