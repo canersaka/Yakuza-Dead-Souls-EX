@@ -18,8 +18,11 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * FS-specific error codes
  * -----------------------------------------------------------------------*/
-#define CELL_FS_ERROR_EBADF         (s32)0x80010009
-#define CELL_FS_ERROR_EMFILE        (s32)0x80010018
+/* s23 conformance fix: EBADF was 0x80010009 (= CELL_EPERM) and EMFILE was
+ * 0x80010018 (= CELL_ENOTMSELF) -- both wrong numerics; a guest comparing
+ * against the real constants never matched (RPCS3 ErrorCodes.h:145/147). */
+#define CELL_FS_ERROR_EBADF         (s32)0x8001002A
+#define CELL_FS_ERROR_EMFILE        (s32)0x8001002C
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -81,6 +84,25 @@ typedef struct CellFsStat {
     u64  st_size;
     u64  st_blksize;
 } CellFsStat;
+
+/* s23 conformance fix: the real cellFsReaddir ABI takes THIS 258-byte struct
+ * (RPCS3 sys_fs.h CellFsDirent: u8 d_type; u8 d_namlen; char d_name[256]),
+ * NOT CellFsDirectoryEntry -- the old signature memset 308 bytes over the
+ * guest's 258-byte buffer (50-byte OOB guest write) and put the name 50
+ * bytes past where the guest reads d_name. CellFsDirectoryEntry belongs to
+ * cellFsGetDirectoryEntries (not imported by this game). */
+#pragma pack(push, 1)
+typedef struct CellFsDirent {
+    u8   d_type;                                    /* CELL_FS_TYPE_* */
+    u8   d_namlen;
+    char d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
+} CellFsDirent;
+#pragma pack(pop)
+
+#define CELL_FS_TYPE_UNKNOWN   0
+#define CELL_FS_TYPE_DIRECTORY 1
+#define CELL_FS_TYPE_REGULAR   2
+#define CELL_FS_TYPE_SYMLINK   3
 
 typedef struct CellFsDirectoryEntry {
     CellFsStat attribute;
@@ -154,7 +176,7 @@ s32 cellFsChmod(const char* path, s32 mode);
 s32 cellFsOpendir(const char* path, CellFsDir* fd);
 
 /* NID: 0x9F951810 */
-s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread);
+s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread);
 
 /* NID: 0xFF42DCC3 */
 s32 cellFsClosedir(CellFsDir fd);

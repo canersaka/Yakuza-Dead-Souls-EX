@@ -31,6 +31,7 @@
 static char s_title_id[64]  = "BLUS30826";  /* fallback; overridden at boot by cellGame_init_from_paramsfo (reads PARAM.SFO) */
 static char s_title[256]    = "Unknown Title";
 static char s_app_ver[16]   = "01.00";
+static char s_version[16]   = "01.00";   /* SFO VERSION (content version, PARAMID 101) */
 
 /* Content info / usrdir paths */
 static char s_content_path[CELL_GAME_PATH_MAX] = "./gamedata/dev_hdd0/game";
@@ -179,6 +180,9 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
     }
+    if (sfo_read_string(sfo_path, "VERSION", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_version, tmp, sizeof(s_version) - 1); s_version[sizeof(s_version) - 1] = '\0';
+    }
 }
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
@@ -220,8 +224,13 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     }
 
     if (dirName) {
-        strncpy(dirName, s_title_id, CELL_GAME_PATH_MAX - 1);
-        dirName[CELL_GAME_PATH_MAX - 1] = '\0';
+        /* s23 conformance fix: dirName is a 32-byte guest array
+         * (CELL_GAME_DIRNAME_SIZE, RPCS3 cellGame.cpp:742) -- the old
+         * CELL_GAME_PATH_MAX bound (then 1055) let strncpy zero-pad 1054
+         * bytes over it. Unreached by this title (BootCheck not imported)
+         * but a landmine for any other. */
+        strncpy(dirName, s_title_id, CELL_GAME_DIRNAME_SIZE - 1);
+        dirName[CELL_GAME_DIRNAME_SIZE - 1] = '\0';
     }
 
     s_boot_checked = 1;
@@ -287,18 +296,11 @@ s32 cellGameGetParamInt(s32 id, s32* value)
 
     switch (id) {
     case CELL_GAME_PARAMID_PARENTAL_LEVEL:
-        *value = 0;
-        break;
     case CELL_GAME_PARAMID_RESOLUTION:
-        *value = 0;
-        break;
     case CELL_GAME_PARAMID_SOUND_FORMAT:
+        /* s23: the unified enum makes these 102/103/104; APP_VER (106) is a
+         * STRING param and no longer answered here. 0 is byte-invariant BE. */
         *value = 0;
-        break;
-    case CELL_GAME_PARAMID_APP_VER:
-        /* guest big-endian s32 (other cases write 0, which is byte-invariant) */
-        { unsigned char* p = (unsigned char*)value; u32 v = 100u; /* 1.00 */
-          p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16); p[2]=(unsigned char)(v>>8); p[3]=(unsigned char)v; }
         break;
     default:
         printf("[cellGame] WARNING: unknown param int id %d\n", id);
@@ -326,8 +328,13 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
         strncpy(buf, s_title_id, bufsize - 1);
         buf[bufsize - 1] = '\0';
         break;
-    case CELL_GAME_PARAMID_APP_VER_STR:
     case CELL_GAME_PARAMID_VERSION:
+        /* s23: the game's measured GetParamString(101, 6) is the content
+         * VERSION string (SFO "VERSION" key), previously the unknown-id path. */
+        strncpy(buf, s_version, bufsize - 1);
+        buf[bufsize - 1] = '\0';
+        break;
+    case CELL_GAME_PARAMID_APP_VER:
         strncpy(buf, s_app_ver, bufsize - 1);
         buf[bufsize - 1] = '\0';
         break;
