@@ -17,7 +17,13 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-#define CELL_GAME_PATH_MAX          1055
+/* s23 conformance fix: PATH_MAX was 1055 (copy-pasted from the SYSCACHE
+ * header's CELL_SYSCACHE_PATH_MAX); the real content-path constant is 128
+ * (RPCS3 cellGame.cpp:943 vm::ptr<char[CELL_GAME_PATH_MAX]> with
+ * CELL_GAME_PATH_MAX=128) and guest buffers are sized to it -- the old value
+ * let our snprintf/strncpy bound writes 8x past the guest's real array. */
+#define CELL_GAME_PATH_MAX          128
+#define CELL_GAME_DIRNAME_SIZE      32
 
 #define CELL_GAME_GAMETYPE_DISC     1
 #define CELL_GAME_GAMETYPE_HDD      2
@@ -34,18 +40,21 @@ extern "C" {
 #define CELL_GAME_ATTRIBUTE_CUSTOM_DATA_MESSAGE (1 << 6)
 #define CELL_GAME_ATTRIBUTE_WEB_BROWSER     (1 << 8)
 
-/* PARAM.SFO integer parameter IDs */
+/* PARAM.SFO parameter IDs -- s23 conformance fix: this is ONE unified enum
+ * (RPCS3 cellGame.h CELL_GAME_PARAMID_*), not disjoint int/string ranges.
+ * The old invented scheme (ints 100-104, strings 200-203) made the game's
+ * real GetParamString(101 = VERSION, bufsize 6) hit the unknown-id path and
+ * return "" every boot (measured s23boot1.out:214). Types: 0/1/100/101/105/
+ * 106 are strings; 102/103/104 are ints. */
+#define CELL_GAME_PARAMID_TITLE                  0
+#define CELL_GAME_PARAMID_TITLE_DEFAULT          1
 #define CELL_GAME_PARAMID_TITLE_ID              100
-#define CELL_GAME_PARAMID_PARENTAL_LEVEL        101
-#define CELL_GAME_PARAMID_RESOLUTION             102
-#define CELL_GAME_PARAMID_SOUND_FORMAT           103
-#define CELL_GAME_PARAMID_APP_VER               104
-
-/* PARAM.SFO string parameter IDs */
-#define CELL_GAME_PARAMID_TITLE                  200
-#define CELL_GAME_PARAMID_TITLE_DEFAULT          201
-#define CELL_GAME_PARAMID_APP_VER_STR            202
-#define CELL_GAME_PARAMID_VERSION                203
+#define CELL_GAME_PARAMID_VERSION               101
+#define CELL_GAME_PARAMID_PARENTAL_LEVEL        102
+#define CELL_GAME_PARAMID_RESOLUTION            103
+#define CELL_GAME_PARAMID_SOUND_FORMAT          104
+#define CELL_GAME_PARAMID_PS3_SYSTEM_VER        105
+#define CELL_GAME_PARAMID_APP_VER               106
 
 /* Size info mode */
 #define CELL_GAME_SIZEKB_NOTCALC    (-1)
