@@ -593,10 +593,16 @@ class SPULifter:
                 # cross-function loops run iteratively (constant host stack).
                 # host_depth brackets the nested host call so SPU_RET can tell
                 # a live lifted frame from one consumed by a resume/restack
-                # unwind (see SPU_RET in spu_context.h).
-                return (f"{link} ctx->host_depth++; "
+                # unwind (see SPU_RET in spu_context.h). The image_id local +
+                # spu_img_restore = the restore-on-host-return bracket of the
+                # adopt-on-serve image model (spu_context.h): an image adopted
+                # inside the callee (dispatcher serve, foreign adoption, drain
+                # tail-chain hops) is scoped to the call and cannot leak into
+                # this function's continuation.
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                        f"ctx->host_depth++; "
                         f"{self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx); "
-                        f"ctx->host_depth--;")
+                        f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             self.unresolved_calls.append(addr)
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -645,12 +651,14 @@ class SPULifter:
             # the callee was silently skipped. ops[-1] handles both formats.
             tgt_reg = _reg(ops[-1])
             # Indirect call: dispatch, then drain the callee's tail-calls.
-            # host_depth brackets the nested call (see the brsl emission).
+            # host_depth brackets the nested call (see the brsl emission);
+            # the image bracket scopes any adopt-on-serve to the call.
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
+                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
-                    f"ctx->host_depth--;")
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
