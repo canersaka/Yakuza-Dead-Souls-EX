@@ -55,6 +55,10 @@ typedef struct {
     uint32_t     stack_size;
     uint64_t     exit_code;
     char         name[28];
+    /* Batch fixes (RPCS3 sys_ppu_thread.cpp): detach state (:286-287 re-detach
+     * guard) and the single-joiner guard (:195-211). */
+    int          detached;
+    int          joiner;       /* tid currently joined on this thread, 0 = none */
 } thr_rec;
 
 static thr_rec          s_threads[MAX_GUEST_THREADS];
@@ -266,6 +270,15 @@ extern "C" void yz_ovr_sys_ppu_thread_create(ppu_context* ctx)
     uint64_t flags    = ctx->gpr[8];
     uint32_t name_ea  = (uint32_t)ctx->gpr[9];
 
+    /* Priority/flags validation (RPCS3 sys_ppu_thread.cpp:336,487,492-495).
+     * s23 REGRESSION BISECT: LOG-ONLY until the values the game passes are
+     * measured (an enforcement in this batch wedged the boot at 3 flips). */
+    if (priority < 0 || priority > 3071 || (flags & 3) == 3) {
+        static int n = 0; if (n < 8) { n++;
+            fprintf(stderr, "[thr] create would-reject: prio=%lld flags=0x%llX (log-only)\n",
+                    (long long)priority, (unsigned long long)flags); fflush(stderr); }
+    }
+
     if (stacksz < THR_STACK_MIN) stacksz = THR_STACK_DEFAULT;
     stacksz = (stacksz + 0xFFFF) & ~0xFFFFu;
 
@@ -402,13 +415,31 @@ extern "C" int64_t yz_sc_thread_join(ppu_context* ctx)
     uint32_t tid    = (uint32_t)ctx->gpr[3];
     uint32_t out_ea = (uint32_t)ctx->gpr[4];
 
+    /* Self-join guard (RPCS3 sys_ppu_thread.cpp:188-191): a thread can never
+     * complete waiting on itself. */
+    if (tid == s_cur_tid)
+        return (int64_t)(int32_t)0x80010008; /* CELL_EDEADLK */
+
     thr_lock();
     thr_rec* t = thr_find(tid);
-    HANDLE h = t ? t->handle : NULL;
+    if (!t) {
+        thr_unlock();
+        return (int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+    }
+    if (t->detached) {
+        thr_unlock();
+        return (int64_t)(int32_t)0x80010002; /* CELL_EINVAL: not joinable */
+    }
+    /* Double-join guard (RPCS3 sys_ppu_thread.cpp:195-211): only one joiner
+     * at a time. */
+    if (t->joiner) {
+        thr_unlock();
+        return (int64_t)(int32_t)0x80010002; /* CELL_EINVAL */
+    }
+    t->joiner = (int)s_cur_tid;
+    HANDLE h = t->handle;
     thr_unlock();
 
-    if (!t)
-        return (int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
     if (h) {
         WaitForSingleObject(h, INFINITE);
         CloseHandle(h);
@@ -417,17 +448,64 @@ extern "C" int64_t yz_sc_thread_join(ppu_context* ctx)
     if (out_ea)
         vm_write64(out_ea, t->exit_code);
     t->in_use = 0;
+    t->joiner = 0;
     thr_unlock();
+    return 0;
+}
+
+/* sys_ppu_thread_detach: routed here (not the runtime's standalone table) so
+ * ids line up with threads created through the sysPrxForUser import
+ * overrides -- see the file header + shims.cpp registration comment. */
+extern "C" int64_t yz_sc_thread_detach(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+
+    thr_lock();
+    thr_rec* t = thr_find(tid);
+    if (!t) {
+        thr_unlock();
+        return (int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+    }
+    if (t->detached) {
+        thr_unlock();
+        return (int64_t)(int32_t)0x80010002; /* CELL_EINVAL: RPCS3 sys_ppu_thread.cpp:286-287 */
+    }
+    t->detached = 1;
+    thr_unlock();
+    return 0;
+}
+
+/* sys_ppu_thread_get_join_state: reports whether the CALLING thread is still
+ * joinable. Out-param convention mirrors sys_ppu_thread.c's
+ * sys_ppu_thread_get_join_state (277-380 range covers the sibling
+ * join/detach out-EA writes this copies). */
+extern "C" int64_t yz_sc_thread_get_join_state(ppu_context* ctx)
+{
+    uint32_t out_ea = (uint32_t)ctx->gpr[3];
+
+    thr_lock();
+    thr_rec* t = thr_find(s_cur_tid);
+    int32_t joinable = (t && !t->detached) ? 1 : 0;
+    thr_unlock();
+
+    if (out_ea)
+        vm_write32(out_ea, (uint32_t)joinable);
     return 0;
 }
 
 extern "C" int64_t yz_sc_thread_set_priority(ppu_context* ctx)
 {
-    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t tid  = (uint32_t)ctx->gpr[3];
+    int32_t  prio = (int32_t)ctx->gpr[4];
+
+    /* Priority validation (RPCS3 sys_ppu_thread.cpp:336,487). */
+    if (prio < 0 || prio > 3071)
+        return (int64_t)(int32_t)0x80010002; /* CELL_EINVAL */
+
     thr_lock();
     thr_rec* t = thr_find(tid);
     if (t)
-        t->priority = (int32_t)ctx->gpr[4];
+        t->priority = prio;
     thr_unlock();
     return t ? 0 : (int64_t)(int32_t)0x80010005;
 }

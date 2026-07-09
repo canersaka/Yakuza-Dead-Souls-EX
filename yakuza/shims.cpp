@@ -73,6 +73,10 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp; the mgmt-CAS diag */
+/* threads.cpp: sc45/46 handlers (batch fix item 1 -- yakuza_runner.h is out
+ * of scope for this batch, so declared here at the call site instead). */
+extern "C" int64_t yz_sc_thread_detach(ppu_context* ctx);
+extern "C" int64_t yz_sc_thread_get_join_state(ppu_context* ctx);
 /* DIAG (env YZ_WATCH_BD): catch any PPU store covering spurs+0xBD
  * (sysSrvMsgUpdateWorkload @ 0x40197D3D) to find who writes the bad 0xE0. */
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
@@ -690,12 +694,18 @@ extern "C" void yz_init_syscalls(void)
     lv2_register_all_syscalls(&g_lv2_syscalls);
     lv2_syscall_register(&g_lv2_syscalls, 988, yz_sc_abort_report);
 
-    /* PPU thread syscalls the game issues directly (43/44/47/48/49):
-     * route them to the runner's thread runtime (threads.cpp) instead of
-     * the runtime's standalone table, so ids and joins line up with
-     * threads created through the sysPrxForUser import overrides. */
+    /* PPU thread syscalls the game issues directly (43-49): route them to
+     * the runner's thread runtime (threads.cpp) instead of the runtime's
+     * standalone table, so ids and joins line up with threads created
+     * through the sysPrxForUser import overrides. 45/46 (detach/
+     * get_join_state) used to fall through to the generic runtime handlers,
+     * which key off a table Yakuza threads never populate -- route them here
+     * too (declared extern since yakuza_runner.h is out of scope for this
+     * batch of fixes). */
     lv2_syscall_register(&g_lv2_syscalls, 43, yz_sc_thread_yield);
     lv2_syscall_register(&g_lv2_syscalls, 44, yz_sc_thread_join);
+    lv2_syscall_register(&g_lv2_syscalls, 45, yz_sc_thread_detach);
+    lv2_syscall_register(&g_lv2_syscalls, 46, yz_sc_thread_get_join_state);
     lv2_syscall_register(&g_lv2_syscalls, 47, yz_sc_thread_set_priority);
     lv2_syscall_register(&g_lv2_syscalls, 48, yz_sc_thread_get_priority);
     lv2_syscall_register(&g_lv2_syscalls, 49, yz_sc_thread_get_stack_information);

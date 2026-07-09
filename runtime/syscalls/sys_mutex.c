@@ -182,6 +182,10 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
 
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+     * deadline multiply (usec * qpc_freq) below can't overflow. */
+    if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
+
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 

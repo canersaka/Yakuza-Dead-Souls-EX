@@ -35,8 +35,15 @@ extern "C" {
 /* Maximum event queues that can be registered */
 #define CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES  8
 
-/* Audio port status */
-#define CELL_AUDIO_STATUS_CLOSE             0
+/* Port-open attribute bit: when set, honor CellAudioPortParam::level as the
+ * port's initial level instead of forcing 1.0f (RPCS3 cellAudio.h:63,
+ * cellAudio.cpp:1340-1346). */
+#define CELL_AUDIO_PORTATTR_INITLEVEL       0x1000ULL
+
+/* Audio port status (RPCS3 cellAudio.h:72 -- CLOSE was wrongly 0, which
+ * collided with a legitimate zero-initialized/never-set status value; a
+ * closed port must be distinguishable from an unstarted one). */
+#define CELL_AUDIO_STATUS_CLOSE             0x1010
 #define CELL_AUDIO_STATUS_READY             1
 #define CELL_AUDIO_STATUS_RUN               2
 

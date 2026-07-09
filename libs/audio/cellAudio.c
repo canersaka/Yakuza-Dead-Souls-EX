@@ -442,9 +442,14 @@ static void audio_mix_one_block(void)
 
         u32 nch    = (u32)port->param.nChannel;
         u32 nblock = (u32)port->param.nBlock;
+        /* U6 fix (2026-07-09): removed the level<=0 -> 1.0 clamp that used
+         * to live here. cellAudioPortOpen now resolves the port's level
+         * once (honoring CELL_AUDIO_PORTATTR_INITLEVEL, RPCS3
+         * cellAudio.cpp:1340-1346) and an intentional level=0 (mute) must
+         * stay muted through the mixer, not get silently un-muted. */
         float level = port->param.level;
-        if (level <= 0.0f) level = 1.0f;
         if (level > 1.0f) level = 1.0f;
+        if (level < 0.0f) level = 0.0f;
 
         /* Read one block at the current read_index */
         u32 block_idx = (u32)(port->read_index % nblock);
@@ -684,8 +689,9 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     hp.attr     = ca_be64(param->attr);
     { union { u32 u; float f; } lv; lv.u = ca_be32(*(const u32*)&param->level); hp.level = lv.f; }
 
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
-           (unsigned long long)hp.nChannel, (unsigned long long)hp.nBlock);
+    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu, attr=0x%llX, level=%f)\n",
+           (unsigned long long)hp.nChannel, (unsigned long long)hp.nBlock,
+           (unsigned long long)hp.attr, (double)hp.level);
 
     /* Validate parameters */
     u64 nch = hp.nChannel;
@@ -694,6 +700,20 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
         return CELL_AUDIO_ERROR_PARAM;
     if (nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 && nblk != CELL_AUDIO_BLOCK_32)
         return CELL_AUDIO_ERROR_PARAM;
+
+    /* U6 fix (2026-07-09): only honor the game's requested level when
+     * CELL_AUDIO_PORTATTR_INITLEVEL is set (RPCS3 cellAudio.cpp:1340-1346);
+     * otherwise default to 1.0f, same as before this fix. Clamped to [0,1]
+     * as our own safety margin (RPCS3 itself only rejects level <= -1.0f). */
+    {
+        float resolved_level = 1.0f;
+        if (hp.attr & CELL_AUDIO_PORTATTR_INITLEVEL) {
+            resolved_level = hp.level;
+            if (resolved_level < 0.0f) resolved_level = 0.0f;
+            if (resolved_level > 1.0f) resolved_level = 1.0f;
+        }
+        hp.level = resolved_level;
+    }
 
     mutex_lock(&s_audio_mutex);
 
@@ -1013,6 +1033,17 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
 
     if (!stamp)
         return CELL_AUDIO_ERROR_PARAM;
+
+    /* U6c fix (2026-07-09): RPCS3 cellAudio.cpp:1519-1521 --
+     * `if (port.global_counter < tag) return CELL_AUDIO_ERROR_TAG_NOT_FOUND;`
+     * before this fix we always answered with a timestamp, even for a tag
+     * the port hasn't advanced to yet. Our read_index is the same monotonic
+     * global counter used by cellAudioGetPortBlockTag above. */
+    mutex_lock(&s_audio_mutex);
+    u64 global_counter = s_ports[portNum].read_index;
+    mutex_unlock(&s_audio_mutex);
+    if (tag > global_counter)
+        return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
 
     u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
     unsigned char* c = (unsigned char*)stamp;

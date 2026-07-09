@@ -183,6 +183,10 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
 
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
+
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -228,7 +232,15 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
             SwitchToThread();
         }
     } else {
-        DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
+        /* Batch fixes item 8: never let a converted ms value land on
+         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
+        DWORD ms;
+        if (timeout_us == 0) {
+            ms = INFINITE;
+        } else {
+            uint64_t ms64 = timeout_us / 1000;
+            ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
+        }
         result = WaitForSingleObject(s->sem_handle, ms);
     }
     if (result == WAIT_TIMEOUT) {

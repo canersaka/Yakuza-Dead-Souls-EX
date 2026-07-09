@@ -103,6 +103,13 @@ extern sys_event_port_info g_sys_event_ports[SYS_EVENT_PORT_MAX];
  * -----------------------------------------------------------------------*/
 #define SYS_EVENT_FLAG_MAX  256
 
+/* sys_event_flag_attribute_t::type (batch fixes item 9a). s23 fix: the real
+ * values are 0x10000/0x20000 (RPCS3 sys_event_flag.h:9-10), NOT 0x1/0x2 --
+ * the wrong constants rejected every valid create (measured: the game passes
+ * type=0x20000 = WAITER_MULTIPLE with the corrected attr-offset parse). */
+#define SYS_SYNC_WAITER_SINGLE   0x10000
+#define SYS_SYNC_WAITER_MULTIPLE 0x20000
+
 /* Wait modes */
 #define SYS_EVENT_FLAG_WAIT_AND        0x01
 #define SYS_EVENT_FLAG_WAIT_OR         0x02
@@ -115,6 +122,14 @@ typedef struct sys_event_flag_info {
     uint32_t type;       /* single / multi waiter */
     char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
+    /* Batch fixes item 9(b)/(c): count of threads parked in
+     * sys_event_flag_wait, so a SYS_SYNC_WAITER_SINGLE flag can reject a
+     * second concurrent waiter (RPCS3 sys_event_flag.cpp:170-173) and destroy
+     * can refuse to tear down a flag with parked waiters (:103-108). */
+    int      waiters;
+    /* Batch fixes item 9(d): set by sys_event_flag_cancel; every waiter
+     * checks this on wake and returns CELL_ECANCELED instead of re-parking. */
+    int      force_cancelled;
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;
@@ -154,6 +169,7 @@ int64_t sys_event_flag_set(ppu_context* ctx);
 int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat);
 int64_t sys_event_flag_clear(ppu_context* ctx);
 int64_t sys_event_flag_get(ppu_context* ctx);
+int64_t sys_event_flag_cancel(ppu_context* ctx);
 
 /* Registration */
 void sys_event_init(lv2_syscall_table* tbl);

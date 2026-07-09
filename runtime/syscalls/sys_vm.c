@@ -24,6 +24,7 @@
  */
 
 #include "sys_vm.h"
+#include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -72,6 +73,19 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
         vsize > (SYS_VM_REGION_END - SYS_VM_REGION_BASE))
         return (int64_t)(int32_t)CELL_EINVAL;
 
+    /* M8 (partial -- see analyst report): real lv2 additionally rejects
+     * psize < 1M, but ONLY when reached via syscall 300 (sys_vm_memory_map)
+     * and not 313 (sys_vm_memory_map_different), which shares this handler.
+     * RPCS3 sys_vm.cpp:61: `if (ppu.gpr[11] == 300 && psize < 0x10'0000)
+     * return CELL_EINVAL;`. psize's granularity itself is fixed at 64K
+     * regardless of the flag arg on real HW (sys_vm.cpp:56) -- the audit's
+     * "derive granularity from flag" / "psize >= 257MB -> ENOMEM" clauses
+     * were NOT found anywhere in the in-repo RPCS3 oracle (sys_vm.cpp,
+     * sys_memory.cpp, lv2_memory_container); left unimplemented pending
+     * re-verification (see report). */
+    if ((uint32_t)ctx->gpr[11] == SYS_VM_MEMORY_MAP && psize < 0x100000u)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
     if (s_vm_bump_ptr + vsize > SYS_VM_REGION_END)
         return (int64_t)(int32_t)CELL_ENOMEM;
 
@@ -96,6 +110,13 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
 
     if (addr_out != 0)
         write_be32(addr_out, base);
+
+    /* M1: bill psize against the same user-memory budget sys_memory reports
+     * (real HW: ct->take(psize) against the process's lv2_memory_container,
+     * RPCS3 sys_vm.cpp:91; measured on this title, RPCS3.log:61484-61486 +
+     * :62755 -- Avail drops sharply after this call). No-op under
+     * YZ_NO_MEMACCT. */
+    sys_memory_account(psize);
 
     fprintf(stderr, "[sys_vm] memory_map(vsize=0x%X, psize=0x%X) -> 0x%08X\n",
             vsize, psize, base);

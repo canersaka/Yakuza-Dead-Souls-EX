@@ -915,13 +915,23 @@ s32 sys_prx_exitspawn_with_level(void)
 
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
+    /* Batch fixes item 11: real ABI is (name, flags, pOpt) -- the 3rd arg is
+     * an optional attribute struct, legally NULL and ignored here, NOT an
+     * out-param; the module id comes back in the RETURN VALUE (positive) or
+     * a negative error (RPCS3 Emu/Cell/Modules/sys_prx_.cpp:227-238
+     * sys_prx_get_module_id_by_name, Emu/Cell/lv2/sys_prx.cpp:1086-1114
+     * _sys_prx_get_module_id_by_name: not_an_error(id) / EBUSY on unknown). */
     (void)flags;
+    (void)id;
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
            name ? name : "(null)");
 
-    if (!id) return CELL_EFAULT;
-    *id = 0; /* fake module ID */
-    return CELL_OK;
+    /* This game only ever loads pxd_shader (the ogrez_shader_ps3 family);
+     * any other name is unknown -- no registry lookup needed. */
+    if (name && strncmp(name, "ogrez_shader_ps3", 16) == 0)
+        return (s32)0x23000001;
+
+    return CELL_ESRCH;
 }
 
 /* ---------------------------------------------------------------------------

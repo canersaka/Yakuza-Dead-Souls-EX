@@ -200,6 +200,9 @@ typedef struct {
      * the queue on its port. (2026-06-21 pt29: this was unimplemented -> SPU->PPU
      * events were silently dropped -> SPURS/CRI coordination stalled.) */
     uint32_t spup_queue[64];
+    /* Batch fixes item 10 (RPCS3 sys_spu.cpp:1654-1658): only one thread may
+     * be joined on a group at a time. 0 = no joiner. */
+    int      joiner;
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -703,6 +706,15 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return 0;
     }
+
+    /* Batch fixes item 10 (RPCS3 sys_spu.cpp:1654-1658): only one thread may
+     * be joined on a group at a time. */
+    if (g->joiner) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    g->joiner = 1;
+
     /* If the group was never started, mark it stopped so a subsequent
      * destroy doesn't trip a "still running" check. */
     if (g->state == SPU_GROUP_STATE_INITIALIZED ||
@@ -781,6 +793,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
             id, g->cause, g->exit_status, g->event_queue_id);
     fflush(stderr);
+    g->joiner = 0;
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1457,6 +1470,9 @@ static int64_t sys_lwmutex_lock_syscall(ppu_context* ctx)
 {
     uint32_t id      = (uint32_t)ctx->gpr[3];
     uint64_t timeout = ctx->gpr[4];
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+     * deadline multiply below can't overflow. */
+    if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -1626,6 +1642,10 @@ static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
     uint32_t lwmutex_id = (uint32_t)ctx->gpr[4];
     uint64_t timeout    = ctx->gpr[5];
 
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the
+     * ms-DWORD conversion below can't overflow. */
+    if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+
     if (cond_id == 0 || cond_id > MAX_LW_KERNEL_COND || !s_lw_conds[cond_id - 1].in_use) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -1648,8 +1668,16 @@ static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
     m->lock_count = 0;
 
 #ifdef _WIN32
-    DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
-    if (ms == 0 && timeout > 0) ms = 1;
+    /* Batch fixes item 8: never let a converted ms value land on 0xFFFFFFFF
+     * (INFINITE) -- cap at 0xFFFFFFFE. */
+    DWORD ms;
+    if (timeout == 0) {
+        ms = INFINITE;
+    } else {
+        uint64_t ms64 = timeout / 1000;
+        ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
+        if (ms == 0) ms = 1;
+    }
 
     for (int i = 1; i < saved_count; i++) LeaveCriticalSection(&m->cs);
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
