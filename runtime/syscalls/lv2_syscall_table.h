@@ -137,14 +137,20 @@ extern "C" {
 #define SYS_MEMORY_ALLOCATE_FROM_CONTAINER 350
 #define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h) */
 #define SYS_MEMORY_GET_USER_MEMORY_SIZE 352
-#define SYS_MEMORY_CONTAINER_CREATE     353
-#define SYS_MEMORY_CONTAINER_DESTROY    354
-#define SYS_MEMORY_CONTAINER_GET_SIZE   355
+/* CONTAINER_CREATE/DESTROY/GET_SIZE were wrongly 353/354/355 (355 is really
+ * sys_memory_get_user_memory_stat on real HW; 353/354 are unbound null_funcs).
+ * Verified vs rpcs3/rpcs3/Emu/Cell/lv2/lv2.cpp:402-403,421 (the DBG-slot
+ * aliases at 324/325/343; real HW also aliases these at 341/342/343). */
+#define SYS_MEMORY_CONTAINER_CREATE     324
+#define SYS_MEMORY_CONTAINER_DESTROY    325
+#define SYS_MEMORY_CONTAINER_GET_SIZE   343
 
 #define SYS_MMAPPER_ALLOCATE_ADDRESS     330
 #define SYS_MMAPPER_FREE_ADDRESS         331
 #define SYS_MMAPPER_ALLOCATE_SHARED_MEMORY 332
-#define SYS_MMAPPER_FREE_SHARED_MEMORY   333
+/* was wrongly 333 (real HW: 333 = sys_mmapper_set_shared_memory_flag, a
+ * NULL_FUNC on real HW too). Verified vs lv2.cpp:407. */
+#define SYS_MMAPPER_FREE_SHARED_MEMORY   329
 #define SYS_MMAPPER_MAP_SHARED_MEMORY    334
 #define SYS_MMAPPER_UNMAP_SHARED_MEMORY  335
 #define SYS_MMAPPER_SEARCH_AND_MAP      337

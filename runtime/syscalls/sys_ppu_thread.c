@@ -128,8 +128,16 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t arg          = LV2_ARG_U64(ctx, 2);
     int32_t  priority     = LV2_ARG_S32(ctx, 3);
     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
+    uint64_t flags        = LV2_ARG_U64(ctx, 5);
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
+
+    /* Priority/flags validation (RPCS3 sys_ppu_thread.cpp:336,487,492-495). */
+    if (priority < 0 || priority > 3071) {
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    if ((flags & 3) == 3) {
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
 
     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
     if (stack_size < 0x4000) stack_size = 0x4000; /* 16 KB minimum */
@@ -279,6 +287,12 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
 
+    /* Self-join guard (RPCS3 sys_ppu_thread.cpp:188-191): a thread joining
+     * itself can never complete -- EDEADLK before touching the table. */
+    if (tid == ctx->thread_id) {
+        return (int64_t)(int32_t)CELL_EDEADLK;
+    }
+
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (!t) {
@@ -354,6 +368,13 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     if (!t) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    /* Re-detach guard (RPCS3 sys_ppu_thread.cpp:286-287): a thread already
+     * detached must not be detached again. */
+    if (t->state == PPU_THREAD_STATE_DETACHED) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
     }
 
     if (t->state == PPU_THREAD_STATE_FINISHED) {

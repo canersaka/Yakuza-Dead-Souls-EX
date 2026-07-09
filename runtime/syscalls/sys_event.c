@@ -267,6 +267,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
 
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
+
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -332,7 +336,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             EnterCriticalSection(&q->lock);
         }
     } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
+        /* Batch fixes item 8: never let a converted ms value land on
+         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
+        uint64_t ms64 = timeout_us / 1000;
+        DWORD ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
         while (q->count == 0 && q->active) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
@@ -753,26 +760,52 @@ int64_t sys_event_flag_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
-    sys_event_flag_info* f = &g_sys_event_flags[slot];
-    memset(f, 0, sizeof(*f));
-    f->active  = 1;
-    f->pattern = init_pattern;
+    uint32_t protocol = SYS_SYNC_FIFO;
+    uint32_t ftype     = SYS_SYNC_WAITER_MULTIPLE;
+    uint8_t  name_buf[8];
+    memset(name_buf, 0, sizeof(name_buf));
 
     if (attr_addr != 0) {
+        /* s23 PARSE FIX (found by the validation regression bisect): the attr
+         * struct is {protocol@0x00, pshared@0x04, ipc_key@0x08(u64),
+         * flags@0x10, type@0x14, name@0x18} (RPCS3 sys_event_flag.h
+         * sys_event_flag_attribute_t). The old parse read pshared as "type"
+         * (measured: 0x200 = SYS_SYNC_NOT_PROCESS_SHARED) and ipc_key bytes
+         * as the name -- harmless while unvalidated, fatal once validated. */
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
         uint32_t proto_be, type_be;
         memcpy(&proto_be, attr_raw, 4);
-        memcpy(&type_be, attr_raw + 4, 4);
+        memcpy(&type_be, attr_raw + 0x14, 4);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
         proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
         type_be  = ((type_be >> 24) & 0xFF)  | ((type_be >> 8) & 0xFF00) |
                    ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
 #endif
-        f->protocol = proto_be;
-        f->type     = type_be;
-        memcpy(f->name, attr_raw + 8, 8);
+        protocol = proto_be;
+        ftype    = type_be;
+        memcpy(name_buf, attr_raw + 0x18, 8);
     }
+
+    /* Batch fixes item 9(a): attribute validation, re-enabled after the parse
+     * fix above (the bisect's would-reject values were OUR mis-parse, not the
+     * game's attrs). Loud on rejection so a future mismatch is visible. */
+    if ((protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY) ||
+        (ftype != SYS_SYNC_WAITER_SINGLE && ftype != SYS_SYNC_WAITER_MULTIPLE)) {
+        static int n = 0; if (n < 8) { n++;
+            fprintf(stderr, "[evflag] create REJECT: protocol=0x%X type=0x%X\n",
+                    protocol, ftype); fflush(stderr); }
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+
+    sys_event_flag_info* f = &g_sys_event_flags[slot];
+    memset(f, 0, sizeof(*f));
+    f->active   = 1;
+    f->pattern  = init_pattern;
+    f->protocol = protocol;
+    f->type     = ftype;
+    memcpy(f->name, name_buf, 8);
 
 #ifdef _WIN32
     InitializeCriticalSection(&f->lock);
@@ -804,6 +837,14 @@ int64_t sys_event_flag_destroy(ppu_context* ctx)
     if (!f->active) {
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    /* Batch fixes item 9(c) (RPCS3 sys_event_flag.cpp:103-108): refuse to
+     * tear down a flag with parked waiters instead of destroying it under
+     * them. */
+    if (f->waiters > 0) {
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
 
 #ifdef _WIN32
@@ -846,6 +887,10 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
 
+    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
+
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -853,27 +898,52 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     if (!f->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    if (bitpat == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    /* Batch fixes item 9(e) (RPCS3 sys_event_flag.h:61-79): mode packs a
+     * wait selector (AND/OR) in the low nibble and an optional CLEAR/
+     * CLEAR_ALL in the rest; validate both instead of the invented
+     * bitpat==0 check this replaces. */
+    {
+        /* s23 REGRESSION BISECT: enforcement wedged the boot -- LOG-ONLY
+         * until the mode values the game passes are measured. */
+        uint32_t wmode = mode & 0xFu;
+        uint32_t cmode = mode & ~0xFu;
+        if ((wmode != SYS_EVENT_FLAG_WAIT_AND && wmode != SYS_EVENT_FLAG_WAIT_OR) ||
+            (cmode != 0 && cmode != SYS_EVENT_FLAG_WAIT_CLEAR && cmode != SYS_EVENT_FLAG_WAIT_CLEAR_ALL)) {
+            static int n = 0; if (n < 8) { n++;
+                fprintf(stderr, "[evflag] mode would-reject: mode=0x%X (log-only)\n",
+                        (uint32_t)mode); fflush(stderr); }
+        }
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 
+    /* Batch fixes item 9(b) (RPCS3 sys_event_flag.cpp:170-173): a
+     * SYS_SYNC_WAITER_SINGLE flag rejects a second concurrent waiter. */
+    if (f->type == SYS_SYNC_WAITER_SINGLE && f->waiters > 0) {
+        /* s23 REGRESSION BISECT: log-only (see create validation note). */
+        static int n1 = 0; if (n1 < 8) { n1++;
+            fprintf(stderr, "[evflag] SINGLE double-wait would-reject (log-only)\n");
+            fflush(stderr); }
+    }
+    f->waiters++;
+
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
     } else if (timeout_us < 1000) {
         /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
          * floored-to-1ms condvar wait (see sys_event_queue_receive above). */
         int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
             if (lv2_deadline_passed(deadline)) {
                 /* Write current pattern even on timeout */
                 if (result_addr != 0) {
                     uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                     *out = bswap64(f->pattern);
                 }
+                f->waiters--;
                 LeaveCriticalSection(&f->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
@@ -882,8 +952,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             EnterCriticalSection(&f->lock);
         }
     } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        /* Batch fixes item 8: never let a converted ms value land on
+         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
+        uint64_t ms64 = timeout_us / 1000;
+        DWORD ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     /* Write current pattern even on timeout */
@@ -891,11 +964,21 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                         uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                         *out = bswap64(f->pattern);
                     }
+                    f->waiters--;
                     LeaveCriticalSection(&f->lock);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
             }
         }
+    }
+
+    f->waiters--;
+
+    /* Batch fixes item 9(d): a cancel forced this wake -- report
+     * CELL_ECANCELED instead of consuming the pattern. */
+    if (f->force_cancelled) {
+        LeaveCriticalSection(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -916,8 +999,16 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #else
     pthread_mutex_lock(&f->lock);
 
+    if (f->type == SYS_SYNC_WAITER_SINGLE && f->waiters > 0) {
+        /* s23 REGRESSION BISECT: log-only (see create validation note). */
+        static int n2 = 0; if (n2 < 8) { n2++;
+            fprintf(stderr, "[evflag] SINGLE double-wait would-reject (log-only)\n");
+            fflush(stderr); }
+    }
+    f->waiters++;
+
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
             pthread_cond_wait(&f->cv, &f->lock);
         }
     } else {
@@ -929,17 +1020,25 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
             int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
             if (rc == ETIMEDOUT) {
                 if (result_addr != 0) {
                     uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                     *out = bswap64(f->pattern);
                 }
+                f->waiters--;
                 pthread_mutex_unlock(&f->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
+    }
+
+    f->waiters--;
+
+    if (f->force_cancelled) {
+        pthread_mutex_unlock(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -974,6 +1073,20 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
     if (!f->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* Batch fixes item 9(e): same mode validation as sys_event_flag_wait. */
+    {
+        /* s23 REGRESSION BISECT: enforcement wedged the boot -- LOG-ONLY
+         * until the mode values the game passes are measured. */
+        uint32_t wmode = mode & 0xFu;
+        uint32_t cmode = mode & ~0xFu;
+        if ((wmode != SYS_EVENT_FLAG_WAIT_AND && wmode != SYS_EVENT_FLAG_WAIT_OR) ||
+            (cmode != 0 && cmode != SYS_EVENT_FLAG_WAIT_CLEAR && cmode != SYS_EVENT_FLAG_WAIT_CLEAR_ALL)) {
+            static int n = 0; if (n < 8) { n++;
+                fprintf(stderr, "[evflag] mode would-reject: mode=0x%X (log-only)\n",
+                        (uint32_t)mode); fflush(stderr); }
+        }
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
@@ -1110,6 +1223,50 @@ int64_t sys_event_flag_get(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_event_flag_cancel (batch fixes item 9(d))
+ *
+ * r3 = flag_id
+ * r4 = pointer to receive the number of woken waiters (u32*, optional)
+ *
+ * Mirrors sys_event_queue_destroy's force_destroyed pattern (this file,
+ * ~line 237): force every parked waiter to observe force_cancelled and
+ * return CELL_ECANCELED instead of re-parking.
+ * -----------------------------------------------------------------------*/
+int64_t sys_event_flag_cancel(ppu_context* ctx)
+{
+    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
+    uint32_t num_ea  = LV2_ARG_PTR(ctx, 1);
+
+    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
+    if (!f->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    uint32_t woken;
+#ifdef _WIN32
+    EnterCriticalSection(&f->lock);
+    f->force_cancelled = 1;
+    woken = (uint32_t)f->waiters;
+    WakeAllConditionVariable(&f->cv);
+    LeaveCriticalSection(&f->lock);
+#else
+    pthread_mutex_lock(&f->lock);
+    f->force_cancelled = 1;
+    woken = (uint32_t)f->waiters;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->lock);
+#endif
+
+    if (num_ea != 0) {
+        write_be32(num_ea, woken);
+    }
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
 void sys_event_init(lv2_syscall_table* tbl)
@@ -1147,4 +1304,5 @@ void sys_event_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_SET,      sys_event_flag_set);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_CLEAR,    sys_event_flag_clear);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_GET,      sys_event_flag_get);
+    lv2_syscall_register(tbl, SYS_EVENT_FLAG_CANCEL,   sys_event_flag_cancel);
 }
