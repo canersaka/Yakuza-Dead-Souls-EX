@@ -2174,6 +2174,30 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
                               | (1u << ((uint32_t)a4 & 31)));
         if (yz_ft_on())
             yz_ft("SYSQUEUE head=%u buf=%u (no arm)", head, (uint32_t)a4);
+        /* s23 conformance fix (4th dropped-guest-notification instance, same
+         * class as 0xEB00/0xE920): RPCS3's 0x103 also DELIVERS the queue event
+         * -- send_event(0, SYS_RSX_EVENT_QUEUE_BASE << head, 0), sys_rsx.cpp:637,
+         * sys_rsx.h:74 (1<<5). Gate on the game's registered handler mask like
+         * the vblank/flip sends (Sony's intr thread dispatches by cause bits);
+         * loud first hits. Kill-switch YZ_NO_QEV. */
+        { static int nq = -1; if (nq < 0) { nq = getenv("YZ_NO_QEV") ? 1 : 0;
+            fprintf(stderr, "[qev] armed (queue-event dispatch %s)\n",
+                    nq ? "DISABLED by YZ_NO_QEV" : "on"); fflush(stderr); }
+          if (!nq && g_rsx_event_port) {
+            uint64_t qbit = (uint64_t)(0x20u << head);      /* QUEUE_BASE<<head */
+            uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
+            if (handlers & qbit) {
+                ppu_context sc; memset(&sc, 0, sizeof(sc));
+                sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = qbit;
+                int64_t r = sys_event_port_send(&sc);
+                static unsigned long qn = 0; qn++;
+                if (qn <= 8 || (qn & 0xFFu) == 0) {
+                    fprintf(stderr, "[qev] n=%lu head=%u buf=%u send=%lld\n",
+                            qn, head, (uint32_t)a4, (long long)r); fflush(stderr); }
+            } else { static int w = 0; if (w < 2) { w++;
+                fprintf(stderr, "[qev] game not listening (handlers=0x%08X, qbit=0x%llX) -- benign\n",
+                        handlers, (unsigned long long)qbit); fflush(stderr); } }
+          } }
         break;
     }
     case 0x104: {       /* Display buffer registration */
@@ -2303,7 +2327,10 @@ extern "C" void yz_rsx_vblank_tick(void)
      * stream (0x4019CA80-CB40) + the chain header (0x4019C880-8C0), so the
      * producer's round-N command WRITES are visible independently of the SPU
      * side's fetches -- discriminates "t1 never wrote round 3" from "chain
-     * never fetched round 3". Checked once per vblank tick, dumps on change. */
+     * never fetched round 3". Checked once per vblank tick, dumps on change.
+     * s23: rows also decode SYMBOLICALLY via yz_jc_dec below -- the raw-hex-only
+     * dump cost us two weeks of calling the 0x0000000800000012 park word "END"
+     * when it is JTS (jump-to-self stopper, releasable by one store). */
     { static int jp = -1;
       if (jp < 0) { jp = getenv("YZ_JOBPEEK") ? 1 : 0;
           if (jp) fprintf(stderr, "[jobpeek] ARMED (YZ_JOBPEEK): watching 0x4019CA80-CB40 + hdr 0x4019C880\n"); }
@@ -2321,12 +2348,88 @@ extern "C" void yz_rsx_vblank_tick(void)
                   fprintf(stderr, " %08X", vm_read32(a));
               fprintf(stderr, "\n");
               for (uint32_t row = 0x4019CA80u; row < 0x4019CB40u; row += 0x20) {
+                  char dec[128]; size_t dp = 0; dec[0] = 0;
                   fprintf(stderr, "[jobpeek] cmd 0x%08X:", row);
-                  for (uint32_t a = row; a < row + 0x20; a += 4)
-                      fprintf(stderr, " %08X", vm_read32(a));
-                  fprintf(stderr, "\n");
+                  for (uint32_t a = row; a < row + 0x20; a += 8) {
+                      uint64_t w = ((uint64_t)vm_read32(a) << 32) | vm_read32(a + 4);
+                      fprintf(stderr, " %08X %08X",
+                              (uint32_t)(w >> 32), (uint32_t)w);
+                      /* SPURS jobchain command decode (s23). Opcode table per
+                       * RPCS3 cellSpurs.h:266-281 (CELL_SPURS_JOB_OPCODE_*):
+                       * low 3 bits = class; class-2 sub in bits 3-6 (SYNC=0x02,
+                       * LWSYNC=0x12, JTS=bit35|LWSYNC -- a STOPPER released by
+                       * overwriting the word); class-7 sub in bits 3-6
+                       * (GUARD=1, SET_LABEL=2, RET=14, END=15, ABORT=0). */
+                      const char* t; char tb[24];
+                      uint32_t lo3 = (uint32_t)(w & 7u);
+                      if (w == 0)            t = "NOP";
+                      else if (w == 5)       t = "FLUSH";
+                      else if (lo3 == 2) {
+                          uint64_t s = w & ~0x800000000ull;
+                          if (s == 0x02)      t = "SYNC";
+                          else if (s == 0x12) t = (w & 0x800000000ull) ? "JTS" : "LWSYNC";
+                          else                t = "SYNC?";
+                      } else if (lo3 == 7) {
+                          uint32_t sub = (uint32_t)((w >> 3) & 0xFu);
+                          if (sub == 15)      t = "END";
+                          else if (sub == 14) t = "RET";
+                          else if (sub == 1) { snprintf(tb, sizeof(tb), "GUARD@%04X",
+                                                        (uint32_t)(w & ~127ull) & 0xFFFFu); t = tb; }
+                          else if (sub == 0)  t = "ABORT";
+                          else                t = "CMD7?";
+                      } else {
+                          static const char* cn[8] =
+                              { "JOB", "RESET_PC", "?", "NEXT", "CALL", "?", "JOBLIST", "?" };
+                          snprintf(tb, sizeof(tb), "%s@%04X", cn[lo3],
+                                   (uint32_t)(w & ~7ull) & 0xFFFFu); t = tb;
+                      }
+                      dp += (size_t)snprintf(dec + dp, sizeof(dec) - dp, " %s",
+                                             t);
+                      if (dp >= sizeof(dec) - 1) break;
+                  }
+                  fprintf(stderr, " |%s\n", dec);
               }
               fflush(stderr);
+          }
+      }
+    }
+
+    /* YZ_CNTGATE (s23): the audio-round COUNT GATE probe. RE (caller-chain map):
+     * every frame t1's tick chain calls func_00E5F248, which reads the pending
+     * count at G+0x18 (G = *(*(game_toc-0x7B28)+0x20), read at pc 0x00E5F27C)
+     * and passes it to func_00E5F094 -- which writes NO JOB and returns when
+     * count==0 (early exit pc 0xE5F0D8; a FULL ring would usleep-block instead).
+     * Round 3's missing JOB ⇒ count was 0. This probe resolves G, prints the
+     * count EA once (for a follow-up YZ_WATCH_WR), and logs count + the round
+     * counter @0x015F4410 on change -- one boot names the starved queue and
+     * whether the enqueuer ever runs again. */
+    { static int cg = -1;
+      if (cg < 0) { cg = getenv("YZ_CNTGATE") ? 1 : 0;
+          if (cg) fprintf(stderr, "[cntgate] ARMED (YZ_CNTGATE)\n"); }
+      if (cg && g_yz_game_toc) {
+          static uint32_t lastc = 0xFFFFFFFFu, lastr = 0xFFFFFFFFu;
+          static int announced = 0;
+          uint32_t O = vm_read32(g_yz_game_toc - 0x7B28u);
+          uint32_t G = (O >= 0x10000u && O < 0xE0000000u) ? vm_read32(O + 0x20u) : 0;
+          if (G >= 0x10000u && G < 0xE0000000u) {
+              if (!announced) { announced = 1;
+                  fprintf(stderr, "[cntgate] O=0x%08X G=0x%08X count-EA=0x%08X\n",
+                          O, G, G + 0x18u); fflush(stderr); }
+              uint32_t c = vm_read32(G + 0x18u);
+              uint32_t r = vm_read32(0x015F4410u);
+              /* s23 boot5 ADDENDUM: the round counter moved only 1->2 all boot =
+               * the DRIVER (func_00A9F8AC) itself ran exactly twice, so the gate
+               * is ABOVE the count read. Also watch the driver's own guard field
+               * (absolute-EA check that skips its body when 0, per the chain RE)
+               * and the fields it clears each round. */
+              uint32_t gf = vm_read32(0x014EC864u);
+              uint32_t f1c = vm_read32(0x015F441Cu), f20 = vm_read32(0x015F4420u);
+              static uint32_t lgf = 0xFFFFFFFFu, lf1c = 0xFFFFFFFFu, lf20 = 0xFFFFFFFFu;
+              if (c != lastc || r != lastr || gf != lgf || f1c != lf1c || f20 != lf20) {
+                  lastc = c; lastr = r; lgf = gf; lf1c = f1c; lf20 = f20;
+                  fprintf(stderr, "[cntgate] round=0x%02X count=0x%08X guard=0x%08X f1C=0x%08X f20=0x%08X\n",
+                          r & 0xFFu, c, gf, f1c, f20);
+                  fflush(stderr); }
           }
       }
     }
