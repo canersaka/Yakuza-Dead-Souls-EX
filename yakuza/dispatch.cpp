@@ -378,6 +378,30 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     if (yz_thread_current_id() == 1) {
         g_yz_t1_last_target = target;
         g_yz_t1_sample_seq++;
+
+        /* s24 (env YZ_UPDCB): the master per-object update handler
+         * func_00D1E838 [0xD1E838,0xD1FC38) dispatches ~27 callbacks via bctrl
+         * per main-loop iteration; the oracle completes every iteration in
+         * ~40-65 ms while ours never returns from iteration #2 (chain-probe
+         * census, scratch/s24cp1.err). Logging every bctrl issued FROM inside
+         * it names the callback that never returns (= the last line printed).
+         * Cap 400 lines (2-3 iterations' worth). */
+        { static int ucb = -1; static int ucb_n = 0;
+          if (ucb < 0) { ucb = getenv("YZ_UPDCB") ? 1 : 0;
+              if (ucb) fprintf(stderr, "[updcb] ARMED: t1 bctrl-from-func_00D1E838 log\n"); }
+          if (ucb && ucb_n < 400) {
+              uint32_t l = (uint32_t)ctx->lr;
+              if (l >= 0x00D1E838u && l < 0x00D1FC38u) {
+                  ucb_n++;
+                  fprintf(stderr, "[updcb] #%d target=0x%08X lr=0x%08X r3=0x%llX r4=0x%llX\n",
+                          ucb_n, target, l,
+                          (unsigned long long)ctx->gpr[3],
+                          (unsigned long long)ctx->gpr[4]);
+                  if (ucb_n == 400) fprintf(stderr, "[updcb] cap reached\n");
+                  fflush(stderr);
+              }
+          }
+        }
     }
 
     /* GENERIC indirect-call hook (env YZ_HOOK, 2026-07-02): comma-separated hex

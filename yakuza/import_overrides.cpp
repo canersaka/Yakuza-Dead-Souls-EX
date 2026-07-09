@@ -1478,6 +1478,11 @@ extern "C" int yz_rsx_flip_pending_any(void)
  * thread). Guarded by g_rsx_fifo_lock. */
 static uint32_t g_fifo_ret = ~0u;
 
+/* t1 hop counter from dispatch.cpp — the park-rel fast path's wedge witness:
+ * a t1 that makes no hops while the consumer sits parked cannot be on its way
+ * to drain the release journal (the drain runs on t1). */
+extern "C" volatile long g_yz_t1_sample_seq;
+
 /* Process exactly ONE FIFO command at GET (self-locked). Returns 1 if it made
  * progress (GET advanced / a method dispatched), 0 if idle or stalled (drained,
  * parked on a stopper, segment not finalised, off-ring, or an unsatisfied
@@ -1547,19 +1552,35 @@ static int yz_rsx_fifo_step(void)
              * applies the game's OWN journaled release ONLY after parking on
              * the SAME stopper for 3 s with PUT ahead -- a state that is
              * otherwise a permanent deadlock. Opt-in for A/B validation. */
-            static int prel = -1;
+            static int prel = -1; static unsigned fast_ms = 250;
             if (prel < 0) { prel = getenv("YZ_PARK_REL") ? 1 : 0;
-                if (prel) fprintf(stderr, "[park-rel] ARMED (YZ_PARK_REL): deadlock-only deferred-release apply, 3s threshold\n"); }
+                const char* fm = getenv("YZ_PARKREL_FAST_MS");
+                if (fm) fast_ms = (unsigned)atoi(fm);   /* 0 = fast path off (3 s tier only) */
+                if (prel) fprintf(stderr, "[park-rel] ARMED (YZ_PARK_REL): deadlock-only deferred-release apply, fast=%ums+t1-frozen witness, fallback=3000ms\n", fast_ms); }
+            /* s24 FAST PATH: the 3 s tier alone cost 16x3 s = ~48 s/boot at the
+             * movie boundary (scratch/s24pr1.err). Fire early ONLY when the
+             * deadlock is witnessed, not merely suspected: (a) parked on this
+             * stopper > fast_ms, (b) t1 made ZERO hops since the park began
+             * (the journal drain runs on t1 — a frozen t1 cannot be coming),
+             * (c) the release is in the game's journal (checked below — we
+             * only ever deliver the game's own queued write). The 3 s tier
+             * stays as the unconditional fallback for shapes the witness
+             * misses (e.g. t1 busy in a long direct-call stretch). */
             static uint32_t park_ea = 0; static ULONGLONG park_t0 = 0;
-            if (ea != park_ea) { park_ea = ea; park_t0 = GetTickCount64(); }
-            const int parked3s = prel && (GetTickCount64() - park_t0 > 3000);
+            static long park_seq = 0;
+            if (ea != park_ea) { park_ea = ea; park_t0 = GetTickCount64();
+                                 park_seq = g_yz_t1_sample_seq; }
+            const ULONGLONG parked_ms = GetTickCount64() - park_t0;
+            const int parked3s   = prel && (parked_ms > 3000);
+            const int parkedfast = prel && fast_ms && (parked_ms > fast_ms) &&
+                                   (g_yz_t1_sample_seq == park_seq);
             /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
              * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
              * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
-            const uint32_t rel_entry = ((apply || parked3s) && ahead != 0u && ahead < (ring >> 1))
+            const uint32_t rel_entry = ((apply || parked3s || parkedfast) && ahead != 0u && ahead < (ring >> 1))
                                            ? yz_gcm_stopper_release_entry(ea) : 0u;
             if (rel_entry) {
                 vm_write32(ea, 0x20000000u | ((get + 4u) & 0x1FFFFFFCu));   /* release: self-jump -> jump-forward +4 */
@@ -1569,9 +1590,13 @@ static int yz_rsx_fifo_step(void)
                  * -- zero those tags (the game's GPU-progress ledger; see
                  * yz_jrnl_retire_through). */
                 yz_jrnl_retire_through(rel_entry);
-                { static int n = 0; if (n < 16) { n++;
-                    fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X)%s -> GET advances past stopper\n",
-                            get, ahead, parked3s ? " [park-rel 3s]" : ""); } }
+                { static int n = 0; if (n < 64) { n++;
+                    fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X)%s parked=%llums t1seq=%ld fence0=0x%08X -> GET advances past stopper\n",
+                            get, ahead,
+                            parkedfast && !parked3s ? " [park-rel FAST]" :
+                            parked3s ? " [park-rel 3s]" : "",
+                            (unsigned long long)parked_ms, (long)g_yz_t1_sample_seq,
+                            vm_read32(0x40C00000u)); } }
                 LeaveCriticalSection(&g_rsx_fifo_lock);
                 return 1;
             }
@@ -1708,9 +1733,30 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
 {
     yz_rsx_fifo_lock_ensure();
     fprintf(stderr, "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model)\n");
+    /* s24 idle heartbeat: wall shape #2 is the consumer idling for minutes with
+     * PUT far ahead and NO stopper park (the lever legitimately silent) — and
+     * every return-0 path in yz_rsx_fifo_step is print-silent, so the parked
+     * state was invisible (scratch/s24ride.err: GET=0x7074 PUT=0x18EF8 wedged,
+     * cause unreadable). Every ~10 s of continuous non-advance, print GET/PUT
+     * + the raw words at GET so the blocking command is in the log. */
+    ULONGLONG idle_t0 = 0; uint32_t idle_get = ~0u;
     for (;;) {
         if (!g_rsx_ctx_ready) { SwitchToThread(); continue; }
-        if (!yz_rsx_fifo_step()) SwitchToThread();
+        if (yz_rsx_fifo_step()) { idle_t0 = 0; continue; }
+        const uint32_t g = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
+        const ULONGLONG now = GetTickCount64();
+        if (g != idle_get || !idle_t0) { idle_get = g; idle_t0 = now; }
+        else if (now - idle_t0 >= 10000) {
+            idle_t0 = now;
+            const uint32_t p  = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
+            const uint32_t ea = yz_rsx_io_to_ea(g);
+            fprintf(stderr, "[rsx-idle] 10s no-advance GET=0x%08X PUT=0x%08X ea=0x%08X words=%08X %08X %08X %08X\n",
+                    g, p, ea,
+                    ea ? vm_read32(ea) : 0, ea ? vm_read32(ea + 4) : 0,
+                    ea ? vm_read32(ea + 8) : 0, ea ? vm_read32(ea + 12) : 0);
+            fflush(stderr);
+        }
+        SwitchToThread();
     }
     return 0;
 }
