@@ -574,6 +574,19 @@ unconditional fallback. Rationale: the movie-boundary backlog is 16 consecutive 
 already-witnessed deadlocks. Apply log now records tier + parked-ms + t1seq + fence word.
 `YZ_PARKREL_FAST_MS=<n>` tunes the fast threshold; `0` disables the fast tier (3 s only —
 the A/B control). STATUS: candidate default-ON pending the s24fast/s24slow/s24off matrix.
+**UPDATED s25: fast tier now UNCONDITIONAL at fast_ms (witness dropped).** The measured
+chain that killed the witness: (a) rides s25ride4-6 ground at 3-5 s/flip — t1 parks by
+SPINNING in the gcm progress-throttle usleep loop (hops climb, so the seq-frozen witness
+never fires) while making no flush call (stopper_drain_re.md Q1); (b) ride7 with a widened
+spin witness (hop-target sample) still fired at 469-640 ms because t1's orbit is large in
+the asset phase; (c) the loading-screen steady state re-parks EVERY frame at the
+segment-recycle stopper (io 0x200000, 0x258-byte frame batches) because a LATCHED release
+is only ever applied by the SPU journal consumer (which we lack) or this lever — fast_ms
+is therefore the frame-rate governor (fps <= 1000/fast_ms; RPCS3's consumer releases at
+sub-ms). Safety was always the preconditions (GET parked ON the stopper + the game's own
+journal entry + PUT committed past it) — the 3 s tier fired on exactly those. Baseline
+diag setting now YZ_PARKREL_FAST_MS=16 (~60 Hz consumer-substitute). The ungated
+`g_yz_t1_last_tf` hop-target feed (dispatch.cpp) stays for diagnostics.
 
 `YZ_UPDCB` (yakuza/dispatch.cpp `ps3_indirect_call`, 2026-07-09 s24, diag, default OFF):
 logs every bctrl t1 issues with lr inside the master update handler func_00D1E838

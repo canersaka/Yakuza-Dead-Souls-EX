@@ -218,6 +218,15 @@ extern "C" volatile long g_yz_caller_bt_n  = 0;
 extern "C" volatile uint32_t g_yz_t1_last_target = 0;   /* ctr at t1's last bctr(l) */
 extern "C" volatile uint32_t g_yz_t1_last_lr     = 0;   /* lr at t1's last trampoline hop */
 extern "C" volatile long     g_yz_t1_sample_seq  = 0;
+/* s25: t1's last hop target as a raw HOST fn ptr, written UNGATED (one TLS
+ * read + store per hop; no guest resolution — that linear scan stays gated
+ * behind YZ_T1SAMPLE). Feeds the park-rel fast tier's SPIN witness: a t1
+ * orbiting the gcm progress-throttle usleep loop hops forever (seq climbs)
+ * but lands on the same target — it makes no flush call in that loop
+ * (stopper_drain_re.md Q1), so it is exactly as unable to drain its own
+ * journal as a frozen t1. Measured: rides s25ride4-6 ground at 3-5 s/flip
+ * because the seq-frozen witness never fired against the spin. */
+extern "C" volatile void*    g_yz_t1_last_tf     = 0;
 
 /* s21 HOP CENSUS: size the emission-rework payoff before building it. Every
  * trampoline hop passes this guard; only register-target (bctr-class) calls
@@ -250,13 +259,16 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
      * lifted functions, executed on EVERY t1 trampoline hop. Profiled as the
      * main thread's dominant cost (yz_tramp_guard+0xA5,
      * scratch/hot_threads_id.md). Gate it on the flag it serves. */
-    { static int t1s = -1; if (t1s < 0) t1s = getenv("YZ_T1SAMPLE") ? 1 : 0;
-      if (t1s && yz_thread_current_id() == 1) {
-        uint32_t g = yz_guest_of_host(tf);
-        if (g) g_yz_t1_last_target = g;
-        g_yz_t1_last_lr = (uint32_t)ctx0->lr;
+    if (yz_thread_current_id() == 1) {
+        g_yz_t1_last_tf = tf;            /* ungated spin-witness feed (s25) */
         g_yz_t1_sample_seq++;
-    } }
+        static int t1s = -1; if (t1s < 0) t1s = getenv("YZ_T1SAMPLE") ? 1 : 0;
+        if (t1s) {
+            uint32_t g = yz_guest_of_host(tf);
+            if (g) g_yz_t1_last_target = g;
+            g_yz_t1_last_lr = (uint32_t)ctx0->lr;
+        }
+    }
 
     if (g_yz_catch_caller) {
         static void* usleep_fn = nullptr;
@@ -378,6 +390,11 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     if (yz_thread_current_id() == 1) {
         g_yz_t1_last_target = target;
         g_yz_t1_sample_seq++;
+        /* s25 spin-witness feed (see g_yz_t1_last_tf in this file): guest
+         * addr cast to the same slot the tramp path fills with host ptrs —
+         * only ever compared for equality, and the two spaces can't collide. */
+        extern volatile void* g_yz_t1_last_tf;
+        g_yz_t1_last_tf = (void*)(uintptr_t)target;
 
         /* s24 (env YZ_UPDCB): the master per-object update handler
          * func_00D1E838 [0xD1E838,0xD1FC38) dispatches ~27 callbacks via bctrl
