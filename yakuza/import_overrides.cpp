@@ -607,8 +607,18 @@ static uint32_t yz_rsx_blit_fmt     = 0xB;     /* a8r8g8b8 */
 static uint32_t yz_rsx_blit_point;
 static uint32_t yz_rsx_blit_size_out = 0x00010001;
 
+extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined below */
+
 static int yz_rsx_method(uint32_t method, uint32_t arg)
 {
+    /* GCM_FLIP_HEAD arm banner on the consumer's FIRST method, not the first
+     * 0xE920 hit: a "0xE920 never seen" negative is only MEASURED if the log
+     * proves the probe ran (docs/LESSONS.md, the s22 honesty rules). */
+    static int nf = -1;
+    if (nf < 0) { nf = getenv("YZ_NO_FLIPHEAD") ? 1 : 0;
+        fprintf(stderr, "[fliphead] armed (immediate-flip dispatch %s)\n",
+                nf ? "DISABLED by YZ_NO_FLIPHEAD" : "on"); fflush(stderr); }
+
     /* Track B live draw: mirror the full method stream into the NV4097->D3D12
      * engine (no-op unless YZ_RSX_DRAW + init succeeded). It accumulates
      * clears/state/geometry and self-presents on the 0xE944 flip method. This
@@ -652,6 +662,36 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         { static int n = 0; if (n < 8) { n++;
             fprintf(stderr, "[rsx] DRIVER_QUEUE head=%u buf=%u (flip queued)\n", head, arg); } }
         if (yz_ft_on()) yz_ft("QUEUE head=%u buf=%u", head, arg);
+        return 0;
+    }
+
+    /* GCM_FLIP_HEAD (0xE920 + head*4): the IMMEDIATE display flip driven from
+     * the GPU command stream (the cellGcmSetFlipImmediate path) -- sibling of
+     * the DRIVER_QUEUE path above and the same lv1 driver-method family as the
+     * 0xEB00 user interrupt fixed in s22. Our consumer silently dropped it
+     * (method coverage audit 2026-07-08, top-ranked gap of blocker #20's
+     * missing-mechanism class). RPCS3 binds it as a thin shim onto the SAME
+     * syscall our pkg-0x102 case already implements: rsx_methods.cpp:1729
+     * bind_range<GCM_FLIP_HEAD,1,2,gcm::driver_flip> ->
+     * sys_rsx_context_attribute(0x102, head, arg) (rsx_methods.cpp:93-99,
+     * sys_rsx.cpp:574-627: arg bit31 = grab-queued-buffer, else display-buffer
+     * offset). Route it there. Kill-switch YZ_NO_FLIPHEAD. */
+    if (method == 0xE920 || method == 0xE924) {
+        uint32_t head = (method - 0xE920) >> 2;
+        static unsigned long fn = 0; fn++;
+        if (fn <= 16 || (fn & 0x3FFu) == 0) {
+            fprintf(stderr, "[fliphead] n=%lu head=%u arg=0x%08X%s\n",
+                    fn, head, arg, nf ? " (DROPPED by YZ_NO_FLIPHEAD)" : "");
+            fflush(stderr);
+        }
+        if (yz_ft_on()) yz_ft("FLIP_HEAD head=%u arg=0x%08X", head, arg);
+        if (!nf) {
+            ppu_context sc; memset(&sc, 0, sizeof(sc));
+            sc.gpr[4] = 0x102;                 /* pkg: display flip */
+            sc.gpr[5] = head;
+            sc.gpr[6] = arg;
+            yz_sys_rsx_context_attribute(&sc);
+        }
         return 0;
     }
 
@@ -778,15 +818,24 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                   g_rsx_flip_pending[g_rsx_queued_head & 7u]);
         if (addr)
             yz_rsx_w32(addr, arg);
-        /* A release of the flip semaphore (label+0x10) to the pending marker is
-         * the "flip submitted" signal -- arm the queued head so the next vblank
-         * presents it and clears the label. Arming here (after the 0xFFFFFFFF
-         * write) keeps the vblank clear strictly ordered after the dirty. */
+        /* COMPENSATING HEURISTIC (pre-fliphead era, s23 gated): a release of the
+         * flip semaphore (label+0x10) to the pending marker arms the queued head
+         * so the next vblank presents it. RPCS3's nv406e::semaphore_release does
+         * NOT do this -- the real flip is commanded by GCM_FLIP_HEAD (0xE920),
+         * which we now deliver (s23). While this stays on, any non-flip label
+         * write manufactures a phantom flip (uncommanded present + throttle
+         * bump + FLIP event). Kill-switch YZ_NO_SEMARM for the retirement A/B;
+         * flip the default to OFF once measured redundant. */
         if (addr == RSX_REPORTS + 0x10 && arg != 0) {
-            LONG prev = InterlockedExchange(
-                &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
-            if (yz_ft_on())
-                yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
+            static int nsa = -1; if (nsa < 0) { nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
+                fprintf(stderr, "[semarm] armed (release-arm heuristic %s)\n",
+                        nsa ? "DISABLED by YZ_NO_SEMARM" : "on"); fflush(stderr); }
+            if (!nsa) {
+                LONG prev = InterlockedExchange(
+                    &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+                if (yz_ft_on())
+                    yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
+            }
         }
         break;
     case 0x1A4:                                   /* NV4097 SET_CONTEXT_DMA_SEMAPHORE */
@@ -2103,9 +2152,14 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
             for (uint32_t i = 0; i < g_rsx_dispbuf_count; i++)
                 if (g_rsx_dispbuf[i].offset == (uint32_t)a4) { flip_idx = i; break; }
         }
-        yz_rsx_present(flip_idx);         /* show the frame in the window */
-        /* Mark the flip pending; the vblank tick publishes the done bit so it
-         * survives the game's cellGcmResetFlipStatus ordering. */
+        /* ONE present per flip, done by the vblank retire (s23): presenting here
+         * AND arming pending double-presented every immediate flip once the
+         * 0xE920 method bridge went live (title-bar flips ran ~2x Track B
+         * frames, s23boot1). Record the resolved buffer on the head so the
+         * retire presents the right one for the offset form too, then arm; the
+         * retire presents + publishes the done bit (which also survives the
+         * game's cellGcmResetFlipStatus ordering). */
+        vm_write32(yz_rsx_head_addr(head) + 0x14, flip_idx);  /* lastQueuedBufferId */
         InterlockedExchange(&g_rsx_flip_pending[head], 1);
         if (yz_ft_on())
             yz_ft("SYSFLIP head=%u buf=%u a4=0x%llX (arm pending[%u], no label write)",
