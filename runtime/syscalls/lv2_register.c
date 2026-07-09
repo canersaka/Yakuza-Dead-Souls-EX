@@ -501,7 +501,16 @@ static void* spu_exec_thread_proc(void* arg)
     } else if (sctx->status == SPU_STATUS_STOPPED_BY_STOP &&
                sctx->stop_code == 0x101u /* GROUP_EXIT */ && sctx->ch_out_mbox.count) {
         spu_group_t* grp = spu_find_group(t->group_id);
-        if (grp) grp->exit_status = (int32_t)sctx->ch_out_mbox.value;
+        if (grp) {
+            grp->exit_status = (int32_t)sctx->ch_out_mbox.value;
+            /* s23 conformance fix: record the GROUP_EXIT cause so group_join
+             * reports SYS_SPU_THREAD_GROUP_JOIN_GROUP_EXIT, not the generic
+             * ALL_THREADS_EXIT. The join handler used to overwrite g->cause
+             * unconditionally, so a game-initiated sys_spu_thread_group_exit()
+             * was indistinguishable from natural all-threads completion (SDK
+             * Lv2 ref p.147; RPCS3 sys_spu.h:297 join_state). */
+            grp->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
+        }
         sctx->ch_out_mbox.count = 0;
         t->exit_status = 0;
     } else {
@@ -587,6 +596,21 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                     sctx->gpr[3 + a]._u32[1] = (uint32_t)t->args[a];
                 }
                 sctx->pc = t->entry_point & SPU_LS_MASK;
+                /* s23 conformance fix: START THE DECREMENTER. This live path
+                 * builds sctx via memset and never calls spu_context_init(), so
+                 * every real lifted SPU thread was getting dec_running=0 /
+                 * dec_start_tb=0 -- every `rdch SPU_RdDec` frozen at 0 forever
+                 * (13 read sites, 0 WrDec writes in the lifted images per
+                 * specaudit_spu.md F21). Spec: the decrementer counts from thread
+                 * creation (CBEA v1.02 Section 9.7; RPCS3 SPUThread.cpp:1313-1315
+                 * starts it at cpu_init). Mirror spu_context_init's three lines
+                 * here. Kill-switch YZ_NO_SPUDEC (behavioral: it feeds SPURS
+                 * timing, so A/B it against the frontier). */
+                { static int nd = -1; if (nd < 0) { nd = getenv("YZ_NO_SPUDEC") ? 1 : 0;
+                    fprintf(stderr, "[spudec] armed (decrementer start %s)\n",
+                            nd ? "DISABLED by YZ_NO_SPUDEC" : "on"); }
+                  if (!nd) { sctx->dec_value = 0;
+                      sctx->dec_start_tb = ppu_timebase_now(); sctx->dec_running = 1; } }
                 t->running = 1;
 #ifdef _WIN32
                 if (!t->finish_event)
@@ -718,7 +742,13 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
             if (t->exit_status < worst) worst = t->exit_status;
         }
         g->exit_status = worst;
-        g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        /* s23 conformance fix: only DEFAULT to ALL_THREADS_EXIT. If a thread
+         * reported GROUP_EXIT (or a terminate set TERMINATED) the exit
+         * dispatcher already set g->cause -- don't clobber it. cause==0 is the
+         * unset sentinel (GROUP_EXIT=1/ALL_THREADS_EXIT=2/TERMINATED=4). */
+        if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT &&
+            g->cause != SPU_GROUP_CAUSE_TERMINATED)
+            g->cause   = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
