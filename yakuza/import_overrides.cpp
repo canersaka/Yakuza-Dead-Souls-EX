@@ -1548,6 +1548,7 @@ static uint32_t g_fifo_ret = ~0u;
  * a t1 that makes no hops while the consumer sits parked cannot be on its way
  * to drain the release journal (the drain runs on t1). */
 extern "C" volatile long g_yz_t1_sample_seq;
+extern "C" volatile void* g_yz_t1_last_tf;   /* s25 spin-witness feed (dispatch.cpp) */
 
 /* Process exactly ONE FIFO command at GET (self-locked). Returns 1 if it made
  * progress (GET advanced / a method dispatched), 0 if idle or stalled (drained,
@@ -1633,13 +1634,30 @@ static int yz_rsx_fifo_step(void)
              * stays as the unconditional fallback for shapes the witness
              * misses (e.g. t1 busy in a long direct-call stretch). */
             static uint32_t park_ea = 0; static ULONGLONG park_t0 = 0;
-            static long park_seq = 0;
+            static long park_seq = 0; static void* park_tf = 0;
             if (ea != park_ea) { park_ea = ea; park_t0 = GetTickCount64();
-                                 park_seq = g_yz_t1_sample_seq; }
+                                 park_seq = g_yz_t1_sample_seq;
+                                 park_tf  = (void*)g_yz_t1_last_tf; }
             const ULONGLONG parked_ms = GetTickCount64() - park_t0;
             const int parked3s   = prel && (parked_ms > 3000);
-            const int parkedfast = prel && fast_ms && (parked_ms > fast_ms) &&
-                                   (g_yz_t1_sample_seq == park_seq);
+            /* s25: fast tier now UNCONDITIONAL at fast_ms (witness dropped).
+             * Measured chain: (a) rides s25ride4-6 ground at 3-5 s/flip
+             * because t1 SPINS in the throttle (seq climbs, hop-frozen
+             * witness never fires) yet makes no flush call
+             * (stopper_drain_re.md Q1); (b) the loading-screen steady state
+             * re-parks EVERY frame at the segment-recycle stopper (io
+             * 0x200000, 0x258-byte frame batches) because a LATCHED release
+             * is only ever applied by the SPU journal consumer (which we
+             * lack) or this lever — so fast_ms is the frame-rate governor
+             * (fps <= 1000/fast_ms), and RPCS3's consumer does this at
+             * sub-ms. Safety was never the witness: the preconditions (GET
+             * parked ON the stopper + the release IS the game's own journal
+             * entry + PUT committed past it) carry it, and the 3 s tier
+             * already fired on exactly those. Lever remains opt-in
+             * (YZ_PARK_REL) until the real consumer story lands. park_seq/
+             * park_tf kept for the apply log's diagnostics. */
+            (void)park_tf;
+            const int parkedfast = prel && fast_ms && (parked_ms > fast_ms);
             /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
              * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
              * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
