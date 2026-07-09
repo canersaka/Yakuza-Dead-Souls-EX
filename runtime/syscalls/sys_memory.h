@@ -55,6 +55,14 @@ extern sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
 extern sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer */
 
+/* M1/M7 (2026-07-09): external memory accounting -- lets other subsystems
+ * (e.g. sys_vm's psize) charge bytes against the same 213MB user-memory
+ * budget that sys_memory_get_user_memory_size reports, the way real HW bills
+ * every physical-memory consumer against one lv2_memory_container (RPCS3
+ * rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h's lv2_memory_container::take/free).
+ * No-op when YZ_NO_MEMACCT is set (A/B kill-switch; see sys_memory.c). */
+void sys_memory_account(uint32_t bytes);
+
 /* Syscall handlers */
 int64_t sys_memory_allocate(ppu_context* ctx);
 int64_t sys_memory_free(ppu_context* ctx);

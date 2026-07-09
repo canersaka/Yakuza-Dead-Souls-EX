@@ -6,6 +6,7 @@
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -16,6 +17,14 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
+
+/* Batch fixes item 6 (one-shot timers): per-slot state parallel to
+ * g_sys_timers, kept here rather than in sys_timer_info (sys_timer.h is out
+ * of scope for this batch) -- base_time (absolute, timer_now_usec() clock)
+ * and whether sys_timer_start armed this slot as one-shot (period == 0,
+ * RPCS3 sys_timer.cpp:271-319). Reset when a slot is (re)created. */
+static uint64_t s_timer_base_time[SYS_TIMER_MAX];
+static int      s_timer_one_shot[SYS_TIMER_MAX];
 
 #ifdef _WIN32
 static LARGE_INTEGER s_qpc_freq;
@@ -233,14 +242,56 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
+    /* U1/U2 fix (2026-07-09): the old code reported time since the QPC
+     * counter's own epoch (host uptime) as if it were calendar time -- a
+     * guest reading this as a real timestamp would see garbage (e.g. hours
+     * since this PC booted, not seconds since 1970). Anchor once to the real
+     * wall clock instead, mirroring RPCS3 sys_time.cpp:30-52
+     * (s_time_aux_info's GetSystemTimeAsFileTime + QPC anchor pair) and
+     * :352-367 (sys_time_get_current_time: anchor + QPC delta). Kill-switch
+     * YZ_NO_TIMEANCHOR restores the old host-uptime behaviour for A/B --
+     * system_time DELTAS (used for pacing everywhere) are identical either
+     * way; only the absolute epoch moves. */
+    static int           s_no_anchor = -1;
+    static int           s_anchor_init = 0;
+    static uint64_t      s_anchor_epoch_ns = 0;  /* Unix epoch ns at anchor */
+    static LARGE_INTEGER s_anchor_qpc;
+
+    if (s_no_anchor < 0) {
+        s_no_anchor = getenv("YZ_NO_TIMEANCHOR") ? 1 : 0;
+        fprintf(stderr, "[sys_time] timeanchor armed (wall-clock epoch %s)\n",
+                s_no_anchor ? "DISABLED by YZ_NO_TIMEANCHOR" : "on");
+        fflush(stderr);
+    }
+
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    if (s_no_anchor) {
+        /* Convert QPC to seconds + nanoseconds (old behaviour) */
+        sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
+        uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
+        nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    } else {
+        if (!s_anchor_init) {
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            uint64_t ft100ns = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+            /* 100ns units since 1601-01-01 -> since 1970-01-01 (RPCS3
+             * sys_time.cpp:49's constant), then to nanoseconds. */
+            s_anchor_epoch_ns = (ft100ns - 116444736000000000ULL) * 100ULL;
+            s_anchor_qpc = now;
+            s_anchor_init = 1;
+        }
+
+        uint64_t d = (uint64_t)(now.QuadPart - s_anchor_qpc.QuadPart);
+        uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+        uint64_t delta_ns = (d / q) * 1000000000ULL + (d % q) * 1000000000ULL / q;
+        uint64_t time_ns  = s_anchor_epoch_ns + delta_ns;
+        sec  = time_ns / 1000000000ULL;
+        nsec = time_ns % 1000000000ULL;
+    }
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -276,10 +327,75 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
+/* Batch fixes item 6: the same wall-clock-anchored microsecond clock as
+ * sys_time_get_current_time (RPCS3 sys_time.cpp:30-52 anchor pair), so a
+ * base_time obtained from sys_time_get_current_time and handed to
+ * sys_timer_start compares against the same clock here. Self-contained
+ * (duplicated, not shared) since this file registers its own timer thread. */
+#ifdef _WIN32
+static uint64_t timer_now_usec(void)
+{
+    static int           anchor_init = 0;
+    static uint64_t      anchor_epoch_ns = 0;
+    static LARGE_INTEGER anchor_qpc;
+
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    if (!anchor_init) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        uint64_t ft100ns = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        anchor_epoch_ns = (ft100ns - 116444736000000000ULL) * 100ULL;
+        anchor_qpc = now;
+        anchor_init = 1;
+    }
+
+    uint64_t d = (uint64_t)(now.QuadPart - anchor_qpc.QuadPart);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    uint64_t delta_ns = (d / q) * 1000000000ULL + (d % q) * 1000000000ULL / q;
+    uint64_t time_ns  = anchor_epoch_ns + delta_ns;
+    return time_ns / 1000ULL;
+}
+#else
+static uint64_t timer_now_usec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+#endif
+
 #ifdef _WIN32
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    int slot = (int)(t - g_sys_timers);
+    uint64_t base = s_timer_base_time[slot];
+    int one_shot  = s_timer_one_shot[slot];
+
+    /* One-shot / first-periodic-fire base_time wait (RPCS3
+     * sys_timer.cpp:271-319): wait until base_time is reached, or fire
+     * immediately if it's already past. stop_event still cancels the wait. */
+    if (base != 0) {
+        uint64_t now = timer_now_usec();
+        if (base > now) {
+            uint64_t delta_ms64 = (base - now) / 1000;
+            DWORD wait_ms = (delta_ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)delta_ms64;
+            if (wait_ms == 0) wait_ms = 1;
+            if (WaitForSingleObject(t->stop_event, wait_ms) == WAIT_OBJECT_0)
+                return 0; /* stop signaled before base_time */
+        }
+    }
+
+    if (!t->running) return 0;
+
+    if (one_shot) {
+        timer_send_event(t);
+        t->running = 0;
+        return 0;
+    }
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);
@@ -301,8 +417,40 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
 static void* timer_thread_proc(void* param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    int slot = (int)(t - g_sys_timers);
+    uint64_t base = s_timer_base_time[slot];
+    int one_shot  = s_timer_one_shot[slot];
 
     pthread_mutex_lock(&t->mtx);
+
+    if (base != 0) {
+        uint64_t now = timer_now_usec();
+        if (base > now) {
+            uint64_t delta = base - now;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += (time_t)(delta / 1000000);
+            ts.tv_nsec += (long)((delta % 1000000) * 1000);
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            while (!t->stop_flag) {
+                int rc = pthread_cond_timedwait(&t->cv, &t->mtx, &ts);
+                if (rc == ETIMEDOUT) break;
+            }
+        }
+    }
+
+    if (t->stop_flag) {
+        pthread_mutex_unlock(&t->mtx);
+        return NULL;
+    }
+
+    if (one_shot) {
+        pthread_mutex_unlock(&t->mtx);
+        timer_send_event(t);
+        t->running = 0;
+        return NULL;
+    }
+
     while (!t->stop_flag) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -389,6 +537,8 @@ int64_t sys_timer_create(ppu_context* ctx)
     t->active  = 1;
     t->running = 0;
     t->event_queue_id = 0;
+    s_timer_base_time[slot] = 0;
+    s_timer_one_shot[slot]  = 0;
 
 #ifdef _WIN32
     t->stop_event    = NULL;
@@ -423,6 +573,13 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     sys_timer_info* t = &g_sys_timers[timer_id - 1];
     if (!t->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* U7 fix (2026-07-09): a timer still connected to an event queue must be
+     * disconnected first (RPCS3 sys_timer.cpp:206-209: destroy checks
+     * `lv2_obj::check(timer.port)` under the timer's lock and returns
+     * CELL_EISCONN rather than silently tearing down the connection). */
+    if (t->event_queue_id != 0)
+        return (int64_t)(int32_t)CELL_EISCONN;
 
     /* Stop if running */
     if (t->running) {
@@ -511,7 +668,7 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
 int64_t sys_timer_start(ppu_context* ctx)
 {
     uint32_t timer_id    = LV2_ARG_U32(ctx, 0);
-    /* uint64_t base_time = LV2_ARG_U64(ctx, 1); -- ignored for now */
+    uint64_t base_time   = LV2_ARG_U64(ctx, 1);
     uint64_t period      = LV2_ARG_U64(ctx, 2);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
@@ -524,8 +681,35 @@ int64_t sys_timer_start(ppu_context* ctx)
     if (t->running)
         return (int64_t)(int32_t)CELL_EBUSY;
 
-    if (period == 0)
+    if (period != 0 && period < 100)
         return (int64_t)(int32_t)CELL_EINVAL;
+
+    /* Batch fixes item 6 (2026-07-09): period == 0 is a lv2 ONE-SHOT timer
+     * (RPCS3 sys_timer.cpp:271-319), not an error -- it fires exactly once
+     * when base_time is reached (immediately if base_time is already past)
+     * and does not re-arm. This was previously EINVAL'd unconditionally, so
+     * kill-switch YZ_NO_TIMER1SHOT restores that behavior for A/B. */
+    static int no_1shot = -1;
+    if (no_1shot < 0) {
+        no_1shot = getenv("YZ_NO_TIMER1SHOT") ? 1 : 0;
+        fprintf(stderr, "[timer1shot] armed (%s)\n",
+                no_1shot ? "DISABLED by YZ_NO_TIMER1SHOT" : "on");
+    }
+    if (period == 0 && no_1shot)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    int slot = (int)(timer_id - 1);
+    s_timer_base_time[slot] = base_time;
+    s_timer_one_shot[slot]  = (period == 0) ? 1 : 0;
+
+    if (period == 0) {
+        static long n1s = 0;
+        if (n1s < 4) {
+            n1s++;
+            fprintf(stderr, "[timer] ONE-SHOT armed base=%llu\n",
+                    (unsigned long long)base_time);
+        }
+    }
 
     t->period_usec = period;
     t->running     = 1;
@@ -587,14 +771,9 @@ int64_t sys_timer_stop(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  *
- * NOTE: There are syscall number collisions in the existing table:
- *   SYS_TIMER_USLEEP (141) == SYS_EVENT_FLAG_WAIT (141)
- *   SYS_TIMER_SLEEP  (142) == SYS_EVENT_FLAG_TRYWAIT (142)
- *   SYS_TIME_GET_CURRENT_TIME (145) == SYS_EVENT_FLAG_CANCEL (145)
- * The event flag handlers are registered separately and will win.
- * Timer sleep/time functions should be called via wrapper functions
- * or fixed syscall numbers should be assigned.
- * For now, we register the timer-specific syscalls that don't collide.
+ * The syscall numbers below are the real, non-colliding lv2 values -- see
+ * lv2_syscall_table.h:91-94 for the history (the old 139-146 block collided
+ * with the event-flag syscalls; fixed).
  * -----------------------------------------------------------------------*/
 void sys_timer_init(lv2_syscall_table* tbl)
 {
@@ -611,14 +790,7 @@ void sys_timer_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_TIMER_CONNECT_EVENT_QUEUE,      sys_timer_connect_event_queue);
     lv2_syscall_register(tbl, SYS_TIMER_DISCONNECT_EVENT_QUEUE,   sys_timer_disconnect_event_queue);
 
-    /* These have conflicting numbers with event flag syscalls.
-     * Register them here -- last registration wins. If events are
-     * registered after timers, the event handlers will override.
-     * The runtime should dispatch timer_usleep/sleep/get_current_time
-     * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
-
-    /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);

@@ -128,10 +128,37 @@ extern "C" void yz_ovr__sys_heap_free(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 extern "C" void yz_ovr_sys_time_get_system_time(ppu_context* ctx)
 {
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
+    /* U1/U2 fix (2026-07-09): the old code returned microseconds since the
+     * QPC counter's own epoch, i.e. leaked this PC's uptime straight into
+     * the game -- RPCS3 sys_time.cpp:191-192 calls this out explicitly
+     * ("Add an offset to get_timebased_time to avoid leaking PC's uptime
+     * into the game / As if PS3 starts at value 0 (base time) when the game
+     * boots"). Cache the QPC frequency once and report elapsed time since a
+     * first-call anchor instead of raw QPC. Kill-switch YZ_NO_TIMEANCHOR
+     * (shared with sys_timer.c's sys_time_get_current_time anchor) restores
+     * the old raw-QPC (host-uptime) behaviour for A/B. */
+    static LARGE_INTEGER s_freq;
+    static LARGE_INTEGER s_anchor;
+    static int s_init = 0;
+    static int s_no_anchor = -1;
+
+    if (s_no_anchor < 0) {
+        s_no_anchor = getenv("YZ_NO_TIMEANCHOR") ? 1 : 0;
+        fprintf(stderr, "[yz_time] system_time armed (anchor-to-boot %s)\n",
+                s_no_anchor ? "DISABLED by YZ_NO_TIMEANCHOR" : "on");
+        fflush(stderr);
+    }
+
+    if (!s_init) {
+        QueryPerformanceFrequency(&s_freq);
+        QueryPerformanceCounter(&s_anchor);
+        s_init = 1;
+    }
+
+    LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    ctx->gpr[3] = (uint64_t)((c.QuadPart * 1000000) / f.QuadPart);
+    int64_t d = s_no_anchor ? c.QuadPart : (c.QuadPart - s_anchor.QuadPart);
+    ctx->gpr[3] = (uint64_t)((d * 1000000) / s_freq.QuadPart);
 }
 
 /* ---------------------------------------------------------------------------
@@ -655,13 +682,21 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
      * flip-sema RELEASE that follows (which arms `pending`). */
     if (method >= 0xE940 && method <= 0xE95C) {
         uint32_t head = ((method - 0xE940) >> 2) & 7u;
-        uint32_t ha = yz_rsx_head_addr(head);
-        vm_write32(ha + 0x14, arg);                              /* lastQueuedBufferId */
-        vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x40000000u | (1u << (arg & 31)));
         g_rsx_queued_head = head;
         { static int n = 0; if (n < 8) { n++;
             fprintf(stderr, "[rsx] DRIVER_QUEUE head=%u buf=%u (flip queued)\n", head, arg); } }
         if (yz_ft_on()) yz_ft("QUEUE head=%u buf=%u", head, arg);
+        /* s23: route through the pkg-0x103 syscall case instead of the old
+         * inline duplicate -- RPCS3's gcm::queue_flip method IS that shim
+         * (rsx_methods.cpp:101-113 -> sys_rsx 0x103), and the syscall case now
+         * also delivers the queue event; boot9 measured the game queues ONLY
+         * via this method (the 0x103 syscall itself never fires), so the
+         * event delivery was dead until this bridge. */
+        ppu_context sc; memset(&sc, 0, sizeof(sc));
+        sc.gpr[4] = 0x103;
+        sc.gpr[5] = head;
+        sc.gpr[6] = arg;
+        yz_sys_rsx_context_attribute(&sc);
         return 0;
     }
 
@@ -2944,6 +2979,15 @@ extern "C" void yz_ovr_sys_spu_image_import(ppu_context* ctx)
         }
         if (p_type == 1 && p_memsz != p_filesz && p_filesz) nsegs += 2;
         else nsegs += 1;
+    }
+
+    /* Batch fixes item 12 (RPCS3 sys_spu.h:107): sys_spu_image segment count
+     * is capped at 0x20 -- an image that would overflow that (malformed or
+     * adversarial phdr table) must fail ENOMEM instead of driving an
+     * oversized heap allocation / segment table. */
+    if (nsegs <= 0 || nsegs > 0x20) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_ENOMEM;
+        return;
     }
 
     uint32_t segs_ea = yz_heap_alloc((uint32_t)nsegs * 0x18u, 16);

@@ -396,7 +396,15 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
               hk[hn++] = (uint32_t)v;
               s = (*end == ',') ? end + 1 : end;
               if (*s == '\0') break;
-          } }
+          }
+          /* s23: armed banner (a zero-hit boot without one is PLAUSIBLE, not
+           * MEASURED -- this bit us on the 00DDDA6C hook). NB per the SIGCALL
+           * comment below, a bctrl may carry the OPD address rather than the
+           * code address: hook BOTH (find the OPD EA whose word0 = the code
+           * addr) or expect false negatives. */
+          if (hn) { fprintf(stderr, "[hook] armed:"); for (int i = 0; i < hn; i++)
+                        fprintf(stderr, " 0x%08X", hk[i]);
+                    fprintf(stderr, "\n"); fflush(stderr); } }
       for (int i = 0; i < hn; i++) {
           if (target == hk[i]) {
               static int n = 0; if (n < 60) { n++;
