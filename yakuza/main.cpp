@@ -121,6 +121,7 @@ extern "C" void spu_begin_image(int image_id);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
 extern "C" int g_yz_watch_dlist;
+extern "C" int g_yz_slotstore;   /* YZ_SLOTSTORE: wid4 record-store watch (spu_channels.c) */
 
 static int load_elf(const char* path, uint64_t* entry_out)
 {
@@ -574,7 +575,13 @@ extern "C" void yz_watch_arm_read(uint32_t guest_addr)
 #define YZ_WATCH_WR_MAX 16
 static uint32_t g_wwr_ea[YZ_WATCH_WR_MAX];
 static uint8_t* g_wwr_host[YZ_WATCH_WR_MAX];
-static uint32_t g_wwr_page[YZ_WATCH_WR_MAX];      /* page base (host) per slot */
+/* page base (HOST address) per slot. s26 FIX: was uint32_t — vm_base is a
+ * 64-bit mapping (~0x1Fxxxxxxxxx), so the stored page truncated, the VEH's
+ * page match never hit, and the arming VirtualProtect targeted a bogus low-32
+ * address (first ride6 crashed on the un-guarded lazy-commit fault instead).
+ * Instrument-class bug: the flag shipped s14 and this was its first real use
+ * on a >4GB vm_base (LESSONS #21 — check the instrument). */
+static uintptr_t g_wwr_page[YZ_WATCH_WR_MAX];
 static uint32_t g_wwr_old[YZ_WATCH_WR_MAX];       /* last-seen guest-BE dword, for old/new */
 static int      g_wwr_n = 0;
 static unsigned long g_wwr_otherhits = 0;         /* same-page-other-dword counter (all slots) */
@@ -591,7 +598,7 @@ static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
         uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
         uintptr_t page = tgt & ~(uintptr_t)0xFFF;
         int onpage = 0;
-        for (int i = 0; i < g_wwr_n; i++) if ((uintptr_t)g_wwr_page[i] == page) { onpage = 1; break; }
+        for (int i = 0; i < g_wwr_n; i++) if (g_wwr_page[i] == page) { onpage = 1; break; }
         if (!onpage) return EXCEPTION_CONTINUE_SEARCH;   /* not one of our pages */
         (void)acc;   /* PAGE_READONLY only traps writes; reads pass through untouched */
         /* We can't know from the fault alone which bytes changed (x86 doesn't
@@ -657,7 +664,7 @@ static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
         for (int j = 0; j < i; j++) if (g_wwr_page[j] == g_wwr_page[i]) { done_before = true; break; }
         if (done_before) continue;
         DWORD old;
-        VirtualProtect((void*)(uintptr_t)g_wwr_page[i], 0x1000, PAGE_READONLY, &old);
+        VirtualProtect((void*)g_wwr_page[i], 0x1000, PAGE_READONLY, &old);
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -680,15 +687,30 @@ extern "C" void yz_watch_wr_init(void)
         uintptr_t page = (uintptr_t)host & ~(uintptr_t)0xFFF;
         g_wwr_ea[g_wwr_n]   = ea;
         g_wwr_host[g_wwr_n] = host;
-        g_wwr_page[g_wwr_n] = (uint32_t)page;
+        g_wwr_page[g_wwr_n] = page;
+        /* Commit the page explicitly BEFORE touching it: this init runs before
+         * the vmguard lazy-commit VEH is installed, so a first-touch read here
+         * AVs straight into the crash reporter (s26ride6/6b — mis-symbolized
+         * as guest func_022001B4 per LESSONS #12; tramp_idx=0 was the tell).
+         * MEM_COMMIT on an already-committed page is a no-op. */
+        if (!VirtualAlloc((void*)page, 0x1000, MEM_COMMIT, PAGE_READWRITE)) {
+            fprintf(stderr, "[watch-wr] COMMIT failed ea=0x%08X err=%lu — slot skipped\n",
+                    ea, GetLastError());
+            fflush(stderr);
+            s = (*end == ',') ? end + 1 : end;
+            continue;
+        }
         uint32_t cur; memcpy(&cur, host, 4);
         g_wwr_old[g_wwr_n]  = cur;
         g_wwr_n++;
-        fprintf(stderr, "[watch-wr] armed ea=0x%08X page=0x%08X\n", ea, (uint32_t)page);
+        fprintf(stderr, "[watch-wr] armed ea=0x%08X hostpage=0x%llX\n",
+                ea, (unsigned long long)page);
         /* A page-guard traps the WHOLE 4 KB page. Warn loudly if
          * this page overlaps the known-hot SPURS mgmt page class, but arm it
-         * anyway (spec: warn, don't refuse) -- caller owns the tradeoff. */
-        if ((page & 0xFFFFF000u) == 0x40197000u) {
+         * anyway (spec: warn, don't refuse) -- caller owns the tradeoff.
+         * (s26 fix: compare the GUEST page — the old host-page compare could
+         * never match a guest constant.) */
+        if ((ea & 0xFFFFF000u) == 0x40197000u) {
             fprintf(stderr, "[watch-wr] WARNING: ea=0x%08X is on the hot SPURS-mgmt page "
                     "0x40197xxx -- this page-guard single-steps EVERY access to the whole "
                     "4KB page and can badly slow or wedge the run.\n", ea);
@@ -703,7 +725,12 @@ extern "C" void yz_watch_wr_init(void)
         for (int j = 0; j < i; j++) if (g_wwr_page[j] == g_wwr_page[i]) { done_before = true; break; }
         if (done_before) continue;
         DWORD old;
-        VirtualProtect((void*)(uintptr_t)g_wwr_page[i], 0x1000, PAGE_READONLY, &old);
+        if (!VirtualProtect((void*)g_wwr_page[i], 0x1000, PAGE_READONLY, &old)) {
+            fprintf(stderr, "[watch-wr] VirtualProtect FAILED for ea=0x%08X (err=%lu) — "
+                    "watch on this page is DEAD, treat its zero-hits as PLAUSIBLE only\n",
+                    g_wwr_ea[i], GetLastError());
+            fflush(stderr);
+        }
     }
 }
 
@@ -2173,6 +2200,11 @@ int main(int argc, char** argv)
      * trampolines, invisible to spu_indirect_branch). Set before threads run. */
     g_spu_prof_on = getenv("YZ_SPU_PROF") ? 1 : 0;
     g_yz_watch_dlist = getenv("YZ_WATCH_DLIST") ? 1 : 0;
+    g_yz_slotstore = getenv("YZ_SLOTSTORE") ? 1 : 0;
+    if (g_yz_slotstore) {
+        fprintf(stderr, "[slotstore] ARMED: wid4 work-record store watch live\n");
+        fflush(stderr);
+    }
 
     /* PS3 e_entry points at an OPD descriptor: word0 = code, word1 = TOC */
     uint32_t entry_code = vm_read32(e_entry);

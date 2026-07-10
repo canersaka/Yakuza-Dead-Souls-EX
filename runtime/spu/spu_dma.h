@@ -732,6 +732,81 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               fflush(stderr);
           }
       } }
+    /* wid4 work-record fetch watch (env YZ_W4REC, 2026-07-10 s26 ⚡1, diag —
+     * scratch/s26_wkl4_publish_re.md): each wid4 pool dispatch is a FRESH task
+     * run that blocking-GETs its 64-byte work record (value + EA-guard +
+     * flags) from EA = word[1] of taskInfo->args (SPU pc 0x319C-0x31DC). Log
+     * every such GET with the EA and the 64 record bytes as fetched (read from
+     * vm_base at issue — same bytes the transfer copies). One capture
+     * discriminates: EA fixed vs per-round; failing round's record
+     * stale-repeat vs zero vs garbage — then the EA feeds a PPU-side
+     * YZ_WATCH_WR. Low volume (~5 tasks/round), uncapped, armed banner. */
+    { static int w4r = -1;
+      if (w4r < 0) { w4r = getenv("YZ_W4REC") ? 1 : 0;
+          if (w4r) { fprintf(stderr, "[w4rec] ARMED: image-4 64-byte work-record GET watch live\n"); fflush(stderr); } }
+      if (w4r && spu->image_id == 4 && mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
+              && size == 0x40u) {
+          static unsigned long wn = 0; wn++;
+          uint32_t rea = (uint32_t)(ea & ~0x80000000ull);
+          const uint8_t* m = vm_base + rea;
+          /* single-write print: interleaved per-byte fprintf tore mid-line
+           * under concurrent stderr writers (s26ride8 lost the publish-gate
+           * fields of the decisive fetch) */
+          char rb[320]; int ri = 0;
+          ri += snprintf(rb + ri, sizeof(rb) - (size_t)ri,
+                  "[w4rec] n=%lu spu=%X pc=0x%05X lsa=0x%05X ea=0x%08X rec:",
+                  wn, spu->spu_id, spu->pc & SPU_LS_MASK, lsa & SPU_LS_MASK, rea);
+          for (int i = 0; i < 64 && ri < (int)sizeof(rb) - 4; i++)
+              ri += snprintf(rb + ri, sizeof(rb) - (size_t)ri,
+                             "%s%02X", (i & 3) ? "" : " ", m[i]);
+          fprintf(stderr, "%s\n", rb); fflush(stderr);
+      } }
+    /* Taskset ctx-save EA watch (env YZ_CTXWATCH, 2026-07-10 s26 ⚡1, diag —
+     * DONT_RECHASE #53/#54): the wid4 pool republished a STALE decode counter
+     * ([fe0] val=1 twice, s25ride12) — the task's state never advanced between
+     * WAIT_SIGNAL cycles. The context round-trips main memory via the taskInfo
+     * ctxsave EA (registered by spu_task_launch into g_yz_ctxw_*): the yield's
+     * plain-PUT is the SAVE, GETs are Sony's own restore reads (our host-memcpy
+     * restore is logged separately as [ctxw] RESUME in spu_channels.c). SAVE
+     * hashes the LS payload (the post-image being written); LOAD hashes main
+     * memory at the block base (what a restore reads) — RESUME hashes share the
+     * LOAD domain. NB the ctx save/restore path is plain-PUT/plain-GET, OUTSIDE
+     * the c47c1cc lockline tear fix's coverage. Volume-bounded. */
+    { static int cw = -1;
+      if (cw < 0) { cw = getenv("YZ_CTXWATCH") ? 1 : 0;
+          if (cw) { fprintf(stderr, "[ctxw] dma save/load watch armed\n"); fflush(stderr); } }
+      if (cw) {
+          extern uint32_t g_yz_ctxw_ea[32], g_yz_ctxw_len[32];
+          extern volatile int g_yz_ctxw_n;
+          uint32_t cea = (uint32_t)(ea & ~0x80000000ull);
+          int catomic = (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+                         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD);
+          uint32_t csz = catomic ? 128u : size;
+          uint32_t cbase = catomic ? (cea & ~127u) : cea;
+          int cn2 = g_yz_ctxw_n;
+          for (int i = 0; i < cn2 && i < 32; i++) {
+              if (cbase >= g_yz_ctxw_ea[i] + g_yz_ctxw_len[i]
+                  || cbase + csz <= g_yz_ctxw_ea[i]) continue;
+              static unsigned long cwn = 0; cwn++;
+              if (cwn <= 3000 || (cwn & 0xFFu) == 0) {
+                  int cput = mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                             cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD;
+                  uint32_t hb = csz < 0x380u ? csz : 0x380u;
+                  const uint8_t* hp = cput ? spu->ls + (lsa & SPU_LS_MASK)
+                                           : vm_base + cbase;
+                  uint32_t h = 2166136261u;
+                  for (uint32_t k = 0; k < hb; k++) { h ^= hp[k]; h *= 16777619u; }
+                  fprintf(stderr, "[ctxw] %s n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
+                          "lsa=0x%05X ea=0x%08X size=0x%X blk=0x%08X h=%08X "
+                          "head=%02X%02X%02X%02X\n",
+                          cput ? "SAVE" : "LOAD", cwn, spu->spu_id, spu->image_id,
+                          spu->pc & SPU_LS_MASK, cmd, lsa & SPU_LS_MASK, cea, size,
+                          g_yz_ctxw_ea[i], h, hp[0], hp[1], hp[2], hp[3]);
+                  fflush(stderr);
+              }
+              break;
+          }
+      } }
     /* Overlay + job-consumer watch (env YZ_OVL, 2026-07-03, diag — the entry-7
      * gate): (A) log code-sized GETs into HIGH LS (>=0x10000) per image — the
      * image-5 runtime overlay load names its SOURCE EA + size (needed both to

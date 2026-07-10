@@ -18,6 +18,11 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#if defined(_MSC_VER)
+#  include <intrin.h>          /* _ReturnAddress -- the YZ_SLOTSTORE diag */
+#else
+#  define _ReturnAddress() __builtin_return_address(0)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -124,12 +129,33 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
             }
         }
     }
+    /* DIAG (env YZ_SLOTSTORE, s26 — DONT_RECHASE #57 mode B): name the PPU
+     * writer of the wid4 work-record slots (the round value a signaled task
+     * consumes half-staged). The page-guard watch was defeated by the vm's
+     * aliased mappings; every LIFTED store flows through here instead. One
+     * predicted-not-taken branch when off. */
+    if (addr >= 0x42452880u && addr < 0x424529E0u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(addr, val, 32, _ReturnAddress());
+        }
+    }
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
+    if (addr >= 0x42452880u && addr < 0x424529E0u) {   /* see vm_write32 */
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(addr, val, 64, _ReturnAddress());
+        }
+    }
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
