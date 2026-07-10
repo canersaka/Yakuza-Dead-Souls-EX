@@ -1543,6 +1543,156 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
 static const char* g_dump_dir;     /* --dump-shaders target (NULL = off)   */
 static u32 g_xlat_fail, g_xlat_ok; /* distinct shader pairs                */
 
+/* ---------------------------------------------------------------------------
+ * RSX_FP_FORCE_STAGE (session s26, scratch/s26_fp_bisect.md): forced-output
+ * pixel bisection for ONE named shader (fp_4792e42b9f86ad33, the s25g/s25e
+ * black-character FP). Env-gated, default OFF, no effect on any other PSO
+ * key. On a match, the generated ps_hlsl text is patched (post-decompile,
+ * pre-D3DCompile) to capture a named intermediate value into a fresh
+ * `dbg_stage` local right after the line that computes it, then the FP's
+ * final `return h[0];` is replaced with `return dbg_stage;` so the rendered
+ * image shows that one pipeline stage's value directly instead of the final
+ * shaded color. Vector-valued stages (normals/half-vectors, range [-1,1])
+ * are remapped *0.5+0.5 so a legitimate unit vector doesn't itself read as
+ * "black"; scalar stages (dot/saturate light terms, already [0,1]) and the
+ * raw texture sample are passed through unchanged. This is a text patch of
+ * ONE cached shader's HLSL, not decompiler surgery -- least invasive surface
+ * per the task's instruction, and it cannot perturb any other shader (the
+ * key match is exact and this is the sole call site). */
+#define FP_FORCE_TARGET_KEY 0x4792e42b9f86ad33ULL
+
+typedef struct { const char* anchor; const char* capture; } fp_force_stage_t;
+
+/* Anchors are verbatim substrings of the LIVE decompiler output, confirmed
+ * MEASURED byte-identical to scratch/shd_dump2/fp_4792e42b9f86ad33.hlsl via
+ * `diff` this session (scratch/s26_shaders/fp_4792e42b9f86ad33.hlsl) before
+ * writing these strings, so a strstr() match is not a guess. */
+static const fp_force_stage_t g_fp_force_stages[] = {
+    /* 0: raw tex0 (diffuse) sample, unmodified colors */
+    { "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)); h[5].xyzw = _v.xyzw; }",
+      "dbg_stage = h[5];" },
+    /* 1: h[1] = normalize(tc2.xyz), the primary shading normal (s25 diag's
+     *    "the intermediate register the diag doc identifies") */
+    { "float4(normalize(((input.tc2).xyzw).xyz), 1.0)); h[1].xyz = _v.xyz; }",
+      "dbg_stage = float4(h[1].xyz * 0.5 + 0.5, 1.0);" },
+    /* 2: first fixed-direction fill-light term, saturate(dot(h1,-L1)) */
+    { "dot(((h[1]).xyzw).xyz, (-((float4(-0.317166,0.812425,0.489256,1)).xyzw)).xyz)); _v = saturate(_v); h[4].z = _v.z; }",
+      "dbg_stage = float4(h[4].zzz, 1.0);" },
+    /* 3: second fixed-direction fill-light term */
+    { "dot(((h[1]).xyzw).xyz, (-((float4(0.317166,-0.812425,-0.489256,1.649)).xyzw)).xyz)); _v = saturate(_v); h[5].w = _v.w; }",
+      "dbg_stage = float4(h[5].www, 1.0);" },
+    /* 4: h[2] = normalize(tc3.xyz), the dynamic per-vertex key-light dir
+     *    (VP-computed, traced to a point-light direction relative to
+     *    vp_c[56] -- see scratch/s26_fp_bisect.md) */
+    { "float4(normalize(((input.tc3).xyzw).xyz), 1.0)); h[2].xyz = _v.xyz; }",
+      "dbg_stage = float4(h[2].xyz * 0.5 + 0.5, 1.0);" },
+    /* 5: key-light term, saturate(dot(h1,-h2)), captured BEFORE it is
+     *    overwritten by its own log2() a few lines later */
+    { "dot(((h[1]).xyzw).xyz, (-((h[2]).xyzw)).xyz)); _v = saturate(_v); h[4].w = _v.w; }",
+      "dbg_stage = float4(h[4].www, 1.0);" },
+    /* 6: half-vector h[5] = normalize(r[1]) (r[1] = h2 + a light-dir literal) */
+    { "float4(normalize(((r[1]).xyzw).xyz), 1.0)); h[5].xyz = _v.xyz; }",
+      "dbg_stage = float4(h[5].xyz * 0.5 + 0.5, 1.0);" },
+    /* 7: specular-ish term, saturate(dot(h1,-halfvec)) */
+    { "dot(((h[1]).xyzw).xyz, (-((h[5]).xyzw)).xyz)); _v = saturate(_v); h[5].x = _v.x; }",
+      "dbg_stage = float4(h[5].xxx, 1.0);" },
+    /* 8: first specular-power result, exp2(log2(ndotl)*(4,4,4,256)) */
+    { "exp2(((h[4]).wwww).x)); h[7].z = _v.z; }",
+      "dbg_stage = float4(h[7].zzz, 1.0);" },
+    /* 9: second specular-power result (same pow-via-log2/exp2 idiom, other
+     *    light) */
+    { "exp2(((h[1]).wwww).x)); h[4].w = _v.w; }",
+      "dbg_stage = float4(h[4].www, 1.0);" },
+    /* 10: h[3], the diffuse accumulation term feeding the final combine */
+    { "(((r[1]).xyzw) * ((h[4]).xxxx) + ((h[5]).xyzw)); h[3].xyz = _v.xyz; }",
+      "dbg_stage = float4(h[3].xyz, 1.0);" },
+    /* 11: h[4], the near-final accumulation (one add away from the return) */
+    { "(((h[3]).xyzw) * ((h[5]).xyzw) + ((h[0]).xyzw)); h[4].xyz = _v.xyz; }",
+      "dbg_stage = float4(h[4].xyz, 1.0);" },
+    /* 12: input.tc0 (the diffuse UV itself) as a heatmap (r=frac(u),
+     *      g=frac(v)), added after stage 0 showed the tex0 sample ITSELF
+     *      already black at the character silhouette -- this checks whether
+     *      the UV feeding that sample is degenerate. frac() folds the raw
+     *      coordinate into canonical [0,1) the same way a WRAP sampler
+     *      would resolve it, so this reads the effective sample position,
+     *      not a signed value that a UNORM target would clip to black for
+     *      any negative component (measured ATTR8 span for draw 1040 is
+     *      x in [-2.51,3.49] -- a naive unclamped dump would read black for
+     *      every negative-u vertex regardless of the real sampled texel).
+     *      Anchor is the just-inserted dbg_stage declaration (always
+     *      present, always before any other FP code runs). */
+    { " float4 dbg_stage = (float4)0;",
+      " dbg_stage = float4(frac(input.tc0.x), frac(input.tc0.y), 0.0, 1.0);" },
+    /* 13: unconditional constant white -- a control, not a data probe. If
+     * the character-silhouette region is a GEOMETRY HOLE (no fragment
+     * rasterized there at all, background bleeding through) rather than a
+     * drawn-but-wrong-colored fragment, every earlier stage would read
+     * identically black regardless of what's forced, since forcing the FP's
+     * *output* cannot paint a pixel the rasterizer never shades. This stage
+     * settles that confound: if the silhouette is still black here, there
+     * is no fragment there and the defect is upstream of the FP entirely
+     * (geometry/culling/restart), not a wrong-color FP output. */
+    { " float4 dbg_stage = (float4)0;",
+      " dbg_stage = float4(1.0, 1.0, 1.0, 1.0);" },
+};
+#define FP_FORCE_NSTAGES (int)(sizeof(g_fp_force_stages) / sizeof(g_fp_force_stages[0]))
+
+static int g_fp_force_stage = -1; /* RSX_FP_FORCE_STAGE, parsed once in main() */
+
+static int fp_insert_after(char* buf, size_t cap, const char* anchor, const char* text)
+{
+    char* pos = strstr(buf, anchor);
+    if (!pos) return 0;
+    pos += strlen(anchor);
+    const size_t tail = strlen(pos);
+    const size_t ins = strlen(text);
+    if (strlen(buf) + ins >= cap) return 0;
+    memmove(pos + ins, pos, tail + 1); /* +1: NUL */
+    memcpy(pos, text, ins);
+    return 1;
+}
+
+static int fp_replace_first(char* buf, size_t cap, const char* needle, const char* repl)
+{
+    char* pos = strstr(buf, needle);
+    if (!pos) return 0;
+    const size_t nlen = strlen(needle), rlen = strlen(repl);
+    const size_t tail = strlen(pos + nlen);
+    if (rlen > nlen && strlen(buf) + (rlen - nlen) >= cap) return 0;
+    memmove(pos + rlen, pos + nlen, tail + 1);
+    memcpy(pos, repl, rlen);
+    return 1;
+}
+
+/* Patches ps_hlsl in place for the target key only. Returns 1 if the patch
+ * (declaration + capture + return-replace) all applied, 0 otherwise (any
+ * failure leaves ps_hlsl untouched by convention of the caller re-decompiling
+ * fresh each time this is invoked). */
+static int fp_apply_force_stage(char* ps_hlsl, size_t cap, int stage)
+{
+    if (stage < 0 || stage >= FP_FORCE_NSTAGES) {
+        printf("[fpforce] RSX_FP_FORCE_STAGE=%d out of range [0,%d)\n", stage, FP_FORCE_NSTAGES);
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap,
+            "float4 r[48]; float4 h[48];",
+            " float4 dbg_stage = (float4)0;")) {
+        printf("[fpforce] declaration anchor not found\n");
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap, g_fp_force_stages[stage].anchor,
+            g_fp_force_stages[stage].capture)) {
+        printf("[fpforce] stage %d capture anchor not found\n", stage);
+        return 0;
+    }
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return dbg_stage;")) {
+        printf("[fpforce] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce] stage %d patch applied OK\n", stage);
+    return 1;
+}
+
 static u64 fnv1a(const void* data, u32 n, u64 h)
 {
     const u8* p = data;
@@ -1685,6 +1835,8 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
     const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    if (fi > 0 && g_fp_force_stage >= 0 && key == FP_FORCE_TARGET_KEY)
+        fp_apply_force_stage(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage);
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
@@ -1875,8 +2027,25 @@ static void sink_clear(void* user, const rsx_dispatch* rsx, u32 mask)
 {
     sink_ctx* c = user;
     c->clear_count++;
+    /* s26 fix (scratch/s26_fp_bisect.md): honor the game's OWN depth/stencil
+     * clears at their per-pass cadence — a direct port of the live path's
+     * already-correct sink_clear (rsx_live_draw.c:1130-1148). The old
+     * discard-depth-clears + once-per-frame heuristic left draws testing
+     * against stale depth from earlier passes (the black-character class;
+     * A/B receipt: isolated draw 1040 renders perfectly). The frame-top
+     * clear (see B1 below) remains as a first-clear safety net only.
+     * Kill-switch RSX_NO_PASS_DEPTH_CLEAR restores the old behavior. */
+    { static int nodc = -1;
+      if (nodc < 0) nodc = getenv("RSX_NO_PASS_DEPTH_CLEAR") ? 1 : 0;
+      if (!nodc && (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+          D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+          g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dsv);
+          g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+              D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+          g.depth_cleared = 1;
+      } }
     if (!(mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)))
-        return; /* depth/stencil-only clear; no depth buffer yet */
+        return; /* no color bits: nothing further to do */
 
     const u32 argb = rsx_dsp_clear_color(rsx);
     float col[4] = {
@@ -2554,6 +2723,129 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                a2.type, a2_type_name, a2.size, a2.stride, a2.location, a2.offset,
                c->dbg_first_vert_valid ? c->dbg_first_vert : 0, addr2, raw2_hex,
                tri[0].a[2][0], tri[0].a[2][1], tri[0].a[2][2], tri[0].a[2][3]);
+
+        /* s26 follow-up (scratch/s26_fp_bisect.md): forced-output pixel
+         * bisection on this draw's FP (fp_4792e42b9f86ad33) found the
+         * collapse ALREADY present at the very first FP stage (the raw tex0
+         * sample) and traced it to input.tc0 itself reading (0,0) at the
+         * black triangles -- i.e. upstream of the FP, in TEXCOORD0 (VP o[7]
+         * = vp_c[60] + ATTR8.xy). Dump ATTR8's declared format once plus its
+         * PER-VERTEX decoded spread across this whole draw (not just vertex
+         * 0, since this draw batches disjoint sub-meshes via primitive
+         * restart -- vertex 0 may not belong to the affected sub-mesh) to
+         * test whether ATTR8 genuinely varies (some vertices zero, others
+         * not) within one draw call sharing one vertex format. */
+        rsx_dsp_vertex_attr a8;
+        rsx_dsp_get_vertex_attr(rsx, 8, &a8);
+        const char* a8_type_name = a8.type < 8 ? type_names[a8.type] : "?";
+        float a8min[2] = {  1e30f,  1e30f };
+        float a8max[2] = { -1e30f, -1e30f };
+        u32 a8_nzero = 0;
+        for (u32 vi = 0; vi < c->n_verts; vi++) {
+            const float x = c->verts[vi].a[8][0], y = c->verts[vi].a[8][1];
+            if (x < a8min[0]) a8min[0] = x;
+            if (y < a8min[1]) a8min[1] = y;
+            if (x > a8max[0]) a8max[0] = x;
+            if (y > a8max[1]) a8max[1] = y;
+            if (x == 0.0f && y == 0.0f) a8_nzero++;
+        }
+        printf("       ATTR8: type=%u(%s) size=%u stride=%u loc=%u offset=0x%X"
+               " -- per-draw span over %u verts: xy_min=(%.4f %.4f) xy_max=(%.4f %.4f)"
+               " zero_xy_count=%u/%u\n",
+               a8.type, a8_type_name, a8.size, a8.stride, a8.location, a8.offset,
+               c->n_verts, a8min[0], a8min[1], a8max[0], a8max[1], a8_nzero, c->n_verts);
+
+        /* s26 coordinator follow-up (scratch/s26_fp_bisect.md "per-vertex
+         * clip-space depth dump"): the stage-13 control proved the missing
+         * fragments never reach the pixel shader, and YZ_B1_DEPTH=0 changed
+         * the image drastically, pointing at the depth/position pipeline.
+         * vp_4792e42b9f86ad33's clip position o[0]=r[0] is built in exactly
+         * two DP4 stages (hand-decoded against the raw ucode this session,
+         * scratch/s26_vp_decode.py output, both UNINDEXED plain constant
+         * reads, no a0-relative addressing anywhere in this VP):
+         *   r7.xyz = ( dot(v0,c112), dot(v0,c113), dot(v0,c114) )
+         *   r4 = (r7.xyz, 0)              -- r4.w is never written before
+         *                                    this point (array zero-init)
+         *   clip.xyzw = ( dot(r4,c108), dot(r4,c109), dot(r4,c110), dot(r4,c111) )
+         * Replicated here on the CPU (same constants already read for the
+         * c108-111 printf above) for a sample of vertices in EVERY
+         * primitive-restart SEGMENT of this draw (c->cuts[]) -- s26 already
+         * found draw 1040 batches disjoint sub-meshes across cuts (a
+         * correctly-shaded prop and the black region), so a per-segment
+         * split is what can actually discriminate them, unlike the
+         * whole-draw ATTR8 span above. Gated to RSX_VP_CLIP_DUMP=1 (default
+         * off) AND this exact VP (dbg_vp_key match) since the two-DP4
+         * formula is specific to this VP's own instruction stream. */
+        if (getenv("RSX_VP_CLIP_DUMP") && dbg_vp_key == FP_FORCE_TARGET_KEY) {
+            rsx_dsp_viewport cvp;
+            rsx_dsp_get_viewport(rsx, &cvp);
+            printf("       [clipdump] draw %u: vp scale=(%.4f %.4f %.4f)"
+                   " translate=(%.4f %.4f %.4f) n_segs=%u n_verts=%u\n",
+                   c->draw_count, cvp.scale[0], cvp.scale[1], cvp.scale[2],
+                   cvp.translate[0], cvp.translate[1], cvp.translate[2],
+                   c->n_cuts + 1, c->n_verts);
+
+            u32 seg_start = 0;
+            for (u32 s = 0; s <= c->n_cuts; s++) {
+                const u32 seg_end = (s < c->n_cuts) ? c->cuts[s] : c->n_verts; /* exclusive */
+                if (seg_end <= seg_start) { seg_start = seg_end; continue; }
+                const u32 samples[3] = { seg_start, (seg_start + seg_end - 1) / 2, seg_end - 1 };
+                float ndc_min = 1e30f, ndc_max = -1e30f, w_min = 1e30f, w_max = -1e30f;
+                int any_behind = 0, any_nan = 0;
+                char sampletxt[300] = {0};
+                int stpos = 0;
+                for (u32 si = 0; si < 3; si++) {
+                    const u32 vi = samples[si];
+                    if (vi >= c->n_verts) continue;
+                    const float* p0 = c->verts[vi].a[0]; /* ATTR0, object-space position */
+                    const float v0w = p0[3] != 0.0f ? p0[3] : 1.0f;
+                    const float r7x = p0[0]*c112[0].f + p0[1]*c112[1].f + p0[2]*c112[2].f + v0w*c112[3].f;
+                    const float r7y = p0[0]*c113[0].f + p0[1]*c113[1].f + p0[2]*c113[2].f + v0w*c113[3].f;
+                    const float r7z = p0[0]*c114[0].f + p0[1]*c114[1].f + p0[2]*c114[2].f + v0w*c114[3].f;
+                    /* CORRECTED this session: r4.w is NOT 0 here. Ucode
+                     * instruction [2] (scratch/s26_vp_decode.txt) sets
+                     * r[4].w = dot(v[0], vp_c[115]) BEFORE r[4].xyz is even
+                     * written (instruction [11]) -- an earlier hand-trace
+                     * missed this and assumed r4.w=0, which silently dropped
+                     * the c108-111 rows' .w column entirely and produced
+                     * nonsensical clip_x/clip_w ratios (~[-2,-20], nowhere
+                     * near a plausible NDC range) on the first run of this
+                     * dump. c115 is measured identity-like (0,0,0,1) for
+                     * these draws, so r4.w = dot(v0,c115) = v0.w = ATTR0's
+                     * own w (typically 1.0), NOT 0. */
+                    const float r4w = p0[0]*c115[0].f + p0[1]*c115[1].f + p0[2]*c115[2].f + v0w*c115[3].f;
+                    const float clip_x = r7x*c108[0].f + r7y*c108[1].f + r7z*c108[2].f + r4w*c108[3].f;
+                    const float clip_y = r7x*c109[0].f + r7y*c109[1].f + r7z*c109[2].f + r4w*c109[3].f;
+                    const float clip_z = r7x*c110[0].f + r7y*c110[1].f + r7z*c110[2].f + r4w*c110[3].f;
+                    const float clip_w = r7x*c111[0].f + r7y*c111[1].f + r7z*c111[2].f + r4w*c111[3].f;
+                    const float ndc_z = (clip_w != 0.0f)
+                        ? (clip_z * cvp.scale[2] + clip_w * cvp.translate[2]) / clip_w
+                        : 0.0f;
+                    if (clip_w <= 0.0f) any_behind = 1;
+                    if (clip_w != clip_w || ndc_z != ndc_z) any_nan = 1;
+                    if (ndc_z < ndc_min) ndc_min = ndc_z;
+                    if (ndc_z > ndc_max) ndc_max = ndc_z;
+                    if (clip_w < w_min) w_min = clip_w;
+                    if (clip_w > w_max) w_max = clip_w;
+                    /* RSX window-space xy directly from clip/w * viewport
+                     * scale + translate (same semantics as the xf[] upload
+                     * a few hundred lines up) -- lets a segment's screen
+                     * footprint be read off directly, not guessed from
+                     * vertex-index order. */
+                    const float scr_x = (clip_w != 0.0f) ? (clip_x/clip_w)*cvp.scale[0] + cvp.translate[0] : 0.0f;
+                    const float scr_y = (clip_w != 0.0f) ? (clip_y/clip_w)*cvp.scale[1] + cvp.translate[1] : 0.0f;
+                    stpos += snprintf(sampletxt + stpos, (size_t)(sizeof(sampletxt) - stpos),
+                        "[v%u scr=(%.1f,%.1f) clip=(%.3f %.3f %.6f %.6f) ndc_z=%.9f] ",
+                        vi, scr_x, scr_y, clip_x, clip_y, clip_z, clip_w, ndc_z);
+                }
+                printf("         seg %u: verts[%u,%u) n=%u ndc_z_range=[%.9f,%.9f]"
+                       " clip_w_range=[%.4f,%.4f]%s%s -- %s\n",
+                       s, seg_start, seg_end, seg_end - seg_start, ndc_min, ndc_max,
+                       w_min, w_max, any_behind ? " BEHIND-EYE(w<=0)" : "",
+                       any_nan ? " NAN" : "", sampletxt);
+                seg_start = seg_end;
+            }
+        }
     }
 
     /* Resolve the fragment texture units into a 16-slot table (fallback
@@ -2842,6 +3134,17 @@ int main(int argc, char** argv)
     b1_read_env();
     printf("[b1] state: blend=%d depth=%d cull=%d samp=%d\n",
            g_b1_blend, g_b1_depth, g_b1_cull, g_b1_samp);
+
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE");
+        if (e && e[0]) {
+            g_fp_force_stage = atoi(e);
+            printf("[fpforce] RSX_FP_FORCE_STAGE ARMED: stage=%d target_key=%016llx"
+                   " (only fp_%016llx's PSO is affected)\n",
+                   g_fp_force_stage, (unsigned long long)FP_FORCE_TARGET_KEY,
+                   (unsigned long long)FP_FORCE_TARGET_KEY);
+        }
+    }
 
     rxs_stream s = {0};
     if (rxs_load(path, &s))
