@@ -145,12 +145,13 @@ static void null_end_frame(void* ud)
     }
 
     /* Flip count + FPS live in the window title so they show even when the GPU
-     * backend (Track B) owns the surface and the GDI overlay is suppressed. */
+     * backend owns the surface and the GDI overlay is suppressed. The internal
+     * renderer label (live-draw D3D12 vs GDI fallback) stays out of the title
+     * (user request 2026-07-10); it is still visible in the boot log banner. */
     if (s_state.hwnd) {
         char title[192];
         snprintf(title, sizeof(title),
-                 "Yakuza: Dead Souls (ps3recomp)  |  %s  |  flips %llu  |  frames %u  |  %u FPS",
-                 s_present_suppressed ? "Track B (D3D12)" : "null (GDI)",
+                 "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  %u FPS",
                  (unsigned long long)s_state.frame_count,
                  rsx_live_draw_get_frames(), s_state.fps);
         SetWindowTextA(s_state.hwnd, title);
@@ -261,6 +262,10 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    /* Host exe's embedded icon (resource id 1) for taskbar/alt-tab; NULL
+     * (default) when the game project embeds none. */
+    wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1));
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = "ps3recomp_null";
     RegisterClassExA(&wc);
 
@@ -279,6 +284,17 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     if (!s_state.hwnd) {
         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
         return -1;
+    }
+    {   /* WM_SETICON beats the shell's per-app taskbar icon cache (see the
+         * d3d12 backend's create_window). */
+        HICON big = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1),
+                                      IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                      GetSystemMetrics(SM_CYICON), 0);
+        HICON sml = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1),
+                                      IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                      GetSystemMetrics(SM_CYSMICON), 0);
+        if (big) SendMessageA(s_state.hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (sml) SendMessageA(s_state.hwnd, WM_SETICON, ICON_SMALL, (LPARAM)sml);
     }
 
     s_state.hdc = GetDC(s_state.hwnd);
