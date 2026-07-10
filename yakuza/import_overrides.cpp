@@ -657,7 +657,12 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined belo
  * multiple causes in one send) and the consumer-top retry sends the
  * accumulated mask once the queue drains. The user-cmd cause arg still
  * travels via driverInfo.userCmdParam (latest-wins, lv1 coalescing). */
-static uint64_t g_rsx_ev_pending = 0;   /* 0 = none; else latched cause bits */
+/* 0 = none; else latched cause bits. s26: retried from BOTH the consumer loop
+ * top and the vblank tick (the consumer-top-only retry deadlocked when the
+ * lost delivery parked the consumer itself — s26ride4), so take-and-retry is
+ * atomic: one thread wins the exchange, a failed send re-ORs the bits back.
+ * Prevents double-delivery of the same latched cause. */
+static volatile long long g_rsx_ev_pending = 0;
 
 static int64_t yz_rsx_ev_send(uint64_t bits)
 {
@@ -670,7 +675,7 @@ static int64_t yz_rsx_ev_send(uint64_t bits)
         if (no_retry < 0) no_retry = (getenv("YZ_NO_UCMD_RETRY")
                                       || getenv("YZ_NO_EV_RETRY")) ? 1 : 0;
         if (!no_retry) {
-            g_rsx_ev_pending |= bits;
+            _InterlockedOr64(&g_rsx_ev_pending, (long long)bits);
             fprintf(stderr, "[rsx-ev] send FAILED r=0x%llX bits=0x%llX -> LATCHED "
                     "for retry (queue full; lossless delivery, s25 fix)\n",
                     (unsigned long long)(uint64_t)r, (unsigned long long)bits);
@@ -683,22 +688,24 @@ static int64_t yz_rsx_ev_send(uint64_t bits)
 static void yz_ucmd_retry_pending(void)
 {
     if (!g_rsx_ev_pending || !g_rsx_event_port) return;
+    uint64_t bits = (uint64_t)_InterlockedExchange64(&g_rsx_ev_pending, 0);
+    if (!bits) return;                     /* another thread took it */
     ppu_context sc; memset(&sc, 0, sizeof(sc));
     sc.gpr[3] = g_rsx_event_port;
-    sc.gpr[5] = g_rsx_ev_pending;
+    sc.gpr[5] = bits;
     int64_t r = sys_event_port_send(&sc);
     if (r == 0) {
         fprintf(stderr, "[rsx-ev] RETRY delivered latched bits=0x%llX (queue drained)\n",
-                (unsigned long long)g_rsx_ev_pending);
+                (unsigned long long)bits);
         fflush(stderr);
-        g_rsx_ev_pending = 0;
     } else {
-        /* still full — keep the latch; log sparsely so a permanently-wedged
-         * intr thread is visible without flooding */
+        /* still full — put the bits back; log sparsely so a permanently-
+         * wedged intr thread is visible without flooding */
+        _InterlockedOr64(&g_rsx_ev_pending, (long long)bits);
         static unsigned long rn = 0; rn++;
-        if ((rn & 0x3FFFu) == 1) {
+        if ((rn & 0x3FFu) == 1) {
             fprintf(stderr, "[rsx-ev] retry still failing bits=0x%llX r=0x%llX (n=%lu)\n",
-                    (unsigned long long)g_rsx_ev_pending,
+                    (unsigned long long)bits,
                     (unsigned long long)(uint64_t)r, rn);
             fflush(stderr);
         }
@@ -2448,6 +2455,47 @@ extern "C" void yz_rsx_vblank_tick(void)
     { extern void yz_throw_retry_flush(void);
       yz_throw_retry_flush(); }
 
+    /* s26: wid4 work-record slot poll (env YZ_W4REC_POLL, diag — ledger #57
+     * mode B). The page-guard write-watch on these slots was BOTH invasive
+     * (shares the 4 KB page with the pool's ctx save area) and unreliable
+     * (s26ride6c: pool ran, ctx saves hit the page, ZERO guard hits) — poll
+     * the five 0x40-stride record slots here instead, log word0 (publish
+     * value) + word1 (target EA guard) on change. No faults, ~16 ms
+     * resolution; records persist between stagings so transitions are
+     * caught. Correlate with [w4rec] fetch-time dumps. */
+    { static int wp = -1;
+      if (wp < 0) { wp = getenv("YZ_W4REC_POLL") ? 1 : 0;
+          if (wp) { fprintf(stderr, "[w4poll] ARMED: record-slot poll live\n"); fflush(stderr); } }
+      if (wp) {
+          static const uint32_t slots[5] =
+              {0x424528A0u,0x424528E0u,0x42452920u,0x42452960u,0x424529A0u};
+          static uint32_t prev[5][2];
+          static int winit = 0;
+          for (int i = 0; i < 5; i++) {
+              uint32_t w0 = vm_read32(slots[i]);
+              uint32_t w1 = vm_read32(slots[i] + 4);
+              if (!winit || w0 != prev[i][0] || w1 != prev[i][1]) {
+                  fprintf(stderr, "[w4poll] slot=0x%08X val=0x%08X ea=0x%08X\n",
+                          slots[i], w0, w1);
+                  fflush(stderr);
+                  prev[i][0] = w0; prev[i][1] = w1;
+              }
+          }
+          winit = 1;
+      } }
+
+    /* s26: redeliver any latched RSX event bits (the s25 ucmd/EBUSY latch,
+     * ledger #52) from HERE too. The consumer-top retry site DEADLOCKS when
+     * the lost delivery itself parks the FIFO consumer (MEASURED s26ride4:
+     * coalesced cause=2 EBUSY-latched, exactly one consumer-side retry, then
+     * the consumer parked on the 0xFE0 acquire that the lost handler run
+     * caused — the latch never retried again all boot). lv1 redelivers when
+     * the queue drains, independent of FIFO flow; this tick is our
+     * queue-drain-independent cadence (same pattern as the throw latch
+     * above). Same kill-switches (YZ_NO_UCMD_RETRY / YZ_NO_EV_RETRY) gate the
+     * latch at its source, so no separate gate here. */
+    if (g_rsx_ev_pending) yz_ucmd_retry_pending();
+
     /* DIAG (one-time, vblank-dispatch hunt): dump Sony's libgcm vblank/flip
      * handler table once the game has registered a handler. The lifted intr-
      * thread dispatcher (libgcm 0x021082D8) reads the table from
@@ -3020,10 +3068,24 @@ extern "C" void yz_rsx_vblank_tick(void)
         uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
         { static uint32_t lh = 0xFFFFFFFFu; if (handlers != lh) { lh = handlers;
             fprintf(stderr, "[sys_rsx] driver_info.handlers=0x%08X\n", handlers); } }
-        /* On a flip, deliver ALL registered bits (Sony's LLE bit assignment is
+        /* On a flip, deliver the flip+vblank bits (Sony's LLE bit assignment is
          * not RPCS3's HLE enum -- handlers=0x6 => vblank bit1 + flip bit2); on a
-         * plain vblank, just VBLANK (0x2). */
-        uint64_t ev = (flip_ev ? (uint64_t)handlers : ((uint64_t)0x2 & handlers));
+         * plain vblank, just VBLANK (0x2).
+         * s26 ROOT FIX (ledger #57 mode B): the old `flip_ev ? handlers` shape
+         * delivered ALL registered bits -- written when handlers was 0x6, it
+         * silently started including bit 0x80 (USER_CMD) once the game
+         * registered its user handler (mask 0x86 at the movie boundary). Every
+         * flip then spuriously dispatched the user handler with the
+         * not-yet-written userCmdParam: handler(0) staged a val=0 work record
+         * + consumed the pool task's wake -> the real cause's publish desynced
+         * (publishes of 0 / stale re-publishes; s26ride8/9 [chain] hit#1
+         * r3=0x0 before the first [ucmd]). USER_CMD is delivered EXCLUSIVELY
+         * by the 0xEB00 method path. Kill-switch YZ_UCMD_ON_FLIP restores the
+         * over-broadcast. */
+        static int uof = -1;
+        if (uof < 0) uof = getenv("YZ_UCMD_ON_FLIP") ? 1 : 0;
+        uint64_t fmask = uof ? (uint64_t)handlers : ((uint64_t)handlers & 0x7Full);
+        uint64_t ev = (flip_ev ? fmask : ((uint64_t)0x2 & handlers));
         if (ev) {
             ppu_context sc; memset(&sc, 0, sizeof(sc));
             sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = ev;
