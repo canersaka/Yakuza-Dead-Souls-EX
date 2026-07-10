@@ -35,6 +35,7 @@ extern "C" int64_t sys_event_port_create(ppu_context*);
 extern "C" int64_t sys_event_queue_create(ppu_context*);
 extern "C" int64_t sys_event_port_connect_local(ppu_context*);
 extern "C" int64_t sys_event_port_send(ppu_context*);
+extern "C" void yz_hwwatch_arm(void);   /* main.cpp: DR0 watch on the wid4 record slot */
 extern "C" void spu_lockline_lock(void);    /* SPU GETLLAR/PUTLLC serialization */
 extern "C" void spu_lockline_unlock(void);
 
@@ -914,8 +915,22 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                 yz_ft("ACQ addr=0x%08X want=0x%08X have=0x%08X %s",
                       addr, arg, have, ok ? "pass" : "STALL-enter"); }
         }
-        if (addr && vm_read32(addr) != arg)
+        if (addr && vm_read32(addr) != arg) {
+            /* s26 ride16 discriminator: the wedge acquire never passed even
+             * after the wanted value was published — is this path still being
+             * RETRIED (and reading what?), or does the caller stop re-invoking
+             * (park upstream)? Heartbeat every 64k retries of the same
+             * (addr,want): proves retry liveness + the value actually read
+             * (LESSONS #6d: episode-entry dedup hides both). */
+            { static uint32_t ha=0, hw=0; static unsigned long hn=0;
+              if (addr==ha && arg==hw) { hn++;
+                  if ((hn & 0xFFFFu)==0) {
+                      fprintf(stderr, "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X retries=%lu\n",
+                              addr, arg, vm_read32(addr), hn);
+                      fflush(stderr); } }
+              else { ha=addr; hw=arg; hn=0; } }
             return 1;                             /* not yet satisfied: stall, retry later */
+        }
         break;
     case 0x06C:                                   /* NV406E SEMAPHORE_RELEASE */
         addr = yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
@@ -2455,6 +2470,13 @@ extern "C" void yz_rsx_vblank_tick(void)
     { extern void yz_throw_retry_flush(void);
       yz_throw_retry_flush(); }
 
+    /* s26: hardware watchpoint arm trigger (env YZ_HWWATCH — main.cpp
+     * yz_hwwatch_arm): fire once at tick 2000 (~32 s, all threads live). */
+    { static int hw = -1; static int hwdone = 0; static unsigned long hwt = 0;
+      if (hw < 0) hw = getenv("YZ_HWWATCH") ? 1 : 0;
+      if (hw && !hwdone && ++hwt == 2000) { hwdone = 1;
+          yz_hwwatch_arm(); } }
+
     /* s26: wid4 work-record slot poll (env YZ_W4REC_POLL, diag — ledger #57
      * mode B). The page-guard write-watch on these slots was BOTH invasive
      * (shares the 4 KB page with the pool's ctx save area) and unreliable
@@ -2467,11 +2489,16 @@ extern "C" void yz_rsx_vblank_tick(void)
       if (wp < 0) { wp = getenv("YZ_W4REC_POLL") ? 1 : 0;
           if (wp) { fprintf(stderr, "[w4poll] ARMED: record-slot poll live\n"); fflush(stderr); } }
       if (wp) {
-          static const uint32_t slots[5] =
-              {0x424528A0u,0x424528E0u,0x42452920u,0x42452960u,0x424529A0u};
-          static uint32_t prev[5][2];
+          /* s26 ride17 addition: slot[5] = the decode label itself — [fe0]
+           * proved publish-8 ISSUED while the acquire read 7 forever; this
+           * poll discriminates lost-write (never becomes 8) vs reverted-write
+           * (8 flickers then 7 — a stale-snapshot PUTLLC restoring the line). */
+          static const uint32_t slots[6] =
+              {0x424528A0u,0x424528E0u,0x42452920u,0x42452960u,0x424529A0u,
+               0x10200FE0u};
+          static uint32_t prev[6][2];
           static int winit = 0;
-          for (int i = 0; i < 5; i++) {
+          for (int i = 0; i < 6; i++) {
               uint32_t w0 = vm_read32(slots[i]);
               uint32_t w1 = vm_read32(slots[i] + 4);
               if (!winit || w0 != prev[i][0] || w1 != prev[i][1]) {

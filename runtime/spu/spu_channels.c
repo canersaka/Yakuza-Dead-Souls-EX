@@ -143,6 +143,24 @@ static void yz_ctxw_cycle(spu_context* c, int image, uint32_t tpc, int is_resume
     }
 }
 
+/* YZ_DEFER_PROBE handler (s26, ledger #48 value hunt — injected into
+ * func_00E9BE4C by scratch/patch_defer_probe.py): logs both operands of the
+ * gcm flush's defer-vs-immediate release decision + the branch taken. The
+ * healthy oracle takes IMMEDIATE (ledger #54①); ours chronically DEFERs. */
+void yz_defer_probe(unsigned s24, unsigned cend, unsigned s, unsigned p, int imm)
+{
+    static int dp = -1;
+    if (dp < 0) { dp = getenv("YZ_DEFER_PROBE") ? 1 : 0;
+        if (dp) { fprintf(stderr, "[defer] ARMED (E9BE4C compare probe)\n"); fflush(stderr); } }
+    if (!dp) return;
+    static unsigned long dn = 0; dn++;
+    if (dn <= 60 || (dn & 0x3FFu) == 0) {
+        fprintf(stderr, "[defer] n=%lu S24=0x%08X end=0x%08X -> %s (S=0x%08X P=0x%08X)\n",
+                dn, s24, cend, imm ? "IMMEDIATE" : "DEFER", s, p);
+        fflush(stderr);
+    }
+}
+
 /* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
  * cross-function tail branch in lifted SPU code; drained iteratively by the
  * enclosing call site or the host-thread driver. */
