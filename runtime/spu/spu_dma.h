@@ -328,26 +328,56 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   static int n = 0; if (n < 60) { n++;
                     fprintf(stderr, "[put-wild] spu=%X pc=0x%05X PUT ea=0x%08X size=0x%X lsa=0x%05X (policy -> GAME region)\n",
                             spu->spu_id, spu->pc & SPU_LS_MASK, (uint32_t)ea, size, lsa); fflush(stderr); } } }
-            memcpy(ea_ptr, ls_ptr, size);
-            /* s21 (lock-free GETLLAR prerequisite): a plain PUT into a line any
-             * SPU has ever reserved must bump the coherence generation (same
-             * rule as the PPU's VM_WRITE_COH), else a peer's cached-copy fast
-             * path could serve stale data. Rare relative to GETLLAR polls; the
-             * notify runs under the lock-line lock like every other caller. */
-            if (size != 0) {
+            /* s25 (atomics-conformance harness, CONFIRMED-BUG invariant 2,
+             * scratch/s25_atomics_conformance.md): this payload copy ran
+             * UNLOCKED while GETLLAR snapshots the same line under the
+             * lockline lock — torn mixed-writer 128-byte snapshots measured
+             * at ~0.4% under contention. Every other writer path (GETLLAR/
+             * PUTLLC/PUTLLUC) copies under the lock; mirror that HERE when
+             * the span overlaps any reserved line, and keep the lock-free
+             * copy for unreserved spans (bulk asset PUTs are large and hot).
+             * Residual: a line reserved AFTER the span check but during an
+             * unlocked copy can still observe a tear — a far narrower window
+             * than the whole-copy exposure this closes; revisit if the
+             * harness ever catches it. */
+            {
                 extern int  spu_coh_is_reserved(uint32_t);
                 extern void spu_coh_notify_write(uint32_t);
                 extern void spu_lockline_lock(void);
                 extern void spu_lockline_unlock(void);
+                int span_reserved = 0;
                 uint32_t a0 = (uint32_t)ea & ~127u;
-                uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
-                for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
-                        spu_coh_notify_write(a);
-                        spu_lockline_unlock();
+                uint32_t a1 = size ? (((uint32_t)ea + size - 1u) & ~127u) : a0;
+                if (size != 0)
+                    for (uint32_t a = a0; ; a += 128u) {
+                        if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                        if (a == a1) break;
                     }
-                    if (a == a1) break;
+                if (span_reserved) {
+                    /* copy + generation bump + peer-reservation kill as ONE
+                     * critical section (spu_coh_notify_write expects the lock
+                     * held — same contract as the PUTLLC commit path). */
+                    spu_lockline_lock();
+                    memcpy(ea_ptr, ls_ptr, size);
+                    for (uint32_t a = a0; ; a += 128u) {
+                        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+                        if (a == a1) break;
+                    }
+                    spu_lockline_unlock();
+                } else {
+                    memcpy(ea_ptr, ls_ptr, size);
+                    /* s21 rule unchanged for the unreserved case: any line
+                     * that turns out reserved still gets its generation bump
+                     * (the fast-path staleness guard). */
+                    if (size != 0)
+                        for (uint32_t a = a0; ; a += 128u) {
+                            if (spu_coh_is_reserved(a)) {
+                                spu_lockline_lock();
+                                spu_coh_notify_write(a);
+                                spu_lockline_unlock();
+                            }
+                            if (a == a1) break;
+                        }
                 }
             }
         }
