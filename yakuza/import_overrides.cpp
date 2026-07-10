@@ -650,35 +650,56 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined belo
  * undelivered cause, retry from the consumer loop (userCmdParam already
  * carries the latest arg, so a retry delivers correct coalesced state).
  * Consumer-thread-only state, no locking. Kill-switch YZ_NO_UCMD_RETRY. */
-static uint32_t g_ucmd_pending = 0;     /* 0 = none; else latched cause arg */
-static int      g_ucmd_have_pending = 0;
+/* s25 GENERALIZED (post notification-surface audit, scratch/
+ * s25_notification_audit.md risk #1): the latch now covers ANY event bits
+ * sent to the RSX port, not just USER_CMD — a failed send ORs its cause
+ * bits into one pending mask (exactly how the vblank path already delivers
+ * multiple causes in one send) and the consumer-top retry sends the
+ * accumulated mask once the queue drains. The user-cmd cause arg still
+ * travels via driverInfo.userCmdParam (latest-wins, lv1 coalescing). */
+static uint64_t g_rsx_ev_pending = 0;   /* 0 = none; else latched cause bits */
 
-static int64_t yz_ucmd_send(uint32_t arg)
+static int64_t yz_rsx_ev_send(uint64_t bits)
 {
-    (void)arg;   /* the cause travels via driverInfo.userCmdParam; the event
-                  * carries only the USER_CMD bit */
     ppu_context sc; memset(&sc, 0, sizeof(sc));
     sc.gpr[3] = g_rsx_event_port;
-    sc.gpr[5] = 0x80ull;                              /* SYS_RSX_EVENT_USER_CMD */
-    return sys_event_port_send(&sc);
+    sc.gpr[5] = bits;
+    int64_t r = sys_event_port_send(&sc);
+    if (r != 0) {
+        static int no_retry = -1;
+        if (no_retry < 0) no_retry = (getenv("YZ_NO_UCMD_RETRY")
+                                      || getenv("YZ_NO_EV_RETRY")) ? 1 : 0;
+        if (!no_retry) {
+            g_rsx_ev_pending |= bits;
+            fprintf(stderr, "[rsx-ev] send FAILED r=0x%llX bits=0x%llX -> LATCHED "
+                    "for retry (queue full; lossless delivery, s25 fix)\n",
+                    (unsigned long long)(uint64_t)r, (unsigned long long)bits);
+            fflush(stderr);
+        }
+    }
+    return r;
 }
 
 static void yz_ucmd_retry_pending(void)
 {
-    if (!g_ucmd_have_pending || !g_rsx_event_port) return;
-    int64_t r = yz_ucmd_send(g_ucmd_pending);
+    if (!g_rsx_ev_pending || !g_rsx_event_port) return;
+    ppu_context sc; memset(&sc, 0, sizeof(sc));
+    sc.gpr[3] = g_rsx_event_port;
+    sc.gpr[5] = g_rsx_ev_pending;
+    int64_t r = sys_event_port_send(&sc);
     if (r == 0) {
-        fprintf(stderr, "[ucmd] RETRY delivered latched cause=0x%08X (queue drained)\n",
-                g_ucmd_pending);
+        fprintf(stderr, "[rsx-ev] RETRY delivered latched bits=0x%llX (queue drained)\n",
+                (unsigned long long)g_rsx_ev_pending);
         fflush(stderr);
-        g_ucmd_have_pending = 0;
+        g_rsx_ev_pending = 0;
     } else {
         /* still full — keep the latch; log sparsely so a permanently-wedged
          * intr thread is visible without flooding */
         static unsigned long rn = 0; rn++;
         if ((rn & 0x3FFFu) == 1) {
-            fprintf(stderr, "[ucmd] retry still failing cause=0x%08X r=0x%llX (n=%lu)\n",
-                    g_ucmd_pending, (unsigned long long)(uint64_t)r, rn);
+            fprintf(stderr, "[rsx-ev] retry still failing bits=0x%llX r=0x%llX (n=%lu)\n",
+                    (unsigned long long)g_rsx_ev_pending,
+                    (unsigned long long)(uint64_t)r, rn);
             fflush(stderr);
         }
     }
@@ -686,11 +707,9 @@ static void yz_ucmd_retry_pending(void)
 
 static int yz_rsx_method(uint32_t method, uint32_t arg)
 {
-    /* Deliver any latched (queue-full) user-interrupt before consuming more
+    /* Deliver any latched (queue-full) RSX event bits before consuming more
      * of the stream — one predicted-not-taken branch when idle. */
-    static int no_ucmd_retry = -1;
-    if (no_ucmd_retry < 0) no_ucmd_retry = getenv("YZ_NO_UCMD_RETRY") ? 1 : 0;
-    if (g_ucmd_have_pending && !no_ucmd_retry) yz_ucmd_retry_pending();
+    if (g_rsx_ev_pending) yz_ucmd_retry_pending();
 
     /* GCM_FLIP_HEAD arm banner on the consumer's FIRST method, not the first
      * 0xE920 hit: a "0xE920 never seen" negative is only MEASURED if the log
@@ -831,20 +850,8 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         if (g_rsx_event_port) {
             /* A newer cause supersedes any latched one (lv1 coalescing: ONE
              * pending cause register, latest wins; userCmdParam above already
-             * carries it). */
-            int64_t r = yz_ucmd_send(arg);
-            if (r != 0) {
-                static int no_retry = -1;
-                if (no_retry < 0) no_retry = getenv("YZ_NO_UCMD_RETRY") ? 1 : 0;
-                if (!no_retry) {
-                    g_ucmd_pending = arg;
-                    g_ucmd_have_pending = 1;
-                    fprintf(stderr, "[ucmd] send FAILED r=0x%llX cause=0x%08X -> LATCHED "
-                            "for retry (queue full; lossless delivery, s25 fix)\n",
-                            (unsigned long long)(uint64_t)r, arg);
-                    fflush(stderr);
-                }
-            }
+             * carries it). Failure latches into the shared pending mask. */
+            int64_t r = yz_rsx_ev_send(0x80ull);          /* SYS_RSX_EVENT_USER_CMD */
             static unsigned long un = 0; un++;
             if (un <= 40 || (un & 0xFFu) == 0) {
                 fprintf(stderr, "[ucmd] n=%lu cause=0x%08X handlers=0x%08X send=%lld\n",
@@ -2352,9 +2359,11 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
             uint64_t qbit = (uint64_t)(0x20u << head);      /* QUEUE_BASE<<head */
             uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
             if (handlers & qbit) {
-                ppu_context sc; memset(&sc, 0, sizeof(sc));
-                sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = qbit;
-                int64_t r = sys_event_port_send(&sc);
+                /* s25 audit risk #1: same lossless-latch as the user-cmd —
+                 * a queue-full send ORs into the shared pending mask and the
+                 * consumer-top retry delivers it (edge event, loss was
+                 * permanent). */
+                int64_t r = yz_rsx_ev_send(qbit);
                 static unsigned long qn = 0; qn++;
                 if (qn <= 8 || (qn & 0xFFu) == 0) {
                     fprintf(stderr, "[qev] n=%lu head=%u buf=%u send=%lld\n",
@@ -2433,6 +2442,11 @@ extern "C" void yz_rsx_vblank_tick(void)
 {
     if (!g_rsx_ctx_ready) return;
     yz_ft_start();   /* YZ_FLIPTRACE arm banner + label watcher (no-op if off) */
+
+    /* s25: redeliver any latched SPU throw_events (spu_channels.c loss latch,
+     * notification-audit risk #3) — ~16 ms retry cadence, no-op when empty. */
+    { extern void yz_throw_retry_flush(void);
+      yz_throw_retry_flush(); }
 
     /* DIAG (one-time, vblank-dispatch hunt): dump Sony's libgcm vblank/flip
      * handler table once the game has registered a handler. The lifted intr-
