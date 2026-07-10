@@ -56,6 +56,93 @@ _Thread_local jmp_buf* g_spu_restart_jmp = 0;
 _Thread_local char*    g_spu_stack_base  = 0;
 #endif
 
+/* YZ_CTXWATCH (2026-07-10 s26 ⚡1, diag — DONT_RECHASE #53/#54): taskset
+ * context-save EA watch table. s25ride12 published the decode counter val=1
+ * TWICE ([fe0]) — the pool task re-ran with STALE STATE between WAIT_SIGNAL
+ * cycles. The task context round-trips main memory through the taskInfo's
+ * ctxsave EA (be64 @LS 0x2798): the yield's plain-PUT saves LS 0x2C80.. to
+ * EA+0, the resume restores from it (host memcpy in spu_task_launch below,
+ * plus optionally Sony's own GET). spu_task_launch registers each observed
+ * ctx block here; the spu_dma.h watch logs every DMA touching one, so
+ * "no SAVE between two RESUMEs" (double-resume) separates mechanically from
+ * "SAVE landed but the restore read stale bytes". Registration is benign-race
+ * append-only (diag; worst case a duplicate row). */
+uint32_t g_yz_ctxw_ea[32];
+uint32_t g_yz_ctxw_len[32];
+uint32_t g_yz_ctxw_ts[32];
+uint32_t g_yz_ctxw_tid[32];
+volatile int g_yz_ctxw_n = 0;
+
+static uint32_t yz_ctxw_hash(const uint8_t* p, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static void yz_ctxw_register(uint32_t ea, uint32_t len, uint32_t ts, uint32_t tid)
+{
+    for (int i = 0; i < g_yz_ctxw_n && i < 32; i++)
+        if (g_yz_ctxw_ea[i] == ea) return;
+    if (g_yz_ctxw_n >= 32) return;
+    int i = g_yz_ctxw_n;
+    g_yz_ctxw_ea[i] = ea; g_yz_ctxw_len[i] = len;
+    g_yz_ctxw_ts[i] = ts; g_yz_ctxw_tid[i] = tid;
+    g_yz_ctxw_n = i + 1;
+    fprintf(stderr, "[ctxw] REG ctx=0x%08X len=0x%X taskset=0x%08X taskId=%u\n",
+            ea, len, ts, tid);
+    fflush(stderr);
+}
+
+/* One task launch/resume observation: register the ctxsave block + log the
+ * cycle with the register-block hash AS READ FROM MAIN MEMORY (comparable
+ * with the spu_dma.h LOAD hashes). Called from BOTH launch paths — the legacy
+ * spu_task_launch (assisted launch) and spu_indirect_branch's natural
+ * StartTask image-switch (the path the wid4 pool tasks actually take;
+ * s26ride2 measured zero registrations from the legacy hook alone). Returns
+ * quietly when YZ_CTXWATCH is off. */
+static int g_yz_ctxw_armed = -1;
+static void yz_ctxw_cycle(spu_context* c, int image, uint32_t tpc, int is_resume)
+{
+    if (g_yz_ctxw_armed < 0) { g_yz_ctxw_armed = getenv("YZ_CTXWATCH") ? 1 : 0;
+        if (g_yz_ctxw_armed) { fprintf(stderr, "[ctxw] ARMED: taskset ctx save/restore watch live\n"); fflush(stderr); } }
+    if (!g_yz_ctxw_armed) return;
+    const unsigned char* ls = c->ls;
+    const unsigned char* ti = ls + 0x2798u;
+    uint64_t css = ((uint64_t)ti[0]<<56)|((uint64_t)ti[1]<<48)
+                 |((uint64_t)ti[2]<<40)|((uint64_t)ti[3]<<32)
+                 |((uint64_t)ti[4]<<24)|((uint64_t)ti[5]<<16)
+                 |((uint64_t)ti[6]<<8)|ti[7];
+    uint32_t ctx_ea = (uint32_t)(css & ~0x7Full);
+    uint32_t ts  = ((uint32_t)ls[0x27BC]<<24)|((uint32_t)ls[0x27BD]<<16)
+                 |((uint32_t)ls[0x27BE]<<8)|ls[0x27BF];
+    uint32_t tid = ((uint32_t)ls[0x27D4]<<24)|((uint32_t)ls[0x27D5]<<16)
+                 |((uint32_t)ls[0x27D6]<<8)|ls[0x27D7];
+    if (ctx_ea)
+        yz_ctxw_register(ctx_ea, 0x400u + (uint32_t)(css & 0x7Fu) * 0x800u, ts, tid);
+    /* Per-image budgets: gs_task (image 0) re-enters its same-SPU idle poll
+     * thousands of times and ate the whole print budget in s26ride3,
+     * suppressing exactly the pool-task (image 4) cycles the instrument
+     * exists for (LESSONS #21). */
+    static unsigned long crn_img0 = 0, crn = 0;
+    if (image == 0) { crn_img0++;
+        if (!(crn_img0 <= 50 || (crn_img0 & 0x3FFu) == 0)) return; }
+    else crn++;
+    if (image == 0 || crn <= 4000 || (crn & 0xFFu) == 0) {
+        uint32_t h = 0;
+        if (ctx_ea) { extern uint8_t* vm_base;
+                      h = yz_ctxw_hash(vm_base + ctx_ea, 0x380u); }
+        fprintf(stderr, "[ctxw] %s n=%lu spu=%X img=%d taskset=0x%08X taskId=%u "
+                "scl=0x%05X ctx=0x%08X h=%08X gpr0=%08X sp=%08X g80=%08X g81=%08X\n",
+                is_resume ? "RESUME" : "START",
+                image == 0 ? crn_img0 : crn, c->spu_id, image, ts, tid,
+                tpc, ctx_ea, h,
+                c->gpr[0]._u32[0], c->gpr[1]._u32[0],
+                c->gpr[80]._u32[0], c->gpr[81]._u32[0]);
+        fflush(stderr);
+    }
+}
+
 /* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
  * cross-function tail branch in lifted SPU code; drained iteratively by the
  * enclosing call site or the host-thread driver. */
@@ -658,6 +745,22 @@ void spu_begin_image(int image_id) { s_reg_image = image_id; }
  * ===========================================================================*/
 int g_spu_prof_on = 0;   /* set from YZ_SPU_PROF at startup (main.cpp) */
 int g_yz_watch_dlist = 0;        /* YZ_WATCH_DLIST: watch PPU writes to io 0x1104D00 */
+int g_yz_slotstore = 0;          /* YZ_SLOTSTORE: name the wid4 work-record writers (s26 #57B) */
+
+/* Compare-on-store logger for the wid4 work-record slots (called from the
+ * vm_write32/vm_write64 hot-path branch in ppu_memory.h when YZ_SLOTSTORE=1).
+ * ra = the call site inside the lifted chunk (resolve vs yakuza_recomp.map,
+ * or via yz_guest_addr_from_host when available). Uncapped: staging writes
+ * are rare (~2/round). */
+void yz_slotstore_log(uint32_t addr, unsigned long long val, int width, void* ra)
+{
+    extern uint32_t yz_guest_addr_from_host(const void* rip);   /* main.cpp helper */
+    extern uint32_t yz_thread_current_id(void);
+    uint32_t g = yz_guest_addr_from_host(ra);
+    fprintf(stderr, "[slotstore] tid=%u ea=0x%08X val=0x%0*llX w%d guest=0x%08X host_ra=%p\n",
+            yz_thread_current_id(), addr, width / 4, val, width, g, ra);
+    fflush(stderr);
+}
 unsigned long g_yz_dlist_w = 0;  /* cap for the [dlist-w] log */
 uint32_t g_yz_taskset_ea = 0;    /* EA of the gs_task CellSpursTaskset (bitset line); captured from the task_info DMA */
 
@@ -822,6 +925,9 @@ void spu_task_launch(spu_context* c)
          * byte-exactly). RESUME must NOT zero (LS persists across yields). */
         spu_image_zero_bss(c->ls, imd);
     }
+    /* YZ_CTXWATCH: register + log this cycle (see yz_ctxw_cycle — the
+     * discriminator for the s26 ⚡1 stale-republish signature). */
+    yz_ctxw_cycle(c, image, scl, resume);
     c->gpr[2]._u32[0] = scl;                  /* bi gpr2 -> task entry / resume PC */
     c->image_id = image;
     { static int rn = 0; if (resume && rn < 6) { rn++;
@@ -1517,6 +1623,11 @@ void spu_indirect_branch(spu_context* ctx)
                  * across yields by design). */
                 if (tpc == imd->entry)
                     spu_image_zero_bss(ctx->ls, imd);
+                /* YZ_CTXWATCH: this natural-launch path is the one the wid4
+                 * pool tasks take (s26ride2: zero registrations from the
+                 * legacy spu_task_launch hook while [fe0] published twice) —
+                 * register the ctxsave block + log the cycle here too. */
+                yz_ctxw_cycle(ctx, img, tpc, tpc != imd->entry);
                 /* The lifted policy StartTask does NOT propagate the SPURS task-ABI
                  * registers on this natural-launch path -- measured (pt47): the
                  * cri_audio task enters with gpr3=0, so its context base is null and
