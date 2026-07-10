@@ -590,6 +590,30 @@ journal entry + PUT committed past it) — the 3 s tier fired on exactly those. 
 diag setting now YZ_PARKREL_FAST_MS=16 (~60 Hz consumer-substitute). The ungated
 `g_yz_t1_last_tf` hop-target feed (dispatch.cpp) stays for diagnostics.
 
+`YZ_DEFERWATCH` (yakuza/main.cpp, s24, diag, default OFF): 1 ms journal-head advance watcher —
+dumps every new op-list entry (tag+ea) plus the defer-gate inputs (S1C/S20/S24, bufdesc
+end/cur, PUT/GET) on each advance. ⚠ print volume PERTURBS the boot heavily (s25ride3:
+iteration 1 at 3 min vs 10 at 2 min clean — LESSONS #6c); diagnostic boots only.
+
+`YZ_FE0_WATCH` (runtime/spu/spu_dma.h, s22, diag, default OFF): logs every SPU PUT that
+covers the 0x10200FE0 decode label ([fe0], armed banner) — the wid4-pool publish witness.
+
+`YZ_JOBPUT` (runtime/spu/spu_dma.h, s24, diag, default OFF): job-image (13-15) DMA-PUT census
+at all three MFC execution paths (list, plain, atomic) — the first-site-only census produced
+a false zero that hid the flag CAS.
+
+`YZ_LOOKAHEAD` (yakuza/main.cpp, s24, lever, default OFF — ledger #50 REFUTED eager use):
+the 0x7F journal lookahead drain; first boot reproduced the June torn-content wedge.
+Explicit opt-in only; do not enable without the patch-class entries being applied first.
+
+`YZ_T1POLL` (yakuza/shims.cpp, s21, diag, default OFF): t1 poll-site sampler companion to
+YZ_T1SAMPLE (names the syscall/poll site t1 spins in).
+
+`YZ_W4TS` (runtime/spu/spu_dma.h SPU side + shims.cpp PPU side, s22, diag, default OFF):
+uncapped CAS watch on the wid4 pool taskset bitset line 0x42450E00 ([w4ts-spu]/[w4ts-ppu],
+running/ready/signalled/waiting transitions with writer attribution) — the s25 thrash
+capture's instrument.
+
 `YZ_UPDCB` (yakuza/dispatch.cpp `ps3_indirect_call`, 2026-07-09 s24, diag, default OFF):
 logs every bctrl t1 issues with lr inside the master update handler func_00D1E838
 [0xD1E838,0xD1FC38). ⚠ MEASURED USELESS AS BUILT: our lifter never materializes ctx->lr at
