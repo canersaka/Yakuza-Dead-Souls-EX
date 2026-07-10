@@ -205,6 +205,44 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_get(cmd)) {
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            /* s26 ROOT FIX (the varying-round wall — STATUS ⚡ stager-hunt):
+             * the wid4 pool task's 64-byte work-record fetch can race the
+             * game's OWN staging (hardware-watch MEASURED: the pxd module on
+             * the intr thread stores the round value AFTER its SendSignal —
+             * benign on real HW where SPU wake latency exceeds the store gap;
+             * our task wakes faster and fetches a HALF-STAGED record: guard
+             * EA armed at +4, value word still 0 → publishes 0/nothing → the
+             * exact-equality acquire wedges the boot at a varying round).
+             * Absorb the race where real hardware does — in the transfer
+             * latency: when a wid4 record fetch shows the half-staged
+             * signature, re-copy briefly until the value lands (bounded; the
+             * measured gap is <2 vblank ticks). Timeout ⇒ keep the fetched
+             * bytes (current behavior). Kill-switch YZ_NO_RECWAIT. */
+            if (spu->image_id == 4 && size == 0x40u && cmd != MFC_GETLLAR_CMD) {
+                uint32_t rea = (uint32_t)ea;
+                if (rea >= 0x42452880u && rea < 0x424529E0u) {
+                    static int nrw = -1;
+                    if (nrw < 0) { nrw = getenv("YZ_NO_RECWAIT") ? 1 : 0;
+                        if (!nrw) { fprintf(stderr, "[recwait] ARMED: half-staged record absorber live\n"); fflush(stderr); } }
+                    if (!nrw) {
+                        uint32_t w0, w1;
+                        memcpy(&w0, ls_ptr, 4); memcpy(&w1, ls_ptr + 4, 4);
+                        if (w0 == 0 && w1 != 0) {          /* guard armed, value empty */
+                            volatile const uint32_t* vw = (volatile const uint32_t*)ea_ptr;
+                            for (long spin = 0; spin < 4000000 && *vw == 0; spin++)
+                                ;                            /* bounded ~ms-scale spin */
+                            memcpy(ls_ptr, ea_ptr, size);    /* re-copy the settled record */
+                            static unsigned long rwn = 0; rwn++;
+                            if (rwn <= 20 || (rwn & 0xFFu) == 0) {
+                                fprintf(stderr, "[recwait] n=%lu spu=%X ea=0x%08X settled val(be)=%02X%02X%02X%02X\n",
+                                        rwn, spu->spu_id, rea,
+                                        ls_ptr[0], ls_ptr[1], ls_ptr[2], ls_ptr[3]);
+                                fflush(stderr);
+                            }
+                        }
+                    }
+                }
+            }
             /* DIAG (env YZ_JOBDESC, 2026-07-08, capped): payload dump of every
              * GET from the CRI jobchain object area (0x4019xxxx) — the jobchain
              * header/commands/JOB DESCRIPTORS the module stages before calling
@@ -378,6 +416,33 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                             }
                             if (a == a1) break;
                         }
+                }
+            }
+            /* s26 ~04:30 (ride17/25 lost-publish hunt): VERIFY-AFTER-WRITE for
+             * any PUT covering the decode label 0x10200FE0 — ride17 PROVED an
+             * issued publish ([fe0] val=8) that never became visible (5.2M
+             * acquire re-reads saw 7), and ride25's losing round shows the
+             * task treating an unlanded publish as done. Read back the label
+             * word after the copy; on mismatch, log LOUDLY and re-write (the
+             * mismatch itself names a concurrent line-restorer). Cheap: one
+             * compare on a rare EA. */
+            {
+                uint32_t vea = (uint32_t)ea;
+                if (vea <= 0x10200FE0u && vea + size > 0x10200FE0u && size <= 0x80u) {
+                    uint32_t off = 0x10200FE0u - vea;
+                    uint32_t want_, got_;
+                    memcpy(&want_, ls_ptr + off, 4);
+                    memcpy(&got_,  vm_base + 0x10200FE0u, 4);
+                    if (want_ != got_) {
+                        fprintf(stderr, "[put-verify] LABEL PUT DID NOT LAND: wrote=%02X%02X%02X%02X "
+                                "readback=%02X%02X%02X%02X spu=%X pc=0x%05X — REWRITING\n",
+                                ls_ptr[off], ls_ptr[off+1], ls_ptr[off+2], ls_ptr[off+3],
+                                ((uint8_t*)&got_)[0], ((uint8_t*)&got_)[1],
+                                ((uint8_t*)&got_)[2], ((uint8_t*)&got_)[3],
+                                spu->spu_id, spu->pc & SPU_LS_MASK);
+                        fflush(stderr);
+                        memcpy(vm_base + 0x10200FE0u, ls_ptr + off, 4);
+                    }
                 }
             }
         }
@@ -639,6 +704,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                           cn, spu->spu_id, spu->pc & SPU_LS_MASK, jea);
                   fflush(stderr);
               }
+              /* s26 (task #4): dump the FULL 128-byte line the consumer just
+               * GETLLAR'd — the consume gate tests the +0x20 sub-entry vs the
+               * 0x4000 sentinel (gs_task.c 0x63F4), which a 32-byte dump cut
+               * off. (The earlier gpr3 struct dump was measured-useless: the
+               * routine zeroes gpr3 at 0x6368, before the Cmd wrch we catch.)
+               * ride11 already proved the head is NON-EMPTY at the stall. */
+              if (cn <= 12 || (cn & 0xFFFu) == 0) {
+                  const uint8_t* hl = vm_base + (jea & ~127u);
+                  char cb[420]; int ci = 0;
+                  ci += snprintf(cb + ci, sizeof(cb) - (size_t)ci,
+                          "[jrnl-line] n=%lu ea=0x%08X:", cn, jea & ~127u);
+                  for (int k = 0; k < 128 && ci < (int)sizeof(cb) - 4; k += 4)
+                      ci += snprintf(cb + ci, sizeof(cb) - (size_t)ci, "%s%02X%02X%02X%02X",
+                                     (k & 31) ? " " : " | ", hl[k], hl[k+1], hl[k+2], hl[k+3]);
+                  fprintf(stderr, "%s\n", cb); fflush(stderr);
+              }
           }
           if (head && cmd == MFC_GETLLAR_CMD && jline == 0x41F00080u) {
               /* release event-armed tracing (YZ_SPU_TRACE_EVARM) at the
@@ -744,6 +825,29 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     { static int w4r = -1;
       if (w4r < 0) { w4r = getenv("YZ_W4REC") ? 1 : 0;
           if (w4r) { fprintf(stderr, "[w4rec] ARMED: image-4 64-byte work-record GET watch live\n"); fflush(stderr); } }
+      /* s26 ~03:25 (STATUS frontier): the record STAGER watch — who WRITES the
+       * work-record slots (not a lifted PPU store per YZ_SLOTSTORE) — any-image
+       * PUT-class DMA covering the slot range, payload+pc dumped. One boot
+       * names the stager; the fix enforces its stage→signal ordering. */
+      if (w4r && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD
+                  || cmd == MFC_PUTQLLUC_CMD)) {
+          uint32_t pea = (uint32_t)(ea & ~0x80000000ull);
+          uint32_t psz = (cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD
+                          || cmd == MFC_PUTQLLUC_CMD) ? 128u : size;
+          uint32_t pb  = (cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD
+                          || cmd == MFC_PUTQLLUC_CMD) ? (pea & ~127u) : pea;
+          if (pb < 0x424529E0u && pb + psz > 0x42452880u) {
+              static unsigned long sn = 0; sn++;
+              const uint8_t* pl = spu->ls + (lsa & SPU_LS_MASK);
+              char sb[200]; int si = 0;
+              si += snprintf(sb + si, sizeof(sb) - (size_t)si,
+                      "[w4stage] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X size=0x%X head:",
+                      sn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd, pea, size);
+              for (int i = 0; i < 16 && si < (int)sizeof(sb) - 4; i++)
+                  si += snprintf(sb + si, sizeof(sb) - (size_t)si, "%s%02X", (i & 3) ? "" : " ", pl[i]);
+              fprintf(stderr, "%s\n", sb); fflush(stderr);
+          }
+      }
       if (w4r && spu->image_id == 4 && mfc_is_get(cmd) && cmd != MFC_GETLLAR_CMD
               && size == 0x40u) {
           static unsigned long wn = 0; wn++;

@@ -123,6 +123,69 @@ extern "C" int g_spu_prof_on;
 extern "C" int g_yz_watch_dlist;
 extern "C" int g_yz_slotstore;   /* YZ_SLOTSTORE: wid4 record-store watch (spu_channels.c) */
 
+/* YZ_HWWATCH (s26 ~04:25, the stager hunt's definitive tool): a HARDWARE
+ * debug-register watchpoint (DR0, exact 4-byte write watch) on the wid4
+ * work-record slot0 value word — immune to every write-path/aliasing gap that
+ * defeated the software watches (STATUS ⚡ STAGER-HUNT STATE: all helper
+ * widths, atomics, MFC forms, HLE bulk, raw-ptr greps eliminated while the
+ * bytes provably change). Armed from the vblank tick once all threads exist;
+ * threads created after arming are not covered (acceptable — the writer runs
+ * from early rounds). */
+#include <tlhelp32.h>
+extern "C" uint32_t yz_guest_addr_from_host(const void* rip);  /* defined below */
+extern "C" uint32_t yz_thread_current_id(void);                /* threads.cpp */
+extern "C" uint8_t* vm_base;
+static void* g_hww_addr = nullptr;
+static LONG CALLBACK yz_hwwatch_veh(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    if (!(c->Dr6 & 0x1)) return EXCEPTION_CONTINUE_SEARCH;   /* not our DR0 */
+    static unsigned long hn = 0; hn++;
+    if (hn <= 40 || (hn & 0xFFu) == 0) {
+        uint32_t g = yz_guest_addr_from_host((void*)c->Rip);
+        uint32_t v = 0; memcpy(&v, g_hww_addr, 4);
+        fprintf(stderr, "[hww] n=%lu tid=%u rip=%p guest=0x%08X val_now=0x%08X\n",
+                hn, yz_thread_current_id(), (void*)c->Rip, g, ps3_bswap32(v));
+        fflush(stderr);
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+extern "C" void yz_hwwatch_arm(void)
+{
+    g_hww_addr = vm_base + 0x424528A0u;
+    AddVectoredExceptionHandler(1, yz_hwwatch_veh);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    int armed = 0;
+    if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                              THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT c; memset(&c, 0, sizeof(c));
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &c)) {
+                c.Dr0 = (DWORD64)(uintptr_t)g_hww_addr;
+                /* L0=1 (bit0), RW0=01 write (bits16-17), LEN0=11 4-byte
+                 * (bits18-19) -> 0xD0001 over the DR0 fields */
+                c.Dr7 = (c.Dr7 & ~0xF0003ull) | 0xD0001ull;
+                if (SetThreadContext(h, &c)) armed++;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+    fprintf(stderr, "[hww] ARMED DR0=%p (guest 0x424528A0) on %d threads\n",
+            g_hww_addr, armed);
+    fflush(stderr);
+}
+
 static int load_elf(const char* path, uint64_t* entry_out)
 {
     FILE* f = fopen(path, "rb");

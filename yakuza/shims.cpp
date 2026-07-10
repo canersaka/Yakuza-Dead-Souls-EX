@@ -290,8 +290,17 @@ extern "C" uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t addr)
     return ps3_bswap64(raw);
 }
 
+/* s26 stager hunt (STATUS ⚡ frontier): the wid4 work-record stager's last
+ * candidate class = PPU atomic stores (they bypass vm_write*, MFC, and HLE
+ * watches). Logger + gate live in spu_channels.c / main.cpp. */
+extern "C" void yz_slotstore_log(uint32_t a, unsigned long long v, int w, void* ra);
+extern "C" int g_yz_slotstore;
+
 extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
 {
+    if ((uint32_t)addr >= 0x42452880u && (uint32_t)addr < 0x424529E0u) {
+        if (g_yz_slotstore) yz_slotstore_log((uint32_t)addr, val, 32, _ReturnAddress());
+    }
     int ok = 0;
     if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
         uint32_t expected = (uint32_t)ctx->reserve_value;   /* raw BE */
@@ -469,6 +478,9 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
 
 extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
 {
+    if ((uint32_t)addr >= 0x42452880u && (uint32_t)addr < 0x424529E0u) {
+        if (g_yz_slotstore) yz_slotstore_log((uint32_t)addr, val, 64, _ReturnAddress());
+    }
     int ok = 0;
     if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
         uint64_t expected = ctx->reserve_value;
