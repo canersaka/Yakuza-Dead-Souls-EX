@@ -103,11 +103,28 @@ static inline double vm_read_f64(uint32_t addr)
  * -----------------------------------------------------------------------*/
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
+    /* s26 stager hunt (final unwatched widths — see vm_write32) */
+    if (addr >= 0x42452880u && addr < 0x424529E0u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(addr, val, 8, _ReturnAddress());
+        }
+    }
     *vm_ptr8(addr) = val;
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
+    if (addr >= 0x42452880u && addr < 0x424529E0u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(addr, val, 16, _ReturnAddress());
+        }
+    }
     uint16_t raw = ps3_bswap16(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
@@ -140,6 +157,18 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
             extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
                                          int width, void* ra);
             yz_slotstore_log(addr, val, 32, _ReturnAddress());
+        }
+    }
+    /* s26 ride15 pivot (STATUS ⚡): PPU writes to the decode label 0x10200FE0
+     * (the per-round RE-ARM zeroes) — order vs the SPU publishes ([fe0]) is
+     * the wedge discriminator (acquire parks on an already-published value).
+     * Same env gate as the slot watch. */
+    if (addr == 0x10200FE0u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(addr, val, 33, _ReturnAddress());  /* width 33 = label tag */
         }
     }
     uint32_t raw = ps3_bswap32(val);
@@ -184,11 +213,33 @@ static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len
 
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
+    /* s26 stager hunt (STATUS ⚡ ~03:25): the wid4 work-record slots are
+     * written by NEITHER lifted PPU stores (YZ_SLOTSTORE zero) NOR SPU DMA
+     * ([w4stage] zero) ⇒ this bulk path is the remaining candidate. Same env
+     * gate; width tag 99 = memcpy_to. */
+    if (guest_dst < 0x424529E0u && guest_dst + len > 0x42452880u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            unsigned long long head = 0;
+            memcpy(&head, host_src, len < 8 ? len : 8);
+            yz_slotstore_log(guest_dst, head, 99, _ReturnAddress());
+        }
+    }
     memcpy(vm_ptr8(guest_dst), host_src, len);
 }
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
+    if (guest_dst < 0x424529E0u && guest_dst + len > 0x42452880u) {
+        extern int g_yz_slotstore;
+        if (g_yz_slotstore) {
+            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
+                                         int width, void* ra);
+            yz_slotstore_log(guest_dst, (unsigned long long)(unsigned)val, 98, _ReturnAddress());
+        }
+    }
     memset(vm_ptr8(guest_dst), val, len);
 }
 
