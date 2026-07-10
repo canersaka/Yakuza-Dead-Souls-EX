@@ -153,19 +153,38 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = d3d12_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    /* Use the host exe's embedded icon (resource id 1) for the window class so
+     * the taskbar/alt-tab show the game's art; NULL (default icon) when the
+     * game project embeds none. */
+    wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1));
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
-    return CreateWindowExA(
+    HWND hwnd = CreateWindowExA(
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (hwnd) {
+        /* Class hIcon alone loses to the shell's per-app taskbar icon cache;
+         * WM_SETICON on the live window wins. No-op when the game project
+         * embeds no icon resource (id 1). */
+        HICON big = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1),
+                                      IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                      GetSystemMetrics(SM_CYICON), 0);
+        HICON sml = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1),
+                                      IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                      GetSystemMetrics(SM_CYSMICON), 0);
+        if (big) SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (sml) SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)sml);
+    }
+    return hwnd;
 }
 
 /* ---------------------------------------------------------------------------

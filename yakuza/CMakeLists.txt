@@ -72,6 +72,7 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
 
 add_executable(yakuza_recomp
     main.cpp
+    app.rc
     dispatch.cpp
     shims.cpp
     threads.cpp
