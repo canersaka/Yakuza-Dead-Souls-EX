@@ -973,19 +973,22 @@ static void gpu_wait(void)
     }
 }
 
-/* s27 part 3 (scratch/s26_fp_bisect.md, coordinator's depth-RT fix spec):
- * default ON (honor depth-target-as-texture reads); RSX_NO_DEPTH_RT
- * restores the pre-existing behavior (every zeta-address texture read
- * falls through to raw guest memory, which is stale/zeroed for a target
- * that's never actually written back to the capture's memory blocks). */
+/* s27 part 3 (scratch/s26_fp_bisect.md, depth-target-as-texture snapshots).
+ * s27 A/B CORRECTION (~07:20): default flipped to OFF — with the RSQ fix in,
+ * the full-composite A/B showed this feature REGRESSES the room geometry
+ * (walls/cabinets replaced by sky punch-through: scratch/s27_rsqfix vs
+ * scratch/s27_rsq_nodrt) — its part-3 "zero regressions" diff did not cover
+ * the composite. The mechanism is real (shadow-map reads sample live data)
+ * but the readback/redirect corrupts some room passes; debug before
+ * re-defaulting. Opt-in: RSX_DEPTH_RT=1. */
 static int honor_depth_rt(void)
 {
-    static int inited = 0, on = 1;
+    static int inited = 0, on = 0;
     if (!inited) {
         inited = 1;
-        on = !getenv("RSX_NO_DEPTH_RT");
-        printf("[depthrt] RSX_NO_DEPTH_RT %s -> depth-target snapshotting %s\n",
-               getenv("RSX_NO_DEPTH_RT") ? "SET" : "unset", on ? "ON (default)" : "OFF");
+        on = getenv("RSX_DEPTH_RT") ? 1 : 0;
+        printf("[depthrt] RSX_DEPTH_RT %s -> depth-target snapshotting %s\n",
+               on ? "SET" : "unset", on ? "ON" : "OFF (default; s27 A/B regression)");
     }
     return on;
 }
@@ -2091,6 +2094,33 @@ static const fp_force_stage2_t g_fp_force_stages2[] = {
      * (stage 29) is healthy but .w was never separately checked */
     { "{ float4 _v = (float4)((input.tc3).xyzw); h[5].xyzw = _v.xyzw; }",
       "input.tc3.w" },
+    /* s27 part 4 (coordinator ask 2): dump the ACTUAL MAGNITUDE of the
+     * unpacked normal's x,y and the rsqrt radicand, not just sign -- the
+     * signed encoding above can't distinguish "slightly negative" from
+     * "very negative" and both look identical to the near-zero flag once
+     * saturated. Captured right after line 18 (before line 19's dot
+     * overwrites h[0].y with the cross term): h[0].x = unpacked X
+     * (texX*2-1), h[0].w = unpacked Y (texY*2-1) -- see the s27p4 writeup
+     * for the swizzle derivation (h0.y and h0.z become -1/1 constants at
+     * line 18, not the unpacked Y, which lands in h0.w instead). Wide-range
+     * direct-color encoding: v*0.25+0.5 maps [-2,2] to [0,1] (readable back
+     * as (pixel/255-0.5)*4), instead of the standard encoding's implicit
+     * [-1,1] clip. */
+    /* 31: unpacked X magnitude (h0.x right after line 18) */
+    { "{ float4 _v = (float4)(((h[0]).xxyy) * ((float4(2,0,-1,1)).xyyx) + ((float4(2,0,-1,1)).zzwz)); h[0].xyzw = _v.xyzw; }",
+      "float4(h[0].x*0.25+0.5, 0.0, 0.0, 1.0)" },
+    /* 32: unpacked Y magnitude (h0.w right after line 18) */
+    { "{ float4 _v = (float4)(((h[0]).xxyy) * ((float4(2,0,-1,1)).xyyx) + ((float4(2,0,-1,1)).zzwz)); h[0].xyzw = _v.xyzw; }",
+      "float4(h[0].w*0.25+0.5, 0.0, 0.0, 1.0)" },
+    /* 33: the actual rsqrt radicand (1-x^2-y^2) magnitude, computed
+     * DIRECTLY (independent of line 19's own dot-product formulation, as a
+     * cross-check) -- positive means healthy (rsqrt of a positive number),
+     * negative means x^2+y^2>1 and rsqrt(-negative)=rsqrt(positive-arg)
+     * wait: line 22 computes rsqrt(-(h0.y)) where h0.y(19)=x^2+y^2-1, so
+     * rsqrt argument = 1-x^2-y^2; if THIS captured value is negative,
+     * x^2+y^2>1 and the FP's own rsqrt argument goes negative -> NaN. */
+    { "{ float4 _v = (float4)(((h[0]).xxyy) * ((float4(2,0,-1,1)).xyyx) + ((float4(2,0,-1,1)).zzwz)); h[0].xyzw = _v.xyzw; }",
+      "float4((1.0-h[0].x*h[0].x-h[0].w*h[0].w)*0.25+0.5, 0.0, 0.0, 1.0)" },
 };
 #define FP_FORCE_NSTAGES2 (int)(sizeof(g_fp_force_stages2) / sizeof(g_fp_force_stages2[0]))
 
@@ -2207,6 +2237,64 @@ static int fp_apply_force_stage3(char* ps_hlsl, size_t cap, int stage)
         return 0;
     }
     printf("[fpforce3] stage %d patch applied OK\n", stage);
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * RSX_FP_FORCE_STAGE4 (session s27 part 4): the overlay half of the
+ * "zombie splotch" blue pair (draw 1350, part 4's pixel-bisected culprit --
+ * paired with draw 1349's ac8f022372b4de59 base, same body+overlay pattern
+ * as the woman's 47f48eae1f650e68/ac8f022372b4de59 pair from parts 1-2).
+ * fp_d4ec2f11b39b1d38 shares the EXACT same structure as 47f48eae1f650e68:
+ * a packed-normal-map + rsqrt Z-reconstruct feeding a shading normal, and a
+ * final `h[0]=input.col1; ...; h[0]=h1.w*h0+h1` lerp gated by a fog-sourced
+ * weight (line 85: h[1].w=input.fog.x). Reuses fp_insert_after/
+ * fp_replace_first. */
+#define FP_FORCE_TARGET_KEY4 0xd4ec2f11b39b1d38ULL
+
+static const fp_force_stage2_t g_fp_force_stages4[] = {
+    /* 0: h[1].x right after its final writer (line 101, the "lit*col0"
+     * term feeding the final lerp) -- signed encoding to catch the
+     * impossible-triple-zero NaN signature from part 2, not just a
+     * naive black read */
+    { "{ float4 _v = (float4)(((h[2]).xyzw) * ((h[1]).xyzw)); h[1].xyz = _v.xyz; }",
+      "h[1].x" },
+};
+#define FP_FORCE_NSTAGES4 (int)(sizeof(g_fp_force_stages4) / sizeof(g_fp_force_stages4[0]))
+
+static int g_fp_force_stage4 = -1; /* RSX_FP_FORCE_STAGE4, parsed once in main() */
+
+static int fp_apply_force_stage4(char* ps_hlsl, size_t cap, int stage)
+{
+    if (stage < 0 || stage >= FP_FORCE_NSTAGES4) {
+        printf("[fpforce4] RSX_FP_FORCE_STAGE4=%d out of range [0,%d)\n", stage, FP_FORCE_NSTAGES4);
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap,
+            "float4 r[48]; float4 h[48];",
+            " float4 dbg_stage4 = (float4)0;")) {
+        printf("[fpforce4] declaration anchor not found\n");
+        return 0;
+    }
+    char capture[256];
+    if (!strncmp(g_fp_force_stages4[stage].expr, "float4(", 7)) {
+        snprintf(capture, sizeof(capture), " dbg_stage4 = %s;",
+            g_fp_force_stages4[stage].expr);
+    } else {
+        snprintf(capture, sizeof(capture),
+            " dbg_stage4 = float4(saturate(%s), (%s > -0.001 && %s < 0.001) ? 1.0 : 0.0, saturate(-(%s)), 1.0);",
+            g_fp_force_stages4[stage].expr, g_fp_force_stages4[stage].expr,
+            g_fp_force_stages4[stage].expr, g_fp_force_stages4[stage].expr);
+    }
+    if (!fp_insert_after(ps_hlsl, cap, g_fp_force_stages4[stage].anchor, capture)) {
+        printf("[fpforce4] stage %d capture anchor not found\n", stage);
+        return 0;
+    }
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return dbg_stage4;")) {
+        printf("[fpforce4] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce4] stage %d patch applied OK\n", stage);
     return 1;
 }
 
@@ -2358,6 +2446,8 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
         fp_apply_force_stage2(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage2);
     if (fi > 0 && g_fp_force_stage3 >= 0 && key == FP_FORCE_TARGET_KEY3)
         fp_apply_force_stage3(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage3);
+    if (fi > 0 && g_fp_force_stage4 >= 0 && key == FP_FORCE_TARGET_KEY4)
+        fp_apply_force_stage4(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage4);
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
@@ -3791,6 +3881,16 @@ int main(int argc, char** argv)
                    " (only fp_%016llx's PSO is affected)\n",
                    g_fp_force_stage3, (unsigned long long)FP_FORCE_TARGET_KEY3,
                    (unsigned long long)FP_FORCE_TARGET_KEY3);
+        }
+    }
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE4");
+        if (e && e[0]) {
+            g_fp_force_stage4 = atoi(e);
+            printf("[fpforce4] RSX_FP_FORCE_STAGE4 ARMED: stage=%d target_key=%016llx"
+                   " (only fp_%016llx's PSO is affected)\n",
+                   g_fp_force_stage4, (unsigned long long)FP_FORCE_TARGET_KEY4,
+                   (unsigned long long)FP_FORCE_TARGET_KEY4);
         }
     }
 
