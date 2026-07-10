@@ -1721,13 +1721,24 @@ static int yz_rsx_fifo_step(void)
                  * -- zero those tags (the game's GPU-progress ledger; see
                  * yz_jrnl_retire_through). */
                 yz_jrnl_retire_through(rel_entry);
-                { static int n = 0; if (n < 64) { n++;
+                /* s29 (ledger #65): the n<64 cap made a 900 s boot read as "64
+                 * applies total" — a false lever exoneration. Keep the first 64
+                 * verbose, then a census line every 256th so the steady-state
+                 * fire rate stays measurable at any boot length. */
+                { static unsigned long n = 0; n++;
+                  if (n <= 64) {
                     fprintf(stderr, "[rsx] applied deferred release @io 0x%06X (PUT ahead 0x%X)%s parked=%llums t1seq=%ld fence0=0x%08X -> GET advances past stopper\n",
                             get, ahead,
                             parkedfast && !parked3s ? " [park-rel FAST]" :
                             parked3s ? " [park-rel 3s]" : "",
                             (unsigned long long)parked_ms, (long)g_yz_t1_sample_seq,
-                            vm_read32(0x40C00000u)); } }
+                            vm_read32(0x40C00000u));
+                  } else if ((n & 255u) == 0u) {
+                    fprintf(stderr, "[park-rel] census: %lu applies total (latest @io 0x%06X%s parked=%llums)\n",
+                            n, get,
+                            parkedfast && !parked3s ? " FAST" : parked3s ? " 3s" : "",
+                            (unsigned long long)parked_ms);
+                  } }
                 LeaveCriticalSection(&g_rsx_fifo_lock);
                 return 1;
             }
