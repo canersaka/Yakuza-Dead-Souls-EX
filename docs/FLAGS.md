@@ -632,3 +632,37 @@ bctrl). Census prints on probe hits (5 s tick) AND from the watchdog every 60 s
 (`watchdog-<n>m` tags, LESSONS #6d). Re-apply after any relift; runtime handler
 `yz_chain_probe` lives in yakuza/main.cpp and is always compiled in (inert without the
 patch).
+
+`YZ_CTXWATCH` (runtime/spu/spu_channels.c + spu_dma.h, 2026-07-10 s26, diag, default OFF):
+taskset context save/restore watch — registers each task's ctxsave EA at launch (both the
+legacy spu_task_launch path AND spu_indirect_branch's natural-launch path; the pool tasks
+take only the latter), logs per-cycle START/RESUME with a FNV hash of the main-memory
+register block, and the spu_dma.h side logs every DMA SAVE/LOAD touching a registered
+block. Parser: scratch/parse_ctxw.py. s26 verdict: the ctx round-trip is byte-healthy —
+exonerated the save/restore path for ledger #57. Per-image print budgets (gs_task's idle
+poll ate a flat cap — LESSONS #21).
+
+`YZ_W4REC` (runtime/spu/spu_dma.h, s26, diag, default OFF): dumps every image-4 64-byte
+work-record GET (EA + full record bytes, single-write print). Decoded the wid4 record
+economy: five 0x40-stride slots at 0x424528A0-0x424529A0, word0=publish value, word1=target
+EA guard (0 ⇒ legal no-op).
+
+`YZ_W4REC_POLL` (yakuza/import_overrides.cpp vblank tick, s26, diag, default OFF):
+non-faulting poll of the five record slots (word0/word1 on change) — replaced the page-guard
+write-watch, which was BOTH invasive (shares the ctx-save page) and silently defeated by the
+vm's aliased mappings. Caught the half-staged fetch that cracked ledger #57/#58.
+
+`YZ_SLOTSTORE` (runtime/ppu/ppu_memory.h + spu_channels.c logger, s26, diag, default OFF):
+compare-on-store in vm_write32/vm_write64 for the record-slot range — names any LIFTED PPU
+store writer with tid + guest fn (via _ReturnAddress). s26 measured ZERO lifted stores to
+the slots (the stagers are DMA/HLE-side) — kept as the store-path discriminator.
+
+`YZ_UCMD_ON_FLIP` (yakuza/import_overrides.cpp, s26, kill-switch, default OFF): restores the
+pre-s26 flip-event over-broadcast (delivering ALL handler-mask bits incl. USER_CMD 0x80 on
+flip completion) — THE ledger #58 mode-B root. Only for A/B archaeology; never enable in a
+real boot.
+
+`RSX_NO_PASS_DEPTH_CLEAR` (libs/video/tests/replay_main.c, s26, kill-switch, default OFF):
+restores the replay harness's old discard-depth-clears + once-per-frame heuristic (the
+black-character class root, ledger #56/#58-era render fix). Harness-only; the live path was
+already correct.
