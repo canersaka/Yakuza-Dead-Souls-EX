@@ -666,3 +666,40 @@ real boot.
 restores the replay harness's old discard-depth-clears + once-per-frame heuristic (the
 black-character class root, ledger #56/#58-era render fix). Harness-only; the live path was
 already correct.
+
+`YZ_W4MGMT` (runtime/spu/spu_dma.h, s27, diag, default OFF): img-4 atomics on the SPURS
+mgmt line 0x40197C80 — measured the pool's readyCount pinned at 01 constant (select-gating
+exonerated for the round-tail). ⚠ its print budget throttled across the wedge once
+(fresh-eyes caught it) — treat capped tails per LESSONS #21.
+
+`YZ_DLIST_SPU` (runtime/spu/spu_dma.h, s28, diag, default OFF): SPU PUT watch on the
+display-list head EA 0x41504C00-4E00 — with YZ_WATCH_DLIST (PPU side) proved NOBODY writes
+the list in early-stalled boots (ledger #63; downstream of the #64 lever misfire).
+
+`YZ_NO_RECWAIT` (runtime/spu/spu_dma.h, s26, kill-switch, default OFF): disables the
+half-staged work-record absorber (bounded wait-and-recopy on guard-armed/value-empty
+fetches). Absorber measured inert when unneeded.
+
+`YZ_NO_FIFO_RECOVER` (yakuza/import_overrides.cpp, s28, kill-switch, default OFF):
+disables the RPCS3 recover_fifo analog (skip-forward past an ILLEGAL FIFO header word —
+low bits 11 — after 3 stuck polls). Unexercised so far; its target word class measured in
+s26m1/s27m2.
+
+`YZ_T1_HB` (yakuza/import_overrides.cpp vblank tick, s28, diag, default OFF): 2 s t1
+host-liveness heartbeat — host CPU-time deltas + sampled RIP (brief suspend) + the
+in-flight lv2 syscall/r3 (g_yz_t1_sc, set in lv2_syscall_dispatch). Cracked ledger #64.
+
+`YZ_FASTLEVER_EARLY` (yakuza/import_overrides.cpp, s28, kill-switch, default OFF):
+restores the pre-#64 behavior (park-rel fast tier active before the update loop starts).
+Only for A/B archaeology — the early fast tier is THE measured early-stall trigger.
+
+`YZ_GATE_PROBE` (scratch/patch_wkl4_gates.py + patch_gate_probe.py injections into
+recomp_prx lifts, s26-s27, diag, default OFF): the wkl4 barrier/gate operand probes
+([arr-pred]/[leg-*]/[cont-*]/[g31FC]/[g3678]) and the gs_task consume-gate probes.
+Re-apply the scripts after any SPU relift; --revert removes.
+
+`RSX_DEPTH_RT` (libs/video/tests/replay_main.c, s27, opt-in, default OFF): depth-target-
+as-texture snapshots in the replay harness — mechanism validated but regresses room
+geometry in the full composite (A/B scratch/s27_rsqfix vs s27_rsq_nodrt); debug before
+re-defaulting. RSX_NO_PASS_DEPTH_CLEAR / RSX_FP_FORCE_STAGE* / RSX_VP_CLIP_DUMP /
+RSX_LOG_ZETA are harness diagnostics from the same investigation (s26_fp_bisect.md).
