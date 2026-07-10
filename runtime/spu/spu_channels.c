@@ -316,6 +316,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * left the CRI voice-init response unconsumed forever. */
         { uint32_t code = v >> 24;
           if (code < 128 && ctx->ch_out_mbox.count) {
+              extern int yz_throw_latch_add(uint32_t qid, uint64_t src,
+                                            uint64_t d1, uint64_t d2, uint64_t d3);
               uint32_t spup = code & 63;
               extern uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup);
               extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
@@ -345,6 +347,30 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   if (code < 64)                       /* send_event acks the SPU */
                       spu_channel_write(&ctx->ch_in_mbox,
                           rc == 0 ? 0u /* CELL_OK */ : (uint32_t)(int32_t)CELL_EBUSY);
+                  /* s25 (notification-surface audit risk #3): throw_event
+                   * (code>=64) has NO ack path by protocol — on real HW a
+                   * full destination queue means the event is simply lost,
+                   * and the game only survives because its consumer keeps
+                   * up. Our timing widens the full-queue window, so latch
+                   * the failed throw and redeliver when the queue drains
+                   * (vblank-tick flush). The event WAS thrown; only its
+                   * delivery timing shifts. Loud per-latch log so it is
+                   * visible whenever this actually fires. Kill-switch
+                   * YZ_NO_THROW_RETRY restores the faithful drop. */
+                  if (code >= 64 && rc != 0) {
+                      static int ntr = -1;
+                      if (ntr < 0) ntr = getenv("YZ_NO_THROW_RETRY") ? 1 : 0;
+                      if (!ntr) {
+                          int ok = yz_throw_latch_add(qid,
+                                      0xFFFFFFFF53505501ULL, ctx->spu_id,
+                                      ((uint64_t)spup << 32) | (v & 0xFFFFFFu), data);
+                          fprintf(stderr, "[throw-lat] spup=%u queue %u FULL -> "
+                                  "%s (rc=%d)\n", spup, qid,
+                                  ok ? "LATCHED for redelivery" : "latch FULL, LOST",
+                                  rc);
+                          fflush(stderr);
+                      }
+                  }
                   { static unsigned long n = 0;
                     if (n < 24) { n++;
                         fprintf(stderr, "[SPU] %s spup=%u data0=0x%X data1=0x%X -> queue %u (rc=%d)\n",
@@ -1331,6 +1357,62 @@ int spu_have_function(uint32_t addr)
  * discard the bracket locals with their frames; those paths set image_id
  * explicitly. Kill-switch: YZ_NO_IMGSTACK=1 reverts to the old sticky-image
  * behavior. */
+/* ===========================================================================
+ * throw_event loss latch (s25, notification-surface audit risk #3).
+ *
+ * SPU WrOutIntrMbox codes 64-127 (throw_event) are fire-and-forget by
+ * protocol: no ack channel exists, so a full destination lv2 queue loses the
+ * event with no guest-visible signal. Real HW tolerates this because its
+ * consumers keep pace; our host timing widens the full-queue window. Failed
+ * throws are latched here and redelivered from the vblank tick once the
+ * queue has drained — the throw happened, only delivery timing shifts.
+ * Small fixed ring; overflow drops (the faithful behavior) with a loud log
+ * at the latch site. Writers = SPU threads, flusher = the vblank thread;
+ * serialized by a spinlock. */
+#define YZ_THROW_LAT_MAX 16
+typedef struct { uint32_t qid; uint64_t src, d1, d2, d3; int used; } yz_throw_lat;
+static yz_throw_lat g_throw_lat[YZ_THROW_LAT_MAX];
+static atomic_flag  g_throw_lat_lock = ATOMIC_FLAG_INIT;
+
+int yz_throw_latch_add(uint32_t qid, uint64_t src,
+                       uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    int ok = 0;
+    while (atomic_flag_test_and_set_explicit(&g_throw_lat_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+    for (int i = 0; i < YZ_THROW_LAT_MAX; i++)
+        if (!g_throw_lat[i].used) {
+            g_throw_lat[i].qid = qid; g_throw_lat[i].src = src;
+            g_throw_lat[i].d1 = d1; g_throw_lat[i].d2 = d2; g_throw_lat[i].d3 = d3;
+            g_throw_lat[i].used = 1; ok = 1; break;
+        }
+    atomic_flag_clear_explicit(&g_throw_lat_lock, memory_order_release);
+    return ok;
+}
+
+/* Called from the vblank tick (~16 ms cadence). Retries every latched throw
+ * in order; entries that still fail stay latched. */
+void yz_throw_retry_flush(void)
+{
+    extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
+                                          uint64_t d1, uint64_t d2, uint64_t d3);
+    while (atomic_flag_test_and_set_explicit(&g_throw_lat_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+    for (int i = 0; i < YZ_THROW_LAT_MAX; i++) {
+        if (!g_throw_lat[i].used) continue;
+        int rc = sys_event_queue_push_by_id(g_throw_lat[i].qid, g_throw_lat[i].src,
+                                            g_throw_lat[i].d1, g_throw_lat[i].d2,
+                                            g_throw_lat[i].d3);
+        if (rc == 0) {
+            fprintf(stderr, "[throw-lat] REDELIVERED latched throw -> queue %u\n",
+                    g_throw_lat[i].qid);
+            fflush(stderr);
+            g_throw_lat[i].used = 0;
+        }
+    }
+    atomic_flag_clear_explicit(&g_throw_lat_lock, memory_order_release);
+}
+
 void spu_img_restore(spu_context* ctx, int32_t saved_img)
 {
     static int off = -1;
