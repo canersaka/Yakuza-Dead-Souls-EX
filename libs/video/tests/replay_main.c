@@ -203,7 +203,10 @@ static void apply_block(const rxs_stream* s, u32 index)
 #define SRV_WHITE        0
 #define SRV_SURFACE_BASE 1
 #define SRV_TEXTURE_BASE (SRV_SURFACE_BASE + MAX_SURFACES)
-#define SRV_HEAP_SLOTS   (SRV_TEXTURE_BASE + MAX_TEXTURES)
+/* s27 part 3: depth-target snapshots get their own slot range, separate
+ * from both color surfaces and the guest-texture cache (RSX_NO_DEPTH_RT) */
+#define SRV_DEPTH_BASE   (SRV_TEXTURE_BASE + MAX_TEXTURES)
+#define SRV_HEAP_SLOTS   (SRV_DEPTH_BASE + MAX_SURFACES)
 
 #define SRV_TABLE_SIZE   16      /* descriptors per draw table              */
 #define SRV_RING_TABLES  4096
@@ -230,6 +233,19 @@ typedef struct {
     ID3D12Resource* tex;
     u32             draw_hits;   /* draws that targeted this surface this run */
 } surface_t;
+
+/* s27 part 3 (scratch/s26_fp_bisect.md, RSX_NO_DEPTH_RT fix): a depth/zeta
+ * render target that later gets sampled as a texture (the tex15-class
+ * shadow-map read) needs its own snapshot the same way color surfaces do --
+ * but there is only ONE shared D3D12 depth-stencil resource (g.depth,
+ * reused by every draw's depth test), so unlike a color surface a snapshot
+ * has to be an explicit CPU-readback-and-reupload copy taken at the moment
+ * the zeta target changes to something else (the pass boundary), not a
+ * live view of the shared buffer. */
+typedef struct {
+    u32             location, offset;
+    ID3D12Resource* tex;        /* RGBA8 snapshot, NULL until first flush   */
+} depth_surface_t;
 
 typedef struct {
     u32             location, offset, format, width, height, pitch, remap;
@@ -267,6 +283,15 @@ typedef struct {
     ID3D12DescriptorHeap*      dsv_heap;
     ID3D12Resource*            depth;
     int                        depth_cleared;   /* per-frame clear latch      */
+
+    /* s27 part 3: depth-target-as-texture snapshots (RSX_NO_DEPTH_RT kill
+     * switch reverts to the pre-existing raw-guest-memory fallback) */
+    depth_surface_t            depth_surfaces[MAX_SURFACES];
+    u32                        n_depth_surfaces;
+    ID3D12Resource*            depth_readback;  /* dedicated CPU-readable copy target */
+    u32                        cur_zeta_loc, cur_zeta_off;
+    int                        cur_zeta_valid, cur_zeta_had_write;
+    u32                        depth_snapshot_count;
 
     /* B1: dynamic sampler heap (per-unit filter/wrap/LOD from the capture).
      * Samplers are interned by their decoded key; a per-draw table of 16
@@ -457,6 +482,31 @@ static int gpu_init(u32 width, u32 height, int use_hw)
             D3D12_CPU_DESCRIPTOR_HANDLE dh;
             g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dh);
             g.dev->lpVtbl->CreateDepthStencilView(g.dev, g.depth, NULL, dh);
+        }
+    }
+
+    /* s27 part 3: dedicated CPU-readable copy target for depth-target
+     * snapshots (RSX_NO_DEPTH_RT). Only the DEPTH plane (subresource 0 of
+     * the planar D32_FLOAT_S8X24_UINT resource) is copied -- R32_FLOAT,
+     * 4 bytes/texel; row pitch padded to the mandatory 256-byte D3D12 copy
+     * alignment. */
+    if (g.depth) {
+        D3D12_HEAP_PROPERTIES dhp2 = {0};
+        dhp2.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC dbd = {0};
+        dbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        const u32 depth_pitch = (width * 4 + 255) & ~255u;
+        dbd.Width = (u64)depth_pitch * height;
+        dbd.Height = 1;
+        dbd.DepthOrArraySize = 1;
+        dbd.MipLevels = 1;
+        dbd.SampleDesc.Count = 1;
+        dbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &dhp2, D3D12_HEAP_FLAG_NONE, &dbd,
+                                                          D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                          &IID_ID3D12Resource, (void**)&g.depth_readback))) {
+            printf("[gpu] depth readback buffer create failed; RSX_NO_DEPTH_RT-equivalent fallback\n");
+            g.depth_readback = NULL;
         }
     }
 
@@ -923,6 +973,140 @@ static void gpu_wait(void)
     }
 }
 
+/* s27 part 3 (scratch/s26_fp_bisect.md, coordinator's depth-RT fix spec):
+ * default ON (honor depth-target-as-texture reads); RSX_NO_DEPTH_RT
+ * restores the pre-existing behavior (every zeta-address texture read
+ * falls through to raw guest memory, which is stale/zeroed for a target
+ * that's never actually written back to the capture's memory blocks). */
+static int honor_depth_rt(void)
+{
+    static int inited = 0, on = 1;
+    if (!inited) {
+        inited = 1;
+        on = !getenv("RSX_NO_DEPTH_RT");
+        printf("[depthrt] RSX_NO_DEPTH_RT %s -> depth-target snapshotting %s\n",
+               getenv("RSX_NO_DEPTH_RT") ? "SET" : "unset", on ? "ON (default)" : "OFF");
+    }
+    return on;
+}
+
+/* Find or lazily register a depth_surfaces[] entry for (location, offset).
+ * Returns its index; a freshly-created entry has tex==NULL until the first
+ * depth_snapshot_flush() populates it (mirrors surface_get()'s pattern). */
+static u32 depth_surface_get(u32 location, u32 offset)
+{
+    for (u32 i = 0; i < g.n_depth_surfaces; i++)
+        if (g.depth_surfaces[i].location == location && g.depth_surfaces[i].offset == offset)
+            return i;
+    if (g.n_depth_surfaces >= MAX_SURFACES)
+        return 0;
+    depth_surface_t* d = &g.depth_surfaces[g.n_depth_surfaces];
+    d->location = location;
+    d->offset = offset;
+    d->tex = NULL;
+    return g.n_depth_surfaces++;
+}
+
+/* Snapshot the shared depth buffer's CURRENT content into a dedicated,
+ * sampleable RGBA8 texture tagged (location, offset) -- called at a zeta
+ * pass boundary (the zeta target is about to change), so this captures the
+ * just-finished pass's final depth state before anything overwrites it.
+ * Structured like gpu_flush() (close/execute/wait/reopen) with the
+ * depth-plane copy + CPU readback + reupload inserted in between; the
+ * ring-buffer resets at the end mirror gpu_flush()'s own tail exactly,
+ * since this executes and fully drains the command list the same way. */
+static void depth_snapshot_flush(u32 location, u32 offset)
+{
+    if (!g.depth || !g.depth_readback || !honor_depth_rt())
+        return;
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g.depth;
+    b.Transition.Subresource = 0;   /* depth plane only */
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    const u32 depth_pitch = (g.width * 4 + 255) & ~255u;
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = g.depth;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;       /* plane 0 = depth for D32_FLOAT_S8X24_UINT */
+    dst.pResource = g.depth_readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+    dst.PlacedFootprint.Footprint.Width = g.width;
+    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = depth_pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    g.list->lpVtbl->Close(g.list);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    gpu_wait();
+
+    u8* src_px = NULL;
+    D3D12_RANGE rr = {0, (size_t)depth_pitch * g.height};
+    g.depth_readback->lpVtbl->Map(g.depth_readback, 0, &rr, (void**)&src_px);
+    u8* rgba = malloc((size_t)g.width * g.height * 4);
+    if (rgba && src_px) {
+        for (u32 y = 0; y < g.height; y++) {
+            const float* row = (const float*)(src_px + (size_t)y * depth_pitch);
+            for (u32 x = 0; x < g.width; x++) {
+                /* Same 8-bit approximation decode_texel()'s DEPTH24_D8 case
+                 * already uses for guest-memory depth textures: broadcast
+                 * one grayscale byte, opaque alpha -- keeps this snapshot's
+                 * sampled value consistent with what the raw-memory path
+                 * would have produced had the data actually been there. */
+                float dv = row[x];
+                if (dv < 0.0f) dv = 0.0f;
+                if (dv > 1.0f) dv = 1.0f;
+                const u8 d8 = (u8)(dv * 255.0f + 0.5f);
+                u8* px = rgba + ((size_t)y * g.width + x) * 4;
+                px[0] = px[1] = px[2] = d8;
+                px[3] = 255;
+            }
+        }
+    }
+    D3D12_RANGE wr = {0, 0};
+    g.depth_readback->lpVtbl->Unmap(g.depth_readback, 0, &wr);
+
+    g.alloc->lpVtbl->Reset(g.alloc);
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    g.vb_used = 0;
+    g.cb_used = 0;
+    g.srv_ring_used = 0;
+    g.upload_used = 0;
+
+    if (rgba) {
+        ID3D12Resource* tex = create_texture_rgba(rgba, g.width, g.height);
+        free(rgba);
+        if (tex) {
+            const u32 idx = depth_surface_get(location, offset);
+            if (g.depth_surfaces[idx].tex)
+                g.depth_surfaces[idx].tex->lpVtbl->Release(g.depth_surfaces[idx].tex);
+            g.depth_surfaces[idx].tex = tex;
+            srv_write(SRV_DEPTH_BASE + idx, tex);
+            g.depth_snapshot_count++;
+            printf("[depthrt] snapshot #%u: zeta (loc=%u off=0x%X) -> %ux%u RGBA8"
+                   " (srv slot %u)\n", g.depth_snapshot_count, location, offset,
+                   g.width, g.height, SRV_DEPTH_BASE + idx);
+        }
+    }
+}
+
+/* depth_pass_track() (s27 part 3) is defined further down, right after
+ * decode_render_state()/render_state_t -- it needs both and they're not
+ * declared yet at this point in the file. */
+static void depth_pass_track(const rsx_dispatch* rsx);
+
 static void write_ppm(const char* path, const u8* px, u32 pitch, u32 w, u32 h)
 {
     FILE* f = fopen(path, "wb");
@@ -1258,6 +1442,34 @@ static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
     rs->color_mask = cm ? cm : 0xFFFFFFFFu;
 }
 
+/* Called once per draw, right after the draw's own vertex fetch (BEFORE any
+ * GPU-side vertex-buffer upload for it): detects a zeta-target pass
+ * boundary and flushes the JUST-FINISHED pass's depth content into a
+ * sampleable snapshot before the new pass's clear/writes would otherwise
+ * make it unrecoverable. Only passes that actually wrote depth (depth_write
+ * seen at least once) are snapshotted, to skip depth-test-only passes with
+ * nothing new to capture. (s27 part 3, scratch/s26_fp_bisect.md) */
+static void depth_pass_track(const rsx_dispatch* rsx)
+{
+    if (!honor_depth_rt())
+        return;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(rsx, &sf);
+    render_state_t rs;
+    decode_render_state(rsx, &rs);
+    if (g.cur_zeta_valid &&
+        (sf.zeta_location != g.cur_zeta_loc || sf.zeta_offset != g.cur_zeta_off)) {
+        if (g.cur_zeta_had_write)
+            depth_snapshot_flush(g.cur_zeta_loc, g.cur_zeta_off);
+        g.cur_zeta_had_write = 0;
+    }
+    g.cur_zeta_loc = sf.zeta_location;
+    g.cur_zeta_off = sf.zeta_offset;
+    g.cur_zeta_valid = 1;
+    if (rs.depth_write)
+        g.cur_zeta_had_write = 1;
+}
+
 /* Populate a D3D12 PSO descriptor's blend/depth/raster/DSV fields from rs.
  * Depth is only enabled if the shared depth buffer exists. */
 static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
@@ -1472,6 +1684,20 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         const u8* src = guest_ptr(t->location, t->offset);
         if (!src)
             break;
+
+        /* s27 part 2 (scratch/s26_fp_bisect.md): the zero-lit-term hunt
+         * found EVERY texture unit 2-15 for the blue-patch draws bound to
+         * the SAME guest address, a 1x1 texture -- print its raw decoded
+         * texel so we can tell whether the dummy/default texture the game
+         * (or our replay) binds to unused units is itself black, which
+         * would explain any effect reading it collapsing to zero. Additive,
+         * env-gated, no effect unless RSX_TEXLOG_RAW is set. */
+        if (getenv("RSX_TEXLOG_RAW")) {
+            u8 t00[4];
+            decode_texel(base_fmt, src, remap, t00);
+            printf("[texlograw] off=0x%X fmt=0x%02X %ux%u texel0=(%u,%u,%u,%u)\n",
+                   t->offset, t->format, w, h, t00[0], t00[1], t00[2], t00[3]);
+        }
 
         /* Decode each mip level to RGBA8. Linear levels use the level-0 pitch
          * for the base and packed w*texel for reduced levels (the guest can
@@ -1693,6 +1919,297 @@ static int fp_apply_force_stage(char* ps_hlsl, size_t cap, int stage)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * RSX_FP_FORCE_STAGE2 (session s27 part 1, scratch/s26_fp_bisect.md part 5's
+ * "residual 2" follow-up): forced-output probe for ONE named shader
+ * (fp_47f48eae1f650e68, the woman/zombie blue-patch FP), independent of and
+ * additive to RSX_FP_FORCE_STAGE above (different target key, different env
+ * var, same insert/replace mechanism, reuses fp_insert_after/
+ * fp_replace_first). Two stages:
+ *   0: tc7.w -- the raw interpolated w feeding the line-47 projective divide
+ *      `rsx_tex[13].Sample(rsx_samp[13], input.tc7.xy / input.tc7.w)`, the
+ *      part-5-named degenerate-w suspect.
+ *   1: the actual line-95 lerp weight (h[0].w at the point it is consumed by
+ *      `h[0] = h[0].w*(h[4]-h[0])+h[0]`) -- traced by static read of the
+ *      live-dumped HLSL (scratch/s27_shaders/fp_47f48eae1f650e68.hlsl,
+ *      confirmed byte-identical to the pre-existing
+ *      scratch/s26r_shaders/ copy via `diff` this session) to be set by the
+ *      single line `h[0].w = input.fog.xxxx.w;` and never touched again
+ *      before line 95 -- NOT the log2/reflection chain part 5 guessed (that
+ *      chain writes h[0].x via exp2, not h[0].w; see the s27 writeup).
+ * Both stages encode the probed scalar as R=saturate(x), G=1 if |x|<1e-3
+ * else 0 (a "near-zero" flag, since saturate() alone can't distinguish a
+ * true 0 from any negative value), B=saturate(-x), so the rendered PNG is
+ * directly readable: pure green = degenerate/near-zero, red-dominant =
+ * healthy positive, blue-dominant = negative. */
+#define FP_FORCE_TARGET_KEY2 0x47f48eae1f650e68ULL
+
+typedef struct { const char* anchor; const char* expr; } fp_force_stage2_t;
+
+static const fp_force_stage2_t g_fp_force_stages2[] = {
+    /* 0: raw tc7.w, captured at the exact point it feeds the divide */
+    { "rsx_tex[13].Sample(rsx_samp[13], ((input.tc7).xyzw).xy / ((input.tc7).xyzw).w)); r[1].xy = _v.xy; }",
+      "input.tc7.w" },
+    /* 1: the line-95 lerp weight, captured right after its last writer */
+    { "{ float4 _v = (float4)((input.fog).xxxx); h[0].w = _v.w; }",
+      "h[0].w" },
+    /* 2: diagnostic-only diff check (s27 part 1): are tc7.w and the fog
+     * interpolant (stage 1's weight source) literally the same VP output,
+     * or merely correlated? Captured at the same point as stage 1 so
+     * input.tc7.w is also in scope. */
+    { "{ float4 _v = (float4)((input.fog).xxxx); h[0].w = _v.w; }",
+      "(input.tc7.w - h[0].w)" },
+    /* 3: sanity check (s27 part 1) -- capture input.fog.x DIRECTLY (bypass
+     * h[0].w entirely) to rule out an h[]-array-aliasing artifact in stage
+     * 1's own capture. If this disagrees with stage 1's reading, the bug is
+     * in how this probe reads h[0].w, not in the shader's real data. */
+    { "{ float4 _v = (float4)((input.fog).xxxx); h[0].w = _v.w; }",
+      "input.fog.x" },
+    /* 4: the "lit" term h[1] right after its final writer (line 91) -- with
+     * the weight (stage 1) measured ~0 across the whole mesh, line 95's
+     * lerp reduces to h[0]=h[0] (COL1/h[4] has no effect), so the final
+     * color is h[1]*COL0 -- this is the next place to look for the actual
+     * blue source. Direct color passthrough, no scalar encoding needed. */
+    { "(((h[7]).xyzw) * ((h[6]).xxxx) + ((h[2]).xyzw)); h[1].xyz = _v.xyz; }",
+      "float4(h[1].xyz, 1.0)" },
+    /* 5: input.col0 direct passthrough (the other multiplicand at line 93) */
+    { "{ float4 _v = (float4)((input.col0).xyzw); h[0].xyz = _v.xyz; }",
+      "float4(input.col0.xyz, 1.0)" },
+    /* 6: weight * 20 (s27 part 1 follow-up) -- stage 1 read "100% near-zero"
+     * under the |x|<0.001 flag, but a SMALL nonzero weight is exactly what
+     * `weight*COL1` (COL1=(0.84,0.89,1.0,1)) needs to read as a faint DARK
+     * BLUE rather than pure black once h[1]=0 kills the COL0 term (stage 4)
+     * -- this rescales by 20x before saturating so a weight in roughly
+     * [0,0.05] becomes visible instead of clipping into the <0.001 flag. */
+    { "{ float4 _v = (float4)((input.fog).xxxx); h[0].w = _v.w; }",
+      "(h[0].w * 20.0)" },
+    /* 7: weight * 100000 -- is it exactly 0.0 or merely extremely small? */
+    { "{ float4 _v = (float4)((input.fog).xxxx); h[0].w = _v.w; }",
+      "(h[0].w * 100000.0)" },
+    /* s27 part 2 (coordinator follow-up): hunt the zero lit term. Line 91
+     * is `h[1] = h[7]*h[6].xxxx + h[2]` -- bisect the two addends first. */
+    /* 8: h[7] right after its final writer (line 89) */
+    { "{ float4 _v = (float4)(((h[0]).xyzw) * ((h[3]).wwww)); h[7].xyz = _v.xyz; }",
+      "float4(h[7].xyz, 1.0)" },
+    /* 9: h[6].xyz right after its writer (line 50, raw rsx_tex[2] sample) */
+    { "{ float4 _v = (float4)(rsx_tex[2].Sample(rsx_samp[2], ((input.tc0).xyzw).xy)); h[6].xyz = _v.xyz; }",
+      "float4(h[6].xyz, 1.0)" },
+    /* 10: h[2] right after its final writer (line 90) */
+    { "{ float4 _v = (float4)(((h[2]).xyzw) * ((h[1]).xyzw)); h[2].xyz = _v.xyz; }",
+      "float4(h[2].xyz, 1.0)" },
+    /* 11: raw rsx_tex[0] (diffuse) sample, right after line 85 */
+    { "{ float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)); h[1].xyzw = _v.xyzw; }",
+      "float4(h[1].xyz, 1.0)" },
+    /* 12: h[3].w (the scalar multiplying h[0] into h[7] at line 89),
+     * captured right after its line-58 writer */
+    { "{ float4 _v = (float4)(min(((h[7]).zzzz), ((h[7]).xyzw))); h[3].w = _v.w; }",
+      "h[3].w" },
+    /* 13: h[0].x, the specular exp2() term (line 84), captured right after
+     * its writer -- one factor feeding h[7] via lines 87-89 */
+    { "{ float4 _v = (float4)(exp2(((h[2]).wwww).x)); h[0].x = _v.x; }",
+      "h[0].x" },
+    /* 14: h[2] right after line 78 (before line 83 modifies it further) --
+     * bisects whether the accumulator is already zero here or only becomes
+     * zero after line 83's additive term */
+    { "{ float4 _v = (float4)(((h[6]).yyyy) * ((h[1]).xyzw) + ((h[7]).xyzw)); h[2].xyz = _v.xyz; }",
+      "float4(h[2].xyz, 1.0)" },
+    /* 15: h[1] right after line 74 (the "diffuse * atten" term feeding
+     * line 78's h[6].y * h[1] product) */
+    { "{ float4 _v = (float4)(((h[1]).xyzw) * ((h[2]).xxxx)); h[1].xyz = _v.xyz; }",
+      "float4(h[1].xyz, 1.0)" },
+    /* 16: h[6].w right after its last writer before line 80 (line 77) --
+     * feeds h[0].xyz(80)=h6.w broadcast, the other additive term at 83 */
+    { "{ float4 _v = (float4)(((h[0]).zzzz) / ((h[2]).zzzz).x); _v = saturate(_v); h[6].w = _v.w; }",
+      "h[6].w" },
+    /* 17: input.tc6 direct passthrough -- h[1]@74 traces back to
+     * h[1].xyz(45) = input.tc6.xyz + h[3].xyz(41); checking the raw
+     * interpolant itself before chasing the h[3] addend further */
+    { "{ float4 _v = (float4)((input.tc6).xyzw); h[1].xyzw = _v.xyzw; }",
+      "float4(input.tc6.xyz, 1.0)" },
+    /* 18: h[3].xyz right after line 41 (the other addend at line 45) */
+    { "{ float4 _v = (float4)(((h[1]).wwww) * ((h[6]).xyzw) + ((float4(0,0,0.117647,1)).xyzw)); h[3].xyz = _v.xyz; }",
+      "float4(h[3].xyz, 1.0)" },
+    /* s27 part 2 methodology fix: stages 14/18 (and originally 8/10) used a
+     * direct float4 color passthrough, which clips NEGATIVE values to black
+     * in the UNORM render target -- indistinguishable from a true zero.
+     * Re-probe the .x component of each suspect with the signed
+     * saturate/near-zero/negative encoding (stages 0-3's scheme) to tell
+     * "exactly 0" from "negative and clipped". */
+    /* 19: h[3].x @41 signed */
+    { "{ float4 _v = (float4)(((h[1]).wwww) * ((h[6]).xyzw) + ((float4(0,0,0.117647,1)).xyzw)); h[3].xyz = _v.xyz; }",
+      "h[3].x" },
+    /* 20: h[1].x @74 signed */
+    { "{ float4 _v = (float4)(((h[1]).xyzw) * ((h[2]).xxxx)); h[1].xyz = _v.xyz; }",
+      "h[1].x" },
+    /* 21: h[2].x @78 signed */
+    { "{ float4 _v = (float4)(((h[6]).yyyy) * ((h[1]).xyzw) + ((h[7]).xyzw)); h[2].xyz = _v.xyz; }",
+      "h[2].x" },
+    /* 22: h[7].x @89 signed */
+    { "{ float4 _v = (float4)(((h[0]).xyzw) * ((h[3]).wwww)); h[7].xyz = _v.xyz; }",
+      "h[7].x" },
+    /* s27 part 2: stages 19-21 read (0,0,0) on ALL THREE channels under the
+     * signed R=saturate(x)/G=|x|<0.001-flag/B=saturate(-x) encoding --
+     * mathematically impossible for any FINITE x (R and B can't both be 0
+     * unless x==0, which forces G=1) -- this is the signature of NaN, since
+     * saturate(NaN) and the NaN comparison both evaluate to 0 in HLSL.
+     * Chasing the NaN source: line 22's rsqrt(-h[0].y) is a classic
+     * normal-map Z-reconstruct that goes NaN if the packed XY is outside
+     * the unit disk (1-x^2-y^2 < 0). */
+    /* 23: h[0].y @19 (the rsqrt's -argument, i.e. x^2+y^2-ish term) signed */
+    { "{ float4 _v = (float4)(dot(((h[0]).xwyw).xyz, ((h[0]).xwzw).xyz)); h[0].y = _v.y; }",
+      "h[0].y" },
+    /* 24: h[1].w @22 (the rsqrt RESULT itself) signed -- if THIS reads the
+     * all-0 NaN signature, the rsqrt argument was negative */
+    { "{ float4 _v = (float4)(rsqrt((-((h[0]).yyyy)).x)); h[1].w = _v.w; }",
+      "h[1].w" },
+    /* 25: raw rsx_tex[5] sample (the packed normal map), direct color */
+    { "{ float4 _v = (float4)(rsx_tex[5].Sample(rsx_samp[5], ((input.tc0).xyzw).xy)); h[0].xy = _v.xy; }",
+      "float4(h[0].xy, 0.0, 1.0)" },
+    /* 26: h[0].xyz @28, the DIRECT input to line 29's normalize() -- the
+     * most direct test of "normalize(~0 vector) = NaN". Signed .x probe
+     * (this is the actual dependency; line 27's h[4] read is pre-init
+     * zero and division by the healthy stage-24 rsqrt result is a
+     * harmless dead branch, corrected trace from the first attempt). */
+    { "{ float4 _v = (float4)(((h[1]).xyzw) + ((h[0]).xyzw)); h[0].xyz = _v.xyz; }",
+      "h[0].x" },
+    /* 27: h[4].x @29, the normalize() RESULT itself, signed */
+    { "{ float4 _v = (float4)(float4(normalize(((h[0]).xyzw).xyz), 1.0)); h[4].xyz = _v.xyz; }",
+      "h[4].x" },
+    /* 28: h[0].x @25 signed -- h[0].w(26) traces to zero (never written
+     * before line 26, so the *h[0].w term is a harmless no-op) meaning
+     * h[0].xyz(26)=h[0].xyz(25) directly: h[0].xyz(25) = h[0].xxxx(18,
+     * = tex5.x*2-1, and stage 25 already showed tex5.x is a CONSTANT 0
+     * min=max=0, so this term is the constant -1) * h[5].xyzw(14=tc3) */
+    { "{ float4 _v = (float4)(((h[0]).xxxx) * ((h[5]).xyzw)); h[0].xyz = _v.xyz; }",
+      "h[0].x" },
+    /* 29: input.tc3 direct passthrough (h[5]@14, feeds stage 28's product) */
+    { "{ float4 _v = (float4)((input.tc3).xyzw); h[5].xyzw = _v.xyzw; }",
+      "float4(input.tc3.xyz, 1.0)" },
+    /* 30: input.tc3.w signed -- h[0].w(18) and h[0].xyz(25) both measured
+     * healthy, so for h[0]@26 = h0.w(18)*h[1](24) + h0(25) to go NaN,
+     * h[1](24) = h[1](23)*h[5].wwww(=tc3.w) must be the carrier; tc3.xyz
+     * (stage 29) is healthy but .w was never separately checked */
+    { "{ float4 _v = (float4)((input.tc3).xyzw); h[5].xyzw = _v.xyzw; }",
+      "input.tc3.w" },
+};
+#define FP_FORCE_NSTAGES2 (int)(sizeof(g_fp_force_stages2) / sizeof(g_fp_force_stages2[0]))
+
+static int g_fp_force_stage2 = -1; /* RSX_FP_FORCE_STAGE2, parsed once in main() */
+
+static int fp_apply_force_stage2(char* ps_hlsl, size_t cap, int stage)
+{
+    if (stage < 0 || stage >= FP_FORCE_NSTAGES2) {
+        printf("[fpforce2] RSX_FP_FORCE_STAGE2=%d out of range [0,%d)\n", stage, FP_FORCE_NSTAGES2);
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap,
+            "float4 r[48]; float4 h[48];",
+            " float4 dbg_stage2 = (float4)0;")) {
+        printf("[fpforce2] declaration anchor not found\n");
+        return 0;
+    }
+    char capture[256];
+    /* Stages whose expr is already a float4 color (starts with "float4(")
+     * are a direct passthrough -- the scalar sign/near-zero encoding below
+     * only applies to bare scalar expressions. */
+    if (!strncmp(g_fp_force_stages2[stage].expr, "float4(", 7)) {
+        snprintf(capture, sizeof(capture), " dbg_stage2 = %s;",
+            g_fp_force_stages2[stage].expr);
+    } else {
+        snprintf(capture, sizeof(capture),
+            " dbg_stage2 = float4(saturate(%s), (%s > -0.001 && %s < 0.001) ? 1.0 : 0.0, saturate(-(%s)), 1.0);",
+            g_fp_force_stages2[stage].expr, g_fp_force_stages2[stage].expr,
+            g_fp_force_stages2[stage].expr, g_fp_force_stages2[stage].expr);
+    }
+    if (!fp_insert_after(ps_hlsl, cap, g_fp_force_stages2[stage].anchor, capture)) {
+        printf("[fpforce2] stage %d capture anchor not found\n", stage);
+        return 0;
+    }
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return dbg_stage2;")) {
+        printf("[fpforce2] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce2] stage %d patch applied OK\n", stage);
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * RSX_FP_FORCE_STAGE3 (session s27 part 2, coordinator lead 2): bisect the
+ * "blue" symptom's OTHER paired program, fp_ac8f022372b4de59 (draw 1370's
+ * "opaque body pass", part 4's naming), a tiny 8-statement shader:
+ *   h[0].xy = min(tex[14].Sample(tc0.xy/tc0.w), tex[15].Sample(tc1.xy/tc1.w))
+ *   h[0].z  = saturate(tc2.x)^2
+ *   h[0].w  = tex[0].Sample(tc2.zw).a
+ *   return h[0]
+ * i.e. the entire RGB output is (min(tex14,tex15).x, min(tex14,tex15).y,
+ * saturate(tc2.x)^2) -- if the two projective light/shadow-map samples
+ * (tex14/tex15) read low while the tc2.x^2 term reads relatively higher,
+ * that alone is a self-contained, simple mechanism for a blue-dominant
+ * output, independent of anything found in the fp_47f48eae1f650e68
+ * investigation. Reuses fp_insert_after/fp_replace_first. */
+#define FP_FORCE_TARGET_KEY3 0xac8f022372b4de59ULL
+
+static const fp_force_stage2_t g_fp_force_stages3[] = {
+    /* 0: raw tex14 sample (r[1].xy), direct color */
+    { "{ float4 _v = (float4)(rsx_tex[14].Sample(rsx_samp[14], ((input.tc0).xyzw).xy / ((input.tc0).xyzw).w)); r[1].xy = _v.xy; }",
+      "float4(r[1].xy, 0.0, 1.0)" },
+    /* 1: raw tex15 sample (r[2].xy), direct color */
+    { "{ float4 _v = (float4)(rsx_tex[15].Sample(rsx_samp[15], ((input.tc1).xyzw).xy / ((input.tc1).xyzw).w)); r[2].xy = _v.xy; }",
+      "float4(r[2].xy, 0.0, 1.0)" },
+    /* 2: h[0].xy = min(tex14,tex15), direct color -- the shader's own R,G */
+    { "{ float4 _v = (float4)(min(((r[1]).xyzw), ((r[2]).xyzw))); h[0].xy = _v.xy; }",
+      "float4(h[0].xy, 0.0, 1.0)" },
+    /* 3: h[0].z = saturate(tc2.x)^2, direct color -- the shader's own B */
+    { "{ float4 _v = (float4)(((r[1]).wwww) * ((r[1]).wwww)); h[0].z = _v.z; }",
+      "float4(0.0, 0.0, h[0].z, 1.0)" },
+    /* 4: tc0.w signed (tex14's projective divisor) */
+    { "{ float4 _v = (float4)(rsx_tex[14].Sample(rsx_samp[14], ((input.tc0).xyzw).xy / ((input.tc0).xyzw).w)); r[1].xy = _v.xy; }",
+      "input.tc0.w" },
+    /* 5: tc1.w signed (tex15's projective divisor) */
+    { "{ float4 _v = (float4)(rsx_tex[15].Sample(rsx_samp[15], ((input.tc1).xyzw).xy / ((input.tc1).xyzw).w)); r[2].xy = _v.xy; }",
+      "input.tc1.w" },
+    /* 6: tex0.a (h[0].w) direct, and 7: unmodified real output for baseline */
+    { "{ float4 _v = (float4)((r[0]).xyzw); h[0].w = _v.w; }",
+      "float4(0.0, 0.0, 0.0, h[0].w)" },
+};
+#define FP_FORCE_NSTAGES3 (int)(sizeof(g_fp_force_stages3) / sizeof(g_fp_force_stages3[0]))
+
+static int g_fp_force_stage3 = -1; /* RSX_FP_FORCE_STAGE3, parsed once in main() */
+
+static int fp_apply_force_stage3(char* ps_hlsl, size_t cap, int stage)
+{
+    if (stage < 0 || stage >= FP_FORCE_NSTAGES3) {
+        printf("[fpforce3] RSX_FP_FORCE_STAGE3=%d out of range [0,%d)\n", stage, FP_FORCE_NSTAGES3);
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap,
+            "float4 r[48]; float4 h[48];",
+            " float4 dbg_stage3 = (float4)0;")) {
+        printf("[fpforce3] declaration anchor not found\n");
+        return 0;
+    }
+    char capture[256];
+    if (!strncmp(g_fp_force_stages3[stage].expr, "float4(", 7)) {
+        snprintf(capture, sizeof(capture), " dbg_stage3 = %s;",
+            g_fp_force_stages3[stage].expr);
+    } else {
+        snprintf(capture, sizeof(capture),
+            " dbg_stage3 = float4(saturate(%s), (%s > -0.001 && %s < 0.001) ? 1.0 : 0.0, saturate(-(%s)), 1.0);",
+            g_fp_force_stages3[stage].expr, g_fp_force_stages3[stage].expr,
+            g_fp_force_stages3[stage].expr, g_fp_force_stages3[stage].expr);
+    }
+    if (!fp_insert_after(ps_hlsl, cap, g_fp_force_stages3[stage].anchor, capture)) {
+        printf("[fpforce3] stage %d capture anchor not found\n", stage);
+        return 0;
+    }
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return dbg_stage3;")) {
+        printf("[fpforce3] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce3] stage %d patch applied OK\n", stage);
+    return 1;
+}
+
 static u64 fnv1a(const void* data, u32 n, u64 h)
 {
     const u8* p = data;
@@ -1837,6 +2354,10 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
     const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
     if (fi > 0 && g_fp_force_stage >= 0 && key == FP_FORCE_TARGET_KEY)
         fp_apply_force_stage(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage);
+    if (fi > 0 && g_fp_force_stage2 >= 0 && key == FP_FORCE_TARGET_KEY2)
+        fp_apply_force_stage2(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage2);
+    if (fi > 0 && g_fp_force_stage3 >= 0 && key == FP_FORCE_TARGET_KEY3)
+        fp_apply_force_stage3(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage3);
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
@@ -2295,6 +2816,17 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         return;
     }
 
+    /* s27 part 3: detect+flush a finished zeta pass. MUST run before this
+     * draw's own vertex data is memcpy'd into the shared g.vb ring further
+     * down this function (depth_snapshot_flush executes and drains the
+     * command list, resetting g.vb_used/g.cb_used/g.srv_ring_used the same
+     * way gpu_flush() does -- doing that AFTER this draw's own vertex
+     * upload would orphan it, since the DrawInstanced call later reads the
+     * now-reset g.vb_used as its buffer offset instead of where the data
+     * actually landed). Safe here: nothing GPU-side for this draw has
+     * happened yet, only CPU-side vertex fetch above. */
+    depth_pass_track(rsx);
+
     /* RSX_LOG_DRAW extra: scan every fetched vertex's ATTR0 (position) for
      * this draw and print the bounding box + any outlier beyond a generous
      * scene-scale radius, and any NaN/Inf. Tests the "one bad vertex in a
@@ -2697,6 +3229,41 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                c->dbg_first_vert_valid ? c->dbg_first_vert : 0, addr7, raw_hex,
                tri[0].a[7][0], tri[0].a[7][1], tri[0].a[7][2], tri[0].a[7][3]);
 
+        /* s26 part 5 (scratch/s26_fp_bisect.md): vp_47f48eae1f650e68's own
+         * ucode (independently decoded, scratch/s26_vp_decode.py) shows
+         * o[1]/o[2] (COL0/COL1, which the paired FP feeds directly into the
+         * final pixel color) are NOT sourced from the bone-blend accumulator
+         * at all -- their last writers before the output MOVs are plain,
+         * non-indexed constant reads vp_c[467].yyyy and vp_c[62].xyzx. Dump
+         * both in full (all 4 components) for any RSX_LOG_DRAW-named draw so
+         * the runtime value feeding the blue color can be read directly,
+         * cross-checked against the .rrc's own CONSTANT_LOAD record for
+         * these two slots. Also dumps c58 (residual-3's blit dest-rect
+         * constant, vp_f9177145503f1f42, draw 1624) in the same line so one
+         * RSX_LOG_DRAW run covers both asks. */
+        if (dbg_force_log) {
+            union { u32 u; float f; } c467[4], c62[4], c58[4], c63[4];
+            for (u32 k = 0; k < 4; k++) {
+                c467[k].u = rsx_dsp_constant(rsx, 467)[k];
+                c62[k].u = rsx_dsp_constant(rsx, 62)[k];
+                c58[k].u = rsx_dsp_constant(rsx, 58)[k];
+                c63[k].u = rsx_dsp_constant(rsx, 63)[k];
+            }
+            /* s27 part 1 (scratch/s26_fp_bisect.md): the last writer to
+             * r[3].w before o[5].x=r[3].w (FOGC, the source of the FP's
+             * line-95 lerp weight, see scratch/s26p5_vp_47f48eae.txt instr
+             * [82]) is `MAD r[0].wwww * vp_c[63].zzzz + vp_c[63].wwww ->
+             * r[3].w` -- a classic linear fog scale+bias idiom. Dump c63 to
+             * sanity-check it's a plausible scale/bias pair, not garbage. */
+            printf("       [s27] c63(fog scale/bias)=(%.6f %.6f %.6f %.6f)\n",
+                   c63[0].f, c63[1].f, c63[2].f, c63[3].f);
+            printf("       [s26p5] c467=(%.6f %.6f %.6f %.6f) c62=(%.6f %.6f %.6f %.6f)"
+                   " c58=(%.6f %.6f %.6f %.6f)\n",
+                   c467[0].f, c467[1].f, c467[2].f, c467[3].f,
+                   c62[0].f, c62[1].f, c62[2].f, c62[3].f,
+                   c58[0].f, c58[1].f, c58[2].f, c58[3].f);
+        }
+
         /* s25f follow-up (scratch/s25_skin_diag.md): the character-class
          * black-shading diagnosis pins EVERY lighting term of the affected
          * FP family on the vertex NORMAL (ATTR2 -> VP o[9] -> FP h[1] =
@@ -2879,6 +3446,22 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                 break;
             }
         }
+        /* s27 part 3: a depth/zeta target rendered earlier this frame and
+         * later sampled as a texture (the tex15-class shadow-map read) --
+         * check AFTER color surfaces (a color-RTV match should always win
+         * if both somehow existed) but BEFORE falling to raw guest memory,
+         * which is stale/zeroed for an address that's never actually
+         * written back into the capture's own memory blocks. */
+        int sampled_depth = -1;
+        if (sampled_surface < 0 && honor_depth_rt()) {
+            for (u32 i = 0; i < g.n_depth_surfaces; i++) {
+                if (g.depth_surfaces[i].location == t.location &&
+                    g.depth_surfaces[i].offset == t.offset && g.depth_surfaces[i].tex) {
+                    sampled_depth = (int)i;
+                    break;
+                }
+            }
+        }
         if (sampled_surface >= 0) {
             slots[u] = SRV_SURFACE_BASE + sampled_surface;
             u32 seen = 0;
@@ -2887,6 +3470,8 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                     seen = 1;
             if (!seen && n_surf_used < SRV_TABLE_SIZE)
                 surf_used[n_surf_used++] = (u32)sampled_surface;
+        } else if (sampled_depth >= 0) {
+            slots[u] = SRV_DEPTH_BASE + sampled_depth;
         } else {
             slots[u] = texture_srv_slot(&t);
         }
@@ -2894,8 +3479,8 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
             (target < g.n_surfaces && g.surfaces[target].offset == 0x3C0000);
         if ((c->draw_count < 40 || dbg_target || dbg_force_log) && t.enabled)
             printf("          tex%u <- %s 0x%X (%ux%u fmt=0x%02X)%s\n", u,
-                   sampled_surface >= 0 ? "surface" : "guest", t.offset,
-                   t.width, t.height, t.format & 0xFF,
+                   sampled_surface >= 0 ? "surface" : sampled_depth >= 0 ? "depth-rt" : "guest",
+                   t.offset, t.width, t.height, t.format & 0xFF,
                    slots[u] == SRV_WHITE ? " [WHITE-FALLBACK]" : "");
     }
 
@@ -2913,6 +3498,17 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                p0[0], p0[1], p0[2],
                drs.cull_enable, drs.cull_face, drs.front_face,
                drs.blend_enable, drs.depth_test, drs.depth_write, drs.depth_func);
+        /* s27 part 3 (scratch/s26_fp_bisect.md, coordinator's depth-RT fix):
+         * is any draw's ZETA target ever the tex15-class address (0x2910000)
+         * or does a depth-only pass (RT_ENABLE with no color, depth write
+         * on) exist at all before draw 1370? Diagnostic-only, gated on the
+         * same RSX_LOG_DRAW range so a wide scan (e.g. RSX_LOG_DRAW=0-1370)
+         * answers the capture-scope question directly. */
+        if (getenv("RSX_LOG_ZETA"))
+            printf("          [s27zeta] zeta_offset=0x%X zeta_loc=%u zeta_pitch=%u"
+                   " color_target=0x%X depth(t=%u w=%u)\n",
+                   sf.zeta_offset, sf.zeta_location, sf.zeta_pitch,
+                   sf.color_target, drs.depth_test, drs.depth_write);
     }
 
     /* transition every sampled surface RT -> SRV around the draw */
@@ -2979,6 +3575,28 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                    vp.translate[0], vp.translate[1], vp.translate[2],
                    sf.clip_w, sf.clip_h);
 
+        /* s27 part 1 (scratch/s26_fp_bisect.md residual 3, x=820 scanout
+         * band): the harness never reads NV4097_SET_SCISSOR_HORIZONTAL/
+         * VERTICAL (0x8C0/0x8C4) at all -- every register write lands in
+         * rsx->regs[] unconditionally (rsx_dispatch.c:220) regardless of
+         * whether any consumer decodes it, so the capture's real scissor
+         * value is sitting right here, just unread. Decode it the same way
+         * rsx_commands.c's (unused-by-this-path) NV4097_SET_SCISSOR_*
+         * handler does: x=lo16,w=hi16 / y=lo16,h=hi16. Diagnostic-only
+         * print, gated on the same RSX_LOG_DRAW/dbg_force_log condition as
+         * the vp= line above -- no behavior change here, see
+         * RSX_HONOR_SCISSOR below for the actual fix. */
+        if (dbg_force_log) {
+            const u32 sc_h_reg = rsx_dsp_reg(rsx, 0x000008C0u); /* NV4097_SET_SCISSOR_HORIZONTAL */
+            const u32 sc_v_reg = rsx_dsp_reg(rsx, 0x000008C4u); /* NV4097_SET_SCISSOR_VERTICAL */
+            printf("          [s27scissor] raw_h=0x%08X raw_v=0x%08X"
+                   " decoded=(x=%u y=%u w=%u h=%u) surf_clip=%ux%u\n",
+                   sc_h_reg, sc_v_reg,
+                   sc_h_reg & 0xFFFFu, sc_v_reg & 0xFFFFu,
+                   sc_h_reg >> 16, sc_v_reg >> 16,
+                   sf.clip_w, sf.clip_h);
+        }
+
         g.list->lpVtbl->SetPipelineState(g.list, xpso);
         g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
         g.list->lpVtbl->SetGraphicsRootConstantBufferView(
@@ -3023,11 +3641,21 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
 
 static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
 {
-    (void)rsx;
     sink_ctx* c = user;
     const rxs_stream* s = c->stream;
     const u32 buf = arg & 7;
     const u32 scan_offset = buf < s->disp_count ? s->disp[buf].offset : 0;
+
+    /* s27 part 3: flush whatever zeta pass was still active at frame end --
+     * without this, a shadow/depth pass that happens to be the LAST one
+     * before the flip (no later draw ever changes the zeta target again)
+     * would never hit depth_pass_track()'s boundary-detection and its
+     * snapshot would be silently skipped. */
+    if (honor_depth_rt() && g.cur_zeta_valid && g.cur_zeta_had_write) {
+        depth_snapshot_flush(g.cur_zeta_loc, g.cur_zeta_off);
+        g.cur_zeta_had_write = 0;
+    }
+    (void)rsx;
 
     printf("[replay] flip(buffer %u @0x%X) -> frame %u"
            " (%u clears, %u draws [%u translated], %u verts, %u surfaces, %u flushes)\n",
@@ -3143,6 +3771,26 @@ int main(int argc, char** argv)
                    " (only fp_%016llx's PSO is affected)\n",
                    g_fp_force_stage, (unsigned long long)FP_FORCE_TARGET_KEY,
                    (unsigned long long)FP_FORCE_TARGET_KEY);
+        }
+    }
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE2");
+        if (e && e[0]) {
+            g_fp_force_stage2 = atoi(e);
+            printf("[fpforce2] RSX_FP_FORCE_STAGE2 ARMED: stage=%d target_key=%016llx"
+                   " (only fp_%016llx's PSO is affected)\n",
+                   g_fp_force_stage2, (unsigned long long)FP_FORCE_TARGET_KEY2,
+                   (unsigned long long)FP_FORCE_TARGET_KEY2);
+        }
+    }
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE3");
+        if (e && e[0]) {
+            g_fp_force_stage3 = atoi(e);
+            printf("[fpforce3] RSX_FP_FORCE_STAGE3 ARMED: stage=%d target_key=%016llx"
+                   " (only fp_%016llx's PSO is affected)\n",
+                   g_fp_force_stage3, (unsigned long long)FP_FORCE_TARGET_KEY3,
+                   (unsigned long long)FP_FORCE_TARGET_KEY3);
         }
     }
 
