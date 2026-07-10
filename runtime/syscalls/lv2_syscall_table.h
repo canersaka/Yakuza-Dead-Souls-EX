@@ -281,6 +281,14 @@ static inline void lv2_syscall_register(lv2_syscall_table* tbl, uint32_t num, lv
  * Called when the recompiled code encounters an `sc` instruction.
  * The syscall number is in gpr[11].
  * -----------------------------------------------------------------------*/
+/* s28 ([t1-hb] rider, ledger #63/#64 hunt): t1's current in-flight syscall +
+ * its first arg — the heartbeat prints them, naming the wait t1 spins in
+ * (the LV2:first dedup hides re-entered syscalls; the stalled t1 burns full
+ * CPU inside a QPC-polling wait that never satisfies). Written only for
+ * tid 1; benign torn reads acceptable (diag). */
+extern uint32_t g_yz_t1_sc;
+extern uint64_t g_yz_t1_sc_r3;
+
 static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx)
 {
     uint32_t num = (uint32_t)ctx->gpr[11];
@@ -290,8 +298,12 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
         return;
     }
 
-    lv2_syscall_fn handler = tbl->handlers[num];
-    ctx->gpr[3] = (uint64_t)handler(ctx);
+    {   extern uint32_t yz_thread_current_id(void);
+        if (yz_thread_current_id() == 1) { g_yz_t1_sc = num; g_yz_t1_sc_r3 = ctx->gpr[3]; }
+        lv2_syscall_fn handler = tbl->handlers[num];
+        ctx->gpr[3] = (uint64_t)handler(ctx);
+        if (yz_thread_current_id() == 1) g_yz_t1_sc = 0;
+    }
 }
 
 /* Convenience wrapper using the global table */

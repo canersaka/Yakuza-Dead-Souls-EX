@@ -865,6 +865,47 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                              "%s%02X", (i & 3) ? "" : " ", m[i]);
           fprintf(stderr, "%s\n", rb); fflush(stderr);
       } }
+    /* Display-list SPU-writer watch (env YZ_DLIST_SPU, s28 ledger #63): the
+     * early-boot stall parks GET on the A2000500 placeholder at io 0x1104D00
+     * (EA 0x41504Dxx) and ZERO PPU stores ever hit it — the writer is
+     * SPU-side (gs_task geometry output). Log any SPU PUT covering the list
+     * head so a stalled boot names whether the write is attempted at all. */
+    { static int dls = -1;
+      if (dls < 0) { dls = getenv("YZ_DLIST_SPU") ? 1 : 0;
+          if (dls) { fprintf(stderr, "[dlist-spu] ARMED: SPU PUT watch on EA 0x41504C00-4E00\n"); fflush(stderr); } }
+      if (dls && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD)) {
+          uint32_t dea = (uint32_t)(ea & ~0x80000000ull);
+          uint32_t dsz = (cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD) ? 128u : size;
+          if (dea < 0x41504E00u && dea + dsz > 0x41504C00u) {
+              static unsigned long dn = 0; dn++;
+              fprintf(stderr, "[dlist-spu] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X ea=0x%08X size=0x%X\n",
+                      dn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK, cmd, dea, size);
+              fflush(stderr);
+          }
+      } }
+    /* wid4 mgmt-line raise watch (env YZ_W4MGMT, s27 — STATUS 🌄 grace-window
+     * verdict): does the pool's inlined task-SendSignal (A2F0/A5E8) ever raise
+     * the WORKLOAD's readyCount/signal on the SPURS mgmt line 0x40197C80 so
+     * kernels re-select the taskset? Log every img=4 atomic touching that
+     * line. Healthy-rounds-with-raises + wedge-without = a lost-raise value
+     * hunt; none-ever = decode the real kernel wake path. */
+    { static int wm = -1;
+      if (wm < 0) { wm = getenv("YZ_W4MGMT") ? 1 : 0;
+          if (wm) { fprintf(stderr, "[w4mgmt] ARMED: img4 mgmt-line atomic watch live\n"); fflush(stderr); } }
+      if (wm && spu->image_id == 4
+             && (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD)
+             && (((uint32_t)(ea & ~0x80000000ull)) & ~127u) == 0x40197C80u) {
+          static unsigned long wmn = 0; wmn++;
+          if (wmn <= 400 || (wmn & 0xFFu) == 0) {
+              const uint8_t* pl = spu->ls + (lsa & SPU_LS_MASK);
+              fprintf(stderr, "[w4mgmt] n=%lu spu=%X pc=0x%05X cmd=0x%02X ls16:"
+                      " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      wmn, spu->spu_id, spu->pc & SPU_LS_MASK, cmd,
+                      pl[0],pl[1],pl[2],pl[3], pl[4],pl[5],pl[6],pl[7],
+                      pl[8],pl[9],pl[10],pl[11], pl[12],pl[13],pl[14],pl[15]);
+              fflush(stderr);
+          }
+      } }
     /* Taskset ctx-save EA watch (env YZ_CTXWATCH, 2026-07-10 s26 ⚡1, diag —
      * DONT_RECHASE #53/#54): the wid4 pool republished a STALE decode counter
      * ([fe0] val=1 twice, s25ride12) — the task's state never advanced between

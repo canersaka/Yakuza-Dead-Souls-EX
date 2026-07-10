@@ -845,8 +845,16 @@ void yz_chain_census_dump(const char* tag)
     fflush(stderr);
 }
 
+/* s28 (ledger #64): the update loop's existence — set at the first
+ * func_00D1E838 entry; gates the park-rel FAST tier (its 100 ms t1-frozen
+ * witness misfires during boot-start, applying releases before t1 finalizes
+ * the segment: 7/7 boots separated stalled-vs-clean purely by lever-fire
+ * order). */
+int g_yz_updloop_started = 0;
+
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
 {
+    if (addr == 0x00D1E838u) g_yz_updloop_started = 1;
     unsigned* as = g_yz_chain_addrs;
     volatile long long* ns = g_yz_chain_counts;
     static int banner = 0;
@@ -1137,6 +1145,7 @@ void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 /* Main thread's context, exposed for the stall watchdog (thread_local
  * g_yz_cur_ctx isn't readable from another host thread). */
 ppu_context* g_yz_main_ctx = nullptr;
+HANDLE g_yz_t1_handle = nullptr;   /* s28: t1 real handle for the [t1-hb] heartbeat */
 static HANDLE g_yz_main_hthread = nullptr;
 
 /* Suspend the main/guest thread and dump its HOST rip + stack-return
@@ -2268,6 +2277,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "[slotstore] ARMED: wid4 work-record store watch live\n");
         fflush(stderr);
     }
+    /* s28 (ledger #63 / s28_earlystall_diff): t1 host-liveness heartbeat needs
+     * a real handle for GetThreadTimes — main() runs ON t1, duplicate here. */
+    { extern HANDLE g_yz_t1_handle;
+      DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                      &g_yz_t1_handle, 0, FALSE, DUPLICATE_SAME_ACCESS); }
 
     /* PS3 e_entry points at an OPD descriptor: word0 = code, word1 = TOC */
     uint32_t entry_code = vm_read32(e_entry);
