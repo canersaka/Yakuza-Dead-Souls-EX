@@ -36,6 +36,9 @@ extern "C" int64_t sys_event_queue_create(ppu_context*);
 extern "C" int64_t sys_event_port_connect_local(ppu_context*);
 extern "C" int64_t sys_event_port_send(ppu_context*);
 extern "C" void yz_hwwatch_arm(void);   /* main.cpp: DR0 watch on the wid4 record slot */
+extern HANDLE g_yz_t1_handle;           /* main.cpp: t1 real handle ([t1-hb]) */
+extern ppu_context* g_yz_main_ctx;      /* main.cpp: t1's guest context */
+extern int g_yz_updloop_started;        /* main.cpp: first func_00D1E838 entry (ledger #64) */
 extern "C" void spu_lockline_lock(void);    /* SPU GETLLAR/PUTLLC serialization */
 extern "C" void spu_lockline_unlock(void);
 
@@ -1686,7 +1689,22 @@ static int yz_rsx_fifo_step(void)
              * (YZ_PARK_REL) until the real consumer story lands. park_seq/
              * park_tf kept for the apply log's diagnostics. */
             (void)park_tf;
-            const int parkedfast = prel && fast_ms && (parked_ms > fast_ms);
+            /* s28 ROOT FIX (ledger #64, the "1/6" early-boot stall = a LEVER
+             * MISFIRE RACE): the fast tier during BOOT-START applies the
+             * release before t1 finalizes the following segment — GET runs
+             * into the A2000500 placeholder at io 0x1104D00 and t1 parks in
+             * its usleep(30) GPU-progress throttle forever (measured: [t1-hb]
+             * sc=141 r3=0x1E full-CPU; 7/7 boots separate stalled-vs-clean
+             * purely by lever-fire order at the first stopper). Gate the fast
+             * tier on the UPDATE LOOP having started (g_yz_updloop_started,
+             * set at the first func_00D1E838 entry) — before that, only the
+             * 3 s fallback fires, which boot-start timing survives (clean
+             * boots' own lever fires were effectively that late). Kill-switch
+             * YZ_FASTLEVER_EARLY restores the old behavior. */
+            static int fle = -1;
+            if (fle < 0) fle = getenv("YZ_FASTLEVER_EARLY") ? 1 : 0;
+            const int fast_ok = fle || g_yz_updloop_started;
+            const int parkedfast = prel && fast_ms && fast_ok && (parked_ms > fast_ms);
             /* The FIFO ring is 8x1MB = 0x800000 (GET/PUT wrap io 0x7xxxxx -> 0x0; the
              * iomap's 0x1B00000 is the whole io SPAN incl. off-ring buffers, NOT the
              * wrap period). Hard-coded so a future HLE _cellGcmInitBody can't leak the
@@ -1773,6 +1791,37 @@ static int yz_rsx_fifo_step(void)
         static int w = 0; if (w < 24) { w++;
             fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
                     "finalised; waiting for producer\n", cmd, get, put); }
+        /* s28 wall-2 W2-1 (scratch/s28_wall2_re.md): RPCS3 treats a header
+         * that fails jump/call/return/method classification as FIFO_ERROR and
+         * RECOVERS (recover_fifo(): abort the in-flight state, ~2 ms pause,
+         * retry; only escalates after 20 recoveries in ~2 s —
+         * rsx/RSXFIFO.cpp:402-417, RSXThread.cpp:2792-2833). Ours spun forever
+         * (s26m1/s27m2: 30+ min on the same illegal word 0x0005DF5F at io
+         * 0x602E8). Model the recovery: for a word that is ILLEGAL (not just
+         * unfinalised: low bits 11 can never become a valid header by more
+         * producer writes), skip the GET forward one word after a bounded
+         * wait, RPCS3-style, and count recoveries loudly. Kill-switch
+         * YZ_NO_FIFO_RECOVER keeps the faithful-wait for A/B. */
+        { static int nfr = -1;
+          if (nfr < 0) { nfr = getenv("YZ_NO_FIFO_RECOVER") ? 1 : 0;
+              if (!nfr) { fprintf(stderr, "[fifo-rec] ARMED (RPCS3 recover_fifo analog)\n"); fflush(stderr); } }
+          int illegal = ((cmd & 3u) == 3u);   /* never a legal PS3 FIFO encoding */
+          if (!nfr && illegal) {
+              static uint32_t last_get = 0xFFFFFFFFu; static int strikes = 0;
+              static ULONGLONG first_ms = 0;
+              if (get != last_get) { last_get = get; strikes = 0; first_ms = GetTickCount64(); }
+              strikes++;
+              if (strikes >= 3) {              /* ~3 poll cycles stuck on one illegal word */
+                  static unsigned long recn = 0; recn++;
+                  fprintf(stderr, "[fifo-rec] n=%lu ILLEGAL header 0x%08X at io=0x%X -- "
+                          "recovering (skip 4; RPCS3 recover_fifo analog)\n", recn, cmd, get);
+                  fflush(stderr);
+                  vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
+                  strikes = 0;
+                  LeaveCriticalSection(&g_rsx_fifo_lock);
+                  return 1;
+              }
+          } }
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 0;
     }
@@ -2469,6 +2518,49 @@ extern "C" void yz_rsx_vblank_tick(void)
      * notification-audit risk #3) — ~16 ms retry cadence, no-op when empty. */
     { extern void yz_throw_retry_flush(void);
       yz_throw_retry_flush(); }
+
+    /* s28 t1 host-liveness heartbeat (env YZ_T1_HB — ledger #63, the
+     * early-stall root probe): every ~2 s, t1's guest cia/lr/r1 (syscall-
+     * boundary stale is fine) + the HOST thread's kernel/user CPU-time DELTAS.
+     * du climbing = t1 SPINS in untagged guest code (hypothesis a); both ~0 =
+     * the host thread is never rescheduled after sys_ppu_thread_create
+     * returns (hypothesis b, runtime scheduling bug). Armed banner so zero
+     * output is MEASURED. */
+    { static int hb = -1; static ULONGLONG hbms = 0;
+      static unsigned long long lk = 0, lu = 0;
+      if (hb < 0) { hb = getenv("YZ_T1_HB") ? 1 : 0;
+          if (hb) { fprintf(stderr, "[t1-hb] ARMED (2s host-liveness heartbeat)\n"); fflush(stderr); } }
+      if (hb) { ULONGLONG now = GetTickCount64();
+        if (now - hbms >= 2000) { hbms = now;
+            FILETIME c1, e1, kt, ut;
+            unsigned long long k = 0, u = 0;
+            if (g_yz_t1_handle && GetThreadTimes(g_yz_t1_handle, &c1, &e1, &kt, &ut)) {
+                k = ((unsigned long long)kt.dwHighDateTime << 32) | kt.dwLowDateTime;
+                u = ((unsigned long long)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
+            }
+            /* s28m6 answered the fork: the stalled t1 burns FULL cpu (du at
+             * the healthy baseline) with zero trace output = a pure guest
+             * spin. Sample the spinning RIP (brief suspend, 1/2s — mild per
+             * LESSONS #6b, and the boot is already stalled when it matters)
+             * and resolve to the guest function. */
+            uint32_t grip = 0; unsigned long long hrip = 0;
+            if (g_yz_t1_handle && SuspendThread(g_yz_t1_handle) != (DWORD)-1) {
+                CONTEXT tc; memset(&tc, 0, sizeof(tc));
+                tc.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(g_yz_t1_handle, &tc)) {
+                    hrip = tc.Rip;
+                    extern uint32_t yz_guest_addr_from_host(const void* rip);
+                    grip = yz_guest_addr_from_host((const void*)tc.Rip);
+                }
+                ResumeThread(g_yz_t1_handle);
+            }
+            { extern uint32_t g_yz_t1_sc; extern uint64_t g_yz_t1_sc_r3;
+              fprintf(stderr, "[t1-hb] rip=%llX guest=0x%08X sc=%u r3=0x%llX r1=0x%08X dk=%llu du=%llu\n",
+                    hrip, grip, g_yz_t1_sc, (unsigned long long)g_yz_t1_sc_r3,
+                    g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->gpr[1] : 0,
+                    k - lk, u - lu); }
+            fflush(stderr);
+            lk = k; lu = u; } } }
 
     /* s26: hardware watchpoint arm trigger (env YZ_HWWATCH — main.cpp
      * yz_hwwatch_arm): fire once at tick 2000 (~32 s, all threads live). */

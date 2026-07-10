@@ -942,3 +942,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 
 /* Guest-callback hook g_ps3_guest_caller: defined by the runtime
  * (libs/system/cellSysutil.c), installed by main.cpp. */
+
+/* s28: [t1-hb] rider globals (lv2_syscall_table.h externs) */
+extern "C" uint32_t g_yz_t1_sc = 0;
+extern "C" uint64_t g_yz_t1_sc_r3 = 0;
