@@ -2527,6 +2527,33 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                a7.type, a7_type_name, a7.size, a7.stride, a7.location, a7.offset,
                c->dbg_first_vert_valid ? c->dbg_first_vert : 0, addr7, raw_hex,
                tri[0].a[7][0], tri[0].a[7][1], tri[0].a[7][2], tri[0].a[7][3]);
+
+        /* s25f follow-up (scratch/s25_skin_diag.md): the character-class
+         * black-shading diagnosis pins EVERY lighting term of the affected
+         * FP family on the vertex NORMAL (ATTR2 -> VP o[9] -> FP h[1] =
+         * normalize(tc2.xyz)); a degenerate ATTR2 collapses all shading to
+         * black. Dump ATTR2 exactly like ATTR7 above: declared format, the
+         * first fetched vertex's raw guest bytes, and the CPU-decoded value
+         * the VS actually received — discriminates raw-data-zero (capture
+         * gap) from wrong-decode (VTXFMT offset/stride) from healthy. */
+        rsx_dsp_vertex_attr a2;
+        rsx_dsp_get_vertex_attr(rsx, 2, &a2);
+        const char* a2_type_name = a2.type < 8 ? type_names[a2.type] : "?";
+        const u32 addr2 = base_off + a2.offset +
+            (c->dbg_first_vert_valid ? c->dbg_first_vert : 0) * a2.stride;
+        const u8* p2 = guest_ptr(a2.location, addr2);
+        char raw2_hex[3 * 16 + 1] = {0};
+        if (p2 && addr2 <= ARENA_SIZE - 16) {
+            for (u32 k = 0; k < 16; k++)
+                snprintf(raw2_hex + k * 3, 4, "%02X ", p2[k]);
+        } else {
+            snprintf(raw2_hex, sizeof(raw2_hex), "<unmapped/near-end loc=%u addr=0x%X>", a2.location, addr2);
+        }
+        printf("       ATTR2: type=%u(%s) size=%u stride=%u loc=%u offset=0x%X"
+               " vert_idx=%u raw@0x%X=[ %s] decoded=(%.4f %.4f %.4f %.4f)\n",
+               a2.type, a2_type_name, a2.size, a2.stride, a2.location, a2.offset,
+               c->dbg_first_vert_valid ? c->dbg_first_vert : 0, addr2, raw2_hex,
+               tri[0].a[2][0], tri[0].a[2][1], tri[0].a[2][2], tri[0].a[2][3]);
     }
 
     /* Resolve the fragment texture units into a 16-slot table (fallback
