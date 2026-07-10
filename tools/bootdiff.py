@@ -217,6 +217,25 @@ REF_RPCS3LOG_PATTERNS = [
     dict(etype="FLIP",
          regex=re.compile(r"\[yzlabel\] POLL .*? int_flip_index=(?P<idx>\d+)"),
          args=lambda m: (m.group("idx"),)),
+    # UCMD reference analog (added s29, 2026-07-10): sys_rsx.cpp case 0xFEF
+    # (GCM_SET_USER_COMMAND / method 0xEB00 delivery) - see
+    # Emu/Cell/lv2/sys_rsx.cpp's [yzucmd probe]. Always-on (no env gate),
+    # logs every delivery via sys_rsx.error (visible regardless of channel
+    # level). Closes the "no reference UCMD probe" gap flagged in
+    # scratch/s25_bootdiff.md's fragmentation list item 5.
+    dict(etype="UCMD",
+         regex=re.compile(r"\[yzucmd\] n=(?P<n>\d+) cause=0x(?P<cause>[0-9A-Fa-f]+)"),
+         args=lambda m: (m.group("cause"),)),
+    # PXD_GATE reference analog (added s29): per-vblank poll of the
+    # label_addr+0xFE0 round/transition-gate label (our port's hardcoded
+    # 0x10200FE0) - Emu/RSX/RSXThread.cpp post_vblank_event's [pxdgate]
+    # probe. NOTE: this line fires on EITHER a real value change OR a
+    # periodic (every-200-poll) heartbeat - the raw ordinal count here is
+    # NOT a pure transition count; distinguish by comparing val= vs the
+    # line's own prev= field offline (see report caveat).
+    dict(etype="PXD_GATE",
+         regex=re.compile(r"\[pxdgate\] POLL vblank_count=(?P<vc>\d+) ea=(?P<ea>0x[0-9A-Fa-f]+) val=(?P<val>0x[0-9A-Fa-f]+) \(prev=(?P<prev>0x[0-9A-Fa-f]+)\)"),
+         args=lambda m: (m.group("val"), m.group("prev"))),
 ]
 
 # etype -> regex for the ARMED banner that proves the probe was live in this
@@ -228,6 +247,8 @@ RPCS3LOG_ARM_BANNERS = {
     "WKL_RAISE": re.compile(r"\[w4raise\] ARMED"),
     "LABEL_PUBLISH": re.compile(r"\[yzlabel\] ARMED"),
     "FLIP": re.compile(r"\[yzlabel\] ARMED"),
+    "UCMD": re.compile(r"\[yzucmd\] ARMED"),
+    "PXD_GATE": re.compile(r"\[pxdgate\] ARMED"),
 }
 
 # yz_*_oracle.log probe-style lines: "[tag] ... t=<uint> ..." (get_system_time(),
@@ -242,10 +263,20 @@ REF_PROBELOG_PATTERNS = [
     dict(etype="JOB_ENTRY_WRITE",
          regex=re.compile(r"\[yzround\] tag=JOBWR n=(?P<n>\d+)"),
          args=lambda m: ()),
+    # JOB_ROUND, second source (added s29): yz_jobchain_oracle.log's DUMP
+    # region=CMDSTREAM lines - one per detected change to the per-round
+    # command-list region [0x4019CA80,0x4019CB40). This probe (unlike the
+    # yzround one above) has NO 60s-after-first-ROUNDDRIVER cutoff, so it
+    # is the better round-cadence source for a boot that runs past 60s.
+    # Same etype as the yzround pattern above; bootdiff reports whichever
+    # --ref file yields the larger count for a given etype.
+    dict(etype="JOB_ROUND",
+         regex=re.compile(r"\[yzjobchain\] DUMP region=CMDSTREAM"),
+         args=lambda m: ()),
 ]
 
 PROBELOG_ARM_BANNERS = {
-    "JOB_ROUND": re.compile(r"\[yzround\] ARMED"),
+    "JOB_ROUND": re.compile(r"\[yzround\] ARMED|\[yzjobchain\] ARMED"),
     "JOB_ENTRY_WRITE": re.compile(r"\[yzround\] ARMED"),
 }
 # Verbatim cap text lifted from the ARMED banner itself (not asserted by
@@ -258,7 +289,7 @@ PROBELOG_ARM_BANNER_FULL = re.compile(r"\[yzround\] ARMED:.*")
 # this is the "missing reference-side events" deliverable.
 FULL_VOCAB = [
     "FILE_OPEN", "AUDIO_PORT_START", "WKL_RAISE", "JOB_ROUND", "JOB_ENTRY_WRITE",
-    "SPUP17", "LABEL_PUBLISH", "UCMD", "FLIP", "MAINLOOP_ITER",
+    "SPUP17", "LABEL_PUBLISH", "UCMD", "FLIP", "MAINLOOP_ITER", "PXD_GATE",
 ]
 
 CENSUS_BACKED_TYPES = set(CHAIN_ADDR_TO_ETYPE.values())
