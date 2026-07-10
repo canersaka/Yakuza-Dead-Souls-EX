@@ -815,6 +815,12 @@ typedef struct {
     batch_t idx[256]; u32 n_idx;
     vtx_t*  verts; u32 n_verts, cap_verts;
     int     fetch_ok;
+    /* Primitive-restart cut points (s25 port of the replay-harness fix):
+     * a guest index equal to the RSX restart sentinel is a cut marker, not
+     * a vertex reference (RPCS3 RSXThread.cpp:398); fetch_batches records
+     * the n_verts position at each one and the STRIP/FAN expansion must
+     * not bridge across a cut. */
+    u32     cuts[520]; u32 n_cuts;
 } draw_ctx;
 
 static draw_ctx dc;
@@ -822,6 +828,7 @@ static draw_ctx dc;
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_verts = 0;
+    dc.n_cuts = 0;
     dc.fetch_ok = 1;
 }
 static void push_vert(const vtx_t* v)
@@ -883,6 +890,15 @@ static void fetch_batches(void)
             fetch_one(base, base_index + dc.arr[r].first + i);
     if (!dc.n_idx) return;
     rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+    /* Restart sentinel handling, same rule as the replay harness (RPCS3
+     * RSXThread.cpp:398 "if (value == restart) continue" + rsx_methods.h
+     * restart_index_enabled()/restart_index()): record a cut, never fetch
+     * the phantom vertex. Kill-switch RSX_NO_RESTART shared with the
+     * harness for byte-exact A/B. */
+    static int s_no_restart = -1;
+    if (s_no_restart < 0) s_no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+    const int restart_en = !s_no_restart && rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
+    const u32 restart_val = rsx_dsp_restart_index(&g.rsx);
     for (u32 r = 0; r < dc.n_idx && dc.fetch_ok; r++)
         for (u32 i = 0; i < dc.idx[r].count && dc.fetch_ok; i++) {
             const u32 esz = ia.is_u32 ? 4 : 2;
@@ -891,6 +907,10 @@ static void fetch_batches(void)
             const u32 index = ia.is_u32
                 ? (((u32)ip[0] << 24) | ((u32)ip[1] << 16) | ((u32)ip[2] << 8) | ip[3])
                 : (u32)((ip[0] << 8) | ip[1]);
+            if (restart_en && index == restart_val) {
+                if (dc.n_cuts < 520) dc.cuts[dc.n_cuts++] = dc.n_verts;
+                continue;
+            }
             fetch_one(base, base_index + index);
         }
 }
@@ -925,23 +945,69 @@ static void sink_end(void* user, const rsx_dispatch* r)
     fetch_batches();
     if (!dc.n_verts || !dc.fetch_ok) return;
 
+    /* Segment table from the restart cuts (port of the replay-harness s25c/
+     * s25d fixes): STRIP/FAN never bridge a cut, strips alternate winding
+     * per LOCAL triangle index (odd triangles flip vertex order to keep
+     * face orientation under backface culling), fans anchor to their OWN
+     * segment's first vertex. */
+    u32 seg_start[521], seg_count[521], n_seg = 0;
+    {
+        u32 prev = 0;
+        for (u32 ci = 0; ci < dc.n_cuts && n_seg < 521; ci++) {
+            seg_start[n_seg] = prev;
+            seg_count[n_seg] = dc.cuts[ci] > prev ? dc.cuts[ci] - prev : 0;
+            n_seg++; prev = dc.cuts[ci];
+        }
+        if (n_seg < 521) {
+            seg_start[n_seg] = prev;
+            seg_count[n_seg] = dc.n_verts > prev ? dc.n_verts - prev : 0;
+            n_seg++;
+        }
+    }
+
     vtx_t* tri = NULL; u32 n_tri = 0;
     switch (prim) {
     case PRIM_TRIANGLES: tri = dc.verts; n_tri = dc.n_verts - dc.n_verts % 3; break;
-    case PRIM_TRIANGLE_STRIP:
+    case PRIM_TRIANGLE_STRIP: {
         if (dc.n_verts < 3) return;
-        n_tri = (dc.n_verts - 2) * 3; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
-        for (u32 i = 0; i + 2 < dc.n_verts; i++) {
-            tri[i*3+0] = dc.verts[i]; tri[i*3+1] = dc.verts[i+1]; tri[i*3+2] = dc.verts[i+2];
+        u32 total = 0;
+        for (u32 s = 0; s < n_seg; s++)
+            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        if (!total) return;
+        n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+        u32 w = 0;
+        for (u32 s = 0; s < n_seg; s++) {
+            const u32 sb = seg_start[s], cnt = seg_count[s];
+            if (cnt < 3) continue;
+            for (u32 i = 0; i + 2 < cnt; i++) {
+                if (i & 1) {
+                    tri[w*3+0] = dc.verts[sb+i+1]; tri[w*3+1] = dc.verts[sb+i];   tri[w*3+2] = dc.verts[sb+i+2];
+                } else {
+                    tri[w*3+0] = dc.verts[sb+i];   tri[w*3+1] = dc.verts[sb+i+1]; tri[w*3+2] = dc.verts[sb+i+2];
+                }
+                w++;
+            }
         }
         break;
-    case PRIM_TRIANGLE_FAN:
+    }
+    case PRIM_TRIANGLE_FAN: {
         if (dc.n_verts < 3) return;
-        n_tri = (dc.n_verts - 2) * 3; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
-        for (u32 i = 1; i + 1 < dc.n_verts; i++) {
-            tri[(i-1)*3+0] = dc.verts[0]; tri[(i-1)*3+1] = dc.verts[i]; tri[(i-1)*3+2] = dc.verts[i+1];
+        u32 total = 0;
+        for (u32 s = 0; s < n_seg; s++)
+            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        if (!total) return;
+        n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+        u32 w = 0;
+        for (u32 s = 0; s < n_seg; s++) {
+            const u32 sb = seg_start[s], cnt = seg_count[s];
+            if (cnt < 3) continue;
+            for (u32 i = 1; i + 1 < cnt; i++) {
+                tri[w*3+0] = dc.verts[sb]; tri[w*3+1] = dc.verts[sb+i]; tri[w*3+2] = dc.verts[sb+i+1];
+                w++;
+            }
         }
         break;
+    }
     case PRIM_QUADS: {
         const u32 quads = dc.n_verts / 4; if (!quads) return;
         n_tri = quads * 6; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
