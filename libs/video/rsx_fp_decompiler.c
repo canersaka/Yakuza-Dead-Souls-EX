@@ -299,7 +299,14 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
-        case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt((%s).x)", a); break;
+        /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
+         * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
+         * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
+         * normal-map Z-reconstruction (1-x²-y² measurably negative for most
+         * pixels, median -0.0078) and poisoned the whole lighting chain — the
+         * s25-s27 black/blue character class (scratch/s26_fp_bisect.md s27
+         * part 4; two independent shader pairs confirmed). */
+        case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt(abs((%s).x))", a); break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
