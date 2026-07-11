@@ -313,7 +313,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
         case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
-        case OP_DIVSQ: snprintf(rhs, sizeof(rhs), "(%s) / sqrt((%s).x)", a, b); break;
+        /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
+         * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
+         * reused by _builtin_divsq) AND forces the result to exactly 0,
+         * component-wise, wherever the NUMERATOR component is 0 -- even if
+         * the denominator is also 0 (oracle: same file, "DIVSQ is not
+         * compliant. Result is 0 if numerator is 0 regardless of
+         * denominator", FragmentProgramDecompiler.cpp:1076). Using a true
+         * per-component select (HLSL vector `?:`, not lerp/mix) avoids NaN
+         * contamination from the 0/0 branch, matching the oracle's own note
+         * on why it can't use a blend here. */
+        case OP_DIVSQ:
+            snprintf(rhs, sizeof(rhs),
+                     "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
+                     a, a, b);
+            break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
