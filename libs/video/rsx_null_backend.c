@@ -14,6 +14,7 @@
  * Lets the title show frames-actually-rendered next to the raw flip/present
  * count, so a stall (frames frozen while flips keep climbing) is visible. */
 extern u32 rsx_live_draw_get_frames(void);
+extern u32 rsx_live_draw_get_last_draws(void);
 
 #ifdef _WIN32
 
@@ -151,9 +152,10 @@ static void null_end_frame(void* ud)
     if (s_state.hwnd) {
         char title[192];
         snprintf(title, sizeof(title),
-                 "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  %u FPS",
+                 "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  draws %u  |  %u FPS",
                  (unsigned long long)s_state.frame_count,
-                 rsx_live_draw_get_frames(), s_state.fps);
+                 rsx_live_draw_get_frames(), rsx_live_draw_get_last_draws(),
+                 s_state.fps);
         SetWindowTextA(s_state.hwnd, title);
     }
 }
