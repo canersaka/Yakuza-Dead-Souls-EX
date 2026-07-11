@@ -139,7 +139,7 @@ The ELF's import table lists: `(module_name, NID)` pairs. At load time, the PS3 
 3. Replace the import stub with a call to our HLE implementation (e.g., `cellFsOpen`).
 4. Unresolved NIDs log a warning and return `CELL_ENOSYS`.
 
-The NID database is derived from the RPCS3 project's function tables and Sony SDK headers.
+The NID database is derived from the RPCS3 project's function tables and public NID databases.
 
 ## RSX Graphics Pipeline
 

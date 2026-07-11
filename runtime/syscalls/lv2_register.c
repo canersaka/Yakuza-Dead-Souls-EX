@@ -100,7 +100,7 @@ static int64_t sys_tty_read(ppu_context* ctx)
  * set. It doesn't try to emulate actual SPU work — the group transitions
  * straight from STARTED to STOPPED with exit code 0.
  *
- * Cause values match the public Sony SDK headers:
+ * Cause values match RPCS3's lv2 definitions:
  *   GROUP_EXIT       = 0x0001 — sys_spu_thread_group_exit() was called
  *   ALL_THREADS_EXIT = 0x0002 — all threads completed their entry fn
  *   TERMINATED       = 0x0004 — sys_spu_thread_group_terminate() fired
