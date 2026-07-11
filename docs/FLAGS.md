@@ -703,4 +703,15 @@ as-texture snapshots in the replay harness — mechanism validated but regresses
 geometry in the full composite (A/B scratch/s27_rsqfix vs s27_rsq_nodrt); debug before
 re-defaulting. RSX_NO_PASS_DEPTH_CLEAR / RSX_FP_FORCE_STAGE* / RSX_VP_CLIP_DUMP /
 RSX_LOG_ZETA are harness diagnostics from the same investigation (s26_fp_bisect.md).
+
+`RSX_SURF_CROP` (libs/video/tests/replay_main.c, s29, opt-in, default OFF — KNOWN
+REGRESSIVE, debug only): CPU-round-trip crop of a color surface sampled at a smaller
+game-declared size than the physical canvas (the x=820 band mechanism,
+scratch/s29_x820_band.md). The crop's flush ordering loses the target's own paint
+(flush-only isolation repro in the same report) — do not re-default until that is fixed;
+the ship fix direction is logical-size surface allocation, not this. Same-session harness
+diagnostics: `RSX_DEPTH_DUMP_PRE`/`RSX_DEPTH_DUMP_POST` (`idx:path[,...]` raw float32
+depth readbacks at exact draw indices, s29_draw803_occluder.md), `RSX_FP_FORCE_STAGE5`
+(draw-803 footprint force-white probe), `RSX_FP_FORCE_STAGE6` (DIVSQ divisor/result
+probes, s29_blue_remnants.md), `RSX_D3D_DEBUG` (D3D12 validation layer).
 | `YZ_FS_LAT` | diag | OFF | s29 (2026-07-10): cellFs latency-model/discriminator knob for the ledger-#67 staging race. `<usec>` = QPC busy-wait floor per data call (Open/Read/Fstat/Lseek/Close; Read waits POST-fread); `-1` = stderr lock-touch mode (rendezvous discriminator). All four s29 modes measured NOT the FS_TRACE-flip mechanism (STATUS ⚡2) - kept as the probe kit for the s30 fresh-eyes pass. Armed banner `[fs-lat]`. |
