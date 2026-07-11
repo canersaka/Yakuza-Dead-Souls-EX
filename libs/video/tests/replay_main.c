@@ -206,7 +206,13 @@ static void apply_block(const rxs_stream* s, u32 index)
 /* s27 part 3: depth-target snapshots get their own slot range, separate
  * from both color surfaces and the guest-texture cache (RSX_NO_DEPTH_RT) */
 #define SRV_DEPTH_BASE   (SRV_TEXTURE_BASE + MAX_TEXTURES)
-#define SRV_HEAP_SLOTS   (SRV_DEPTH_BASE + MAX_SURFACES)
+/* s29 (scratch/s29_x820_band.md): a color surface later sampled as a
+ * texture at a smaller GAME-DECLARED size than the physical canvas every
+ * surface_get() texture is allocated at (g.width x g.height) gets its own
+ * cropped snapshot slot range, one per physical surface index, mirroring
+ * the depth-RT snapshot range above (RSX_SURF_CROP). */
+#define SRV_CROP_BASE    (SRV_DEPTH_BASE + MAX_SURFACES)
+#define SRV_HEAP_SLOTS   (SRV_CROP_BASE + MAX_SURFACES)
 
 #define SRV_TABLE_SIZE   16      /* descriptors per draw table              */
 #define SRV_RING_TABLES  4096
@@ -232,6 +238,11 @@ typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;
     u32             draw_hits;   /* draws that targeted this surface this run */
+    /* s29: cropped snapshot cache (RSX_SURF_CROP), NULL until this
+     * surface is first sampled as a texture at a size smaller than the
+     * physical canvas. Reused/replaced across draws by (crop_w, crop_h). */
+    ID3D12Resource* crop_tex;
+    u32             crop_w, crop_h;
 } surface_t;
 
 /* s27 part 3 (scratch/s26_fp_bisect.md, RSX_NO_DEPTH_RT fix): a depth/zeta
@@ -336,12 +347,26 @@ static gpu_t g;
 
 static void srv_write(u32 slot, ID3D12Resource* tex);
 static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h);
+static void gpu_wait(void);   /* s29: surface_crop_flush() needs this ahead of its definition */
 static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t);
 static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot);
 
 static int gpu_init(u32 width, u32 height, int use_hw)
 {
     HRESULT hr;
+    /* s29 DEBUG: RSX_D3D_DEBUG=1 enables the D3D12 validation layer for
+     * bisecting the surface-crop corruption -- temporary, not part of the
+     * fix itself. */
+    if (getenv("RSX_D3D_DEBUG")) {
+        ID3D12Debug* dbg = NULL;
+        if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12Debug, (void**)&dbg)) && dbg) {
+            dbg->lpVtbl->EnableDebugLayer(dbg);
+            dbg->lpVtbl->Release(dbg);
+            printf("[gpu] D3D12 debug layer ENABLED (RSX_D3D_DEBUG)\n");
+        } else {
+            printf("[gpu] D3D12 debug layer unavailable\n");
+        }
+    }
     IDXGIFactory4* factory = NULL;
     hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
     if (FAILED(hr)) { printf("dxgi factory failed 0x%08lX\n", hr); return -1; }
@@ -955,6 +980,163 @@ static u32 surface_get(u32 location, u32 offset)
     return g.n_surfaces++;
 }
 
+/* s29 (scratch/s29_x820_band.md): every surface_get() texture is allocated
+ * at the fixed physical canvas size (g.width x g.height), regardless of the
+ * GCM surface's own logical clip/pitch dims -- a deliberate uniform-canvas
+ * simplification so any (location,offset) can alias any texture without
+ * reallocation. On real RSX hardware a render target IS its declared size,
+ * so a game-authored blit/downsample pass whose texcoords are normalized
+ * against its OWN declared texture width (t.width/t.height, this draw's
+ * captured texture-unit format registers) samples correctly. In our
+ * uniform-canvas replay, binding the raw oversized physical resource as
+ * that texture unit's SRV makes UV [0,1] span the FULL physical width
+ * instead of the declared one -- for a source narrower than the canvas,
+ * anything past declared_w/physical_w of the destination silently samples
+ * the never-rendered padding columns (black), producing a hard vertical
+ * cutoff at declared_w/physical_w of the destination's own width (measured
+ * root of the x=820 band: source 0xE40000 declared 1024 wide, physical
+ * canvas 1280, dest viewport 1024 -> cutoff at 1024*(1024/1280)=819.2 ~=
+ * 820, scratch/s29_x820_band.md).
+ *
+ * MECHANISM CONFIRMED, FIX NOT SHIP-SAFE (2026-07-10): the CPU-round-trip
+ * crop below is architecturally correct but MEASURED to regress worse than
+ * the defect it fixes -- inserting the extra Close/Execute/Wait/Reset cycle
+ * anywhere inside a draw's texture-unit resolution loop (i.e. AFTER
+ * `target`'s own prior CLEAR was already recorded but BEFORE this draw's
+ * OWN paint of that same target is recorded) causes the paint to be LOST,
+ * leaving only the clear color -- reproduced with the crop's GPU work
+ * stripped out entirely (a bare flush with no barrier/copy/recreate still
+ * breaks it, scratch/s29_x820_band.md "flush-only isolation"). Root cause
+ * of THAT is still open. Default OFF pending a fix for the flush-ordering
+ * bug; RSX_SURF_CROP=1 opts in for further debugging only -- do not flip
+ * this default without first re-verifying the flush-only repro is gone. */
+static int honor_surf_crop(void)
+{
+    static int inited = 0, on = 0;
+    if (!inited) {
+        inited = 1;
+        on = getenv("RSX_SURF_CROP") ? 1 : 0;
+        printf("[surfcrop] RSX_SURF_CROP %s -> surface-as-texture size crop %s\n",
+               getenv("RSX_SURF_CROP") ? "SET" : "unset",
+               on ? "ON (opt-in, s29 fix -- KNOWN REGRESSIVE, debug only)" : "OFF (default, safe)");
+    }
+    return on;
+}
+
+/* Crop physical surface g.surfaces[phys_idx]'s top-left (log_w x log_h)
+ * region into a tightly-sized RGBA8 texture, via a CPU round trip (same
+ * close/execute/wait/reopen shape as depth_snapshot_flush()): the surface
+ * is read back through the existing g.readback scratch buffer (already
+ * sized g.width x g.height RGBA8 for the per-flip scanout dump), the
+ * declared sub-rect is copied out, and create_texture_rgba() re-uploads it
+ * as an independent, correctly-sized resource. Called from inside the
+ * per-draw texture-unit resolution loop, BEFORE this draw's own vertex/
+ * constant-buffer/SRV-table writes (g.vb_used/g.cb_used/g.srv_ring_used/
+ * g.upload_used are all still at their pre-draw values at that point, same
+ * precondition gpu_flush() relies on a few hundred lines down), so
+ * resetting those ring counters here is safe. Returns NULL (caller falls
+ * back to the raw oversized bind) if anything about the source is
+ * unusable. */
+static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
+{
+    if (phys_idx >= g.n_surfaces || !g.surfaces[phys_idx].tex || !g.readback)
+        return NULL;
+    if (log_w == 0 || log_h == 0 || log_w > g.width || log_h > g.height)
+        return NULL;
+    surface_t* sp = &g.surfaces[phys_idx];
+    static u32 s29_crop_calls = 0;
+    s29_crop_calls++;
+    printf("[s29crop] call #%u phys_idx=%u off=0x%X log=%ux%u phys=%ux%u\n",
+           s29_crop_calls, phys_idx, sp->offset, log_w, log_h, g.width, g.height);
+    if (sp->crop_tex && sp->crop_w == log_w && sp->crop_h == log_h) {
+        /* Reuse the existing crop resource's SLOT but content must still be
+         * refreshed every call (the physical surface may have been
+         * re-rendered since the last crop) -- fall through to redo the
+         * copy, only the CreateCommittedResource is skippable in principle;
+         * not optimized here, correctness over perf for this fix. */
+    }
+
+    /* s29 DEBUG FINDING (not fixed, see honor_surf_crop()'s comment): a bare
+     * Close/Execute/Wait/Reset at this exact point in the caller's texture-
+     * unit loop -- with NO barrier/copy/recreate at all -- was independently
+     * confirmed (this session, not left as live code) to reproduce the same
+     * "draw's paint lost, target shows only its clear color" regression.
+     * The corruption is in the FLUSH ITSELF landing between `target`'s own
+     * prior clear and this draw's own paint of that target, not in any of
+     * the copy/barrier/texture-create work below. Do not re-litigate the
+     * barrier states as the culprit -- also independently ruled out this
+     * session (skipping both ResourceBarrier calls changed nothing). */
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = sp->tex;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = sp->tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    dst.pResource = g.readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = g.width;
+    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = g.rb_pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    g.list->lpVtbl->Close(g.list);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    gpu_wait();
+    {
+        HRESULT dr = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
+        if (FAILED(dr))
+            printf("[s29crop] DEVICE REMOVED after flush: 0x%08lX\n", dr);
+    }
+
+    u8* src_px = NULL;
+    D3D12_RANGE rr = {0, (size_t)g.rb_pitch * g.height};
+    g.readback->lpVtbl->Map(g.readback, 0, &rr, (void**)&src_px);
+    u8* rgba = src_px ? malloc((size_t)log_w * log_h * 4) : NULL;
+    if (rgba) {
+        for (u32 y = 0; y < log_h; y++)
+            memcpy(rgba + (size_t)y * log_w * 4,
+                   src_px + (size_t)y * g.rb_pitch, (size_t)log_w * 4);
+    }
+    D3D12_RANGE wr = {0, 0};
+    g.readback->lpVtbl->Unmap(g.readback, 0, &wr);
+
+    g.alloc->lpVtbl->Reset(g.alloc);
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    g.vb_used = 0;
+    g.cb_used = 0;
+    g.srv_ring_used = 0;
+    g.upload_used = 0;
+
+    ID3D12Resource* tex = NULL;
+    if (rgba) {
+        tex = create_texture_rgba(rgba, log_w, log_h);
+        free(rgba);
+    }
+    if (tex) {
+        if (sp->crop_tex)
+            sp->crop_tex->lpVtbl->Release(sp->crop_tex);
+        sp->crop_tex = tex;
+        sp->crop_w = log_w;
+        sp->crop_h = log_h;
+        srv_write(SRV_CROP_BASE + phys_idx, tex);
+    }
+    return tex;
+}
+
 /* Surface currently selected as color target 0 by the register state. */
 static u32 current_surface(const rsx_dispatch* rsx)
 {
@@ -1103,6 +1285,125 @@ static void depth_snapshot_flush(u32 location, u32 offset)
                    g.width, g.height, SRV_DEPTH_BASE + idx);
         }
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * RSX_DEPTH_DUMP_PRE / RSX_DEPTH_DUMP_POST (session s29, coordinator's
+ * mechanism-pin follow-up, scratch/s29_draw803_occluder.md): a raw
+ * float32-per-texel depth-buffer readback, independent of RSX_DEPTH_RT
+ * (which snapshots at zeta-boundary switches, only, and re-encodes to 8-bit
+ * grayscale for texture reuse -- this dumps the RAW shared depth resource
+ * at an EXACT draw-index boundary chosen by the caller, unencoded, so a
+ * Python diff can name individual differing texels precisely).
+ * `RSX_DEPTH_DUMP_PRE=idx:path[,idx:path...]` dumps immediately BEFORE that
+ * draw index is processed (no GPU work for it recorded yet).
+ * `RSX_DEPTH_DUMP_POST=idx:path[,idx:path...]` dumps immediately AFTER that
+ * draw's DrawInstanced is recorded, using the exact same Close/Execute/Wait
+ * flush depth_snapshot_flush() already uses in production (15d7900) so the
+ * GPU has actually retired the draw before the copy -- this is a proven
+ * pattern in this file, not a new synchronization primitive. Reuses the
+ * existing g.depth_readback scratch resource (already sized for this exact
+ * copy shape). Additive, env-gated, no effect unless armed. */
+typedef struct { int idx; char path[260]; } depth_dump_t;
+static depth_dump_t g_ddump_pre[8];
+static int g_ddump_pre_n = 0;
+static depth_dump_t g_ddump_post[8];
+static int g_ddump_post_n = 0;
+
+static void parse_ddump_list(const char* env, depth_dump_t* arr, int* n, int cap)
+{
+    if (!env) return;
+    const char* p = env;
+    while (*p && *n < cap) {
+        const int idx = atoi(p);
+        const char* colon = strchr(p, ':');
+        if (!colon) break;
+        const char* start = colon + 1;
+        const char* comma = strchr(start, ',');
+        size_t len = comma ? (size_t)(comma - start) : strlen(start);
+        if (len >= sizeof(arr[*n].path)) len = sizeof(arr[*n].path) - 1;
+        memcpy(arr[*n].path, start, len);
+        arr[*n].path[len] = 0;
+        arr[*n].idx = idx;
+        (*n)++;
+        p = comma ? comma + 1 : start + len;
+    }
+}
+
+static const char* ddump_lookup(const depth_dump_t* arr, int n, u32 draw_idx)
+{
+    for (int i = 0; i < n; i++)
+        if ((u32)arr[i].idx == draw_idx)
+            return arr[i].path;
+    return NULL;
+}
+
+/* Flushes the command list (same shape as depth_snapshot_flush()) and
+ * writes the shared depth resource's RAW float32 texels, row-major,
+ * g.width*g.height*4 bytes, no header -- a Python script does the diffing. */
+static void dump_depth_raw(const char* path)
+{
+    if (!g.depth || !g.depth_readback) {
+        printf("[ddump] no depth resource, skip %s\n", path);
+        return;
+    }
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g.depth;
+    b.Transition.Subresource = 0;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    const u32 depth_pitch = (g.width * 4 + 255) & ~255u;
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = g.depth;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    dst.pResource = g.depth_readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+    dst.PlacedFootprint.Footprint.Width = g.width;
+    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = depth_pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    g.list->lpVtbl->Close(g.list);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    gpu_wait();
+
+    u8* src_px = NULL;
+    D3D12_RANGE rr = {0, (size_t)depth_pitch * g.height};
+    g.depth_readback->lpVtbl->Map(g.depth_readback, 0, &rr, (void**)&src_px);
+    if (src_px) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            for (u32 y = 0; y < g.height; y++)
+                fwrite(src_px + (size_t)y * depth_pitch, 1, (size_t)g.width * 4, f);
+            fclose(f);
+            printf("[ddump] wrote %s (%ux%u float32, raw)\n", path, g.width, g.height);
+        } else {
+            printf("[ddump] cannot write %s\n", path);
+        }
+    } else {
+        printf("[ddump] map failed for %s\n", path);
+    }
+    D3D12_RANGE wr = {0, 0};
+    g.depth_readback->lpVtbl->Unmap(g.depth_readback, 0, &wr);
+
+    g.alloc->lpVtbl->Reset(g.alloc);
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    g.vb_used = 0;
+    g.cb_used = 0;
+    g.srv_ring_used = 0;
+    g.upload_used = 0;
 }
 
 /* depth_pass_track() (s27 part 3) is defined further down, right after
@@ -2298,6 +2599,94 @@ static int fp_apply_force_stage4(char* ps_hlsl, size_t cap, int stage)
     return 1;
 }
 
+/* RSX_FP_FORCE_STAGE5 (session s29, scratch/s29_draw803_occluder.md): a
+ * minimal shape probe for the "draw 803 cubemap-fallback occluder" PSO
+ * (vp_key=04153642dbaa34c9, cited scratch/s26r_draw803diag.log:1984 -- this
+ * IS the combined PSO cache key per get_translated_pso()'s out_key, not just
+ * a VP hash, despite the field's printf label). Its own shading renders
+ * solid/near-black against the harness's black clear color, so isolating
+ * this one draw shows nothing -- this stage forces its output to
+ * unconditional white so the draw's actual rasterized SCREEN FOOTPRINT
+ * becomes visible, independent of its own (broken-cubemap) shading. Single
+ * stage, no capture table needed -- reuses fp_replace_first() verbatim.
+ * Env-gated (RSX_FP_FORCE_STAGE5=1), default off, touches only this one PSO
+ * key's cached HLSL text. */
+#define FP_FORCE_TARGET_KEY5 0x04153642dbaa34c9ULL
+static int g_fp_force_stage5 = -1; /* RSX_FP_FORCE_STAGE5, parsed once in main() */
+
+static int fp_apply_force_stage5(char* ps_hlsl, size_t cap)
+{
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return float4(1.0,1.0,1.0,1.0);")) {
+        printf("[fpforce5] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce5] force-white patch applied OK\n");
+    return 1;
+}
+
+/* RSX_FP_FORCE_STAGE6 (session s29b, scratch/s29_blue_remnants.md): the RSQ
+ * fix's sibling check for DIVSQ. fp_d43fd20cbbad3342 (draw 1589, inside the
+ * woman's own 1491-1589 span) computes a packed-normal-map normalize idiom:
+ *   r[0].xyz = tex1.xyz*2-1; r[0].w = dot(r[0].xyz, r[0].xyz);
+ *   r[0].xyz = r[0].xyz / sqrt(r[0].w);   <- OP_DIVSQ, rsx_fp_decompiler.c:316
+ * RPCS3's oracle (Program/FragmentProgramDecompiler.cpp:966,1009-1013)
+ * documents _builtin_divsq(a,b) as routing its divisor through
+ * _builtin_sqrt(b)=sqrt(abs(b)) (same sign-ignoring quirk as the already-
+ * fixed RSQ) AND forcing the result to exactly 0 when the numerator is 0
+ * even if the denominator is also 0 (avoiding 0/0=NaN) -- our decompiler's
+ * plain "(%s) / sqrt((%s).x)" has neither. This probe measures r[0].w (the
+ * divisor, always >=0 for a real dot(v,v) unless v itself carries a NaN)
+ * signed at its writer, and the post-divsq r[0].xyz as a direct color, to
+ * see whether this specific site is live/degenerate for the still-blue
+ * pixels. Reuses fp_insert_after/fp_replace_first. */
+#define FP_FORCE_TARGET_KEY6 0xd43fd20cbbad3342ULL
+
+static const fp_force_stage2_t g_fp_force_stages6[] = {
+    /* 0: r[0].w (the dot-product divisor) signed, right after its writer */
+    { "{ float4 _v = (float4)(dot(((r[0]).xyzw).xyz, ((r[0]).xyzw).xyz)); r[0].w = _v.w; }",
+      "r[0].w" },
+    /* 1: r[0].xyz right after the divsq line, direct color */
+    { "{ float4 _v = (float4)(((r[0]).xyzw) / sqrt(((r[0]).wwww).x)); r[0].xyz = _v.xyz; }",
+      "float4(r[0].xyz, 1.0)" },
+};
+#define FP_FORCE_NSTAGES6 (int)(sizeof(g_fp_force_stages6) / sizeof(g_fp_force_stages6[0]))
+
+static int g_fp_force_stage6 = -1; /* RSX_FP_FORCE_STAGE6, parsed once in main() */
+
+static int fp_apply_force_stage6(char* ps_hlsl, size_t cap, int stage)
+{
+    if (stage < 0 || stage >= FP_FORCE_NSTAGES6) {
+        printf("[fpforce6] RSX_FP_FORCE_STAGE6=%d out of range [0,%d)\n", stage, FP_FORCE_NSTAGES6);
+        return 0;
+    }
+    if (!fp_insert_after(ps_hlsl, cap,
+            "float4 r[48]; float4 h[48];",
+            " float4 dbg_stage6 = (float4)0;")) {
+        printf("[fpforce6] declaration anchor not found\n");
+        return 0;
+    }
+    char capture[256];
+    if (!strncmp(g_fp_force_stages6[stage].expr, "float4(", 7)) {
+        snprintf(capture, sizeof(capture), " dbg_stage6 = %s;",
+            g_fp_force_stages6[stage].expr);
+    } else {
+        snprintf(capture, sizeof(capture),
+            " dbg_stage6 = float4(saturate(%s), (%s > -0.001 && %s < 0.001) ? 1.0 : 0.0, saturate(-(%s)), 1.0);",
+            g_fp_force_stages6[stage].expr, g_fp_force_stages6[stage].expr,
+            g_fp_force_stages6[stage].expr, g_fp_force_stages6[stage].expr);
+    }
+    if (!fp_insert_after(ps_hlsl, cap, g_fp_force_stages6[stage].anchor, capture)) {
+        printf("[fpforce6] stage %d capture anchor not found\n", stage);
+        return 0;
+    }
+    if (!fp_replace_first(ps_hlsl, cap, "return h[0];", "return dbg_stage6;")) {
+        printf("[fpforce6] return-statement anchor not found\n");
+        return 0;
+    }
+    printf("[fpforce6] stage %d patch applied OK\n", stage);
+    return 1;
+}
+
 static u64 fnv1a(const void* data, u32 n, u64 h)
 {
     const u8* p = data;
@@ -2448,6 +2837,10 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
         fp_apply_force_stage3(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage3);
     if (fi > 0 && g_fp_force_stage4 >= 0 && key == FP_FORCE_TARGET_KEY4)
         fp_apply_force_stage4(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage4);
+    if (fi > 0 && g_fp_force_stage5 >= 0 && key == FP_FORCE_TARGET_KEY5)
+        fp_apply_force_stage5(ps_hlsl, sizeof(ps_hlsl));
+    if (fi > 0 && g_fp_force_stage6 >= 0 && key == FP_FORCE_TARGET_KEY6)
+        fp_apply_force_stage6(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage6);
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
@@ -3171,6 +3564,14 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         return;
     }
 
+    /* RSX_DEPTH_DUMP_PRE: raw depth readback right before this draw index
+     * is processed (no GPU work for it recorded yet). See the definition
+     * near depth_snapshot_flush() for the format/rationale. */
+    {
+        const char* ddp = ddump_lookup(g_ddump_pre, g_ddump_pre_n, c->draw_count);
+        if (ddp) dump_depth_raw(ddp);
+    }
+
     /* RSX_SKIP_DRAW attribution probe: drop this draw entirely (no VB write,
      * no PSO, no DrawInstanced) but still consume its draw_count slot so
      * every OTHER draw keeps the exact same index as the baseline run —
@@ -3553,13 +3954,29 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
             }
         }
         if (sampled_surface >= 0) {
-            slots[u] = SRV_SURFACE_BASE + sampled_surface;
-            u32 seen = 0;
-            for (u32 k = 0; k < n_surf_used; k++)
-                if (surf_used[k] == (u32)sampled_surface)
-                    seen = 1;
-            if (!seen && n_surf_used < SRV_TABLE_SIZE)
-                surf_used[n_surf_used++] = (u32)sampled_surface;
+            /* s29: this texture unit's GAME-DECLARED size (t.width/height)
+             * vs the physical canvas every surface_get() texture is
+             * allocated at (g.width/g.height) -- see honor_surf_crop()'s
+             * comment for the mechanism. Only crop when declared is
+             * strictly smaller (the mismatch case); an exact match (e.g.
+             * a surface already at full canvas size) takes the unmodified
+             * raw-bind path, identical to pre-fix behavior. */
+            ID3D12Resource* cropped = NULL;
+            if (honor_surf_crop() && t.width && t.height &&
+                (t.width != g.width || t.height != g.height) &&
+                t.width <= g.width && t.height <= g.height)
+                cropped = surface_crop_flush((u32)sampled_surface, t.width, t.height);
+            if (cropped) {
+                slots[u] = SRV_CROP_BASE + (u32)sampled_surface;
+            } else {
+                slots[u] = SRV_SURFACE_BASE + sampled_surface;
+                u32 seen = 0;
+                for (u32 k = 0; k < n_surf_used; k++)
+                    if (surf_used[k] == (u32)sampled_surface)
+                        seen = 1;
+                if (!seen && n_surf_used < SRV_TABLE_SIZE)
+                    surf_used[n_surf_used++] = (u32)sampled_surface;
+            }
         } else if (sampled_depth >= 0) {
             slots[u] = SRV_DEPTH_BASE + sampled_depth;
         } else {
@@ -3582,12 +3999,14 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         render_state_t drs;
         decode_render_state(rsx, &drs);
         printf("[draw %2u] prim=%u verts=%u surf=0x%X %s v0=(%.2f %.2f %.2f)"
-               " cull(en=%u face=0x%X front=0x%X) blend=%u depth(t=%u w=%u f=0x%X)\n",
+               " cull(en=%u face=0x%X front=0x%X) blend=%u depth(t=%u w=%u f=0x%X)"
+               " cmask_raw=0x%08X cmask_eff=0x%08X\n",
                c->draw_count, prim, n_tri, sf.color_offset[0],
                xpso ? "XLAT" : (have_mvp ? "fb-mvp" : "fb-vp"),
                p0[0], p0[1], p0[2],
                drs.cull_enable, drs.cull_face, drs.front_face,
-               drs.blend_enable, drs.depth_test, drs.depth_write, drs.depth_func);
+               drs.blend_enable, drs.depth_test, drs.depth_write, drs.depth_func,
+               rsx_dsp_reg(rsx, M_COLOR_MASK), drs.color_mask);
         /* s27 part 3 (scratch/s26_fp_bisect.md, coordinator's depth-RT fix):
          * is any draw's ZETA target ever the tex15-class address (0x2910000)
          * or does a depth-only pass (RT_ENABLE with no color, depth write
@@ -3723,6 +4142,13 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     g.vb_used += n_tri * VERT_STRIDE;
     if (target < g.n_surfaces)
         g.surfaces[target].draw_hits++;
+    /* RSX_DEPTH_DUMP_POST: raw depth readback right after this draw's
+     * DrawInstanced was recorded -- c->draw_count is still THIS draw's
+     * index here (incremented right below). */
+    {
+        const char* ddp = ddump_lookup(g_ddump_post, g_ddump_post_n, c->draw_count);
+        if (ddp) dump_depth_raw(ddp);
+    }
     c->draw_count++;
     c->drawn_verts += n_tri;
     if (tri != c->verts)
@@ -3891,6 +4317,46 @@ int main(int argc, char** argv)
                    " (only fp_%016llx's PSO is affected)\n",
                    g_fp_force_stage4, (unsigned long long)FP_FORCE_TARGET_KEY4,
                    (unsigned long long)FP_FORCE_TARGET_KEY4);
+        }
+    }
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE5");
+        if (e && e[0]) {
+            g_fp_force_stage5 = atoi(e);
+            printf("[fpforce5] RSX_FP_FORCE_STAGE5 ARMED: force-white target_key=%016llx"
+                   " (only fp_%016llx's PSO / draw 803's PSO is affected)\n",
+                   (unsigned long long)FP_FORCE_TARGET_KEY5,
+                   (unsigned long long)FP_FORCE_TARGET_KEY5);
+        }
+    }
+    {
+        const char* e = getenv("RSX_DEPTH_DUMP_PRE");
+        if (e && e[0]) {
+            parse_ddump_list(e, g_ddump_pre, &g_ddump_pre_n, 8);
+            printf("[ddump] RSX_DEPTH_DUMP_PRE ARMED: %d target(s)", g_ddump_pre_n);
+            for (int i = 0; i < g_ddump_pre_n; i++)
+                printf(" [%d]=%s", g_ddump_pre[i].idx, g_ddump_pre[i].path);
+            printf("\n");
+        }
+    }
+    {
+        const char* e = getenv("RSX_DEPTH_DUMP_POST");
+        if (e && e[0]) {
+            parse_ddump_list(e, g_ddump_post, &g_ddump_post_n, 8);
+            printf("[ddump] RSX_DEPTH_DUMP_POST ARMED: %d target(s)", g_ddump_post_n);
+            for (int i = 0; i < g_ddump_post_n; i++)
+                printf(" [%d]=%s", g_ddump_post[i].idx, g_ddump_post[i].path);
+            printf("\n");
+        }
+    }
+    {
+        const char* e = getenv("RSX_FP_FORCE_STAGE6");
+        if (e && e[0]) {
+            g_fp_force_stage6 = atoi(e);
+            printf("[fpforce6] RSX_FP_FORCE_STAGE6 ARMED: stage=%d target_key=%016llx"
+                   " (only fp_%016llx's PSO / draw 1589's PSO is affected)\n",
+                   g_fp_force_stage6, (unsigned long long)FP_FORCE_TARGET_KEY6,
+                   (unsigned long long)FP_FORCE_TARGET_KEY6);
         }
     }
 
