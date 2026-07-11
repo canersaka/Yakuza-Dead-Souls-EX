@@ -373,9 +373,19 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
              * behavior. */
             char line[800];
             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+            /* NV40 per-instruction result-scale modifier (SRC1 word bits
+             * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
+             * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
+             * SetDst, RSXFragmentProgram.h SRC1.scale:3). Dropped entirely
+             * until s32: draw 1625's two-tap box filter (÷2 on the final
+             * ADD) summed unaveraged -- the flat 2x composite gain behind
+             * the whiteout/overbright class (scratch/s32_gain_hunt.md). */
+            u32 res_scale = (w2 >> 28) & 0x7u;
+            static const char* scale_txt[8] = { "", " * 2.0", " * 4.0", " * 8.0",
+                                                "", " / 2.0", " / 4.0", " / 8.0" };
             snprintf(line, sizeof(line),
-                     "    { float4 _v = (float4)(%s);%s %s[%u].%s = _v.%s; }\n",
-                     rhs, sat, dst_half ? "h" : "r", dst_idx, m, m);
+                     "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
+                     rhs, scale_txt[res_scale], sat, dst_half ? "h" : "r", dst_idx, m, m);
             out_puts(&o, line);
 
             if (!dst_half && dst_idx == 0) wrote_r0 = 1;
