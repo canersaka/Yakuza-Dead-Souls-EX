@@ -710,11 +710,23 @@ REGRESSIVE, debug only): CPU-round-trip crop of a color surface sampled at a sma
 game-declared size than the physical canvas (the x=820 band mechanism,
 scratch/s29_x820_band.md). The crop's flush ordering loses the target's own paint
 (flush-only isolation repro in the same report) — do not re-default until that is fixed;
-the ship fix direction is logical-size surface allocation, not this. Same-session harness
+the ship fix direction is logical-size surface allocation, not this. **s31 UPDATE: that
+ship fix is now IMPLEMENTED default-on (logical-size surface_get, no flag — see
+scratch/s31_render_fixes.md, x=820 band FIXED + A/B'd); the crop path stays default-OFF
+debug and was only made dimension-consistent.** Same-session harness
 diagnostics: `RSX_DEPTH_DUMP_PRE`/`RSX_DEPTH_DUMP_POST` (`idx:path[,...]` raw float32
 depth readbacks at exact draw indices, s29_draw803_occluder.md), `RSX_FP_FORCE_STAGE5`
 (draw-803 footprint force-white probe), `RSX_FP_FORCE_STAGE6` (DIVSQ divisor/result
 probes, s29_blue_remnants.md), `RSX_D3D_DEBUG` (D3D12 validation layer).
+
+`RSX_NO_ZETA_TRACK` (libs/video/tests/replay_main.c, s31, kill-switch, default OFF =
+tracking ON): restores the replay harness's old SINGLE shared depth buffer. The s31 fix
+models each zeta target (location, offset) as its OWN depth resource (lazy, inline
+far-clear on create, content persists across pass revisits, game depth clears applied to
+the CURRENT zeta target) — the MEASURED root of the s29-5a player-character occluder
+(cross-pass depth contamination; A/B + kill-switch byte-identity receipts in
+scratch/s31_render_fixes.md). Setting the flag reproduces the pre-fix baseline
+byte-for-byte on cap_user3d.rxs (verified 22/22 surface dumps).
 | `YZ_FS_LAT` | diag | OFF | s29 (2026-07-10): cellFs latency-model/discriminator knob for the ledger-#67 staging race. `<usec>` = QPC busy-wait floor per data call (Open/Read/Fstat/Lseek/Close; Read waits POST-fread); `-1` = stderr lock-touch mode (rendezvous discriminator); `-3` = STDOUT lock-touch (s30 fresh-eyes: -1 tested the wrong stream). All four s29 modes measured NOT the FS_TRACE-flip mechanism (STATUS ⚡2) - kept as the probe kit. Armed banner `[fs-lat]`. |
 | `YZ_FS_TRACE` | diag | OFF | extended s30: `=2` DARK mode — identical trace work (per-read ftell + same formatting) but written to a private 4KB-buffered scratch/fs_darktrace.log, ZERO stdout — splits the #67 flip-flag into local-work vs stdout-output atoms. `=1` (or any non-numeric value) = the legacy stdout trace. Banner `[fs-trace] ARMED: DARK mode 2`. |
 | `YZ_SEM_TRACE` | diag | OFF | s30: bounded (4000-line) stderr trace of sys_semaphore wait/trywait/post on sem ids ≤ 8, with tid/value/caller-lr — built for the staging-race handoff hunt (measured: t1 stops posting the FS request sem 1 at the death; sem layer exonerated). Two ALWAYS-ON capped tripwires ride the post path regardless of the flag: `[sem-post] EBUSY refused` (the shadow-counter max check can spuriously refuse for small-max sems) and `[sem-post] RELEASE-FAILED` (handle/shadow desync = a silently lost wake). Banner `[sem-trace] ARMED`. |

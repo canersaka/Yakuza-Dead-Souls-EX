@@ -237,6 +237,15 @@ static void apply_block(const rxs_stream* s, u32 index)
 typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;
+    /* s31 FIX 2 (scratch/s31_render_fixes.md, the x=820 band): allocated at
+     * the surface's LOGICAL (game-declared clip) size, not a fixed physical
+     * canvas -- on real RSX a render target IS its declared size, so a
+     * later draw sampling it as a texture gets UV [0,1] spanning exactly
+     * the rendered columns/rows. The old uniform-canvas allocation made
+     * UV span never-rendered padding (hard cutoff at declared/canvas of
+     * the destination width, MEASURED x=819.2 for the 1024-wide 0xE40000
+     * source, scratch/s29_x820_band.md). */
+    u32             w, h;
     u32             draw_hits;   /* draws that targeted this surface this run */
     /* s29: cropped snapshot cache (RSX_SURF_CROP), NULL until this
      * surface is first sampled as a texture at a size smaller than the
@@ -257,6 +266,29 @@ typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;        /* RGBA8 snapshot, NULL until first flush   */
 } depth_surface_t;
+
+/* s31 FIX 1 (scratch/s31_render_fixes.md, s29-5a "pass-boundary depth
+ * tracking"): on real RSX every zeta target (location, offset) is its own
+ * piece of memory -- depth written while zeta=0x2310000 is simply not there
+ * when the game later renders with zeta=0xB40000. The harness's single
+ * shared g.depth resource merged ALL passes' depth (MEASURED: 80% of the
+ * canvas carried residual cross-pass depth before draw 803,
+ * scratch/s29_draw803_occluder.md mechanism 1), so later same-canvas draws
+ * failed their depth test against unrelated earlier-pass content (the
+ * player-character occluder class). Model each distinct zeta target as its
+ * OWN depth resource, lazily created and far-cleared INLINE in the command
+ * list (constraint from scratch/s29_x820_band.md: no Close/Execute/Wait/
+ * Reset may be introduced inside the draw path -- resource creation and
+ * ClearDepthStencilView are both flushless). Content persists across pass
+ * revisits (the capture returns to zeta 0xB40000 at draw 803 after a
+ * 57-draw 0x20C0000 interlude WITHOUT re-clearing -- deliberate depth
+ * continuity that a clear-on-switch scheme would destroy). */
+typedef struct {
+    u32             location, offset;
+    ID3D12Resource* tex;        /* dedicated D32_FLOAT_S8 buffer            */
+    u32             w, h;       /* s31 FIX 2: >= every RT it's bound with   */
+    int             cleared;    /* per-frame first-use clear latch          */
+} zdepth_t;
 
 typedef struct {
     u32             location, offset, format, width, height, pitch, remap;
@@ -292,8 +324,14 @@ typedef struct {
     /* B1: shared depth-stencil target (one D32_FLOAT_S8 buffer bound with
      * every color surface; depth test/write honor the captured state) */
     ID3D12DescriptorHeap*      dsv_heap;
+    u32                        dsv_step;
     ID3D12Resource*            depth;
     int                        depth_cleared;   /* per-frame clear latch      */
+
+    /* s31 FIX 1: per-zeta-target depth buffers (DSV heap slot 1+i; slot 0
+     * stays the shared fallback g.depth for RSX_NO_ZETA_TRACK) */
+    zdepth_t                   zdepths[MAX_SURFACES];
+    u32                        n_zdepths;
 
     /* s27 part 3: depth-target-as-texture snapshots (RSX_NO_DEPTH_RT kill
      * switch reverts to the pre-existing raw-guest-memory fallback) */
@@ -409,12 +447,17 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         return -1;
     g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    /* readback buffer */
+    /* readback buffer -- s31 FIX 2: logical-size surfaces can exceed the
+     * display canvas (this capture declares 1024x768 and 1024x1024 passes
+     * on a 1280x720 display), so give the scratch readback enough room for
+     * any surface up to 2048x2048 RGBA8. */
     D3D12_HEAP_PROPERTIES hp = {0};
     hp.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC bd = {0};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     bd.Width = (u64)g.rb_pitch * height;
+    if (bd.Width < 16u * 1024 * 1024)
+        bd.Width = 16u * 1024 * 1024;
     bd.Height = 1;
     bd.DepthOrArraySize = 1;
     bd.MipLevels = 1;
@@ -481,9 +524,10 @@ static int gpu_init(u32 width, u32 height, int use_hw)
     {
         D3D12_DESCRIPTOR_HEAP_DESC dhd = {0};
         dhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        dhd.NumDescriptors = 1;
+        dhd.NumDescriptors = 1 + MAX_SURFACES;   /* s31: slot 0 = shared fallback, 1+i = per-zeta-target */
         if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &dhd, &IID_ID3D12DescriptorHeap, (void**)&g.dsv_heap)))
             return -1;
+        g.dsv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         D3D12_HEAP_PROPERTIES dhp = {0};
         dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC drd = {0};
@@ -940,23 +984,46 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     return tex;
 }
 
-/* Find or create the render target for a (location, color offset) pair. */
-static u32 surface_get(u32 location, u32 offset)
+/* Find or create the render target for a (location, color offset) pair.
+ * s31 FIX 2: allocated at the LOGICAL (want_w x want_h) size -- the game's
+ * declared clip dims at bind time (0 = fall back to the display canvas).
+ * A (location, offset) redeclared at different dims is REALLOCATED in place
+ * (same cache slot, content dropped, logged): the game re-purposed that
+ * memory, and one slot per (location, offset) keeps the sampled-surface
+ * lookup unambiguous. MEASURED on cap_user3d.rxs: every offset is bound
+ * with exactly one size across the whole capture, so the realloc path
+ * never fires there. */
+static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h)
 {
+    if (!want_w) want_w = g.width;
+    if (!want_h) want_h = g.height;
+    u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
-        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset)
-            return i;
-    if (g.n_surfaces >= MAX_SURFACES) {
-        printf("[gpu] surface cache full; reusing surface 0\n");
-        return 0;
+        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
+            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h)
+                return i;
+            slot = i;
+            break;
+        }
+    if (slot == MAX_SURFACES) {
+        if (g.n_surfaces >= MAX_SURFACES) {
+            printf("[gpu] surface cache full; reusing surface 0\n");
+            return 0;
+        }
+        slot = g.n_surfaces;
+    } else {
+        surface_t* olds = &g.surfaces[slot];
+        printf("[surfsz] surface 0x%X redeclared %ux%u -> %ux%u (content dropped)\n",
+               offset, olds->w, olds->h, want_w, want_h);
+        if (olds->tex) { olds->tex->lpVtbl->Release(olds->tex); olds->tex = NULL; }
     }
 
     D3D12_HEAP_PROPERTIES hp = {0};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = g.width;
-    rd.Height = g.height;
+    rd.Width = want_w;
+    rd.Height = want_h;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -964,7 +1031,7 @@ static u32 surface_get(u32 location, u32 offset)
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv = {0};
     cv.Format = rd.Format;
-    surface_t* s = &g.surfaces[g.n_surfaces];
+    surface_t* s = &g.surfaces[slot];
     HRESULT hr = g.dev->lpVtbl->CreateCommittedResource(
         g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
@@ -975,9 +1042,13 @@ static u32 surface_get(u32 location, u32 offset)
     }
     s->location = location;
     s->offset = offset;
-    g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex, NULL, surface_rtv(g.n_surfaces));
-    srv_write(SRV_SURFACE_BASE + g.n_surfaces, s->tex);
-    return g.n_surfaces++;
+    s->w = want_w;
+    s->h = want_h;
+    g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex, NULL, surface_rtv(slot));
+    srv_write(SRV_SURFACE_BASE + slot, s->tex);
+    if (slot == g.n_surfaces)
+        g.n_surfaces++;
+    return slot;
 }
 
 /* s29 (scratch/s29_x820_band.md): every surface_get() texture is allocated
@@ -1041,13 +1112,17 @@ static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
 {
     if (phys_idx >= g.n_surfaces || !g.surfaces[phys_idx].tex || !g.readback)
         return NULL;
-    if (log_w == 0 || log_h == 0 || log_w > g.width || log_h > g.height)
-        return NULL;
     surface_t* sp = &g.surfaces[phys_idx];
+    /* s31 FIX 2: the "physical" size is now the surface's own logical size */
+    const u32 phys_w = sp->w ? sp->w : g.width;
+    const u32 phys_h = sp->h ? sp->h : g.height;
+    const u32 phys_pitch = (phys_w * 4 + 255) & ~255u;
+    if (log_w == 0 || log_h == 0 || log_w > phys_w || log_h > phys_h)
+        return NULL;
     static u32 s29_crop_calls = 0;
     s29_crop_calls++;
     printf("[s29crop] call #%u phys_idx=%u off=0x%X log=%ux%u phys=%ux%u\n",
-           s29_crop_calls, phys_idx, sp->offset, log_w, log_h, g.width, g.height);
+           s29_crop_calls, phys_idx, sp->offset, log_w, log_h, phys_w, phys_h);
     if (sp->crop_tex && sp->crop_w == log_w && sp->crop_h == log_h) {
         /* Reuse the existing crop resource's SLOT but content must still be
          * refreshed every call (the physical surface may have been
@@ -1082,10 +1157,10 @@ static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Offset = 0;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = phys_w;
+    dst.PlacedFootprint.Footprint.Height = phys_h;
     dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = g.rb_pitch;
+    dst.PlacedFootprint.Footprint.RowPitch = phys_pitch;
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1103,13 +1178,13 @@ static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
     }
 
     u8* src_px = NULL;
-    D3D12_RANGE rr = {0, (size_t)g.rb_pitch * g.height};
+    D3D12_RANGE rr = {0, (size_t)phys_pitch * phys_h};
     g.readback->lpVtbl->Map(g.readback, 0, &rr, (void**)&src_px);
     u8* rgba = src_px ? malloc((size_t)log_w * log_h * 4) : NULL;
     if (rgba) {
         for (u32 y = 0; y < log_h; y++)
             memcpy(rgba + (size_t)y * log_w * 4,
-                   src_px + (size_t)y * g.rb_pitch, (size_t)log_w * 4);
+                   src_px + (size_t)y * phys_pitch, (size_t)log_w * 4);
     }
     D3D12_RANGE wr = {0, 0};
     g.readback->lpVtbl->Unmap(g.readback, 0, &wr);
@@ -1137,12 +1212,13 @@ static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
     return tex;
 }
 
-/* Surface currently selected as color target 0 by the register state. */
+/* Surface currently selected as color target 0 by the register state.
+ * s31 FIX 2: sized by the surface state's own declared clip dims. */
 static u32 current_surface(const rsx_dispatch* rsx)
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(rsx, &sf);
-    return surface_get(sf.color_location[0], sf.color_offset[0]);
+    return surface_get(sf.color_location[0], sf.color_offset[0], sf.clip_w, sf.clip_h);
 }
 
 static void gpu_wait(void)
@@ -1154,6 +1230,127 @@ static void gpu_wait(void)
         WaitForSingleObject(g.fence_event, INFINITE);
     }
 }
+
+/* ---- s31 FIX 1: per-zeta-target depth buffers (see zdepth_t) ----------- */
+
+/* Kill switch: RSX_NO_ZETA_TRACK=1 restores the old single-shared-depth
+ * behavior (every pass merged into g.depth). Default ON. */
+static int honor_zeta_track(void)
+{
+    static int inited = 0, on = 1;
+    if (!inited) {
+        inited = 1;
+        on = getenv("RSX_NO_ZETA_TRACK") ? 0 : 1;
+        printf("[zetatrack] RSX_NO_ZETA_TRACK %s -> per-zeta-target depth buffers %s\n",
+               on ? "unset" : "SET",
+               on ? "ON (default, s31 fix)" : "OFF (legacy shared depth)");
+    }
+    return on;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &h);
+    h.ptr += (size_t)slot * g.dsv_step;
+    return h;
+}
+
+/* Find or create the dedicated depth buffer for zeta target
+ * (location, offset). Returns the DSV heap slot: 1+i for a per-target
+ * buffer, 0 = fall back to the shared g.depth (table full / create failed).
+ * A fresh committed resource's contents are undefined, so creation records
+ * an inline far-plane ClearDepthStencilView -- flushless by design
+ * (constraint: scratch/s29_x820_band.md's mid-draw-flush hazard).
+ * s31 FIX 2: (rt_w, rt_h) is the CURRENT color target's logical size; the
+ * buffer is sized to cover max(RT, canvas) so the DSV is never smaller
+ * than the RT it's bound with (this capture declares 1024x768/1024x1024
+ * passes on a 1280x720 canvas). If a later bind outgrows it, it is
+ * recreated larger (fresh far clear, logged -- never fires on this
+ * capture, where each zeta target pairs with fixed-size passes). */
+static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+{
+    u32 want_w = rt_w > g.width  ? rt_w : g.width;
+    u32 want_h = rt_h > g.height ? rt_h : g.height;
+    u32 idx = MAX_SURFACES;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].location == location && g.zdepths[i].offset == offset) {
+            if (g.zdepths[i].w >= want_w && g.zdepths[i].h >= want_h)
+                return 1 + i;
+            idx = i;   /* outgrown: recreate larger below */
+            break;
+        }
+    if (idx == MAX_SURFACES) {
+        if (g.n_zdepths >= MAX_SURFACES) {
+            printf("[zetatrack] zdepth cache full; falling back to shared depth\n");
+            return 0;
+        }
+        idx = g.n_zdepths;
+    } else {
+        zdepth_t* oz = &g.zdepths[idx];
+        printf("[zetatrack] zdepth loc=%u off=0x%X outgrown %ux%u -> %ux%u"
+               " (content dropped, re-cleared)\n",
+               location, offset, oz->w, oz->h, want_w, want_h);
+        if (want_w < oz->w) want_w = oz->w;
+        if (want_h < oz->h) want_h = oz->h;
+        if (oz->tex) { oz->tex->lpVtbl->Release(oz->tex); oz->tex = NULL; }
+    }
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = want_w;
+    rd.Height = want_h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {0};
+    cv.Format = rd.Format;
+    cv.DepthStencil.Depth = 1.0f;
+    zdepth_t* z = &g.zdepths[idx];
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                                      &IID_ID3D12Resource, (void**)&z->tex))) {
+        printf("[zetatrack] zdepth create failed (loc=%u off=0x%X); shared fallback\n",
+               location, offset);
+        z->tex = NULL;
+        return 0;
+    }
+    z->location = location;
+    z->offset = offset;
+    z->w = want_w;
+    z->h = want_h;
+    const u32 slot = 1 + idx;
+    g.dev->lpVtbl->CreateDepthStencilView(g.dev, z->tex, NULL, dsv_handle(slot));
+    D3D12_CPU_DESCRIPTOR_HANDLE dh = dsv_handle(slot);
+    g.list->lpVtbl->ClearDepthStencilView(g.list, dh,
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    z->cleared = 1;
+    printf("[zetatrack] new zeta depth target #%u loc=%u off=0x%X (%ux%u)\n",
+           idx, location, offset, want_w, want_h);
+    if (idx == g.n_zdepths)
+        g.n_zdepths++;
+    return slot;
+}
+
+/* Resource behind a zeta (location, offset), WITHOUT creating one: used by
+ * the opt-in depth-readback diagnostics so they read the pass-correct
+ * buffer under tracking. NULL -> caller uses the shared g.depth. */
+static ID3D12Resource* zdepth_find_res(u32 location, u32 offset)
+{
+    if (!honor_zeta_track())
+        return NULL;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].location == location && g.zdepths[i].offset == offset)
+            return g.zdepths[i].tex;
+    return NULL;
+}
+
+/* The depth resource bound by the most recent draw (RSX_DEPTH_DUMP_* reads
+ * this so its raw dumps stay meaningful under per-target tracking). */
+static ID3D12Resource* g_zdump_res = NULL;
 
 /* s27 part 3 (scratch/s26_fp_bisect.md, depth-target-as-texture snapshots).
  * s27 A/B CORRECTION (~07:20): default flipped to OFF — with the RSQ fix in,
@@ -1205,9 +1402,14 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     if (!g.depth || !g.depth_readback || !honor_depth_rt())
         return;
 
+    /* s31 FIX 1: under per-zeta-target tracking, this pass's depth lives in
+     * ITS OWN buffer, not the shared g.depth -- snapshot the right one. */
+    ID3D12Resource* zres = zdepth_find_res(location, offset);
+    ID3D12Resource* dres = zres ? zres : g.depth;
+
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g.depth;
+    b.Transition.pResource = dres;
     b.Transition.Subresource = 0;   /* depth plane only */
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1215,7 +1417,7 @@ static void depth_snapshot_flush(u32 location, u32 offset)
 
     const u32 depth_pitch = (g.width * 4 + 255) & ~255u;
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
-    src.pResource = g.depth;
+    src.pResource = dres;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;       /* plane 0 = depth for D32_FLOAT_S8X24_UINT */
     dst.pResource = g.depth_readback;
@@ -1226,7 +1428,10 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     dst.PlacedFootprint.Footprint.Height = g.height;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = depth_pitch;
-    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+    /* s31 FIX 2: per-zeta-target buffers are sized >= the canvas; copy
+     * exactly the canvas-sized top-left region the readback is sized for. */
+    D3D12_BOX zbox = {0, 0, 0, g.width, g.height, 1};
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &zbox);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -1347,9 +1552,12 @@ static void dump_depth_raw(const char* path)
         printf("[ddump] no depth resource, skip %s\n", path);
         return;
     }
+    /* s31 FIX 1: dump the buffer bound by the most recent draw (under
+     * per-zeta-target tracking the shared g.depth is only a fallback). */
+    ID3D12Resource* dres = g_zdump_res ? g_zdump_res : g.depth;
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g.depth;
+    b.Transition.pResource = dres;
     b.Transition.Subresource = 0;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1357,7 +1565,7 @@ static void dump_depth_raw(const char* path)
 
     const u32 depth_pitch = (g.width * 4 + 255) & ~255u;
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
-    src.pResource = g.depth;
+    src.pResource = dres;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
     dst.pResource = g.depth_readback;
@@ -1368,7 +1576,9 @@ static void dump_depth_raw(const char* path)
     dst.PlacedFootprint.Footprint.Height = g.height;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = depth_pitch;
-    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+    /* s31 FIX 2: same canvas-sized box rationale as depth_snapshot_flush */
+    D3D12_BOX zbox = {0, 0, 0, g.width, g.height, 1};
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &zbox);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -1429,6 +1639,10 @@ static void write_ppm(const char* path, const u8* px, u32 pitch, u32 w, u32 h)
 static void gpu_readback_surface(u32 surf_idx, const char* path)
 {
     ID3D12Resource* rt = g.surfaces[surf_idx].tex;
+    /* s31 FIX 2: surfaces carry their own logical dims now. */
+    const u32 sw = g.surfaces[surf_idx].w ? g.surfaces[surf_idx].w : g.width;
+    const u32 sh = g.surfaces[surf_idx].h ? g.surfaces[surf_idx].h : g.height;
+    const u32 spitch = (sw * 4 + 255) & ~255u;
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1444,10 +1658,10 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
     dst.pResource = g.readback;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = sw;
+    dst.PlacedFootprint.Footprint.Height = sh;
     dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = g.rb_pitch;
+    dst.PlacedFootprint.Footprint.RowPitch = spitch;
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1460,9 +1674,9 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
     gpu_wait();
 
     u8* px = NULL;
-    D3D12_RANGE rr = {0, (size_t)g.rb_pitch * g.height};
+    D3D12_RANGE rr = {0, (size_t)spitch * sh};
     g.readback->lpVtbl->Map(g.readback, 0, &rr, (void**)&px);
-    write_ppm(path, px, g.rb_pitch, g.width, g.height);
+    write_ppm(path, px, spitch, sw, sh);
     D3D12_RANGE wr = {0, 0};
     g.readback->lpVtbl->Unmap(g.readback, 0, &wr);
 
@@ -1739,11 +1953,13 @@ static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
     rs->cull_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE) & 1;
     rs->cull_face   = rsx_dsp_reg(rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(rsx, M_FRONT_FACE);
-    /* RSX/nv40 default (register never written) is all channels enabled;
-     * the capture confirms this (no COLOR_MASK write before the earliest
-     * draws still show correct channel output). */
-    const u32 cm = rsx_dsp_reg(rsx, M_COLOR_MASK);
-    rs->color_mask = cm ? cm : 0xFFFFFFFFu;
+    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register — 0 is a
+     * legitimate game-written "write no color channels" (the character
+     * shadow-mask depth-prime pass; treating it as ALL force-wrote the
+     * pre-pass's garbage = the blue-character class, 5,635 px -> 0
+     * validated in replay_blue_main.c). rsx_dispatch_init now seeds the
+     * nv40 reset default (0x01010101), so never-written reads all-on. */
+    rs->color_mask = rsx_dsp_reg(rsx, M_COLOR_MASK);
 }
 
 /* Called once per draw, right after the draw's own vertex fetch (BEFORE any
@@ -3042,8 +3258,20 @@ static void sink_clear(void* user, const rsx_dispatch* rsx, u32 mask)
     { static int nodc = -1;
       if (nodc < 0) nodc = getenv("RSX_NO_PASS_DEPTH_CLEAR") ? 1 : 0;
       if (!nodc && (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
-          D3D12_CPU_DESCRIPTOR_HANDLE dsv;
-          g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dsv);
+          /* s31 FIX 1: the game's depth clear applies to the CURRENTLY BOUND
+           * zeta target's own memory, not to one global buffer. */
+          u32 zslot = 0;
+          if (honor_zeta_track()) {
+              rsx_dsp_surface zsf;
+              rsx_dsp_get_surface(rsx, &zsf);
+              zslot = zdepth_get(zsf.zeta_location, zsf.zeta_offset, zsf.clip_w, zsf.clip_h);
+              if (zslot) {
+                  g.zdepths[zslot - 1].cleared = 1;
+                  printf("[zetatrack] game depth clear -> zeta loc=%u off=0x%X\n",
+                         zsf.zeta_location, zsf.zeta_offset);
+              }
+          }
+          D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_handle(zslot);
           g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
               D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
           g.depth_cleared = 1;
@@ -3962,9 +4190,15 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
              * a surface already at full canvas size) takes the unmodified
              * raw-bind path, identical to pre-fix behavior. */
             ID3D12Resource* cropped = NULL;
+            /* s31 FIX 2: with logical-size surfaces the declared-vs-physical
+             * mismatch this crop existed for is gone whenever the texture
+             * unit declares the surface's own size; compare against the
+             * surface's real dims, not the display canvas. */
+            const u32 ss_w = g.surfaces[sampled_surface].w ? g.surfaces[sampled_surface].w : g.width;
+            const u32 ss_h = g.surfaces[sampled_surface].h ? g.surfaces[sampled_surface].h : g.height;
             if (honor_surf_crop() && t.width && t.height &&
-                (t.width != g.width || t.height != g.height) &&
-                t.width <= g.width && t.height <= g.height)
+                (t.width != ss_w || t.height != ss_h) &&
+                t.width <= ss_w && t.height <= ss_h)
                 cropped = surface_crop_flush((u32)sampled_surface, t.width, t.height);
             if (cropped) {
                 slots[u] = SRV_CROP_BASE + (u32)sampled_surface;
@@ -4037,13 +4271,34 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     D3D12_CPU_DESCRIPTOR_HANDLE dsv;
     int have_dsv = 0;
     if (g.depth) {
-        g.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.dsv_heap, &dsv);
+        /* s31 FIX 1: bind THIS draw's zeta target's own depth buffer (slot 0
+         * = legacy shared fallback under RSX_NO_ZETA_TRACK / create-fail). */
+        u32 zslot = 0;
+        if (honor_zeta_track()) {
+            rsx_dsp_surface zsf;
+            rsx_dsp_get_surface(rsx, &zsf);
+            zslot = zdepth_get(zsf.zeta_location, zsf.zeta_offset, zsf.clip_w, zsf.clip_h);
+        }
+        dsv = dsv_handle(zslot);
         have_dsv = 1;
-        if (!g.depth_cleared) {
-            g.list->lpVtbl->ClearDepthStencilView(
-                g.list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                1.0f, 0, 0, NULL);
-            g.depth_cleared = 1;
+        if (zslot) {
+            zdepth_t* z = &g.zdepths[zslot - 1];
+            if (!z->cleared) {   /* per-frame first-use safety net (mirrors
+                                  * the legacy g.depth_cleared latch) */
+                g.list->lpVtbl->ClearDepthStencilView(
+                    g.list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                    1.0f, 0, 0, NULL);
+                z->cleared = 1;
+            }
+            g_zdump_res = z->tex;
+        } else {
+            if (!g.depth_cleared) {
+                g.list->lpVtbl->ClearDepthStencilView(
+                    g.list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                    1.0f, 0, 0, NULL);
+                g.depth_cleared = 1;
+            }
+            g_zdump_res = g.depth;
         }
     }
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, have_dsv ? &dsv : NULL);
@@ -4123,6 +4378,19 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
     }
     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+    /* s31 FIX 2: the boot-time/flush-reopen scissor is display-canvas-sized;
+     * a logical surface TALLER than the canvas (this capture: 1024x768 and
+     * 1024x1024 passes on a 1280x720 display) would have its bottom rows
+     * scissored away. Default scissor = the current target's full extent
+     * (the guest's own scissor decodes to full-surface for every draw this
+     * harness has measured; general per-draw guest scissor plumbing remains
+     * the known separate gap, s27-4). */
+    {
+        D3D12_RECT dsc = {0, 0,
+            (LONG)(target < g.n_surfaces && g.surfaces[target].w ? g.surfaces[target].w : g.width),
+            (LONG)(target < g.n_surfaces && g.surfaces[target].h ? g.surfaces[target].h : g.height)};
+        g.list->lpVtbl->RSSetScissorRects(g.list, 1, &dsc);
+    }
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
@@ -4186,7 +4454,7 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
                g.surfaces[i].offset == scan_offset ? "  <- SCANOUT" : "");
 
     char path[MAX_PATH];
-    const u32 si = surface_get(RSX_LOCATION_LOCAL, scan_offset);
+    const u32 si = surface_get(RSX_LOCATION_LOCAL, scan_offset, g.width, g.height);
     snprintf(path, sizeof(path), "%s\\frame_%03u.ppm", c->outdir, c->frame_no);
     gpu_readback_surface(si, path);
 
@@ -4201,6 +4469,8 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
     }
     c->frame_no++;
     g.depth_cleared = 0;    /* B1: re-clear depth for the next frame */
+    for (u32 i = 0; i < g.n_zdepths; i++)   /* s31: same latch, per target */
+        g.zdepths[i].cleared = 0;
 }
 
 /* ---------------------------------------------------------------------------

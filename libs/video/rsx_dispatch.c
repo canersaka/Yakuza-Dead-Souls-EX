@@ -142,6 +142,16 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     if (sink)
         rsx->sink = *sink;
 
+    /* s31 (scratch/s31_blue_emitter.md): the nv40 RESET DEFAULT for
+     * COLOR_MASK is all-channels-on (RPCS3 rsx_methods.cpp:345,983 seeds
+     * registers[NV4097_SET_COLOR_MASK]=0x1010101). Seeding it here makes a
+     * raw register read trustworthy for every consumer: a game-written 0 is
+     * a REAL "write no color channels" (the character shadow-mask
+     * depth-prime pass), distinguishable from never-initialized. Without
+     * the seed, consumers substituted mask=ALL for 0 and force-wrote the
+     * depth-only pass's garbage FP output (the blue-character class). */
+    rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
