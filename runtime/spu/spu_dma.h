@@ -311,6 +311,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                  * at every pc==0xA00 entry, surviving host-return bracket
                  * restores between the load and the dispatch branch. */
                 spu->module_img_a00 = img;
+                spu->module_src_ea = (uint32_t)ea;
+                spu->module_src_size = (uint32_t)size;
                 if (spu->image_id != img) {
                     extern int g_spu_prof_on;
                     /* THROWAWAY DIAG (env YZ_IMGLOG, non-prof): log every kernel->workload
@@ -941,12 +943,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                                            : vm_base + cbase;
                   uint32_t h = 2166136261u;
                   for (uint32_t k = 0; k < hb; k++) { h ^= hp[k]; h *= 16777619u; }
+                  /* s32 flavor-A hunt: the fatal POLL reads the kernel-ctx
+                   * vector via LS 0x2FB0 (= offset +0x330 in the 0x380
+                   * regblock at 0x2C80). Ride the slot's word on every
+                   * regblock-window SAVE/LOAD so the FIRST zeroed sighting
+                   * names where the poison enters (save-side = clobbered
+                   * while live; load-side-only = ctxsave written wrong). */
+                  uint32_t v2fb0 = 0;
+                  if (hb >= 0x334u)
+                      v2fb0 = ((uint32_t)hp[0x330]<<24)|((uint32_t)hp[0x331]<<16)
+                            |((uint32_t)hp[0x332]<<8)|hp[0x333];
                   fprintf(stderr, "[ctxw] %s n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
                           "lsa=0x%05X ea=0x%08X size=0x%X blk=0x%08X h=%08X "
-                          "head=%02X%02X%02X%02X\n",
+                          "head=%02X%02X%02X%02X k2FB0=%08X\n",
                           cput ? "SAVE" : "LOAD", cwn, spu->spu_id, spu->image_id,
                           spu->pc & SPU_LS_MASK, cmd, lsa & SPU_LS_MASK, cea, size,
-                          g_yz_ctxw_ea[i], h, hp[0], hp[1], hp[2], hp[3]);
+                          g_yz_ctxw_ea[i], h, hp[0], hp[1], hp[2], hp[3], v2fb0);
                   fflush(stderr);
               }
               break;

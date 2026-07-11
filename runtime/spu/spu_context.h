@@ -234,6 +234,16 @@ typedef struct spu_context {
      * recorded yet (s24 adopt-on-serve model, ledger #51). */
     int32_t  module_img_a00;
 
+    /* s32: the LS-0xA00 module's SOURCE (guest EA + byte size), recorded at
+     * the same kernel module load as module_img_a00. Ground truth for the
+     * module-image staleness guard at the 0xA00 entry (the s32coop1 death:
+     * the policy's syscall jump table at LS 0x1CC8 read as zeros mid-boot --
+     * the workload-level sibling of the #34 task-segment class; the
+     * module-entry contract makes fresh redelivery always-safe: modules
+     * rebuild their working state at entry, measured + RPCS3 dispatch). 0 = none. */
+    uint32_t module_src_ea;
+    uint32_t module_src_size;
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
