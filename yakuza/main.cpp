@@ -33,6 +33,7 @@ thread_local ppu_context* g_yz_cur_ctx = nullptr;
  * (dispatch.cpp yz_tramp_guard). */
 extern "C" uint32_t g_yz_game_toc;
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
+extern "C" void yz_spu_crash_note(void);       /* s31 §13 crash attribution (spu_channels.c) */
 
 /* ---------------------------------------------------------------------------
  * Minimal big-endian ELF64 loader (PT_LOAD only)
@@ -2148,6 +2149,12 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
             fprintf(stderr, " (guest 0x%08llX)",
                     (unsigned long long)(va - (uint64_t)vm_base));
     }
+    /* s31 §13 (ledger #74): if the faulting thread is an SPU host thread, say so
+     * -- SPU threads report the fallback tid=1 (threads.cpp s_cur_tid default)
+     * and the [crash-t1] dump below would show the HEALTHY main thread, the
+     * exact misattribution behind the recurring "t1 intermittent" (s31roll3/
+     * cure3; tramp_idx=0 is the tell). */
+    yz_spu_crash_note();
     /* Per-thread ground truth: the GLOBAL indirect-target ring is useless here
      * (dozens of CRI poll threads spam it), so for the main thread walk its OWN
      * guest back-chain via g_yz_main_ctx -- on a host stack overflow this names

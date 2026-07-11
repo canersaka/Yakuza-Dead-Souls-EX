@@ -225,6 +225,25 @@ void yz_w2life_dump(const char* tag)
     }
 }
 
+/* s31 s13: crash attribution for SPU host threads. SPU host threads never set
+ * threads.cpp's s_cur_tid (thread_local default 1), so a fault on one reports
+ * "tid=1" and the handler dumps the HEALTHY main thread's guest state -- the
+ * recurring "t1 intermittent crash" misattribution (tramp_idx=0 was the tell,
+ * main.cpp:758 precedent; measured s31roll3/cure3). Called by yz_crash_handler:
+ * if this thread carries an SPU context (maintained at every indirect branch),
+ * name it. */
+extern SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx;   /* defined below */
+void yz_spu_crash_note(void)
+{
+    spu_context* c = g_spu_cur_ctx;
+    if (!c) return;
+    fprintf(stderr, "\n[crash] faulting thread is an SPU HOST THREAD: spu=%X img=%d "
+            "pc=0x%05X (ignore the tid above -- TLS fallback; any [crash-t1] dump "
+            "below is the MAIN thread's state, not the faulter's)",
+            c->spu_id, (int)c->image_id, c->pc & SPU_LS_MASK);
+    fflush(stderr);
+}
+
 /* ---- s31 §12 (ledger #72/#34): TASK-IMAGE READ-ONLY SEGMENT GUARD.
  * The real SPURS resume contract re-DMAs the task ELF's READ-ONLY segments on
  * EVERY resume (spursTasksetDispatch RESUME leg: spursTasksetLoadElf(...,
@@ -1729,7 +1748,11 @@ void spu_indirect_branch(spu_context* ctx)
     { unsigned _wi = ctx->spu_id & 7u;
       g_yz_spu_hops[_wi]++;
       g_yz_spu_lastpc[_wi] = ctx->pc & SPU_LS_MASK;
-      g_yz_spu_lastimg[_wi] = (int)ctx->image_id; }
+      g_yz_spu_lastimg[_wi] = (int)ctx->image_id;
+      /* s31 s13: keep the per-thread ctx pointer live so the crash handler can
+       * attribute SPU-thread faults (previously set only under profiling --
+       * the tid=1 TLS-fallback misattribution class, scratch/s31_t1_crash.md). */
+      g_spu_cur_ctx = ctx; }
 
     /* RESIDENCY RE-ADOPTION at the workload-module entry (s24 image model).
      * The DMA layer records which module image is resident at LS 0xA00
