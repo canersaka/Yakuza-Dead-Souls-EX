@@ -218,9 +218,19 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (ct) {
         static long n = 0;
         if (n < 4000) { n++;
-            fprintf(stderr, "[cond] t%u WAIT-enter cond=%u mutex=%u owner=t%u cnt=%d\n",
-                    yz_thread_current_id(), cond_id, mutex_id,
-                    (uint32_t)m->owner_tid, m->lock_count);
+            /* s29 cond-4 rider: the cri_dlg work flag P->[0x4] (0x1661474) is a
+             * PULSE — a polling peek misses it (s29peek: zero changes all boot);
+             * read it event-driven at the trace points instead. wC0 = the
+             * loop-exit flag arg+0x50. */
+            if (cond_id == 4)
+                fprintf(stderr, "[cond] t%u WAIT-enter cond=4 mutex=%u owner=t%u cnt=%d w474=%08X wC0=%08X\n",
+                        yz_thread_current_id(), mutex_id,
+                        (uint32_t)m->owner_tid, m->lock_count,
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+            else
+                fprintf(stderr, "[cond] t%u WAIT-enter cond=%u mutex=%u owner=t%u cnt=%d\n",
+                        yz_thread_current_id(), cond_id, mutex_id,
+                        (uint32_t)m->owner_tid, m->lock_count);
             fflush(stderr); }
     }
 
@@ -305,9 +315,14 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (ct) {
         static long n2 = 0;
         if (n2 < 4000) { n2++;
-            fprintf(stderr, "[cond] t%u WAIT-exit cond=%u %s\n",
-                    yz_thread_current_id(), cond_id,
-                    !ok ? "TIMEOUT" : "ok");
+            if (cond_id == 4)
+                fprintf(stderr, "[cond] t%u WAIT-exit cond=4 %s w474=%08X wC0=%08X\n",
+                        yz_thread_current_id(), !ok ? "TIMEOUT" : "ok",
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+            else
+                fprintf(stderr, "[cond] t%u WAIT-exit cond=%u %s\n",
+                        yz_thread_current_id(), cond_id,
+                        !ok ? "TIMEOUT" : "ok");
             fflush(stderr); }
     }
 
@@ -378,6 +393,25 @@ int64_t sys_cond_signal(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* s29: the trace logged ONLY the wait side — the cond-4 signaler was
+     * invisible (and LV2:first dedups per (tid,sc), hiding later-cond calls).
+     * Log the signal side under the same gate/cap. */
+    if (cond_trace_on() && cond_id <= 16) {
+        static long sn = 0;
+        if (sn < 4000) { sn++;
+            /* lr names the guest CALL SITE (the s29 cond-4 staging hunt:
+             * which t1 function stages cri_dlg work — it stops at ~t=106 s
+             * while t1 itself keeps iterating, scratch/s29sig.err). */
+            if (cond_id == 4)
+                fprintf(stderr, "[cond] t%u SIGNAL cond=4 committed=%d pending=%d w474=%08X wC0=%08X\n",
+                        yz_thread_current_id(), c->committed, c->pending,
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+            else
+                fprintf(stderr, "[cond] t%u SIGNAL cond=%u committed=%d pending=%d lr=0x%08llX\n",
+                        yz_thread_current_id(), cond_id, c->committed, c->pending,
+                        (unsigned long long)ctx->lr); }
+    }
+
     /* FAITHFUL lv2 semantics, revision 2 (2026-07-03 s8): real sys_cond_signal
      * NEVER acquires the guest mutex (the 3f1377c fix stands — the former
      * mutex-CS guard caused hold-and-wait). BUT "signal between a waiter's
@@ -422,6 +456,13 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     sys_cond_info* c = &g_sys_conds[cond_id - 1];
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    if (cond_trace_on() && cond_id <= 16) {
+        static long sn = 0;
+        if (sn < 4000) { sn++;
+            fprintf(stderr, "[cond] t%u SIGNAL-ALL cond=%u committed=%d pending=%d\n",
+                    yz_thread_current_id(), cond_id, c->committed, c->pending); }
+    }
 
     /* FAITHFUL lv2 semantics, revision 2 (see sys_cond_signal): rendezvous
      * broadcast — serve every committed waiter; never touch the guest mutex. */
