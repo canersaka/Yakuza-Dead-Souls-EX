@@ -265,6 +265,16 @@ typedef struct {
 typedef struct {
     u32             location, offset;
     ID3D12Resource* tex;        /* RGBA8 snapshot, NULL until first flush   */
+    /* s32 depth-dims fix: the snapshot is taken at the ZETA RESOURCE'S OWN
+     * dims (a 1280x1024 shadow-map zeta was previously cropped to the
+     * 1280x720 canvas AND sampled at the wrong scale -- the mechanism
+     * behind both the R=G==0 shadow-factor surface and ledger #62's s27
+     * "sky punch-through" regression). rgba keeps the CPU copy so the
+     * bind-time path can re-window it to the texture unit's DECLARED size
+     * (same principle as the s31 logical-size surface fix). */
+    u8*             rgba;       /* snap_w*snap_h*4 CPU copy of the snapshot */
+    u32             snap_w, snap_h;
+    u32             tex_w, tex_h;   /* dims `tex` is currently built at     */
 } depth_surface_t;
 
 /* s31 FIX 1 (scratch/s31_render_fixes.md, s29-5a "pass-boundary depth
@@ -566,6 +576,11 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         dbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         const u32 depth_pitch = (width * 4 + 255) & ~255u;
         dbd.Width = (u64)depth_pitch * height;
+        /* s32 depth-dims fix: zeta targets can be TALLER than the canvas
+         * (1280x1024 shadow maps on a 720 canvas) -- size the scratch for
+         * any zeta up to 2048x2048 R32. */
+        if (dbd.Width < 32u * 1024 * 1024)
+            dbd.Width = 32u * 1024 * 1024;
         dbd.Height = 1;
         dbd.DepthOrArraySize = 1;
         dbd.MipLevels = 1;
@@ -1348,26 +1363,44 @@ static ID3D12Resource* zdepth_find_res(u32 location, u32 offset)
     return NULL;
 }
 
+/* s32 depth-dims fix: same lookup but returning the whole entry so the
+ * snapshot can size its copy to the zeta's OWN dims. */
+static const zdepth_t* zdepth_find(u32 location, u32 offset)
+{
+    if (!honor_zeta_track())
+        return NULL;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].location == location && g.zdepths[i].offset == offset)
+            return &g.zdepths[i];
+    return NULL;
+}
+
 /* The depth resource bound by the most recent draw (RSX_DEPTH_DUMP_* reads
  * this so its raw dumps stay meaningful under per-target tracking). */
 static ID3D12Resource* g_zdump_res = NULL;
 
 /* s27 part 3 (scratch/s26_fp_bisect.md, depth-target-as-texture snapshots).
- * s27 A/B CORRECTION (~07:20): default flipped to OFF — with the RSQ fix in,
- * the full-composite A/B showed this feature REGRESSES the room geometry
- * (walls/cabinets replaced by sky punch-through: scratch/s27_rsqfix vs
- * scratch/s27_rsq_nodrt) — its part-3 "zero regressions" diff did not cover
- * the composite. The mechanism is real (shadow-map reads sample live data)
- * but the readback/redirect corrupts some room passes; debug before
- * re-defaulting. Opt-in: RSX_DEPTH_RT=1. */
+ * s27 A/B CORRECTION (~07:20): default flipped to OFF -- the full-composite
+ * A/B showed the feature regressed room geometry (walls/cabinets replaced by
+ * sky punch-through, ledger #62).
+ * s32 RE-DEFAULT ON: the regression's MECHANISM is now root-caused and fixed
+ * -- the snapshot hard-copied the 1280x720 canvas out of zetas that are
+ * TALLER (1280x768 / 1280x1024 shadow maps) and the SRV was then sampled at
+ * the declared texture scale, spatially garbling every projective read (and
+ * zeroing rows past 720). With the s32 depth-dims fix (zeta-sized snapshots
+ * + declared-size windowing) the s32 A/B shows no guard regression and the
+ * frame moves toward the hardware reference (whiteout V 0.679 unchanged,
+ * character bbox mean|d-ref| 14.1 -> 10.8; scratch/s32_character_fixes.md
+ * section 5). Kill switch: RSX_DEPTH_RT=0. */
 static int honor_depth_rt(void)
 {
     static int inited = 0, on = 0;
     if (!inited) {
         inited = 1;
-        on = getenv("RSX_DEPTH_RT") ? 1 : 0;
+        const char* e = getenv("RSX_DEPTH_RT");
+        on = e ? (atoi(e) != 0) : 1;
         printf("[depthrt] RSX_DEPTH_RT %s -> depth-target snapshotting %s\n",
-               on ? "SET" : "unset", on ? "ON" : "OFF (default; s27 A/B regression)");
+               e ? e : "unset", on ? "ON (default since s32 dims fix)" : "OFF");
     }
     return on;
 }
@@ -1383,9 +1416,9 @@ static u32 depth_surface_get(u32 location, u32 offset)
     if (g.n_depth_surfaces >= MAX_SURFACES)
         return 0;
     depth_surface_t* d = &g.depth_surfaces[g.n_depth_surfaces];
+    memset(d, 0, sizeof(*d));
     d->location = location;
     d->offset = offset;
-    d->tex = NULL;
     return g.n_depth_surfaces++;
 }
 
@@ -1404,8 +1437,23 @@ static void depth_snapshot_flush(u32 location, u32 offset)
 
     /* s31 FIX 1: under per-zeta-target tracking, this pass's depth lives in
      * ITS OWN buffer, not the shared g.depth -- snapshot the right one. */
-    ID3D12Resource* zres = zdepth_find_res(location, offset);
-    ID3D12Resource* dres = zres ? zres : g.depth;
+    const zdepth_t* zd = zdepth_find(location, offset);
+    ID3D12Resource* dres = (zd && zd->tex) ? zd->tex : g.depth;
+    /* s32 depth-dims fix: snapshot at the zeta resource's OWN dims (was:
+     * hard g.width x g.height, which cropped 1280x1024 shadow-map zetas to
+     * the 720-tall canvas and scale-garbled every projective sample). */
+    const u32 zw = (zd && zd->tex) ? zd->w : g.width;
+    const u32 zh = (zd && zd->tex) ? zd->h : g.height;
+    const u32 depth_pitch = (zw * 4 + 255) & ~255u;
+    {
+        /* the shared readback scratch is >=32MB (gpu_init); guard anyway */
+        D3D12_RESOURCE_DESC rbd;
+        g.depth_readback->lpVtbl->GetDesc(g.depth_readback, &rbd);
+        if ((u64)depth_pitch * zh > rbd.Width) {
+            printf("[depthrt] snapshot skipped: %ux%u exceeds readback scratch\n", zw, zh);
+            return;
+        }
+    }
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1415,7 +1463,6 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
-    const u32 depth_pitch = (g.width * 4 + 255) & ~255u;
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
     src.pResource = dres;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1424,13 +1471,11 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Offset = 0;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = zw;
+    dst.PlacedFootprint.Footprint.Height = zh;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = depth_pitch;
-    /* s31 FIX 2: per-zeta-target buffers are sized >= the canvas; copy
-     * exactly the canvas-sized top-left region the readback is sized for. */
-    D3D12_BOX zbox = {0, 0, 0, g.width, g.height, 1};
+    D3D12_BOX zbox = {0, 0, 0, zw, zh, 1};
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &zbox);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1443,13 +1488,13 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     gpu_wait();
 
     u8* src_px = NULL;
-    D3D12_RANGE rr = {0, (size_t)depth_pitch * g.height};
+    D3D12_RANGE rr = {0, (size_t)depth_pitch * zh};
     g.depth_readback->lpVtbl->Map(g.depth_readback, 0, &rr, (void**)&src_px);
-    u8* rgba = malloc((size_t)g.width * g.height * 4);
+    u8* rgba = malloc((size_t)zw * zh * 4);
     if (rgba && src_px) {
-        for (u32 y = 0; y < g.height; y++) {
+        for (u32 y = 0; y < zh; y++) {
             const float* row = (const float*)(src_px + (size_t)y * depth_pitch);
-            for (u32 x = 0; x < g.width; x++) {
+            for (u32 x = 0; x < zw; x++) {
                 /* Same 8-bit approximation decode_texel()'s DEPTH24_D8 case
                  * already uses for guest-memory depth textures: broadcast
                  * one grayscale byte, opaque alpha -- keeps this snapshot's
@@ -1459,7 +1504,7 @@ static void depth_snapshot_flush(u32 location, u32 offset)
                 if (dv < 0.0f) dv = 0.0f;
                 if (dv > 1.0f) dv = 1.0f;
                 const u8 d8 = (u8)(dv * 255.0f + 0.5f);
-                u8* px = rgba + ((size_t)y * g.width + x) * 4;
+                u8* px = rgba + ((size_t)y * zw + x) * 4;
                 px[0] = px[1] = px[2] = d8;
                 px[3] = 255;
             }
@@ -1476,20 +1521,72 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     g.upload_used = 0;
 
     if (rgba) {
-        ID3D12Resource* tex = create_texture_rgba(rgba, g.width, g.height);
-        free(rgba);
+        ID3D12Resource* tex = create_texture_rgba(rgba, zw, zh);
         if (tex) {
             const u32 idx = depth_surface_get(location, offset);
-            if (g.depth_surfaces[idx].tex)
-                g.depth_surfaces[idx].tex->lpVtbl->Release(g.depth_surfaces[idx].tex);
-            g.depth_surfaces[idx].tex = tex;
+            depth_surface_t* d = &g.depth_surfaces[idx];
+            if (d->tex)
+                d->tex->lpVtbl->Release(d->tex);
+            free(d->rgba);
+            d->tex = tex;
+            d->rgba = rgba;             /* kept for bind-time re-windowing */
+            d->snap_w = zw; d->snap_h = zh;
+            d->tex_w = zw;  d->tex_h = zh;
             srv_write(SRV_DEPTH_BASE + idx, tex);
             g.depth_snapshot_count++;
             printf("[depthrt] snapshot #%u: zeta (loc=%u off=0x%X) -> %ux%u RGBA8"
                    " (srv slot %u)\n", g.depth_snapshot_count, location, offset,
-                   g.width, g.height, SRV_DEPTH_BASE + idx);
+                   zw, zh, SRV_DEPTH_BASE + idx);
+        } else {
+            free(rgba);
         }
+    } else {
+        free(rgba);
     }
+}
+
+/* s32 depth-dims fix, bind-time half: the texture unit samples the depth
+ * snapshot through its DECLARED width/height as the [0,1] UV window (the
+ * guest texture is a same-pitch window over the zeta's memory, so texel
+ * (x,y) of the declared WxH map IS zeta texel (x,y)). Rebuild the SRV
+ * texture from the stored CPU copy at the declared size when it differs --
+ * the exact principle of the s31 logical-size surface fix, applied to
+ * depth. Returns the srv slot to bind. */
+static u32 depth_srv_windowed(u32 idx, u32 want_w, u32 want_h)
+{
+    depth_surface_t* d = &g.depth_surfaces[idx];
+    if (!d->tex || !d->rgba || !want_w || !want_h)
+        return SRV_DEPTH_BASE + idx;
+    if (want_w == d->tex_w && want_h == d->tex_h)
+        return SRV_DEPTH_BASE + idx;
+    if (want_w > d->snap_w || want_h > d->snap_h)
+        return SRV_DEPTH_BASE + idx;    /* declared larger than zeta: bind as-is */
+    u8* crop = malloc((size_t)want_w * want_h * 4);
+    if (!crop)
+        return SRV_DEPTH_BASE + idx;
+    for (u32 y = 0; y < want_h; y++)
+        memcpy(crop + (size_t)y * want_w * 4,
+               d->rgba + (size_t)y * d->snap_w * 4, (size_t)want_w * 4);
+    ID3D12Resource* tex = create_texture_rgba(crop, want_w, want_h);
+    free(crop);
+    if (!tex)
+        return SRV_DEPTH_BASE + idx;
+    /* Do NOT Release the old texture here: this runs inside the draw path
+     * (flushless, s29 constraint) and earlier recorded-but-unexecuted draws
+     * may still reference it. Park it; bounded (one per distinct declared
+     * size per map). */
+    {
+        static ID3D12Resource* s_retired[64];
+        static u32 s_retired_n = 0;
+        if (s_retired_n < 64) s_retired[s_retired_n++] = d->tex;
+        (void)s_retired;
+    }
+    d->tex = tex;
+    d->tex_w = want_w; d->tex_h = want_h;
+    srv_write(SRV_DEPTH_BASE + idx, tex);
+    printf("[depthrt] windowed zeta snapshot (loc=%u off=0x%X) %ux%u -> declared %ux%u\n",
+           d->location, d->offset, d->snap_w, d->snap_h, want_w, want_h);
+    return SRV_DEPTH_BASE + idx;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2155,8 +2252,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         if (base_fmt == RSX_TEX_FMT_DXT1 || base_fmt == RSX_TEX_FMT_DXT23 ||
             base_fmt == RSX_TEX_FMT_DXT45) {
             /* S3TC blocks are byte-ordered identically on RSX and D3D12:
-             * pass through as BC1/BC2/BC3 (no remap; the capture's DXT
-             * textures all use the identity crossbar). Levels are packed
+             * pass through as BC1/BC2/BC3. The component crossbar (remap)
+             * is applied at SRV-creation time below (s32 remap fix -- the
+             * old "all identity" assumption here was wrong). Levels are packed
              * back to back; BC data is never swizzled. */
             const DXGI_FORMAT dxgi = base_fmt == RSX_TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
                                    : base_fmt == RSX_TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
@@ -2259,9 +2357,48 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             free(rgba[m]);
     } while (0);
 
-    if (e->tex)
-        srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
-    else
+    if (e->tex) {
+        /* s32 remap fix: the BC1/BC2/BC3 passthrough uploads raw block data,
+         * so the RSX component crossbar (TEX_SWIZZLE remap word) that
+         * decode_texel() bakes in for uncompressed formats was silently
+         * DROPPED for compressed ones -- the old "the capture's DXT textures
+         * all use the identity crossbar" comment is REFUTED by measurement:
+         * draw 1198's tex5 normal map (DXT45) carries remap=0x69E0, the
+         * classic DXT5nm layout (shader R <- texture A, G <- G, B=1, A=1).
+         * Oracle: RPCS3 gcm_enums.h:225-232 (REMAP_FROM_A/R/G/B = 0/1/2/3,
+         * REMAP_ZERO/ONE/REMAP = 0/1/2) applied for ALL formats via
+         * RSXTexture.cpp decoded_remap(); D3D12's SRV Shader4ComponentMapping
+         * expresses the same crossbar without touching the block data.
+         * Identity words keep the exact previous SRV (default mapping). */
+        const int compressed = (base_fmt == RSX_TEX_FMT_DXT1 ||
+                                base_fmt == RSX_TEX_FMT_DXT23 ||
+                                base_fmt == RSX_TEX_FMT_DXT45);
+        if (compressed && remap != 0xAAE4) {
+            /* comp index order (gcm): 0=A 1=R 2=G 3=B; sel 0=A 1=R 2=G 3=B.
+             * D3D12 source values: 0=R 1=G 2=B 3=A 4=force0 5=force1. */
+            static const u32 sel2d3d[4] = { 3, 0, 1, 2 };   /* A,R,G,B -> D3D */
+            u32 m[4]; /* D3D mapping source for out R,G,B,A */
+            static const u32 out2comp[4] = { 1, 2, 3, 0 };  /* R,G,B,A -> gcm comp */
+            for (u32 oc = 0; oc < 4; oc++) {
+                const u32 comp = out2comp[oc];
+                const u32 op  = (remap >> (8 + comp * 2)) & 3;
+                const u32 sel = (remap >> (comp * 2)) & 3;
+                m[oc] = (op == 0) ? 4 : (op == 1) ? 5 : sel2d3d[sel];
+            }
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+            sd.Format = base_fmt == RSX_TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+                      : base_fmt == RSX_TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
+                                                      : DXGI_FORMAT_BC3_UNORM;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping =
+                (m[0]) | (m[1] << 3) | (m[2] << 6) | (m[3] << 9) | (1u << 12);
+            sd.Texture2D.MipLevels = (UINT)-1;
+            g.dev->lpVtbl->CreateShaderResourceView(g.dev, e->tex, &sd,
+                                                    srv_cpu(SRV_TEXTURE_BASE + g.n_textures));
+        } else {
+            srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
+        }
+    } else
         printf("[gpu] tex fallback: off=0x%X fmt=0x%02X %ux%u pitch=%u %s dim=%u cube=%u mips=%u loc=%u\n",
                t->offset, t->format, w, h, t->pitch, linear ? "linear" : "swizzled",
                t->dimension, t->cubemap, t->mipmaps, t->location);
@@ -4212,7 +4349,9 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
                     surf_used[n_surf_used++] = (u32)sampled_surface;
             }
         } else if (sampled_depth >= 0) {
-            slots[u] = SRV_DEPTH_BASE + sampled_depth;
+            /* s32 depth-dims fix: window the snapshot to this unit's
+             * declared size (see depth_srv_windowed). */
+            slots[u] = depth_srv_windowed((u32)sampled_depth, t.width, t.height);
         } else {
             slots[u] = texture_srv_slot(&t);
         }
