@@ -1214,6 +1214,7 @@ static void yz_dump_host_stack_of(HANDLE h, const char* tag)
 }
 
 extern "C" void yz_for_each_thread(void (*cb)(uint32_t, const char*, void*));
+extern "C" void yz_thread_registry_raw(void);   /* s29 [t11fate] raw dump */
 
 /* Name the well-known blocking lv2 syscalls so the per-thread dump reads as
  * "BLOCKED in sys_event_queue_receive" instead of a bare number. */
@@ -2410,11 +2411,32 @@ int main(int argc, char** argv)
      * rates (must not perturb the thread it measures). */
     if (const char* da = getenv("YZ_DUMP_AT")) {
         static int dump_at_s = atoi(da);
+        static int t11fate = getenv("YZ_T11_FATE") ? 1 : 0;
+        if (t11fate) fprintf(stderr, "[t11fate] armed (rides YZ_DUMP_AT=%d)\n", dump_at_s);
         if (dump_at_s > 0)
             CreateThread(NULL, 0, [](LPVOID) -> DWORD {
                 Sleep((DWORD)dump_at_s * 1000);
                 fprintf(stderr, "[dump-at] +%ds on-demand snapshot:\n", dump_at_s);
                 yz_dump_all_threads("dump-at");
+                /* s29 [t11fate] (probe spec scratch/s29_t11_fate.md): raw
+                 * registry + cri_dlg exit-flag + wait-state, all at the same
+                 * instant so registry/flag/wait correlate in one snapshot.
+                 * Flag EAs = thread arg+0x50 (func_00F00E80's loop-exit
+                 * test): t11 arg=0x1661470, t12 arg=0x1661408. */
+                if (t11fate) {
+                    yz_thread_registry_raw();
+                    for (uint32_t tid = 11; tid <= 12; tid++) {
+                        uint32_t scn = 0, held = 0; uint64_t a3 = 0, a4 = 0, a5 = 0;
+                        if (yz_wait_get(tid, &scn, &a3, &a4, &a5, &held))
+                            fprintf(stderr, "[t11fate] t%u BLOCKED sc=%u r3=0x%llX held=%ums\n",
+                                    tid, scn, (unsigned long long)a3, (unsigned)held);
+                        else
+                            fprintf(stderr, "[t11fate] t%u not-in-syscall\n", tid);
+                    }
+                    fprintf(stderr, "[t11fate] exitflag t11@0x16614C0=0x%08X t12@0x1661458=0x%08X\n",
+                            vm_read32(0x16614C0), vm_read32(0x1661458));
+                    fflush(stderr);
+                }
                 return 0;
             }, NULL, 0, NULL);
     }

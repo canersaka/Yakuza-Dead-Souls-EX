@@ -35,6 +35,54 @@
 #endif
 
 /* ---------------------------------------------------------------------------
+ * FS latency model (env YZ_FS_LAT=<usec>, s29 ledger #67)
+ *
+ * MEASURED: a pure logging flag (YZ_FS_TRACE, ~usec of printf inside Fstat/
+ * Lseek) deterministically flips whether the CRI preloader stages its next
+ * step (3/3 flagged boots read scenario.bin, 0/6 unflagged) — the game's own
+ * cross-thread staging protocol implicitly depends on FS syscalls taking
+ * REALISTIC time (real HDD/BD latency is micro-to-milliseconds; our host
+ * page-cache returns in ~100 ns). This is a hardware-timing MODEL (like the
+ * vblank), not a force: every call keeps its exact result, it just doesn't
+ * return sooner than the floor. QPC busy-wait for sub-ms precision. Applied
+ * at the completion boundary (before return) of the data-path entry points.
+ * Default OFF until the A/B validates; retirement condition: if the real
+ * divergence is later pinned to a specific missing ordering on OUR side,
+ * prefer that and retire this.
+ * -----------------------------------------------------------------------*/
+static void yz_fs_lat_wait(void)
+{
+#ifdef _WIN32
+    static int lat_us = -2;
+    if (lat_us == -2) {
+        const char* e = getenv("YZ_FS_LAT");
+        lat_us = e ? atoi(e) : 0;
+        if (lat_us > 0)
+            fprintf(stderr, "[fs-lat] ARMED: %d us floor per cellFs data call\n", lat_us);
+        else if (lat_us == -1)
+            fprintf(stderr, "[fs-lat] ARMED: stderr LOCK-TOUCH mode (s29 rendezvous discriminator)\n");
+    }
+    if (lat_us == 0) return;
+    if (lat_us == -1) {
+        /* Discriminator (s29): the FS_TRACE flip may be the fprintf's CRT
+         * stderr lock acting as an accidental cross-thread rendezvous (a
+         * concurrent printer, e.g. t2's signal-path trace, holds it) rather
+         * than the print's duration — 200 us of pure busy-wait did NOT
+         * reproduce the flip (s29lat). Take+release the lock, emit nothing:
+         * duration ~0, ordering edge identical to a print. */
+        _lock_file(stderr);
+        _unlock_file(stderr);
+        return;
+    }
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    const LONGLONG ticks = (f.QuadPart * (LONGLONG)lat_us) / 1000000;
+    do { QueryPerformanceCounter(&t1); } while (t1.QuadPart - t0.QuadPart < ticks);
+#endif
+}
+
+/* ---------------------------------------------------------------------------
  * Path translation
  * -----------------------------------------------------------------------*/
 
@@ -386,6 +434,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         static int armed = 0;
         if (!armed) { armed = 1; yz_watch_arm_read(0x0135D9E0u); }
     }
+    yz_fs_lat_wait();
     return CELL_OK;
 }
 
@@ -393,6 +442,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
 s32 cellFsClose(CellFsFd fd)
 {
     printf("[cellFs] Close(fd=%d)\n", fd);
+    yz_fs_lat_wait();
 
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
@@ -440,6 +490,11 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
     }
+    /* s29 position finding: the latency model must run POST-result ("the read
+     * took longer"), not at entry ("the call started later") — a concurrent
+     * observer only sees the former. Entry-side floors measured no-effect
+     * (s29lat/s29lat2). */
+    yz_fs_lat_wait();
 
     if (is_stream) {
         const unsigned char* b = (const unsigned char*)buf;
@@ -760,6 +815,7 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
+    yz_fs_lat_wait();
     if (s_files[fd].host_fp) {
         int host_whence = SEEK_SET;
         if (whence == CELL_FS_SEEK_CUR) host_whence = SEEK_CUR;
@@ -792,6 +848,7 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
 s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 {
     printf("[cellFs] Fstat(fd=%d)\n", fd);
+    yz_fs_lat_wait();
 
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
