@@ -85,6 +85,9 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
  * and stopped producing. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);
 
+/* Draws in the last completed frame (title-bar telemetry). */
+u32  rsx_live_draw_get_last_draws(void);
+
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
 
