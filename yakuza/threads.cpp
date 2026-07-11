@@ -166,6 +166,24 @@ extern "C" void yz_for_each_thread(void (*cb)(uint32_t tid, const char* name, vo
     for (int i = 0; i < n; i++) cb(snap[i].tid, snap[i].name, (void*)snap[i].h);
 }
 
+/* s29 [t11fate] (probe spec scratch/s29_t11_fate.md): raw registry dump
+ * BYPASSING the enumeration filter above -- the +150s dump showed EVERY
+ * tid>=11 thread absent while no implemented exit path clears the filter
+ * fields, so either the registry lost them or the filter hides them. Prints
+ * every slot that was ever used, so the two cases separate in one boot. */
+extern "C" void yz_thread_registry_raw(void)
+{
+    thr_lock();
+    for (int i = 0; i < MAX_GUEST_THREADS; i++) {
+        const thr_rec* t = &s_threads[i];
+        if (!t->in_use && !t->tid) continue;   /* never used */
+        fprintf(stderr, "[t11fate] slot%02d in_use=%d started=%d handle=%p tid=%u \"%s\"\n",
+                i, t->in_use, t->started, (void*)t->handle, t->tid, t->name);
+    }
+    thr_unlock();
+    fflush(stderr);
+}
+
 /* Register the main thread so join/priority/stack-info work on id 1. */
 extern "C" void yz_threads_init(uint32_t main_stack_base, uint32_t main_stack_size)
 {
