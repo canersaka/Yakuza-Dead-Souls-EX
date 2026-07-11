@@ -1576,6 +1576,72 @@ extern "C" int yz_rsx_flip_pending_any(void)
  * thread). Guarded by g_rsx_fifo_lock. */
 static uint32_t g_fifo_ret = ~0u;
 
+/* s29 (scratch/s29_terminal_park_re.md, Q4): RPCS3 (RSXFIFO.cpp) treats BOTH a
+ * nested CALL (a second CALL before the pending one RETURNs) and a RETURN with
+ * no pending CALL as FIFO_ERROR and calls recover_fifo() -- checkpoint/retry,
+ * escalating to a fatal abort after 20 recoveries inside a 2 s window. Our port
+ * used to (a) silently clobber the one-level g_fifo_ret slot on a nested CALL
+ * with zero diagnostic, and (b) idle forever, completely silently after one
+ * one-ever warning, on a RETURN-without-CALL (the s28m10/s28m4 terminal park at
+ * GET=0x011001EC / 0x0000098C). The loud detection log below fires
+ * UNCONDITIONALLY (zero behavior change, always-on diagnostic per the report's
+ * "smallest diagnostic first" recommendation). The checkpoint/retry+escalation
+ * recovery itself is a behavior change and stays behind YZ_FIFO_RECOVER_RET
+ * (default OFF -- unvalidated against a live boot; kill-switch semantics
+ * inverted from YZ_NO_FIFO_RECOVER's sibling non-command path because this one
+ * hasn't been through an A/B boot yet). Our step function has no valid
+ * "rewind" target for either case (GET never advanced into the bad word), so
+ * "restore to checkpoint" is a no-op position-wise -- the recovery's value is
+ * the bounded, loud retry/escalation cadence instead of a truly-silent
+ * infinite idle. Retirement: fold into the default path once a live boot
+ * confirms neither state corrupts anything worse than idling. */
+static int g_fifo_recover_ret_fatal = 0;
+static ULONGLONG g_fifo_recover_ret_last_ms = 0;
+static ULONGLONG g_fifo_recover_ret_window0 = 0;
+static int g_fifo_recover_ret_n = 0;
+
+static int yz_fifo_recover_ret_enabled(void)
+{
+    static int rr = -1;
+    if (rr < 0) { rr = getenv("YZ_FIFO_RECOVER_RET") ? 1 : 0;
+        if (rr) fprintf(stderr, "[fifo-rec-ret] ARMED (YZ_FIFO_RECOVER_RET): RETURN-without-CALL "
+                "and CALL-inside-subroutine get the RPCS3 recover_fifo checkpoint-retry analog "
+                "(20 strikes / 2s -> fatal) instead of silent-forever-idle / silent-clobber\n"); }
+    return rr;
+}
+
+/* One recovery attempt for the RETURN-without-CALL / CALL-inside-subroutine
+ * states. Rate-limited to ~1 attempt/50ms (our poll loop has no RPCS3-style
+ * blocking 2ms sleep between retries, so this substitutes the existing
+ * SwitchToThread poll cadence -- the strike count and 2s window are faithful
+ * to the RPCS3 shape). After 20 strikes inside a rolling 2s window, latches
+ * fatal permanently: one loud print, then this and all further calls are a
+ * cheap no-op so the FIFO consumer's existing idle/heartbeat machinery takes
+ * over (matches "kills RSX" in spirit without tearing down the process --
+ * the consumer parks, loudly, instead of RPCS3's hard exception). */
+static void yz_fifo_ret_recover(uint32_t get, const char* what)
+{
+    if (g_fifo_recover_ret_fatal) return;
+    const ULONGLONG now = GetTickCount64();
+    if (g_fifo_recover_ret_last_ms && now - g_fifo_recover_ret_last_ms < 50) return;
+    g_fifo_recover_ret_last_ms = now;
+    if (!g_fifo_recover_ret_window0 || now - g_fifo_recover_ret_window0 > 2000) {
+        g_fifo_recover_ret_window0 = now; g_fifo_recover_ret_n = 0;
+    }
+    g_fifo_recover_ret_n++;
+    if (g_fifo_recover_ret_n >= 20) {
+        g_fifo_recover_ret_fatal = 1;
+        fprintf(stderr, "[fifo-rec-ret] FATAL: %s struck %d recoveries within 2s at io=0x%08X -- "
+                "giving up (RPCS3 recover_fifo analog); FIFO consumer parks permanently\n",
+                what, g_fifo_recover_ret_n, get);
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[fifo-rec-ret] n=%d %s at io=0x%08X -- retry (RPCS3 recover_fifo analog)\n",
+            g_fifo_recover_ret_n, what, get);
+    fflush(stderr);
+}
+
 /* t1 hop counter from dispatch.cpp — the park-rel fast path's wedge witness:
  * a t1 that makes no hops while the consumer sits parked cannot be on its way
  * to drain the release journal (the drain runs on t1). */
@@ -1775,6 +1841,28 @@ static int yz_rsx_fifo_step(void)
             LeaveCriticalSection(&g_rsx_fifo_lock);
             return 0;
         }
+        if (g_fifo_ret != ~0u) {
+            /* Nested CALL (s29, scratch/s29_terminal_park_re.md Q4a): RPCS3
+             * checks fifo_ret_addr != RSX_CALL_STACK_EMPTY here and logs "CALL
+             * found inside a subroutine" instead of silently overwriting the
+             * pending return -- our one-level slot used to just get clobbered,
+             * losing the outer return address with no diagnostic. */
+            static unsigned long nc = 0; nc++;
+            if (nc <= 64 || (nc & 255u) == 0u)
+                fprintf(stderr, "[rsx] CALL inside subroutine at io=0x%08X: live return 0x%08X "
+                        "would be clobbered by new return 0x%08X (n=%lu)\n",
+                        get, g_fifo_ret, get + 4u, nc);
+            if (yz_fifo_recover_ret_enabled()) {
+                /* Faithful: don't execute this CALL (don't touch g_fifo_ret or
+                 * GET) -- the outer return address survives. Retry/escalate
+                 * exactly like the RETURN-without-CALL path below. */
+                yz_fifo_ret_recover(get, "CALL-inside-subroutine");
+                LeaveCriticalSection(&g_rsx_fifo_lock);
+                return 0;
+            }
+            /* flag off: preserve the pre-existing default (clobber-and-proceed),
+             * now with the loud log above instead of silence. */
+        }
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -1787,9 +1875,17 @@ static int yz_rsx_fifo_step(void)
             LeaveCriticalSection(&g_rsx_fifo_lock);
             return 1;
         }
+        /* s29 terminal park (scratch/s29_terminal_park_re.md): RPCS3 logs
+         * "RET found without corresponding CALL" and calls recover_fifo() here
+         * instead of idling; our one-ever warning below is unchanged (still the
+         * MEASURED s28m10/s28m4 receipt), but YZ_FIFO_RECOVER_RET now adds the
+         * bounded retry/escalation analog instead of a completely silent
+         * forever-idle after the first print. */
         static int warned = 0;
         if (!warned) { warned = 1;
             fprintf(stderr, "[rsx] RETURN without CALL at io=0x%08X; idling\n", get); }
+        if (yz_fifo_recover_ret_enabled())
+            yz_fifo_ret_recover(get, "RETURN-without-CALL");
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 0;
     }
