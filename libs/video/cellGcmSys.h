@@ -288,6 +288,12 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index);
 /* NID: 0x97FC4B73 */
 u64 cellGcmGetTimeStamp(u32 index);
 
+/* Shared monotonic timebase (ns) backing cellGcmGetTimeStamp/GetLastFlipTime.
+ * Also used by rsx_commands.c's NV4097_GET_REPORT FIFO handler so a report
+ * timer written via the command buffer and one read back via the API above
+ * are the same clock. */
+u64 cellGcmReportTimestampNs(void);
+
 /* Tile / Zcull */
 
 /* NID: 0x0B4B62D5 */

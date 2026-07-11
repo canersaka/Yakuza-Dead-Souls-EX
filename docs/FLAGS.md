@@ -716,6 +716,27 @@ at any boot depth (every prior terminal park was invisible behind count-capped p
 successful JUMP/CALL/RETURN flow transfer (get -> target). The s33 audit's discriminator
 for how GET arrived anywhere; success paths were previously silent.
 
+`YZ_MUTEX_LEGACY` (runtime/syscalls/sys_mutex.c, s33 conformance fleet, kill-switch,
+default OFF): reverts BOTH s33 mutex guards (trylock EDEADLK on a NOT_RECURSIVE
+self-relock; destroy EBUSY on an owned mutex) to the old non-conformant behavior.
+
+`YZ_SPU_ET_LEGACY` (runtime/syscalls/lv2_register.c, s33 conformance fleet, kill-switch,
+default OFF): collapses sys_spu_thread_group_connect_event's three per-source slots
+(RUN/EXCEPTION/SYSTEM_MODULE) back into the old single slot and disables per-et
+EINVAL/EBUSY.
+
+`YZ_SPU_EXC_EVT` (runtime/syscalls/lv2_register.c, s33, opt-in, default OFF): deliver
+guest-visible SPU-exception EVENTS to a connected exception queue. The host-side
+[spu-exc] fault log is always on; delivery is gated because every current SPU fault is
+an emulation artifact the resume machinery heals — real hardware never faults here, and
+first delivery (golden 2026-07-11) showed Sony's default SPURS handler waking and
+dumping diagnostics for our internal hiccups. Flip the default when the death classes
+are extinct.
+
+`YZ_AUDIO_LEGACY_PACE` (libs/audio/cellAudio.c, s33 conformance fleet, kill-switch,
+default OFF): reverts guest block progression/notifies to WASAPI-occupancy pacing
+instead of the fixed 5.333 ms block heartbeat.
+
 `YZ_T1_HB` (yakuza/import_overrides.cpp vblank tick, s28, diag, default OFF): 2 s t1
 host-liveness heartbeat — host CPU-time deltas + sampled RIP (brief suspend) + the
 in-flight lv2 syscall/r3 (g_yz_t1_sc, set in lv2_syscall_dispatch). Cracked ledger #64.

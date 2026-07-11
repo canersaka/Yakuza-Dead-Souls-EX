@@ -52,6 +52,9 @@ typedef struct sys_timer_info {
     int32_t  event_queue_id;   /* connected event queue */
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
+    uint64_t data2;            /* event data2 (the connect-time data2
+                                 * argument, delivered verbatim in every
+                                 * fired event; RPCS3 sys_timer.cpp:363/90) */
 
 #ifdef _WIN32
     HANDLE   timer_handle;
