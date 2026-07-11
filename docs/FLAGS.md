@@ -703,3 +703,4 @@ as-texture snapshots in the replay harness — mechanism validated but regresses
 geometry in the full composite (A/B scratch/s27_rsqfix vs s27_rsq_nodrt); debug before
 re-defaulting. RSX_NO_PASS_DEPTH_CLEAR / RSX_FP_FORCE_STAGE* / RSX_VP_CLIP_DUMP /
 RSX_LOG_ZETA are harness diagnostics from the same investigation (s26_fp_bisect.md).
+| `YZ_FS_LAT` | diag | OFF | s29 (2026-07-10): cellFs latency-model/discriminator knob for the ledger-#67 staging race. `<usec>` = QPC busy-wait floor per data call (Open/Read/Fstat/Lseek/Close; Read waits POST-fread); `-1` = stderr lock-touch mode (rendezvous discriminator). All four s29 modes measured NOT the FS_TRACE-flip mechanism (STATUS ⚡2) - kept as the probe kit for the s30 fresh-eyes pass. Armed banner `[fs-lat]`. |
