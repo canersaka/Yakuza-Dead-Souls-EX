@@ -25,6 +25,25 @@ static int t1_unblock_on(void)
 }
 extern uint32_t yz_thread_current_id(void);
 
+/* s30 sem trace (env YZ_SEM_TRACE, diag, ledger #67 successor-staging hunt):
+ * the stage handoff's last unobserved link is the async-FS request semaphore
+ * (t2 parks in wait(sem=1) at every death — s30_fresheyes_fable.md). Bounded
+ * stderr trace of wait/post on low sem ids answers, at the death window:
+ * did a post ever happen (requester alive, wake lost) or not (requester's
+ * decision gate is upstream). Cap 4000 lines, armed banner. */
+static int sem_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("YZ_SEM_TRACE");
+        on = (e && *e) ? 1 : 0;
+        if (on) { fprintf(stderr, "[sem-trace] ARMED (YZ_SEM_TRACE): wait/post on sem ids <= 8\n"); fflush(stderr); }
+    }
+    return on;
+}
+static long s_sem_trace_n = 0;
+#define SEM_TRACE_CAP 4000
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
@@ -194,6 +213,14 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+        s_sem_trace_n++;
+        fprintf(stderr, "[sem] t%u WAIT-enter id=%u val=%d tmo=%llu lr=0x%08llX\n",
+                yz_thread_current_id(), sem_id, s->value,
+                (unsigned long long)timeout_us, (unsigned long long)ctx->lr);
+        fflush(stderr);
+    }
+
     /* YZ_T1_UNBLOCK: if t1 would block here (value <= 0), return CELL_OK
      * immediately instead of parking. Cap logging at ~100 lines but let the
      * forcing continue unbounded (per the diagnostic's request). */
@@ -244,6 +271,11 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         result = WaitForSingleObject(s->sem_handle, ms);
     }
     if (result == WAIT_TIMEOUT) {
+        if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+            s_sem_trace_n++;
+            fprintf(stderr, "[sem] t%u WAIT-timeout id=%u\n", yz_thread_current_id(), sem_id);
+            fflush(stderr);
+        }
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
     if (result != WAIT_OBJECT_0) {
@@ -253,6 +285,12 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     EnterCriticalSection(&s->value_lock);
     s->value--;
     LeaveCriticalSection(&s->value_lock);
+    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+        s_sem_trace_n++;
+        fprintf(stderr, "[sem] t%u WAIT-exit id=%u val=%d\n",
+                yz_thread_current_id(), sem_id, s->value);
+        fflush(stderr);
+    }
 #else
     pthread_mutex_lock(&s->mtx);
 
@@ -304,6 +342,12 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
 #ifdef _WIN32
     DWORD result = WaitForSingleObject(s->sem_handle, 0);
     if (result == WAIT_TIMEOUT) {
+        if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+            s_sem_trace_n++;
+            fprintf(stderr, "[sem] t%u TRYWAIT-busy id=%u val=%d\n",
+                    yz_thread_current_id(), sem_id, s->value);
+            fflush(stderr);
+        }
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     if (result != WAIT_OBJECT_0) {
@@ -312,6 +356,12 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
     EnterCriticalSection(&s->value_lock);
     s->value--;
     LeaveCriticalSection(&s->value_lock);
+    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+        s_sem_trace_n++;
+        fprintf(stderr, "[sem] t%u TRYWAIT-ok id=%u val=%d\n",
+                yz_thread_current_id(), sem_id, s->value);
+        fflush(stderr);
+    }
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value <= 0) {
@@ -354,12 +404,39 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
         LeaveCriticalSection(&s->value_lock);
+        /* Always-on (capped): a refused post is a dropped-notification-shaped
+         * event (the shadow `value` can lag the handle count between a
+         * waiter's wake and its decrement, so this refusal can be SPURIOUS
+         * for small max_value semaphores — s30 audit). Loud regardless of
+         * YZ_SEM_TRACE. */
+        static long ebusy_n = 0;
+        if (ebusy_n < 64) { ebusy_n++;
+            fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d max=%d (n=%ld)\n",
+                    yz_thread_current_id(), sem_id, count, s->value, s->max_value, ebusy_n);
+            fflush(stderr); }
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
     LeaveCriticalSection(&s->value_lock);
 
-    ReleaseSemaphore(s->sem_handle, count, NULL);
+    if (!ReleaseSemaphore(s->sem_handle, count, NULL)) {
+        /* Always-on: a failed release after a passed shadow check = a wake
+         * silently lost (handle/shadow desync). Never expected; if it prints,
+         * that IS the dropped notification. */
+        static long relfail_n = 0;
+        if (relfail_n < 64) { relfail_n++;
+            fprintf(stderr, "[sem-post] t%u RELEASE-FAILED id=%u count=%d val=%d max=%d gle=%lu\n",
+                    yz_thread_current_id(), sem_id, count, s->value, s->max_value,
+                    (unsigned long)GetLastError());
+            fflush(stderr); }
+    }
+    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+        s_sem_trace_n++;
+        fprintf(stderr, "[sem] t%u POST id=%u count=%d val=%d lr=0x%08llX\n",
+                yz_thread_current_id(), sem_id, count, s->value,
+                (unsigned long long)ctx->lr);
+        fflush(stderr);
+    }
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {

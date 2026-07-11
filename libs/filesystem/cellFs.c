@@ -61,6 +61,8 @@ static void yz_fs_lat_wait(void)
             fprintf(stderr, "[fs-lat] ARMED: %d us floor per cellFs data call\n", lat_us);
         else if (lat_us == -1)
             fprintf(stderr, "[fs-lat] ARMED: stderr LOCK-TOUCH mode (s29 rendezvous discriminator)\n");
+        else if (lat_us == -3)
+            fprintf(stderr, "[fs-lat] ARMED: STDOUT LOCK-TOUCH mode (s30 rendezvous discriminator)\n");
     }
     if (lat_us == 0) return;
     if (lat_us == -1) {
@@ -72,6 +74,18 @@ static void yz_fs_lat_wait(void)
          * duration ~0, ordering edge identical to a print. */
         _lock_file(stderr);
         _unlock_file(stderr);
+        return;
+    }
+    if (lat_us == -3) {
+        /* Discriminator (s30 fresh-eyes): -1 tested the WRONG STREAM.
+         * YZ_FS_TRACE's per-read/Lseek prints go to STDOUT — the lock t1's
+         * frame-loop printf sites (cellGcm etc.) contend on — while the -1
+         * mode touched stderr, which t1's producer path doesn't take. Same
+         * zero-duration take+release, correct object this time. Reads
+         * scenario.bin => the stdout CRT-lock rendezvous IS the flip
+         * mechanism; stays unread => volume/flush-yield candidates next. */
+        _lock_file(stdout);
+        _unlock_file(stdout);
         return;
     }
     LARGE_INTEGER f, t0, t1;
@@ -270,6 +284,12 @@ typedef struct {
     char   path[CELL_FS_MAX_FS_PATH_LENGTH];
     FILE*  host_fp;
     s32    flags;
+    /* s30: once-per-open first-read stderr marker — the file-chain walk
+     * (scenario.bin -> player_pos.bin -> ... -> all_csb.par) must be readable
+     * WITHOUT YZ_FS_TRACE (whose stdout flood is the ledger-#67 treatment
+     * itself). stderr is measured NOT the flip mechanism (s29lock inert);
+     * volume ~1 line per open, LESSONS #6c bounded. */
+    int    read_seen;
 } FsFileSlot;
 
 typedef struct {
@@ -293,6 +313,7 @@ static CellFsFd alloc_fd(void)
     for (int i = 3; i < MAX_OPEN_FILES; i++) {  /* skip 0,1,2 = stdin/out/err */
         if (!s_files[i].in_use) {
             s_files[i].in_use = 1;
+            s_files[i].read_seen = 0;
             return i;
         }
     }
@@ -309,6 +330,42 @@ static CellFsDir alloc_dir(void)
         }
     }
     return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * s30 dark-trace (fresh-eyes discriminator, ledger #67): YZ_FS_TRACE=2 does
+ * the IDENTICAL trace work as mode 1 (same per-read ftell, same formatting)
+ * but writes to a private 4KB-buffered file instead of stdout. Splits the
+ * flip-flag into its atoms: dark mode flips the boot => the mechanism is the
+ * LOCAL WORK (ftell/duration/position) and stdout is exonerated; doesn't
+ * flip => the mechanism is the stdout OUTPUT path (lock/volume/flush —
+ * YZ_FS_LAT=-3 separates the lock edge next).
+ * -----------------------------------------------------------------------*/
+static int yz_fs_trace_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("YZ_FS_TRACE");
+        int m = e ? atoi(e) : 0;
+        if (e && m == 0) m = 1;   /* legacy: any non-numeric value = mode 1 */
+        if (m == 2)
+            fprintf(stderr, "[fs-trace] ARMED: DARK mode 2 (private-file trace, zero stdout)\n");
+        mode = m;
+    }
+    return mode;
+}
+
+static void yz_fs_dark_puts(const char* line)
+{
+    /* First FS calls happen on one thread long before the CRI fleet spawns,
+     * so the lazy-open race is theoretical; a double fopen would only leak a
+     * handle, never corrupt (diag-only code). */
+    static FILE* darkf = NULL;
+    if (!darkf) {
+        darkf = fopen("scratch/fs_darktrace.log", "w");
+        if (darkf) setvbuf(darkf, NULL, _IOFBF, 4096);
+    }
+    if (darkf) fputs(line, darkf);
 }
 
 /* Build fopen mode string from PS3 flags */
@@ -475,10 +532,10 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     /* YZ_FS_TRACE (2026-07-03 s8, diag — the pxd spurious-completion probe):
      * log EVERY read/lseek/fstat, not just stream containers; the boundary
      * streams read an archive fd whose path misses the is_stream filters. */
-    static int fs_trace = -1;
-    if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
-    int is_stream = fs_trace ||
-        (p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/")));
+    int fs_trace = yz_fs_trace_mode();
+    int path_stream =
+        (p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/"))) ? 1 : 0;
+    int is_stream = fs_trace || path_stream;
     long long off_before = -1;
     if (is_stream && s_files[fd].host_fp) off_before = (long long)
 #ifdef _MSC_VER
@@ -490,6 +547,23 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
     }
+    if (!s_files[fd].read_seen) {
+        /* s30 first-read marker (see FsFileSlot.read_seen) — stderr on
+         * purpose: stdout is the ledger-#67 treatment under test. tms =
+         * GetTickCount64 wall clock so stage cadence is measurable (the
+         * .err stream has no other timestamps). */
+        s_files[fd].read_seen = 1;
+#ifdef _WIN32
+        fprintf(stderr, "[cellFs] t%u FIRST-READ tms=%llu fd=%d '%s' nbytes=0x%llX -> 0x%llX\n",
+                yz_thread_current_id(), (unsigned long long)GetTickCount64(),
+                fd, p ? p : "?",
+                (unsigned long long)nbytes, (unsigned long long)bytes_read);
+#else
+        fprintf(stderr, "[cellFs] t%u FIRST-READ fd=%d '%s' nbytes=0x%llX -> 0x%llX\n",
+                yz_thread_current_id(), fd, p ? p : "?",
+                (unsigned long long)nbytes, (unsigned long long)bytes_read);
+#endif
+    }
     /* s29 position finding: the latency model must run POST-result ("the read
      * took longer"), not at entry ("the call started later") — a concurrent
      * observer only sees the former. Entry-side floors measured no-effect
@@ -498,6 +572,21 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     if (is_stream) {
         const unsigned char* b = (const unsigned char*)buf;
+        if (fs_trace == 2 && !path_stream) {
+            /* dark mode: same formatting work, private sink, zero stdout
+             * (path-stream files keep their always-on stdout print so the
+             * boot's stdout profile stays identical to an unflagged run) */
+            char tl[256];
+            snprintf(tl, sizeof(tl), "[cellFs] t%u Read(fd=%d '%s') off=0x%llX nbytes=0x%llX -> 0x%llX  hdr=%02X%02X%02X%02X %02X%02X%02X%02X (%c%c%c%c)\n",
+                   yz_thread_current_id(),
+                   fd, p, (unsigned long long)off_before, (unsigned long long)nbytes,
+                   (unsigned long long)bytes_read,
+                   bytes_read>0?b[0]:0, bytes_read>1?b[1]:0, bytes_read>2?b[2]:0, bytes_read>3?b[3]:0,
+                   bytes_read>4?b[4]:0, bytes_read>5?b[5]:0, bytes_read>6?b[6]:0, bytes_read>7?b[7]:0,
+                   (bytes_read>0&&b[0]>=32&&b[0]<127)?b[0]:'.', (bytes_read>1&&b[1]>=32&&b[1]<127)?b[1]:'.',
+                   (bytes_read>2&&b[2]>=32&&b[2]<127)?b[2]:'.', (bytes_read>3&&b[3]>=32&&b[3]<127)?b[3]:'.');
+            yz_fs_dark_puts(tl);
+        } else
         printf("[cellFs] t%u Read(fd=%d '%s') off=0x%llX nbytes=0x%llX -> 0x%llX  hdr=%02X%02X%02X%02X %02X%02X%02X%02X (%c%c%c%c)\n",
                yz_thread_current_id(),
                fd, p, (unsigned long long)off_before, (unsigned long long)nbytes,
@@ -828,9 +917,14 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
         fseeko(s_files[fd].host_fp, (off_t)offset, host_whence);
         s64 cur = (s64)ftello(s_files[fd].host_fp);
 #endif
-        { static int fs_trace = -1;
-          if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
-          if (fs_trace)
+        { int fs_trace = yz_fs_trace_mode();
+          if (fs_trace == 2) {
+              char tl[256];
+              snprintf(tl, sizeof(tl), "[cellFs] Lseek(fd=%d '%s') off=0x%llX whence=%d -> pos=0x%llX\n",
+                     fd, s_files[fd].path ? s_files[fd].path : "?",
+                     (unsigned long long)offset, whence, (unsigned long long)cur);
+              yz_fs_dark_puts(tl);
+          } else if (fs_trace)
               printf("[cellFs] Lseek(fd=%d '%s') off=0x%llX whence=%d -> pos=0x%llX\n",
                      fd, s_files[fd].path ? s_files[fd].path : "?",
                      (unsigned long long)offset, whence, (unsigned long long)cur); }
@@ -860,9 +954,14 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
         int file_no = _fileno(s_files[fd].host_fp);
         HOST_STAT_T hst;
         if (HOST_FSTAT(file_no, &hst) == 0) {
-            { static int fs_trace = -1;
-              if (fs_trace < 0) fs_trace = getenv("YZ_FS_TRACE") ? 1 : 0;
-              if (fs_trace)
+            { int fs_trace = yz_fs_trace_mode();
+              if (fs_trace == 2) {
+                  char tl[256];
+                  snprintf(tl, sizeof(tl), "[cellFs] Fstat(fd=%d '%s') -> st_size=0x%llX\n",
+                         fd, s_files[fd].path ? s_files[fd].path : "?",
+                         (unsigned long long)hst.st_size);
+                  yz_fs_dark_puts(tl);
+              } else if (fs_trace)
                   printf("[cellFs] Fstat(fd=%d '%s') -> st_size=0x%llX\n",
                          fd, s_files[fd].path ? s_files[fd].path : "?",
                          (unsigned long long)hst.st_size); }
