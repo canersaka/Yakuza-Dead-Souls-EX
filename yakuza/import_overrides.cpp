@@ -1611,6 +1611,18 @@ static int yz_fifo_recover_ret_enabled(void)
     return rr;
 }
 
+/* s33 [fifo-flow] (env YZ_FIFO_FLOWLOG): log every SUCCESSFUL flow-control
+ * transfer. The s33 audit's discriminator: JUMP/CALL were silent on success,
+ * so a stranded GET's arrival path (jump vs call vs walked) was never in the
+ * log — s32resur1's teleport from io 0x8007C to 0x200BF4 had zero trace. */
+static int yz_fifo_flowlog(void)
+{
+    static int fl = -1;
+    if (fl < 0) { fl = getenv("YZ_FIFO_FLOWLOG") ? 1 : 0;
+        if (fl) { fprintf(stderr, "[fifo-flow] ARMED (jump/call/return transition log)\n"); fflush(stderr); } }
+    return fl;
+}
+
 /* One recovery attempt for the RETURN-without-CALL / CALL-inside-subroutine
  * states. Rate-limited to ~1 attempt/50ms (our poll loop has no RPCS3-style
  * blocking 2ms sleep between retries, so this substitutes the existing
@@ -1660,6 +1672,21 @@ static int yz_rsx_fifo_step(void)
     EnterCriticalSection(&g_rsx_fifo_lock);
     uint32_t       get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
     const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
+
+    /* s33 [fifo-hb] (env YZ_FIFO_HB): uncapped 5 s GET/PUT heartbeat. Every
+     * deep-boot terminal FIFO state so far was invisible because the apply/
+     * park prints are count-capped (ledger #65 class); this always answers
+     * "where is the FIFO right now". Placed BEFORE the empty check so a
+     * drained ring (get==put, producer stopped) is a visible state too. */
+    { static int hb = -1; static ULONGLONG hb_t = 0;
+      if (hb < 0) { hb = getenv("YZ_FIFO_HB") ? 1 : 0;
+          if (hb) { fprintf(stderr, "[fifo-hb] ARMED (5s GET/PUT heartbeat)\n"); fflush(stderr); } }
+      if (hb) { const ULONGLONG now = GetTickCount64();
+          if (now - hb_t >= 5000) { hb_t = now;
+              const uint32_t hea = yz_rsx_io_to_ea(get);
+              fprintf(stderr, "[fifo-hb] get=0x%08X put=0x%08X word=0x%08X ret=0x%08X\n",
+                      get, put, hea ? vm_read32(hea) : 0xDEADDEADu, g_fifo_ret);
+              fflush(stderr); } } }
 
     /* FIFO_EMPTY: ring drained. Never reach/pass PUT. (RPCS3 read(): put==get) */
     if (get == put) { LeaveCriticalSection(&g_rsx_fifo_lock); return 0; }
@@ -1738,6 +1765,19 @@ static int yz_rsx_fifo_step(void)
                                  park_seq = g_yz_t1_sample_seq;
                                  park_tf  = (void*)g_yz_t1_last_tf; }
             const ULONGLONG parked_ms = GetTickCount64() - park_t0;
+            /* s33 0x4C24 discriminator (STATUS ⚡ #1, always-on, low-volume):
+             * at any >=5 s stopper park, LEVER ON OR OFF, say whether the
+             * game's tag-0x7F journal holds this stopper's release entry.
+             * PRESENT -> the consumer has a consume-gap (it applied dozens of
+             * others, s33retA/B); ABSENT -> the producer never journaled it
+             * (t1 wedged pre-append). Resamples every 10 s while parked. */
+            { static uint32_t sj_ea = 0; static ULONGLONG sj_t = 0;
+              if (parked_ms > 5000 && (sj_ea != ea || GetTickCount64() - sj_t > 10000)) {
+                  sj_ea = ea; sj_t = GetTickCount64();
+                  const uint32_t je = yz_gcm_stopper_release_entry(ea);
+                  fprintf(stderr, "[stop-jrnl] parked %llums @io 0x%06X ea=0x%08X journal-entry=%s (0x%08X)\n",
+                          (unsigned long long)parked_ms, get, ea, je ? "PRESENT" : "ABSENT", je);
+                  fflush(stderr); } }
             const int parked3s   = prel && (parked_ms > 3000);
             /* s25: fast tier now UNCONDITIONAL at fast_ms (witness dropped).
              * Measured chain: (a) rides s25ride4-6 ground at 3-5 s/flip
@@ -1850,6 +1890,10 @@ static int yz_rsx_fifo_step(void)
             LeaveCriticalSection(&g_rsx_fifo_lock);
             return 0;
         }
+        if (yz_fifo_flowlog()) {
+            fprintf(stderr, "[fifo-flow] JUMP io=0x%08X -> 0x%08X (word 0x%08X)\n", get, tgt, cmd);
+            fflush(stderr);
+        }
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 1;
@@ -1882,6 +1926,10 @@ static int yz_rsx_fifo_step(void)
             /* flag off: preserve the pre-existing default (clobber-and-proceed),
              * now with the loud log above instead of silence. */
         }
+        if (yz_fifo_flowlog()) {
+            fprintf(stderr, "[fifo-flow] CALL io=0x%08X -> 0x%08X (ret=0x%08X)\n", get, ctgt, get + 4u);
+            fflush(stderr);
+        }
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -1889,6 +1937,10 @@ static int yz_rsx_fifo_step(void)
     }
     if ((cmd & 0xFFFF0003u) == 0x00020000u) {                        /* return */
         if (g_fifo_ret != ~0u) {
+            if (yz_fifo_flowlog()) {
+                fprintf(stderr, "[fifo-flow] RET  io=0x%08X -> 0x%08X\n", get, g_fifo_ret);
+                fflush(stderr);
+            }
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
             g_fifo_ret = ~0u;
             LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -1914,40 +1966,50 @@ static int yz_rsx_fifo_step(void)
      * tests, a finalised method has those bits clear. If set, GET reached the
      * end of finalised commands in this segment -- wait, don't parse data. */
     if (cmd & 0xA0030003u) {
-        static int w = 0; if (w < 24) { w++;
+        /* s33 FIX (user-confirmed; scratch/s33_fifo_return_audit.md): the s28
+         * default here modeled RPCS3's recover_fifo as "skip GET forward one
+         * word" for illegal (cmd&3==3) headers. That MIS-MODELED the oracle —
+         * RSXThread re-reads the SAME GET (an illegal word is content the
+         * producer hasn't finalised yet; recover_fifo aborts in-flight state
+         * and RETRIES, it does not advance) — and the skip demonstrably
+         * STRANDED GET: s32resur1 walked 22 skips through the unwritten
+         * next-phase segment at io 0x8000xx then teleported via a garbage
+         * jump to io 0x200BF4 with zero further trace; s28m10's 650 s
+         * RETURN-without-CALL park was the same walk ending on a foreign
+         * RETURN. Default now = faithful re-read of the same GET forever,
+         * with an UNCAPPED time-sampled park print (the old print capped at
+         * 24 — terminal parks went invisible, ledger #65 class).
+         * YZ_FIFO_SKIP4=1 restores the legacy skip for A/B. */
+        static int skip4 = -1;
+        if (skip4 < 0) { skip4 = getenv("YZ_FIFO_SKIP4") ? 1 : 0;
+            fprintf(stderr, "[fifo-rec] ARMED (%s)\n",
+                    skip4 ? "LEGACY skip-4 recovery, YZ_FIFO_SKIP4"
+                          : "s33 faithful re-read; illegal words wait for the producer");
+            fflush(stderr); }
+        static uint32_t stuck_get = 0xFFFFFFFFu;
+        static ULONGLONG stuck_t0 = 0, said_t = 0;
+        static unsigned long nnc = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (get != stuck_get) {
+            stuck_get = get; stuck_t0 = now; said_t = now; nnc++;
             fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
-                    "finalised; waiting for producer\n", cmd, get, put); }
-        /* s28 wall-2 W2-1 (scratch/s28_wall2_re.md): RPCS3 treats a header
-         * that fails jump/call/return/method classification as FIFO_ERROR and
-         * RECOVERS (recover_fifo(): abort the in-flight state, ~2 ms pause,
-         * retry; only escalates after 20 recoveries in ~2 s —
-         * rsx/RSXFIFO.cpp:402-417, RSXThread.cpp:2792-2833). Ours spun forever
-         * (s26m1/s27m2: 30+ min on the same illegal word 0x0005DF5F at io
-         * 0x602E8). Model the recovery: for a word that is ILLEGAL (not just
-         * unfinalised: low bits 11 can never become a valid header by more
-         * producer writes), skip the GET forward one word after a bounded
-         * wait, RPCS3-style, and count recoveries loudly. Kill-switch
-         * YZ_NO_FIFO_RECOVER keeps the faithful-wait for A/B. */
-        { static int nfr = -1;
-          if (nfr < 0) { nfr = getenv("YZ_NO_FIFO_RECOVER") ? 1 : 0;
-              if (!nfr) { fprintf(stderr, "[fifo-rec] ARMED (RPCS3 recover_fifo analog)\n"); fflush(stderr); } }
-          int illegal = ((cmd & 3u) == 3u);   /* never a legal PS3 FIFO encoding */
-          if (!nfr && illegal) {
-              static uint32_t last_get = 0xFFFFFFFFu; static int strikes = 0;
-              static ULONGLONG first_ms = 0;
-              if (get != last_get) { last_get = get; strikes = 0; first_ms = GetTickCount64(); }
-              strikes++;
-              if (strikes >= 3) {              /* ~3 poll cycles stuck on one illegal word */
-                  static unsigned long recn = 0; recn++;
-                  fprintf(stderr, "[fifo-rec] n=%lu ILLEGAL header 0x%08X at io=0x%X -- "
-                          "recovering (skip 4; RPCS3 recover_fifo analog)\n", recn, cmd, get);
-                  fflush(stderr);
-                  vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
-                  strikes = 0;
-                  LeaveCriticalSection(&g_rsx_fifo_lock);
-                  return 1;
-              }
-          } }
+                    "finalised; waiting for producer (n=%lu)\n", cmd, get, put, nnc);
+            fflush(stderr);
+        } else if (now - said_t >= 2000) {
+            said_t = now;
+            fprintf(stderr, "[rsx] still parked on non-command 0x%08X at io=0x%X (%llus; PUT=0x%X)\n",
+                    cmd, get, (unsigned long long)((now - stuck_t0) / 1000u), put);
+            fflush(stderr);
+        }
+        if (skip4 && (cmd & 3u) == 3u && now - stuck_t0 >= 30) {
+            static unsigned long recn = 0; recn++;
+            fprintf(stderr, "[fifo-rec] n=%lu ILLEGAL header 0x%08X at io=0x%X -- LEGACY skip 4\n",
+                    recn, cmd, get);
+            fflush(stderr);
+            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 1;
+        }
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 0;
     }

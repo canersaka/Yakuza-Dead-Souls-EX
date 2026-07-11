@@ -699,10 +699,22 @@ the list in early-stalled boots (ledger #63; downstream of the #64 lever misfire
 half-staged work-record absorber (bounded wait-and-recopy on guard-armed/value-empty
 fetches). Absorber measured inert when unneeded.
 
-`YZ_NO_FIFO_RECOVER` (yakuza/import_overrides.cpp, s28, kill-switch, default OFF):
-disables the RPCS3 recover_fifo analog (skip-forward past an ILLEGAL FIFO header word —
-low bits 11 — after 3 stuck polls). Unexercised so far; its target word class measured in
-s26m1/s27m2.
+`YZ_NO_FIFO_RECOVER` — RETIRED s33 (2026-07-11). The s28 "recover_fifo analog" it gated
+mis-modeled the oracle (RPCS3 re-reads the SAME GET on an illegal word; it never advances)
+and measurably stranded GET (s32resur1: 22 skips through the unwritten io-0x8000xx segment
+then a garbage-jump teleport; s28m10's 650 s RETURN park). The faithful re-read is now the
+DEFAULT; see YZ_FIFO_SKIP4.
+
+`YZ_FIFO_SKIP4` (yakuza/import_overrides.cpp, s33, A/B archaeology, default OFF): restores
+the retired s28 skip-4 illegal-word recovery. Only for reproducing the stranded-GET class.
+
+`YZ_FIFO_HB` (yakuza/import_overrides.cpp, s33, diag, default OFF): uncapped 5 s FIFO
+heartbeat — GET, PUT, the word at GET, the CALL-return slot. Answers "where is the FIFO"
+at any boot depth (every prior terminal park was invisible behind count-capped prints).
+
+`YZ_FIFO_FLOWLOG` (yakuza/import_overrides.cpp, s33, diag, default OFF): log every
+successful JUMP/CALL/RETURN flow transfer (get -> target). The s33 audit's discriminator
+for how GET arrived anywhere; success paths were previously silent.
 
 `YZ_T1_HB` (yakuza/import_overrides.cpp vblank tick, s28, diag, default OFF): 2 s t1
 host-liveness heartbeat — host CPU-time deltas + sampled RIP (brief suspend) + the
