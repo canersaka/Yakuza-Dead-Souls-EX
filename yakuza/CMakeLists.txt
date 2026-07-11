@@ -45,10 +45,19 @@ set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)
 target_include_directories(ppu_recomp_objs PRIVATE
     "${PS3RECOMP_DIR}/recomp"
     "${PS3RECOMP_DIR}/recomp_prx")
+option(YZ_RECOMP_OPT
+    "Optimize the lifted recomp chunks (/O1). Costly compile; default OFF keeps the fast-iteration /Od build. s31: /Od measured as a prime suspect in the guest-code slowness that loses the boot-preload race (STATUS ⚡2)."
+    OFF)
 if(MSVC)
-    # /Od: machine-generated code; optimizing it costs minutes and gigabytes
-    # per chunk for little runtime benefit at this stage.
-    target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
+    if(YZ_RECOMP_OPT)
+        # /O1 not /O2: MSVC on 400k-line machine-generated TUs — favor-size
+        # optimizes far cheaper than /O2 and captures most of the win vs /Od
+        # (inlining the vm helpers is the bulk of it).
+        target_compile_options(ppu_recomp_objs PRIVATE /O1 /bigobj /W0)
+    else()
+        # /Od: fast iteration; optimizing costs minutes and gigabytes per chunk.
+        target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
+    endif()
 endif()
 
 # Lifted SPU images (Sony's SPURS kernel + system-service workload, extracted
