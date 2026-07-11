@@ -1199,6 +1199,50 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 fflush(stderr);
             }
         }
+        /* ---- s31 §13 GUARD (ledger #74; scratch/s31_t1_crash.md): COMPLETE the
+         * null-page atomic instead of letting the unguarded 128-byte copies AV
+         * the whole process. The 2026-07-03 diag above chose "print then
+         * proceed -- don't mask the symptom"; that was right for the diagnosis
+         * era, and it is now measured to be THE recurring fatal "t1 crash"
+         * (s31roll3/cure3: 0xC0000005 reading guest 0x00000000 in
+         * spu_channels.c-obj statics, misattributed to tid=1 by the TLS
+         * fallback -- SPU threads never set s_cur_tid -- with tramp_idx=0 as
+         * the documented tell, main.cpp:758; the [crash-t1] dump is the HEALTHY
+         * main thread). On the console EA 0 is mapped kernel memory: an SPU
+         * lock-line atomic there completes without halting the machine; the
+         * fatal host AV is purely our uncommitted-page artifact. Model the
+         * conservative completion: GETLLAR reads zeros (no reservation kept),
+         * PUTLLC fails (no valid reservation -- the faithful result), PUTLLUC/
+         * PUTQLLUC are dropped. The [dma-null] print above still fires first
+         * (the attribution signal is preserved; the null-EA PRODUCER -- the
+         * yield-resume register-loss class the July-03 note names -- remains a
+         * tracked bug, ledger #74). Kill-switch: YZ_NO_DMAGUARD=1 restores the
+         * fatal proceed. */
+        if ((uint32_t)(ea & ~127ull) < 0x10000u) {
+            static int ng = -1;
+            if (ng < 0) ng = getenv("YZ_NO_DMAGUARD") ? 1 : 0;
+            if (!ng) {
+                static unsigned long gn = 0; gn++;
+                if (gn <= 16 || (gn & 63u) == 0) {
+                    fprintf(stderr, "[dma-guard] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
+                            "ea=0x%08llX -> completed benignly (GETLLAR=zeros, PUTLLC=fail)\n",
+                            gn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                            cmd, (unsigned long long)ea);
+                    fflush(stderr);
+                }
+                if (cmd == MFC_GETLLAR_CMD) {
+                    memset(&spu->ls[lsa & SPU_LS_MASK & ~127u], 0, 128);
+                    mfc->resv_active = 0;
+                    mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+                } else if (cmd == MFC_PUTLLC_CMD) {
+                    mfc->atomic_stat = MFC_PUTLLC_FAILURE;
+                } else {
+                    mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;   /* dropped write */
+                }
+                mfc->tag_completed |= (1u << tag);
+                return 0;
+            }
+        }
         /* jobchain header-CAS watch (2026-07-03 s7, parked-SYNC frontier;
          * YZ_OVL, REMOVE with the frontier): every PUTLLC commit on the
          * CellSpursJobChain line 0x4019C880 -- pc + the +0x20..0x2F bytes
