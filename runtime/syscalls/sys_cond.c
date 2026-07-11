@@ -223,10 +223,14 @@ int64_t sys_cond_wait(ppu_context* ctx)
              * read it event-driven at the trace points instead. wC0 = the
              * loop-exit flag arg+0x50. */
             if (cond_id == 4)
-                fprintf(stderr, "[cond] t%u WAIT-enter cond=4 mutex=%u owner=t%u cnt=%d w474=%08X wC0=%08X\n",
+                /* s30 rider extension (s30_staging_decision.md §4.1): seq =
+                 * 0x16614B8, cmd OPD = 0x16614B0 (names the staged command
+                 * class per pulse; 0x1356188 = the read handler). */
+                fprintf(stderr, "[cond] t%u WAIT-enter cond=4 mutex=%u owner=t%u cnt=%d w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
                         yz_thread_current_id(), mutex_id,
                         (uint32_t)m->owner_tid, m->lock_count,
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
+                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
             else
                 fprintf(stderr, "[cond] t%u WAIT-enter cond=%u mutex=%u owner=t%u cnt=%d\n",
                         yz_thread_current_id(), cond_id, mutex_id,
@@ -316,9 +320,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
         static long n2 = 0;
         if (n2 < 4000) { n2++;
             if (cond_id == 4)
-                fprintf(stderr, "[cond] t%u WAIT-exit cond=4 %s w474=%08X wC0=%08X\n",
+                fprintf(stderr, "[cond] t%u WAIT-exit cond=4 %s w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
                         yz_thread_current_id(), !ok ? "TIMEOUT" : "ok",
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
+                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
             else
                 fprintf(stderr, "[cond] t%u WAIT-exit cond=%u %s\n",
                         yz_thread_current_id(), cond_id,
@@ -403,9 +408,10 @@ int64_t sys_cond_signal(ppu_context* ctx)
              * which t1 function stages cri_dlg work — it stops at ~t=106 s
              * while t1 itself keeps iterating, scratch/s29sig.err). */
             if (cond_id == 4)
-                fprintf(stderr, "[cond] t%u SIGNAL cond=4 committed=%d pending=%d w474=%08X wC0=%08X\n",
+                fprintf(stderr, "[cond] t%u SIGNAL cond=4 committed=%d pending=%d w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
                         yz_thread_current_id(), c->committed, c->pending,
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u));
+                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
+                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
             else
                 fprintf(stderr, "[cond] t%u SIGNAL cond=%u committed=%d pending=%d lr=0x%08llX\n",
                         yz_thread_current_id(), cond_id, c->committed, c->pending,

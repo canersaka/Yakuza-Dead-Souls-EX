@@ -2444,6 +2444,60 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, yz_ts_watch, NULL, 0, NULL);
     if (getenv("YZ_PEEK"))
         CreateThread(NULL, 0, yz_peek_thread, NULL, 0, NULL);
+    /* s30 staging-decision peek (env YZ_STAGE_DECIDE, spec
+     * scratch/s30_staging_decision.md §4 tier 1): every 5 s walk the CRI
+     * preload pipeline's state from static roots, reads only, all pointers
+     * null-guarded, NO page watches (0x1661xxx is the CRI cs hot page,
+     * LESSONS #6c). Discriminates the variant-A/B/C failure stories at the
+     * chain death (pre-committed table in the report). */
+    if (getenv("YZ_STAGE_DECIDE"))
+        CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+            fprintf(stderr, "[stagedec] ARMED (YZ_STAGE_DECIDE): 5s CRI pipeline peek\n");
+            fflush(stderr);
+            /* v2 (s30_staging_decision.md §6): walk the CRI FS DRIVER POOL —
+             * 40 slots of 0x4D0 bytes at base+0x868, live when vm[D]==1.
+             * The per-live-slot phase/status dump at the death IS the
+             * decision-input capture (pre-committed verdicts in §6). */
+            for (long tick = 0;; tick++) {
+                Sleep(5000);
+                uint32_t base = vm_read32(0x135CDFCu);
+                int nlive = 0;
+                char slots[8][224]; /* capture up to 8 live-slot lines */
+                if (base) {
+                    for (uint32_t k = 0; k < 40; k++) {
+                        uint32_t D = base + 0x868u + k * 0x4D0u;
+                        if (vm_read32(D) != 1) continue;
+                        if (nlive < 8) {
+                            char name[25];
+                            for (int w = 0; w < 6; w++) {
+                                uint32_t v = vm_read32(D + 0x10u + (uint32_t)w * 4u);
+                                name[w*4+0] = (char)(v >> 24); name[w*4+1] = (char)(v >> 16);
+                                name[w*4+2] = (char)(v >> 8);  name[w*4+3] = (char)v;
+                            }
+                            name[24] = 0;
+                            for (int j = 0; j < 24; j++)
+                                if (name[j] && (name[j] < 32 || name[j] > 126)) name[j] = '.';
+                            snprintf(slots[nlive], sizeof slots[0],
+                                "[stagedec]   slot%u D=%08X open=%u status=%u mode=%08X tot=%08X cons=%08X take=%08X seq=%08X phase=%u name='%s'\n",
+                                k, D, vm_read32(D + 4u), vm_read32(D + 8u),
+                                vm_read32(D + 0x414u), vm_read32(D + 0x428u),
+                                vm_read32(D + 0x42Cu), vm_read32(D + 0x430u),
+                                vm_read32(D + 0x444u), vm_read32(D + 0x448u), name);
+                        }
+                        nlive++;
+                    }
+                }
+                fprintf(stderr, "[stagedec] tick=%ld nLive=%d w474=%08X stagedSeq=%08X exit=%08X base=%08X pathOps=%08X P2=%08X\n",
+                        tick, nlive,
+                        vm_read32(0x1661474u), vm_read32(0x16614B8u), vm_read32(0x16614C0u),
+                        base,
+                        base ? vm_read32(base + 0x40Cu) : 0xDEAD,
+                        base ? vm_read32(base + 0xC8ECu) : 0xDEAD);
+                for (int i = 0; i < nlive && i < 8; i++) fputs(slots[i], stderr);
+                fflush(stderr);
+            }
+            return 0;
+        }, NULL, 0, NULL);
 
     g_yz_cur_ctx = &ctx;
     g_yz_main_ctx = &ctx;
