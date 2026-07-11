@@ -93,6 +93,7 @@ extern unsigned int sys_event_find_queue_by_key(unsigned long long key);
 #else
   #include <pthread.h>
   #include <unistd.h>
+  #include <time.h>
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -527,27 +528,116 @@ static void audio_notify_event_queues(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest block-progression pacing (conformance fix, 2026-07-11)
+ *
+ * The console's audio server runs a fixed hardware heartbeat: one block is
+ * exactly 256 samples / 5.3 ms (5 1/3 ms), and BOTH the ring-buffer
+ * read-index advance and the per-block notify event fire on that fixed
+ * cadence, independent of how the host sink is draining (oracle: RPCS3
+ * cellAudio.cpp advances its ring on the emulated clock, never on backend
+ * occupancy). Before this fix the loop below paced itself with
+ * Sleep(2)/Sleep(5) gated on host WASAPI buffer occupancy, so guest-visible
+ * progress rode the backend's drain rate instead of the fixed heartbeat.
+ *
+ * Kill switch: YZ_AUDIO_LEGACY_PACE reverts to that occupancy-paced
+ * Sleep(2)/Sleep(5) branch (prints a banner once, legacy path only).
+ *
+ * Pacing math: the block period (16000/3 us) is not an integer, so rather
+ * than accumulate a per-iteration sleep duration (which would accumulate
+ * rounding error), every wait target is an ABSOLUTE deadline computed fresh
+ * from a thread-start anchor and the monotonic block sequence number via
+ * 64-bit integer division: deadline = anchor + n * period. Truncation of
+ * that division alternates by at most one low-order tick and cancels out
+ * exactly every 3 blocks (== 16 ms, an exact integer), so there is no
+ * running remainder to leak drift into over an arbitrarily long session. */
+static int audio_legacy_pace(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("YZ_AUDIO_LEGACY_PACE") ? 1 : 0;
+        if (cached)
+            printf("[cellAudio] YZ_AUDIO_LEGACY_PACE: reverting to WASAPI-occupancy "
+                   "pacing (non-conformant; guest block progress rides the host "
+                   "backend's drain rate instead of the fixed 5.3ms heartbeat)\n");
+    }
+    return cached;
+}
+
 #ifdef _WIN32
+
+static HANDLE          s_pace_timer;
+static ULARGE_INTEGER  s_pace_anchor;      /* FILETIME 100ns units, thread-start */
+static u64             s_pace_block_seq;
+
+static void audio_pace_reset(void)
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    s_pace_anchor.LowPart  = ft.dwLowDateTime;
+    s_pace_anchor.HighPart = ft.dwHighDateTime;
+    s_pace_block_seq = 1;   /* block 0 already ran (right at the anchor) */
+    if (!s_pace_timer)
+        s_pace_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+}
+
+/* Block until the next fixed-cadence deadline, then advance the sequence. */
+static void audio_pace_wait_block(void)
+{
+    /* period, in 100ns units: 160000/3 (== 5.3333... ms). Integer division
+     * against the running sequence number, not an accumulator. */
+    ULONGLONG target = s_pace_anchor.QuadPart + (s_pace_block_seq * 160000ULL) / 3ULL;
+    s_pace_block_seq++;
+
+    if (s_pace_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = (LONGLONG)target;   /* positive => absolute FILETIME */
+        if (SetWaitableTimer(s_pace_timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(s_pace_timer, INFINITE);
+            return;
+        }
+    }
+
+    /* Fallback if timer creation/arming failed: poll the same absolute
+     * clock. Still zero-drift (deadline is unaffected), just coarser wake
+     * granularity. */
+    for (;;) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER now;
+        now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
+        if (now.QuadPart >= target) break;
+        Sleep(1);
+    }
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    int legacy = audio_legacy_pace();
+    if (!legacy) audio_pace_reset();
+
     while (s_mix_thread_running) {
-        /* Mix and submit one block */
+        /* Mix and submit one block. audio_backend_submit() still clips to
+         * whatever the host WASAPI ring can currently accept (occupancy
+         * governs the HOST sink only, not guest block progression below). */
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 
         /* Notify event queues */
         audio_notify_event_queues();
 
-        /* Wait approximately one audio period (~5.333ms).
-         * Adjust based on how much is queued to avoid buffer overrun. */
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            Sleep(5);
+        if (legacy) {
+            u32 queued = audio_backend_queued_samples();
+            if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+                Sleep(5);
+            } else {
+                Sleep(2);
+            }
         } else {
-            Sleep(2);
+            audio_pace_wait_block();
         }
     }
 
@@ -555,21 +645,69 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+
+static struct timespec s_pace_anchor_ts;
+static u64             s_pace_block_seq;
+
+static void audio_pace_reset(void)
+{
+    clock_gettime(CLOCK_MONOTONIC, &s_pace_anchor_ts);
+    s_pace_block_seq = 1;   /* block 0 already ran (right at the anchor) */
+}
+
+static void audio_pace_wait_block(void)
+{
+    /* period, in ns: 16000000/3 (== 5.3333... ms). Integer division against
+     * the running sequence number, not an accumulator. */
+    u64 offset_ns = (s_pace_block_seq * 16000000ULL) / 3ULL;
+    s_pace_block_seq++;
+
+    struct timespec target = s_pace_anchor_ts;
+    target.tv_sec  += (time_t)(offset_ns / 1000000000ULL);
+    target.tv_nsec += (long)(offset_ns % 1000000000ULL);
+    if (target.tv_nsec >= 1000000000L) {
+        target.tv_nsec -= 1000000000L;
+        target.tv_sec  += 1;
+    }
+
+#if defined(__linux__)
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
+#else
+    /* Portable fallback: poll the same monotonic clock. Still zero-drift
+     * (the deadline itself doesn't move), just coarser wake granularity. */
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > target.tv_sec ||
+            (now.tv_sec == target.tv_sec && now.tv_nsec >= target.tv_nsec))
+            break;
+        usleep(200);
+    }
+#endif
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+
+    int legacy = audio_legacy_pace();
+    if (!legacy) audio_pace_reset();
 
     while (s_mix_thread_running) {
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
+        if (legacy) {
+            u32 queued = audio_backend_queued_samples();
+            if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+                usleep(5000);
+            } else {
+                usleep(2000);
+            }
         } else {
-            usleep(2000);
+            audio_pace_wait_block();
         }
     }
 
@@ -606,6 +744,10 @@ static void audio_stop_mix_thread(void)
         WaitForSingleObject(s_mix_thread, 2000);
         CloseHandle(s_mix_thread);
         s_mix_thread = NULL;
+    }
+    if (s_pace_timer) {
+        CloseHandle(s_pace_timer);
+        s_pace_timer = NULL;
     }
 #else
     pthread_join(s_mix_thread, NULL);

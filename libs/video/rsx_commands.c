@@ -15,6 +15,8 @@
  */
 
 #include "rsx_commands.h"
+#include "cellGcmSys.h"       /* CELL_GCM_MAX_REPORT_COUNT/REPORT_DATA_SIZE, cellGcmReportTimestampNs() */
+#include "ps3emu/endian.h"    /* ps3_bswap32/64 for guest-endian (BE) report writes */
 #include <stdio.h>
 #include <string.h>
 
@@ -74,6 +76,11 @@ void rsx_state_init(rsx_state* state)
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
     state->alpha_ref = 0;
+
+    /* RPCS3's register file resets this to LOCAL before any FIFO command runs
+     * (rsx_methods.cpp:173,811) — match so NV4097_GET_REPORT resolves even if
+     * a game never issues NV4097_SET_CONTEXT_DMA_REPORT. */
+    state->context_dma_report = RSX_DMA_REPORT_DEFAULT;
 
     /* Mark everything dirty */
     state->surface_dirty = 1;
@@ -248,6 +255,84 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
     }
 
     return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Report / ZCULL method processing
+ *
+ * NV4097_GET_REPORT/NV4097_CLEAR_REPORT_VALUE are the only methods in this
+ * file that write guest memory directly (everything else here only tracks
+ * state or calls back into the backend) -- real hardware uses them so the
+ * GPU can publish a timestamp/occlusion-query result somewhere the CPU polls
+ * without a round trip through the command stream. Guest-endian (BE) writes
+ * follow the same ps3_bswap32 pattern already used for guest-visible BE
+ * fields elsewhere in libs/video (cellVideoOut.c:105,148-149,177).
+ * -----------------------------------------------------------------------*/
+
+/* Resolve (context_dma_report, 24-bit offset) to a guest EA. See the
+ * RSX_DMA_REPORT_... / RSX_DMA_MEMORY_... comments in rsx_commands.h for the
+ * oracle citations behind each class id. */
+static u32 rsx_report_address(u32 dma, u32 offset)
+{
+    switch (dma) {
+    case RSX_DMA_REPORT_LOCATION_LOCAL:
+    case RSX_DMA_MEMORY_FRAME_BUFFER:
+        if (offset >= RSX_REPORT_AREA_SIZE)
+            return 0;
+        return RSX_REPORT_LOCAL_BASE + offset;
+    case RSX_DMA_REPORT_LOCATION_MAIN:
+    case RSX_DMA_MEMORY_HOST_BUFFER:
+        /* This generic FIFO processor has no io-map table (that lives in
+         * yakuza/import_overrides.cpp, out of scope for this module), so a
+         * MAIN-classified io offset CANNOT be resolved here. These are
+         * guest-memory WRITES: treating the raw 24-bit offset as an EA (the
+         * read-side simplification the vertex uploader uses) would corrupt
+         * low guest memory, where the game image lives. Drop the write and
+         * say so loudly instead -- the log line is the signal to route MAIN
+         * reports through the io-mapped consumer if a title ever uses them. */
+        { static int warned = 0;
+          if (!warned) { warned = 1;
+              fprintf(stderr, "[rsx] GET_REPORT with MAIN report DMA (0x%08X) "
+                      "unresolvable in rsx_commands (no io map) -- report "
+                      "writes DROPPED\n", dma);
+              fflush(stderr); } }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* Write a big-endian u32/u64 into guest memory at `addr` if it looks sane.
+ * Mirrors the vm_base + bounds-check + manual-BE-store pattern already used
+ * by rsx_d3d12_backend.c (upload_vertices_from_rsx) -- the only existing
+ * guest-memory access pattern in this directory's Track B code. */
+static int rsx_report_write32(u32 addr, u32 value)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || addr == 0)
+        return 0;
+    u32 be = ps3_bswap32(value);
+    memcpy(vm_base + addr, &be, 4);
+    return 1;
+}
+
+static int rsx_report_write64(u32 addr, u64 value)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || addr == 0)
+        return 0;
+    u64 be = ps3_bswap64(value);
+    memcpy(vm_base + addr, &be, 8);
+    return 1;
+}
+
+static int rsx_report_is_zcull_type(u32 type)
+{
+    return type == RSX_REPORT_TYPE_ZPASS_PIXEL_CNT ||
+           type == RSX_REPORT_TYPE_ZCULL_STATS ||
+           type == RSX_REPORT_TYPE_ZCULL_STATS1 ||
+           type == RSX_REPORT_TYPE_ZCULL_STATS2 ||
+           type == RSX_REPORT_TYPE_ZCULL_STATS3;
 }
 
 /* ---------------------------------------------------------------------------
@@ -557,6 +642,68 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        return 0;
+    }
+
+    /* Report / ZCULL context selection */
+    if (method == NV4097_SET_CONTEXT_DMA_REPORT) {
+        state->context_dma_report = data;
+        return 0;
+    }
+
+    /* NV4097_GET_REPORT: arg = type<<24 | 24-bit offset (nv4097.cpp:579-580).
+     * Writes CellGcmReportData{u64 timer; u32 value; u32 pad} (16 bytes,
+     * libs/video/cellGcmSys.h) at the location selected by the last
+     * NV4097_SET_CONTEXT_DMA_REPORT. */
+    if (method == NV4097_GET_REPORT) {
+        u32 type = data >> 24;
+        u32 offset = data & 0xFFFFFFu;
+        u32 addr = rsx_report_address(state->context_dma_report, offset);
+
+        /* addr==0 means unresolved (bad dma class / out-of-range offset /
+         * no vm_base yet) -- guard here rather than per-write, since
+         * addr+8/addr+12 would otherwise look like valid nonzero addresses
+         * to the individual write helpers and corrupt low guest memory. */
+        if (addr) {
+            if (rsx_report_is_zcull_type(type)) {
+                /* We don't implement real hardware ZCULL occlusion counting.
+                 * Write a faithfully-shaped zero record -- this matches
+                 * RPCS3's OWN fallback for this exact case (RSXThread.cpp:
+                 * 2595-2619, the g_cfg.video.disable_zcull_queries path):
+                 * timer + value=0 + pad=0, all 16 bytes. */
+                rsx_report_write64(addr, cellGcmReportTimestampNs());
+                rsx_report_write32(addr + 8, 0);   /* value: not tracked, see above */
+                rsx_report_write32(addr + 12, 0);  /* pad */
+            } else {
+                /* Ordinary timestamp report. RPCS3's own default branch
+                 * (nv4097.cpp:598-606) only stores timer+padding and leaves
+                 * the `value` field alone -- reproduce that exactly rather
+                 * than zeroing a field real hardware doesn't touch here. */
+                rsx_report_write64(addr, cellGcmReportTimestampNs());
+                rsx_report_write32(addr + 12, 0);  /* pad; bytes 8..11 (value) untouched */
+            }
+        } else {
+#ifndef NDEBUG
+            static int s_bad_report = 0;
+            if (s_bad_report < 20) {
+                s_bad_report++;
+                printf("[RSX] NV4097_GET_REPORT: could not resolve dma=0x%08X off=0x%X\n",
+                       state->context_dma_report, offset);
+            }
+#endif
+        }
+        return 0;
+    }
+
+    /* NV4097_CLEAR_REPORT_VALUE: on real hardware/RPCS3 this resets the
+     * ZCULL statistics accumulator (nv4097.cpp:610-623, RSXThread.cpp:2590-
+     * 2593 zcull_ctrl->clear). We don't track a real ZCULL accumulator (see
+     * NV4097_GET_REPORT above -- its ZCULL branch always returns a shaped
+     * zero record rather than an accumulated count), so there is no state
+     * to reset yet. No-op until real ZCULL tracking exists; kept as its own
+     * case (rather than falling to "unrecognized") so it isn't miscounted
+     * as a coverage gap. */
+    if (method == NV4097_CLEAR_REPORT_VALUE) {
         return 0;
     }
 

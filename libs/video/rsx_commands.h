@@ -68,6 +68,54 @@ extern "C" {
 #define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x000001D8
 #define NV4097_CLEAR_SURFACE                   0x00001D94
 
+/* Reports / ZCULL — writes land in guest memory (unlike most of this file's
+ * other state-tracking methods), at the location selected by
+ * NV4097_SET_CONTEXT_DMA_REPORT. Method addresses + DMA context ids per
+ * RPCS3 (semantics-only oracle): Emu/RSX/gcm_enums.h:549 (0x1a8), :664
+ * (0x17c8), :666 (0x1800); Emu/RSX/NV47/HW/nv4097.cpp:577-623
+ * (get_report/clear_report_value); record layout = CellGcmReportData
+ * (libs/video/cellGcmSys.h). */
+#define NV4097_SET_CONTEXT_DMA_REPORT           0x000001A8
+#define NV4097_CLEAR_REPORT_VALUE               0x000017C8
+#define NV4097_GET_REPORT                       0x00001800
+
+/* context_dma_report values this register can carry (gcm_enums.h:496-499,
+ * 518-519, 1828-1843). LOCAL/FRAME_BUFFER classes select the local report
+ * area; MAIN/HOST_BUFFER classes select io-mapped main memory. */
+#define RSX_DMA_REPORT_LOCATION_LOCAL           0x66626660u
+#define RSX_DMA_REPORT_LOCATION_MAIN            0xBAD68000u
+#define RSX_DMA_MEMORY_FRAME_BUFFER             0xFEED0000u /* local, generic alias */
+#define RSX_DMA_MEMORY_HOST_BUFFER              0xFEED0001u /* main, generic alias */
+/* RPCS3's register file resets NV4097_SET_CONTEXT_DMA_REPORT to LOCAL before
+ * any FIFO command runs (rsx_methods.cpp:173,811) — match that default so
+ * NV4097_GET_REPORT works even if a game never issues an explicit
+ * NV4097_SET_CONTEXT_DMA_REPORT. */
+#define RSX_DMA_REPORT_DEFAULT                  RSX_DMA_REPORT_LOCATION_LOCAL
+
+/* Guest-memory window this module writes local-area reports into. This
+ * generic FIFO-method processor has no io-map table of its own (that lives
+ * in yakuza/import_overrides.cpp, out of scope here), so it owns a small,
+ * independent guest window sized to match the real report region
+ * (CellGcmReportData is 16 bytes * 256 slots = 0x1000, per
+ * libs/video/cellGcmSys.h's
+ * CELL_GCM_MAX_REPORT_COUNT/CELL_GCM_REPORT_DATA_SIZE). Pinned to the same
+ * numeric base the live Yakuza consumer already uses for this exact region
+ * (yakuza/import_overrides.cpp: RSX_CTX_BASE 0x10000000 + 0x200000 ==
+ * RSX_REPORTS) so a report written here lands where the rest of that
+ * consumer's label/semaphore code already expects report data to live. */
+#define RSX_REPORT_LOCAL_BASE                   0x10200000u
+#define RSX_REPORT_AREA_SIZE                    0x1000u
+
+/* NV4097_GET_REPORT's arg packs a report "type" into the top byte and a
+ * 24-bit offset in the rest (nv4097.cpp:579-580). type values matching
+ * gcm_enums.h:483-487 select a ZCULL/occlusion statistic instead of an
+ * ordinary GPU timestamp. */
+#define RSX_REPORT_TYPE_ZPASS_PIXEL_CNT          1
+#define RSX_REPORT_TYPE_ZCULL_STATS              2
+#define RSX_REPORT_TYPE_ZCULL_STATS1             3
+#define RSX_REPORT_TYPE_ZCULL_STATS2             4
+#define RSX_REPORT_TYPE_ZCULL_STATS3             5
+
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
@@ -193,6 +241,10 @@ typedef struct rsx_state {
     /* Clear */
     u32 color_clear_value;
     u32 zstencil_clear_value;
+
+    /* Report / ZCULL context — selects where NV4097_GET_REPORT writes
+     * (NV4097_SET_CONTEXT_DMA_REPORT). See RSX_DMA_REPORT_* above. */
+    u32 context_dma_report;
 
     /* Blend */
     int blend_enable;

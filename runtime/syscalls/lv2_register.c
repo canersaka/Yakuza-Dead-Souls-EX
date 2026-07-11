@@ -116,6 +116,20 @@ static int64_t sys_tty_read(ppu_context* ctx)
 #define SPU_GROUP_CAUSE_ALL_THREADS_EXIT  0x0002u
 #define SPU_GROUP_CAUSE_TERMINATED        0x0004u
 
+/* s33 conformance fix: sys_spu_thread_group_connect_event(id, eq, et) event
+ * source types and their event keys, per RPCS3 sys_spu.h:35-44
+ * (numeric et values + key constants, semantics only -- oracle, not copied).
+ * RUN, EXCEPTION and SYSTEM_MODULE are three INDEPENDENT event sources with
+ * independent connect/EBUSY slots; our handler used to collapse all of them
+ * into one slot and always tag the pushed event RUN_KEY. */
+#define SYS_SPU_THREAD_GROUP_EVENT_RUN            1u
+#define SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION      2u
+#define SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE  4u
+
+#define SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY           0xFFFFFFFF53505500ull
+#define SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION_KEY     0xFFFFFFFF53505503ull
+#define SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE_KEY 0xFFFFFFFF53505504ull
+
 #define MAX_SPU_GROUPS   32
 #define MAX_SPU_THREADS  (MAX_SPU_GROUPS * 8)
 
@@ -188,11 +202,27 @@ typedef struct {
     char     name[32];
     int32_t  exit_status;        /* final ppu-side status the group reports */
     uint32_t cause;              /* how the group ended */
-    /* Event queue connected via sys_spu_thread_group_connect_event[_all_threads].
-     * When the group transitions to STOPPED (in group_join), an event is pushed
-     * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
-     * PPU code blocked on sys_event_queue_receive wakes up. */
-    uint32_t event_queue_id;
+    /* Event queues connected via sys_spu_thread_group_connect_event(id, eq, et).
+     * s33 conformance fix: et selects one of three INDEPENDENT event sources
+     * (RPCS3 sys_spu.h:35-44 + sys_spu.cpp connect_event) -- each gets its
+     * own connect/EBUSY slot:
+     *   event_queue_run       (et=SYS_SPU_THREAD_GROUP_EVENT_RUN)
+     *     fired once from group_join when the group reaches STOPPED;
+     *     source=RUN_KEY, data1=group id, data2/data3=N/A.
+     *   event_queue_exception (et=SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION)
+     *     fired per faulting SPU thread from spu_exec_thread_proc's fault
+     *     path; source=EXCEPTION_KEY, data1=group_id<<32|thread_id,
+     *     data2=NPC<<32|cause (cause zeroed -- no oracle-verified numeric
+     *     encoding available, see spu_exec_thread_proc).
+     *   event_queue_sysmodule (et=SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE)
+     *     slot tracked for connect/EBUSY bookkeeping only; nothing in this
+     *     runtime posts to it (no system-module cooperation path).
+     * YZ_SPU_ET_LEGACY=1 reverts to the pre-s33 behavior: every connect
+     * (regardless of et) collapses into event_queue_run, and group_join is
+     * the only source that ever fires. */
+    uint32_t event_queue_run;
+    uint32_t event_queue_exception;
+    uint32_t event_queue_sysmodule;
     /* SPU->PPU user-event ports: connect_event_all_threads(req, *spup) assigns a
      * free port from `req`, binds the queue to it, and returns the port in *spup.
      * spup_queue[port] = the connected event-queue id (0 = unconnected). The SPU's
@@ -228,6 +258,42 @@ uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
     spu_group_t* g = spu_find_group(group_id);
     if (!g || spup >= 64) return 0;
     return g->spup_queue[spup];
+}
+
+/* Kill-switch for the s33 per-source event-type fix: reverts
+ * sys_spu_thread_group_connect_event to the pre-fix single-slot behavior
+ * (every et collapses into event_queue_run). getenv is cached (checked
+ * once) per LESSONS-consistent static-cache convention elsewhere in this
+ * file; banner only fires when legacy mode is actually active. */
+static int spu_et_legacy(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("YZ_SPU_ET_LEGACY");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (cached) {
+            fprintf(stderr, "[SPU] YZ_SPU_ET_LEGACY=1: group_connect_event collapses "
+                    "RUN/EXCEPTION/SYSTEM_MODULE into one slot (pre-s33 behavior)\n");
+            fflush(stderr);
+        }
+    }
+    return cached;
+}
+
+/* Resolve the per-group connection slot for a given et. Returns NULL for an
+ * invalid et (caller returns EINVAL). Under YZ_SPU_ET_LEGACY, every et
+ * (valid or not) resolves to event_queue_run, matching the pre-s33 single
+ * collapsed slot. */
+static uint32_t* spu_group_event_slot(spu_group_t* g, uint32_t et)
+{
+    if (spu_et_legacy())
+        return &g->event_queue_run;
+    switch (et) {
+        case SYS_SPU_THREAD_GROUP_EVENT_RUN:           return &g->event_queue_run;
+        case SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION:     return &g->event_queue_exception;
+        case SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE: return &g->event_queue_sysmodule;
+        default: return NULL;
+    }
 }
 
 static spu_group_t* spu_alloc_group(void)
@@ -517,7 +583,65 @@ static void* spu_exec_thread_proc(void* arg)
         sctx->ch_out_mbox.count = 0;
         t->exit_status = 0;
     } else {
-        t->exit_status = 0;   /* no exit-protocol stop: unchanged from prior behavior */
+        /* Anything that stops the thread outside the documented THREAD_EXIT/
+         * GROUP_EXIT protocol -- STOPPED_BY_HALT (spu_channels.c's fault
+         * unwind for a bad dispatch/unknown branch) or STOPPED_BY_STOP with
+         * any other stop code -- is the SPU-exception class
+         * (SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION). s33 conformance fix: post
+         * that event to the group's EXCEPTION slot if one is connected,
+         * instead of silently swallowing the fault. Contract:
+         * source=EXCEPTION_KEY, data1=group_id<<32|thread_id,
+         * data2=NPC<<32|cause, data3=option. We have sctx->pc for NPC
+         * (best-effort: the value at halt time, not a captured SPU SRR0);
+         * we do NOT have an oracle-verified numeric encoding for `cause`
+         * (not defined in RPCS3's in-repo sys_spu.h) or `option`, so those
+         * are zeroed rather than guessed. This is a minimal
+         * one-post-per-fault observability hookup, not a full
+         * exception-cause classifier. */
+        t->exit_status = 0;
+        if (!spu_et_legacy()) {
+            spu_group_t* grp = spu_find_group(t->group_id);
+            if (grp && grp->event_queue_exception) {
+                /* Host-side observability: ALWAYS say the fault happened
+                 * (lowercase tag on purpose -- golden_boot.ps1's exceptions
+                 * counter greps for "EXCEPTION", which must keep meaning
+                 * host/guest crashes, not this probe). */
+                /* Wording note: golden_boot.ps1 counts real crashes by a
+                 * case-INSENSITIVE grep for "EXCEPTION" -- this probe line
+                 * must not contain that word in any case. */
+                fprintf(stderr, "[spu-exc] tid=0x%X group=0x%X fault, exc-evt queue "
+                        "connected (status=0x%X code=0x%X pc=0x%05X)\n",
+                        t->tid, t->group_id, sctx->status, sctx->stop_code, sctx->pc);
+                fflush(stderr);
+                /* GUEST-VISIBLE delivery is opt-in (YZ_SPU_EXC_EVT=1) for
+                 * now: every SPU fault we currently see is an EMULATION
+                 * artifact that the task resume machinery heals -- on real
+                 * hardware these never happen, so the game's handler never
+                 * runs during boot. First live delivery (golden, 2026-07-11)
+                 * proved the plumbing works: Sony's default SPURS handler
+                 * received the event and printed its diagnostic dump. But
+                 * feeding the game our internal recoverable hiccups is
+                 * unfaithful noise and risks the handler fighting the
+                 * resurrection path. Flip the default once SPU faults are
+                 * real guest faults (i.e. the death classes are extinct). */
+                static int exc_evt = -1;
+                if (exc_evt < 0) {
+                    exc_evt = getenv("YZ_SPU_EXC_EVT") ? 1 : 0;
+                    if (exc_evt) {
+                        fprintf(stderr, "[spu-exc] ARMED (YZ_SPU_EXC_EVT): guest-visible "
+                                "exc-event delivery ON\n");
+                        fflush(stderr);
+                    }
+                }
+                if (exc_evt) {
+                    uint64_t data1 = ((uint64_t)t->group_id << 32) | (uint64_t)t->tid;
+                    uint64_t data2 = (uint64_t)sctx->pc << 32; /* cause: unmapped, zeroed */
+                    sys_event_queue_push_by_id(grp->event_queue_exception,
+                                               SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION_KEY,
+                                               data1, data2, 0 /* option: unmapped */);
+                }
+            }
+        }
     }
 #ifdef _WIN32
     t->running = 0;
@@ -772,34 +896,39 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
-    /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
-     * event with type-specific data; we collapse to a "group stopped" tag
-     * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
-     * blocked in sys_event_queue_receive on this queue wakes up here.
+    /* Notify the RUN-slot event queue only. Real PS3 sends the SPU Thread
+     * Group Run Event (SYS_SPU_THREAD_GROUP_EVENT_RUN) here, per Lv2
+     * Reference p.148: source=RUN_KEY, data1=SPU thread group ID,
+     * data2=N/A, data3=N/A. PPU code blocked in sys_event_queue_receive on
+     * event_queue_run wakes up here.
      *
-     * Audit sec.5 item 5 (2026-07-03, user-confirmed): the event `source`
-     * must be the real SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY, not the raw
-     * group_id -- RPCS3 sys_spu.h:42/311 + sys_spu.cpp:1266
-     * (group->send_run_event() on group start/stop) sends via `ep_run`
-     * with source = SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY
-     * (0xFFFFFFFF53505500, sys_spu.h:42). Receivers that switch on source
-     * (rather than trusting whichever queue fired) got the bare group_id,
-     * which collides with the guest's own generic tag namespace. SPURS
-     * uses the (correct) user-key path instead of this group-event path,
-     * so the practical impact is low -- flagged low priority in the audit. */
-    if (g->event_queue_id) {
-        sys_event_queue_push_by_id(g->event_queue_id,
-                                   0xFFFFFFFF53505500ull, /* SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY */
-                                   (uint64_t)(int64_t)g->exit_status,
-                                   (uint64_t)g->cause,
-                                   0);
+     * s33 conformance fix: this used to push to whatever single queue_id
+     * was connected regardless of the et the game asked for, and packed
+     * (exit_status, cause) into data1/data2 -- neither matches the spec's
+     * (group id, N/A, N/A) shape, and a queue connected for et=EXCEPTION
+     * (observed live: SPURS kernel group 0x1000 requests et=2) got this
+     * RUN-tagged event instead of nothing. Now only event_queue_run is
+     * notified, with the spec's data1=group id.
+     *
+     * Audit sec.5 item 5 (2026-07-03, user-confirmed) established the
+     * RUN_KEY source value itself -- RPCS3 sys_spu.h:42/311 +
+     * sys_spu.cpp:1266 (group->send_run_event()) sends via `ep_run` with
+     * source=RUN_KEY (0xFFFFFFFF53505500, sys_spu.h:42). SPURS uses the
+     * separate user-key event path instead of this group-event path, so
+     * this event's consumers (if any) are non-SPURS PPU-side wrappers. */
+    if (g->event_queue_run) {
+        sys_event_queue_push_by_id(g->event_queue_run,
+                                   SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY,
+                                   (uint64_t)id,  /* data1 = group id (RPCS3 send_run_event) */
+                                   0,             /* data2 = N/A */
+                                   0);            /* data3 = N/A */
     }
 
     vm_write_be32(cause_ea,  g->cause);
     vm_write_be32(status_ea, (uint32_t)g->exit_status);
 
-    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
-            id, g->cause, g->exit_status, g->event_queue_id);
+    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue_run=0x%X)\n",
+            id, g->cause, g->exit_status, g->event_queue_run);
     fflush(stderr);
     g->joiner = 0;
     ctx->gpr[3] = 0;
@@ -900,25 +1029,44 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 }
 
 /* sys_spu_thread_group_connect_event(group_id, queue_id, event_type)
- * sys_spu_thread_group_connect_event_all_threads(group_id, queue_id, name, port)
  *
- * Both bind a SYS_EVENT queue to the group; we record queue_id so
- * group_join can push a completion event. Sony's docs distinguish event
- * types (group state changes vs SPU-emitted user events) but we collapse
- * them into "the queue gets notified when the group transitions to
- * STOPPED" — sufficient for the common SPURS pattern. */
+ * s33 conformance fix (oracle: RPCS3 sys_spu.cpp connect_event): et selects
+ * one of three INDEPENDENT event sources (RUN / EXCEPTION / SYSTEM_MODULE),
+ * each with its own connection slot. Previously this handler never read
+ * gpr[5] (et) at all and stored a single collapsed queue id, so an
+ * EXCEPTION-only connect (observed live: SPURS kernel group 0x1000 requests
+ * et=2 during boot) shared the same slot as a RUN connect and got RUN-tagged
+ * "group stopped" events instead of exception data. Contract: EINVAL for an
+ * invalid et, EBUSY if that specific source is already connected.
+ * YZ_SPU_ET_LEGACY=1 restores the old single-slot behavior. */
 static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
     uint32_t queue_id = (uint32_t)ctx->gpr[4];
+    uint32_t et       = (uint32_t)ctx->gpr[5];
     spu_group_t* g = spu_find_group(group_id);
     if (!g) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
         return -1;
     }
-    g->event_queue_id = queue_id;
-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
-            group_id, queue_id);
+    uint32_t* slot = spu_group_event_slot(g, et);
+    if (!slot) {
+        fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u INVALID\n",
+                group_id, queue_id, et);
+        fflush(stderr);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL;
+        return -1;
+    }
+    if (*slot) {
+        fprintf(stderr, "[SPU] group_connect_event group=0x%X et=%u EBUSY "
+                "(queue=0x%X already connected)\n", group_id, et, *slot);
+        fflush(stderr);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+        return -1;
+    }
+    *slot = queue_id;
+    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u\n",
+            group_id, queue_id, et);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -957,12 +1105,22 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     return 0;
 }
 
+/* sys_spu_thread_group_disconnect_event(id, et) -- takes et as its second
+ * argument (same source-type enum as connect_event; oracle: RPCS3
+ * sys_spu.cpp disconnect_event); s33 conformance fix: read gpr[4]=et and
+ * clear only that source's slot instead of the single collapsed queue id.
+ * Under YZ_SPU_ET_LEGACY, et is ignored and the one legacy slot is cleared,
+ * matching the old behavior. */
 static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
+    uint32_t et       = (uint32_t)ctx->gpr[4];
     spu_group_t* g = spu_find_group(group_id);
-    if (g) g->event_queue_id = 0;
-    fprintf(stderr, "[SPU] group_disconnect_event group=0x%X\n", group_id);
+    if (g) {
+        uint32_t* slot = spu_group_event_slot(g, et);
+        if (slot) *slot = 0;
+    }
+    fprintf(stderr, "[SPU] group_disconnect_event group=0x%X et=%u\n", group_id, et);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;

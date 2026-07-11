@@ -43,6 +43,23 @@ static void mtx_table_unlock(void)
 #endif
 }
 
+/* s33 conformance kill switch: YZ_MUTEX_LEGACY reverts BOTH the
+ * trylock EDEADLK self-relock check and the destroy EBUSY owner-held check
+ * to the pre-s33 (non-conformant) behavior. Checked once, static-cached. */
+static int mutex_legacy_mode(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("YZ_MUTEX_LEGACY") ? 1 : 0;
+        if (cached) {
+            fprintf(stderr, "[mtx] YZ_MUTEX_LEGACY set: trylock EDEADLK and "
+                            "destroy EBUSY guards DISABLED (pre-s33 behavior)\n");
+            fflush(stderr);
+        }
+    }
+    return cached;
+}
+
 static int mtx_find_free(void)
 {
     for (int i = 0; i < SYS_MUTEX_MAX; i++) {
@@ -159,6 +176,17 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* s33: refuse to destroy a mutex a PPU thread still owns, mirroring the
+     * lwmutex owner_tid guard in sysPrxForUser.c. Deleting a held
+     * CRITICAL_SECTION out from under a live owner is UB (the same
+     * forever-block class the lwmutex guard was added to avoid), and the
+     * guest sees CELL_OK instead of the EBUSY it may depend on to keep
+     * tearing-down-a-live-heap sequences safe. */
+    if (!mutex_legacy_mode() && m->owner_tid != 0) {
+        mtx_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
     if (m->wait_handle) CloseHandle(m->wait_handle);
@@ -260,6 +288,16 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     uint64_t caller_tid = ctx->thread_id;
+
+    /* s33: a NOT_RECURSIVE mutex already owned by the calling thread must
+     * fail with EDEADLK, mirroring the check in sys_mutex_lock above.
+     * Without this, TryEnterCriticalSection below re-enters successfully on
+     * Windows for the owning thread, returning CELL_OK and bumping
+     * lock_count with no corresponding extra guest unlock -- unbalancing the
+     * Enter/Leave pairing and leaking a lock level. */
+    if (!mutex_legacy_mode() && !m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+        return (int64_t)(int32_t)CELL_EDEADLK;
+    }
 
     /* Recursive re-entry. MUST still acquire the host primitive: unlock
      * calls LeaveCriticalSection unconditionally per guest unlock, so every
