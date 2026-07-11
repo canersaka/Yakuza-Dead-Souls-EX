@@ -32,6 +32,7 @@ thread_local ppu_context* g_yz_cur_ctx = nullptr;
 /* Game module TOC (set from the entry OPD); used by the dispatcher's TOC repair
  * (dispatch.cpp yz_tramp_guard). */
 extern "C" uint32_t g_yz_game_toc;
+extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 
 /* ---------------------------------------------------------------------------
  * Minimal big-endian ELF64 loader (PT_LOAD only)
@@ -852,6 +853,85 @@ void yz_chain_census_dump(const char* tag)
  * order). */
 int g_yz_updloop_started = 0;
 
+/* s30 §8.4 (scratch/s30_staging_decision.md): the boot-phase HOLD shim,
+ * injected at func_001AB63C entry (the mode-machine's boot-flag clearer:
+ * for mode ids [306..322] it ANDs vm[0x136786C] with ~0x400, ending the
+ * GameMain boot pump that drives the CRI file preload — MEASURED to fire
+ * mid-preload on our port, stranding the chain; on real HW the preload
+ * always wins this race). When YZ_HOLD_BOOT_PHASE is set and the transition
+ * would strand in-flight preload work, return-early defers the clear.
+ * ALWAYS logs each call (mode id + preload state) — the OFF-mode log IS the
+ * §8.4 discriminator (call cadence: single-shot vs retried decides whether
+ * this hold design can work at all). Faithfulness: the game's own transition
+ * manager (func_00507EB4) gates transitions on object-granular "loaded"
+ * state; the hold only forbids an ordering real HW never exhibits. Capped:
+ * after 1200 held calls it lets the clear through (a stuck preload must not
+ * wedge the boot). Default OFF. */
+extern "C" int yz_hold_boot(void* ctxv)
+{
+    /* v2 (§9.3): the primary injection site is func_001AAB20 — the
+     * SINGLE-CALLER setter of the exit-request flag vm[0x1367874] that ends
+     * GameMain's boot pump (D0140 then returns 0x80004005 and the preload
+     * strands). The 1AB63C injection stays as insurance (measured 0 calls).
+     * Predicate: the preload is ACTIVE = any live driver-pool slot with an
+     * async op in flight (status==2) or open/close pending (phase!=0), a
+     * staged command pending (w474), OR the staging seq advanced within the
+     * last 120 s (the measured inter-file gap runs ~60 s at fast=100 — a
+     * short window would release the hold between files; deliberately
+     * immune to the CVM archive handle's permanent idle state). On real HW
+     * the intro timeline always outlasts the seconds-long preload — the
+     * hold forbids only an ordering hardware never exhibits. */
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("YZ_HOLD_BOOT") ? 1 : 0;
+        fprintf(stderr, "[holdboot] ARMED (%s): 1AAB20+1AB63C shims live, hold %s\n",
+                on ? "YZ_HOLD_BOOT" : "log-only", on ? "ENABLED" : "disabled");
+        fflush(stderr);
+    }
+    (void)ctxv;
+    static uint32_t last_seq = 0xFFFFFFFFu;
+    static unsigned long long last_seq_ms = 0;
+    const unsigned long long now = GetTickCount64();
+    const uint32_t seq = vm_read32(0x16614B8u);
+    if (seq != last_seq) { last_seq = seq; last_seq_ms = now; }
+    int active = 0;
+    uint32_t base = vm_read32(0x135CDFCu);
+    if (base) {
+        for (uint32_t k = 0; k < 40 && !active; k++) {
+            uint32_t D = base + 0x868u + k * 0x4D0u;
+            if (vm_read32(D) != 1) continue;
+            if (vm_read32(D + 8u) == 2u || vm_read32(D + 0x448u) != 0u) active = 1;
+        }
+    }
+    if (vm_read32(0x1661474u)) active = 1;
+    if (last_seq_ms && (now - last_seq_ms) < 120000ull) active = 1;
+    static long calls = 0, holds = 0;
+    long c = ++calls;
+    if (c <= 40 || (c & 0xFF) == 0) {
+        fprintf(stderr, "[holdboot] call#%ld active=%d seq=%08X seq_age=%llums held=%ld\n",
+                c, active, seq, last_seq_ms ? (now - last_seq_ms) : 0, holds);
+        fflush(stderr);
+    }
+    if (!on) return 0;
+    /* cap: 20000 held calls (~1/frame; covers a full slow preload) then let
+     * the exit through so a genuinely stuck preload can't wedge the boot */
+    if (active && holds < 20000) {
+        holds++;
+        if ((holds % 100) == 1) {
+            fprintf(stderr, "[holdboot] HOLDING boot-exit (hold #%ld, seq=%08X)\n", holds, seq);
+            fflush(stderr);
+        }
+        return 1;
+    }
+    if (on && holds >= 20000) {
+        static int capped = 0;
+        if (!capped) { capped = 1;
+            fprintf(stderr, "[holdboot] CAP REACHED (20000) - letting the boot-exit through\n");
+            fflush(stderr); }
+    }
+    return 0;
+}
+
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
 {
     if (addr == 0x00D1E838u) g_yz_updloop_started = 1;
@@ -1412,6 +1492,10 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
      * measures; the read-only guest-state dump below is the only default. */
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-30s"); }
+    /* s31 W2LIFE (ledger #71): one early (usually pre-CRI-transition) sample of
+     * the SPURS wid accounting + per-SPU liveness, then one per watchdog minute
+     * below -- the healthy-vs-dead comparison for the wid2 journal consumer. */
+    yz_w2life_dump("watchdog-30s");
     if (getenv("YZ_L1SNAP")) { yz_sample_t1_spin("watchdog-30s");
                                yz_dump_layer1_snapshot("watchdog-30s"); }
     Sleep(15000);
@@ -1430,6 +1514,7 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
         snprintf(tag, sizeof tag, "watchdog-%dm", mins);
         if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, tag);
         yz_chain_census_dump(tag);
+        yz_w2life_dump(tag);   /* s31 W2LIFE */
     }
     return 0;
 }
@@ -2487,12 +2572,20 @@ int main(int argc, char** argv)
                         nlive++;
                     }
                 }
-                fprintf(stderr, "[stagedec] tick=%ld nLive=%d w474=%08X stagedSeq=%08X exit=%08X base=%08X pathOps=%08X P2=%08X\n",
+                /* s31: bootflag/exitreq = the two boot-pump exit cells
+                 * (vm[0x136786C] bit 0x400 = pump-run flag; vm[0x1367874] =
+                 * exit request read by D0140 via 1AB304). BOTH decoded doors
+                 * measured 0 calls while the pump exits (s31power1) — these
+                 * plain reads catch WHICH cell actually changes at the exit
+                 * (the page is too write-hot for a page-guard watch,
+                 * s31door1). */
+                fprintf(stderr, "[stagedec] tick=%ld nLive=%d w474=%08X stagedSeq=%08X exit=%08X base=%08X pathOps=%08X P2=%08X bootflag=%08X exitreq=%08X\n",
                         tick, nlive,
                         vm_read32(0x1661474u), vm_read32(0x16614B8u), vm_read32(0x16614C0u),
                         base,
                         base ? vm_read32(base + 0x40Cu) : 0xDEAD,
-                        base ? vm_read32(base + 0xC8ECu) : 0xDEAD);
+                        base ? vm_read32(base + 0xC8ECu) : 0xDEAD,
+                        vm_read32(0x136786Cu), vm_read32(0x1367874u));
                 for (int i = 0; i < nlive && i < 8; i++) fputs(slots[i], stderr);
                 fflush(stderr);
             }

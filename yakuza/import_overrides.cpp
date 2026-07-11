@@ -28,6 +28,7 @@
 #include <windows.h>
 
 extern "C" uint8_t* vm_base;
+extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 
 /* lv2 sys_event handlers (runtime/syscalls/sys_event.c) -- driven directly from
  * sys_rsx_context_allocate to set up libgcm's RSX event port/queue. */
@@ -1787,6 +1788,19 @@ static int yz_rsx_fifo_step(void)
                  * -- zero those tags (the game's GPU-progress ledger; see
                  * yz_jrnl_retire_through). */
                 yz_jrnl_retire_through(rel_entry);
+                /* s31 [park-line] (s31_journal_linefill.md §7): the applied
+                 * entry's 128-byte line, slot tags only — discriminates "pure
+                 * consumer-dispatch death" (line complete, nobody consumed)
+                 * from "completion circle also binds" (line's later slots
+                 * still unwritten at apply time). First 8 applies only. */
+                { static int pl = 0;
+                  if (pl < 8) { pl++;
+                    const uint32_t line = rel_entry & ~0x7Fu;
+                    fprintf(stderr, "[park-line] entry=0x%08X line=0x%08X tags: %08X %08X %08X %08X\n",
+                            rel_entry, line,
+                            vm_read32(line), vm_read32(line + 0x20u),
+                            vm_read32(line + 0x40u), vm_read32(line + 0x60u));
+                  } }
                 /* s29 (ledger #65): the n<64 cap made a 900 s boot read as "64
                  * applies total" — a false lever exoneration. Keep the first 64
                  * verbose, then a census line every 256th so the steady-state
@@ -1804,7 +1818,12 @@ static int yz_rsx_fifo_step(void)
                             n, get,
                             parkedfast && !parked3s ? " FAST" : parked3s ? " 3s" : "",
                             (unsigned long long)parked_ms);
-                  } }
+                  }
+                  /* s31 W2LIFE (ledger #71): the SPURS wid accounting in the
+                   * lever-substitution regime -- every lever apply means the SPU
+                   * journal consumer did NOT release this stopper. Sampled so a
+                   * long boot can't exhaust the dump's 64-print cap. */
+                  if (n == 1 || (n & 63u) == 0u) yz_w2life_dump("lever"); }
                 LeaveCriticalSection(&g_rsx_fifo_lock);
                 return 1;
             }
