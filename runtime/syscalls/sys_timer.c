@@ -485,11 +485,17 @@ static void timer_send_event(sys_timer_info* t)
     if (!q->active)
         return;
 
+    /* s33 conformance fix: data2 was hardcoded 0 (dropping the connect-time
+     * arg) and data3 was hardcoded 0 where the contract delivers the system
+     * time at expiry (RPCS3 sys_timer.cpp:90 emits current time as data3).
+     * timer_now_usec() is the same wall-clock-anchored microsecond clock
+     * sys_time_get_current_time uses (RPCS3 sys_time.cpp:30-52 anchor pair),
+     * i.e. system_time_t at the moment of firing. */
     sys_event_t evt;
     evt.source = t->source;
     evt.data1  = t->data1;
-    evt.data2  = 0;
-    evt.data3  = 0;
+    evt.data2  = t->data2;
+    evt.data3  = timer_now_usec();
 
     /* Push event (ignore if queue full) */
 #ifdef _WIN32
@@ -611,8 +617,17 @@ int64_t sys_timer_destroy(ppu_context* ctx)
  *
  * r3 = timer_id
  * r4 = queue_id
- * r5 = source
+ * r5 = name (source in the delivered event; SYS_TIMER_EVENT_NO_NAME
+ *      substitutes PID<<32|timer_id)
  * r6 = data1
+ * r7 = data2
+ *
+ * s33 conformance fix (fs-async/timers-clock sweep): the 5th argument (data2,
+ * r7) was never read or stored, and the delivered event always hardcoded
+ * data2=0; the connect-time data2 is delivered verbatim in every fired event
+ * (RPCS3 sys_timer.cpp:363 connect + :90 send). NO_NAME source substitution
+ * remains a separate, not-yet-fixed gap (t->source is still stored/emitted
+ * raw); out of scope for this fix.
  * -----------------------------------------------------------------------*/
 int64_t sys_timer_connect_event_queue(ppu_context* ctx)
 {
@@ -620,6 +635,7 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     uint32_t queue_id = LV2_ARG_U32(ctx, 1);
     uint64_t source   = LV2_ARG_U64(ctx, 2);
     uint64_t data1    = LV2_ARG_U64(ctx, 3);
+    uint64_t data2    = LV2_ARG_U64(ctx, 4);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -634,6 +650,7 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     t->event_queue_id = (int32_t)queue_id;
     t->source         = source;
     t->data1          = data1;
+    t->data2          = data2;
 
     return CELL_OK;
 }

@@ -717,6 +717,17 @@ u64 cellGcmGetTimeStamp(u32 index)
     return s_report_data[index].timestamp;
 }
 
+/* Shared monotonic timebase (ns), exposed so other RSX modules stamp reports
+ * with the exact same clock cellGcmGetTimeStamp/cellGcmGetLastFlipTime use,
+ * instead of inventing a second epoch. Consumer: the NV4097_GET_REPORT FIFO
+ * method handler in rsx_commands.c (rsx_process_method), which writes report
+ * timers directly into guest memory rather than through this file's host-side
+ * s_report_data pool. */
+u64 cellGcmReportTimestampNs(void)
+{
+    return get_timestamp_ns();
+}
+
 /* ---------------------------------------------------------------------------
  * Tile / Zcull configuration
  * -----------------------------------------------------------------------*/
