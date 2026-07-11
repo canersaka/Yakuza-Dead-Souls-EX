@@ -1373,6 +1373,12 @@ void rsx_live_draw_set_movie_mode(int on) { g_ld_movie_mode = on ? 1 : 0; }
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
 
+static u32 g_ld_last_frame_draws = 0;
+/* Draws in the last COMPLETED frame (title-bar telemetry: distinguishes
+ * "presenting fresh content" from "flipping a static image" -- the dead
+ * journal-consumer limp state renders ~0 draws/frame while flips tick). */
+u32 rsx_live_draw_get_last_draws(void) { return g_ld_last_frame_draws; }
+
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
  * swap-chain backbuffer (both R8G8B8A8_UNORM at the swap size) and Present.
  * The frame is clamped to the backbuffer size. Call from a single thread with
@@ -1515,6 +1521,9 @@ void rsx_live_draw_present(u32 buffer_id)
     ld_flush();
     g.swap->lpVtbl->Present(g.swap, 1, 0);
 
+    { static u32 draws_at_last_frame = 0;
+      g_ld_last_frame_draws = g_ld_draws - draws_at_last_frame;
+      draws_at_last_frame = g_ld_draws; }
     g_ld_frames++;
     /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
      * making the TRUE frame count measurable from the log. (The old hard cap
