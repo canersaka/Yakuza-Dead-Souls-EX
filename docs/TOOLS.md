@@ -420,7 +420,7 @@ python tools/find_functions.py path/to/EBOOT.ELF --output functions.json
 
 ### Features
 
-- **2000+ NID-to-name mappings** from RPCS3 and Sony SDK
+- **2000+ NID-to-name mappings** from RPCS3 and public NID databases
 - **Forward lookup**: name → NID (SHA-1 computation)
 - **Reverse lookup**: NID → name (database search)
 - **Module classification**: which module owns each NID

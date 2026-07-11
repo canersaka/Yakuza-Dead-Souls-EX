@@ -312,7 +312,7 @@ Modules start unloaded. The `cellSysmodule` HLE module manages loading/unloading
 
 The Python NID database tool provides:
 
-1. **2000+ precomputed NID-to-name mappings** derived from RPCS3's function tables and Sony SDK headers
+1. **2000+ precomputed NID-to-name mappings** derived from RPCS3's function tables and public NID databases
 2. **NID computation** for new function names
 3. **Reverse lookup** from NID to function name
 4. **Module classification** — which NIDs belong to which modules
@@ -340,7 +340,7 @@ python tools/nid_database.py --module cellFs
 The NID database is compiled from:
 
 1. **RPCS3 source code** — the most comprehensive source, with module-by-module NID tables
-2. **Sony SDK headers** — official function declarations with NID annotations
+2. **Public NID databases** — community-maintained NID-to-name tables
 3. **Community research** — reverse-engineered NIDs from homebrew and analysis tools
 4. **ps3recomp discoveries** — NIDs found during game analysis
 
