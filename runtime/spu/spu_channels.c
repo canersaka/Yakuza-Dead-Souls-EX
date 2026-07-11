@@ -161,6 +161,70 @@ void yz_defer_probe(unsigned s24, unsigned cend, unsigned s, unsigned p, int imm
     }
 }
 
+/* ---- s31 W2LIFE probe (ledger #70/#71): SPURS wid accounting + per-SPU liveness.
+ * The journal-consumer death (scratch/s31_consumer_death.md) leaves wid2 (the
+ * gs_task taskset hosting the gcm journal consumer) permanently undispatched
+ * after its first contended workload switch at the CRI bring-up. This dump
+ * captures, from PPU-visible main memory, everything the kernel's SelectWorkload
+ * eligibility test reads (RPCS3 cellSpursSpu.cpp:283-346 semantics; CellSpurs
+ * field offsets from cellSpurs.h:667-740): readyCount1/current/pending/max
+ * contention, wklState1, wklSignal1, sysSrvMsgUpdateWorkload, wid2's per-SPU
+ * priorities -- plus the gs_task taskset bitsets and a per-SPU host-liveness
+ * census (hops/lastpc/lastimg, maintained in spu_indirect_branch). Env
+ * YZ_W2LIFE, armed banner, hard 64-dump cap. Callers: the coret poll-yield
+ * site, the exit-unwind site (below), the park-rel lever apply
+ * (import_overrides.cpp), the stall watchdog (main.cpp). */
+volatile unsigned long long g_yz_spu_hops[8];
+volatile unsigned int       g_yz_spu_lastpc[8];
+volatile int                g_yz_spu_lastimg[8];
+
+void yz_w2life_dump(const char* tag)
+{
+    static int w2 = -1;
+    if (w2 < 0) { w2 = getenv("YZ_W2LIFE") ? 1 : 0;
+        if (w2) { fprintf(stderr, "[w2life] ARMED (SPURS wid accounting + per-SPU liveness)\n");
+                  fflush(stderr); } }
+    if (!w2) return;
+    static int wn = 0;
+    if (wn >= 64) return;
+    wn++;
+    {
+        extern uint8_t* vm_base;
+        const uint8_t* S = vm_base + 0x40197C80u;  /* CellSpurs (measured constant:
+                                                    * wklSignal1@+0x70 = 0x40197CF0) */
+        const uint8_t* T = vm_base + 0x42100080u;  /* gs_task taskset (bitsets +0x00..+0x50) */
+        const uint8_t* P = S + 0xB00u + 2u * 0x20u + 0x18u;  /* wklInfo1[2].priority[8] */
+        fprintf(stderr,
+            "[w2life:%s] rdy=%02X%02X%02X%02X%02X cur=%02X%02X%02X%02X%02X "
+            "pnd=%02X%02X%02X%02X%02X max=%02X%02X%02X%02X%02X st=%02X%02X%02X%02X%02X "
+            "sig1=%02X%02X srvmsg=%02X pri2=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+            tag,
+            S[0x00],S[0x01],S[0x02],S[0x03],S[0x04],
+            S[0x20],S[0x21],S[0x22],S[0x23],S[0x24],
+            S[0x30],S[0x31],S[0x32],S[0x33],S[0x34],
+            S[0x50],S[0x51],S[0x52],S[0x53],S[0x54],
+            S[0x80],S[0x81],S[0x82],S[0x83],S[0x84],
+            S[0x70],S[0x71], S[0xBD],
+            P[0],P[1],P[2],P[3],P[4],P[5],P[6],P[7]);
+        fprintf(stderr,
+            "[w2life:%s] ts run=%02X%02X%02X%02X rdy=%02X%02X%02X%02X prdy=%02X%02X%02X%02X "
+            "en=%02X%02X%02X%02X sig=%02X%02X%02X%02X wait=%02X%02X%02X%02X wid=%02X |"
+            " hops 0-5: %llu/%04X/%d %llu/%04X/%d %llu/%04X/%d %llu/%04X/%d %llu/%04X/%d %llu/%04X/%d\n",
+            tag,
+            T[0x00],T[0x01],T[0x02],T[0x03], T[0x10],T[0x11],T[0x12],T[0x13],
+            T[0x20],T[0x21],T[0x22],T[0x23], T[0x30],T[0x31],T[0x32],T[0x33],
+            T[0x40],T[0x41],T[0x42],T[0x43], T[0x50],T[0x51],T[0x52],T[0x53],
+            T[0x74],
+            g_yz_spu_hops[0], g_yz_spu_lastpc[0], g_yz_spu_lastimg[0],
+            g_yz_spu_hops[1], g_yz_spu_lastpc[1], g_yz_spu_lastimg[1],
+            g_yz_spu_hops[2], g_yz_spu_lastpc[2], g_yz_spu_lastimg[2],
+            g_yz_spu_hops[3], g_yz_spu_lastpc[3], g_yz_spu_lastimg[3],
+            g_yz_spu_hops[4], g_yz_spu_lastpc[4], g_yz_spu_lastimg[4],
+            g_yz_spu_hops[5], g_yz_spu_lastpc[5], g_yz_spu_lastimg[5]);
+        fflush(stderr);
+    }
+}
+
 /* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
  * cross-function tail branch in lifted SPU code; drained iteratively by the
  * enclosing call site or the host-thread driver. */
@@ -1595,6 +1659,16 @@ void spu_indirect_branch(spu_context* ctx)
         }
     }
 
+    /* s31 W2LIFE: per-SPU host-liveness census (always on -- three stores; read
+     * by yz_w2life_dump). Discriminates "SPU thread wedged/frozen" (hops static,
+     * lastpc names the site) from "alive but the workload is never re-selected"
+     * (hops climb under other images) -- the H-wedge/H-accounting fork of
+     * scratch/s31_consumer_death.md §6. */
+    { unsigned _wi = ctx->spu_id & 7u;
+      g_yz_spu_hops[_wi]++;
+      g_yz_spu_lastpc[_wi] = ctx->pc & SPU_LS_MASK;
+      g_yz_spu_lastimg[_wi] = (int)ctx->image_id; }
+
     /* RESIDENCY RE-ADOPTION at the workload-module entry (s24 image model).
      * The DMA layer records which module image is resident at LS 0xA00
      * (module_img_a00, spu_dma.h); the kernel may perform that load inside a
@@ -1941,15 +2015,61 @@ void spu_indirect_branch(spu_context* ctx)
             if (coret_gen < 0) coret_gen = getenv("YZ_CORET_GEN") ? 1 : 0;
             if (lpc == 0x838u && link == 0x231Cu
                     && (wcl == 2u || ctx->image_id == 13 || coret_gen)) {
-                ctx->gpr[3]._u32[0] = ctx->gpr[3]._u32[1] = 0;
-                ctx->gpr[3]._u32[2] = ctx->gpr[3]._u32[3] = 0;
-                g_spu_trampoline_fn = 0;   /* no chain -> caller resumes at 0x231C */
-                static int rl = 0;
-                if (rl < 64) { rl++;
-                    fprintf(stderr, "[yz-coret] poll yield 0x838 wcl=%u -> resume at 0x231C\n", wcl);
-                    fflush(stderr);
+                /* s31 iteration 2 (ledger #71; MEASURED scratch/s31cure1.err): for
+                 * wcl==2 the synchronous fake is WRONG whenever the kernel would
+                 * SWITCH AWAY. The validation boot showed: readyCount1[2]=1 (the
+                 * task correctly parked+requeued) but wklCurrentContention[2]
+                 * stuck == maxContention[2] == 1 for the whole boot, SPU4 alive
+                 * spinning the policy's select-verify loop (lastpc=0x290, img=2,
+                 * ~150k hops/30s) -- the LLE policy loops until its own select
+                 * pick equals wklCurrentId, i.e. it WAITS for the workload switch
+                 * that only the real kernel 0x838 performs (kernel-mode select:
+                 * subtract the yielder's wklLocContention claim, commit
+                 * wklCurrentContention, update wklCurrentId, dispatch -- RPCS3
+                 * cellSpursSpu.cpp:283,384-405; the exact fields the fake left
+                 * poisoned). And wid2 is PINNED to this SPU (wklInfo1[2].priority
+                 * nonzero on slot 4 only, [w2life:coret]) so no other kernel can
+                 * ever rescue it. FIX: run the REAL lifted kernel 0x838 for the
+                 * wcl==2 poll -- unwind to the driver and re-dispatch at depth 0,
+                 * the identical path the s31 exit-unwind below exercised 11,520+
+                 * times (wcl=1/3/32, depths 4-8) in the same boot with zero
+                 * regressions. Nothing of wid2 is lost on a switch-away: at the
+                 * poll instant the task is already OFF-CPU with its context saved
+                 * (taskset bitsets run=0/ready/waiting, readyCount=1 -- measured),
+                 * and its later resume is the acfccf6 cross-context class. The
+                 * fake is retained for image 13/coret_gen (measured ZERO hits in
+                 * current boots) and under YZ_CORET_LEGACY=1. */
+                static int legacy2 = -1;
+                if (legacy2 < 0) legacy2 = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+                if (!legacy2 && wcl == 2u) {
+                    static int rn = 0;
+                    if (rn < 16) { rn++;
+                        fprintf(stderr, "[yz-coret] REAL kernel poll 0x838 wcl=%u depth=%u%s\n",
+                                wcl, ctx->host_depth,
+                                ctx->host_depth ? " -> unwind to depth 0" : " (at depth 0, dispatching)");
+                        fflush(stderr);
+                        yz_w2life_dump("poll-real");
+                    }
+                    if (ctx->host_depth > 0 && g_spu_restart_jmp) {
+                        g_spu_trampoline_fn = 0;
+                        longjmp(*g_spu_restart_jmp, 1);   /* driver re-enters from
+                                                           * ctx->pc==0x838, depth 0 */
+                    }
+                    /* Already at depth 0: fall through -- the normal dispatch
+                     * below serves the real lifted spu_func_00000838 (kernel
+                     * entries are universal servers). */
+                } else {
+                    ctx->gpr[3]._u32[0] = ctx->gpr[3]._u32[1] = 0;
+                    ctx->gpr[3]._u32[2] = ctx->gpr[3]._u32[3] = 0;
+                    g_spu_trampoline_fn = 0;   /* no chain -> caller resumes at 0x231C */
+                    static int rl = 0;
+                    if (rl < 64) { rl++;
+                        fprintf(stderr, "[yz-coret] poll yield 0x838 wcl=%u -> resume at 0x231C (fake)\n", wcl);
+                        fflush(stderr);
+                        yz_w2life_dump("coret");   /* s31: the wid accounting at the yield */
+                    }
+                    return;
                 }
-                return;
             }
             /* Force the poll-status 2nd call (0x2340 `bisl selectWorkloadAddr`,
              * link 0x2344) to report "current workload selected" when the taskset
@@ -1982,6 +2102,52 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
+
+    /* ---- s31 FIX (ledger #71, scratch/s31_consumer_death.md): REAL module-exit
+     * -> kernel transition. cellSpursModuleExit is a ONE-WAY jump to
+     * exitToKernelAddr (LS 0x838): the kernel entry immediately resets the SPU
+     * stack pointer to 0x3FFD0 (spurs_kernel2.c spu_func_00000838), so no lifted
+     * host C frame above this point can ever be returned into -- the nested
+     * frames mirroring the exited workload are dead by construction. Running the
+     * kernel's select/contention-commit/dispatch chain NESTED inside them is the
+     * seam that killed wid2 (the gcm journal consumer's taskset) at the CRI
+     * bring-up: the first-ever CONTENDED workload switch on that SPU (85/85
+     * boots, exactly one wcl=2 poll-yield each, always the last wid2 event; the
+     * SPU thread never exits -- no [SPU] stopped line -- it just never runs wid2
+     * again on any SPU). Model the transition the way the hardware does: unwind
+     * the host stack to the driver (the same context-replacement mechanism as
+     * the task-launch unwind above and the acfccf6 depth-aware-return class) and
+     * re-dispatch the lifted kernel at 0x838 on a fresh top-level stack. SPU
+     * semantics are identical (all state lives in the heap ctx); host execution
+     * becomes the depth-0 kernel entry the healthy SPUs already use. NOTE the
+     * POLL yield (bisl with link 0x231C, special-cased above) is NOT an exit:
+     * the oracle implements it as a synchronous select-and-return (RPCS3
+     * cellSpursSpu.cpp:97-119 cellSpursModulePollStatus returns
+     * `wklId == wklCurrentId ? 0 : 1` to the caller, no context switch), so the
+     * clean-coroutine return above is the faithful poll model and stays.
+     * Kill-switch: YZ_CORET_LEGACY=1 restores the pre-s31 nested-exit behavior
+     * exactly. */
+    {
+        static int legacy = -1;
+        if (legacy < 0) legacy = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+        if (!legacy && (ctx->pc & SPU_LS_MASK) == 0x838u
+                && ctx->host_depth > 0 && g_spu_restart_jmp) {
+            uint32_t wcl = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16)
+                         | ((uint32_t)ctx->ls[0x1DE] << 8) | ctx->ls[0x1DF];
+            static unsigned long xn = 0; xn++;
+            if (xn <= 8 || (xn & 0xFFu) == 0) {
+                fprintf(stderr, "[exit-unwind] n=%lu spu=%X img=%d wcl=%u depth=%u "
+                        "-> kernel 0x838 on a fresh stack\n",
+                        xn, ctx->spu_id, (int)ctx->image_id, wcl, ctx->host_depth);
+                fflush(stderr);
+            }
+            if (wcl == 2u) yz_w2life_dump("exit");   /* the wid2 switch-away snapshot */
+            g_spu_trampoline_fn = 0;
+            longjmp(*g_spu_restart_jmp, 1);   /* driver re-enters spu_indirect_branch
+                                               * from ctx->pc == 0x838, host_depth = 0 */
+        }
+    }
+
     /* DIAG (YZ_SPU_PROF): gs_task launch + flow. gs_task loads at LS 0x3000
      * (entry 0x3050, code .. 0xBC00); it gets its EDGE-job pointer in gpr3 and
      * taskset args/spurs in gpr4 (SPURS task-start ABI, cellSpursSpu.cpp:1395).
@@ -2244,6 +2410,29 @@ void spu_indirect_branch(spu_context* ctx)
                       ctx->spu_id, ra,
                       (unsigned long long)((uintptr_t)ra - mod)); }
 #endif
+            /* s31 iteration 3 (ledger #34/#42/#71; MEASURED scratch/s31cure2.err:
+             * 4746-4780): the long-standing 0x2004 null-branch death is now
+             * PINNED to gs_task's first-work-item vtable dispatch -- LS 0x3CA4
+             * `bi $r6` (via 0x4F5C, gpr0=0x4F60 in every historical sighting):
+             * object = *(gs_ctx+0xE0), method = (*(*(obj+12)))[+8] read as ZERO
+             * from LS, fired at the first CRI-phase work item (a wid4 signal
+             * raise landed the same instant). At the halt the registers still
+             * hold the whole chain (0x3C88 ori r3,r2: gpr3 = the object LS addr,
+             * gpr9 = the vtable LS addr, gpr8 = vtable+8, gpr6 = the null
+             * method). Dump gpr3-9 + the object/vtable quads so the next
+             * sighting names the un-initialized structure outright. */
+            fprintf(stderr, "[SPU] unknown-branch REGS: g3=%08X g4=%08X g5=%08X "
+                    "g6=%08X g7=%08X g8=%08X g9=%08X\n",
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
+                    ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0],
+                    ctx->gpr[9]._u32[0]);
+            { uint32_t obj = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+              uint32_t vtb = ctx->gpr[9]._u32[0] & SPU_LS_MASK;
+              fprintf(stderr, "[SPU] unknown-branch LS[obj 0x%05X]:", obj);
+              for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", ctx->ls[(obj + i) & SPU_LS_MASK]);
+              fprintf(stderr, "  LS[vtbl 0x%05X]:", vtb);
+              for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", ctx->ls[(vtb + i) & SPU_LS_MASK]);
+              fprintf(stderr, "\n"); }
             fflush(stderr);
         }
     }
