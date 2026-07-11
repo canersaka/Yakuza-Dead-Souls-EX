@@ -225,6 +225,68 @@ void yz_w2life_dump(const char* tag)
     }
 }
 
+/* ---- s31 §12 (ledger #72/#34): TASK-IMAGE READ-ONLY SEGMENT GUARD.
+ * The real SPURS resume contract re-DMAs the task ELF's READ-ONLY segments on
+ * EVERY resume (spursTasksetDispatch RESUME leg: spursTasksetLoadElf(...,
+ * skipWriteableSegments=true) unless the ls_pattern is FULL -- RPCS3
+ * cellSpursSpu.cpp:1815-1830), precisely because other workloads legitimately
+ * deploy over the task region while the task is parked (rotation). Our port's
+ * resumes measurably do NOT deliver that: s31roll2.err caught a work item whose
+ * vtable pointer (LS 0xBA88 -- gs_task TEXT/RODATA, ph0 flags R+X) read as ALL
+ * ZEROS at dispatch = the #34 death's second flavor; pre-rotation, the same
+ * class fired through the image-0 wildcard door (gs_task code served on SPUs
+ * whose LS never held its image at all, ledger #24). This guard enforces the
+ * oracle's resume step idempotently at our task re-entry boundary: parse the
+ * task's guest ELF (taskInfo.elf EA -- a real 32-bit BE ELF, verified: gs_task
+ * 0x0127A580 ph0 vaddr 0x3000 filesz 0x8C00 flags 0x5), and for each PT_LOAD
+ * WITHOUT PF_W, memcmp the whole LS span vs the ELF source and redeploy on
+ * mismatch. Writable/BSS state is deliberately untouched (that is the ctxsave/
+ * ls_pattern leg's job -- if roll1's BSS-husk flavor persists with this guard
+ * live, the save/restore leg is the residual, cleanly discriminated). Runs at
+ * the natural-launch adoption point (branch INTO the task region: the task is
+ * not executing yet, so healing text there is race-free). Kill-switch:
+ * YZ_NO_TASKRELOAD=1. */
+void yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("YZ_NO_TASKRELOAD") ? 1 : 0;
+    if (off || !imd) return;
+    {
+        extern uint8_t* vm_base;
+        const uint8_t* e = vm_base + imd->elf_ea;
+        if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) return;
+#define YZB32(p) (((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(p)[3])
+        {
+            uint32_t phoff = YZB32(e + 0x1C);
+            uint32_t phnum = ((uint32_t)e[0x2C] << 8) | e[0x2D];
+            uint32_t i;
+            if (phnum > 8) return;
+            for (i = 0; i < phnum; i++) {
+                const uint8_t* ph = e + phoff + i * 0x20;
+                uint32_t p_type   = YZB32(ph + 0x00);
+                uint32_t p_offset = YZB32(ph + 0x04);
+                uint32_t p_vaddr  = YZB32(ph + 0x08);
+                uint32_t p_filesz = YZB32(ph + 0x10);
+                uint32_t p_flags  = YZB32(ph + 0x18);
+                if (p_type != 1 /* PT_LOAD */ || (p_flags & 2 /* PF_W */)) continue;
+                if (p_filesz == 0 || p_vaddr >= SPU_LS_SIZE ||
+                    p_filesz > SPU_LS_SIZE - p_vaddr) continue;
+                if (memcmp(ctx->ls + p_vaddr, e + p_offset, p_filesz) != 0) {
+                    memcpy(ctx->ls + p_vaddr, e + p_offset, p_filesz);
+                    { static unsigned long rn = 0; rn++;
+                      if (rn <= 16 || (rn & 63u) == 0) {
+                        fprintf(stderr, "[task-reload] n=%lu spu=%X %s RO seg vaddr=0x%05X "
+                                "len=0x%X was STALE -> redeployed (resume contract)\n",
+                                rn, ctx->spu_id, imd->name, p_vaddr, p_filesz);
+                        fflush(stderr);
+                      } }
+                }
+            }
+        }
+#undef YZB32
+    }
+}
+
 /* Tail-call trampoline target (see spu_context.h / SPU_DRAIN). Set by a
  * cross-function tail branch in lifted SPU code; drained iteratively by the
  * enclosing call site or the host-thread driver. */
@@ -1706,6 +1768,15 @@ void spu_indirect_branch(spu_context* ctx)
             int img = imd ? imd->image_id : -1;
             if (img >= 0) {
                 ctx->image_id = img;
+                /* s31 §12: the resume-contract RO-segment guard -- heal the
+                 * task's text/rodata if another workload's residency clobbered
+                 * it while the task was parked (the #34 roll2 flavor: a static
+                 * vtable at LS 0xBA88 read as zeros at dispatch). Mirrors the
+                 * oracle's LoadElf(skipWriteableSegments=true)-on-every-resume;
+                 * idempotent (memcmp first); race-free here (the branch INTO
+                 * the task region -- task code not yet executing). Kill-switch
+                 * YZ_NO_TASKRELOAD. */
+                yz_task_segment_guard(ctx, imd);
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
                  * zero the task image's BSS ([filesz,memsz) spans), per the ELF
                  * contract Sony's LoadElf honors -- our image deploy copies only
