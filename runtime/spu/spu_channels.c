@@ -458,6 +458,64 @@ void yz_ctx_shadow_save(spu_context* ctx, const char* site)
     }
 }
 
+/* ---- s32 FINAL LEG: TASK WRITABLE-CONTEXT RESTORE FROM GUEST CTXSAVE.
+ * Completes Sony's resume contract at the adoption boundary (RPCS3
+ * spursTasksetDispatch resume leg, cellSpursSpu.cpp:1823-1846: LoadElf +
+ * 0x380 header + ls_pattern windows). The RO guard is leg 1; this is leg 2.
+ * WHY IT IS SAFE NOW (vs the iteration-4 rollback death): the source is the
+ * GUEST ctxsave, which Sony's own save path populates at every real yield
+ * since the seam correction -- for a task that was OFF-CPU through a foreign
+ * era, ctxsave IS the current truth (the task cannot have newer state while
+ * parked). Gates: resume-only; foreign era (region owner changed) OR the RO
+ * guard measured staleness (proof of foreign presence -- boot 9 named the
+ * wiper: pool-task work fetches into LS 0xB880 legally overlay the parked
+ * region); never from a VIRGIN ctxsave (loud warning instead -- a parked
+ * task with no save should be impossible post-seam-fix). Kill-switch
+ * YZ_NO_CTXRESTORE. Pre-committed failure shape: a rollback would show as
+ * the journal cursor ([jrnl-cur] ea) regressing right after a [ctx-restore].
+ * Owner tracking is maintained here ALWAYS (independent of the opt-in
+ * shadow, which shares the array). */
+void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("YZ_NO_CTXRESTORE") ? 1 : 0;
+    {
+        uint32_t region_len = 0, region_base = 0;
+        uint32_t ea = yz_ctxsh_key(ctx->ls, &region_len, &region_base);
+        unsigned wi = ctx->spu_id & 7u;
+        uint32_t prev_owner = s_yz_region_owner[wi];
+        if (!ea) return;
+        s_yz_region_owner[wi] = ea;
+        if (off || !is_resume) return;
+        if (prev_owner == ea && !ro_was_stale) return;   /* same era, LS live */
+        {
+            extern uint8_t* vm_base;
+            static uint32_t virgin_h = 0; static int vh = 0;
+            if (!vh) { static const uint8_t z[0x380];
+                       virgin_h = yz_ctxw_hash(z, 0x380u); vh = 1; }
+            if (yz_ctxw_hash(vm_base + ea, 0x380u) == virgin_h) {
+                static int vn = 0;
+                if (vn < 8) { vn++;
+                    fprintf(stderr, "[ctx-restore] WARN spu=%X ctx=0x%08X parked "
+                            "across a foreign era with VIRGIN ctxsave -- nothing "
+                            "to restore (contract violation upstream?)\n",
+                            ctx->spu_id, ea);
+                    fflush(stderr); }
+                return;
+            }
+            memcpy(ctx->ls + YZ_CTXSH_REGBASE, vm_base + ea, YZ_CTXSH_REGLEN);
+            memcpy(ctx->ls + region_base, vm_base + ea + 0x400u, region_len);
+            { static unsigned long rn = 0; rn++;
+              if (rn <= 24 || (rn & 63u) == 0) {
+                fprintf(stderr, "[ctx-restore] n=%lu spu=%X ctx=0x%08X header+0x%X "
+                        "at LS 0x%05X (%s)\n",
+                        rn, ctx->spu_id, ea, region_len, region_base,
+                        ro_was_stale ? "RO-stale" : "foreign era");
+                fflush(stderr); } }
+        }
+    }
+}
+
 /* Adoption hook (call right after the RO segment guard, every adoption).
  * Fresh starts (is_resume=0) only take ownership -- Sony's isWaiting=0 leg
  * memsets + loads fresh, a shadow restore there would be wrong. Resumes
@@ -2046,13 +2104,15 @@ void spu_indirect_branch(spu_context* ctx)
                  * the task region -- task code not yet executing). Kill-switch
                  * YZ_NO_TASKRELOAD. */
                 {
-                /* s32: the writable half of the same contract (shadow restore
-                 * on resume when a foreign owner used the region; ownership
-                 * update only on fresh starts). RO staleness from the guard
-                 * doubles as the foreign-presence proof (Sony's order too:
-                 * LoadElf first, THEN the saved context overlays it --
-                 * cellSpursSpu.cpp:1820-1841). */
+                /* s32: legs 2+3 of the resume contract. The RO guard heals
+                 * code (leg 1); yz_task_ctx_restore overlays the header +
+                 * pattern windows from the GUEST ctxsave when a foreign era
+                 * or measured staleness intervened (Sony's order: LoadElf
+                 * first, THEN the saved context on top -- cellSpursSpu.cpp:
+                 * 1820-1846). The opt-in host shadow (default OFF) stays as
+                 * an evidence tool behind it. */
                 int stale = yz_task_segment_guard(ctx, imd);
+                yz_task_ctx_restore(ctx, tpc != imd->entry, stale);
                 yz_ctx_shadow_restore(ctx, tpc != imd->entry, stale);
                 }
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):

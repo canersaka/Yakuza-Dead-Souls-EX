@@ -205,6 +205,35 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_get(cmd)) {
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            /* s32 [ls-wipe] watch (census verdict, scratch/s32_flavor_census.md:
+             * every death boot shows gs_task/policy spans ZERO-WIPED with ragged
+             * offsets, each flavor = a different unresurrected span meeting its
+             * first reader; the wiper was never directly observed). This is THE
+             * choke point for guest-driven LS writes: flag any >=64-byte
+             * all-zeros GET landing in the policy-data/task-header windows
+             * ([0xA00,0x3000) or [0xB800,0xBE00)) with full writer identity.
+             * Always on, capped; a hit names the wiper red-handed. */
+            { uint32_t wl = lsa & SPU_LS_MASK;
+              if (size >= 64u && wl < 0x40000u
+                  && ((wl < 0x3000u && wl + size > 0xA00u)
+                      || (wl < 0xBE00u && wl + size > 0xB800u))) {
+                  const uint8_t* zp = (const uint8_t*)ls_ptr;
+                  uint32_t zi = 0;
+                  while (zi < size && zp[zi] == 0) zi++;
+                  if (zi >= 64u) {  /* leading zero run covers the window? */
+                      static unsigned long wn = 0; wn++;
+                      if (wn <= 24 || (wn & 255u) == 0) {
+                          fprintf(stderr, "[ls-wipe] n=%lu spu=%X img=%d pc=0x%05X "
+                                  "cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X "
+                                  "zeros=0x%X%s\n",
+                                  wn, spu->spu_id, spu->image_id,
+                                  spu->pc & SPU_LS_MASK, cmd, wl,
+                                  (unsigned long long)ea, size, zi,
+                                  zi == size ? " (ALL-ZERO)" : "");
+                          fflush(stderr);
+                      }
+                  }
+              } }
             /* s26 ROOT FIX (the varying-round wall — STATUS ⚡ stager-hunt):
              * the wid4 pool task's 64-byte work-record fetch can race the
              * game's OWN staging (hardware-watch MEASURED: the pxd module on
@@ -706,6 +735,34 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                           cn, spu->spu_id, spu->pc & SPU_LS_MASK, jea);
                   fflush(stderr);
               }
+              /* s32 RO-BRACKET probe (always on, ~1 memcmp per 256 polls):
+               * s32coop3 proved the one remaining death = gs_task's RO span
+               * zeroed MID-EXECUTION between a byte-identical restore and the
+               * fault (block-0 round-trip h constant; DMA synchronous; no
+               * foreign SPU activity in the bracket) -- a same-thread guest
+               * store to a wrong computed address. This rides the consumer's
+               * own poll: verify the vtable-carrying tail of the RO span
+               * [0xB800,0xBC00) against the ELF source; the FIRST mismatch
+               * brackets the zeroing store to ~256 polls, with offset bytes
+               * for the store-watch that names the instruction next boot. */
+              { static int brk_hit = 0;
+                if (!brk_hit && (cn & 0xFFu) == 0 && spu->image_id == 0) {
+                    const uint8_t* src = vm_base + 0x0127A580u + 0x100u + 0x8800u;
+                    const uint8_t* dst = spu->ls + 0xB800u;
+                    if (memcmp(dst, src, 0x400u) != 0) {
+                        uint32_t bo = 0;
+                        while (bo < 0x400u && dst[bo] == src[bo]) bo++;
+                        brk_hit = 1;
+                        fprintf(stderr, "[ro-brk] FIRST RO-span mismatch at poll n=%lu "
+                                "spu=%X off=+0x%X (LS 0x%05X) ls=%02X%02X%02X%02X "
+                                "elf=%02X%02X%02X%02X (zeroing store within ~256 polls "
+                                "before this)\n",
+                                cn, spu->spu_id, bo, 0xB800u + bo,
+                                dst[bo], dst[bo+1], dst[bo+2], dst[bo+3],
+                                src[bo], src[bo+1], src[bo+2], src[bo+3]);
+                        fflush(stderr);
+                    }
+                } }
               /* s26 (task #4): dump the FULL 128-byte line the consumer just
                * GETLLAR'd — the consume gate tests the +0x20 sub-entry vs the
                * 0x4000 sentinel (gs_task.c 0x63F4), which a 32-byte dump cut
