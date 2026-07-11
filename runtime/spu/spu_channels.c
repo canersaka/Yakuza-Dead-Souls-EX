@@ -265,21 +265,22 @@ void yz_spu_crash_note(void)
  * the natural-launch adoption point (branch INTO the task region: the task is
  * not executing yet, so healing text there is race-free). Kill-switch:
  * YZ_NO_TASKRELOAD=1. */
-void yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
+int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
 {
+    int any_stale = 0;
     static int off = -1;
     if (off < 0) off = getenv("YZ_NO_TASKRELOAD") ? 1 : 0;
-    if (off || !imd) return;
+    if (off || !imd) return 0;
     {
         extern uint8_t* vm_base;
         const uint8_t* e = vm_base + imd->elf_ea;
-        if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) return;
+        if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) return 0;
 #define YZB32(p) (((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(p)[3])
         {
             uint32_t phoff = YZB32(e + 0x1C);
             uint32_t phnum = ((uint32_t)e[0x2C] << 8) | e[0x2D];
             uint32_t i;
-            if (phnum > 8) return;
+            if (phnum > 8) return 0;
             for (i = 0; i < phnum; i++) {
                 const uint8_t* ph = e + phoff + i * 0x20;
                 uint32_t p_type   = YZB32(ph + 0x00);
@@ -291,18 +292,226 @@ void yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
                 if (p_filesz == 0 || p_vaddr >= SPU_LS_SIZE ||
                     p_filesz > SPU_LS_SIZE - p_vaddr) continue;
                 if (memcmp(ctx->ls + p_vaddr, e + p_offset, p_filesz) != 0) {
+                    /* s32: name the first divergent offset (stale vs source
+                     * bytes) BEFORE healing, and re-verify AFTER -- separates
+                     * wrong-source and concurrent-writer classes from plain
+                     * staleness (the s32ctxsh1 death read zeros at 0xBAA8
+                     * right after a logged redeploy of the covering span). */
+                    uint32_t d0 = 0;
+                    uint8_t was[4] = {0,0,0,0};
+                    while (d0 < p_filesz && ctx->ls[p_vaddr + d0] == e[p_offset + d0]) d0++;
+                    if (d0 + 4 <= p_filesz) memcpy(was, ctx->ls + p_vaddr + d0, 4);
                     memcpy(ctx->ls + p_vaddr, e + p_offset, p_filesz);
+                    any_stale = 1;
                     { static unsigned long rn = 0; rn++;
                       if (rn <= 16 || (rn & 63u) == 0) {
                         fprintf(stderr, "[task-reload] n=%lu spu=%X %s RO seg vaddr=0x%05X "
-                                "len=0x%X was STALE -> redeployed (resume contract)\n",
-                                rn, ctx->spu_id, imd->name, p_vaddr, p_filesz);
+                                "len=0x%X was STALE -> redeployed (first-diff +0x%X "
+                                "was=%02X%02X%02X%02X src=%02X%02X%02X%02X%s)\n",
+                                rn, ctx->spu_id, imd->name, p_vaddr, p_filesz, d0,
+                                was[0], was[1], was[2], was[3],
+                                e[p_offset+d0], e[p_offset+d0+1],
+                                e[p_offset+d0+2], e[p_offset+d0+3],
+                                memcmp(ctx->ls + p_vaddr, e + p_offset, p_filesz)
+                                    ? " VERIFY-FAIL(concurrent writer?)" : "");
                         fflush(stderr);
                       } }
                 }
             }
         }
 #undef YZB32
+    }
+    return any_stale;
+}
+
+/* ---- s32 (ledger #73's pre-committed residual): TASK WRITABLE-CONTEXT SHADOW.
+ * The other half of the resume contract. On silicon a taskset switch-away can
+ * only happen AFTER the yielding task's writable state is saved (the policy's
+ * SaveTaskContext: ctxt savedContext block LS 0x2C80..0x3000 + the ls_pattern
+ * task-region blocks -> the per-task ctxsave EA; RPCS3 cellSpursSpu.cpp:1683-
+ * 1737), and the dispatch RESUME leg restores the same windows (ibid 1812-1864).
+ * MEASURED s32ctxw1.err: our gs_task's guest ctxsave register block carries the
+ * task-START hash through every healthy resume (no save leg ever runs), and the
+ * one divergent write observed before the fatal resume delivered byte-SHIFTED
+ * content (the death forensics' off-by-N object/vtable bytes) -- so the guest-
+ * side path cannot be trusted for either leg. This shadow preserves ground-truth
+ * LS bytes host-side instead: SAVE at the kernel poll-yield seam (the only
+ * switch-away door for the taskset workload -- the wcl==2 real-kernel branch
+ * below), RESTORE at the natural-launch re-adoption right after the RO guard,
+ * and ONLY when a different owner used the task region since (same-owner
+ * resumes keep the live LS; restoring a stale shadow over newer live state
+ * would roll the task back). Content-equivalent to Sony's contract at every
+ * observation point; the guest ctxsave area itself stays untouched (nothing
+ * PPU-side reads it -- deviation noted). Kill-switch: YZ_NO_CTXSHADOW=1.
+ * Pre-committed residual: job workloads (img 13-15) DMA into the task region
+ * without an adoption event, invisible to the owner tracking -- if a death
+ * follows a [job-launch] with no interleaved foreign ADOPTION, that is the
+ * next leg. */
+#define YZ_CTXSH_SLOTS   8
+#define YZ_CTXSH_REGBASE 0x2C80u   /* ctxt savedContext block */
+#define YZ_CTXSH_REGLEN  0x380u
+#define YZ_CTXSH_TASKTOP 0x3000u   /* CELL_SPURS_TASK_TOP */
+static struct {
+    uint32_t ctx_ea;      /* per-task ctxsave EA (identity key only) */
+    uint32_t region_len;  /* allocLsBlocks * 0x800 */
+    uint8_t* buf;         /* REGLEN + region_len */
+    int      valid;
+    uint32_t guest_h;     /* hash of the GUEST ctxsave register block at save
+                           * time: if it changes before our restore, the guest
+                           * save/restore path is live for this task and our
+                           * (older) snapshot must not roll it back */
+    int      guest_managed; /* sticky: guest path proven live, stay out */
+} s_yz_ctxsh[YZ_CTXSH_SLOTS];
+static uint32_t s_yz_region_owner[8];   /* per-SPU: ctx_ea of the task region's
+                                         * last adopter (0 = unknown/foreign) */
+
+static int yz_ctxsh_off(void)
+{
+    /* s32 late: OPT-IN (YZ_CTXSHADOW=1), default OFF. The decoded contract (lifted firmware binaries +
+     * the RPCS3 oracle) established that every legitimate kernel crossing happens
+     * AFTER Sony's own save path ran -- the shadow's forced restores were
+     * measured causing rollback deaths (s32ctxsh4: a snapshot ~79k polls
+     * stale restored over live state), and its write-through can fight the
+     * guest's own saves. Kept as an evidence tool / contingency for the
+     * [exit-unsaved] probe's findings. */
+    static int off = -1;
+    if (off < 0) off = (getenv("YZ_CTXSHADOW") && !getenv("YZ_NO_CTXSHADOW")) ? 0 : 1;
+    return off;
+}
+
+/* Parse the CURRENT task's ctxsave EA + saved-LS window from the resident
+ * taskInfo (LS 0x2798, same field the YZ_CTXWATCH probe reads). Returns 0 if
+ * none. THE WINDOW BASE IS NOT TASK_TOP: the ls_pattern covers the TOP of LS
+ * (stack down from 0x40000; Sony's stack-in-pattern check cellSpursSpu.cpp:
+ * 1706 forces blocks sp>>11..127), and the ctxsave data area is position-
+ * keyed from the pattern base. MEASURED from the guest's own restore DMAs
+ * (s32ctxsh3.err: LOAD ea=ctx+0x28400 <-> lsa 0x33800, tail ea+0x34400+0x800
+ * == storage end 0x34C00 <-> lsa 0x3F800..0x40000): base = 0x40000 -
+ * blocks*0x800 (gs_task: 0xB800), ctxsave+0x400+k*0x800 <-> LS base+k*0x800.
+ * Iteration 3's TASK_TOP-based window wrote everything shifted +0x8800 --
+ * the guest restore then delivered the byte-shifted corruption itself. */
+static uint32_t yz_ctxsh_key(const unsigned char* ls, uint32_t* region_len,
+                             uint32_t* region_base)
+{
+    const unsigned char* ti = ls + 0x2798u;
+    uint64_t css = ((uint64_t)ti[0]<<56)|((uint64_t)ti[1]<<48)
+                 |((uint64_t)ti[2]<<40)|((uint64_t)ti[3]<<32)
+                 |((uint64_t)ti[4]<<24)|((uint64_t)ti[5]<<16)
+                 |((uint64_t)ti[6]<<8)|ti[7];
+    uint32_t ea = (uint32_t)(css & ~0x7Full);
+    uint32_t blocks = (uint32_t)(css & 0x7Fu);
+    if (!ea || !blocks) return 0;
+    *region_len = blocks * 0x800u;
+    if (*region_len > SPU_LS_SIZE - YZ_CTXSH_TASKTOP)
+        *region_len = SPU_LS_SIZE - YZ_CTXSH_TASKTOP;
+    *region_base = SPU_LS_SIZE - *region_len;
+    return ea;
+}
+
+/* SAVE at the switch-away seam. Idempotent, overwrites the slot each time. */
+void yz_ctx_shadow_save(spu_context* ctx, const char* site)
+{
+    if (yz_ctxsh_off()) return;
+    {
+        uint32_t region_len = 0, region_base = 0;
+        uint32_t ea = yz_ctxsh_key(ctx->ls, &region_len, &region_base);
+        int i, slot = -1;
+        if (!ea) return;
+        for (i = 0; i < YZ_CTXSH_SLOTS; i++) {
+            if (s_yz_ctxsh[i].ctx_ea == ea) { slot = i; break; }
+            if (slot < 0 && s_yz_ctxsh[i].ctx_ea == 0) slot = i;
+        }
+        if (slot < 0) return;
+        if (s_yz_ctxsh[slot].ctx_ea == ea && s_yz_ctxsh[slot].guest_managed) return;
+        if (!s_yz_ctxsh[slot].buf || s_yz_ctxsh[slot].region_len < region_len) {
+            free(s_yz_ctxsh[slot].buf);
+            s_yz_ctxsh[slot].buf = (uint8_t*)malloc(YZ_CTXSH_REGLEN + region_len);
+            if (!s_yz_ctxsh[slot].buf) { s_yz_ctxsh[slot].ctx_ea = 0; return; }
+        }
+        s_yz_ctxsh[slot].ctx_ea = ea;
+        s_yz_ctxsh[slot].region_len = region_len;
+        memcpy(s_yz_ctxsh[slot].buf, ctx->ls + YZ_CTXSH_REGBASE, YZ_CTXSH_REGLEN);
+        memcpy(s_yz_ctxsh[slot].buf + YZ_CTXSH_REGLEN,
+               ctx->ls + region_base, region_len);
+        /* s32 iter-3/4 (THE decisive leg -- s32ctxsh2.err:3625 smoking gun):
+         * Sony's RESTORE leg RUNS on our side (policy pc=0x25CC GETs from the
+         * ctxsave EA) but the SAVE leg never does -- so it restored virgin
+         * ZEROS over live LS and the zeroed savedContextLr branched to LS 0.
+         * Fix: perform the save where Sony's save writes it, in Sony's layout
+         * (register block at +0, pattern-base-keyed LS blocks at +0x400 --
+         * the mapping MEASURED from the restore leg's own DMAs, see
+         * yz_ctxsh_key). Byte-verbatim like the real DMA (no swap). Deviation
+         * noted: fpscr/event-mask/tag-mask are channel reads Sony's save
+         * performs that we skip -- those ctxt fields carry LS-stale values. */
+        { extern uint8_t* vm_base;
+          memcpy(vm_base + ea, ctx->ls + YZ_CTXSH_REGBASE, YZ_CTXSH_REGLEN);
+          memcpy(vm_base + ea + 0x400u, ctx->ls + region_base, region_len);
+          s_yz_ctxsh[slot].guest_h = yz_ctxw_hash(vm_base + ea, 0x380u); }
+        s_yz_ctxsh[slot].valid = 1;
+        /* the saver still owns the region until someone else adopts it */
+        s_yz_region_owner[ctx->spu_id & 7u] = ea;
+        { static unsigned long sn = 0; sn++;
+          if (sn <= 16 || (sn & 63u) == 0) {
+            fprintf(stderr, "[ctxsh] SAVE n=%lu spu=%X ctx=0x%08X region=0x%X (%s)\n",
+                    sn, ctx->spu_id, ea, region_len, site);
+            fflush(stderr); } }
+    }
+}
+
+/* Adoption hook (call right after the RO segment guard, every adoption).
+ * Fresh starts (is_resume=0) only take ownership -- Sony's isWaiting=0 leg
+ * memsets + loads fresh, a shadow restore there would be wrong. Resumes
+ * restore ONLY when this SPU's task region belonged to someone else since
+ * the last save (same-owner resumes keep the live LS). */
+void yz_ctx_shadow_restore(spu_context* ctx, int is_resume, int force_foreign)
+{
+    if (yz_ctxsh_off()) return;
+    {
+        uint32_t region_len = 0, region_base = 0;
+        uint32_t ea = yz_ctxsh_key(ctx->ls, &region_len, &region_base);
+        unsigned wi = ctx->spu_id & 7u;
+        int i;
+        if (!ea) return;
+        if (!is_resume) { s_yz_region_owner[wi] = ea;   /* fresh content, fresh owner */
+                          return; }
+        /* force_foreign: the RO guard just measured this span STALE -- proof a
+         * foreign writer used the region regardless of what adoption events we
+         * saw (the s32ctxsh1 blind spot: the cri policy's ctx-block DMA sweep
+         * over LS 0xB000+ never passes through an adoption). */
+        if (!force_foreign && s_yz_region_owner[wi] == ea) return;
+        for (i = 0; i < YZ_CTXSH_SLOTS; i++) {
+            if (s_yz_ctxsh[i].ctx_ea == ea && s_yz_ctxsh[i].valid) {
+                uint32_t rl = s_yz_ctxsh[i].region_len < region_len
+                            ? s_yz_ctxsh[i].region_len : region_len;
+                /* Guest save/restore live for this task since our snapshot?
+                 * Then ours is the stale one -- disengage permanently (the
+                 * multi-task-taskset rollback hazard; gs_task's guest block
+                 * measurably never moves, s32ctxw1). */
+                { extern uint8_t* vm_base;
+                  if (yz_ctxw_hash(vm_base + ea, 0x380u) != s_yz_ctxsh[i].guest_h) {
+                    s_yz_ctxsh[i].valid = 0;
+                    s_yz_ctxsh[i].guest_managed = 1;
+                    { static int gm = 0; if (gm < 8) { gm++;
+                        fprintf(stderr, "[ctxsh] DISENGAGE ctx=0x%08X (guest ctxsave "
+                                "moved since our save -- guest path live)\n", ea);
+                        fflush(stderr); } }
+                    break;
+                  } }
+                memcpy(ctx->ls + YZ_CTXSH_REGBASE, s_yz_ctxsh[i].buf, YZ_CTXSH_REGLEN);
+                memcpy(ctx->ls + (SPU_LS_SIZE - rl),
+                       s_yz_ctxsh[i].buf + YZ_CTXSH_REGLEN, rl);
+                { static unsigned long rn = 0; rn++;
+                  if (rn <= 16 || (rn & 63u) == 0) {
+                    fprintf(stderr, "[ctxsh] RESTORE n=%lu spu=%X ctx=0x%08X region=0x%X "
+                            "(%s; last owner 0x%08X)\n",
+                            rn, ctx->spu_id, ea, rl,
+                            force_foreign ? "RO-stale forced" : "foreign owner",
+                            s_yz_region_owner[wi]);
+                    fflush(stderr); } }
+                break;
+            }
+        }
+        s_yz_region_owner[wi] = ea;
     }
 }
 
@@ -1770,6 +1979,43 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr); }
         ctx->image_id = ctx->module_img_a00;
     }
+    /* s32 MODULE-IMAGE STALENESS GUARD (the workload-level sibling of
+     * yz_task_segment_guard; s32coop1 death: the policy's syscall jump table
+     * at LS 0x1CC8 read as zeros -- the kernel's skip-reload-if-resident
+     * check under-detects). At every module ENTRY, byte-verify the resident
+     * module against its recorded guest source and redeploy on mismatch.
+     * Safe at exactly this boundary by the decoded module contract
+     * (policy-module state is NOT preserved across workload swaps --
+     * measured, and RPCS3\'s dispatch rebuilds module state at entry): a
+     * module must tolerate arriving fresh at entry; its 0x2700+ working
+     * context is rebuilt from the taskset EA at entry, so the guard stops
+     * short of 0x2700. Kill-switch YZ_NO_MODRELOAD. */
+    if ((ctx->pc & SPU_LS_MASK) == 0xA00u && ctx->module_src_ea) {
+        static int moff = -1;
+        if (moff < 0) moff = getenv("YZ_NO_MODRELOAD") ? 1 : 0;
+        if (!moff) {
+            extern uint8_t* vm_base;
+            uint32_t mlen = ctx->module_src_size;
+            if (0xA00u + mlen > 0x2700u) mlen = 0x2700u - 0xA00u;
+            if (mlen && memcmp(ctx->ls + 0xA00, vm_base + ctx->module_src_ea, mlen) != 0) {
+                uint32_t d0 = 0;
+                uint8_t was[4] = {0,0,0,0};
+                const uint8_t* src = vm_base + ctx->module_src_ea;
+                while (d0 < mlen && ctx->ls[0xA00 + d0] == src[d0]) d0++;
+                if (d0 + 4 <= mlen) memcpy(was, ctx->ls + 0xA00 + d0, 4);
+                memcpy(ctx->ls + 0xA00, src, mlen);
+                { static unsigned long mn = 0; mn++;
+                  if (mn <= 16 || (mn & 63u) == 0) {
+                    fprintf(stderr, "[mod-reload] n=%lu spu=%X img=%d module STALE at entry "
+                            "-> redeployed (src=0x%08X len=0x%X first-diff +0x%X "
+                            "was=%02X%02X%02X%02X now=%02X%02X%02X%02X)\n",
+                            mn, ctx->spu_id, ctx->module_img_a00, ctx->module_src_ea, mlen,
+                            d0, was[0], was[1], was[2], was[3],
+                            src[d0], src[d0+1], src[d0+2], src[d0+3]);
+                    fflush(stderr); } }
+            }
+        }
+    }
 
     /* SPURS TASK LAUNCH (image switch). The taskset policy (image 2) launches an
      * SPU task by running Sony's real spursTasksetStartTask, which ends in
@@ -1799,7 +2045,16 @@ void spu_indirect_branch(spu_context* ctx)
                  * idempotent (memcmp first); race-free here (the branch INTO
                  * the task region -- task code not yet executing). Kill-switch
                  * YZ_NO_TASKRELOAD. */
-                yz_task_segment_guard(ctx, imd);
+                {
+                /* s32: the writable half of the same contract (shadow restore
+                 * on resume when a foreign owner used the region; ownership
+                 * update only on fresh starts). RO staleness from the guard
+                 * doubles as the foreign-presence proof (Sony's order too:
+                 * LoadElf first, THEN the saved context overlays it --
+                 * cellSpursSpu.cpp:1820-1841). */
+                int stale = yz_task_segment_guard(ctx, imd);
+                yz_ctx_shadow_restore(ctx, tpc != imd->entry, stale);
+                }
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
                  * zero the task image's BSS ([filesz,memsz) spans), per the ELF
                  * contract Sony's LoadElf honors -- our image deploy copies only
@@ -2105,9 +2360,27 @@ void spu_indirect_branch(spu_context* ctx)
              * is the gs_task-only restriction; YZ_CORET_GEN drops it so ANY
              * taskset's poll resumes (the cri_audio codec taskset = wid 3).
              * Default unchanged (gs_task only) until verified. */
+            /* s32 CONTRACT CORRECTION (scratch/s32_pollswitch_contract.md, decoded
+             * from the lifted binaries + the RPCS3 oracle): LS 0x2308 is
+             * NOT the poll helper -- it is cellSpursModuleExit's stub (the
+             * real pollStatus at 0x2320 calls SelectWorkload 0x290 directly
+             * and NEVER enters the kernel; TaskPoll is spec-guaranteed
+             * switch-free). Every 0x838 entry with link 0x231C is therefore
+             * a MODULE EXIT: total workload death, fresh re-entry at 0xA00,
+             * nothing to preserve (the syscall path saved the task context
+             * BEFORE reaching the exit -- the three-door rule: yield-with-switch,
+             * exit, and sync-wait are the only ways a task leaves RUNNING
+             * (RPCS3 spursTasksetProcessSyscall semantics)).
+             * The correct handling is the general exit-unwind below --
+             * this whole special case (the gpr3=0 fake "poll resume" + the
+             * wcl==2 real-kernel branch) modeled a coroutine seam that does
+             * not exist on silicon. Retained ONLY under YZ_CORET_LEGACY=1
+             * for A/B. */
             static int coret_gen = -1;
             if (coret_gen < 0) coret_gen = getenv("YZ_CORET_GEN") ? 1 : 0;
-            if (lpc == 0x838u && link == 0x231Cu
+            static int legacy_seam = -1;
+            if (legacy_seam < 0) legacy_seam = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+            if (legacy_seam && lpc == 0x838u && link == 0x231Cu
                     && (wcl == 2u || ctx->image_id == 13 || coret_gen)) {
                 /* s31 iteration 2 (ledger #71; MEASURED scratch/s31cure1.err): for
                  * wcl==2 the synchronous fake is WRONG whenever the kernel would
@@ -2136,6 +2409,10 @@ void spu_indirect_branch(spu_context* ctx)
                 static int legacy2 = -1;
                 if (legacy2 < 0) legacy2 = getenv("YZ_CORET_LEGACY") ? 1 : 0;
                 if (!legacy2 && wcl == 2u) {
+                    /* s32: the kernel may switch this workload away -- shadow
+                     * the parked task's writable state FIRST (the save leg the
+                     * guest path never delivers, s32ctxw1 hash evidence). */
+                    yz_ctx_shadow_save(ctx, "poll");
                     static int rn = 0;
                     if (rn < 16) { rn++;
                         fprintf(stderr, "[yz-coret] REAL kernel poll 0x838 wcl=%u depth=%u%s\n",
@@ -2236,6 +2513,43 @@ void spu_indirect_branch(spu_context* ctx)
                 fflush(stderr);
             }
             if (wcl == 2u) yz_w2life_dump("exit");   /* the wid2 switch-away snapshot */
+            /* s32: a taskset exiting here may carry a yielded task whose
+             * writable state the kernel is about to let another workload
+             * overlay -- shadow it (see yz_ctx_shadow_save; opt-in). */
+            if (ctx->image_id == 2) yz_ctx_shadow_save(ctx, "exit");
+            /* s32 [exit-unsaved] probe (always on, cheap): per the decoded
+             * contract, a taskset module may only cross into the kernel with
+             * ZERO live unsaved task state (the task saved at its syscall, or
+             * exited, or never started). A crossing that violates that --
+             * task still marked RUNNING in the taskset bitset, or a resumable
+             * task whose ctxsave register block is still VIRGIN -- is the one
+             * remaining unexplained event of the #34 writable class; log it
+             * with full identity so the next death names its guilty path. */
+            if (ctx->image_id == 2) {
+                const unsigned char* tls = ctx->ls;
+                uint32_t run0 = ((uint32_t)tls[0x2700]<<24)|((uint32_t)tls[0x2701]<<16)
+                              |((uint32_t)tls[0x2702]<<8)|tls[0x2703];
+                uint32_t wait0 = ((uint32_t)tls[0x2750]<<24)|((uint32_t)tls[0x2751]<<16)
+                               |((uint32_t)tls[0x2752]<<8)|tls[0x2753];
+                uint32_t rl2 = 0, rb2 = 0;
+                uint32_t cea = yz_ctxsh_key(tls, &rl2, &rb2);
+                uint32_t gh = 0;
+                static uint32_t virgin_h = 0; static int vh_init = 0;
+                if (!vh_init) { static const uint8_t z[0x380]; /* zero */
+                                virgin_h = yz_ctxw_hash(z, 0x380u); vh_init = 1; }
+                if (cea) { extern uint8_t* vm_base;
+                           gh = yz_ctxw_hash(vm_base + cea, 0x380u); }
+                if (run0 != 0 || (cea && wait0 && gh == virgin_h)) {
+                    static unsigned long un = 0; un++;
+                    if (un <= 32 || (un & 255u) == 0) {
+                        fprintf(stderr, "[exit-unsaved] n=%lu spu=%X wcl=%u run0=%08X "
+                                "wait0=%08X ctx=0x%08X ctxsave_h=%08X%s\n",
+                                un, ctx->spu_id, wcl, run0, wait0, cea, gh,
+                                gh == virgin_h ? " (VIRGIN)" : "");
+                        fflush(stderr);
+                    }
+                }
+            }
             g_spu_trampoline_fn = 0;
             longjmp(*g_spu_restart_jmp, 1);   /* driver re-enters spu_indirect_branch
                                                * from ctx->pc == 0x838, host_depth = 0 */
