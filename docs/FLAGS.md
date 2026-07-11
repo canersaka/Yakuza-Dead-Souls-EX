@@ -717,11 +717,17 @@ recomp_prx lifts, s26-s27, diag, default OFF): the wkl4 barrier/gate operand pro
 ([arr-pred]/[leg-*]/[cont-*]/[g31FC]/[g3678]) and the gs_task consume-gate probes.
 Re-apply the scripts after any SPU relift; --revert removes.
 
-`RSX_DEPTH_RT` (libs/video/tests/replay_main.c, s27, opt-in, default OFF): depth-target-
-as-texture snapshots in the replay harness — mechanism validated but regresses room
-geometry in the full composite (A/B scratch/s27_rsqfix vs s27_rsq_nodrt); debug before
-re-defaulting. RSX_NO_PASS_DEPTH_CLEAR / RSX_FP_FORCE_STAGE* / RSX_VP_CLIP_DUMP /
-RSX_LOG_ZETA are harness diagnostics from the same investigation (s26_fp_bisect.md).
+`RSX_DEPTH_RT` (libs/video/tests/replay_main.c + replay_chr_main.c, s27; **s32: default
+ON, set =0 to disable**): depth-target-as-texture snapshots in the replay harness. The
+s27 composite regression (ledger #62) that kept this OFF was root-caused in s32: the
+snapshot copied the 1280x720 canvas out of TALLER zetas (1280x768 / 1280x1024 shadow
+maps) and the SRV was sampled at the declared texture scale — spatially garbled
+projective reads plus zeroed rows past 720. Fixed by zeta-dims snapshots +
+declared-size bind windowing (scratch/s32_character_fixes.md §5); s32 A/B: guard
+patches unchanged, frame moves toward the hardware reference (character bbox
+mean|d-ref| 14.1→10.8). RSX_NO_PASS_DEPTH_CLEAR / RSX_FP_FORCE_STAGE* /
+RSX_VP_CLIP_DUMP / RSX_LOG_ZETA are harness diagnostics from the same investigation
+(s26_fp_bisect.md).
 
 `RSX_SURF_CROP` (libs/video/tests/replay_main.c, s29, opt-in, default OFF — KNOWN
 REGRESSIVE, debug only): CPU-round-trip crop of a color surface sampled at a smaller
