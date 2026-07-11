@@ -1,4 +1,4 @@
-# RSX Graphics Translation
+﻿# RSX Graphics Translation
 
 How ps3recomp translates PS3 RSX GPU commands to host graphics APIs.
 
@@ -10,34 +10,34 @@ The RSX graphics pipeline has three layers, each in its own source file:
 
 ```
 Game code (recompiled C)
-    │
-    ▼
-cellGcmSys HLE                    ← libs/video/cellGcmSys.c (33+ functions)
-  │ State management: display buffers, IO mapping, flip/VBlank,
-  │ tile/zcull config, command buffer control (put/get/ref),
-  │ local memory allocator, offset tables, timestamps
-  │
-  ▼
-RSX Command Processor             ← libs/video/rsx_commands.c
-  │ Parses NV47xx FIFO command buffer
-  │ Tracks all GPU state with dirty flags
-  │ Dispatches to registered backend via callbacks
-  │
-  ├──▶ Null Backend               ← libs/video/rsx_null_backend.c
-  │    Win32 window + GDI clear color (debugging)
-  │
-  ├──▶ D3D12 Backend              ← libs/video/rsx_d3d12_backend.c
-  │    Real GPU rendering (Windows) with compiled shaders
-  │
-  └──▶ Vulkan Backend             ← (planned)
+    â”‚
+    â–¼
+cellGcmSys HLE                    â† libs/video/cellGcmSys.c (33+ functions)
+  â”‚ State management: display buffers, IO mapping, flip/VBlank,
+  â”‚ tile/zcull config, command buffer control (put/get/ref),
+  â”‚ local memory allocator, offset tables, timestamps
+  â”‚
+  â–¼
+RSX Command Processor             â† libs/video/rsx_commands.c
+  â”‚ Parses NV47xx FIFO command buffer
+  â”‚ Tracks all GPU state with dirty flags
+  â”‚ Dispatches to registered backend via callbacks
+  â”‚
+  â”œâ”€â”€â–¶ Null Backend               â† libs/video/rsx_null_backend.c
+  â”‚    Win32 window + GDI clear color (debugging)
+  â”‚
+  â”œâ”€â”€â–¶ D3D12 Backend              â† libs/video/rsx_d3d12_backend.c
+  â”‚    Real GPU rendering (Windows) with compiled shaders
+  â”‚
+  â””â”€â”€â–¶ Vulkan Backend             â† (planned)
        Cross-platform GPU rendering
 
 Supporting files:
-  libs/video/rsx_primitives.h      ← RSX → D3D12 topology mapping + index conversion
-  libs/video/rsx_vertex_formats.h  ← RSX → DXGI format mapping
-  libs/video/rsx_d3d12_shaders.h   ← Built-in HLSL shaders
-  libs/video/cellResc.c            ← Resolution scaling (16 functions)
-  libs/video/cellVideoOut.c        ← Video output configuration
+  libs/video/rsx_primitives.h      â† RSX â†’ D3D12 topology mapping + index conversion
+  libs/video/rsx_vertex_formats.h  â† RSX â†’ DXGI format mapping
+  libs/video/rsx_d3d12_shaders.h   â† Built-in HLSL shaders
+  libs/video/cellResc.c            â† Resolution scaling (16 functions)
+  libs/video/cellVideoOut.c        â† Video output configuration
 ```
 
 ---
@@ -46,40 +46,40 @@ Supporting files:
 
 **File:** `libs/video/cellGcmSys.c` (~800 lines, 33+ functions)
 
-The game interacts with the GPU through `cellGcmSys` — the PS3 SDK's RSX interface. Our HLE implementation provides:
+The game interacts with the GPU through `cellGcmSys` â€” the PS3 SDK's RSX interface. Our HLE implementation provides:
 
 ### Initialization
-- `cellGcmInit(cmdSize, ioSize, ioAddress)` — Sets up the RSX configuration struct (local memory address/size, IO region, clock frequencies), initializes the offset translation tables, and creates the command buffer control registers.
-- `cellGcmGetConfiguration(config)` — Returns the `CellGcmConfig` struct with local/IO memory addresses and sizes. Games read this to know where GPU memory starts.
-- `cellGcmGetControlRegister()` — Returns a pointer to the `CellGcmControl` struct (`put`, `get`, `ref` registers). The game writes the `put` pointer to advance the command buffer. **Important:** This must return a guest-accessible address (allocated in guest VM), not a host pointer.
+- `cellGcmInit(cmdSize, ioSize, ioAddress)` â€” Sets up the RSX configuration struct (local memory address/size, IO region, clock frequencies), initializes the offset translation tables, and creates the command buffer control registers.
+- `cellGcmGetConfiguration(config)` â€” Returns the `CellGcmConfig` struct with local/IO memory addresses and sizes. Games read this to know where GPU memory starts.
+- `cellGcmGetControlRegister()` â€” Returns a pointer to the `CellGcmControl` struct (`put`, `get`, `ref` registers). The game writes the `put` pointer to advance the command buffer. **Important:** This must return a guest-accessible address (allocated in guest VM), not a host pointer.
 
 ### Display Buffers
-- `cellGcmSetDisplayBuffer(id, offset, pitch, width, height)` — Registers a framebuffer region. Games typically register 2 buffers for double-buffering.
-- `cellGcmSetFlipMode(mode)` — VSYNC or HSYNC.
-- `cellGcmSetFlipHandler(handler)` / `cellGcmSetVBlankHandler(handler)` — Callback registration. In recomp, these store guest function pointers but don't fire automatically (no real VBlank interrupt).
-- `cellGcmResetFlipStatus()` / `cellGcmGetFlipStatus()` — Flip state tracking.
-- `cellGcmGetLastFlipTime()` — Returns host timestamp via `QueryPerformanceCounter` (Windows) or `clock_gettime` (POSIX).
+- `cellGcmSetDisplayBuffer(id, offset, pitch, width, height)` â€” Registers a framebuffer region. Games typically register 2 buffers for double-buffering.
+- `cellGcmSetFlipMode(mode)` â€” VSYNC or HSYNC.
+- `cellGcmSetFlipHandler(handler)` / `cellGcmSetVBlankHandler(handler)` â€” Callback registration. In recomp, these store guest function pointers but don't fire automatically (no real VBlank interrupt).
+- `cellGcmResetFlipStatus()` / `cellGcmGetFlipStatus()` â€” Flip state tracking.
+- `cellGcmGetLastFlipTime()` â€” Returns host timestamp via `QueryPerformanceCounter` (Windows) or `clock_gettime` (POSIX).
 
 ### Memory Management
-- `cellGcmMapMainMemory(ea, size, offset)` — Maps main memory for GPU access. Uses a bump allocator with 1MB alignment and tracks mappings in an offset table.
-- `cellGcmMapEaIoAddress(ea, io, size)` — Explicit EA→IO mapping with overlap detection.
-- `cellGcmAddressToOffset(address, offset)` — Translates effective address to RSX-relative offset using the populated offset tables.
-- `cellGcmGetOffsetTable(table)` — Returns pointers to the ioAddress/eaAddress translation arrays.
+- `cellGcmMapMainMemory(ea, size, offset)` â€” Maps main memory for GPU access. Uses a bump allocator with 1MB alignment and tracks mappings in an offset table.
+- `cellGcmMapEaIoAddress(ea, io, size)` â€” Explicit EAâ†’IO mapping with overlap detection.
+- `cellGcmAddressToOffset(address, offset)` â€” Translates effective address to RSX-relative offset using the populated offset tables.
+- `cellGcmGetOffsetTable(table)` â€” Returns pointers to the ioAddress/eaAddress translation arrays.
 
 ### Tile and Zcull
-- `cellGcmSetTile(index, ...)` — Configures one of 15 tile regions with compression parameters.
-- `cellGcmSetZcull(index, ...)` — Configures one of 8 zcull (hierarchical depth) regions.
-- `cellGcmBindTile(index)` / `cellGcmUnbindTile(index)` — Activate/deactivate tile regions.
-- `cellGcmSetTileInfo(...)` — Alternative tile configuration (same as SetTile, needed by Tokyo Jungle).
+- `cellGcmSetTile(index, ...)` â€” Configures one of 15 tile regions with compression parameters.
+- `cellGcmSetZcull(index, ...)` â€” Configures one of 8 zcull (hierarchical depth) regions.
+- `cellGcmBindTile(index)` / `cellGcmUnbindTile(index)` â€” Activate/deactivate tile regions.
+- `cellGcmSetTileInfo(...)` â€” Alternative tile configuration (same as SetTile, needed by Tokyo Jungle).
 
 ### Labels and Reports
-- `cellGcmGetLabelAddress(index)` — Returns a guest pointer to one of 256 label slots (4 bytes each). **Must be in guest VM memory** for the game to read/write via vm_read/vm_write.
-- `cellGcmGetReportDataAddress(index)` — Returns pointer to report data (16 bytes: timestamp + value).
-- `cellGcmGetNotifyDataAddress(index)` — Notify data area (256 slots, used by Tokyo Jungle).
+- `cellGcmGetLabelAddress(index)` â€” Returns a guest pointer to one of 256 label slots (4 bytes each). **Must be in guest VM memory** for the game to read/write via vm_read/vm_write.
+- `cellGcmGetReportDataAddress(index)` â€” Returns pointer to report data (16 bytes: timestamp + value).
+- `cellGcmGetNotifyDataAddress(index)` â€” Notify data area (256 slots, used by Tokyo Jungle).
 
 ### Reference
 - Based on RPCS3's `rpcs3/Emu/RSX/rsx_methods.cpp` and `cellGcmSys.cpp`
-- PS3 SDK documentation: `cell/target/ppu/include/cell/gcm/` headers
+- Open register/method references: envytools/rnndb and Mesa nvfx (MIT), RPCS3 cellGcmSys sources
 
 ---
 
@@ -122,8 +122,8 @@ The `rsx_state` struct tracks ALL GPU state that methods modify:
 | **Cull** | enable, face (front/back), winding (CW/CCW) | 0x2BC-0x2C4 |
 | **Color mask** | ARGB channel write enables | 0x028 |
 | **Alpha test** | enable, function, reference value | 0x104-0x10C |
-| **Textures** | 16 units × 8 registers (offset, format, address, control, filter, rect, border) | 0x1A00-0x1BFF |
-| **Vertices** | 16 attribs × format + offset (type, size, stride, enabled) | 0x1680-0x177F |
+| **Textures** | 16 units Ã— 8 registers (offset, format, address, control, filter, rect, border) | 0x1A00-0x1BFF |
+| **Vertices** | 16 attribs Ã— format + offset (type, size, stride, enabled) | 0x1680-0x177F |
 | **Shaders** | fragment program addr, vertex load slot, constants, output mask | 0x8E4, 0x1E9C, 0x1EFC |
 | **Draw** | primitive type, draw_arrays (first+count), draw_indexed | 0x1808, 0x1814, 0x1820 |
 
@@ -210,7 +210,7 @@ Real GPU rendering via Direct3D 12. Current capabilities:
 |---------|--------|---------|
 | Device creation | **Done** | Feature level 11.0, any D3D12-capable GPU |
 | Swap chain | **Done** | Double-buffered, flip-discard, VSync present |
-| Clear | **Done** | Clears to RSX clear color (ARGB → float4 RGBA) |
+| Clear | **Done** | Clears to RSX clear color (ARGB â†’ float4 RGBA) |
 | Root signature | **Done** | Input assembler enabled |
 | Pipeline state | **Done** | Vertex-colored shader (position + color) compiled at init |
 | Vertex buffer | **Done** | 4MB upload heap, persistently mapped, DrawInstanced |
@@ -223,20 +223,20 @@ Real GPU rendering via Direct3D 12. Current capabilities:
 | Blend state | Logging | Logs blend enable/factors (PSO recreation needed) |
 | Depth/stencil | Logging | Logs depth test/stencil state |
 | Texture binding | Logging | Logs format, dimensions, guest address. Format decode ready. |
-| Texture upload | Scaffold | 25 RSX→DXGI format mappings, upload process documented |
-| RSX shaders | Not started | Need NV40 ISA → HLSL translation |
+| Texture upload | Scaffold | 25 RSXâ†’DXGI format mappings, upload process documented |
+| RSX shaders | Not started | Need NV40 ISA â†’ HLSL translation |
 | Depth buffer | Not started | Need depth/stencil texture creation |
 
 **How the D3D12 backend renders a frame:**
 
 ```
 1. Reset command allocator + command list for current frame
-2. Transition render target: PRESENT → RENDER_TARGET
+2. Transition render target: PRESENT â†’ RENDER_TARGET
 3. Set render target, viewport, scissor
 4. ClearRenderTargetView with RSX clear color
 5. Bind root signature + PSO + vertex buffer + topology
 6. DrawInstanced with accumulated vertex data
-7. Transition render target: RENDER_TARGET → PRESENT
+7. Transition render target: RENDER_TARGET â†’ PRESENT
 8. Present with VSync
 9. Signal fence, advance to next frame
 ```
@@ -261,7 +261,7 @@ Additional shader definitions in `rsx_d3d12_shaders.h`: solid color fill, textur
 
 ### Primitive Type Mapping (`rsx_primitives.h`)
 
-Maps RSX primitive types to D3D12 topologies. D3D12 doesn't support triangle fans, quads, or line loops — these need index buffer conversion:
+Maps RSX primitive types to D3D12 topologies. D3D12 doesn't support triangle fans, quads, or line loops â€” these need index buffer conversion:
 
 | RSX Primitive | Value | D3D12 | Conversion |
 |--------------|-------|-------|------------|
@@ -276,9 +276,9 @@ Maps RSX primitive types to D3D12 topologies. D3D12 doesn't support triangle fan
 | Quad Strip | 9 | TRIANGLELIST | Expand |
 
 Conversion functions generate index buffers:
-- `rsx_convert_triangle_fan(first, count, indices, max)` — (N-2)×3 indices
-- `rsx_convert_quads(first, count, indices, max)` — (N/4)×6 indices
-- `rsx_convert_line_loop(first, count, indices, max)` — N+1 indices
+- `rsx_convert_triangle_fan(first, count, indices, max)` â€” (N-2)Ã—3 indices
+- `rsx_convert_quads(first, count, indices, max)` â€” (N/4)Ã—6 indices
+- `rsx_convert_line_loop(first, count, indices, max)` â€” N+1 indices
 
 ### Vertex Format Mapping (`rsx_vertex_formats.h`)
 
@@ -375,7 +375,7 @@ The window should show the RSX clear color. Draw calls are logged to stderr.
 Look at the `[D3D12] draw_arrays(prim=5, first=0, count=36)` log messages:
 - `prim=5` = triangles, `prim=6` = triangle strip
 - Check which vertex attributes are enabled and what format they use
-- Note the draw count — small counts suggest UI elements, large counts suggest 3D geometry
+- Note the draw count â€” small counts suggest UI elements, large counts suggest 3D geometry
 
 ### Step 4: Wire Vertex Upload
 
@@ -405,4 +405,4 @@ For each unique shader program the game uses:
 | `rsx_d3d12_shaders.h` | 100 | Built-in HLSL shader strings |
 | `rsx_null_backend.c` | 260 | Win32 window + GDI clear |
 | `rsx_primitives.h` | 112 | Topology mapping + index conversion |
-| `rsx_vertex_formats.h` | 115 | Vertex type → DXGI format mapping |
+| `rsx_vertex_formats.h` | 115 | Vertex type â†’ DXGI format mapping |
