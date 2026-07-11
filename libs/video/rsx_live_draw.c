@@ -208,6 +208,7 @@ int rsx_live_draw_enabled(void)
 #define M_CULL_FACE          0x1830
 #define M_FRONT_FACE         0x1834
 #define M_CULL_FACE_ENABLE   0x183C
+#define M_COLOR_MASK         0x0324
 
 static D3D12_COMPARISON_FUNC gcm_cmp(u32 f)
 {
@@ -258,6 +259,7 @@ typedef struct {
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
+    u32 color_mask;
 } render_state_t;
 
 static void decode_render_state(render_state_t* rs)
@@ -276,13 +278,25 @@ static void decode_render_state(render_state_t* rs)
     rs->cull_enable = rsx_dsp_reg(&g.rsx, M_CULL_FACE_ENABLE) & 1;
     rs->cull_face   = rsx_dsp_reg(&g.rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(&g.rsx, M_FRONT_FACE);
+    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register — 0 is a
+     * legitimate game-written "write no color channels" (the character
+     * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
+     * reset default (0x01010101), so never-written reads as all-on. */
+    rs->color_mask  = rsx_dsp_reg(&g.rsx, M_COLOR_MASK);
 }
 
 static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
                                const render_state_t* rs)
 {
     D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
-    b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    /* nv40_3d COLOR_MASK byte layout (Mesa/nouveau nv40_3d.xml.h, MIT/X11):
+     * B=[0:7] G=[8:15] R=[16:23] A=[24:31]; any nonzero byte = channel on.
+     * (s31: was hardcoded ENABLE_ALL — the blue-character class' live twin.) */
+    b->RenderTargetWriteMask =
+        (((rs->color_mask       ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_BLUE  : 0) |
+        (((rs->color_mask >>  8 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
+        (((rs->color_mask >> 16 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_RED   : 0) |
+        (((rs->color_mask >> 24 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0);
     if (rs->blend_enable) {
         b->BlendEnable   = TRUE;
         b->SrcBlend      = gcm_blend_factor(rs->sf_rgb, 0);
