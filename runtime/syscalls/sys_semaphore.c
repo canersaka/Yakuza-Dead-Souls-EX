@@ -381,6 +381,28 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * r3 = sem_id
  * r4 = count (number to post)
  * -----------------------------------------------------------------------*/
+/* s36 force-wake diagnostic (YZ_FORCE_WAKE): post a semaphore from a WATCHDOG
+ * thread (not a guest syscall) to un-park a starved CRI consumer. Used only to
+ * TEST whether the completion-dispatch stall (consumers parked forever) is the
+ * preload blocker; capped at max_value so it can't over-count. */
+void yz_force_sem_post(uint32_t sem_id)
+{
+    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) return;
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active) return;
+#ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    int ok = (s->value < s->max_value);
+    if (ok) s->value++;
+    LeaveCriticalSection(&s->value_lock);
+    if (ok) ReleaseSemaphore(s->sem_handle, 1, NULL);
+#else
+    pthread_mutex_lock(&s->mtx);
+    if (s->value < s->max_value) { s->value++; pthread_cond_signal(&s->cv); }
+    pthread_mutex_unlock(&s->mtx);
+#endif
+}
+
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);

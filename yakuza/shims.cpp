@@ -750,6 +750,10 @@ extern "C" void yz_init_syscalls(void)
     lv2_syscall_register(&g_lv2_syscalls, 677, yz_sys_rsx_attribute);
 }
 
+/* s37 PROTOTYPES B/C: bounded-concurrency gate hooks (defined in threads.cpp). */
+extern "C" void yz_gate_syscall_release(void);
+extern "C" void yz_gate_syscall_acquire(void);
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* TEMP DEBUG (SPURS bring-up): log the first call of each syscall
@@ -924,8 +928,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Record the in-flight syscall so a stall dump can name exactly what each
      * blocked thread is parked in (object-id args survive in the GPRs while the
      * dispatch below blocks). Cleared on return. (blocker #21 diagnostic) */
+    /* s37 PROTOTYPES B/C: the bounded-concurrency gate. A guest PPU thread holds
+     * its run-slot while executing guest code; vacate it across the (possibly
+     * blocking) syscall dispatch so a higher-priority runnable thread can run,
+     * then re-acquire on return (the priority arbitration point). No-op when the
+     * gate is OFF (default). */
     yz_wait_enter(num, a3, a4, a5);
+    yz_gate_syscall_release();
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
+    yz_gate_syscall_acquire();
     yz_wait_exit();
 
     if (first || (lv2_log_full && (spu_range || intr))) {
