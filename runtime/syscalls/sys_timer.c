@@ -140,9 +140,32 @@ extern void (*g_yz_usleep_pump)(void);
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+extern uint32_t yz_thread_current_id(void);
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+
+    /* s36 root-hunt: at the preload stall, t1's master loop wedges spinning on
+     * usleep(250). Log the CALLER (lr) of each distinct t1 usleep(250) site so we
+     * can decode the poll predicate it's stuck on (LESSONS #3: name the stuck
+     * flag). Env-gated YZ_USLEEP_LR, dedup per distinct lr, low volume. */
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("YZ_USLEEP_LR") ? 1 : 0;
+        if (on && usec == 250 && yz_thread_current_id() == 1) {
+            static uint32_t seen[24]; static int sn = 0;
+            uint32_t lr = (uint32_t)ctx->lr;
+            int dup = 0;
+            for (int k = 0; k < sn; k++) if (seen[k] == lr) { dup = 1; break; }
+            if (!dup && sn < 24) {
+                seen[sn++] = lr;
+                fprintf(stderr, "[usleep-lr] t1 usleep(250) lr=0x%08X r1=0x%08X ctr=0x%08X r3in=0x%08X\n",
+                        lr, (uint32_t)ctx->gpr[1], (uint32_t)ctx->ctr, (uint32_t)ctx->gpr[3]);
+                fflush(stderr);
+            }
+        }
+    }
 
 #ifdef _WIN32
     ensure_time_period_init();

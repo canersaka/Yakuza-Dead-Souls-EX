@@ -329,7 +329,7 @@ static void guest_caller(uint32_t opd_addr,
         cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);
         if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return; }
         cb_ctx.gpr[1] = ((uint64_t)cb_stack + 256 * 1024 - 0x100) & ~0xFull;
-        /* Null back-chain terminator: an SDK stack-trace walker (e.g. libsre's
+        /* Null back-chain terminator: a platform stack-trace walker (e.g. libsre's
          * assertion handler) follows [r1] up until it reads 0. Without this the
          * walk runs off the top of the callback stack into garbage and loops
          * forever, blowing the stack. Mirrors the main/created-thread setup. */
@@ -830,8 +830,8 @@ static const yz_func_entry* yz_func_from_guest(uint32_t addr)
  * tail-branch hops. Volume-bounded: 4 first-hits per site + one census line
  * per 5 s (LESSONS #6c); racy counters tolerable (census). The first-hit
  * banner + the control site make zero-hit negatives MEASURED (LESSONS #21b). */
-static unsigned g_yz_chain_addrs[16];
-static volatile long long g_yz_chain_counts[16];
+static unsigned g_yz_chain_addrs[32];
+static volatile long long g_yz_chain_counts[32];
 
 /* Independent census printer (LESSONS #6d: the in-probe census goes silent the
  * moment the probed functions stop running — exactly when the counters matter
@@ -840,7 +840,7 @@ void yz_chain_census_dump(const char* tag)
 {
     fprintf(stderr, "[chain] census(%s) t=%llums:", tag,
             (unsigned long long)GetTickCount64());
-    for (int k = 0; k < 16 && g_yz_chain_addrs[k]; k++)
+    for (int k = 0; k < 32 && g_yz_chain_addrs[k]; k++)
         fprintf(stderr, " 0x%08X=%lld", g_yz_chain_addrs[k],
                 (long long)g_yz_chain_counts[k]);
     fprintf(stderr, "\n");
@@ -853,6 +853,10 @@ void yz_chain_census_dump(const char* tag)
  * the segment: 7/7 boots separated stalled-vs-clean purely by lever-fire
  * order). */
 int g_yz_updloop_started = 0;
+
+/* s36 force-wake test helpers (runtime/syscalls/sys_semaphore.c + sys_cond.c). */
+extern "C" void yz_force_sem_post(uint32_t sem_id);
+extern "C" void yz_force_cond_signal(uint32_t cond_id);
 
 /* s30 §8.4 (scratch/s30_staging_decision.md): the boot-phase HOLD shim,
  * injected at func_001AB63C entry (the mode-machine's boot-flag clearer:
@@ -933,16 +937,327 @@ extern "C" int yz_hold_boot(void* ctxv)
     return 0;
 }
 
+/* s37 Path-B VALIDATION EXPERIMENT (YZ_CRI_INLINE, default OFF): force the CRI-FS
+ * loader read-dispatch (func_00E54A08) down the INLINE/synchronous completion branch
+ * (func_00E54B78) instead of sem-posting the async worker (func_00E561B4). RPCS3 (the
+ * playable oracle) reads the whole preload INLINE on cri_dlg in ~17ms/file with the async
+ * worker never posted (MEASURED, scratch/s37_root_b_syncdiverge.md); our LLE'd CRI loader
+ * diverges to async (obj+0x4 bit0=0) and the completion is gated on t1's ~10s render-throttled
+ * outer loop. Since our sys_fs_read is already a synchronous host fread (data resident), the
+ * inline callback finishes immediately. This is a MEASUREMENT-ONLY branch-forcer to confirm
+ * inline collapses the ~10s/file crawl (and removes the async wedge) before shipping the
+ * faithful root-fix (make our loader-pool init produce bit0=1 on its own). Reentrancy note:
+ * the inline callback runs on the caller thread (tid=1) — watch for a crash/reentrancy in the
+ * validation boot. Injected before the func_00E54B78 tail-branch by scratch/patch_cri_inline.py. */
+extern "C" int yz_cri_inline_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("YZ_CRI_INLINE") ? 1 : 0;
+        fprintf(stderr, "[cri-inline] ARMED (%s): func_00E54A08 forced-inline %s\n",
+                on ? "YZ_CRI_INLINE" : "log-only", on ? "ENABLED" : "disabled");
+        fflush(stderr);
+    }
+    return on;
+}
+
+/* s36: the [dstatus]/[readdone] riders fprintf on the HOT driver-status path,
+ * which perturbs timing (flips the s36 completion race). Gate them OFF by default
+ * so the light [req]/[cinvoke] probes can measure the race WITHOUT that latency
+ * (e.g. the YZ_THREAD_PRIO A/B); enable with YZ_DSTATUS for the fork A/B/C census. */
+static int yz_dstatus_probe_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("YZ_DSTATUS") ? 1 : 0;
+    return on;
+}
+
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
 {
     if (addr == 0x00D1E838u) g_yz_updloop_started = 1;
+    /* s35 Root-B rider (scratch/s35_completion_advance.md): func_00F01CE0 is the CRI
+     * file-engine per-handle state machine. Filter to scenario.bin's handle
+     * (*(obj+0xC14) == its driver 0x01655848) and log the state + the paired-source
+     * field obj+0xC10 (the candidate NULL that wedges the close at gates 0xF01ED8/
+     * 0xF01E0C). Sampled to bound volume. If this NEVER fires, scenario's handle is not
+     * in the stream machine at all (points at Root A / a different path). */
+    if (addr == 0x00F01CE0u) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t obj = (uint32_t)c->gpr[3];
+        if (vm_read32(obj + 0xC14u) == 0x01655848u) {
+            static long fc = 0;
+            if ((++fc & 0x3F) == 1) {
+                fprintf(stderr, "[f01ce0] scenario obj=0x%08X state=%u C10(paired)=0x%08X C28(thresh)=0x%08X C2C(pos)=0x%08X\n",
+                        obj, vm_read32(obj + 8u), vm_read32(obj + 0xC10u),
+                        vm_read32(obj + 0xC28u), vm_read32(obj + 0xC2Cu));
+                fflush(stderr);
+            }
+        }
+    }
+    /* s36 (2026-07-12): the request STATE MACHINE. func_00068EDC(mgr, index)
+     * addresses its record as record = *(mgr+0xC) + 0x130*(index & 0xFFFF)
+     * (DISASM-verified prologue). record[0]=state, record[+0x28]=loader (this),
+     * record[+0xD]=defer/hold flag, record[+0x24]=completion callback. The
+     * SUCCESS completion (fires the loader callback func_0033DE5C with status=1,
+     * setting loader ready byte@+8=1) is reached only when the record walks to
+     * the fire state with record[+0xD]==0 -- DISASM REFUTES s35 Root A: +0xD is a
+     * DEFER flag, so the register (func_0033DBD4/069DA0) being NEVER called
+     * (+0xD==0) is the FIRE path, not the block. This rider logs each record's
+     * state TRAJECTORY (deduped on state-change, capped per record) so we see
+     * whether scenario's record is pumped by this machine at all, and where it
+     * stalls. Correlate loader= to scenario's loader (from the 0x0036CBE4 ctor
+     * r3). Guest is big-endian: byte at rec+0xD = (word(rec+0xC) >> 16) & 0xFF. */
+    if (addr == 0x00068EDCu) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t mgr = (uint32_t)c->gpr[3];
+        uint32_t idx = (uint32_t)(c->gpr[4] & 0xFFFFu);
+        uint32_t rec = vm_read32(mgr + 0xCu) + idx * 0x130u;
+        uint32_t state = vm_read32(rec);
+        static uint32_t req_rec[256];
+        static uint32_t req_state[256];
+        static uint16_t req_cnt[256];
+        int slot = -1, freeslot = -1;
+        for (int k = 0; k < 256; k++) {
+            if (req_rec[k] == rec) { slot = k; break; }
+            if (freeslot < 0 && req_rec[k] == 0) freeslot = k;
+        }
+        if (slot < 0 && freeslot >= 0) {
+            slot = freeslot; req_rec[slot] = rec;
+            req_state[slot] = 0xFFFFFFFFu; req_cnt[slot] = 0;
+        }
+        if (slot < 0 || (req_state[slot] != state && req_cnt[slot] < 60)) {
+            if (slot >= 0) { req_state[slot] = state; req_cnt[slot]++; }
+            uint32_t w0C = vm_read32(rec + 0xCu);
+            fprintf(stderr, "[req] mgr=0x%08X idx=%u rec=0x%08X state=%u loader=0x%08X hold=%u f4=0x%08X f18=0x%08X fF=%u\n",
+                    mgr, idx, rec, state, vm_read32(rec + 0x28u),
+                    (unsigned)((w0C >> 16) & 0xFFu), vm_read32(rec + 0x4u),
+                    vm_read32(rec + 0x18u), (unsigned)(w0C & 0xFFu));
+            fflush(stderr);
+        }
+    }
+    /* s37 (2026-07-12) — THE ARM/FIRE RACE confirmation (verifiers A+B converged,
+     * scratch/s37_verifyA_disasm.md + s37_verifyB_oracle.md; env YZ_ARMFIRE).
+     * The driver read-done handler func_00EEF88C (reached from the pump
+     * func_00EEF740 when slot status *(D+8)==2) delivers via
+     * func_00F00530 -> func_00F00484, which requires the completion MAILBOX
+     * M=*(D+0x440) to be ARMED (*(M+0x4)!=0) AND seq-matched (*(M+0x48)==arg=
+     * *(D+0x444)). If not, func_00F00484 returns 1 (DISASM-verified polarity:
+     * li r9,1 default, r9=0 only on the sys_cond_signal path) and func_00EEF88C
+     * RETIRES the slot (status 2->1, 0xEEF8A4 bne->retire) with NO cond-4 signal
+     * -> t11 never wakes, func_0006A1A8 never runs, record frozen at 0xC. The
+     * client arms M via func_00F00580 (*(M+0x4)=1, *(M+0x48)=seq, stores record).
+     * QUESTION (LESSONS #2 run-confirm): at scenario's D=0x01655848 fire, is M
+     * armed? and does the arm ever run (arm-late RACE vs arm-never DEADLOCK)?
+     * Deduped on armed-state change so the fprintf latency stays low (heavy
+     * logging here can flip the race, A's observer caveat). */
+    {
+        static int af = -1; if (af < 0) af = getenv("YZ_ARMFIRE") ? 1 : 0;
+        if (af && addr == 0x00EEF88Cu) {          /* FIRE: read-done; r31 = slot D */
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t D = (uint32_t)c->gpr[31];
+            if (D == 0x01655848u) {               /* scenario.bin's driver slot only */
+                uint32_t M   = vm_read32(D + 0x440u);
+                uint32_t arg = vm_read32(D + 0x444u);
+                int okM = (M >= 0x10000u && M < 0xE0000000u);
+                uint32_t armed = okM ? vm_read32(M + 0x4u)  : 0xBADBADu;
+                uint32_t mseq  = okM ? vm_read32(M + 0x48u) : 0xBADBADu;
+                static uint32_t last = 0xFFFFFFFFu; static long n = 0;
+                uint32_t key = (armed << 1) | ((mseq == arg) ? 1u : 0u);
+                if (key != last || (++n & 0x3FFu) == 1) {
+                    last = key;
+                    fprintf(stderr, "[armfire] FIRE SCENARIO D=%08X M=%08X arg=%08X armed=%08X mseq=%08X match=%d tid=%u n=%ld\n",
+                            D, M, arg, armed, mseq, (mseq == arg), yz_thread_current_id(), n);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (af && addr == 0x00F00580u) {          /* ARM: r3=M(obj), r4=arg, r5=record */
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t M      = (uint32_t)c->gpr[3];
+            uint32_t arg    = (uint32_t)c->gpr[4];
+            uint32_t record = (uint32_t)c->gpr[5];
+            static long ac = 0;
+            if (record == 0x60559B00u || (++ac & 0x7Fu) == 1) {
+                fprintf(stderr, "[armfire] ARM  M=%08X arg=%08X record=%08X tid=%u\n",
+                        M, arg, record, yz_thread_current_id());
+                fflush(stderr);
+            }
+        }
+    }
+    /* s37 (2026-07-13) — THE ENQUEUE-vs-INLINE BRANCH probe (env YZ_ENQ). func_00E54A08
+     * (state-0xC op, args r3=handle r4=descriptor r5=record r6=mode) enqueues the request
+     * inside a lock, UNLOCKS (func_00E588D0 @0xE54B04), then re-reads *(obj+0x4) OUTSIDE
+     * the lock (@0xE54B0C) and branches on bit0: ==0 -> func_00E561B4 (signal worker t2 ->
+     * func_00E55F3C posts sem 1 -> t2 runs func_00E59908 idx=2 -> func_0006A1A8 record
+     * 0xC->0xD); ==1 -> inline completion (0xE54B78, bctrl r4=259). That re-read races the
+     * concurrent obj+0x4 writer (t1 driver-status path) under our unbounded parallelism =
+     * the suspected seam (fact-4: latency on the status path wins). DECISION: for scenario's
+     * read (record 0x60559B00 / descriptor 0x13260A8), is func_00E561B4 called right after
+     * func_00E54A08 (worker path) or not (inline path)? Correlate with [cinvoke] idx=2. */
+    {
+        static int eq = -1; if (eq < 0) eq = getenv("YZ_ENQ") ? 1 : 0;
+        if (eq && addr == 0x00E54A08u) {
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t handle = (uint32_t)c->gpr[3], desc = (uint32_t)c->gpr[4];
+            uint32_t record = (uint32_t)c->gpr[5], mode = (uint32_t)c->gpr[6];
+            static long n = 0;
+            if (record == 0x60559B00u || desc == 0x13260A8u || (++n & 0x3Fu) == 1) {
+                fprintf(stderr, "[enq] E54A08 handle=0x%08X desc=0x%08X record=0x%08X mode=%u tid=%u%s\n",
+                        handle, desc, record, mode, yz_thread_current_id(),
+                        (record == 0x60559B00u) ? " SCENARIO" : "");
+                fflush(stderr);
+            }
+        }
+        if (eq && addr == 0x00E561B4u) {           /* worker-signal path (bit0==0) taken */
+            ppu_context* c = (ppu_context*)ctxv;
+            static long n = 0;
+            if ((++n & 0x3Fu) == 1 || (uint32_t)c->gpr[4] == 0x000E0008u) {
+                fprintf(stderr, "[enq] E561B4 SIGNAL-WORKER r3=0x%08llX handle=0x%08llX mode=0x%08llX tid=%u%s\n",
+                        (unsigned long long)c->gpr[3], (unsigned long long)c->gpr[4],
+                        (unsigned long long)c->gpr[5], yz_thread_current_id(),
+                        ((uint32_t)c->gpr[4] == 0x000E0008u) ? " scenario-handle" : "");
+                fflush(stderr);
+            }
+        }
+    }
+    /* s37 six-pass CONVERGED-ROOT sub-mechanism probe (env YZ_WRK): the t2 worker loop.
+     * Distinguishes the three surviving hypotheses at the 9th->10th inter-chunk handoff:
+     * (pass 6) SPINNING-DEFER — func_00E55C84 fires repeatedly for scenario's node with
+     *   accumulated node+0x174 STUCK below target node+0x14/+0x178; vs
+     * (pass 2) DEACTIVATION DROP — func_00E5888C's handle lookup goes NULL for scenario's
+     *   handle 0xE0008 (obj = *(r2-0x7C04) + ((handle>>16)&0xFFFF)*392; active iff *(obj+0x4)<0). */
+    {
+        static int wk = -1; if (wk < 0) wk = getenv("YZ_WRK") ? 1 : 0;
+        if (wk && addr == 0x00E55C84u) {           /* worker DEFER/read-more; r24 = req node */
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t node  = (uint32_t)c->gpr[24];
+            uint32_t accum = vm_read32(node + 0x174u);
+            uint32_t t14   = vm_read32(node + 0x14u);
+            uint32_t t178  = vm_read32(node + 0x178u);
+            static uint32_t last_node = 0, last_accum = 0xFFFFFFFFu; static long dn = 0;
+            ++dn;
+            if (node != last_node || accum != last_accum || (dn & 0x3FFFu) == 1) {
+                last_node = node; last_accum = accum;
+                fprintf(stderr, "[wrk] DEFER node=0x%08X accum=0x%08X t14=0x%08X t178=0x%08X tid=%u n=%ld\n",
+                        node, accum, t14, t178, yz_thread_current_id(), dn);
+                fflush(stderr);
+            }
+        }
+        if (wk && addr == 0x00E5888Cu) {           /* driver handle lookup; r3 = handle */
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t h = (uint32_t)c->gpr[3];
+            if (h == 0x000E0008u) {                /* scenario.bin's driver handle */
+                uint32_t tbl = vm_read32((uint32_t)c->gpr[2] - 0x7C04u);
+                uint32_t obj = tbl + ((h >> 16) & 0xFFFFu) * 392u;
+                uint32_t f4  = (obj >= 0x10000u && obj < 0xE0000000u) ? vm_read32(obj + 0x4u) : 0;
+                static uint32_t last = 0xDEADBEEFu;
+                if (f4 != last) { last = f4;
+                    fprintf(stderr, "[wrk] LOOKUP handle=0x%08X obj=0x%08X f4=0x%08X %s tid=%u\n",
+                            h, obj, f4, ((int32_t)f4 < 0) ? "ACTIVE" : "DEACTIVATED->NULL",
+                            yz_thread_current_id());
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+    /* s37 (2026-07-13) — THE FIX CANDIDATE (env YZ_CRI_YIELD). The scenario.bin stall is a
+     * SPINNING-DEFER, MEASURED by YZ_WRK: the t2 worker wedges with accum=0x50000 < target
+     * 0x55D00, handle ACTIVE — the driver never delivers the last chunk to the worker's read
+     * view while t1(pump func_00EEF88C)/t2(worker defer func_00E55C84)/the status poll
+     * (func_00EEEE04) HOT-SPIN, starving the deliver thread t11 (func_00F00208). PS3's bounded
+     * 2-SMT + priority scheduler serializes these; our unbounded truly-parallel port does not.
+     * Yield the timeslice at the hot-spin sites so t11 runs and delivers — the faithful stand-in
+     * for the scheduling we lack, and exactly what the winning fprintf (evidence #6) does by
+     * accident. NOT the refuted YZ_THREAD_PRIO (#56a: that set Windows priorities). Env-gated,
+     * default-OFF, kill-switch; SwitchToThread is a cheap no-op when nothing else is ready. */
+    {
+        static int cy = -1; if (cy < 0) cy = getenv("YZ_CRI_YIELD") ? 1 : 0;
+        if (cy && (addr == 0x00EEF88Cu || addr == 0x00E55C84u ||
+                   addr == 0x00EEEE04u || addr == 0x00EEECDCu)) {
+            SwitchToThread();
+        }
+    }
+    /* s36 completion-invoke discriminator (verifierA vs verifierB): the CRI-FS
+     * server-thread completion invoker func_00E59908(obj, idx, status) reads
+     * slot=obj+idx*8+0x10; descriptor=*(slot+8), record=*(slot+0xC); if desc!=0
+     * ps3_indirect_call -> descriptor op0 with r5=record. For a read (idx=2) that
+     * op0 = func_0006A1A8 -> record[0]=0xD. func_0006A104 = OPEN op0 (idx=0), the
+     * WORKING control (scenario reached state 6). These riders decide: does the
+     * read completion fire for scenario, or does the read stall upstream? */
+    if (addr == 0x00E59908u) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t obj = (uint32_t)c->gpr[3];
+        uint32_t idx = (uint32_t)(c->gpr[4] & 0xFFu);
+        uint32_t slot = obj + idx * 8u + 0x10u;
+        uint32_t rec = vm_read32(slot + 0xCu);
+        static long ic = 0;
+        if (++ic <= 300) {
+            fprintf(stderr, "[cinvoke] obj=0x%08X idx=%u status=0x%08X desc=0x%08X rec=0x%08X loader=0x%08X\n",
+                    obj, idx, (uint32_t)c->gpr[5], vm_read32(slot + 0x8u), rec,
+                    rec ? vm_read32(rec + 0x28u) : 0u);
+            fflush(stderr);
+        }
+    }
+    if (addr == 0x0006A1A8u || addr == 0x0006A104u) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t rec = (uint32_t)c->gpr[5];
+        static uint32_t adv_rec[128]; static int adv_n = 0;
+        int seen = 0;
+        for (int k = 0; k < adv_n; k++) if (adv_rec[k] == rec) { seen = 1; break; }
+        if (!seen && adv_n < 128) adv_rec[adv_n++] = rec;
+        if (!seen) {
+            fprintf(stderr, "[%s] rec=0x%08X loader=0x%08X status=0x%08X state=%u\n",
+                    addr == 0x0006A1A8u ? "radv" : "oadv", rec,
+                    rec ? vm_read32(rec + 0x28u) : 0u, (uint32_t)c->gpr[4],
+                    rec ? vm_read32(rec) : 0u);
+            fflush(stderr);
+        }
+    }
+    /* s36 fork A/B/C localizer: the driver read of scenario.bin completes
+     * (cons=tot=0xAC) but func_0006A1A8 (read completion) never fires. func_00EEF740
+     * dispatches the read-done handler func_00EEF88C ONLY on slot status==2. This
+     * catches every status write (func_00EEECDC: *(D+0x8)=status) + every read-done
+     * dispatch. If scenario's slot (D=0x1655848) never shows status=2 -> fork A (the
+     * cons==tot -> status=2 transition is the drop). If it shows status=2 but
+     * func_00EEF88C -> completion still doesn't reach func_0006A1A8 -> fork B. */
+    if (addr == 0x00EEECDCu && yz_dstatus_probe_on()) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t D = (uint32_t)c->gpr[3];
+        uint32_t st = (uint32_t)(c->gpr[4] & 0xFFu);
+        static uint32_t sd_D[96]; static uint8_t sd_st[96]; static int sd_n = 0;
+        static long sd_cap = 0;
+        int slot = -1;
+        for (int k = 0; k < sd_n; k++) if (sd_D[k] == D) { slot = k; break; }
+        if (slot < 0 && sd_n < 96) { slot = sd_n++; sd_D[slot] = D; sd_st[slot] = 0xFF; }
+        if ((slot < 0 || sd_st[slot] != (uint8_t)st) && sd_cap < 500) {
+            if (slot >= 0) sd_st[slot] = (uint8_t)st;
+            sd_cap++;
+            fprintf(stderr, "[dstatus] D=0x%08X status=%u err=0x%08X\n",
+                    D, st, (uint32_t)c->gpr[5]);
+            fflush(stderr);
+        }
+    }
+    if (addr == 0x00EEF88Cu && yz_dstatus_probe_on()) {
+        ppu_context* c = (ppu_context*)ctxv;
+        uint32_t D = (uint32_t)c->gpr[31];
+        static uint32_t rd_D[96]; static int rd_n = 0;
+        int seen = 0;
+        for (int k = 0; k < rd_n; k++) if (rd_D[k] == D) { seen = 1; break; }
+        if (!seen && rd_n < 96) rd_D[rd_n++] = D;
+        if (!seen) {
+            fprintf(stderr, "[readdone] D=0x%08X status=%u phase=%u cons=%u tot=%u\n", D,
+                    (uint32_t)(vm_read32(D + 8u) & 0xFFu), (uint32_t)(vm_read32(D + 0x448u) & 0xFFu),
+                    vm_read32(D + 0x44Cu), vm_read32(D + 0x448u));
+            fflush(stderr);
+        }
+    }
     unsigned* as = g_yz_chain_addrs;
     volatile long long* ns = g_yz_chain_counts;
     static int banner = 0;
     static unsigned long long lastms = 0;
     ppu_context* ctx = (ppu_context*)ctxv;
     int i = 0;
-    for (; i < 15 && as[i] && as[i] != addr; i++) {}
+    for (; i < 31 && as[i] && as[i] != addr; i++) {}
     if (!as[i]) as[i] = addr;
     long long n = ++ns[i];
     if (!banner) {
@@ -2542,6 +2857,36 @@ int main(int argc, char** argv)
      * null-guarded, NO page watches (0x1661xxx is the CRI cs hot page,
      * LESSONS #6c). Discriminates the variant-A/B/C failure stories at the
      * chain death (pre-committed table in the report). */
+    /* s36 force-wake test (YZ_FORCE_WAKE): the sync-dump proved the CRI completion
+     * consumers (t2 on sem_wait, t11 on cond_wait) park FOREVER at the preload stall
+     * while t1 keeps pumping. This watchdog pokes any CRI consumer parked >500ms so
+     * it re-checks its work queue -- a decisive test of whether re-driving the stalled
+     * dispatch lets the preload walk (root confirmed) or not (work not even enqueued).
+     * Diagnostic, env-gated OFF. */
+    if (getenv("YZ_FORCE_WAKE")) {
+        fprintf(stderr, "[force-wake] ARMED (YZ_FORCE_WAKE): poking parked CRI consumers\n");
+        fflush(stderr);
+        CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+            static const uint32_t tids[] = {2u, 3u, 11u, 12u};
+            long pokes = 0;
+            for (;;) {
+                Sleep(250);
+                for (unsigned i = 0; i < sizeof(tids)/sizeof(tids[0]); i++) {
+                    uint32_t scn = 0, held = 0; uint64_t a3 = 0, a4 = 0, a5 = 0;
+                    if (!yz_wait_get(tids[i], &scn, &a3, &a4, &a5, &held) || held <= 500)
+                        continue;
+                    if (scn == 92)       yz_force_sem_post((uint32_t)a3);
+                    else if (scn == 107) yz_force_cond_signal((uint32_t)a3);
+                    else continue;
+                    if (++pokes <= 40 || (pokes & 0xFF) == 0) {
+                        fprintf(stderr, "[force-wake] poked t%u sc%u id=%llu held=%ums (poke#%ld)\n",
+                                tids[i], scn, (unsigned long long)a3, held, pokes);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }, NULL, 0, NULL);
+    }
     if (getenv("YZ_STAGE_DECIDE"))
         CreateThread(NULL, 0, [](LPVOID) -> DWORD {
             fprintf(stderr, "[stagedec] ARMED (YZ_STAGE_DECIDE): 5s CRI pipeline peek\n");
@@ -2578,6 +2923,28 @@ int main(int argc, char** argv)
                         }
                         nlive++;
                     }
+                }
+                /* s36: per-tick blocked-state of the CRI producer/consumer threads
+                 * (yz_wait_get: the in-flight syscall each thread is parked in). At
+                 * the preload stall this names the EXACT sync primitive gating the
+                 * record-advancing completion. t1=main(producer/pump), t2=file-server
+                 * (func_00E55538->func_00E59908->func_0006A1A8 = the record advance),
+                 * t11/t12=cri_dlg, t16-20=CRI FS File Access, t21=decompression. */
+                {
+                    const uint32_t tids[] = {1u,2u,3u,11u,12u,16u,17u,21u};
+                    char wb[640]; int wn = 0; wb[0] = 0;
+                    for (unsigned i = 0; i < sizeof(tids)/sizeof(tids[0]); i++) {
+                        uint32_t scn = 0, held = 0; uint64_t a3 = 0, a4 = 0, a5 = 0;
+                        if (yz_wait_get(tids[i], &scn, &a3, &a4, &a5, &held))
+                            wn += snprintf(wb + wn, sizeof(wb) - (size_t)wn,
+                                    " t%u:sc%u(r3=%llX %ums)", tids[i], scn,
+                                    (unsigned long long)a3, held);
+                        else
+                            wn += snprintf(wb + wn, sizeof(wb) - (size_t)wn, " t%u:run", tids[i]);
+                        if (wn > (int)sizeof(wb) - 48) break;
+                    }
+                    fprintf(stderr, "[syncdump]%s\n", wb);
+                    fflush(stderr);
                 }
                 /* s31: bootflag/exitreq = the two boot-pump exit cells
                  * (vm[0x136786C] bit 0x400 = pump-run flag; vm[0x1367874] =
