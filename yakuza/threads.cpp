@@ -184,6 +184,167 @@ extern "C" void yz_thread_registry_raw(void)
     fflush(stderr);
 }
 
+static int yz_lv2_prio_to_win(int32_t prio);   /* defined below */
+static int yz_thread_prio_on(void);            /* defined below */
+
+/* s37 PROTOTYPE A (bounded-concurrency proof): pin every GUEST PPU thread (the
+ * thr_proc-spawned threads + the registered main thread) to a small host-core
+ * mask, so at most popcount(mask) PPU threads run truly-parallel. Models the
+ * Cell's single PPU (2 SMT) against our one-host-thread-per-guest-thread runtime.
+ * SPU host threads (lv2_register.c) and the render/window/RSX host threads
+ * (import_overrides.cpp/main.cpp) are created outside this file, so they stay
+ * UNPINNED (free on all cores). Env YZ_PPU_AFFINITY = the host affinity mask
+ * (base-0 parse: '3' = cores {0,1}, '1' = core {0}, '0xF' = 4 cores). Default
+ * OFF (mask 0 -> no pinning) so the working boot is untouched. */
+static DWORD_PTR yz_ppu_affinity_mask(void)
+{
+    static long long m = -1;   /* -1 = not yet read */
+    if (m == -1) {
+        const char* e = getenv("YZ_PPU_AFFINITY");
+        m = e ? strtoll(e, NULL, 0) : 0;   /* 0 = disabled */
+        fprintf(stderr, "[ppu-aff] ARMED (%s): guest PPU threads %s (mask=0x%llX)\n",
+                e ? "YZ_PPU_AFFINITY" : "off",
+                (e && m) ? "PINNED" : "unpinned", (unsigned long long)m);
+        fflush(stderr);
+    }
+    return (DWORD_PTR)m;
+}
+
+/* ---------------------------------------------------------------------------
+ * s37 PROTOTYPES B/C + CONTROLS: bounded-concurrency admission gate.
+ *
+ * Thesis under test: our runtime runs every guest PPU thread truly-parallel on
+ * its own host core, vs the Cell's ONE PPU (2 SMT lanes) time-sliced by lv2
+ * PRIORITY. The CRI scenario.bin read-completion is a HW-calibrated
+ * producer/consumer/deliver handshake that our over-parallelism shreds.
+ *
+ * A guest PPU thread HOLDS a slot while running guest code and VACATES it across
+ * every lv2 syscall (release before the dispatch that may block, re-acquire
+ * after) and at thread start/exit. Re-acquire is the arbitration point. A thread
+ * blocked in a wait is parked INSIDE the dispatch with its slot vacated, so it
+ * never occupies a slot while sleeping -> no deadlock from blocked high-prio
+ * threads. Modes (env, checked once in yz_threads_init, all default OFF):
+ *   YZ_PPU_CAP=N    Proto B  : priority-BLIND cap of N (FIFO admission).
+ *   YZ_PPU_PRIO=N   Proto C  : faithful top-N by lv2 priority (lowest number =
+ *                              highest priority runs).
+ *   YZ_PPU_WRONG=N  control  : top-N by INVERTED priority (admit LOWEST prio).
+ *   YZ_PPU_DELAY=1  control  : NO cap/priority; just SwitchToThread() at the same
+ *                              sites (pure-latency, to separate timing from
+ *                              mechanism -- broader than the refuted YZ_CRI_YIELD).
+ * default cap = 2 (the PS3's 2 SMT lanes) unless N given.
+ */
+enum { GATE_OFF = 0, GATE_CAP, GATE_PRIO, GATE_WRONG, GATE_DELAY };
+
+static int  g_gate_mode = GATE_OFF;
+static int  g_gate_cap  = 2;
+
+static CRITICAL_SECTION   g_gate_cs;
+static CONDITION_VARIABLE  g_gate_cv;
+static int                g_gate_admitted = 0;
+static volatile long      g_gate_ticket   = 0;
+
+typedef struct { int active; int prio; long ticket; } gate_waiter;
+static gate_waiter s_gate_waiters[MAX_GUEST_THREADS * 2];
+
+static thread_local int s_gate_held = 0;   /* does THIS thread hold a slot? */
+
+/* Parse env + init primitives. Called once from yz_threads_init (single-threaded,
+ * before any worker spawns). */
+static void yz_gate_init(void)
+{
+    InitializeCriticalSection(&g_gate_cs);
+    InitializeConditionVariable(&g_gate_cv);
+
+    const char* e;
+    if ((e = getenv("YZ_PPU_CAP")))        { g_gate_mode = GATE_CAP;   g_gate_cap = atoi(e); }
+    else if ((e = getenv("YZ_PPU_PRIO")))  { g_gate_mode = GATE_PRIO;  g_gate_cap = atoi(e); }
+    else if ((e = getenv("YZ_PPU_WRONG"))) { g_gate_mode = GATE_WRONG; g_gate_cap = atoi(e); }
+    else if ((e = getenv("YZ_PPU_DELAY"))) { g_gate_mode = GATE_DELAY; }
+    if (g_gate_cap < 1) g_gate_cap = 2;
+
+    const char* mn = g_gate_mode == GATE_CAP  ? "CAP(blind)"
+                   : g_gate_mode == GATE_PRIO ? "PRIO(faithful)"
+                   : g_gate_mode == GATE_WRONG? "WRONG(inverted-ctrl)"
+                   : g_gate_mode == GATE_DELAY? "DELAY(pure-latency-ctrl)"
+                   : "off";
+    fprintf(stderr, "[ppu-gate] ARMED: mode=%s cap=%d\n", mn, g_gate_cap);
+    fflush(stderr);
+}
+
+/* Called when this thread is about to run guest code and must occupy a slot. */
+extern "C" void yz_gate_acquire(void)
+{
+    if (g_gate_mode == GATE_OFF || g_gate_mode == GATE_DELAY) return;
+    if (s_gate_held) return;                       /* already holding */
+
+    int myprio = 1001;
+    thr_lock();
+    if (thr_rec* t = thr_find(s_cur_tid)) myprio = t->priority;
+    thr_unlock();
+
+    long myticket = InterlockedIncrement(&g_gate_ticket);
+
+    EnterCriticalSection(&g_gate_cs);
+    /* register as a waiter */
+    int wi = -1;
+    for (int i = 0; i < (int)(sizeof(s_gate_waiters)/sizeof(s_gate_waiters[0])); i++)
+        if (!s_gate_waiters[i].active) { wi = i; break; }
+    if (wi >= 0) { s_gate_waiters[wi].active = 1; s_gate_waiters[wi].prio = myprio;
+                   s_gate_waiters[wi].ticket = myticket; }
+
+    for (;;) {
+        int ahead = 0;   /* how many OTHER waiters get a slot before me */
+        for (int i = 0; i < (int)(sizeof(s_gate_waiters)/sizeof(s_gate_waiters[0])); i++) {
+            if (i == wi || !s_gate_waiters[i].active) continue;
+            const gate_waiter* w = &s_gate_waiters[i];
+            int wins;
+            if (g_gate_mode == GATE_CAP)
+                wins = (w->ticket < myticket);                 /* blind FIFO */
+            else {
+                int wp = (g_gate_mode == GATE_WRONG) ? -w->prio : w->prio;
+                int mp = (g_gate_mode == GATE_WRONG) ? -myprio  : myprio;
+                wins = (wp < mp) || (wp == mp && w->ticket < myticket);
+            }
+            if (wins) ahead++;
+        }
+        if (g_gate_admitted + ahead < g_gate_cap) {
+            g_gate_admitted++;
+            if (wi >= 0) s_gate_waiters[wi].active = 0;
+            break;
+        }
+        SleepConditionVariableCS(&g_gate_cv, &g_gate_cs, INFINITE);
+    }
+    LeaveCriticalSection(&g_gate_cs);
+    s_gate_held = 1;
+}
+
+/* Called when this thread stops running guest code (about to block in a syscall,
+ * or exiting). Vacates its slot and wakes the arbitration. */
+extern "C" void yz_gate_release(void)
+{
+    if (g_gate_mode == GATE_OFF || g_gate_mode == GATE_DELAY) return;
+    if (!s_gate_held) return;
+    EnterCriticalSection(&g_gate_cs);
+    if (g_gate_admitted > 0) g_gate_admitted--;
+    WakeAllConditionVariable(&g_gate_cv);
+    LeaveCriticalSection(&g_gate_cs);
+    s_gate_held = 0;
+}
+
+/* The lv2 syscall funnel (shims.cpp) brackets its (possibly blocking) dispatch
+ * with these: release the slot before, re-acquire after. For the DELAY control
+ * this is a pure SwitchToThread() at the same rate, no admission logic. */
+extern "C" void yz_gate_syscall_release(void)
+{
+    if (g_gate_mode == GATE_DELAY) { SwitchToThread(); return; }
+    yz_gate_release();
+}
+extern "C" void yz_gate_syscall_acquire(void)
+{
+    if (g_gate_mode == GATE_DELAY) return;
+    yz_gate_acquire();
+}
+
 /* Register the main thread so join/priority/stack-info work on id 1. */
 extern "C" void yz_threads_init(uint32_t main_stack_base, uint32_t main_stack_size)
 {
@@ -193,11 +354,30 @@ extern "C" void yz_threads_init(uint32_t main_stack_base, uint32_t main_stack_si
     t->in_use     = 1;
     t->started    = 1;
     t->tid        = 1;
-    t->priority   = 1001;
+    t->priority   = 1001;   /* lv2 default main-thread priority (est.) */
     t->stack_base = main_stack_base;
     t->stack_size = main_stack_size;
     strcpy(t->name, "main");
     thr_unlock();
+
+    /* s36: the MAIN thread is the CRI-FS completion PRODUCER (runs the driver
+     * pump func_00EEF740 + the register/signal func_00F00580, MEASURED tid=1),
+     * while the CONSUMER is cri_dlg (tid=11, lv2 prio 800). On HW cri_dlg (higher
+     * priority) preempts main to consume the completion; on our flat scheduler it
+     * doesn't -> the s36 completion race. The main thread is created outside the
+     * import path, so apply its priority here (prio 1001 -> BELOW_NORMAL) so the
+     * mapped CRI threads (800 -> NORMAL) can preempt it, as on HW. Env-gated. */
+    if (yz_thread_prio_on())
+        SetThreadPriority(GetCurrentThread(), yz_lv2_prio_to_win(1001));
+
+    /* s37 PROTOTYPE A: pin the main guest PPU thread to the bounded core mask. */
+    if (DWORD_PTR am = yz_ppu_affinity_mask())
+        SetThreadAffinityMask(GetCurrentThread(), am);
+
+    /* s37 PROTOTYPES B/C: init the admission gate (single-threaded here, before
+     * any worker spawns) and give the main guest PPU thread its starting slot. */
+    yz_gate_init();
+    yz_gate_acquire();
 }
 
 /* Build a TLS block with the same layout sys_initialize_tls uses for the
@@ -230,7 +410,41 @@ typedef struct {
     uint32_t sp;
     uint64_t r13;
     uint32_t tid;
+    int32_t  priority;
 } thr_start_params;
+
+/* s36 (2026-07-12, user lead): the game assigns lv2 thread priorities (0=highest
+ * .. 3071=lowest; e.g. _gcm_intr=1, cri_dlg=800, cri_adxm_idle=1500) and lv2
+ * schedules strictly by them. Our runtime creates one host thread per guest
+ * thread and previously DROPPED the priority (never SetThreadPriority'd) -> every
+ * PPU thread ran at Windows NORMAL, so a HW-calibrated producer/consumer handshake
+ * (the scenario.bin CRI-FS read-completion, s36) becomes a timing race. Map the
+ * lv2 priority onto Windows' coarse thread-priority levels, preserving the game's
+ * relative ordering, and apply it. Faithful direction (honors the game's own
+ * priorities); RPCS3 respects lv2 priority in its PPU scheduler (Utilities/
+ * Thread.cpp set_native_priority uses BELOW/NORMAL/ABOVE), we have no scheduler so
+ * this coarse host mapping is the available approximation. Env-gated YZ_THREAD_PRIO
+ * (default OFF) for a clean A/B until validated; kill-switch by design. */
+static int yz_lv2_prio_to_win(int32_t prio)
+{
+    if (prio <  150) return THREAD_PRIORITY_HIGHEST;      /* +2 */
+    if (prio <  450) return THREAD_PRIORITY_ABOVE_NORMAL; /* +1 */
+    if (prio <  900) return THREAD_PRIORITY_NORMAL;       /*  0 */
+    if (prio < 1200) return THREAD_PRIORITY_BELOW_NORMAL; /* -1 */
+    return THREAD_PRIORITY_LOWEST;                        /* -2 */
+}
+
+static int yz_thread_prio_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("YZ_THREAD_PRIO") ? 1 : 0;
+        fprintf(stderr, "[thr-prio] ARMED (%s): lv2->win priority mapping %s\n",
+                on ? "YZ_THREAD_PRIO" : "off", on ? "APPLIED" : "disabled");
+        fflush(stderr);
+    }
+    return on;
+}
 
 static DWORD WINAPI thr_proc(LPVOID pv)
 {
@@ -238,6 +452,17 @@ static DWORD WINAPI thr_proc(LPVOID pv)
     free(pv);
 
     s_cur_tid = p.tid;
+
+    /* s36: honor the guest thread priority (env-gated, see yz_lv2_prio_to_win). */
+    if (yz_thread_prio_on())
+        SetThreadPriority(GetCurrentThread(), yz_lv2_prio_to_win(p.priority));
+
+    /* s37 PROTOTYPE A: pin this guest PPU thread to the bounded core mask. */
+    if (DWORD_PTR am = yz_ppu_affinity_mask())
+        SetThreadAffinityMask(GetCurrentThread(), am);
+
+    /* s37 PROTOTYPES B/C: take a slot before running any guest code. */
+    yz_gate_acquire();
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -260,6 +485,9 @@ static DWORD WINAPI thr_proc(LPVOID pv)
 
     /* resolves code+TOC from the descriptor, dispatches, drains trampolines */
     yz_call_guest_opd(p.opd_addr, &ctx);
+
+    /* s37 PROTOTYPES B/C: guest code done, vacate the slot permanently. */
+    yz_gate_release();
 
     thr_lock();
     thr_rec* t = thr_find(p.tid);
@@ -348,6 +576,7 @@ extern "C" void yz_ovr_sys_ppu_thread_create(ppu_context* ctx)
         p->sp       = (t->stack_base + stacksz - 0x100) & ~0xFu;
         p->r13      = r13;
         p->tid      = t->tid;
+        p->priority = priority;
         HANDLE h = CreateThread(NULL, 0, thr_proc, p, 0, NULL);
         if (!h) {
             fprintf(stderr, "[thread] CreateThread failed (%lu)\n", GetLastError());

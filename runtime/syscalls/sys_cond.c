@@ -387,6 +387,26 @@ int64_t sys_cond_wait(ppu_context* ctx)
  *
  * r3 = cond_id
  * -----------------------------------------------------------------------*/
+
+/* s36 force-wake diagnostic (YZ_FORCE_WAKE): signal a cond from a WATCHDOG
+ * thread to un-park a starved CRI consumer (mirrors the rendezvous core of
+ * sys_cond_signal). Only wakes a committed waiter; a no-waiter call is a no-op. */
+void yz_force_cond_signal(uint32_t cond_id)
+{
+    if (cond_id == 0 || cond_id > SYS_COND_MAX) return;
+    sys_cond_info* c = &g_sys_conds[cond_id - 1];
+    if (!c->active) return;
+#ifdef _WIN32
+    EnterCriticalSection(&c->sig_cs);
+    if (c->committed > c->pending) { c->pending++; WakeConditionVariable(&c->cv); }
+    LeaveCriticalSection(&c->sig_cs);
+#else
+    pthread_mutex_lock(&c->sig_mtx);
+    if (c->committed > c->pending) { c->pending++; pthread_cond_signal(&c->cv); }
+    pthread_mutex_unlock(&c->sig_mtx);
+#endif
+}
+
 int64_t sys_cond_signal(ppu_context* ctx)
 {
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
