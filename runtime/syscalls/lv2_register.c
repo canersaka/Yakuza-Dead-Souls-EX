@@ -576,8 +576,8 @@ static void* spu_exec_thread_proc(void* arg)
              * reports SYS_SPU_THREAD_GROUP_JOIN_GROUP_EXIT, not the generic
              * ALL_THREADS_EXIT. The join handler used to overwrite g->cause
              * unconditionally, so a game-initiated sys_spu_thread_group_exit()
-             * was indistinguishable from natural all-threads completion (SDK
-             * Lv2 ref p.147; RPCS3 sys_spu.h:297 join_state). */
+             * was indistinguishable from natural all-threads completion (the
+             * platform Lv2 reference, local notes; RPCS3 sys_spu.h:297 join_state). */
             grp->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
         }
         sctx->ch_out_mbox.count = 0;
@@ -1263,6 +1263,11 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
             ch->value |= val;
         else
             spu_channel_write(ch, val);
+        /* s39: this is the cross-thread producer for a blocked RdSigNotify1/2
+         * (the SPU host thread parks in spu_ch_wait until count!=0). Wake it now
+         * that the signal is pending; the store above is ordered before the wake
+         * on x86 TSO, and the waiter re-polls every 10 ms as a safety net. */
+        spu_ch_wake(t->sctx);
         { static int n = 0; if (n < 12) { n++;
             fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
                     tid, num + 1, val, or_mode ? "OR" : "overwrite");
@@ -1416,7 +1421,7 @@ static int64_t sys_process_getpid_handler(ppu_context* ctx)
 }
 
 /* sys_process_get_sdk_version (25): (pid, u32* version). Writes the
- * process's SDK version from PROC_PARAM (offset 0xC); the loader sets
+ * process's toolchain version from PROC_PARAM (offset 0xC); the loader sets
  * g_ps3_sdk_version. Yakuza: Dead Souls = 0x350001 (RPCS3 ppu_loader). */
 uint32_t g_ps3_sdk_version = 0x00350001;
 
@@ -1483,7 +1488,7 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
  * libs/system/sysPrxForUser.c and does its own userspace fast-path +
  * blocking without ever executing the raw `sc N` instructions below. These
  * exist for completeness/robustness (any code path that DOES issue the raw
- * syscall, e.g. a differently-linked SDK routine) and are independent
+ * syscall, e.g. a differently-linked toolchain routine) and are independent
  * kernel objects distinct from that HLE's tables.
  *
  * Faithful subset of the RPCS3 contract (sys_lwmutex.cpp / sys_lwcond.cpp):

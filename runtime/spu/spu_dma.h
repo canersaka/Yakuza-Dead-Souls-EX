@@ -205,6 +205,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_get(cmd)) {
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            /* s38 arm-gate witness DMA-watch (env YZ_ARMGATE): a GET landing on LS
+             * 0xBD70 would be the (non-store) writer of the apply_entry arm-gate witness.
+             * Complements the spu_ls_write128 store-watch -- if BOTH stay silent the
+             * witness is never written by the code (stuck at init). */
+            { static int agd = -1;
+              if (agd < 0) agd = getenv("YZ_ARMGATE") ? 1 : 0;
+              if (agd && spu->image_id == 0 && lsa <= 0xBD70u && 0xBD70u < lsa + size) {
+                  static int agdn = 0;
+                  if (agdn < 200) { agdn++;
+                      const uint8_t* w = &spu->ls[0xBD70u];
+                      uint32_t nv = ((uint32_t)w[0]<<24)|((uint32_t)w[1]<<16)|((uint32_t)w[2]<<8)|w[3];
+                      fprintf(stderr, "[armgate-dma] GET lsa=0x%05X ea=0x%08X size=0x%X -> LS[0xBD70]=0x%08X\n",
+                              lsa, (uint32_t)ea, size, nv); fflush(stderr); }
+              } }
             /* s32 [ls-wipe] watch (census verdict, scratch/s32_flavor_census.md:
              * every death boot shows gs_task/policy spans ZERO-WIPED with ragged
              * offsets, each flavor = a different unresurrected span meeting its
@@ -214,9 +228,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * ([0xA00,0x3000) or [0xB800,0xBE00)) with full writer identity.
              * Always on, capped; a hit names the wiper red-handed. */
             { uint32_t wl = lsa & SPU_LS_MASK;
+              /* s34: WIDENED to cover gs_task's whole text+data [0xA00,0xBE00)
+               * -- the churn-analysis verdict says gs_task text [0x3000,0xB800)
+               * is zeroed ~32k x (a DMA-zeroer would land here; the old window
+               * had a blind spot exactly there). */
               if (size >= 64u && wl < 0x40000u
-                  && ((wl < 0x3000u && wl + size > 0xA00u)
-                      || (wl < 0xBE00u && wl + size > 0xB800u))) {
+                  && (wl < 0xBE00u && wl + size > 0xA00u)) {
                   const uint8_t* zp = (const uint8_t*)ls_ptr;
                   uint32_t zi = 0;
                   while (zi < size && zp[zi] == 0) zi++;
@@ -546,8 +563,10 @@ static inline int mfc_do_list_transfer_from(mfc_engine* mfc, spu_context* spu,
              * element i+1 on MFC_WrListStallAck, and raise Sn (edge-triggered
              * on the first tag to stall, matching RPCS3). */
             uint32_t bit = 1u << (tag & 0x1Fu);
-            if (!mfc->stall_mask)
+            if (!mfc->stall_mask) {
                 spu->event_status |= SPU_EVENT_SN;
+                spu_ch_wake(spu);   /* s39: wake a blocked RdEventStat */
+            }
             mfc->stall_mask |= bit;
             mfc->stall_list_lsa[tag]     = list_lsa;
             mfc->stall_ea_base[tag]      = ea_base;
@@ -729,10 +748,27 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
            * proves the consumer is still alive late in the run */
           int curs = (cmd == MFC_GETLLAR_CMD && (lsa & SPU_LS_MASK) == 0x37780u);
           if (curs && !head) {
+              /* s34: publish the live cursor EA for the [stop-jrnl] hexdump
+               * (import_overrides.cpp) -- maintained on EVERY poll, not just
+               * the capped print, so the FIFO side always sees the current
+               * value even after the [jrnl-cur] log stops printing. */
+              extern volatile uint32_t g_yz_jrnl_cur_ea;
+              g_yz_jrnl_cur_ea = jea;
               static unsigned long cn = 0; cn++;
               if (cn <= 40 || (cn & 0x3FFu) == 0) {
-                  fprintf(stderr, "[jrnl-cur] n=%lu spu=%X pc=0x%05X ea=0x%08X\n",
-                          cn, spu->spu_id, spu->pc & SPU_LS_MASK, jea);
+                  /* s38 desync check: dump the TWO cursor counters + base so the
+                   * wedge state shows whether walkctr (cb0.w1 @0xBC90, wraps 32,
+                   * drives the gate shadow addr r11) and counter2 (cb2.w1 @0xBCB0,
+                   * wraps 128, drives curEA) have DESYNCED after a segment wrap.
+                   * Expected steady relation: curEA(jea) == base(cb2.w0) + counter2*0x80. */
+                  const uint8_t* c0 = &spu->ls[0xBC90u]; const uint8_t* c2 = &spu->ls[0xBCB0u];
+                  uint32_t walkctr = ((uint32_t)c0[4]<<24)|((uint32_t)c0[5]<<16)|((uint32_t)c0[6]<<8)|c0[7];
+                  uint32_t base    = ((uint32_t)c2[0]<<24)|((uint32_t)c2[1]<<16)|((uint32_t)c2[2]<<8)|c2[3];
+                  uint32_t counter2= ((uint32_t)c2[4]<<24)|((uint32_t)c2[5]<<16)|((uint32_t)c2[6]<<8)|c2[7];
+                  uint32_t predEA  = base + counter2*0x80u;
+                  fprintf(stderr, "[jrnl-cur] n=%lu spu=%X pc=0x%05X ea=0x%08X | walkctr=%u counter2=%u base=0x%08X predEA=0x%08X %s\n",
+                          cn, spu->spu_id, spu->pc & SPU_LS_MASK, jea,
+                          walkctr, counter2, base, predEA, (predEA==jea)?"EAok":"EA-MISMATCH");
                   fflush(stderr);
               }
               /* s32 RO-BRACKET probe (always on, ~1 memcmp per 256 polls):
@@ -1383,8 +1419,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                                    : mfc->resv_poll_n > 256       ? 1 : 0); }
                 { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
                   if (lw && (uint32_t)le == 0x40197C80u
-                      && (mfc->resv_data[0x70] | mfc->resv_data[0x71]))
-                      spu->event_status |= 0x400u; }
+                      && (mfc->resv_data[0x70] | mfc->resv_data[0x71])) {
+                      spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ } }
                 mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
                 mfc->tag_completed |= (1u << tag);
                 return 0;
@@ -1541,7 +1577,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * kernel wakes. Closes the lost-wakeup that made codec dispatch a coin-flip. */
             { extern uint32_t spu_coh_gen(uint32_t);
               uint64_t le = ea & ~127ull; uint32_t g = spu_coh_gen((uint32_t)le);
-              if (mfc->resv_ea == le && g != mfc->resv_gen) spu->event_status |= 0x400u;
+              if (mfc->resv_ea == le && g != mfc->resv_gen) {
+                  spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ }
               /* IDLE-POLL BACKOFF (2026-07-03; kill-switch YZ_NO_SPUBACKOFF).
                * The SPURS kernels poll their management lines with GETLLAR at
                * full host speed -- measured 5 SPU threads x ~97% of a core --
@@ -1594,7 +1631,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * idle-GETLLARing). */
             { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
               if (lw && (uint32_t)(ea & ~127ull) == 0x40197C80u
-                  && (line[0x70] | line[0x71])) spu->event_status |= 0x400u; }
+                  && (line[0x70] | line[0x71])) {
+                  spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ } }
             /* THROWAWAY DIAG (env YZ_SIGW): does the SPU kernel's GETLLAR of the SPURS
              * mgmt line ever SEE a nonzero wklSignal1 (offset 0x70)? Unconditional (not
              * gated by the wid3-present sampler) so it can't miss the transient signal. */

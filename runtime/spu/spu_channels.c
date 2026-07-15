@@ -73,6 +73,20 @@ uint32_t g_yz_ctxw_ts[32];
 uint32_t g_yz_ctxw_tid[32];
 volatile int g_yz_ctxw_n = 0;
 
+/* s34 CB-write watchpoint support: the gs_task advance-routine entry count,
+ * mirrored from the [jADVin] probe, so the CB write-watchpoint in spu_dma.h /
+ * spu_context.h can gate to the FREEZE window (cadv large) instead of the
+ * climb. See YZ_CBWATCH. */
+volatile unsigned long g_yz_cadv = 0;
+
+/* s34 CONSUME-GAP DECODE (STATUS ⚡ #1): the live journal-consumer cursor EA
+ * (the source EA of the GETLLAR poll staging through LS 0x37780), maintained
+ * by the [jrnl-cur] watch in spu_dma.h whenever the consumer polls. Read by
+ * the [stop-jrnl] hexdump on the FIFO side to anchor the [cursor, entry]
+ * window precisely. 0 = the consumer never polled (or YZ_JRNL_WATCH off);
+ * the hexdump then falls back to an entry-relative window. */
+volatile uint32_t g_yz_jrnl_cur_ea = 0;
+
 static uint32_t yz_ctxw_hash(const uint8_t* p, uint32_t n)
 {
     uint32_t h = 2166136261u;
@@ -630,9 +644,19 @@ void spu_lockline_unlock(void)
 #if defined(_WIN32)
 __declspec(dllimport) int __stdcall SwitchToThread(void);
 __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+/* s39 channel-stall wake: Win32 SRWLOCK + CONDITION_VARIABLE (each a single
+ * pointer-sized struct; passing &field as the opaque handle is ABI-correct). */
+__declspec(dllimport) void __stdcall AcquireSRWLockExclusive(void* lock);
+__declspec(dllimport) void __stdcall ReleaseSRWLockExclusive(void* lock);
+__declspec(dllimport) void __stdcall WakeAllConditionVariable(void* cv);
+__declspec(dllimport) int  __stdcall SleepConditionVariableSRW(void* cv, void* lock,
+                                                               unsigned long ms,
+                                                               unsigned long flags);
+__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 #else
 #include <sched.h>
 #include <unistd.h>
+#include <time.h>
 #endif
 void spu_idle_yield(int level)
 {
@@ -652,6 +676,151 @@ void spu_idle_yield(int level)
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ===========================================================================
+ * s39 (2026-07-15) FAITHFUL SPU CHANNEL-STALL CONTRACT
+ *
+ * The SPU ISA stalls the pipeline on a channel access that cannot complete:
+ * `rdch` on an empty read channel WAITS until data arrives; `wrch` on a full
+ * write channel WAITS until a slot frees. Our runtime historically returned
+ * immediately with a stale/architected-default value, which can steer guest
+ * code down control-flow paths hardware never takes. This block implements the
+ * faithful behavior for the READ channels that have a real cross-thread
+ * producer (RdInMbox, RdSigNotify1/2, RdEventStat), default-ON.
+ *
+ * Threading model (verified): every SPU runs on its own host thread
+ * (spu_exec_thread_proc, lv2_register.c); spu_rdch is only ever called from
+ * that thread. The producers run on OTHER threads -- the PPU (write_snr,
+ * vm_write coherence) or a different SPU (PUTLLC LR-raise) -- so blocking one
+ * SPU host thread never blocks its own waker. Correctness does NOT depend on
+ * the CV signal arriving: the waiter re-polls the predicate every 10 ms, so a
+ * missed/racy wake only costs latency (the wake is a latency optimization, and
+ * the 10 ms timeout is the missed-wake safety net). The predicate is read
+ * fresh each slice (x86 TSO makes a producer's plain store globally visible
+ * well within 10 ms), so no lock is needed around the shared state itself.
+ *
+ * WRITES (SPU_WrOutMbox / SPU_WrOutIntrMbox) are deliberately NOT made blocking
+ * -- see the comment at those cases in spu_wrch: this runtime has no cross-
+ * thread out-mbox drainer, so a block-while-full there would deadlock the SPU
+ * host thread (the DEADLOCK-RISK carve-out of the s39 design).
+ *
+ * Kill switch YZ_CH_NONBLOCK=1 restores the exact legacy non-blocking behavior
+ * everywhere. Env is read once and cached.
+ * ===========================================================================*/
+static int yz_ch_nonblock(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("YZ_CH_NONBLOCK") ? 1 : 0;
+    return v;
+}
+static int yz_ch_strict(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("YZ_CH_STRICT") ? 1 : 0;
+    return v;
+}
+
+/* Predicate: is `channel` readable right now (would rdch complete)? */
+static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+{
+    switch (channel) {
+    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
+    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
+    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
+    case SPU_RdEventStat:
+        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) != 0;
+    default:                return 1;   /* non-blocking channels: always "ready" */
+    }
+}
+
+/* rchcnt-equivalent count-at-entry, for the witness log. */
+static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
+{
+    switch (channel) {
+    case SPU_RdInMbox:      return ctx->ch_in_mbox.count;
+    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count;
+    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count;
+    case SPU_RdEventStat:
+        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) ? 1u : 0u;
+    default:                return 0;
+    }
+}
+
+/* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate. */
+void spu_ch_wake(spu_context* ctx)
+{
+    if (!ctx) return;
+#if defined(_WIN32)
+    WakeAllConditionVariable(&ctx->ch_wait_cv);
+#else
+    (void)ctx;
+#endif
+}
+
+/* Block the calling SPU host thread until `channel` is readable. Never returns
+ * a fabricated value -- the caller reads the channel only after this returns.
+ * Sets status WAITING_CHANNEL while parked, RUNNING on wake. Witness-logs the
+ * first 50 blocked attempts + every 512th; heartbeats every cumulative 2000 ms
+ * of a single wait (uncapped -- a permanent stall stays visible). */
+static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+{
+    if (spu_ch_ready(ctx, channel)) return;   /* fast path: no stall */
+
+    /* Witness (always-on, cheap): does the wedge involve zero-capacity
+     * channel attempts at all? */
+    {
+        static unsigned long bn = 0;
+        unsigned long n = ++bn;
+        if (n <= 50 || (n % 512) == 0) {
+            fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u count-at-entry=%u "
+                    "evstat=0x%X evmask=0x%X\n",
+                    ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
+                    spu_ch_count_at(ctx, channel), ctx->event_status, ctx->event_mask);
+            fflush(stderr);
+        }
+    }
+
+    ctx->status = SPU_STATUS_WAITING_CHANNEL;
+#if defined(_WIN32)
+    {
+        unsigned long long start   = GetTickCount64();
+        unsigned long long next_hb = 2000;
+        while (!spu_ch_ready(ctx, channel)) {
+            /* The SRWLOCK only satisfies SleepConditionVariableSRW's API
+             * contract; the predicate lives in shared channel state, re-checked
+             * under and outside the lock. 10 ms timeout = the missed-wake net. */
+            AcquireSRWLockExclusive(&ctx->ch_wait_lock);
+            if (!spu_ch_ready(ctx, channel))
+                SleepConditionVariableSRW(&ctx->ch_wait_cv, &ctx->ch_wait_lock, 10, 0);
+            ReleaseSRWLockExclusive(&ctx->ch_wait_lock);
+
+            unsigned long long waited = GetTickCount64() - start;
+            if (waited >= next_hb) {
+                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums\n",
+                        ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited);
+                fflush(stderr);
+                next_hb = ((waited / 2000) + 1) * 2000;
+            }
+        }
+    }
+#else
+    {
+        unsigned long long waited = 0, next_hb = 2000;
+        while (!spu_ch_ready(ctx, channel)) {
+            struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 10 * 1000 * 1000;
+            nanosleep(&ts, NULL);
+            waited += 10;
+            if (waited >= next_hb) {
+                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums\n",
+                        ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited);
+                fflush(stderr);
+                next_hb += 2000;
+            }
+        }
+    }
+#endif
+    ctx->status = SPU_STATUS_RUNNING;
+}
 
 /* ===========================================================================
  * PPU<->SPU lock-line coherence (1f SPURS dispatch fix, 2026-06-16b).
@@ -750,6 +919,11 @@ void spu_coh_notify_write(uint32_t ea)
             c->event_status |= 0x400u;   /* SPU_EVENT_LR */
             m->resv_active = 0;          /* reservation lost */
             g_spu_lr_raise++;
+            /* s39: the event_status store above must be visible before the wake.
+             * On x86 TSO the plain store is globally ordered ahead of the
+             * WakeAll call's own writes; the blocked RdEventStat waiter also
+             * re-polls, so a straggling store is caught within 10 ms regardless. */
+            spu_ch_wake(c);
         }
     }
 }
@@ -781,8 +955,24 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     }
 
     switch (channel) {
-    case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);       break;
+    case SPU_WrOutMbox:
+        /* s39 DEADLOCK CARVE-OUT: the ISA stalls wrch on a FULL out-mbox until
+         * the PPU reads it. This runtime has NO cross-thread out-mbox drainer --
+         * the regular out-mbox is read only same-thread (thread-exit status pop
+         * in lv2_register.c, and the send_event/eflag routing in SPU_WrOutIntrMbox
+         * below), never by an independent PPU reader thread (no sys_spu_thread_
+         * read_mb is implemented/registered). Making this block-while-full would
+         * therefore deadlock the sole SPU host thread where today it does not, so
+         * per the s39 design's deadlock guidance this write stays NON-BLOCKING
+         * (legacy overwrite) even when YZ_CH_NONBLOCK is unset. Depth is 1 and a
+         * same-thread double-write overwrites rather than stalls -- documented
+         * fidelity gap, not a silent one. */
+        spu_channel_write(&ctx->ch_out_mbox, v);       break;
     case SPU_WrOutIntrMbox:
+        /* s39: same deadlock carve-out as SPU_WrOutMbox -- the interrupt mbox has
+         * NO drainer at all in this runtime (spu_channel_write below is the only
+         * toucher of ch_out_intr_mbox), so block-while-full is a guaranteed hang.
+         * Stays non-blocking. */
         /* DIAG (env YZ_INTRMBOX_LOG, 2026-07-04 -- pure diagnosis, log every
          * class-2 doorbell write UNCONDITIONALLY before any routing decision,
          * answering: does the SPU ever target port 17 / queue 2 (t1's SPURS
@@ -861,9 +1051,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                    * this file's OWN existing convention for that same -1 (see
                    * sys_event_port_send, sys_event.c:642-643) is CELL_EBUSY, so
                    * reuse it rather than inventing a new mapping. */
-                  if (code < 64)                       /* send_event acks the SPU */
+                  if (code < 64) {                     /* send_event acks the SPU */
                       spu_channel_write(&ctx->ch_in_mbox,
                           rc == 0 ? 0u /* CELL_OK */ : (uint32_t)(int32_t)CELL_EBUSY);
+                      spu_ch_wake(ctx);   /* s39: in-mbox now readable (same-thread ack, harmless) */
+                  }
                   /* s25 (notification-surface audit risk #3): throw_event
                    * (code>=64) has NO ack path by protocol — on real HW a
                    * full destination queue means the event is simply lost,
@@ -913,8 +1105,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               int64_t rc = (bit < 64)
                   ? sys_event_flag_set_by_id(fid, 1ull << bit)
                   : (int64_t)(int32_t)0x80010002 /* CELL_EINVAL */;
-              if (code == 128)
+              if (code == 128) {
                   spu_channel_write(&ctx->ch_in_mbox, (uint32_t)rc);
+                  spu_ch_wake(ctx);   /* s39: in-mbox now readable (same-thread ack) */
+              }
               { static unsigned long n = 0;
                 if (n < 24) { n++;
                     fprintf(stderr, "[SPU] eflag_set_bit%s id=%u bit=%u (rc=0x%X)\n",
@@ -952,7 +1146,16 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         ctx->dec_start_tb = ppu_timebase_now();
         ctx->dec_running  = 1;
         break;
-    case SPU_WrEventMask:    ctx->event_mask = v;                           break;
+    case SPU_WrEventMask:
+        /* s39: a mask write can NEWLY enable an already-pending event, making
+         * (event_status & event_mask) satisfy a blocked RdEventStat. Same-thread
+         * with any such reader (the SPU can't be both here and parked in rdch),
+         * so the wake is moot in practice, but issued for producer completeness.
+         * (WrEventAck below only CLEARS status bits -- it can never satisfy the
+         * predicate, so it gets no wake.) */
+        ctx->event_mask = v;
+        spu_ch_wake(ctx);
+        break;
     case SPU_WrEventAck:
         /* Lost-wakeup fix: serialize this read-modify-write against the PPU
          * coherence write (spu_coh_notify_write, |= SPU_EVENT_LR) and the GETLLAR
@@ -976,7 +1179,21 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
-        /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
+        /* s39: unknown/unhandled channel write. Loud once-per-channel; by
+         * default CONTINUE (ignore, matches a no-op SPU / legacy). YZ_CH_STRICT
+         * halts via the existing stop mechanism. */
+        if (!yz_ch_nonblock()) {
+            static uint8_t seen[128];
+            if (channel < 128 && !seen[channel]) {
+                seen[channel] = 1;
+                fprintf(stderr, "[ch] UNIMPLEMENTED wrch ch=%u pc=0x%05X val=0x%08X%s\n",
+                        channel, ctx->pc & SPU_LS_MASK, v,
+                        yz_ch_strict() ? " (STRICT: halting)" : " (continuing)");
+                fflush(stderr);
+            }
+            if (yz_ch_strict())
+                spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);   /* does not return */
+        }
         break;
     }
 }
@@ -1033,9 +1250,18 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     switch (channel) {
-    case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
-    case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
-    case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
+    case SPU_RdInMbox:
+        /* s39: rdch on an empty in-mbox WAITs (producer = PPU-side mailbox write
+         * / the same-thread send_event ack). Legacy = read-and-return-stale. */
+        if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdInMbox, "rdch");
+        v = spu_channel_read(&ctx->ch_in_mbox);     break;
+    case SPU_RdSigNotify1:
+        /* s39: WAIT while empty (producer = sys_spu_thread_write_snr, PPU thread). */
+        if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdSigNotify1, "rdch");
+        v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
+    case SPU_RdSigNotify2:
+        if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdSigNotify2, "rdch");
+        v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     case SPU_RdDec:
         /* Decrementer read (CBEA v1.02 Section 9.7 p146; F9/F21). Nonblocking;
          * "successive reads can return the same value" (p146) -- true here too
@@ -1057,12 +1283,17 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         break;
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:
-        /* NOTE: HW stalls here until an enabled event is pending; a hard block
-         * hangs (the reserved-line vs PPU-write-line alignment isn't yet proven
-         * -- the service parks but the LR never wakes it). Kept non-blocking; the
-         * LR bit raised by spu_coh_notify_write is still visible to this read so
-         * the polling service can pick it up. Revisit blocking once the idle
-         * reservation line is confirmed to match what the PPU writes. */
+        /* s39: the architected stall -- rdch RdEventStat WAITs until an ENABLED
+         * event is pending, i.e. (event_status & event_mask) != 0. The original
+         * comment below feared the wake never comes; s39 plumbs it: every
+         * event_status producer (spu_coh_notify_write's LR raise, the spu_dma.h
+         * GETLLAR/PUTLLC LR + SN raises) now calls spu_ch_wake(ctx), and the
+         * 10 ms re-poll is the safety net if a producer path is still missed.
+         * Legacy (YZ_CH_NONBLOCK) returns the possibly-zero masked status. */
+        if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdEventStat, "rdch");
+        /* Original NOTE (retained): HW stalls here until an enabled event is
+         * pending; the LR bit raised by spu_coh_notify_write is visible to this
+         * read so even the legacy polling service can pick it up. */
         /* F10 (CBEA v1.02 Section 9.11.1 p153): "Reading the SPU Read Event
          * Status Channel... returns the value of the SPU Pending Event
          * Register logically ANDed with the value in the SPU Write Event Mask
@@ -1088,6 +1319,24 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
+        /* s39: unknown/unimplemented read channel. Loud once-per-channel; the
+         * ISA would stall on an unimplemented read channel (zero capacity), but
+         * we have no producer to ever satisfy it -- so by default we CONTINUE
+         * with 0 (matches legacy) rather than hang. YZ_CH_STRICT additionally
+         * halts the SPU via the existing stop mechanism (spu_halt longjmps to
+         * the host-thread driver). */
+        if (!yz_ch_nonblock()) {
+            static uint8_t seen[128];
+            if (channel < 128 && !seen[channel]) {
+                seen[channel] = 1;
+                fprintf(stderr, "[ch] UNIMPLEMENTED rdch ch=%u pc=0x%05X -> 0%s\n",
+                        channel, ctx->pc & SPU_LS_MASK,
+                        yz_ch_strict() ? " (STRICT: halting)" : " (continuing)");
+                fflush(stderr);
+            }
+            if (yz_ch_strict())
+                spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);   /* does not return */
+        }
         v = 0;
         break;
     }
@@ -1135,7 +1384,31 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
          * and fell through to the generic `default: return 1`, which was
          * spec-wrong for the common "nothing stalled" case). */
         return mfc_for(ctx)->stall_mask ? 1u : 0u;
-    default:                 return 1;  /* default: channel ready */
+    default:
+        /* s39: an UNIMPLEMENTED channel has zero capacity on the ISA -- rchcnt
+         * must read 0, not 1. The old default-1 falsely told guest code the
+         * channel was ready/drainable. Loud once-per-channel. Under
+         * YZ_CH_NONBLOCK the legacy default-1 is preserved for exact A/B.
+         *
+         * EXCEPTION (do NOT touch MFC channels, s39 scope): the MFC-class
+         * channels without an explicit rchcnt case here (WrTagMask=22,
+         * WrTagUpdate=23, WrListStallAck=26, RdAtomicStat=27, ...) are
+         * IMPLEMENTED (routed through the MFC engine in rdch/wrch), not
+         * unimplemented -- they merely lack a bespoke count. Keep their legacy
+         * ready(=1) reply rather than falsely reporting zero capacity for a
+         * live channel (measured: the boot polls rchcnt(23) and rchcnt(27)). */
+        if (yz_ch_nonblock() || channel_is_mfc(channel))
+            return 1;
+        {
+            static uint8_t seen[128];
+            if (channel < 128 && !seen[channel]) {
+                seen[channel] = 1;
+                fprintf(stderr, "[rchcnt] UNIMPLEMENTED ch=%u pc=0x%05X -> 0\n",
+                        channel, ctx->pc & SPU_LS_MASK);
+                fflush(stderr);
+            }
+        }
+        return 0;
     }
 }
 
