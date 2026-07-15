@@ -88,6 +88,7 @@ add_executable(yakuza_recomp
     func_table_gen.cpp
     import_bridges_gen.cpp
     import_overrides.cpp
+    edge_journal_hle.cpp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )

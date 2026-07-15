@@ -15,6 +15,7 @@
 
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
+#include "edge_journal_hle.h"
 
 #include "ps3emu/error_codes.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
@@ -577,7 +578,7 @@ static void yz_rsx_present(uint32_t buffer_id)
 }
 
 /* ---- Minimal RSX fifo consumer ("mini-RSX") --------------------------------
- * The game's SDK-inline flush/finish writes ctrl->put and spins until
+ * The game's inline flush/finish routine writes ctrl->put and spins until
  * ctrl->get (and for SetReference waits, ctrl->ref) catch up — on real
  * hardware the RSX advances them. This host thread walks the command
  * stream from get to put: follows jumps, skips methods by their count
@@ -626,8 +627,8 @@ static uint32_t yz_rsx_sem_addr(uint32_t dma, uint32_t offset)
     }
 }
 
-/* NV3062 (2D surface) + NV308A (image-from-cpu) state: the SDK's
- * cellGcmInlineTransfer writes data words into memory through the 2D blit
+/* NV3062 (2D surface) + NV308A (image-from-cpu) state: cellGcmInlineTransfer
+ * writes data words into memory through the 2D blit
  * engine — Yakuza uses it to publish its flip/vsync counters to a spot in
  * io memory that the PPU then polls. Semantics per RPCS3 nv308a.cpp:
  * A8R8G8B8/Y32 is a raw word copy to dst_offset + x*4 + y*pitch; operands
@@ -644,8 +645,8 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined belo
 /* Lossless user-interrupt delivery (s25, the round-25 stall root — the FIFTH
  * dropped-guest-notification instance after 0xEB00/0xE920/flip/0x103).
  * MEASURED (scratch/s25ride.err): the game COALESCES its ucmd cause counter
- * (deliveries 1-21 sequential, then one method carrying cause=25 — the
- * SDK-documented rapid-user-command coalescing), and that single coalesced
+ * (deliveries 1-21 sequential, then one method carrying cause=25 — a
+ * documented rapid-user-command coalescing behavior), and that single coalesced
  * send hit a momentarily FULL RSX event queue: sys_event_port_send returned
  * 0x8001000A (EBUSY) and our fire-and-forget path LOST it. The handler never
  * saw cause 25, the wid4 pool never published rounds 22-25, and the stream
@@ -1187,6 +1188,229 @@ static uint32_t yz_gcm_stopper_release_entry(uint32_t stopper_ea)
     return 0;
 }
 
+/* ============================================================================
+ * ORDERED EDGE JOURNAL HLE (YZ_JRNL_HLE, opt-in; merged from the 2026-07-14
+ * Mac export, docs/EDGE_JOURNAL_HLE.md + scratch/WINDOWS_HANDOFF_2026-07-14.md).
+ *
+ * A wedge takeover, not an eager second consumer: considered only while RSX
+ * GET is parked on a committed jump-to-self, and only after the producer's
+ * journal head has been stable for a debounce window. The pure helper
+ * (yakuza/edge_journal_hle.cpp) validates the COMPLETE span from the takeover
+ * cursor through the release matching the parked stopper before the first
+ * guest write, applies patches before releases in journal order, retires each
+ * tag only after its operation, and fails CLOSED on any undecoded tag (the
+ * stopper stays locked; the full entry is logged for decoding).
+ *
+ * Two Windows-side adaptations of the Mac design, both measured-evidence:
+ *  - release VALUE: the SPU consumer clears a stopper with a gcm jump-FORWARD
+ *    word (top byte 0x20; rpcs3clone oracle census + the lever below), never
+ *    zero -- so the release goes through yz_jrnl_hle_release, not write32(0).
+ *  - takeover CURSOR: bootstrapped from the real consumer's own poll cursor
+ *    (g_yz_jrnl_cur_ea, maintained on every GETLLAR poll), sampled at its
+ *    episode MINIMUM because the stuck cursor oscillates across a 7-8 line
+ *    window. Walking from arena base instead would re-apply entries the
+ *    consumer already consumed without zeroing.
+ *
+ * Decoded tags: 0x10 memcpy{src@+4,size@+8,dst@+0xC}, 0x7F ordered release
+ * {stopper EA@+4}. Tags 0x04/08/09/0A/0D/11 intentionally unsupported here
+ * until decoded against the consumer's own apply code + the RPCS3 oracle. */
+extern "C" volatile uint32_t g_yz_jrnl_cur_ea;   /* spu_channels.c: live consumer cursor */
+
+enum class yz_jrnl_hle_park_result { waiting, applied };
+
+static int yz_jrnl_hle_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("YZ_JRNL_HLE") ? 1 : 0;
+        if (enabled) {
+            fprintf(stderr,
+                    "[jrnl-hle] ARMED: frozen-head ordered takeover; known tags=10,11,0A,7F; "
+                    "legacy APPLY_REL/PARK_REL disabled\n");
+            fflush(stderr);
+        }
+    }
+    return enabled;
+}
+
+static uint32_t yz_jrnl_hle_read32(void*, uint32_t address)
+{
+    return vm_read32(address);
+}
+
+static void yz_jrnl_hle_write32(void*, uint32_t address, uint32_t value)
+{
+    vm_write32(address, value);
+}
+
+static bool yz_jrnl_hle_copy(void*, uint32_t destination, uint32_t source,
+                             uint32_t size)
+{
+    if (!vm_base || source + size < source || destination + size < destination)
+        return false;
+    memmove(vm_base + destination, vm_base + source, size);
+    return true;
+}
+
+static void yz_jrnl_hle_release(void*, uint32_t stopper_ea)
+{
+    /* Faithful release value (DONT_RECHASE #83 + the validated lever below):
+     * a gcm jump-forward word targeting the io offset just past the stopper.
+     * The io map is linear here (io = ea - 0x40400000, the same mapping the
+     * segment classifier uses). A stopper outside the io window should not
+     * exist; fall back to a NOP clear and say so once. */
+    if (stopper_ea >= 0x40400000u && stopper_ea < 0x40C00000u) {
+        const uint32_t io_off = stopper_ea - 0x40400000u;
+        vm_write32(stopper_ea, 0x20000000u | ((io_off + 4u) & 0x1FFFFFFCu));
+        return;
+    }
+    static int said = 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[jrnl-hle] release outside io window ea=0x%08X -> NOP clear\n",
+                stopper_ea);
+        fflush(stderr);
+    }
+    vm_write32(stopper_ea, 0u);
+}
+
+static yz_jrnl_hle_park_result yz_jrnl_hle_try(uint32_t stopper_ea)
+{
+    static uint32_t arena_base = 0;
+    static uint32_t arena_end = 0;
+    static uint32_t cursor = 0;          /* persisted past prior HLE applies */
+    static uint32_t episode_min = 0;     /* min consumer-cursor EA this episode */
+    static uint32_t last_head = 0;
+    static uint32_t last_stopper = 0;
+    static ULONGLONG stable_since = 0;
+    static unsigned stable_ms = 16;
+    static int configured = 0;
+    static uint32_t last_problem_entry = 0;
+    static uint32_t last_problem_tag = 0;
+
+    if (!configured) {
+        configured = 1;
+        if (const char* value = getenv("YZ_JRNL_HLE_STABLE_MS")) {
+            const unsigned parsed = (unsigned)atoi(value);
+            stable_ms = parsed > 5000u ? 5000u : parsed;
+        }
+        fprintf(stderr, "[jrnl-hle] producer-head stability window=%ums\n", stable_ms);
+        fflush(stderr);
+    }
+
+    if (!g_yz_game_toc) return yz_jrnl_hle_park_result::waiting;
+    const uint32_t state = vm_read32(g_yz_game_toc - 0x7410u);
+    if (state < 0x10000u || state >= 0xE0000000u)
+        return yz_jrnl_hle_park_result::waiting;
+
+    const uint32_t base = vm_read32(state + 0x08u);
+    const uint32_t end = vm_read32(state + 0x0cu);
+    const uint32_t head = vm_read32(state + 0x00u);
+    if (base < 0x10000u || end <= base || end - base > 0x1000000u ||
+        head < base || head >= end || ((end - base) & 0x1fu) != 0 ||
+        ((head - base) & 0x1fu) != 0) {
+        static uint32_t said_state = 0;
+        if (said_state != state) {
+            said_state = state;
+            fprintf(stderr,
+                    "[jrnl-hle] invalid arena state S=0x%08X base=0x%08X end=0x%08X head=0x%08X\n",
+                    state, base, end, head);
+            fflush(stderr);
+        }
+        return yz_jrnl_hle_park_result::waiting;
+    }
+
+    if (base != arena_base || end != arena_end) {
+        arena_base = base;
+        arena_end = end;
+        cursor = 0;
+        episode_min = 0;
+        last_head = 0;
+        stable_since = 0;
+    }
+
+    /* Sample the live consumer cursor toward its episode minimum (the stuck
+     * window's start line). Maintained on every consumer GETLLAR poll, so
+     * repeated stepper calls during the stability window see the whole
+     * oscillation range. */
+    {
+        const uint32_t live = g_yz_jrnl_cur_ea;
+        if (live >= base && live < end && ((live - base) & 0x1fu) == 0 &&
+            (episode_min == 0 || live < episode_min))
+            episode_min = live;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (head != last_head || stopper_ea != last_stopper) {
+        last_head = head;
+        last_stopper = stopper_ea;
+        stable_since = now;
+        episode_min = 0;   /* new episode: resample the consumer window */
+        return yz_jrnl_hle_park_result::waiting;
+    }
+    if (now - stable_since < stable_ms)
+        return yz_jrnl_hle_park_result::waiting;
+
+    /* The consumer's own stuck position is ground truth for "everything
+     * before this is consumed": prefer it over the persisted cursor and the
+     * arena base. Entries the HLE already applied rescan as harmless tag-0. */
+    const uint32_t start = episode_min ? episode_min : (cursor ? cursor : base);
+    {
+        static uint32_t said_start = 0;
+        if (said_start != start) {
+            said_start = start;
+            fprintf(stderr,
+                    "[jrnl-hle] takeover cursor=0x%08X (%s) head=0x%08X stopper=0x%08X\n",
+                    start,
+                    episode_min ? "consumer-window-min" : (cursor ? "persisted" : "arena-base"),
+                    head, stopper_ea);
+            fflush(stderr);
+        }
+    }
+
+    const yz::edge_journal::Io io{nullptr, yz_jrnl_hle_read32, yz_jrnl_hle_write32,
+                                  yz_jrnl_hle_copy, yz_jrnl_hle_release};
+    spu_lockline_lock();
+    const yz::edge_journal::Result result = yz::edge_journal::apply_through_release(
+        io, base, end, start, head, stopper_ea);
+    spu_lockline_unlock();
+
+    if (result.status == yz::edge_journal::Status::applied) {
+        cursor = result.next_cursor;
+        last_problem_entry = 0;
+        last_problem_tag = 0;
+        fprintf(stderr,
+                "[jrnl-hle] applied %u ordered entries through release=0x%08X; cursor=0x%08X head=0x%08X\n",
+                result.applied_entries, stopper_ea, cursor, head);
+        fflush(stderr);
+        return yz_jrnl_hle_park_result::applied;
+    }
+
+    if (result.status == yz::edge_journal::Status::changed_during_validation) {
+        /* Producer or consumer activity was observed despite a stable head.
+         * Restart the stability proof instead of racing it. */
+        stable_since = now;
+        return yz_jrnl_hle_park_result::waiting;
+    }
+
+    if (result.problem_entry != last_problem_entry ||
+        result.problem_tag != last_problem_tag) {
+        last_problem_entry = result.problem_entry;
+        last_problem_tag = result.problem_tag;
+        fprintf(stderr,
+                "[jrnl-hle] BLOCKED status=%s entry=0x%08X tag=0x%08X words="
+                "%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                yz::edge_journal::status_name(result.status),
+                result.problem_entry, result.problem_tag,
+                result.problem_words[0], result.problem_words[1],
+                result.problem_words[2], result.problem_words[3],
+                result.problem_words[4], result.problem_words[5],
+                result.problem_words[6], result.problem_words[7]);
+        fflush(stderr);
+    }
+    return yz_jrnl_hle_park_result::waiting;
+}
+
 /* SINGLE-SEGMENT regime (env YZ_BIG_SEG, 2026-06-16): pin ctx->end (gcm_ctx+4) to the
  * io-buffer end so the game's same-segment release check (S[0x24]==ctx->end) ALWAYS
  * passes -> every stopper-release is IMMEDIATE (no cross-segment defer, no S[0x1C] latch,
@@ -1557,6 +1781,36 @@ extern "C" int yz_rsx_flip_pending_any(void)
     return 0;
 }
 
+/* s37 fix (scratch/s37_render_ordering.md, ledger #82 candidate): RPCS3
+ * retires a flip -- present + flip-done bit + label clear + the throttle
+ * fence bump + FLIP event -- ON THE RSX/FIFO-CONSUMER THREAD, in FIFO order,
+ * when GET reaches the flip (ORACLE RSXThread.cpp:3383 handle_emu_flip,
+ * sys_rsx.cpp:880-892 0xFEC clears label+0x10). The vblank handler explicitly
+ * REFUSES to run on a ppu/timer thread (ORACLE sys_rsx.cpp:896-900, "wrong
+ * thread"). Our default retires on the free-running 60 Hz vblank timer
+ * instead (yz_rsx_vblank_tick below), decoupling the render throttle's fence
+ * from actual consumer progress -- t1 can arm a flip and outrun the consumer
+ * because the fence bumps on wall-clock, not on drain.
+ *
+ * YZ_FLIP_ON_CONSUMER (default OFF) moves the retire into yz_rsx_fifo_step
+ * (below), gated on g_rsx_fifo_lock, so it fires exactly once per arm right
+ * after GET has drained past the flip -- restoring the RPCS3 lockstep. When
+ * ON, yz_rsx_vblank_tick's per-head retire is skipped entirely (it does only
+ * vBlankCount + the VBLANK event, mirroring RPCS3's 0xFED). Default OFF is a
+ * one-token change at each call site: zero behavior change from the
+ * pre-existing vblank-thread retire. */
+static int yz_flip_on_consumer(void)
+{
+    static int on = -1;
+    if (on < 0) { on = getenv("YZ_FLIP_ON_CONSUMER") ? 1 : 0;
+        fprintf(stderr, "[flip-consumer] armed: flip completion runs on %s (YZ_FLIP_ON_CONSUMER=%s)\n",
+                on ? "the FIFO consumer thread" : "the vblank timer (default, unchanged)",
+                on ? "1" : "0");
+        fflush(stderr);
+    }
+    return on;
+}
+
 /* Faithful rules (NO heuristics, NO deferred-release, NO GET-forcing):
  *   - GET re-read every iteration; PUT bounds us to [GET, PUT). get == put =>
  *     drained: yield and re-poll. GET NEVER reaches or passes PUT.
@@ -1660,6 +1914,7 @@ static void yz_fifo_ret_recover(uint32_t get, const char* what)
  * to drain the release journal (the drain runs on t1). */
 extern "C" volatile long g_yz_t1_sample_seq;
 extern "C" volatile void* g_yz_t1_last_tf;   /* s25 spin-witness feed (dispatch.cpp) */
+extern "C" volatile uint32_t g_yz_jrnl_cur_ea;  /* s34 live journal-consumer cursor EA (spu_channels.c / spu_dma.h) */
 
 /* Process exactly ONE FIFO command at GET (self-locked). Returns 1 if it made
  * progress (GET advanced / a method dispatched), 0 if idle or stalled (drained,
@@ -1684,8 +1939,21 @@ static int yz_rsx_fifo_step(void)
       if (hb) { const ULONGLONG now = GetTickCount64();
           if (now - hb_t >= 5000) { hb_t = now;
               const uint32_t hea = yz_rsx_io_to_ea(get);
-              fprintf(stderr, "[fifo-hb] get=0x%08X put=0x%08X word=0x%08X ret=0x%08X\n",
-                      get, put, hea ? vm_read32(hea) : 0xDEADDEADu, g_fifo_ret);
+              /* s38 reframe discriminator: log the gcm-journal PRODUCER HEAD
+               * (S+0x00) + BASE (S+0x08), S=vm[game_toc-0x7410], alongside the
+               * SPU consumer cursor (g_yz_jrnl_cur_ea). If the head keeps
+               * ADVANCING while the cursor stays stuck in its small window =>
+               * the consumer's window LIMIT never refreshes to the head (the
+               * fix locus). If the head is FROZEN during the wedge => the
+               * PRODUCER (t1) stalled and the consumer is exonerated (root
+               * upstream). Distance head-cursor = how far behind the consumer is. */
+              uint32_t jS = g_yz_game_toc ? vm_read32(g_yz_game_toc - 0x7410u) : 0u;
+              uint32_t jhead = (jS >= 0x10000u && jS < 0xE0000000u) ? vm_read32(jS + 0x00u) : 0u;
+              uint32_t jbase = (jS >= 0x10000u && jS < 0xE0000000u) ? vm_read32(jS + 0x08u) : 0u;
+              uint32_t jcur  = g_yz_jrnl_cur_ea;
+              fprintf(stderr, "[fifo-hb] get=0x%08X put=0x%08X word=0x%08X ret=0x%08X | jhead=0x%08X jcur=0x%08X behind=0x%X jbase=0x%08X\n",
+                      get, put, hea ? vm_read32(hea) : 0xDEADDEADu, g_fifo_ret,
+                      jhead, jcur, (jhead > jcur) ? (jhead - jcur) : 0u, jbase);
               fflush(stderr); } } }
 
     /* FIFO_EMPTY: ring drained. Never reach/pass PUT. (RPCS3 read(): put==get) */
@@ -1732,7 +2000,9 @@ static int yz_rsx_fifo_step(void)
              * Evidence: scratch/{bad1,cfgA*,cfgB*,val*}.err. The default is
              * now a faithful memwatch: spin at the stopper until the real
              * consumer patches it. Delete after quiet sessions. */
-            static int apply = -1; if (apply < 0) apply = getenv("YZ_APPLY_REL") ? 1 : 0;
+            const int journal_hle = yz_jrnl_hle_enabled();
+            static int apply = -1;
+            if (apply < 0) apply = (!journal_hle && getenv("YZ_APPLY_REL")) ? 1 : 0;
             /* YZ_PARK_REL (s21, the movie-phase deadlock triangle -- full map in
              * scratch/stopper_drain_re.md): at the logo->movie boundary a commit
              * crosses a segment recycle, so the game DEFERS this stopper's
@@ -1746,7 +2016,7 @@ static int yz_rsx_fifo_step(void)
              * the SAME stopper for 3 s with PUT ahead -- a state that is
              * otherwise a permanent deadlock. Opt-in for A/B validation. */
             static int prel = -1; static unsigned fast_ms = 250;
-            if (prel < 0) { prel = getenv("YZ_PARK_REL") ? 1 : 0;
+            if (prel < 0) { prel = (!journal_hle && getenv("YZ_PARK_REL")) ? 1 : 0;
                 const char* fm = getenv("YZ_PARKREL_FAST_MS");
                 if (fm) fast_ms = (unsigned)atoi(fm);   /* 0 = fast path off (3 s tier only) */
                 if (prel) fprintf(stderr, "[park-rel] ARMED (YZ_PARK_REL): deadlock-only deferred-release apply, fast=%ums+t1-frozen witness, fallback=3000ms\n", fast_ms); }
@@ -1777,7 +2047,63 @@ static int yz_rsx_fifo_step(void)
                   const uint32_t je = yz_gcm_stopper_release_entry(ea);
                   fprintf(stderr, "[stop-jrnl] parked %llums @io 0x%06X ea=0x%08X journal-entry=%s (0x%08X)\n",
                           (unsigned long long)parked_ms, get, ea, je ? "PRESENT" : "ABSENT", je);
-                  fflush(stderr); } }
+                  fflush(stderr);
+                  /* s34 CONSUME-GAP HEXDUMP — fires ONCE at the 2nd park
+                   * sample (>15s), anchored on the STABLE release entry (NOT
+                   * the cursor). The consumer cursor has two measured steady
+                   * shapes: LOCKED at one value past the entry (s34gapA:
+                   * 0x41F1E300) or CYCLING a ~6-line window that CONTAINS the
+                   * entry (s34frzA: sweeps [0x41F2EF80..0x41F2F280] forever,
+                   * entry 0x41F2F200 inside it). A cursor-stable gate misses
+                   * the cycling flavor entirely, so anchor on the entry and
+                   * dump WIDE (6 lines back + entry line + 3 forward) to
+                   * capture the whole active window in both. cur is printed so
+                   * we see where in the cycle it was. Adds the live RING word
+                   * (still jump-to-self?) + a [base,head) scan for EVERY
+                   * tag-0x7F entry naming this stopper. Entry stride 0x20:
+                   * word0=tag (0x7F release / 04,05,09,0D,10 patch-data /
+                   * 0=hole), word1=target EA; consumer accepts 128B lines. */
+                  static int sj_dumped = 0;
+                  if (je && !sj_dumped && parked_ms > 15000) {
+                      sj_dumped = 1;
+                      const uint32_t S2    = vm_read32(g_yz_game_toc - 0x7410u);
+                      const int Sok        = (S2 >= 0x10000u && S2 < 0xE0000000u);
+                      const uint32_t jbase = Sok ? vm_read32(S2 + 0x08u) : 0;
+                      const uint32_t jhead = Sok ? vm_read32(S2 + 0x00u) : 0;
+                      const uint32_t cur   = g_yz_jrnl_cur_ea;
+                      const uint32_t ringword = vm_read32(ea);
+                      uint32_t lo = (je & ~127u) - 0x300u;          /* 6 lines back */
+                      uint32_t hi = (je & ~127u) + 0x180u;          /* entry line + 3 forward */
+                      if (jbase && lo < jbase) lo = jbase;
+                      if (hi - lo > 0x800u) hi = lo + 0x800u;
+                      fprintf(stderr, "[stop-jrnl] HEXDUMP [0x%08X..0x%08X) cursor=0x%08X entry=0x%08X base=0x%08X head=0x%08X ringword@0x%08X=0x%08X\n",
+                              lo, hi, cur, je, jbase, jhead, ea, ringword);
+                      for (uint32_t a = lo; a < hi; a += 0x20u) {
+                          const char* mark = "    ";
+                          if (jhead && a >= jhead) mark = "UNW>";
+                          if (cur && (a & ~127u) == (cur & ~127u)) mark = "CUR>";
+                          if (a == je) mark = "ENT>";
+                          fprintf(stderr, "%s 0x%08X (%+5d): %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                                  mark, a, (int)(a - cur),
+                                  vm_read32(a+0x00u), vm_read32(a+0x04u), vm_read32(a+0x08u), vm_read32(a+0x0Cu),
+                                  vm_read32(a+0x10u), vm_read32(a+0x14u), vm_read32(a+0x18u), vm_read32(a+0x1Cu));
+                      }
+                      if (jbase && jhead > jbase && (jhead - jbase) < 0x1000000u) {
+                          int n7f = 0;
+                          fprintf(stderr, "[stop-jrnl] SCAN tag-0x7F entries with word1==0x%08X in [0x%08X..0x%08X):\n", ea, jbase, jhead);
+                          for (uint32_t e = jbase; e < jhead; e += 0x20u) {
+                              if (vm_read32(e) == 0x7Fu && vm_read32(e + 0x04u) == ea) {
+                                  n7f++;
+                                  if (n7f <= 8)
+                                      fprintf(stderr, "    #%d @0x%08X (%s cursor by %d)\n",
+                                              n7f, e, e < cur ? "behind" : "ahead of", (int)(e - cur));
+                              }
+                          }
+                          fprintf(stderr, "[stop-jrnl] SCAN total=%d\n", n7f);
+                      }
+                      fflush(stderr);
+                  }
+                  } }
             const int parked3s   = prel && (parked_ms > 3000);
             /* s25: fast tier now UNCONDITIONAL at fast_ms (witness dropped).
              * Measured chain: (a) rides s25ride4-6 ground at 3-5 s/flip
@@ -1818,6 +2144,22 @@ static int yz_rsx_fifo_step(void)
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
+            if (journal_hle) {
+                if (ahead != 0u && ahead < (ring >> 1) &&
+                    yz_jrnl_hle_try(ea) == yz_jrnl_hle_park_result::applied) {
+                    /* The ordered HLE applied every decoded patch first, then
+                     * wrote the faithful jump-forward release word. Advance GET
+                     * past the released stopper exactly like the lever does. */
+                    vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
+                    LeaveCriticalSection(&g_rsx_fifo_lock);
+                    return 1;
+                }
+                /* Never fall through to a release-only lever while the HLE owns
+                 * the recovery decision. Unsupported entries intentionally stay
+                 * parked so a partial journal can never reach RSX. */
+                LeaveCriticalSection(&g_rsx_fifo_lock);
+                return 0;
+            }
             const uint32_t rel_entry = ((apply || parked3s || parkedfast) && ahead != 0u && ahead < (ring >> 1))
                                            ? yz_gcm_stopper_release_entry(ea) : 0u;
             if (rel_entry) {
@@ -1995,11 +2337,72 @@ static int yz_rsx_fifo_step(void)
             fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
                     "finalised; waiting for producer (n=%lu)\n", cmd, get, put, nnc);
             fflush(stderr);
+            /* s35 hole-structure dump (env YZ_FIFO_HOLE_DUMP): on first hit of a
+             * given non-command park, hexdump [get, get+0x120) so the
+             * unfinalised-hole layout AND where real commands resume can be read
+             * directly -- the discriminator for "unfinalised Edge hole" (a small
+             * data run then valid cmds) vs "GET desynced into a data segment"
+             * (all data to PUT). Read-only, one dump per distinct park. */
+            static int holedump = -1;
+            if (holedump < 0) holedump = getenv("YZ_FIFO_HOLE_DUMP") ? 1 : 0;
+            if (holedump) {
+                fprintf(stderr, "[fifo-holedump] hole @io 0x%X (PUT=0x%X) g_fifo_ret=0x%08X:\n", get, put, g_fifo_ret);
+                for (uint32_t off = 0; off < 0x120u; off += 0x10u) {
+                    const uint32_t io0 = get + off;
+                    const uint32_t e0 = yz_rsx_io_to_ea(io0);
+                    if (!e0) { fprintf(stderr, "  io 0x%X: <off-ring>\n", io0); break; }
+                    fprintf(stderr, "  io 0x%X: %08X %08X %08X %08X\n", io0,
+                            vm_read32(e0), vm_read32(e0+4u), vm_read32(e0+8u), vm_read32(e0+12u));
+                }
+                fflush(stderr);
+            }
         } else if (now - said_t >= 2000) {
             said_t = now;
             fprintf(stderr, "[rsx] still parked on non-command 0x%08X at io=0x%X (%llus; PUT=0x%X)\n",
                     cmd, get, (unsigned long long)((now - stuck_t0) / 1000u), put);
             fflush(stderr);
+        }
+        /* s35 STALE-HOLE SKIP (env YZ_FIFO_SKIP_STALE, diagnostic, default OFF):
+         * when GET parks on an illegal header (cmd&3==3) for >500 ms with PUT
+         * ahead, the SPU (gs_task/EDGE) never finalised this command-buffer hole
+         * (the s34 consume-gap: our journal consumer scans but never writes the
+         * real commands into the reserved hole). The faithful re-read then waits
+         * forever for a producer that has already moved on (PUT past it). This
+         * band-aid scans forward from GET for the next VALID command header/jump
+         * and resumes there, dropping only the unfinalised region -- which is 3D
+         * Edge geometry we cannot render anyway; the 2D loading UI + the CRI
+         * preload (both frame-pump-driven) keep flowing. NOT faithful: it drops
+         * a draw the same way the park-release lever synthesises a release. A
+         * milestone bridge to prove the loading-screen phase is reachable while
+         * the SPU-finalisation root is fixed. Kill-switch: the env flag. */
+        static int skipstale = -1;
+        if (skipstale < 0) { skipstale = getenv("YZ_FIFO_SKIP_STALE") ? 1 : 0;
+            if (skipstale) { fprintf(stderr, "[fifo-skipstale] ARMED (YZ_FIFO_SKIP_STALE): resume past unfinalised holes after 500ms park\n"); fflush(stderr); } }
+        if (skipstale && (cmd & 3u) == 3u && now - stuck_t0 >= 500) {
+            uint32_t scan = get + 4u, found = 0;
+            while (scan < put) {
+                const uint32_t sea = yz_rsx_io_to_ea(scan);
+                if (!sea) break;
+                const uint32_t w = vm_read32(sea);
+                const int is_jump   = ((w & 0xE0000003u) == 0x20000000u) || ((w & 3u) == 1u);
+                const int is_method = (w & 0xA0030003u) == 0u && (w & 0x3FFFCu) != 0u;
+                if (is_jump || is_method) { found = scan; break; }
+                scan += 4u;
+            }
+            static unsigned long ssn = 0; ssn++;
+            if (found) {
+                fprintf(stderr, "[fifo-skipstale] n=%lu skipped hole io[0x%X..0x%X) -> resume at cmd 0x%08X @io 0x%X (PUT=0x%X)\n",
+                        ssn, get, found, vm_read32(yz_rsx_io_to_ea(found)), found, put);
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, found);
+            } else {
+                fprintf(stderr, "[fifo-skipstale] n=%lu no valid cmd in io[0x%X,0x%X) -> resync GET to PUT\n",
+                        ssn, get, put);
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
+            }
+            g_fifo_ret = ~0u;
+            fflush(stderr);
+            LeaveCriticalSection(&g_rsx_fifo_lock);
+            return 1;
         }
         if (skip4 && (cmd & 3u) == 3u && now - stuck_t0 >= 30) {
             static unsigned long recn = 0; recn++;
@@ -2043,6 +2446,57 @@ static int yz_rsx_fifo_step(void)
         return 0;
     }
     vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, pkt_end);
+
+    /* s37 fix (YZ_FLIP_ON_CONSUMER): retire any flip armed by the method(s)
+     * just dispatched (e.g. GCM_FLIP_HEAD 0xE920, or the semaphore-release
+     * arm heuristic, both inside yz_rsx_method above) right here on the
+     * consumer thread, still under g_rsx_fifo_lock -- GET has now advanced
+     * past the flip, matching RPCS3's in-FIFO-order handle_emu_flip. Retire
+     * EXACTLY ONCE per arm (InterlockedExchange consumes the pending flag);
+     * yz_rsx_vblank_tick's legacy retire is disabled whenever this flag is
+     * on (see its "!yz_flip_on_consumer() &&" guard), so there is no
+     * double-present (s23 caveat, scratch/s37_render_ordering.md 3). */
+    if (yz_flip_on_consumer()) {
+        uint64_t flip_ev = 0;
+        for (int h = 0; h < 2; h++) {          /* PS3 has 2 active heads */
+            if (!InterlockedExchange(&g_rsx_flip_pending[h], 0)) continue;
+            uint32_t ha  = yz_rsx_head_addr((uint32_t)h);
+            uint32_t buf = vm_read32(ha + 0x14);           /* lastQueuedBufferId */
+            uint64_t t   = (uint64_t)GetTickCount() * 1000;
+            { static int n = 0; if (n < 12) { n++;
+                fprintf(stderr, "[flip-consumer] FLIP COMPLETE head=%d buf=%u -> clear label@0x10200010\n",
+                        h, buf); } }
+            if (yz_ft_on())
+                yz_ft("CONSUMER-RETIRE head=%d buf=%u label-before=0x%08X",
+                      h, buf, vm_read32(RSX_REPORTS + 0x10));
+            yz_rsx_present(buf);
+            vm_write32(ha + 0x10, buf);                    /* flipBufferId */
+            vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x80000000u); /* flip done */
+            vm_write64(ha + 0x00, t);                      /* lastFlipTime */
+            vm_write64(RSX_REPORTS + 0x10, 0);              /* flip sema (u128) = 0 */
+            vm_write64(RSX_REPORTS + 0x18, 0);
+            if (yz_ft_on()) yz_ft("CONSUMER-CLEAR label=0 head=%d", h);
+            /* Bump the render-throttle fence exactly once per retired flip,
+             * ordered after present+label-clear (same rule as the vblank
+             * path's comment at the fence write below). */
+            vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
+            flip_ev |= (uint64_t)(0x8u << 1);              /* SYS_RSX_EVENT_FLIP_BASE<<1 */
+        }
+        if (flip_ev && g_rsx_event_port) {
+            uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
+            static int uof = -1; if (uof < 0) uof = getenv("YZ_UCMD_ON_FLIP") ? 1 : 0;
+            uint64_t fmask = uof ? (uint64_t)handlers : ((uint64_t)handlers & 0x7Full);
+            if (fmask) {
+                ppu_context sc; memset(&sc, 0, sizeof(sc));
+                sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = fmask;
+                int64_t r = sys_event_port_send(&sc);
+                static int n = 0; if (n < 8) { n++;
+                    fprintf(stderr, "[flip-consumer] flip event ev=0x%llX -> send=%lld\n",
+                            (unsigned long long)fmask, (long long)r); }
+            }
+        }
+    }
+
     LeaveCriticalSection(&g_rsx_fifo_lock);
     return 1;
 }
@@ -2295,7 +2749,7 @@ extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
     ctx->gpr[3] = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
 }
 
-/* HLE flip: present the buffer + signal the flip label the game polls. The SDK
+/* HLE flip: present the buffer + signal the flip label the game polls. These
  * entry points take the gcm CONTEXT as arg0 (r3), the buffer id in r4. */
 extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 {
@@ -3311,8 +3765,18 @@ extern "C" void yz_rsx_vblank_tick(void)
          * 0xFEC-equivalent completion (RPCS3 sys_rsx.cpp:856-868) -- set the
          * flip-done flag, stamp flipBufferId/lastFlipTime, and clear the flip
          * semaphore at label+0x10 (16 bytes, as real HW does). Clearing it
-         * releases the consumer's `ACQUIRE label+0x10 == 0`. */
-        if (InterlockedExchange(&g_rsx_flip_pending[h], 0)) {
+         * releases the consumer's `ACQUIRE label+0x10 == 0`.
+         *
+         * s37 fix (YZ_FLIP_ON_CONSUMER): when armed, the FIFO consumer thread
+         * (yz_rsx_fifo_step) retires the flip instead, in FIFO order, so this
+         * thread does ONLY vBlankCount + the VBLANK event below -- mirroring
+         * RPCS3's explicit "wrong thread" 0xFED guard (sys_rsx.cpp:896-900).
+         * The "!yz_flip_on_consumer() &&" guard is the ONLY change on this
+         * path; default OFF leaves the InterlockedExchange/present/etc. below
+         * byte-for-byte as before. Skipping this entirely (rather than just
+         * not presenting) also guarantees g_rsx_flip_pending is consumed by
+         * exactly one thread -- no double-retire race between the two. */
+        if (!yz_flip_on_consumer() && InterlockedExchange(&g_rsx_flip_pending[h], 0)) {
             uint32_t buf = vm_read32(ha + 0x14);          /* lastQueuedBufferId */
             { static int n = 0; if (n < 12) { n++;
                 fprintf(stderr, "[vbl] FLIP COMPLETE head=%d buf=%u -> clear label@0x10200010\n", h, buf); } }
