@@ -169,7 +169,7 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
 # Mnemonics that do NOT write the rt register (so we skip the post-trace).
 # Everything else writes rt = ops[0] (= insn.raw & 0x7F).
 _NO_RT_WRITE = {
-    "stop", "stopd", "lnop", "nop", "sync", "dsync",
+    "stop", "stopd", "lnop", "nop", "sync", "syncc", "dsync",
     "bi", "iret", "biz", "binz", "bihz", "bihnz",
     "br", "bra", "brz", "brnz", "brhz", "brhnz",
     "hbr", "hbra", "hbrr",
@@ -350,8 +350,14 @@ class SPULifter:
         # ---- nop / sync / stop ----
         if mn in ("nop", "lnop"):
             return "/* nop */;"
-        if mn in ("sync", "dsync"):
-            return "/* sync */;"
+        if mn in ("sync", "dsync", "syncc"):
+            # SPU ISA v1.2 §13 + the 'Synchronize (Data)' pages: these order
+            # earlier LS/channel accesses before later ones and publish LS for
+            # external observers (Table 13-6 = our exact PPU-thread->SPU
+            # handoff). Formerly a no-op -- the SPU twin of LESSONS #11d.
+            # syncc's extra duty (channel-written execution state) is covered
+            # structurally: our channel ops are locked host calls.
+            return "spu_arch_fence();"
         if mn == "fscrwr":
             # Write FP status/control register -- we don't model FPSCR (rounding
             # mode / exception flags), so this is a no-op (matches spu_fscrrd=0).
