@@ -32,7 +32,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_KERN_WILDCARD_OK` | spu_channels.c (spu_lookup_apply_job_guard + the foreign-resident adopter) | **Kill-switch for the KERNEL-context wildcard/adoption refusal (s24 4881ef0, extended s25 to the foreign-resident adopter; guard DEFAULT ON).** A context tagged image 16 (SPURS kernel) whose computed branch misses every kernel registration is a wild branch by definition (legitimate kernel exits switch images before entering foreign code); serving it from the image-0 wildcard — or, the s25 close, the foreign-resident adopter — executed gs_task's code in kernel era and mis-attributed the tid-0x2004 death for weeks (ledger #34/#49/#51). `=1` restores the old silent substitution for A/B. |
 | `YZ_NO_EV_RETRY` | import_overrides.cpp (yz_rsx_ev_send) | **Kill-switch for the GENERALIZED lossless RSX-event latch (s25, post notification-surface audit — DEFAULT ON).** Any failed sys_event_port_send to the RSX port (user-cmd 0x80, queue event 0x20<<head, future bits) ORs its cause bits into one pending mask retried at the consumer top; covers audit risks #1/#2 with the ride-validated ucmd mechanism. `YZ_NO_UCMD_RETRY` is honored as an alias for off. |
 | `YZ_NO_THROW_RETRY` | spu_channels.c (yz_throw_latch_add/yz_throw_retry_flush) + import_overrides.cpp (vblank flush) | **Kill-switch for the SPU throw_event loss latch (s25, audit risk #3 — DEFAULT ON).** WrOutIntrMbox codes 64-127 are fire-and-forget by protocol: a full destination queue loses the event with no guest signal (the CRI doorbell wall's mechanism class). Failed throws latch into a 16-entry ring and redeliver from the vblank tick (~16 ms); loud [throw-lat] log per latch so firings are visible; latch overflow drops (the faithful behavior). `=1` restores the pure drop. |
-| `YZ_NO_UCMD_RETRY` | import_overrides.cpp (yz_rsx_method 0xEB00 + yz_ucmd_retry_pending) | **Kill-switch for LOSSLESS user-interrupt delivery (s25, DEFAULT ON — the round-25 stall root, ledger #52).** MEASURED (scratch/s25ride.err): the game coalesces its ucmd cause counter (1..21 then 25, SDK-documented rapid-user-command coalescing) and the single coalesced send hit a momentarily full RSX event queue — sys_event_port_send returned 0x8001000A EBUSY and the fire-and-forget path lost it; the wid4 pool never published rounds 22-25 and the stream parked forever on SEMAPHORE_ACQUIRE want=25. Fix mirrors lv1's single pending-cause register: latch the undelivered cause, retry at the top of the consumer loop until the queue drains (userCmdParam already carries the latest arg). `=1` restores fire-and-forget for A/B. |
+| `YZ_NO_UCMD_RETRY` | import_overrides.cpp (yz_rsx_method 0xEB00 + yz_ucmd_retry_pending) | **Kill-switch for LOSSLESS user-interrupt delivery (s25, DEFAULT ON — the round-25 stall root, ledger #52).** MEASURED (scratch/s25ride.err): the game coalesces its ucmd cause counter (1..21 then 25, a documented rapid-user-command coalescing behavior) and the single coalesced send hit a momentarily full RSX event queue — sys_event_port_send returned 0x8001000A EBUSY and the fire-and-forget path lost it; the wid4 pool never published rounds 22-25 and the stream parked forever on SEMAPHORE_ACQUIRE want=25. Fix mirrors lv1's single pending-cause register: latch the undelivered cause, retry at the top of the consumer loop until the queue drains (userCmdParam already carries the latest arg). `=1` restores fire-and-forget for A/B. |
 | `YZ_NO_IMGSTACK` | spu_channels.c (spu_img_restore + adopt-on-serve in spu_indirect_branch) | **Kill-switch for the s25 adopt-on-serve + restore-on-host-return image model (ledger #51's designed fix; DEFAULT ON).** Lifted brsl/bisl brackets save/restore ctx->image_id across nested host calls (the host C stack of bracket locals = the shadow image stack); the dispatcher adopts the image whose registration serves each lookup; pc==0xA00 re-adopts the DMA-recorded resident module (ctx->module_img_a00, spu_dma.h). `=1` reverts to the old sticky-image behavior AND disables adopt-on-serve with it (only safe together — adoption without brackets is the ledger-#51 mislabel trap). Keep permanently for regression bisection. |
 | `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause â†’ scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5Ã—~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. Note: setting this (disable backoff) ALSO breaks the SPURS dispatch livelock (SPU polls hot, catches the transient workload signal) â€” it was the discovery lever for `YZ_NO_LRWAKE`'s fix. |
 | `YZ_NO_LRWAKE` | spu_dma.h (GETLLAR mgmt line) | **Kill-switch for the SPURS dispatch LOST-WAKEUP FIX (2026-07-05, DEFAULT ON).** ROOT (MEASURED): the backed-off SPURS kernel misses the PPU-side wklSignal/readyCount workload-submit (that write doesn't raise the kernel's SPU_EVENT_LR â€” it bypasses the coherence write-generation path), so the transient signal lands in a poll gap and the workload that the main thread's `cellSpursEventFlagWait` on 0x4019C680 bit0 depends on is never dispatched â†’ boot livelocks (the long-standing dispatch gate). The fix delivers the missed HW edge: on a GETLLAR of the mgmt line 0x40197C80 that still carries a pending wklSignal1 (+0x70 != 0), raise LR so the kernel re-enters selection + dispatches. Faithful (re-derives a dropped cross-processor wakeup, not a game-logic force; self-limits once dispatched). `=1` disables for A/B. MEASURED: default boot now progresses into rendering (~520-560 set_render_target, stable, no crash) where before it livelocked. |
@@ -289,7 +289,17 @@ work-item CONSTRUCTION probe -- [w2ctor] at ctor 0x76E0 entry prints item/payloa
 payload bytes (the type word), and the dispatcher 0x3C78 prints a loud HUSK DISPATCH line
 when an object's vtable word is zero (the #34 death state, caught pre-crash with the payload
 in hand). Armed banner; re-apply the patch after any gs_task relift; retire with the #34
-race), `YZ_JRNL_WATCH`
+race), `YZ_ARMGATE`
+(spu_context.h spu_ls_read128/write128 + spu_dma.h GET path, s38 scratch/s38_findings.md:
+the gs_task RELEASE state machine apply_entry (LS 0xB088) emits a stopper release
+(0xB170->0x5EB8->0x5F00) for a CODE==0 descriptor ONLY if the arm-gate witness
+LS[0xBD70]==key(r11) at gate 0xB0C4/0xB0CC (recomp_prx/gs_task.c:41037-41062); LS[0xBD70]
+is READ at the gate but has NO literal-address writer in the whole image. Logs [armgate]
+on every gate read (CODE=r3, key=r11, witness value, descriptor quad, MATCH/nomatch),
+[armgate-wr] on any lifted store to 0xBD70, [armgate-dma] on any GET landing on it. Armed
+banner, capped. One boot names whether the witness is stuck/never-written/written-but-stale
+and whether it ever equals the stuck stopper's key. Retire when the consumer releases the
+stuck stopper natively), `YZ_JRNL_WATCH`
 (spu_dma.h: the LAYER-1 consumer discriminator â€” logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
@@ -625,6 +635,30 @@ a false zero that hid the flag CAS.
 the 0x7F journal lookahead drain; first boot reproduced the June torn-content wedge.
 Explicit opt-in only; do not enable without the patch-class entries being applied first.
 
+`YZ_JRNL_HLE` (yakuza/edge_journal_hle.cpp + import_overrides.cpp, 2026-07-14/15,
+experimental, default OFF): ordered, fail-closed EDGE journal wedge takeover (the Mac
+07-14 export + two Windows adaptations). Runs only when GET is parked at a committed
+self-jump and the producer head is stable; validates the complete span through the
+matching release, applies known patch entries before tag-0x7F, and retires a tag only
+after its operation. Windows adaptations vs the Mac design: (a) releases write the
+faithful gcm jump-forward word (ledger #83 oracle; same value as the lever), not zero;
+(b) the takeover cursor bootstraps from the live consumer poll cursor's episode
+minimum (g_yz_jrnl_cur_ea), not arena base, so consumed-but-unzeroed entries are never
+re-applied. Enabling it disables the legacy release-only `YZ_APPLY_REL` and
+`YZ_PARK_REL` paths. Current decoder supports tag `0x10` memcpy, tag `0x7F` release, and
+(s39, evidence-triangulated) the `[0x11 header][0x0A payload]` unit as retire-only (no
+memory operation — scratch/s39_stage2_probe.md et al.); tags `0x04/08/09/0D` stop safely
+and emit all eight entry words. PERMANENT CEILING (s39 decode): `0x08`/`0x09` are
+render-attribute decoders writing through SPU-side pointer state — NOT host-replayable
+from entry bytes, so spans containing them stay fail-closed by design; the faithful LLE
+consumer is the only path through those. This is a safe decoding and A/B scaffold, not
+yet a claim that the 800-frame wall is closed. Full contract and test instructions:
+`docs/EDGE_JOURNAL_HLE.md`.
+
+`YZ_JRNL_HLE_STABLE_MS` (same path, default `16`, range clamped to `0..5000`): producer-head
+stability debounce before the HLE attempts an ordered transaction. This detects a frozen,
+complete journal; it is not cycle timing and does not try to emulate SPURS scheduling latency.
+
 `YZ_T1POLL` (yakuza/shims.cpp, s21, diag, default OFF): t1 poll-site sampler companion to
 YZ_T1SAMPLE (names the syscall/poll site t1 spins in).
 
@@ -788,3 +822,81 @@ byte-for-byte on cap_user3d.rxs (verified 22/22 surface dumps).
 | `YZ_FS_TRACE` | diag | OFF | extended s30: `=2` DARK mode — identical trace work (per-read ftell + same formatting) but written to a private 4KB-buffered scratch/fs_darktrace.log, ZERO stdout — splits the #67 flip-flag into local-work vs stdout-output atoms. `=1` (or any non-numeric value) = the legacy stdout trace. Banner `[fs-trace] ARMED: DARK mode 2`. |
 | `YZ_SEM_TRACE` | diag | OFF | s30: bounded (4000-line) stderr trace of sys_semaphore wait/trywait/post on sem ids ≤ 8, with tid/value/caller-lr — built for the staging-race handoff hunt (measured: t1 stops posting the FS request sem 1 at the death; sem layer exonerated). Two ALWAYS-ON capped tripwires ride the post path regardless of the flag: `[sem-post] EBUSY refused` (the shadow-counter max check can spuriously refuse for small-max sems) and `[sem-post] RELEASE-FAILED` (handle/shadow desync = a silently lost wake). Banner `[sem-trace] ARMED`. |
 | `YZ_STAGE_DECIDE` | diag | OFF | s30: 5 s stderr peek of the CRI FS DRIVER POOL (base vm[0x135CDFC], 40×0x4D0 slots at +0x868; per-live-slot open/status/mode/tot/cons/take/seq/phase/name) + staging header (w474/stagedSeq/exit/pathOps/P2) — the decision-input camera for the staging-race death (spec scratch/s30_staging_decision.md §6; caught the two wedged status=1/phase=0 slots). Reads only, no page watches. Banner `[stagedec] ARMED`. The `[cellFs] FIRST-READ tms=` stderr markers (once per open) are always-on companions. |
+
+## s35 preload/render diagnostic flags (2026-07-12)
+
+`YZ_FIFO_SKIP_STALE` (yakuza/import_overrides.cpp, RSX FIFO non-command handler, s35): **diag
+band-aid, default OFF.** When GET parks on an illegal header (cmd&3==3) for >500 ms with PUT
+ahead, scans forward for the next valid command/jump and resumes GET there (else GET<-PUT),
+to skip an unfinalised Edge command-buffer hole. MEASURED insufficient on its own (the skip
+landed on hole-data that looked like a jump -> off-ring -> drained to PUT, dropping the flip;
+s35skip). Kept as a diagnostic; the render-FIFO desync is a PARALLEL track to the preload wall.
+
+`YZ_FIFO_HOLE_DUMP` (yakuza/import_overrides.cpp, same handler, s35): **diag, default OFF.**
+On first hit of a non-command park, hexdumps [get, get+0x120) so the unfinalised-hole layout
+can be read (used to characterise the round-8 io=0x602E8 hole and the round-43 io=0x800028
+out-of-ring 0xFFFFFFFF park). Read-only, one dump per distinct park.
+
+`YZ_HOLD_BOOT` (yakuza/main.cpp yz_hold_boot, injected at func_001AAB20/func_001AB63C entry via
+scratch/patch_chain_probes.py, s30 — first registered here s35): **diag/tactical, default OFF.**
+Swallows the boot-pump exit-request while the CRI preload is demonstrably in flight (any live
+driver-pool slot status==2 or the staging seq advanced within 120 s), capped at 20000 holds.
+MEASURED INERT this era: func_001AAB20 is never called on the current binary (the boot pump
+STALLS on the render-FIFO, it doesn't reach the intro-timeline exit) -> the shim never fires.
+Retained; superseded as the preload fix by the s35 reframe (the wall is the CRI completion-
+delivery, not the boot-pump exit). ALWAYS logs an [holdboot] ARMED banner + per-call lines.
+
+### YZ_THREAD_PRIO (s36, 2026-07-12)
+Apply the guest lv2 thread priority to the host thread (SetThreadPriority) in the PPU thread
+create path (yakuza/threads.cpp, yz_lv2_prio_to_win). The game assigns lv2 priorities
+(0=highest..3071=lowest; _gcm_intr=1, cri_dlg=800, cri_adxm_idle=1500) and lv2 schedules
+strictly by them; our one-host-thread-per-guest-thread model previously DROPPED the priority
+(all threads NORMAL), turning HW-calibrated producer/consumer handshakes (the scenario.bin CRI-FS
+read-completion, s36) into timing races. Coarse 5-band map to Windows THREAD_PRIORITY levels
+preserving the game's relative ordering. DEFAULT OFF (clean A/B until validated); [thr-prio] ARMED
+banner. Faithful direction (honors the game's own priorities).
+
+### YZ_DSTATUS (s36, 2026-07-12)
+Enable the [dstatus] (driver status-setter func_00EEECDC) + [readdone] (func_00EEF88C) diagnostic
+riders in yz_chain_probe. Their fprintf is on the HOT driver-status path and PERTURBS timing (flips
+the s36 completion race, LESSONS #6b), so they are DEFAULT OFF; enable only for the fork-A/B/C
+status-transition census. The light [req]/[cinvoke]/[radv]/[oadv] completion probes stay always-on.
+
+### YZ_FORCE_WAKE (s36, 2026-07-12) — REFUTED, kept for archaeology
+Watchdog thread that pokes any CRI consumer thread (t2/t3/t11/t12) parked >500ms on sem_wait/cond_wait,
+via yz_force_sem_post / yz_force_cond_signal (runtime/syscalls/sys_semaphore.c + sys_cond.c). Diagnostic
+test of whether re-driving the stalled CRI completion dispatch walks the preload. RESULT: NEGATIVE — the
+poked consumer wakes to no enqueued work and re-parks; the preload does not advance (the work is never
+enqueued; the root is t1's master loop wedging, not the wakeup). Default OFF.
+
+### YZ_USLEEP_LR (s36, 2026-07-12)
+Log the caller LR (dedup per distinct lr) of each t1 usleep(250) site (runtime/syscalls/sys_timer.c), to
+name t1's stuck poll loop at the preload stall. NB the guest LR came back ZERO (ctr=0x010DD688) — use
+g_yz_last_targets / YZ_T1SAMPLE instead. Default OFF.
+
+### YZ_ARMFIRE (s37, 2026-07-12) — the completion arrival-before-arm race probe
+In yz_chain_probe (yakuza/main.cpp), gates two handlers on the existing chain-probe targets: FIRE at
+func_00EEF88C (the driver read-done handler; for scenario's slot D=0x01655848 logs M=*(D+0x440), arg=*(D+0x444),
+armed=*(M+0x4), mseq=*(M+0x48), deduped on armed-state change) and ARM at func_00F00580 (the client mailbox
+arm; logs M/arg/record). Confirmed the no-preemption race: the mailbox fires completions both armed=1
+(delivered) and armed=0 (dropped) intermittently. Low-perturbation (deduped, few lines); heavy logging here can
+flip the race (LESSONS #6b). Default OFF. [armfire] tag.
+
+## s39 SPU channel-stall contract flags (2026-07-15)
+
+The faithful SPU channel-wait implementation (runtime/spu/spu_channels.c `spu_ch_wait`/`spu_ch_wake`;
+per-SPU CONDITION_VARIABLE+SRWLOCK appended to spu_context.h). `rdch` on an empty read channel now WAITS
+instead of returning a stale/architected-default value; the wake is plumbed at every cross-thread producer.
+Blocking is DEFAULT-ON. Scope: reads only — `SPU_RdInMbox`, `SPU_RdSigNotify1/2`, `SPU_RdEventStat`. Writes
+(`SPU_WrOutMbox`/`SPU_WrOutIntrMbox`) are deliberately left NON-BLOCKING (this runtime has no cross-thread
+out-mbox drainer, so block-while-full would deadlock the SPU host thread — documented at the wrch cases).
+The `[ch-block]` witness (first 50 + every 512th blocked attempt) and `[ch-wait]` heartbeat (every cumulative
+2000 ms of one stall, uncapped) are ALWAYS-ON (cheap; only emit when a stall actually happens).
+
+| Flag | Where | Class | Default | Meaning |
+|---|---|---|---|---|
+| `YZ_CH_NONBLOCK` | spu_channels.c (`yz_ch_nonblock`; `spu_rdch`/`spu_rchcnt`/`spu_wrch`) | kill-switch | OFF (blocking ON) | `=1` restores the exact legacy non-blocking channel behavior everywhere: `rdch` reads-and-returns-stale, `rchcnt` unknown-channel default stays `1`, and the unimplemented-channel logs are suppressed. Use for A/B against the faithful path. |
+| `YZ_CH_STRICT` | spu_channels.c (`yz_ch_strict`; `spu_rdch`/`spu_wrch` default cases) | diag | OFF | `=1` makes an UNIMPLEMENTED `rdch`/`wrch` (unknown channel id) additionally HALT the SPU via the existing stop mechanism (`spu_halt` → `SPU_STATUS_STOPPED_BY_HALT`, longjmp to the host-thread driver) instead of the default continue-with-0/ignore. Surfaces guest use of channels we don't model. Inert under `YZ_CH_NONBLOCK`. |
+
+Note: the s39 design brief said "three new env flags"; the spec itself names only these two (the witness log and
+heartbeat are unconditional, not flag-gated), so two are registered. See scratch/s39_ch_wait.md.
