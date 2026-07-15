@@ -158,10 +158,20 @@ def mask64(mb, me):
         return m & ((MASK64 << (63 - me)) & MASK64)
     return ((MASK64 >> mb) | ((MASK64 << (63 - me)) & MASK64)) & MASK64
 
-def ref_rlwinm(a, sh, mb, me):   return rotl32(a, sh) & mask32(mb, me), None
+def ref_rlwinm(a, sh, mb, me):
+    # PowerISA full 64-bit semantics: r = ROTL64(x||x, sh), m = MASK(mb+32, me+32).
+    # For mb<=me the result is the zero-extended masked word; for mb>me the mask
+    # WRAPS through the high 32 bits, which legitimately receive the rotated
+    # duplicate. (The old 32-bit reference + MASK32 compares hid a lifter
+    # sign-extension bug at 95k call sites — never mask a word-op compare.)
+    r = rotl32(a, sh)
+    return ((r << 32) | r) & mask64(mb + 32, me + 32), None
 def ref_rlwimi(ra, rs, sh, mb, me):
-    m = mask32(mb, me)
-    return ((rotl32(rs, sh) & m) | (ra & MASK32 & ~m)) & MASK32, None   # low32 compare
+    # Insert under the same 64-bit wrapped mask; RA bits outside m are PRESERVED
+    # across the full 64 bits (high half survives a non-wrap mask untouched).
+    r = rotl32(rs, sh)
+    m = mask64(mb + 32, me + 32)
+    return ((((r << 32) | r) & m) | (ra & MASK64 & ~m)) & MASK64, None
 def ref_rldicl(a, sh, mb): return rotl64(a, sh) & mask64(mb, 63), None
 def ref_rldicr(a, sh, me): return rotl64(a, sh) & mask64(0, me), None
 def ref_rldimi(ra, rs, sh, mb):
@@ -501,12 +511,12 @@ def build_cases():
             v, _ = ref_rlwinm(a, sh, mb, me)
             case(f"rlwinm a={a:#x} sh={sh} mb={mb} me={me}",
                  m_form(21, R[0], R[1], sh, mb, me),
-                 {R[0]: a}, [(R[1], v, MASK32)])
+                 {R[0]: a}, [(R[1], v, MASK64)])
             r0 = 0xAAAAAAAABBBBBBBB
             v2, _ = ref_rlwimi(r0, a, sh, mb, me)
             case(f"rlwimi a={a:#x} sh={sh} mb={mb} me={me}",
                  m_form(20, R[0], R[1], sh, mb, me),
-                 {R[0]: a, R[1]: r0}, [(R[1], v2, MASK32)])
+                 {R[0]: a, R[1]: r0}, [(R[1], v2, MASK64)])
     for a in (0x123456789ABCDEF0, 0x8000000000000001, MASK64):
         for sh, mbe in [(0, 0), (0, 63), (1, 0), (17, 5), (32, 31), (63, 1), (40, 63)]:
             v, _ = ref_rldicl(a, sh, mbe)
@@ -1231,12 +1241,12 @@ def build_fuzz_cases(n, seed):
         sh, mb, me = rng.randint(0, 31), rng.randint(0, 31), rng.randint(0, 31)
         v, _ = ref_rlwinm(a, sh, mb, me)
         _fuzz_case(f"rlwinm a={a:#x} sh={sh} mb={mb} me={me}",
-                   m_form(21, R[0], R[1], sh, mb, me), {R[0]: a}, [(R[1], v, MASK32)])
-        r0 = _fuzz_operand(rng, 32)
+                   m_form(21, R[0], R[1], sh, mb, me), {R[0]: a}, [(R[1], v, MASK64)])
+        r0 = _fuzz_operand(rng, 64)
         v2, _ = ref_rlwimi(r0, a, sh, mb, me)
         _fuzz_case(f"rlwimi a={a:#x} sh={sh} mb={mb} me={me}",
                    m_form(20, R[0], R[1], sh, mb, me),
-                   {R[0]: a, R[1]: r0}, [(R[1], v2, MASK32)])
+                   {R[0]: a, R[1]: r0}, [(R[1], v2, MASK64)])
 
     for i in range(n):
         a = _fuzz_operand(rng, 64)
