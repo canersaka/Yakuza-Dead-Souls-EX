@@ -116,6 +116,16 @@ SOURCE_PREAMBLE = """\
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+/* PPC memory barriers (sync/lwsync/eieio/isync) lift to real fences: the game's
+ * lock-free CRI/SPURS handoffs rely on them; emitting no-ops let x86 store-load
+ * reordering break the driver->worker completion handoff (s37, 2026-07-13). */
+#ifdef __cplusplus
+#include <atomic>
+#define PPU_FENCE(o) std::atomic_thread_fence(std::memory_order_##o)
+#else
+#include <stdatomic.h>
+#define PPU_FENCE(o) atomic_thread_fence(memory_order_##o)
+#endif
 
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
@@ -196,7 +206,12 @@ static inline double ppu_frsp(double v)
     if (v != v) {
         uint64_t bits;
         memcpy(&bits, &v, 8);
-        bits |= (1ULL << 51);   /* force the quiet bit; sign/payload untouched */
+        bits |= (1ULL << 51);       /* force the quiet bit; sign untouched */
+        bits &= ~0x1FFFFFFFULL;     /* frsp truncates the payload to single
+                                     * precision: mantissa bits below the
+                                     * 23-bit single field are zeroed (audit
+                                     * s39 B4, 2/2 verifier-confirmed vs
+                                     * PowerISA frsp NaN rules) */
         memcpy(&v, &bits, 8);
         return v;
     }
@@ -287,6 +302,18 @@ def _reg_idx(token: str) -> str:
     """Extract register index from 'r3' -> '3', 'f5' -> '5', 'v2' -> '2'."""
     m = re.match(r"[rfv](\d+)", token)
     return m.group(1) if m else token
+
+
+def _ppc_mask64(mb: int, me: int) -> int:
+    """PowerISA MASK(mb, me) over 64 bits, big-endian bit numbering (bit 0 =
+    MSB). mb <= me gives a contiguous field; mb > me WRAPS through both ends
+    (the word-rotate wrap-mask case). Computed at lift time so the emission is
+    a literal AND."""
+    def _ones(lo: int, hi: int) -> int:
+        return (((1 << (hi - lo + 1)) - 1) << (63 - hi))
+    if mb <= me:
+        return _ones(mb, me)
+    return _ones(mb, 63) | _ones(0, me)
 
 
 def _disp_base(token: str):
@@ -653,17 +680,27 @@ class PPULifter:
                     f"__builtin_clzll(ctx->gpr[{rs}]) : 64;")
 
         # ------- Shift / Rotate -------
+        # PowerISA word rotates: r = ROTL64(RS_low||RS_low, sh), m = MASK(MB+32, ME+32).
+        # The 64-bit mask is a lift-time constant; for mb<=me it lies in the low
+        # word (result zero-extends), for mb>me it WRAPS through the high 32 bits
+        # which receive the rotated duplicate. The old (int64_t)(int32_t) emission
+        # sign-extended bit-31 results (corrupting cmpd/address math/record-form
+        # CR0) and dropped the wrap-mask high half entirely.
         if mn.startswith("rlwinm"):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
-                    f"ppc_rlwinm((uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
+            sh, mb, me = ops[2], int(ops[3]), int(ops[4])
+            m = _ppc_mask64(mb + 32, me + 32)
+            return (f"ctx->gpr[{ra}] = ppc_rlwdup((uint32_t)ctx->gpr[{rs}], {sh})"
+                    f" & 0x{m:016X}ULL;")
 
         if mn.startswith("rlwimi"):
+            # Insert under the wrapped 64-bit mask; RA bits outside it are
+            # PRESERVED across all 64 bits.
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
-                    f"ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
+            sh, mb, me = ops[2], int(ops[3]), int(ops[4])
+            m = _ppc_mask64(mb + 32, me + 32)
+            return (f"ctx->gpr[{ra}] = (ppc_rlwdup((uint32_t)ctx->gpr[{rs}], {sh})"
+                    f" & 0x{m:016X}ULL) | (ctx->gpr[{ra}] & 0x{(~m) & 0xFFFFFFFFFFFFFFFF:016X}ULL);")
 
         if mn in ("slw", "slw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -981,7 +1018,11 @@ class PPULifter:
                 tgt = int(target, 16)
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                return f"func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                # PPC bl architecturally sets LR to the return address. Control
+                # flow here rides the native call stack, but guest reads of LR
+                # (mflr, frame-saved LRs, back-chain walkers) must see the real
+                # value -- the s36 lr=0 diagnostic dead-ends were this gap.
+                return f"ctx->lr = 0x{insn.addr + 4:08X}u; func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
 
@@ -1009,7 +1050,9 @@ class PPULifter:
                 (mn.endswith("ctr") or mn.endswith("ctrl"))):
             cond = self._branch_condition(mn, ops)
             if mn.endswith("ctrl"):   # conditional indirect CALL — continue after
-                return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
+                # Link form sets LR (same class as the bl fix; audit s39 A1).
+                return (f"if ({cond}) {{ ctx->lr = 0x{insn.addr + 4:08X}u; "
+                        f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
             return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
 
         # Conditional branches
@@ -1036,7 +1079,11 @@ class PPULifter:
             # Indirect call through CTR register. The CTR value is a GUEST
             # address (or OPD pointer). We dispatch through a hash table
             # that maps guest addresses to host function pointers.
-            return "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
+            # bctrl architecturally sets LR = CIA+4 (audit s39 A1, 30,631
+            # sites): control flow rides the native stack, but guest mflr /
+            # frame-saved LR reads after a virtual call must see the real
+            # return address — the exact class fixed for bl this session.
+            return f"ctx->lr = 0x{insn.addr + 4:08X}u; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
 
         # ------- SPR -------
         if mn == "mflr":
@@ -1271,18 +1318,22 @@ class PPULifter:
                     f"ctx->fpr[{frd}] = (double)iv; }}")
 
         if mn_base == "fsqrt" or mn_base == "fsqrts":
+            # QNaN results must be sign-0 (PowerISA default QNaN; audit s39
+            # B5): host sqrt(-x) yields a sign-1 NaN. Canonicalize like
+            # fadd/fmul already do.
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
-            return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)(float)sqrt(ctx->fpr[{frb}]));"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan(sqrt(ctx->fpr[{frb}]));"
 
         if mn_base in ("frsqrte", "frsqrtes"):
+            # Same QNaN-sign canonicalization (audit s39 B7).
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "frsqrtes":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
-            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fp_canon_nan((double)(float)(1.0 / sqrt(ctx->fpr[{frb}])));"
+            return f"ctx->fpr[{frd}] = ppu_fp_canon_nan(1.0 / sqrt(ctx->fpr[{frb}]));"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
@@ -1480,14 +1531,17 @@ class PPULifter:
             return (f"{{ uint32_t field = (ctx->cr >> {src_shift}) & 0xF; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {dst_shift})) | (field << {dst_shift}); }}")
 
-        # rlwnm — rotate left word then AND with mask (register shift)
+        # rlwnm — rotate left word then AND with mask (register shift). Same
+        # full 64-bit dup32+wrapped-mask semantics as rlwinm above.
         if mn.startswith("rlwnm"):
             ra = _reg_idx(ops[0])
             rs = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             mb = int(ops[3])
             me = int(ops[4])
-            return f"ctx->gpr[{ra}] = ppc_rlwinm((uint32_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 31), {mb}, {me});"
+            m = _ppc_mask64(mb + 32, me + 32)
+            return (f"ctx->gpr[{ra}] = ppc_rlwdup((uint32_t)ctx->gpr[{rs}], "
+                    f"(int)(ctx->gpr[{rb}] & 31)) & 0x{m:016X}ULL;")
 
         # mffs — move from FPSCR
         if mn == "mffs" or mn == "mffs.":
@@ -1629,9 +1683,17 @@ class PPULifter:
             return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0x7FULL; "
                     f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
-        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
-                  "sync", "eieio", "isync", "lwsync", "ptesync"):
-            return f"/* {mn}: cache/sync — no-op */;"
+        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
+            return f"/* {mn}: cache hint — no-op */;"
+        # PPC memory barriers -> real fences (see SOURCE_PREAMBLE / PPU_FENCE).
+        if mn in ("sync", "ptesync"):
+            return "PPU_FENCE(seq_cst);   /* hwsync: full barrier incl StoreLoad */"
+        if mn == "lwsync":
+            return "PPU_FENCE(acq_rel);   /* lightweight sync (no StoreLoad) */"
+        if mn == "eieio":
+            return "PPU_FENCE(release);   /* I/O store ordering */"
+        if mn == "isync":
+            return "PPU_FENCE(acquire);   /* instruction sync / acquire barrier */"
 
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):
@@ -2633,6 +2695,13 @@ class PPULifter:
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
+        lines.append("/* PowerISA word-rotate core: the rotated 32-bit value duplicated into both")
+        lines.append(" * halves (ROTL64(x||x, sh)); the caller ANDs a lift-time 64-bit mask that")
+        lines.append(" * may wrap through the high word. */")
+        lines.append("static inline uint64_t ppc_rlwdup(uint32_t rs, int sh) {")
+        lines.append("    uint32_t r = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
+        lines.append("    return ((uint64_t)r << 32) | (uint64_t)r;")
+        lines.append("}")
         lines.append("static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {")
         lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
         lines.append("    uint32_t mask;")
