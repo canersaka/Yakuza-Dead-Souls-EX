@@ -244,6 +244,19 @@ typedef struct spu_context {
     uint32_t module_src_ea;
     uint32_t module_src_size;
 
+    /* s39 (2026-07-15) faithful channel-stall contract: per-SPU wake mechanism
+     * for the blocking rdch path (spu_ch_wait/spu_ch_wake, spu_channels.c).
+     * Storage for a Win32 CONDITION_VARIABLE + SRWLOCK -- each is a single
+     * pointer-sized struct whose all-zero state IS the documented INIT value
+     * (CONDITION_VARIABLE_INIT / SRWLOCK_INIT == {0}), so the spu_context_init /
+     * lv2_register calloc+memset zero-init is a valid initialization and no
+     * explicit Init call is needed. Declared as void* to keep <windows.h> out of
+     * this shared header (the helpers in spu_channels.c cast &field). On non-
+     * Windows these stay unused (the POSIX wait path polls). Appended per the
+     * struct's APPEND-ONLY rule -- nothing above moves. */
+    void* ch_wait_cv;     /* CONDITION_VARIABLE */
+    void* ch_wait_lock;   /* SRWLOCK */
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
@@ -324,6 +337,33 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
                     ((uint32_t)p[i*4 + 2] <<  8) |
                     (uint32_t)p[i*4 + 3];
     }
+    /* s38 arm-gate witness read-watch (env YZ_ARMGATE). The gs_task release state
+     * machine apply_entry (LS 0xB088) emits a stopper release (0xB170->0x5EB8->0x5F00)
+     * for a CODE==0 descriptor ONLY if LS[0xBD70]==key(r11) at the gate 0xB0C4/0xB0CC
+     * (recomp_prx/gs_task.c:41037-41062). LS[0xBD70] is READ here (0xB0C4) but has NO
+     * literal-address writer in the whole image -> the arm-gate witness. Log every
+     * gate read: CODE(r3), key(r11), the witness value, the descriptor(r80) + its
+     * first quad, and whether they MATCH -- so one boot shows whether the witness ever
+     * equals the stuck stopper's key (and thus whether the descriptor can ever arm). */
+    { static int ag = -1;
+      extern char* getenv(const char*);
+      if (ag < 0) { ag = getenv("YZ_ARMGATE") ? 1 : 0;
+          if (ag) { fprintf(stderr, "[armgate] ARMED (LS 0xBD70 gate read/write watch, img0)\n"); fflush(stderr); } }
+      if (ag && ctx->image_id == 0 && lsa == 0xBD70u) {
+          static unsigned long agn = 0;
+          if (agn < 3000) { agn++;
+              uint32_t desc = ctx->gpr[80]._u32[0] & (SPU_LS_MASK & ~0xFu);
+              const uint8_t* d = &ctx->ls[desc];
+              uint32_t d0=((uint32_t)d[0]<<24)|((uint32_t)d[1]<<16)|((uint32_t)d[2]<<8)|d[3];
+              uint32_t d1=((uint32_t)d[4]<<24)|((uint32_t)d[5]<<16)|((uint32_t)d[6]<<8)|d[7];
+              uint32_t d2=((uint32_t)d[8]<<24)|((uint32_t)d[9]<<16)|((uint32_t)d[10]<<8)|d[11];
+              uint32_t d3=((uint32_t)d[12]<<24)|((uint32_t)d[13]<<16)|((uint32_t)d[14]<<8)|d[15];
+              fprintf(stderr, "[armgate] pc=%05X code=%08X key=%08X witness=%08X desc=%05X dq=%08X_%08X_%08X_%08X %s\n",
+                      ctx->pc, ctx->gpr[3]._u32[0], ctx->gpr[11]._u32[0], v._u32[0], desc, d0, d1, d2, d3,
+                      (v._u32[0]==ctx->gpr[11]._u32[0]) ? "MATCH" : "nomatch");
+              fflush(stderr);
+          }
+      } }
     return v;
 }
 
@@ -342,6 +382,70 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
           if (qn < 40) { qn++;
               fprintf(stderr, "[qline] pc=0x%05X LS80 <= %08X %08X %08X %08X\n",
                       ctx->pc, val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
+              fflush(stderr);
+          }
+      } }
+    /* s38 arm-gate witness WRITE-watch (env YZ_ARMGATE): catch any lifted store to
+     * LS 0xBD70 (the apply_entry arm-gate witness read at 0xB0C4). If ZERO hits across
+     * a boot AND the DMA watch is also silent, the witness is never written by the code
+     * (stuck at init -> only descriptors whose key==init ever arm). If hit, this names
+     * the writer pc + old->new so we can see whether it ever advances to the stuck key. */
+    { static int agw = -1;
+      extern char* getenv(const char*);
+      if (agw < 0) agw = getenv("YZ_ARMGATE") ? 1 : 0;
+      if (agw && ctx->image_id == 0 && lsa == 0xBD70u) {
+          static unsigned long agwn = 0;
+          if (agwn < 400) { agwn++;
+              const uint8_t* q = &ctx->ls[lsa];
+              uint32_t ow0=((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+              fprintf(stderr, "[armgate-wr] pc=%05X old=%08X new=%08X\n", ctx->pc, ow0, val._u32[0]);
+              fflush(stderr);
+          }
+      } }
+    /* s38 window-LIMIT write-watch (env YZ_ARMGATE): the consumer's poll-loop
+     * advance (gs_task.c ~0x64E0) preserves cb1.word0/1/2 and only rewrites
+     * cb1.word3 (curEA), so the window LIMIT = cb1.word2 (@LS 0xBCA0+8) is set
+     * ELSEWHERE and gates the whole ring-slide (measured stuck at 0x41F12880 while
+     * the producer head is ~52 lines ahead). Log every CHANGE to cb1.word2 (its
+     * writer pc + old->new) so the last one names the stale-limit setter = the fix
+     * locus (is it a once-only init, or a head-read that returns stale?). */
+    { static int lw = -1;
+      extern char* getenv(const char*);
+      if (lw < 0) lw = getenv("YZ_ARMGATE") ? 1 : 0;
+      if (lw && ctx->image_id == 0 && lsa == 0xBCA0u) {
+          const uint8_t* q = &ctx->ls[lsa];
+          uint32_t ow2 = ((uint32_t)q[8]<<24)|((uint32_t)q[9]<<16)|((uint32_t)q[10]<<8)|q[11];
+          if (ow2 != val._u32[2]) {
+              static unsigned long lwn = 0;
+              if (lwn < 400) { lwn++;
+                  fprintf(stderr, "[limwatch] pc=%05X cb1.word2(limit) %08X -> %08X (w0=%08X w1=%08X w3=%08X)\n",
+                          ctx->pc, ow2, val._u32[2], val._u32[0], val._u32[1], val._u32[3]);
+                  fflush(stderr); }
+          }
+      } }
+    /* s34 CB-write watchpoint (env YZ_CBWATCH): gs_task's journal-consumer
+     * control block sits at LS 0xBC90 (cb0: w1=walkctr) and 0xBCB0 (cb2:
+     * w0=segment base, w1=counter2 = the real cursor index). At the wedge the
+     * base advanced 7 segments then pinned at 0x41F30080 with counter2 stuck
+     * BELOW 128 while advance() runs 82k+ times; the CB is NEVER DMA-reloaded
+     * (measured), so a single-thread SPU store must revert the counter. This
+     * catches the WRITER pc with zero assumptions: log every store to the CB
+     * quads in the FREEZE window (g_yz_cadv > 45000), old vs new, capped. A pc
+     * NOT in {064EC,064F4,064F8,06500,06528} that writes the counter DOWN is
+     * the root. Reads ctx->ls BEFORE the store below (old value). */
+    { static int cbw = -1;
+      extern char* getenv(const char*);
+      extern volatile unsigned long g_yz_cadv;
+      if (cbw < 0) cbw = getenv("YZ_CBWATCH") ? 1 : 0;
+      if (cbw && ctx->image_id == 0 && ctx->pc == 0x32BCu && lsa == 0xBCB0u) {
+          static unsigned long cbn = 0;
+          if (cbn < 400) { cbn++;
+              const uint8_t* q = &ctx->ls[lsa];
+              uint32_t ow0 = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+              uint32_t ow1 = ((uint32_t)q[4]<<24)|((uint32_t)q[5]<<16)|((uint32_t)q[6]<<8)|q[7];
+              fprintf(stderr, "[cbw] pc=%05X lsa=%05X old=%08X_%08X new=%08X_%08X r3=%08X r7=%08X r8=%08X r16=%08X cadv=%lu\n",
+                      ctx->pc, lsa, ow0, ow1, val._u32[0], val._u32[1],
+                      ctx->gpr[3]._u32[0], ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[16]._u32[0], g_yz_cadv);
               fflush(stderr);
           }
       } }
@@ -475,6 +579,14 @@ void spu_halt(spu_context* ctx, int status);
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the context's active image and runs it. Referenced by SPU_RET. */
 void spu_indirect_branch(spu_context* ctx);
+
+/* s39 channel-stall wake (spu_channels.c): signal the per-SPU wait CV so a
+ * host thread blocked in spu_rdch (RdInMbox / RdSigNotify1/2 / RdEventStat)
+ * re-checks its predicate immediately. MUST be called by every PPU/SPU-side
+ * producer AFTER it makes such a predicate true (in-mbox/signal writes, event
+ * status raises). The blocking waiter also re-polls every 10 ms, so a missed
+ * wake only costs latency, never a permanent hang. No-op on non-Windows. */
+void spu_ch_wake(spu_context* ctx);
 
 /* Restore-on-host-return (s24 adopt-on-serve image model, ledger #51): the
  * lifted brsl/bisl call brackets save image_id in a call-site local and hand
