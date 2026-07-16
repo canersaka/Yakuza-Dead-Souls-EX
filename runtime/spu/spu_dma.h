@@ -231,9 +231,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               /* s34: WIDENED to cover gs_task's whole text+data [0xA00,0xBE00)
                * -- the churn-analysis verdict says gs_task text [0x3000,0xB800)
                * is zeroed ~32k x (a DMA-zeroer would land here; the old window
-               * had a blind spot exactly there). */
+               * had a blind spot exactly there).
+               * s40: WIDENED AGAIN 0xBE00 -> 0xC400: the item-slot region
+               * [0xBF00,0xC400) was the remaining blind spot, and both wedge
+               * modes start with zeroed quads exactly there
+               * (scratch/s40_evidence.md, verifyA/verifyB). */
               if (size >= 64u && wl < 0x40000u
-                  && (wl < 0xBE00u && wl + size > 0xA00u)) {
+                  && (wl < 0xC400u && wl + size > 0xA00u)) {
                   const uint8_t* zp = (const uint8_t*)ls_ptr;
                   uint32_t zi = 0;
                   while (zi < size && zp[zi] == 0) zi++;
@@ -250,6 +254,46 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           fflush(stderr);
                       }
                   }
+              } }
+            /* s40 item-slot DMA-landing watch (env YZ_ZSLOT, companion of the
+             * spu_context.h zero-store watch): log EVERY GET-class landing that
+             * overlaps the gs_task item-slot region LS [0xBF00,0xC400) in image 0,
+             * ANY size (the [ls-wipe] watch above needs >=64B and a 64B zero run;
+             * a 16-byte zero landing on one sub-object is invisible to it). Reports
+             * whether the landed overlap bytes are zero. */
+            { static int zsd = -1;
+              if (zsd < 0) { zsd = getenv("YZ_ZSLOT") ? 1 : 0;
+                  if (zsd) { fprintf(stderr, "[z-slot] ARMED-DMA (any GET overlapping LS [0xBF00,0xC400) img0)\n"); fflush(stderr); } }
+              if (zsd && spu->image_id == 0) {
+                  /* s40 late: bound extended to 0xB800 (static-vtable band, s40_husk_residual.md) */
+                  uint32_t wl2 = lsa & SPU_LS_MASK;
+                  if (wl2 < 0xC400u && wl2 + size > 0xB800u) {
+                      uint32_t lo = wl2 > 0xB800u ? wl2 : 0xB800u;
+                      uint32_t hi = (wl2 + size) < 0xC400u ? (wl2 + size) : 0xC400u;
+                      const uint8_t* op = &spu->ls[lo];
+                      uint32_t oz = 0, on = hi - lo;
+                      while (oz < on && op[oz] == 0) oz++;
+                      { static unsigned long zdn = 0; zdn++;
+                        if (zdn <= 2000 || (zdn & 63) == 0) {
+                            fprintf(stderr, "[z-slot] dma pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X spu=%X overlap=[0x%05X,0x%05X) zeros=0x%X%s n=%lu\n",
+                                    spu->pc & SPU_LS_MASK, cmd, wl2, (unsigned long long)ea, size,
+                                    spu->spu_id, lo, hi, oz, oz == on ? " (ALL-ZERO)" : "", zdn);
+                            fflush(stderr);
+                        } }
+                  }
+                  /* s40b [anch-dma]: any GET landing over the poll-EA home
+                   * (published by the [anch] probe; 0 until discovered). */
+                  { extern uint32_t g_yz_anch_home;
+                    if (g_yz_anch_home && wl2 <= g_yz_anch_home &&
+                        g_yz_anch_home + 4u <= wl2 + size) {
+                        static unsigned long adn = 0; adn++;
+                        if (adn <= 200 || (adn & 63) == 0) {
+                            fprintf(stderr, "[anch-dma] pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08llX size=0x%X spu=%X n=%lu\n",
+                                    spu->pc & SPU_LS_MASK, cmd, wl2, (unsigned long long)ea,
+                                    size, spu->spu_id, adn);
+                            fflush(stderr);
+                        }
+                    } }
               } }
             /* s26 ROOT FIX (the varying-round wall — STATUS ⚡ stager-hunt):
              * the wid4 pool task's 64-byte work-record fetch can race the

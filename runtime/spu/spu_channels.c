@@ -279,6 +279,9 @@ void yz_spu_crash_note(void)
  * the natural-launch adoption point (branch INTO the task region: the task is
  * not executing yet, so healing text there is race-free). Kill-switch:
  * YZ_NO_TASKRELOAD=1. */
+static uint32_t yz_ctxsh_key(const unsigned char* ls, uint32_t* region_len,
+                             uint32_t* region_base);
+
 int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
 {
     int any_stale = 0;
@@ -305,6 +308,24 @@ int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
                 if (p_type != 1 /* PT_LOAD */ || (p_flags & 2 /* PF_W */)) continue;
                 if (p_filesz == 0 || p_vaddr >= SPU_LS_SIZE ||
                     p_filesz > SPU_LS_SIZE - p_vaddr) continue;
+                /* s40 late (the it2_3 red-handed catch, scratch/s40it2_3.err +
+                 * s40_husk_residual.md): the R+X segment's TAIL overlaps the
+                 * task's DECLARED context-save window (base 0x40000-blocks*
+                 * 0x800, gs_task 0xB800) — the game legitimately REWRITES that
+                 * band at its phase transition (pcs 0x352C-0x3550 zero-sweep +
+                 * rebuild). ELF PF flags are a linker artifact; SPUs have no
+                 * memory protection. Healing the band from the ELF reverts the
+                 * game's live state on every adoption (the maintenance-
+                 * abandonment + husk classes) and spams false RO-stale. Clamp
+                 * the guard's ownership at the declared window base; the
+                 * save/restore machinery owns bytes above it. */
+                { uint32_t grl = 0, grb = 0;
+                  uint32_t gkey = yz_ctxsh_key(ctx->ls, &grl, &grb);
+                  if (gkey && grb > p_vaddr && grb < p_vaddr + p_filesz)
+                      p_filesz = grb - p_vaddr;
+                  else if (gkey && grb <= p_vaddr)
+                      continue;   /* whole segment above the window base */
+                }
                 if (memcmp(ctx->ls + p_vaddr, e + p_offset, p_filesz) != 0) {
                     /* s32: name the first divergent offset (stale vs source
                      * bytes) BEFORE healing, and re-verify AFTER -- separates
@@ -315,6 +336,35 @@ int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
                     uint8_t was[4] = {0,0,0,0};
                     while (d0 < p_filesz && ctx->ls[p_vaddr + d0] == e[p_offset + d0]) d0++;
                     if (d0 + 4 <= p_filesz) memcpy(was, ctx->ls + p_vaddr + d0, 4);
+                    /* s40b diff CLASSIFIER: is the divergence a zero-wipe (heal
+                     * is right) or NEW NONZERO content (the game installed
+                     * phase-2 data-in-text; healing DESTROYS it)? Count bytes +
+                     * name the first 3 runs. Rides YZ_STG2. */
+                    { static int gc = -1; if (gc < 0) gc = getenv("YZ_STG2") ? 1 : 0;
+                      if (gc) {
+                        uint32_t zd = 0, nzd = 0, runs = 0, i2 = 0;
+                        char rbuf[160]; int rp = 0; rbuf[0] = 0;
+                        while (i2 < p_filesz) {
+                            if (ctx->ls[p_vaddr + i2] == e[p_offset + i2]) { i2++; continue; }
+                            { uint32_t rs = i2, rz = 1;
+                              while (i2 < p_filesz && ctx->ls[p_vaddr + i2] != e[p_offset + i2]) {
+                                  if (ctx->ls[p_vaddr + i2] != 0) rz = 0;
+                                  if (ctx->ls[p_vaddr + i2] != 0) nzd++; else zd++;
+                                  i2++;
+                              }
+                              runs++;
+                              if (runs <= 3 && rp < 120)
+                                  rp += snprintf(rbuf + rp, sizeof(rbuf) - rp,
+                                                 " run%u@+0x%X len=0x%X %s", runs, rs,
+                                                 i2 - rs, rz ? "ZERO" : "NONZERO");
+                            }
+                        }
+                        fprintf(stderr, "[reload-diff] spu=%X vaddr=0x%05X diff-bytes=%u "
+                                "(zero=%u nonzero=%u) runs=%u%s%s\n",
+                                ctx->spu_id, p_vaddr, zd + nzd, zd, nzd, runs, rbuf,
+                                runs > 3 ? " ..." : "");
+                        fflush(stderr);
+                      } }
                     memcpy(ctx->ls + p_vaddr, e + p_offset, p_filesz);
                     any_stale = 1;
                     { static unsigned long rn = 0; rn++;
@@ -422,6 +472,122 @@ static uint32_t yz_ctxsh_key(const unsigned char* ls, uint32_t* region_len,
     return ea;
 }
 
+/* ===========================================================================
+ * s40 RESIDENT-RECORD SAVE — the missing half of the task-context round-trip.
+ *
+ * Root (s40, measured; scratch/s40_evidence.md + s40_ctxsave_design_review.md):
+ * yz_task_ctx_restore (default ON) restores from the guest ctxsave, but NOTHING
+ * ever saves to it — the two yz_ctx_shadow_save call sites are dead for tasks
+ * (the "poll" site's gates are contradictory; "exit" is image-2-only) and the
+ * guest's own save leg measurably never runs for gs_task. Result: restores
+ * replay a FROZEN era (mode-B rotation rewind → starved stopper release) or a
+ * bounced task resumes over foreign/virgin content (mode-A husk death).
+ *
+ * Model: s_yz_resident[spu] names WHOSE content occupies this SPU's task
+ * region right now (set at every task launch, cleared by every save). Save =
+ * write the region back to the resident's guest ctxsave at the FIRST seam
+ * after its residency ends (next task launch, or workload exit-unwind) — at
+ * that moment the region is provably untouched since the task stopped (only
+ * policy code ran, which stays below CELL_SPURS_TASK_TOP). One save per
+ * residency era; the clear guarantees foreign bytes are never saved into a
+ * task's ctxsave. The savedContext HEADER (LS 0x2C80) is deliberately NOT
+ * deferred-saved: by next-launch time the policy has rewritten it, and the
+ * measured boots resume correctly on the existing header (park point stable);
+ * region content was the disease. Kill-switch YZ_NO_CTXSAVE (default ON).
+ * =========================================================================*/
+static struct { uint32_t ea, region_base, region_len; } s_yz_resident[8];
+
+/* s40b: the journal-consumer poll-EA home (obj+0x1C). obj = the manager at LS
+ * 0xBC90 (MEASURED s40b3 via the poll-site probe) => home = 0xBCAC statically.
+ * The write-watch in spu_context.h and the save/restore witnesses key on it. */
+uint32_t g_yz_anch_home = 0xBCACu;
+
+static uint32_t yz_ls_w32(const uint8_t* p)
+{
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+
+static int yz_ctxsave_off(void)
+{
+    static int off = -1;
+    if (off < 0) { off = getenv("YZ_NO_CTXSAVE") ? 1 : 0;
+        if (!off) { fprintf(stderr, "[ctxsv] ARMED: resident-record task ctxsave (kill: YZ_NO_CTXSAVE)\n");
+                    fflush(stderr); } }
+    return off;
+}
+
+/* s40 late: eas OUR save has written this boot — proof the ctxsave REGION holds
+ * real content even when the guest never wrote the 0x380 header (the virgin-
+ * refusal inertness, scratch/s40_husk_residual.md defect b). */
+static uint32_t s_yz_saved_eas[24];
+static int      s_yz_saved_n;
+static int yz_we_saved(uint32_t ea)
+{
+    for (int i = 0; i < s_yz_saved_n; i++)
+        if (s_yz_saved_eas[i] == ea) return 1;
+    return 0;
+}
+
+/* s40 late, CORRECTED SAME NIGHT (it2_3's red-handed catch overturned the
+ * first version): [0xB800,0xBC00) is NOT immutable rodata — the game's own
+ * phase-2 code (pcs 0x352C-0x3550) zero-sweeps and REWRITES it, and the s32
+ * guest-DMA measurement shows Sony's own context restore covering it. The
+ * ELF's R+X flag is a linker artifact (SPUs have no memory protection). So
+ * save/restore OWNS the full declared window (floor = the window base itself,
+ * i.e. no clamp) and the RO GUARD is clamped to stop at the window base
+ * instead (yz_task_segment_guard). */
+#define YZ_CTXSH_RW_FLOOR 0xB800u
+
+void yz_resident_save(spu_context* ctx, const char* site)
+{
+    unsigned wi = ctx->spu_id & 7u;
+    uint32_t ea = s_yz_resident[wi].ea;
+    if (!ea) return;
+    if (!yz_ctxsave_off()) {
+        extern uint8_t* vm_base;
+        uint32_t rb = s_yz_resident[wi].region_base;
+        uint32_t rl = s_yz_resident[wi].region_len;
+        uint32_t skip = rb < YZ_CTXSH_RW_FLOOR ? YZ_CTXSH_RW_FLOOR - rb : 0;
+        if (skip < rl) {
+            /* s40b anchor witness: what poll-EA value does THIS save capture?
+             * A zero here = the save landed mid-sweep (post-zero, pre-rebuild)
+             * and every later restore will replay the dead anchor. */
+            if (g_yz_anch_home >= rb + skip && g_yz_anch_home + 4 <= rb + rl) {
+                uint32_t av = yz_ls_w32(ctx->ls + g_yz_anch_home);
+                static unsigned long awn = 0; awn++;
+                if (av == 0 || awn <= 32 || (awn & 255u) == 0) {
+                    fprintf(stderr, "[anch-save] spu=%X ctx=0x%08X anchor=0x%08X%s "
+                            "mgr-cnt=%02X bd70=%08X n=%lu (%s)\n",
+                            ctx->spu_id, ea, av, av == 0 ? " **ZERO**" : "",
+                            ctx->ls[0xBC90u + 0xC3u], yz_ls_w32(ctx->ls + 0xBD70u),
+                            awn, site);
+                    fflush(stderr);
+                }
+            }
+            memcpy(vm_base + ea + 0x400u + skip, ctx->ls + rb + skip, rl - skip);
+            if (!yz_we_saved(ea) && s_yz_saved_n < 24)
+                s_yz_saved_eas[s_yz_saved_n++] = ea;
+        }
+        { static unsigned long sn = 0; sn++;
+          if (sn <= 100 || (sn & 255u) == 0) {
+            fprintf(stderr, "[ctxsv] SAVE n=%lu spu=%X ctx=0x%08X region=0x%X skip=0x%X (%s)\n",
+                    sn, ctx->spu_id, ea, rl, skip, site);
+            fflush(stderr); } }
+    }
+    s_yz_resident[wi].ea = 0;   /* one save per residency era */
+}
+
+void yz_resident_set(spu_context* ctx)
+{
+    uint32_t rl = 0, rb = 0;
+    uint32_t ea = yz_ctxsh_key(ctx->ls, &rl, &rb);
+    unsigned wi = ctx->spu_id & 7u;
+    if (!ea) { s_yz_resident[wi].ea = 0; return; }
+    s_yz_resident[wi].ea = ea;
+    s_yz_resident[wi].region_base = rb;
+    s_yz_resident[wi].region_len = rl;
+}
+
 /* SAVE at the switch-away seam. Idempotent, overwrites the slot each time. */
 void yz_ctx_shadow_save(spu_context* ctx, const char* site)
 {
@@ -501,13 +667,22 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
         if (!ea) return;
         s_yz_region_owner[wi] = ea;
         if (off || !is_resume) return;
-        if (prev_owner == ea && !ro_was_stale) return;   /* same era, LS live */
+        /* s40: the old same-era skip keyed on the per-SPU owner slot — which
+         * stays "mine" across Y->X->Y bounces and foreign overlays (mode-A's
+         * silent no-restore path, s40_ctxsave_design_review.md attack B/D).
+         * The RESIDENT record is the real era witness: skip only when the
+         * region provably still holds THIS task's content. (With save-clear
+         * at every seam this is rarely true at adoption — a redundant restore
+         * of just-saved bytes is harmless; a wrong skip kills the boot.) */
+        if (s_yz_resident[wi].ea == ea && !ro_was_stale) return;
+        (void)prev_owner;
         {
             extern uint8_t* vm_base;
             static uint32_t virgin_h = 0; static int vh = 0;
             if (!vh) { static const uint8_t z[0x380];
                        virgin_h = yz_ctxw_hash(z, 0x380u); vh = 1; }
-            if (yz_ctxw_hash(vm_base + ea, 0x380u) == virgin_h) {
+            int hdr_virgin = (yz_ctxw_hash(vm_base + ea, 0x380u) == virgin_h);
+            if (hdr_virgin && !yz_we_saved(ea)) {
                 static int vn = 0;
                 if (vn < 8) { vn++;
                     fprintf(stderr, "[ctx-restore] WARN spu=%X ctx=0x%08X parked "
@@ -517,14 +692,120 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                     fflush(stderr); }
                 return;
             }
-            memcpy(ctx->ls + YZ_CTXSH_REGBASE, vm_base + ea, YZ_CTXSH_REGLEN);
-            memcpy(ctx->ls + region_base, vm_base + ea + 0x400u, region_len);
+            /* s40 restore-rewind watch (env YZ_ZSLOT): mode-B wedge boots show bd70
+             * (LS 0xBD70) changing WITHOUT a lifted store while ~10k RO-stale
+             * restores replay the same ctxsave over the live applier state
+             * (scratch/s40p2.err rotation-sequence discontinuities). Before the
+             * region memcpy, log whenever the incoming snapshot DIFFERS from live
+             * LS at bd70 or anywhere in the item-slot span [0xBF00,0xC400). */
+            { static int zsr = -1;
+              if (zsr < 0) { zsr = getenv("YZ_ZSLOT") ? 1 : 0;
+                  if (zsr) { fprintf(stderr, "[z-slot] ARMED-RESTORE (ctx-restore diff on bd70 + slot span)\n"); fflush(stderr); } }
+              if (zsr && region_base <= 0xBD70u && region_base + region_len >= 0xC400u) {
+                  const uint8_t* inc = vm_base + ea + 0x400u + (0xBD70u - region_base);
+                  const uint8_t* live = ctx->ls + 0xBD70u;
+                  uint32_t iw = ((uint32_t)inc[0]<<24)|((uint32_t)inc[1]<<16)|((uint32_t)inc[2]<<8)|inc[3];
+                  uint32_t lw = ((uint32_t)live[0]<<24)|((uint32_t)live[1]<<16)|((uint32_t)live[2]<<8)|live[3];
+                  int slotdiff = memcmp(vm_base + ea + 0x400u + (0xBF00u - region_base),
+                                        ctx->ls + 0xBF00u, 0x500u) != 0;
+                  if (iw != lw || slotdiff) {
+                      static unsigned long zrn = 0; zrn++;
+                      if (zrn <= 400 || (zrn & 255) == 0) {
+                          fprintf(stderr, "[z-slot] restore-REWIND spu=%X bd70 live=%08X incoming=%08X slots-differ=%d n=%lu\n",
+                                  ctx->spu_id, lw, iw, slotdiff, zrn);
+                          fflush(stderr);
+                      }
+                  }
+              } }
+            /* s40 late (defects a+b, s40_husk_residual.md): never fabricate a
+             * header (virgin header + our-saved region => REGION-ONLY restore
+             * — the phase-2 tasks); clamp the region at the RO floor so a
+             * poisoned static-vtable copy can never be replayed. */
+            if (!hdr_virgin)
+                memcpy(ctx->ls + YZ_CTXSH_REGBASE, vm_base + ea, YZ_CTXSH_REGLEN);
+            { uint32_t rskip = region_base < YZ_CTXSH_RW_FLOOR
+                             ? YZ_CTXSH_RW_FLOOR - region_base : 0;
+              /* s40b iter-6 [vtbl-restore]: the static-vtable band [0xBA00,0xBC00)
+               * was NEVER covered by a restore-diff witness (the b3/b8 "machinery
+               * exonerated" verdicts watched the manager block + anchor only).
+               * The s40unstick2 death = a dispatch through vtable 0xBA88 that was
+               * ALL ZEROS while the object pointing at it was intact. If a seam-
+               * save captured the game's mid-sweep state, every restore replays
+               * zeroed vtables over the rebuilt ones. Diff live-vs-incoming; log
+               * ALWAYS when the incoming band zeroes a live nonzero vtable word. */
+              if (region_base <= 0xBA00u && region_base + region_len >= 0xBC00u) {
+                  const uint8_t* incV = vm_base + ea + 0x400u + (0xBA00u - region_base);
+                  const uint8_t* liveV = ctx->ls + 0xBA00u;
+                  uint32_t vz = 0, vd = 0;
+                  for (uint32_t vi = 0; vi < 0x200u; vi += 4) {
+                      uint32_t lw2 = yz_ls_w32(liveV + vi), iw2 = yz_ls_w32(incV + vi);
+                      if (lw2 != iw2) { vd++; if (iw2 == 0 && lw2 != 0) vz++; }
+                  }
+                  if (vd) {
+                      static unsigned long vrn = 0; vrn++;
+                      if (vz || vrn <= 64 || (vrn & 63u) == 0) {
+                          fprintf(stderr, "[vtbl-restore] spu=%X ctx=0x%08X band-diff=%u "
+                                  "zeroing-live=%u%s vtbl0xBA88 live=%08X inc=%08X n=%lu (%s)\n",
+                                  ctx->spu_id, ea, vd, vz, vz ? " **KILL-CLASS**" : "",
+                                  yz_ls_w32(ctx->ls + 0xBA88u),
+                                  yz_ls_w32(vm_base + ea + 0x400u + (0xBA88u - region_base)),
+                                  vrn, ro_was_stale ? "RO-stale" : "foreign-era");
+                          fflush(stderr);
+                      }
+                  }
+              }
+              /* s40b manager-block witness: does this restore REPLACE the manager
+               * (cb 0xBC90..0xBDB0: count +0xC0, active table +0xDC..) with bytes
+               * that differ from live? A diff here = the restore rewinds item-ring/
+               * table registrations made since the snapshot (the frozen-gate wedge
+               * candidate). Rides YZ_ZSLOT via the zsr flag pattern. */
+              if (region_base <= 0xBC90u && region_base + region_len >= 0xBDB0u) {
+                  const uint8_t* incM = vm_base + ea + 0x400u + (0xBC90u - region_base);
+                  const uint8_t* liveM = ctx->ls + 0xBC90u;
+                  uint32_t md = 0;
+                  for (uint32_t mi = 0; mi < 0x120u; mi++) if (incM[mi] != liveM[mi]) md++;
+                  if (md) {
+                      static unsigned long mrn = 0; mrn++;
+                      if (mrn <= 96 || (mrn & 63u) == 0) {
+                          fprintf(stderr, "[mgr-restore] spu=%X ctx=0x%08X mgr-diff=%u "
+                                  "cnt live=%02X inc=%02X bd70 live=%08X inc=%08X n=%lu (%s)\n",
+                                  ctx->spu_id, ea, md,
+                                  liveM[0xC3], incM[0xC3],
+                                  yz_ls_w32(liveM + 0xE0), yz_ls_w32(incM + 0xE0), mrn,
+                                  ro_was_stale ? "RO-stale" : "foreign-era");
+                          fflush(stderr);
+                      }
+                  }
+              }
+              /* s40b anchor witness: incoming-vs-live poll EA. incoming==0 with
+               * live!=0 is the kill shot (replaying a dead anchor over a live one). */
+              if (g_yz_anch_home >= region_base + rskip &&
+                  g_yz_anch_home + 4 <= region_base + region_len) {
+                  uint32_t liveA = yz_ls_w32(ctx->ls + g_yz_anch_home);
+                  uint32_t incA  = yz_ls_w32(vm_base + ea + 0x400u
+                                             + (g_yz_anch_home - region_base));
+                  if (incA != liveA) {
+                      static unsigned long arn = 0; arn++;
+                      if ((incA == 0) != (liveA == 0) || arn <= 64 || (arn & 63u) == 0) {
+                          fprintf(stderr, "[anch-restore] spu=%X ctx=0x%08X live=0x%08X "
+                                  "incoming=0x%08X%s n=%lu (%s)\n",
+                                  ctx->spu_id, ea, liveA, incA,
+                                  (incA == 0 && liveA != 0) ? " **KILL**" : "", arn,
+                                  ro_was_stale ? "RO-stale" : "foreign-era");
+                          fflush(stderr);
+                      }
+                  }
+              }
+              if (rskip < region_len)
+                  memcpy(ctx->ls + region_base + rskip,
+                         vm_base + ea + 0x400u + rskip, region_len - rskip); }
             { static unsigned long rn = 0; rn++;
               if (rn <= 24 || (rn & 63u) == 0) {
                 fprintf(stderr, "[ctx-restore] n=%lu spu=%X ctx=0x%08X header+0x%X "
-                        "at LS 0x%05X (%s)\n",
+                        "at LS 0x%05X (%s%s)\n",
                         rn, ctx->spu_id, ea, region_len, region_base,
-                        ro_was_stale ? "RO-stale" : "foreign era");
+                        ro_was_stale ? "RO-stale" : "foreign era",
+                        hdr_virgin ? "; REGION-ONLY virgin-hdr" : "");
                 fflush(stderr); } }
         }
     }
@@ -891,7 +1172,18 @@ static mfc_engine* mfc_for(spu_context* ctx)
         mfc_engine_init(&free_slot->mfc);
         return &free_slot->mfc;
     }
-    /* Out of slots: fall back to a shared engine (correct for single-SPU). */
+    /* Out of slots: fall back to a shared engine (correct for single-SPU).
+     * s40: SHARED-STATE HAZARD — a shared engine mixes reservations, tag masks
+     * and list-stall state across unrelated SPUs (2026-07-15 external review,
+     * confirmed by code read; slots are also never freed on group_destroy, so
+     * destroy/create cycles leak slots). Current boots register ~5 contexts so
+     * this path never engages (grep for this banner to verify per boot); if it
+     * EVER fires, fix the registry before trusting any SPU behavior. */
+    { static int warned = 0;
+      if (!warned) { warned = 1;
+          fprintf(stderr, "[mfc] WARNING: context registry EXHAUSTED (>%d) — SHARED fallback engine engaged, cross-SPU state mixing possible\n",
+                  SPU_MAX_CONTEXTS);
+          fflush(stderr); } }
     static mfc_engine fallback;
     static int fallback_init = 0;
     if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
@@ -2383,10 +2675,17 @@ void spu_indirect_branch(spu_context* ctx)
                  * or measured staleness intervened (Sony's order: LoadElf
                  * first, THEN the saved context on top -- cellSpursSpu.cpp:
                  * 1820-1846). The opt-in host shadow (default OFF) stays as
-                 * an evidence tool behind it. */
-                int stale = yz_task_segment_guard(ctx, imd);
+                 * an evidence tool behind it.
+                 * s40: leg 4 — SAVE the previous resident's region FIRST (the
+                 * missing half; content still intact at this seam), so the
+                 * restore below replays the CURRENT era, then record the new
+                 * residency AFTER the restore decision. */
+                int stale;
+                yz_resident_save(ctx, "launch");
+                stale = yz_task_segment_guard(ctx, imd);
                 yz_task_ctx_restore(ctx, tpc != imd->entry, stale);
                 yz_ctx_shadow_restore(ctx, tpc != imd->entry, stale);
+                yz_resident_set(ctx);
                 }
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
                  * zero the task image's BSS ([filesz,memsz) spans), per the ELF
@@ -2850,6 +3149,11 @@ void spu_indirect_branch(spu_context* ctx)
              * writable state the kernel is about to let another workload
              * overlay -- shadow it (see yz_ctx_shadow_save; opt-in). */
             if (ctx->image_id == 2) yz_ctx_shadow_save(ctx, "exit");
+            /* s40: the resident-record save at the workload-exit seam — the
+             * kernel is about to let another workload overlay this LS; save
+             * the resident task's region NOW (any image; the record is only
+             * ever set by task launches). */
+            yz_resident_save(ctx, "exit-unwind");
             /* s32 [exit-unsaved] probe (always on, cheap): per the decoded
              * contract, a taskset module may only cross into the kernel with
              * ZERO live unsaved task state (the task saved at its syscall, or
