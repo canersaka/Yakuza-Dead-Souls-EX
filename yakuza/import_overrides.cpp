@@ -30,6 +30,9 @@
 
 extern "C" uint8_t* vm_base;
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
+/* s40b v2: the GPU-parked stopper EA, published by the FIFO park tracker below for
+ * the SPU-side targeted unstick (gs_task.c YZ_QROT_UNSTICK). 0 = not parked >2s. */
+extern "C" { uint32_t g_yz_parked_pub_ea = 0; }
 
 /* lv2 sys_event handlers (runtime/syscalls/sys_event.c) -- driven directly from
  * sys_rsx_context_allocate to set up libgcm's RSX event port/queue. */
@@ -2035,6 +2038,12 @@ static int yz_rsx_fifo_step(void)
                                  park_seq = g_yz_t1_sample_seq;
                                  park_tf  = (void*)g_yz_t1_last_tf; }
             const ULONGLONG parked_ms = GetTickCount64() - park_t0;
+            /* s40b v2 (the adversarial review's targeting requirement,
+             * scratch/s40b_refute_unstick.md): publish the stopper EA the GPU is
+             * provably parked on, so the SPU-side YZ_QROT_UNSTICK can fire ONLY
+             * for the item carrying THIS release (not a blind lottery). >2s parked
+             * = published; resets to 0 on any new park until it matures. */
+            g_yz_parked_pub_ea = (parked_ms > 2000) ? ea : 0;
             /* s33 0x4C24 discriminator (STATUS ⚡ #1, always-on, low-volume):
              * at any >=5 s stopper park, LEVER ON OR OFF, say whether the
              * game's tag-0x7F journal holds this stopper's release entry.
