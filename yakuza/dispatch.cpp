@@ -949,7 +949,14 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * LLE firmware module (indices >= g_yz_lle_import_first) with args
          * and result. Strip once SPURS init survives. */
         unsigned idx = (target - YZ_IMPORT_FAKE_BASE) / 4;
-        int trace = target != YZ_GCM_CB_FAKE_KEY &&
+        /* s40b: the "TEMP DEBUG (SPURS bring-up)" trace above was never stripped
+         * and is UNGATED — measured firing thousands of times/min on t10's
+         * memcpy loop in the current boot phase, two stderr writes per import
+         * call on the hot dispatch path (LESSONS #6c: the logging floor is an
+         * instrument). Now env-gated OFF; YZ_LLECALL_TRACE=1 restores it. */
+        static int lle_trace_on = -1;
+        if (lle_trace_on < 0) lle_trace_on = getenv("YZ_LLECALL_TRACE") ? 1 : 0;
+        int trace = lle_trace_on && target != YZ_GCM_CB_FAKE_KEY &&
                     idx >= g_yz_lle_import_first && idx < g_yz_import_count;
         if (trace)
             fprintf(stderr, "[lle-call t%u] %s(r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)\n",
