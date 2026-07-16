@@ -402,6 +402,141 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
               fflush(stderr);
           }
       } }
+    /* s40 item-slot zero-store watch (env YZ_ZSLOT): the gs_task item-slot region
+     * LS [0xBF00,0xC400) (image 0) holds the journal work items + their sub-objects;
+     * two verified failure modes both start with quads in this region reading zero
+     * (husk-dispatch crash / silent release loss — scratch/s40_evidence.md). The old
+     * [ls-wipe] watch is blind here (window ends 0xBE00, DMA-only, >=64B-only). Log
+     * every LIFTED store of an ALL-ZERO quad into the region with writer pc + spu.
+     * A zero from game code doing legal retirement names the pc just the same —
+     * the pc discriminates wiper vs legit retire. */
+    { static int zs = -1;
+      extern char* getenv(const char*);
+      if (zs < 0) { zs = getenv("YZ_ZSLOT") ? 1 : 0;
+          if (zs) { fprintf(stderr, "[z-slot] ARMED (zero-quad stores into LS [0xBF00,0xC400) img0)\n"); fflush(stderr); } }
+      /* s40 late: lower bound extended 0xBF00 -> 0xB800 (s40_husk_residual.md — the
+       * static vtables at 0xBA88/0xBAA8 live in [0xB800,0xBC00) and one got zeroed). */
+      if (zs && ctx->image_id == 0 && lsa >= 0xB800u && lsa < 0xC400u
+          && val._u32[0] == 0 && val._u32[1] == 0 && val._u32[2] == 0 && val._u32[3] == 0) {
+          static unsigned long zn = 0; zn++;
+          if (zn <= 4000 || (zn & 63) == 0) {
+              fprintf(stderr, "[z-slot] st pc=%05X lsa=0x%05X spu=%X n=%lu\n",
+                      ctx->pc, lsa, ctx->spu_id, zn);
+              fflush(stderr);
+          }
+      } }
+    /* s40 singleton-slot rotation watch (env YZ_BD70W): LS 0xBD70 (image 0 = gs_task)
+     * caches the ONE item-slot address whose stage-2 release path may fire (0xB088's
+     * identity gate). The s39 stg2 probe measured items retrying as no-ops until the
+     * cache rotates to them. This watch is UNCAPPED change-only (the old YZ_ARMGATE
+     * watch above caps at 400 — useless at the minutes-in wedge, LESSONS #6d):
+     * logs every old!=new write (decimated 1/16 after 20000) + a heartbeat with the
+     * current value + total write count every 4096 writes, so a FROZEN rotation at
+     * the wedge is measurable, not inferred from silence. */
+    /* s40b [anch-wr]: lifted-store watch on the journal-consumer poll-EA home
+     * (obj+0x1C, published at runtime by the [anch] probe at gs_task 0x6380 --
+     * 0 until discovered). Logs pc + old/new word; ALWAYS when either is zero
+     * (the wipe / the rebuild), sampled otherwise (the cursor advance rewrites
+     * it once per consumed line). Rides YZ_BD70W. */
+    { static int aw = -1;
+      extern char* getenv(const char*);
+      extern uint32_t g_yz_anch_home;
+      if (aw < 0) aw = getenv("YZ_BD70W") ? 1 : 0;
+      if (aw && ctx->image_id == 0 && g_yz_anch_home &&
+          lsa <= g_yz_anch_home && g_yz_anch_home + 4u <= lsa + 16u) {
+          const uint8_t* op = &ctx->ls[g_yz_anch_home];
+          uint32_t oldw = ((uint32_t)op[0]<<24)|((uint32_t)op[1]<<16)|((uint32_t)op[2]<<8)|op[3];
+          uint32_t bo = g_yz_anch_home - lsa;
+          uint32_t neww = val._u32[bo >> 2];
+          if (oldw != neww) {
+              static unsigned long awn = 0; awn++;
+              if (oldw == 0 || neww == 0 || awn <= 64 || (awn & 63u) == 0) {
+                  fprintf(stderr, "[anch-wr] pc=%05X old=%08X new=%08X spu=%X n=%lu\n",
+                          ctx->pc, oldw, neww, ctx->spu_id, awn);
+                  fflush(stderr);
+              }
+          }
+      } }
+    /* s40b iter-6 [vtbl-wr]: ALL lifted stores into the static-vtable cells
+     * [0xBA80,0xBAC0) with pc + first word — the sweep (zeros) and the rebuild
+     * (nonzero) both visible, so the death's last-writer is attributable.
+     * Rides YZ_BD70W. */
+    { static int vw = -1;
+      extern char* getenv(const char*);
+      if (vw < 0) vw = getenv("YZ_BD70W") ? 1 : 0;
+      if (vw && ctx->image_id == 0 && lsa >= 0xBA80u && lsa < 0xBAC0u) {
+          static unsigned long vwn = 0; vwn++;
+          if (vwn <= 400 || (vwn & 31) == 0) {
+              fprintf(stderr, "[vtbl-wr] pc=%05X lsa=0x%05X w0=%08X%s spu=%X n=%lu\n",
+                      ctx->pc, lsa, val._u32[0],
+                      (val._u32[0]|val._u32[1]|val._u32[2]|val._u32[3]) == 0 ? " ZERO" : "",
+                      ctx->spu_id, vwn);
+              fflush(stderr);
+          }
+      } }
+    /* s40b iter-5 [feed-wr]: the rotation's FEEDSTOCK list at mgr+0x110
+     * (LS 0xBDA0..0xBDD0). c7AC4 POPS it (zeroing cells) and halts at n~5,500
+     * every boot — who PUSHES into it, and why does that stop at the phase
+     * transition? Log every write that lands a NONZERO word in the range
+     * (pushes), change-only per cell; zero-writes (pops) counted only.
+     * Rides YZ_BD70W. */
+    { static int fw = -1;
+      extern char* getenv(const char*);
+      if (fw < 0) { fw = getenv("YZ_BD70W") ? 1 : 0;
+          if (fw) { fprintf(stderr, "[feed-wr] ARMED (mgr+0x110 push witness)\n"); fflush(stderr); } }
+      if (fw && ctx->image_id == 0 && lsa >= 0xBDA0u && lsa < 0xBDD0u) {
+          static unsigned long fwn = 0, fzn = 0;
+          int nz = (val._u32[0] | val._u32[1] | val._u32[2] | val._u32[3]) != 0;
+          if (nz) { fwn++;
+              if (fwn <= 200 || (fwn & 63) == 0) {
+                  fprintf(stderr, "[feed-wr] pc=%05X lsa=0x%05X q=%08X %08X %08X %08X n=%lu z=%lu spu=%X\n",
+                          ctx->pc, lsa, val._u32[0], val._u32[1], val._u32[2], val._u32[3],
+                          fwn, fzn, ctx->spu_id);
+                  fflush(stderr);
+              }
+          } else { fzn++;
+              if ((fzn & 511) == 0) {
+                  fprintf(stderr, "[feed-wr] zero-writes n=%lu (pushes=%lu) spu=%X\n", fzn, fwn, ctx->spu_id);
+                  fflush(stderr);
+              } } } }
+    { static int bw = -1;
+      extern char* getenv(const char*);
+      if (bw < 0) { bw = getenv("YZ_BD70W") ? 1 : 0;
+          if (bw) { fprintf(stderr, "[bd70-wr] ARMED (uncapped change-only + hb4096)\n"); fflush(stderr); } }
+      if (bw && ctx->image_id == 0 && lsa == 0xBD70u) {
+          static unsigned long bwn = 0, bwch = 0;
+          const uint8_t* q = &ctx->ls[lsa];
+          uint32_t ow0=((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+          bwn++;
+          if (ow0 != val._u32[0]) {
+              bwch++;
+              if (bwch <= 20000 || (bwch & 15) == 0) {
+                  fprintf(stderr, "[bd70-wr] pc=%05X old=%08X new=%08X n=%lu ch=%lu\n",
+                          ctx->pc, ow0, val._u32[0], bwn, bwch);
+                  fflush(stderr);
+              }
+              /* s40b review-1's missing measurement: the compaction's ELECTION
+               * INPUT at front changes — all 12 item word0 markers + the mgr
+               * counts (+0xB4 pool, +0xC0 work). Every 64th change (~40/boot);
+               * diffing the last healthy election vs the freeze names whether
+               * the input is legitimate-but-strandable or corrupt. */
+              if ((bwch & 63) == 0 || bwch <= 8) {
+                  char eb[220]; int ep = 0;
+                  for (int ei = 0; ei < 12; ei++) {
+                      uint32_t a2 = 0xBDD0u + (uint32_t)ei*0x80u;
+                      uint32_t w2 = ((uint32_t)ctx->ls[a2]<<24)|((uint32_t)ctx->ls[a2+1]<<16)|((uint32_t)ctx->ls[a2+2]<<8)|ctx->ls[a2+3];
+                      ep += snprintf(eb + ep, sizeof(eb) - ep, " %08X", w2);
+                  }
+                  fprintf(stderr, "[elect] ch=%lu new=%08X w0:%s poolcnt=%02X workcnt=%02X\n",
+                          bwch, val._u32[0], eb, ctx->ls[0xBD47], ctx->ls[0xBD53]);
+                  fflush(stderr);
+              }
+          }
+          if ((bwn & 4095) == 0) {
+              fprintf(stderr, "[bd70-hb] cur=%08X n=%lu ch=%lu\n", val._u32[0], bwn, bwch);
+              fflush(stderr);
+          }
+      } }
     /* s38 window-LIMIT write-watch (env YZ_ARMGATE): the consumer's poll-loop
      * advance (gs_task.c ~0x64E0) preserves cb1.word0/1/2 and only rewrites
      * cb1.word3 (curEA), so the window LIMIT = cb1.word2 (@LS 0xBCA0+8) is set
