@@ -299,7 +299,37 @@ on every gate read (CODE=r3, key=r11, witness value, descriptor quad, MATCH/noma
 [armgate-wr] on any lifted store to 0xBD70, [armgate-dma] on any GET landing on it. Armed
 banner, capped. One boot names whether the witness is stuck/never-written/written-but-stale
 and whether it ever equals the stuck stopper's key. Retire when the consumer releases the
-stuck stopper natively), `YZ_JRNL_WATCH`
+stuck stopper natively), `YZ_BD70W`
+(spu_context.h spu_ls_write128, s40: UNCAPPED change-only watch on the gs_task singleton-slot
+cache LS 0xBD70 (image 0) — the s39 stg2 probe measured stage-2 (0xB088) firing a release
+ONLY when LS[0xBD70] equals the item's own slot address, items retrying as no-ops until the
+cache rotates to them. Logs [bd70-wr] pc+old→new on every real change (1/16 decimation past
+20000) + [bd70-hb] current value + write count every 4096 writes, so a frozen/skipping
+rotation AT THE WEDGE is measurable (the YZ_ARMGATE watch caps at 400 = blind by then,
+LESSONS #6d). Pair with YZ_STG2 (the re-added gs_task.c 0xB088 entry probe, change-only +
+hb, lost on relift). Retire with the journal-consumer wedge), `YZ_ZSLOT`
+(s40 foreign-wiper kit, one flag arms three watches: [z-slot st] spu_context.h
+spu_ls_write128 = any LIFTED all-zero-quad store into the gs_task item-slot region LS
+[0xBF00,0xC400) img0 with writer pc; [z-slot dma] spu_dma.h = ANY GET-class landing
+overlapping that region, any size, with zero-run report (the always-on [ls-wipe] needs
+>=64B and had a 0xBE00 window blind spot exactly there — s40 widened it to 0xC400);
+[z-slot restore-REWIND] spu_channels.c yz_task_ctx_restore = logs when a ctx-restore's
+incoming snapshot DIFFERS from live LS at bd70 (0xBD70) or the slot span — the mode-B
+rewind discriminator (verifyA). Retire with the journal-consumer wedge), `YZ_HUSKLOG`
+(recomp_prx/gs_task.c dispatch 0x3CA4, s40, LOST ON RELIFT: logs [husk] DISPATCH when the
+work-item dispatcher is about to branch through a zeroed sub-object (vtbl or method = 0)
+— the mode-A death signature. + `YZ_HUSK_SKIP` (default OFF, interventional only): return
+via the dispatcher's own null-leg idiom instead of dying, to A/B whether the boot crosses
+the wedge when the applier survives. Retire with the journal-consumer wedge), `YZ_NO_CTXSAVE`
+(spu_channels.c, s40 — KILL SWITCH for the resident-record task-context SAVE, the fix for the
+journal-consumer wedge root: the guest ctxsave was restored-from but never saved-to (frozen
+era → mode-B rotation rewind; virgin/foreign content → mode-A husk death). Default = save ON
+([ctxsv] ARMED banner + SAVE lines): the region of the previous resident task is written back
+to its guest ctxsave at the next task-launch or workload-exit seam (content provably intact
+until then), one save per residency era; the restore's same-era skip now keys on the per-SPU
+RESIDENT record instead of the broken owner slot. Set YZ_NO_CTXSAVE=1 to get the old
+frozen-ctxsave behavior for A/B. Design scratch/s40_ctxsave_fix_design.md + the adversarial
+review s40_ctxsave_design_review.md), `YZ_JRNL_WATCH`
 (spu_dma.h: the LAYER-1 consumer discriminator â€” logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
@@ -900,3 +930,21 @@ The `[ch-block]` witness (first 50 + every 512th blocked attempt) and `[ch-wait]
 
 Note: the s39 design brief said "three new env flags"; the spec itself names only these two (the witness log and
 heartbeat are unconditional, not flag-gated), so two are registered. See scratch/s39_ch_wait.md.
+
+## s40b diagnostics + the ungated-trace fix (2026-07-16)
+
+### YZ_LLECALL_TRACE (s40b, 2026-07-16)
+Restores the per-call [lle-call] import trace in yakuza/dispatch.cpp (every import call made by
+LLE firmware modules, args + result, two stderr lines per call). This was an UNGATED June-era
+"TEMP DEBUG (SPURS bring-up)" that was never stripped: it was 34% of every boot log for ~a month
+and materially paced the guest (LESSONS #6c; DONT_RECHASE #95). DEFAULT OFF. Turn on only for
+targeted import-call archaeology, never during pacing/fps measurements.
+
+### s40b witness kit (all ride YZ_STG2 / YZ_ZSLOT / YZ_BD70W; gs_task.c probes LOST on relift)
+[stg2] v3 (sobj/a04/state + pool count + bd80/90), [slots] 12-slot word0 snapshots, [pool]
+descriptor-pool alloc witness (0x5168), [s1]/[s1-bail] alloc-entry + alloc-NULL witnesses
+(0xB0F4/0xB110), [credit] poll line-credit episodes (0x664C), [anch] poll-EA logger (0x6380),
+[anch-wr]/[anch-dma] writes to the poll-EA home 0xBCAC, [anch-save]/[anch-restore]/[mgr-restore]
+host ctx save/restore divergence witnesses (spu_channels.c), [reload-diff] RO-guard heal
+classifier (zero vs nonzero runs), [feed-wr] mgr+0x110 feed-list push witness (spu_context.h),
+[c5064-src]/[c7AC4-val] table-writer source/value witnesses. All default-OFF via their flags.
