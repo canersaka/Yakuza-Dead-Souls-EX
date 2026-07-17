@@ -42,6 +42,8 @@ file(GLOB_RECURSE HLE_SOURCES
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
 # Runtime core (syscalls, PPU, SPU, memory)
+# (s42 2026-07-16: touched to force a reconfigure so this GLOB_RECURSE --
+# no CONFIGURE_DEPENDS -- picks up the new runtime/spu/spu_lockstep.c)
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
