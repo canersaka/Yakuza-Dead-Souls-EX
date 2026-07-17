@@ -26,8 +26,139 @@
 #  include <intrin.h>
 #  define SPU_CPU_RELAX() _mm_pause()
 #else
+#  include <time.h>
 #  define SPU_CPU_RELAX() ((void)0)
 #endif
+
+/* s41 FLIGHT RECORDER Probe 1 (scratch/s41_upstream_audit.md): a second dump
+ * trigger alongside the existing [stop-jrnl] park trigger
+ * (yakuza/import_overrides.cpp). Fires once, on the 8th "[spu-ximg] cross-
+ * image call ... adopting" event within any 2-second host-clock sliding
+ * window -- the audit's M1 (reverse cross-image adopter) is architecturally
+ * upstream of the tag-2 dispatch and a burst of adoptions is the observed
+ * precursor (16 preceded the wedge every time). yz_fltrec_dump's own
+ * max-dumps guard makes this dump #1 and the park trigger dump #2. */
+static uint64_t yz_host_clock_ms(void)
+{
+#if defined(_MSC_VER)
+    /* Minimal local decl (no <windows.h>) -- this translation unit already
+     * avoids the header (see the GetModuleHandleA extern below) to dodge
+     * exactly the kind of redefinition conflict a full include would cause;
+     * QueryPerformance{Counter,Frequency}'s ABI (stdcall, pointer to an
+     * 8-byte out-param) is stable, so a same-layout local struct suffices. */
+    typedef union { long long QuadPart; struct { unsigned long LowPart; long HighPart; } s; } yz_large_int_t;
+    extern int __stdcall QueryPerformanceCounter(yz_large_int_t*);
+    extern int __stdcall QueryPerformanceFrequency(yz_large_int_t*);
+    static yz_large_int_t freq; static int have_freq = 0;
+    yz_large_int_t now;
+    if (!have_freq) { QueryPerformanceFrequency(&freq); have_freq = 1; }
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(((uint64_t)now.QuadPart * 1000ull) / (uint64_t)freq.QuadPart);
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000ull);
+#endif
+}
+
+/* ============================================================================
+ * s42 BOUNDARY-DRAIN (YZ_BOUNDARY_DRAIN, DEFAULT OFF) -- tier-1 mitigation.
+ * Design scratch/s42_boundary_drain_v2.md as amended by scratch/s42_drain_review.md.
+ *
+ * SCOPE (review CHANGE 1): this is a Doors-1/2 mitigation, NOT "all doors."
+ * Door 3 (FuncB spu_func_0000B6C0, dispatching on the LS[0x2FB0] task object's
+ * own vtable) is CODE-VERIFIED disjoint from the mgr+0xE0 release table, so a
+ * Door-3 death (branch via an obj+0xC4 target / return-site ~0x7BD4) survives a
+ * perfect drain and is an EXPECTED RESIDUAL, not a drain failure.
+ *
+ * WHAT IT DOES, per live release record carried across the phase boundary:
+ *  - neutralize (ALL records): zero item+0x0C (pointee) so the doorway
+ *    spu_func_00003C78/0x3C8C takes its silent null leg at Doors 1 AND 2, and
+ *    set item+0x00's sign bit so the next compaction (spu_func_00004F00) retires
+ *    it and REPLACES count with the shrunk alive-count -> table empties.
+ *  - fire-all-pending (s42 matrix adjudication, supersedes review CHANGE 4's
+ *    front-only): EVERY tag=0x7F record whose stopper EA is in the RSX FIFO
+ *    window gets its release word written, READ-GUARDED (write only when the
+ *    location still holds this record's JTS self-jump, computed from the live
+ *    relbase). Front-only self-defeated: g_yz_parked_pub_ea==0 at storm time ->
+ *    fired=0 across the whole v1..v5 matrix, so real pending releases were
+ *    neutralized WITHOUT firing -> permanent park at their own neutralized EAs.
+ *    Fire-all is sound (not a double-release hazard) because: the fire is
+ *    idempotent + read-guarded (never clobbers content, re-fire is a no-op); a
+ *    queued release record implies its hole content already PUT (JTS "content
+ *    first, release last" + synchronous DMA); and unfilled holes are JTS-paved
+ *    per 128B block so an early release only advances GET to the next stopper --
+ *    plus our modeled RSX has no prefetch cache, so the §2.4.4 stale-fetch
+ *    torn-content malfunction cannot reproduce locally.
+ *
+ * TIER-1 PREREQ (review CHANGE 2) SETTLED: spu_func_00003BF0 (the game's per-item
+ * retire helper the compaction calls per dead entry, gs_task.c:3823-3985) reads
+ * item+0x0C at 0x3C0C-0x3C18 and SKIPS its indirect vmethod dispatch when the
+ * pointee is 0 (`if gpr5==0 goto 0x3C34`), then only clears the tag + word0 low
+ * bit. Because the drain sets pointee=0 on every neutralized item, a burst-dead
+ * pass is a sequence of dispatch-free, purely-local finalizes -- it handles the
+ * all-dead pass safely. The free-list push is in the caller (compaction loop
+ * 0x5004-0x501C), not 0x3BF0.
+ *
+ * Race-freedom: executes only on the consumer ctx (spu 2004, image 0) from its
+ * own 0x352C sweep stream (gs_task.c hand-edit), so LS mutation is race-free
+ * (each ctx owns a private ls[]). The guest-RAM release write targets the same
+ * bytes the SPU's own MFC PUT would (big-endian, single GCM method word --
+ * review CHANGE 3).
+ *
+ * Retirement: delete when the tag-2 producer is found+suppressed (then no reinit
+ * runs and the drain never fires) OR gs_task is block-lifted. Default OFF: the
+ * fire is a lossy force and the "no-op on a non-diverged reinit" claim is not yet
+ * measured (LESSONS #13). Kill = unset the env var. ========================= */
+static volatile int g_yz_bdrain_armed = 0;   /* set by the ximg-storm signal (primary anchor) */
+static volatile int g_yz_bdrain_done  = 0;   /* one-shot latch: FIRST transition only, never re-armed */
+
+static int yz_bdrain_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("YZ_BOUNDARY_DRAIN") ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "[bdrain] ARMED (boundary drain tier-1: fire-all-pending (read-guarded) "
+                    "+ neutralize, Doors-1/2; kill: unset YZ_BOUNDARY_DRAIN)\n");
+            fflush(stderr);
+        }
+    }
+    return on;
+}
+
+static void yz_ximg_storm_note(void)
+{
+    static uint64_t times[8];
+    static uint64_t count = 0;
+    static int fired = 0;
+    uint64_t now, oldest;
+    int idx;
+    if (fired) return;
+    idx = (int)(count & 7u);
+    now = yz_host_clock_ms();
+    times[idx] = now;
+    count++;
+    if (count < 8) return;
+    oldest = times[count & 7u];
+    if (now - oldest <= 2000ull) {
+        fired = 1;
+        fprintf(stderr, "[spu-ximg] STORM: 8 cross-image adoptions within %llums "
+                "(host clock) -> yz_fltrec_dump(\"ximg-storm\")\n",
+                (unsigned long long)(now - oldest));
+        fflush(stderr);
+        yz_fltrec_dump("ximg-storm");
+        /* s42 BOUNDARY-DRAIN primary anchor: the storm is the every-boot
+         * transition precursor (~20 lines pre-wedge, MEASURED
+         * scratch/s42_tag2_producer.md:51), so it reliably precedes the whole
+         * reinit burst. Arm here; the drain EXECUTES race-free at the next 0x352C
+         * sweep on the consumer ctx (recomp_prx/gs_task.c hand-edit). */
+        if (yz_bdrain_on()) {
+            g_yz_bdrain_armed = 1;
+            fprintf(stderr, "[bdrain] storm-arm: transition detected -> drain will fire at next 0x352C on consumer\n");
+            fflush(stderr);
+        }
+    }
+}
 
 /* Per-thread unwind target: a halted SPU (stop instruction, or an indirect
  * branch into unlifted code) must abort the lifted call chain rather than
@@ -366,6 +497,12 @@ int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
                         fflush(stderr);
                       } }
                     memcpy(ctx->ls + p_vaddr, e + p_offset, p_filesz);
+                    /* s41 FLIGHT RECORDER (Probe 1, scratch/s41_upstream_audit.md):
+                     * host-side write into the consumer's LS by the RO-guard heal
+                     * (site 4). Closes the recorder's previously blind spot at
+                     * this candidate-#1 upstream writer. */
+                    if (yz_fltrec_hot(ctx))
+                        yz_fltrec_foreign_write(ctx, p_vaddr, p_filesz, 4);
                     any_stale = 1;
                     { static unsigned long rn = 0; rn++;
                       if (rn <= 16 || (rn & 63u) == 0) {
@@ -502,9 +639,198 @@ static struct { uint32_t ea, region_base, region_len; } s_yz_resident[8];
  * The write-watch in spu_context.h and the save/restore witnesses key on it. */
 uint32_t g_yz_anch_home = 0xBCACu;
 
+/* s42 HAND-EDIT — LOST ON RELIFT — decisive-probe shared state
+ * (scratch/s42_desync_verdict.md §5). g_yz_fl_restore_R is a global,
+ * monotonic count of ctx-restore events that actually copy the ctxsave
+ * region into LS (incremented once per real restore, in
+ * yz_task_ctx_restore below); gs_task.c's [pop-slot] probe tags each pop
+ * with the most recent value so a reader can tell "was there a restore
+ * since the last pop". g_yz_fl_lastwriter[12] is the free-list last-writer
+ * shadow (index = free-list slot i=0..11, LS 0xBDA0+i*4): 0=unknown/never
+ * written this boot, 1=pop-zero (spu_func_00007AB4, gs_task.c), 2=
+ * compaction-push (spu_func_00004F00 store 0x501C, gs_task.c), 3=
+ * restore-memcpy WITH an observed value change (this file). Both arrays
+ * are process-global (single gs_task/image-0 SPU is the only writer of the
+ * manager triad per s40b3), no locking -- diagnostic-only, never read by
+ * emulated code. */
+unsigned long g_yz_fl_restore_R = 0;
+uint8_t g_yz_fl_lastwriter[12];
+
 static uint32_t yz_ls_w32(const uint8_t* p)
 {
     return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+
+/* s40b PRODUCER THROTTLE support (scratch/s40b_findings.md sec.20): the
+ * journal consumer's identity, published by the gs_task poll-DMA site
+ * (spu_func_00006380 — a gs_task.c hand-edit, lost on relift). The PPU-side
+ * throttle (yz_jrnl_throttle, import_overrides.cpp) reads the live poll
+ * cursor out of that SPU's LS so the producer can bound the head-to-cursor
+ * gap. Cross-thread reads of another SPU's LS are racy by design — the value
+ * is a pacing heuristic, never a correctness input, and every consumer is
+ * fail-open on 0. */
+volatile void* g_yz_consumer_ctx;
+
+uint32_t yz_consumer_cursor(void)
+{
+    spu_context* c = (spu_context*)g_yz_consumer_ctx;
+    if (!c) return 0;
+    /* The LS bytes at the anchor home only mean "poll cursor" while gs_task
+     * (image 0) is resident on that SPU; after a workload switch they are
+     * another image's bytes. */
+    if (c->image_id != 0) return 0;
+    return yz_ls_w32((const uint8_t*)c->ls + g_yz_anch_home);
+}
+
+/* s42 BOUNDARY-DRAIN guest-RAM accessors: byte-identical to vm_read32/vm_write32
+ * (runtime/ppu/ppu_memory.h) and to the MFC PUT's raw memcpy of big-endian LS
+ * bytes -- the drain writes the release word exactly as the SPU's own PUT would
+ * (review CHANGE 3). Local so this TU needs no PPU header. */
+static uint32_t yz_ram_r32be(uint32_t ea)
+{
+    extern uint8_t* vm_base;
+    const uint8_t* p = vm_base + ea;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static void yz_ram_w32be(uint32_t ea, uint32_t val)
+{
+    extern uint8_t* vm_base;
+    uint8_t* p = vm_base + ea;
+    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
+    p[2] = (uint8_t)(val >> 8);  p[3] = (uint8_t)val;
+}
+static void yz_ls_wr32(spu_context* ctx, uint32_t lsa, uint32_t val)
+{
+    ctx->ls[lsa + 0] = (uint8_t)(val >> 24); ctx->ls[lsa + 1] = (uint8_t)(val >> 16);
+    ctx->ls[lsa + 2] = (uint8_t)(val >> 8);  ctx->ls[lsa + 3] = (uint8_t)val;
+}
+
+/* The boundary drain. Called from the gs_task 0x352C sweep hand-edit
+ * (recomp_prx/gs_task.c). Runs at most once per boot, on the FIRST 0x352C on the
+ * consumer ctx after the ximg-storm arms it (first transition only). */
+void yz_bdrain_maybe(spu_context* ctx)
+{
+    if (!yz_bdrain_on())                          return;
+    if (g_yz_bdrain_done)                         return;
+    if (!g_yz_bdrain_armed)                       return;
+    if ((const void*)ctx != (const void*)g_yz_consumer_ctx) return;
+    if (ctx->image_id != 0)                       return;
+
+    enum { MGR = 0xBC90u };
+    const uint32_t off_count = MGR + 0xC0u; /* 0xBD50 table occupancy */
+    const uint32_t off_relb  = MGR + 0xD4u; /* 0xBD64 release-word base */
+    const uint32_t off_table = MGR + 0xE0u; /* 0xBD70 table[0] = front */
+
+    uint32_t count = yz_ls_w32(ctx->ls + off_count);
+
+    /* count>12 is a transient/garbage read of the occupancy field mid-rebuild;
+     * do NOT latch -- retry at the next 0x352C. count==0..12 is a real snapshot
+     * (0 = engine already empty at reinit, the HW invariant -> nothing to do). */
+    if (count > 12u) {
+        static unsigned oor = 0;
+        if (oor < 8u) { oor++;
+            fprintf(stderr, "[bdrain] count=%u out of range at 0x352C -> waiting (no latch)\n", count);
+            fflush(stderr); }
+        return;
+    }
+
+    g_yz_bdrain_done = 1;   /* one-shot: never re-armed -> first transition only */
+
+    uint32_t relbase = yz_ls_w32(ctx->ls + off_relb);
+    extern uint32_t g_yz_parked_pub_ea;
+    uint32_t pea = g_yz_parked_pub_ea;
+
+    fprintf(stderr, "[bdrain] FIRE: consumer spu=%X pc=0x%X count=%u relbase=0x%08X parked=0x%08X bd70=0x%08X\n",
+            ctx->spu_id, ctx->pc, count, relbase, pea, yz_ls_w32(ctx->ls + off_table));
+    fflush(stderr);
+
+    if (count == 0u) {
+        fprintf(stderr, "[bdrain] SUMMARY: count=0 -> engine already empty at reinit (HW invariant holds, no-op)\n");
+        fflush(stderr);
+        return;
+    }
+
+    unsigned drained = 0, fired = 0, skipped = 0, invalid = 0;
+    unsigned n7f = 0, nother = 0;   /* per-tag: releasable (0x7F) vs neutralize-only */
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t item = yz_ls_w32(ctx->ls + off_table + 4u * i);
+        if (item < 0x400u || item + 0x20u > (uint32_t)SPU_LS_SIZE) {
+            invalid++;
+            fprintf(stderr, "[bdrain]   [%u] item=0x%08X INVALID (out of LS range) -> skip\n", i, item);
+            fflush(stderr);
+            continue;
+        }
+        uint32_t w0  = yz_ls_w32(ctx->ls + item + 0x00u);
+        uint32_t tag = yz_ls_w32(ctx->ls + item + 0x04u);
+        uint32_t ptr = yz_ls_w32(ctx->ls + item + 0x0Cu);
+        uint32_t s14 = yz_ls_w32(ctx->ls + item + 0x14u);
+        uint32_t s1C = yz_ls_w32(ctx->ls + item + 0x1Cu);
+        const char* action = "neutralize";
+
+        /* (a) FIRE-ALL-PENDING release fire (s42 matrix adjudication, supersedes
+         * review CHANGE 4's front-only): fire EVERY tag=0x7F record whose stopper
+         * EA is in the guest RSX FIFO window. The front-only policy self-defeated
+         * (parked EA g_yz_parked_pub_ea == 0 at storm time -> fired=0 in the whole
+         * v1..v5 matrix), so real pending releases (s1C=0x4040xxxx) were
+         * neutralized WITHOUT their release words -> v2/v3/v4 parked permanently at
+         * an EA that appears in their own neutralized-record list.
+         *
+         * Safety (why fire-all is sound HERE, not a double-release hazard):
+         *  - IDEMPOTENT + READ-GUARDED: we write only when the location still holds
+         *    THIS record's JTS self-jump (cur==selfjmp, computed from the live
+         *    relbase); a re-fire finds cur==relword and skips; real content (cur
+         *    is neither) is never clobbered. The guard also filters stale-era
+         *    stoppers (their selfjmp was against a different relbase).
+         *  - CONTENT-COMMITTED: a queued release record implies its hole content was
+         *    PUT first (JTS contract "content first, release last",
+         *    scratch/sdk_notes/s39_jts_whitepaper_findings.md §2); our DMA is
+         *    synchronous (#94) so "queued" == "content landed".
+         *  - NO RUN-THROUGH-GARBAGE: unfilled holes are PAVED with a JTS at every
+         *    128B block (whitepaper §2.4/§3.1.5), so an early release only advances
+         *    GET to the next block stopper and re-parks; and our modeled RSX has no
+         *    prefetch cache, so the §2.4.4 stale-fetch torn-content malfunction
+         *    (the review's cited hazard) cannot reproduce locally. Confirmed
+         *    empirically: at the front stopper 0x40404C24 the following FIFO words
+         *    are real methods (00141EFC ...), not stoppers -> hole is filled. */
+        if (tag == 0x7Fu && s14 != 3u) {
+            if (s1C >= 0x40400000u && s1C < 0x40C00000u) {
+                uint32_t relword = 0x20000000u | (((s1C + 4u) - relbase) & 0x1FFFFFFCu);
+                uint32_t selfjmp = 0x20000000u | ((s1C - relbase) & 0x1FFFFFFCu);
+                uint32_t cur = yz_ram_r32be(s1C);
+                if (cur == selfjmp) {                 /* still a parked JTS self-jump stopper */
+                    yz_ram_w32be(s1C, relword);
+                    fired++; action = "fire+neutralize";
+                } else if (cur == relword) {
+                    skipped++; action = "skip(already-released)+neutralize";
+                } else {
+                    skipped++; action = "skip(stopper-not-parked)+neutralize";
+                }
+            } else {
+                skipped++; action = "skip(EA-out-of-io-window)+neutralize";
+            }
+            n7f++;
+        } else {
+            nother++;
+        }
+
+        /* (b) neutralize (both death and orbit shapes): pointee=0 closes Doors
+         * 1/2 and makes the 0x3BF0 retire dispatch-free; word0 sign bit set marks
+         * the item dead so the compaction retires it and shrinks count. */
+        yz_ls_wr32(ctx, item + 0x0Cu, 0u);
+        yz_ls_wr32(ctx, item + 0x00u, w0 | 0x80000000u);
+        drained++;
+
+        fprintf(stderr, "[bdrain]   [%u] item=0x%08X tag=0x%X s14=0x%X s1C=0x%08X ptr=0x%08X w0=0x%08X -> %s\n",
+                i, item, tag, s14, s1C, ptr, w0, action);
+        fflush(stderr);
+    }
+
+    fprintf(stderr, "[bdrain] SUMMARY: drained=%u fired=%u skipped=%u invalid=%u | "
+            "per-tag: tag7F=%u (releasable: fired+skipped) non7F=%u (neutralize-only) "
+            "(count was %u; compaction retires -> count->alive; bd70 now 0x%08X)\n",
+            drained, fired, skipped, invalid, n7f, nother, count,
+            yz_ls_w32(ctx->ls + off_table));
+    fflush(stderr);
 }
 
 static int yz_ctxsave_off(void)
@@ -538,8 +864,37 @@ static int yz_we_saved(uint32_t ea)
  * instead (yz_task_segment_guard). */
 #define YZ_CTXSH_RW_FLOOR 0xB800u
 
+/* s41 CBEA conformance (SPE_MFC-Tutorial p.27 "Conditions for Losing
+ * Reservations"): a context switch flushes the atomic cache — reservations do
+ * not survive it. Our task-switch seams never cleared them; with PUTLLC's full
+ * 128-byte content validation the practical exposure is the ABA case only
+ * (content changed and restored byte-identically across the switch), but the
+ * contract fix is cheap and the witness MEASURES whether live reservations
+ * actually exist at seams (data either way). Kill switch YZ_NO_RESVSW
+ * restores the legacy keep-across-switch behavior for A/B. */
+static mfc_engine* mfc_for(spu_context* ctx);
+static void yz_resv_ctxswitch_clear(spu_context* ctx, const char* seam)
+{
+    static int off = -1;
+    if (off < 0) { off = getenv("YZ_NO_RESVSW") ? 1 : 0;
+        if (!off) { fprintf(stderr, "[resv-sw] ARMED: reservations cleared at task-switch seams (kill: YZ_NO_RESVSW)\n");
+                    fflush(stderr); } }
+    if (off) return;
+    mfc_engine* m = mfc_for(ctx);
+    if (m->resv_active) {
+        static unsigned long n = 0; n++;
+        if (n <= 16 || (n & 255u) == 0) {
+            fprintf(stderr, "[resv-sw] cleared LIVE reservation ea=0x%08X at %s n=%lu spu=%X img=%d\n",
+                    (uint32_t)m->resv_ea, seam, n, ctx->spu_id, ctx->image_id);
+            fflush(stderr);
+        }
+        m->resv_active = 0;
+    }
+}
+
 void yz_resident_save(spu_context* ctx, const char* site)
 {
+    yz_resv_ctxswitch_clear(ctx, site);
     unsigned wi = ctx->spu_id & 7u;
     uint32_t ea = s_yz_resident[wi].ea;
     if (!ea) return;
@@ -591,6 +946,7 @@ void yz_resident_set(spu_context* ctx)
 /* SAVE at the switch-away seam. Idempotent, overwrites the slot each time. */
 void yz_ctx_shadow_save(spu_context* ctx, const char* site)
 {
+    yz_resv_ctxswitch_clear(ctx, site);
     if (yz_ctxsh_off()) return;
     {
         uint32_t region_len = 0, region_base = 0;
@@ -657,6 +1013,7 @@ void yz_ctx_shadow_save(spu_context* ctx, const char* site)
  * shadow, which shares the array). */
 void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
 {
+    yz_resv_ctxswitch_clear(ctx, is_resume ? "task-restore-resume" : "task-restore");
     static int off = -1;
     if (off < 0) off = getenv("YZ_NO_CTXRESTORE") ? 1 : 0;
     {
@@ -721,8 +1078,14 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
              * header (virgin header + our-saved region => REGION-ONLY restore
              * — the phase-2 tasks); clamp the region at the RO floor so a
              * poisoned static-vtable copy can never be replayed. */
-            if (!hdr_virgin)
+            if (!hdr_virgin) {
                 memcpy(ctx->ls + YZ_CTXSH_REGBASE, vm_base + ea, YZ_CTXSH_REGLEN);
+                /* s41 FLIGHT RECORDER: host-side write into the consumer's LS
+                 * by the ctx save/restore machinery (site 0 = ctxsave header
+                 * restore). Part of the ordered history per spu_fltrec.h. */
+                if (yz_fltrec_hot(ctx))
+                    yz_fltrec_foreign_write(ctx, YZ_CTXSH_REGBASE, YZ_CTXSH_REGLEN, 0);
+            }
             { uint32_t rskip = region_base < YZ_CTXSH_RW_FLOOR
                              ? YZ_CTXSH_RW_FLOOR - region_base : 0;
               /* s40b iter-6 [vtbl-restore]: the static-vtable band [0xBA00,0xBC00)
@@ -759,11 +1122,15 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                * that differ from live? A diff here = the restore rewinds item-ring/
                * table registrations made since the snapshot (the frozen-gate wedge
                * candidate). Rides YZ_ZSLOT via the zsr flag pattern. */
-              if (region_base <= 0xBC90u && region_base + region_len >= 0xBDB0u) {
+              if (region_base <= 0xBC90u && region_base + region_len >= 0xBDD0u) {
                   const uint8_t* incM = vm_base + ea + 0x400u + (0xBC90u - region_base);
                   const uint8_t* liveM = ctx->ls + 0xBC90u;
+                  /* s42: band widened from mi<0x120 (through 0xBDB0) to mi<0x140
+                   * (through 0xBDD0) per scratch/s42_desync_verdict.md §5 -- the old
+                   * bound left FL[4..11] (LS [0xBDB0,0xBDD0)) outside every restore
+                   * witness (§2's measured gap). */
                   uint32_t md = 0;
-                  for (uint32_t mi = 0; mi < 0x120u; mi++) if (incM[mi] != liveM[mi]) md++;
+                  for (uint32_t mi = 0; mi < 0x140u; mi++) if (incM[mi] != liveM[mi]) md++;
                   if (md) {
                       static unsigned long mrn = 0; mrn++;
                       if (mrn <= 96 || (mrn & 63u) == 0) {
@@ -776,6 +1143,34 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                           fflush(stderr);
                       }
                   }
+                  /* s42 HAND-EDIT — LOST ON RELIFT — [fl-restore] decisive probe
+                   * (scratch/s42_desync_verdict.md §5, step 1). Per free-list slot
+                   * i=0..11 (LS 0xBDA0+i*4 = mgr+0x110+i*4), log incoming-vs-live
+                   * BEFORE the region memcpy below (same bytes the memcpy is about
+                   * to write), tagged with the global restore counter R so
+                   * gs_task.c's [pop-slot] probe can tell whether a restore touched
+                   * a slot since the last pop. A diff also marks that slot's
+                   * last-writer shadow entry as "restore" (tag 3) -- the mechanical
+                   * discriminator between "ctx-restore is the author" and
+                   * "compaction/pop lift is the author". Gated on YZ_STG2 (shared
+                   * arm with gs_task.c's [flpop]/[cnt-val]/[compact-item]). */
+                  { static int flr = -1;
+                    if (flr < 0) { flr = getenv("YZ_STG2") ? 1 : 0;
+                        if (flr) { fprintf(stderr, "[fl-restore] ARMED (free-list band [0xBDA0,0xBDD0), 12 slots)\n"); fflush(stderr); } }
+                    if (flr) {
+                        const uint8_t* incFL = incM + 0x110u;
+                        const uint8_t* liveFL = liveM + 0x110u;
+                        for (uint32_t i = 0; i < 12u; i++) {
+                            uint32_t lw3 = yz_ls_w32(liveFL + i * 4u);
+                            uint32_t iw3 = yz_ls_w32(incFL + i * 4u);
+                            if (iw3 != lw3) {
+                                g_yz_fl_lastwriter[i] = 3u; /* restore-memcpy, with a real value change */
+                                fprintf(stderr, "[fl-restore] spu=%X i=%u live=%08X inc=%08X R=%lu\n",
+                                        ctx->spu_id, i, lw3, iw3, g_yz_fl_restore_R);
+                                fflush(stderr);
+                            }
+                        }
+                    } }
               }
               /* s40b anchor witness: incoming-vs-live poll EA. incoming==0 with
                * live!=0 is the kill shot (replaying a dead anchor over a live one). */
@@ -796,9 +1191,19 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                       }
                   }
               }
-              if (rskip < region_len)
+              if (rskip < region_len) {
+                  /* s42 HAND-EDIT — LOST ON RELIFT — global restore-event counter
+                   * (scratch/s42_desync_verdict.md §5). Counts real restore-memcpy
+                   * events (always, not gated on YZ_STG2 -- a plain unsigned-long
+                   * increment, no side effect on emulated state) so gs_task.c's
+                   * [pop-slot] probe can report "R at pop time" even across TUs. */
+                  g_yz_fl_restore_R++;
                   memcpy(ctx->ls + region_base + rskip,
-                         vm_base + ea + 0x400u + rskip, region_len - rskip); }
+                         vm_base + ea + 0x400u + rskip, region_len - rskip);
+                  /* s41 FLIGHT RECORDER (site 1 = ctxsave region restore). */
+                  if (yz_fltrec_hot(ctx))
+                      yz_fltrec_foreign_write(ctx, region_base + rskip, region_len - rskip, 1);
+              } }
             { static unsigned long rn = 0; rn++;
               if (rn <= 24 || (rn & 63u) == 0) {
                 fprintf(stderr, "[ctx-restore] n=%lu spu=%X ctx=0x%08X header+0x%X "
@@ -818,6 +1223,7 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
  * the last save (same-owner resumes keep the live LS). */
 void yz_ctx_shadow_restore(spu_context* ctx, int is_resume, int force_foreign)
 {
+    yz_resv_ctxswitch_clear(ctx, is_resume ? "shadow-restore-resume" : "shadow-restore");
     if (yz_ctxsh_off()) return;
     {
         uint32_t region_len = 0, region_base = 0;
@@ -853,6 +1259,11 @@ void yz_ctx_shadow_restore(spu_context* ctx, int is_resume, int force_foreign)
                 memcpy(ctx->ls + YZ_CTXSH_REGBASE, s_yz_ctxsh[i].buf, YZ_CTXSH_REGLEN);
                 memcpy(ctx->ls + (SPU_LS_SIZE - rl),
                        s_yz_ctxsh[i].buf + YZ_CTXSH_REGLEN, rl);
+                /* s41 FLIGHT RECORDER (site 2/3 = shadow hdr/region restore). */
+                if (yz_fltrec_hot(ctx)) {
+                    yz_fltrec_foreign_write(ctx, YZ_CTXSH_REGBASE, YZ_CTXSH_REGLEN, 2);
+                    yz_fltrec_foreign_write(ctx, (uint32_t)(SPU_LS_SIZE - rl), (uint32_t)rl, 3);
+                }
                 { static unsigned long rn = 0; rn++;
                   if (rn <= 16 || (rn & 63u) == 0) {
                     fprintf(stderr, "[ctxsh] RESTORE n=%lu spu=%X ctx=0x%08X region=0x%X "
@@ -1062,6 +1473,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     }
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
+    /* s42 YZ_SPU_LOCKSTEP: release the run token before this OS-level block --
+     * a waker that itself needs the token to proceed (another SPU) must never
+     * be blocked on this ctx holding it. No-op when unset. */
+    yz_lockstep_block_begin(ctx);
 #if defined(_WIN32)
     {
         unsigned long long start   = GetTickCount64();
@@ -1100,6 +1515,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         }
     }
 #endif
+    /* s42 YZ_SPU_LOCKSTEP: rejoin the rotation and reacquire the token after
+     * the wake (block_end blocks until granted, same as a fresh registrant).
+     * No-op when unset. */
+    yz_lockstep_block_end(ctx);
     ctx->status = SPU_STATUS_RUNNING;
 }
 
@@ -1121,6 +1540,21 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 #define SPU_COH_HI 0x44000000u
 static unsigned char s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 KB, bit per 128B line */
 
+/* s41 WINDOW 2 (2026-07-16, CBEA conformance — the audit found reservation
+ * coherence hard-scoped to window 1 while CBEA 9.12.10 puts NO address bound
+ * on reservation loss; measured consequence: PPU writes to SPU-reserved lines
+ * OUTSIDE window 1 take the plain-memcpy path with NO lock-line serialization
+ * — the exact torn-write clobber class the 2026-06-16 window-1 fix proved and
+ * stopped, alive on every out-of-window line. Known resident: the SPURS
+ * tasksets (0x63Dxxxxx), PPU-written by CreateTask2 while SPUs PUTLLC-cycle
+ * them.) Same bitmap+generation machinery, second range. Reservations outside
+ * ALL windows fail open but LOUD (the [coh] witness below) so future gaps are
+ * visible instead of silent. */
+#define SPU_COH2_LO 0x60000000u
+#define SPU_COH2_HI 0x68000000u
+static unsigned char s_coh2_bitmap[((SPU_COH2_HI - SPU_COH2_LO) >> 7) / 8];
+static uint32_t s_coh2_gen[(SPU_COH2_HI - SPU_COH2_LO) >> 7];
+
 /* Per-128B-line write GENERATION (mirrors RPCS3 vm::reservation_acquire). Bumped on
  * every PPU coherence write to a reserved line; GETLLAR snapshots it and LR is
  * RE-DERIVED at the next GETLLAR by comparison -- so a write that lands while no SPU
@@ -1129,21 +1563,44 @@ static unsigned char s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 
 static uint32_t s_coh_gen[(SPU_COH_HI - SPU_COH_LO) >> 7];
 uint32_t spu_coh_gen(uint32_t addr)
 {
-    if (addr - SPU_COH_LO >= SPU_COH_HI - SPU_COH_LO) return 0;
-    return s_coh_gen[(addr - SPU_COH_LO) >> 7];
+    if (addr - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO)
+        return s_coh_gen[(addr - SPU_COH_LO) >> 7];
+    if (addr - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO)
+        return s_coh2_gen[(addr - SPU_COH2_LO) >> 7];
+    return 0;
 }
 
 void spu_coh_reserve(uint32_t ea)
 {
-    if (ea - SPU_COH_LO >= SPU_COH_HI - SPU_COH_LO) return;
-    uint32_t line = (ea - SPU_COH_LO) >> 7;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+    if (ea - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO) {
+        uint32_t line = (ea - SPU_COH_LO) >> 7;
+        s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+        return;
+    }
+    if (ea - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO) {
+        uint32_t line = (ea - SPU_COH2_LO) >> 7;
+        s_coh2_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+        return;
+    }
+    /* Outside every coherence window: fail open, LOUD (LESSONS #21b — a
+     * silent gap here cost the taskset region its serialization for a month). */
+    { static unsigned long n = 0; n++;
+      if (n <= 8 || (n & 4095u) == 0) {
+          fprintf(stderr, "[coh] reservation OUTSIDE coherence windows ea=0x%08X n=%lu — PPU writes to this line are UNSERIALIZED\n",
+                  ea, n);
+          fflush(stderr); } }
 }
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (addr - SPU_COH_LO >= SPU_COH_HI - SPU_COH_LO) return 0;
-    uint32_t line = (addr - SPU_COH_LO) >> 7;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    if (addr - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO) {
+        uint32_t line = (addr - SPU_COH_LO) >> 7;
+        return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    }
+    if (addr - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO) {
+        uint32_t line = (addr - SPU_COH2_LO) >> 7;
+        return (s_coh2_bitmap[line >> 3] >> (line & 7)) & 1u;
+    }
+    return 0;
 }
 
 /* ===========================================================================
@@ -1203,6 +1660,8 @@ void spu_coh_notify_write(uint32_t ea)
     uint32_t line = ea & ~127u;
     if (line - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO)
         s_coh_gen[(line - SPU_COH_LO) >> 7]++;   /* generation bump -- the missed-edge fix */
+    else if (line - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO)
+        s_coh2_gen[(line - SPU_COH2_LO) >> 7]++; /* s41 window 2 */
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         spu_context* c = s_mfc_slots[i].ctx;
         if (!c) continue;
@@ -1240,6 +1699,12 @@ static int channel_is_mfc(uint32_t ch)
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
+
+    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). Fires for
+     * every channel write, including the MFC parameter channels (LSA/EAH/
+     * EAL/Size/TagID/Cmd) -- the DMA itself is recorded separately at
+     * mfc_submit (spu_dma.h) once the whole command is assembled. */
+    if (yz_fltrec_hot(ctx)) yz_fltrec_wrch(ctx, channel, v);
 
     if (channel_is_mfc(channel)) {
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
@@ -1529,6 +1994,17 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
     uint32_t v = 0;
     if (channel < 128) g_spu_ch_rd[channel]++;
+    /* s42 YZ_SPU_LOCKSTEP token pass (deadlock fix): a channel READ is a
+     * per-iteration touchpoint of the SPU idle/poll loops. The blocking rdch
+     * cases below release the token via spu_ch_wait, but the NON-blocking reads
+     * (RdDec, RdEventStat-when-pending, RdMachStat) and every MFC read (RdTagStat,
+     * returns early at the mfc branch below) are polled in tight intra-region
+     * `goto` loops (spu_lifter.py) that never re-enter SPU_DRAIN and never call
+     * GETLLAR -- so a holder spinning on one never advanced the quantum and
+     * never rotated the token (the s42ls* wedge: 5 SPUs up, zero heartbeat, zero
+     * watchdog, zero ch-block). Tick here so every channel poll advances the
+     * quantum. No-op when YZ_SPU_LOCKSTEP is unset (single predicted branch). */
+    yz_lockstep_tick(ctx);
     /* DIAG: what channel does gs_task (LS 0x3000..0xBC00) read while it stalls
      * in init? (29=RdInMbox 3/4=RdSigNotify1/2 23=MFC_RdTagStat 0=RdEventStat) */
     if (g_spu_prof_on && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
@@ -1538,6 +2014,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 
     if (channel_is_mfc(channel)) {
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). */
+        if (yz_fltrec_hot(ctx)) yz_fltrec_rdch(ctx, channel, v);
         return spu_make_preferred_u32(v);
     }
 
@@ -1632,6 +2110,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         v = 0;
         break;
     }
+    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). */
+    if (yz_fltrec_hot(ctx)) yz_fltrec_rdch(ctx, channel, v);
     return spu_make_preferred_u32(v);
 }
 
@@ -1641,6 +2121,13 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
     if (channel < 128) g_spu_ch_cnt[channel]++;
+    /* s42 YZ_SPU_LOCKSTEP token pass (deadlock fix): rchcnt is THE hot poll
+     * touchpoint of the SPU wait idiom `while (!rchcnt(ch)) ;` -- it is
+     * non-blocking and emitted as an intra-region `goto` backedge, so it reaches
+     * neither SPU_DRAIN nor GETLLAR nor the blocking spu_ch_wait. Without a tick
+     * here a holder busy-polling rchcnt starves every other SPU forever (the
+     * measured s42ls* wedge). No-op when YZ_SPU_LOCKSTEP is unset. */
+    yz_lockstep_tick(ctx);
     if (g_spu_prof_on && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
         static int n = 0;
         if (n < 50) { n++; fprintf(stderr, "[gst-ch] rchcnt ch%u pc=0x%05X\n", channel, ctx->pc & SPU_LS_MASK); }
@@ -2517,6 +3004,19 @@ void yz_throw_retry_flush(void)
 void spu_img_restore(spu_context* ctx, int32_t saved_img)
 {
     static int off = -1;
+    /* s42 FLIGHT RECORDER v2 (gap 3, closest runtime-visible approximation
+     * for direct-call coverage): every lifted call site's return bracket
+     * calls this function unconditionally (tools/spu_lifter.py ~726-831),
+     * both for direct brsl/bisl-modeled nested calls (whose target is a bare
+     * C call with no runtime hook) and for indirect/register calls -- this
+     * is the one runtime-owned function on that path, regardless of
+     * YZ_NO_IMGSTACK. It cannot see the call's target/callee (that stays
+     * genuinely invisible without touching the lifter or generated code,
+     * scratch/s42_order_reconstruction.md); it CAN see the RETURN edge
+     * (ctx->pc already holds the resumed address) and any image switch that
+     * happened inside the call. */
+    if (yz_fltrec_hot(ctx)) yz_fltrec_call_ret(ctx, saved_img, ctx->image_id);
+
     if (off < 0) {
         off = getenv("YZ_NO_IMGSTACK") ? 1 : 0;
         fprintf(stderr, "[img-ret] %s: restore-on-host-return image model %s\n",
@@ -2627,6 +3127,10 @@ void spu_indirect_branch(spu_context* ctx)
                 while (d0 < mlen && ctx->ls[0xA00 + d0] == src[d0]) d0++;
                 if (d0 + 4 <= mlen) memcpy(was, ctx->ls + 0xA00 + d0, 4);
                 memcpy(ctx->ls + 0xA00, src, mlen);
+                /* s41 FLIGHT RECORDER (Probe 1): host-side write by the
+                 * mod-reload guard (site 6). */
+                if (yz_fltrec_hot(ctx))
+                    yz_fltrec_foreign_write(ctx, 0xA00u, mlen, 6);
                 { static unsigned long mn = 0; mn++;
                   if (mn <= 16 || (mn & 63u) == 0) {
                     fprintf(stderr, "[mod-reload] n=%lu spu=%X img=%d module STALE at entry "
@@ -2694,8 +3198,17 @@ void spu_indirect_branch(spu_context* ctx)
                  * entries come from the generated image table (auto-derived from
                  * the ELF headers). Resume paths must NOT zero (LS persists
                  * across yields by design). */
-                if (tpc == imd->entry)
+                if (tpc == imd->entry) {
                     spu_image_zero_bss(ctx->ls, imd);
+                    /* s41 FLIGHT RECORDER (Probe 1): host-side write by the
+                     * fresh-entry BSS zero (site 5), one record per span. */
+                    if (yz_fltrec_hot(ctx)) {
+                        int _bi;
+                        for (_bi = 0; _bi < imd->bss_n; _bi++)
+                            yz_fltrec_foreign_write(ctx, imd->bss_va[_bi],
+                                                     imd->bss_len[_bi], 5);
+                    }
+                }
                 /* YZ_CTXWATCH: this natural-launch path is the one the wid4
                  * pool tasks take (s26ride2: zero registrations from the
                  * legacy spu_task_launch hook while [fe0] published twice) —
@@ -3356,6 +3869,11 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[spu-ximg] cross-image call LS 0x%05X: image %d -> %d "
                         "(resident runtime, adopting)\n", la, ctx->image_id, foreign_img);
                 fflush(stderr); }
+            /* s42 FLIGHT RECORDER v2 (gap 3): the cross-image adoption
+             * resolution point is a workload-switch event the BRANCH channel
+             * alone missed (order_reconstruction fallback item 3). */
+            if (yz_fltrec_hot(ctx)) yz_fltrec_xadopt(ctx, la, ctx->image_id, foreign_img);
+            yz_ximg_storm_note();
             /* TASKSET-SYSCALL probe (env YZ_CTXSAVE_WATCH, 2026-07-02, diag —
              * REMOVE when settled): at the task->policy 0xA70 syscall entry, log
              * the syscall + pre-evaluate the three bail checks Sony's
