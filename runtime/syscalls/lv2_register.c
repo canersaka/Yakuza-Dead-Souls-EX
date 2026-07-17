@@ -478,6 +478,8 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
 #include <setjmp.h>
 void spu_indirect_branch(spu_context* sctx);   /* runtime/spu/spu_channels.c */
 int  spu_have_function(uint32_t addr);
+void spu_mfc_unregister(spu_context* sctx);    /* runtime/spu/spu_channels.c: free the MFC
+                                                 * context-registry slot at thread teardown */
 /* per-thread unwind target for SPU halt (spu_channels.c) */
 #if defined(_MSC_VER)
 extern __declspec(thread) jmp_buf* g_spu_halt_jmp;
@@ -956,6 +958,14 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
+                /* Free the MFC context-registry slot (runtime/spu/spu_channels.c
+                 * s_mfc_slots) keyed on this thread's spu_context pointer -- the
+                 * registry never cleared it before, so SPU_MAX_CONTEXTS
+                 * destroy/create cycles exhausted the registry and pushed every
+                 * later context onto the shared-state-hazard fallback engine.
+                 * No-op if this thread never registered (e.g. it only ever ran
+                 * a PPU fallback, or was destroyed before its first MFC access). */
+                spu_mfc_unregister(t->sctx);
                 if (t->local_store) {
                     free(t->local_store);
                     t->local_store = NULL;
@@ -1270,7 +1280,12 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     if (t->sctx) {
         spu_channel* ch = &t->sctx->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
-        if (or_mode && ch->count)
+        /* FIX 2 (2026-07-17, runtime/spu/spu_context.h): count is now
+         * _Atomic uint32_t; acquire-load it explicitly here since this is
+         * the actual cross-thread producer (this handler runs on the PPU
+         * thread, spu_channel_read runs on the SPU host thread) the
+         * spu_channels.c model comment describes. */
+        if (or_mode && atomic_load_explicit(&ch->count, memory_order_acquire))
             ch->value |= val;
         else
             spu_channel_write(ch, val);

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>     /* FIX 2 (2026-07-17): channel/event cross-thread atomics */
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,11 +109,37 @@ extern "C" {
 
 /* ---------------------------------------------------------------------------
  * Channel state
- * -----------------------------------------------------------------------*/
+ *
+ * `count` is a C11 atomic (2026-07-17, spu_channels.c FIX 2). RdInMbox,
+ * RdSigNotify1/2 and RdEventStat's underlying storage (this field, and
+ * event_status below) have a real or intended cross-thread producer -- the
+ * PPU (sys_spu_thread_write_snr) or another SPU (the coherence-loss LR raise)
+ * writes it while the owning SPU host thread polls/blocks on it in
+ * spu_ch_ready/spu_ch_wait (spu_channels.c). Plain uint32_t reads/writes were
+ * previously justified by x86 TSO (a producer's plain store is globally
+ * visible, and the 10 ms spu_ch_wait re-poll is a missed-wake safety net) --
+ * that argument covers cross-CPU VISIBILITY latency but not the compiler's
+ * freedom to cache/reorder a plain load across loop iterations, which _Atomic
+ * plus an explicit memory_order closes without weakening the existing
+ * TSO/relaxed-visibility model (relaxed is still used wherever that argument
+ * applies). `count` is used as a ready-flag guarding `value` (message-passing
+ * idiom): the producer stores value then releases count; the consumer
+ * acquire-loads count and, only once it observes nonzero, reads value -- so
+ * `value` itself does not need to be atomic. spu_channel is shared by all
+ * four mailbox/signal instances (ch_out_mbox and ch_out_intr_mbox are
+ * same-thread only per spu_wrch's own comments) -- one struct definition, so
+ * they get the same atomic field; harmless for the same-thread instances
+ * (default sequentially-consistent ops on a single-thread-owned atomic are
+ * just a locked no-op on x86, never a behavior change). */
 typedef struct spu_channel {
-    uint32_t value;
-    uint32_t count;   /* number of valid entries (0 or 1 for most channels) */
+    uint32_t          value;
+    _Atomic uint32_t  count;   /* number of valid entries (0 or 1 for most channels) */
 } spu_channel;
+/* Struct-layout guard (spu_context's APPEND-ONLY rule, see below): atomic_uint
+ * is guaranteed lock-free and same size/alignment as uint32_t on every target
+ * this project builds for (x86-64 MSVC/clang/gcc); this assertion makes that
+ * assumption load-bearing and checked, not just assumed. */
+_Static_assert(sizeof(spu_channel) == 8, "spu_channel size must not change (APPEND-ONLY struct layout rule)");
 
 /* ---------------------------------------------------------------------------
  * SPU execution context
@@ -166,9 +193,22 @@ typedef struct spu_context {
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask */
-    uint32_t event_status;
-    uint32_t event_mask;
+    /* Event status / mask. event_status is a C11 atomic (FIX 2, 2026-07-17):
+     * it has TWO writer classes -- the owning SPU thread itself (WrEventAck's
+     * clear, and the MFC engine's own SN/LR self-raises in spu_dma.h) and a
+     * genuinely cross-thread writer (spu_coh_notify_write's LR raise, called
+     * from the PPU coherence-write path in another thread). Both `|=`/`&=`
+     * writer sites now go through atomic_fetch_or_explicit/
+     * atomic_fetch_and_explicit so the read-modify-write itself is a single
+     * atomic op (closing a possible lost-update between the two writer
+     * classes) in addition to the pre-existing spu_lockline_lock serialization
+     * (see SPU_WrEventAck in spu_channels.c) -- belt-and-suspenders, not a
+     * replacement for the lock. event_mask has exactly one writer, the owning
+     * SPU thread's own WrEventMask (spu_channels.c), so it stays plain
+     * uint32_t per the conservative fix scope (only fields with a real
+     * cross-thread writer get promoted). */
+    _Atomic uint32_t event_status;
+    uint32_t         event_mask;
 
     /* Channels */
     spu_channel ch_out_mbox;        /* SPU -> PPU outbound mailbox */
@@ -696,23 +736,36 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 
 /* ---------------------------------------------------------------------------
  * Channel read/write helpers
+ *
+ * FIX 2 (2026-07-17): `count` is the ready-flag guarding `value` (see the
+ * spu_channel comment above) -- release-store count AFTER value is written,
+ * so a consumer's acquire-load of count that observes the new count also
+ * observes the new value (message-passing / "release sequence" idiom, C11
+ * 5.1.2.4p16-17). `value` itself stays a plain access; it never needs to be
+ * atomic on its own; only ordering relative to `count` matters. Callers that
+ * are same-thread-only (ch_out_mbox/ch_out_intr_mbox, per spu_wrch's own
+ * comments) get the same ordering for free -- release/acquire on a variable
+ * only that thread touches is a same-cost no-op on x86.
  * -----------------------------------------------------------------------*/
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
     ch->value = val;
-    ch->count = 1;
+    atomic_store_explicit(&ch->count, 1u, memory_order_release);
 }
 
 static inline uint32_t spu_channel_read(spu_channel* ch)
 {
     uint32_t val = ch->value;
-    ch->count = 0;
+    atomic_store_explicit(&ch->count, 0u, memory_order_release);
     return val;
 }
 
 static inline int spu_channel_has_data(const spu_channel* ch)
 {
-    return ch->count > 0;
+    /* Cast away const to call atomic_load_explicit: reading is non-mutating,
+     * but the C11 atomic_load API's `object` parameter is `volatile A*`
+     * (never `const`-qualified), same as any other atomic accessor here. */
+    return atomic_load_explicit((_Atomic uint32_t*)&ch->count, memory_order_acquire) > 0;
 }
 
 /* ---------------------------------------------------------------------------

@@ -1466,28 +1466,42 @@ static int yz_ch_strict(void)
     return v;
 }
 
-/* Predicate: is `channel` readable right now (would rdch complete)? */
+/* Predicate: is `channel` readable right now (would rdch complete)?
+ * FIX 2 (2026-07-17): acquire-loads on the cross-thread-shared fields --
+ * this predicate is what gates the actual data read (spu_channel_read /
+ * the event_status & event_mask test), so it needs to synchronize-with the
+ * producer's release store (spu_channel_write / atomic_fetch_or_explicit on
+ * event_status), not just be "eventually visible" under TSO. */
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 {
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
-    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
-    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
+    case SPU_RdInMbox:
+        return atomic_load_explicit(&ctx->ch_in_mbox.count, memory_order_acquire) != 0;
+    case SPU_RdSigNotify1:
+        return atomic_load_explicit(&ctx->ch_sig_notify[0].count, memory_order_acquire) != 0;
+    case SPU_RdSigNotify2:
+        return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire) != 0;
     case SPU_RdEventStat:
-        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) != 0;
+        return (atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask) != 0;
     default:                return 1;   /* non-blocking channels: always "ready" */
     }
 }
 
-/* rchcnt-equivalent count-at-entry, for the witness log. */
+/* rchcnt-equivalent count-at-entry, for the witness log. Diagnostic-only (not
+ * gating a subsequent data read itself -- the caller re-checks via
+ * spu_ch_ready before ever touching the channel), so relaxed suffices per
+ * the file's existing TSO-visibility argument. */
 static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
 {
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->ch_in_mbox.count;
-    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count;
-    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count;
+    case SPU_RdInMbox:
+        return atomic_load_explicit(&ctx->ch_in_mbox.count, memory_order_relaxed);
+    case SPU_RdSigNotify1:
+        return atomic_load_explicit(&ctx->ch_sig_notify[0].count, memory_order_relaxed);
+    case SPU_RdSigNotify2:
+        return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_relaxed);
     case SPU_RdEventStat:
-        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) ? 1u : 0u;
+        return (atomic_load_explicit(&ctx->event_status, memory_order_relaxed) & ctx->event_mask) ? 1u : 0u;
     default:                return 0;
     }
 }
@@ -1521,7 +1535,9 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u count-at-entry=%u "
                     "evstat=0x%X evmask=0x%X\n",
                     ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
-                    spu_ch_count_at(ctx, channel), ctx->event_status, ctx->event_mask);
+                    spu_ch_count_at(ctx, channel),
+                    atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
+                    ctx->event_mask);
             fflush(stderr);
         }
     }
@@ -1686,10 +1702,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
     /* Out of slots: fall back to a shared engine (correct for single-SPU).
      * s40: SHARED-STATE HAZARD — a shared engine mixes reservations, tag masks
      * and list-stall state across unrelated SPUs (2026-07-15 external review,
-     * confirmed by code read; slots are also never freed on group_destroy, so
-     * destroy/create cycles leak slots). Current boots register ~5 contexts so
-     * this path never engages (grep for this banner to verify per boot); if it
-     * EVER fires, fix the registry before trusting any SPU behavior. */
+     * confirmed by code read). Current boots register ~5 contexts so this path
+     * never engages (grep for this banner to verify per boot); if it EVER
+     * fires, fix the registry before trusting any SPU behavior. */
     { static int warned = 0;
       if (!warned) { warned = 1;
           fprintf(stderr, "[mfc] WARNING: context registry EXHAUSTED (>%d) — SHARED fallback engine engaged, cross-SPU state mixing possible\n",
@@ -1699,6 +1714,27 @@ static mfc_engine* mfc_for(spu_context* ctx)
     static int fallback_init = 0;
     if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
     return &fallback;
+}
+
+/* Unregister a context's MFC engine slot. Called at SPU thread/group teardown
+ * (sys_spu_thread_group_destroy_handler, runtime/syscalls/lv2_register.c) so
+ * a destroy/create cycle does not permanently strand a slot -- previously
+ * s_mfc_slots entries were never cleared, so SPU_MAX_CONTEXTS destroy/create
+ * cycles exhausted the registry and pushed every later context onto the
+ * shared-state-hazard fallback engine above. Matches on the same key mfc_for()
+ * uses (the spu_context pointer). No-op if `ctx` never registered (e.g. a
+ * thread whose entry only ever resolved to a PPU fallback, or whose group was
+ * destroyed before it made its first MFC channel access) or is NULL. */
+void spu_mfc_unregister(spu_context* ctx)
+{
+    if (!ctx) return;
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
+        if (s_mfc_slots[i].ctx == ctx) {
+            s_mfc_slots[i].ctx = NULL;
+            memset(&s_mfc_slots[i].mfc, 0, sizeof(s_mfc_slots[i].mfc));
+            return;
+        }
+    }
 }
 
 /* SPU_EVENT_LR (lock-line reservation lost): a write by another processor to a
@@ -1721,7 +1757,19 @@ void spu_coh_notify_write(uint32_t ea)
         if (!c) continue;
         mfc_engine* m = &s_mfc_slots[i].mfc;
         if (m->resv_active && (uint32_t)(m->resv_ea & ~127ull) == line) {
-            c->event_status |= 0x400u;   /* SPU_EVENT_LR */
+            /* FIX 2 (2026-07-17): atomic fetch-or, not a plain `|=`. This is a
+             * genuine cross-thread write (the caller, shims.cpp VM_WRITE_COH,
+             * runs on the PPU-writer thread, not this SPU's own host thread)
+             * that races the owning SPU thread's own WrEventAck `&=` below and
+             * the MFC engine's same-thread self-raises (spu_dma.h) -- a plain
+             * compound `|=` is a load+store, not one instruction, so a
+             * concurrent writer could still land between them and lose an
+             * update even though spu_lockline_lock already serializes this
+             * call against WrEventAck (belt-and-suspenders, not a replacement
+             * for that lock). Relaxed: only the bit accumulation itself needs
+             * to be atomic here; ordering vs the wake is covered below exactly
+             * as before. */
+            atomic_fetch_or_explicit(&c->event_status, 0x400u, memory_order_relaxed);
             m->resv_active = 0;          /* reservation lost */
             g_spu_lr_raise++;
             /* s39: the event_status store above must be visible before the wake.
@@ -1973,9 +2021,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * LR-raise (spu_dma.h), both of which set event_status under
          * spu_lockline_lock. A bare `&= ~v` here could read event_status, then have
          * a concurrent `|= 0x400` land, then write back the stale value -> the LR
-         * edge is dropped and the idle SPURS kernel never wakes. */
+         * edge is dropped and the idle SPURS kernel never wakes. FIX 2
+         * (2026-07-17): atomic_fetch_and_explicit, not a plain `&=`, for the
+         * same reason spu_coh_notify_write's write went atomic above -- the
+         * lock keeps ordering correct, the atomic RMW keeps the operation
+         * itself a single indivisible op (defense in depth, not a replacement
+         * for the lock). */
         spu_lockline_lock();
-        ctx->event_status &= ~v;
+        atomic_fetch_and_explicit(&ctx->event_status, ~v, memory_order_relaxed);
         spu_lockline_unlock();
         /* Decrementer stop rule (CBEA v1.02 Section 9.11.2 p158 implementation
          * note): acking the Tm event (bit 0x20) while Tm is DISABLED in the
@@ -2125,7 +2178,14 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
          * `(event_status & event_mask)` (spu_lifter.py) -- this makes the
          * runtime channel-read path consistent with that, so code that masks
          * an event to defer it does not still observe it here. */
-        v = (*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask;
+        /* FIX 2 (2026-07-17): acquire-load, not a volatile cast -- this is the
+         * actual channel VALUE the guest observes, so it must synchronize-with
+         * whichever producer's release/atomic-RMW store set the bit(s) being
+         * read (spu_ch_wait's predicate just above used the same acquire load
+         * to decide the wait was over; re-reading here instead of reusing that
+         * result matches the pre-existing structure and stays correct either
+         * way since both are acquire loads of the same atomic object). */
+        v = atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask;
         /* DIAG (YZ_SPU_PROF): does the service reach the event-wait path in
          * STEADY STATE? If RdEventStat fires after 20M GETLLARs, the LR-event
          * (Loop A) is live and worth implementing; if never, the spin is the
@@ -2135,7 +2195,9 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             if (g_spu_getllar_n > 20000000UL) {
                 if (g_spu_evstat_rd < 20)
                     fprintf(stderr, "[spu-ev] spu=%X RdEventStat steady: status=0x%X mask=0x%X lr_raised=%lu\n",
-                            ctx->spu_id, ctx->event_status, ctx->event_mask, g_spu_lr_raise);
+                            ctx->spu_id,
+                            atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
+                            ctx->event_mask, g_spu_lr_raise);
                 g_spu_evstat_rd++;
             }
         }
@@ -2196,12 +2258,16 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
          * current lifted images (specaudit_spu.md F10/F22's live sweep), so
          * this closes a real spec gap without a currently-exercised regression
          * risk. */
-        return ((*(volatile uint32_t*)&ctx->event_status) & ctx->event_mask) ? 1u : 0u;
-    case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
-    case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
-    case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
-    case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
-    case SPU_RdSigNotify2:   return ctx->ch_sig_notify[1].count;
+        /* FIX 2 (2026-07-17): acquire-load -- rchcnt is itself the busy-wait
+         * predicate for `while (!rchcnt(ch));` idioms (see the s42 comment
+         * just above), so it needs the same synchronizes-with guarantee as
+         * spu_ch_ready's identical test, not just eventual TSO visibility. */
+        return (atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask) ? 1u : 0u;
+    case SPU_RdInMbox:       return atomic_load_explicit(&ctx->ch_in_mbox.count, memory_order_acquire); /* readable */
+    case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots (same-thread only) */
+    case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count; /* same-thread only */
+    case SPU_RdSigNotify1:   return atomic_load_explicit(&ctx->ch_sig_notify[0].count, memory_order_acquire);
+    case SPU_RdSigNotify2:   return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire);
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
     case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
     case MFC_RdListStallStat:
