@@ -30,6 +30,7 @@
 
 extern "C" uint8_t* vm_base;
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
+extern "C" void yz_fltrec_dump(const char*);   /* s41 flight recorder (runtime/spu/spu_fltrec.c) */
 /* s40b v2: the GPU-parked stopper EA, published by the FIFO park tracker below for
  * the SPU-side targeted unstick (gs_task.c YZ_QROT_UNSTICK). 0 = not parked >2s. */
 extern "C" { uint32_t g_yz_parked_pub_ea = 0; }
@@ -1173,6 +1174,141 @@ static void yz_jrnl_retire_through(uint32_t entry_addr)
                   zeroed, entry_addr, total); } }
 }
 
+/* ============================================================================
+ * s40b PRODUCER THROTTLE (YZ_JRNL_THROTTLE=<K lines>, default OFF; K=8 when
+ * set without a number). scratch/s40b_findings.md sec.19-20.
+ *
+ * THE MEASURED ROOT of both terminal modes at the frame-~800 phase transition:
+ * our backlog carries live release records ACROSS the game's phase-boundary
+ * reinit (which zero-sweeps + rebuilds the dispatch vtables) — a state real
+ * HW never reaches because releases complete in ~72us there and the engine is
+ * EMPTY at the reinit. This throttle restores that invariant by BACKPRESSURE
+ * instead of speed: every [0x11][0x0A] journal append funnels through
+ * func_00E7DE88 (single choke point, 4 call sites), whose head calls
+ * yz_jrnl_throttle() (a ppu_recomp_006.cpp hand-edit, LOST ON RELIFT) —
+ * t1 waits until the consumer's live poll cursor is within K lines of the
+ * producer head before publishing more.
+ *
+ * FAIL-OPEN everywhere: no consumer yet / anchor wiped / cursor outside the
+ * arena / arena unparsable => pass through untouched. Timeout escape per
+ * append (YZ_JRNL_THROTTLE_MS, default 200) so a consumer wedge can never
+ * deadlock t1; 64 CONSECUTIVE timeouts disarm the throttle for the rest of
+ * the boot (past the wall the consumer is gone and waiting only burns time).
+ * Caught-up slack: the consumer's cursor legitimately polls AT or slightly
+ * AHEAD of head between appends — a small forward window reads as gap 0,
+ * not as a wrapped full ring. */
+extern "C" uint32_t yz_consumer_cursor(void);   /* runtime/spu/spu_channels.c */
+
+extern "C" void yz_jrnl_throttle(void)
+{
+    static int on = -1; static uint32_t K = 8; static uint32_t budget_ms = 200;
+    if (on < 0) {
+        const char* e = getenv("YZ_JRNL_THROTTLE");
+        on = (e && *e) ? 1 : 0;
+        if (on) {
+            int k = atoi(e); if (k > 0 && k <= 4096) K = (uint32_t)k;
+            const char* m = getenv("YZ_JRNL_THROTTLE_MS");
+            if (m && atoi(m) > 0) budget_ms = (uint32_t)atoi(m);
+            fprintf(stderr, "[jthr] ARMED K=%u lines budget=%ums (producer throttle at append 0xE7DE88)\n",
+                    K, budget_ms);
+            fflush(stderr);
+        }
+    }
+    static int disarmed = 0;
+    if (!on || disarmed || !g_yz_game_toc) return;
+
+    /* Call/fail-open census (review finding #1: an inert throttle must be
+     * distinguishable from a healthy one — the ARMED banner alone is a false
+     * witness since both hand-edit halves are lost on relift independently).
+     * Sampled print keeps the log volume flat (LESSONS #6c). */
+    static unsigned long ncall = 0, nofcur = 0, engaged = 0, timeouts = 0, consec_to = 0;
+    static unsigned long long wait_ms_tot = 0; static unsigned long wait_ms_max = 0;
+    static uint32_t lastgap = 0;    /* lines; the steady-state lag sample */
+    ncall++;
+    if ((ncall & 4095u) == 0) {
+        fprintf(stderr, "[jthr] census ncall=%lu cursor-failopen=%lu waited=%lu to=%lu tot=%llums lastgap=%u\n",
+                ncall, nofcur, engaged, timeouts, wait_ms_tot, lastgap);
+        fflush(stderr);
+    }
+
+    const uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
+    if (S < 0x10000u || S >= 0xE0000000u) return;
+    const uint32_t base = vm_read32(S + 0x08u);
+    const uint32_t aend = vm_read32(S + 0x0Cu);
+    if (base < 0x10000u || aend <= base || aend - base > 0x1000000u) return;
+    const uint32_t span = aend - base;
+    const uint32_t bound = K * 0x80u;
+    if (bound >= span / 2u) {                               /* review finding #9 */
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "[jthr] K=%u out of range for span=0x%X — throttle inert\n", K, span);
+            fflush(stderr); }
+        return;
+    }
+
+    unsigned long long t0 = 0; unsigned long spins = 0;
+    for (;;) {
+        const uint32_t cur = yz_consumer_cursor();
+        if (cur < base || cur >= aend) { nofcur++; return; } /* fail-open (incl. 0) */
+        const uint32_t head = vm_read32(S + 0x00u);
+        if (head < base || head >= aend) return;            /* fail-open */
+        /* Caught-up slack (review findings #2/#3): the consumer's cursor may
+         * legitimately poll AT or a few lines PAST head between appends; a
+         * cursor up to 8 lines ahead reads as gap 0. A cursor "ahead" by more
+         * than that with a near-full ring behind it means the consumer LAPPED
+         * — unrecoverable by pacing anyway, so failing open there is the safe
+         * direction (no lap counter exists to disambiguate). */
+        const uint32_t ahead = (cur - head + span) % span;
+        const uint32_t gap = (ahead <= 0x400u) ? 0 : (head - cur + span) % span;
+        lastgap = gap / 0x80u;
+        { /* one-shot LIVE witness: proves both hand-edit halves are wired
+           * (publish + call) and the gap math sees real values */
+            static int live = 0;
+            if (!live) { live = 1;
+                fprintf(stderr, "[jthr] LIVE head=0x%08X cur=0x%08X gap=%u lines (arena 0x%08X..0x%08X)\n",
+                        head, cur, gap / 0x80u, base, aend);
+                fflush(stderr); }
+        }
+        if (gap <= bound) {
+            consec_to = 0;      /* any pass (fast or waited) breaks the streak */
+            if (t0) {                                       /* we waited and won */
+                const unsigned long w = (unsigned long)(GetTickCount64() - t0);
+                engaged++; wait_ms_tot += w;
+                if (w > wait_ms_max) wait_ms_max = w;
+                if (engaged <= 4 || (engaged & 4095u) == 0) {
+                    fprintf(stderr, "[jthr] n=%lu wait=%lums tot=%llums max=%lums to=%lu\n",
+                            engaged, w, wait_ms_tot, wait_ms_max, timeouts);
+                    fflush(stderr);
+                }
+            }
+            return;
+        }
+        const unsigned long long now = GetTickCount64();
+        if (!t0) t0 = now;
+        else if (now - t0 >= budget_ms) {                   /* timeout escape */
+            timeouts++; consec_to++; engaged++;
+            wait_ms_tot += (unsigned long long)(now - t0);
+            if (timeouts <= 8 || (timeouts & 255u) == 0) {
+                fprintf(stderr, "[jthr] TIMEOUT #%lu (consec %lu) gap=%u lines head=0x%08X cur=0x%08X\n",
+                        timeouts, consec_to, gap / 0x80u, head, cur);
+                fflush(stderr);
+            }
+            if (consec_to >= 64) {
+                disarmed = 1;
+                fprintf(stderr, "[jthr] DISARMED after %lu consecutive timeouts (consumer gone; n=%lu tot=%llums)\n",
+                        consec_to, engaged, wait_ms_tot);
+                fflush(stderr);
+            }
+            return;                                         /* fail-open */
+        }
+        /* backoff by iteration count (GetTickCount64 is ~15.6ms-granular —
+         * time-based thresholds below one tick would hot-spin a core) */
+        spins++;
+        if (spins < 256) YieldProcessor();
+        else Sleep(spins < 2048 ? 0 : 1);
+    }
+}
+
 /* Locate the journal entry for a deferred release (same match as
  * yz_gcm_stopper_release_deferred but returns the ENTRY ADDRESS so the
  * retirement sweep knows how far GET's consumption has proven progress). */
@@ -2038,6 +2174,15 @@ static int yz_rsx_fifo_step(void)
                                  park_seq = g_yz_t1_sample_seq;
                                  park_tf  = (void*)g_yz_t1_last_tf; }
             const ULONGLONG parked_ms = GetTickCount64() - park_t0;
+            /* s41 FLIGHT RECORDER dump trigger A: fire once when this stopper
+             * park first crosses 30s (runtime/spu/spu_fltrec.c). Independent
+             * of the [stop-jrnl] witness prints below; a no-op unless
+             * YZ_FLTREC armed the recorder (yz_fltrec_dump checks that). */
+            { static int fr_dumped = 0;
+              if (!fr_dumped && parked_ms > 30000) {
+                  fr_dumped = 1;
+                  yz_fltrec_dump("park-30s");
+              } }
             /* s40b v2 (the adversarial review's targeting requirement,
              * scratch/s40b_refute_unstick.md): publish the stopper EA the GPU is
              * provably parked on, so the SPU-side YZ_QROT_UNSTICK can fire ONLY

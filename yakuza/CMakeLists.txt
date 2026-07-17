@@ -60,15 +60,29 @@ if(MSVC)
     endif()
 endif()
 
+# s41 SPU REGION LIFT: gs_task built from the region-lifted FAST source
+# (recomp_prx/gs_task_fast.c, tools/spu_lifter.py --regions) instead of the
+# per-instruction DIAG source (recomp_prx/gs_task.c, which carries hand-edited
+# probes -- see scratch/s41_spu_region_lift_design.md). Off by default: the
+# active wall investigation (s40b) stays on DIAG. Both define the same
+# `spu_recomp_register_gstask()` C symbol, so this is a drop-in source swap --
+# no other file needs to change either way.
+option(YZ_SPU_FAST "Build gs_task from the region-lifted FAST source instead of the per-instruction DIAG source." OFF)
+
 # Lifted SPU images (Sony's SPURS kernel + system-service workload, extracted
 # from libsre by tools/lift_prx.py + tools/spu_lifter.py). Listed explicitly:
 # spurs_kernel1.c is excluded (unused; its register fn would collide), and each
 # image has a distinct --register-name so their globals don't clash.
+if(YZ_SPU_FAST)
+    set(GS_TASK_SOURCE "${PS3RECOMP_DIR}/recomp_prx/gs_task_fast.c")
+else()
+    set(GS_TASK_SOURCE "${PS3RECOMP_DIR}/recomp_prx/gs_task.c")
+endif()
 file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/spurs_kernel2.c"
     "${PS3RECOMP_DIR}/recomp_prx/spurs_sysservice.c"
     "${PS3RECOMP_DIR}/recomp_prx/policy_module.c"   # taskset policy module (libsre 0x02023680), loaded to LS 0xA00 over the service
-    "${PS3RECOMP_DIR}/recomp_prx/gs_task.c"   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580
+    "${GS_TASK_SOURCE}"   # game render task (Edge geometry), EBOOT SPU img #3 @0x0127A580 -- DIAG or s41 FAST per YZ_SPU_FAST
     "${PS3RECOMP_DIR}/recomp_prx/cri_audio.c"   # SOFDEC/ADX codec task, EBOOT SPU img #7 @0x012B4980 (overlaps gs_task LS -> image 3)
     "${PS3RECOMP_DIR}/recomp_prx/wkl4_task.c"   # 4-task worker pool, EBOOT SPU img #5 @0x01284200 (wid 4; overlaps LS 0x3000 -> image 4)
     "${PS3RECOMP_DIR}/recomp_prx/spuimg_*.c"   # remaining EBOOT task images, batch-lifted by tools/gen_spu_images.py (image ids 5+; see recomp_prx/spu_image_table.h)
