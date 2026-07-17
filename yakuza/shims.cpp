@@ -472,8 +472,11 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                   fflush(stderr); } } }
     }
     ctx->reserve_addr = 0;
-    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
-                 :  (ctx->cr & ~(0xFu << 28));
+    /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
+     * folds the sticky SO like every compare/record op; SO is provably 0 in
+     * this title today, so this is spec conformance, not a behavior change). */
+    ctx->cr = (ctx->cr & ~(0xFu << 28))
+              | ((((ok ? 2u : 0u) | ((ctx->xer >> 31) & 1u))) << 28);
 }
 
 extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
@@ -542,8 +545,11 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
               } } }
     }
     ctx->reserve_addr = 0;
-    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
-                 :  (ctx->cr & ~(0xFu << 28));
+    /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
+     * folds the sticky SO like every compare/record op; SO is provably 0 in
+     * this title today, so this is spec conformance, not a behavior change). */
+    ctx->cr = (ctx->cr & ~(0xFu << 28))
+              | ((((ok ? 2u : 0u) | ((ctx->xer >> 31) & 1u))) << 28);
 }
 
 extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }

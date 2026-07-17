@@ -899,7 +899,9 @@ def run_suite():
         # default COFF object section-table limit (MSVC C1128). /bigobj
         # lifts that limit with no semantic effect on the compiled code --
         # safe to always pass.
-        f.write(f'cl /nologo /O1 /W3 /std:c17 /bigobj /I {OUTDIR} /I runtime\\spu '
+        # /experimental:c11atomics: spu_context.h carries _Atomic fields
+        # (s43 channel-atomicity fix); matches CMakeLists' runtime target.
+        f.write(f'cl /nologo /O1 /W3 /std:c17 /experimental:c11atomics /bigobj /I {OUTDIR} /I runtime\\spu '
                 f'/Fo{OUTDIR}\\ /Fe:{exe} '
                 f'{OUTDIR}\\spu_conf_driver.c {OUTDIR}\\spu_recomp.c '
                 f'> "{log}" 2>&1\n')

@@ -343,11 +343,17 @@ def _bin_vcase(name, xo, ain, bin_, result_bytes, form="vx", exp_cr=None, rc=0):
           {R_ADDR: result_bytes}, exp_cr=exp_cr)
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_fprs=None, exp_fprs=None, in_cr=0, exp_ov=None, exp_so=None):
+         in_fprs=None, exp_fprs=None, in_cr=0, exp_ov=None, exp_so=None, in_so=None,
+         exp_trap=None, exp_crbit=None):
+    # in_so: seed XER[SO]=1 before the op (SO-fold coverage: compares and
+    # record forms must OR the sticky SO into their CR field's bit 3).
+    # exp_trap: expected ppc_trap hit count for the statement (tw/twi/tdi).
+    # exp_crbit: (host CR bit index 0=MSB, want) -- single-bit CR assert.
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
                       in_fprs=in_fprs or {}, exp_fprs=exp_fprs or [], in_cr=in_cr,
-                      exp_ov=exp_ov, exp_so=exp_so))
+                      exp_ov=exp_ov, exp_so=exp_so, in_so=in_so, exp_trap=exp_trap,
+                      exp_crbit=exp_crbit))
 
 def dbits(x):
     """64-bit pattern of a Python float as an IEEE double."""
@@ -732,7 +738,9 @@ def build_cases():
              {R[0]: 0x11223344AABBCCDD, R[1]: 0x100, R[2]: 0x24},
              [(R[1], 0x124, MASK64)])
 
-build_cases()
+# NOTE: build_cases() is invoked ONCE, below (next to build_vcases()). A
+# second module-level call here silently duplicated every case for several
+# sessions (1966 built vs 987 distinct, caught 2026-07-17) -- keep one call.
 
 def _sat_s32(x):  return 0x7FFFFFFF if x > 0x7FFFFFFF else (-0x80000000 if x < -0x80000000 else x)
 
@@ -961,6 +969,184 @@ def build_vcases():
 
 build_cases()
 build_vcases()
+
+# ---------------------------------------------------------------------------
+# s43 conformance tranche (2026-07-17): trap family (tw/twi/tdi), compare
+# SO-folds, Rc=1 X-form logical coverage, and VMX element load/store lane +
+# EA-mask semantics. TO-bit semantics oracle-checked vs RPCS3
+# PPUInterpreter.cpp TDI/TWI/TW (0x10 s<, 0x08 s>, 0x04 ==, 0x02 u<, 0x01 u>;
+# tw/twi compare 32-bit, td/tdi 64-bit); element op semantics per the AltiVec
+# PEM (EA masked to element alignment, element at VR byte lane EA & 0xF).
+# ---------------------------------------------------------------------------
+
+def tw_word(to, ra, rb):    return (31 << 26) | (to << 21) | (ra << 16) | (rb << 11) | (4 << 1)
+def twi_word(to, ra, si):   return d_form(3, to, ra, si)
+def tdi_word(to, ra, si):   return d_form(2, to, ra, si)
+def addi_word(rt, ra, imm): return d_form(14, rt, ra, imm)
+
+def build_s43_cases():
+    R = 3, 4, 5
+
+    # --- trap family: each case asserts the ppc_trap hit count -------------
+    trap_cases = [
+        ("s< taken (-1<0)",           0x10, 0xFFFFFFFFFFFFFFFF, 0, 1),
+        ("s< not (1<0)",              0x10, 1,                  0, 0),
+        ("s< taken (0x80000000 s32-neg)", 0x10, 0x80000000,     0, 1),
+        ("u< not (0x80000000 u32-huge)",  0x02, 0x80000000,     0, 0),
+        ("u> taken (0x80000000 vs 1)",    0x01, 0x80000000,     1, 1),
+        ("eq taken",                  0x04, 0x1234, 0x1234, 1),
+        ("eq not",                    0x04, 0x1235, 0x1234, 0),
+        ("TO=0 never traps",          0x00, 5, 5, 0),
+        ("TO=31 always traps",        0x1F, 7, 9, 1),
+    ]
+    for nm, to, a, si, want in trap_cases:
+        case(f"twi {nm}", twi_word(to, R[1], si), {R[1]: a}, [], exp_trap=want)
+    case("tw s< taken", tw_word(0x10, R[1], R[2]),
+         {R[1]: 0xFFFFFFFFFFFFFFFF, R[2]: 0}, [], exp_trap=1)
+    case("tw eq not", tw_word(0x04, R[1], R[2]), {R[1]: 1, R[2]: 2}, [], exp_trap=0)
+    # 32-vs-64 discriminator: ra = 0xFFFFFFFF_00000000. twi eq 0 sees the s32
+    # truncation (0) -> trap; tdi eq 0 sees the full 64-bit value -> no trap.
+    case("twi eq 32bit-truncation traps", twi_word(0x04, R[1], 0),
+         {R[1]: 0xFFFFFFFF00000000}, [], exp_trap=1)
+    case("tdi eq 64bit does not trap", tdi_word(0x04, R[1], 0),
+         {R[1]: 0xFFFFFFFF00000000}, [], exp_trap=0)
+    case("tdi s< taken 64bit", tdi_word(0x10, R[1], 0),
+         {R[1]: 0x8000000000000000}, [], exp_trap=1)
+
+    # --- compare-family SO fold: CR field bit 3 = XER[SO] ------------------
+    # (check_cr masks the SO bit out by design; exp_crbit asserts it.)
+    case("cmpwi SO fold set", cmpi_form(11, 0, 0, R[1], 5),
+         {R[1]: 5}, [], in_so=1, exp_crbit=(3, 1), exp_cr=(2, 28))
+    case("cmpwi SO fold clear", cmpi_form(11, 0, 0, R[1], 5),
+         {R[1]: 5}, [], exp_crbit=(3, 0), exp_cr=(2, 28))
+    case("cmpdi SO fold set", cmpi_form(11, 0, 1, R[1], 5),
+         {R[1]: 4}, [], in_so=1, exp_crbit=(3, 1), exp_cr=(8, 28))
+    case("cmplwi SO fold set (cr2)", cmpi_form(10, 2, 0, R[1], 5),
+         {R[1]: 9}, [], in_so=1, exp_crbit=(11, 1), exp_cr=(4, 20))
+    case("cmpw SO fold set", cmp_form(0, 0, 0, R[1], R[2]),
+         {R[1]: 3, R[2]: 3}, [], in_so=1, exp_crbit=(3, 1), exp_cr=(2, 28))
+    case("cmpld SO fold set (cr7)", cmp_form(32, 7, 1, R[1], R[2]),
+         {R[1]: 1, R[2]: 2}, [], in_so=1, exp_crbit=(31, 1), exp_cr=(8, 0))
+    case("cmplw SO fold clear", cmp_form(32, 0, 0, R[1], R[2]),
+         {R[1]: 2, R[2]: 1}, [], exp_crbit=(3, 0), exp_cr=(4, 28))
+
+    # --- Rc=1 X-form logical coverage (s39 gap: no rc=1 case existed) ------
+    # The _translate CR0 wrapper computes LT/GT/EQ from the s64 result and ORs
+    # XER[SO]; these pin that behavior per mnemonic.
+    logic_ops = [("and", 28,  lambda a, b: a & b),
+                 ("or",  444, lambda a, b: a | b),
+                 ("xor", 316, lambda a, b: a ^ b),
+                 ("nand", 476, lambda a, b: ~(a & b) & MASK64),
+                 ("nor", 124, lambda a, b: ~(a | b) & MASK64),
+                 ("andc", 60, lambda a, b: a & ~b & MASK64),
+                 ("orc", 412, lambda a, b: (a | (~b & MASK64)) & MASK64),
+                 ("eqv", 284, lambda a, b: ~(a ^ b) & MASK64)]
+    lpairs = [(0x8000000000000000, 1), (0, 0), (0x7FF, 0x800), (MASK64, MASK64)]
+    for lname, xo, ref in logic_ops:
+        for a, b in lpairs:
+            v = ref(a, b)
+            nib = 8 if (v >> 63) else (2 if v == 0 else 4)
+            for so in (0, 1):
+                case(f"{lname}. rc=1 a={a:#x} b={b:#x} so={so}",
+                     x_logic(xo, R[0], R[1], R[2], rc=1),
+                     {R[0]: a, R[2]: b}, [(R[1], v, MASK64)],
+                     in_so=so, exp_cr=(nib, 28), exp_crbit=(3, so))
+
+    # --- VMX element load/store: lane select + EA masking ------------------
+    # vr convention (matches lvx/stvlx): raw guest byte order, element i of
+    # size s at byte offset s*i. Loads: EA masked to element alignment, the
+    # element lands at VR lane (EA & 0xF). Stores: only the element bytes are
+    # written, from that lane, to the masked EA.
+    A_el = bytes([0xC1, 0x02, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                  0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10])
+
+    def lane16(pairs_):
+        out = bytearray(16)
+        for off, blob in pairs_:
+            out[off:off + len(blob)] = blob
+        return bytes(out)
+
+    def elx(xo, vrt, ra, rb):
+        return (31 << 26) | (vrt << 21) | (ra << 16) | (rb << 11) | (xo << 1)
+
+    # store-only legs (lane pinned against the architected lvx)
+    vcase("stvewx lane+mask (EA%16=5 -> lane 4)",
+          [lvx_word(0, 0, 10), addi_word(14, 13, 5), elx(199, 0, 0, 14)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(4, A_el[4:8])])})
+    vcase("stvehx lane+mask (EA%16=0xB -> lane 0xA)",
+          [lvx_word(0, 0, 10), addi_word(14, 13, 0xB), elx(167, 0, 0, 14)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(0xA, A_el[0xA:0xC])])})
+    vcase("stvebx lane (EA%16=7)",
+          [lvx_word(0, 0, 10), addi_word(14, 13, 7), elx(135, 0, 0, 14)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(7, A_el[7:8])])})
+    # load+store round trips (pin the load's mask+lane via the pinned stores)
+    vcase("lvewx roundtrip (load EA%16=6 -> lane 4)",
+          [addi_word(14, 10, 6), elx(71, 3, 0, 14),
+           addi_word(15, 13, 4), elx(199, 3, 0, 15)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(4, A_el[4:8])])})
+    vcase("lvehx roundtrip (load EA%16=0xD -> lane 0xC)",
+          [addi_word(14, 10, 0xD), elx(39, 3, 0, 14),
+           addi_word(15, 13, 0xC), elx(167, 3, 0, 15)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(0xC, A_el[0xC:0xE])])})
+    vcase("lvebx roundtrip (EA%16=9)",
+          [addi_word(14, 10, 9), elx(7, 3, 0, 14),
+           addi_word(15, 13, 9), elx(135, 3, 0, 15)],
+          {A_ADDR: A_el}, {R_ADDR: lane16([(9, A_el[9:10])])})
+
+build_s43_cases()
+
+def test_jump_table_sizing():
+    """Python-level regression for discover_jump_tables: the cmp-derived count
+    must be a HINT, not a hard cap (the 30-insn window can latch a post-call
+    `cmpwi cr7, r3, 0` from a sibling block and truncate the table -- the
+    0xFB7F10 instance shipped 1 entry of 25). Returns the number of failures."""
+    class Ins:
+        def __init__(self, mnemonic, operands, addr):
+            self.mnemonic, self.operands, self.addr = mnemonic, operands, addr
+
+    from ppu_lifter import discover_jump_tables
+    fails = 0
+
+    def run(entries, cmp_seq, first_case_at):
+        toc, disp, table_base = 0x10000, 0x100, 0x2000
+        mem = {toc + disp: table_base}
+        targets = [first_case_at + 8 * k for k in range(entries)]
+        for k, t in enumerate(targets):
+            mem[table_base + 4 * k] = t
+        addr = [0xF00]
+        insns = []
+        def emit(mn, opsx):
+            insns.append(Ins(mn, opsx, addr[0])); addr[0] += 4
+        for mn, opsx in cmp_seq:
+            emit(mn, opsx)
+        emit("lwz", "r11, 0x100(r2)")
+        emit("rlwinm", "r4, r3, 2, 0, 29")
+        emit("lwzx", "r0, r4, r11")
+        emit("mtctr", "r0")
+        emit("bctr", "")
+        bctr_addr = addr[0] - 4
+        got = discover_jump_tables(
+            insns, lambda a: mem.get(a & 0xFFFFFFFF), toc, 0x1000, 0x8000)
+        return got.get(bctr_addr, []), sorted(set(targets))
+
+    # 1) the truncation shape: real bound cmplwi 24, then a post-bl poison
+    #    cmpwi 0 nearer the bctr. Table of 25 immediately before its cases.
+    got, want = run(25, [("cmplwi", "cr6, r3, 24"), ("bgt", "cr6, 0x3000"),
+                         ("bl", "0x5000"), ("cmpwi", "cr7, r3, 0")],
+                    first_case_at=0x2000 + 25 * 4)
+    if got != want:
+        print(f"FAIL jump-table truncation shape: {len(got)} entries, want {len(want)}")
+        fails += 1
+    # 2) regression guard: a well-formed table (cmp bound == structural bound)
+    #    must still decode exactly its 5 entries.
+    got, want = run(5, [("cmplwi", "cr6, r3, 4"), ("bgt", "cr6, 0x3000")],
+                    first_case_at=0x2000 + 5 * 4)
+    if got != want:
+        print(f"FAIL jump-table well-formed shape: {len(got)} entries, want {len(want)}")
+        fails += 1
+    if not fails:
+        print("[test_ppu_lift] jump-table sizing: PASS (2 shapes)")
+    return fails
 
 # ---------------------------------------------------------------------------
 # VMX vector-op SEMANTIC tranche (2026-07-04): the suite tested VMX endianness
@@ -1397,6 +1583,12 @@ static void check_crbit(const char* name, uint32_t cr, int bit, int want) {
         g_fail++;
     } else g_pass++;
 }
+static void check_trap(const char* name, int got, int want) {
+    if (got != want) {
+        printf("FAIL %s: trap hits = %d want %d\\n", name, got, want);
+        g_fail++;
+    } else g_pass++;
+}
 static void check_fpr(const char* name, int reg, double got_d, uint64_t want, uint64_t mask) {
     uint64_t got; memcpy(&got, &got_d, 8);
     if ((got & mask) != (want & mask)) {
@@ -1466,6 +1658,10 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
                        f"memcpy(&ctx->fpr[{reg}], &t, 8); }}")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        if c.get("in_so"):
+            out.append("      ctx->xer |= (1u << 31);")
+        if c.get("exp_trap") is not None:
+            out.append("      g_ppc_trap_hits = 0;")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
@@ -1485,6 +1681,8 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
         if c.get("exp_crbit") is not None:
             bit, want = c["exp_crbit"]
             body.append(f'        check_crbit("{nm}", ctx->cr, {bit}, {want});')
+        if c.get("exp_trap") is not None:
+            body.append(f'        check_trap("{nm}", g_ppc_trap_hits, {int(c["exp_trap"])});')
         if c["may_trap"]:
             out.append("      __try {")
             out.extend(body)
@@ -1601,6 +1799,8 @@ def main():
               f"{'GREEN' if rc == 0 else 'FAILURES FOUND'}")
         sys.exit(0 if rc == 0 else 1)
 
+    jt_fails = test_jump_table_sizing()
+
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
     epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")
     emit_c(cpath)
@@ -1609,7 +1809,7 @@ def main():
 
     log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
     rc = _compile_and_run(cpath, epath, log, "ppu_conformance")
-    sys.exit(0 if rc == 0 else 1)
+    sys.exit(0 if (rc == 0 and jt_fails == 0) else 1)
 
 if __name__ == "__main__":
     main()

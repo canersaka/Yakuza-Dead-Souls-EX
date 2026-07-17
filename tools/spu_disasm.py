@@ -546,13 +546,19 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         if mne == "bi":
             result.operands = f"$r{ra}"
             return result
-        if mne == "bisl":
-            # bisl sets the link register (RT) as well as branching to RA --
-            # RT is a real encoded operand, was silently dropped here
+        if mne in ("bisl", "bisled"):
+            # bisl/bisled set the link register (RT) as well as branching to
+            # RA -- RT is a real encoded operand, was silently dropped here
             # (display-only omission; tools/spu_lifter.py already recovers
             # it via `insn.raw & 0x7F` directly, so lift output is
             # unaffected by this fix -- see the 2026-07-05 operand-audit
-            # report).
+            # report). bisled shares bisl's RR operand shape (RT, RA; RB
+            # unused) but fell through to the generic 3-operand RR default
+            # below before this case existed, handing the lifter's
+            # ops[-1]-based target read (spu_lifter.py's bisl/bisled
+            # emission) a spurious RB instead of RA (fork dd5d98d /
+            # 2026-07-17 cellmark audit finding #2; zero bisled instances
+            # in our shipped images, latent-class hygiene per LESSONS #11c).
             result.operands = f"$r{rt}, $r{ra}"
             return result
         if mne in ("biz", "binz", "bihz", "bihnz"):
