@@ -3147,6 +3147,10 @@ def main() -> None:
     parser.add_argument("--raw", action="store_true", help="Treat input as raw binary")
     parser.add_argument("--base", type=lambda x: int(x, 0), default=0,
                         help="Base address (for raw binary)")
+    parser.add_argument("--toc", type=lambda x: int(x, 0), default=0,
+                        help="Module TOC address (raw binaries only; enables "
+                             "jump-table discovery -- lift_prx.py records it "
+                             "in the module's exports json)")
     parser.add_argument("--little-endian", action="store_true")
     parser.add_argument("--trace", action="store_true",
                         help="Emit ppu_trace_pc(ctx, PC) before every instruction for the "
@@ -3244,12 +3248,23 @@ def main() -> None:
         return i >= 0 and a < code_spans[i][1]
 
     jt_targets = set()
-    if not args.raw:
+    # Raw images (relocated PRX dumps) carry no program headers and no entry
+    # OPD, so they historically SKIPPED discovery entirely -- every case
+    # target of every dispatcher in libsre/libgcm/pxd_shader stayed
+    # unregistered (the s43 0x02012EA8 interior-target class). The blob
+    # itself is the one segment, and the module TOC comes from --toc (the
+    # value lift_prx.py records in the module's exports json). A raw lift
+    # WITHOUT --toc still skips, exactly as before (every discovery pattern
+    # is TOC-relative, so toc=0 would find nothing anyway).
+    if not args.raw or args.toc:
         try:
-            seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
-                        elf.get_segment_data(elf.program_headers.index(ph)))
-                       for ph in elf.program_headers
-                       if ph.p_type == PT_LOAD and ph.p_filesz > 0]
+            if args.raw:
+                seg_map = [(base_addr, base_addr + len(file_data), file_data)]
+            else:
+                seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
+                            elf.get_segment_data(elf.program_headers.index(ph)))
+                           for ph in elf.program_headers
+                           if ph.p_type == PT_LOAD and ph.p_filesz > 0]
             def _read_u32(a):
                 for v0, v1, d in seg_map:
                     if v0 <= a and a + 4 <= v1:
@@ -3258,7 +3273,8 @@ def main() -> None:
                 return None
             text_lo = min(s for s, _ in func_bounds)
             text_hi = max(e for _, e in func_bounds)
-            toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
+            toc = (args.toc if args.raw
+                   else _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0)
             tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
             for ts in tables.values():
                 jt_targets.update(ts)
