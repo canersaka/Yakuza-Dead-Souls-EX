@@ -259,9 +259,135 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 
-/* ---- single-precision float (4 lanes) ---- */
-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
+/* ---- single-precision float (4 lanes) ----
+ *
+ * FIX 3 (2026-07-17): SPU-accurate extended-range ("xfloat") semantics for
+ * fa/fs/fm/fma/fms/fnms, replacing the native-IEEE math this file used
+ * before. ORACLE(SPU_ISA_v1.2_27Jan2007_pub.pdf p195-196, 202/204/206/208/
+ * 210/212) + cross-verified (read-only, GPLv2 -- semantics only, no code or
+ * comments copied) against rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's
+ * precise-mode FA_FS/FM/FMA.
+ *
+ * SPU single precision differs from IEEE 754 single precision:
+ *   - Register range is extended: an 8-bit exponent field of 0xFF is a
+ *     NORMAL value here (magnitude up to Smax), never Inf/NaN (Table 9-1,
+ *     p195). Smin bit pattern = 0x00800000, Smax bit pattern = 0x7FFFFFFF
+ *     (Table 9-1 "Register Value" row -- confirms the task's stated Smax
+ *     pattern).
+ *   - No NaN, no Inf are ever produced. A result whose magnitude would
+ *     exceed Smax instead SATURATES to Smax with the operation's sign
+ *     (p202 fa, p204 fs, p206 fm, p208 fma, p210 fnms, p212 fms, all
+ *     identical wording).
+ *   - Denormals are not supported: "an operation that would generate a
+ *     denorm under IEEE rules instead generates a positive zero. If a
+ *     denorm is used as an operand, it is treated as a zero" (p196). The
+ *     ISA text does not state a sign for the single-precision operand-flush
+ *     case (only the double-precision analog on p198 explicitly says
+ *     "preserve the sign"); RPCS3's precise interpreter resolves this by
+ *     flushing BOTH denormal operands and denormal/zero results to
+ *     UNSIGNED +0.0f unconditionally (SPUInterpreter.cpp FA_FS/FM/FMA) --
+ *     this is the one place this implementation's ISA reading and RPCS3
+ *     disagree/are ambiguous, and per this project's convention RPCS3 (the
+ *     trace-diff oracle) is followed: every flush here, operand or result,
+ *     is unsigned +0.0, matching "a zero result is always a positive zero"
+ *     (p195) exactly and extending it to operands too.
+ *   - Only rounding mode: truncation toward zero (p196).
+ *   - fma/fms/fnms's multiply is EXACT and unbounded in range before the
+ *     add/subtract -- only the FINAL (post add/subtract) result is checked
+ *     against Smax/Smin (p208/210/212: "the multiplication is exact and not
+ *     subject to limits on its range... If the magnitude of the RESULT OF
+ *     THE ADDITION is greater than Smax...").
+ *
+ * Implementation: decode each SPU-shaped f32 BIT PATTERN (never through the
+ * host `float` type -- an extended-range SPU value's bits, read as IEEE
+ * binary32, literally ARE an Inf/NaN pattern, e.g. Smax=0x7FFFFFFF is a
+ * QNaN bit pattern; touching that through a real float/double add/compare
+ * would invoke the host FPU's Inf/NaN rules, which is exactly wrong) into a
+ * double (flushing an exponent-field-0 operand to +0.0 first), do the
+ * requested arithmetic in double, then encode the double result back to an
+ * SPU-shaped f32 bit pattern: truncate the mantissa to 23 bits, flush a
+ * sub-Smin magnitude to +0.0, saturate a magnitude beyond Smax to Smax with
+ * the result's sign.
+ *
+ * ACCURACY (INFERRED, s43 review-corrected): fm's normal case is bit-exact
+ * (a 24x24-bit product fits double's 53-bit mantissa exactly, so truncation
+ * equals toward-zero single rounding). fa/fs/fma/fms/fnms are NOT proven
+ * bit-exact against the RPCS3 precise interpreter: the double add rounds to
+ * NEAREST before the final truncate (double rounding, up to 1 ULP off a
+ * direct toward-zero single computation when operand exponents are far
+ * apart), and RPCS3's extended-range special cases (1-ULP borrows,
+ * exponent-gap shortcuts in FA_FS/FMA) are approximated by plain double
+ * arithmetic here. Saturation magnitude and every flush/saturate CLASS
+ * decision do match. A measured RPCS3 float A/B is queued before SPU float
+ * register values may be treated as oracle-parity in trace-diffs.
+ *
+ * Kill switch YZ_XF_IEEE=1 restores the previous native-IEEE path (+, -, *,
+ * fmaf) below -- see docs/FLAGS.md. Default OFF (SPU-accurate active). Env
+ * read once and cached (this file's local-extern getenv convention, matching
+ * spu_context.h's other yz_* flags, avoids the <stdlib.h> vs the custom
+ * getenv extern linkage clash noted there under dynamic-CRT MSVC builds). */
+static inline int yz_xf_ieee(void)
+{
+    static int v = -1;
+    if (v < 0) { extern char* getenv(const char*); v = getenv("YZ_XF_IEEE") ? 1 : 0; }
+    return v;
+}
+
+#define SPU_XF_SMAX_MAG   0x7FFFFFFFu   /* Smax magnitude bits (sign OR'd in by the caller) */
+
+/* SPU-shaped f32 bits -> double. Flushes an exponent-field-0 operand
+ * (true zero OR IEEE-denormal-shaped) to unsigned +0.0; any other exponent
+ * (including 0xFF, "extended") decodes as a genuine 1.fraction * 2^(exp-127)
+ * magnitude -- never routed through the host `float` type. */
+static inline double spu_xf_decode(uint32_t bits)
+{
+    uint32_t exp  = (bits >> 23) & 0xFFu;
+    if (exp == 0) return 0.0;
+    uint32_t sign = bits >> 31;
+    uint32_t frac = bits & 0x7FFFFFu;
+    double mant = 1.0 + (double)frac / 8388608.0;   /* / 2^23 */
+    double val  = ldexp(mant, (int)exp - 127);
+    return sign ? -val : val;
+}
+
+/* double -> SPU-shaped f32 bits. Zero (either sign) and any magnitude below
+ * Smin flush to unsigned +0.0 (p195/196; RPCS3 matches). A magnitude beyond
+ * Smax saturates to Smax with the value's sign (p202 et al). Otherwise
+ * truncates (never rounds) the mantissa to 23 fraction bits (p196). */
+static inline uint32_t spu_xf_encode(double val)
+{
+    if (val == 0.0) return 0u;
+    int sign = (val < 0.0) ? 1 : 0;
+    double mag = sign ? -val : val;
+    int fexp;
+    double mant = frexp(mag, &fexp);      /* mag = mant * 2^fexp, mant in [0.5,1) */
+    mant *= 2.0; fexp -= 1;               /* rebase: mant in [1,2), mag = mant * 2^fexp */
+    int biased = fexp + 127;
+    if (biased > 255)
+        return ((uint32_t)sign << 31) | SPU_XF_SMAX_MAG;   /* overflow: saturate to Smax */
+    if (biased <= 0)
+        return 0u;                                          /* underflow: flush to +0.0 */
+    uint32_t frac = (uint32_t)((mant - 1.0) * 8388608.0);   /* truncate toward zero */
+    if (frac > 0x7FFFFFu) frac = 0x7FFFFFu;   /* defensive; truncation of mant<2.0 can't reach this */
+    return ((uint32_t)sign << 31) | ((uint32_t)biased << 23) | frac;
+}
+
+static inline u128 spu_fa(u128 a, u128 b)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] + b._f32[i]; return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) + spu_xf_decode(b._u32[i]));
+    return r;
+}
+static inline u128 spu_fs(u128 a, u128 b)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] - b._f32[i]; return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) - spu_xf_decode(b._u32[i]));
+    return r;
+}
 
 /* Float<->int conversions with scale (RI8). HW/RPCS3 semantics (verified vs
  * SPUInterpreter.cpp precise CFLTS=ldexp(a,173-i8) + SPUASMJITRecompiler.cpp):
@@ -277,19 +403,61 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
+static inline u128 spu_fm(u128 a, u128 b)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] * b._f32[i]; return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
+    return r;
+}
 /* fma/fms/fnms: the SPU multiply is EXACT (single final rounding = true fused
  * multiply-add), ISA v1.2 p208/210/212 "the multiplication is exact and not
- * subject to limits on its range". Plain a*b+c under /fp:precise double-rounds
- * (rounds the product to f32 first) -> sparse 1-ULP errors; fmaf() gives the
- * single-rounded result RPCS3's precise interpreter (std::fma) also uses.
- * fms = a*b - c => fmaf(a,b,-c); fnms = c - a*b => fmaf(a,-b,c) (negate BEFORE
- * the FMA so the one rounding lands on the full expression). Note: on a build
- * without /arch:AVX2, MSVC lowers fmaf to a CRT software-FMA call (correctness
- * over the old 2-instruction product; RPCS3 pays the same cost). */
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+ * subject to limits on its range" -- see the xfloat block comment above
+ * spu_fa for the full derivation. The YZ_XF_IEEE=1 legacy path keeps the old
+ * native-IEEE fmaf() model: fms = a*b - c => fmaf(a,b,-c); fnms = c - a*b =>
+ * fmaf(a,-b,c) (negate BEFORE the FMA so the one rounding lands on the full
+ * expression); on a build without /arch:AVX2, MSVC lowers fmaf to a CRT
+ * software-FMA call (correctness over a 2-instruction product; RPCS3 pays
+ * the same cost). The default (SPU-accurate) path computes the product and
+ * accumulate entirely in double (exact, per the xfloat block comment) and
+ * encodes once at the end -- the same "exact multiply, one final rounding"
+ * property, but in the SPU's own extended-range/no-NaN/no-Inf format rather
+ * than IEEE. */
+static inline u128 spu_fma(u128 a, u128 b, u128 c)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) + spu_xf_decode(c._u32[i]));
+    return r;
+}
+static inline u128 spu_fms(u128 a, u128 b, u128 c)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) - spu_xf_decode(c._u32[i]));
+    return r;
+}
+static inline u128 spu_fnms(u128 a, u128 b, u128 c)
+{
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(c._u32[i]) - spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
+    return r;
+}
+/* FIX 3 scope note (2026-07-17): fceq/fcgt are OUT of scope (the task asked
+ * only for fa/fs/fm/fma/fms/fnms) and are left as plain host-float compares
+ * here. NOT verified faithful: RPCS3's precise FCGT/FCMGT (SPUInterpreter.cpp)
+ * special-case any operand with |bits| < Smin (0x00800000) -- zero AND
+ * denormal-shaped -- as "zero" for the comparison, rather than doing a plain
+ * IEEE `>`/`==` on the host float, so the ISA's extended-range/denormal
+ * model DOES affect this family. Left unfixed per the task's explicit
+ * instruction to touch compares only if confirmed affected, and to note it
+ * rather than fix it -- this is a new, separate finding for the verify-then-
+ * implement queue, not part of this change. */
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 

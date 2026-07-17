@@ -137,6 +137,9 @@ if(MSVC)
         /W3 /wd4100 /wd4244 /wd4267
         /bigobj
         /Zc:__cplusplus
+        # C sources only: the SPU PRX TUs include spu_context.h, which carries
+        # _Atomic fields (s43 channel-atomicity fix); C++ never sees _Atomic.
+        $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
     )
     target_compile_definitions(yakuza_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
     # /MAP: symbol->RVA listing so crash-handler RVAs resolve to functions.
