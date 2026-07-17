@@ -2135,10 +2135,24 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify1:
         /* s39: WAIT while empty (producer = sys_spu_thread_write_snr, PPU thread). */
         if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdSigNotify1, "rdch");
-        v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
+        /* FIX 1 (2026-07-17, lv2_register.c sys_spu_thread_write_snr_handler):
+         * the read-value-then-clear-count pair must be mutually exclusive
+         * with the writer's check-count-then-mutate-value pair (OR-mode
+         * accumulate), not just individually atomic -- see the long comment
+         * at the write_snr handler for why. Same global lock-line spinlock
+         * that handler takes; critical section is one plain load + one
+         * atomic store (spu_channel_read), same tiny-section shape as every
+         * other spu_lockline_lock user in this file. */
+        spu_lockline_lock();
+        v = spu_channel_read(&ctx->ch_sig_notify[0]);
+        spu_lockline_unlock();
+        break;
     case SPU_RdSigNotify2:
         if (!yz_ch_nonblock()) spu_ch_wait(ctx, SPU_RdSigNotify2, "rdch");
-        v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
+        spu_lockline_lock();
+        v = spu_channel_read(&ctx->ch_sig_notify[1]);
+        spu_lockline_unlock();
+        break;
     case SPU_RdDec:
         /* Decrementer read (CBEA v1.02 Section 9.7 p146; F9/F21). Nonblocking;
          * "successive reads can return the same value" (p146) -- true here too

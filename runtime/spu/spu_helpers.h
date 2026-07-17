@@ -309,17 +309,20 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
  * sub-Smin magnitude to +0.0, saturate a magnitude beyond Smax to Smax with
  * the result's sign.
  *
- * ACCURACY (INFERRED, s43 review-corrected): fm's normal case is bit-exact
- * (a 24x24-bit product fits double's 53-bit mantissa exactly, so truncation
- * equals toward-zero single rounding). fa/fs/fma/fms/fnms are NOT proven
- * bit-exact against the RPCS3 precise interpreter: the double add rounds to
- * NEAREST before the final truncate (double rounding, up to 1 ULP off a
- * direct toward-zero single computation when operand exponents are far
- * apart), and RPCS3's extended-range special cases (1-ULP borrows,
- * exponent-gap shortcuts in FA_FS/FMA) are approximated by plain double
- * arithmetic here. Saturation magnitude and every flush/saturate CLASS
- * decision do match. A measured RPCS3 float A/B is queued before SPU float
- * register values may be treated as oracle-parity in trace-diffs.
+ * ACCURACY (MEASURED, s43 A/B vs the RPCS3 precise interpreter — full
+ * numbers in scratch/s43_float_ab.md): fm is BIT-EXACT (0 mismatches in
+ * 2.36M samples, every condition). fa/fs/fma/fms/fnms currently diverge
+ * because of the AMBIENT ROUNDING MODE, not the algorithm: RPCS3 forces
+ * FE_TOWARDZERO around every float op while this runtime never calls
+ * fesetround anywhere, so the double arithmetic here rounds to nearest
+ * before the final truncate — 31% of fa/fs pairs and 17-19% of fma-family
+ * triples differ by >=1 ULP on random data, and near the Smin flush
+ * boundary the fma family can misclassify flush-vs-normal outright.
+ * With ambient rounding set toward zero the residual drops to genuine
+ * 1-ULP corners (0.002%-0.16%, RPCS3's own extended-range special cases).
+ * FIX CANDIDATE (awaiting user confirm, verify-then-implement):
+ * fesetround(FE_TOWARDZERO) at SPU exec-thread entry. Until it lands, SPU
+ * float register values are NOT oracle-parity in trace-diffs.
  *
  * Kill switch YZ_XF_IEEE=1 restores the previous native-IEEE path (+, -, *,
  * fmaf) below -- see docs/FLAGS.md. Default OFF (SPU-accurate active). Env
@@ -448,18 +451,45 @@ static inline u128 spu_fnms(u128 a, u128 b, u128 c)
         r._u32[i] = spu_xf_encode(spu_xf_decode(c._u32[i]) - spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
     return r;
 }
-/* FIX 3 scope note (2026-07-17): fceq/fcgt are OUT of scope (the task asked
- * only for fa/fs/fm/fma/fms/fnms) and are left as plain host-float compares
- * here. NOT verified faithful: RPCS3's precise FCGT/FCMGT (SPUInterpreter.cpp)
- * special-case any operand with |bits| < Smin (0x00800000) -- zero AND
- * denormal-shaped -- as "zero" for the comparison, rather than doing a plain
- * IEEE `>`/`==` on the host float, so the ISA's extended-range/denormal
- * model DOES affect this family. Left unfixed per the task's explicit
- * instruction to touch compares only if confirmed affected, and to note it
- * rather than fix it -- this is a new, separate finding for the verify-then-
- * implement queue, not part of this change. */
-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+/* FIX 2 -- compare family (2026-07-17, s43 review -- closes the gap the FIX 3
+ * scope note above used to leave open; distinct from the OTHER "FIX 2" used
+ * elsewhere in this file/spu_channels.c/spu_dma.h/spu_context.h for the
+ * count/event_status atomic promotion -- same date, same review batch,
+ * unrelated change, numbered per the task that requested this one).
+ * fceq/fcgt joined YZ_XF_IEEE. ORACLE(SPU_ISA_v1.2_
+ * 27Jan2007_pub.pdf p195-196; also see the xfloat block comment above
+ * spu_fa) + cross-checked (read-only, GPLv2 -- semantics only, no code
+ * copied) against rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's precise-mode
+ * FCEQ/FCGT/FCMEQ/FCMGT: both special-case any operand with |bits| < Smin
+ * (0x00800000 -- zero AND every denormal-shaped pattern) as zero before
+ * comparing, and compare extended-range magnitudes (exponent field 0xFF,
+ * an IEEE Inf/NaN bit shape here) by their true SPU-defined magnitude, not
+ * by routing through the host float type (where 0x7FFFFFFF IS a QNaN
+ * pattern and a host `>`/`==` against it is false unconditionally --
+ * exactly backwards from the SPU's own compare result). Reuses
+ * spu_xf_decode (above) for both requirements at once: it already flushes
+ * an exponent-field-0 operand to unsigned +0.0 and decodes exp==0xFF as a
+ * genuine ~Smax-magnitude double, never through `float`. Default (SPU-
+ * accurate) path decodes both operands and compares the doubles;
+ * YZ_XF_IEEE=1 restores the previous plain host-float `==`/`>` verbatim.
+ * ACCURACY: exact class match (decode is a lossless bit-pattern-to-double
+ * widening, so the comparison result is bit-for-bit the same decision
+ * RPCS3's special-cased compare makes) -- unlike fa/fs/fma/fms/fnms this
+ * family has no rounding step, so there is no double-rounding caveat. */
+static inline u128 spu_fceq(u128 a, u128 b) {
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._u32[i] = (a._f32[i] == b._f32[i]) ? 0xFFFFFFFFu : 0; return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = (spu_xf_decode(a._u32[i]) == spu_xf_decode(b._u32[i])) ? 0xFFFFFFFFu : 0;
+    return r;
+}
+static inline u128 spu_fcgt(u128 a, u128 b) {
+    u128 r;
+    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._u32[i] = (a._f32[i] > b._f32[i]) ? 0xFFFFFFFFu : 0; return r; }
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = (spu_xf_decode(a._u32[i]) > spu_xf_decode(b._u32[i])) ? 0xFFFFFFFFu : 0;
+    return r;
+}
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
@@ -581,8 +611,24 @@ static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
-static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
-static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
+/* FIX 2 -- compare family (2026-07-17): same YZ_XF_IEEE gate + spu_xf_decode
+ * reuse as fceq/fcgt above (see that comment) -- the magnitude compare here is
+ * `fabs` of the decoded double rather than of the raw bit pattern, which
+ * is equivalent (decode's sign bit only flips the final sign, so
+ * fabs(decode(bits)) == decode(bits & 0x7FFFFFFF)) and avoids a second
+ * decode helper. */
+static inline u128 spu_fcmeq(u128 a, u128 b){
+    u128 r;
+    if (yz_xf_ieee()) { for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+    for(int i=0;i<4;i++){ double fa=fabs(spu_xf_decode(a._u32[i])), fb=fabs(spu_xf_decode(b._u32[i])); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; }
+    return r;
+}
+static inline u128 spu_fcmgt(u128 a, u128 b){
+    u128 r;
+    if (yz_xf_ieee()) { for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
+    for(int i=0;i<4;i++){ double fa=fabs(spu_xf_decode(a._u32[i])), fb=fabs(spu_xf_decode(b._u32[i])); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; }
+    return r;
+}
 /* spu_frest / spu_frsqest: floating reciprocal estimate / floating reciprocal
  * absolute square root estimate. Both must emit the packed base+step encoding
  * that spu_fi (above) decodes -- NOT a plain full-precision 1/x or 1/sqrt(x)
