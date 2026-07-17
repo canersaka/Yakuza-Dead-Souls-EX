@@ -608,7 +608,13 @@ static inline int mfc_do_list_transfer_from(mfc_engine* mfc, spu_context* spu,
              * on the first tag to stall, matching RPCS3). */
             uint32_t bit = 1u << (tag & 0x1Fu);
             if (!mfc->stall_mask) {
-                spu->event_status |= SPU_EVENT_SN;
+                /* FIX 2 (2026-07-17): event_status is now _Atomic uint32_t
+                 * (runtime/spu/spu_context.h); atomic_fetch_or_explicit, not a
+                 * plain `|=`, for consistency with the field's other writers
+                 * (this one is same-thread -- the issuing SPU's own list
+                 * transfer -- so relaxed is enough; no cross-thread ordering
+                 * is being established here). */
+                atomic_fetch_or_explicit(&spu->event_status, SPU_EVENT_SN, memory_order_relaxed);
                 spu_ch_wake(spu);   /* s39: wake a blocked RdEventStat */
             }
             mfc->stall_mask |= bit;
@@ -1479,7 +1485,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
                   if (lw && (uint32_t)le == 0x40197C80u
                       && (mfc->resv_data[0x70] | mfc->resv_data[0x71])) {
-                      spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ } }
+                      /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
+                       * site above; same-thread self-raise, relaxed order. */
+                      atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ } }
                 mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
                 mfc->tag_completed |= (1u << tag);
                 return 0;
@@ -1648,7 +1656,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             { extern uint32_t spu_coh_gen(uint32_t);
               uint64_t le = ea & ~127ull; uint32_t g = spu_coh_gen((uint32_t)le);
               if (mfc->resv_ea == le && g != mfc->resv_gen) {
-                  spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ }
+                  /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
+                       * site above; same-thread self-raise, relaxed order. */
+                      atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ }
               /* IDLE-POLL BACKOFF (2026-07-03; kill-switch YZ_NO_SPUBACKOFF).
                * The SPURS kernels poll their management lines with GETLLAR at
                * full host speed -- measured 5 SPU threads x ~97% of a core --
@@ -1702,7 +1712,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
               if (lw && (uint32_t)(ea & ~127ull) == 0x40197C80u
                   && (line[0x70] | line[0x71])) {
-                  spu->event_status |= 0x400u; spu_ch_wake(spu); /* s39 */ } }
+                  /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
+                       * site above; same-thread self-raise, relaxed order. */
+                      atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ } }
             /* THROWAWAY DIAG (env YZ_SIGW): does the SPU kernel's GETLLAR of the SPURS
              * mgmt line ever SEE a nonzero wklSignal1 (offset 0x70)? Unconditional (not
              * gated by the wid3-present sampler) so it can't miss the transient signal. */
