@@ -234,6 +234,43 @@ def compute_bi_r0_jumps(insns, logical_bounds) -> set:
     return jumps
 
 
+def form_regions(insns: list[SPUInstruction], region_starts: set, cap: int) -> list[tuple[int, int]]:
+    """s41 SPU REGION LIFT (--regions): split the (dense, 4-aligned) image
+    instruction stream into regions per the reviewed design -- split at (a)
+    known function starts (`region_starts`: REAL subroutine-entry addresses --
+    see main()'s construction of this set, which is deliberately narrower than
+    find_spu_functions' full --seed-all seed list; design mechanic 1 is
+    explicit that plain branch targets are NOT a split, only function starts
+    are) and (b) a size cap, cutting wherever the cap is hit. Every cut point
+    is safe: lift_region() labels and cases EVERY pc, and a branch/call whose
+    target lands in the adjacent region degrades to the existing cross-region
+    trampoline/call path rather than an illegal cross-function goto (design
+    [REV] 3, review (d)). Returns a sorted list of (start, end) tuples that
+    partitions every insn address exactly once.
+    """
+    addrs = sorted(i.addr for i in insns)
+    if not addrs:
+        return []
+    starts = set(region_starts)
+    regions: list[tuple[int, int]] = []
+    region_start = addrs[0]
+    count = 0
+    for idx, a in enumerate(addrs):
+        if a != region_start and a in starts:
+            regions.append((region_start, a))
+            region_start = a
+            count = 0
+        count += 1
+        if count >= cap and idx + 1 < len(addrs):
+            nxt = addrs[idx + 1]
+            if nxt == a + 4:   # contiguous -- safe to cut cleanly here
+                regions.append((region_start, nxt))
+                region_start = nxt
+                count = 0
+    regions.append((region_start, addrs[-1] + 4))
+    return regions
+
+
 class SPULifter:
     def __init__(self, trace: bool = False):
         self.functions: list[LiftedFunction] = []
@@ -246,6 +283,12 @@ class SPULifter:
         # round-1 early-exit.
         self.unresolved_calls: list[int] = []
         self.trace = trace
+        # s41 SPU REGION LIFT (--regions): count of cross-region call/branch
+        # targets that were NOT found in the region owner map and had to fall
+        # back to the global spu_indirect_branch dispatch (safe, but should be
+        # ~0 for a fully-covered single-image lift like gs_task -- surfaced in
+        # the CLI summary so a nonzero count is visible, not silent).
+        self.region_fallback_hits = 0
         self.header_name = "spu_recomp.h"   # what emit_source #includes
         self.register_name = "spu_recomp_register"  # global init fn name
         # Per-image C symbol prefix for the emitted functions. Images that load
@@ -312,6 +355,68 @@ class SPULifter:
         self.functions.append(func)
         return func
 
+    # ------------------------------------------------------------------ #
+    def lift_region(self, insns: list[SPUInstruction], start: int, end: int,
+                     pc_to_region: dict) -> LiftedFunction:
+        """s41 SPU REGION LIFT (--regions): emit ONE region-spanning function
+        covering [start, end) instead of one function per instruction. Mirrors
+        lift_function()'s per-instruction translation (same _translate(), same
+        rr_bin/etc tables) but with region-scoped control flow:
+
+          * entry: `switch ((uint32_t)ctx->pc) { case <every pc>: goto
+            loc_<pc>; ... default: <loud error>; }` -- preserves seed-all's
+            enter-at-any-pc (design [REV] 2, review R8/R5).
+          * every pc gets a `loc_<pc>:` label (not just branch targets) so
+            in-region control transfer is always a plain `goto` -- the SAME
+            label name _translate()/_uncond_branch() already emit for
+            "internal" targets (func.start_addr <= tgt < func.end_addr), so
+            no change was needed to the goto-emission side at all.
+          * cross-region control transfers set ctx->pc THEN hand off (the
+            [REV] 1 emitter invariant) -- see the pc_to_region-guarded
+            branches inside _translate()/_uncond_branch().
+        """
+        func = LiftedFunction(name=f"spu_region_{start:08X}", start_addr=start, end_addr=end)
+        region_insns = sorted((i for i in insns if start <= i.addr < end), key=lambda x: x.addr)
+
+        # Entry switch: case every registered pc in the region (dense ->
+        # MSVC jump table) + a LOUD default (design [REV] 2, review R8). A pc
+        # that reaches default is a genuinely corrupted resume -- every real
+        # instruction start in the region is cased below.
+        func.body_lines.append("switch ((uint32_t)ctx->pc) {")
+        for insn in region_insns:
+            func.body_lines.append(f"case 0x{insn.addr:08X}u: goto loc_{insn.addr:08X};")
+        func.body_lines.append("default:")
+        func.body_lines.append(
+            f'    fprintf(stderr, "[spu-region] pc=0x%05X not a case in '
+            f'spu_region_{start:08X} (image=%d)\\n", ctx->pc, ctx->image_id); '
+            f'fflush(stderr);')
+        func.body_lines.append("    spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);")
+        func.body_lines.append("    return;")
+        func.body_lines.append("}")
+
+        last_insn = None
+        for insn in region_insns:
+            func.body_lines.append(f"loc_{insn.addr:08X}:")
+            c = self._translate(insn, func, pc_to_region)
+            if c:
+                func.body_lines.append(f"    {c}")
+            last_insn = insn
+
+        # Fall-through: regions tile the image contiguously by construction,
+        # so `end` is either the next region's start (a real case in THAT
+        # region's switch) or past the last instruction of the image. Same
+        # tail-transfer shape as lift_function's chaining, generalized to
+        # regions (and already pc-materialized, matching [REV] 1).
+        _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
+        if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
+                and end in pc_to_region):
+            func.body_lines.append(
+                f"    {{ ctx->pc = 0x{end:X}u; g_spu_trampoline_fn = "
+                f"spu_region_{end:08X}; return; }}")
+
+        self.functions.append(func)
+        return func
+
     @staticmethod
     def _branch_target(insn: SPUInstruction):
         mn = insn.mnemonic
@@ -337,7 +442,15 @@ class SPULifter:
         return None
 
     # ------------------------------------------------------------------ #
-    def _translate(self, insn: SPUInstruction, func: LiftedFunction) -> str:
+    def _translate(self, insn: SPUInstruction, func: LiftedFunction,
+                    pc_to_region: dict = None) -> str:
+        # pc_to_region is None on every existing (legacy/DIAG) call site --
+        # lift_function() never passes it -- so every branch below guarded by
+        # `pc_to_region is not None` is DEAD in DIAG mode and the emitted text
+        # is byte-identical to before this parameter existed. Only lift_region()
+        # (s41 --regions) passes a real dict, activating the pc-materialization
+        # invariant ([REV] 1/4: ctx->pc must be set before every trampoline set
+        # or region call -- see scratch/s41_spu_region_lift_design.md).
         mn = insn.mnemonic
         ops = _ops(insn.operands)
         addr = insn.addr
@@ -365,7 +478,10 @@ class SPULifter:
         if mn == "stop":
             # F18: capture the 14-bit stop code (disasm emits it as ops[0]) so the
             # driver can dispatch the stop-and-signal protocol (thread/group exit).
-            return f"ctx->stop_code = {_imm(ops[0])}; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            # [REV] 4/5: materialize pc before a stop in region mode (a stop/halt
+            # site) -- no-op in legacy (pc_set == "").
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return f"{pc_set}ctx->stop_code = {_imm(ops[0])}; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -393,7 +509,8 @@ class SPULifter:
             return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
         if mn == "stopd":
             # stopd's stop code is architecturally fixed at 0x3FFF (CBEA p97).
-            return "ctx->stop_code = 0x3FFF; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return f"{pc_set}ctx->stop_code = 0x3FFF; ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
@@ -547,15 +664,22 @@ class SPULifter:
             return f"spu_ls_write128(ctx, {g(ra())}._u32[0] + {g(rb())}._u32[0], {g(rt())});"
 
         # ---- channel ops ----
+        # [REV] 4/5: materialize ctx->pc before every channel call in region
+        # mode -- spu_ch_wait's [ch-block]/[ch-wait] diagnostics log ctx->pc,
+        # and would otherwise read a stale/region-granular pc (spu_channels.c
+        # ~1092/1116). No-op in legacy (pc_set == "").
         if mn == "rdch":
-            return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return f"{pc_set}{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
-            return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return f"{pc_set}{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return f"{pc_set}spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -565,8 +689,9 @@ class SPULifter:
             # `goto loc_self` busy-spins the host thread forever; stop the SPU
             # instead (same halt path the lifter emits for a `stop` instruction).
             if tgt == addr:
-                return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
-            return self._uncond_branch(tgt, func)
+                pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+                return f"{pc_set}ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+            return self._uncond_branch(tgt, func, pc_to_region)
         if mn in ("brsl", "brasl"):
             # The disassembler drops the link register from brsl operands, so
             # recover it from the raw encoding (rt = bits 25-31 = raw & 0x7F).
@@ -582,7 +707,8 @@ class SPULifter:
             # boot in cri_audio_00023C58). Set the link, then stop the SPU (same
             # halt path the lifter emits for a `stop` instruction).
             if tgt == addr:
-                return f"{link} ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+                pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+                return f"{link} {pc_set}ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
             # PC-GETTER IDIOM: `brsl rX, .+4` (target == next instruction) just
             # loads PC+4 into rX for PC-relative addressing / computed jump tables;
             # it is NOT a real call. Emitting a host call here imbalances the C
@@ -592,7 +718,7 @@ class SPULifter:
             # landed back inside its own clear loop, running it with a stale count).
             # Treat it as: set the link, then fall through to addr+4.
             if tgt == addr + 4:
-                return f"{link} {self._uncond_branch(addr + 4, func)}"
+                return f"{link} {self._uncond_branch(addr + 4, func, pc_to_region)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 # Call, then drain any tail-call the callee left pending so
@@ -605,9 +731,31 @@ class SPULifter:
                 # inside the callee (dispatcher serve, foreign adoption, drain
                 # tail-chain hops) is scoped to the call and cannot leak into
                 # this function's continuation.
-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                #
+                # [REV] 3: under regions, the callee is no longer a per-address
+                # symbol -- it's the REGION that CONTAINS tgt, entered via its
+                # `switch (ctx->pc)`, so ctx->pc = tgt MUST be set before the
+                # call (design brief §3 direct-call idiom). Legacy (pc_to_region
+                # is None) is unaffected: the callee ignores ctx->pc and this
+                # produces byte-identical text to before.
+                if pc_to_region is not None:
+                    owner = pc_to_region.get(tgt)
+                    pc_set = f"ctx->pc = 0x{tgt:X}u; "
+                    if owner is not None:
+                        callee = f"spu_region_{owner:08X}(ctx);"
+                    else:
+                        # Not found in this image's region map (should not
+                        # happen for a fully-covered single-image lift) --
+                        # fall back to the global indirect dispatcher instead
+                        # of guessing an unlinkable symbol name.
+                        self.region_fallback_hits += 1
+                        callee = "spu_indirect_branch(ctx);"
+                else:
+                    pc_set = ""
+                    callee = f"{self.func_prefix}{tgt:08X}(ctx);"
+                return (f"{link} {pc_set}{{ int32_t _si = (int32_t)ctx->image_id; "
                         f"ctx->host_depth++; "
-                        f"{self.func_prefix}{tgt:08X}(ctx); SPU_DRAIN(ctx); "
+                        f"{callee} SPU_DRAIN(ctx); "
                         f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             self.unresolved_calls.append(addr)
             return f"{link} /* TODO spu: brsl unresolved target */;"
@@ -621,7 +769,23 @@ class SPULifter:
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail call: hand
             # the target to the trampoline and unwind (see SPU_DRAIN).
-            return (f"if ({cond}) {{ g_spu_trampoline_fn = {self.func_prefix}{tgt:08X}; "
+            # [REV] 1: under regions the trampoline target's entry switch
+            # CONSUMES ctx->pc, so it must be set before the trampoline fn
+            # (this was the review's CONFIRMED HOLE -- "exactly as today" was
+            # false for this exact site). Legacy (pc_to_region is None) is
+            # unaffected -- byte-identical to before.
+            if pc_to_region is not None:
+                owner = pc_to_region.get(tgt)
+                pc_set = f"ctx->pc = 0x{tgt:X}u; "
+                if owner is not None:
+                    tgt_sym = f"spu_region_{owner:08X}"
+                else:
+                    self.region_fallback_hits += 1
+                    tgt_sym = "spu_indirect_branch"
+            else:
+                pc_set = ""
+                tgt_sym = f"{self.func_prefix}{tgt:08X}"
+            return (f"if ({cond}) {{ {pc_set}g_spu_trampoline_fn = {tgt_sym}; "
                     f"return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
@@ -717,14 +881,28 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
-    def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
+    def _uncond_branch(self, tgt, func: LiftedFunction, pc_to_region: dict = None) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
         # Cross-function unconditional branch = tail call: trampoline + unwind.
-        return f"{{ g_spu_trampoline_fn = {self.func_prefix}{tgt:08X}; return; }}"
+        # [REV] 1: same CONFIRMED HOLE as the conditional-branch case above --
+        # ctx->pc must be set before the trampoline fn in region mode. Legacy
+        # (pc_to_region is None) is unaffected -- byte-identical to before.
+        if pc_to_region is not None:
+            owner = pc_to_region.get(tgt)
+            pc_set = f"ctx->pc = 0x{tgt:X}u; "
+            if owner is not None:
+                tgt_sym = f"spu_region_{owner:08X}"
+            else:
+                self.region_fallback_hits += 1
+                tgt_sym = "spu_indirect_branch"
+        else:
+            pc_set = ""
+            tgt_sym = f"{self.func_prefix}{tgt:08X}"
+        return f"{{ {pc_set}g_spu_trampoline_fn = {tgt_sym}; return; }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -786,6 +964,54 @@ class SPULifter:
         lines.append("")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------ #
+    # s41 SPU REGION LIFT (--regions) emission. Separate from emit_header/
+    # emit_source (rather than parametrizing them) so the DIAG path above is
+    # untouched code, not code with a new branch threaded through it --
+    # the no-regression proof is "the DIAG emitter wasn't edited," not "the
+    # edited DIAG emitter still produces the same bytes."
+    def emit_region_header(self) -> str:
+        lines = [HEADER_PREAMBLE, ""]
+        for f in self.functions:
+            lines.append(f"void {f.name}(spu_context* ctx);")
+        lines.append("")
+        lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
+        lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
+        lines.append("/* Call once at init to register this image's functions for")
+        lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
+        lines.append(f"void {self.register_name}(void);")
+        lines.append("")
+        return "\n".join(lines)
+
+    def emit_region_source(self, pc_to_region: dict) -> str:
+        lines = [SOURCE_PREAMBLE.replace("{header_name}", self.header_name), ""]
+        for f in self.functions:
+            lines.append(f"void {f.name}(spu_context* ctx) {{")
+            for b in f.body_lines:
+                lines.append(b if b.endswith(":") else f"    {b}")
+            lines.append("}")
+            lines.append("")
+
+        # Per-pc registration table: EVERY instruction address in the image
+        # maps to the region function that CONTAINS it (design mechanic 3/5;
+        # review (g)) -- same table shape as the per-instruction seed-all
+        # build, just far fewer distinct function pointers behind it.
+        lines.append("/* Function table -- every pc maps to its containing region (s41 region lift) */")
+        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
+        lines.append("static const spu_func_entry spu_function_table[] = {")
+        for addr in sorted(pc_to_region.keys()):
+            owner = pc_to_region[addr]
+            lines.append(f'    {{ 0x{addr:08X}u, spu_region_{owner:08X}, "spu_region_{owner:08X}" }},')
+        lines.append("    { 0, NULL, NULL }")
+        lines.append("};")
+        lines.append("")
+        lines.append(f"void {self.register_name}(void) {{")
+        lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+        lines.append("        spu_register_function(e->addr, e->func);")
+        lines.append("}")
+        lines.append("")
+        return "\n".join(lines)
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -834,7 +1060,29 @@ def main() -> None:
                         "dispatcher never halts 'unknown branch'. Over-seeds heavily "
                         "(one C function per instruction) -- only for small, "
                         "perf-noncritical images like the policy module.")
+    p.add_argument("--regions", action="store_true",
+                   help="s41 SPU REGION LIFT: emit multi-instruction REGION "
+                        "functions (internal goto/labels, trampoline only at "
+                        "region boundaries) instead of one C function per "
+                        "instruction -- the FAST build path. See "
+                        "scratch/s41_spu_region_lift_design.md. Off by default; "
+                        "--seed-all is ignored when this is set (regions "
+                        "supersede it -- every pc is still registered, just "
+                        "grouped behind far fewer functions). Refuses --trace "
+                        "(DIAG covers per-instruction tracing).")
+    p.add_argument("--region-cap", type=int, default=256,
+                   help="Max instructions per region before a forced cut "
+                        "(design [REV] 7 / review R4: start at 256-512, raise "
+                        "only after measuring /O2 compile time). Only used "
+                        "with --regions.")
     args = p.parse_args()
+
+    if args.regions and args.trace:
+        print("ERROR: --trace is not supported with --regions (DIAG is the "
+              "per-instruction trace substrate; use a non-region lift for "
+              "tracediff.py work). See design [REV] 7 / review R7.",
+              file=sys.stderr)
+        sys.exit(1)
 
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text
@@ -876,6 +1124,33 @@ def main() -> None:
 
     insns = disassemble_spu(data, base)
 
+    region_starts = None
+    if args.regions:
+        if args.auto_functions:
+            # DELIBERATELY narrower than `logical_bounds` here: find_spu_functions'
+            # detected-function list also seeds every plain branch target,
+            # jump-table word, ila-immediate, and computed-branch landing site
+            # (all needed for --seed-all's enter-at-any-pc coverage). Forcing a
+            # region split at EVERY one of those defeats the region model's
+            # whole purpose -- measured: 527 regions for gs_task (many
+            # singletons) when logical_bounds was fed directly to
+            # form_regions(). Design mechanic 1 is explicit that plain branch
+            # targets are NOT a split, only real function starts are; the real
+            # ones are brsl/brasl call targets + indirect-call (bisl family)
+            # return points. The rest still get full coverage regardless (the
+            # entry switch cases every pc; a branch/call landing on any of
+            # them just resolves via pc_to_region as an internal goto or a
+            # cross-region hop -- never a missing case).
+            from find_spu_functions import collect_brsl_targets
+            region_starts = set(collect_brsl_targets(insns))
+            for ins in insns:
+                if ins.mnemonic in ("bisl", "bisld", "bisle"):
+                    region_starts.add(ins.addr + 4)
+        else:
+            # --functions gave an explicit, non-over-seeded boundary list (or
+            # main() fell back to the single whole-image span); use it as-is.
+            region_starts = {s for s, _e in logical_bounds}
+
     lifter = SPULifter(trace=args.trace)
     lifter.header_name = args.header_name
     lifter.register_name = args.register_name
@@ -885,13 +1160,82 @@ def main() -> None:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
               f"(r0 reloaded via lqa/lqr): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
+    os.makedirs(args.output, exist_ok=True)
+    hp = os.path.join(args.output, args.header_name)
+    sp = os.path.join(args.output, args.source_name)
+
+    if args.regions:
+        # s41 SPU REGION LIFT: split the WHOLE image into regions from the
+        # real (pre-seed-all) function boundaries + a size cap, register
+        # every pc -> containing region (design mechanic 1/3; review (g)).
+        regions = form_regions(insns, region_starts, args.region_cap)
+        pc_to_region: dict = {}
+        for (rs, re_) in regions:
+            for insn in insns:
+                if rs <= insn.addr < re_:
+                    pc_to_region[insn.addr] = rs
+        for (rs, re_) in regions:
+            lifter.lift_region(insns, rs, re_, pc_to_region)
+
+        header_text = lifter.emit_region_header()
+        source_text = lifter.emit_region_source(pc_to_region)
+        with open(hp, "w") as f:
+            f.write(header_text)
+        with open(sp, "w") as f:
+            f.write(source_text)
+
+        print(f"Wrote {hp}")
+        print(f"Wrote {sp}")
+        print(f"  REGION LIFT: {len(regions)} region(s) (cap={args.region_cap}), "
+              f"{len(insns)} insn(s) total")
+        for (rs, re_) in regions:
+            n = sum(1 for a in range(rs, re_, 4) if a in pc_to_region)
+            print(f"      spu_region_{rs:08X} [0x{rs:X}, 0x{re_:X}): {n} insn(s)")
+        if lifter.region_fallback_hits:
+            print(f"  WARNING: {lifter.region_fallback_hits} cross-region call/branch "
+                  f"target(s) fell back to the global indirect dispatcher (not found "
+                  f"in the region owner map -- investigate before trusting the lift).")
+        if lifter.unresolved_calls:
+            print(f"  WARNING: {len(lifter.unresolved_calls)} brsl/brasl call(s) with "
+                  f"UNRESOLVED targets lifted as NO-OPS (dropped calls = miscompile!): "
+                  + ", ".join(f"0x{a:X}" for a in lifter.unresolved_calls[:12])
+                  + (" ..." if len(lifter.unresolved_calls) > 12 else ""))
+        if lifter.unsupported:
+            total = sum(lifter.unsupported.values())
+            print(f"  {total} unsupported instruction(s) across "
+                  f"{len(lifter.unsupported)} mnemonic(s):")
+            for mn, n in sorted(lifter.unsupported.items(), key=lambda kv: -kv[1]):
+                print(f"      {mn:<10s} {n}")
+
+        # [REV] 1 HARD ASSERTION (design's own required check): every
+        # `g_spu_trampoline_fn =` site in the generated source must be
+        # preceded, on the SAME line, by a `ctx->pc = ` store -- every
+        # trampoline-set emission in this file is a single-line block, so a
+        # same-line substring-position check is exact, not a heuristic.
+        total_hops = 0
+        bad_hops = []
+        for lineno, line in enumerate(source_text.splitlines(), 1):
+            idx = line.find("g_spu_trampoline_fn =")
+            if idx < 0:
+                continue
+            total_hops += 1
+            if "ctx->pc = " not in line[:idx] and "ctx->pc=" not in line[:idx]:
+                bad_hops.append((lineno, line.strip()))
+        if bad_hops:
+            print(f"  ASSERTION FAILED: {len(bad_hops)}/{total_hops} "
+                  f"g_spu_trampoline_fn site(s) missing a preceding ctx->pc store "
+                  f"(the [REV] 1 emitter invariant is violated):")
+            for ln, txt in bad_hops[:20]:
+                print(f"      line {ln}: {txt}")
+            sys.exit(1)
+        print(f"  PASS: emitter invariant holds -- {total_hops}/{total_hops} "
+              f"g_spu_trampoline_fn site(s) have ctx->pc materialized first")
+        return
+
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
 
-    os.makedirs(args.output, exist_ok=True)
-    hp = os.path.join(args.output, args.header_name)
-    sp = os.path.join(args.output, args.source_name)
     with open(hp, "w") as f:
         f.write(lifter.emit_header())
     with open(sp, "w") as f:
