@@ -945,7 +945,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpwi" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = (int64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplwi", "cmpldi"):
@@ -960,7 +960,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplwi" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = (uint64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmpw", "cmpd"):
@@ -975,7 +975,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpw" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplw", "cmpld"):
@@ -990,7 +990,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplw" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- Branches -------
@@ -1607,9 +1607,33 @@ class PPULifter:
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"ppu_res_stdcx(ctx, ea, ctx->gpr[{rs}]); }}")
 
-        # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
-        if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
-            return f"/* trap: {mn} {insn.operands} — ignored */;"
+        # ------- Trap (tw/twi/td/tdi) -------
+        # TO bits select the trap conditions: 0x10 s<, 0x08 s>, 0x04 ==,
+        # 0x02 u<, 0x01 u>. tw/twi compare 32-bit values, td/tdi 64-bit.
+        # Games use traps as assertions; a TAKEN trap is logged (capped) via
+        # ppc_trap and execution continues (the old emission ignored the
+        # compare entirely, so a firing assertion was invisible).
+        if mn in ("tw", "twi", "td", "tdi"):
+            to = int(ops[0], 0)
+            ra_i = _reg_idx(ops[1])
+            wide = mn in ("td", "tdi")
+            cast = "(int64_t)" if wide else "(int32_t)"
+            ucast = "(uint64_t)" if wide else "(uint32_t)"
+            if mn in ("twi", "tdi"):
+                b_expr = f"{cast}{_imm(ops[2])}"
+            else:
+                b_expr = f"{cast}ctx->gpr[{_reg_idx(ops[2])}]"
+            if to == 0:
+                return f";  /* trap: {mn} TO=0 never taken */"
+            conds = []
+            if to & 0x10: conds.append("(a < b)")
+            if to & 0x08: conds.append("(a > b)")
+            if to & 0x04: conds.append("(a == b)")
+            if to & 0x02: conds.append(f"({ucast}a < {ucast}b)")
+            if to & 0x01: conds.append(f"({ucast}a > {ucast}b)")
+            it = "int64_t" if wide else "int32_t"
+            return (f"{{ {it} a = {cast}ctx->gpr[{ra_i}]; {it} b = {b_expr}; "
+                    f"if ({' || '.join(conds)}) ppc_trap(0x{addr:08X}u); }}")
 
         # ------- Byte-reverse loads/stores -------
         if mn == "lwbrx":
@@ -1807,20 +1831,25 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            # These load a single element into the vector register.
-            # For simplicity, zero the register and load at the element position.
+            # Element load: EA is masked to the element alignment and the
+            # element lands at VR byte lane EA & 0xF (raw guest-byte-order
+            # convention, same as lvx/vperm). The other 15/14/12 bytes are
+            # architecturally UNDEFINED, so loading the whole containing
+            # aligned quadword is conformant, places the element in the right
+            # lane for free, and cannot cross a page (16B block in a 4K page).
             size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
-            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"memset(&ctx->vr[{vd}], 0, 16); "
-                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
+            return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~{size - 1:#x}ULL; "
+                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), 16); }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
+            # Element store: only the element's bytes are written, taken from
+            # VR byte lane EA & 0xF, to the alignment-masked EA.
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
-            return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
+            return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~{size - 1:#x}ULL; "
+                    f"memcpy(vm_base + (uint32_t)ea, (uint8_t*)&ctx->vr[{vs}] + (ea & 0xF), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2724,6 +2753,21 @@ class PPULifter:
         lines.append("    return (rotated & mask) | (ra & ~mask);")
         lines.append("}")
         lines.append("")
+        lines.append("/* Trap family (tw/twi/td/tdi): lv2 turns a taken trap into an exception;")
+        lines.append(" * games use traps as assertions. Log (capped, per-TU) and continue -- a")
+        lines.append(" * taken trap in a healthy boot is itself a diagnostic worth surfacing. */")
+        lines.append("static int g_ppc_trap_hits;")
+        lines.append("static inline void ppc_trap(uint32_t addr) {")
+        lines.append("    static int logged;")
+        lines.append("    g_ppc_trap_hits++;")
+        lines.append("    if (logged < 32) {")
+        lines.append("        logged++;")
+        lines.append('        fprintf(stderr, "[trap] guest trap TAKEN at 0x%08X (hit %d this TU)\\n",')
+        lines.append("                addr, g_ppc_trap_hits);")
+        lines.append("        fflush(stderr);")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
         # 64-bit rotate helpers
         lines.append("/* 64-bit rotate helpers */")
         lines.append("static inline uint64_t ppc_rotl64(uint64_t v, int n) {")
@@ -2974,7 +3018,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         table_base = read_u32((toc + disp) & 0xFFFFFFFF)
         if table_base is None:
             continue
-        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
+        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT` -- a
+        # HINT only, never a hard cap: the 30-insn backward window spans
+        # sibling basic blocks, so it can latch a per-case or post-call test
+        # (`cmpwi cr7, r3, 0`) instead of the real bounds check and silently
+        # truncate the table (the 0xFB7F10 dispatcher shipped 1 entry of 25
+        # that way; 3 of its 4 handlers were reachable ONLY via the table and
+        # never got lifted). Scan generously; the per-entry validation plus
+        # the structural stop below find the true end. (Structural-stop
+        # approach adopted from the dev/cellmark fork's fix.)
         count = None
         for w in reversed(win):
             if w.mnemonic in ('cmplwi', 'cmpwi'):
@@ -2985,9 +3037,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 break
         if count is None or count < 0 or count > 4096:
             count = 256
+        scan = min(max(count + 1, 256), 4096)
         targets = []
-        for k in range(count + 1):
-            v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
+        for k in range(scan):
+            ea = (table_base + k * 4) & 0xFFFFFFFF
+            # Structural end-of-table: a jump table never overlaps the code it
+            # dispatches to, so once the cursor reaches the lowest case target
+            # that lies AHEAD of the table base, the table has ended (the
+            # gcc/SN layout puts the table immediately before its cases).
+            # Forward targets only -- a table whose cases branch backwards
+            # must not bound at k=0.
+            fwd = [t for t in targets if t > table_base]
+            if fwd and ea >= min(fwd):
+                break
+            v = read_u32(ea)
             if v is None:
                 break
             if is_offset:
