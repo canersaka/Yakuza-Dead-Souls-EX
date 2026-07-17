@@ -118,8 +118,13 @@ static int yz_bdrain_on(void)
     if (on < 0) {
         on = getenv("YZ_BOUNDARY_DRAIN") ? 1 : 0;
         if (on) {
-            fprintf(stderr, "[bdrain] ARMED (boundary drain tier-1: fire-all-pending (read-guarded) "
-                    "+ neutralize, Doors-1/2; kill: unset YZ_BOUNDARY_DRAIN)\n");
+            const char* dw = getenv("YZ_BDRAIN_DWELL_MS");
+            const char* cp = getenv("YZ_BDRAIN_CAP");
+            fprintf(stderr, "[bdrain] ARMED (iteration C, PARK-TIME FIRE: host FIFO consumer fires the "
+                    "guarded release write for a stopper it has been parked on past "
+                    "YZ_BDRAIN_DWELL_MS=%sms, cap YZ_BDRAIN_CAP=%s/boot; no host LS writes; "
+                    "kill: unset YZ_BOUNDARY_DRAIN)\n",
+                    dw ? dw : "3000", cp ? cp : "64");
             fflush(stderr);
         }
     }
@@ -153,8 +158,9 @@ static void yz_ximg_storm_note(void)
          * reinit burst. Arm here; the drain EXECUTES race-free at the next 0x352C
          * sweep on the consumer ctx (recomp_prx/gs_task.c hand-edit). */
         if (yz_bdrain_on()) {
-            g_yz_bdrain_armed = 1;
-            fprintf(stderr, "[bdrain] storm-arm: transition detected -> drain will fire at next 0x352C on consumer\n");
+            g_yz_bdrain_armed = 1;   /* iteration B latch; retained but no longer gates the fire */
+            fprintf(stderr, "[bdrain] storm-arm: transition detected (informational; iteration C fires "
+                    "at PARK-TIME on the host FIFO consumer, not at 0x352C)\n");
             fflush(stderr);
         }
     }
@@ -705,9 +711,57 @@ static void yz_ls_wr32(spu_context* ctx, uint32_t lsa, uint32_t val)
     ctx->ls[lsa + 2] = (uint8_t)(val >> 8);  ctx->ls[lsa + 3] = (uint8_t)val;
 }
 
-/* The boundary drain. Called from the gs_task 0x352C sweep hand-edit
- * (recomp_prx/gs_task.c). Runs at most once per boot, on the FIRST 0x352C on the
- * consumer ctx after the ximg-storm arms it (first transition only). */
+/* s42 BOUNDARY-DRAIN iteration C -- PARK-TIME FIRE (supersedes the 0x352C-hook
+ * fire of iteration B, now disabled in recomp_prx/gs_task.c). Host-callable:
+ * fires the drain's EXISTING guarded release write for ONE stopper EA -- the one
+ * the host FIFO consumer is provably parked on (yakuza/import_overrides.cpp
+ * [stop-jrnl] site, after the YZ_BDRAIN_DWELL_MS dwell). This is byte-for-byte the
+ * SAME guarded write as yz_bdrain_maybe's fire branch below (RSX-arena bounds
+ * check + JTS self-jump read-guard), lifted out so it runs from the site the
+ * wedged consumer ACTUALLY reaches. Iteration B fired at the 0x352C consumer-reinit
+ * boundary, which is UNREACHABLE once the park forms -- the consumer parks at the
+ * 0x4C24 stopper upstream of reinit and never advances (postmortem
+ * scratch/s42_drainB_postmortem.md Q1: only 1 of 5 boots ever fired; the one that
+ * did, v2, advanced GET past every fired stopper -> the fire MECHANISM is proven).
+ *
+ * relbase is derived as (parked_ea - io_off): a JTS self-jump stopper at FIFO io
+ * offset G reads exactly 0x20000000|G, so (parked_ea - io_off) == the FIFO base EA
+ * and the drain's relword/selfjmp formulas reproduce identically (relbase in fact
+ * cancels; kept explicit to mirror yz_bdrain_maybe's write path verbatim).
+ *
+ * NO LS is touched from the host: the neutralize half stays RETIRED (iteration B),
+ * and the engine's own release machinery is left entirely alone -- this only
+ * rewrites the guest RSX FIFO stopper word the SPU's own MFC PUT would have written.
+ *
+ * HONEST FRAMING: this marries the RETIRED park-release lever's fire-POINT (fire the
+ * game's own journaled release once the GPU has been stranded on the SAME stopper
+ * past a dwell) to the drain's guarded faithful WRITE. It is a BRIDGE, not a root
+ * fix -- WHY our engine stops applying releases post-storm remains OPEN (block-lift
+ * gs_task is the durable road). Iteration B v2 measured that crossing this wall
+ * exposes a downstream guest fault (a 0x23C786AD read); expect new crash flavors
+ * past the wall -- that is PROGRESS, logged loudly by the caller.
+ *
+ * Returns 1 if the guarded write fired, 0 if the guard rejected (already released,
+ * not a parked JTS, or EA outside the RSX FIFO window) -- content is never clobbered. */
+int yz_bdrain_fire_ea(uint32_t parked_ea, uint32_t io_off)
+{
+    if (!yz_bdrain_on())                                        return 0;
+    if (!(parked_ea >= 0x40400000u && parked_ea < 0x40C00000u)) return 0;  /* RSX FIFO window */
+    uint32_t relbase = parked_ea - io_off;
+    uint32_t relword = 0x20000000u | (((parked_ea + 4u) - relbase) & 0x1FFFFFFCu);
+    uint32_t selfjmp = 0x20000000u | ((parked_ea - relbase) & 0x1FFFFFFCu);
+    uint32_t cur = yz_ram_r32be(parked_ea);
+    if (cur == selfjmp) {                 /* still a parked JTS self-jump stopper */
+        yz_ram_w32be(parked_ea, relword);
+        return 1;
+    }
+    return 0;                             /* already-released / not-parked-JTS: leave alone */
+}
+
+/* The boundary drain (iteration B). SUPERSEDED by the park-time fire above:
+ * its 0x352C-hook call in recomp_prx/gs_task.c is now disabled, so this body is
+ * no longer reached. Kept as the reference for the guarded write path (which
+ * yz_bdrain_fire_ea reuses) and the neutralize half (retired with iteration B). */
 void yz_bdrain_maybe(spu_context* ctx)
 {
     if (!yz_bdrain_on())                          return;

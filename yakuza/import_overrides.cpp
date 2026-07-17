@@ -31,6 +31,8 @@
 extern "C" uint8_t* vm_base;
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 extern "C" void yz_fltrec_dump(const char*);   /* s41 flight recorder (runtime/spu/spu_fltrec.c) */
+extern "C" int  yz_bdrain_fire_ea(uint32_t parked_ea, uint32_t io_off);  /* s42 park-time boundary drain (runtime/spu/spu_channels.c) */
+extern "C" void yz_fltrec_dump(const char* reason);                      /* s42 broken-phase dump rides the drain fire */
 /* s40b v2: the GPU-parked stopper EA, published by the FIFO park tracker below for
  * the SPU-side targeted unstick (gs_task.c YZ_QROT_UNSTICK). 0 = not parked >2s. */
 extern "C" { uint32_t g_yz_parked_pub_ea = 0; }
@@ -2189,6 +2191,64 @@ static int yz_rsx_fifo_step(void)
              * for the item carrying THIS release (not a blind lottery). >2s parked
              * = published; resets to 0 on any new park until it matures. */
             g_yz_parked_pub_ea = (parked_ms > 2000) ? ea : 0;
+            /* s42 BOUNDARY-DRAIN iteration C -- PARK-TIME FIRE (YZ_BOUNDARY_DRAIN,
+             * default OFF). The postmortem (scratch/s42_drainB_postmortem.md) proved
+             * iteration B's fire MECHANISM sound (v2's fired release advanced GET past
+             * every stopper) but its 0x352C-reinit fire SITE unreachable once the park
+             * forms. Move the trigger HERE, to the site the wedged consumer actually
+             * reaches: when the host FIFO consumer has been parked on the SAME jump-to-
+             * self stopper past YZ_BDRAIN_DWELL_MS (default 3000ms), fire the drain's
+             * existing guarded release write for THIS stopper EA only (RSX-window bounds
+             * + JTS self-jump read-guard, in spu_channels.c -- NO host LS writes). Re-fire
+             * is allowed per NEW distinct park (io/ea changes), capped at YZ_BDRAIN_CAP/
+             * boot (default 64). BRIDGE, not a root fix: this is the retired park-release
+             * lever's fire-point married to the drain's guarded faithful write; WHY our
+             * engine stops applying releases post-storm is OPEN (durable road = block-lift
+             * gs_task). v2 measured that crossing the wall exposes a downstream guest
+             * fault, so expect new crash flavors past it (that is progress). */
+            {
+                static int      bd_on    = -1;
+                static unsigned bd_dwell = 3000u, bd_cap = 64u;
+                if (bd_on < 0) {
+                    bd_on = getenv("YZ_BOUNDARY_DRAIN") ? 1 : 0;
+                    const char* d = getenv("YZ_BDRAIN_DWELL_MS"); if (d) bd_dwell = (unsigned)atoi(d);
+                    const char* c = getenv("YZ_BDRAIN_CAP");      if (c) bd_cap   = (unsigned)atoi(c);
+                }
+                if (bd_on) {
+                    static uint32_t bd_acted_ea = 0;   /* last EA acted on (fire or skip) -- gates re-fire to NEW distinct parks */
+                    static unsigned bd_fires    = 0;   /* successful guarded writes this boot */
+                    if (parked_ms > bd_dwell && ea != bd_acted_ea && bd_fires < bd_cap) {
+                        const uint32_t ring = vm_read32(ea);
+                        fprintf(stderr, "[bdrain] FIRE: park-time -> parked=%llums @io 0x%06X ea=0x%08X ring@ea=0x%08X (fired so far=%u/%u)\n",
+                                (unsigned long long)parked_ms, get, ea, ring, bd_fires, bd_cap);
+                        fflush(stderr);
+                        const int fired = yz_bdrain_fire_ea(ea, get);
+                        bd_acted_ea = ea;   /* do not re-attempt this EA until a NEW distinct park forms */
+                        if (fired) {
+                            bd_fires++;
+                            fprintf(stderr, "[bdrain] SUMMARY: FIRED release for ea=0x%08X (io 0x%06X); GET should advance past it next step. fires=%u/%u\n",
+                                    ea, get, bd_fires, bd_cap);
+                            /* s42: broken-phase recorder dump rides the drain — the drain
+                             * fires only in the post-storm dead-engine phase, and the
+                             * park-30s trigger can never fire while the drain keeps parks
+                             * short. YZ_BDRAIN_DUMP_AT_FIRE=N dumps the flight-recorder
+                             * ring at the Nth successful fire (solidly mid-broken-phase). */
+                            { static int dump_at = -2;
+                              if (dump_at == -2) { const char* s = getenv("YZ_BDRAIN_DUMP_AT_FIRE");
+                                                   dump_at = s ? atoi(s) : -1; }
+                              if (dump_at > 0 && (int)bd_fires == dump_at) {
+                                  fprintf(stderr, "[bdrain] DUMP trigger: fire #%u -> fltrec dump (broken-phase capture)\n", bd_fires);
+                                  yz_fltrec_dump("bdrain-fire");
+                              } }
+                            fprintf(stderr, "[bdrain] NOTE: past-wall territory -- releasing this stopper crosses the wedge; a downstream guest fault beyond here is PROGRESS, not a drain failure (postmortem v2: 0x23C786AD read).\n");
+                        } else {
+                            fprintf(stderr, "[bdrain] SUMMARY: SKIP ea=0x%08X (ring@ea=0x%08X not a parked JTS self-jump / out of RSX window) -- no write. fires=%u/%u\n",
+                                    ea, ring, bd_fires, bd_cap);
+                        }
+                        fflush(stderr);
+                    }
+                }
+            }
             /* s33 0x4C24 discriminator (STATUS ⚡ #1, always-on, low-volume):
              * at any >=5 s stopper park, LEVER ON OR OFF, say whether the
              * game's tag-0x7F journal holds this stopper's release entry.
