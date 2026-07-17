@@ -516,6 +516,11 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_context* sctx = t->sctx;
 
+    /* s42 YZ_SPU_LOCKSTEP: register at thread entry, BEFORE any lifted SPU
+     * code runs -- yz_lockstep_register blocks until this ctx actually holds
+     * the run token. No-op when YZ_SPU_LOCKSTEP is unset. */
+    yz_lockstep_register(sctx);
+
 #ifdef _WIN32
     /* pt35e: reserve stack so the unhandled-exception filter (yz_crash_handler) can
      * still RUN on a STACK OVERFLOW. The SPURS dispatch overflows via a brsl call/return
@@ -552,6 +557,12 @@ static void* spu_exec_thread_proc(void* arg)
     g_spu_restart_jmp = 0;
     g_spu_stack_base = 0;
     g_spu_trampoline_fn = 0;
+
+    /* s42 YZ_SPU_LOCKSTEP: unregister in the outermost frame -- this thread is
+     * really done running lifted SPU code (the context-replacement/restart
+     * longjmp above re-enters at `restart_jb`, INSIDE the setjmp block, so it
+     * never reaches here without a genuine halt/stop). No-op when unset. */
+    yz_lockstep_unregister(sctx);
 
     fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X)\n",
             t->tid, sctx->status, sctx->pc, sctx->stop_code);
