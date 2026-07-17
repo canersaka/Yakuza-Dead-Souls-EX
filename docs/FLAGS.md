@@ -64,6 +64,7 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_ADX_RELEASE_TEST` | libs/filesystem/cellFs.c (`yz_adx_release_test_tick`) | **2026-07-04, decisive control-flow experiment (default OFF), independent of `YZ_ADX_HLE`.** Fires the SAME two calls a real ADX decode batch would (`yz_adx_hle_advance_adxm` + `yz_adx_hle_release_spurs_waiter`, i.e. advance ADXM `0x01613368+0x294/+298/+29C` to a fabricated monotonic "N blocks decoded" value, then call the guest's real `cellSpursEventFlagSet` on `0x63D61720` with all bits set) UNCONDITIONALLY on every `.cvm`/voice-stream `cellFsRead`, with NO real decode (silent/zero PCM â€” tests the control-flow release only, not audio). Purpose: settle whether the SPURS-release lever is even the right one BEFORE building an AHX/MPEG-Layer-II decoder (YZ_ADX_HLE was measured inert on the real stream â€” it's AHX not ADX). REMOVE once the SPURS-release question is settled either way. |
 | `YZ_ADX_HLE` | libs/filesystem/cellFs.c (`yz_adx_hle_on_read` + helpers) | **2026-07-04, opt-in experiment (default OFF). MEASURED INERT on the real stream â€” see below.** Clean-room host ADX decode (libs/codec/adx_decode.{c,h}, written from the public ADX spec only) of the CRI intro-voice stream, intended to bypass the LLE `cri_audio` SPU codec (measured dead: launches, never advances the ADXM progress fields). Hooks `cellFsRead` on `adv_voice_talk.cvm`/`*.cvm` paths: mirrors read bytes into a host shadow buffer by file offset, scans for a valid ADX header, decodes every complete block, advances the ADXM progress object `0x01613368+0x294/+298/+29C`, and calls the guest's real `cellSpursEventFlagSet` (libsre 0x02016010) on the measured SPURS poll object `0x63D61720` with an all-bits-set release (UNPROVEN which bits t1's `cellSpursEventFlagWait` call actually waits on). **BOOT-TESTED 2026-07-04 (YZ_AUDIO_FORCE=1 YZ_ADX_HLE=1, scratch/adx_hle_boot2.{out,err}): zero `[adx-hle]` log lines â€” the decoder never fires.** Root cause (parsed the container's real ISO9660 directory, scratch investigation not yet a committed tool): `adv_voice_talk.cvm` holds `*.AHX` files, not `*.ADX` â€” AHX is a DIFFERENT CRI codec (ADX-shaped header + MPEG-1 Layer II payload, confirmed via the MPEG sync word right after the copyright tag), which `adx_open()` correctly rejects (encoding_type != 2/3). The SPURS-release/ADXM-advance machinery is therefore UNEXERCISED against the live boot. REMOVE or extend to AHX (MPEG Layer II) decode when the CRI-voice frontier is next picked up. |
 | `YZ_FIFO_RECOVER_RET` | yakuza/import_overrides.cpp (`yz_rsx_fifo_step`, CALL and RETURN branches, ~line 1577-1638 helpers + the two call sites) | **2026-07-10, opt-in behavior change (default OFF), NOT yet A/B'd against a live boot.** Per scratch/s29_terminal_park_re.md (Q4): RPCS3 (RSXFIFO.cpp) treats a nested CALL (a second CALL before the pending one RETURNs) and a RETURN with no pending CALL as FIFO_ERROR and calls `recover_fifo()` -- checkpoint/retry, escalating to a fatal abort after 20 recoveries inside a 2s window. Our port used to silently clobber the one-level `g_fifo_ret` return slot on a nested CALL, and idle completely silently forever (after one one-ever warning) on a RETURN-without-CALL -- the MEASURED s28m10 terminal park at GET=0x011001EC and the s28m4 park at GET=0x0000098C. Loud detection logging (`[rsx] CALL inside subroutine ...`) is now UNCONDITIONAL (zero behavior change) at both sites. With the flag SET, both states additionally get the recovery analog: no valid rewind target exists in either case (GET never advanced into the bad word), so "restore to checkpoint" is a same-position retry, rate-limited to ~1 attempt/50ms (substituting our poll loop's SwitchToThread cadence for RPCS3's blocking 2ms sleep), logged `[fifo-rec-ret]`, escalating to one latched `[fifo-rec-ret] FATAL` print + a permanent, loud park after 20 strikes in a rolling 2s window (does not tear down the process, unlike RPCS3's hard exception -- the FIFO consumer just parks with a clear diagnostic instead of silently). Armed banner `[fifo-rec-ret] ARMED (YZ_FIFO_RECOVER_RET)` prints once, on first use of either recovery path. Default OFF preserves the exact pre-existing default-boot behavior (now logged instead of silent). Retirement: fold into the default path once a live A/B boot confirms the recovery doesn't regress a healthy boot and the s28-class terminal park is either avoided or at least loudly diagnosed instead of silently pinned. |
+| `YZ_BOUNDARY_DRAIN` | runtime/spu/spu_channels.c (`yz_bdrain_maybe`, arm in `yz_ximg_storm_note`) + recomp_prx/gs_task.c (0x352C sweep hand-edit) | **s42 boundary drain, tier-1 (default OFF). Design scratch/s42_boundary_drain_v2.md as amended by scratch/s42_drain_review.md.** A faithfulness-restoring MITIGATION for the release-engine wall: our engine carries live pre-transition release records across the frame-~830 phase boundary (HW drains them in ~72us and reinits empty), and a carried record either dispatches into the half-rebuilt vtable band (DEATH) or strands the queue front (ORBIT/park). Armed by the ximg-storm signal (every-boot transition precursor), the drain executes once on the FIRST 0x352C sweep on the consumer ctx (spu 2004, image 0 — race-free, its own LS), walks the mgr+0xE0 release table (count = LS[mgr+0xC0]), and for each live record: (b) NEUTRALIZES — zeroes item+0x0C (pointee) so the 0x3C78/0x3C8C doorway takes its silent null leg at Doors 1 AND 2 (and the 0x3BF0 retire helper's dispatch is skipped), and sets item+0x00's sign bit so the compaction (0x4F00) retires it and REPLACES count with the shrunk alive-count → table empties; (a) FIRE-ALL-PENDING (s42 matrix adjudication, supersedes review CHANGE 4's front-only) — EVERY tag=0x7F record whose stopper EA (item+0x1C) is in the RSX FIFO window gets its release word `0x20000000 \| ((stopperEA+4 − LS[mgr+0xD4]) & 0x1FFFFFFC)` written big-endian to guest RSX FIFO memory (mirrors the SPU's MFC PUT), gated by a read-guard that fires only while the target still holds its JTS self-jump stopper (idempotent: a re-fire finds the release word and skips; real content is never clobbered). Front-only self-defeated (`g_yz_parked_pub_ea==0` at storm time → fired=0 across the v1..v5 matrix; real pending releases neutralized WITHOUT firing → permanent park at their own neutralized EAs). Fire-all is sound (not a double-release hazard): a queued release record implies its hole content was PUT first (JTS "content first, release last" + synchronous DMA), unfilled holes are JTS-paved per 128B block so an early release only advances GET to the next stopper, and our modeled RSX has no prefetch cache so the §2.4.4 stale-fetch torn-content malfunction cannot reproduce locally. **SCOPE (review CHANGE 1):** Doors 1/2 only — Door 3 (spu_func_0000B6C0 dispatching on the LS[0x2FB0] task-object vtable) is CODE-VERIFIED disjoint, so a Door-3 death (branch via obj+0xC4 / ret-site ~0x7BD4) is an EXPECTED RESIDUAL, not a drain failure. One-shot, first transition only (re-arm across later transitions unmeasured). Witnesses: `[bdrain] ARMED` banner, `[bdrain] storm-arm`, per-record action lines, `[bdrain] SUMMARY drained/fired/skipped/invalid + per-tag tag7F/non7F`. Kill = unset the env var (zero footprint). **Retirement:** delete when the tag-2 producer is found+suppressed (then no reinit runs, drain never fires) OR gs_task is block-lifted. Stays default OFF (the fire is a lossy force; "no-op on a non-diverged reinit" not yet measured — LESSONS #13) until a boot demonstrates it is both decisive at the wall and a measured no-op on a clean reinit. |
 
 ## Diagnostics (default OFF; side-effect-free when unset)
 
@@ -948,3 +949,132 @@ descriptor-pool alloc witness (0x5168), [s1]/[s1-bail] alloc-entry + alloc-NULL 
 host ctx save/restore divergence witnesses (spu_channels.c), [reload-diff] RO-guard heal
 classifier (zero vs nonzero runs), [feed-wr] mgr+0x110 feed-list push witness (spu_context.h),
 [c5064-src]/[c7AC4-val] table-writer source/value witnesses. All default-OFF via their flags.
+
+### YZ_JRNL_THROTTLE=<K lines> (+ YZ_JRNL_THROTTLE_MS) (s41, 2026-07-16)
+The PRODUCER THROTTLE — the mechanism-proven fix candidate for the s40b wall (scratch/
+s40b_findings.md sec.19-20): t1's [0x11][0x0A] journal append (single choke point
+func_00E7DE88, a ppu_recomp_006.cpp HAND-EDIT lost on relift) waits until the consumer's
+live poll cursor (published ctx at gs_task.c 0x6380 -> yz_consumer_cursor(),
+spu_channels.c) is within K lines (0x80 B) of the producer head (S+0x00, S=vm[toc-0x7410])
+before publishing more. Restores the real-HW invariant that the release engine is EMPTY
+at the game's phase-boundary reinit. Default OFF; `=1..4096` sets K (a bare non-numeric
+value = K 8). Fail-open everywhere (no consumer / wiped anchor / cursor outside arena /
+unparsable arena); per-append timeout escape YZ_JRNL_THROTTLE_MS (default 200) so a
+consumer wedge can never deadlock t1; 64 consecutive timeouts DISARM for the boot.
+Witnesses: [jthr] ARMED banner, sampled wait stats, TIMEOUT/DISARMED lines.
+Expect a slower boot while armed (t1 locksteps to the consumer) — never leave on for
+fps measurements. Retirement condition: block-lifted gs_task hot loops making the
+consumer fast enough that the backlog never builds.
+
+## s41/s42 SPU flight recorder (v2: 2026-07-16)
+
+Phase 1 (s41): a binary ring-buffer history of every LS store, cross-function branch,
+channel op and DMA transfer on the gs_task journal-consumer SPU (g_yz_consumer_ctx,
+spu_channels.c), dumped on the wedge signature. Replaces sampled fprintf probes with a
+complete ordered history. Design + validation: scratch/s41_fltrec_report.md.
+
+v2 (s42, same day): scratch/s42_order_reconstruction.md's sufficiency verdict named three
+gaps for the planned RPCS3 ordering diff and this closes them — records now carry a global
+atomic `seq` + `spu_id` (multi-context capture, source identity for every record kind
+including FOREIGN_WRITE), and two new record kinds (YZ_FR_XIMG at the cross-image adoption
+site, YZ_FR_CALL_RET at spu_img_restore — the closest runtime-visible approximation for
+direct-call coverage; the lifter's bare-C-call codegen for statically-resolved calls stays
+genuinely invisible without touching the lifter/generated code, out of scope). Format
+version bumped (28-byte v2 records; old 16-byte s41 dumps stay decodable — see
+tools/fltrec_dump.py's format_version dispatch, meta.json's `format_version` field).
+
+Code: runtime/spu/spu_fltrec.{h,c} (rings + record types), hooks in spu_context.h
+(spu_ls_write32/128, SPU_DRAIN), spu_channels.c (spu_wrch/rdch, the ctx save/restore memcpy
+sites, spu_img_restore, the "[spu-ximg]" adopt site), spu_dma.h (mfc_submit); decoder
+tools/fltrec_dump.py.
+
+### YZ_FLTREC (s41/s42, 2026-07-16)
+Arms the recorder. Default OFF (unset/`0` = fully inert: every hook site is a single
+`g_yz_fltrec_on == 0` check, one predicted-not-taken branch). `=1` (or any non-`0` value)
+allocates the two rings (both now atomic-cursor multi-writer as of v2 — see
+YZ_FLTREC_ALLCTX) and begins recording once g_yz_consumer_ctx is published. `[fltrec]
+ARMED v2 ...` banner names the ring sizes, record size, and allctx state. Without
+YZ_FLTREC_ALLCTX, recording still only happens for the one designated consumer ctx (cheap
+pointer compare) — inert on every other SPU thread even when armed, same as phase 1.
+
+### YZ_FLTREC_ALLCTX (s42, 2026-07-16)
+Multi-context mode. Default OFF (consumer-ctx-only, phase-1 behavior). `=1` records every
+registered lifted-SPU context, not just g_yz_consumer_ctx — the MAIN ring's atomic `seq`
+cursor makes the cross-writer arrival order reconstructible (same guarantee the FOREIGN
+ring already had). Only read once, at arm time, alongside YZ_FLTREC.
+
+### YZ_FLTREC_MUTE_PCS=<hex[,hex-hex,...]> (s42, 2026-07-16 night; ranges added same night)
+Per-pc flood mute for allctx captures. Entries are single pcs ("11B0") or inclusive hex
+RANGES ("1170-1200"), comma-separated, max 8. Records emitted at a matching pc are sampled
+1/256 per SPU instead of recorded raw. Ranges exist because single-pc muting on an unrolled
+hot loop just promotes the neighboring instruction (measured: muting 0x11B0 crowned 0x1178
+at equal weight, s42 flood census). Max 16 entries. Companion `YZ_FLTREC_MUTE_SKIP_IMG0=1`
+exempts image-0 (gs_task/consumer) contexts from ALL mutes — needed because the kernel/policy
+flood bands (0x0A00-0x4700, ~93% of idle-SPU traffic) overlap gs_task's own signal pcs
+(sweep 0x352C-0x3568) and the mute is otherwise image-blind. Built for the s42 diff's closing
+spec (scratch/s42_ordering_diff.md §5): the two spin floods (channel programming 0x11B0,
+reservation retry 0x5AC) were ~95% of allctx ring traffic and shrank the visible window to
+~2s. `YZ_FLTREC_MUTE_PCS=11B0,5AC` stretches the window to steady-state scale. Unset =
+record everything (default, behavior unchanged). Sampling counters deliberately non-atomic
+(approximate 1/256). Loud `[fltrec] MUTE armed` banner. Retire with the recorder.
+
+### YZ_FLTREC_MB=<n> (s41, 2026-07-16)
+Sizes the MAIN ring in megabytes. Default 1024 (unset). The foreign ring is a separate
+fixed 4 MB, not controlled by this flag (see the report for why). Only read once, at arm
+time; changing it after boot has no effect.
+
+### YZ_FLTREC_DUMP_ON_SWEEP (s41, 2026-07-16)
+Opt-in second dump trigger (independent of YZ_FLTREC being armed for recording — either
+trigger fires yz_fltrec_dump, which itself no-ops if the recorder was never armed): dumps
+once on the first write to LS [0xBA00,0xBC00) from guest pcs 0x3520-0x3560 (the reinit
+sweep), consumer ctx only. Hooked in spu_context.h's spu_ls_write128. The other trigger
+(always on, no flag) is the [stop-jrnl] park detector in yakuza/import_overrides.cpp,
+which dumps once when a stopper park first crosses 30s. Max 2 dumps per process either way.
+
+### YZ_NO_RESVSW (s41, 2026-07-16) — kill switch, default OFF (fix ON)
+CBEA conformance (SPE_MFC-Tutorial p.27): atomic reservations do not survive a context
+switch; our task-switch seams (yz_resident_save / yz_ctx_shadow_save / yz_task_ctx_restore /
+yz_ctx_shadow_restore, spu_channels.c) now clear the SPU's reservation, with the always-on
+[resv-sw] witness logging every LIVE reservation cleared (sampled). Practical exposure was
+the ABA case only (PUTLLC content-validates the full line), so this is conformance + a
+measurement, not a claimed wall fix. `=1` restores the legacy keep-across-switch behavior.
+
+### Coherence window 2 (s41, 2026-07-16) — always on, no flag
+CBEA 9.12.10 puts no address bound on reservation coherence; window 1 [0x40000000,
+0x44000000) left every out-of-window SPU-reserved line (notably the SPURS tasksets at
+0x63Dxxxxx, PPU-written by CreateTask2) with UNSERIALIZED plain-memcpy PPU writes — the
+proven torn-write clobber class of the 2026-06-16 fix. Window 2 [0x60000000,0x68000000)
+gets the same bitmap+generation machinery (spu_channels.c). Reservations outside ALL
+windows now print the loud [coh] witness (sampled) instead of failing silent — treat any
+such line in a log as a coverage gap to close.
+
+## s42 YZ_SPU_LOCKSTEP (2026-07-16) — interventional diagnostic, default OFF
+
+Reviewed design: scratch/s42_lockstep_design.md (v2, the ★REVIEW DELTAS section is
+binding) + scratch/s42_lockstep_review.md (adversarial attack log). Code:
+runtime/spu/spu_lockstep.{h,c} (ring registry + one global run token, mutex+condvar);
+hooks in spu_context.h (SPU_DRAIN, the ★REVIEW-corrected gate site — NOT
+spu_indirect_branch), spu_dma.h (both GETLLAR legs), spu_channels.c (spu_ch_wait
+block_begin/end), lv2_register.c (spu_exec_thread_proc register/unregister). Interventional
+test of the M8 (ORDERING) finalist for the s41 release-engine wall (ledger #101): forces a
+structured round-robin SPU interleave and checks whether the wedge dissolves. Per ★REVIEW
+(A), the ONLY positive readout is the wedge DISSOLVING past the frame-~800 content
+milestone — any terminal-shape change alone is a NULL result (#93: every probe this arc
+moved the shape). Class: diagnostic/interventional, never a shipping behavior change
+(LESSONS #13); retirement condition = M8 resolved (wall closed or ordering refuted).
+
+### YZ_SPU_LOCKSTEP (s42, 2026-07-16)
+Arms the round-robin token. Default OFF/unset = fully inert (every hook site is a single
+`g_yz_lockstep_on == 0` check). `=1` (or any non-`0` value) registers every lifted-SPU host
+thread into one ring (registration order) behind a global run token; only the holder
+executes lifted code. `[lockstep] ARMED quantum=N` banner at first registration; heartbeat
+every 100k token passes; starvation watchdog (token held >5s wall by one member while
+another is registered) prints up to 10 loud lines. The decrementer is frozen to
+wall-time-while-holding-the-token (★REVIEW C) by advancing `ctx->dec_start_tb` at every
+acquire — the RdDec/WrDec formulas in spu_channels.c are UNCHANGED, and this module writes
+`dec_start_tb` only while armed, so the default boot is bit-identical.
+
+### YZ_LOCKSTEP_QUANTUM=<n> (s42, 2026-07-16)
+Quantum unit, default 65536. Counted per drain-tick (SPU_DRAIN re-entry, ≈ one guest
+instruction) AND per GETLLAR (both spu_dma.h legs) — whichever fires first ticks the shared
+counter. Only read once, at arm time.

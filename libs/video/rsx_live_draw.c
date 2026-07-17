@@ -1531,6 +1531,19 @@ void rsx_live_draw_present(u32 buffer_id)
     if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
         fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
                 g_ld_frames, g_ld_draws, g_ld_clears);
+    /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
+     * Exists because pace repeatedly had to be inferred from frame-counter
+     * arithmetic and log ordering, and two such inferences were wrong in one
+     * night (s42). Volume-bounded per LESSONS #6c. */
+    { static ULONGLONG fps_t0 = 0; static u32 fps_f0 = 0;
+      ULONGLONG now = GetTickCount64();
+      if (fps_t0 == 0) { fps_t0 = now; fps_f0 = g_ld_frames; }
+      else if (now - fps_t0 >= 5000) {
+          fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
+                  (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
+                  fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
+          fps_t0 = now; fps_f0 = g_ld_frames;
+      } }
     if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
