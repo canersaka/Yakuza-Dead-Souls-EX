@@ -1263,6 +1263,14 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
  * NOTE: the SNR-write SPU event edge (CBEA event facility S1/S2 bits) is
  * not raised here -- consistent with the rest of the channel model (audit
  * F10, its own queued fix). */
+/* Global lock-line spinlock (defined runtime/spu/spu_channels.c, declared
+ * locally the same way runtime/spu/spu_dma.h does, to avoid pulling that
+ * header's whole MFC/DMA surface into this translation unit for two
+ * function prototypes). See the FIX 1 comment below for why write_snr's
+ * OR-mode path takes it. */
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
+
 static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
 {
     uint32_t tid = (uint32_t)ctx->gpr[3];
@@ -1280,15 +1288,50 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     if (t->sctx) {
         spu_channel* ch = &t->sctx->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
-        /* FIX 2 (2026-07-17, runtime/spu/spu_context.h): count is now
-         * _Atomic uint32_t; acquire-load it explicitly here since this is
-         * the actual cross-thread producer (this handler runs on the PPU
-         * thread, spu_channel_read runs on the SPU host thread) the
-         * spu_channels.c model comment describes. */
-        if (or_mode && atomic_load_explicit(&ch->count, memory_order_acquire))
+        /* FIX 1 (2026-07-17, s43 review): serialize the whole
+         * check-count-then-mutate-value sequence against the SPU host
+         * thread's paired read-value-then-clear-count sequence
+         * (SPU_RdSigNotify1/2 in spu_rdch, spu_channels.c ~2135-2141) with
+         * the existing global lock-line spinlock (spu_dma.h
+         * spu_lockline_lock/unlock, already used for the analogous
+         * WrEventAck-vs-coherence-write race -- spu_channels.c SPU_WrEventAck,
+         * spu_context.h event_status comment).
+         *
+         * FIX 2 (2026-07-17) alone (count promoted to _Atomic uint32_t) does
+         * NOT close this race: `count` and `value` together form ONE
+         * compound mailbox slot (empty+count==0, or pending+count==1+
+         * value==X), and OR-mode's CBEA contract ("accumulate written bits
+         * until read-and-cleared") needs that whole slot updated as a unit.
+         * A lone atomic_fetch_or on value cannot provide that: if the SPU's
+         * spu_channel_read plain-reads value and release-stores count=0 in
+         * between this handler's count-check and its value mutation, the
+         * fetch_or still lands (bits are not lost from `value`), but it
+         * lands AFTER the reader already cleared count -- so `value` holds
+         * merged bits while count says "nothing pending", and the SPU never
+         * observes a pending signal for them (it already consumed the old
+         * value and has no reason to poll again). That is a silently lost
+         * SNR write, not a torn one, so promoting only `value` to atomic
+         * cannot fix it -- the check-then-act pair must be mutually
+         * exclusive with the reader's read-then-clear pair, hence the lock.
+         *
+         * memory_order_relaxed on the count check: the lock's
+         * acquire/release pair (spu_lockline_lock/unlock) already provides
+         * the happens-before edge for everything inside the critical
+         * section, same reasoning as SPU_WrEventAck's atomic_fetch_and
+         * under the same lock (spu_channels.c: "the lock keeps ordering
+         * correct, the atomic RMW keeps the operation itself a single
+         * indivisible op -- defense in depth, not a replacement for the
+         * lock"). `ch->value |= val` stays a plain RMW here: it is no
+         * longer raced against the reader now that both sides hold the
+         * lock, so promoting it to an atomic op would be pure overhead with
+         * no correctness benefit (nothing outside this lock touches
+         * ch_sig_notify's `value` field). */
+        spu_lockline_lock();
+        if (or_mode && atomic_load_explicit(&ch->count, memory_order_relaxed))
             ch->value |= val;
         else
             spu_channel_write(ch, val);
+        spu_lockline_unlock();
         /* s39: this is the cross-thread producer for a blocked RdSigNotify1/2
          * (the SPU host thread parks in spu_ch_wait until count!=0). Wake it now
          * that the signal is pending; the store above is ordered before the wake
