@@ -37,6 +37,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from spu_disasm import disassemble_spu, spu_decode  # noqa: E402
+from spu_lifter import _NO_RT_WRITE, _dest_reg  # noqa: E402  (shared write-tracking table)
 
 # ELF constants
 ELF_MAGIC          = b"\x7FELF"
@@ -188,6 +189,48 @@ def is_return(ins):
     return ops == ["$r0"]
 
 
+def _il_dest_reg(token):
+    """'$r12' -> 12, else None (used only by the il-seeding dataflow check)."""
+    token = token.strip()
+    if token.startswith("$r"):
+        try:
+            return int(token[2:])
+        except ValueError:
+            return None
+    return None
+
+
+def _bi_family_target_reg(ins):
+    """The target register of a bi/bisl/bisled/biz/binz/bihz/bihnz, or None.
+    Mirrors spu_lifter.py's _bi_target_reg but also covers the indirect-CALL
+    forms (bisl/bisled put the target in the LAST operand, RT being the link
+    register) -- needed here because an `il`-loaded address can legally reach
+    either a plain jump or an indirect call."""
+    ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+    if ins.mnemonic == "bi" and ops:
+        return _il_dest_reg(ops[0])
+    if ins.mnemonic in ("bisl", "bisled") and ops:
+        return _il_dest_reg(ops[-1])
+    if ins.mnemonic in ("biz", "binz", "bihz", "bihnz") and len(ops) >= 2:
+        return _il_dest_reg(ops[1])
+    return None
+
+
+def _reaches_bi_target(insns, start_idx, reg, max_window=64):
+    """True iff, scanning forward from `insns[start_idx]` (exclusive) with no
+    intervening write to `reg`, a bi/bisl-family instruction targets `reg`
+    within `max_window` instructions -- see the `il`-seeding note above for
+    why this dataflow check exists (a bare address-range check false-hits on
+    ordinary size/count constants)."""
+    for j in range(start_idx + 1, min(start_idx + 1 + max_window, len(insns))):
+        ins = insns[j]
+        if _bi_family_target_reg(ins) == reg:
+            return True
+        if ins.mnemonic not in _NO_RT_WRITE and _dest_reg(ins) == reg:
+            return False  # clobbered before reaching any branch
+    return False
+
+
 def find_end(start, insns_by_addr, sorted_starts, code_end):
     """Walk forward from `start` until a terminator or the next function."""
     # Index of next function start
@@ -289,6 +332,43 @@ def detect_functions(buf, base_override=None, verbose=True):
                     seed_starts.add(v)
                     n_imm += 1
 
+    #   (b2) `il $rX, addr` -- unlike ila (an 18-bit field that is ALWAYS an
+    #        address by construction), a bare `il` is a generic 16-bit signed
+    #        immediate load; SPU code uses it constantly for ordinary size/
+    #        count/mask constants (added 2026-07-17, fork 3badf65 / cellmark
+    #        audit finding #3, then MEASURED here: a first cut that seeded
+    #        every in-range 4-aligned `il` value unconditionally, mirroring
+    #        ila's rule verbatim, changed the detected function set on 10/20
+    #        SPU images -- every spurious hit was a round-number SIZE
+    #        constant like 0x4000/0x2000 that happened to fall inside the
+    #        code range, not an address; see scratch/spu_funcset_diff diffs
+    #        in the 2026-07-17 batch report). So `il` is only trusted as an
+    #        address source when it demonstrably FEEDS a `bi`/`bisl`-family
+    #        branch on the same register with no intervening rewrite -- the
+    #        one shape where the SPU ISA has no other legal reading (the
+    #        genuine 'il $rX,addr ... bi/bisl $rX' immediate-function-
+    #        pointer idiom, same idea as (b)'s ila+bisl pairing, just typed
+    #        out for the smaller-immediate compiler path).
+    n_imm_il = 0
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic != "il":
+            continue
+        toks = ins.operands.split(",")
+        if len(toks) < 2:
+            continue
+        try:
+            v = int(toks[-1].strip(), 0)
+        except ValueError:
+            continue
+        if not (code_start <= v < code_end and (v & 3) == 0 and v not in seed_starts):
+            continue
+        rt = _il_dest_reg(toks[0])
+        if rt is None or not _reaches_bi_target(insns, idx, rt):
+            continue
+        seed_starts.add(v)
+        n_imm_il += 1
+    n_imm += n_imm_il
+
     #   (c) COMPUTED-BRANCH (Duff's-device) targets. SPU compilers emit a
     #       `bi $rX` (rX != $r0, i.e. not a return) that jumps to base+offset
     #       INTO a nearby unrolled load/store run to handle a partial head/tail.
@@ -355,7 +435,7 @@ def detect_functions(buf, base_override=None, verbose=True):
               f"{len(collect_brsl_targets(insns))} brsl/brasl + "
               f"{len(collect_branch_targets(insns)) - len(collect_brsl_targets(insns))} "
               f"other branch targets, "
-              f"{n_tbl} jump-table + {n_imm} ila-immediate + {n_comp} "
+              f"{n_tbl} jump-table + {n_imm} ila/il-immediate + {n_comp} "
               f"computed-branch indirect targets, "
               f"{len(sorted_starts)} unique starts")
         print(f"Detected {len(cleaned)} function(s)")

@@ -207,6 +207,23 @@ def _dest_reg(insn) -> int:
     return insn.raw & 0x7F
 
 
+# Absolute/immediate-address writers that make a `bi $r0` a computed jump
+# rather than a return (see compute_bi_r0_jumps below).
+_R0_JUMP_SEED_OPS = ("lqa", "lqr", "il", "ila")
+
+
+def _find_nearest_writer(fn, before_idx: int, reg: int):
+    """Nearest instruction before position `before_idx` (exclusive) in the
+    (address-sorted) instruction list `fn` that writes register `reg`,
+    skipping mnemonics that don't write rt at all. Returns (index, insn) or
+    None if no such write precedes it in this logical function."""
+    for j in range(before_idx - 1, -1, -1):
+        w = fn[j]
+        if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == reg:
+            return j, w
+    return None
+
+
 def compute_bi_r0_jumps(insns, logical_bounds) -> set:
     """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
     (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
@@ -215,22 +232,48 @@ def compute_bi_r0_jumps(insns, logical_bounds) -> set:
     NOT back to the caller. Mistranslating that as `return;` makes the launch
     fall through and the dispatcher loop forever (same bug class as the brsl
     mislifts). Detect it: within each LOGICAL function, a `bi $r0` is a computed
-    jump iff the NEAREST preceding write to r0 is an ABSOLUTE load (lqa/lqr).
-    A genuine return restores the link via a register/stack load (lqd/lqx) or
-    never rewrites r0 -- those stay returns. Returns the set of such bi addrs."""
+    jump iff the NEAREST preceding write to r0 is an ABSOLUTE/IMMEDIATE address
+    load (lqa/lqr/il/ila -- extended 2026-07-17, fork 3badf65 / cellmark audit
+    finding #3: il/ila are as valid a source of a jump address as lqa/lqr, our
+    classifier only recognized the memory-load pair). A genuine return restores
+    the link via a register/stack load (lqd/lqx) or never rewrites r0 -- those
+    stay returns.
+
+    IDENTITY-MOVE LOOK-THROUGH: Sony's compiler sometimes routes the loaded
+    value through a no-op register rename -- `ai rX,rY,0` or `ori rX,rY,0`
+    (add/or zero, i.e. copy rY into rX unchanged) -- between the real address
+    load and the `bi`. If the nearest r0-writer is exactly this shape, look
+    through it to the nearest writer of rY and classify on THAT instruction
+    instead (matches the fork's ai/ori chase). Followed exactly one hop: any
+    other writer (including a second identity move) still stops the scan as
+    a genuine, non-address write, so no existing classification can change
+    unless this precise shape is present -- MEASURED zero real instances in
+    all 12 shipped/firmware SPU images (2026-07-17 cellmark audit finding #3;
+    the lone il $r0 in policy_module.elf is a stack-zero spill, not a jump
+    source). Returns the set of such bi addrs."""
     jumps = set()
     for (s, e) in logical_bounds:
         fn = sorted((i for i in insns if s <= i.addr < e), key=lambda x: x.addr)
         for idx, insn in enumerate(fn):
             if _bi_target_reg(insn) != "0":
                 continue
-            # backward scan for the nearest instruction that writes r0
-            for j in range(idx - 1, -1, -1):
-                w = fn[j]
-                if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0:
-                    if w.mnemonic in ("lqa", "lqr"):
-                        jumps.add(insn.addr)
-                    break  # nearest r0 writer found; classification decided
+            found = _find_nearest_writer(fn, idx, 0)
+            if found is not None and found[1].mnemonic in ("ai", "ori"):
+                w = found[1]
+                ops = _ops(w.operands)
+                imm = None
+                if len(ops) >= 3:
+                    try:
+                        imm = int(_imm(ops[2]), 0)
+                    except ValueError:
+                        imm = None
+                if imm == 0:
+                    src_reg = int(_reg(ops[1]))
+                    found = _find_nearest_writer(fn, found[0], src_reg)
+                else:
+                    found = None  # a real ALU op on r0, not an address -- not a jump
+            if found is not None and found[1].mnemonic in _R0_JUMP_SEED_OPS:
+                jumps.add(insn.addr)
     return jumps
 
 
@@ -503,10 +546,33 @@ class SPULifter:
         if mn == "bgx":
             return f"{g(rt())} = spu_bgx({g(ra())}, {g(rb())}, {g(rt())});"
 
-        # Halt-on-condition + stopd: pure stop semantics in recompiled code;
-        # we just continue execution (no host halt path for these yet).
+        # Halt-on-condition: compares the PREFERRED SLOT (word 0) of RA
+        # against RB (register form) or the sign-extended I10 immediate
+        # (*i form, already sign-extended by the disassembler -- see
+        # RI10_TABLE in spu_disasm.py); RT is a documented false target and
+        # is never read (SPU ISA: heq/heqi = equal, hgt/hgti = RA signed-
+        # greater-than operand, hlgt/hlgti = RA unsigned-greater-than
+        # operand). On a true result the SPU halts -- mirrors the existing
+        # br-self-loop / brsl-self-loop halt emission just above (set
+        # status via spu_halt(), same call the region-switch default uses
+        # at ~line 393) so no new runtime entry point is needed. Falls
+        # through (no C emitted) when the condition is false, unlike stop/
+        # stopd which are unconditional.
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
-            return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
+            lhs = f"{g(ra())}._u32[0]"
+            if mn in ("heqi", "hgti", "hlgti"):
+                rhs = f"({_imm(ops[2])})"
+            else:
+                rhs = f"{g(rb())}._u32[0]"
+            if mn in ("heq", "heqi"):
+                cond = f"(int32_t){lhs} == (int32_t){rhs}"
+            elif mn in ("hgt", "hgti"):
+                cond = f"(int32_t){lhs} > (int32_t){rhs}"
+            else:  # hlgt, hlgti
+                cond = f"(uint32_t){lhs} > (uint32_t){rhs}"
+            pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
+            return (f"if ({cond}) {{ {pc_set}spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT); "
+                    f"return; }}")
         if mn == "stopd":
             # stopd's stop code is architecturally fixed at 0x3FFF (CBEA p97).
             pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
