@@ -11,6 +11,8 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
+#include "spu_fltrec.h"    /* s41 flight recorder (env YZ_FLTREC, default off) */
+#include "spu_lockstep.h"  /* s42 YZ_SPU_LOCKSTEP round-robin token (default off) */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -257,6 +259,21 @@ typedef struct spu_context {
     void* ch_wait_cv;     /* CONDITION_VARIABLE */
     void* ch_wait_lock;   /* SRWLOCK */
 
+    /* s42 YZ_SPU_LOCKSTEP (diagnostic, default OFF; runtime/spu/spu_lockstep.c):
+     * per-context state for the round-robin SPU run token.
+     * lockstep_quantum_ctr counts drain-ticks/getllars since this ctx's last
+     * token-pass check. lockstep_release_tb is the guest timebase
+     * (ppu_timebase_now()) at which this ctx most recently stopped holding
+     * the token (or was registered, if it never held it yet); consumed at
+     * the next acquire to advance dec_start_tb by exactly the paused
+     * wall-clock span, so RdDec only drains while this SPU actually holds
+     * the token (review change C, scratch/s42_lockstep_review.md Attack 4) --
+     * the RdDec/WrDec formulas in spu_channels.c are UNCHANGED. Both fields
+     * are inert (never written) when YZ_SPU_LOCKSTEP is unset. Appended per
+     * the struct's APPEND-ONLY rule -- nothing above moves. */
+    uint32_t lockstep_quantum_ctr;
+    uint64_t lockstep_release_tb;
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
@@ -309,6 +326,11 @@ static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 {
     lsa &= SPU_LS_MASK;
+    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
+     * No lifted SPU code currently calls this path (the ISA has no scalar
+     * LS store -- see spu_fltrec.h), but it is hooked for completeness /
+     * any future host-side scalar writer. */
+    if (yz_fltrec_hot(ctx)) yz_fltrec_store32(ctx, lsa, val);
     uint8_t* p = &ctx->ls[lsa];
     p[0] = (uint8_t)(val >> 24);
     p[1] = (uint8_t)(val >> 16);
@@ -370,6 +392,26 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
+     * SPU LS stores are quadword-only (no scalar LS store in the ISA), so
+     * this is the dominant STORE event source -- logged as 4 fixed-size
+     * lane records (see spu_fltrec.h's header comment). */
+    if (yz_fltrec_hot(ctx))
+        yz_fltrec_store128(ctx, lsa, val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
+    /* s41 FLIGHT RECORDER dump trigger B (env YZ_FLTREC_DUMP_ON_SWEEP): fire
+     * yz_fltrec_dump once on the first write to the static-vtable band
+     * [0xBA00,0xBC00) from guest pcs 0x3520-0x3560 (the reinit sweep),
+     * consumer ctx only. Independent of YZ_FLTREC being armed for general
+     * recording -- either trigger can fire the dump. */
+    { static int swd = -1;
+      extern char* getenv(const char*);
+      if (swd < 0) swd = getenv("YZ_FLTREC_DUMP_ON_SWEEP") ? 1 : 0;
+      if (swd == 1 && ctx == (spu_context*)g_yz_consumer_ctx
+          && lsa >= 0xBA00u && lsa < 0xBC00u
+          && ctx->pc >= 0x3520u && ctx->pc <= 0x3560u) {
+          swd = 2;   /* fire once */
+          yz_fltrec_dump("sweep-write");
+      } }
     /* Queue-line-copy write watch (env YZ_QLINE, 2026-07-02, diag — REMOVE with
      * the voice frontier): the codec's SpursQueue push commits {front=1,...}
      * where front must stay 0; log every lifted store to the GETLLAR line copy
@@ -737,6 +779,16 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img);
         while (g_spu_trampoline_fn) {                          \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
             g_spu_trampoline_fn = 0;                           \
+            /* s41 FLIGHT RECORDER: this re-entry is a cross-function tail   \
+             * branch; (ctx)->pc already holds the target (every trampoline \
+             * setter assigns ctx->pc before g_spu_trampoline_fn -- see the  \
+             * cri_audio.c-style setters). This is the ONE central pc-level \
+             * hook site (function/tail-call granularity, not per intra-     \
+             * function branch instruction -- see spu_fltrec.h). */         \
+            if (yz_fltrec_hot(ctx)) yz_fltrec_branch((ctx), (ctx)->pc);      \
+            /* s42 YZ_SPU_LOCKSTEP gate site (★REVIEW B): SPU_DRAIN, not      \
+             * spu_indirect_branch -- see spu_lockstep.h. No-op when unset. */ \
+            yz_lockstep_tick(ctx);                                          \
             if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
             else spu_task_launch_check((ctx), (void*)_tf);     \
             _tf(ctx);                                          \
