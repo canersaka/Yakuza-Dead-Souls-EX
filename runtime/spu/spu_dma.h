@@ -688,6 +688,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
+    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
+     * Covers every real transfer including the lock-line atomics (GETLLAR/
+     * PUTLLC/PUTLLUC/PUTQLLUC all satisfy mfc_is_get/mfc_is_put). Two fixed
+     * records per op: DMA_GET/DMA_PUT (addr=LSA, value=EA-low) then
+     * DMA_META (addr=EA-high, value=raw cmd, aux=tag, len_or_ch=size). */
+    if (yz_fltrec_hot(spu))
+        yz_fltrec_dma(spu, mfc_is_put(cmd), lsa, (uint32_t)ea,
+                      (uint32_t)(ea >> 32), size, tag, cmd);
+
     /* TEMP DEBUG (7d bring-up): trace DMAs that load WORKLOAD CODE into LS
      * (lsa in the workload region >=0x900, code-sized). These reveal the
      * source EA + size of the SPURS system-service / policy blobs we must
@@ -1456,6 +1465,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
                 memcpy(ls_ptr, mfc->resv_data, 128);
                 mfc->resv_poll_n++;
+                /* s42 YZ_SPU_LOCKSTEP (★REVIEW D/E): the fast cached GETLLAR leg is
+                 * the hottest SPURS management poll (5 kernels spinning here per the
+                 * s21 profile above) -- tick BEFORE the idle-yield backoff below, so a
+                 * quantum-expiry token pass never races a Sleep that would hold the
+                 * token through it. No-op when YZ_SPU_LOCKSTEP is unset. */
+                yz_lockstep_tick(spu);
                 { static int nb = -1;
                   if (nb < 0) nb = getenv("YZ_NO_SPUBACKOFF") ? 1 : 0;
                   if (!nb && mfc->resv_poll_n > 16)
@@ -1470,6 +1485,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 return 0;
             }
         }
+        /* s42 YZ_SPU_LOCKSTEP (★REVIEW D, DEADLOCK FIX): tick the slow GETLLAR
+         * leg BEFORE taking the process-wide lock-line spinlock. yz_lockstep_tick
+         * can hand the run token to a peer SPU and BLOCK until it is regranted;
+         * doing that while holding spu_lockline_lock() wedges the whole ring --
+         * every peer that reaches spu_lockline_lock() then spins forever on the
+         * held spinlock, so none can reach a yield site to hand the token back
+         * (the measured s42ls* wedge: 5 SPUs up, then zero heartbeat / zero
+         * watchdog / zero ch-block). The fast cached leg above already ticks
+         * outside the lock. Guarded on GETLLAR so only that command ticks here,
+         * preserving the prior in-switch semantics. No-op when unset. */
+        if (cmd == MFC_GETLLAR_CMD) yz_lockstep_tick(spu);
         spu_lockline_lock();
         switch (cmd) {
         case MFC_GETLLAR_CMD: {
