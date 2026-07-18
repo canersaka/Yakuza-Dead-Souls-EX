@@ -1032,6 +1032,48 @@ sweep), consumer ctx only. Hooked in spu_context.h's spu_ls_write128. The other 
 (always on, no flag) is the [stop-jrnl] park detector in yakuza/import_overrides.cpp,
 which dumps once when a stopper park first crosses 30s. Max 2 dumps per process either way.
 
+### YZ_FLTREC_DUMP_ON_HALT (s44, 2026-07-17)
+Opt-in dump trigger: fires yz_fltrec_dump("halt") at the unknown-branch halt door
+(spu_channels.c, right before spu_halt STOPPED_BY_HALT), consumer ctx only. Motivation:
+the s44 root hunt proved the wall = spu 0x2004's quiet halt at the gs_task item dispatcher
+(one per wedge boot, deterministic, right after the ximg storm — scratch/
+s44_selfdiff_verdict.md), and the banked d1 capture missed the fatal final ~15ms because
+the ximg-storm trigger's dump landed just before the death. This trigger captures the
+entire fatal episode with recording still live. Retirement: remove once the halt root is
+fixed and the wall is down.
+
+### YZ_NULLPAGE_FAIL (s46, 2026-07-18) — kill switch, default OFF (fix ON)
+The s31 dma-guard (ledger #74) completed low-EA (<0x10000) lockline atomics with
+PUTLLC=always-FAIL. s46 measured that turning a guest CAS retry loop at EA 0 into a
+PERMANENT hang: spray shrapnel (guest pcs 0x32B0/0x32BC) zeroed the kernel's select-EA
+staging quad LS[0x1C0], the next select CASed EA 0, and the forced failure spun 1.94M
+iterations to boot end — the consumer SPU was lost and the boot parked at 0x40408A24
+(scratch/s46_1c0_writers.py; s44_selfdiff_verdict.md s46 section; s46_orbit_verdict.md).
+On the console EA 0 is ordinary mapped memory and the CAS completes. The fix (default)
+completes low-EA lockline ops against a zero-init 64KB host backing store so guest CAS
+loops TERMINATE as on hardware. YZ_NULLPAGE_FAIL=1 restores the old always-fail
+completion; YZ_NO_DMAGUARD=1 still restores the pre-#74 fatal proceed. Retirement:
+fold into the guard permanently once a hold-armed deep boot validates spin-free
+operation; the underlying stray-write producer (the premature transition-apply
+divergence) is the live frontier and tracked separately.
+Opt-in (YZ_RESUME_HOLD=<ms>, values 1-99 map to 3000ms): at every consumer (gs_task)
+resume, if walk-pending construct items are found in the restored LS (obj vtbl 0xB988,
+state 4-5, pointee set), journal windows bearing tag-0x05/0x0D records read as EMPTY at
+the GETLLAR site (guest memory untouched; windows are deferred, re-polled later — opus
+review confirmed no corruption path, plus a PUTLLC-arena tripwire) until the pending
+walks drain (DRAINED) or the ms deadline passes (DEADLINE). HONEST STATUS (s46): the
+switch-replay theory this was built on is REFUTED by measurement (the fatal stage->walk
+ran in correct order within one uninterrupted dispatch, 0.48s after the last task switch —
+scratch/s46_seam_verdict.md + s46_walktime_tiebreak.py); when the hold engages it works
+by DELAYING transition-class record application (v2 MEASURED: Driver-B spray fully
+prevented, classic 0x4C24 park signature dissolved that boot), but engagement is dice
+(0-3 FIREs/boot; one death face never matches the scan — s45fix3) and the 6-boot matrix
+shows the terminal park UNCHANGED ON vs OFF (scratch/s46mx_report.md). Useful for
+experiments that need the storm's transition records deferred. Retirement: delete once
+the premature transition-apply divergence (why our boot drains the 0x05/0x0D/0x10
+transition class pre-movie when correct execution never does — the s46 frontier) is
+rooted and fixed.
+
 ### YZ_NO_RESVSW (s41, 2026-07-16) — kill switch, default OFF (fix ON)
 CBEA conformance (SPE_MFC-Tutorial p.27): atomic reservations do not survive a context
 switch; our task-switch seams (yz_resident_save / yz_ctx_shadow_save / yz_task_ctx_restore /

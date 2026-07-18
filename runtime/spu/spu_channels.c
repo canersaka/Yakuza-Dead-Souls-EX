@@ -38,7 +38,7 @@
  * upstream of the tag-2 dispatch and a burst of adoptions is the observed
  * precursor (16 preceded the wedge every time). yz_fltrec_dump's own
  * max-dumps guard makes this dump #1 and the park trigger dump #2. */
-static uint64_t yz_host_clock_ms(void)
+uint64_t yz_host_clock_ms(void)   /* s45: exported for spu_dma.h's resume-hold deadline */
 {
 #if defined(_MSC_VER)
     /* Minimal local decl (no <windows.h>) -- this translation unit already
@@ -223,6 +223,13 @@ volatile unsigned long g_yz_cadv = 0;
  * window precisely. 0 = the consumer never polled (or YZ_JRNL_WATCH off);
  * the hexdump then falls back to an entry-relative window. */
 volatile uint32_t g_yz_jrnl_cur_ea = 0;
+/* s45 RESUME-HOLD counter (the wall fix): armed by yz_task_ctx_restore when a
+ * consumer resume finds walk-pending construct items in the restored LS;
+ * consumed (decremented) by spu_dma.h's mfc_submit, which serves that many
+ * consumer journal-ring window GETs as EMPTY. Single effective writer at a
+ * time (armed on the consumer's own thread inside its restore; consumed on
+ * the same thread's DMA path), so a plain volatile long suffices. */
+volatile long long g_yz_resume_hold = 0;   /* v3: QPC deadline (0 = idle) */
 
 static uint32_t yz_ctxw_hash(const uint8_t* p, uint32_t n)
 {
@@ -1065,6 +1072,61 @@ void yz_ctx_shadow_save(spu_context* ctx, const char* site)
  * the journal cursor ([jrnl-cur] ea) regressing right after a [ctx-restore].
  * Owner tracking is maintained here ALWAYS (independent of the opt-in
  * shadow, which shares the array). */
+/* s45 RESUME-HOLD arm -- DIAGNOSTIC LEVER, default OFF (s46 verdict).
+ * Called at EVERY consumer resume exit of yz_task_ctx_restore (restore,
+ * resident-skip, virgin paths). If walk-pending construct items exist
+ * (obj vtbl 0xB988, state 4..5, ptee set), hold tag-0x05/0x0D-bearing
+ * journal windows EMPTY (spu_dma.h GETLLAR site consumes) until the
+ * pending walks drain or a ms deadline passes. HONEST STATUS: the
+ * switch-replay theory this was built on is REFUTED (the fatal stage->walk
+ * ran in order, within one dispatch, 0.48s after the last switch --
+ * scratch/s46_seam_verdict.md, tie-break s46_walktime_tiebreak.py); when
+ * the hold engages it works by DELAYING transition-class record
+ * application (v2 measured: spray prevented), but engagement is dice
+ * (0-3 FIREs/boot) and the terminal park is unchanged ON vs OFF
+ * (scratch/s46mx_report.md, 4+2 boots). Keep for experiments only;
+ * retire when the premature transition-apply divergence is rooted. */
+static void yz_resume_hold_arm(spu_context* ctx, const char* path)
+{
+    static int rhn = -2;
+    if (rhn == -2) { const char* e = getenv("YZ_RESUME_HOLD");
+        rhn = e ? atoi(e) : 0;   /* s46: default OFF (diagnostic lever, not the root fix --
+                                  * matrix s46mx: terminal park identical ON vs OFF 4+2 boots;
+                                  * the switch-replay theory it was built on is refuted,
+                                  * scratch/s46_seam_verdict.md + s46_walktime_tiebreak.py) */
+        if (rhn > 0)
+            fprintf(stderr, "[resume-hold] ARMED %d ms hold-deadline per pending resume (kill: YZ_RESUME_HOLD=0)\n",
+                    rhn < 100 ? 3000 : rhn);
+        else
+            fprintf(stderr, "[resume-hold] OFF (opt-in: YZ_RESUME_HOLD=<ms>)\n");
+        fflush(stderr); }
+    if (rhn <= 0 || (volatile void*)ctx != g_yz_consumer_ctx) return;
+    {
+        int pend = 0;
+        for (uint32_t k = 0; k < 12; k++) {
+            uint32_t it = 0xBDD0u + 0x80u * k;
+            uint32_t ptee = yz_ls_w32(ctx->ls + it + 0xC);
+            uint32_t obj  = it + 0x10u;
+            uint32_t vt = yz_ls_w32(ctx->ls + obj);
+            uint32_t st = yz_ls_w32(ctx->ls + obj + 4);
+            if (ptee != 0 && vt == 0xB988u && (st == 4u || st == 5u))
+                pend++;
+        }
+        { static unsigned long rr = 0; rr++;
+          if (rr <= 24 || pend) {
+              fprintf(stderr, "[resume-hold] resume n=%lu spu=%X path=%s pending=%d%s\n",
+                      rr, ctx->spu_id, path, pend, pend ? " -> FIRE" : "");
+              fflush(stderr); } }
+        /* v3: g_yz_resume_hold carries a QPC DEADLINE (now + rhn milliseconds;
+         * the env value is now interpreted as ms, default 256 -> use >=2000 for
+         * real drains). The DMA site re-scans the pending signature per poll
+         * and releases early the moment the walks complete. */
+        if (pend)
+            g_yz_resume_hold = (long long)(yz_host_clock_ms()
+                                           + (uint64_t)(rhn < 100 ? 3000 : rhn));
+    }
+}
+
 void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
 {
     yz_resv_ctxswitch_clear(ctx, is_resume ? "task-restore-resume" : "task-restore");
@@ -1085,7 +1147,10 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
          * region provably still holds THIS task's content. (With save-clear
          * at every seam this is rarely true at adoption — a redundant restore
          * of just-saved bytes is harmless; a wrong skip kills the boot.) */
-        if (s_yz_resident[wi].ea == ea && !ro_was_stale) return;
+        if (s_yz_resident[wi].ea == ea && !ro_was_stale) {
+            yz_resume_hold_arm(ctx, "resident-skip");   /* s45: LS already live */
+            return;
+        }
         (void)prev_owner;
         {
             extern uint8_t* vm_base;
@@ -1101,6 +1166,7 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                             "to restore (contract violation upstream?)\n",
                             ctx->spu_id, ea);
                     fflush(stderr); }
+                yz_resume_hold_arm(ctx, "virgin");   /* s45 */
                 return;
             }
             /* s40 restore-rewind watch (env YZ_ZSLOT): mode-B wedge boots show bd70
@@ -1258,6 +1324,7 @@ void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
                   if (yz_fltrec_hot(ctx))
                       yz_fltrec_foreign_write(ctx, region_base + rskip, region_len - rskip, 1);
               } }
+            yz_resume_hold_arm(ctx, "restored");   /* s45: post-region-memcpy */
             { static unsigned long rn = 0; rn++;
               if (rn <= 24 || (rn & 63u) == 0) {
                 fprintf(stderr, "[ctx-restore] n=%lu spu=%X ctx=0x%08X header+0x%X "
@@ -4133,6 +4200,15 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         }
     }
+    /* s44: dump the flight recorder AT the halt itself (env YZ_FLTREC_DUMP_ON_HALT,
+     * consumer ctx only). The banked d1/d2 self-diff pair missed the fatal final
+     * ~15ms because the ximg-storm trigger's dump landed just before the death;
+     * firing the dump here instead captures the entire fatal episode -- the halt
+     * is deterministic, one per wedge boot (scratch/s44_selfdiff_verdict.md). */
+    { static int hd = -1;
+      if (hd < 0) { const char* e = getenv("YZ_FLTREC_DUMP_ON_HALT"); hd = (e && *e == '1') ? 1 : 0; }
+      if (hd == 1 && ctx == (spu_context*)g_yz_consumer_ctx)
+          yz_fltrec_dump("halt"); }
     spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);   /* unwinds; does not return */
 }
 
