@@ -694,6 +694,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
+    /* s44: durable consumer-identity publish (replaces the gs_task.c 0x6380
+     * hand-edit the s43 relift wiped -- generated-file edits die on relift).
+     * The journal consumer = the image-0 (gs_task) context GETting from the
+     * journal arena [0x41F00000,0x42200000) (the same constant range
+     * spu_fltrec.c's arena dump uses). First such GET publishes; same
+     * diagnostic-only, fail-open-on-0 semantics as the old publish site. */
+    if (!g_yz_consumer_ctx && spu->image_id == 0 && mfc_is_get(cmd)
+        && ea >= 0x41F00000ull && ea < 0x42200000ull) {
+        g_yz_consumer_ctx = (volatile void*)spu;
+        fprintf(stderr, "[fltrec] consumer ctx published: spu=%X (journal GET ea=0x%08X pc=0x%05X)\n",
+                spu->spu_id, (uint32_t)ea, spu->pc & SPU_LS_MASK);
+        fflush(stderr);
+    }
+
     /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
      * Covers every real transfer including the lock-line atomics (GETLLAR/
      * PUTLLC/PUTLLUC/PUTQLLUC all satisfy mfc_is_get/mfc_is_put). Two fixed
@@ -702,6 +716,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     if (yz_fltrec_hot(spu))
         yz_fltrec_dma(spu, mfc_is_put(cmd), lsa, (uint32_t)ea,
                       (uint32_t)(ea >> 32), size, tag, cmd);
+
 
     /* TEMP DEBUG (7d bring-up): trace DMAs that load WORKLOAD CODE into LS
      * (lsa in the workload region >=0x900, code-sized). These reveal the
@@ -1386,22 +1401,61 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             static int ng = -1;
             if (ng < 0) ng = getenv("YZ_NO_DMAGUARD") ? 1 : 0;
             if (!ng) {
-                static unsigned long gn = 0; gn++;
-                if (gn <= 16 || (gn & 63u) == 0) {
-                    fprintf(stderr, "[dma-guard] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
-                            "ea=0x%08llX -> completed benignly (GETLLAR=zeros, PUTLLC=fail)\n",
-                            gn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
-                            cmd, (unsigned long long)ea);
-                    fflush(stderr);
-                }
-                if (cmd == MFC_GETLLAR_CMD) {
-                    memset(&spu->ls[lsa & SPU_LS_MASK & ~127u], 0, 128);
-                    mfc->resv_active = 0;
-                    mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
-                } else if (cmd == MFC_PUTLLC_CMD) {
-                    mfc->atomic_stat = MFC_PUTLLC_FAILURE;
-                } else {
-                    mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;   /* dropped write */
+                /* s46 REVISION (scratch/s46_1c0_writers.py + the s46 section of
+                 * scratch/s44_selfdiff_verdict.md): the conservative
+                 * PUTLLC=always-FAIL completion turned a guest CAS retry loop
+                 * at EA 0 into a PERMANENT hang -- spray shrapnel (guest pcs
+                 * 0x32B0/0x32BC) zeroed the kernel's select-EA staging quad at
+                 * LS 0x1C0, the next select CASed EA 0, and the forced failure
+                 * spun it for 1.94M iterations until boot end (park 0x8A24,
+                 * consumer SPU lost). On the console EA 0 is ordinary mapped
+                 * memory: the CAS completes and the loop terminates. Model
+                 * that: lockline ops against guest [0,0x10000) complete
+                 * against a zero-init host backing store. The backing is not
+                 * arbitrated across SPU threads (nothing legitimate lives
+                 * there; stray CAS traffic only needs TERMINATION, not
+                 * cross-thread coherency). Kill-switch YZ_NULLPAGE_FAIL=1
+                 * restores the old always-fail completion; YZ_NO_DMAGUARD=1
+                 * still restores the fatal proceed. */
+                static uint8_t s_lowmem[0x10000];
+                static int npf = -1;
+                if (npf < 0) npf = getenv("YZ_NULLPAGE_FAIL") ? 1 : 0;
+                { uint32_t loff = (uint32_t)ea & 0xFFFFu & ~127u;
+                  uint8_t* lls = &spu->ls[lsa & SPU_LS_MASK & ~127u];
+                  static unsigned long gn = 0; gn++;
+                  if (gn <= 16 || (gn & 63u) == 0) {
+                      fprintf(stderr, "[dma-guard] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
+                              "ea=0x%08llX -> %s\n",
+                              gn, spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                              cmd, (unsigned long long)ea,
+                              npf ? "completed benignly (GETLLAR=zeros, PUTLLC=fail)"
+                                  : "completed vs low-mem backing (CAS terminates)");
+                      fflush(stderr);
+                  }
+                  if (cmd == MFC_GETLLAR_CMD) {
+                      if (npf) {
+                          memset(lls, 0, 128);
+                          mfc->resv_active = 0;
+                      } else {
+                          memcpy(lls, s_lowmem + loff, 128);
+                          memcpy(mfc->resv_data, s_lowmem + loff, 128);
+                          mfc->resv_active = 1;
+                          mfc->resv_ea = (ea & ~127ull);
+                      }
+                      mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+                  } else if (cmd == MFC_PUTLLC_CMD) {
+                      if (!npf && mfc->resv_active && mfc->resv_ea == (ea & ~127ull)
+                          && memcmp(s_lowmem + loff, mfc->resv_data, 128) == 0) {
+                          memcpy(s_lowmem + loff, lls, 128);
+                          mfc->resv_active = 0;
+                          mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
+                      } else {
+                          mfc->atomic_stat = MFC_PUTLLC_FAILURE;
+                      }
+                  } else {
+                      if (!npf) memcpy(s_lowmem + loff, lls, 128);
+                      mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;
+                  }
                 }
                 mfc->tag_completed |= (1u << tag);
                 return 0;
@@ -1514,6 +1568,62 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               if (g_spu_prof_on) spu_llar_note((uint32_t)(ea & ~127ull)); }
             spu_coh_reserve((uint32_t)(ea & ~127ull));
             memcpy(ls_ptr, line, 128);
+            /* s45 RESUME-HOLD v3 consumption (DIAGNOSTIC LEVER, default OFF --
+             * s46 verdict: the switch-replay theory refuted, terminal park
+             * unchanged ON vs OFF; see yz_resume_hold_arm's comment in
+             * spu_channels.c for the honest status). Armed in
+             * yz_task_ctx_restore when a consumer resume finds walk-pending
+             * construct items; scratch/s44_selfdiff_verdict.md. v2's blanket
+             * empty-poll hold starved the pending walk's own dispatch trigger
+             * (record processing) -- s45fix2: no spray, but the pending patch
+             * never applied either (RSX parked on the unpatched hole). v3
+             * SERIALIZES instead: while walk-pending construct items remain
+             * (re-scanned live each poll) and the deadline holds, journal
+             * windows CONTAINING new construct/arm records (line tag 0x05 or
+             * 0x0D) read as EMPTY; all other records flow, so the engine keeps
+             * dispatching and the pending walk completes on its own consistent
+             * restored inputs, then the held records apply unchanged. The
+             * reservation and true memory stay intact throughout. */
+            { extern volatile long long g_yz_resume_hold;   /* ms deadline (v3) */
+              extern uint64_t yz_host_clock_ms(void);
+              if (g_yz_resume_hold != 0 && (volatile void*)spu == g_yz_consumer_ctx
+                  && ea >= 0x41F00080ull && ea < 0x42100080ull) {
+                  if ((long long)yz_host_clock_ms() >= g_yz_resume_hold) {
+                      fprintf(stderr, "[resume-hold] DEADLINE release (pending may remain)\n");
+                      fflush(stderr);
+                      g_yz_resume_hold = 0;
+                  } else {
+                      int pend = 0;
+                      for (uint32_t k = 0; k < 12; k++) {
+                          uint32_t it = 0xBDD0u + 0x80u * k;
+                          const uint8_t* p = &spu->ls[it];
+                          uint32_t ptee = ((uint32_t)p[0xC]<<24)|((uint32_t)p[0xD]<<16)|((uint32_t)p[0xE]<<8)|p[0xF];
+                          uint32_t vt   = ((uint32_t)p[0x10]<<24)|((uint32_t)p[0x11]<<16)|((uint32_t)p[0x12]<<8)|p[0x13];
+                          uint32_t st   = ((uint32_t)p[0x14]<<24)|((uint32_t)p[0x15]<<16)|((uint32_t)p[0x16]<<8)|p[0x17];
+                          if (ptee != 0 && vt == 0xB988u && (st == 4u || st == 5u)) pend++;
+                      }
+                      if (!pend) {
+                          fprintf(stderr, "[resume-hold] DRAINED release (pending=0)\n");
+                          fflush(stderr);
+                          g_yz_resume_hold = 0;
+                      } else {
+                          int hazard = 0;
+                          for (int li = 0; li < 4; li++) {
+                              uint32_t tag2 = ((uint32_t)ls_ptr[li*32]<<24)|((uint32_t)ls_ptr[li*32+1]<<16)
+                                            |((uint32_t)ls_ptr[li*32+2]<<8)|ls_ptr[li*32+3];
+                              if (tag2 == 0x05u || tag2 == 0x0Du) hazard = 1;
+                          }
+                          if (hazard) {
+                              memset(ls_ptr, 0, 128);
+                              { static long hn = 0;
+                                if (hn < 10) { hn++;
+                                    fprintf(stderr, "[resume-hold] hazard window held ea=0x%08X (pend=%d)\n",
+                                            (uint32_t)ea, pend);
+                                    fflush(stderr); } }
+                          }
+                      }
+                  }
+              } }
             /* THROWAWAY DIAG (env YZ_SIGCNT): NON-SAMPLED count of GETLLARs whose
              * snapshot of the SPURS mgmt line (0x40197C80) has ANY wklSignal1 bit set
              * (signal half @ +0x70..71). Decisive bisection: if this stays 0 the whole
@@ -1947,6 +2057,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               } }
             break; }
         case MFC_PUTLLC_CMD:
+            /* s46 TRIPWIRE (resume-hold review change #4): the hold's safety
+             * argument rests on the MEASURED invariant that nothing ever
+             * PUTLLCs the journal-record arena (it is consumed read-only via
+             * GETLLAR; s45cap1: 11,264 lockline commits, zero to 0x41F...).
+             * If that invariant ever breaks, a hold-zeroed LS copy could
+             * commit zeros over real records. Enforce it as a loud tripwire
+             * so the failure is visible, not silent. */
+            if (ea >= 0x41F00080ull && ea < 0x42100080ull) {
+                static unsigned long jw = 0; jw++;
+                if (jw <= 8) {
+                    fprintf(stderr, "[resume-hold] TRIPWIRE: PUTLLC into journal arena "
+                            "ea=0x%08llX spu=%X img=%d pc=0x%05X (read-only invariant broken "
+                            "-- re-audit the hold's zeroed-window safety)\n",
+                            (unsigned long long)ea, spu->spu_id, spu->image_id,
+                            spu->pc & SPU_LS_MASK);
+                    fflush(stderr);
+                }
+            }
             /* s24 (YZ_JOBPUT site 3 of 3): the atomic lockline executor — the
              * path the jobB flag CAS actually takes (site 1 saw zero of its
              * 23 measured commits). Same census, tagged. */
