@@ -843,9 +843,8 @@ void yz_bdrain_maybe(spu_context* ctx)
          *    is neither) is never clobbered. The guard also filters stale-era
          *    stoppers (their selfjmp was against a different relbase).
          *  - CONTENT-COMMITTED: a queued release record implies its hole content was
-         *    PUT first (JTS contract "content first, release last",
-         *    scratch/sdk_notes/s39_jts_whitepaper_findings.md §2); our DMA is
-         *    synchronous (#94) so "queued" == "content landed".
+         *    PUT first and released last. Synchronous DMA (#94) makes
+         *    "queued" equivalent to "content landed".
          *  - NO RUN-THROUGH-GARBAGE: unfilled holes are PAVED with a JTS at every
          *    128B block (whitepaper §2.4/§3.1.5), so an early release only advances
          *    GET to the next block stopper and re-parks; and our modeled RSX has no
@@ -1552,6 +1551,14 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
         return (atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask) != 0;
     case MFC_RdAtomicStat:
         return mfc_for(ctx)->atomic_stat_ready != 0;
+    case MFC_Cmd:
+        return mfc_for(ctx)->queue_count < MFC_QUEUE_DEPTH;
+    case MFC_RdTagStat:
+        return mfc_for(ctx)->tag_status_ready != 0;
+    case MFC_WrTagUpdate:
+        /* The write channel is acknowledged once the request is accepted;
+         * conditional result readiness belongs to RdTagStat, not this count. */
+        return 1;
     default:                return 1;   /* non-blocking channels: always "ready" */
     }
 }
@@ -1573,6 +1580,12 @@ static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
         return (atomic_load_explicit(&ctx->event_status, memory_order_relaxed) & ctx->event_mask) ? 1u : 0u;
     case MFC_RdAtomicStat:
         return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
+    case MFC_Cmd:
+        return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
+    case MFC_RdTagStat:
+        return mfc_for(ctx)->tag_status_ready ? 1u : 0u;
+    case MFC_WrTagUpdate:
+        return 1u;
     default:                return 0;
     }
 }
@@ -1880,6 +1893,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     if (yz_fltrec_hot(ctx)) yz_fltrec_wrch(ctx, channel, v);
 
     if (channel_is_mfc(channel)) {
+        if (channel == MFC_Cmd && !yz_ch_nonblock())
+            spu_ch_wait(ctx, MFC_Cmd, "wrch");
+        if (channel == MFC_WrTagUpdate && !yz_ch_nonblock())
+            spu_ch_wait(ctx, MFC_WrTagUpdate, "wrch");
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         return;
     }
@@ -2191,8 +2208,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     if (channel_is_mfc(channel)) {
-        if (channel == MFC_RdAtomicStat && !yz_ch_nonblock())
-            spu_ch_wait(ctx, MFC_RdAtomicStat, "rdch");
+        if ((channel == MFC_RdAtomicStat || channel == MFC_RdTagStat) && !yz_ch_nonblock())
+            spu_ch_wait(ctx, channel, "rdch");
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
         /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). */
         if (yz_fltrec_hot(ctx)) yz_fltrec_rdch(ctx, channel, v);
@@ -2356,7 +2373,8 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify1:   return atomic_load_explicit(&ctx->ch_sig_notify[0].count, memory_order_acquire);
     case SPU_RdSigNotify2:   return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire);
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
-    case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
+    case MFC_RdTagStat:      return mfc_for(ctx)->tag_status_ready ? 1u : 0u;
+    case MFC_WrTagUpdate:    return 1u;
     case MFC_RdAtomicStat:   return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
     case MFC_RdListStallStat:
         /* F11/P6: nonzero (readable) iff at least one tag is currently
@@ -3799,9 +3817,8 @@ int yz_sguard_check(spu_context* ctx, void* tf)
      * Measured correct-world behavior: RPCS3 runs ZERO staged sweeps and zero
      * staging-arena GETs pre-gameplay (#99 store-corroborated; the s47 sealed
      * oracle), while the routine tag-0x10 flow applies via the refresh path
-     * and never dispatches items here. Triangulated with the SDK kick/commit
-     * contract (scratch/s47_sgf_match.md) and the sagemono producer-signal
-     * pattern (scratch/s47_sagemono_compare.md): this class is not committed
+     * and never dispatches items here. This matches the measured kick/commit
+     * and producer-signal behavior: this class is not committed
      * for consumption pre-gameplay. Defer ALL dispatches of this driver while
      * armed -- measured-equivalence enforcement of the commit gate's effect
      * until the gate cell itself is located. Same SPU_RET defer semantics as
@@ -4116,23 +4133,14 @@ void spu_indirect_branch(spu_context* ctx)
                  * the task region -- task code not yet executing). Kill-switch
                  * YZ_NO_TASKRELOAD. */
                 {
-                /* s32: legs 2+3 of the resume contract. The RO guard heals
-                 * code (leg 1); yz_task_ctx_restore overlays the header +
-                 * pattern windows from the GUEST ctxsave when a foreign era
-                 * or measured staleness intervened (Sony's order: LoadElf
-                 * first, THEN the saved context on top -- cellSpursSpu.cpp:
-                 * 1820-1846). The opt-in host shadow (default OFF) stays as
-                 * an evidence tool behind it.
-                 * s40: leg 4 — SAVE the previous resident's region FIRST (the
-                 * missing half; content still intact at this seam), so the
-                 * restore below replays the CURRENT era, then record the new
-                 * residency AFTER the restore decision. */
+                /* List DMA now performs the policy's context transfer using
+                 * MFC_EAL as the list pointer and MFC_LSA as the data cursor.
+                 * Do not replay a second host-maintained snapshot here: it can
+                 * resurrect an older yielded task after the native restore. */
                 int stale;
-                yz_resident_save(ctx, "launch");
+                yz_resv_ctxswitch_clear(ctx, "task-adopt");
                 stale = yz_task_segment_guard(ctx, imd);
-                yz_task_ctx_restore(ctx, tpc != imd->entry, stale);
                 yz_ctx_shadow_restore(ctx, tpc != imd->entry, stale);
-                yz_resident_set(ctx);
                 }
                 /* FRESH START (branch target == ELF entry, not a mid-body resume):
                  * zero the task image's BSS ([filesz,memsz) spans), per the ELF
@@ -4601,15 +4609,8 @@ void spu_indirect_branch(spu_context* ctx)
                 fflush(stderr);
             }
             if (wcl == 2u) yz_w2life_dump("exit");   /* the wid2 switch-away snapshot */
-            /* s32: a taskset exiting here may carry a yielded task whose
-             * writable state the kernel is about to let another workload
-             * overlay -- shadow it (see yz_ctx_shadow_save; opt-in). */
             if (ctx->image_id == 2) yz_ctx_shadow_save(ctx, "exit");
-            /* s40: the resident-record save at the workload-exit seam — the
-             * kernel is about to let another workload overlay this LS; save
-             * the resident task's region NOW (any image; the record is only
-             * ever set by task launches). */
-            yz_resident_save(ctx, "exit-unwind");
+            yz_resv_ctxswitch_clear(ctx, "exit-unwind");
             /* s32 [exit-unsaved] probe (always on, cheap): per the decoded
              * contract, a taskset module may only cross into the kernel with
              * ZERO live unsaved task state (the task saved at its syscall, or

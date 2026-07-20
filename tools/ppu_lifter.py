@@ -2859,6 +2859,33 @@ class PPULifter:
 
     def _function_def_lines(self, func) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
+        # This statically linked strcmp is a major synchronous-load hot path in
+        # the game image. Lifting its internal basic-block entries separately
+        # preserves behavior but turns each short comparison into several
+        # trampoline dispatches. Emit the equivalent unsigned-byte comparison
+        # directly for the main image so archive initialization remains bounded.
+        if (self.header_name == "ppu_recomp.h" and
+                func.start_addr == 0x00FB574C):
+            return [
+                f"void {func.name}(ppu_context* ctx) {{",
+                "    uint32_t lhs = (uint32_t)ctx->gpr[3];",
+                "    uint32_t rhs = (uint32_t)ctx->gpr[4];",
+                "    for (;;) {",
+                "        const uint8_t a = vm_read8(lhs++);",
+                "        const uint8_t b = vm_read8(rhs++);",
+                "        if (a != b) {",
+                "            ctx->gpr[3] = (uint64_t)(int64_t)(a < b ? -1 : 1);",
+                "            return;",
+                "        }",
+                "        if (a == 0) {",
+                "            ctx->gpr[3] = 0;",
+                "            return;",
+                "        }",
+                "    }",
+                "}",
+                "",
+            ]
+
         lines: list[str] = []
         label = self.name_map.get(func.start_addr)
         if label:

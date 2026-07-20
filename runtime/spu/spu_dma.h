@@ -39,7 +39,7 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 typedef struct mfc_cmd {
     uint32_t lsa;       /* Local store address */
-    uint64_t ea;        /* Effective (main memory) address: EAH << 32 | EAL */
+    uint64_t ea;        /* EA for ordinary DMA; EAH plus list-LS pointer for list DMA */
     uint32_t size;      /* Transfer size in bytes */
     uint32_t tag;       /* Tag group ID (0-31) */
     uint32_t cmd;       /* Command opcode (MFC_PUT_CMD, MFC_GET_CMD, etc.) */
@@ -51,9 +51,9 @@ typedef struct mfc_cmd {
 /* DMA list element (used by PUTL/GETL) */
 typedef struct mfc_list_element {
     /* In PS3 memory these are big-endian:
-     *   bits  0-14 : reserved (notify/stall flags in upper halfword)
-     *   bit   15   : stall-and-notify
-     *   bits 16-31 : transfer size (low 16 bits)
+     *   bit       0 : stall-and-notify (MSB of the first word)
+     *   bits   1-16 : reserved
+     *   bits  17-31 : transfer size
      *   bits 32-63 : effective address low 32 bits
      */
     uint32_t size_and_flags;
@@ -69,6 +69,19 @@ typedef struct mfc_engine {
 
     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
     uint32_t    tag_completed;
+    uint16_t    tag_outstanding[32];
+
+    /* Deferred same-tag commands. A fenced command waits here while an older
+     * list command with the same tag is stalled; later commands on that tag
+     * queue behind the fence. */
+    uint32_t    deferred_count;
+    uint8_t     draining_deferred;
+
+    /* One-entry tag-status result channel. */
+    uint8_t     tag_update_pending;
+    uint8_t     tag_status_ready;
+    uint8_t     tag_update_type;
+    uint32_t    tag_update_mask;
 
     /* Lock-line reservation (GETLLAR/PUTLLC). A 128-byte snapshot of the
      * line is taken under the global lock-line lock; PUTLLC commits only
@@ -145,6 +158,78 @@ static inline void mfc_publish_atomic_status(mfc_engine* mfc, uint32_t status)
     mfc->atomic_stat_ready = 1;
 }
 
+static inline int mfc_tag_update_satisfied(const mfc_engine* mfc)
+{
+    uint32_t completed = mfc->tag_completed & mfc->tag_update_mask;
+    switch (mfc->tag_update_type) {
+    case 0: return 1;
+    case 1: return completed != 0;
+    case 2: return completed == mfc->tag_update_mask;
+    default: return 1;
+    }
+}
+
+static inline void mfc_refresh_tag_status(mfc_engine* mfc, spu_context* spu)
+{
+    if (!mfc->tag_update_pending || !mfc_tag_update_satisfied(mfc))
+        return;
+    spu->mfc_tag_status = mfc->tag_completed & mfc->tag_update_mask;
+    mfc->tag_update_pending = 0;
+    mfc->tag_status_ready = 1;
+    spu_ch_wake(spu);
+}
+
+static inline int mfc_tag_accept(mfc_engine* mfc, uint32_t tag)
+{
+    uint32_t bit = 1u << tag;
+    if (mfc->queue_count >= MFC_QUEUE_DEPTH || mfc->tag_outstanding[tag] == UINT16_MAX)
+        return -1;
+    mfc->tag_outstanding[tag]++;
+    mfc->queue_count++;
+    mfc->tag_completed &= ~bit;
+    return 0;
+}
+
+static inline void mfc_tag_finish(mfc_engine* mfc, spu_context* spu,
+                                  uint32_t tag)
+{
+    uint32_t bit = 1u << tag;
+    if (mfc->tag_outstanding[tag] != 0) {
+        mfc->tag_outstanding[tag]--;
+        if (mfc->queue_count != 0)
+            mfc->queue_count--;
+    }
+    if (mfc->tag_outstanding[tag] == 0)
+        mfc->tag_completed |= bit;
+    else
+        mfc->tag_completed &= ~bit;
+    mfc_refresh_tag_status(mfc, spu);
+    spu_ch_wake(spu);
+}
+
+static inline int mfc_has_deferred_tag(const mfc_engine* mfc, uint32_t tag)
+{
+    for (uint32_t i = 0; i < mfc->deferred_count; i++)
+        if (mfc->queue[i].tag == tag)
+            return 1;
+    return 0;
+}
+
+static inline int mfc_defer_command(mfc_engine* mfc, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t tag, uint32_t cmd)
+{
+    if (mfc->deferred_count >= MFC_QUEUE_DEPTH)
+        return -1;
+    mfc_cmd* q = &mfc->queue[mfc->deferred_count++];
+    q->lsa = lsa;
+    q->ea = ea;
+    q->size = size;
+    q->tag = tag;
+    q->cmd = cmd;
+    q->active = 1;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Core DMA transfer (synchronous for recompiled code)
  *
@@ -177,6 +262,26 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+static inline int mfc_is_atomic(uint32_t cmd)
+{
+    return cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+           cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD;
+}
+
+static inline int mfc_uses_tag(uint32_t cmd)
+{
+    switch (cmd) {
+    case MFC_PUT_CMD:  case MFC_PUTB_CMD:  case MFC_PUTF_CMD:
+    case MFC_GET_CMD:  case MFC_GETB_CMD:  case MFC_GETF_CMD:
+    case MFC_PUTL_CMD: case MFC_PUTLB_CMD: case MFC_PUTLF_CMD:
+    case MFC_GETL_CMD: case MFC_GETLB_CMD: case MFC_GETLF_CMD:
+    case MFC_SNDSIG_CMD:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -184,9 +289,12 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
-    /* Validate size */
-    if (size == 0 || size > MFC_MAX_DMA_SIZE)
+    /* Zero is an architecturally valid no-op transfer size. It still retires
+     * its command and participates in tag completion. */
+    if (size > MFC_MAX_DMA_SIZE)
         return -1;
+    if (size == 0)
+        return 0;
 
     /* Mask LSA to local store range */
     lsa &= SPU_LS_MASK;
@@ -459,8 +567,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * descriptor eaBinary values are unique keys on their own. */
             if ((lsa & SPU_LS_MASK) >= 0x4880u) {
                 switch ((uint32_t)ea) {
-                case 0x01254500u: spu->job_bin_base[0] = lsa & SPU_LS_MASK; break; /* image 14 */
-                case 0x01275A00u: spu->job_bin_base[1] = lsa & SPU_LS_MASK; break; /* image 15 */
+                case 0x01254500u: { /* image 14 */
+                    uint32_t base = lsa & SPU_LS_MASK;
+                    uint32_t other = spu->job_bin_base[1];
+                    /* A newly loaded binary owns its entire LS range.  Forget
+                     * an older occupant whose recorded range it replaces, or
+                     * dispatch can resolve the new entry through stale code. */
+                    if (other && base < other + 0x14C0u && other < base + 0x9540u)
+                        spu->job_bin_base[1] = 0;
+                    spu->job_bin_base[0] = base;
+                    break;
+                }
+                case 0x01275A00u: { /* image 15 */
+                    uint32_t base = lsa & SPU_LS_MASK;
+                    uint32_t other = spu->job_bin_base[0];
+                    if (other && base < other + 0x9540u && other < base + 0x14C0u)
+                        spu->job_bin_base[0] = 0;
+                    spu->job_bin_base[1] = base;
+                    break;
+                }
                 default: break;
                 }
             }
@@ -624,13 +749,34 @@ static inline int mfc_do_list_transfer_from(mfc_engine* mfc, spu_context* spu,
 
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
 
-        int rc = mfc_do_transfer(spu, cur_lsa, ea, xfer_size, base_cmd);
-        if (rc != 0) return rc;
+        /* For a sub-quadword element, the transfer LSA takes its low nibble
+         * from the element EA. After every nonzero element the running LSA
+         * advances to the next quadword boundary. */
+        uint32_t transfer_lsa = cur_lsa;
+        if (xfer_size != 0 && xfer_size < 16)
+            transfer_lsa = (cur_lsa & ~0xFu) | (eal & 0xFu);
 
-        /* MFC 16-byte-aligns each list element's LS landing. */
-        cur_lsa += (xfer_size + 15u) & ~15u;
+        int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
+        if (rc != 0) {
+            static unsigned list_error_count = 0;
+            if (list_error_count++ < 64) {
+                fprintf(stderr,
+                        "[mfc-list-error] spu=%X img=%d pc=0x%05X tag=%u "
+                        "cmd=0x%02X list=0x%05X elem=%u/%u elem-lsa=0x%05X "
+                        "raw=0x%08X eal=0x%08X xfer=%u cur-lsa=0x%05X rc=%d\n",
+                        spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                        tag, base_cmd, list_lsa, i, num_elements, elem_lsa,
+                        size_and_flags, eal, xfer_size, transfer_lsa & SPU_LS_MASK, rc);
+                fflush(stderr);
+            }
+            return rc;
+        }
 
-        if (stall_notify) {
+        if (xfer_size != 0)
+            cur_lsa = (transfer_lsa + xfer_size + 15u) & ~15u;
+
+        /* A stall bit on the final element is unsupported and ignored. */
+        if (stall_notify && i + 1u < num_elements) {
             /* Suspend the list AFTER this element (the transfer above already
              * ran -- CBEA: the stalling element's OWN transfer completes; only
              * the REST of the list is held). Record enough to resume from
@@ -665,16 +811,25 @@ static inline int mfc_do_list_transfer_from(mfc_engine* mfc, spu_context* spu,
  * existing mfc_submit call site reads the same as before; routes through
  * mfc_do_list_transfer_from starting at element 0. */
 static inline int mfc_do_list_transfer(mfc_engine* mfc, spu_context* spu,
-                                        uint32_t tag, uint32_t list_lsa,
-                                        uint64_t ea_base, uint32_t list_size,
+                                        uint32_t tag, uint32_t transfer_lsa,
+                                        uint64_t list_addr, uint32_t list_size,
                                         uint32_t cmd)
 {
+    if (list_size > MFC_MAX_DMA_SIZE || (list_size & 7u) != 0)
+        return -1;
+
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
-    /* The LS landing accumulates across elements but the staging MFC_LSA register
-     * must NOT be permanently mutated -- use a local cursor (RPCS3 SPUThread.cpp). */
-    uint32_t cur_lsa = spu->mfc_lsa;
+    /* For a list command, MFC_EAL is not an effective address: it is the
+     * local-store pointer to the list. MFC_LSA remains the transfer cursor,
+     * and MFC_EAH supplies the high half of every element's effective address. */
+    uint32_t list_lsa = (uint32_t)list_addr & SPU_LS_MASK;
+    uint64_t ea_base = list_addr & 0xFFFFFFFF00000000ull;
+
+    /* The LS landing accumulates across elements, but the staging MFC_LSA
+     * register itself is not mutated. */
+    uint32_t cur_lsa = transfer_lsa;
 
     return mfc_do_list_transfer_from(mfc, spu, tag, list_lsa, ea_base, base_cmd,
                                       0, num_elements, cur_lsa);
@@ -711,16 +866,29 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
+    int tagged = mfc_uses_tag(cmd);
     int rc = 0;
 
-    /* Mark tag as in-progress */
-    mfc->tag_completed &= ~(1u << tag);
+    if (tagged && !mfc->draining_deferred && mfc_tag_accept(mfc, tag) != 0)
+        return -1;
+
+    /* A fence cannot pass an older stalled command with the same tag. Once a
+     * fence is queued, later commands on that tag preserve issue order behind
+     * it until the stalled command retires. */
+    if (tagged && !mfc->draining_deferred &&
+        ((mfc_is_fence(cmd) && (mfc->stall_mask & (1u << tag))) ||
+         mfc_has_deferred_tag(mfc, tag))) {
+        if (mfc_defer_command(mfc, lsa, ea, size, tag, cmd) == 0)
+            return 0;
+        mfc_tag_finish(mfc, spu, tag);
+        return -1;
+    }
 
     /* Handle sync/barrier commands */
     if (cmd == MFC_BARRIER_CMD || cmd == MFC_EIEIO_CMD || cmd == MFC_SYNC_CMD) {
         /* For synchronous emulation these are no-ops; all prior DMAs
          * have already completed. */
-        mfc->tag_completed |= (1u << tag);
+        if (tagged) mfc_tag_finish(mfc, spu, tag);
         return 0;
     }
 
@@ -1501,7 +1669,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
                   }
                 }
-                mfc->tag_completed |= (1u << tag);
+                if (tagged) mfc_tag_finish(mfc, spu, tag);
                 return 0;
             }
         }
@@ -1596,7 +1764,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                        * site above; same-thread self-raise, relaxed order. */
                       atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ } }
                 mfc_publish_atomic_status(mfc, MFC_GETLLAR_SUCCESS);
-                mfc->tag_completed |= (1u << tag);
+                if (tagged) mfc_tag_finish(mfc, spu, tag);
                 return 0;
             }
         }
@@ -2338,7 +2506,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               #undef TW_W
           } }
         spu_lockline_unlock();
-        mfc->tag_completed |= (1u << tag);
+        if (tagged) mfc_tag_finish(mfc, spu, tag);
         return 0;
     }
 
@@ -2372,8 +2540,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * the transfer is genuinely incomplete until MFC_WrListStallAck resumes
      * and finishes it, so RdTagStat/WrTagUpdate must not report this tag done
      * yet (CBEA: a stalled list is not "completed", it is paused). */
-    if (rc != 1)
-        mfc->tag_completed |= (1u << tag);
+    if (rc != 1) {
+        if (rc < 0) {
+            static unsigned error_count = 0;
+            if (error_count++ < 24) {
+                fprintf(stderr, "[mfc-error] cmd=0x%02X tag=%u ea=0x%08X "
+                                "lsa=0x%05X size=%u rc=%d\n",
+                        cmd, tag, (uint32_t)ea, lsa, size, rc);
+                fflush(stderr);
+            }
+        }
+        /* Command retirement and fault reporting are independent. A retired
+         * command must not leave an ALL tag-status request pending forever. */
+        if (tagged) mfc_tag_finish(mfc, spu, tag);
+    }
 
     return (rc == 1) ? 0 : rc;   /* stall is not a transfer error */
 }
@@ -2399,26 +2579,57 @@ static inline uint32_t mfc_read_tag_status(const mfc_engine* mfc, uint32_t tag_m
 
 /*
  * Poll for tag completion.
- * update_type: 0 = immediate, 1 = any, 2 = all.
- * Returns the completed tag mask.  In synchronous mode, always succeeds.
+ * update_type: 0 = immediate, 1 = any, 2 = all. ANY and ALL leave the
+ * one-entry result channel pending until their completion condition is met.
  */
-static inline uint32_t mfc_tag_wait(const mfc_engine* mfc, uint32_t tag_mask,
-                                     uint32_t update_type)
+static inline void mfc_request_tag_status(mfc_engine* mfc, spu_context* spu,
+                                          uint32_t tag_mask, uint32_t update_type)
 {
-    uint32_t completed = mfc->tag_completed & tag_mask;
+    mfc->tag_update_mask = tag_mask;
+    mfc->tag_update_type = (uint8_t)update_type;
+    mfc->tag_status_ready = 0;
+    mfc->tag_update_pending = 1;
+    mfc_refresh_tag_status(mfc, spu);
+}
 
-    switch (update_type) {
-    case MFC_TAG_UPDATE_IMMEDIATE:
-        return completed;
-    case MFC_TAG_UPDATE_ANY:
-        /* In async mode we would block until any bit is set.
-         * Synchronous: always returns immediately. */
-        return completed;
-    case MFC_TAG_UPDATE_ALL:
-        /* Block until all bits in mask are set. */
-        return completed;
-    default:
-        return completed;
+static inline void mfc_drain_deferred_tag(mfc_engine* mfc, spu_context* spu,
+                                           uint32_t tag)
+{
+    while (!(mfc->stall_mask & (1u << tag))) {
+        uint32_t index = mfc->deferred_count;
+        for (uint32_t i = 0; i < mfc->deferred_count; i++) {
+            if (mfc->queue[i].tag == tag) {
+                index = i;
+                break;
+            }
+        }
+        if (index == mfc->deferred_count)
+            break;
+
+        mfc_cmd q = mfc->queue[index];
+        for (uint32_t i = index + 1; i < mfc->deferred_count; i++)
+            mfc->queue[i - 1] = mfc->queue[i];
+        mfc->deferred_count--;
+        memset(&mfc->queue[mfc->deferred_count], 0, sizeof(mfc->queue[0]));
+
+        uint32_t saved_lsa = spu->mfc_lsa;
+        uint32_t saved_eah = spu->mfc_eah;
+        uint32_t saved_eal = spu->mfc_eal;
+        uint32_t saved_size = spu->mfc_size;
+        uint32_t saved_tag = spu->mfc_tag;
+        spu->mfc_lsa = q.lsa;
+        spu->mfc_eah = (uint32_t)(q.ea >> 32);
+        spu->mfc_eal = (uint32_t)q.ea;
+        spu->mfc_size = q.size;
+        spu->mfc_tag = q.tag;
+        mfc->draining_deferred = 1;
+        (void)mfc_submit(mfc, spu, q.cmd);
+        mfc->draining_deferred = 0;
+        spu->mfc_lsa = saved_lsa;
+        spu->mfc_eah = saved_eah;
+        spu->mfc_eal = saved_eal;
+        spu->mfc_size = saved_size;
+        spu->mfc_tag = saved_tag;
     }
 }
 
@@ -2451,7 +2662,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_tag_mask = value;
         break;
     case MFC_WrTagUpdate:
-        spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
+        mfc_request_tag_status(mfc, spu, spu->mfc_tag_mask, value);
         break;
     case MFC_WrListStallAck:
         /* F11/P6 (CBEA v1.02 list commands + RPCS3 SPUThread.cpp:6280-6298):
@@ -2481,8 +2692,18 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
                  * clean finish (rc==0) marks the tag's DMA as done -- this is
                  * the same "list truly complete" gate mfc_submit applies to a
                  * fresh (non-resumed) list. */
-                if (rc == 0)
-                    mfc->tag_completed |= bit;
+                if (rc == 0) {
+                    mfc_tag_finish(mfc, spu, t);
+                    mfc_drain_deferred_tag(mfc, spu, t);
+                } else if (rc < 0) {
+                    static unsigned resume_error_count = 0;
+                    if (resume_error_count++ < 24) {
+                        fprintf(stderr, "[mfc-error] resumed-list tag=%u rc=%d\n", t, rc);
+                        fflush(stderr);
+                    }
+                    mfc_tag_finish(mfc, spu, t);
+                    mfc_drain_deferred_tag(mfc, spu, t);
+                }
             }
         }
         break;
@@ -2496,7 +2717,12 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
 {
     switch (channel) {
     case MFC_RdTagStat:
-        return spu->mfc_tag_status;
+        {
+            uint32_t status = spu->mfc_tag_status;
+            mfc->tag_status_ready = 0;
+            spu_ch_wake(spu);
+            return status;
+        }
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
     case MFC_RdListStallStat:

@@ -515,9 +515,9 @@ class SPULifter:
             # structurally: our channel ops are locked host calls.
             return "spu_arch_fence();"
         if mn == "fscrwr":
-            # Write FP status/control register -- we don't model FPSCR (rounding
-            # mode / exception flags), so this is a no-op (matches spu_fscrrd=0).
-            return "/* fscrwr (FPSCR not modelled) */;"
+            return f"spu_fscrwr(ctx, {g(ra())});"
+        if mn == "fscrrd":
+            return f"{g(rt())} = spu_fscrrd(ctx);"
         if mn == "stop":
             # F18: capture the 14-bit stop code (disasm emits it as ops[0]) so the
             # driver can dispatch the stop-and-signal protocol (thread/group exit).
@@ -625,7 +625,6 @@ class SPULifter:
         # ---- unary (register) ----
         rr_un = {
             "clz": "spu_clz", "cntb": "spu_cntb",
-            "fscrrd": "spu_fscrrd",
             "gb": "spu_gb", "gbh": "spu_gbh", "gbb": "spu_gbb",
             "frsqest": "spu_frsqest", "frest": "spu_frest",
             "fesd": "spu_fesd", "frds": "spu_frds",   # single<->double convert

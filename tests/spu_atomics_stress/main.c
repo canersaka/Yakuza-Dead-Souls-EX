@@ -185,8 +185,12 @@ static void mfc_stage(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t size
 static uint32_t mfc_go(spu_context* ctx, uint32_t cmd)
 {
     spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(cmd));
-    u128 s = spu_rdch(ctx, MFC_RdAtomicStat);
-    return s._u32[0];
+    if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+        cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+        u128 s = spu_rdch(ctx, MFC_RdAtomicStat);
+        return s._u32[0];
+    }
+    return 0;
 }
 
 /* Global reusable SPU-context pool. mfc_for()'s registry (spu_channels.c) is
@@ -280,6 +284,180 @@ static int test0_atomic_status_channel(void)
         fail(name, "PUTLLUC status=%u, expected %u", status, MFC_PUTLLUC_SUCCESS);
     if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 0)
         fail(name, "PUTLLUC status remained readable after consume");
+
+    printf("[%s] -> %s\n", name, g_fail_count == before ? "PASS" : "FAIL");
+    return g_fail_count == before ? 0 : 1;
+}
+
+/* =========================================================================
+ * TEST 0b -- TAG STATUS AND SAME-TAG FENCE ORDERING
+ * ========================================================================= */
+#define EA_TAG_LIST0 0x40106000u
+#define EA_TAG_LIST1 0x40106100u
+#define EA_TAG_FENCE 0x40106200u
+
+static void make_stalling_put_list(spu_context* ctx, uint32_t list_lsa,
+                                   uint32_t target_ea, uint32_t tag)
+{
+    uint32_t data_lsa = 0x1000u + tag * 0x100u;
+    memset(ctx->ls + data_lsa, (int)(0x40u + tag), 16);
+    spu_ls_write32(ctx, list_lsa + 0, 0x80000010u);
+    spu_ls_write32(ctx, list_lsa + 4, target_ea);
+    /* A final-element stall flag is ignored, so provide a zero-sized second
+     * element for the post-ack completion step. */
+    spu_ls_write32(ctx, list_lsa + 8, 0u);
+    spu_ls_write32(ctx, list_lsa + 12, target_ea + 16u);
+    mfc_stage(ctx, data_lsa, list_lsa, 16, tag);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTL_CMD));
+}
+
+static int test0b_tag_status_and_fence(void)
+{
+    const char* name = "test0b_tag_status_and_fence";
+    LONG before = g_fail_count;
+    spu_context* ctx = &g_spu_pool[SPU_POOL_N - 2];
+    uint32_t status;
+
+    printf("[%s] pending ANY/ALL and deferred PUTF ordering...\n", name);
+    vm_commit_page(EA_TAG_LIST0);
+    memset(vm_base + EA_TAG_LIST0, 0, 0x1000);
+    spu_context_init(ctx, 0xE000u);
+
+    /* MFC_EAL points at list elements; MFC_LSA is the independent transfer
+     * cursor. A short element also adopts the EA's low nibble for its LSA. */
+    memset(ctx->ls + 0x1500, 0, 0x40);
+    memset(ctx->ls + 0x1508, 0xA1, 8);
+    memset(ctx->ls + 0x1510, 0xB2, 16);
+    spu_ls_write32(ctx, 0x2600, 8u);
+    spu_ls_write32(ctx, 0x2604, EA_TAG_LIST0 + 0x88u);
+    spu_ls_write32(ctx, 0x2608, 16u);
+    spu_ls_write32(ctx, 0x260C, EA_TAG_LIST0 + 0xA0u);
+    mfc_stage(ctx, 0x1500, 0x2600, 16, 6);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTL_CMD));
+    if (memcmp(vm_base + EA_TAG_LIST0 + 0x88, ctx->ls + 0x1508, 8) != 0 ||
+        memcmp(vm_base + EA_TAG_LIST0 + 0xA0, ctx->ls + 0x1510, 16) != 0)
+        fail(name, "list pointer or sub-quadword LSA alignment was wrong");
+
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(1u));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_IMMEDIATE));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "immediate tag result was not readable");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != 1u || spu_rchcnt(ctx, MFC_RdTagStat) != 0)
+        fail(name, "immediate result=%08X or result was not consumed", status);
+
+    /* A zero-length DMA is a valid no-op, but it is still an accepted command
+     * and must retire its tag so an ALL request cannot wait forever. */
+    mfc_stage(ctx, 0x1800, EA_TAG_LIST0, 0, 4);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_GET_CMD));
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(1u << 4));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_ALL));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "zero-length DMA left its tag incomplete");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != (1u << 4))
+        fail(name, "zero-length result=%08X, expected tag 4", status);
+
+    /* Command retirement is distinct from error reporting. Even a rejected
+     * transfer must not poison future ALL waits on its tag. */
+    mfc_stage(ctx, 0x1800, EA_TAG_LIST0, MFC_MAX_DMA_SIZE + 1u, 5);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_GET_CMD));
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(1u << 5));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_ALL));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "rejected DMA poisoned its tag");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != (1u << 5))
+        fail(name, "rejected-DMA result=%08X, expected tag 5", status);
+
+    make_stalling_put_list(ctx, 0x2000, EA_TAG_LIST0, 1);
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(1u << 1));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_ANY));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 0)
+        fail(name, "ANY completed while its only tag was stalled");
+    if (spu_rchcnt(ctx, MFC_WrTagUpdate) != 1)
+        fail(name, "WrTagUpdate stayed busy after accepting a conditional request");
+    spu_wrch(ctx, MFC_WrTagUpdate,
+             spu_make_preferred_u32(MFC_TAG_UPDATE_IMMEDIATE));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "immediate request did not cancel pending ANY");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != 0)
+        fail(name, "cancelled ANY immediate result=%08X, expected 0", status);
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_ANY));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 0)
+        fail(name, "replacement ANY completed before the stalled tag retired");
+    spu_wrch(ctx, MFC_WrListStallAck, spu_make_preferred_u32(1));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "ANY did not publish when the stalled tag completed");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != (1u << 1))
+        fail(name, "ANY result=%08X, expected tag 1", status);
+
+    make_stalling_put_list(ctx, 0x2100, EA_TAG_LIST0, 1);
+    make_stalling_put_list(ctx, 0x2200, EA_TAG_LIST1, 2);
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32((1u << 1) | (1u << 2)));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(MFC_TAG_UPDATE_ALL));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 0)
+        fail(name, "ALL completed before either stalled tag retired");
+    spu_wrch(ctx, MFC_WrListStallAck, spu_make_preferred_u32(1));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 0)
+        fail(name, "ALL completed after only one tag retired");
+    spu_wrch(ctx, MFC_WrListStallAck, spu_make_preferred_u32(2));
+    if (spu_rchcnt(ctx, MFC_RdTagStat) != 1)
+        fail(name, "ALL did not publish after both tags retired");
+    status = spu_rdch(ctx, MFC_RdTagStat)._u32[0];
+    if (status != ((1u << 1) | (1u << 2)))
+        fail(name, "ALL result=%08X, expected tags 1 and 2", status);
+
+    make_stalling_put_list(ctx, 0x2300, EA_TAG_LIST0, 3);
+    memset(ctx->ls + 0x3000, 0xA5, 16);
+    memset(vm_base + EA_TAG_FENCE, 0, 16);
+    mfc_stage(ctx, 0x3000, EA_TAG_FENCE, 16, 3);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTF_CMD));
+    if (memcmp(vm_base + EA_TAG_FENCE, ctx->ls + 0x3000, 16) == 0)
+        fail(name, "same-tag PUTF passed a stalled predecessor");
+    if (spu_rchcnt(ctx, MFC_Cmd) != MFC_QUEUE_DEPTH - 2)
+        fail(name, "queue capacity did not count stalled plus deferred commands");
+
+    /* Lock-line atomics do not belong to a tag group. They must execute and
+     * publish RdAtomicStat even when ordinary same-tag work is deferred. */
+    mfc_stage(ctx, 0x3400, EA_TAG_LIST0 + 0x80, 128, 3);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_GETLLAR_CMD));
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 1) {
+        fail(name, "GETLLAR was deferred behind tagged fence work");
+    } else {
+        status = spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+        if (status != MFC_GETLLAR_SUCCESS)
+            fail(name, "GETLLAR status=%u, expected success", status);
+    }
+    if (spu_rchcnt(ctx, MFC_Cmd) != MFC_QUEUE_DEPTH - 2)
+        fail(name, "atomic command incorrectly consumed tagged queue capacity");
+
+    spu_wrch(ctx, MFC_WrListStallAck, spu_make_preferred_u32(3));
+    if (memcmp(vm_base + EA_TAG_FENCE, ctx->ls + 0x3000, 16) != 0)
+        fail(name, "deferred same-tag PUTF did not execute after stall ack");
+    if (spu_rchcnt(ctx, MFC_Cmd) != MFC_QUEUE_DEPTH)
+        fail(name, "queue capacity did not recover after retirement");
+
+    /* If a resumed list element faults, the list still retires in this
+     * synchronous model and must release fenced work queued behind it. */
+    memset(ctx->ls + 0x1700, 0xC3, 16);
+    spu_ls_write32(ctx, 0x2700, 0x80000010u);
+    spu_ls_write32(ctx, 0x2704, EA_TAG_LIST0);
+    spu_ls_write32(ctx, 0x2708, MFC_MAX_DMA_SIZE + 1u);
+    spu_ls_write32(ctx, 0x270C, EA_TAG_LIST0 + 0x20u);
+    mfc_stage(ctx, 0x1700, 0x2700, 16, 7);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTL_CMD));
+    memset(ctx->ls + 0x3100, 0xD4, 16);
+    memset(vm_base + EA_TAG_FENCE + 0x20, 0, 16);
+    mfc_stage(ctx, 0x3100, EA_TAG_FENCE + 0x20, 16, 7);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTF_CMD));
+    spu_wrch(ctx, MFC_WrListStallAck, spu_make_preferred_u32(7));
+    if (memcmp(vm_base + EA_TAG_FENCE + 0x20, ctx->ls + 0x3100, 16) != 0)
+        fail(name, "resumed-list error stranded deferred fenced work");
+    if (spu_rchcnt(ctx, MFC_Cmd) != MFC_QUEUE_DEPTH)
+        fail(name, "resumed-list error leaked queue capacity");
 
     printf("[%s] -> %s\n", name, g_fail_count == before ? "PASS" : "FAIL");
     return g_fail_count == before ? 0 : 1;
@@ -1026,6 +1204,7 @@ int main(int argc, char** argv)
     ULONGLONG t_start = now_ms();
 
     int rc0  = test0_atomic_status_channel();
+    int rc0b = test0b_tag_status_and_fence();
     int rc1  = test1_reservation_kill();
     int rc1b = test1b_bulk_writer_gap();   /* NOT folded into the pass/fail spec set below */
     int rc2  = test2_snapshot_atomicity();
@@ -1038,6 +1217,7 @@ int main(int argc, char** argv)
 
     printf("=== invariant verdicts ===\n");
     printf("  0 atomic-status lifecycle      : %s\n", rc0  ? "FAIL" : "PASS");
+    printf("  0b tag status/fence ordering   : %s\n", rc0b ? "FAIL" : "PASS");
     printf("  1 reservation-kill (ABA)      : %s\n", rc1  ? "FAIL" : "PASS");
     printf("  1b bulk-writer gap (bonus)    : %s\n", rc1b ? "REPRODUCED (pre-existing, documented)" : "not reproduced");
     printf("  2 snapshot atomicity          : %s\n", rc2  ? "FAIL" : "PASS");
@@ -1045,7 +1225,7 @@ int main(int argc, char** argv)
     printf("  4 lost-wakeup edge            : %s\n", rc4  ? "FAIL" : "PASS");
     printf("  5 CAS retry liveness          : %s\n", rc5  ? "FAIL" : "PASS");
 
-    int failed = rc0 || rc1 || rc2 || rc3 || rc4 || rc5;
+    int failed = rc0 || rc0b || rc1 || rc2 || rc3 || rc4 || rc5;
     printf("=== RESULT: %s (fail_count=%ld; test1b is informational, excluded) ===\n",
            failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
