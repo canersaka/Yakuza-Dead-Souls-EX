@@ -572,8 +572,13 @@ def ri7(fam, mn, op11, ref, vecname, i7s, note=None):
     a = V[vecname]
     for i7 in i7s:
         i7 &= 0x7F
+        # The disassembler prints the ISA's signed RI7 classes canonically as
+        # -64..63. The insertion-control family is explicitly unsigned u7.
+        # Compare against that decoded spelling while retaining the raw field
+        # for the reference helper (the helpers apply the instruction mask).
+        decoded_i7 = i7 if mn in {"cbd", "chd", "cwd", "cdd"} else sext(i7, 7)
         add(fam, f"{mn} {vecname},i7={i7}", enc_ri7(op11, RT, RA, i7), mn,
-            [f"$r{RT}", f"$r{RA}", str(i7)], {RA: a}, ref(a, i7), note)
+            [f"$r{RT}", f"$r{RA}", str(decoded_i7)], {RA: a}, ref(a, i7), note)
 
 
 def ri10(fam, mn, op8, ref, vecnames, imms, note=None, gap=False):
