@@ -23,6 +23,7 @@
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
 #include "sys_event.h"
+#include "../ppu/ppu_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>  /* calloc/free: without the prototype MSVC assumed int

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(edge_journal_hle_test LANGUAGES CXX)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(edge_journal_hle_test LANGUAGES CXX)
+    enable_testing()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,3 +23,6 @@ if(MSVC)
 else()
     target_compile_options(edge_journal_hle_test PRIVATE -Wall -Wextra -Werror)
 endif()
+
+add_test(NAME edge_journal_hle COMMAND edge_journal_hle_test)
+set_tests_properties(edge_journal_hle PROPERTIES LABELS "unit;yakuza" TIMEOUT 30)

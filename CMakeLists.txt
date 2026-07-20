@@ -23,7 +23,7 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 # ---------------------------------------------------------------------------
 
 # HLE library sources
-file(GLOB_RECURSE HLE_SOURCES
+file(GLOB_RECURSE HLE_SOURCES CONFIGURE_DEPENDS
     "libs/system/*.c"
     "libs/filesystem/*.c"
     "libs/input/*.c"
@@ -42,9 +42,7 @@ file(GLOB_RECURSE HLE_SOURCES
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
 # Runtime core (syscalls, PPU, SPU, memory)
-# (s42 2026-07-16: touched to force a reconfigure so this GLOB_RECURSE --
-# no CONFIGURE_DEPENDS -- picks up the new runtime/spu/spu_lockstep.c)
-file(GLOB_RECURSE RUNTIME_SOURCES
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "runtime/*.c"
     "runtime/*.cpp"
 )
@@ -134,6 +132,40 @@ elseif(MSVC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(PS3RECOMP_BUILD_TESTS)
+    enable_testing()
+
+    add_subdirectory(tests/sync_stress)
+    add_subdirectory(tests/spu_atomics_stress)
+    add_subdirectory(tests/edge_journal_hle)
+
+    # These two suites currently use the MSVC-based generated-code harness.
+    # Keep them visible to CTest where that harness is supported; the native
+    # stress tests above remain portable across the other toolchains.
+    if(MSVC)
+        find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+        add_test(
+            NAME ppu_lifter_conformance
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lift.py"
+        )
+        add_test(
+            NAME spu_lifter_conformance
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lift.py"
+        )
+        set_tests_properties(
+            ppu_lifter_conformance
+            spu_lifter_conformance
+            PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 300
+                LABELS "conformance;lifter"
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

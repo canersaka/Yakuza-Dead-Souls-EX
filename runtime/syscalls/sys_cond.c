@@ -5,6 +5,7 @@
 #include "sys_cond.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
+#include "../ppu/ppu_memory.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>

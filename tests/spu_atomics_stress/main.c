@@ -85,6 +85,7 @@ extern void     spu_coh_notify_write(uint32_t ea);
  * shared header outside the lifter's generated per-test spu_recomp.h). */
 extern void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 extern u128 spu_rdch(spu_context* ctx, uint32_t channel);
+extern uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
 /* ---------------------------------------------------------------------------
  * Link-only stubs: spu_channels.c's SPU_WrOutIntrMbox handler (doorbell/
@@ -99,6 +100,9 @@ extern u128 spu_rdch(spu_context* ctx, uint32_t channel);
  * does, so each one asserts if it is. -----------------------------------*/
 uint32_t g_yz_spurs_taskset = 0;
 uint32_t g_yz_codec_taskset = 0;
+uint32_t g_yz_parked_pub_ea = 0;
+uint32_t yz_guest_addr_from_host(const void* rip) { (void)rip; return 0; }
+uint32_t yz_thread_current_id(void) { return 0; }
 uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
 {
     (void)group_id; (void)spup;
@@ -210,6 +214,76 @@ static void fail(const char* test, const char* fmt, ...)
     fprintf(stderr, "\n"); fflush(stderr);
 }
 static ULONGLONG now_ms(void) { return GetTickCount64(); }
+
+/* =========================================================================
+ * TEST 0 -- ATOMIC STATUS CHANNEL LIFECYCLE
+ *
+ * Each completed lock-line command publishes one readable status entry.
+ * Reading that entry consumes it; channel-count probes never consume it.
+ * ========================================================================= */
+#define EA_CHSTAT 0x40105000u
+
+static int test0_atomic_status_channel(void)
+{
+    const char* name = "test0_atomic_status_channel";
+    LONG before = g_fail_count;
+    spu_context* ctx = &g_spu_pool[SPU_POOL_N - 1];
+    uint32_t count, status;
+
+    printf("[%s] ready/publish/consume sequence...\n", name);
+    vm_commit_page(EA_CHSTAT);
+    memset(vm_base + EA_CHSTAT, 0, 128);
+    spu_context_init(ctx, 0xF000u);
+
+    count = spu_rchcnt(ctx, MFC_RdAtomicStat);
+    if (count != 0)
+        fail(name, "fresh channel count=%u, expected 0", count);
+
+    mfc_stage(ctx, 0x1000, EA_CHSTAT, 128, 0);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_GETLLAR_CMD));
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 1 ||
+        spu_rchcnt(ctx, MFC_RdAtomicStat) != 1)
+        fail(name, "GETLLAR completion was not stably readable before consume");
+    status = spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+    if (status != MFC_GETLLAR_SUCCESS)
+        fail(name, "GETLLAR status=%u, expected %u", status, MFC_GETLLAR_SUCCESS);
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 0)
+        fail(name, "GETLLAR status remained readable after consume");
+
+    memset(ctx->ls + 0x1000, 0x5A, 128);
+    mfc_stage(ctx, 0x1000, EA_CHSTAT, 128, 0);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTLLC_CMD));
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 1)
+        fail(name, "PUTLLC success did not publish a status entry");
+    status = spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+    if (status != MFC_PUTLLC_SUCCESS)
+        fail(name, "PUTLLC status=%u, expected success", status);
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 0)
+        fail(name, "PUTLLC success remained readable after consume");
+
+    mfc_stage(ctx, 0x1000, EA_CHSTAT, 128, 0);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTLLC_CMD));
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 1)
+        fail(name, "PUTLLC failure did not publish a status entry");
+    status = spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+    if (status != MFC_PUTLLC_FAILURE)
+        fail(name, "second PUTLLC status=%u, expected reservation failure", status);
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 0)
+        fail(name, "PUTLLC failure remained readable after consume");
+
+    mfc_stage(ctx, 0x1000, EA_CHSTAT, 128, 0);
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(MFC_PUTLLUC_CMD));
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 1)
+        fail(name, "PUTLLUC completion did not publish a status entry");
+    status = spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+    if (status != MFC_PUTLLUC_SUCCESS)
+        fail(name, "PUTLLUC status=%u, expected %u", status, MFC_PUTLLUC_SUCCESS);
+    if (spu_rchcnt(ctx, MFC_RdAtomicStat) != 0)
+        fail(name, "PUTLLUC status remained readable after consume");
+
+    printf("[%s] -> %s\n", name, g_fail_count == before ? "PASS" : "FAIL");
+    return g_fail_count == before ? 0 : 1;
+}
 
 /* =========================================================================
  * TEST 1 -- RESERVATION-KILL (the ABA case)
@@ -951,6 +1025,7 @@ int main(int argc, char** argv)
 
     ULONGLONG t_start = now_ms();
 
+    int rc0  = test0_atomic_status_channel();
     int rc1  = test1_reservation_kill();
     int rc1b = test1b_bulk_writer_gap();   /* NOT folded into the pass/fail spec set below */
     int rc2  = test2_snapshot_atomicity();
@@ -962,6 +1037,7 @@ int main(int argc, char** argv)
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
     printf("=== invariant verdicts ===\n");
+    printf("  0 atomic-status lifecycle      : %s\n", rc0  ? "FAIL" : "PASS");
     printf("  1 reservation-kill (ABA)      : %s\n", rc1  ? "FAIL" : "PASS");
     printf("  1b bulk-writer gap (bonus)    : %s\n", rc1b ? "REPRODUCED (pre-existing, documented)" : "not reproduced");
     printf("  2 snapshot atomicity          : %s\n", rc2  ? "FAIL" : "PASS");
@@ -969,7 +1045,7 @@ int main(int argc, char** argv)
     printf("  4 lost-wakeup edge            : %s\n", rc4  ? "FAIL" : "PASS");
     printf("  5 CAS retry liveness          : %s\n", rc5  ? "FAIL" : "PASS");
 
-    int failed = rc1 || rc2 || rc3 || rc4 || rc5;
+    int failed = rc0 || rc1 || rc2 || rc3 || rc4 || rc5;
     printf("=== RESULT: %s (fail_count=%ld; test1b is informational, excluded) ===\n",
            failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
