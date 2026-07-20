@@ -1550,6 +1550,8 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
         return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire) != 0;
     case SPU_RdEventStat:
         return (atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask) != 0;
+    case MFC_RdAtomicStat:
+        return mfc_for(ctx)->atomic_stat_ready != 0;
     default:                return 1;   /* non-blocking channels: always "ready" */
     }
 }
@@ -1569,6 +1571,8 @@ static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
         return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_relaxed);
     case SPU_RdEventStat:
         return (atomic_load_explicit(&ctx->event_status, memory_order_relaxed) & ctx->event_mask) ? 1u : 0u;
+    case MFC_RdAtomicStat:
+        return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
     default:                return 0;
     }
 }
@@ -2187,6 +2191,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     if (channel_is_mfc(channel)) {
+        if (channel == MFC_RdAtomicStat && !yz_ch_nonblock())
+            spu_ch_wait(ctx, MFC_RdAtomicStat, "rdch");
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
         /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). */
         if (yz_fltrec_hot(ctx)) yz_fltrec_rdch(ctx, channel, v);
@@ -2351,6 +2357,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify2:   return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire);
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
     case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
+    case MFC_RdAtomicStat:   return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
     case MFC_RdListStallStat:
         /* F11/P6: nonzero (readable) iff at least one tag is currently
          * stalled, mirroring RPCS3 SPUThread.cpp:5298
@@ -2415,6 +2422,618 @@ static uint32_t s_registry_count = 0;
  * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
+
+/* ===========================================================================
+ * s48 LS-CODE-WATCH (env YZ_LS_CODE_WATCH, diag, default OFF) -- the
+ * self-modifying-SPU-code tripwire.
+ *
+ * Our SPU model executes pre-lifted native code: LS code bytes are never
+ * re-read as instructions. Dynamic LOADING of whole known images is handled
+ * (fingerprint dispatch + the DMA-residency image switches), and a branch
+ * into UNKNOWN code is loud (dispatch-miss halt) -- but an IN-PLACE patch (a
+ * store or DMA landing inside the resident image's text that CHANGES bytes)
+ * would leave lifted code running stale semantics with ZERO signal. Every
+ * trace-diff so far rests on the unmeasured assumption that our images never
+ * do this; this watch converts that PLAUSIBLE into a MEASURED yes/no.
+ *
+ * Text extents come from the dispatch registry itself: per image, [min,
+ * max+0x10) over registered lifted-function START addresses. Starts-only =>
+ * the last function's tail past its first quad is uncovered (v1 gap,
+ * accepted); between-function alignment/rodata pockets ARE covered, but
+ * byte-identical rewrites stay silent by design, so only actual content
+ * changes report (context restores and idempotent reloads are quiet).
+ *
+ * Report tiers -- the discriminator is transfer SHAPE, so legitimate SPURS
+ * code movement cannot drown the signal:
+ *   PATCH (THE signal; cap 200 then 1/256): lifted stores (16 B), GETLLAR
+ *     line lands, and GET-family DMAs < 0x400 B that change in-extent bytes.
+ *     LBP-loader-class self-modification lives here.
+ *   LOAD (first 8 + running count): GET-family DMAs >= 0x400 B that change
+ *     in-extent bytes = segment/image (re)deploys over old text (module
+ *     switches at 0xA00, task ELF loads, job binaries). These flip image_id
+ *     through the existing residency machinery; freshly GENERATED code
+ *     arriving this way would branch to a dispatch-miss halt, so the silent
+ *     class is not here.
+ *
+ * Liveness (session honesty rule 2): ARMED banner + extents line + one-shot
+ * "live" line + bounded heartbeat. Zero PATCH hits WITHOUT those lines in
+ * the log = probe not live, NOT a clean negative.
+ *
+ * v1 gaps (documented, all cold paths): host-side spu_elf_load_to_ls
+ * (pre-execution by definition), the mfc settle re-copy (same transfer,
+ * re-checked next pass), PPU-side writes through an LS window (exotic;
+ * no known user in this title). */
+volatile int g_yz_lscw_on = -1;
+
+#define YZ_LSCW_IMG_MAX 64
+static uint32_t s_lscw_lo[YZ_LSCW_IMG_MAX];   /* per-image text lo (inclusive) */
+static uint32_t s_lscw_hi[YZ_LSCW_IMG_MAX];   /* per-image text hi (exclusive) */
+static _Atomic int  s_lscw_ext_built = 0;
+static atomic_flag  s_lscw_lock = ATOMIC_FLAG_INIT;
+
+int yz_lscw_arm(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_lscw_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+    if (g_yz_lscw_on < 0) {
+        int on = getenv("YZ_LS_CODE_WATCH") ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "[ls-code] ARMED (self-mod tripwire: lifted stores + DMA-GET/GETLLAR "
+                    "LS landings, change-only, vs per-image registry text extents; "
+                    "PATCH <0x400B cap 200+1/256, LOAD first 8+count; v1 gaps: last-fn tail, "
+                    "host elf-load, PPU LS-window writes)\n");
+            fflush(stderr);
+        }
+        g_yz_lscw_on = on;
+    }
+    atomic_flag_clear_explicit(&s_lscw_lock, memory_order_release);
+    return g_yz_lscw_on;
+}
+
+static void yz_lscw_build_extents(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_lscw_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+    if (!atomic_load_explicit(&s_lscw_ext_built, memory_order_relaxed)) {
+        unsigned imgs = 0;
+        for (int i = 0; i < YZ_LSCW_IMG_MAX; i++) { s_lscw_lo[i] = 0xFFFFFFFFu; s_lscw_hi[i] = 0; }
+        /* Registration is 100% complete before any SPU host thread runs (the
+         * same precondition the sorted dispatch index build rests on above),
+         * and the first check call comes from an SPU thread, so this walk
+         * races nothing. */
+        for (uint32_t i = 0; i < s_registry_count; i++) {
+            int img = s_registry[i].image_id;
+            uint32_t a = s_registry[i].addr;
+            if (img < 0 || img >= YZ_LSCW_IMG_MAX) continue;
+            if (s_lscw_lo[img] > s_lscw_hi[img]) imgs++;   /* first entry for this img */
+            if (a < s_lscw_lo[img]) s_lscw_lo[img] = a;
+            if (a + 0x10u > s_lscw_hi[img]) s_lscw_hi[img] = a + 0x10u;
+        }
+        fprintf(stderr, "[ls-code] extents built: %u images / %u registrations "
+                "(img0 [0x%05X,0x%05X) img16 [0x%05X,0x%05X))\n",
+                imgs, (unsigned)s_registry_count,
+                s_lscw_lo[0] < s_lscw_hi[0] ? s_lscw_lo[0] : 0, s_lscw_hi[0],
+                s_lscw_lo[16] < s_lscw_hi[16] ? s_lscw_lo[16] : 0, s_lscw_hi[16]);
+        fflush(stderr);
+        atomic_store_explicit(&s_lscw_ext_built, 1, memory_order_release);
+    }
+    atomic_flag_clear_explicit(&s_lscw_lock, memory_order_release);
+}
+
+/* Check one LS-writing event (pre-write: current LS bytes must still be the
+ * OLD content). `incoming` = the bytes about to land (big-endian, `size` of
+ * them); `ea` = DMA source (0 for lifted stores); `kind` = "st"/"dma-get"/
+ * "getllar". Called from spu_ls_write128 (spu_context.h) and the mfc GET +
+ * GETLLAR legs (spu_dma.h). */
+void yz_lscw_check(spu_context* ctx, uint32_t lsa, uint32_t size,
+                   const uint8_t* incoming, unsigned long long ea, const char* kind)
+{
+    static _Atomic unsigned long long s_nchk = 0;
+    static _Atomic unsigned long s_same = 0, s_patch = 0, s_load = 0;
+    static _Atomic int s_live = 0;
+    unsigned long long nchk;
+    uint32_t lo, hi, a1, o0, o1, dlen;
+    int img;
+
+    if (!atomic_load_explicit(&s_lscw_ext_built, memory_order_acquire))
+        yz_lscw_build_extents();
+    nchk = atomic_fetch_add_explicit(&s_nchk, 1, memory_order_relaxed) + 1;
+    if (!atomic_exchange_explicit(&s_live, 1, memory_order_relaxed)) {
+        fprintf(stderr, "[ls-code] live: first check kind=%s spu=%X img=%d\n",
+                kind, ctx->spu_id, ctx->image_id);
+        fflush(stderr);
+    }
+    if ((nchk & 0xFFFFFFull) == 0 && nchk <= (16ull << 24)) {   /* <=16 prints/boot */
+        fprintf(stderr, "[ls-code] hb checks=%lluM same=%lu patch=%lu load=%lu\n",
+                nchk >> 20,
+                (unsigned long)atomic_load_explicit(&s_same, memory_order_relaxed),
+                (unsigned long)atomic_load_explicit(&s_patch, memory_order_relaxed),
+                (unsigned long)atomic_load_explicit(&s_load, memory_order_relaxed));
+        fflush(stderr);
+    }
+    img = ctx->image_id;
+    if (img < 0 || img >= YZ_LSCW_IMG_MAX) return;
+    lo = s_lscw_lo[img]; hi = s_lscw_hi[img];
+    if (lo >= hi) return;                       /* image with no lifted text */
+    lsa &= SPU_LS_MASK;
+    a1 = lsa + size;
+    if (a1 > SPU_LS_MASK + 1u) a1 = SPU_LS_MASK + 1u;
+    if (a1 <= lo || lsa >= hi) return;          /* landing outside text */
+    o0 = lsa < lo ? lo : lsa;
+    o1 = a1 > hi ? hi : a1;
+    dlen = o1 - o0;
+    if (memcmp(&ctx->ls[o0], incoming + (o0 - lsa), dlen) == 0) {
+        atomic_fetch_add_explicit(&s_same, 1, memory_order_relaxed);
+        return;
+    }
+    {   /* byte-CHANGING write into the resident image's text: report */
+        const uint8_t* cur = &ctx->ls[o0];
+        const uint8_t* inc = incoming + (o0 - lsa);
+        uint32_t d = 0, p, ow, nw;
+        int loadshape;
+        unsigned long n;
+        while (cur[d] == inc[d]) d++;           /* memcmp!=0 bounds this < dlen */
+        if (dlen >= 4) {
+            p = d > dlen - 4 ? dlen - 4 : d;
+            ow = ((uint32_t)cur[p]<<24)|((uint32_t)cur[p+1]<<16)|((uint32_t)cur[p+2]<<8)|cur[p+3];
+            nw = ((uint32_t)inc[p]<<24)|((uint32_t)inc[p+1]<<16)|((uint32_t)inc[p+2]<<8)|inc[p+3];
+        } else {
+            p = d; ow = cur[d]; nw = inc[d];
+        }
+        loadshape = size >= 0x400u;
+        n = atomic_fetch_add_explicit(loadshape ? &s_load : &s_patch, 1,
+                                      memory_order_relaxed) + 1;
+        if (loadshape ? n <= 8 : (n <= 200 || (n & 255u) == 0)) {
+            fprintf(stderr, "[ls-code] %s n=%lu kind=%s spu=%X img=%d pc=0x%05X "
+                    "lsa=0x%05X size=0x%X ea=0x%08llX text=[0x%05X,0x%05X) "
+                    "diff@0x%05X %08X->%08X\n",
+                    loadshape ? "LOAD" : "PATCH", n, kind, ctx->spu_id, img,
+                    ctx->pc & SPU_LS_MASK, lsa, size, ea, lo, hi, o0 + p, ow, nw);
+            fflush(stderr);
+        }
+    }
+}
+
+/* ===========================================================================
+ * s49 MASK-SEAL (env YZ_MASK_SEAL, diag, default OFF)
+ *
+ * Target: the gs_task item "pending-DMA-tag mask" at *(OBJ+0xB8) -- the lane-8
+ * word of the quad the reaper loads at LS pc 0x624C (`lqd $r2,0xB0($r3)`;
+ * `rotqbyi $r2,$r2,8`), whose zero-ness takes the early return at pc 0x6254
+ * (`biz $r2,$r0`). The measured stall (scratch/s49_starve_onset.md) is 829
+ * byte-identical polls all taking that early return.
+ *
+ * Two legs, both driven from spu_context.h so no generated file is touched:
+ *   READ leg  -- spu_ls_read128, gated img0 && pc==0x624C (the instruction
+ *     immediately before the biz, so it fires exactly once per gate entry):
+ *     logs obj LS addr, the mask, the quad's other words (base ptr at +0xB0,
+ *     alloc count at +0xB4), the 12 item states (base + i*0x40, word0), and
+ *     the recorded last writer pc/value for this object. Dedup by
+ *     (mask,count,states,lastwriter) -- prints only on CHANGE, plus a bounded
+ *     periodic count line.
+ *   WRITE leg -- spu_ls_write128, gated img0 && pc in the statically-decoded
+ *     mask-writer set (see the switch below). Records last-writer per object
+ *     and logs the new lane-8 word.
+ *
+ * Writer set is MEASURED from scratch/s49_gstask_ls.txt (every store whose
+ * address is <base>+0xB0 in the gs_task image):
+ *   ARM   (mask |= 1<<tag): 0x5B44 0x5D60 0x5F20 0x5F90 0x6000 0x66D8 0x6AA0
+ *   REAP  (mask &= ~bit)  : 0x62D8
+ *   INIT  (mask := 0)     : 0x53F4
+ *   OTHER (same quad, other lanes / bulk struct copy -- included because a
+ *          bulk write CAN clobber lane 8): 0x535C 0x5164 0x54EC 0x568C 0x9A60
+ *
+ * Liveness (session honesty rule 2): ARMED banner at first arm + a one-shot
+ * "live" line from each leg. Zero hits WITHOUT those lines = dead probe, NOT
+ * a clean negative.
+ * ===========================================================================*/
+volatile int g_yz_ms_on = -1;
+
+#define YZ_MS_SLOTS 64
+static uint32_t      s_ms_obj[YZ_MS_SLOTS];      /* obj LS addr (quad addr - 0xB0), 0 = free */
+static uint32_t      s_ms_lw_pc[YZ_MS_SLOTS];    /* last writer pc */
+static uint32_t      s_ms_lw_val[YZ_MS_SLOTS];   /* lane-8 word it wrote */
+static unsigned long s_ms_lw_seq[YZ_MS_SLOTS];   /* write sequence number */
+static unsigned long s_ms_wseq = 0;
+static unsigned long s_ms_wlog = 0;              /* write lines emitted */
+static unsigned long s_ms_rlog = 0;              /* read lines emitted */
+static unsigned long s_ms_rhits = 0;             /* total 0x624C reads */
+static int           s_ms_wlive = 0, s_ms_rlive = 0;
+/* dedup state for the read leg */
+static uint32_t      s_ms_last_mask = 0xFFFFFFFFu, s_ms_last_cnt = 0xFFFFFFFFu;
+static uint32_t      s_ms_last_lw = 0xFFFFFFFFu, s_ms_last_states = 0xFFFFFFFFu;
+
+int yz_mask_seal_arm(void)
+{
+    if (g_yz_ms_on < 0) {
+        int on = getenv("YZ_MASK_SEAL") ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "[maskseal] ARMED (gs_task item pending-DMA-tag mask *(OBJ+0xB8): "
+                    "read gate img0 pc=0x624C change-only, write gate img0 pc in "
+                    "{5B44,5D60,5F20,5F90,6000,66D8,6AA0=ARM 62D8=REAP 53F4=INIT "
+                    "535C,5164,54EC,568C,9A60=OTHER})\n");
+            fflush(stderr);
+        }
+        g_yz_ms_on = on;
+    }
+    return g_yz_ms_on;
+}
+
+static int yz_ms_slot(uint32_t obj)
+{
+    unsigned h = (obj >> 4) & (YZ_MS_SLOTS - 1);
+    for (unsigned i = 0; i < YZ_MS_SLOTS; i++) {
+        unsigned s = (h + i) & (YZ_MS_SLOTS - 1);
+        if (s_ms_obj[s] == obj) return (int)s;
+        if (s_ms_obj[s] == 0) { s_ms_obj[s] = obj; return (int)s; }
+    }
+    return -1;
+}
+
+static const char* yz_ms_kind(uint32_t pc)
+{
+    switch (pc) {
+    case 0x5B44: case 0x5D60: case 0x5F20: case 0x5F90:
+    case 0x6000: case 0x66D8: case 0x6AA0: return "ARM";
+    case 0x62D8:                           return "REAP";
+    case 0x53F4:                           return "INIT";
+    default:                               return "OTHER";
+    }
+}
+
+/* WRITE leg. `w` = the four words about to be stored (SPU lane order, so
+ * w[2] is the byte-8 word = the mask). */
+void yz_ms_write(spu_context* ctx, uint32_t lsa, const uint32_t* w)
+{
+    uint32_t pc = ctx->pc & SPU_LS_MASK;
+    uint32_t obj, oldm;
+    int s;
+    const uint8_t* q;
+
+    if (ctx->image_id != 0) return;
+    switch (pc) {
+    case 0x5B44: case 0x5D60: case 0x5F20: case 0x5F90: case 0x6000:
+    case 0x66D8: case 0x6AA0: case 0x62D8: case 0x53F4: case 0x535C:
+    case 0x5164: case 0x54EC: case 0x568C: case 0x9A60: break;
+    default: return;
+    }
+    if (lsa < 0xB0u) return;
+    obj = lsa - 0xB0u;
+    s = yz_ms_slot(obj);
+    q = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
+    oldm = ((uint32_t)q[8] << 24) | ((uint32_t)q[9] << 16) |
+           ((uint32_t)q[10] << 8) | (uint32_t)q[11];
+    s_ms_wseq++;
+    if (s >= 0) {
+        s_ms_lw_pc[s]  = pc;
+        s_ms_lw_val[s] = w[2];
+        s_ms_lw_seq[s] = s_ms_wseq;
+    }
+    if (!s_ms_wlive) {
+        s_ms_wlive = 1;
+        fprintf(stderr, "[maskseal] live: WRITE leg firing (first hit pc=0x%05X obj=0x%05X)\n", pc, obj);
+    }
+    /* Cap: full detail for the first 400, then only on a 0<->nonzero
+     * transition of the mask (the events that matter), capped again. */
+    if (s_ms_wlog < 400 || ((oldm == 0) != (w[2] == 0) && s_ms_wlog < 4000)) {
+        s_ms_wlog++;
+        fprintf(stderr, "[maskseal] W n=%lu %-5s pc=0x%05X obj=0x%05X mask %08X -> %08X "
+                "(quad %08X %08X %08X %08X)\n",
+                s_ms_wseq, yz_ms_kind(pc), pc, obj, oldm, w[2], w[0], w[1], w[2], w[3]);
+        fflush(stderr);
+    }
+}
+
+/* READ leg. `v` = the four words just loaded from OBJ+0xB0. */
+void yz_ms_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
+{
+    uint32_t obj, base, mask, cnt, st[12], stsig = 0;
+    uint32_t lwpc = 0, lwval = 0;
+    unsigned long lwseq = 0;
+    int s, i;
+    char sb[64];
+
+    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x624Cu) return;
+    if (lsa < 0xB0u) return;
+    obj  = lsa - 0xB0u;
+    base = v[0];
+    cnt  = v[1];
+    mask = v[2];
+    s_ms_rhits++;
+    if (!s_ms_rlive) {
+        s_ms_rlive = 1;
+        fprintf(stderr, "[maskseal] live: READ leg firing at pc=0x624C (obj=0x%05X mask=%08X)\n",
+                obj, mask);
+    }
+    /* the 12 item states: base + i*0x40, word0 */
+    for (i = 0; i < 12; i++) {
+        uint32_t a = (base + (uint32_t)i * 0x40u) & (SPU_LS_MASK & ~0x3u);
+        const uint8_t* p = &ctx->ls[a];
+        st[i] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        sb[i] = (char)((st[i] < 10) ? ('0' + (int)st[i]) : '?');
+        stsig = stsig * 31u + st[i];
+    }
+    sb[12] = 0;
+    s = yz_ms_slot(obj);
+    if (s >= 0) { lwpc = s_ms_lw_pc[s]; lwval = s_ms_lw_val[s]; lwseq = s_ms_lw_seq[s]; }
+    if (mask == s_ms_last_mask && cnt == s_ms_last_cnt &&
+        lwpc == s_ms_last_lw && stsig == s_ms_last_states) {
+        /* unchanged -- bounded heartbeat only */
+        if ((s_ms_rhits % 200000UL) == 0) {
+            fprintf(stderr, "[maskseal] R heartbeat n=%lu obj=0x%05X mask=%08X cnt=%u "
+                    "states=%s lastw=pc0x%05X val=%08X seq=%lu (UNCHANGED)\n",
+                    s_ms_rhits, obj, mask, cnt, sb, lwpc, lwval, lwseq);
+            fflush(stderr);
+        }
+        return;
+    }
+    s_ms_last_mask = mask; s_ms_last_cnt = cnt;
+    s_ms_last_lw = lwpc;   s_ms_last_states = stsig;
+    if (s_ms_rlog < 6000) {
+        s_ms_rlog++;
+        fprintf(stderr, "[maskseal] R n=%lu obj=0x%05X base=0x%05X mask=%08X cnt=%u "
+                "states=%s lastw=pc0x%05X(%s) val=%08X seq=%lu %s\n",
+                s_ms_rhits, obj, base, mask, cnt, sb, lwpc, yz_ms_kind(lwpc), lwval, lwseq,
+                mask ? "REAP" : "EARLY-RET");
+        fflush(stderr);
+    }
+}
+
+/* ===========================================================================
+ * s49 TAG-READ PROBE (env YZ_TAGREAD, default OFF)
+ *
+ * THE ONE MISSING DATUM of the s49 plateau: WHAT TAG VALUE the journal
+ * consumer actually reads at the publish-by-tag gate. The flight recorder
+ * stores that site as a BRANCH record with no operand field, so the value is
+ * unrecoverable from any banked dump (scratch/s49_stale_window.md:VERDICT).
+ *
+ * Site (recomp_prx/gs_task.c, verified by pc not by line -- the file is
+ * regenerated):
+ *   0x65D0  r16 = lq(r3+0x00)
+ *   0x65D4  r14 = rotqbyi(r16,4)          ; word1 of the header quad
+ *   0x65D8  r13 = rotqbyi(r16,12)         ; word3
+ *   0x65DC  r12 = r14 << 7                ; word1 * 128  = window line
+ *   0x65E0  r11 = r12 + r13               ; + word3      = record cursor (LS)
+ *   0x65E4  r10 = lq(r11+0x60)            ; <== THE TAG READ  (this hook)
+ *   0x65E8  r5  = rotqby(r10, r11)        ; align: word0 = bytes [r11&15 ..]
+ *   0x65EC  if (r5.w0 == 0) -> 0x6604     ; the gate: 0 = "nothing published"
+ *
+ * READ leg (spu_ls_read128, img0, pc==0x65E4) logs per event:
+ *   (1) the journal line EA the consumer is reading -- resolved through the
+ *       FETCH map below, not guessed;
+ *   (2) ls_tag: the tag word as the SPU will see it (rotqby reproduced here);
+ *   (3) host_tag: a re-read of the SAME EA from guest memory (vm_base) at
+ *       that instant -- the crux of the S2 test;
+ *   (4) the LS address of the fetched window + the record offset;
+ *   (5) the consumer's read sequence counter and the fetch's sequence.
+ *   Dedup by (ea, ls_tag, host_tag); periodic heartbeat otherwise.
+ *   Additionally tracks, per EA, the wall time from the FIRST observation of
+ *   host_tag==0 to the first observation of host_tag!=0 -- the publish LAG
+ *   that decides the PRODUCER-TIMING row.
+ *
+ * FETCH map: yz_tr_fetch() is called from spu_dma.h's plain-GET leg and its
+ * GETLLAR leg for every arena-range transfer by image 0, recording
+ * (LS 128-byte line -> EA line, seq, host clock). This is what makes claim
+ * (1) measured rather than inferred.
+ *
+ * FALL-THROUGH leg (img0, pc==0x624C, mask!=0): the sibling site
+ * s49_stale_window.md flags as possibly the most informative in the window --
+ * pc 0x6258 executed only 12x in-plateau against 1,679 early returns at
+ * 0x6254. 0x624C is `lq(r3+0xB0)`, 0x6250 rotates lane 8 into word0, 0x6254
+ * is the `biz` -- so v[2]!=0 here is EXACTLY the predicate for reaching
+ * 0x6258. Logged with full context, uncapped-but-bounded (these are rare).
+ *
+ * Liveness (session honesty rule 2): ARMED banner at first arm plus a
+ * one-shot "live" line from each of the three legs. Zero hits WITHOUT those
+ * lines is an instrument failure, NOT a clean negative.
+ * ===========================================================================*/
+volatile int g_yz_tr_on = -1;
+
+#define YZ_TR_ARENA_LO  0x41F00000u
+#define YZ_TR_ARENA_HI  0x42200000u
+
+int yz_tagread_arm(void)
+{
+    if (g_yz_tr_on < 0) {
+        int on = getenv("YZ_TAGREAD") ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "[tagread] ARMED (gs_task publish-by-tag gate: read leg img0 "
+                    "pc=0x65E4 lq(r11+0x60) with host EA re-read, change-only; "
+                    "fall-through leg img0 pc=0x624C mask!=0 -> 0x6258; "
+                    "fetch map over arena [0x%08X,0x%08X))\n",
+                    YZ_TR_ARENA_LO, YZ_TR_ARENA_HI);
+            fflush(stderr);
+        }
+        g_yz_tr_on = on;
+    }
+    return g_yz_tr_on;
+}
+
+/* --- fetch map: LS 128-byte line -> arena EA line ------------------------ */
+#define YZ_TR_MAP 128
+static uint32_t      s_tr_mls[YZ_TR_MAP];    /* LS line addr | 1 in bit0 = occupied */
+static uint32_t      s_tr_mea[YZ_TR_MAP];    /* EA line addr */
+static unsigned long s_tr_mseq[YZ_TR_MAP];   /* fetch sequence */
+static uint64_t      s_tr_mms[YZ_TR_MAP];    /* host clock ms of the fetch */
+static unsigned long s_tr_fseq = 0;
+static int           s_tr_flive = 0, s_tr_rlive = 0, s_tr_tlive = 0;
+
+static int yz_tr_slot(uint32_t lsline, int create)
+{
+    unsigned h = (lsline >> 7) & (YZ_TR_MAP - 1);
+    for (unsigned i = 0; i < YZ_TR_MAP; i++) {
+        unsigned s = (h + i) & (YZ_TR_MAP - 1);
+        if (s_tr_mls[s] == (lsline | 1u)) return (int)s;
+        if (s_tr_mls[s] == 0) {
+            if (!create) return -1;
+            s_tr_mls[s] = lsline | 1u;
+            return (int)s;
+        }
+    }
+    return -1;
+}
+
+/* Called from spu_dma.h on every arena-range GET / GETLLAR by image 0. */
+void yz_tr_fetch(spu_context* ctx, uint32_t lsa, unsigned long long ea, uint32_t size)
+{
+    uint32_t lsline, ealine;
+    uint32_t off;
+    if (ctx->image_id != 0) return;
+    if ((uint32_t)ea < YZ_TR_ARENA_LO || (uint32_t)ea >= YZ_TR_ARENA_HI) return;
+    s_tr_fseq++;
+    if (!s_tr_flive) {
+        s_tr_flive = 1;
+        fprintf(stderr, "[tagread] live: FETCH leg firing (lsa=0x%05X ea=0x%08X size=%u)\n",
+                lsa & SPU_LS_MASK, (uint32_t)ea, size);
+        fflush(stderr);
+    }
+    /* record every 128-byte line the transfer covers */
+    for (off = 0; off < size && off < 0x4000u; off += 128u) {
+        int s;
+        lsline = (lsa + off) & (SPU_LS_MASK & ~127u);
+        ealine = ((uint32_t)ea + off) & ~127u;
+        s = yz_tr_slot(lsline, 1);
+        if (s < 0) continue;
+        s_tr_mea[s]  = ealine;
+        s_tr_mseq[s] = s_tr_fseq;
+        s_tr_mms[s]  = yz_host_clock_ms();
+    }
+}
+
+/* --- read leg ------------------------------------------------------------ */
+static unsigned long s_tr_reads = 0, s_tr_rlog = 0;
+static uint32_t      s_tr_last_ea = 0xFFFFFFFFu;
+static uint32_t      s_tr_last_ls = 0xFFFFFFFFu, s_tr_last_ht = 0xFFFFFFFFu;
+/* publish-lag tracking for the currently-polled EA */
+static uint32_t      s_tr_zea = 0;          /* EA first seen with host_tag==0 */
+static uint64_t      s_tr_zms = 0;          /* when */
+static unsigned long s_tr_zn  = 0;          /* how many reads since */
+
+static uint32_t yz_tr_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
+{
+    extern uint8_t* vm_base;
+    uint8_t  q[16];
+    uint32_t r3, r11, k, tag_off_in_line, ea_line, tag_ea, ls_tag, host_tag;
+    uint32_t win_ls, rec_off, lst[4], hst[4];
+    unsigned long fseq = 0;
+    int s, i, mapped;
+    uint64_t now;
+
+    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x65E4u) return;
+    s_tr_reads++;
+    r3  = ctx->gpr[3]._u32[0];
+    r11 = ctx->gpr[11]._u32[0];
+    k   = r11 & 0xFu;
+    /* reproduce rotqby(r10,r11) word0 from the quad just loaded */
+    for (i = 0; i < 16; i++)
+        q[i] = (uint8_t)((v[i >> 2] >> (8 * (3 - (i & 3)))) & 0xFFu);
+    ls_tag = ((uint32_t)q[k & 15] << 24) | ((uint32_t)q[(k + 1) & 15] << 16) |
+             ((uint32_t)q[(k + 2) & 15] << 8) | (uint32_t)q[(k + 3) & 15];
+
+    /* resolve the source EA of this LS byte through the fetch map */
+    win_ls  = lsa & (SPU_LS_MASK & ~127u);
+    rec_off = (lsa & 127u) + k;                   /* byte offset of the tag word in the line */
+    tag_off_in_line = rec_off & 127u;
+    s = yz_tr_slot(win_ls, 0);
+    mapped = (s >= 0 && s_tr_mea[s] != 0);
+    ea_line = mapped ? s_tr_mea[s] : 0;
+    if (mapped) fseq = s_tr_mseq[s];
+    tag_ea  = mapped ? (ea_line + tag_off_in_line) : 0;
+
+    /* host-side re-read of the SAME EA, at this instant */
+    host_tag = 0;
+    for (i = 0; i < 4; i++) { lst[i] = 0; hst[i] = 0; }
+    if (mapped) {
+        const uint8_t* hp = vm_base + ea_line;
+        host_tag = yz_tr_be32(hp + tag_off_in_line);
+        for (i = 0; i < 4; i++) {
+            hst[i] = yz_tr_be32(hp + i * 32);                     /* the 4 record tags, host */
+            lst[i] = yz_tr_be32(&ctx->ls[(win_ls + i * 32u) & SPU_LS_MASK]);  /* ... and LS */
+        }
+    }
+
+    if (!s_tr_rlive) {
+        s_tr_rlive = 1;
+        fprintf(stderr, "[tagread] live: READ leg firing at pc=0x65E4 (r11=0x%05X lsa=0x%05X "
+                "ls_tag=%08X mapped=%d)\n", r11, lsa, ls_tag, mapped);
+        fflush(stderr);
+    }
+
+    now = yz_host_clock_ms();
+    /* publish-lag: first host_tag==0 at an EA, then its transition to nonzero */
+    if (mapped) {
+        if (host_tag == 0) {
+            if (s_tr_zea != tag_ea) { s_tr_zea = tag_ea; s_tr_zms = now; s_tr_zn = 0; }
+            s_tr_zn++;
+        } else if (s_tr_zea == tag_ea) {
+            fprintf(stderr, "[tagread] PUBLISH-LAG ea=0x%08X host_tag 0 -> %08X after %llu ms "
+                    "/ %lu reads\n", tag_ea, host_tag,
+                    (unsigned long long)(now - s_tr_zms), s_tr_zn);
+            fflush(stderr);
+            s_tr_zea = 0; s_tr_zn = 0;
+        }
+    }
+
+    if (tag_ea == s_tr_last_ea && ls_tag == s_tr_last_ls && host_tag == s_tr_last_ht) {
+        if ((s_tr_reads % 20000UL) == 0) {
+            fprintf(stderr, "[tagread] R heartbeat n=%lu ea=0x%08X ls_tag=%08X host_tag=%08X "
+                    "(UNCHANGED) %s\n", s_tr_reads, tag_ea, ls_tag, host_tag,
+                    (ls_tag == 0 && host_tag != 0) ? "STALE-LS" :
+                    (ls_tag == 0 ? "both-zero" : "nonzero"));
+            fflush(stderr);
+        }
+        return;
+    }
+    s_tr_last_ea = tag_ea; s_tr_last_ls = ls_tag; s_tr_last_ht = host_tag;
+    if (s_tr_rlog < 8000) {
+        s_tr_rlog++;
+        fprintf(stderr, "[tagread] R n=%lu r3=0x%05X r11=0x%05X k=%u win_ls=0x%05X "
+                "ea=0x%08X(+0x%02X) fseq=%lu ls_tag=%08X host_tag=%08X %s "
+                "lsq=%08X,%08X,%08X,%08X hostq=%08X,%08X,%08X,%08X\n",
+                s_tr_reads, r3, r11, k, win_ls, tag_ea, tag_off_in_line, fseq,
+                ls_tag, host_tag,
+                !mapped ? "UNMAPPED" :
+                (ls_tag == 0 && host_tag != 0) ? "STALE-LS(S2)" :
+                (ls_tag == 0 && host_tag == 0) ? "BOTH-ZERO(timing)" :
+                (ls_tag == host_tag) ? "MATCH-NONZERO(downstream)" : "DIFF-NONZERO",
+                lst[0], lst[1], lst[2], lst[3], hst[0], hst[1], hst[2], hst[3]);
+        fflush(stderr);
+    }
+}
+
+/* --- fall-through leg (pc 0x624C, mask != 0 => control reaches 0x6258) ---- */
+static unsigned long s_tr_tlog = 0, s_tr_thits = 0;
+
+void yz_tr_tag(spu_context* ctx, uint32_t lsa, const uint32_t* v)
+{
+    uint32_t obj, mask;
+    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x624Cu) return;
+    if (lsa < 0xB0u) return;
+    mask = v[2];                       /* rotqbyi(r2,8) puts lane 8 in word0 */
+    if (!s_tr_tlive) {
+        s_tr_tlive = 1;
+        fprintf(stderr, "[tagread] live: FALLTHRU leg firing at pc=0x624C (first mask=%08X)\n", mask);
+        fflush(stderr);
+    }
+    if (mask == 0) return;             /* the 0x6254 early return -- the normal idle case */
+    obj = lsa - 0xB0u;
+    s_tr_thits++;
+    if (s_tr_tlog < 4000) {
+        s_tr_tlog++;
+        fprintf(stderr, "[tagread] FALLTHRU n=%lu obj=0x%05X base=0x%05X cnt=%u mask=%08X "
+                "(-> 0x6258 tag-wait) reads=%lu lastea=0x%08X lastls=%08X lasthost=%08X\n",
+                s_tr_thits, obj, v[0], v[1], mask, s_tr_reads,
+                s_tr_last_ea, s_tr_last_ls, s_tr_last_ht);
+        fflush(stderr);
+    }
+}
 
 /* ===========================================================================
  * Function-level SPU spin profiler (diagnostic, env YZ_SPU_PROF)
@@ -3124,6 +3743,129 @@ static spu_fn spu_lookup(uint32_t addr, int image_id, int* serve_img)
 int spu_have_function(uint32_t addr)
 {
     return spu_lookup(addr, 0, NULL) != NULL;
+}
+
+/* ===========================================================================
+ * s47 SENTINEL-GUARD (YZ_SENTINEL_GUARD=1, default OFF) -- ledger #109 fix
+ * fork 2; design scratch/s46_fill_verdict.md Deliverable 4 fix 2.
+ *
+ * Driver B (gs_task LS 0x4DC4->0x4DC8; entry ABI gpr3=state record item+0x10,
+ * gpr4=item) walks the table *(item+8) and relies on FILL-B's -1 sentinels to
+ * terminate. At the ximg storm, transition-class items reach walk-ready
+ * (state 5) with FILL-B quiesced; the sentinel-less tail (interim-BSS zeros +
+ * stale floats + code bytes) yields a garbage count and the walk sprays the
+ * whole LS -- every wall flavor is downstream (#109). Defer such a walk:
+ * behave exactly as if Driver B executed `bi $r0` at entry (SPU_RET
+ * semantics, depth-aware -- honors the doorway's linkage; NOT a C-unwind).
+ * State stays 5, the doorway re-dispatches, and the shape check itself is the
+ * completion signal once FILL-B writes the sentinels. Guest memory untouched.
+ * Pointer-identity gate (tf == gs_task's registrations) is image-unambiguous
+ * by construction (LESSONS #6 LS-overlap class). TWO legs share this helper:
+ * the SPU_DRAIN hop (direct tail-chains -- the leg boot s47sg_on1 proved
+ * necessary: banner-armed 0 fires on the indirect leg alone while the wall
+ * reproduced) and spu_indirect_branch (bi $rN). g_yz_sguard_on starts -1 so
+ * the first drain hop of any SPU thread performs the one-time init.
+ * Retirement: closing the phase-skew root (why the transition record class
+ * is consumed pre-gameplay at all). */
+int g_yz_sguard_on = -1;
+
+int yz_sguard_check(spu_context* ctx, void* tf)
+{
+    if (g_yz_sguard_on < 0) {
+        const char* e = getenv("YZ_SENTINEL_GUARD");
+        int on = (e && *e && *e != '0') ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "[sguard] ARMED: defer sentinel-less state-5 "
+                    "Driver-B walks (gs_task 0x4DC4/0x4DC8, tail scan "
+                    "+0x40..+0x130; drain + indirect legs)\n");
+            fflush(stderr);
+        }
+        g_yz_sguard_on = on;
+    }
+    if (!g_yz_sguard_on) return 0;
+
+    static spu_fn sg_fn4 = 0, sg_fn8 = 0, sg_fn6f = 0;
+    if (!sg_fn4) {   /* lazy: gs_task registers after early boot */
+        sg_fn4 = spu_lookup(0x4DC4u, 0, NULL);
+        sg_fn8 = spu_lookup(0x4DC8u, 0, NULL);
+        sg_fn6f = spu_lookup(0x6F98u, 0, NULL);
+        if (!sg_fn4) return 0;
+    }
+
+    /* s47 COMMIT-GATE EXTENSION (the second heavy door). The 0x6F98 driver =
+     * the tag-2 staged-patch sweep (stage 2 of the staged tag-0x10 item class,
+     * ledger #106 -- the LS-wide stamp walk whose targets derive from fetched
+     * hole content; the door that wounded the consumer in push boot 1).
+     * Measured correct-world behavior: RPCS3 runs ZERO staged sweeps and zero
+     * staging-arena GETs pre-gameplay (#99 store-corroborated; the s47 sealed
+     * oracle), while the routine tag-0x10 flow applies via the refresh path
+     * and never dispatches items here. Triangulated with the SDK kick/commit
+     * contract (scratch/s47_sgf_match.md) and the sagemono producer-signal
+     * pattern (scratch/s47_sagemono_compare.md): this class is not committed
+     * for consumption pre-gameplay. Defer ALL dispatches of this driver while
+     * armed -- measured-equivalence enforcement of the commit gate's effect
+     * until the gate cell itself is located. Same SPU_RET defer semantics as
+     * the Driver-B leg. */
+    if (sg_fn6f && tf == (void*)sg_fn6f) {
+        static unsigned long sw_n = 0;
+        unsigned long n = ++sw_n;
+        if (n <= 16 || (n & 4095u) == 0) {
+            const uint8_t* ls = ctx->ls;
+            uint32_t a3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+            uint32_t a4 = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+            fprintf(stderr, "[sguard] DEFER-SWEEP n=%lu spu=%X r3=0x%05X r4=0x%05X "
+                    "lr=0x%05X r3q=%02X%02X%02X%02X\n",
+                    n, ctx->spu_id, a3, a4,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    ls[a3 & SPU_LS_MASK], ls[(a3+1) & SPU_LS_MASK],
+                    ls[(a3+2) & SPU_LS_MASK], ls[(a3+3) & SPU_LS_MASK]);
+            fflush(stderr);
+        }
+        ctx->pc = ctx->gpr[0]._u32[0];
+        g_spu_trampoline_fn = (ctx->host_depth == 0) ? spu_indirect_branch : 0;
+        return 1;
+    }
+
+    if (tf != (void*)sg_fn4 && tf != (void*)sg_fn8) return 0;
+
+    {
+        const uint8_t* ls = ctx->ls;
+        uint32_t item = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+#define SG_LSW(A) (((uint32_t)ls[(A) & SPU_LS_MASK] << 24) |            \
+                   ((uint32_t)ls[((A)+1) & SPU_LS_MASK] << 16) |        \
+                   ((uint32_t)ls[((A)+2) & SPU_LS_MASK] << 8) |         \
+                    (uint32_t)ls[((A)+3) & SPU_LS_MASK])
+        uint32_t state = SG_LSW(item + 0x14);
+        uint32_t tbl   = SG_LSW(item + 0x08) & SPU_LS_MASK;
+        if (state == 5 && tbl >= 0x80u && tbl + 0x130u <= (uint32_t)SPU_LS_SIZE) {
+            int sentinel = 0;
+            uint32_t off;
+            for (off = 0x40u; off < 0x130u; off += 4u)
+                if (SG_LSW(tbl + off) == 0xFFFFFFFFu) { sentinel = 1; break; }
+            if (!sentinel) {
+                static unsigned long sg_n = 0;
+                unsigned long n = ++sg_n;
+                if (n <= 16 || (n & 4095u) == 0) {
+                    fprintf(stderr, "[sguard] DEFER n=%lu spu=%X item=0x%05X "
+                            "tbl=0x%05X lr=0x%05X state=%u tail=%08X %08X %08X %08X\n",
+                            n, ctx->spu_id, item, tbl,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK, state,
+                            SG_LSW(tbl + 0x40u), SG_LSW(tbl + 0x80u),
+                            SG_LSW(tbl + 0xC0u), SG_LSW(tbl + 0x100u));
+                    fflush(stderr);
+                }
+                /* SPU_RET semantics, split across the two legs: set pc +
+                 * trampoline here; the drain leg `continue`s (re-dispatches
+                 * the armed trampoline, or exits the loop on 0 = the
+                 * plain-return path), the indirect leg plain-`return`s. */
+                ctx->pc = ctx->gpr[0]._u32[0];
+                g_spu_trampoline_fn = (ctx->host_depth == 0) ? spu_indirect_branch : 0;
+                return 1;
+            }
+        }
+#undef SG_LSW
+    }
+    return 0;
 }
 
 /* ===========================================================================
@@ -3947,6 +4689,16 @@ void spu_indirect_branch(spu_context* ctx)
     }
     int serve_img = ctx->image_id;
     spu_fn fn = spu_lookup(ctx->pc, ctx->image_id, &serve_img);
+
+    /* s47 SENTINEL-GUARD, indirect-dispatch leg (see yz_sguard_check below /
+     * FLAGS.md YZ_SENTINEL_GUARD). The other leg is in SPU_DRAIN (direct
+     * tail-chains never pass through this function -- boot s47sg_on1 measured
+     * the banner-armed guard at 0 fires while the wall reproduced, proving
+     * this leg alone does not see the dispatch). On defer the helper has
+     * already set pc/trampoline per SPU_RET semantics; just return. */
+    if (g_yz_sguard_on && fn && yz_sguard_check(ctx, (void*)fn))
+        return;
+
     if (fn) {
         /* ADOPT-ON-SERVE (s24 image model, ledger #51): tag the context with
          * the image whose registration actually serves this dispatch (kernel

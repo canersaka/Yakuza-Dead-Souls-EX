@@ -88,6 +88,62 @@ proof the function is unused.);
 entry branch â€” with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
 only launch args are needed â€” PROF's per-branch overhead crawls the whole boot).
 
+`YZ_MASK_SEAL` (spu_channels.c `yz_mask_seal_arm`/`yz_ms_read`/`yz_ms_write` + hooks in
+spu_context.h `spu_ls_read128` and `spu_ls_write128`, 2026-07-20 s49, diag, default OFF):
+**the gs_task pending-DMA-tag mask trail.** The measured consumer stall
+(`scratch/s49_starve_onset.md`) is 829 byte-identical poll iterations all taking the early
+return at LS pc 0x6254 (`biz $r2,$r0`) because the item mask `*(OBJ+0xB8)` (lane-8 word of
+the quad loaded at 0x624C) reads zero. When set, the READ leg fires once per gate entry
+(img0, pc 0x624C) and logs the object LS addr, the mask, the allocation count at +0xB4, the
+12 item states (base + i*0x40 word0, one digit each) and the recorded last-writer pc/value,
+deduped so only CHANGES print plus a 200k heartbeat; the WRITE leg fires on the
+statically-decoded writer set (ARM 0x5B44/0x5D60/0x5F20/0x5F90/0x6000/0x66D8/0x6AA0, REAP
+0x62D8, INIT 0x53F4, plus the same-quad/bulk-copy sites 0x535C/0x5164/0x54EC/0x568C/0x9A60)
+and logs old->new mask with its pc, first 400 in full then transition-only. Liveness per the
+honesty rule: an ARMED banner plus a one-shot `live:` line from each leg; zero hits without
+those lines is a dead probe, not a clean negative. Retire when the mask protocol question is
+closed. Cost when off: one already-loaded int test on the LS load/store paths.
+
+`YZ_TAGREAD` (spu_channels.c `yz_tagread_arm`/`yz_tr_fetch`/`yz_tr_read`/`yz_tr_tag` +
+hooks in spu_context.h `spu_ls_read128` and spu_dma.h's plain-GET and GETLLAR legs,
+2026-07-20 s49, diag, default OFF): **the publish-by-tag value probe — the one missing
+datum of the plateau.** The consumer's gate at LS pc 0x65E4 executed 839 times in-plateau
+(`scratch/s49_stale_window.md`), but the flight recorder stores that site as a BRANCH
+record with no operand field, so the tag value it read is unrecoverable from any banked
+dump. When set, the READ leg fires once per gate entry (img0, pc 0x65E4 = `lq(r11+0x60)`)
+and logs the resolved journal line EA, `ls_tag` (the value the SPU will see, reproducing
+the following `rotqby(r10,r11)`), `host_tag` (a re-read of the SAME EA from guest memory
+via `vm_base` at that instant — the S2 coherency test), the fetched window's LS address and
+record offset, the fetch sequence and the read sequence, plus both the LS and host copies of
+the line's four record tags. It classifies each event inline: `STALE-LS(S2)` /
+`BOTH-ZERO(timing)` / `MATCH-NONZERO(downstream)` / `DIFF-NONZERO` / `UNMAPPED`, dedups by
+(EA, ls_tag, host_tag) with a 20k heartbeat, and emits a `PUBLISH-LAG` line giving the wall
+time and read count between the first `host_tag==0` at an EA and its first nonzero. The EA
+resolution is measured, not inferred: the FETCH leg records LS-128-byte-line -> arena-EA-line
+for every image-0 transfer into [0x41F00000,0x42200000). The FALL-THROUGH leg (img0,
+pc 0x624C, lane-8 word != 0) catches the sibling event that reaches 0x6258 — 12 occurrences
+in-plateau against 1,679 early returns at 0x6254 — with the object, base, count, mask and the
+last tag-read triple. Liveness per the honesty rule: an ARMED banner plus a one-shot `live:`
+line from each of the three legs; zero hits without those lines is instrument failure, not a
+clean negative. Retire when the plateau's tag value is settled. Cost when off: one
+already-loaded int test on the LS load path and the two DMA legs.
+
+`YZ_LS_CODE_WATCH` (spu_channels.c `yz_lscw_check` + hooks in spu_context.h
+`spu_ls_write128` and spu_dma.h mfc GET/both GETLLAR legs, 2026-07-20 s48, diag, default
+OFF): **the self-modifying-SPU-code tripwire.** Our SPU model runs pre-lifted native code
+(LS code bytes are never re-read as instructions), so an in-place code patch would execute
+stale semantics silently; every trace-diff to date assumed the title never does this
+without measuring it. When set, every lifted store and every LS-writing DMA landing is
+checked against the current image's text extent (derived per image from the dispatch
+registry: [min, max+0x10) over lifted-function starts) and only byte-CHANGING writes
+report: PATCH-shaped (<0x400 B — the real self-mod signal, cap 200 then 1/256) vs
+LOAD-shaped (>=0x400 B segment/image deploys, first 8 + count). Liveness per the honesty
+rules: ARMED banner, extents line, one-shot live line, bounded heartbeat — zero PATCH
+hits without those lines = probe not live, not a clean negative. v1 gaps (documented in
+the code): last-function tail beyond its first quad, host-side spu_elf_load_to_ls
+(pre-execution), PPU LS-window writes. Retire or promote to a guard if a real PATCH hit
+ever shows; keep as the standing answer to "does this title self-modify SPU code."
+
 `YZ_INTRMBOX_LOG` (spu_channels.c, `SPU_WrOutIntrMbox` handler, 2026-07-04, diag â€” pure
 diagnosis for the t1 event-flag wedge): logs EVERY SPU class-2 doorbell write
 UNCONDITIONALLY, before any routing decision â€” raw value, decoded code/port(spup), the
@@ -1121,3 +1177,41 @@ acquire — the RdDec/WrDec formulas in spu_channels.c are UNCHANGED, and this m
 Quantum unit, default 65536. Counted per drain-tick (SPU_DRAIN re-entry, ≈ one guest
 instruction) AND per GETLLAR (both spu_dma.h legs) — whichever fires first ticks the shared
 counter. Only read once, at arm time.
+
+### YZ_SENTINEL_GUARD (s47, 2026-07-19 — the #109 fix-fork-2 bridge, default OFF)
+Defers Driver-B walks of fill-incomplete items (the measured spray mechanism, ledger
+#109; design scratch/s46_fill_verdict.md Deliverable 4 fix 2). TWO legs, one shared
+helper (yz_sguard_check, spu_channels.c): the SPU_DRAIN hop (direct tail-chains — the
+leg boot s47sg_on1 proved necessary: banner-armed 0 fires on the indirect leg alone
+while the wall reproduced) and spu_indirect_branch (bi $rN); pointer-identity gate on
+gs_task's 0x4DC4/0x4DC8 registrations — image-unambiguous by construction. A state-5
+item whose walked table
+*(item+8) carries no -1 sentinel in [+0x40,+0x130) — FILL-B's measured span — is
+deferred: the dispatch behaves as `bi $r0` at entry (SPU_RET, depth-aware; the
+doorway's linkage honored), state stays 5, the doorway re-dispatches, and the shape
+check is the completion signal once FILL-B populates the table. Guest memory untouched;
+zero writes. Banner `[sguard] ARMED`; per-defer `[sguard] DEFER` lines (first 16 +
+every 4096th) with item/table/lr/tail bytes. Known possible failure mode (pre-committed
+honest readout): a deferred item at the active-list head can convert the spray death
+into an orbit strand (the #108 HOLB gate) — that outcome measures the second wall, it
+does not validate the guard. Class: diagnostic bridge, NOT the root fix; do not iterate
+its policy (per the #104/#107 discipline). Retirement: closing the phase-skew root (why
+the transition record class is consumed pre-gameplay at all).
+A/B OUTCOME (s47, ledger #110): fires exactly as designed — 231 defers in the armed boot
+(s47sg_on2), items 0xC050/0xBDD0 at the storm, lr=0x4F60, state 5, all-zero tails = the
+FIRST live (non-dump) confirmation of the #109 armed-unfilled mechanism; defers run
+cleanly to boot end (~3k re-dispatches/s, engine alive). But the terminal park is
+UNCHANGED vs the OFF control (0x4C24 vs 0x53FC, both classic; loading frozen at the same
+6 files) — the un-retired head item strands the queue either way (the #108 HOLB gate).
+KEEP default-OFF as the live per-item detector of the #109 mechanism; it is not a wall
+lever.
+s47 PUSH EXTENSION (same flag, second door): the guard now ALSO defers every dispatch
+of the 0x6F98 tag-2 staged-patch sweep driver (ledger #106's LS-wide stamp walk — the
+door that wounded the consumer in push boot 1 after the first door was closed).
+Measured-equivalence basis: RPCS3 runs zero staged sweeps / zero staging-arena GETs
+pre-gameplay (#99 + the s47 SEALED oracle); triangulated with the SDK per-frame
+kick/commit contract and the sagemono producer-signal pattern. `[sguard] DEFER-SWEEP`
+lines (first 16 + every 4096th) with r3/r4/lr + the state quad. This is the
+commit-gate's measured EFFECT enforced host-side until the gate cell is located — the
+armed guard is now a two-door class gate, not just a corruption detector. Retirement
+unchanged (the real commit-gate fix at the named cell).
