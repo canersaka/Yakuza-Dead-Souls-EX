@@ -81,7 +81,8 @@ typedef struct mfc_engine {
     uint32_t    resv_poll_n;      /* consecutive same-line GETLLARs with an unchanged
                                    * write-generation = an idle reservation poll loop;
                                    * drives the host-yield backoff (see MFC_GETLLAR_CMD) */
-    uint32_t    atomic_stat;      /* last MFC_RdAtomicStat value */
+    uint32_t    atomic_stat;      /* value waiting in MFC_RdAtomicStat */
+    uint32_t    atomic_stat_ready;/* 1 while that single channel entry is readable */
 
     /* ---- Appended 2026-07-03: DMA-list stall-and-notify (F11/P6). ----
      * CBEA v1.02 lists a stall-and-notify list element (bit 15 of the
@@ -136,6 +137,12 @@ static inline void mfc_engine_init(mfc_engine* mfc)
 {
     memset(mfc, 0, sizeof(*mfc));
     mfc->tag_completed = 0xFFFFFFFF; /* all tags idle = completed */
+}
+
+static inline void mfc_publish_atomic_status(mfc_engine* mfc, uint32_t status)
+{
+    mfc->atomic_stat = status;
+    mfc->atomic_stat_ready = 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -203,8 +210,31 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     __try {
 #endif
         if (mfc_is_get(cmd)) {
+            /* s48 LS-CODE-WATCH DMA leg (env YZ_LS_CODE_WATCH, spu_channels.c
+             * yz_lscw_check): pre-copy so current LS bytes are still comparable
+             * against the incoming ea bytes; inside the __try (ea may point at
+             * uncommitted guest space -- an AV here skips the transfer exactly
+             * like the memcpy below would have). Covers plain GETs AND every
+             * DMA-list element (mfc_do_list_transfer_from funnels here per
+             * element). GETLLAR lands via the two lock-line legs, checked
+             * there. */
+            { extern volatile int g_yz_lscw_on;
+              extern int yz_lscw_arm(void);
+              extern void yz_lscw_check(spu_context*, uint32_t, uint32_t,
+                                        const uint8_t*, unsigned long long, const char*);
+              int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
+              if (lcw) yz_lscw_check(spu, lsa, size, ea_ptr,
+                                     (unsigned long long)ea, "dma-get"); }
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            /* s49 TAG-READ fetch map (env YZ_TAGREAD, spu_channels.c yz_tr_fetch):
+             * record LS-line -> arena-EA-line so the tag-read leg can name the
+             * journal line EA it is reading instead of inferring it. */
+            { extern volatile int g_yz_tr_on;
+              extern int yz_tagread_arm(void);
+              extern void yz_tr_fetch(spu_context*, uint32_t, unsigned long long, uint32_t);
+              int trf = g_yz_tr_on; if (trf < 0) trf = yz_tagread_arm();
+              if (trf) yz_tr_fetch(spu, lsa, (unsigned long long)ea, size); }
             /* s38 arm-gate witness DMA-watch (env YZ_ARMGATE): a GET landing on LS
              * 0xBD70 would be the (non-store) writer of the apply_entry arm-gate witness.
              * Complements the spu_ls_write128 store-watch -- if BOTH stay silent the
@@ -880,6 +910,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                * routine zeroes gpr3 at 0x6368, before the Cmd wrch we catch.)
                * ride11 already proved the head is NON-EMPTY at the stall. */
               if (cn <= 12 || (cn & 0xFFFu) == 0) {
+                  /* s47: the dump must not deref a wounded EA -- push boot 1
+                   * died HERE, not in the game: consumer state zeroed -> jea=0
+                   * -> vm_base+0 = the uncommitted null page -> host AV
+                   * (LESSONS #6b). Out-of-arena EA -> note-and-skip. */
+                  if ((jea & ~127u) < 0x41F00000u || (jea & ~127u) >= 0x42200000u) {
+                      static unsigned long oo = 0; oo++;
+                      if (oo <= 8 || (oo & 0xFFFu) == 0) {
+                          fprintf(stderr, "[jrnl-line] n=%lu ea=0x%08X OUT-OF-ARENA "
+                                  "(wounded consumer state; dump skipped)\n",
+                                  cn, jea & ~127u);
+                          fflush(stderr);
+                      }
+                  } else {
                   const uint8_t* hl = vm_base + (jea & ~127u);
                   char cb[420]; int ci = 0;
                   ci += snprintf(cb + ci, sizeof(cb) - (size_t)ci,
@@ -888,6 +931,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       ci += snprintf(cb + ci, sizeof(cb) - (size_t)ci, "%s%02X%02X%02X%02X",
                                      (k & 31) ? " " : " | ", hl[k], hl[k+1], hl[k+2], hl[k+3]);
                   fprintf(stderr, "%s\n", cb); fflush(stderr);
+                  }
               }
           }
           if (head && cmd == MFC_GETLLAR_CMD && jline == 0x41F00080u) {
@@ -1442,19 +1486,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                           mfc->resv_active = 1;
                           mfc->resv_ea = (ea & ~127ull);
                       }
-                      mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+                      mfc_publish_atomic_status(mfc, MFC_GETLLAR_SUCCESS);
                   } else if (cmd == MFC_PUTLLC_CMD) {
                       if (!npf && mfc->resv_active && mfc->resv_ea == (ea & ~127ull)
                           && memcmp(s_lowmem + loff, mfc->resv_data, 128) == 0) {
                           memcpy(s_lowmem + loff, lls, 128);
                           mfc->resv_active = 0;
-                          mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
+                          mfc_publish_atomic_status(mfc, MFC_PUTLLC_SUCCESS);
                       } else {
-                          mfc->atomic_stat = MFC_PUTLLC_FAILURE;
+                          mfc_publish_atomic_status(mfc, MFC_PUTLLC_FAILURE);
                       }
                   } else {
                       if (!npf) memcpy(s_lowmem + loff, lls, 128);
-                      mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;
+                      mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
                   }
                 }
                 mfc->tag_completed |= (1u << tag);
@@ -1523,6 +1567,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 && spu_coh_gen((uint32_t)le) == mfc->resv_gen) {
                 extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
                 g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
+                /* s48 LS-CODE-WATCH (fast cached GETLLAR leg): a lock line
+                 * staged inside lifted text would be self-mod-adjacent. */
+                { extern volatile int g_yz_lscw_on;
+                  extern int yz_lscw_arm(void);
+                  extern void yz_lscw_check(spu_context*, uint32_t, uint32_t,
+                                            const uint8_t*, unsigned long long, const char*);
+                  int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
+                  if (lcw) yz_lscw_check(spu, (uint32_t)(ls_ptr - spu->ls), 128,
+                                         mfc->resv_data, (unsigned long long)le, "getllar"); }
                 memcpy(ls_ptr, mfc->resv_data, 128);
                 mfc->resv_poll_n++;
                 /* s42 YZ_SPU_LOCKSTEP (★REVIEW D/E): the fast cached GETLLAR leg is
@@ -1542,7 +1595,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
                        * site above; same-thread self-raise, relaxed order. */
                       atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ } }
-                mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+                mfc_publish_atomic_status(mfc, MFC_GETLLAR_SUCCESS);
                 mfc->tag_completed |= (1u << tag);
                 return 0;
             }
@@ -1567,7 +1620,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             { extern void spu_llar_note(uint32_t); extern int g_spu_prof_on;
               if (g_spu_prof_on) spu_llar_note((uint32_t)(ea & ~127ull)); }
             spu_coh_reserve((uint32_t)(ea & ~127ull));
+            /* s48 LS-CODE-WATCH (locked GETLLAR leg): companion of the fast
+             * cached leg's check above. */
+            { extern volatile int g_yz_lscw_on;
+              extern int yz_lscw_arm(void);
+              extern void yz_lscw_check(spu_context*, uint32_t, uint32_t,
+                                        const uint8_t*, unsigned long long, const char*);
+              int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
+              if (lcw) yz_lscw_check(spu, (uint32_t)(ls_ptr - spu->ls), 128,
+                                     (const uint8_t*)line, (unsigned long long)(ea & ~127ull),
+                                     "getllar"); }
             memcpy(ls_ptr, line, 128);
+            /* s49 TAG-READ fetch map (GETLLAR leg -- the consumer's journal
+             * window arrives here, pc 0x638C). Same helper as the plain-GET leg. */
+            { extern volatile int g_yz_tr_on;
+              extern int yz_tagread_arm(void);
+              extern void yz_tr_fetch(spu_context*, uint32_t, unsigned long long, uint32_t);
+              int trf = g_yz_tr_on; if (trf < 0) trf = yz_tagread_arm();
+              if (trf) yz_tr_fetch(spu, (uint32_t)(ls_ptr - spu->ls),
+                                   (unsigned long long)(ea & ~127ull), 128u); }
             /* s45 RESUME-HOLD v3 consumption (DIAGNOSTIC LEVER, default OFF --
              * s46 verdict: the switch-replay theory refuted, terminal park
              * unchanged ON vs OFF; see yz_resume_hold_arm's comment in
@@ -1800,7 +1871,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               mfc->resv_ea  = le;
               mfc->resv_gen = g; }
             mfc->resv_active = 1;
-            mfc->atomic_stat = MFC_GETLLAR_SUCCESS;
+            mfc_publish_atomic_status(mfc, MFC_GETLLAR_SUCCESS);
             /* LOST-WAKEUP FIX (2026-07-05; DEFAULT ON, kill-switch YZ_NO_LRWAKE). ROOT
              * (MEASURED, confirmed two independent ways): the SPURS idle
              * kernel backs off (host-yield) between GETLLAR polls of its management line;
@@ -2220,9 +2291,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 mfc->resv_active = 0;
                 { extern void spu_coh_notify_write(uint32_t);
                   spu_coh_notify_write((uint32_t)(ea & ~127ull)); }
-                mfc->atomic_stat = MFC_PUTLLC_SUCCESS;
+                mfc_publish_atomic_status(mfc, MFC_PUTLLC_SUCCESS);
             } else {
-                mfc->atomic_stat = MFC_PUTLLC_FAILURE;
+                mfc_publish_atomic_status(mfc, MFC_PUTLLC_FAILURE);
             }
             mfc->resv_active = 0;
             break;
@@ -2233,7 +2304,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             memcpy(line, ls_ptr, 128);
             { extern void spu_coh_notify_write(uint32_t);
               spu_coh_notify_write((uint32_t)(ea & ~127ull)); }  /* clears resv_active + raises LR for all matching ctxs */
-            mfc->atomic_stat = MFC_PUTLLUC_SUCCESS;
+            mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
             break;
         }
         /* TS-WATCH (env YZ_TS_WATCH, 2026-06-20 pt27): log every SPU atomic touch of
@@ -2439,7 +2510,12 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
          * change (F11's "behaves exactly as today" requirement). */
         return mfc->stall_mask;
     case MFC_RdAtomicStat:
-        return mfc->atomic_stat;
+        {
+            uint32_t status = mfc->atomic_stat;
+            if (mfc->atomic_stat_ready)
+                mfc->atomic_stat_ready = 0;
+            return status;
+        }
     default:
         return 0;
     }
