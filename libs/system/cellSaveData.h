@@ -54,8 +54,9 @@ extern "C" {
 #define CELL_SAVEDATA_FILETYPE_CONTENT_SND0   5
 
 /* Callback result values */
-#define CELL_SAVEDATA_CBRESULT_OK_LAST      0
-#define CELL_SAVEDATA_CBRESULT_OK_NEXT      1
+#define CELL_SAVEDATA_CBRESULT_OK_NEXT      0
+#define CELL_SAVEDATA_CBRESULT_OK_LAST      1
+#define CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM 2
 #define CELL_SAVEDATA_CBRESULT_ERR_NOSPACE  (-1)
 #define CELL_SAVEDATA_CBRESULT_ERR_FAILURE  (-2)
 #define CELL_SAVEDATA_CBRESULT_ERR_BROKEN   (-3)
@@ -102,7 +103,8 @@ typedef struct CellSaveDataCBResult {
     s32  result;
     u32  progressBarInc;
     s32  errNeedSizeKB;
-    char invalidMsg[CELL_SAVEDATA_INVALIDMSG_MAX];
+    char* invalidMsg;
+    void* userdata;
 } CellSaveDataCBResult;
 
 typedef struct CellSaveDataDirList {
@@ -112,17 +114,11 @@ typedef struct CellSaveDataDirList {
 } CellSaveDataDirList;
 
 typedef struct CellSaveDataListGet {
+    u32  dirNum;
     u32  dirListNum;
     CellSaveDataDirList* dirList;
+    char reserved[64];
 } CellSaveDataListGet;
-
-typedef struct CellSaveDataListSet {
-    u32  focusPosition;
-    char* focusDirName;
-    u32  fixedListNum;
-    CellSaveDataDirList* fixedList;
-    char reserved[12];
-} CellSaveDataListSet;
 
 typedef struct CellSaveDataNewDataIcon {
     char* title;
@@ -130,12 +126,27 @@ typedef struct CellSaveDataNewDataIcon {
     void* iconBuf;
 } CellSaveDataNewDataIcon;
 
+typedef struct CellSaveDataFixedSet {
+    char* dirName;
+    CellSaveDataNewDataIcon* newIcon;
+    u32 option;
+} CellSaveDataFixedSet;
+
 typedef struct CellSaveDataListNewData {
     u32  iconPosition;
     char* dirName;
     CellSaveDataNewDataIcon* icon;
     char reserved[8];
 } CellSaveDataListNewData;
+
+typedef struct CellSaveDataListSet {
+    u32  focusPosition;
+    char* focusDirName;
+    u32  fixedListNum;
+    CellSaveDataDirList* fixedList;
+    CellSaveDataListNewData* newData;
+    void* reserved;
+} CellSaveDataListSet;
 
 typedef struct CellSaveDataSystemFileParam {
     char title[CELL_SAVEDATA_SYSP_TITLE_SIZE];
@@ -217,7 +228,7 @@ typedef void (*CellSaveDataListCallback)(CellSaveDataCBResult* cbResult,
 
 typedef void (*CellSaveDataFixedCallback)(CellSaveDataCBResult* cbResult,
                                            CellSaveDataListGet* get,
-                                           CellSaveDataListSet* set);
+                                           CellSaveDataFixedSet* set);
 
 typedef void (*CellSaveDataStatCallback)(CellSaveDataCBResult* cbResult,
                                           CellSaveDataStatGet* get,

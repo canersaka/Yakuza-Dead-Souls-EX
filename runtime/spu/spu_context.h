@@ -315,6 +315,11 @@ typedef struct spu_context {
     uint32_t lockstep_quantum_ctr;
     uint64_t lockstep_release_tb;
 
+    /* Floating-point status/control state. Arithmetic helpers currently use
+     * fixed execution rules, but task save/restore code still relies on these
+     * bits surviving fscrrd/fscrwr round trips. */
+    SPU_ALIGN16 u128 fpscr;
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same

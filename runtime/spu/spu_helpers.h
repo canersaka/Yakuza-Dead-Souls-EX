@@ -571,7 +571,8 @@ static inline u128 spu_cgthi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)
 static inline u128 spu_cgtbi(u128 a, int32_t imm)  { u128 r; int8_t v=(int8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>v)?0xFFu:0; return r; }
 
 /* ---- Phase 2: misc one-offs ---- */
-static inline u128 spu_fscrrd(u128 a) { (void)a; return spu_zero(); }
+static inline u128 spu_fscrrd(const spu_context* ctx) { return ctx->fpscr; }
+static inline void spu_fscrwr(spu_context* ctx, u128 value) { ctx->fpscr = value; }
 static inline u128 spu_gb(u128 a) {
     uint32_t v = ((a._u32[0]&1)<<3)|((a._u32[1]&1)<<2)|((a._u32[2]&1)<<1)|(a._u32[3]&1);
     u128 r = spu_zero(); r._u32[0]=v; return r;

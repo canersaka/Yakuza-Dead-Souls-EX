@@ -1,6 +1,7 @@
 # Build directories
 build/
 build-*/
+build_*/
 cmake-build-*/
 out/
 
@@ -77,6 +78,11 @@ yakuza/func_table_gen.cpp
 yakuza/import_bridges_gen.cpp
 yakuza/imports.json
 
+# Generated replay snapshots
+/libs/video/tests/build_replay_chr.cmd
+/libs/video/tests/build_replay_s31blue.cmd
+/libs/video/tests/replay_*_main.c
+
 # Reference manuals
 *.pdf
 RSX ISA Documentation Search.md
@@ -95,6 +101,10 @@ docs/RSX_LAYER1.md
 docs/SPU_INTERP_PLAN.md
 docs/SPURS_TASKSET.md
 docs/TRACEDIFF.md
+/docs/A0??_*.md
+/docs/BOOT_ORDERING_ANALYSIS.md
+/docs/CLAUDE_HANDOFF_*.md
+/docs/*_HANDOFF.md
 tools/lint_handoff.py
 CHEATSHEET.md
 CLAUDE.md
@@ -154,6 +164,10 @@ altivec.txt
 scratch/
 scratchpad/
 goldens/
+/wt/
+/*scratch_*.txt
+/rpcs3_guest_memory_dumper.zip
+/libs/video/tests/frame_*.ppm
 functions_old.json
 functions_gapfill.json
 *.png

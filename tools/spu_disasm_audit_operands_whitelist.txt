@@ -61,8 +61,8 @@ gbb:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (onl
 fsmh:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
 fesd:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
 frds:spurious 3rd "$rb" operand never read by spu_lifter.py's rr_un dispatch (only rt=ops[0], ra=ops[1] used)
-fscrwr:fscrwr is an unconditional FPSCR no-op in spu_lifter.py (~line 342); no operand ever read
-fscrrd:spurious "ra" operand (real ISA has none; SPUDisAsm FSCRRD takes rt only) computed via spu_fscrrd(ra) but the arg is (void)-discarded and always returns zero (runtime/spu/spu_helpers.h ~286) -- read has no side effects, PROVEN benign
+fscrwr:the lifter consumes the instruction's source register and stores it in the execution context's FPSCR state
+fscrrd:spurious "ra" operand (the instruction has no source register); the lifter ignores it and reads the execution context's FPSCR state
 iret:extra rt/rb operands never real (real ISA: iret takes no GPR operand, jumps to fixed SRR0); spu_lifter.py's iret codegen (~line 618) reads zero operands -- PROVEN benign
 
 # --- nop: SPU ISA's "rt" field on a NOP-class instruction is architecturally
