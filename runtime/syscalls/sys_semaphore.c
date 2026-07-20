@@ -137,7 +137,12 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    s->sem_handle = CreateSemaphoreA(NULL, initial, max_val, NULL);
+    /* s47 lost-wake fix: the kernel semaphore is a PURE WAKE CHANNEL, not a
+     * count mirror — it starts at 0 regardless of `initial` (the count lives
+     * only in s->value; a waiter checks value before ever sleeping). Cap the
+     * handle at LONG_MAX-ish: tokens are bounded by waiters and spurious
+     * leftovers are benign (a woken waiter re-checks value and re-sleeps). */
+    s->sem_handle = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
     InitializeCriticalSection(&s->value_lock);
     if (s->sem_handle == NULL) {
         s->active = 0;
@@ -246,57 +251,64 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    DWORD result;
-    if (timeout_us > 0 && timeout_us < 1000) {
-        /* Sub-ms timed wait: WaitForSingleObject floors to 1 ms and the OS
-         * rounds up to the timer tick; poll the handle (0-timeout try-acquire)
-         * to a QPC deadline instead. */
-        int64_t deadline = lv2_usec_deadline(timeout_us);
-        for (;;) {
-            result = WaitForSingleObject(s->sem_handle, 0);
-            if (result != WAIT_TIMEOUT) break;
-            if (lv2_deadline_passed(deadline)) break;
-            SwitchToThread();
+    /* s47 LOST-WAKE FIX (the s36-s38 completion-race family, finally named —
+     * ledger/STATUS s47; 1-minute repro in wt/exp-menu). The old scheme kept
+     * the count TWICE (kernel handle + shadow s->value) and post() made its
+     * EBUSY decision off the shadow, which LAGS between a waiter's kernel
+     * grant and its value-- — the s30-era comment in post() documented the
+     * spurious-refusal window but the refusal also SKIPPED ReleaseSemaphore:
+     * a dropped wake the guest never recovers from (the CRI device-server
+     * lane treats posts as fire-and-forget). Single-truth rewrite, mirroring
+     * the (already-correct) POSIX branch: s->value is the ONLY count, checked
+     * and decremented under value_lock BEFORE any sleep; the kernel sem is a
+     * pure wake channel (post releases min(count, waiters) tokens; spurious
+     * or orphaned tokens just cause a benign re-check loop). */
+    int64_t deadline = (timeout_us > 0) ? lv2_usec_deadline(timeout_us) : 0;
+    for (;;) {
+        /* Take a token if available (the ONLY count, under the lock). */
+        EnterCriticalSection(&s->value_lock);
+        if (s->value > 0) {
+            s->value--;
+            LeaveCriticalSection(&s->value_lock);
+            if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+                s_sem_trace_n++;
+                fprintf(stderr, "[sem] t%u WAIT-exit id=%u val=%d\n",
+                        yz_thread_current_id(), sem_id, s->value);
+                fflush(stderr);
+            }
+            return CELL_OK;
         }
-    } else {
-        /* Batch fixes item 8: never let a converted ms value land on
-         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
-        DWORD ms;
-        if (timeout_us == 0) {
-            ms = INFINITE;
-        } else {
-            uint64_t ms64 = timeout_us / 1000;
-            ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
+        if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
+            LeaveCriticalSection(&s->value_lock);
+            if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
+                s_sem_trace_n++;
+                fprintf(stderr, "[sem] t%u WAIT-timeout id=%u\n", yz_thread_current_id(), sem_id);
+                fflush(stderr);
+            }
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
-        result = WaitForSingleObject(s->sem_handle, ms);
-    }
-    if (result == WAIT_TIMEOUT) {
-        if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-            s_sem_trace_n++;
-            fprintf(stderr, "[sem] t%u WAIT-timeout id=%u\n", yz_thread_current_id(), sem_id);
-            fflush(stderr);
-        }
-        return (int64_t)(int32_t)CELL_ETIMEDOUT;
-    }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
+        s->waiters++;
+        LeaveCriticalSection(&s->value_lock);
 
-    EnterCriticalSection(&s->value_lock);
-    s->value--;
-    LeaveCriticalSection(&s->value_lock);
-    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-        s_sem_trace_n++;
-        fprintf(stderr, "[sem] t%u WAIT-exit id=%u val=%d\n",
-                yz_thread_current_id(), sem_id, s->value);
-        fflush(stderr);
+        /* Sleep on the wake channel. Bounded 1ms slices when timed so the QPC
+         * deadline (not the OS timer tick) governs; INFINITE when untimed —
+         * a post always releases a token so a real wake is never missed. */
+        DWORD ms = (timeout_us == 0) ? INFINITE : 1;
+        WaitForSingleObject(s->sem_handle, ms);
+
+        EnterCriticalSection(&s->value_lock);
+        if (s->waiters > 0) s->waiters--;
+        LeaveCriticalSection(&s->value_lock);
+        /* loop: re-check value */
     }
 #else
     pthread_mutex_lock(&s->mtx);
 
     if (timeout_us == 0) {
         while (s->value <= 0) {
+            s->waiters++;
             pthread_cond_wait(&s->cv, &s->mtx);
+            s->waiters--;
         }
     } else {
         struct timespec ts;
@@ -308,7 +320,9 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
             ts.tv_nsec -= 1000000000L;
         }
         while (s->value <= 0) {
+            s->waiters++;
             int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+            s->waiters--;
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&s->mtx);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
@@ -340,20 +354,19 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    DWORD result = WaitForSingleObject(s->sem_handle, 0);
-    if (result == WAIT_TIMEOUT) {
+    /* s47 single-truth: decide purely on s->value (the handle is a wake
+     * channel, not a count mirror). */
+    EnterCriticalSection(&s->value_lock);
+    if (s->value <= 0) {
+        LeaveCriticalSection(&s->value_lock);
         if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
             s_sem_trace_n++;
-            fprintf(stderr, "[sem] t%u TRYWAIT-busy id=%u val=%d\n",
-                    yz_thread_current_id(), sem_id, s->value);
+            fprintf(stderr, "[sem] t%u TRYWAIT-busy id=%u val=0\n",
+                    yz_thread_current_id(), sem_id);
             fflush(stderr);
         }
         return (int64_t)(int32_t)CELL_EBUSY;
     }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
-    EnterCriticalSection(&s->value_lock);
     s->value--;
     LeaveCriticalSection(&s->value_lock);
     if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
@@ -394,11 +407,15 @@ void yz_force_sem_post(uint32_t sem_id)
     EnterCriticalSection(&s->value_lock);
     int ok = (s->value < s->max_value);
     if (ok) s->value++;
+    int wake = (ok && s->waiters > 0) ? 1 : 0;
     LeaveCriticalSection(&s->value_lock);
-    if (ok) ReleaseSemaphore(s->sem_handle, 1, NULL);
+    if (wake) ReleaseSemaphore(s->sem_handle, 1, NULL);
 #else
     pthread_mutex_lock(&s->mtx);
-    if (s->value < s->max_value) { s->value++; pthread_cond_signal(&s->cv); }
+    if (s->value < s->max_value) {
+        s->value++;
+        if (s->waiters > 0) pthread_cond_signal(&s->cv);
+    }
     pthread_mutex_unlock(&s->mtx);
 #endif
 }
@@ -426,11 +443,11 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
         LeaveCriticalSection(&s->value_lock);
-        /* Always-on (capped): a refused post is a dropped-notification-shaped
-         * event (the shadow `value` can lag the handle count between a
-         * waiter's wake and its decrement, so this refusal can be SPURIOUS
-         * for small max_value semaphores — s30 audit). Loud regardless of
-         * YZ_SEM_TRACE. */
+        /* Faithful: RPCS3 sys_semaphore.cpp post() returns EBUSY (not_an_error)
+         * when the post would exceed max_val. s47: with single-truth `value`
+         * this is now a TRUE refusal (no shadow lag) — the guest's own retry
+         * contract governs, and no wake is dropped because none was owed (a
+         * waiter can only exist when value<=0, i.e. far below max). */
         static long ebusy_n = 0;
         if (ebusy_n < 64) { ebusy_n++;
             fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d max=%d (n=%ld)\n",
@@ -439,16 +456,18 @@ int64_t sys_semaphore_post(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
+    /* Wake channel: release exactly enough tokens to cover the parked waiters
+     * this post can satisfy (min(count, waiters)). Woken waiters re-check
+     * value under the lock; an orphaned token (waiter already left) is benign.
+     * This is the lost-wake fix — a post can NEVER skip the release now. */
+    int wake = (count < s->waiters) ? count : s->waiters;
     LeaveCriticalSection(&s->value_lock);
 
-    if (!ReleaseSemaphore(s->sem_handle, count, NULL)) {
-        /* Always-on: a failed release after a passed shadow check = a wake
-         * silently lost (handle/shadow desync). Never expected; if it prints,
-         * that IS the dropped notification. */
+    if (wake > 0 && !ReleaseSemaphore(s->sem_handle, wake, NULL)) {
         static long relfail_n = 0;
         if (relfail_n < 64) { relfail_n++;
-            fprintf(stderr, "[sem-post] t%u RELEASE-FAILED id=%u count=%d val=%d max=%d gle=%lu\n",
-                    yz_thread_current_id(), sem_id, count, s->value, s->max_value,
+            fprintf(stderr, "[sem-post] t%u RELEASE-FAILED id=%u wake=%d val=%d max=%d gle=%lu\n",
+                    yz_thread_current_id(), sem_id, wake, s->value, s->max_value,
                     (unsigned long)GetLastError());
             fflush(stderr); }
     }
@@ -466,10 +485,10 @@ int64_t sys_semaphore_post(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
-    /* Wake waiters */
-    for (int i = 0; i < count; i++) {
-        pthread_cond_signal(&s->cv);
-    }
+    /* Wake the waiters this post can satisfy (broadcast is also correct — they
+     * re-check value — but min(count,waiters) signals is precise). */
+    { int wake = (count < s->waiters) ? count : s->waiters;
+      for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
 #endif
 

@@ -31,8 +31,12 @@ typedef struct sys_semaphore_info {
     int      active;
     char     name[8];
     uint32_t protocol;
-    int32_t  value;      /* current count */
+    int32_t  value;      /* current count — THE single source of truth (s47) */
     int32_t  max_value;
+    int32_t  waiters;    /* s47 lost-wake fix: threads parked in wait(); the
+                          * kernel sem is a pure wake channel, posts release
+                          * min(count, waiters) tokens (spurious wakes benign,
+                          * waiters re-check value under the lock) */
 
 #ifdef _WIN32
     HANDLE   sem_handle;
