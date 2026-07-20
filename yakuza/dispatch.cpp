@@ -58,7 +58,13 @@ static bool addr_readable(uint32_t a)
 static bool yz_mwply_probe_target(uint32_t target)
 {
     static int en = -1;
-    if (en < 0) en = getenv("YZ_MWPLY_PROBE") ? 1 : 0;
+    if (en < 0) {
+        en = getenv("YZ_MWPLY_PROBE") ? 1 : 0;
+        if (en == 1) {
+            fprintf(stderr, "[mwply] probe ARMED (3 targets)\n");
+            fflush(stderr);
+        }
+    }
     if (!en) return false;
     return target == YZ_MWPLY_ISREADY || target == YZ_MWPLY_GETFRM ||
            target == YZ_MWPLY_GETAUDIO;

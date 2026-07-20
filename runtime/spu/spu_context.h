@@ -14,6 +14,7 @@
 #include "spu_fltrec.h"    /* s41 flight recorder (env YZ_FLTREC, default off) */
 #include "spu_lockstep.h"  /* s42 YZ_SPU_LOCKSTEP round-robin token (default off) */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>     /* FIX 2 (2026-07-17): channel/event cross-thread atomics */
@@ -408,7 +409,6 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
      * first quad, and whether they MATCH -- so one boot shows whether the witness ever
      * equals the stuck stopper's key (and thus whether the descriptor can ever arm). */
     { static int ag = -1;
-      extern char* getenv(const char*);
       if (ag < 0) { ag = getenv("YZ_ARMGATE") ? 1 : 0;
           if (ag) { fprintf(stderr, "[armgate] ARMED (LS 0xBD70 gate read/write watch, img0)\n"); fflush(stderr); } }
       if (ag && ctx->image_id == 0 && lsa == 0xBD70u) {
@@ -425,6 +425,30 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
                       (v._u32[0]==ctx->gpr[11]._u32[0]) ? "MATCH" : "nomatch");
               fflush(stderr);
           }
+      } }
+    /* s49 MASK-SEAL read leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_read):
+     * the gs_task pending-DMA-tag mask gate. pc 0x624C is the `lqd $r2,0xB0($r3)`
+     * immediately before the `biz $r2,$r0` early return at 0x6254, so this fires
+     * exactly once per gate entry with the freshly-loaded quad in hand. */
+    { extern volatile int g_yz_ms_on;
+      extern int yz_mask_seal_arm(void);
+      extern void yz_ms_read(spu_context*, uint32_t, const uint32_t*);
+      int msr = g_yz_ms_on; if (msr < 0) msr = yz_mask_seal_arm();
+      if (msr) yz_ms_read((spu_context*)ctx, lsa, v._u32); }
+    /* s49 TAG-READ probe (env YZ_TAGREAD, spu_channels.c). Two read-side legs:
+     * pc 0x65E4 = the publish-by-tag read `lq(r11+0x60)` whose value the flight
+     * recorder cannot store (BRANCH record, no operand field), and pc 0x624C =
+     * the pending-tag-mask load whose lane-8 word IS the 0x6254 biz predicate,
+     * so mask!=0 here means control reaches the 12x fall-through at 0x6258. */
+    { extern volatile int g_yz_tr_on;
+      extern int yz_tagread_arm(void);
+      extern void yz_tr_read(spu_context*, uint32_t, const uint32_t*);
+      extern void yz_tr_tag(spu_context*, uint32_t, const uint32_t*);
+      int trr = g_yz_tr_on; if (trr < 0) trr = yz_tagread_arm();
+      if (trr) {
+          uint32_t tpc = ctx->pc & SPU_LS_MASK;
+          if (tpc == 0x65E4u)      yz_tr_read((spu_context*)ctx, lsa, v._u32);
+          else if (tpc == 0x624Cu) yz_tr_tag((spu_context*)ctx, lsa, v._u32);
       } }
     return v;
 }
@@ -444,7 +468,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * consumer ctx only. Independent of YZ_FLTREC being armed for general
      * recording -- either trigger can fire the dump. */
     { static int swd = -1;
-      extern char* getenv(const char*);
       if (swd < 0) swd = getenv("YZ_FLTREC_DUMP_ON_SWEEP") ? 1 : 0;
       if (swd == 1 && ctx == (spu_context*)g_yz_consumer_ctx
           && lsa >= 0xBA00u && lsa < 0xBC00u
@@ -457,7 +480,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * where front must stay 0; log every lifted store to the GETLLAR line copy
      * at LS 0x80 (image 3) with pc + value to name the word-0 corruptor. */
     { static int qw = -1;
-      extern char* getenv(const char*);
       if (qw < 0) qw = getenv("YZ_QLINE") ? 1 : 0;
       if (qw && lsa == 0x80u && ctx->image_id == 3) {
           static int qn = 0;
@@ -473,7 +495,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * (stuck at init -> only descriptors whose key==init ever arm). If hit, this names
      * the writer pc + old->new so we can see whether it ever advances to the stuck key. */
     { static int agw = -1;
-      extern char* getenv(const char*);
       if (agw < 0) agw = getenv("YZ_ARMGATE") ? 1 : 0;
       if (agw && ctx->image_id == 0 && lsa == 0xBD70u) {
           static unsigned long agwn = 0;
@@ -493,7 +514,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * A zero from game code doing legal retirement names the pc just the same —
      * the pc discriminates wiper vs legit retire. */
     { static int zs = -1;
-      extern char* getenv(const char*);
       if (zs < 0) { zs = getenv("YZ_ZSLOT") ? 1 : 0;
           if (zs) { fprintf(stderr, "[z-slot] ARMED (zero-quad stores into LS [0xBF00,0xC400) img0)\n"); fflush(stderr); } }
       /* s40 late: lower bound extended 0xBF00 -> 0xB800 (s40_husk_residual.md — the
@@ -521,7 +541,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * (the wipe / the rebuild), sampled otherwise (the cursor advance rewrites
      * it once per consumed line). Rides YZ_BD70W. */
     { static int aw = -1;
-      extern char* getenv(const char*);
       extern uint32_t g_yz_anch_home;
       if (aw < 0) aw = getenv("YZ_BD70W") ? 1 : 0;
       if (aw && ctx->image_id == 0 && g_yz_anch_home &&
@@ -544,7 +563,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * (nonzero) both visible, so the death's last-writer is attributable.
      * Rides YZ_BD70W. */
     { static int vw = -1;
-      extern char* getenv(const char*);
       if (vw < 0) vw = getenv("YZ_BD70W") ? 1 : 0;
       if (vw && ctx->image_id == 0 && lsa >= 0xBA80u && lsa < 0xBAC0u) {
           static unsigned long vwn = 0; vwn++;
@@ -563,7 +581,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * (pushes), change-only per cell; zero-writes (pops) counted only.
      * Rides YZ_BD70W. */
     { static int fw = -1;
-      extern char* getenv(const char*);
       if (fw < 0) { fw = getenv("YZ_BD70W") ? 1 : 0;
           if (fw) { fprintf(stderr, "[feed-wr] ARMED (mgr+0x110 push witness)\n"); fflush(stderr); } }
       if (fw && ctx->image_id == 0 && lsa >= 0xBDA0u && lsa < 0xBDD0u) {
@@ -582,7 +599,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
                   fflush(stderr);
               } } } }
     { static int bw = -1;
-      extern char* getenv(const char*);
       if (bw < 0) { bw = getenv("YZ_BD70W") ? 1 : 0;
           if (bw) { fprintf(stderr, "[bd70-wr] ARMED (uncapped change-only + hb4096)\n"); fflush(stderr); } }
       if (bw && ctx->image_id == 0 && lsa == 0xBD70u) {
@@ -627,7 +643,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * writer pc + old->new) so the last one names the stale-limit setter = the fix
      * locus (is it a once-only init, or a head-read that returns stale?). */
     { static int lw = -1;
-      extern char* getenv(const char*);
       if (lw < 0) lw = getenv("YZ_ARMGATE") ? 1 : 0;
       if (lw && ctx->image_id == 0 && lsa == 0xBCA0u) {
           const uint8_t* q = &ctx->ls[lsa];
@@ -651,7 +666,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * NOT in {064EC,064F4,064F8,06500,06528} that writes the counter DOWN is
      * the root. Reads ctx->ls BEFORE the store below (old value). */
     { static int cbw = -1;
-      extern char* getenv(const char*);
       extern volatile unsigned long g_yz_cadv;
       if (cbw < 0) cbw = getenv("YZ_CBWATCH") ? 1 : 0;
       if (cbw && ctx->image_id == 0 && ctx->pc == 0x32BCu && lsa == 0xBCB0u) {
@@ -666,6 +680,35 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
               fflush(stderr);
           }
       } }
+    /* s48 LS-CODE-WATCH store leg (env YZ_LS_CODE_WATCH, spu_channels.c
+     * yz_lscw_check): the self-modifying-code tripwire -- flags lifted stores
+     * that CHANGE bytes inside the resident image's registry-derived text
+     * extent. Must run BEFORE the store below (old bytes still readable). */
+    { extern volatile int g_yz_lscw_on;
+      extern int yz_lscw_arm(void);
+      extern void yz_lscw_check(spu_context*, uint32_t, uint32_t, const uint8_t*,
+                                unsigned long long, const char*);
+      int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
+      if (lcw) {
+          uint8_t nb[16];
+          for (int ni = 0; ni < 4; ni++) {
+              uint32_t w = val._u32[ni];
+              nb[ni*4]     = (uint8_t)(w >> 24);
+              nb[ni*4 + 1] = (uint8_t)(w >> 16);
+              nb[ni*4 + 2] = (uint8_t)(w >>  8);
+              nb[ni*4 + 3] = (uint8_t)w;
+          }
+          yz_lscw_check(ctx, lsa, 16, nb, 0, "st");
+      } }
+    /* s49 MASK-SEAL write leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_write):
+     * records the last writer pc/value of every gs_task *(OBJ+0xB0) quad (the
+     * lane-8 word is the pending-DMA-tag mask). Must run BEFORE the store so the
+     * old mask is still readable for the old->new report. */
+    { extern volatile int g_yz_ms_on;
+      extern int yz_mask_seal_arm(void);
+      extern void yz_ms_write(spu_context*, uint32_t, const uint32_t*);
+      int msw = g_yz_ms_on; if (msw < 0) msw = yz_mask_seal_arm();
+      if (msw) yz_ms_write(ctx, lsa, val._u32); }
     uint8_t* p = &ctx->ls[lsa];
     for (int i = 0; i < 4; i++) {
         uint32_t w = val._u32[i];
@@ -787,6 +830,15 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 #endif
 
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+
+/* s47 SENTINEL-GUARD (YZ_SENTINEL_GUARD, default OFF -- FLAGS.md; ledger #109
+ * fix fork 2). g_yz_sguard_on: -1 until the first check performs the one-time
+ * env init (so the drain-leg gate below is self-arming), then 0/1. The helper
+ * returns 1 when it deferred a sentinel-less state-5 Driver-B walk and has
+ * already set ctx->pc + g_spu_trampoline_fn per SPU_RET semantics -- the
+ * drain leg must `continue`, the indirect leg must `return`. */
+extern int g_yz_sguard_on;
+int yz_sguard_check(spu_context* ctx, void* tf);
 /* Current ctx of the SPU thread inside SPU_DRAIN -- lets spu_prof_hop() read LS
  * for targeted gate diagnostics (e.g. dumping a polled flag). Diagnostic only. */
 extern SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx;
@@ -844,6 +896,11 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img);
             yz_lockstep_tick(ctx);                                          \
             if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
             else spu_task_launch_check((ctx), (void*)_tf);     \
+            /* s47 SENTINEL-GUARD drain leg (direct tail-chains never reach   \
+             * spu_indirect_branch): on defer the helper set pc+trampoline    \
+             * per SPU_RET semantics -- re-loop (dispatches the return, or    \
+             * exits on the plain-return path). Self-arming via -1.  */      \
+            if (g_yz_sguard_on && yz_sguard_check((ctx), (void*)_tf)) continue; \
             _tf(ctx);                                          \
         }                                                     \
     } while (0)
