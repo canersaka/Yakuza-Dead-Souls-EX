@@ -127,9 +127,21 @@ cmake --install build --prefix /usr/local
 
 | CMake Option | Default | Description |
 |---|---|---|
-| `PS3RECOMP_BUILD_TESTS` | `OFF` | Build unit tests |
+| `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register unit, stress, and conformance tests |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
+
+### Running the Test Suites
+
+```bash
+cmake -S . -B build-tests -G Ninja -DPS3RECOMP_BUILD_TESTS=ON
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+The native synchronization, SPU-atomics, and edge-journal tests are portable.
+MSVC builds additionally register the generated-code PPU and SPU lifter
+conformance suites.
 
 ### Compile Definitions
 

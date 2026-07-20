@@ -50,11 +50,16 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-### Running Tests (if available)
+### Running Tests
+
 ```bash
-cmake -B build -DPS3RECOMP_BUILD_TESTS=ON
-cmake --build build --target test
+cmake -S . -B build-tests -G Ninja -DPS3RECOMP_BUILD_TESTS=ON
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
 ```
+
+This runs the native runtime stress/unit tests. With MSVC it also runs the
+generated-code PPU and SPU lifter conformance suites.
 
 ---
 

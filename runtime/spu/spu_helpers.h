@@ -16,6 +16,7 @@
 #include "spu_context.h"
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -325,14 +326,13 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
  * float register values are NOT oracle-parity in trace-diffs.
  *
  * Kill switch YZ_XF_IEEE=1 restores the previous native-IEEE path (+, -, *,
- * fmaf) below -- see docs/FLAGS.md. Default OFF (SPU-accurate active). Env
- * read once and cached (this file's local-extern getenv convention, matching
- * spu_context.h's other yz_* flags, avoids the <stdlib.h> vs the custom
- * getenv extern linkage clash noted there under dynamic-CRT MSVC builds). */
+ * fmaf) below -- see docs/FLAGS.md. Default OFF (SPU-accurate active). The
+ * environment is read once and cached; <stdlib.h> supplies the CRT-correct
+ * getenv declaration for static and dynamic MSVC runtime builds alike. */
 static inline int yz_xf_ieee(void)
 {
     static int v = -1;
-    if (v < 0) { extern char* getenv(const char*); v = getenv("YZ_XF_IEEE") ? 1 : 0; }
+    if (v < 0) v = getenv("YZ_XF_IEEE") ? 1 : 0;
     return v;
 }
 

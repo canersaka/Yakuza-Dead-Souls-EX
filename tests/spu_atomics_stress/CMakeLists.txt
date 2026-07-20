@@ -17,28 +17,13 @@
 #   .\tests\spu_atomics_stress\build\spu_atomics_stress.exe [seed]
 #
 cmake_minimum_required(VERSION 3.20)
-project(spu_atomics_stress LANGUAGES C)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(spu_atomics_stress LANGUAGES C)
+    enable_testing()
+endif()
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-
-# Force the STATIC CRT (/MT), like yakuza/CMakeLists.txt does (its own comment:
-# "Everything here uses the static CRT (/MT)..."). Confirmed via standalone
-# cl.exe repro (identical flags, only the CRT choice varies): compiling
-# spu_channels.c with EITHER dynamic-CRT flag (/MD release OR /MDd debug)
-# fails with "error C2375: 'getenv': redefinition; different linkage" against
-# runtime/spu/spu_context.h:328's local `extern char* getenv(const char*);`
-# (used to gate the YZ_QLINE diagnostic in spu_ls_write128) colliding with the
-# DLL-imported UCRT getenv declaration; /MT's statically-linked getenv has no
-# dllimport decoration to collide with, so it compiles clean. This means ANY
-# translation unit that includes spu_context.h under a dynamic-CRT (/MD or
-# /MDd) MSVC build breaks -- the real project is unaffected only because
-# yakuza/CMakeLists.txt already forces /MT; a plain `cmake --preset` default
-# (dynamic CRT, CMake's own MSVC default) or any other consumer of
-# spu_context.h would hit this. Reported separately as its own finding, not
-# fixed here (verify-then-implement protocol) -- this line only matches this
-# harness's CRT choice to the real project's so the harness can link.
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 # ---------------------------------------------------------------------------
 # Location of the ps3recomp runtime sources under test. Overridable so a
@@ -58,6 +43,8 @@ endif()
 add_executable(spu_atomics_stress
     main.c
     "${RUNTIME_SPU_DIR}/spu_channels.c"
+    "${RUNTIME_SPU_DIR}/spu_fltrec.c"
+    "${RUNTIME_SPU_DIR}/spu_lockstep.c"
 )
 
 target_include_directories(spu_atomics_stress PRIVATE
@@ -77,3 +64,6 @@ else()
     target_compile_options(spu_atomics_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(spu_atomics_stress PRIVATE pthread)
 endif()
+
+add_test(NAME spu_atomics_stress COMMAND spu_atomics_stress)
+set_tests_properties(spu_atomics_stress PROPERTIES LABELS "stress;runtime;spu" TIMEOUT 120)
