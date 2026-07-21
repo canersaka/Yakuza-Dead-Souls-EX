@@ -86,7 +86,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         s_dialog_open = 0;
         if (s_callback_opd) {
             ps3_invoke_guest(s_callback_opd, (uint64_t)(uint32_t)result,
-                             (uint64_t)s_userdata_ea, 0, 0);
+                             (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
         }
     } else {
         printf("[cellMsgDialog] Progress bar dialog opened (will close on explicit Close/Abort)\n");
@@ -108,7 +108,7 @@ s32 cellMsgDialogClose(float delayMs)
     if (s_callback_opd) {
         ps3_invoke_guest(s_callback_opd,
                          (uint64_t)(uint32_t)CELL_MSGDIALOG_BUTTON_NONE,
-                         (uint64_t)s_userdata_ea, 0, 0);
+                         (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
         s_callback_opd = 0;
     }
 
@@ -128,7 +128,7 @@ s32 cellMsgDialogAbort(void)
     if (s_callback_opd) {
         ps3_invoke_guest(s_callback_opd,
                          (uint64_t)(uint32_t)CELL_MSGDIALOG_BUTTON_ESCAPE,
-                         (uint64_t)s_userdata_ea, 0, 0);
+                         (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
         s_callback_opd = 0;
     }
 

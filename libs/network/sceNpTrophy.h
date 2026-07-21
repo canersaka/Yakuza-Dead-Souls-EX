@@ -125,6 +125,9 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
 typedef s32 (*SceNpTrophyStatusCallback)(SceNpTrophyContext context, s32 status,
                                           s32 completed, s32 total, void* callbackArg);
 
+/* Registration has finished and trophy APIs may be used for this context. */
+#define SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE 8
+
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
                                SceNpTrophyStatusCallback statusCb,

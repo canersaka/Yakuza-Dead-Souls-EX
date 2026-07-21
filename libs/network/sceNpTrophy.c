@@ -9,6 +9,7 @@
  */
 
 #include "sceNpTrophy.h"
+#include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,28 @@
 static int s_trophy_initialized = 0;
 static char s_storage_path[512] = "gamedata/trophies";
 
+static void trophy_store_be32(void* dst, u32 value)
+{
+    u8* p = (u8*)dst;
+    p[0] = (u8)(value >> 24);
+    p[1] = (u8)(value >> 16);
+    p[2] = (u8)(value >> 8);
+    p[3] = (u8)value;
+}
+
+static void trophy_store_be64(void* dst, u64 value)
+{
+    u8* p = (u8*)dst;
+    p[0] = (u8)(value >> 56);
+    p[1] = (u8)(value >> 48);
+    p[2] = (u8)(value >> 40);
+    p[3] = (u8)(value >> 32);
+    p[4] = (u8)(value >> 24);
+    p[5] = (u8)(value >> 16);
+    p[6] = (u8)(value >> 8);
+    p[7] = (u8)value;
+}
+
 /* Per-context data */
 typedef struct {
     int                      in_use;
@@ -47,8 +70,9 @@ typedef struct {
     int in_use;
 } TrophyHandle;
 
-static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS];
-static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES];
+/* Public IDs are positive; slot zero is reserved as the invalid sentinel. */
+static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS + 1];
+static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES + 1];
 
 /* ---------------------------------------------------------------------------
  * Persistent storage helpers
@@ -190,7 +214,7 @@ s32 sceNpTrophyTerm(void)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     /* Save all registered contexts */
-    for (int i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+    for (int i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
         if (s_contexts[i].in_use && s_contexts[i].registered)
             trophy_save(&s_contexts[i]);
     }
@@ -227,13 +251,13 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    for (s32 i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+    for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
         if (!s_contexts[i].in_use) {
             memset(&s_contexts[i], 0, sizeof(TrophyContext));
             s_contexts[i].in_use = 1;
             s_contexts[i].commId = *commId;
             s_contexts[i].total_trophies = SCE_NP_TROPHY_MAX_NUM_TROPHIES;
-            *context = i;
+            trophy_store_be32(context, (u32)i);
             printf("[sceNpTrophy] CreateContext(commId=\"%s\") -> ctx=%d\n",
                    commId->data, i);
             return CELL_OK;
@@ -248,7 +272,7 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -268,10 +292,10 @@ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
     if (!handle)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    for (s32 i = 0; i < SCE_NP_TROPHY_MAX_HANDLES; i++) {
+    for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_HANDLES; i++) {
         if (!s_handles[i].in_use) {
             s_handles[i].in_use = 1;
-            *handle = i;
+            trophy_store_be32(handle, (u32)i);
             printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
             return CELL_OK;
         }
@@ -285,7 +309,7 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (handle < 0 || handle >= SCE_NP_TROPHY_MAX_HANDLES ||
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
         !s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
@@ -300,16 +324,16 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                void* callbackArg,
                                u64 options)
 {
-    (void)statusCb; (void)callbackArg; (void)options;
+    (void)options;
 
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
-    if (handle < 0 || handle >= SCE_NP_TROPHY_MAX_HANDLES ||
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
         !s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
@@ -319,6 +343,18 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     /* Load any previously saved trophy data */
     trophy_load(&s_contexts[context]);
     s_contexts[context].registered = 1;
+
+    /* Registration is synchronous here, but callers still require the status
+     * callback that announces completion. The callback value is a guest OPD. */
+    uint32_t status_opd = (uint32_t)(uintptr_t)statusCb;
+    if (status_opd && g_ps3_guest_caller) {
+        g_ps3_guest_caller(status_opd,
+                           (uint64_t)context,
+                           SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
+                           0, 0,
+                           (uint32_t)(uintptr_t)callbackArg,
+                           0, 0, 0);
+    }
 
     printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d) -> loaded saved data\n",
            context, handle);
@@ -334,7 +370,7 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -342,7 +378,7 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
     /* Typical trophy pack size */
-    *reqSpace = 1024 * 1024; /* 1 MB */
+    trophy_store_be64(reqSpace, 1024 * 1024); /* 1 MB */
     printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
     return CELL_OK;
 }
@@ -357,7 +393,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -366,11 +402,11 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyGameDetails));
-        details->numTrophies = 32; /* default trophy set */
-        details->numPlatinum = 1;
-        details->numGold     = 2;
-        details->numSilver   = 8;
-        details->numBronze   = 21;
+        trophy_store_be32(&details->numTrophies, 32); /* default trophy set */
+        trophy_store_be32(&details->numPlatinum, 1);
+        trophy_store_be32(&details->numGold, 2);
+        trophy_store_be32(&details->numSilver, 8);
+        trophy_store_be32(&details->numBronze, 21);
         strncpy(details->title, "PS3 Game",
                 SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
         strncpy(details->description, "Trophy set",
@@ -379,13 +415,14 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyGameData));
-        data->unlockedTrophies = trophy_count_unlocked(&s_contexts[context]);
+        const u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
+        trophy_store_be32(&data->unlockedTrophies, unlocked);
         /* Count by grade would require per-trophy grade data;
          * return conservative estimates */
-        data->unlockedPlatinum = 0;
-        data->unlockedGold     = 0;
-        data->unlockedSilver   = 0;
-        data->unlockedBronze   = data->unlockedTrophies;
+        trophy_store_be32(&data->unlockedPlatinum, 0);
+        trophy_store_be32(&data->unlockedGold, 0);
+        trophy_store_be32(&data->unlockedSilver, 0);
+        trophy_store_be32(&data->unlockedBronze, unlocked);
     }
 
     printf("[sceNpTrophy] GetGameInfo(ctx=%d)\n", context);
@@ -403,7 +440,7 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -415,8 +452,8 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyDetails));
-        details->trophyId = (u32)trophyId;
-        details->trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;
+        trophy_store_be32(&details->trophyId, (u32)trophyId);
+        trophy_store_be32(&details->trophyGrade, SCE_NP_TROPHY_GRADE_BRONZE);
         snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
                  "Trophy %d", trophyId);
         snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
@@ -426,9 +463,9 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyData));
-        data->trophyId = (u32)trophyId;
+        trophy_store_be32(&data->trophyId, (u32)trophyId);
         data->unlocked = s_contexts[context].unlocked[trophyId];
-        data->timestamp = s_contexts[context].unlock_time[trophyId];
+        trophy_store_be64(&data->timestamp, s_contexts[context].unlock_time[trophyId]);
     }
 
     return CELL_OK;
@@ -444,7 +481,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -473,7 +510,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {
-        *platinumId = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+        trophy_store_be32(platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
         /* Simplified: don't auto-award platinum without grade info */
     }
 
@@ -490,7 +527,7 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -500,14 +537,15 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!flags || !count)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    memset(flags, 0, sizeof(SceNpTrophyFlagArray));
-
+    u32 words[SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32] = {0};
     for (u32 i = 0; i < s_contexts[context].total_trophies; i++) {
         if (s_contexts[context].unlocked[i])
-            flags->flag[i / 32] |= (1u << (i % 32));
+            words[i / 32] |= (1u << (i % 32));
     }
+    for (u32 i = 0; i < SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32; i++)
+        trophy_store_be32(&flags->flag[i], words[i]);
 
-    *count = s_contexts[context].total_trophies;
+    trophy_store_be32(count, s_contexts[context].total_trophies);
     return CELL_OK;
 }
 
@@ -520,7 +558,7 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -533,9 +571,10 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     u32 total = s_contexts[context].total_trophies;
     u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
 
-    *percentage = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    const s32 result = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    trophy_store_be32(percentage, (u32)result);
 
     printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
-           context, *percentage);
+           context, result);
     return CELL_OK;
 }
