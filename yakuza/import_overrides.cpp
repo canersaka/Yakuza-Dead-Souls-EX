@@ -507,15 +507,25 @@ static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
 
 /* The guest movie player owns sequencing and post-movie state, but its decoded
  * surface is not yet reaching the live RSX draw path and its software decode
- * runs far below the authored frame rate. Mirror successful .sfd opens into
- * the host decoder, hold the guest at its first stream read while presenting,
- * then return EOF so both sides observe one movie at the intended duration. */
+ * runs far below the authored frame rate. The game opens each .sfd once for a
+ * small header validation and again for the actual stream. Preserve validation
+ * reads, then hold the playback stream while the host presents it and return
+ * EOF only to that stream when presentation is complete. */
 static SRWLOCK g_movie_open_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_movie_done_cv = CONDITION_VARIABLE_INIT;
 static char g_movie_open_path[MAX_PATH];
 static volatile LONG g_movie_open_serial = 0;
 static volatile LONG g_movie_completed_serial = 0;
 static LONG g_movie_played_serial = 0;
+
+#define YZ_MOVIE_FD_SLOTS 64
+struct yz_movie_fd_state {
+    int active;
+    int validation;
+    LONG serial;
+    char host_path[MAX_PATH];
+};
+static yz_movie_fd_state g_movie_fds[YZ_MOVIE_FD_SLOTS];
 
 static int yz_has_sfd_suffix(const char* path)
 {
@@ -524,41 +534,70 @@ static int yz_has_sfd_suffix(const char* path)
     return n >= 4 && _stricmp(path + n - 4, ".sfd") == 0;
 }
 
-static void yz_movie_open_hook(const char* guest_path, const char* host_path)
+static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
+                               const char* host_path)
 {
-    if (!yz_has_sfd_suffix(guest_path) || !host_path || !*host_path ||
-        getenv("YZ_NO_MOVIE_PRESENT"))
+    if (fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
         return;
 
     AcquireSRWLockExclusive(&g_movie_open_lock);
-    if (_stricmp(g_movie_open_path, host_path) != 0) {
-        strncpy(g_movie_open_path, host_path, sizeof(g_movie_open_path) - 1);
-        g_movie_open_path[sizeof(g_movie_open_path) - 1] = '\0';
-        InterlockedIncrement(&g_movie_open_serial);
-        fprintf(stderr, "[movie] queued guest movie '%s'\n", guest_path);
-        fflush(stderr);
+    memset(&g_movie_fds[fd], 0, sizeof(g_movie_fds[fd]));
+    if (yz_has_sfd_suffix(guest_path) && host_path && *host_path &&
+        !getenv("YZ_NO_MOVIE_PRESENT")) {
+        g_movie_fds[fd].active = 1;
+        strncpy(g_movie_fds[fd].host_path, host_path,
+                sizeof(g_movie_fds[fd].host_path) - 1);
     }
     ReleaseSRWLockExclusive(&g_movie_open_lock);
 }
 
-static int yz_movie_read_eof_hook(const char* guest_path)
+static void yz_movie_close_hook(CellFsFd fd, const char* guest_path)
+{
+    (void)guest_path;
+    if (fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
+        return;
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    memset(&g_movie_fds[fd], 0, sizeof(g_movie_fds[fd]));
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+}
+
+static int yz_movie_read_eof_hook(CellFsFd fd, const char* guest_path,
+                                  u64 offset, u64 nbytes)
 {
     if (!yz_has_sfd_suffix(guest_path) || getenv("YZ_NO_MOVIE_PRESENT") ||
         getenv("YZ_NO_MOVIE_SYNC") || !rsx_live_draw_enabled() ||
-        !movie_ffmpeg_available())
-        return 0;
-
-    char host_path[MAX_PATH] = {};
-    if (cellfs_translate_path(guest_path, host_path, sizeof(host_path)) != 0)
+        !movie_ffmpeg_available() || fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
         return 0;
 
     AcquireSRWLockExclusive(&g_movie_open_lock);
-    const LONG serial = InterlockedCompareExchange(&g_movie_open_serial, 0, 0);
-    if (!serial || _stricmp(g_movie_open_path, host_path) != 0) {
+    yz_movie_fd_state* stream = &g_movie_fds[fd];
+    if (!stream->active || !stream->host_path[0]) {
         ReleaseSRWLockExclusive(&g_movie_open_lock);
         return 0;
     }
 
+    /* The validation handle reads a 0x5000-byte prefix (and a small follow-up).
+     * The playback handle's first request is much larger. Let the validator see
+     * real bytes; a stream request is the stable player-instance boundary. */
+    if (!stream->serial && offset == 0 && nbytes <= 0x10000u)
+        stream->validation = 1;
+    if (stream->validation) {
+        ReleaseSRWLockExclusive(&g_movie_open_lock);
+        return 0;
+    }
+
+    if (!stream->serial) {
+        strncpy(g_movie_open_path, stream->host_path,
+                sizeof(g_movie_open_path) - 1);
+        g_movie_open_path[sizeof(g_movie_open_path) - 1] = '\0';
+        stream->serial = InterlockedIncrement(&g_movie_open_serial);
+        fprintf(stderr,
+                "[movie] queued playback fd=%d serial=%ld guest='%s' request=0x%llX\n",
+                fd, stream->serial, guest_path, (unsigned long long)nbytes);
+        fflush(stderr);
+    }
+
+    const LONG serial = stream->serial;
     while (InterlockedCompareExchange(&g_movie_completed_serial, 0, 0) < serial &&
            InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
         SleepConditionVariableSRW(&g_movie_done_cv, &g_movie_open_lock, 1000, 0);
@@ -643,6 +682,7 @@ static DWORD WINAPI yz_window_thread(LPVOID)
     }
 
     cellfs_set_open_hook(yz_movie_open_hook);
+    cellfs_set_close_hook(yz_movie_close_hook);
     cellfs_set_read_eof_hook(yz_movie_read_eof_hook);
 
     /* YZ_MOVIE_TEST=<path.sfd>: standalone proof of the host movie path -- decode

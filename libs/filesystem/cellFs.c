@@ -111,11 +111,17 @@ typedef struct {
 static PathMapping s_path_mappings[MAX_PATH_MAPPINGS];
 static char s_root_path[CELL_FS_MAX_FS_PATH_LENGTH] = ".";
 static CellFsOpenHook s_open_hook;
+static CellFsCloseHook s_close_hook;
 static CellFsReadEofHook s_read_eof_hook;
 
 void cellfs_set_open_hook(CellFsOpenHook hook)
 {
     s_open_hook = hook;
+}
+
+void cellfs_set_close_hook(CellFsCloseHook hook)
+{
+    s_close_hook = hook;
 }
 
 void cellfs_set_read_eof_hook(CellFsReadEofHook hook)
@@ -493,7 +499,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
 
     if (s_open_hook)
-        s_open_hook(path, host_path);
+        s_open_hook(slot, path, host_path);
 
     /* CRI-gate diag (pt29, env YZ_CODEC_WATCH): when the intro voice container opens,
      * arm a read-watch on the cri_audio codec-registry entry (guest EA 0x135D9E0 ->
@@ -518,6 +524,9 @@ s32 cellFsClose(CellFsFd fd)
 
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
+
+    if (s_close_hook)
+        s_close_hook(fd, s_files[fd].path);
 
     if (s_files[fd].host_fp) {
         fclose(s_files[fd].host_fp);
@@ -552,12 +561,6 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
         (p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/"))) ? 1 : 0;
     int is_stream = fs_trace || path_stream;
 
-    if (s_read_eof_hook && s_read_eof_hook(p)) {
-        if (nread) *nread = ps3_bswap64(0);
-        yz_fs_lat_wait();
-        return CELL_OK;
-    }
-
     long long off_before = -1;
     if (is_stream && s_files[fd].host_fp) off_before = (long long)
 #ifdef _MSC_VER
@@ -565,6 +568,13 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 #else
         ftello(s_files[fd].host_fp);
 #endif
+
+    if (s_read_eof_hook &&
+        s_read_eof_hook(fd, p, off_before < 0 ? 0 : (u64)off_before, nbytes)) {
+        if (nread) *nread = ps3_bswap64(0);
+        yz_fs_lat_wait();
+        return CELL_OK;
+    }
 
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
