@@ -103,6 +103,7 @@ void rsx_live_draw_shutdown(void) {}
 #define TEX_FMT_DXT1       0x86
 #define TEX_FMT_DXT23      0x87
 #define TEX_FMT_DXT45      0x88
+#define TEX_FMT_G8B8       0x8B
 #define TEX_FMT_DEPTH24_D8 0x90
 #define TEX_FMT_LINEAR     0x20
 #define TEX_FMT_UNNORM     0x40
@@ -517,6 +518,18 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
         s[2] = (u8)(((v >> 5) & 0x1F) * 255 / 31);
         s[3] = (u8)((v & 0x1F) * 255 / 31); break;
     }
+    case TEX_FMT_R5G6B5: {
+        const u16 v = (u16)((p[0] << 8) | p[1]);
+        s[0] = 255;
+        s[1] = (u8)(((v >> 11) & 0x1F) * 255 / 31);
+        s[2] = (u8)(((v >> 5) & 0x3F) * 255 / 63);
+        s[3] = (u8)((v & 0x1F) * 255 / 31); break;
+    }
+    case TEX_FMT_G8B8:
+        s[0] = 255;
+        s[1] = s[2] = p[0];
+        s[3] = p[1];
+        break;
     case TEX_FMT_DEPTH24_D8: s[0] = 255; s[1] = s[2] = s[3] = p[0]; break;
     default: s[0] = p[0]; s[1] = p[1]; s[2] = p[2]; s[3] = p[3]; break;
     }
@@ -632,7 +645,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         switch (base_fmt) {
         case TEX_FMT_B8: texel_sz = 1; break;
         case TEX_FMT_A4R4G4B4:
-        case TEX_FMT_A1R5G5B5: texel_sz = 2; break;
+        case TEX_FMT_A1R5G5B5:
+        case TEX_FMT_R5G6B5:
+        case TEX_FMT_G8B8: texel_sz = 2; break;
         case TEX_FMT_A8R8G8B8:
         case TEX_FMT_DEPTH24_D8: texel_sz = 4; break;
         default: texel_sz = 0; break;
@@ -675,7 +690,37 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         for (u32 m = 0; m < n; m++) free(rgba[m]);
     } while (0);
 
-    if (e->tex) srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
+    if (e->tex) {
+        const int compressed = (base_fmt == TEX_FMT_DXT1 ||
+                                base_fmt == TEX_FMT_DXT23 ||
+                                base_fmt == TEX_FMT_DXT45);
+        if (compressed && remap != 0xAAE4) {
+            /* Compressed blocks are uploaded without CPU decoding, so apply
+             * their component crossbar in the SRV instead. */
+            static const u32 sel2d3d[4] = { 3, 0, 1, 2 }; /* guest A,R,G,B -> D3D A,R,G,B indices */
+            static const u32 out2comp[4] = { 1, 2, 3, 0 }; /* output R,G,B,A -> guest component */
+            u32 mapping[4];
+            for (u32 out = 0; out < 4; out++) {
+                const u32 comp = out2comp[out];
+                const u32 op = (remap >> (8 + comp * 2)) & 3;
+                const u32 sel = (remap >> (comp * 2)) & 3;
+                mapping[out] = (op == 0) ? 4 : (op == 1) ? 5 : sel2d3d[sel];
+            }
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+            sd.Format = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+                      : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
+                                                  : DXGI_FORMAT_BC3_UNORM;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = mapping[0] | (mapping[1] << 3) |
+                                         (mapping[2] << 6) | (mapping[3] << 9) |
+                                         (1u << 12);
+            sd.Texture2D.MipLevels = (UINT)-1;
+            g.dev->lpVtbl->CreateShaderResourceView(
+                g.dev, e->tex, &sd, srv_cpu(SRV_TEXTURE_BASE + g.n_textures));
+        } else {
+            srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
+        }
+    }
     const u32 slot = e->tex ? SRV_TEXTURE_BASE + g.n_textures : SRV_WHITE;
     g.n_textures++;
     return slot;
