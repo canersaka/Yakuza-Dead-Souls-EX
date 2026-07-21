@@ -13,6 +13,7 @@
 #include "cellPad.h"
 #include "ps3emu/endian.h"   /* ps3_bswap16/32: CellPadData/Info2 are guest big-endian */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -76,6 +77,22 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+
+static int pad_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_PAD_TRACE") ? 1 : 0;
+    return enabled;
+}
+
+static u32 pad_connected_mask(void)
+{
+    u32 mask = 0;
+    for (u32 i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_host_state[i].connected) mask |= 1u << i;
+    return mask;
+}
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -347,6 +364,10 @@ s32 cellPadInit(u32 max_connect)
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
+    if (pad_trace_enabled()) {
+        fprintf(stderr, "[pad-trace] init connected_mask=0x%X\n", pad_connected_mask());
+        fflush(stderr);
+    }
 
     return CELL_OK;
 }
@@ -374,6 +395,8 @@ void cellPad_poll(void)
 
 s32 cellPadGetData(u32 port_no, CellPadData* data)
 {
+    static u16 last_buttons[PAD_MAX_HOST_PORTS];
+    static int first_call = 1;
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
@@ -385,6 +408,13 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     /* Poll fresh state */
     pad_poll_backend();
 
+    if (pad_trace_enabled() && first_call) {
+        first_call = 0;
+        fprintf(stderr, "[pad-trace] first GetData port=%u connected_mask=0x%X\n",
+                port_no, pad_connected_mask());
+        fflush(stderr);
+    }
+
     if (port_no >= PAD_MAX_HOST_PORTS || !s_host_state[port_no].connected) {
         data->len = 0;
         return CELL_OK;
@@ -392,6 +422,11 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
 
     PadHostState* hs = &s_host_state[port_no];
     u32 setting = s_port_setting[port_no];
+    if (pad_trace_enabled() && hs->buttons != last_buttons[port_no]) {
+        fprintf(stderr, "[pad-trace] port=%u buttons=0x%04X\n", port_no, hs->buttons);
+        fflush(stderr);
+        last_buttons[port_no] = hs->buttons;
+    }
 
     /* Determine data length based on port settings */
     s32 len = CELL_PAD_LEN_CHANGE_DEFAULT;
@@ -452,6 +487,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
 
 s32 cellPadGetInfo2(CellPadInfo2* info)
 {
+    static u32 last_mask = ~0u;
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
@@ -460,6 +496,14 @@ s32 cellPadGetInfo2(CellPadInfo2* info)
 
     /* Poll to get latest connection state */
     pad_poll_backend();
+    if (pad_trace_enabled()) {
+        u32 mask = pad_connected_mask();
+        if (mask != last_mask) {
+            fprintf(stderr, "[pad-trace] GetInfo2 connected_mask=0x%X\n", mask);
+            fflush(stderr);
+            last_mask = mask;
+        }
+    }
 
     memset(info, 0, sizeof(CellPadInfo2));
     info->max_connect = s_max_connect;
