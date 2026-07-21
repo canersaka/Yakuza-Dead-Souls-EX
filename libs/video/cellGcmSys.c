@@ -369,14 +369,14 @@ void cellGcmTickVBlank(void)
     s_vblank_count++;
     if (s_vblank_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_vblank_handler_opd,
-                           (uint64_t)s_vblank_count, 0, 0, 0);
+                           (uint64_t)s_vblank_count, 0, 0, 0, 0, 0, 0, 0);
     }
 }
 
 void cellGcmTickFlip(void)
 {
     if (s_flip_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
+        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
     }
 }
 
@@ -417,7 +417,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     /* s_flip_handler is a guest OPD, not a host fn-ptr: dispatch via the guest
      * caller (same as cellGcmTickFlip), never call it directly. */
     if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);  /* head 0 = primary display */
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
 }
@@ -453,7 +453,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     /* s_flip_handler is a guest OPD, not a host fn-ptr: dispatch via the guest caller. */
     if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
     return CELL_OK;
 }

@@ -320,7 +320,8 @@ static vm_stack_alloc g_stacks;
 extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp: caller's guest tid */
 
 static void guest_caller(uint32_t opd_addr,
-                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     /* One lazily-allocated guest stack + context per host thread. */
     static thread_local ppu_context cb_ctx;
@@ -348,6 +349,10 @@ static void guest_caller(uint32_t opd_addr,
     cb_ctx.gpr[4] = a1;
     cb_ctx.gpr[5] = a2;
     cb_ctx.gpr[6] = a3;
+    cb_ctx.gpr[7] = a4;
+    cb_ctx.gpr[8] = a5;
+    cb_ctx.gpr[9] = a6;
+    cb_ctx.gpr[10] = a7;
     ppu_context* prev = g_yz_cur_ctx;
     g_yz_cur_ctx = &cb_ctx;
     yz_call_guest_opd(opd_addr, &cb_ctx);

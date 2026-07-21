@@ -209,7 +209,7 @@ static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName
 
     printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d)\n",
            func_opd, cb_ea, get_ea, set_ea, is_new);
-    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0);
+    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
     s32 result = marshal_cbresult_read_result(cb_ea);
     printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
@@ -609,7 +609,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
     vm_write32(get_ea + 1632, listed);
     vm_write32(get_ea + 1636, listed ? buf_ea : 0);
 
-    g_ps3_guest_caller(stat_opd, cb_ea, get_ea, set_ea, 0);
+    g_ps3_guest_caller(stat_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
     s32 result = marshal_cbresult_read_result(cb_ea);
     userdata_ea = vm_read32(cb_ea + 16);
     printf("[cellSaveData] funcStat returned cbResult.result=%d userdata=0x%08X\n",
@@ -640,7 +640,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
             memset(vm_base + file_set_ea, 0, SAVEDATA_FILESET_SIZE);
             vm_write32(file_get_ea, (uint32_t)exc_size);
             marshal_cbresult_reset(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT);
-            g_ps3_guest_caller(file_opd, cb_ea, file_get_ea, file_set_ea, 0);
+            g_ps3_guest_caller(file_opd, cb_ea, file_get_ea, file_set_ea, 0, 0, 0, 0, 0);
             result = marshal_cbresult_read_result(cb_ea);
             userdata_ea = vm_read32(cb_ea + 16);
             if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
@@ -696,7 +696,7 @@ static s32 savedata_select_guest(CellSaveDataSetList* setList,
     vm_write32(get_ea + 0, dir_num);
     vm_write32(get_ea + 4, listed);
     vm_write32(get_ea + 8, listed ? buf_ea : 0);
-    g_ps3_guest_caller(callback_opd, cb_ea, get_ea, set_ea, 0);
+    g_ps3_guest_caller(callback_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
     s32 result = marshal_cbresult_read_result(cb_ea);
     *userdata_ea = vm_read32(cb_ea + 16);
