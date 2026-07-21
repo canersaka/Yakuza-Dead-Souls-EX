@@ -116,11 +116,15 @@ typedef s32 CellFsFd;
 /* Optional host observer for successful opens. The filesystem still owns the
  * file and all guest-visible state; observers may use the translated path for
  * side-band services such as media presentation. */
-typedef void (*CellFsOpenHook)(const char* guest_path, const char* host_path);
+typedef void (*CellFsOpenHook)(CellFsFd fd, const char* guest_path,
+                               const char* host_path);
 void cellfs_set_open_hook(CellFsOpenHook hook);
+typedef void (*CellFsCloseHook)(CellFsFd fd, const char* guest_path);
+void cellfs_set_close_hook(CellFsCloseHook hook);
 /* Optional override for streams presented by a host-side media service.
  * Returning nonzero completes the guest read successfully with zero bytes. */
-typedef int (*CellFsReadEofHook)(const char* guest_path);
+typedef int (*CellFsReadEofHook)(CellFsFd fd, const char* guest_path,
+                                u64 offset, u64 nbytes);
 void cellfs_set_read_eof_hook(CellFsReadEofHook hook);
 typedef s32 CellFsDir;
 
