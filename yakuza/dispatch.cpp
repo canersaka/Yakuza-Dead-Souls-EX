@@ -38,6 +38,101 @@ static bool addr_readable(uint32_t a)
            (a >= 0xD0000000u && a < 0xE0000000u);
 }
 
+/* Opt-in observer for the title prompt/selector state machine.  The indirect
+ * dispatcher below covers callback transitions without changing behavior;
+ * local generated entry probes may reuse it when direct-call detail is needed. */
+extern "C" void yz_title_trace(ppu_context* ctx, unsigned address)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("YZ_TITLE_TRACE") ? 1 : 0;
+    if (!enabled) return;
+
+    unsigned slot;
+    switch (address) {
+    case 0x00AF1FB0u: slot = 0; break;
+    case 0x00AF24A4u: slot = 1; break;
+    case 0x00AF2F40u: slot = 2; break;
+    case 0x00AF4CA0u: slot = 3; break;
+    case 0x00AF53DCu: slot = 4; break;
+    case 0x00AF5614u: slot = 5; break;
+    case 0x00AF56BCu: slot = 6; break;
+    case 0x00AF5860u: slot = 7; break;
+    case 0x00AF0E10u: slot = 8; break;
+    case 0x00AF0FE4u: slot = 9; break;
+    case 0x00AF11CCu: slot = 10; break;
+    case 0x00AF13E4u: slot = 11; break;
+    case 0x00AF1390u: slot = 12; break;
+    default: return;
+    }
+
+    const uint32_t obj = (uint32_t)ctx->gpr[3];
+    if (obj < 0x10000u || obj >= 0xD0000000u) return;
+
+    const uint32_t now[] = {
+        vm_read32(obj + 0x138u), vm_read32(obj + 0x13Cu),
+        vm_read32(obj + 0x148u), vm_read32(obj + 0x14Cu),
+        vm_read32(obj + 0x150u), vm_read32(obj + 0x154u),
+        vm_read32(obj + 0x17Cu), vm_read32(obj + 0x180u),
+        vm_read32(obj + 0x188u), vm_read32(obj + 0x1A0u),
+        vm_read32(obj + 0x1ACu), vm_read32(obj + 0x1B0u),
+        vm_read32(obj + 0x1B4u), vm_read32(obj + 0x1B8u),
+        vm_read32(obj + 0x1C0u), vm_read32(obj + 0x100u),
+        vm_read32(obj + 0x104u), vm_read32(obj + 0x108u),
+        vm_read32(obj + 0x10Cu), vm_read32(obj + 0x114u),
+        vm_read32(obj + 0x118u), vm_read32(obj + 0x11Cu),
+        vm_read32(obj + 0x120u), vm_read32(obj + 0x124u),
+        vm_read32(obj + 0x128u), vm_read32(obj + 0x134u),
+        vm_read32(obj + 0x140u), vm_read32(obj + 0x144u)
+    };
+    const uint32_t table = now[4];
+    const uint32_t index = now[6];
+    uint32_t selected = 0xFFFFFFFFu;
+    uint32_t states[9] = {};
+    if (table >= 0x10000u && table < 0xD0000000u && index < 0x1000u) {
+        for (unsigned i = 0; i < 9; ++i)
+            states[i] = vm_read32(table + i * 4u);
+        selected = vm_read32(table + index * 4u);
+    }
+
+    static uint32_t last_obj[16];
+    static uint32_t last[16][sizeof(now) / sizeof(now[0])];
+    static uint32_t last_selected[16];
+    static unsigned seen;
+    static unsigned lines;
+    static bool armed;
+    if (!armed) {
+        armed = true;
+        fprintf(stderr, "[title-trace] direct observer armed\n");
+    }
+
+    bool changed = !(seen & (1u << slot)) || obj != last_obj[slot] ||
+                   selected != last_selected[slot];
+    for (unsigned i = 0; i < sizeof(now) / sizeof(now[0]); ++i)
+        if (now[i] != last[slot][i]) changed = true;
+    if (!changed || lines >= 2000) return;
+
+    ++lines;
+    fprintf(stderr,
+            "[title-trace] fn=%08X obj=%08X ui=%08X input=%08X "
+            "timer=%u handle=%08X table=%08X count=%u idx=%u selected=%u "
+            "180=%u 188=%u 1a0=%u 1ac=%u 1b0=%u 1b4=%08X 1b8=%u 1c0=%u "
+            "100=%u 104=%u 108=%u 10c=%u 114=%u 118=%u 11c=%u 120=%u "
+            "124=%u 128=%u 134=%u 140=%08X 144=%08X "
+            "states=[%u,%u,%u,%u,%u,%u,%u,%u,%u]\n",
+            address, obj, now[0], now[1], now[2], now[3], now[4], now[5],
+            now[6], selected, now[7], now[8], now[9], now[10], now[11],
+            now[12], now[13], now[14], now[15], now[16], now[17], now[18],
+            now[19], now[20], now[21], now[22], now[23], now[24], now[25],
+            now[26], now[27], states[0], states[1], states[2],
+            states[3], states[4], states[5], states[6], states[7], states[8]);
+    fflush(stderr);
+    seen |= 1u << slot;
+    last_obj[slot] = obj;
+    last_selected[slot] = selected;
+    for (unsigned i = 0; i < sizeof(now) / sizeof(now[0]); ++i)
+        last[slot][i] = now[i];
+}
+
 /* ===========================================================================
  * mwPly (CRI Sofdec player) dynamic-ABI probe (env YZ_MWPLY_PROBE, 2026-07-04)
  * See scratch/MWPLY_RESOLVE.md for the resolution recipe. Three resolved
@@ -463,6 +558,24 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
               break;
           }
       } }
+
+    /* Observe callback transitions that pass through the indirect dispatcher. */
+    switch (target) {
+    case 0x00AF1FB0u: case 0x01347AC0u: yz_title_trace(ctx, 0x00AF1FB0u); break;
+    case 0x00AF24A4u: case 0x01347AC8u: yz_title_trace(ctx, 0x00AF24A4u); break;
+    case 0x00AF2F40u: case 0x01347AE8u: yz_title_trace(ctx, 0x00AF2F40u); break;
+    case 0x00AF4CA0u: case 0x01347B60u: yz_title_trace(ctx, 0x00AF4CA0u); break;
+    case 0x00AF53DCu: case 0x01347B78u: yz_title_trace(ctx, 0x00AF53DCu); break;
+    case 0x00AF5614u: case 0x01347B80u: yz_title_trace(ctx, 0x00AF5614u); break;
+    case 0x00AF56BCu: case 0x01347B90u: yz_title_trace(ctx, 0x00AF56BCu); break;
+    case 0x00AF5860u:                       yz_title_trace(ctx, 0x00AF5860u); break;
+    case 0x00AF0E10u: case 0x01347A58u: yz_title_trace(ctx, 0x00AF0E10u); break;
+    case 0x00AF0FE4u: case 0x01347A60u: yz_title_trace(ctx, 0x00AF0FE4u); break;
+    case 0x00AF11CCu: case 0x01347A68u: yz_title_trace(ctx, 0x00AF11CCu); break;
+    case 0x00AF13E4u: case 0x01347A78u: yz_title_trace(ctx, 0x00AF13E4u); break;
+    case 0x00AF1390u: case 0x01347A70u: yz_title_trace(ctx, 0x00AF1390u); break;
+    default: break;
+    }
     /* SPURS task-signal call watch (env YZ_SIGCALL, 2026-07-02, diag — REMOVE
      * when the voice frontier closes): all 6 SPU tasks park in WAIT_SIGNAL and
      * the tasksets' `signalled` bitmaps never set — does the PPU EVER call the
