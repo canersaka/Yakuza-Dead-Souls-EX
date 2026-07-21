@@ -110,6 +110,12 @@ typedef struct {
 
 static PathMapping s_path_mappings[MAX_PATH_MAPPINGS];
 static char s_root_path[CELL_FS_MAX_FS_PATH_LENGTH] = ".";
+static CellFsOpenHook s_open_hook;
+
+void cellfs_set_open_hook(CellFsOpenHook hook)
+{
+    s_open_hook = hook;
+}
 
 static void init_default_mappings(void)
 {
@@ -479,6 +485,9 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
 
     *fd = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
+
+    if (s_open_hook)
+        s_open_hook(path, host_path);
 
     /* CRI-gate diag (pt29, env YZ_CODEC_WATCH): when the intro voice container opens,
      * arm a read-watch on the cri_audio codec-registry entry (guest EA 0x135D9E0 ->

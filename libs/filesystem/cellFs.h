@@ -112,6 +112,12 @@ typedef struct CellFsDirectoryEntry {
 
 /* Opaque file/directory descriptors */
 typedef s32 CellFsFd;
+
+/* Optional host observer for successful opens. The filesystem still owns the
+ * file and all guest-visible state; observers may use the translated path for
+ * side-band services such as media presentation. */
+typedef void (*CellFsOpenHook)(const char* guest_path, const char* host_path);
+void cellfs_set_open_hook(CellFsOpenHook hook);
 typedef s32 CellFsDir;
 
 /* ---------------------------------------------------------------------------

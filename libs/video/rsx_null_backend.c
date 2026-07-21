@@ -190,16 +190,22 @@ static void null_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 static void null_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
-    printf("[RSX null] set_render_target(format=0x%X, %ux%u)\n",
-           state->surface_format, state->surface_clip_w, state->surface_clip_h);
+    static u32 log_count = 0;
+    if (log_count++ < 64) {
+        printf("[RSX null] set_render_target(format=0x%X, %ux%u)\n",
+               state->surface_format, state->surface_clip_w, state->surface_clip_h);
+    }
 }
 
 static void null_set_viewport(void* ud, const rsx_state* state)
 {
     (void)ud;
-    printf("[RSX null] set_viewport(%u,%u %ux%u)\n",
-           state->viewport_x, state->viewport_y,
-           state->viewport_w, state->viewport_h);
+    static u32 log_count = 0;
+    if (log_count++ < 64) {
+        printf("[RSX null] set_viewport(%u,%u %ux%u)\n",
+               state->viewport_x, state->viewport_y,
+               state->viewport_w, state->viewport_h);
+    }
 }
 
 static void null_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)

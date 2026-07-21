@@ -21,6 +21,7 @@
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 #include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
+#include "../libs/filesystem/cellFs.h"
 
 #include <cstdio>
 #include <cstring>
@@ -504,6 +505,80 @@ static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
     return (const u8*)(vm_base + ea);
 }
 
+/* The guest movie player owns sequencing and state transitions, but its
+ * decoded video surface is not yet reaching the live RSX draw path. Mirror
+ * successful .sfd opens into the host decoder so only the missing picture is
+ * supplied while the guest remains authoritative. */
+static SRWLOCK g_movie_open_lock = SRWLOCK_INIT;
+static char g_movie_open_path[MAX_PATH];
+static volatile LONG g_movie_open_serial = 0;
+static LONG g_movie_played_serial = 0;
+
+static int yz_has_sfd_suffix(const char* path)
+{
+    if (!path) return 0;
+    const size_t n = strlen(path);
+    return n >= 4 && _stricmp(path + n - 4, ".sfd") == 0;
+}
+
+static void yz_movie_open_hook(const char* guest_path, const char* host_path)
+{
+    if (!yz_has_sfd_suffix(guest_path) || !host_path || !*host_path ||
+        getenv("YZ_NO_MOVIE_PRESENT"))
+        return;
+
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    if (_stricmp(g_movie_open_path, host_path) != 0) {
+        strncpy(g_movie_open_path, host_path, sizeof(g_movie_open_path) - 1);
+        g_movie_open_path[sizeof(g_movie_open_path) - 1] = '\0';
+        InterlockedIncrement(&g_movie_open_serial);
+        fprintf(stderr, "[movie] queued guest movie '%s'\n", guest_path);
+        fflush(stderr);
+    }
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+}
+
+static void yz_play_queued_movie(const char* path, LONG serial)
+{
+    if (!rsx_live_draw_enabled() || !movie_ffmpeg_available())
+        return;
+
+    MoviePlayer* mv = movie_open(path);
+    if (!mv) {
+        fprintf(stderr, "[movie] unable to decode queued movie '%s'\n", path);
+        return;
+    }
+
+    const uint32_t w = (uint32_t)movie_width(mv);
+    const uint32_t h = (uint32_t)movie_height(mv);
+    int fps = (int)(movie_framerate(mv) + 0.5);
+    if (fps <= 0) fps = 30;
+    const DWORD frame_ms = (DWORD)(1000 / fps);
+    int frames = 0;
+    int superseded = 0;
+
+    fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n", path, w, h, fps);
+    fflush(stderr);
+    rsx_live_draw_set_movie_mode(1);
+    for (;;) {
+        if (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) != serial) {
+            superseded = 1;
+            break;
+        }
+        const uint8_t* rgba = movie_next_rgba(mv, nullptr);
+        if (!rgba) break;
+        rsx_live_draw_present_rgba(rgba, w, h);
+        frames++;
+        if (rsx_null_backend_pump_messages() < 0) break;
+        Sleep(frame_ms);
+    }
+    rsx_live_draw_set_movie_mode(0);
+    movie_close(mv);
+    fprintf(stderr, "[movie] %s after %d frames\n",
+            superseded ? "switched streams" : "presentation complete", frames);
+    fflush(stderr);
+}
+
 /* Dedicated window thread. A Win32 window must be created AND message-pumped on
  * the same thread, so it lives here rather than on the main/consumer threads.
  * rsx_null_backend_init() opens the window and registers the null backend (GDI
@@ -526,6 +601,8 @@ static DWORD WINAPI yz_window_thread(LPVOID)
             fprintf(stderr, "[rsx] live-draw init FAILED (%d) -> falling back to null present\n", r);
         }
     }
+
+    cellfs_set_open_hook(yz_movie_open_hook);
 
     /* YZ_MOVIE_TEST=<path.sfd>: standalone proof of the host movie path -- decode
      * the movie with FFmpeg and present it straight to the D3D12 window (movie
@@ -565,6 +642,18 @@ static DWORD WINAPI yz_window_thread(LPVOID)
     }
 
     for (;;) {
+        char queued_movie[MAX_PATH] = {};
+        LONG queued_serial = 0;
+        AcquireSRWLockShared(&g_movie_open_lock);
+        queued_serial = g_movie_open_serial;
+        if (queued_serial != g_movie_played_serial)
+            strncpy(queued_movie, g_movie_open_path, sizeof(queued_movie) - 1);
+        ReleaseSRWLockShared(&g_movie_open_lock);
+
+        if (queued_movie[0] && queued_serial != g_movie_played_serial) {
+            g_movie_played_serial = queued_serial;
+            yz_play_queued_movie(queued_movie, queued_serial);
+        }
         if (rsx_null_backend_pump_messages() < 0)
             break;            /* window closed */
         Sleep(8);
