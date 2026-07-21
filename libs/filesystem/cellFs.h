@@ -118,6 +118,10 @@ typedef s32 CellFsFd;
  * side-band services such as media presentation. */
 typedef void (*CellFsOpenHook)(const char* guest_path, const char* host_path);
 void cellfs_set_open_hook(CellFsOpenHook hook);
+/* Optional override for streams presented by a host-side media service.
+ * Returning nonzero completes the guest read successfully with zero bytes. */
+typedef int (*CellFsReadEofHook)(const char* guest_path);
+void cellfs_set_read_eof_hook(CellFsReadEofHook hook);
 typedef s32 CellFsDir;
 
 /* ---------------------------------------------------------------------------

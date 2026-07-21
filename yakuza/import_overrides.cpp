@@ -505,13 +505,16 @@ static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
     return (const u8*)(vm_base + ea);
 }
 
-/* The guest movie player owns sequencing and state transitions, but its
- * decoded video surface is not yet reaching the live RSX draw path. Mirror
- * successful .sfd opens into the host decoder so only the missing picture is
- * supplied while the guest remains authoritative. */
+/* The guest movie player owns sequencing and post-movie state, but its decoded
+ * surface is not yet reaching the live RSX draw path and its software decode
+ * runs far below the authored frame rate. Mirror successful .sfd opens into
+ * the host decoder, hold the guest at its first stream read while presenting,
+ * then return EOF so both sides observe one movie at the intended duration. */
 static SRWLOCK g_movie_open_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_movie_done_cv = CONDITION_VARIABLE_INIT;
 static char g_movie_open_path[MAX_PATH];
 static volatile LONG g_movie_open_serial = 0;
+static volatile LONG g_movie_completed_serial = 0;
 static LONG g_movie_played_serial = 0;
 
 static int yz_has_sfd_suffix(const char* path)
@@ -538,6 +541,41 @@ static void yz_movie_open_hook(const char* guest_path, const char* host_path)
     ReleaseSRWLockExclusive(&g_movie_open_lock);
 }
 
+static int yz_movie_read_eof_hook(const char* guest_path)
+{
+    if (!yz_has_sfd_suffix(guest_path) || getenv("YZ_NO_MOVIE_PRESENT") ||
+        getenv("YZ_NO_MOVIE_SYNC") || !rsx_live_draw_enabled() ||
+        !movie_ffmpeg_available())
+        return 0;
+
+    char host_path[MAX_PATH] = {};
+    if (cellfs_translate_path(guest_path, host_path, sizeof(host_path)) != 0)
+        return 0;
+
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    const LONG serial = InterlockedCompareExchange(&g_movie_open_serial, 0, 0);
+    if (!serial || _stricmp(g_movie_open_path, host_path) != 0) {
+        ReleaseSRWLockExclusive(&g_movie_open_lock);
+        return 0;
+    }
+
+    while (InterlockedCompareExchange(&g_movie_completed_serial, 0, 0) < serial &&
+           InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
+        SleepConditionVariableSRW(&g_movie_done_cv, &g_movie_open_lock, 1000, 0);
+    }
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+    return 1;
+}
+
+static void yz_movie_complete(LONG serial)
+{
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    if (serial > g_movie_completed_serial)
+        InterlockedExchange(&g_movie_completed_serial, serial);
+    WakeAllConditionVariable(&g_movie_done_cv);
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+}
+
 static void yz_play_queued_movie(const char* path, LONG serial)
 {
     if (!rsx_live_draw_enabled() || !movie_ffmpeg_available())
@@ -546,6 +584,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     MoviePlayer* mv = movie_open(path);
     if (!mv) {
         fprintf(stderr, "[movie] unable to decode queued movie '%s'\n", path);
+        yz_movie_complete(serial);
         return;
     }
 
@@ -574,6 +613,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     }
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
+    yz_movie_complete(serial);
     fprintf(stderr, "[movie] %s after %d frames\n",
             superseded ? "switched streams" : "presentation complete", frames);
     fflush(stderr);
@@ -603,6 +643,7 @@ static DWORD WINAPI yz_window_thread(LPVOID)
     }
 
     cellfs_set_open_hook(yz_movie_open_hook);
+    cellfs_set_read_eof_hook(yz_movie_read_eof_hook);
 
     /* YZ_MOVIE_TEST=<path.sfd>: standalone proof of the host movie path -- decode
      * the movie with FFmpeg and present it straight to the D3D12 window (movie
