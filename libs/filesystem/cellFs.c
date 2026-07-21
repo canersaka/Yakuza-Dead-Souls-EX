@@ -111,10 +111,16 @@ typedef struct {
 static PathMapping s_path_mappings[MAX_PATH_MAPPINGS];
 static char s_root_path[CELL_FS_MAX_FS_PATH_LENGTH] = ".";
 static CellFsOpenHook s_open_hook;
+static CellFsReadEofHook s_read_eof_hook;
 
 void cellfs_set_open_hook(CellFsOpenHook hook)
 {
     s_open_hook = hook;
+}
+
+void cellfs_set_read_eof_hook(CellFsReadEofHook hook)
+{
+    s_read_eof_hook = hook;
 }
 
 static void init_default_mappings(void)
@@ -545,6 +551,13 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     int path_stream =
         (p && (strstr(p, ".cvm") || strstr(p, ".sfd") || strstr(p, "/stream/") || strstr(p, "/movie/"))) ? 1 : 0;
     int is_stream = fs_trace || path_stream;
+
+    if (s_read_eof_hook && s_read_eof_hook(p)) {
+        if (nread) *nread = ps3_bswap64(0);
+        yz_fs_lat_wait();
+        return CELL_OK;
+    }
+
     long long off_before = -1;
     if (is_stream && s_files[fd].host_fp) off_before = (long long)
 #ifdef _MSC_VER
