@@ -81,9 +81,13 @@ static int           s_movie_skip_down = 0;
 #if PAD_BACKEND_XINPUT
 static volatile LONG s_movie_skip_active = 0;
 static volatile LONG s_movie_skip_guest_seen = 0;
+static volatile LONG s_movie_skip_poll_serial = 0;
+static volatile LONG s_movie_skip_seen_poll = 0;
 #else
 static volatile int  s_movie_skip_active = 0;
 static volatile int  s_movie_skip_guest_seen = 0;
+static volatile int  s_movie_skip_poll_serial = 0;
+static volatile int  s_movie_skip_seen_poll = 0;
 #endif
 
 static int pad_trace_enabled(void)
@@ -517,9 +521,13 @@ void cellPad_host_movie_skip_begin(void)
 {
 #if PAD_BACKEND_XINPUT
     InterlockedExchange(&s_movie_skip_guest_seen, 0);
+    InterlockedExchange(&s_movie_skip_poll_serial, 0);
+    InterlockedExchange(&s_movie_skip_seen_poll, 0);
     InterlockedExchange(&s_movie_skip_active, 1);
 #else
     s_movie_skip_guest_seen = 0;
+    s_movie_skip_poll_serial = 0;
+    s_movie_skip_seen_poll = 0;
     s_movie_skip_active = 1;
 #endif
 #if PAD_BACKEND_XINPUT
@@ -539,9 +547,13 @@ void cellPad_host_movie_skip_begin(void)
 int cellPad_host_movie_skip_guest_seen(void)
 {
 #if PAD_BACKEND_XINPUT
-    return InterlockedCompareExchange(&s_movie_skip_guest_seen, 0, 0) != 0;
+    const LONG seen = InterlockedCompareExchange(&s_movie_skip_guest_seen, 0, 0);
+    const LONG poll = InterlockedCompareExchange(&s_movie_skip_poll_serial, 0, 0);
+    const LONG seen_poll = InterlockedCompareExchange(&s_movie_skip_seen_poll, 0, 0);
+    return seen && poll > seen_poll;
 #else
-    return s_movie_skip_guest_seen != 0;
+    return s_movie_skip_guest_seen &&
+           s_movie_skip_poll_serial > s_movie_skip_seen_poll;
 #endif
 }
 
@@ -605,13 +617,21 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     PadHostState* hs = &s_host_state[port_no];
     u32 setting = s_port_setting[port_no];
 #if PAD_BACKEND_XINPUT
+    LONG movie_poll = 0;
+    if (port_no == 0 && InterlockedCompareExchange(&s_movie_skip_active, 0, 0))
+        movie_poll = InterlockedIncrement(&s_movie_skip_poll_serial);
     if (port_no == 0 && (hs->buttons & CELL_PAD_CTRL_START) &&
         InterlockedCompareExchange(&s_movie_skip_active, 0, 0) &&
         !InterlockedExchange(&s_movie_skip_guest_seen, 1)) {
+        InterlockedExchange(&s_movie_skip_seen_poll, movie_poll);
 #else
+    int movie_poll = 0;
+    if (port_no == 0 && s_movie_skip_active)
+        movie_poll = ++s_movie_skip_poll_serial;
     if (port_no == 0 && (hs->buttons & CELL_PAD_CTRL_START) &&
         s_movie_skip_active && !s_movie_skip_guest_seen) {
         s_movie_skip_guest_seen = 1;
+        s_movie_skip_seen_poll = movie_poll;
 #endif
         fprintf(stderr, "[cellPad] guest observed movie Start request\n");
         fflush(stderr);

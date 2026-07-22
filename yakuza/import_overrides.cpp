@@ -698,8 +698,9 @@ static void yz_play_queued_movie(const char* path, LONG serial)
              * guest, but can observe its edge first. SAIL cancellation is
              * asynchronous: the player's Stop request is established before
              * source completion is reported. Wait for cellPadGetData to hand
-             * the press to guest code, then give that update one frame to
-             * establish Stop before EOS publication. */
+             * the press to guest code and observe its following poll. That
+             * proves the receiving update returned to game code and had a
+             * chance to establish Stop before EOS publication. */
             const DWORD deadline = GetTickCount() + 1000;
             while (!cellPad_host_movie_skip_guest_seen() &&
                    (LONG)(deadline - GetTickCount()) > 0) {
@@ -708,10 +709,9 @@ static void yz_play_queued_movie(const char* path, LONG serial)
                 Sleep(1);
             }
             const int guest_seen = cellPad_host_movie_skip_guest_seen();
-            fprintf(stderr, "[movie] Start handoff guest_seen=%d\n", guest_seen);
+            fprintf(stderr, "[movie] Start handoff guest_update_acked=%d\n",
+                    guest_seen);
             fflush(stderr);
-            if (guest_seen)
-                Sleep(32);
             cancelled = 1;
             break;
         }
