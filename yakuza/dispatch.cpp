@@ -30,12 +30,59 @@ extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
 /* TLS trampoline slot -- the generated code declares this extern and both
  * sets it (direct tail branches) and drains it. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
+extern "C" volatile long g_yz_cri_yield_phase;
 
 static bool addr_readable(uint32_t a)
 {
     /* main memory (incl. loaded ELF) or stack region */
     return (a >= 0x00010000u && a < 0x10000000u) ||
            (a >= 0xD0000000u && a < 0xE0000000u);
+}
+
+/* One-shot diagnostic Start press at the title callback. The game does not
+ * read cellPadGetData here; it consumes two cached button bitsets owned by its
+ * input manager. Injecting both copies immediately before func_00AF1DD0 runs
+ * follows the same title-state-machine path as a real Start press. */
+static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
+{
+    static int enabled = -1;
+    static int state;
+    static std::chrono::steady_clock::time_point deadline;
+    const auto guest_readable = [](uint32_t a) {
+        return (a >= 0x00010000u && a < 0xD0000000u) ||
+               (a >= 0xD0000000u && a < 0xE0000000u);
+    };
+
+    if (enabled < 0) enabled = getenv("YZ_AUTO_START") ? 1 : 0;
+    if (!enabled || state == 2 || address != 0x00AF1DD0u) return;
+
+    if (state == 0) {
+        state = 1;
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        fprintf(stderr, "[auto-start] title input callback reached; injecting START in 3 seconds\n");
+        fflush(stderr);
+        return;
+    }
+    if (std::chrono::steady_clock::now() < deadline) return;
+
+    const uint32_t title = (uint32_t)ctx->gpr[3];
+    if (!guest_readable(title) || !guest_readable(title + 0x13Cu)) return;
+    const uint32_t input = vm_read32(title + 0x13Cu);
+    if (!guest_readable(input) || !guest_readable(input + 0x8u)) return;
+    const uint32_t owner = vm_read32(input + 0x8u);
+    if (!guest_readable(owner) || !guest_readable(owner + 0xE70u)) return;
+    const uint32_t cached = owner + 0xB68u;
+    if (!guest_readable(cached + 0x308u)) return;
+    const uint32_t mask = vm_read32(cached + 0x308u);
+    if (!guest_readable(mask)) return;
+
+    vm_write32(mask, vm_read32(mask) | 0x100u);
+    vm_write32(cached + 0x8u, vm_read32(cached + 0x8u) | 0x100u);
+    state = 2;
+    fprintf(stderr,
+            "[auto-start] injected cached START title=%08X input=%08X cached=%08X mask=%08X\n",
+            title, input, cached, mask);
+    fflush(stderr);
 }
 
 /* Opt-in observer for the title prompt/selector state machine.  The indirect
@@ -62,6 +109,8 @@ extern "C" void yz_title_trace(ppu_context* ctx, unsigned address)
     case 0x00AF11CCu: slot = 10; break;
     case 0x00AF13E4u: slot = 11; break;
     case 0x00AF1390u: slot = 12; break;
+    case 0x00AF1DD0u: slot = 13; break;
+    case 0x00AF1F48u: slot = 14; break;
     default: return;
     }
 
@@ -560,6 +609,14 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       } }
 
     /* Observe callback transitions that pass through the indirect dispatcher. */
+    if ((target == 0x00AF1F48u || target == 0x01347AB8u) &&
+        !g_yz_cri_yield_phase) {
+        g_yz_cri_yield_phase = 1;
+        fprintf(stderr, "[cri-yield] phase gate enabled at title-to-menu callback\n");
+        fflush(stderr);
+    }
+    if (target == 0x00AF1DD0u || target == 0x01347AB0u)
+        yz_title_auto_start(ctx, 0x00AF1DD0u);
     switch (target) {
     case 0x00AF1FB0u: case 0x01347AC0u: yz_title_trace(ctx, 0x00AF1FB0u); break;
     case 0x00AF24A4u: case 0x01347AC8u: yz_title_trace(ctx, 0x00AF24A4u); break;
@@ -574,6 +631,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     case 0x00AF11CCu: case 0x01347A68u: yz_title_trace(ctx, 0x00AF11CCu); break;
     case 0x00AF13E4u: case 0x01347A78u: yz_title_trace(ctx, 0x00AF13E4u); break;
     case 0x00AF1390u: case 0x01347A70u: yz_title_trace(ctx, 0x00AF1390u); break;
+    case 0x00AF1DD0u: case 0x01347AB0u: yz_title_trace(ctx, 0x00AF1DD0u); break;
+    case 0x00AF1F48u: case 0x01347AB8u: yz_title_trace(ctx, 0x00AF1F48u); break;
     default: break;
     }
     /* SPURS task-signal call watch (env YZ_SIGCALL, 2026-07-02, diag — REMOVE

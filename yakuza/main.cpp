@@ -977,9 +977,102 @@ static int yz_dstatus_probe_on(void)
     return on;
 }
 
+static volatile LONG g_yz_req1270_active = 0;
+
+/* s42 diagnostic fix: request 1270 has already published handle 0x00090061,
+ * so driver slot 9 owns the CRI object named by driver[0]. Destroying that
+ * object while the request is in states 6/7 invalidates the second-stage pool
+ * lookup and leaves f18 at -1 forever. Suppress only that exact destructor,
+ * only while the target request is active, and only when explicitly enabled. */
+extern "C" int yz_preserve_cri_object(void* ctxv)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("YZ_REQ1270_FIX") ? 1 : 0;
+    if (!enabled || !InterlockedCompareExchange(&g_yz_req1270_active, 0, 0))
+        return 0;
+
+    ppu_context* c = (ppu_context*)ctxv;
+    uint32_t obj = (uint32_t)c->gpr[3];
+    uint32_t drivers = vm_read32((uint32_t)c->gpr[2] - 0x7C04u);
+    uint32_t d = drivers + 9u * 0x188u;
+    uint32_t oid = vm_read32(d + 0x0u);
+    uint32_t flags = vm_read32(d + 0x4u);
+    uint32_t generation = vm_read16(d + 0xAu);
+    uint32_t obj_oid = vm_read32(obj + 0x64u);
+    uint32_t obj_pi = vm_read16(obj + 0x66u);
+
+    if ((int32_t)flags < 0 && generation == 0x61u &&
+        (obj_oid == oid || obj_pi == (oid & 0xFFFFu))) {
+        fprintf(stderr,
+                "[req1270-fix] preserve obj=%08X oid=%08X pi=%u driver=%08X flags=%08X gen=%04X tid=%u lr=%08X\n",
+                obj, obj_oid, obj_pi, d, flags, generation,
+                yz_thread_current_id(), (uint32_t)c->lr);
+        fflush(stderr);
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
 {
     if (addr == 0x00D1E838u) g_yz_updloop_started = 1;
+    /* s42: request 1270 (New Game -> Now Loading) reaches state 7 with handle
+     * 0x00090061, then its size/status poll never reports progress. The handle
+     * resolves in two stages: high16 selects a 0x188-byte driver record; that
+     * record's word 0 is an id into the 8-byte CRI object pool. The object
+     * destructor clears pool[id].ptr. Keep this env-gated because both lookup
+     * functions are hot during normal boot. */
+    {
+        static int s42 = -1;
+        if (s42 < 0) s42 = getenv("YZ_REQ1270") ? 1 : 0;
+        if (s42 && addr == 0x00E591B8u) {
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t h = (uint32_t)c->gpr[3];
+            if (h == 0x00090061u) {
+                uint32_t drivers = vm_read32((uint32_t)c->gpr[2] - 0x7C04u);
+                uint32_t di = h >> 16;
+                uint32_t d = drivers + di * 0x188u;
+                uint32_t oid = vm_read32(d + 0x0u);
+                uint32_t pool = vm_read32((uint32_t)c->gpr[2] - 0x7ACCu);
+                uint32_t pobj = pool ? vm_read32(pool + (oid & 0xFFFFu) * 8u + 4u) : 0;
+                static long n = 0;
+                if (++n <= 24 || (n & 0x3FFu) == 1) {
+                    fprintf(stderr, "[req1270] POLL n=%ld h=%08X d=%08X oid=%08X dflags=%08X d150=%08X poolobj=%08X poolobjid=%08X tid=%u lr=%08X\n",
+                            n, h, d, oid, vm_read32(d + 4u), vm_read32(d + 0x150u),
+                            pobj, pobj ? vm_read32(pobj + 0x64u) : 0,
+                            yz_thread_current_id(), (uint32_t)c->lr);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (s42 && addr == 0x00E65528u) {
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t oid = (uint32_t)c->gpr[3];
+            uint32_t pool = vm_read32((uint32_t)c->gpr[2] - 0x7ACCu);
+            uint32_t pobj = pool ? vm_read32(pool + (oid & 0xFFFFu) * 8u + 4u) : 0;
+            if (oid == 0x61u || pobj == 0x6096CB80u) {
+                fprintf(stderr, "[req1270] LOOKUP oid=%08X pool=%08X obj=%08X objid=%08X tid=%u lr=%08X\n",
+                        oid, pool, pobj, pobj ? vm_read32(pobj + 0x64u) : 0,
+                        yz_thread_current_id(), (uint32_t)c->lr);
+                fflush(stderr);
+            }
+        }
+        if (s42 && addr == 0x00E65A94u) {
+            ppu_context* c = (ppu_context*)ctxv;
+            uint32_t obj = (uint32_t)c->gpr[3];
+            uint32_t oid = vm_read32(obj + 0x64u);
+            uint32_t pi = vm_read16(obj + 0x66u);
+            uint32_t pool = vm_read32((uint32_t)c->gpr[2] - 0x7ACCu);
+            uint32_t slotptr = pool ? vm_read32(pool + pi * 8u + 4u) : 0;
+            static long dn = 0;
+            if (InterlockedCompareExchange(&g_yz_req1270_active, 0, 0) && ++dn <= 2000) {
+                fprintf(stderr, "[req1270] DESTROY obj=%08X oid=%08X pi=%u slotptr=%08X f50=%08X f60=%08X tid=%u lr=%08X\n",
+                        obj, oid, pi, slotptr, vm_read32(obj + 0x50u),
+                        vm_read32(obj + 0x60u), yz_thread_current_id(), (uint32_t)c->lr);
+                fflush(stderr);
+            }
+        }
+    }
     /* s35 Root-B rider (scratch/s35_completion_advance.md): func_00F01CE0 is the CRI
      * file-engine per-handle state machine. Filter to scenario.bin's handle
      * (*(obj+0xC14) == its driver 0x01655848) and log the state + the paired-source
@@ -1018,6 +1111,10 @@ extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
         uint32_t idx = (uint32_t)(c->gpr[4] & 0xFFFFu);
         uint32_t rec = vm_read32(mgr + 0xCu) + idx * 0x130u;
         uint32_t state = vm_read32(rec);
+        if (vm_read32(rec + 0x4u) == 0x00090061u && state >= 6u && state <= 12u)
+            InterlockedExchange(&g_yz_req1270_active, 1);
+        else if (vm_read32(rec + 0x4u) == 0x00090061u && state == 13u)
+            InterlockedExchange(&g_yz_req1270_active, 0);
         static uint32_t req_rec[256];
         static uint32_t req_state[256];
         static uint16_t req_cnt[256];
@@ -1176,7 +1273,10 @@ extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
      * accident. NOT the refuted YZ_THREAD_PRIO (#56a: that set Windows priorities). Env-gated,
      * default-OFF, kill-switch; SwitchToThread is a cheap no-op when nothing else is ready. */
     {
-        static int cy = -1; if (cy < 0) cy = getenv("YZ_CRI_YIELD") ? 1 : 0;
+        extern volatile LONG g_yz_cri_yield_phase;
+        const int cy = !getenv("YZ_CRI_NO_YIELD") &&
+            (getenv("YZ_CRI_YIELD") ? 1 :
+             (InterlockedCompareExchange(&g_yz_cri_yield_phase, 0, 0) != 0));
         if (cy && (addr == 0x00EEF88Cu || addr == 0x00E55C84u ||
                    addr == 0x00EEEE04u || addr == 0x00EEECDCu)) {
             SwitchToThread();
