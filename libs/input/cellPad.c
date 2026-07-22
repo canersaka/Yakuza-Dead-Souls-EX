@@ -189,6 +189,75 @@ static void pad_poll_xinput(void)
     }
 }
 
+static int pad_keyboard_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_NO_KEYBOARD_PAD") ? 0 : 1;
+    return enabled;
+}
+
+static int pad_key_down(int virtual_key)
+{
+    return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
+}
+
+/* Merge a keyboard-backed virtual controller into port 0.  This deliberately
+ * runs after XInput so a real controller and the keyboard can be used at the
+ * same time.  The keyboard also keeps port 0 connected when no XInput device
+ * is present, which lets title/menu input work without a controller. */
+static void pad_merge_keyboard(void)
+{
+    if (!pad_keyboard_enabled())
+        return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!hs->connected) {
+        memset(hs, 0, sizeof(*hs));
+        hs->analog_lx = 128;
+        hs->analog_ly = 128;
+        hs->analog_rx = 128;
+        hs->analog_ry = 128;
+    }
+    hs->connected = 1;
+
+    u16 btns = hs->buttons;
+    if (pad_key_down(VK_BACK))   btns |= CELL_PAD_CTRL_SELECT;
+    if (pad_key_down(VK_RETURN)) btns |= CELL_PAD_CTRL_START;
+    if (pad_key_down(VK_UP))     btns |= CELL_PAD_CTRL_UP;
+    if (pad_key_down(VK_RIGHT))  btns |= CELL_PAD_CTRL_RIGHT;
+    if (pad_key_down(VK_DOWN))   btns |= CELL_PAD_CTRL_DOWN;
+    if (pad_key_down(VK_LEFT))   btns |= CELL_PAD_CTRL_LEFT;
+    if (pad_key_down('1'))       btns |= CELL_PAD_CTRL_L2;
+    if (pad_key_down('3'))       btns |= CELL_PAD_CTRL_R2;
+    if (pad_key_down('Q'))       btns |= CELL_PAD_CTRL_L1;
+    if (pad_key_down('E'))       btns |= CELL_PAD_CTRL_R1;
+    if (pad_key_down('V') || pad_key_down('I')) btns |= CELL_PAD_CTRL_TRIANGLE;
+    if (pad_key_down('C') || pad_key_down('L')) btns |= CELL_PAD_CTRL_CIRCLE;
+    if (pad_key_down('X') || pad_key_down('K')) btns |= CELL_PAD_CTRL_CROSS;
+    if (pad_key_down('Z') || pad_key_down('J')) btns |= CELL_PAD_CTRL_SQUARE;
+    hs->buttons = btns;
+
+    /* WASD supplies a full-strength left stick while arrows remain a D-pad. */
+    if (pad_key_down('A')) hs->analog_lx = 0;
+    if (pad_key_down('D')) hs->analog_lx = 255;
+    if (pad_key_down('W')) hs->analog_ly = 0;
+    if (pad_key_down('S')) hs->analog_ly = 255;
+
+    if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+    if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+    hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+    hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+    hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+    hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+    hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+    hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+    hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+    hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+    hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+}
+
 static void pad_init_backend(void)
 {
     /* XInput needs no explicit init */
@@ -336,6 +405,7 @@ static void pad_poll_backend(void)
 {
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
+    pad_merge_keyboard();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
@@ -364,6 +434,14 @@ s32 cellPadInit(u32 max_connect)
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
+#if PAD_BACKEND_XINPUT
+    if (pad_keyboard_enabled()) {
+        fprintf(stderr,
+                "[cellPad] keyboard pad enabled: Enter=Start arrows=D-pad WASD=left-stick "
+                "X/K=Cross C/L=Circle Z/J=Square V/I=Triangle\n");
+        fflush(stderr);
+    }
+#endif
     if (pad_trace_enabled()) {
         fprintf(stderr, "[pad-trace] init connected_mask=0x%X\n", pad_connected_mask());
         fflush(stderr);
