@@ -77,6 +77,7 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+static int           s_movie_skip_down = 0;
 
 static int pad_trace_enabled(void)
 {
@@ -210,6 +211,22 @@ static int pad_keyboard_window_focused(void)
         return 0;
     GetWindowThreadProcessId(foreground, &foreground_pid);
     return foreground_pid == GetCurrentProcessId();
+}
+
+static int pad_host_start_down(void)
+{
+    int down = 0;
+    for (DWORD i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        XINPUT_STATE state;
+        memset(&state, 0, sizeof(state));
+        if (XInputGetState(i, &state) == ERROR_SUCCESS &&
+            (state.Gamepad.wButtons & XINPUT_GAMEPAD_START))
+            down = 1;
+    }
+    if (pad_keyboard_enabled() && pad_keyboard_window_focused() &&
+        pad_key_down(VK_RETURN))
+        down = 1;
+    return down;
 }
 
 /* Merge a keyboard-backed virtual controller into port 0.  This deliberately
@@ -483,6 +500,46 @@ void cellPad_poll(void)
 {
     if (s_pad_initialized) {
         pad_poll_backend();
+    }
+}
+
+/* Movie playback runs on the window thread while the guest pad reader keeps
+ * running independently. Poll the host APIs directly and edge-detect Start so
+ * the press that entered the movie cannot immediately skip it while held. */
+void cellPad_host_movie_skip_begin(void)
+{
+#if PAD_BACKEND_XINPUT
+    s_movie_skip_down = pad_host_start_down();
+#elif PAD_BACKEND_SDL2
+    SDL_GameControllerUpdate();
+    s_movie_skip_down = 0;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        if (gc && SDL_GameControllerGetAttached(gc) &&
+            SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))
+            s_movie_skip_down = 1;
+    }
+#endif
+}
+
+int cellPad_host_movie_skip_requested(void)
+{
+    int down = 0;
+#if PAD_BACKEND_XINPUT
+    down = pad_host_start_down();
+#elif PAD_BACKEND_SDL2
+    SDL_GameControllerUpdate();
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        if (gc && SDL_GameControllerGetAttached(gc) &&
+            SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))
+            down = 1;
+    }
+#endif
+    {
+        const int pressed = down && !s_movie_skip_down;
+        s_movie_skip_down = down;
+        return pressed;
     }
 }
 
