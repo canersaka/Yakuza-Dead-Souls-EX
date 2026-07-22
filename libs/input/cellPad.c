@@ -202,6 +202,16 @@ static int pad_key_down(int virtual_key)
     return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
 }
 
+static int pad_keyboard_window_focused(void)
+{
+    HWND foreground = GetForegroundWindow();
+    DWORD foreground_pid = 0;
+    if (!foreground)
+        return 0;
+    GetWindowThreadProcessId(foreground, &foreground_pid);
+    return foreground_pid == GetCurrentProcessId();
+}
+
 /* Merge a keyboard-backed virtual controller into port 0.  This deliberately
  * runs after XInput so a real controller and the keyboard can be used at the
  * same time.  The keyboard also keeps port 0 connected when no XInput device
@@ -220,6 +230,11 @@ static void pad_merge_keyboard(void)
         hs->analog_ry = 128;
     }
     hs->connected = 1;
+
+    /* GetAsyncKeyState is system-wide. Ignore it unless a process window is
+     * foreground so background key state cannot reach guest input. */
+    if (!pad_keyboard_window_focused())
+        return;
 
     u16 btns = hs->buttons;
     if (pad_key_down(VK_BACK))   btns |= CELL_PAD_CTRL_SELECT;
