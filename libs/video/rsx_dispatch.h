@@ -118,6 +118,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink);
  * No side effects, no callbacks — mirrors loading hardware context. */
 void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count);
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count);
+void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count);
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);

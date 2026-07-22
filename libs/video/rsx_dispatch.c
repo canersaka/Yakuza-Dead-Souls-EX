@@ -222,6 +222,14 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
     memcpy(rsx->vp, words, count * sizeof(u32));
 }
 
+void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
+{
+    const u32 max_words = RSX_DSP_NUM_CONSTANTS * 4;
+    if (count > max_words)
+        count = max_words;
+    memcpy(rsx->constants, words, count * sizeof(u32));
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;

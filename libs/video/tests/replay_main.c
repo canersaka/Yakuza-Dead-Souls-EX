@@ -85,10 +85,12 @@ typedef struct {
 
 typedef struct {
     u32  n_blocks, n_records, reg_words, vp_words, disp_w, disp_h;
+    u32  const_words;
     u32  disp_count;
     rxs_display_buf disp[8];
     u32* regs;
     u32* vp;
+    u32* constants;
     rxs_block* blocks;
     u8*  data;      /* concatenated block payloads */
     u32* records;   /* n_records * 2 words         */
@@ -100,8 +102,9 @@ static int rxs_load(const char* path, rxs_stream* s)
     if (!f) { printf("cannot open %s\n", path); return -1; }
 
     u32 hdr[8];
-    if (fread(hdr, 4, 8, f) != 8 || memcmp(hdr, "RXS1", 4) != 0 || hdr[1] != 2) {
-        printf("%s: not an RXS1 v2 stream (re-run tools/rrc_export.py)\n", path);
+    if (fread(hdr, 4, 8, f) != 8 || memcmp(hdr, "RXS1", 4) != 0 ||
+        (hdr[1] != 2 && hdr[1] != 3)) {
+        printf("%s: not a supported RXS1 v2/v3 stream (re-run tools/rrc_export.py)\n", path);
         fclose(f);
         return -1;
     }
@@ -117,12 +120,19 @@ static int rxs_load(const char* path, rxs_stream* s)
         fclose(f);
         return -1;
     }
+    if (hdr[1] >= 3 && fread(&s->const_words, 4, 1, f) != 1) {
+        printf("%s: truncated transform-constant header\n", path);
+        fclose(f);
+        return -1;
+    }
 
     s->regs   = malloc((size_t)s->reg_words * 4);
     s->vp     = malloc((size_t)s->vp_words * 4);
+    s->constants = malloc(s->const_words ? (size_t)s->const_words * 4 : 1);
     s->blocks = malloc((size_t)s->n_blocks * sizeof(rxs_block));
     if (fread(s->regs, 4, s->reg_words, f) != s->reg_words ||
         fread(s->vp, 4, s->vp_words, f) != s->vp_words ||
+        (s->const_words && fread(s->constants, 4, s->const_words, f) != s->const_words) ||
         fread(s->blocks, sizeof(rxs_block), s->n_blocks, f) != s->n_blocks) {
         printf("%s: truncated header sections\n", path);
         fclose(f);
@@ -4803,6 +4813,8 @@ int main(int argc, char** argv)
     rsx_dispatch_init(&rsx, &sink);
     rsx_dispatch_seed_registers(&rsx, s.regs, s.reg_words);
     rsx_dispatch_seed_transform_program(&rsx, s.vp, s.vp_words);
+    if (s.const_words)
+        rsx_dispatch_seed_transform_constants(&rsx, s.constants, s.const_words);
 
     for (u32 i = 0; i < s.n_records; i++) {
         const u32 a = s.records[i * 2];
