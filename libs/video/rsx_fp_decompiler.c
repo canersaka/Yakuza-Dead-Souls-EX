@@ -228,6 +228,12 @@ static void dest_mask(u32 op0, char* m)
 
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
+    return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
+}
+
+int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                        u32 tex_cube_mask, char* out, u32 out_size)
+{
     if (!ucode || !out || out_size == 0) return -1;
 
     Out o = { out, out_size, 0, 1 };
@@ -240,8 +246,22 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         "    float4 fog : FOG;\n"
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
-        "};\n"
-        "Texture2D    rsx_tex[16] : register(t0);\n"
+        "};\n");
+    /* Texture bank. With no cube units (the default) emit the exact legacy
+     * array declaration so 2D-only programs are byte-identical. When any unit
+     * is a cubemap, declare each unit individually at its t-register so the
+     * cube units can be TextureCube while the rest stay Texture2D. */
+    if (tex_cube_mask == 0) {
+        out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
+    } else {
+        char decl[64];
+        for (u32 u = 0; u < 16; u++) {
+            snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
+                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
+            out_puts(&o, decl);
+        }
+    }
+    out_puts(&o,
         "SamplerState rsx_samp[16] : register(s0);\n"
         "float4 main(PSInput input) : SV_TARGET {\n"
         "    float4 r[48]; float4 h[48];\n"
@@ -387,13 +407,31 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
-            snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+            if ((tex_cube_mask >> tex_unit) & 1u)
+                /* Cubemap: sample with the full 3-component direction vector. */
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
+            else if (tex_cube_mask)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+            else
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
-            snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                     tex_unit, tex_unit, a, a);
+            if ((tex_cube_mask >> tex_unit) & 1u)
+                /* Projective divide is meaningless for a cube lookup; sample
+                 * the direction directly. */
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
+            else if (tex_cube_mask)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         tex_unit, tex_unit, a, a);
+            else
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         tex_unit, tex_unit, a, a);
             break;
         case OP_KIL:
             out_puts(&o, "    /* TODO: KIL (condition not modeled) */\n");

@@ -205,6 +205,33 @@ int main(void)
         check("set_cond_write", hlsl, "cc1.xyzw = r[0].xyzw;");
     }
 
+    /* Test 10: cube unit -> TextureCube declaration + 3-component sample. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | TEXU(6) | INSRC(4) | END); /* TEX unit 6, TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | UNCOND);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_ex(prog, sizeof(prog), RSX_FP_CTRL_AUTO, (1u<<6), hlsl, sizeof(hlsl));
+        check("cube_decl",   hlsl, "TextureCube rsx_tex6 : register(t6);");
+        check("cube_sample", hlsl, "rsx_tex6.Sample(rsx_samp[6], ((input.tc0).xyzw).xyz)");
+        check("cube_2d_unit", hlsl, "rsx_tex0 : register(t0);");   /* other units per-unit, still 2D */
+    }
+
+    /* Test 11: cube_mask 0 must keep the legacy 2D array form byte-for-byte. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | TEXU(6) | INSRC(4) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | UNCOND);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_ex(prog, sizeof(prog), RSX_FP_CTRL_AUTO, 0u, hlsl, sizeof(hlsl));
+        check("no_cube_array",  hlsl, "Texture2D    rsx_tex[16] : register(t0);");
+        check("no_cube_sample", hlsl, "rsx_tex[6].Sample(rsx_samp[6], ((input.tc0).xyzw).xy)");
+        if (strstr(hlsl, "TextureCube")) { printf("[FAIL] no_cube_leak -- TextureCube present at mask 0\n"); g_fail++; }
+        else { printf("[PASS] no_cube_leak -- no TextureCube at mask 0\n"); g_pass++; }
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
