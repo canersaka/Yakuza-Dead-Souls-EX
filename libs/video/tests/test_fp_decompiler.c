@@ -56,6 +56,19 @@ static void check(const char* test, const char* hlsl, const char* needle)
 #define T_CONST     2u
 #define REG(i)      ((u32)(i) << 2)
 
+/* exec_if / set_cond bit positions (SRC0=DWORD1): exec_if_lt@18,
+ * exec_if_eq@19, exec_if_gr@20, cond_swizzle@21, cond_mod_reg_index@30,
+ * cond_reg_index@31; set_cond = OPDEST@8. All three exec bits == the
+ * unconditional default that real compiled programs always emit; none set
+ * == never. */
+#define EXEC_LT      (1u<<18)
+#define EXEC_EQ      (1u<<19)
+#define EXEC_GR      (1u<<20)
+#define UNCOND       (EXEC_LT | EXEC_EQ | EXEC_GR)
+#define COND_REG     (1u<<31)   /* cond_reg_index: exec_if READ source       */
+#define COND_MOD_REG (1u<<30)   /* cond_mod_reg_index: set_cond WRITE target */
+#define SET_COND     (1u<<8)
+
 int main(void)
 {
     char hlsl[8192];
@@ -64,7 +77,7 @@ int main(void)
     {
         u8 prog[16];
         put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV, COL0 */
-        put_word(prog + 4, T_INPUT | SWZ_IDENT);                       /* src0 = INPUT */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | UNCOND);              /* src0 = INPUT */
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
         int n = rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
@@ -79,7 +92,7 @@ int main(void)
         u8 prog[16];
         u32 mask_xy = (1u<<9)|(1u<<10);
         put_word(prog + 0, OPC(0x02) | mask_xy | (1u<<1) | END); /* MUL, dest r1 */
-        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | UNCOND);
         put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
         put_word(prog + 12, 0);
         rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
@@ -91,7 +104,7 @@ int main(void)
     {
         u8 prog[32];
         put_word(prog + 0, OPC(0x04) | OUTMASK_ALL | (1u<<31) | END); /* MAD + SAT */
-        put_word(prog + 4, T_TEMP  | REG(0) | SWZ_IDENT);
+        put_word(prog + 4, T_TEMP  | REG(0) | SWZ_IDENT | UNCOND);
         put_word(prog + 8, T_CONST | SWZ_IDENT);                       /* src1 CONST */
         put_word(prog + 12, T_TEMP | REG(0) | SWZ_IDENT);
         put_float(prog + 16, 0.5f);  /* inline constant float4 */
@@ -108,7 +121,7 @@ int main(void)
     {
         u8 prog[16];
         put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | TEXU(3) | END); /* TEX */
-        put_word(prog + 4, T_INPUT | SWZ_IDENT);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | UNCOND);
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
         rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
@@ -119,7 +132,7 @@ int main(void)
     {
         u8 prog[16];
         put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);
-        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u<<17) | (1u<<29)); /* neg+abs */
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u<<17) | (1u<<29) | UNCOND); /* neg+abs */
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
         rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
@@ -130,7 +143,7 @@ int main(void)
     {
         u8 prog[16];
         put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
-        put_word(prog + 4, T_INPUT | SWZ_IDENT);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | UNCOND);
         put_word(prog + 8, 0);
         put_word(prog + 12, 0);
         rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
@@ -144,6 +157,52 @@ int main(void)
             g_pass++;
         else
             g_fail++;
+    }
+
+    /* Test 7: unconditional MOV (all three exec bits) must stay a plain
+     * write -- i.e. predication support must NOT perturb the default path. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | EXEC_LT | EXEC_EQ | EXEC_GR);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        check("uncond_plain", hlsl, "r[0].xyzw = _v.xyzw; }");
+    }
+
+    /* Test 8: predicated write, exec_if=GT reading cc0 -> per-component select. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);       /* MOV r0 */
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | EXEC_GR); /* exec_if_gr only */
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        check("pred_cc0",   hlsl, "(cc0).xxxx > (float4)0.0");
+        check("pred_lerp",  hlsl, "lerp(r[0].xyzw, _v.xyzw, _p.xyzw)");
+    }
+
+    /* Test 9: exec_if=none (no bits) -> write suppressed. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT);         /* zero exec bits */
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        check("pred_none", hlsl, "exec_if=none: write suppressed");
+    }
+
+    /* Test 10: set_cond writes the CC register (cc1 via cond_mod_reg_index). */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | SET_COND | END); /* MOV r0, set CC */
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | EXEC_LT | EXEC_EQ | EXEC_GR | COND_MOD_REG);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        check("set_cond_write", hlsl, "cc1.xyzw = r[0].xyzw;");
     }
 
     printf("\n===========================================\n");
