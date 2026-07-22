@@ -78,6 +78,13 @@ static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 static int           s_movie_skip_down = 0;
+#if PAD_BACKEND_XINPUT
+static volatile LONG s_movie_skip_active = 0;
+static volatile LONG s_movie_skip_guest_seen = 0;
+#else
+static volatile int  s_movie_skip_active = 0;
+static volatile int  s_movie_skip_guest_seen = 0;
+#endif
 
 static int pad_trace_enabled(void)
 {
@@ -509,6 +516,13 @@ void cellPad_poll(void)
 void cellPad_host_movie_skip_begin(void)
 {
 #if PAD_BACKEND_XINPUT
+    InterlockedExchange(&s_movie_skip_guest_seen, 0);
+    InterlockedExchange(&s_movie_skip_active, 1);
+#else
+    s_movie_skip_guest_seen = 0;
+    s_movie_skip_active = 1;
+#endif
+#if PAD_BACKEND_XINPUT
     s_movie_skip_down = pad_host_start_down();
 #elif PAD_BACKEND_SDL2
     SDL_GameControllerUpdate();
@@ -519,6 +533,24 @@ void cellPad_host_movie_skip_begin(void)
             SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))
             s_movie_skip_down = 1;
     }
+#endif
+}
+
+int cellPad_host_movie_skip_guest_seen(void)
+{
+#if PAD_BACKEND_XINPUT
+    return InterlockedCompareExchange(&s_movie_skip_guest_seen, 0, 0) != 0;
+#else
+    return s_movie_skip_guest_seen != 0;
+#endif
+}
+
+void cellPad_host_movie_skip_end(void)
+{
+#if PAD_BACKEND_XINPUT
+    InterlockedExchange(&s_movie_skip_active, 0);
+#else
+    s_movie_skip_active = 0;
 #endif
 }
 
@@ -572,6 +604,18 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
 
     PadHostState* hs = &s_host_state[port_no];
     u32 setting = s_port_setting[port_no];
+#if PAD_BACKEND_XINPUT
+    if (port_no == 0 && (hs->buttons & CELL_PAD_CTRL_START) &&
+        InterlockedCompareExchange(&s_movie_skip_active, 0, 0) &&
+        !InterlockedExchange(&s_movie_skip_guest_seen, 1)) {
+#else
+    if (port_no == 0 && (hs->buttons & CELL_PAD_CTRL_START) &&
+        s_movie_skip_active && !s_movie_skip_guest_seen) {
+        s_movie_skip_guest_seen = 1;
+#endif
+        fprintf(stderr, "[cellPad] guest observed movie Start request\n");
+        fflush(stderr);
+    }
     if (pad_trace_enabled() && hs->buttons != last_buttons[port_no]) {
         fprintf(stderr, "[pad-trace] port=%u buttons=0x%04X\n", port_no, hs->buttons);
         fflush(stderr);

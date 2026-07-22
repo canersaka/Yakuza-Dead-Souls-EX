@@ -184,6 +184,8 @@ void cellPad_poll(void);
  * pad data from cellPadGetData. */
 void cellPad_host_movie_skip_begin(void);
 int cellPad_host_movie_skip_requested(void);
+int cellPad_host_movie_skip_guest_seen(void);
+void cellPad_host_movie_skip_end(void);
 
 #ifdef __cplusplus
 }
