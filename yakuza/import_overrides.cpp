@@ -52,6 +52,10 @@ extern ppu_context* g_yz_main_ctx;      /* main.cpp: t1's guest context */
 extern int g_yz_updloop_started;        /* main.cpp: first func_00D1E838 entry (ledger #64) */
 extern "C" void spu_lockline_lock(void);    /* SPU GETLLAR/PUTLLC serialization */
 extern "C" void spu_lockline_unlock(void);
+extern "C" void yz_rsx_fifo_acquire(void);
+extern "C" void yz_rsx_fifo_release(void);
+extern "C" int yz_rsx_flip_pending_any(void);
+extern "C" void yz_rsx_vblank_tick(void);
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
@@ -642,6 +646,24 @@ static void yz_movie_complete(LONG serial)
     ReleaseSRWLockExclusive(&g_movie_open_lock);
 }
 
+static void yz_movie_publish_output_eos(LONG serial)
+{
+    /* libsail keeps source EOS distinct from player/output completion. Do the
+     * equivalent here: stop the RSX consumer at a command boundary, publish
+     * one final vblank/flip completion, and only then wake the guest source
+     * read. Without this ordering, the guest can resume CRI teardown while a
+     * pre-movie flip still owns label+0x10, making the next scene depend on a
+     * timer race. The consumer lock prevents a new release from re-arming the
+     * label between this completion and the source notification. */
+    yz_rsx_fifo_acquire();
+    yz_rsx_vblank_tick();
+    fprintf(stderr,
+            "[movie] output EOS serial=%ld label=0x%08X pending=%d\n",
+            serial, vm_read32(RSX_REPORTS + 0x10), yz_rsx_flip_pending_any());
+    fflush(stderr);
+    yz_rsx_fifo_release();
+}
+
 static void yz_play_queued_movie(const char* path, LONG serial)
 {
     if (!rsx_live_draw_enabled() || !movie_ffmpeg_available())
@@ -691,6 +713,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     }
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
+    yz_movie_publish_output_eos(serial);
     yz_movie_complete(serial);
     fprintf(stderr, "[movie] %s after %d frames\n",
             superseded ? "switched streams" :
