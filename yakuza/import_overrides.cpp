@@ -1105,20 +1105,31 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                       addr, arg, have, ok ? "pass" : "STALL-enter"); }
         }
         if (addr && vm_read32(addr) != arg) {
-            /* s26 ride16 discriminator: the wedge acquire never passed even
-             * after the wanted value was published — is this path still being
-             * RETRIED (and reading what?), or does the caller stop re-invoking
-             * (park upstream)? Heartbeat every 64k retries of the same
-             * (addr,want): proves retry liveness + the value actually read
-             * (LESSONS #6d: episode-entry dedup hides both). */
-            { static uint32_t ha=0, hw=0; static unsigned long hn=0;
-              if (addr==ha && arg==hw) { hn++;
-                  if ((hn & 0xFFFFu)==0) {
-                      fprintf(stderr, "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X retries=%lu\n",
-                              addr, arg, vm_read32(addr), hn);
-                      fflush(stderr); } }
-              else { ha=addr; hw=arg; hn=0; } }
-            return 1;                             /* not yet satisfied: stall, retry later */
+            /* RPCS3 executes NV406E_SEMAPHORE_ACQUIRE as a blocking method:
+             * FIFO_control has already consumed this argument, and only this
+             * method waits for the external producer (normally vblank/flip
+             * completion) to publish the requested value. Returning "stall"
+             * from here made yz_rsx_fifo_step leave GET on the packet header.
+             * Its next poll therefore replayed every earlier argument in the
+             * packet, including the release that writes the flip semaphore
+             * back to 0xFFFFFFFF. Forward progress then depended on vblank
+             * landing in the tiny release-to-acquire replay window.
+             *
+             * Wait in this invocation instead. The vblank publisher does not
+             * take g_rsx_fifo_lock, matching RPCS3's external semaphore wake,
+             * so it can clear the label while this consumer is parked. Once
+             * it does, the packet commits exactly once and GET advances past
+             * it; preceding side effects are never replayed. */
+            unsigned long waits = 0;
+            while (vm_read32(addr) != arg) {
+                if ((++waits & 0xFFFFu) == 0) {
+                    fprintf(stderr,
+                            "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X waits=%lu\n",
+                            addr, arg, vm_read32(addr), waits);
+                    fflush(stderr);
+                }
+                SwitchToThread();
+            }
         }
         break;
     case 0x06C:                                   /* NV406E SEMAPHORE_RELEASE */
