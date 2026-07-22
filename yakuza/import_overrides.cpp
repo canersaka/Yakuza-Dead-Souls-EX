@@ -22,6 +22,7 @@
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 #include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
 #include "../libs/filesystem/cellFs.h"
+#include "../libs/input/cellPad.h"
 #include "../libs/system/cellSaveData.h"
 
 #include <cstdio>
@@ -517,6 +518,7 @@ static CONDITION_VARIABLE g_movie_done_cv = CONDITION_VARIABLE_INIT;
 static char g_movie_open_path[MAX_PATH];
 static volatile LONG g_movie_open_serial = 0;
 static volatile LONG g_movie_completed_serial = 0;
+static volatile LONG g_movie_cancelled_serial = 0;
 static LONG g_movie_played_serial = 0;
 
 /* Process-wide phase bit for the CRI worker fairness shim.  It is armed by the
@@ -532,6 +534,20 @@ struct yz_movie_fd_state {
     char host_path[MAX_PATH];
 };
 static yz_movie_fd_state g_movie_fds[YZ_MOVIE_FD_SLOTS];
+
+static void yz_movie_request_cancel(LONG serial, const char* reason)
+{
+    if (serial <= 0)
+        return;
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    if (serial > g_movie_completed_serial && serial > g_movie_cancelled_serial) {
+        InterlockedExchange(&g_movie_cancelled_serial, serial);
+        fprintf(stderr, "[movie] cancel requested serial=%ld (%s)\n",
+                serial, reason ? reason : "unspecified");
+        fflush(stderr);
+    }
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+}
 
 static int yz_has_sfd_suffix(const char* path)
 {
@@ -563,8 +579,13 @@ static void yz_movie_close_hook(CellFsFd fd, const char* guest_path)
     if (fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
         return;
     AcquireSRWLockExclusive(&g_movie_open_lock);
+    const LONG serial = g_movie_fds[fd].serial;
     memset(&g_movie_fds[fd], 0, sizeof(g_movie_fds[fd]));
     ReleaseSRWLockExclusive(&g_movie_open_lock);
+    /* Native Stop/Close cancels an outstanding asynchronous source operation;
+     * the host decoder observes this request, tears down its output surface,
+     * and only then publishes completion to the blocked guest read. */
+    yz_movie_request_cancel(serial, "guest close");
 }
 
 static int yz_movie_read_eof_hook(CellFsFd fd, const char* guest_path,
@@ -640,14 +661,25 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     const DWORD frame_ms = (DWORD)(1000 / fps);
     int frames = 0;
     int superseded = 0;
+    int cancelled = 0;
 
     fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n",
             path, w, h, fps);
     fflush(stderr);
     rsx_live_draw_set_movie_mode(1);
+    cellPad_host_movie_skip_begin();
     for (;;) {
         if (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) != serial) {
             superseded = 1;
+            break;
+        }
+        if (InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) >= serial) {
+            cancelled = 1;
+            break;
+        }
+        if (cellPad_host_movie_skip_requested()) {
+            yz_movie_request_cancel(serial, "host Start");
+            cancelled = 1;
             break;
         }
         const uint8_t* rgba = movie_next_rgba(mv, nullptr);
@@ -661,7 +693,8 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     movie_close(mv);
     yz_movie_complete(serial);
     fprintf(stderr, "[movie] %s after %d frames\n",
-            superseded ? "switched streams" : "presentation complete",
+            superseded ? "switched streams" :
+            cancelled ? "cancelled cleanly" : "presentation complete",
             frames);
     fflush(stderr);
 }

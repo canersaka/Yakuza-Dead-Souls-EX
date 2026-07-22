@@ -178,6 +178,13 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Host movie bridge: latch the current Start state at playback begin, then
+ * report only a fresh Start press.  This lets a host decoder request the same
+ * cancel/EOS transition as the guest movie player without stealing ordinary
+ * pad data from cellPadGetData. */
+void cellPad_host_movie_skip_begin(void);
+int cellPad_host_movie_skip_requested(void);
+
 #ifdef __cplusplus
 }
 #endif
