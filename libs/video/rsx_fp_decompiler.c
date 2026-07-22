@@ -44,6 +44,22 @@
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
+/* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
+ * The NV40 fragment ISA predicates each instruction on a condition register
+ * (CC0/CC1). Layout verified against RPCS3's RSXFragmentProgram.h SRC0 union
+ * (exec_if_lt@18, exec_if_eq@19, exec_if_gr@20, cond_swizzle@21..28,
+ * cond_mod_reg_index@30, cond_reg_index@31) and OPDEST.set_cond@8. All three
+ * exec bits set (0b111) == unconditional (the default); none set == never.
+ * Dropped entirely until now: MEASURED present in 4 of this capture's 43
+ * fragment programs (scratch/a010_reports/fragment/, cond_detail_out.txt) —
+ * genuine SET_CC→exec_if producer/consumer pairs (incl. conditional TEX). */
+#define FP_EXEC_IF_LT       (1u << 18)
+#define FP_EXEC_IF_EQ       (1u << 19)
+#define FP_EXEC_IF_GR       (1u << 20)
+#define FP_COND_SWZ_SHIFT   21          /* X@21 Y@23 Z@25 W@27, 2 bits each */
+#define FP_COND_MOD_REG     (1u << 30)  /* set_cond WRITE target: cc0/cc1     */
+#define FP_COND_REG         (1u << 31)  /* exec_if READ source:   cc0/cc1     */
+
 /* ---- Opcodes ------------------------------------------------------------ */
 enum {
     OP_NOP=0x00, OP_MOV=0x01, OP_MUL=0x02, OP_ADD=0x03, OP_MAD=0x04,
@@ -232,7 +248,10 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         /* Fully initialise both register files: RSX programs routinely read a
          * register lane before writing it (the hardware reads undefined), but
          * HLSL rejects use-before-init (error X4000). Zero everything. */
-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n");
+        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+        /* Condition-code registers for exec_if predication / set_cond. Reset
+         * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
+        "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
 
     int wrote_r0 = 0, wrote_h0 = 0;
     int count = 0;
@@ -250,6 +269,34 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+
+        /* Execution condition (exec_if) + condition-code write (set_cond).
+         * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
+         * SetDst}: all-set == unconditional, none-set == never, otherwise a
+         * per-component select of the result vs the destination, gated by a
+         * sign test of the cond-swizzled CC register. */
+        int exec_lt   = (w1 & FP_EXEC_IF_LT) ? 1 : 0;
+        int exec_eq   = (w1 & FP_EXEC_IF_EQ) ? 1 : 0;
+        int exec_gr   = (w1 & FP_EXEC_IF_GR) ? 1 : 0;
+        int is_uncond = (exec_lt && exec_eq && exec_gr);
+        int is_never  = (!exec_lt && !exec_eq && !exec_gr);
+        int set_cond  = (w0 & FP_COND_WRITE) ? 1 : 0;
+        u32 cc_read   = (w1 & FP_COND_REG)     ? 1u : 0u;
+        u32 cc_write  = (w1 & FP_COND_MOD_REG) ? 1u : 0u;
+        static const char comp_c[4] = {'x','y','z','w'};
+        char cswz[5];
+        for (int ci = 0; ci < 4; ci++)
+            cswz[ci] = comp_c[(w1 >> (FP_COND_SWZ_SHIFT + 2 * ci)) & 3];
+        cswz[4] = '\0';
+        /* HLSL comparison operator for the exec_if sign mask (matches the
+         * oracle's SGE/SLE/SNE/SGT/SLT/SEQ selection in GetRawCond). */
+        const char* cmp_op = "==";
+        if      (exec_gr && exec_eq) cmp_op = ">=";
+        else if (exec_lt && exec_eq) cmp_op = "<=";
+        else if (exec_gr && exec_lt) cmp_op = "!=";
+        else if (exec_gr)            cmp_op = ">";
+        else if (exec_lt)            cmp_op = "<";
+        else                         cmp_op = "==";  /* exec_eq only */
 
         Src s0, s1, s2;
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
@@ -360,18 +407,14 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
             break;
         }
 
-        if (handled && !(w0 & FP_OUT_NONE)) {
+        int has_dest = !(w0 & FP_OUT_NONE);
+        if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
+            const char* reg = dst_half ? "h" : "r";
             char m[5];
             dest_mask(w0, m);
 
-            /* Broadcast the result to float4 first so the write-mask picks
-             * the CORRESPONDING components: `dst.w = rhs` would HLSL-truncate
-             * a vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
-             * results (DPx/RCP/...) replicate, which is also the hardware
-             * behavior. */
-            char line[800];
             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
             /* NV40 per-instruction result-scale modifier (SRC1 word bits
              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
@@ -383,13 +426,62 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
             u32 res_scale = (w2 >> 28) & 0x7u;
             static const char* scale_txt[8] = { "", " * 2.0", " * 4.0", " * 8.0",
                                                 "", " / 2.0", " / 4.0", " / 8.0" };
-            snprintf(line, sizeof(line),
-                     "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
-                     rhs, scale_txt[res_scale], sat, dst_half ? "h" : "r", dst_idx, m, m);
-            out_puts(&o, line);
 
-            if (!dst_half && dst_idx == 0) wrote_r0 = 1;
-            if (dst_half  && dst_idx == 0) wrote_h0 = 1;
+            /* Broadcast the result to float4 first so the write-mask picks the
+             * CORRESPONDING components: `dst.w = rhs` would HLSL-truncate a
+             * vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
+             * results (DPx/RCP/...) replicate, which is also the hardware
+             * behavior. */
+            if (has_dest && is_uncond && !set_cond) {
+                /* Common unconditional path — kept byte-identical so the 39
+                 * non-predicated programs in this capture emit unchanged. */
+                char line[800];
+                snprintf(line, sizeof(line),
+                         "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
+                         rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
+                out_puts(&o, line);
+            } else {
+                /* Predicated and/or CC-writing instruction. */
+                char buf[1200];
+                snprintf(buf, sizeof(buf),
+                         "    { float4 _v = (float4)(%s)%s;%s\n",
+                         rhs, scale_txt[res_scale], sat);
+                out_puts(&o, buf);
+                if (has_dest) {
+                    if (is_uncond) {
+                        snprintf(buf, sizeof(buf),
+                                 "      %s[%u].%s = _v.%s;\n", reg, dst_idx, m, m);
+                    } else if (is_never) {
+                        snprintf(buf, sizeof(buf),
+                                 "      /* exec_if=none: write suppressed */\n");
+                    } else {
+                        /* Per-component select gated by the CC sign test.
+                         * lerp(dst, _v, mask) == mask ? _v : dst since the
+                         * mask is exactly 0.0/1.0 from the bool->float cast. */
+                        snprintf(buf, sizeof(buf),
+                                 "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
+                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
+                                 cc_read, cswz, cmp_op,
+                                 reg, dst_idx, m, reg, dst_idx, m, m, m);
+                    }
+                    out_puts(&o, buf);
+                }
+                if (set_cond) {
+                    /* CC receives the destination value (post-select), masked;
+                     * for no-dest set_cond it receives the raw result. */
+                    if (has_dest)
+                        snprintf(buf, sizeof(buf),
+                                 "      cc%u.%s = %s[%u].%s;\n", cc_write, m, reg, dst_idx, m);
+                    else
+                        snprintf(buf, sizeof(buf),
+                                 "      cc%u.%s = _v.%s;\n", cc_write, m, m);
+                    out_puts(&o, buf);
+                }
+                out_puts(&o, "    }\n");
+            }
+
+            if (has_dest && !dst_half && dst_idx == 0) wrote_r0 = 1;
+            if (has_dest && dst_half  && dst_idx == 0) wrote_h0 = 1;
         }
 
         if (w0 & FP_END) break;
