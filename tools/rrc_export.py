@@ -20,12 +20,14 @@ interleaves "apply memory block" records at the positions the capture demands.
 
 Output: <out>.rxs, little-endian, layout (see libs/video/tests/replay_main.c):
 
-  header   : magic "RXS1", u32 version (2), u32 n_blocks, u32 n_records,
+  header   : magic "RXS1", u32 version (2 or 3), u32 n_blocks, u32 n_records,
              u32 reg_words, u32 vp_words, u32 display_w, u32 display_h
   display  : u32 buffer count, then 8 * { u32 w, u32 h, u32 pitch, u32 offset }
              (the gcm display buffer table; flip's argument indexes it)
+  v3 only  : u32 transform_constant_words
   regs     : reg_words   * u32   initial NV4097 register file (method = i*4)
   vp       : vp_words    * u32   initial transform program words
+  constants: transform_constant_words * u32 (v3 only; 512 vec4 constants)
   blocks   : n_blocks    * { u32 location, u32 offset, u32 size, u32 data_off }
   data     : concatenated blob bytes (data_off relative to this section)
   records  : n_records   * { u32 a, u32 b }
@@ -131,18 +133,29 @@ def parse_rrc(data):
         r.u64()  # display_buffer_state id
         commands.append((cmd, val, mem))
 
-    # trailing rsx_state: 544*4 transform program words + 16384 registers
+    # Trailing rsx_state. Older RRC v6 captures serialized only the transform
+    # program and registers. Current RPCS3 still labels the container v6, but
+    # also serializes the 512 vec4 transform-constant array between them.
+    # Distinguish the two layouts by their exact remaining size; never guess
+    # around an unknown state extension.
     vp_words = 544 * 4
+    constant_words = 512 * 4
     reg_words = 0x10000 // 4
-    expect = (vp_words + reg_words) * 4
+    expect_old = (vp_words + reg_words) * 4
+    expect_current = (vp_words + constant_words + reg_words) * 4
     remaining = len(data) - r.pos
-    if remaining != expect:
-        sys.exit("reg_state size mismatch: %d bytes left, expected %d"
-                 % (remaining, expect))
+    if remaining not in (expect_old, expect_current):
+        sys.exit("reg_state size mismatch: %d bytes left, expected old=%d or current=%d"
+                 % (remaining, expect_old, expect_current))
     vp = struct.unpack_from("<%dI" % vp_words, data, r.pos)
-    regs = struct.unpack_from("<%dI" % reg_words, data, r.pos + vp_words * 4)
+    pos = r.pos + vp_words * 4
+    constants = ()
+    if remaining == expect_current:
+        constants = struct.unpack_from("<%dI" % constant_words, data, pos)
+        pos += constant_words * 4
+    regs = struct.unpack_from("<%dI" % reg_words, data, pos)
 
-    return blocks_by_id, data_by_id, display, commands, vp, regs
+    return blocks_by_id, data_by_id, display, commands, vp, constants, regs
 
 
 def expand_stream(commands, block_index_of):
@@ -184,7 +197,7 @@ def main():
     with op(args.capture, "rb") as f:
         data = f.read()
 
-    blocks_by_id, data_by_id, display, commands, vp, regs = parse_rrc(data)
+    blocks_by_id, data_by_id, display, commands, vp, constants, regs = parse_rrc(data)
 
     # block table: stable order, resolve data blobs
     block_ids = sorted(blocks_by_id)
@@ -210,14 +223,19 @@ def main():
             disp_w, disp_h = bufs[0][0], bufs[0][1]
 
     with open(args.out, "wb") as f:
+        stream_version = 3 if constants else 2
         f.write(b"RXS1")
-        f.write(struct.pack("<7I", 2, len(table), len(records),
+        f.write(struct.pack("<7I", stream_version, len(table), len(records),
                             len(regs), len(vp), disp_w, disp_h))
         f.write(struct.pack("<I", disp_count))
         for b in disp_bufs:
             f.write(struct.pack("<4I", *b))
+        if stream_version >= 3:
+            f.write(struct.pack("<I", len(constants)))
         f.write(struct.pack("<%dI" % len(regs), *regs))
         f.write(struct.pack("<%dI" % len(vp), *vp))
+        if constants:
+            f.write(struct.pack("<%dI" % len(constants), *constants))
         for location, offset, size, doff in table:
             f.write(struct.pack("<4I", location, offset, size, doff))
         f.write(data_area)
@@ -244,6 +262,8 @@ def main():
         print("  memory @%s: %s bytes" % (where, format(loc_totals[loc], ",")))
     print("  display buffer   : %dx%d (%d buffers)"
           % (disp_w, disp_h, display[0][1] if display else 0))
+    print("  initial constants: %d words (RXS1 v%d)"
+          % (len(constants), stream_version))
     print("  names sidecar    : %s" % names_path)
 
 
