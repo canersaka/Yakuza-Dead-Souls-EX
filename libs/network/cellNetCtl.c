@@ -1,8 +1,8 @@
 /*
  * ps3recomp - cellNetCtl HLE implementation
  *
- * Provides network control state and info queries.  Returns sensible
- * defaults so that games see an active wired network connection.
+ * Provides network control state and info queries. The runtime has no live
+ * PSN session, so connection state defaults to disconnected.
  */
 
 #include "cellNetCtl.h"
@@ -133,10 +133,10 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* Report that we have a full IP connection (guest big-endian) */
-    *state = (s32)ps3_bswap32((u32)CELL_NET_CTL_STATE_IPObtained);
+    /* Match the runtime's offline NP policy and RPCS3's Disconnected config. */
+    *state = (s32)ps3_bswap32((u32)CELL_NET_CTL_STATE_Disconnected);
 
-    printf("[cellNetCtl] GetState() -> IPObtained\n");
+    printf("[cellNetCtl] GetState() -> Disconnected\n");
     return CELL_OK;
 }
 
@@ -286,11 +286,11 @@ s32 cellNetCtlDelHandler(s32 hid)
  * through the cellSysutil callback queue (LOADED -> FINISHED), after which
  * the game calls UnloadAsync to read the result (RPCS3
  * cellNetCtl.cpp cellNetCtlNetStartDialogLoadAsync/UnloadAsync). We have no
- * PSN session to show a dialog for, and cellNetCtlGetState() above already
- * reports a full wired connection (IPObtained), so LoadAsync immediately
- * posts LOADED + FINISHED to every registered sysutil callback slot (the
- * game may have registered on any of them) and UnloadAsync reports a
- * successful connect.
+ * PSN session to show a dialog for. The explicit connect-dialog path remains
+ * an immediate success even though ordinary state queries default to
+ * Disconnected: LoadAsync posts LOADED + FINISHED to every registered
+ * sysutil callback slot (the game may have registered on any of them), and
+ * UnloadAsync reports a successful connect.
  * -----------------------------------------------------------------------*/
 
 static void netctl_netstart_broadcast(u32 status)

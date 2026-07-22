@@ -11,6 +11,20 @@
 
 /* Track which modules have been "loaded" */
 static int s_module_loaded[CELL_SYSMODULE_MAX_ID];
+static int s_np_trophy_module_loaded;
+
+static int* sysmodule_loaded_slot(u16 id)
+{
+    if (id < CELL_SYSMODULE_MAX_ID)
+        return &s_module_loaded[id];
+
+    switch (id) {
+    case CELL_SYSMODULE_SYSUTIL_NP_TROPHY:
+        return &s_np_trophy_module_loaded;
+    default:
+        return NULL;
+    }
+}
 
 static const char* sysmodule_id_to_name(u16 id)
 {
@@ -51,6 +65,7 @@ static const char* sysmodule_id_to_name(u16 id)
     case CELL_SYSMODULE_SYSUTIL_GAME:  return "CELL_SYSMODULE_SYSUTIL_GAME";
     case CELL_SYSMODULE_FIBER:         return "CELL_SYSMODULE_FIBER";
     case CELL_SYSMODULE_GEM:           return "CELL_SYSMODULE_GEM";
+    case CELL_SYSMODULE_SYSUTIL_NP_TROPHY: return "CELL_SYSMODULE_SYSUTIL_NP_TROPHY";
     default:                           return "UNKNOWN";
     }
 }
@@ -62,43 +77,52 @@ static const char* sysmodule_id_to_name(u16 id)
 /* NID: 0x26A6E12B */
 s32 cellSysmoduleLoadModule(u16 id)
 {
+    int* loaded;
+
     printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (s_module_loaded[id])
+    if (*loaded)
         return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
 
-    s_module_loaded[id] = 1;
+    *loaded = 1;
     return CELL_OK;
 }
 
 /* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id)
 {
+    int* loaded;
+
     printf("[cellSysmodule] UnloadModule(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (!s_module_loaded[id])
+    if (!*loaded)
         return CELL_SYSMODULE_ERROR_UNLOADED;
 
-    s_module_loaded[id] = 0;
+    *loaded = 0;
     return CELL_OK;
 }
 
 /* NID: 0x5A59E258 */
 s32 cellSysmoduleIsLoaded(u16 id)
 {
+    int* loaded;
+
     printf("[cellSysmodule] IsLoaded(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    return s_module_loaded[id] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
+    return *loaded ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
 }
