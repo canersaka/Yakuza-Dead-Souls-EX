@@ -56,7 +56,6 @@ extern "C" void yz_rsx_fifo_acquire(void);
 extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
-extern "C" void yz_rsx_movie_output_eos(void);
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
@@ -587,6 +586,11 @@ static void yz_movie_close_hook(CellFsFd fd, const char* guest_path)
     const LONG serial = g_movie_fds[fd].serial;
     memset(&g_movie_fds[fd], 0, sizeof(g_movie_fds[fd]));
     ReleaseSRWLockExclusive(&g_movie_open_lock);
+    if (serial > 0) {
+        fprintf(stderr, "[movie] guest Close completed fd=%d serial=%ld\n",
+                fd, serial);
+        fflush(stderr);
+    }
     /* Native Stop/Close cancels an outstanding asynchronous source operation;
      * the host decoder observes this request, tears down its output surface,
      * and only then publishes completion to the blocked guest read. */
@@ -634,6 +638,12 @@ static int yz_movie_read_eof_hook(CellFsFd fd, const char* guest_path,
            InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
         SleepConditionVariableSRW(&g_movie_done_cv, &g_movie_open_lock, 1000, 0);
     }
+    fprintf(stderr,
+            "[movie] source EOS delivered fd=%d serial=%ld completed=%ld open=%ld\n",
+            fd, serial,
+            InterlockedCompareExchange(&g_movie_completed_serial, 0, 0),
+            InterlockedCompareExchange(&g_movie_open_serial, 0, 0));
+    fflush(stderr);
     ReleaseSRWLockExclusive(&g_movie_open_lock);
     return 1;
 }
@@ -645,22 +655,6 @@ static void yz_movie_complete(LONG serial)
         InterlockedExchange(&g_movie_completed_serial, serial);
     WakeAllConditionVariable(&g_movie_done_cv);
     ReleaseSRWLockExclusive(&g_movie_open_lock);
-}
-
-static void yz_movie_publish_output_eos(LONG serial)
-{
-    /* libsail keeps source EOS distinct from player/output completion. Do the
-     * equivalent here: stop the RSX consumer at a command boundary, publish
-     * one final vblank/flip completion, and only then wake the guest source
-     * read. Without this ordering, the guest can resume CRI teardown while a
-     * pre-movie flip still owns label+0x10, making the next scene depend on a
-     * timer race. The consumer lock prevents a new release from re-arming the
-     * label between this completion and the source notification. */
-    yz_rsx_movie_output_eos();
-    fprintf(stderr,
-            "[movie] output EOS serial=%ld label=0x%08X pending=%d\n",
-            serial, vm_read32(RSX_REPORTS + 0x10), yz_rsx_flip_pending_any());
-    fflush(stderr);
 }
 
 static void yz_play_queued_movie(const char* path, LONG serial)
@@ -712,7 +706,10 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     }
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
-    yz_movie_publish_output_eos(serial);
+    /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
+     * source EOS before Stop completion, but it does not manufacture a GPU
+     * flip at that boundary. Let the guest's ordinary flip/event path retire
+     * its own work, then publish the sticky source-completion predicate. */
     yz_movie_complete(serial);
     fprintf(stderr, "[movie] %s after %d frames\n",
             superseded ? "switched streams" :
@@ -2149,43 +2146,6 @@ extern "C" void yz_rsx_fifo_release(void)
     LeaveCriticalSection(&g_rsx_fifo_lock);
 }
 
-/* Host movie output-EOS barrier. This is intentionally smaller than a full
- * yz_rsx_vblank_tick: the normal vblank path also runs scheduler/event work
- * that is not safe to call while the movie thread owns the FIFO boundary.
- * Consume any outstanding flip exactly once, publish its display/fence state,
- * and leave the shared flip label released before the guest source sees EOS. */
-extern "C" void yz_rsx_movie_output_eos(void)
-{
-    yz_rsx_fifo_acquire();
-    uint64_t flip_ev = 0;
-    const uint64_t t = (uint64_t)GetTickCount() * 1000;
-    for (int h = 0; h < 2; ++h) {
-        if (!InterlockedExchange(&g_rsx_flip_pending[h], 0))
-            continue;
-        const uint32_t ha = yz_rsx_head_addr((uint32_t)h);
-        const uint32_t buf = vm_read32(ha + 0x14);
-        yz_rsx_present(buf);
-        vm_write32(ha + 0x10, buf);
-        vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x80000000u);
-        vm_write64(ha + 0x00, t);
-        vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
-        flip_ev |= (uint64_t)(0x8u << 1);
-    }
-
-    /* A timer retire may consume the pending bit immediately before lock
-     * acquisition without yet publishing its label clear. Output EOS is a
-     * hard boundary, so release the complete 128-bit flip semaphore here too. */
-    vm_write64(RSX_REPORTS + 0x10, 0);
-    vm_write64(RSX_REPORTS + 0x18, 0);
-    yz_rsx_fifo_release();
-
-    if (flip_ev && g_rsx_event_port) {
-        const uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
-        const uint64_t fmask = (uint64_t)handlers & 0x7Full;
-        if (fmask)
-            (void)yz_rsx_ev_send(fmask);
-    }
-}
 extern "C" int yz_rsx_flip_pending_any(void)
 {
     for (int h = 0; h < 8; ++h)
