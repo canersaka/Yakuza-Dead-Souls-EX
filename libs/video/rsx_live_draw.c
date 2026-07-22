@@ -996,12 +996,13 @@ static u32 g_ld_drop_ring = 0;
 static u32 g_ld_movie_suppressed = 0;
 
 /* Movie mode: while a host-decoded movie owns the window
- * (rsx_live_draw_present_rgba), continue feeding the guest method stream into
- * rsx_dispatch so register/shader/texture state remains current.  Only the
- * execution sinks are suppressed: they touch g.list concurrently with the
- * host presenter.  Dropping the entire method stream here used to leave the
- * first post-movie scene with stale RSX state and made a black frame ambiguous. */
+ * (rsx_live_draw_present_rgba), do not make the default boot process the
+ * guest's otherwise invisible RSX stream.  That experiment materially changes
+ * CRI/movie handoff scheduling and regressed the proven title/menu path.
+ * YZ_MOVIE_TRACK_RSX keeps the state-tracking experiment available for a
+ * focused post-movie A/B once the transition itself is deterministic. */
 static volatile int g_ld_movie_mode = 0;
+static int g_ld_movie_track_rsx = -1;
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
@@ -1433,6 +1434,11 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
 void rsx_live_draw_method(u32 method, u32 arg)
 {
     if (!g.ready) return;
+    if (g_ld_movie_mode) {
+        if (g_ld_movie_track_rsx < 0)
+            g_ld_movie_track_rsx = getenv("YZ_MOVIE_TRACK_RSX") ? 1 : 0;
+        if (!g_ld_movie_track_rsx) return;
+    }
     rsx_dispatch_method(&g.rsx, method, arg);
 }
 
@@ -1444,10 +1450,12 @@ void rsx_live_draw_set_movie_mode(int on)
         g_ld_movie_mode = 1;
     } else {
         g_ld_movie_mode = 0;
-        fprintf(stderr,
-                "[live-draw] movie handoff: tracked RSX state, suppressed %u guest draw batches\n",
-                g_ld_movie_suppressed - suppressed_at_start);
-        fflush(stderr);
+        if (g_ld_movie_track_rsx > 0) {
+            fprintf(stderr,
+                    "[live-draw] movie handoff: tracked RSX state, suppressed %u guest draw batches\n",
+                    g_ld_movie_suppressed - suppressed_at_start);
+            fflush(stderr);
+        }
     }
 }
 
