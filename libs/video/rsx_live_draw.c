@@ -985,24 +985,37 @@ static void fetch_batches(void)
 /* Live-draw activity counters (verification: is real geometry flowing, or only
  * clears?). Reported per presented frame in rsx_live_draw_present. */
 static u32 g_ld_draws = 0, g_ld_clears = 0, g_ld_frames = 0;
+/* A guest DRAW_* packet is only an attempt.  Keep separate outcome counters so
+ * a lively title bar cannot hide a frame whose shaders/vertices were rejected
+ * before DrawInstanced reached D3D12. */
+static u32 g_ld_exec_draws = 0;
+static u32 g_ld_drop_fetch = 0;
+static u32 g_ld_drop_prim = 0;
+static u32 g_ld_drop_pso = 0;
+static u32 g_ld_drop_ring = 0;
+static u32 g_ld_movie_suppressed = 0;
 
-/* Movie mode: while a host-decoded movie owns the window (rsx_live_draw_present_rgba),
- * ignore the guest's method stream so its draws don't record into g.list concurrently
- * with the movie present (they run on different threads). */
+/* Movie mode: while a host-decoded movie owns the window
+ * (rsx_live_draw_present_rgba), continue feeding the guest method stream into
+ * rsx_dispatch so register/shader/texture state remains current.  Only the
+ * execution sinks are suppressed: they touch g.list concurrently with the
+ * host presenter.  Dropping the entire method stream here used to leave the
+ * first post-movie scene with stale RSX state and made a black frame ambiguous. */
 static volatile int g_ld_movie_mode = 0;
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; g_ld_draws++; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
+{ (void)u; (void)r; if (g_ld_movie_mode) { g_ld_movie_suppressed++; return; } g_ld_draws++; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
 static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; g_ld_draws++; if (dc.n_idx < 256) { dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++; } }
+{ (void)u; (void)r; if (g_ld_movie_mode) { g_ld_movie_suppressed++; return; } g_ld_draws++; if (dc.n_idx < 256) { dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++; } }
 
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
+    if (g_ld_movie_mode) return;
     const u32 prim = g.rsx.current_primitive;
     fetch_batches();
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.n_verts || !dc.fetch_ok) { g_ld_drop_fetch++; return; }
 
     /* Segment table from the restart cuts (port of the replay-harness s25c/
      * s25d fixes): STRIP/FAN never bridge a cut, strips alternate winding
@@ -1076,16 +1089,22 @@ static void sink_end(void* user, const rsx_dispatch* r)
         }
         break;
     }
-    default: return;
+    default: g_ld_drop_prim++; return;
     }
 
     if (g.vb_used + n_tri * VERT_STRIDE > MAX_VERTS * VERT_STRIDE) {
+        g_ld_drop_ring++;
         if (tri != dc.verts) free(tri); return;
     }
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     ID3D12PipelineState* pso = get_pso();
-    if (!pso || g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
+    if (!pso) {
+        g_ld_drop_pso++;
+        if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
+    }
+    if (g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
+        g_ld_drop_ring++;
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
 
@@ -1175,6 +1194,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+    g_ld_exec_draws++;
 
     for (u32 k = 0; k < n_surf_used; k++) {
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
@@ -1189,6 +1209,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
+    if (g_ld_movie_mode) return;
     g_ld_clears++;
     const u32 target = current_surface();
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
@@ -1210,6 +1231,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
+    if (g_ld_movie_mode) return;
     rsx_live_draw_present(arg & 7);
 }
 
@@ -1410,11 +1432,24 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
 
 void rsx_live_draw_method(u32 method, u32 arg)
 {
-    if (!g.ready || g_ld_movie_mode) return;
+    if (!g.ready) return;
     rsx_dispatch_method(&g.rsx, method, arg);
 }
 
-void rsx_live_draw_set_movie_mode(int on) { g_ld_movie_mode = on ? 1 : 0; }
+void rsx_live_draw_set_movie_mode(int on)
+{
+    static u32 suppressed_at_start = 0;
+    if (on) {
+        suppressed_at_start = g_ld_movie_suppressed;
+        g_ld_movie_mode = 1;
+    } else {
+        g_ld_movie_mode = 0;
+        fprintf(stderr,
+                "[live-draw] movie handoff: tracked RSX state, suppressed %u guest draw batches\n",
+                g_ld_movie_suppressed - suppressed_at_start);
+        fflush(stderr);
+    }
+}
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
 
@@ -1574,8 +1609,12 @@ void rsx_live_draw_present(u32 buffer_id)
      * making the TRUE frame count measurable from the log. (The old hard cap
      * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
     if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
-        fprintf(stderr, "[live-draw] frame %u presented: draws=%u clears=%u (cumulative)\n",
-                g_ld_frames, g_ld_draws, g_ld_clears);
+        fprintf(stderr,
+                "[live-draw] frame %u presented: batches=%u executed=%u "
+                "drop[fetch=%u prim=%u pso=%u ring=%u] clears=%u (cumulative)\n",
+                g_ld_frames, g_ld_draws, g_ld_exec_draws,
+                g_ld_drop_fetch, g_ld_drop_prim, g_ld_drop_pso,
+                g_ld_drop_ring, g_ld_clears);
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one
