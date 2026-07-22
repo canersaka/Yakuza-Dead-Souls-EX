@@ -56,6 +56,7 @@ extern "C" void yz_rsx_fifo_acquire(void);
 extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
+extern "C" void yz_rsx_movie_output_eos(void);
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
@@ -655,13 +656,11 @@ static void yz_movie_publish_output_eos(LONG serial)
      * pre-movie flip still owns label+0x10, making the next scene depend on a
      * timer race. The consumer lock prevents a new release from re-arming the
      * label between this completion and the source notification. */
-    yz_rsx_fifo_acquire();
-    yz_rsx_vblank_tick();
+    yz_rsx_movie_output_eos();
     fprintf(stderr,
             "[movie] output EOS serial=%ld label=0x%08X pending=%d\n",
             serial, vm_read32(RSX_REPORTS + 0x10), yz_rsx_flip_pending_any());
     fflush(stderr);
-    yz_rsx_fifo_release();
 }
 
 static void yz_play_queued_movie(const char* path, LONG serial)
@@ -1161,31 +1160,20 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                       addr, arg, have, ok ? "pass" : "STALL-enter"); }
         }
         if (addr && vm_read32(addr) != arg) {
-            /* RPCS3 executes NV406E_SEMAPHORE_ACQUIRE as a blocking method:
-             * FIFO_control has already consumed this argument, and only this
-             * method waits for the external producer (normally vblank/flip
-             * completion) to publish the requested value. Returning "stall"
-             * from here made yz_rsx_fifo_step leave GET on the packet header.
-             * Its next poll therefore replayed every earlier argument in the
-             * packet, including the release that writes the flip semaphore
-             * back to 0xFFFFFFFF. Forward progress then depended on vblank
-             * landing in the tiny release-to-acquire replay window.
-             *
-             * Wait in this invocation instead. The vblank publisher does not
-             * take g_rsx_fifo_lock, matching RPCS3's external semaphore wake,
-             * so it can clear the label while this consumer is parked. Once
-             * it does, the packet commits exactly once and GET advances past
-             * it; preceding side effects are never replayed. */
-            unsigned long waits = 0;
-            while (vm_read32(addr) != arg) {
-                if ((++waits & 0xFFFFu) == 0) {
-                    fprintf(stderr,
-                            "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X waits=%lu\n",
-                            addr, arg, vm_read32(addr), waits);
-                    fflush(stderr);
-                }
-                SwitchToThread();
-            }
+            /* This recomp runtime cannot block while holding g_rsx_fifo_lock:
+             * unlike RPCS3's thread model, the runtime vblank/event publisher may need
+             * work that is serialized behind this consumer. Leave GET on the
+             * packet and retry later so the external publisher remains free to
+             * satisfy the acquire. Movie output EOS is synchronized separately
+             * at the host/guest lifecycle boundary. */
+            { static uint32_t ha=0, hw=0; static unsigned long hn=0;
+              if (addr==ha && arg==hw) { hn++;
+                  if ((hn & 0xFFFFu)==0) {
+                      fprintf(stderr, "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X retries=%lu\n",
+                              addr, arg, vm_read32(addr), hn);
+                      fflush(stderr); } }
+              else { ha=addr; hw=arg; hn=0; } }
+            return 1;                             /* not yet satisfied: stall, retry later */
         }
         break;
     case 0x06C:                                   /* NV406E SEMAPHORE_RELEASE */
@@ -2159,6 +2147,44 @@ extern "C" void yz_rsx_fifo_acquire(void)
 extern "C" void yz_rsx_fifo_release(void)
 {
     LeaveCriticalSection(&g_rsx_fifo_lock);
+}
+
+/* Host movie output-EOS barrier. This is intentionally smaller than a full
+ * yz_rsx_vblank_tick: the normal vblank path also runs scheduler/event work
+ * that is not safe to call while the movie thread owns the FIFO boundary.
+ * Consume any outstanding flip exactly once, publish its display/fence state,
+ * and leave the shared flip label released before the guest source sees EOS. */
+extern "C" void yz_rsx_movie_output_eos(void)
+{
+    yz_rsx_fifo_acquire();
+    uint64_t flip_ev = 0;
+    const uint64_t t = (uint64_t)GetTickCount() * 1000;
+    for (int h = 0; h < 2; ++h) {
+        if (!InterlockedExchange(&g_rsx_flip_pending[h], 0))
+            continue;
+        const uint32_t ha = yz_rsx_head_addr((uint32_t)h);
+        const uint32_t buf = vm_read32(ha + 0x14);
+        yz_rsx_present(buf);
+        vm_write32(ha + 0x10, buf);
+        vm_write32(ha + 0x08, vm_read32(ha + 0x08) | 0x80000000u);
+        vm_write64(ha + 0x00, t);
+        vm_write32(0x40C00000u, vm_read32(0x40C00000u) + 1u);
+        flip_ev |= (uint64_t)(0x8u << 1);
+    }
+
+    /* A timer retire may consume the pending bit immediately before lock
+     * acquisition without yet publishing its label clear. Output EOS is a
+     * hard boundary, so release the complete 128-bit flip semaphore here too. */
+    vm_write64(RSX_REPORTS + 0x10, 0);
+    vm_write64(RSX_REPORTS + 0x18, 0);
+    yz_rsx_fifo_release();
+
+    if (flip_ev && g_rsx_event_port) {
+        const uint32_t handlers = vm_read32(RSX_DRIVER_INFO + 0x12C0);
+        const uint64_t fmask = (uint64_t)handlers & 0x7Full;
+        if (fmask)
+            (void)yz_rsx_ev_send(fmask);
+    }
 }
 extern "C" int yz_rsx_flip_pending_any(void)
 {
