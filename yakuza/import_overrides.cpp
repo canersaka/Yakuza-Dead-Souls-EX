@@ -694,6 +694,24 @@ static void yz_play_queued_movie(const char* path, LONG serial)
         }
         if (cellPad_host_movie_skip_requested()) {
             yz_movie_request_cancel(serial, "host Start");
+            /* The window thread polls the same physical Start button as the
+             * guest, but can observe its edge first. SAIL cancellation is
+             * asynchronous: the player's Stop request is established before
+             * source completion is reported. Wait for cellPadGetData to hand
+             * the press to guest code, then give that update one frame to
+             * establish Stop before EOS publication. */
+            const DWORD deadline = GetTickCount() + 1000;
+            while (!cellPad_host_movie_skip_guest_seen() &&
+                   (LONG)(deadline - GetTickCount()) > 0) {
+                if (rsx_null_backend_pump_messages() < 0)
+                    break;
+                Sleep(1);
+            }
+            const int guest_seen = cellPad_host_movie_skip_guest_seen();
+            fprintf(stderr, "[movie] Start handoff guest_seen=%d\n", guest_seen);
+            fflush(stderr);
+            if (guest_seen)
+                Sleep(32);
             cancelled = 1;
             break;
         }
@@ -704,6 +722,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
         if (rsx_null_backend_pump_messages() < 0) break;
         Sleep(frame_ms);
     }
+    cellPad_host_movie_skip_end();
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
     /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
