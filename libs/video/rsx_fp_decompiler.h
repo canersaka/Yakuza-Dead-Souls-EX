@@ -65,6 +65,22 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 
+/* Same as rsx_fp_decompile, plus per-texture-unit dimensionality.
+ *
+ *   tex_cube_mask : bit N set => texture unit N is a CUBEMAP. Cube units are
+ *                   declared `TextureCube` and sampled with the full
+ *                   3-component direction (a.xyz); 2D units keep `Texture2D`
+ *                   and a.xy sampling. Pass 0 for the legacy all-2D behavior
+ *                   (rsx_fp_decompile forwards 0, so its output is unchanged
+ *                   byte-for-byte).
+ *
+ * The mask must match what the backend actually binds: a cube unit needs a
+ * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
+ * fragment lane report (scratch/a010_reports/fragment.md) for replay_main.c
+ * call-site guidance. */
+int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                        u32 tex_cube_mask, char* out, u32 out_size);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);
