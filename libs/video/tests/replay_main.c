@@ -51,6 +51,7 @@
 
 #include "../rsx_dispatch.h"
 #include "../rsx_fp_decompiler.h"
+#include "../rsx_restart_cuts.h"
 #include "../rsx_vp_decompiler.h"
 
 #include <stdio.h>
@@ -3288,8 +3289,9 @@ typedef struct {
      * fetch_batches() records the c->n_verts position at each restart
      * occurrence instead of pushing a phantom vertex; sink_end()'s
      * STRIP/FAN expansion must not bridge across a cut. */
-    u32    cuts[520];
+    u32*   cuts;
     u32    n_cuts;
+    u32    cap_cuts;
 
     /* [skin] diag: the guest vertex index of the first vertex fetched this
      * batch (pre-attribute-conversion), so sink_end can independently
@@ -3565,8 +3567,11 @@ static void fetch_batches(sink_ctx* c, const rsx_dispatch* rsx)
                 ? (((u32)ip[0] << 24) | ((u32)ip[1] << 16) | ((u32)ip[2] << 8) | ip[3])
                 : (u32)((ip[0] << 8) | ip[1]);
             if (restart_en && index == restart_val) {
-                if (c->n_cuts < 520)
-                    c->cuts[c->n_cuts++] = c->n_verts;
+                if (!rsx_restart_cut_push(&c->cuts, &c->n_cuts, &c->cap_cuts,
+                                          c->n_verts)) {
+                    c->fetch_ok = 0;
+                    return;
+                }
                 continue;
             }
             fetch_one(c, rsx, base, base_index + index);
@@ -3829,23 +3834,7 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
      * contains a raw index of 65535 (0xFFFF) buried INSIDE one of those
      * chunks -- the primitive-restart sentinel -- which fetch_batches()
      * now detects and cuts on instead of fetching a phantom vertex. */
-    u32 seg_start[521], seg_count[521];
-    u32 n_seg = 0;
-    {
-        u32 prev = 0;
-        for (u32 ci = 0; ci < c->n_cuts && n_seg < 521; ci++) {
-            const u32 cut = c->cuts[ci];
-            seg_start[n_seg] = prev;
-            seg_count[n_seg] = cut > prev ? cut - prev : 0;
-            n_seg++;
-            prev = cut;
-        }
-        if (n_seg < 521) {
-            seg_start[n_seg] = prev;
-            seg_count[n_seg] = c->n_verts > prev ? c->n_verts - prev : 0;
-            n_seg++;
-        }
-    }
+    const u32 n_seg = c->n_cuts + 1;
 
     /* CPU-expand to a triangle list */
     vtx_t* tri = NULL;
@@ -3858,14 +3847,20 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     case PRIM_TRIANGLE_STRIP: {
         if (c->n_verts < 3) return;
         u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++)
-            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        for (u32 s = 0; s < n_seg; s++) {
+            u32 base, cnt;
+            rsx_restart_segment_bounds(c->cuts, c->n_cuts, c->n_verts,
+                                       s, &base, &cnt);
+            if (cnt >= 3) total += (cnt - 2) * 3;
+        }
         if (!total) return;
         n_tri = total;
         tri = malloc(n_tri * sizeof(vtx_t));
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
-            const u32 base = seg_start[s], cnt = seg_count[s];
+            u32 base, cnt;
+            rsx_restart_segment_bounds(c->cuts, c->n_cuts, c->n_verts,
+                                       s, &base, &cnt);
             if (cnt < 3) continue;
             /* Strip winding alternates every other triangle to keep face
              * orientation consistent (root cause, session s25d, coordinator
@@ -3899,14 +3894,20 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     case PRIM_TRIANGLE_FAN: {
         if (c->n_verts < 3) return;
         u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++)
-            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        for (u32 s = 0; s < n_seg; s++) {
+            u32 base, cnt;
+            rsx_restart_segment_bounds(c->cuts, c->n_cuts, c->n_verts,
+                                       s, &base, &cnt);
+            if (cnt >= 3) total += (cnt - 2) * 3;
+        }
         if (!total) return;
         n_tri = total;
         tri = malloc(n_tri * sizeof(vtx_t));
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
-            const u32 base = seg_start[s], cnt = seg_count[s];
+            u32 base, cnt;
+            rsx_restart_segment_bounds(c->cuts, c->n_cuts, c->n_verts,
+                                       s, &base, &cnt);
             if (cnt < 3) continue;
             /* each segment fans from ITS OWN first vertex, not a global
              * one -- a restart resets the fan's center, same as the strip
@@ -4842,5 +4843,7 @@ int main(int argc, char** argv)
     char names_path[MAX_PATH];
     snprintf(names_path, sizeof(names_path), "%s.names.txt", path);
     coverage_report(&rsx, names_path);
+    free(ctx.cuts);
+    free(ctx.verts);
     return 0;
 }
