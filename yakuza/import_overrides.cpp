@@ -22,6 +22,7 @@
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 #include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
 #include "../libs/filesystem/cellFs.h"
+#include "../libs/system/cellSaveData.h"
 
 #include <cstdio>
 #include <cstring>
@@ -518,6 +519,11 @@ static volatile LONG g_movie_open_serial = 0;
 static volatile LONG g_movie_completed_serial = 0;
 static LONG g_movie_played_serial = 0;
 
+/* Process-wide phase bit for the CRI worker fairness shim.  It is armed by the
+ * confirmed title-to-menu callback in dispatch.cpp; movie playback is too
+ * early because Dolby/title setup still uses the preload scheduling pattern. */
+extern "C" volatile LONG g_yz_cri_yield_phase = 0;
+
 #define YZ_MOVIE_FD_SLOTS 64
 struct yz_movie_fd_state {
     int active;
@@ -635,7 +641,8 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int frames = 0;
     int superseded = 0;
 
-    fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n", path, w, h, fps);
+    fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n",
+            path, w, h, fps);
     fflush(stderr);
     rsx_live_draw_set_movie_mode(1);
     for (;;) {
@@ -654,7 +661,8 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     movie_close(mv);
     yz_movie_complete(serial);
     fprintf(stderr, "[movie] %s after %d frames\n",
-            superseded ? "switched streams" : "presentation complete", frames);
+            superseded ? "switched streams" : "presentation complete",
+            frames);
     fflush(stderr);
 }
 
@@ -2871,9 +2879,11 @@ static int yz_rsx_fifo_step(void)
             static int uof = -1; if (uof < 0) uof = getenv("YZ_UCMD_ON_FLIP") ? 1 : 0;
             uint64_t fmask = uof ? (uint64_t)handlers : ((uint64_t)handlers & 0x7Full);
             if (fmask) {
-                ppu_context sc; memset(&sc, 0, sizeof(sc));
-                sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = fmask;
-                int64_t r = sys_event_port_send(&sc);
+                /* RSX causes are level/coalesced notifications.  A momentarily
+                 * full event queue must not discard the flip edge: route it
+                 * through the shared pending-mask retry path used by queue and
+                 * user-command events. */
+                int64_t r = yz_rsx_ev_send(fmask);
                 static int n = 0; if (n < 8) { n++;
                     fprintf(stderr, "[flip-consumer] flip event ev=0x%llX -> send=%lld\n",
                             (unsigned long long)fmask, (long long)r); }
@@ -4242,9 +4252,10 @@ extern "C" void yz_rsx_vblank_tick(void)
         uint64_t fmask = uof ? (uint64_t)handlers : ((uint64_t)handlers & 0x7Full);
         uint64_t ev = (flip_ev ? fmask : ((uint64_t)0x2 & handlers));
         if (ev) {
-            ppu_context sc; memset(&sc, 0, sizeof(sc));
-            sc.gpr[3] = g_rsx_event_port; sc.gpr[5] = ev;
-            int64_t r = sys_event_port_send(&sc);
+            /* Preserve vblank/flip causes across a transient full event queue.
+             * Dropping one here can strand the guest's next-frame/title movie
+             * transition even though rendering itself remains live. */
+            int64_t r = yz_rsx_ev_send(ev);
             /* Log the result periodically: r==EBUSY (-0x... ) means the queue is
              * full -> the _gcm_intr_thread is NOT draining (the real problem). */
             static int n = 0; if (n < 8) { n++;
@@ -4271,6 +4282,36 @@ extern "C" void yz_ovr_cellSysutilGetSystemParamInt(ppu_context* ctx)
     int32_t  rc = cellSysutilGetSystemParamInt((int32_t)ctx->gpr[3], hp);
     if (hp && rc == 0)
         vm_write32(ctx->gpr[4], (uint32_t)v);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * cellSaveDataListAutoLoad(version, errDialog, setList, setBuf, funcFixed,
+ *                          funcStat, funcFile, container, userdata)
+ *
+ * This legacy nine-argument entry is the New Game gate used by Yakuza: Dead
+ * Souls.  The generic import bridge only forwards the eight register arguments
+ * and used to bind this NID to CELL_ENOSYS, so neither callback ran and the
+ * title state machine waited forever on a black screen.  Its operation is the
+ * same fixed-selection load flow implemented by cellSaveDataFixedLoad2; the
+ * extra errDialog argument is UI policy and does not change that flow.
+ * -----------------------------------------------------------------------*/
+extern "C" void yz_ovr_cellSaveDataListAutoLoad(ppu_context* ctx)
+{
+    const uint32_t set_list_ea = (uint32_t)ctx->gpr[5];
+    const uint32_t set_buf_ea  = (uint32_t)ctx->gpr[6];
+    const uint32_t userdata_ea = (uint32_t)vm_read64(ctx->gpr[1] + 0x70);
+
+    const int32_t rc = cellSaveDataFixedLoad2(
+        (uint32_t)ctx->gpr[3],
+        set_list_ea ? (CellSaveDataSetList*)(vm_base + set_list_ea) : NULL,
+        set_buf_ea  ? (CellSaveDataSetBuf*)(vm_base + set_buf_ea) : NULL,
+        (CellSaveDataFixedCallback)(uintptr_t)(uint32_t)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(uint32_t)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(uint32_t)ctx->gpr[9],
+        (uint32_t)ctx->gpr[10],
+        (void*)(uintptr_t)userdata_ea);
+
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
 

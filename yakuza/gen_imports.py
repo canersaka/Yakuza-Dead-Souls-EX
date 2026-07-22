@@ -258,6 +258,11 @@ def main():
         # libs HLE writes int out-params host-endian; ctx-aware override
         # marshals through vm_write32 (big-endian) instead.
         "cellSysutilGetSystemParamInt",
+        # Nine-argument savedata API: the generic bridge only forwards r3-r10,
+        # while userdata lives in the caller's stack argument area.  The
+        # ctx-aware bridge also routes this legacy API through the implemented
+        # FixedLoad2 callback flow instead of returning CELL_ENOSYS.
+        "cellSaveDataListAutoLoad",
         # gcm init: must build GUEST-side context/control structures (the
         # game's SDK-inline gcm code walks them in guest memory directly).
         "_cellGcmInitBody",
