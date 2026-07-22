@@ -91,10 +91,13 @@ extern "C" {
 #define CELL_SYSMODULE_SYSUTIL_NP_SNS       0x0051
 #define CELL_SYSMODULE_GEM                  0x0052
 
+/* Legacy/high-range module IDs used by retail titles. */
+#define CELL_SYSMODULE_SYSUTIL_NP_TROPHY    0xF035
+
 /* Aliases used in game code */
 #define CELL_SYSMODULE_GCM          CELL_SYSMODULE_GCM_SYS
 
-/* Max module ID for tracking array */
+/* Size of the dense low-ID tracking table. */
 #define CELL_SYSMODULE_MAX_ID       0x0100
 
 /* ---------------------------------------------------------------------------

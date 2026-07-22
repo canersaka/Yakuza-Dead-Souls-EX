@@ -28,6 +28,10 @@ extern "C" {
 #define SCE_NP_ERROR_VARIANT                    0x80550009
 #define SCE_NP_ERROR_UNKNOWN                    0x805500FF
 
+/* NP Community/Score errors (the Score API has its own error namespace). */
+#define SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED 0x8002A101
+#define SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED     0x8002A102
+
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
@@ -126,6 +130,8 @@ s32 sceNpManagerRequestTicket2(const SceNpId* npId, const void* version, const c
 
 s32 sceNpInit(u32 poolSize, void* poolPtr);
 s32 sceNpTerm(void);
+s32 sceNpScoreInit(void);
+s32 sceNpScoreTerm(void);
 
 s32 sceNpGetNpId(s32 userId, SceNpId* npId);
 s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId);

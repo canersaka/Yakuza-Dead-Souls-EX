@@ -14,6 +14,7 @@
  * -----------------------------------------------------------------------*/
 
 static int  s_np_initialized = 0;
+static int  s_np_score_initialized = 0;
 static char s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH + 1] = "PS3Player";
 
 /* ---------------------------------------------------------------------------
@@ -62,7 +63,36 @@ s32 sceNpTerm(void)
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
+    s_np_score_initialized = 0;
     s_np_initialized = 0;
+    return CELL_OK;
+}
+
+s32 sceNpScoreInit(void)
+{
+    printf("[sceNp] ScoreInit()\n");
+
+    if (s_np_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    s_np_score_initialized = 1;
+    return CELL_OK;
+}
+
+s32 sceNpScoreTerm(void)
+{
+    printf("[sceNp] ScoreTerm()\n");
+
+    if (!s_np_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    s_np_score_initialized = 0;
     return CELL_OK;
 }
 
