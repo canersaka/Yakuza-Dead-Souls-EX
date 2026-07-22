@@ -93,6 +93,7 @@ void rsx_live_draw_shutdown(void) {}
 
 #define VERT_STRIDE      (16 * 4 * 4)   /* 16 attrs * float4                  */
 #define MAX_VERTS        (256 * 1024)
+#define LD_INVALID_SURFACE 0xFFFFFFFFu
 
 /* gcm texture format bytes (mirror rsx_dispatch.h) */
 #define TEX_FMT_B8         0x81
@@ -734,7 +735,7 @@ static u32 surface_get(u32 location, u32 offset)
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset)
             return i;
-    if (g.n_surfaces >= MAX_SURFACES) return 0;
+    if (g.n_surfaces >= MAX_SURFACES) return LD_INVALID_SURFACE;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -746,7 +747,7 @@ static u32 surface_get(u32 location, u32 offset)
     if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                       D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
                                                       &IID_ID3D12Resource, (void**)&s->tex)))
-        return 0;
+        return LD_INVALID_SURFACE;
     s->location = location; s->offset = offset;
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
@@ -872,6 +873,7 @@ typedef struct { u32 first, count; } batch_t;
 typedef struct {
     batch_t arr[256]; u32 n_arr;
     batch_t idx[256]; u32 n_idx;
+    u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
     int     fetch_ok;
     /* Primitive-restart cut points (s25 port of the replay-harness fix):
@@ -887,6 +889,7 @@ static draw_ctx dc;
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_verts = 0;
+    dc.n_packets = 0;
     dc.n_cuts = 0;
     dc.fetch_ok = 1;
 }
@@ -984,16 +987,66 @@ static void fetch_batches(void)
 
 /* Live-draw activity counters (verification: is real geometry flowing, or only
  * clears?). Reported per presented frame in rsx_live_draw_present. */
-static u32 g_ld_draws = 0, g_ld_clears = 0, g_ld_frames = 0;
-/* A guest DRAW_* packet is only an attempt.  Keep separate outcome counters so
- * a lively title bar cannot hide a frame whose shaders/vertices were rejected
- * before DrawInstanced reached D3D12. */
-static u32 g_ld_exec_draws = 0;
-static u32 g_ld_drop_fetch = 0;
-static u32 g_ld_drop_prim = 0;
-static u32 g_ld_drop_pso = 0;
-static u32 g_ld_drop_ring = 0;
-static u32 g_ld_movie_suppressed = 0;
+static u32 g_ld_frames = 0;
+/* DRAW_ARRAYS/DRAW_INDEX_ARRAY writes are packets. Multiple packets between a
+ * single BEGIN/END are deliberately coalesced into one D3D12 DrawInstanced,
+ * so comparing packet count directly with executed D3D draws was invalid.
+ * Keep two independently balanced ledgers instead:
+ *
+ *   packets_seen = packets_queued + packets_movie + packets_queue_full
+ *   groups_seen  = groups_executed + every group_drop_* outcome
+ *
+ * An END with no accepted packet is counted separately as groups_empty and is
+ * not a render attempt. This makes every early return explicit. */
+typedef struct ld_stats {
+    unsigned long long packets_seen;
+    unsigned long long packets_queued;
+    unsigned long long packets_movie;
+    unsigned long long packets_queue_full;
+    unsigned long long groups_seen;
+    unsigned long long groups_empty;
+    unsigned long long groups_executed;
+    unsigned long long group_drop_fetch;
+    unsigned long long group_drop_degenerate;
+    unsigned long long group_drop_primitive;
+    unsigned long long group_drop_alloc;
+    unsigned long long group_drop_pso;
+    unsigned long long group_drop_ring;
+    unsigned long long group_drop_surface;
+    unsigned long long clears;
+    unsigned long long clear_drop_surface;
+    unsigned long long implicit_depth_clears;
+} ld_stats;
+
+static ld_stats g_ld_stats;
+
+static unsigned long long ld_groups_accounted(void)
+{
+    return g_ld_stats.groups_executed + g_ld_stats.group_drop_fetch +
+           g_ld_stats.group_drop_degenerate + g_ld_stats.group_drop_primitive +
+           g_ld_stats.group_drop_alloc + g_ld_stats.group_drop_pso +
+           g_ld_stats.group_drop_ring + g_ld_stats.group_drop_surface;
+}
+
+static int ld_target_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("YZ_RSX_TARGET_TRACE") ? 1 : 0;
+    return enabled;
+}
+
+static void ld_trace_target(const char* event, u32 target, u32 mask)
+{
+    if (!ld_target_trace_enabled()) return;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    fprintf(stderr,
+            "[rsx-target] frame=%u event=%s target=%u loc=%u off=0x%08X "
+            "fmt=0x%X pitch=%u clip=%u,%u+%ux%u mask=0x%02X\n",
+            g_ld_frames, event, target, sf.color_location[0], sf.color_offset[0],
+            sf.color_format, sf.color_pitch[0], sf.clip_x, sf.clip_y,
+            sf.clip_w, sf.clip_h, mask);
+}
 
 /* Movie mode: while a host-decoded movie owns the window
  * (rsx_live_draw_present_rgba), do not make the default boot process the
@@ -1006,17 +1059,33 @@ static int g_ld_movie_track_rsx = -1;
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; if (g_ld_movie_mode) { g_ld_movie_suppressed++; return; } g_ld_draws++; if (dc.n_arr < 256) { dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++; } }
+{
+    (void)u; (void)r; g_ld_stats.packets_seen++;
+    if (g_ld_movie_mode) { g_ld_stats.packets_movie++; return; }
+    dc.n_packets++;
+    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
+    dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++;
+    g_ld_stats.packets_queued++;
+}
 static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
-{ (void)u; (void)r; if (g_ld_movie_mode) { g_ld_movie_suppressed++; return; } g_ld_draws++; if (dc.n_idx < 256) { dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++; } }
+{
+    (void)u; (void)r; g_ld_stats.packets_seen++;
+    if (g_ld_movie_mode) { g_ld_stats.packets_movie++; return; }
+    dc.n_packets++;
+    if (dc.n_idx >= 256) { g_ld_stats.packets_queue_full++; return; }
+    dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++;
+    g_ld_stats.packets_queued++;
+}
 
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (g_ld_movie_mode) return;
+    if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
+    g_ld_stats.groups_seen++;
     const u32 prim = g.rsx.current_primitive;
     fetch_batches();
-    if (!dc.n_verts || !dc.fetch_ok) { g_ld_drop_fetch++; return; }
+    if (!dc.n_verts || !dc.fetch_ok) { g_ld_stats.group_drop_fetch++; return; }
 
     /* Segment table from the restart cuts (port of the replay-harness s25c/
      * s25d fixes): STRIP/FAN never bridge a cut, strips alternate winding
@@ -1042,12 +1111,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
     switch (prim) {
     case PRIM_TRIANGLES: tri = dc.verts; n_tri = dc.n_verts - dc.n_verts % 3; break;
     case PRIM_TRIANGLE_STRIP: {
-        if (dc.n_verts < 3) return;
+        if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
         u32 total = 0;
         for (u32 s = 0; s < n_seg; s++)
             if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
-        if (!total) return;
+        if (!total) { g_ld_stats.group_drop_degenerate++; return; }
         n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
             const u32 sb = seg_start[s], cnt = seg_count[s];
@@ -1064,12 +1134,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         break;
     }
     case PRIM_TRIANGLE_FAN: {
-        if (dc.n_verts < 3) return;
+        if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
         u32 total = 0;
         for (u32 s = 0; s < n_seg; s++)
             if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
-        if (!total) return;
+        if (!total) { g_ld_stats.group_drop_degenerate++; return; }
         n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
             const u32 sb = seg_start[s], cnt = seg_count[s];
@@ -1082,34 +1153,49 @@ static void sink_end(void* user, const rsx_dispatch* r)
         break;
     }
     case PRIM_QUADS: {
-        const u32 quads = dc.n_verts / 4; if (!quads) return;
+        const u32 quads = dc.n_verts / 4;
+        if (!quads) { g_ld_stats.group_drop_degenerate++; return; }
         n_tri = quads * 6; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
         for (u32 q = 0; q < quads; q++) {
             const vtx_t* v = &dc.verts[q*4]; vtx_t* t = &tri[q*6];
             t[0]=v[0]; t[1]=v[1]; t[2]=v[2]; t[3]=v[2]; t[4]=v[3]; t[5]=v[0];
         }
         break;
     }
-    default: g_ld_drop_prim++; return;
+    default: g_ld_stats.group_drop_primitive++; return;
+    }
+
+    if (!n_tri) {
+        g_ld_stats.group_drop_degenerate++;
+        if (tri != dc.verts) free(tri);
+        return;
     }
 
     if (g.vb_used + n_tri * VERT_STRIDE > MAX_VERTS * VERT_STRIDE) {
-        g_ld_drop_ring++;
+        g_ld_stats.group_drop_ring++;
         if (tri != dc.verts) free(tri); return;
     }
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     ID3D12PipelineState* pso = get_pso();
     if (!pso) {
-        g_ld_drop_pso++;
+        g_ld_stats.group_drop_pso++;
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
     if (g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
-        g_ld_drop_ring++;
+        g_ld_stats.group_drop_ring++;
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
 
     const u32 target = current_surface();
+    if (target == LD_INVALID_SURFACE) {
+        g_ld_stats.group_drop_surface++;
+        if (tri != dc.verts) free(tri);
+        return;
+    }
+    { static u32 last_target = LD_INVALID_SURFACE;
+      if (target != last_target) { ld_trace_target("draw", target, 0); last_target = target; } }
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
@@ -1151,6 +1237,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
             g.depth_cleared = 1;
+            g_ld_stats.implicit_depth_clears++;
         }
     }
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, have_dsv ? &dsv : NULL);
@@ -1195,7 +1282,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
-    g_ld_exec_draws++;
+    g_ld_stats.groups_executed++;
 
     for (u32 k = 0; k < n_surf_used; k++) {
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
@@ -1211,8 +1298,29 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
     if (g_ld_movie_mode) return;
-    g_ld_clears++;
+    g_ld_stats.clears++;
     const u32 target = current_surface();
+    if (target == LD_INVALID_SURFACE) { g_ld_stats.clear_drop_surface++; return; }
+    if (ld_target_trace_enabled()) {
+        static u32 last_clear_target = LD_INVALID_SURFACE;
+        const int changed = target != last_clear_target;
+        if (changed) {
+            ld_trace_target("clear-target", target, mask);
+            last_clear_target = target;
+        }
+        /* A broken scene can issue tens of thousands of clears. Preserve the
+         * opening sequence and a periodic heartbeat without turning tracing
+         * itself into a scheduler perturbation. Target changes are always
+         * emitted above. */
+        if (g_ld_stats.clears <= 256 || (g_ld_stats.clears & 1023) == 0) {
+            const u32 z = rsx_dsp_clear_zstencil(&g.rsx);
+            fprintf(stderr,
+                    "[rsx-clear] frame=%u n=%llu target=%u mask=0x%02X "
+                    "argb=0x%08X z24=0x%06X stencil=0x%02X\n",
+                    g_ld_frames, g_ld_stats.clears, target, mask,
+                    rsx_dsp_clear_color(&g.rsx), z >> 8, z & 0xFF);
+        }
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
@@ -1444,16 +1552,16 @@ void rsx_live_draw_method(u32 method, u32 arg)
 
 void rsx_live_draw_set_movie_mode(int on)
 {
-    static u32 suppressed_at_start = 0;
+    static unsigned long long suppressed_at_start = 0;
     if (on) {
-        suppressed_at_start = g_ld_movie_suppressed;
+        suppressed_at_start = g_ld_stats.packets_movie;
         g_ld_movie_mode = 1;
     } else {
         g_ld_movie_mode = 0;
         if (g_ld_movie_track_rsx > 0) {
             fprintf(stderr,
-                    "[live-draw] movie handoff: tracked RSX state, suppressed %u guest draw batches\n",
-                    g_ld_movie_suppressed - suppressed_at_start);
+                    "[live-draw] movie handoff: tracked RSX state, suppressed %llu guest draw packets\n",
+                    g_ld_stats.packets_movie - suppressed_at_start);
             fflush(stderr);
         }
     }
@@ -1581,6 +1689,15 @@ void rsx_live_draw_present(u32 buffer_id)
      * The current color target holds this frame's composite; copy it into the
      * swap-chain backbuffer and present. */
     const u32 target = current_surface();
+    if (target == LD_INVALID_SURFACE) {
+        fprintf(stderr, "[live-draw] frame present skipped: no color surface\n");
+        return;
+    }
+    { static u32 last_present_target = LD_INVALID_SURFACE;
+      if (target != last_present_target) {
+          ld_trace_target("present", target, buffer_id);
+          last_present_target = target;
+      } }
     ID3D12Resource* srcimg = g.surfaces[target].tex;
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
@@ -1609,20 +1726,32 @@ void rsx_live_draw_present(u32 buffer_id)
     ld_flush();
     g.swap->lpVtbl->Present(g.swap, 1, 0);
 
-    { static u32 draws_at_last_frame = 0;
-      g_ld_last_frame_draws = g_ld_draws - draws_at_last_frame;
-      draws_at_last_frame = g_ld_draws; }
+    { static unsigned long long packets_at_last_frame = 0;
+      g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+      packets_at_last_frame = g_ld_stats.packets_seen; }
     g_ld_frames++;
     /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
      * making the TRUE frame count measurable from the log. (The old hard cap
      * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
     if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
         fprintf(stderr,
-                "[live-draw] frame %u presented: batches=%u executed=%u "
-                "drop[fetch=%u prim=%u pso=%u ring=%u] clears=%u (cumulative)\n",
-                g_ld_frames, g_ld_draws, g_ld_exec_draws,
-                g_ld_drop_fetch, g_ld_drop_prim, g_ld_drop_pso,
-                g_ld_drop_ring, g_ld_clears);
+                "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
+                "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
+                "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
+                "balance[p=%s g=%s] (cumulative)\n",
+                g_ld_frames,
+                g_ld_stats.packets_seen, g_ld_stats.packets_queued,
+                g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
+                g_ld_stats.groups_seen, g_ld_stats.groups_executed,
+                g_ld_stats.groups_empty, g_ld_stats.group_drop_fetch,
+                g_ld_stats.group_drop_degenerate, g_ld_stats.group_drop_primitive,
+                g_ld_stats.group_drop_alloc, g_ld_stats.group_drop_pso,
+                g_ld_stats.group_drop_ring, g_ld_stats.group_drop_surface,
+                g_ld_stats.clears, g_ld_stats.clear_drop_surface,
+                g_ld_stats.implicit_depth_clears,
+                g_ld_stats.packets_seen == g_ld_stats.packets_queued +
+                    g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
+                g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD");
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one
@@ -1639,9 +1768,11 @@ void rsx_live_draw_present(u32 buffer_id)
     if (getenv("YZ_RSX_DUMP") && g_ld_frames <= 8) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
-        char path[256];
-        snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
-        ld_dump_surface_ppm(path, g.surfaces[cur].tex);
+        if (cur != LD_INVALID_SURFACE) {
+            char path[256];
+            snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
+            ld_dump_surface_ppm(path, g.surfaces[cur].tex);
+        }
     }
 
     /* new frame: reset per-frame ring cursors */
