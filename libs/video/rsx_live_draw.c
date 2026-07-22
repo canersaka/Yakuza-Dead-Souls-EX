@@ -42,6 +42,7 @@ void rsx_live_draw_shutdown(void) {}
 
 #include "rsx_dispatch.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_restart_cuts.h"
 #include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
@@ -881,7 +882,7 @@ typedef struct {
      * a vertex reference (RPCS3 RSXThread.cpp:398); fetch_batches records
      * the n_verts position at each one and the STRIP/FAN expansion must
      * not bridge across a cut. */
-    u32     cuts[520]; u32 n_cuts;
+    u32*    cuts; u32 n_cuts, cap_cuts;
 } draw_ctx;
 
 static draw_ctx dc;
@@ -970,7 +971,11 @@ static void fetch_batches(void)
                 ? (((u32)ip[0] << 24) | ((u32)ip[1] << 16) | ((u32)ip[2] << 8) | ip[3])
                 : (u32)((ip[0] << 8) | ip[1]);
             if (restart_en && index == restart_val) {
-                if (dc.n_cuts < 520) dc.cuts[dc.n_cuts++] = dc.n_verts;
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts,
+                                          dc.n_verts)) {
+                    dc.fetch_ok = 0;
+                    return;
+                }
                 continue;
             }
             fetch_one(base, base_index + index);
@@ -1092,20 +1097,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * per LOCAL triangle index (odd triangles flip vertex order to keep
      * face orientation under backface culling), fans anchor to their OWN
      * segment's first vertex. */
-    u32 seg_start[521], seg_count[521], n_seg = 0;
-    {
-        u32 prev = 0;
-        for (u32 ci = 0; ci < dc.n_cuts && n_seg < 521; ci++) {
-            seg_start[n_seg] = prev;
-            seg_count[n_seg] = dc.cuts[ci] > prev ? dc.cuts[ci] - prev : 0;
-            n_seg++; prev = dc.cuts[ci];
-        }
-        if (n_seg < 521) {
-            seg_start[n_seg] = prev;
-            seg_count[n_seg] = dc.n_verts > prev ? dc.n_verts - prev : 0;
-            n_seg++;
-        }
-    }
+    const u32 n_seg = dc.n_cuts + 1;
 
     vtx_t* tri = NULL; u32 n_tri = 0;
     switch (prim) {
@@ -1113,14 +1105,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
     case PRIM_TRIANGLE_STRIP: {
         if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
         u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++)
-            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        for (u32 s = 0; s < n_seg; s++) {
+            u32 sb, cnt;
+            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                       s, &sb, &cnt);
+            if (cnt >= 3) total += (cnt - 2) * 3;
+        }
         if (!total) { g_ld_stats.group_drop_degenerate++; return; }
         n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
         if (!tri) { g_ld_stats.group_drop_alloc++; return; }
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
-            const u32 sb = seg_start[s], cnt = seg_count[s];
+            u32 sb, cnt;
+            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                       s, &sb, &cnt);
             if (cnt < 3) continue;
             for (u32 i = 0; i + 2 < cnt; i++) {
                 if (i & 1) {
@@ -1136,14 +1134,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
     case PRIM_TRIANGLE_FAN: {
         if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
         u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++)
-            if (seg_count[s] >= 3) total += (seg_count[s] - 2) * 3;
+        for (u32 s = 0; s < n_seg; s++) {
+            u32 sb, cnt;
+            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                       s, &sb, &cnt);
+            if (cnt >= 3) total += (cnt - 2) * 3;
+        }
         if (!total) { g_ld_stats.group_drop_degenerate++; return; }
         n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
         if (!tri) { g_ld_stats.group_drop_alloc++; return; }
         u32 w = 0;
         for (u32 s = 0; s < n_seg; s++) {
-            const u32 sb = seg_start[s], cnt = seg_count[s];
+            u32 sb, cnt;
+            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                       s, &sb, &cnt);
             if (cnt < 3) continue;
             for (u32 i = 1; i + 1 < cnt; i++) {
                 tri[w*3+0] = dc.verts[sb]; tri[w*3+1] = dc.verts[sb+i]; tri[w*3+2] = dc.verts[sb+i+1];
@@ -1797,6 +1801,7 @@ void rsx_live_draw_shutdown(void)
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
+    if (dc.cuts) { free(dc.cuts); dc.cuts = NULL; dc.cap_cuts = 0; }
 }
 
 #endif /* _WIN32 */
