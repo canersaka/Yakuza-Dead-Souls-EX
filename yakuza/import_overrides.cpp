@@ -677,6 +677,8 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int frames = 0;
     int superseded = 0;
     int cancelled = 0;
+    int skip_requested = 0;
+    int skip_guest_acked = 0;
 
     fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n",
             path, w, h, fps);
@@ -693,27 +695,24 @@ static void yz_play_queued_movie(const char* path, LONG serial)
             break;
         }
         if (cellPad_host_movie_skip_requested()) {
-            yz_movie_request_cancel(serial, "host Start");
-            /* The window thread polls the same physical Start button as the
-             * guest, but can observe its edge first. SAIL cancellation is
-             * asynchronous: the player's Stop request is established before
-             * source completion is reported. Wait for cellPadGetData to hand
-             * the press to guest code and observe its following poll. That
-             * proves the receiving update returned to game code and had a
-             * chance to establish Stop before EOS publication. */
-            const DWORD deadline = GetTickCount() + 1000;
-            while (!cellPad_host_movie_skip_guest_seen() &&
-                   (LONG)(deadline - GetTickCount()) > 0) {
-                if (rsx_null_backend_pump_messages() < 0)
-                    break;
-                Sleep(1);
-            }
-            const int guest_seen = cellPad_host_movie_skip_guest_seen();
-            fprintf(stderr, "[movie] Start handoff guest_update_acked=%d\n",
-                    guest_seen);
+            /* The host and guest observe the same physical Start press.  The
+             * host edge is diagnostic only: whether this particular movie is
+             * skippable belongs to the guest player.  Keep decoding until the
+             * guest's Stop/Close hook requests cancellation; otherwise an
+             * ignored or too-early Start must leave playback running. */
+            skip_requested = 1;
+            fprintf(stderr,
+                    "[movie] Start observed; awaiting guest Stop/Close serial=%ld\n",
+                    serial);
             fflush(stderr);
-            cancelled = 1;
-            break;
+        }
+        if (skip_requested && !skip_guest_acked &&
+            cellPad_host_movie_skip_guest_seen()) {
+            skip_guest_acked = 1;
+            fprintf(stderr,
+                    "[movie] guest received Start; awaiting Stop/Close serial=%ld\n",
+                    serial);
+            fflush(stderr);
         }
         const uint8_t* rgba = movie_next_rgba(mv, nullptr);
         if (!rgba) break;
@@ -730,6 +729,11 @@ static void yz_play_queued_movie(const char* path, LONG serial)
      * flip at that boundary. Let the guest's ordinary flip/event path retire
      * its own work, then publish the sticky source-completion predicate. */
     yz_movie_complete(serial);
+    if (skip_requested && !cancelled && !superseded) {
+        fprintf(stderr,
+                "[movie] guest did not accept skip; completed naturally serial=%ld\n",
+                serial);
+    }
     fprintf(stderr, "[movie] %s after %d frames\n",
             superseded ? "switched streams" :
             cancelled ? "cancelled cleanly" : "presentation complete",
