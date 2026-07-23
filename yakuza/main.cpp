@@ -87,12 +87,19 @@ static uint64_t g_proc_param_vaddr = 0;
 
 /* runtime/syscalls/lv2_register.c — served by sys_process_get_sdk_version */
 extern "C" uint32_t g_ps3_sdk_version;
+extern "C" uint64_t spu_workload_fingerprint(const void*, size_t);
+extern "C" size_t spu_elf_image_size(const uint8_t*, size_t);
+extern "C" int spu_workload_register_image(uint64_t, uint32_t, int, uint32_t,
+                                            const char*);
+extern "C" void spu_workload_reset(void);
 
 /* recomp_prx/spurs_kernel2.c + spurs_sysservice.c (generated, C) — register the
  * lifted SPURS kernel and its system-service workload for SPU indirect-branch
  * dispatch. The kernel DMAs the service to LS 0xA00 and branches there. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register(void);
 extern "C" void spu_recomp_register_sysservice(void);
+#endif
 extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
 /* recomp_prx/gs_task.c (generated) — the game's Edge geometry render task
  * (gs_task.elf, EBOOT SPU img #3 @0x0127A580, LS base 0x3000, entry 0x3050).
@@ -103,7 +110,9 @@ extern "C" void spu_recomp_register_gstask(void);
  * (libsre ea 0x02023680). The kernel DMAs it to LS 0xA00 -- SAME address as the
  * system service -- so they must register under DISTINCT image ids and the
  * runtime switches ctx->image_id by DMA source EA (spu_dma.h). */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_policy(void);
+#endif
 /* recomp_prx/ts_exit.c (generated) — Sony's SPURS taskset EXIT-HANDLER blob
  * (libsre ea 0x02025500, 0x680 bytes). On a task's EXIT syscall the policy DMAs
  * it to LS 0x10000 and calls it (r3=taskset, r4=taskId, r5=exitCode, r6=args --
@@ -111,14 +120,18 @@ extern "C" void spu_recomp_register_policy(void);
  * every task exit died as "unknown branch LS 0x10000" (image 5's exit = the
  * entry-7 shader-stream gate). Own image id: the reverse image-switch adopts it
  * at the call and re-adopts the policy on its bi $r0 return. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_tsexit(void);
+#endif
 /* recomp_prx/job_module.c (generated) — Sony's SPURS JOB-CHAIN policy module
  * (libsre ea 0x0202A180, 0x3E80 bytes, loaded to LS 0xA00 like the taskset
  * policy). The game's pxd streaming layer runs a jobchain (wid 1, object
  * 0x4019C880) whose jobs signal the IWL event flag t1 blocks on after the
  * asset sweep; without this lift the kernel dispatched the jobchain into the
  * SERVICE image's code (wrong image) -> wild EA-0 lock-line atomics. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_jobmod(void);
+#endif
 /* recomp_prx/job_bin_{a,b}.c (generated) — the game's two jobchain JOB BINARIES
  * (runtime-loaded per-descriptor SPU code; both EBOOT-static, extracted by
  * eaBinary). A = the 14-way bulk worker (EBOOT 0x01254500, 0x9540 B, loads at
@@ -209,6 +222,49 @@ extern "C" int g_yz_watch_dlist;
 extern "C" int g_yz_slotstore;   /* YZ_SLOTSTORE: wid4 record-store watch (spu_channels.c) */
 extern "C" int g_yz_a010_ppucmd = 0;
 extern "C" volatile LONG g_yz_a010_ppucmd_headers;
+
+#ifdef YZ_NATIVE_SPURS
+static int yz_register_native_spurs_images(void)
+{
+    spu_workload_reset();
+    for (int i = 0; i < SPU_IMAGE_COUNT; ++i) {
+        const spu_image_desc& d = g_spu_images[i];
+        const uint8_t* image = vm_base + d.elf_ea;
+        const size_t size = spu_elf_image_size(image, 16u * 1024u * 1024u);
+        if (!size || !spu_workload_register_image(
+                spu_workload_fingerprint(image, size), (uint32_t)size,
+                d.image_id, d.entry, d.name)) {
+            fprintf(stderr,
+                    "[native-spurs] failed to register exact task image "
+                    "ea=0x%08X id=%d name=%s\n",
+                    d.elf_ea, d.image_id, d.name);
+            return 0;
+        }
+    }
+    struct RawJob {
+        uint32_t ea, size;
+        int image;
+        const char* name;
+    };
+    static const RawJob jobs[] = {
+        {0x01254500u, 0x9540u, 14, "job_bin_a"},
+        {0x01275A00u, 0x14C0u, 15, "job_bin_b"},
+    };
+    for (const RawJob& d : jobs) {
+        const uint8_t* image = vm_base + d.ea;
+        if (!spu_workload_register_image(
+                spu_workload_fingerprint(image, d.size), d.size,
+                d.image, 0x4c00u, d.name)) {
+            fprintf(stderr,
+                    "[native-spurs] failed to register exact job image "
+                    "ea=0x%08X id=%d name=%s\n",
+                    d.ea, d.image, d.name);
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 /* YZ_HWWATCH (s26 ~04:25, the stager hunt's definitive tool): a HARDWARE
  * debug-register watchpoint (DR0, exact 4-byte write watch) on the wid4
@@ -3501,10 +3557,15 @@ int main(int argc, char** argv)
         return 1;
     yz_apply_builtin_text_overrides();
 
+#ifndef YZ_NATIVE_SPURS
     /* LLE firmware: Sony's libsre at its lift_prx relocation base. Must be
      * in place before yz_install_imports patches its import slots. */
     if (load_prx_image("recomp_prx/libsre_image.bin", YZ_LIBSRE_BASE) != 0)
         return 1;
+#else
+    printf("[boot] SPURS backend=NATIVE firmware-free "
+           "(libsre image/PPU lift/kernel modules requested=0)\n");
+#endif
 
     /* LLE firmware: Sony's libgcm_sys (RSX driver). Same contract as libsre --
      * the flat image includes its TOC (0x02114000) referenced by the export
@@ -3541,9 +3602,11 @@ int main(int argc, char** argv)
      * #34/#49; adoption-trace analysis). Group-start now adopts 16 for every
      * thread (lv2_register.c); spu_lookup refuses wildcard service for
      * kernel contexts (kill-switch YZ_KERN_WILDCARD_OK). */
+#ifndef YZ_NATIVE_SPURS
     spu_begin_image(16); spu_recomp_register();           /* kernel  */
     spu_begin_image(1); spu_recomp_register_sysservice(); /* system service @0xA00 */
     spu_begin_image(2); spu_recomp_register_policy();     /* taskset policy @0xA00 */
+#endif
     /* cri_audio (image 3) BEFORE gs_task (image 0): both overlap LS 0x3000+, and
      * spu_lookup returns the first match -- registering the codec first lets its
      * image-3 entries win for codec (image 3) lookups over gs_task's image-0
@@ -3551,8 +3614,10 @@ int main(int argc, char** argv)
     spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
     spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
+#ifndef YZ_NATIVE_SPURS
     spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
     spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
+#endif
     spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, slot base 0x4C00) */
     spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
     spu_recomp_register_jobbin_a_24400();                 /*   ...same binary at non-overlapping LS 0x24400 */
@@ -3606,8 +3671,16 @@ int main(int argc, char** argv)
     spu_begin_image(19);
     spu_recomp_register_jobbin_orphanage_37c00();                 /*   ...same binary at the live Kamurocho slot 0x37C00 */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
+#ifdef YZ_NATIVE_SPURS
+    if (!yz_register_native_spurs_images())
+        return 1;
+    printf("[boot] native SPURS images registered "
+           "(%d exact EBOOT tasks + 2 exact game jobs; no firmware)\n",
+           SPU_IMAGE_COUNT);
+#else
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);
+#endif
 
     /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted

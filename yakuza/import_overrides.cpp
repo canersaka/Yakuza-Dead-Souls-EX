@@ -26,6 +26,7 @@
 #include "../libs/filesystem/cellFs.h"
 #include "../libs/input/cellPad.h"
 #include "../libs/system/cellSaveData.h"
+#include "../libs/spurs/cellSpurs.h"
 
 #include <cstdio>
 #include <cstring>
@@ -982,6 +983,31 @@ extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
 extern "C" void yz_a010_auth_probe_poll(void);
+
+/* The PPU ABI passes only arguments 1-8 in r3-r10. Arguments 9+ are in the
+ * parameter save area at r1+0x30+i*8 (i is zero-based from r3). */
+extern "C" void yz_ovr__cellSpursJobChainAttributeInitialize(ppu_context* ctx)
+{
+    auto stack_arg = [ctx](unsigned i) -> uint64_t {
+        return vm_read64((uint32_t)ctx->gpr[1] + 0x30u + i * 8u);
+    };
+    const int32_t rc = _cellSpursJobChainAttributeInitialize(
+        (uint32_t)ctx->gpr[3],
+        (uint32_t)ctx->gpr[4],
+        (CellSpursJobChainAttribute*)(vm_base + (uint32_t)ctx->gpr[5]),
+        (const uint64_t*)(vm_base + (uint32_t)ctx->gpr[6]),
+        (uint16_t)ctx->gpr[7],
+        (uint16_t)ctx->gpr[8],
+        (const uint8_t*)(vm_base + (uint32_t)ctx->gpr[9]),
+        (uint32_t)ctx->gpr[10],
+        (uint32_t)stack_arg(8),
+        (uint32_t)stack_arg(9),
+        (uint32_t)stack_arg(10),
+        (uint32_t)stack_arg(11),
+        (uint32_t)stack_arg(12),
+        (uint32_t)stack_arg(13));
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
