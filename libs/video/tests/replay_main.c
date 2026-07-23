@@ -2037,6 +2037,7 @@ static void b1_read_env(void)
 
 /* Decoded render state that folds into the PSO (and thus the PSO cache key) */
 typedef struct {
+    u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable;
     u32 sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write;
@@ -2048,6 +2049,12 @@ typedef struct {
 static void decode_render_state(const rsx_dispatch* rsx, render_state_t* rs)
 {
     memset(rs, 0, sizeof(*rs));
+    rs->alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE) & 1;
+    rs->alpha_func = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
+    rs->alpha_ref_raw = rsx_dsp_reg(rsx, M_ALPHA_REF);
+    rsx_dsp_surface alpha_surface;
+    rsx_dsp_get_surface(rsx, &alpha_surface);
+    rs->alpha_ref_format = alpha_surface.color_format;
     rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
     const u32 sf = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
     const u32 df = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
@@ -3192,7 +3199,7 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
     static char ps_hlsl[256 * 1024];
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
-    const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
     if (fi > 0 && g_fp_force_stage >= 0 && key == FP_FORCE_TARGET_KEY)
         fp_apply_force_stage(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage);
     if (fi > 0 && g_fp_force_stage2 >= 0 && key == FP_FORCE_TARGET_KEY2)
@@ -3205,6 +3212,13 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
         fp_apply_force_stage5(ps_hlsl, sizeof(ps_hlsl));
     if (fi > 0 && g_fp_force_stage6 >= 0 && key == FP_FORCE_TARGET_KEY6)
         fp_apply_force_stage6(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage6);
+    if (fi > 0 && rs.alpha_test_enable &&
+        rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+            rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format)) < 0) {
+        printf("[xlat] alpha-test injection failed key=%016llx\n",
+               (unsigned long long)key);
+        fi = -1;
+    }
     if (vi > 0 && fi > 0)
         pso = build_translated_pso(vs_hlsl, ps_hlsl, key, &rs);
     else
