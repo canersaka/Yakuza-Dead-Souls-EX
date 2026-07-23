@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdlib>
+#include <intrin.h>
 
 /* ntdll/kernel32 stack-walk (no windows.h here); links via kernel32.lib. */
 extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
@@ -31,6 +32,8 @@ extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
  * sets it (direct tail branches) and drains it. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
 extern "C" volatile long g_yz_cri_yield_phase;
+extern "C" volatile long g_yz_movie_stop_pending_serial;
+extern "C" volatile long g_yz_movie_stop_applied_serial;
 
 static bool addr_readable(uint32_t a)
 {
@@ -322,6 +325,73 @@ extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
  * lost TOC when a guest function is dispatched with r2==0 (see yz_tramp_guard). */
 extern "C" uint32_t g_yz_game_toc = 0;
 
+/* Natural host EOS must enter CRI through its player lifecycle, not through a
+ * fabricated zero-byte file read. Capture the live mwPly object, then invoke
+ * the game's Stop wrapper on guest PPU thread 1 at a safe dispatch boundary.
+ * The wrapper performs mwPlyStop and, crucially, dispatches the player event
+ * queued at object+0x5e0. A copied context preserves the interrupted caller. */
+static volatile uint32_t g_yz_mwply_active_handle = 0;
+static __declspec(thread) int g_yz_mwply_stop_injecting = 0;
+
+static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
+{
+    static void* start_fn = nullptr;
+    static void* stop_fn = nullptr;
+    static void* stop_wrapper_fn = nullptr;
+    static void* ready_fn = nullptr;
+    static void* frame_fn = nullptr;
+    static void* audio_fn = nullptr;
+    if (!start_fn) start_fn = (void*)yz_lookup_func(0x00F4E720u);
+    if (!stop_fn)  stop_fn  = (void*)yz_lookup_func(0x00F4ED44u);
+    if (!stop_wrapper_fn) stop_wrapper_fn = (void*)yz_lookup_func(0x00F495DCu);
+    if (!ready_fn) ready_fn = (void*)yz_lookup_func(0x00F4D0A8u);
+    if (!frame_fn) frame_fn = (void*)yz_lookup_func(0x00F4DA90u);
+    if (!audio_fn) audio_fn = (void*)yz_lookup_func(0x00F48E48u);
+
+    if (fn == start_fn || fn == ready_fn || fn == frame_fn || fn == audio_fn) {
+        const uint32_t handle = (uint32_t)ctx->gpr[3];
+        if (handle && handle != g_yz_mwply_active_handle) {
+            g_yz_mwply_active_handle = handle;
+            fprintf(stderr, "[movie] captured mwPly handle=%08X via=%s tid=%u\n",
+                    handle,
+                    fn == start_fn ? "StartFname" :
+                    fn == ready_fn ? "IsNextFrmReady" :
+                    fn == frame_fn ? "GetFrm" : "GetAudioPcmData",
+                    yz_thread_current_id());
+            fflush(stderr);
+        }
+    }
+    if (fn == stop_fn && !g_yz_mwply_stop_injecting) {
+        fprintf(stderr, "[movie] guest mwPlyStop handle=%08X tid=%u\n",
+                (uint32_t)ctx->gpr[3], yz_thread_current_id());
+        fflush(stderr);
+    }
+
+    const long serial = g_yz_movie_stop_pending_serial;
+    const uint32_t handle = g_yz_mwply_active_handle;
+    if (serial <= 0 || !handle || yz_thread_current_id() != 1 ||
+        g_yz_mwply_stop_injecting || fn == stop_fn)
+        return;
+
+    g_yz_mwply_stop_injecting = 1;
+    g_yz_movie_stop_pending_serial = 0;
+    ppu_context stop_ctx = *ctx;
+    stop_ctx.gpr[2] = g_yz_game_toc;
+    stop_ctx.gpr[3] = handle;
+    stop_ctx.lr = 0;
+    void (*saved_trampoline)(void*) = g_trampoline_fn;
+    g_trampoline_fn = nullptr;
+    ((yz_ppu_fn)stop_wrapper_fn)(&stop_ctx);
+    yz_drain_trampolines(&stop_ctx);
+    g_trampoline_fn = saved_trampoline;
+    _InterlockedExchange(&g_yz_movie_stop_applied_serial, serial);
+    fprintf(stderr,
+            "[movie] injected game mwPlyStop wrapper handle=%08X serial=%ld tid=1\n",
+            handle, serial);
+    fflush(stderr);
+    g_yz_mwply_stop_injecting = 0;
+}
+
 /* Reverse-map a host fn ptr to its guest address (linear scan, cached miss). */
 static uint32_t yz_guest_of_host(void* hf)
 {
@@ -389,6 +459,7 @@ extern "C" unsigned long long g_yz_hops_total = 0, g_yz_hops_indirect = 0;
 extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
     ppu_context* ctx0 = (ppu_context*)ctxv;
+    yz_mwply_lifecycle_boundary(tf, ctx0);
     if ((++g_yz_hops_total & 0x9FFFFFull) == 0) /* ~every 10.5M */
         fprintf(stderr, "[hops] total=%llu indirect=%llu static=%llu (%.1f%% static)\n",
                 g_yz_hops_total, g_yz_hops_indirect,
@@ -1186,6 +1257,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                 (unsigned long long)ctx->gpr[3]);
         exit(2);
     }
+
+    yz_mwply_lifecycle_boundary((void*)fn, ctx);
 
     /* DYNAMIC PROBE (env YZ_MWPLY_PROBE, 2026-07-04): live-ABI instrumentation
      * for the CRI Sofdec mwPly player (see scratch/MWPLY_RESOLVE.md). Covers
