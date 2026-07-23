@@ -1013,6 +1013,111 @@ extern "C" int yz_preserve_cri_object(void* ctxv)
     return 0;
 }
 
+/* Narrow New Game archive-lookup discriminator (2026-07-22).
+ *
+ * A losing boot can load adjacent members from a010_res_002, then report a
+ * later member as absent even though the nested PARC and its member table are
+ * resident and intact. Broad probes materially perturb this race, so the
+ * diagnostic path uses only four low-volume hooks: lookup entry,
+ * member-search entry/return, and final lookup return. The
+ * helper is dormant unless YZ_ARCLOOKUP is set and then filters to auth/a010.
+ * It records the parsed 64-byte component key and the exact archive node/table
+ * seen by func_00E67CE4, which distinguishes a bad key from bad publication or
+ * premature archive removal without changing the lookup result. */
+static thread_local int g_yz_arc_active = 0;
+static thread_local unsigned g_yz_arc_subcall = 0;
+static thread_local uint32_t g_yz_arc_node = 0;
+static thread_local uint32_t g_yz_arc_components = 0;
+static thread_local uint32_t g_yz_arc_component_index = 0;
+static thread_local uint32_t g_yz_arc_out = 0;
+static thread_local char g_yz_arc_path[320];
+
+static void yz_arc_read_cstr(uint32_t ea, char* dst, size_t cap)
+{
+    if (!cap) return;
+    size_t i = 0;
+    if (ea) {
+        for (; i + 1 < cap; i++) {
+            char c = (char)vm_read8(ea + (uint32_t)i);
+            dst[i] = c;
+            if (!c) return;
+        }
+    }
+    dst[i] = 0;
+}
+
+extern "C" void yz_archive_lookup_probe(void* ctxv, unsigned phase)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("YZ_ARCLOOKUP") ? 1 : 0;
+    if (!enabled) return;
+
+    ppu_context* c = (ppu_context*)ctxv;
+    if (phase == 0) {
+        yz_arc_read_cstr((uint32_t)c->gpr[3], g_yz_arc_path,
+                         sizeof(g_yz_arc_path));
+        g_yz_arc_active = strstr(g_yz_arc_path, "/auth/a010/") != nullptr;
+        g_yz_arc_subcall = 0;
+        if (!g_yz_arc_active) return;
+        uint32_t mgr = vm_read32((uint32_t)c->gpr[2] - 0x7AD4u);
+        fprintf(stderr,
+                "[arclook] BEGIN tid=%u path=%s mgr=%08X root=%08X\n",
+                yz_thread_current_id(), g_yz_arc_path, mgr,
+                mgr ? vm_read32(mgr + 0x20u) : 0);
+        fflush(stderr);
+        return;
+    }
+    if (!g_yz_arc_active) return;
+
+    if (phase == 1) {
+        g_yz_arc_node = (uint32_t)c->gpr[3];
+        g_yz_arc_components = (uint32_t)c->gpr[4];
+        g_yz_arc_component_index = (uint32_t)c->gpr[5];
+        g_yz_arc_out = (uint32_t)c->gpr[6];
+        g_yz_arc_subcall++;
+        uint32_t data = vm_read32(g_yz_arc_components + 0x0u);
+        uint32_t count = vm_read32(g_yz_arc_components + 0x8u);
+        uint32_t key = data + g_yz_arc_component_index * 0x40u;
+        fprintf(stderr,
+                "[arclook] SEARCH n=%u node=%08X idx=%u/%u out=%08X "
+                "node50=%08X node54=%08X node58=%08X node5C=%08X "
+                "key=%08X words=%016llX,%016llX,%016llX,%016llX,"
+                "%016llX,%016llX,%016llX,%016llX\n",
+                g_yz_arc_subcall, g_yz_arc_node, g_yz_arc_component_index,
+                count, g_yz_arc_out,
+                vm_read32(g_yz_arc_node + 0x50u),
+                vm_read32(g_yz_arc_node + 0x54u),
+                vm_read32(g_yz_arc_node + 0x58u),
+                vm_read32(g_yz_arc_node + 0x5Cu), key,
+                (unsigned long long)vm_read64(key + 0x00u),
+                (unsigned long long)vm_read64(key + 0x08u),
+                (unsigned long long)vm_read64(key + 0x10u),
+                (unsigned long long)vm_read64(key + 0x18u),
+                (unsigned long long)vm_read64(key + 0x20u),
+                (unsigned long long)vm_read64(key + 0x28u),
+                (unsigned long long)vm_read64(key + 0x30u),
+                (unsigned long long)vm_read64(key + 0x38u));
+        fflush(stderr);
+        return;
+    }
+    if (phase == 2) {
+        fprintf(stderr,
+                "[arclook] SEARCH-RET n=%u result=%08X outval=%08X "
+                "node=%08X idx=%u\n",
+                g_yz_arc_subcall, (uint32_t)c->gpr[3],
+                g_yz_arc_out ? vm_read32(g_yz_arc_out) : 0,
+                g_yz_arc_node, g_yz_arc_component_index);
+        fflush(stderr);
+        return;
+    }
+    if (phase == 3) {
+        fprintf(stderr, "[arclook] END result=%08X path=%s\n",
+                (uint32_t)c->gpr[3], g_yz_arc_path);
+        fflush(stderr);
+        g_yz_arc_active = 0;
+    }
+}
+
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
 {
     if (addr == 0x00D1E838u) g_yz_updloop_started = 1;
