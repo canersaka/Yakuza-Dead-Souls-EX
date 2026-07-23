@@ -523,7 +523,13 @@ static char g_movie_open_path[MAX_PATH];
 static volatile LONG g_movie_open_serial = 0;
 static volatile LONG g_movie_completed_serial = 0;
 static volatile LONG g_movie_cancelled_serial = 0;
+static volatile LONG g_movie_closed_serial = 0;
 static LONG g_movie_played_serial = 0;
+/* Consumed by dispatch.cpp on guest PPU thread 1. The host presenter may
+ * detect EOS, but CRI player lifecycle calls must execute on the guest thread
+ * that owns the mwPly handle. */
+extern "C" volatile long g_yz_movie_stop_pending_serial = 0;
+extern "C" volatile long g_yz_movie_stop_applied_serial = 0;
 
 /* Process-wide phase bit for the CRI worker fairness shim.  It is armed by the
  * confirmed title-to-menu callback in dispatch.cpp; movie playback is too
@@ -534,6 +540,7 @@ extern "C" volatile LONG g_yz_cri_yield_phase = 0;
 struct yz_movie_fd_state {
     int active;
     int validation;
+    unsigned eof_deliveries;
     LONG serial;
     char host_path[MAX_PATH];
 };
@@ -587,6 +594,9 @@ static void yz_movie_close_hook(CellFsFd fd, const char* guest_path)
     memset(&g_movie_fds[fd], 0, sizeof(g_movie_fds[fd]));
     ReleaseSRWLockExclusive(&g_movie_open_lock);
     if (serial > 0) {
+        if (serial > InterlockedCompareExchange(&g_movie_closed_serial, 0, 0))
+            InterlockedExchange(&g_movie_closed_serial, serial);
+        cellPad_host_movie_skip_end();
         fprintf(stderr, "[movie] guest Close completed fd=%d serial=%ld\n",
                 fd, serial);
         fflush(stderr);
@@ -638,12 +648,15 @@ static int yz_movie_read_eof_hook(CellFsFd fd, const char* guest_path,
            InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
         SleepConditionVariableSRW(&g_movie_done_cv, &g_movie_open_lock, 1000, 0);
     }
-    fprintf(stderr,
-            "[movie] source EOS delivered fd=%d serial=%ld completed=%ld open=%ld\n",
-            fd, serial,
-            InterlockedCompareExchange(&g_movie_completed_serial, 0, 0),
-            InterlockedCompareExchange(&g_movie_open_serial, 0, 0));
-    fflush(stderr);
+    const unsigned delivery = ++stream->eof_deliveries;
+    if (delivery <= 8 || (delivery & 63u) == 0) {
+        fprintf(stderr,
+                "[movie] source EOS delivered fd=%d serial=%ld offset=0x%llX delivery=%u completed=%ld open=%ld\n",
+                fd, serial, (unsigned long long)offset, delivery,
+                InterlockedCompareExchange(&g_movie_completed_serial, 0, 0),
+                InterlockedCompareExchange(&g_movie_open_serial, 0, 0));
+        fflush(stderr);
+    }
     ReleaseSRWLockExclusive(&g_movie_open_lock);
     return 1;
 }
@@ -679,6 +692,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int cancelled = 0;
     int skip_requested = 0;
     int skip_guest_acked = 0;
+    int natural_completion = 0;
 
     fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n",
             path, w, h, fps);
@@ -715,13 +729,42 @@ static void yz_play_queued_movie(const char* path, LONG serial)
             fflush(stderr);
         }
         const uint8_t* rgba = movie_next_rgba(mv, nullptr);
-        if (!rgba) break;
+        if (!rgba) {
+            natural_completion = 1;
+            InterlockedExchange(&g_yz_movie_stop_pending_serial, serial);
+            fprintf(stderr,
+                    "[movie] host EOS; queued guest-thread mwPlyStop wrapper serial=%ld\n",
+                    serial);
+            fflush(stderr);
+
+            /* The wrapper runs Stop plus the game's object+0x5e0 completion
+             * callback on the owning PPU thread. Only after that transition is
+             * applied may the host decoder cancel its asynchronous source. */
+            while (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial &&
+                   InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) < serial &&
+                   InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) < serial &&
+                   InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) < serial) {
+                if (rsx_null_backend_pump_messages() < 0)
+                    break;
+                Sleep(8);
+            }
+            const int wrapper_applied =
+                InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) >= serial;
+            fprintf(stderr,
+                    "[movie] natural completion wrapper_applied=%d serial=%ld\n",
+                    wrapper_applied, serial);
+            fflush(stderr);
+            if (wrapper_applied)
+                yz_movie_request_cancel(serial, "guest mwPlyStop wrapper");
+            cancelled =
+                InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) >= serial;
+            break;
+        }
         rsx_live_draw_present_rgba(rgba, w, h);
         frames++;
         if (rsx_null_backend_pump_messages() < 0) break;
         Sleep(frame_ms);
     }
-    cellPad_host_movie_skip_end();
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
     /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
@@ -729,7 +772,21 @@ static void yz_play_queued_movie(const char* path, LONG serial)
      * flip at that boundary. Let the guest's ordinary flip/event path retire
      * its own work, then publish the sticky source-completion predicate. */
     yz_movie_complete(serial);
-    if (skip_requested && !cancelled && !superseded) {
+    if (natural_completion) {
+        while (InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) < serial &&
+               InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
+            if (rsx_null_backend_pump_messages() < 0)
+                break;
+            Sleep(8);
+        }
+        fprintf(stderr,
+                "[movie] natural completion Close observed=%d serial=%ld\n",
+                InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) >= serial,
+                serial);
+        fflush(stderr);
+    }
+    cellPad_host_movie_skip_end();
+    if (skip_requested && !cancelled && !superseded && !natural_completion) {
         fprintf(stderr,
                 "[movie] guest did not accept skip; completed naturally serial=%ld\n",
                 serial);
