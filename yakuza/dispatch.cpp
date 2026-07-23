@@ -325,30 +325,65 @@ extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
  * lost TOC when a guest function is dispatched with r2==0 (see yz_tramp_guard). */
 extern "C" uint32_t g_yz_game_toc = 0;
 
-/* Natural host EOS must enter CRI through its player lifecycle, not through a
- * fabricated zero-byte file read. Capture the live mwPly object, then invoke
- * the game's Stop wrapper on guest PPU thread 1 at a safe dispatch boundary.
- * The wrapper performs mwPlyStop and, crucially, dispatches the player event
- * queued at object+0x5e0. A copied context preserves the interrupted caller. */
+/* Natural host EOS must enter CRI through the game's movie-owner lifecycle,
+ * not through a fabricated zero-byte file read. The mwPly getter ABIs do not
+ * all receive the player in r3 (GetAudioPcmData uses a transient stack
+ * argument there), so a value sampled from those calls is not authoritative.
+ *
+ * The active post-title movie is owned by:
+ *   *(manager_global + 0x220 + 0x110) -> owner
+ *   *(owner + 0xFC)                   -> movie player
+ *
+ * Ask the owner to stop on guest PPU thread 1, let its normal update advance
+ * state 3 -> 4, then run its cleanup and unregister it. This is the handoff
+ * required before a simultaneously loaded auth sequence (for example a010)
+ * is allowed to update. */
 static volatile uint32_t g_yz_mwply_active_handle = 0;
 static __declspec(thread) int g_yz_mwply_stop_injecting = 0;
+
+static bool yz_movie_heap_ptr(uint32_t address)
+{
+    return address >= 0x00010000u && address < 0x80000000u;
+}
+
+static uint32_t yz_active_movie_owner(uint32_t* slot_out)
+{
+    constexpr uint32_t manager_global = 0x014EC864u;
+    const uint32_t manager = vm_read32(manager_global);
+    if (!yz_movie_heap_ptr(manager))
+        return 0;
+
+    const uint32_t slot = manager + 0x220u + 0x110u;
+    if (!yz_movie_heap_ptr(slot))
+        return 0;
+    if (slot_out)
+        *slot_out = slot;
+
+    const uint32_t owner = vm_read32(slot);
+    return yz_movie_heap_ptr(owner) ? owner : 0;
+}
 
 static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
 {
     static void* start_fn = nullptr;
     static void* stop_fn = nullptr;
     static void* stop_wrapper_fn = nullptr;
+    static void* owner_complete_fn = nullptr;
+    static void* owner_cleanup_fn = nullptr;
     static void* ready_fn = nullptr;
     static void* frame_fn = nullptr;
-    static void* audio_fn = nullptr;
     if (!start_fn) start_fn = (void*)yz_lookup_func(0x00F4E720u);
     if (!stop_fn)  stop_fn  = (void*)yz_lookup_func(0x00F4ED44u);
     if (!stop_wrapper_fn) stop_wrapper_fn = (void*)yz_lookup_func(0x00F495DCu);
+    if (!owner_complete_fn) owner_complete_fn = (void*)yz_lookup_func(0x00D37A9Cu);
+    if (!owner_cleanup_fn) owner_cleanup_fn = (void*)yz_lookup_func(0x00D37980u);
     if (!ready_fn) ready_fn = (void*)yz_lookup_func(0x00F4D0A8u);
     if (!frame_fn) frame_fn = (void*)yz_lookup_func(0x00F4DA90u);
-    if (!audio_fn) audio_fn = (void*)yz_lookup_func(0x00F48E48u);
 
-    if (fn == start_fn || fn == ready_fn || fn == frame_fn || fn == audio_fn) {
+    /* Diagnostic fallback for early boot movies that do not have the game
+     * movie owner registered. Never replace it from GetAudioPcmData: r3 is
+     * an output structure there, not an mwPly handle. */
+    if (fn == start_fn || fn == ready_fn || fn == frame_fn) {
         const uint32_t handle = (uint32_t)ctx->gpr[3];
         if (handle && handle != g_yz_mwply_active_handle) {
             g_yz_mwply_active_handle = handle;
@@ -356,7 +391,7 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
                     handle,
                     fn == start_fn ? "StartFname" :
                     fn == ready_fn ? "IsNextFrmReady" :
-                    fn == frame_fn ? "GetFrm" : "GetAudioPcmData",
+                    "GetFrm",
                     yz_thread_current_id());
             fflush(stderr);
         }
@@ -368,9 +403,68 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
     }
 
     const long serial = g_yz_movie_stop_pending_serial;
-    const uint32_t handle = g_yz_mwply_active_handle;
-    if (serial <= 0 || !handle || yz_thread_current_id() != 1 ||
+    if (serial <= 0 || yz_thread_current_id() != 1 ||
         g_yz_mwply_stop_injecting || fn == stop_fn)
+        return;
+
+    uint32_t owner_slot = 0;
+    const uint32_t owner = yz_active_movie_owner(&owner_slot);
+    if (owner) {
+        const uint32_t state = vm_read32(owner + 0x104u);
+        const uint32_t player = vm_read32(owner + 0xFCu);
+
+        if (state == 2u) {
+            g_yz_mwply_stop_injecting = 1;
+            ppu_context owner_ctx = *ctx;
+            owner_ctx.gpr[2] = g_yz_game_toc;
+            owner_ctx.gpr[3] = owner;
+            owner_ctx.lr = 0;
+            void (*saved_trampoline)(void*) = g_trampoline_fn;
+            g_trampoline_fn = nullptr;
+            ((yz_ppu_fn)owner_complete_fn)(&owner_ctx);
+            yz_drain_trampolines(&owner_ctx);
+            g_trampoline_fn = saved_trampoline;
+            fprintf(stderr,
+                    "[movie] requested owner completion owner=%08X player=%08X "
+                    "state=%u serial=%ld tid=1\n",
+                    owner, player, state, serial);
+            fflush(stderr);
+            g_yz_mwply_stop_injecting = 0;
+            return;
+        }
+
+        /* State 3 is the owner's asynchronous stop/retire phase. Leave it to
+         * the ordinary game update. Once it reports state 4, destroy its
+         * player and remove the registration that otherwise masks auth. */
+        if (state != 4u)
+            return;
+
+        g_yz_mwply_stop_injecting = 1;
+        ppu_context cleanup_ctx = *ctx;
+        cleanup_ctx.gpr[2] = g_yz_game_toc;
+        cleanup_ctx.gpr[3] = owner;
+        cleanup_ctx.lr = 0;
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        ((yz_ppu_fn)owner_cleanup_fn)(&cleanup_ctx);
+        yz_drain_trampolines(&cleanup_ctx);
+        g_trampoline_fn = saved_trampoline;
+        vm_write32(owner_slot, 0);
+        g_yz_movie_stop_pending_serial = 0;
+        _InterlockedExchange(&g_yz_movie_stop_applied_serial, serial);
+        fprintf(stderr,
+                "[movie] cleaned and unregistered owner=%08X player=%08X "
+                "serial=%ld tid=1\n",
+                owner, player, serial);
+        fflush(stderr);
+        g_yz_mwply_stop_injecting = 0;
+        return;
+    }
+
+    /* Early boot fallback: those movies predate the owner registration used
+     * by gameplay sequences. Preserve their existing wrapper path. */
+    const uint32_t handle = g_yz_mwply_active_handle;
+    if (!handle)
         return;
 
     g_yz_mwply_stop_injecting = 1;
