@@ -374,6 +374,15 @@ typedef struct spu_context {
      * bits surviving fscrrd/fscrwr round trips. */
     SPU_ALIGN16 u128 fpscr;
 
+    /* Firmware-free SPURS task-system-call bridge. Appended so generated
+     * mirrors of the historical prefix keep their offsets. A native task
+     * reaches the documented task syscall target (LS 0x0a70); the indirect
+     * branch dispatcher hands the live architectural context to this callback.
+     * The opaque pointer is host side-table state and is never stored in guest
+     * memory. */
+    int (*native_spurs_syscall)(struct spu_context*, void*);
+    void* native_spurs_opaque;
+
 #if defined(YZ_PERF_PROFILE)
     /*
      * Aggregate-only profile lane counters. Each context is driven by one SPU

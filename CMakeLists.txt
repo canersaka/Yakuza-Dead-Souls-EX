@@ -156,6 +156,7 @@ if(PS3RECOMP_BUILD_TESTS)
     add_subdirectory(tests/spu_job_dispatch)
     add_subdirectory(tests/edge_journal_hle)
     add_subdirectory(libs/system/tests)
+    add_subdirectory(tests/native_spurs)
 
     # These two suites currently use the MSVC-based generated-code harness.
     # Keep them visible to CTest where that harness is supported; the native

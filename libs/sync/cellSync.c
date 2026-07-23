@@ -28,8 +28,30 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    atomic_store(&mutex->lock, 0);
+    atomic_store_explicit(&mutex->tickets, 0, memory_order_release);
     return CELL_OK;
+}
+
+static unsigned sync_bswap32(unsigned v)
+{
+#if defined(_MSC_VER)
+    return _byteswap_ulong(v);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap32(v);
+#else
+    return ((v & 0xffu) << 24) | ((v & 0xff00u) << 8) |
+           ((v >> 8) & 0xff00u) | ((v >> 24) & 0xffu);
+#endif
+}
+
+static void sync_mutex_coherence(CellSyncMutex* mutex)
+{
+    extern uint8_t* vm_base;
+    extern int spu_coh_is_reserved(uint32_t);
+    extern void spu_coh_notify_write(uint32_t);
+    if (!vm_base || (uint8_t*)mutex < vm_base) return;
+    uint32_t ea = (uint32_t)((uint8_t*)mutex - vm_base) & ~127u;
+    if (spu_coh_is_reserved(ea)) spu_coh_notify_write(ea);
 }
 
 s32 cellSyncMutexLock(CellSyncMutex* mutex)
@@ -37,14 +59,25 @@ s32 cellSyncMutexLock(CellSyncMutex* mutex)
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected;
+    unsigned int raw, word, desired, ticket;
     int spins = 0;
 
+    raw = atomic_load_explicit(&mutex->tickets, memory_order_acquire);
     for (;;) {
-        expected = 0;
-        if (atomic_compare_exchange_weak(&mutex->lock, &expected, 1))
-            return CELL_OK;
-
+        word = sync_bswap32(raw);
+        ticket = word & 0xffffu;
+        if ((u16)(ticket - (word >> 16)) == 0xffffu)
+            return CELL_SYNC_ERROR_BUSY;
+        desired = sync_bswap32((word & 0xffff0000u) | (u16)(ticket + 1));
+        if (atomic_compare_exchange_weak_explicit(&mutex->tickets, &raw, desired,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire))
+            break;
+    }
+    sync_mutex_coherence(mutex);
+    for (;;) {
+        word = sync_bswap32(atomic_load_explicit(&mutex->tickets, memory_order_acquire));
+        if ((word >> 16) == (u16)ticket) return CELL_OK;
         if (++spins > 1000) {
             SYNC_YIELD();
             spins = 0;
@@ -57,11 +90,20 @@ s32 cellSyncMutexTryLock(CellSyncMutex* mutex)
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected = 0;
-    if (atomic_compare_exchange_strong(&mutex->lock, &expected, 1))
+    unsigned raw = atomic_load_explicit(&mutex->tickets, memory_order_acquire);
+    for (;;) {
+        unsigned word = sync_bswap32(raw);
+        unsigned current = word >> 16;
+        unsigned next = word & 0xffffu;
+        if (current != next) return CELL_SYNC_ERROR_BUSY;
+        unsigned desired = sync_bswap32((current << 16) | (u16)(next + 1));
+        if (!atomic_compare_exchange_weak_explicit(&mutex->tickets, &raw, desired,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire))
+            continue;
+        sync_mutex_coherence(mutex);
         return CELL_OK;
-
-    return CELL_SYNC_ERROR_BUSY;
+    }
 }
 
 s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
@@ -69,8 +111,20 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    atomic_store(&mutex->lock, 0);
-    return CELL_OK;
+    unsigned raw = atomic_load_explicit(&mutex->tickets, memory_order_acquire);
+    for (;;) {
+        unsigned word = sync_bswap32(raw);
+        unsigned current = word >> 16;
+        unsigned next = word & 0xffffu;
+        if (current == next) return CELL_SYNC_ERROR_STAT;
+        unsigned desired = sync_bswap32(((u16)(current + 1) << 16) | next);
+        if (atomic_compare_exchange_weak_explicit(&mutex->tickets, &raw, desired,
+                                                  memory_order_release,
+                                                  memory_order_acquire)) {
+            sync_mutex_coherence(mutex);
+            return CELL_OK;
+        }
+    }
 }
 
 /* =========================================================================
