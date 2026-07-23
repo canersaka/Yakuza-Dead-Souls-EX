@@ -202,6 +202,9 @@ int rsx_live_draw_enabled(void)
  * B1 render/sampler state decode (identical facts to replay_main.c)
  * -----------------------------------------------------------------------*/
 #define M_BLEND_ENABLE       0x0310
+#define M_ALPHA_TEST_ENABLE  0x0304
+#define M_ALPHA_FUNC         0x0308
+#define M_ALPHA_REF          0x030C
 #define M_BLEND_SFACTOR      0x0314
 #define M_BLEND_DFACTOR      0x0318
 #define M_BLEND_EQUATION     0x0320
@@ -259,6 +262,7 @@ static D3D12_BLEND_OP gcm_blend_op(u32 e)
 }
 
 typedef struct {
+    u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
@@ -268,6 +272,12 @@ typedef struct {
 static void decode_render_state(render_state_t* rs)
 {
     memset(rs, 0, sizeof(*rs));
+    rs->alpha_test_enable = rsx_dsp_reg(&g.rsx, M_ALPHA_TEST_ENABLE) & 1;
+    rs->alpha_func = rsx_dsp_reg(&g.rsx, M_ALPHA_FUNC);
+    rs->alpha_ref_raw = rsx_dsp_reg(&g.rsx, M_ALPHA_REF);
+    rsx_dsp_surface alpha_surface;
+    rsx_dsp_get_surface(&g.rsx, &alpha_surface);
+    rs->alpha_ref_format = alpha_surface.color_format;
     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
     const u32 df = rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR);
@@ -856,7 +866,11 @@ static ID3D12PipelineState* get_pso(void)
     static char ps_hlsl[256 * 1024];
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
-    const int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    if (fi > 0 && rs.alpha_test_enable &&
+        rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+            rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format)) < 0)
+        fi = -1;
     if (vi > 0 && fi > 0) pso = build_pso(vs_hlsl, ps_hlsl, &rs);
 
     g.psos[g.n_psos].key = key;

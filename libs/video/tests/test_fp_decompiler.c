@@ -11,6 +11,7 @@
  */
 
 #include "../rsx_fp_decompiler.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -123,6 +124,26 @@ int main(void)
         put_word(prog + 12, 0);
         rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
         check("neg_abs", hlsl, "-(abs((r[1]).xyzw))");
+    }
+
+    /* Test 6: fixed-function alpha test is injected at the final output. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        int patched = rsx_fp_apply_alpha_test(hlsl, sizeof(hlsl), 0x0204,
+                                              rsx_fp_alpha_ref(100, 5));
+        if (patched == 1) g_pass++; else g_fail++;
+        check("alpha_output", hlsl, "float4 _rsx_out = r[0]");
+        check("alpha_greater", hlsl, "_rsx_out.a > _rsx_alpha_ref");
+        check("alpha_discard", hlsl, "discard;");
+        if (fabsf(rsx_fp_alpha_ref(100, 5) - (100.0f / 255.0f)) < 0.000001f)
+            g_pass++;
+        else
+            g_fail++;
     }
 
     printf("\n===========================================\n");

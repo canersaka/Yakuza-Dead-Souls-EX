@@ -419,3 +419,91 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     if (!o.ok) return -1;
     return count;
 }
+
+static float fp_half_to_float(u16 h)
+{
+    const u32 sign = (u32)(h & 0x8000u) << 16;
+    u32 exponent = (h >> 10) & 0x1Fu;
+    u32 mantissa = h & 0x03FFu;
+    u32 bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            exponent = 127u - 15u + 1u;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            mantissa &= 0x03FFu;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + (127u - 15u)) << 23) | (mantissa << 13);
+    }
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
+{
+    /* NV4097 surface color formats: 14=W16Z16Y16X16,
+     * 15=W32Z32Y32X32, 16=X32. */
+    if (surface_color_format == 14u)
+        return fp_half_to_float((u16)(raw & 0xFFFFu));
+    if (surface_color_format == 15u || surface_color_format == 16u) {
+        float value;
+        memcpy(&value, &raw, sizeof(value));
+        return value;
+    }
+    return (float)(raw & 0xFFu) / 255.0f;
+}
+
+int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
+{
+    if (!hlsl || out_size == 0)
+        return -1;
+
+    const u32 cmp = func >= 0x0200u && func <= 0x0207u ? func - 0x0200u : 7u;
+    if (cmp == 7u)
+        return 0;
+
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p;
+         p = strstr(p + 1, "    return "))
+        marker = p;
+    if (!marker)
+        return -1;
+    char* expression = marker + strlen("    return ");
+    char* terminator = strstr(expression, ";\n}\n");
+    if (!terminator || terminator == expression ||
+        (size_t)(terminator - expression) >= 96)
+        return -1;
+    char output[96];
+    memcpy(output, expression, (size_t)(terminator - expression));
+    output[terminator - expression] = '\0';
+
+    static const char* pass_expr[8] = {
+        "false", "_rsx_out.a < _rsx_alpha_ref",
+        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
+        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
+        "_rsx_out.a >= _rsx_alpha_ref", "true"
+    };
+    char suffix[512];
+    const int n = snprintf(suffix, sizeof(suffix),
+        "    float4 _rsx_out = %s;\n"
+        "    const float _rsx_alpha_ref = %.9g;\n"
+        "    if (!(%s)) discard;\n"
+        "    return _rsx_out;\n}\n",
+        output, (double)ref, pass_expr[cmp]);
+    if (n < 0 || (u32)n >= sizeof(suffix))
+        return -1;
+    const size_t prefix = (size_t)(marker - hlsl);
+    if (prefix + (size_t)n + 1 > out_size)
+        return -1;
+    memcpy(marker, suffix, (size_t)n + 1);
+    return 1;
+}

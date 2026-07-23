@@ -51,6 +51,20 @@ u32 rsx_fp_read_word(const u8* p);
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
+/* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
+ * shader. D3D12 has no fixed-function alpha test, so the comparison is
+ * emitted immediately before the shader's final color return. `func` uses
+ * the CELL_GCM comparison values 0x200..0x207 and `ref` is normalized to the
+ * render target's component representation. Returns 1 when a test was
+ * inserted, 0 for ALWAYS, and -1 if the generated shader could not be
+ * patched safely. */
+int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
+
+/* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
+ * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
+ * half float and X32/W32Z32Y32X32 use a 32-bit float. */
+float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);
