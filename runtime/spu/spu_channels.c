@@ -20,7 +20,7 @@
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
-#include "../../yakuza/generated/spu_image_table.h"
+#include "spu_image_table_compat.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1469,6 +1469,38 @@ void spu_halt(spu_context* ctx, int status)
     if (g_spu_halt_jmp)
         longjmp(*g_spu_halt_jmp, 1);
     /* No unwind target (e.g. unit test): fall back to returning. */
+}
+
+int spu_native_image_executor(spu_context* ctx, int image_id, uint32_t entry_pc)
+{
+    jmp_buf halt_jb, restart_jb;
+    char stack_base_marker;
+    int success;
+    if (!ctx) return 0;
+
+    ctx->image_id = image_id;
+    ctx->pc = entry_pc & SPU_LS_MASK;
+    ctx->status = SPU_STATUS_RUNNING;
+    g_spu_halt_jmp = &halt_jb;
+    g_spu_restart_jmp = &restart_jb;
+    g_spu_stack_base = &stack_base_marker;
+    g_spu_trampoline_fn = 0;
+    if (setjmp(halt_jb) == 0) {
+        (void)setjmp(restart_jb);
+        g_spu_trampoline_fn = 0;
+        ctx->host_depth = 0;
+        spu_indirect_branch(ctx);
+        SPU_DRAIN(ctx);
+        if (ctx->status == SPU_STATUS_RUNNING)
+            ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+    }
+    success = ctx->status == SPU_STATUS_STOPPED_BY_STOP ||
+              ctx->status == SPU_STATUS_STOPPED;
+    g_spu_halt_jmp = 0;
+    g_spu_restart_jmp = 0;
+    g_spu_stack_base = 0;
+    g_spu_trampoline_fn = 0;
+    return success;
 }
 
 /* ===========================================================================
@@ -5192,6 +5224,22 @@ int g_spu_trace_evarm = 0;
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* Firmware-free SPURS task syscall entry. LLE contexts leave the callback
+     * null and proceed through the historical dispatcher unchanged. */
+    if ((ctx->pc & SPU_LS_MASK) == 0x0A70u && ctx->native_spurs_syscall) {
+        int native_result = ctx->native_spurs_syscall(
+            ctx, ctx->native_spurs_opaque);
+        if (native_result > 0) {
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            g_spu_trampoline_fn = spu_indirect_branch;
+        } else if (native_result < 0) {
+            spu_halt(ctx, SPU_STATUS_STOPPED_BY_STOP);
+        } else {
+            spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);
+        }
+        return;
+    }
+
     /*
      * Focused a010 item-lifecycle census.  Start at the first static-stage
      * record rather than the later mature 819-record batch: the top-level

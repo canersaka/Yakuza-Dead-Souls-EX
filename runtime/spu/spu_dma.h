@@ -1826,6 +1826,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+        if (mfc_is_put(cmd)) {
+            extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
+            cellSpursNotifyGuestWrite((uint32_t)ea, size);
+        }
 #ifdef _WIN32
     } __except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION */
                 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
@@ -3778,6 +3782,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               spu_coh_notify_write((uint32_t)(ea & ~127ull)); }  /* clears resv_active + raises LR for all matching ctxs */
             mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
             break;
+        }
+        if ((cmd == MFC_PUTLLC_CMD &&
+             mfc->atomic_stat == MFC_PUTLLC_SUCCESS) ||
+            (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD)) {
+            extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
+            cellSpursNotifyGuestWrite((uint32_t)(ea & ~127ull), 128);
         }
 #if !defined(YZ_PERF_CLEAN)
         /* TS-WATCH (env YZ_TS_WATCH, 2026-06-20 pt27): log every SPU atomic touch of

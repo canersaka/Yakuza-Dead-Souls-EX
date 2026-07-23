@@ -36,6 +36,20 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 extern uint8_t* vm_base;
 
+#ifdef PS3RECOMP_NATIVE_SPURS_PPU_WATCH
+extern volatile uint32_t g_native_spurs_ppu_watch_lo;
+extern volatile uint32_t g_native_spurs_ppu_watch_hi;
+void cellSpursNotifyPpuGuestWrite(uint32_t ea, uint32_t size);
+static inline void vm_native_spurs_notify_write(uint32_t addr, uint32_t size)
+{
+    if (addr < g_native_spurs_ppu_watch_hi &&
+        addr + size > g_native_spurs_ppu_watch_lo)
+        cellSpursNotifyPpuGuestWrite(addr, size);
+}
+#else
+#define vm_native_spurs_notify_write(addr, size) ((void)0)
+#endif
+
 /* ---------------------------------------------------------------------------
  * Address translation
  * -----------------------------------------------------------------------*/
@@ -113,6 +127,7 @@ static inline void vm_write8(uint32_t addr, uint8_t val)
         }
     }
     *vm_ptr8(addr) = val;
+    vm_native_spurs_notify_write(addr, 1);
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
@@ -127,6 +142,7 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
     }
     uint16_t raw = ps3_bswap16(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_native_spurs_notify_write(addr, 2);
 }
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
@@ -218,6 +234,7 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
     }
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_native_spurs_notify_write(addr, 4);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
@@ -246,6 +263,7 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     }
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_native_spurs_notify_write(addr, 8);
 }
 
 static inline void vm_write_f32(uint32_t addr, float val)
