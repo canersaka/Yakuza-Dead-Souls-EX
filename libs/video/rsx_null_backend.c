@@ -7,6 +7,7 @@
  */
 
 #include "rsx_null_backend.h"
+#include "rsx_live_draw.h"
 #include "../input/cellPad.h"
 #include <stdio.h>
 #include <string.h>
@@ -58,6 +59,10 @@ static int s_present_suppressed = 0;
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case RSX_LIVE_DRAW_WM_A010_PROBE:
+        rsx_live_draw_a010_probe_begin();
+        return 0;
+
     case WM_CLOSE:
         s_state.window_closed = 1;
         DestroyWindow(hwnd);

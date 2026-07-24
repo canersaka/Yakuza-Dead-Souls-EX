@@ -630,6 +630,17 @@ extern "C" int yz_movie_hle_armed(void);
 static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
                                const char* host_path)
 {
+    /* Arm the bounded live-renderer capture at the authoritative scene-file
+     * boundary.  This runs before the Route-1 early return because a010 is an
+     * in-engine AUTH scene, not an SFD movie. */
+    if (getenv("YZ_RSX_A010_PROBE") && guest_path &&
+        strstr(guest_path, "/auth/a010/a010.par")) {
+        static volatile LONG a010_probe_armed = 0;
+        if (InterlockedCompareExchange(&a010_probe_armed, 1, 0) == 0) {
+            fprintf(stderr, "[a010-probe] arming on open '%s'\n", guest_path);
+            rsx_live_draw_a010_probe_begin();
+        }
+    }
     if (yz_movie_hle_armed())
         return;                 /* Route-1 HLE owns movies; fd-bridge idle */
     if (fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
@@ -1033,6 +1044,14 @@ static DWORD WINAPI yz_window_thread(LPVOID)
             break;            /* window closed */
         Sleep(8);
     }
+    /* The render window is the host application's lifetime boundary. The
+     * lifted guest main thread has no Win32 close event and otherwise keeps
+     * all audio/worker threads alive after DestroyWindow, leaving an
+     * invisible process playing sound. End the host process when its window
+     * pump observes WM_CLOSE/WM_QUIT. */
+    fprintf(stderr, "[window] closed; terminating host process\n");
+    fflush(stderr);
+    ExitProcess(0);
     return 0;
 }
 

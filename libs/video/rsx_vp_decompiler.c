@@ -133,6 +133,12 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
+    return rsx_vp_decompile_ex(ucode, max_bytes, 0u, out, out_size);
+}
+
+int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
+                        char* out, u32 out_size)
+{
     if (!ucode || !out || out_size < 256) return -1;
 
     /* Body is built first, preamble/epilogue wrap it. */
@@ -212,16 +218,16 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
             case 0x14: snprintf(rhs,sizeof rhs,"(float4)((%s)!=(%s))",A,B); break; /* SNE */
             case 0x15: snprintf(rhs,sizeof rhs,"float4(1,1,1,1)"); break;      /* STR */
             case 0x16: snprintf(rhs,sizeof rhs,"sign(%s)",A); break;           /* SSG */
-            case 0x19: /* TXL: vertex texture fetch. No vertex-texture binding
-                * exists yet (rsx_dispatch decodes no vertex-texture registers
-                * and the VS root sig exposes no SRV table), so we cannot sample
-                * the real texture. Emit a DEFINED value instead of leaving the
-                * destination register carrying whatever it held before: the one
-                * VP in this capture that uses TXL feeds the result into the
-                * skinning temps r0..r3, and leaving them stale exploded the mesh
-                * into spikes. A defined result collapses the mesh to a base pose
-                * rather than scattering it. TODO: real vertex texture sampling. */
-                snprintf(rhs,sizeof rhs,"float4(0,0,0,0)"); break;
+            case 0x19: {
+                const u32 tex_unit = (d2 >> 8) & 3u;
+                if ((vtex_mask >> tex_unit) & 1u)
+                    snprintf(rhs, sizeof rhs,
+                        "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
+                        tex_unit, tex_unit, A);
+                else
+                    snprintf(rhs, sizeof rhs, "float4(0,0,0,0)");
+                break;
+            }
             case 0x0D: /* ARL: address register load, rounds down */
                 if (vmx|vmy|vmz|vmw) {
                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
@@ -327,7 +333,19 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         "    float4 vp_c[512];\n"
         "    float4 vp_posscale;\n"
         "    float4 vp_posoffset;\n"
-        "};\n"
+        "};\n");
+
+    for (u32 vtu = 0; vtu < 4; vtu++) {
+        if (!((vtex_mask >> vtu) & 1u)) continue;
+        char decl[128];
+        snprintf(decl, sizeof(decl),
+            "Texture2D rsx_vtex%u : register(t%u);\n"
+            "SamplerState rsx_vsamp%u : register(s%u);\n",
+            vtu, 16u + vtu, vtu, vtu);
+        emit(&o, decl);
+    }
+
+    emit(&o,
         "VSOutput main(VSInput input) {\n"
         "    float4 v[16];\n"
         "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"

@@ -16,6 +16,7 @@
 
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
+#include "rsx_live_draw.h"
 
 #include <cstdio>
 #include <chrono>
@@ -40,6 +41,45 @@ static bool addr_readable(uint32_t a)
     /* main memory (incl. loaded ELF) or stack region */
     return (a >= 0x00010000u && a < 0x10000000u) ||
            (a >= 0xD0000000u && a < 0xE0000000u);
+}
+
+/* The scene manager's active AUTH slot is the value returned by the game's
+ * own func_00BEC570: *(*(0x014EC864) + 0x220 + 0x94). Poll that authoritative
+ * slot only while the bounded renderer probe is armed, avoiding generated-code
+ * edits or a boot-specific heap address. */
+static void yz_a010_auth_probe_poll(void)
+{
+    static int was_active = 0;
+    static uint32_t prior_object = 0;
+    static uint32_t prior_raw = ~0u;
+    const int active = rsx_live_draw_a010_probe_active();
+    if (!active) {
+        was_active = 0;
+        return;
+    }
+    if (!was_active) {
+        was_active = 1;
+        prior_object = 0;
+        prior_raw = ~0u;
+    }
+
+    constexpr uint32_t manager_global = 0x014EC864u;
+    const uint32_t manager = vm_read32(manager_global);
+    const uint32_t object = addr_readable(manager) &&
+                            addr_readable(manager + 0x2B4u)
+                          ? vm_read32(manager + 0x2B4u) : 0;
+    const uint32_t raw = addr_readable(object) &&
+                         addr_readable(object + 0xFCu)
+                       ? vm_read32(object + 0xFCu) : ~0u;
+    if (object == prior_object && raw == prior_raw)
+        return;
+    prior_object = object;
+    prior_raw = raw;
+    fprintf(stderr,
+            "[a010-auth] manager=%08X object=%08X raw=%s%u tid=%u\n",
+            manager, object, raw == ~0u ? "unreadable/" : "",
+            raw == ~0u ? 0u : raw, yz_thread_current_id());
+    fflush(stderr);
 }
 
 /* One-shot diagnostic Start press at the title callback. The game does not
@@ -591,6 +631,7 @@ extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
     ppu_context* ctx0 = (ppu_context*)ctxv;
     yz_mwply_lifecycle_boundary(tf, ctx0);
+    yz_a010_auth_probe_poll();
     if ((++g_yz_hops_total & 0x9FFFFFull) == 0) /* ~every 10.5M */
         fprintf(stderr, "[hops] total=%llu indirect=%llu static=%llu (%.1f%% static)\n",
                 g_yz_hops_total, g_yz_hops_indirect,

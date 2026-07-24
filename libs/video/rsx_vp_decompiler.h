@@ -36,8 +36,15 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
  * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
  * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
- * Not modeled: condition-code tests, flow control (BRA/CAL/...), TXL. */
+ * Not modeled: condition-code tests and flow control (BRA/CAL/...). TXL is
+ * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+
+/* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
+ * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
+ * Unmasked units retain the defined-zero fallback. */
+int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
+                        char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
