@@ -178,6 +178,12 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Win32 renderer hook: mirror window key messages into the pad backend.  This
+ * supplements GetAsyncKeyState, keeps input tied to the game window, and also
+ * makes PostMessage-based automated acceptance boots deterministic. */
+void cellPad_host_key_event(u32 virtual_key, int down);
+void cellPad_host_key_reset(void);
+
 /* Host movie bridge: latch the current Start state at playback begin, then
  * report only a fresh Start press.  This lets a host decoder request the same
  * cancel/EOS transition as the guest movie player without stealing ordinary

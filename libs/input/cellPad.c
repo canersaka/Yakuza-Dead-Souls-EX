@@ -77,6 +77,9 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+#if PAD_BACKEND_XINPUT
+static volatile LONG s_window_key_state[256];
+#endif
 static int           s_movie_skip_down = 0;
 #if PAD_BACKEND_XINPUT
 static volatile LONG s_movie_skip_active = 0;
@@ -211,7 +214,36 @@ static int pad_keyboard_enabled(void)
 
 static int pad_key_down(int virtual_key)
 {
-    return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
+    const int message_down =
+        virtual_key >= 0 && virtual_key < 256 &&
+        InterlockedCompareExchange(&s_window_key_state[virtual_key], 0, 0) != 0;
+    return message_down || (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
+}
+
+static int pad_window_key_down(int virtual_key)
+{
+    return virtual_key >= 0 && virtual_key < 256 &&
+        InterlockedCompareExchange(&s_window_key_state[virtual_key], 0, 0) != 0;
+}
+
+static int pad_window_key_any_down(void)
+{
+    for (unsigned i = 0; i < 256; ++i)
+        if (InterlockedCompareExchange(&s_window_key_state[i], 0, 0) != 0)
+            return 1;
+    return 0;
+}
+
+void cellPad_host_key_event(u32 virtual_key, int down)
+{
+    if (virtual_key < 256)
+        InterlockedExchange(&s_window_key_state[virtual_key], down ? 1 : 0);
+}
+
+void cellPad_host_key_reset(void)
+{
+    for (unsigned i = 0; i < 256; ++i)
+        InterlockedExchange(&s_window_key_state[i], 0);
 }
 
 static int pad_keyboard_window_focused(void)
@@ -234,8 +266,9 @@ static int pad_host_start_down(void)
             (state.Gamepad.wButtons & XINPUT_GAMEPAD_START))
             down = 1;
     }
-    if (pad_keyboard_enabled() && pad_keyboard_window_focused() &&
-        pad_key_down(VK_RETURN))
+    if (pad_keyboard_enabled() &&
+        ((pad_keyboard_window_focused() && pad_key_down(VK_RETURN)) ||
+         pad_window_key_down(VK_RETURN)))
         down = 1;
     return down;
 }
@@ -261,7 +294,7 @@ static void pad_merge_keyboard(void)
 
     /* GetAsyncKeyState is system-wide. Ignore it unless a process window is
      * foreground so background key state cannot reach guest input. */
-    if (!pad_keyboard_window_focused())
+    if (!pad_keyboard_window_focused() && !pad_window_key_any_down())
         return;
 
     u16 btns = hs->buttons;
