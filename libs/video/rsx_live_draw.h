@@ -88,6 +88,12 @@ u32  rsx_live_draw_get_frames(void);
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
 
+/* Bounded live AUTH diagnostic. The null-backend window starts it from a
+ * private WM_APP message immediately before New Game is confirmed. */
+#define RSX_LIVE_DRAW_WM_A010_PROBE (0x8000u + 0x2A0u)
+void rsx_live_draw_a010_probe_begin(void);
+int  rsx_live_draw_a010_probe_active(void);
+
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
 

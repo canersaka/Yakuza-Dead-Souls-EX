@@ -212,6 +212,34 @@ typedef struct rsx_dsp_texture {
 } rsx_dsp_texture;
 void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out);
 
+/* Vertex-texture units (NV4097_SET_VERTEX_TEXTURE_* at
+ * 0x900 + unit*0x20). Transform-program TXL instructions use these for
+ * per-instance placement and displacement data. */
+#define RSX_DSP_NUM_VERTEX_TEXTURES 4
+#define RSX_TEX_FMT_W16Z16Y16X16_FLOAT 0x9A
+#define RSX_TEX_FMT_W32Z32Y32X32_FLOAT 0x9B
+#define RSX_TEX_FMT_X32_FLOAT          0x9C
+#define RSX_TEX_FMT_Y16X16_FLOAT       0x9F
+
+typedef struct rsx_dsp_vertex_texture {
+    u32 enabled;
+    u32 offset;
+    u32 location;
+    u32 format;
+    u32 dimension;
+    u32 cubemap;
+    u32 mipmaps;
+    u32 width, height;
+    u32 pitch;
+    u32 depth;
+    u32 wrap;
+    u32 filter;
+    u32 control0;
+    u32 border_color;
+} rsx_dsp_vertex_texture;
+void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
+                                rsx_dsp_vertex_texture* out);
+
 /* Transform constants as floats (vec4 slot) */
 static inline const u32* rsx_dsp_constant(const rsx_dispatch* rsx, u32 slot)
 {

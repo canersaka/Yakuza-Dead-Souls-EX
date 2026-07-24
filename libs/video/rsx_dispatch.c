@@ -78,6 +78,7 @@
 #define M_VB_INDEX_BATCH        0x1824
 #define M_TEX_SIZE1             0x1840  /* + unit * 4  (control3)           */
 #define M_TEX_OFFSET            0x1A00  /* + unit * 0x20 (8-word unit block) */
+#define M_VERTEX_TEXTURE        0x0900  /* + unit * 0x20 (8-word unit block) */
 #define M_FP_ACTIVE_PROGRAM     0x08E4  /* offset | dma-context [1:0]        */
 #define M_FP_CONTROL            0x1D60
 #define M_VP_START_FROM_ID      0x1EA0
@@ -403,6 +404,33 @@ void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out
     const u32 sz1  = rsx_dsp_reg(rsx, M_TEX_SIZE1 + unit * 4);
     out->pitch     = sz1 & 0xFFFFF;
     out->depth     = sz1 >> 20;
+}
+
+void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
+                                rsx_dsp_vertex_texture* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (unit >= RSX_DSP_NUM_VERTEX_TEXTURES)
+        return;
+    const u32 base = M_VERTEX_TEXTURE + unit * 0x20;
+    const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
+    out->offset    = rsx_dsp_reg(rsx, base + 0x00);
+    out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+    out->cubemap   = (fmt >> 2) & 1;
+    out->dimension = (fmt >> 4) & 0xF;
+    out->format    = (fmt >> 8) & 0xFF;
+    out->mipmaps   = fmt >> 16;
+    out->wrap      = rsx_dsp_reg(rsx, base + 0x08);
+    out->control0  = rsx_dsp_reg(rsx, base + 0x0C);
+    out->enabled   = out->control0 >> 31;
+    const u32 ctl3 = rsx_dsp_reg(rsx, base + 0x10);
+    out->pitch     = ctl3 & 0xFFFFF;
+    out->depth     = ctl3 >> 20;
+    out->filter    = rsx_dsp_reg(rsx, base + 0x14);
+    const u32 rect = rsx_dsp_reg(rsx, base + 0x18);
+    out->width     = rect >> 16;
+    out->height    = rect & 0xFFFF;
+    out->border_color = rsx_dsp_reg(rsx, base + 0x1C);
 }
 
 u32 rsx_dsp_vertex_data_base_offset(const rsx_dispatch* rsx)
