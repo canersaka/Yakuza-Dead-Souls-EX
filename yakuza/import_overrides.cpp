@@ -3795,6 +3795,9 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
             g_rsx_dispbuf[id].pitch  = (uint32_t)(a5 >> 32);
             g_rsx_dispbuf[id].offset = (uint32_t)(a5 & 0xFFFFFFFF);
             if (id + 1 > g_rsx_dispbuf_count) g_rsx_dispbuf_count = id + 1;
+            rsx_live_draw_set_display_buffer(
+                id, 0, g_rsx_dispbuf[id].offset, g_rsx_dispbuf[id].pitch,
+                g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
         }
         break;
     }

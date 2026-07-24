@@ -60,6 +60,12 @@ int  rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 void rsx_live_draw_seed_registers(const u32* regs, u32 count);
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
 
+/* Register a scanout buffer from sys_rsx_context_attribute(0x104). A flip's
+ * argument indexes this table; it is not necessarily the current render
+ * target when the frame is submitted. */
+void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
+                                      u32 pitch, u32 width, u32 height);
+
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
