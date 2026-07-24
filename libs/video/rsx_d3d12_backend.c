@@ -18,6 +18,7 @@
 
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
+#include "../input/cellPad.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -136,10 +137,19 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
     case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        cellPad_host_key_event((u32)wp, 1);
         if (wp == VK_ESCAPE) {
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
+        return 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        cellPad_host_key_event((u32)wp, 0);
+        return 0;
+    case WM_KILLFOCUS:
+        cellPad_host_key_reset();
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);

@@ -8,10 +8,12 @@
  * DISARMED (default): every override forwards to its lifted body; the only
  * added behavior is bounded logging.
  *
- * ARMED (YZ_MOVIE_HLE=1): mwPly lifecycle calls own a direct host FFmpeg
- * session. Video goes through the already-proven D3D12 presenter and movie
- * audio through cellAudio's host stream; the PS3 Sofdec/SPURS decode work is
- * not started in parallel. GetStat/GetTime expose the documented CRI contract.
+ * ARMED (YZ_MOVIE_HLE=1): mwPly lifecycle calls own a host FFmpeg session.
+ * The default direct presenter remains the stable 30 Hz path. With
+ * YZ_MOVIE_SURFACE_HLE=1, decoded frames are instead written into the movie
+ * surface the game already samples, so its ordinary RSX pass composes
+ * subtitles, fades, and UI. Neither route starts the PS3 Sofdec/SPURS decode
+ * work in parallel. GetStat/GetTime return the title-observed status and clock.
  * PLAYEND comes only from real host media EOS, and teardown remains
  * game-initiated. The old fd bridge disables itself while this route is armed.
  */
@@ -74,6 +76,19 @@ struct MwhleSession {
 
 MwhleSession g_sess;   /* the game runs one movie player instance (measured) */
 
+bool surface_mode()
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("YZ_MOVIE_SURFACE_HLE") ? 1 : 0;
+        fprintf(stderr, "[mwhle] presentation route: %s\n",
+                enabled ? "game movie surface + native compositor"
+                        : "direct host presenter");
+        fflush(stderr);
+    }
+    return enabled != 0;
+}
+
 double now_sec(MwhleSession& s)
 {
     if (s.direct_serial > 0) {
@@ -81,7 +96,7 @@ double now_sec(MwhleSession& s)
         yz_host_movie_time(s.direct_serial, &count, &scale);
         return scale ? (double)count / scale : 0.0;
     }
-    if (s.host_audio)
+    if (s.host_audio && !cellAudioHostStreamFinished())
         return (double)cellAudioHostStreamPositionFrames() / 48000.0;
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
@@ -124,7 +139,8 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
     map_host_path(guest, host, sizeof(host));
     MwhleSession& s = g_sess;
     s.handle = handle;
-    s.direct_serial = yz_host_movie_start(host);
+    if (!surface_mode())
+        s.direct_serial = yz_host_movie_start(host);
     if (s.direct_serial > 0) {
         QueryPerformanceFrequency(&s.freq);
         QueryPerformanceCounter(&s.t0);
@@ -179,7 +195,7 @@ void ensure_decoded(MwhleSession& s)
     } else {
         s.eof = true;
         fprintf(stderr, "[mwhle] host decode EOF handle=%08llX after %u frames "
-                        "(no EOS synthesized; native pipeline owns completion)\n",
+                        "(publishing PLAYEND through the game-owned status poll)\n",
                 s.handle, s.frame_id);
         fflush(stderr);
     }
@@ -192,6 +208,41 @@ bool frame_due(MwhleSession& s)
     const double due = (s.cur_pts > 0.0) ? s.cur_pts
                                          : (double)s.frame_id / s.fps;
     return t >= due;
+}
+
+/* The guest compositor can currently flip below the movie's authored rate.
+ * Decode past frames whose presentation time has already elapsed instead of
+ * stretching the movie and its subtitle timeline. The latest due frame is
+ * still delivered through the ordinary game surface; only obsolete pictures
+ * are dropped, exactly as a real-time player does under load. */
+void catch_up_to_clock(MwhleSession& s)
+{
+    ensure_decoded(s);
+    const double clock = now_sec(s);
+    const double frame_span = 1.0 / s.fps;
+    unsigned dropped = 0;
+    while (s.cur_valid && !s.eof) {
+        const double pts = s.cur_pts > 0.0
+            ? s.cur_pts : (double)s.frame_id / s.fps;
+        if (pts + frame_span >= clock)
+            break;
+        s.cur_valid = false;
+        s.frame_id++;
+        dropped++;
+        ensure_decoded(s);
+        if (dropped >= 240)
+            break;
+    }
+    if (dropped) {
+        static unsigned long batches = 0;
+        batches++;
+        if (batches <= 16 || (batches & 127u) == 0) {
+            fprintf(stderr,
+                    "[mwhle] real-time catch-up batch=%lu dropped=%u next=%u clock=%.3f\n",
+                    batches, dropped, s.frame_id, clock);
+            fflush(stderr);
+        }
+    }
 }
 
 extern "C" uint8_t* vm_base;
@@ -234,9 +285,12 @@ void write_pixels(MwhleSession& s, ppu_context* ctx)
     }
 }
 
-/* Fill the title-observed frame descriptor. Required fields are status at
- * +0x00, dimensions at +0x0C/+0x10, matching identifiers at +0x04/+0x2C,
- * pixel format at +0x08, and scaled frame rate at +0x28. */
+/* Fill the decoded-frame descriptor consumed by the title. Runtime traces
+ * show that the caption path reads the per-file frame and time slots in
+ * addition to the display fields, so every observed slot is initialized.
+ * Offset 0x00 is also used as a signed valid-frame gate before conversion
+ * into the title's output plane. Decoded pixels are already present there;
+ * zero is therefore valid, while -1 continues to mean "no frame". */
 void serve_frame(MwhleSession& s, unsigned long long out_ea, ppu_context* ctx)
 {
     for (unsigned off = 0; off < 0xA8; off += 4)
@@ -247,16 +301,38 @@ void serve_frame(MwhleSession& s, unsigned long long out_ea, ppu_context* ctx)
         fmt = f ? (unsigned)atoi(f) : 1u;      /* enum in {1,2,3}; default 1 pending chase */
         if (fmt < 1 || fmt > 3) fmt = 1;
     }
-    vm_write32(out_ea + 0x00, 0);              /* status: non-negative = frame */
-    vm_write32(out_ea + 0x04, s.frame_id);     /* MUST equal +0x2C */
-    vm_write32(out_ea + 0x08, fmt);
-    vm_write32(out_ea + 0x0C, (uint32_t)s.w);
-    vm_write32(out_ea + 0x10, (uint32_t)s.h);
-    vm_write32(out_ea + 0x14, (uint32_t)s.w);
-    vm_write32(out_ea + 0x18, (uint32_t)s.h);
-    vm_write32(out_ea + 0x28, s.fps_x1000);
-    vm_write32(out_ea + 0x2C, s.frame_id);
-    vm_write32(out_ea + 0x38, s.frame_id);
+    const uint32_t frame_time_ms =
+        (uint32_t)((s.cur_pts > 0.0 ? s.cur_pts
+                                   : (double)s.frame_id / s.fps) * 1000.0 + 0.5);
+    vm_write32(out_ea + 0x00, 0);              /* valid-frame gate */
+    vm_write32(out_ea + 0x04, s.frame_id);     /* frame identifier */
+    vm_write32(out_ea + 0x08, fmt);            /* pixel format */
+    vm_write32(out_ea + 0x0C, (uint32_t)s.w);  /* width */
+    vm_write32(out_ea + 0x10, (uint32_t)s.h);  /* height */
+    vm_write32(out_ea + 0x14, (uint32_t)s.w);  /* display width */
+    vm_write32(out_ea + 0x18, (uint32_t)s.h);  /* display height */
+    vm_write32(out_ea + 0x1C, ((uint32_t)s.w + 15u) / 16u); /* horizontal macroblock count */
+    vm_write32(out_ea + 0x20, ((uint32_t)s.h + 15u) / 16u); /* vertical macroblock count */
+    vm_write32(out_ea + 0x24, 1);              /* intra-frame picture type */
+    vm_write32(out_ea + 0x28, s.fps_x1000);    /* fps * 1000 */
+    vm_write32(out_ea + 0x2C, s.frame_id);     /* stream frame index */
+    vm_write32(out_ea + 0x30, frame_time_ms);  /* stream time */
+    vm_write32(out_ea + 0x34, 1000);           /* time units per second */
+    vm_write32(out_ea + 0x38, 0);              /* concatenation count */
+    vm_write32(out_ea + 0x3C, s.frame_id);     /* file frame index */
+    vm_write32(out_ea + 0x40, frame_time_ms);  /* file time */
+    vm_write32(out_ea + 0x44, 0);              /* decode error count */
+    vm_write32(out_ea + 0x48, 0);              /* received frame count */
+    vm_write32(out_ea + 0x4C, 0);              /* user-data pointer */
+    vm_write32(out_ea + 0x50, 0);              /* user-data size */
+    vm_write32(out_ea + 0x54, 1);              /* progressive frame */
+    vm_write32(out_ea + 0x58, 1);              /* BT.601 color matrix */
+    vm_write32(out_ea + 0x5C, 0);              /* zmin */
+    vm_write32(out_ea + 0x60, 0xFFFFFFFFu);    /* zmax */
+    vm_write32(out_ea + 0x64, 1);              /* MPEG-1 video */
+    /* Codec details (+0x68..+0x9C) and auxiliary data (+0xA0..+0xA4)
+     * are intentionally zero: this title obtains localized captions from
+     * scenario/caption.bin rather than the SFD subtitle channel. */
     write_pixels(s, ctx);
     s.cur_valid = false;
     s.held = true;
@@ -301,9 +377,9 @@ static void mwhle_start_common(const char* tag, ppu_context* ctx,
     log_call(tag, c, ctx);
     if (yz_movie_hle_armed()) {
         session_open(handle, fname);
-        /* Direct host playback owns decode, cadence, audio and status. Do not
+        /* Either host route owns decode, cadence, audio and status. Do not
          * start the PS3 Sofdec/SPURS pipeline in parallel. */
-        if (g_sess.direct_serial > 0)
+        if (session_active(g_sess))
             return;
     }
     lifted(ctx);
@@ -328,8 +404,8 @@ void func_00F4D0A8(ppu_context* ctx)
 {
     static call_counter c;
     log_call("IsNextFrmReady", c, ctx);
-    if (yz_movie_hle_armed() && g_sess.direct_serial > 0) {
-        ctx->gpr[3] = 0; /* direct presenter has no guest frame backlog */
+    if (yz_movie_hle_armed() && session_active(g_sess)) {
+        ctx->gpr[3] = 0; /* host route serves at most the currently due frame */
         return;
     }
     func_00F4D0A8_lifted(ctx);
@@ -351,6 +427,16 @@ void func_00F4D878(ppu_context* ctx)   /* GetCurFrm(handle, out_frame*) */
     if (armed && g_sess.direct_serial > 0) {
         vm_write32(out_ea, 0xFFFFFFFFu);
         ctx->gpr[3] = g_sess.handle;
+        return;
+    }
+    if (armed && g_sess.mv) {
+        MwhleSession& s = g_sess;
+        catch_up_to_clock(s);
+        if (s.cur_valid && frame_due(s))
+            serve_frame(s, out_ea, ctx);
+        else
+            vm_write32(out_ea, 0xFFFFFFFFu);
+        ctx->gpr[3] = s.handle;
         return;
     }
     func_00F4D878_lifted(ctx);
@@ -386,6 +472,18 @@ void func_00F4DA90(ppu_context* ctx)   /* GetFrm(handle, int* out_status, out_fr
         vm_write32(out_ea, 0xFFFFFFFFu);
         return;
     }
+    if (armed && g_sess.mv) {
+        MwhleSession& s = g_sess;
+        catch_up_to_clock(s);
+        if (s.cur_valid && frame_due(s)) {
+            serve_frame(s, out_ea, ctx);
+            vm_write32(stat_ea, 0);
+        } else {
+            vm_write32(stat_ea, 0xFFFFFFFFu);
+            vm_write32(out_ea, 0xFFFFFFFFu);
+        }
+        return;
+    }
     func_00F4DA90_lifted(ctx);
     if (!armed) return;
     if (vm_read32(out_ea + 0x0C) != 0) return;   /* real native fill — yield */
@@ -402,7 +500,7 @@ static void mwhle_release_common(const char* tag, ppu_context* ctx,
 {
     static call_counter c;
     log_call(tag, c, ctx);
-    if (!(yz_movie_hle_armed() && g_sess.direct_serial > 0))
+    if (!(yz_movie_hle_armed() && session_active(g_sess)))
         lifted(ctx);
     if (yz_movie_hle_armed())
         g_sess.held = false;
@@ -433,10 +531,15 @@ void func_00F4E608(ppu_context* ctx)   /* RequestStop */
 {
     static call_counter c;
     log_call("RequestStop", c, ctx);
-    if (yz_movie_hle_armed() && g_sess.direct_serial > 0 &&
+    if (yz_movie_hle_armed() && session_active(g_sess) &&
         ctx->gpr[3] == g_sess.handle) {
         g_sess.stopping = true;
-        yz_host_movie_stop(g_sess.direct_serial);
+        if (g_sess.direct_serial > 0)
+            yz_host_movie_stop(g_sess.direct_serial);
+        else if (g_sess.host_audio) {
+            cellAudioHostStreamStop();
+            g_sess.host_audio = false;
+        }
     }
     func_00F4E608_lifted(ctx);
 }
@@ -464,10 +567,13 @@ void func_00F4FD3C(ppu_context* ctx)
     static unsigned long long last_status = ~0ull;
     yz_movie_hle_armed();
     const unsigned long long handle = ctx->gpr[3];
-    if (g_sess.direct_serial > 0 && handle == g_sess.handle)
+    if (g_sess.direct_serial > 0 && handle == g_sess.handle) {
         ctx->gpr[3] = (uint64_t)yz_host_movie_status(g_sess.direct_serial);
-    else
+    } else if (g_sess.mv && handle == g_sess.handle) {
+        ctx->gpr[3] = g_sess.eof || g_sess.stopping ? 3u : 2u;
+    } else {
         func_00F4FD3C_lifted(ctx);
+    }
     const unsigned long long status = ctx->gpr[3];
     c.n++;
     if (c.n <= 8 || handle != last_handle || status != last_status) {
@@ -484,12 +590,24 @@ void func_00F4F8D0(ppu_context* ctx)   /* GetTime(handle, *ncount, *tscale) */
 {
     static call_counter c;
     log_call("GetTime", c, ctx);
-    if (yz_movie_hle_armed() && g_sess.direct_serial > 0 &&
+    if (yz_movie_hle_armed() && session_active(g_sess) &&
         ctx->gpr[3] == g_sess.handle) {
         uint32_t count = 0, scale = 30;
-        yz_host_movie_time(g_sess.direct_serial, &count, &scale);
+        if (g_sess.direct_serial > 0) {
+            yz_host_movie_time(g_sess.direct_serial, &count, &scale);
+        } else {
+            scale = (uint32_t)(g_sess.fps + 0.5);
+            if (!scale) scale = 30;
+            count = (uint32_t)(now_sec(g_sess) * scale);
+        }
         if (ctx->gpr[4]) vm_write32(ctx->gpr[4], count);
         if (ctx->gpr[5]) vm_write32(ctx->gpr[5], scale);
+        if (c.n <= 16 || (c.n & 255u) == 0) {
+            fprintf(stderr,
+                    "[mwhle] GetTime value n=%lu count=%u scale=%u seconds=%.3f\n",
+                    c.n, count, scale, scale ? (double)count / scale : 0.0);
+            fflush(stderr);
+        }
         return;
     }
     func_00F4F8D0_lifted(ctx);
