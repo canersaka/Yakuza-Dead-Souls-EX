@@ -29,6 +29,9 @@ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void*
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
 void rsx_live_draw_seed_transform_program(const u32* w, u32 n) { (void)w; (void)n; }
+void rsx_live_draw_set_display_buffer(
+    u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
+{ (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
@@ -124,6 +127,10 @@ typedef struct {
     u32 w, h;
 } surface_t;
 typedef struct {
+    u32 location, offset, pitch, width, height;
+    int valid;
+} display_buffer_t;
+typedef struct {
     u32 location, offset;
     ID3D12Resource* tex;
     u32 w, h;
@@ -164,6 +171,7 @@ typedef struct {
 
     surface_t                  surfaces[MAX_SURFACES];
     u32                        n_surfaces;
+    display_buffer_t           display_buffers[8];
 
     ID3D12DescriptorHeap*      dsv_heap;
     u32                        dsv_step;
@@ -2753,6 +2761,22 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
     if (g.ready) rsx_dispatch_seed_transform_program(&g.rsx, words, count);
 }
 
+void rsx_live_draw_set_display_buffer(
+    u32 buffer_id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
+{
+    if (buffer_id >= 8) return;
+    display_buffer_t* display = &g.display_buffers[buffer_id];
+    display->location = location;
+    display->offset = offset;
+    display->pitch = pitch;
+    display->width = width;
+    display->height = height;
+    display->valid = width && height;
+    fprintf(stderr,
+            "[live-draw] display buffer %u = loc%u:0x%08X pitch=%u %ux%u\n",
+            buffer_id, location, offset, pitch, width, height);
+}
+
 void rsx_live_draw_method(u32 method, u32 arg)
 {
     const int composite = ld_movie_composite_ui_enabled();
@@ -3023,11 +3047,29 @@ static void ld_dump_surface_ppm(const char* path, ID3D12Resource* rt)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
-    (void)buffer_id;
-    /* transition the presented surface -> backbuffer copy -> present.
-     * The current color target holds this frame's composite; copy it into the
-     * swap-chain backbuffer and present. */
-    const u32 target = current_surface();
+    /* A flip names a registered display buffer. The current color target may
+     * be an offscreen shadow/postprocess surface at that instant; copying it
+     * caused a010 to present black despite executing the scene's draws. */
+    u32 target = LD_INVALID_SURFACE;
+    if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+        const display_buffer_t* display = &g.display_buffers[buffer_id];
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (g.surfaces[i].location == display->location &&
+                g.surfaces[i].offset == display->offset) {
+                target = i;
+                break;
+            }
+        }
+    }
+    if (target == LD_INVALID_SURFACE) {
+        target = current_surface();
+        static u32 fallback_logs = 0;
+        if (fallback_logs++ < 32)
+            fprintf(stderr,
+                    "[live-draw] flip %u has no registered/rendered scanout; "
+                    "falling back to current surface %u\n",
+                    buffer_id, target);
+    }
     if (target == LD_INVALID_SURFACE) {
         fprintf(stderr, "[live-draw] frame present skipped: no color surface\n");
         return;
