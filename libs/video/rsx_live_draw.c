@@ -115,6 +115,8 @@ typedef struct { u32 location, offset; ID3D12Resource* tex; } surface_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap;
     ID3D12Resource* tex;
+    u64 content_hash;
+    u32 last_hash_frame;
 } texcache_t;
 typedef struct { u64 key; ID3D12PipelineState* pso; } psocache_t;
 
@@ -148,9 +150,23 @@ typedef struct {
     ID3D12Resource*            white_tex;
     texcache_t                 textures[MAX_TEXTURES];
     u32                        n_textures;
+    ID3D12Resource*            retired_textures[MAX_TEXTURES];
+    u32                        n_retired_textures;
     ID3D12Resource*            upload;
     u8*                        upload_mapped;
     u32                        upload_used;
+
+    /* Optional host-movie UI compositor. The guest keeps rendering captions
+     * into its ordinary offscreen surface. Each guest flip reads back the
+     * latest sparse overlay for blending over each 30 Hz host movie frame. */
+    ID3D12Resource*            movie_upload;
+    u8*                        movie_upload_mapped;
+    ID3D12Resource*            movie_overlay_readback;
+    u8*                        movie_overlay_rgba;
+    u8*                        movie_overlay_mask;
+    u32                        movie_overlay_pitch;
+    int                        movie_overlay_valid;
+    u64                        movie_overlay_frames;
 
     ID3D12DescriptorHeap*      smp_cpu_heap;
     ID3D12DescriptorHeap*      smp_heap;
@@ -178,6 +194,16 @@ typedef struct {
 } ld_state;
 
 static ld_state g;
+static u32 g_ld_frames = 0;
+/* Host movie presentation and the FIFO consumer live on different threads but
+ * share one D3D12 command list. Normal gameplay remains single-producer and
+ * bypasses this lock; the active-reader handshake closes the movie-mode
+ * transition race without putting every ordinary RSX method behind an SRW
+ * lock. Host-frame priority prevents a flood of guest caption commands from
+ * starving Present when the window is backgrounded. */
+static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
+static volatile LONG g_ld_guest_active = 0;
+static volatile LONG g_ld_host_waiting = 0;
 
 static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 {
@@ -479,6 +505,13 @@ static void ld_flush(void)
         g.fence->lpVtbl->SetEventOnCompletion(g.fence, v, g.fence_event);
         WaitForSingleObject(g.fence_event, INFINITE);
     }
+    /* Dynamic guest textures can replace a cached D3D resource while an
+     * earlier draw in this command list still references the old one.  The
+     * fence above is the first safe point at which those old resources may be
+     * released. */
+    for (u32 i = 0; i < g.n_retired_textures; i++)
+        g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+    g.n_retired_textures = 0;
     g.alloc->lpVtbl->Reset(g.alloc);
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.upload_used = 0;
@@ -491,6 +524,14 @@ static void ld_flush(void)
  * of real GPU time (measured: ours skips the fence wait RPCS3 performs). Gated
  * at the call site by YZ_RSX_FENCE_SYNC. */
 void rsx_live_draw_flush(void) { if (g.ready) ld_flush(); }
+
+static void retire_texture(ID3D12Resource* tex)
+{
+    if (!tex) return;
+    if (g.n_retired_textures >= MAX_TEXTURES)
+        ld_flush();
+    g.retired_textures[g.n_retired_textures++] = tex;
+}
 
 /* ---------------------------------------------------------------------------
  * texture upload (single-level + mip)
@@ -601,141 +642,256 @@ static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
     return create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, &lv, 1);
 }
 
-/* Decode a guest texture descriptor into a cached SRV slot (with mip chain). */
-static u32 texture_srv_slot(const rsx_dsp_texture* t)
+static u32 texture_source_span(const rsx_dsp_texture* t)
 {
-    const u32 remap = t->remap & 0xFFFF;
-    for (u32 i = 0; i < g.n_textures; i++) {
-        const texcache_t* e = &g.textures[i];
-        if (e->location == t->location && e->offset == t->offset &&
-            e->format == t->format && e->width == t->width &&
-            e->height == t->height && e->pitch == t->pitch && e->remap == remap)
-            return e->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+    const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+    u32 texel_size = 0, block_size = 0;
+    switch (base_fmt) {
+    case TEX_FMT_DXT1:  block_size = 8; break;
+    case TEX_FMT_DXT23:
+    case TEX_FMT_DXT45: block_size = 16; break;
+    case TEX_FMT_B8: texel_size = 1; break;
+    case TEX_FMT_A4R4G4B4:
+    case TEX_FMT_A1R5G5B5:
+    case TEX_FMT_R5G6B5:
+    case TEX_FMT_G8B8: texel_size = 2; break;
+    case TEX_FMT_A8R8G8B8:
+    case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+    default: return 0;
     }
-    if (g.n_textures >= MAX_TEXTURES) return SRV_WHITE;
-    texcache_t* e = &g.textures[g.n_textures];
-    e->location = t->location; e->offset = t->offset; e->format = t->format;
-    e->width = t->width; e->height = t->height; e->pitch = t->pitch;
-    e->remap = remap; e->tex = NULL;
+    if (!t->width || !t->height || t->width > 4096 || t->height > 4096 ||
+        t->dimension != 2 || t->cubemap)
+        return 0;
+    u32 n_mips = t->mipmaps ? t->mipmaps : 1;
+    if (n_mips > 14) n_mips = 14;
+    u32 mw = t->width, mh = t->height, span = 0;
+    for (u32 m = 0; m < n_mips; m++) {
+        if (block_size)
+            span += ((mw + 3) / 4) * block_size * ((mh + 3) / 4);
+        else {
+            const u32 pitch = (m == 0 && linear && t->pitch)
+                ? t->pitch : mw * texel_size;
+            span += pitch * mh;
+        }
+        if (mw == 1 && mh == 1) break;
+        mw = mw > 1 ? mw >> 1 : 1;
+        mh = mh > 1 ? mh >> 1 : 1;
+    }
+    return span;
+}
 
+static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+{
+    const u32 span = texture_source_span(t);
+    const u8* src = span ? guest_ptr(t->location, t->offset, span) : NULL;
+    if (!src) {
+        *readable = 0;
+        return 0;
+    }
+    /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
+     * deliberately cheap; this is a mutation detector, not a content ID. */
+    u64 hash = 1469598103934665603ull;
+    u32 i = 0;
+    for (; i + 8 <= span; i += 8) {
+        u64 word;
+        memcpy(&word, src + i, sizeof(word));
+        hash ^= word;
+        hash *= 1099511628211ull;
+    }
+    for (; i < span; i++) {
+        hash ^= src[i];
+        hash *= 1099511628211ull;
+    }
+    *readable = 1;
+    return hash;
+}
+
+static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+{
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
     const u32 w = t->width, h = t->height;
-    do {
-        if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2 || t->cubemap) break;
-        u32 n_mips = t->mipmaps ? t->mipmaps : 1;
-        if (n_mips > 14) n_mips = 14;
+    if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2 || t->cubemap)
+        return NULL;
+    u32 n_mips = t->mipmaps ? t->mipmaps : 1;
+    if (n_mips > 14) n_mips = 14;
 
-        if (base_fmt == TEX_FMT_DXT1 || base_fmt == TEX_FMT_DXT23 || base_fmt == TEX_FMT_DXT45) {
-            const DXGI_FORMAT dxgi = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
-                                   : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
-                                                               : DXGI_FORMAT_BC3_UNORM;
-            const u32 block = base_fmt == TEX_FMT_DXT1 ? 8 : 16;
-            /* size the whole chain for the bounds check */
-            u32 mw = w, mh = h, total = 0;
-            for (u32 m = 0; m < n_mips; m++) {
-                total += ((mw + 3) / 4) * block * ((mh + 3) / 4);
-                if (mw == 1 && mh == 1) break;
-                mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
-            }
-            const u8* src = guest_ptr(t->location, t->offset, total);
-            if (!src) break;
-            tex_level_t lv[14]; mw = w; mh = h; u32 off = 0, n = 0;
-            for (u32 m = 0; m < n_mips && mw >= 1 && mh >= 1; m++) {
-                const u32 bw = (mw + 3) / 4, bh = (mh + 3) / 4;
-                lv[n].w = (mw + 3) & ~3u; lv[n].h = (mh + 3) & ~3u;
-                lv[n].data = src + off; lv[n].row_bytes = bw * block; lv[n].rows = bh; n++;
-                off += bw * block * bh;
-                if (mw == 1 && mh == 1) break;
-                mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
-            }
-            e->tex = create_texture_mipped(dxgi, lv, n);
-            break;
-        }
-
-        u32 texel_sz;
-        switch (base_fmt) {
-        case TEX_FMT_B8: texel_sz = 1; break;
-        case TEX_FMT_A4R4G4B4:
-        case TEX_FMT_A1R5G5B5:
-        case TEX_FMT_R5G6B5:
-        case TEX_FMT_G8B8: texel_sz = 2; break;
-        case TEX_FMT_A8R8G8B8:
-        case TEX_FMT_DEPTH24_D8: texel_sz = 4; break;
-        default: texel_sz = 0; break;
-        }
-        if (!texel_sz) break;
-        if (!linear && ((w & (w - 1)) || (h & (h - 1)))) break;
-        /* whole-chain byte span for the resolver bound */
-        u32 mw = w, mh = h, span = 0;
+    if (base_fmt == TEX_FMT_DXT1 || base_fmt == TEX_FMT_DXT23 ||
+        base_fmt == TEX_FMT_DXT45) {
+        const DXGI_FORMAT dxgi = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+                               : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
+                                                           : DXGI_FORMAT_BC3_UNORM;
+        const u32 block = base_fmt == TEX_FMT_DXT1 ? 8 : 16;
+        const u32 total = texture_source_span(t);
+        const u8* src = guest_ptr(t->location, t->offset, total);
+        if (!src) return NULL;
+        tex_level_t levels[14];
+        u32 mw = w, mh = h, off = 0, n = 0;
         for (u32 m = 0; m < n_mips; m++) {
-            const u32 mpitch = (m == 0 && linear && t->pitch) ? t->pitch : mw * texel_sz;
-            span += mpitch * mh;
+            const u32 bw = (mw + 3) / 4, bh = (mh + 3) / 4;
+            levels[n].w = (mw + 3) & ~3u;
+            levels[n].h = (mh + 3) & ~3u;
+            levels[n].data = src + off;
+            levels[n].row_bytes = bw * block;
+            levels[n].rows = bh;
+            n++;
+            off += bw * block * bh;
             if (mw == 1 && mh == 1) break;
-            mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
+            mw = mw > 1 ? mw >> 1 : 1;
+            mh = mh > 1 ? mh >> 1 : 1;
         }
-        const u8* src = guest_ptr(t->location, t->offset, span);
-        if (!src) break;
-
-        u8* rgba[14] = {0}; tex_level_t lv[14];
-        mw = w; mh = h; u32 off = 0, n = 0; int oom = 0;
-        for (u32 m = 0; m < n_mips && mw >= 1 && mh >= 1; m++) {
-            const u32 mpitch = (m == 0 && linear && t->pitch) ? t->pitch : mw * texel_sz;
-            rgba[n] = (u8*)malloc((size_t)mw * mh * 4);
-            if (!rgba[n]) { oom = 1; break; }
-            const u32 lw = log2_u32(mw), lh = log2_u32(mh);
-            const u8* lsrc = src + off;
-            for (u32 y = 0; y < mh; y++)
-                for (u32 x = 0; x < mw; x++) {
-                    const u8* p = linear
-                        ? lsrc + (size_t)y * mpitch + (size_t)x * texel_sz
-                        : lsrc + (size_t)morton_index(x, y, lw, lh) * texel_sz;
-                    decode_texel(base_fmt, p, remap, rgba[n] + ((size_t)y * mw + x) * 4);
-                }
-            lv[n].w = mw; lv[n].h = mh; lv[n].data = rgba[n];
-            lv[n].row_bytes = mw * 4; lv[n].rows = mh; n++;
-            off += mpitch * mh;
-            if (mw == 1 && mh == 1) break;
-            mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
-        }
-        if (!oom && n) e->tex = create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, lv, n);
-        for (u32 m = 0; m < n; m++) free(rgba[m]);
-    } while (0);
-
-    if (e->tex) {
-        const int compressed = (base_fmt == TEX_FMT_DXT1 ||
-                                base_fmt == TEX_FMT_DXT23 ||
-                                base_fmt == TEX_FMT_DXT45);
-        if (compressed && remap != 0xAAE4) {
-            /* Compressed blocks are uploaded without CPU decoding, so apply
-             * their component crossbar in the SRV instead. */
-            static const u32 sel2d3d[4] = { 3, 0, 1, 2 }; /* guest A,R,G,B -> D3D A,R,G,B indices */
-            static const u32 out2comp[4] = { 1, 2, 3, 0 }; /* output R,G,B,A -> guest component */
-            u32 mapping[4];
-            for (u32 out = 0; out < 4; out++) {
-                const u32 comp = out2comp[out];
-                const u32 op = (remap >> (8 + comp * 2)) & 3;
-                const u32 sel = (remap >> (comp * 2)) & 3;
-                mapping[out] = (op == 0) ? 4 : (op == 1) ? 5 : sel2d3d[sel];
-            }
-            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
-            sd.Format = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
-                      : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
-                                                  : DXGI_FORMAT_BC3_UNORM;
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            sd.Shader4ComponentMapping = mapping[0] | (mapping[1] << 3) |
-                                         (mapping[2] << 6) | (mapping[3] << 9) |
-                                         (1u << 12);
-            sd.Texture2D.MipLevels = (UINT)-1;
-            g.dev->lpVtbl->CreateShaderResourceView(
-                g.dev, e->tex, &sd, srv_cpu(SRV_TEXTURE_BASE + g.n_textures));
-        } else {
-            srv_write(SRV_TEXTURE_BASE + g.n_textures, e->tex);
-        }
+        return create_texture_mipped(dxgi, levels, n);
     }
-    const u32 slot = e->tex ? SRV_TEXTURE_BASE + g.n_textures : SRV_WHITE;
-    g.n_textures++;
-    return slot;
+
+    u32 texel_size;
+    switch (base_fmt) {
+    case TEX_FMT_B8: texel_size = 1; break;
+    case TEX_FMT_A4R4G4B4:
+    case TEX_FMT_A1R5G5B5:
+    case TEX_FMT_R5G6B5:
+    case TEX_FMT_G8B8: texel_size = 2; break;
+    case TEX_FMT_A8R8G8B8:
+    case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+    default: return NULL;
+    }
+    if (!linear && ((w & (w - 1)) || (h & (h - 1)))) return NULL;
+    const u32 span = texture_source_span(t);
+    const u8* src = guest_ptr(t->location, t->offset, span);
+    if (!src) return NULL;
+
+    u8* rgba[14] = {0};
+    tex_level_t levels[14];
+    u32 mw = w, mh = h, off = 0, n = 0;
+    int oom = 0;
+    for (u32 m = 0; m < n_mips; m++) {
+        const u32 pitch = (m == 0 && linear && t->pitch)
+            ? t->pitch : mw * texel_size;
+        rgba[n] = (u8*)malloc((size_t)mw * mh * 4);
+        if (!rgba[n]) { oom = 1; break; }
+        const u32 lw = log2_u32(mw), lh = log2_u32(mh);
+        const u8* level_src = src + off;
+        for (u32 y = 0; y < mh; y++)
+            for (u32 x = 0; x < mw; x++) {
+                const u8* pixel = linear
+                    ? level_src + (size_t)y * pitch + (size_t)x * texel_size
+                    : level_src + (size_t)morton_index(x, y, lw, lh) * texel_size;
+                decode_texel(base_fmt, pixel, remap,
+                             rgba[n] + ((size_t)y * mw + x) * 4);
+            }
+        levels[n].w = mw;
+        levels[n].h = mh;
+        levels[n].data = rgba[n];
+        levels[n].row_bytes = mw * 4;
+        levels[n].rows = mh;
+        n++;
+        off += pitch * mh;
+        if (mw == 1 && mh == 1) break;
+        mw = mw > 1 ? mw >> 1 : 1;
+        mh = mh > 1 ? mh >> 1 : 1;
+    }
+    ID3D12Resource* resource = (!oom && n)
+        ? create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, levels, n) : NULL;
+    for (u32 m = 0; m < n; m++) free(rgba[m]);
+    return resource;
+}
+
+static void write_texture_srv(u32 index, const texcache_t* entry)
+{
+    const u32 base_fmt = entry->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const int compressed = base_fmt == TEX_FMT_DXT1 ||
+                           base_fmt == TEX_FMT_DXT23 ||
+                           base_fmt == TEX_FMT_DXT45;
+    if (compressed && entry->remap != 0xAAE4) {
+        static const u32 sel2d3d[4] = { 3, 0, 1, 2 };
+        static const u32 out2comp[4] = { 1, 2, 3, 0 };
+        u32 mapping[4];
+        for (u32 out = 0; out < 4; out++) {
+            const u32 comp = out2comp[out];
+            const u32 op = (entry->remap >> (8 + comp * 2)) & 3;
+            const u32 sel = (entry->remap >> (comp * 2)) & 3;
+            mapping[out] = op == 0 ? 4 : op == 1 ? 5 : sel2d3d[sel];
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+        desc.Format = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+                    : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
+                                                : DXGI_FORMAT_BC3_UNORM;
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        desc.Shader4ComponentMapping = mapping[0] | (mapping[1] << 3) |
+                                       (mapping[2] << 6) | (mapping[3] << 9) |
+                                       (1u << 12);
+        desc.Texture2D.MipLevels = (UINT)-1;
+        g.dev->lpVtbl->CreateShaderResourceView(
+            g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
+    } else {
+        srv_write(SRV_TEXTURE_BASE + index, entry->tex);
+    }
+}
+
+/* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+ * descriptor-only cache, re-hash the source once per frame and refresh the
+ * D3D resource when the game rewrites the same guest address. */
+static u32 texture_srv_slot(const rsx_dsp_texture* t)
+{
+    const u32 remap = t->remap & 0xFFFF;
+    static int refresh_enabled = -1;
+    if (refresh_enabled < 0)
+        refresh_enabled = getenv("YZ_RSX_NO_TEX_REFRESH") ? 0 : 1;
+
+    for (u32 i = 0; i < g.n_textures; i++) {
+        texcache_t* entry = &g.textures[i];
+        if (entry->location != t->location || entry->offset != t->offset ||
+            entry->format != t->format || entry->width != t->width ||
+            entry->height != t->height || entry->pitch != t->pitch ||
+            entry->remap != remap)
+            continue;
+        if (refresh_enabled && entry->tex &&
+            entry->last_hash_frame != g_ld_frames) {
+            int readable = 0;
+            const u64 hash = texture_content_hash(t, &readable);
+            entry->last_hash_frame = g_ld_frames;
+            if (readable && hash != entry->content_hash) {
+                ID3D12Resource* replacement = decode_guest_texture(t, remap);
+                if (replacement) {
+                    ID3D12Resource* old = entry->tex;
+                    entry->tex = replacement;
+                    entry->content_hash = hash;
+                    write_texture_srv(i, entry);
+                    retire_texture(old);
+                    static u32 refresh_count = 0;
+                    refresh_count++;
+                    if (refresh_count <= 64 || (refresh_count & 255) == 0)
+                        fprintf(stderr,
+                                "[tex-refresh] n=%u frame=%u unit-src=%u:0x%08X "
+                                "fmt=0x%02X %ux%u\n",
+                                refresh_count, g_ld_frames, t->location, t->offset,
+                                t->format, t->width, t->height);
+                }
+            }
+        }
+        return entry->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+    }
+
+    if (g.n_textures >= MAX_TEXTURES) return SRV_WHITE;
+    const u32 index = g.n_textures++;
+    texcache_t* entry = &g.textures[index];
+    memset(entry, 0, sizeof(*entry));
+    entry->location = t->location;
+    entry->offset = t->offset;
+    entry->format = t->format;
+    entry->width = t->width;
+    entry->height = t->height;
+    entry->pitch = t->pitch;
+    entry->remap = remap;
+    entry->last_hash_frame = g_ld_frames;
+    {
+        int readable = 0;
+        entry->content_hash = texture_content_hash(t, &readable);
+    }
+    entry->tex = decode_guest_texture(t, remap);
+    if (entry->tex)
+        write_texture_srv(index, entry);
+    return entry->tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
 }
 
 /* ---------------------------------------------------------------------------
@@ -961,11 +1117,11 @@ static void fetch_one(u32 base, u32 vert)
 static void fetch_batches(void)
 {
     const u32 base = rsx_dsp_vertex_data_base_offset(&g.rsx);
-    const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
     for (u32 r = 0; r < dc.n_arr && dc.fetch_ok; r++)
         for (u32 i = 0; i < dc.arr[r].count && dc.fetch_ok; i++)
-            fetch_one(base, base_index + dc.arr[r].first + i);
+            fetch_one(base, dc.arr[r].first + i);
     if (!dc.n_idx) return;
+    const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
     rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
     /* Restart sentinel handling, same rule as the replay harness (RPCS3
      * RSXThread.cpp:398 "if (value == restart) continue" + rsx_methods.h
@@ -992,7 +1148,8 @@ static void fetch_batches(void)
                 }
                 continue;
             }
-            fetch_one(base, base_index + index);
+            fetch_one(base,
+                      rsx_dsp_resolve_vertex_index(index, base_index));
         }
 }
 
@@ -1006,7 +1163,6 @@ static void fetch_batches(void)
 
 /* Live-draw activity counters (verification: is real geometry flowing, or only
  * clears?). Reported per presented frame in rsx_live_draw_present. */
-static u32 g_ld_frames = 0;
 /* DRAW_ARRAYS/DRAW_INDEX_ARRAY writes are packets. Multiple packets between a
  * single BEGIN/END are deliberately coalesced into one D3D12 DrawInstanced,
  * so comparing packet count directly with executed D3D draws was invalid.
@@ -1075,12 +1231,256 @@ static void ld_trace_target(const char* event, u32 target, u32 mask)
  * focused post-movie A/B once the transition itself is deterministic. */
 static volatile int g_ld_movie_mode = 0;
 static int g_ld_movie_track_rsx = -1;
+static int g_ld_movie_composite_ui = -1;
+
+static int ld_movie_composite_ui_enabled(void)
+{
+    if (g_ld_movie_composite_ui < 0)
+        g_ld_movie_composite_ui = getenv("YZ_MOVIE_COMPOSITE_UI") ? 1 : 0;
+    return g_ld_movie_composite_ui;
+}
+
+static void ld_movie_reset_rings(void)
+{
+    g.vb_used = 0;
+    g.cb_used = 0;
+    g.srv_ring_used = 0;
+    g.smp_ring_used = 0;
+    g.depth_cleared = 0;
+}
+
+static int ld_movie_overlay_ensure(void)
+{
+    if (g.movie_upload && g.movie_upload_mapped &&
+        g.movie_overlay_readback && g.movie_overlay_rgba &&
+        g.movie_overlay_mask)
+        return 1;
+
+    g.movie_overlay_pitch = (g.width * 4 + 255) & ~255u;
+    const UINT64 rb_size = (UINT64)g.movie_overlay_pitch * g.height;
+    D3D12_HEAP_PROPERTIES hp = {0};
+    D3D12_RESOURCE_DESC bd = {0};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = rb_size;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&g.movie_overlay_readback))) {
+        fprintf(stderr, "[movie-ui] readback allocation failed\n");
+        return 0;
+    }
+    g.movie_overlay_rgba = (u8*)malloc((size_t)g.width * g.height * 4);
+    g.movie_overlay_mask = (u8*)malloc((size_t)g.width * g.height);
+    if (!g.movie_overlay_rgba || !g.movie_overlay_mask) {
+        free(g.movie_overlay_rgba);
+        free(g.movie_overlay_mask);
+        g.movie_overlay_rgba = NULL;
+        g.movie_overlay_mask = NULL;
+        g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
+        g.movie_overlay_readback = NULL;
+        fprintf(stderr, "[movie-ui] CPU overlay allocation failed\n");
+        return 0;
+    }
+
+    /* Do not reuse the general guest upload ring for host frames. Guest draw
+     * commands recorded between flips can still reference that memory; a
+     * dedicated upload buffer lets host presentation append to the same
+     * command list without a second fence/wait on every movie frame. */
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&g.movie_upload))) {
+        free(g.movie_overlay_rgba);
+        free(g.movie_overlay_mask);
+        g.movie_overlay_rgba = NULL;
+        g.movie_overlay_mask = NULL;
+        g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
+        g.movie_overlay_readback = NULL;
+        fprintf(stderr, "[movie-ui] host upload allocation failed\n");
+        return 0;
+    }
+    D3D12_RANGE no_read = {0, 0};
+    if (FAILED(g.movie_upload->lpVtbl->Map(
+            g.movie_upload, 0, &no_read, (void**)&g.movie_upload_mapped))) {
+        g.movie_upload->lpVtbl->Release(g.movie_upload);
+        g.movie_upload = NULL;
+        free(g.movie_overlay_rgba);
+        free(g.movie_overlay_mask);
+        g.movie_overlay_rgba = NULL;
+        g.movie_overlay_mask = NULL;
+        g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
+        g.movie_overlay_readback = NULL;
+        fprintf(stderr, "[movie-ui] host upload map failed\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Start movies from a known transparent guest surface. This removes the stale
+ * pre-movie frame before the game begins drawing captions, while leaving the
+ * swap chain entirely owned by the 30 Hz host presenter. */
+static void ld_movie_overlay_begin(void)
+{
+    g.movie_overlay_valid = 0;
+    g.movie_overlay_frames = 0;
+    if (!ld_movie_overlay_ensure()) return;
+
+    ld_flush();
+    const float transparent[4] = {0, 0, 0, 0};
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        g.list->lpVtbl->ClearRenderTargetView(
+            g.list, rtv_handle(LD_SWAP_BUFFERS + i), transparent, 0, NULL);
+    if (g.n_surfaces) ld_flush();
+    ld_movie_reset_rings();
+    fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
+            g.width, g.height, g.n_surfaces);
+    fflush(stderr);
+}
+
+/* Capture the guest's latest offscreen result without presenting it. The
+ * guest target is not a true transparent overlay: depending on the auth
+ * sequence it can contain black, a fade, or a complete rendered scene.
+ * Extract only low-saturation bright glyphs from the subtitle-safe lower band
+ * and synthesize a small dark outline. The decoded movie therefore remains the
+ * background even when the guest rendered an opaque full-screen image. */
+static void ld_movie_capture_overlay(void)
+{
+    if (!ld_movie_overlay_ensure()) return;
+    const u32 target = current_surface();
+    if (target == LD_INVALID_SURFACE) {
+        g.movie_overlay_valid = 0;
+        return;
+    }
+    ID3D12Resource* rt = g.surfaces[target].tex;
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = rt;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = rt;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = g.movie_overlay_readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = g.width;
+    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = g.movie_overlay_pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_flush();
+
+    const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g.height;
+    u8* mapped = NULL;
+    D3D12_RANGE rr = {0, rb_size};
+    if (FAILED(g.movie_overlay_readback->lpVtbl->Map(
+            g.movie_overlay_readback, 0, &rr, (void**)&mapped))) {
+        g.movie_overlay_valid = 0;
+        return;
+    }
+    for (u32 y = 0; y < g.height; y++)
+        memcpy(g.movie_overlay_rgba + (size_t)y * g.width * 4,
+               mapped + (size_t)y * g.movie_overlay_pitch,
+               (size_t)g.width * 4);
+    D3D12_RANGE wr = {0, 0};
+    g.movie_overlay_readback->lpVtbl->Unmap(
+        g.movie_overlay_readback, 0, &wr);
+
+    const u64 total = (u64)g.width * g.height;
+    const u32 band_y0 = g.height * 52 / 100;
+    const u32 band_y1 = g.height * 96 / 100;
+    const u32 band_x0 = g.width * 5 / 100;
+    const u32 band_x1 = g.width * 95 / 100;
+    const u64 band_pixels =
+        (u64)(band_y1 - band_y0) * (band_x1 - band_x0);
+    u64 glyph_pixels = 0;
+    memset(g.movie_overlay_mask, 0, (size_t)total);
+
+    for (u32 y = band_y0; y < band_y1; y++) {
+        for (u32 x = band_x0; x < band_x1; x++) {
+            const u64 i = (u64)y * g.width + x;
+            const u8* p = g.movie_overlay_rgba + i * 4;
+            const int hi = p[0] > p[1]
+                ? (p[0] > p[2] ? p[0] : p[2])
+                : (p[1] > p[2] ? p[1] : p[2]);
+            const int lo = p[0] < p[1]
+                ? (p[0] < p[2] ? p[0] : p[2])
+                : (p[1] < p[2] ? p[1] : p[2]);
+            if (hi < 145 || hi - lo > 52)
+                continue;
+            int coverage = (hi - 96) * 255 / 159;
+            if (coverage < 64) coverage = 64;
+            if (coverage > 255) coverage = 255;
+            g.movie_overlay_mask[i] = (u8)coverage;
+            glyph_pixels++;
+        }
+    }
+
+    /* A value of 1 denotes the synthetic outline; 64..255 are glyph
+     * coverage. Work from a copy condition (>=64) so dilation does not grow
+     * recursively. */
+    if (glyph_pixels >= 8 && glyph_pixels < band_pixels / 6) {
+        for (u32 y = band_y0; y < band_y1; y++) {
+            for (u32 x = band_x0; x < band_x1; x++) {
+                const u64 i = (u64)y * g.width + x;
+                if (g.movie_overlay_mask[i] < 64)
+                    continue;
+                const u32 ya = y > 1 ? y - 2 : 0;
+                const u32 yb = y + 2 < g.height ? y + 2 : g.height - 1;
+                const u32 xa = x > 1 ? x - 2 : 0;
+                const u32 xb = x + 2 < g.width ? x + 2 : g.width - 1;
+                for (u32 oy = ya; oy <= yb; oy++)
+                    for (u32 ox = xa; ox <= xb; ox++) {
+                        u8* m = &g.movie_overlay_mask[(u64)oy * g.width + ox];
+                        if (!*m) *m = 1;
+                    }
+            }
+        }
+    }
+    g.movie_overlay_valid =
+        glyph_pixels >= 8 && glyph_pixels < band_pixels / 6;
+    g.movie_overlay_frames++;
+    if (g.movie_overlay_frames <= 16 ||
+        (g.movie_overlay_frames & 63) == 0 ||
+        (!g.movie_overlay_valid && glyph_pixels)) {
+        fprintf(stderr,
+                "[movie-ui] overlay=%llu glyphs=%llu/%llu %s\n",
+                (unsigned long long)g.movie_overlay_frames,
+                (unsigned long long)glyph_pixels,
+                (unsigned long long)band_pixels,
+                g.movie_overlay_valid ? "accepted" : "rejected");
+        fflush(stderr);
+    }
+
+    /* A guest flip still marks a new texture-generation boundary even though
+     * the guest surface is not sent to the swap chain. */
+    g_ld_frames++;
+    ld_movie_reset_rings();
+}
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)u; (void)r; g_ld_stats.packets_seen++;
-    if (g_ld_movie_mode) { g_ld_stats.packets_movie++; return; }
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+        g_ld_stats.packets_movie++;
+        return;
+    }
     dc.n_packets++;
     if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
     dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++;
@@ -1089,7 +1489,10 @@ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 coun
 static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)u; (void)r; g_ld_stats.packets_seen++;
-    if (g_ld_movie_mode) { g_ld_stats.packets_movie++; return; }
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+        g_ld_stats.packets_movie++;
+        return;
+    }
     dc.n_packets++;
     if (dc.n_idx >= 256) { g_ld_stats.packets_queue_full++; return; }
     dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++;
@@ -1099,7 +1502,7 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    if (g_ld_movie_mode) return;
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
     g_ld_stats.groups_seen++;
     const u32 prim = g.rsx.current_primitive;
@@ -1315,7 +1718,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
-    if (g_ld_movie_mode) return;
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     g_ld_stats.clears++;
     const u32 target = current_surface();
     if (target == LD_INVALID_SURFACE) { g_ld_stats.clear_drop_surface++; return; }
@@ -1358,7 +1761,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
-    if (g_ld_movie_mode) return;
+    if (g_ld_movie_mode) {
+        if (ld_movie_composite_ui_enabled()) ld_movie_capture_overlay();
+        return;
+    }
     rsx_live_draw_present(arg & 7);
 }
 
@@ -1559,6 +1965,33 @@ void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
 
 void rsx_live_draw_method(u32 method, u32 arg)
 {
+    const int composite = ld_movie_composite_ui_enabled();
+    if (composite) {
+        for (;;) {
+            if (g_ld_movie_mode || g_ld_host_waiting) {
+                while (g_ld_host_waiting)
+                    SwitchToThread();
+                AcquireSRWLockExclusive(&g_ld_access_lock);
+                if (!g.ready) {
+                    ReleaseSRWLockExclusive(&g_ld_access_lock);
+                    return;
+                }
+                rsx_dispatch_method(&g.rsx, method, arg);
+                ReleaseSRWLockExclusive(&g_ld_access_lock);
+                return;
+            }
+            InterlockedIncrement(&g_ld_guest_active);
+            MemoryBarrier();
+            if (!g_ld_movie_mode && !g_ld_host_waiting) {
+                if (g.ready)
+                    rsx_dispatch_method(&g.rsx, method, arg);
+                InterlockedDecrement(&g_ld_guest_active);
+                return;
+            }
+            InterlockedDecrement(&g_ld_guest_active);
+        }
+    }
+
     if (!g.ready) return;
     if (g_ld_movie_mode) {
         if (g_ld_movie_track_rsx < 0)
@@ -1571,17 +2004,47 @@ void rsx_live_draw_method(u32 method, u32 arg)
 void rsx_live_draw_set_movie_mode(int on)
 {
     static unsigned long long suppressed_at_start = 0;
+    const int composite = ld_movie_composite_ui_enabled();
+    if (composite) {
+        InterlockedExchange(&g_ld_host_waiting, 1);
+        if (on) InterlockedExchange((volatile LONG*)&g_ld_movie_mode, 1);
+        while (InterlockedCompareExchange(&g_ld_guest_active, 0, 0) != 0)
+            SwitchToThread();
+        AcquireSRWLockExclusive(&g_ld_access_lock);
+    }
     if (on) {
         suppressed_at_start = g_ld_stats.packets_movie;
-        g_ld_movie_mode = 1;
+        if (composite) ld_movie_overlay_begin();
+        else g_ld_movie_mode = 1;
     } else {
-        g_ld_movie_mode = 0;
-        if (g_ld_movie_track_rsx > 0) {
+        if (composite) {
+            g.movie_overlay_valid = 0;
+            /* Do not expose a partially rendered auth/fade surface between
+             * the last host movie frame and the next clean guest scene. */
+            ld_flush();
+            const float black[4] = {0, 0, 0, 1};
+            for (u32 i = 0; i < g.n_surfaces; i++)
+                g.list->lpVtbl->ClearRenderTargetView(
+                    g.list, rtv_handle(LD_SWAP_BUFFERS + i), black, 0, NULL);
+            if (g.n_surfaces) ld_flush();
+            ld_movie_reset_rings();
+            InterlockedExchange((volatile LONG*)&g_ld_movie_mode, 0);
+            fprintf(stderr, "[movie-ui] compositor disarmed after %llu guest overlays\n",
+                    (unsigned long long)g.movie_overlay_frames);
+            fflush(stderr);
+        } else {
+            g_ld_movie_mode = 0;
+        }
+        if (!composite && g_ld_movie_track_rsx > 0) {
             fprintf(stderr,
                     "[live-draw] movie handoff: tracked RSX state, suppressed %llu guest draw packets\n",
                     g_ld_stats.packets_movie - suppressed_at_start);
             fflush(stderr);
         }
+    }
+    if (composite) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        InterlockedExchange(&g_ld_host_waiting, 0);
     }
 }
 
@@ -1599,13 +2062,66 @@ u32 rsx_live_draw_get_last_draws(void) { return g_ld_last_frame_draws; }
  * movie mode on (so guest draws don't touch g.list). */
 void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 {
-    if (!g.ready || !rgba) return;
+    const int composite = ld_movie_composite_ui_enabled();
+    if (composite) {
+        InterlockedExchange(&g_ld_host_waiting, 1);
+        AcquireSRWLockExclusive(&g_ld_access_lock);
+    }
+    if (!g.ready || !rgba) {
+        if (composite) {
+            ReleaseSRWLockExclusive(&g_ld_access_lock);
+            InterlockedExchange(&g_ld_host_waiting, 0);
+        }
+        return;
+    }
+    if (composite && !ld_movie_overlay_ensure()) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        InterlockedExchange(&g_ld_host_waiting, 0);
+        return;
+    }
     if (w > g.width)  w = g.width;
     if (h > g.height) h = g.height;
     const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
-    if ((UINT64)pitch * h > UPLOAD_SIZE) return;
-    for (u32 y = 0; y < h; y++)
-        memcpy(g.upload_mapped + (size_t)y * pitch, rgba + (size_t)y * w * 4, (size_t)w * 4);
+    if ((UINT64)pitch * h > UPLOAD_SIZE) {
+        if (composite) {
+            ReleaseSRWLockExclusive(&g_ld_access_lock);
+            InterlockedExchange(&g_ld_host_waiting, 0);
+        }
+        return;
+    }
+
+    u8* host_upload = composite ? g.movie_upload_mapped : g.upload_mapped;
+    for (u32 y = 0; y < h; y++) {
+        u8* dstrow = host_upload + (size_t)y * pitch;
+        memcpy(dstrow, rgba + (size_t)y * w * 4, (size_t)w * 4);
+        if (composite && g.movie_overlay_valid && g.movie_overlay_rgba &&
+            g.movie_overlay_mask) {
+            const u8* ov = g.movie_overlay_rgba + (size_t)y * g.width * 4;
+            const u8* mask =
+                g.movie_overlay_mask + (size_t)y * g.width;
+            for (u32 x = 0; x < w; x++, ov += 4) {
+                const int coverage = mask[x];
+                if (!coverage) continue;
+                u8* out = dstrow + (size_t)x * 4;
+                if (coverage == 1) {
+                    out[0] = (u8)((out[0] * 64 + 127) / 255);
+                    out[1] = (u8)((out[1] * 64 + 127) / 255);
+                    out[2] = (u8)((out[2] * 64 + 127) / 255);
+                    continue;
+                }
+                const int white = ov[0] > ov[1]
+                    ? (ov[0] > ov[2] ? ov[0] : ov[2])
+                    : (ov[1] > ov[2] ? ov[1] : ov[2]);
+                for (int c = 0; c < 3; c++) {
+                    const int v =
+                        (white * coverage +
+                         out[c] * (255 - coverage) + 127) / 255;
+                    out[c] = (u8)v;
+                }
+                out[3] = 255;
+            }
+        }
+    }
 
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
@@ -1620,7 +2136,8 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
-    src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.pResource = composite ? g.movie_upload : g.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Offset = 0;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     src.PlacedFootprint.Footprint.Width = w;
@@ -1635,6 +2152,10 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 
     ld_flush();
     g.swap->lpVtbl->Present(g.swap, 1, 0);
+    if (composite) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        InterlockedExchange(&g_ld_host_waiting, 0);
+    }
 }
 
 /* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
@@ -1808,6 +2329,10 @@ void rsx_live_draw_shutdown(void)
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
     for (u32 i = 0; i < g.n_textures; i++) if (g.textures[i].tex) g.textures[i].tex->lpVtbl->Release(g.textures[i].tex);
     for (u32 i = 0; i < g.n_surfaces; i++) if (g.surfaces[i].tex) g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
+    if (g.movie_upload) g.movie_upload->lpVtbl->Release(g.movie_upload);
+    if (g.movie_overlay_readback) g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
+    if (g.movie_overlay_rgba) free(g.movie_overlay_rgba);
+    if (g.movie_overlay_mask) free(g.movie_overlay_mask);
     if (g.white_tex) g.white_tex->lpVtbl->Release(g.white_tex);
     if (g.depth) g.depth->lpVtbl->Release(g.depth);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);

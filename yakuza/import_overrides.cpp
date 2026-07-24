@@ -21,6 +21,7 @@
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 #include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
+#include "../libs/audio/cellAudio.h"
 #include "../libs/filesystem/cellFs.h"
 #include "../libs/input/cellPad.h"
 #include "../libs/system/cellSaveData.h"
@@ -525,6 +526,9 @@ static volatile LONG g_movie_completed_serial = 0;
 static volatile LONG g_movie_cancelled_serial = 0;
 static volatile LONG g_movie_closed_serial = 0;
 static LONG g_movie_played_serial = 0;
+static volatile LONG g_movie_presenting_serial = 0;
+static volatile LONG g_movie_presented_frames = 0;
+static volatile LONG g_movie_present_timescale = 30;
 /* Consumed by dispatch.cpp on guest PPU thread 1. The host presenter may
  * detect EOS, but CRI player lifecycle calls must execute on the guest thread
  * that owns the mwPly handle. */
@@ -535,6 +539,60 @@ extern "C" volatile long g_yz_movie_stop_applied_serial = 0;
  * confirmed title-to-menu callback in dispatch.cpp; movie playback is too
  * early because Dolby/title setup still uses the preload scheduling pattern. */
 extern "C" volatile LONG g_yz_cri_yield_phase = 0;
+
+static void yz_movie_request_cancel(LONG serial, const char* reason);
+
+/* mwPly HLE control surface. Unlike the retired fd/read bridge, this is keyed
+ * directly by the game's Start/Stop lifecycle and never manufactures Stop. */
+extern "C" long yz_host_movie_start(const char* host_path)
+{
+    if (!host_path || !*host_path || !rsx_live_draw_enabled() ||
+        !movie_ffmpeg_available())
+        return 0;
+    AcquireSRWLockExclusive(&g_movie_open_lock);
+    strncpy(g_movie_open_path, host_path, sizeof(g_movie_open_path) - 1);
+    g_movie_open_path[sizeof(g_movie_open_path) - 1] = '\0';
+    const LONG serial = InterlockedIncrement(&g_movie_open_serial);
+    InterlockedExchange(&g_movie_presented_frames, 0);
+    InterlockedExchange(&g_movie_present_timescale, 30);
+    ReleaseSRWLockExclusive(&g_movie_open_lock);
+    fprintf(stderr, "[movie] mwPly queued direct host playback serial=%ld '%s'\n",
+            serial, host_path);
+    fflush(stderr);
+    return serial;
+}
+
+extern "C" void yz_host_movie_stop(long serial)
+{
+    yz_movie_request_cancel((LONG)serial, "game mwPly Stop/RequestStop");
+}
+
+extern "C" int yz_host_movie_status(long serial)
+{
+    if (serial <= 0) return 0;
+    if (InterlockedCompareExchange(&g_movie_completed_serial, 0, 0) >= serial)
+        return 3; /* MWSFD_STAT_PLAYEND */
+    if (InterlockedCompareExchange(&g_movie_presenting_serial, 0, 0) == serial)
+        return 2; /* MWSFD_STAT_PLAYING */
+    return 1;     /* MWSFD_STAT_PREP */
+}
+
+extern "C" void yz_host_movie_time(long serial, uint32_t* count,
+                                    uint32_t* scale)
+{
+    if (!count || !scale || serial <= 0) return;
+    const LONG timescale =
+        InterlockedCompareExchange(&g_movie_present_timescale, 0, 0);
+    uint64_t audio_frames = cellAudioHostStreamPositionFrames();
+    if (audio_frames) {
+        *scale = timescale > 0 ? (uint32_t)timescale : 30u;
+        *count = (uint32_t)((audio_frames * *scale) / 48000u);
+    } else {
+        *scale = timescale > 0 ? (uint32_t)timescale : 30u;
+        *count = (uint32_t)InterlockedCompareExchange(
+            &g_movie_presented_frames, 0, 0);
+    }
+}
 
 #define YZ_MOVIE_FD_SLOTS 64
 struct yz_movie_fd_state {
@@ -567,9 +625,13 @@ static int yz_has_sfd_suffix(const char* path)
     return n >= 4 && _stricmp(path + n - 4, ".sfd") == 0;
 }
 
+extern "C" int yz_movie_hle_armed(void);
+
 static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
                                const char* host_path)
 {
+    if (yz_movie_hle_armed())
+        return;                 /* Route-1 HLE owns movies; fd-bridge idle */
     if (fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
         return;
 
@@ -610,7 +672,8 @@ static void yz_movie_close_hook(CellFsFd fd, const char* guest_path)
 static int yz_movie_read_eof_hook(CellFsFd fd, const char* guest_path,
                                   u64 offset, u64 nbytes)
 {
-    if (!yz_has_sfd_suffix(guest_path) || getenv("YZ_NO_MOVIE_PRESENT") ||
+    if (yz_movie_hle_armed() ||
+        !yz_has_sfd_suffix(guest_path) || getenv("YZ_NO_MOVIE_PRESENT") ||
         getenv("YZ_NO_MOVIE_SYNC") || !rsx_live_draw_enabled() ||
         !movie_ffmpeg_available() || fd < 0 || fd >= YZ_MOVIE_FD_SLOTS)
         return 0;
@@ -686,7 +749,31 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     const uint32_t h = (uint32_t)movie_height(mv);
     int fps = (int)(movie_framerate(mv) + 0.5);
     if (fps <= 0) fps = 30;
-    const DWORD frame_ms = (DWORD)(1000 / fps);
+    const int mwply_hle = yz_movie_hle_armed();
+    /* Decode the first picture before starting the audio clock. MPEG frame
+     * startup can cost roughly one frame, which otherwise makes audio lead
+     * from the first visible image even though steady-state cadence is sound. */
+    double first_pts = 0.0;
+    const uint8_t* first_rgba = movie_next_rgba(mv, &first_pts);
+    if (!first_rgba) {
+        fprintf(stderr, "[movie] no video frames in '%s'\n", path);
+        fflush(stderr);
+        movie_close(mv);
+        yz_movie_complete(serial);
+        return;
+    }
+    /* SFD audio is not always the whole scene mix. Auth sequences can keep
+     * dialogue/voice on the game's ordinary audio ports while the movie
+     * carries music and ambience. Keep the conservative mute as the default,
+     * but honor the same A/B switch as mwPly's non-direct host path so those
+     * independent voices can be mixed during direct presentation. */
+    const int mix_guest = getenv("YZ_MOVIE_HLE_MIX_GUEST") ? 1 : 0;
+    const int host_audio = movie_has_audio(mv) &&
+        cellAudioHostStreamStart(movie_audio_s16(mv),
+                                 movie_audio_frames(mv),
+                                 mix_guest ? 0 : 1) == 0;
+    const ULONGLONG wall_start_ms = GetTickCount64();
+    ULONGLONG last_clock_log_ms = wall_start_ms;
     int frames = 0;
     int superseded = 0;
     int cancelled = 0;
@@ -694,8 +781,12 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int skip_guest_acked = 0;
     int natural_completion = 0;
 
-    fprintf(stderr, "[movie] presenting '%s' (%ux%u @ %d fps)\n",
-            path, w, h, fps);
+    InterlockedExchange(&g_movie_present_timescale, fps);
+    InterlockedExchange(&g_movie_presenting_serial, serial);
+    fprintf(stderr,
+            "[movie] presenting '%s' (%ux%u @ %d fps, audio=%s, owner=%s)\n",
+            path, w, h, fps, host_audio ? "FFmpeg ADX" : "native/none",
+            mwply_hle ? "mwPly HLE" : "fd bridge");
     fflush(stderr);
     rsx_live_draw_set_movie_mode(1);
     cellPad_host_movie_skip_begin();
@@ -728,43 +819,106 @@ static void yz_play_queued_movie(const char* path, LONG serial)
                     serial);
             fflush(stderr);
         }
-        const uint8_t* rgba = movie_next_rgba(mv, nullptr);
+        double pts = 0.0;
+        const uint8_t* rgba;
+        if (frames == 0) {
+            rgba = first_rgba;
+            pts = first_pts;
+        } else {
+            rgba = movie_next_rgba(mv, &pts);
+        }
         if (!rgba) {
             natural_completion = 1;
-            InterlockedExchange(&g_yz_movie_stop_pending_serial, serial);
-            fprintf(stderr,
-                    "[movie] host EOS; queued guest-thread mwPlyStop wrapper serial=%ld\n",
-                    serial);
-            fflush(stderr);
+            if (mwply_hle) {
+                fprintf(stderr,
+                        "[movie] host EOS; publishing PLAYEND to mwPly owner serial=%ld\n",
+                        serial);
+                fflush(stderr);
+            } else {
+                InterlockedExchange(&g_yz_movie_stop_pending_serial, serial);
+                fprintf(stderr,
+                        "[movie] host EOS; queued guest-thread mwPlyStop wrapper serial=%ld\n",
+                        serial);
+                fflush(stderr);
 
-            /* The wrapper runs Stop plus the game's object+0x5e0 completion
-             * callback on the owning PPU thread. Only after that transition is
-             * applied may the host decoder cancel its asynchronous source. */
-            while (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial &&
-                   InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) < serial &&
-                   InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) < serial &&
-                   InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) < serial) {
-                if (rsx_null_backend_pump_messages() < 0)
-                    break;
-                Sleep(8);
+                /* Legacy fd bridge only: the wrapper runs Stop plus the game's
+                 * owner callback on its PPU thread. The mwPly HLE path never
+                 * injects Stop; it reports PLAYEND and lets the game call it. */
+                while (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial &&
+                       InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) < serial &&
+                       InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) < serial &&
+                       InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) < serial) {
+                    if (rsx_null_backend_pump_messages() < 0)
+                        break;
+                    Sleep(8);
+                }
+                const int wrapper_applied =
+                    InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) >= serial;
+                fprintf(stderr,
+                        "[movie] natural completion wrapper_applied=%d serial=%ld\n",
+                        wrapper_applied, serial);
+                fflush(stderr);
+                if (wrapper_applied)
+                    yz_movie_request_cancel(serial, "guest mwPlyStop wrapper");
+                cancelled =
+                    InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) >= serial;
             }
-            const int wrapper_applied =
-                InterlockedCompareExchange(&g_yz_movie_stop_applied_serial, 0, 0) >= serial;
-            fprintf(stderr,
-                    "[movie] natural completion wrapper_applied=%d serial=%ld\n",
-                    wrapper_applied, serial);
-            fflush(stderr);
-            if (wrapper_applied)
-                yz_movie_request_cancel(serial, "guest mwPlyStop wrapper");
-            cancelled =
-                InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) >= serial;
             break;
         }
+        const double target = pts > 0.0 ? pts : (double)frames / fps;
+        for (;;) {
+            const uint64_t audio_cursor =
+                host_audio ? cellAudioHostStreamPositionFrames() : 0;
+            const int audio_finished =
+                host_audio ? cellAudioHostStreamFinished() : 0;
+            const double wall_clock =
+                (GetTickCount64() - wall_start_ms) / 1000.0;
+            /* Audio is authoritative while samples are still playing. Some
+             * clips (notably Sega) intentionally have a silent video tail;
+             * after audio EOS, continue that tail on the same wall clock. */
+            const double clock = host_audio && !audio_finished
+                ? (double)audio_cursor / 48000.0
+                : wall_clock;
+            if (clock + 0.001 >= target) break;
+            const ULONGLONG now_ms = GetTickCount64();
+            if (now_ms - last_clock_log_ms >= 1000) {
+                last_clock_log_ms = now_ms;
+                fprintf(stderr,
+                        "[movie-clock] serial=%ld frame=%d target=%.3f "
+                        "clock=%.3f audio_cursor=%llu finished=%d\n",
+                        serial, frames, target, clock,
+                        (unsigned long long)audio_cursor,
+                        audio_finished);
+                fflush(stderr);
+            }
+            if (InterlockedCompareExchange(&g_movie_cancelled_serial, 0, 0) >= serial) {
+                cancelled = 1;
+                break;
+            }
+            if (rsx_null_backend_pump_messages() < 0) {
+                cancelled = 1;
+                break;
+            }
+            Sleep(1);
+        }
+        if (cancelled) break;
         rsx_live_draw_present_rgba(rgba, w, h);
         frames++;
+        InterlockedExchange(&g_movie_presented_frames, frames);
+        if (frames <= 3 || (frames % fps) == 0) {
+            fprintf(stderr,
+                    "[movie-frame] serial=%ld presented=%d pts=%.3f "
+                    "audio_cursor=%llu\n",
+                    serial, frames, pts,
+                    (unsigned long long)(host_audio
+                        ? cellAudioHostStreamPositionFrames() : 0));
+            fflush(stderr);
+        }
         if (rsx_null_backend_pump_messages() < 0) break;
-        Sleep(frame_ms);
     }
+    if (host_audio)
+        cellAudioHostStreamStop();
+    InterlockedCompareExchange(&g_movie_presenting_serial, 0, serial);
     rsx_live_draw_set_movie_mode(0);
     movie_close(mv);
     /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
@@ -772,7 +926,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
      * flip at that boundary. Let the guest's ordinary flip/event path retire
      * its own work, then publish the sticky source-completion predicate. */
     yz_movie_complete(serial);
-    if (natural_completion) {
+    if (natural_completion && !mwply_hle) {
         while (InterlockedCompareExchange(&g_movie_closed_serial, 0, 0) < serial &&
                InterlockedCompareExchange(&g_movie_open_serial, 0, 0) == serial) {
             if (rsx_null_backend_pump_messages() < 0)
@@ -4425,9 +4579,8 @@ extern "C" void yz_ovr_cellSysutilGetSystemParamInt(ppu_context* ctx)
  * This legacy nine-argument entry is the New Game gate used by Yakuza: Dead
  * Souls.  The generic import bridge only forwards the eight register arguments
  * and used to bind this NID to CELL_ENOSYS, so neither callback ran and the
- * title state machine waited forever on a black screen.  Its operation is the
- * same fixed-selection load flow implemented by cellSaveDataFixedLoad2; the
- * extra errDialog argument is UI policy and does not change that flow.
+ * title state machine waited forever on a black screen. The ninth argument
+ * lives in the caller parameter-save area rather than a GPR.
  * -----------------------------------------------------------------------*/
 extern "C" void yz_ovr_cellSaveDataListAutoLoad(ppu_context* ctx)
 {
@@ -4435,8 +4588,9 @@ extern "C" void yz_ovr_cellSaveDataListAutoLoad(ppu_context* ctx)
     const uint32_t set_buf_ea  = (uint32_t)ctx->gpr[6];
     const uint32_t userdata_ea = (uint32_t)vm_read64(ctx->gpr[1] + 0x70);
 
-    const int32_t rc = cellSaveDataFixedLoad2(
+    const int32_t rc = cellSaveDataListAutoLoad(
         (uint32_t)ctx->gpr[3],
+        (uint32_t)ctx->gpr[4],
         set_list_ea ? (CellSaveDataSetList*)(vm_base + set_list_ea) : NULL,
         set_buf_ea  ? (CellSaveDataSetBuf*)(vm_base + set_buf_ea) : NULL,
         (CellSaveDataFixedCallback)(uintptr_t)(uint32_t)ctx->gpr[7],

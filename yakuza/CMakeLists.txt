@@ -91,12 +91,16 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_a.c"   # jobchain bulk-worker JOB binary (EBOOT 0x01254500 -> ~LS 0x4C00, image 14)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b.c"   # jobchain notify JOB binary (EBOOT 0x01275A00 -> ~LS 0xE400, image 15)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_a_e400.c"   # jobA lifted at the ALTERNATE slot base 0xE400 (jobs are relocatable; measured 2026-07-08)
-    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_4c00.c")   # jobB lifted at the ALTERNATE slot base 0x4C00 (round-1 loads jobB there; measured 2026-07-08)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_4c00.c"   # jobB lifted at the ALTERNATE slot base 0x4C00 (round-1 loads jobB there; measured 2026-07-08)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_15800.c"  # jobB relocated to LS 0x15800 at the post-a030 handoff (measured 2026-07-24)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_c_17800.c"  # post-a030 transition job (EBOOT 0x0125DA80, observed LS 0x17800, image 17)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_d_e400.c")  # sibling post-a030 job (EBOOT 0x01265180, declared 0x10610 B, LS 0xE400, image 18)
 
 add_executable(yakuza_recomp
     main.cpp
     app.rc
     dispatch.cpp
+    mwply_hle.cpp
     shims.cpp
     threads.cpp
     func_table_gen.cpp

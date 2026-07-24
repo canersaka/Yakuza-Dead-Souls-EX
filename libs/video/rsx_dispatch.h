@@ -174,6 +174,15 @@ void rsx_dsp_get_vertex_attr(const rsx_dispatch* rsx, u32 index, rsx_dsp_vertex_
 u32 rsx_dsp_vertex_data_base_offset(const rsx_dispatch* rsx);
 u32 rsx_dsp_vertex_data_base_index(const rsx_dispatch* rsx);
 
+/* RSX adds the element-base index to indexed draws in a 20-bit domain before
+ * vertex fetch. Non-indexed array draws use their range.first directly.
+ * The index-array element width controls only how the raw index is read; it
+ * does not truncate the resolved address back to 16 bits. */
+static inline u32 rsx_dsp_resolve_vertex_index(u32 index, u32 base_index)
+{
+    return (index + base_index) & 0x000FFFFFu;
+}
+
 /* Index array state (IDXBUF_OFFSET / IDXBUF_FORMAT) */
 typedef struct rsx_dsp_index_array {
     u32 offset;

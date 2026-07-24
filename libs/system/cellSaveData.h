@@ -17,7 +17,9 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-#define CELL_SAVEDATA_VERSION_CURRENT    0
+#define CELL_SAVEDATA_VERSION_OLD        0
+#define CELL_SAVEDATA_VERSION_420        1
+#define CELL_SAVEDATA_VERSION_CURRENT    CELL_SAVEDATA_VERSION_420
 
 #define CELL_SAVEDATA_DIRNAME_SIZE       32
 #define CELL_SAVEDATA_FILENAME_SIZE      13
@@ -124,7 +126,17 @@ typedef struct CellSaveDataNewDataIcon {
     char* title;
     u32   iconBufSize;
     void* iconBuf;
+    void* reserved;
 } CellSaveDataNewDataIcon;
+
+typedef struct CellSaveDataAutoIndicator {
+    u32   dispPosition;
+    u32   dispMode;
+    char* dispMsg;
+    u32   picBufSize;
+    void* picBuf;
+    void* reserved;
+} CellSaveDataAutoIndicator;
 
 typedef struct CellSaveDataFixedSet {
     char* dirName;
@@ -172,7 +184,7 @@ typedef struct CellSaveDataFileStat {
     s64  st_atime;
     s64  st_mtime;
     s64  st_ctime;
-    char fileName[CELL_SAVEDATA_FILENAME_SIZE + 3]; /* padded */
+    char fileName[CELL_SAVEDATA_FILENAME_SIZE];
     char reserved2[3];
 } CellSaveDataFileStat;
 
@@ -187,12 +199,13 @@ typedef struct CellSaveDataStatGet {
     u32  fileNum;
     u32  fileListNum;
     CellSaveDataFileStat* fileList;
+    char reserved[64];
 } CellSaveDataStatGet;
 
 typedef struct CellSaveDataStatSet {
     CellSaveDataSystemFileParam* setParam;
     u32  reCreateMode;
-    CellSaveDataNewDataIcon* indicator;
+    CellSaveDataAutoIndicator* indicator;
 } CellSaveDataStatSet;
 
 typedef struct CellSaveDataFileGet {
@@ -215,6 +228,7 @@ typedef struct CellSaveDataFileSet {
 typedef struct CellSaveDataDoneGet {
     s32  excResult;
     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
+    s32  sizeKB;
     s32  hddFreeSizeKB;
     char reserved[64];
 } CellSaveDataDoneGet;
@@ -249,6 +263,7 @@ typedef struct CellSaveDataSetList {
     u32  sortType;
     u32  sortOrder;
     char* dirNamePrefix;
+    void* reserved;
 } CellSaveDataSetList;
 
 typedef struct CellSaveDataSetBuf {
@@ -304,6 +319,22 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            CellSaveDataStatCallback funcStat,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata);
+
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                              CellSaveDataSetList* setList,
+                              CellSaveDataSetBuf* setBuf,
+                              CellSaveDataFixedCallback funcFixed,
+                              CellSaveDataStatCallback funcStat,
+                              CellSaveDataFileCallback funcFile,
+                              u32 container, void* userdata);
+
+s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+                              CellSaveDataSetList* setList,
+                              CellSaveDataSetBuf* setBuf,
+                              CellSaveDataFixedCallback funcFixed,
+                              CellSaveDataStatCallback funcStat,
+                              CellSaveDataFileCallback funcFile,
+                              u32 container, void* userdata);
 
 s32 cellSaveDataDelete2(u32 container);
 

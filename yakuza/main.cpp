@@ -111,6 +111,14 @@ extern "C" void spu_recomp_register_jobbin_b(void);
  * event-flag wall, DONT_RECHASE #23). */
 extern "C" void spu_recomp_register_jobbin_a_e400(void);
 extern "C" void spu_recomp_register_jobbin_b_4c00(void);
+extern "C" void spu_recomp_register_jobbin_b_15800(void);
+/* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
+ * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes);
+ * the observed job-manager launch loads it at LS 0x17800. */
+extern "C" void spu_recomp_register_jobbin_c_17800(void);
+/* Sibling post-a030 job: its JOBCRT header declares a 0x10610-byte binary at
+ * EBOOT EA 0x01265180; the live branch entered its head at LS 0xE400. */
+extern "C" void spu_recomp_register_jobbin_d_e400(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -275,6 +283,97 @@ static int load_elf(const char* path, uint64_t* entry_out)
                g_malloc_pagesize, g_ps3_sdk_version);
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Built-in text overrides
+ *
+ * The English title-menu labels are ordinary NUL-terminated strings in the
+ * EBOOT data segment.  ONLINE FEATURES occupies a 16-byte slot, while the
+ * replacement below needs 20 bytes, so the affected label group is packed
+ * into its existing 0x60-byte storage area and its pointer table is updated.
+ *
+ * Keep this data-driven and baseline-guarded: a mismatched executable is left
+ * untouched instead of receiving writes at addresses derived from this build.
+ * -----------------------------------------------------------------------*/
+static void yz_apply_builtin_text_overrides(void)
+{
+    static constexpr uint32_t kOnlinePointer     = 0x01130004u;
+    static constexpr uint32_t kPackedStrings     = 0x01130008u;
+    static constexpr uint32_t kPackedStringsSize = 0x60u;
+    static constexpr uint32_t kMenuPointers      = 0x01130068u;
+
+    static constexpr uint32_t kOriginalPointers[] = {
+        0x01130008u, /* NEW GAME */
+        0x01130018u, /* LOAD GAME */
+        0x01130028u, /* PREMIUM NEW GAME */
+        0x0112FFD4u, /* PREMIUM ADVENTURE */
+        0x01130040u, /* ULTIMATE BATTLE */
+        0x01130050u, /* REMINISCE */
+        0x0112FFBCu, /* SPECIAL GAMES */
+        0x0112FFF4u, /* ONLINE FEATURES */
+        0x01130060u, /* OPTIONS */
+    };
+
+    if (memcmp(vm_base + 0x0112FFF4u, "ONLINE FEATURES", 16) != 0 ||
+        be32(vm_base + kOnlinePointer) != 0x0112FFF4u) {
+        fprintf(stderr,
+                "[mods] title text override skipped: EBOOT string baseline differs\n");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(kOriginalPointers) / sizeof(kOriginalPointers[0]); i++) {
+        if (be32(vm_base + kMenuPointers + (uint32_t)i * 4u) != kOriginalPointers[i]) {
+            fprintf(stderr,
+                    "[mods] title text override skipped: EBOOT pointer baseline differs\n");
+            return;
+        }
+    }
+
+    static constexpr char kRecompiled[] = "Recompiled by Caner";
+    static constexpr char kNewGame[] = "NEW GAME";
+    static constexpr char kLoadGame[] = "LOAD GAME";
+    static constexpr char kPremiumNewGame[] = "PREMIUM NEW GAME";
+    static constexpr char kUltimateBattle[] = "ULTIMATE BATTLE";
+    static constexpr char kReminisce[] = "REMINISCE";
+    static constexpr char kOptions[] = "OPTIONS";
+
+    uint8_t packed[kPackedStringsSize] = {};
+    uint32_t cursor = 0;
+    uint32_t replacement_pointers[9] = {};
+    const auto append = [&](const char* text, size_t size) -> uint32_t {
+        const uint32_t address = kPackedStrings + cursor;
+        memcpy(packed + cursor, text, size);
+        cursor += (uint32_t)size;
+        return address;
+    };
+
+    const uint32_t recompiled = append(kRecompiled, sizeof(kRecompiled));
+    replacement_pointers[0] = append(kNewGame, sizeof(kNewGame));
+    replacement_pointers[1] = append(kLoadGame, sizeof(kLoadGame));
+    replacement_pointers[2] = append(kPremiumNewGame, sizeof(kPremiumNewGame));
+    replacement_pointers[4] = append(kUltimateBattle, sizeof(kUltimateBattle));
+    replacement_pointers[5] = append(kReminisce, sizeof(kReminisce));
+    replacement_pointers[8] = append(kOptions, sizeof(kOptions));
+    replacement_pointers[3] = kOriginalPointers[3];
+    replacement_pointers[6] = kOriginalPointers[6];
+    replacement_pointers[7] = recompiled;
+
+    if (cursor > kPackedStringsSize) {
+        fprintf(stderr, "[mods] title text override skipped: packed strings overflow\n");
+        return;
+    }
+
+    memcpy(vm_base + kPackedStrings, packed, sizeof(packed));
+    {
+        const uint32_t value = _byteswap_ulong(recompiled);
+        memcpy(vm_base + kOnlinePointer, &value, sizeof(value));
+    }
+    for (size_t i = 0; i < sizeof(replacement_pointers) / sizeof(replacement_pointers[0]); i++) {
+        const uint32_t value = _byteswap_ulong(replacement_pointers[i]);
+        memcpy(vm_base + kMenuPointers + (uint32_t)i * 4u, &value, sizeof(value));
+    }
+
+    printf("[mods] title menu: ONLINE FEATURES -> %s\n", kRecompiled);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2823,6 +2922,7 @@ int main(int argc, char** argv)
     uint64_t e_entry = 0;
     if (load_elf(elf_path, &e_entry) != 0)
         return 1;
+    yz_apply_builtin_text_overrides();
 
     /* LLE firmware: Sony's libsre at its lift_prx relocation base. Must be
      * in place before yz_install_imports patches its import slots. */
@@ -2880,6 +2980,9 @@ int main(int argc, char** argv)
     spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
     spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, slot base 0xE400) */
     spu_recomp_register_jobbin_b_4c00();                  /*   ...same binary lifted at the other slot base 0x4C00 (same image) */
+    spu_recomp_register_jobbin_b_15800();                 /*   ...same binary relocated post-a030 at slot base 0x15800 */
+    spu_begin_image(17); spu_recomp_register_jobbin_c_17800(); /* post-a030 transition job (EBOOT 0x0125DA80, LS 0x17800) */
+    spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);

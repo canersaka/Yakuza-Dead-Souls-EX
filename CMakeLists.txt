@@ -102,14 +102,24 @@ if(NOT YZ_FFMPEG_DIR)
     set(YZ_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3/3rdparty/ffmpeg")
 endif()
 if(WIN32 AND EXISTS "${YZ_FFMPEG_DIR}/include/libavcodec/avcodec.h")
+    if(EXISTS "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avcodec.lib")
+        set(YZ_FFMPEG_LIB_DIR "${YZ_FFMPEG_DIR}/lib/windows/x86_64")
+    elseif(EXISTS "${YZ_FFMPEG_DIR}/lib/avcodec.lib")
+        set(YZ_FFMPEG_LIB_DIR "${YZ_FFMPEG_DIR}/lib")
+    else()
+        message(FATAL_ERROR
+            "ps3recomp: FFmpeg headers found but libraries are missing under "
+            "${YZ_FFMPEG_DIR}")
+    endif()
     message(STATUS "ps3recomp: FFmpeg movie decode ENABLED (${YZ_FFMPEG_DIR})")
     target_compile_definitions(ps3recomp_runtime PRIVATE HAVE_FFMPEG=1)
     target_include_directories(ps3recomp_runtime PRIVATE "${YZ_FFMPEG_DIR}/include")
     target_link_libraries(ps3recomp_runtime PRIVATE
-        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avformat.lib"
-        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avcodec.lib"
-        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/avutil.lib"
-        "${YZ_FFMPEG_DIR}/lib/windows/x86_64/swscale.lib"
+        "${YZ_FFMPEG_LIB_DIR}/avformat.lib"
+        "${YZ_FFMPEG_LIB_DIR}/avcodec.lib"
+        "${YZ_FFMPEG_LIB_DIR}/avutil.lib"
+        "${YZ_FFMPEG_LIB_DIR}/swresample.lib"
+        "${YZ_FFMPEG_LIB_DIR}/swscale.lib"
         secur32)
 else()
     message(STATUS "ps3recomp: FFmpeg not found (${YZ_FFMPEG_DIR}) -- movie decode stubbed")
@@ -143,6 +153,7 @@ if(PS3RECOMP_BUILD_TESTS)
     add_subdirectory(tests/sync_stress)
     add_subdirectory(tests/spu_atomics_stress)
     add_subdirectory(tests/edge_journal_hle)
+    add_subdirectory(libs/system/tests)
 
     # These two suites currently use the MSVC-based generated-code harness.
     # Keep them visible to CTest where that harness is supported; the native
