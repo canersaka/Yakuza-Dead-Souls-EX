@@ -553,40 +553,35 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     spu->image_id = img;
                 }
             }
-            /* SPURS jobchain JOB-BINARY loads (2026-07-03). The job module
-             * (image 13) DMAs each descriptor's eaBinary blob into free LS past
-             * its own end and branches there. Both binaries the game's pxd
-             * jobchain uses are EBOOT-static (measured live: the 14-way bulk
-             * worker + the event-flag notify job); they are lifted as images 14/15.
-             * Record the LS base per context so spu_indirect_branch can switch
-             * to the right lifted image when the module branches into the blob.
-             * Chunked GETs (max 0x4000/transfer) only match on the FIRST
-             * chunk's ea == eaBinary; continuation chunks don't re-record.
+            /* SPURS jobchain JOB-BINARY loads. The job module DMAs each
+             * descriptor's EBOOT-static eaBinary blob into free LS and
+             * branches there. Record the current LS residency per context so
+             * spu_indirect_branch can select the matching fixed relocation.
              * NOT image-gated: a mid-cycle kernel adoption can leave the
-             * module's SPU on image 0 (measured, first jobval boot) and the
-             * descriptor eaBinary values are unique keys on their own. */
+             * module's SPU on a stale image id, while eaBinary is an exact
+             * identity key. */
             if ((lsa & SPU_LS_MASK) >= 0x4880u) {
-                switch ((uint32_t)ea) {
-                case 0x01254500u: { /* image 14 */
+                static const uint32_t job_ea[4] = {
+                    0x01254500u, 0x01275A00u, 0x0125DA80u, 0x01265180u
+                };
+                static const uint32_t job_span[4] = {
+                    0x9540u, 0x14C0u, 0x7640u, 0x10610u
+                };
+                for (int ji = 0; ji < 4; ji++) {
+                    if ((uint32_t)ea != job_ea[ji])
+                        continue;
                     uint32_t base = lsa & SPU_LS_MASK;
-                    uint32_t other = spu->job_bin_base[1];
-                    /* A newly loaded binary owns its entire LS range.  Forget
-                     * an older occupant whose recorded range it replaces, or
-                     * dispatch can resolve the new entry through stale code. */
-                    if (other && base < other + 0x14C0u && other < base + 0x9540u)
-                        spu->job_bin_base[1] = 0;
-                    spu->job_bin_base[0] = base;
+                    /* A newly loaded binary owns its entire LS range. Forget
+                     * any older recorded occupant that it overlaps. */
+                    for (int oi = 0; oi < 4; oi++) {
+                        uint32_t other = spu->job_bin_base[oi];
+                        if (oi != ji && other
+                                && base < other + job_span[oi]
+                                && other < base + job_span[ji])
+                            spu->job_bin_base[oi] = 0;
+                    }
+                    spu->job_bin_base[ji] = base;
                     break;
-                }
-                case 0x01275A00u: { /* image 15 */
-                    uint32_t base = lsa & SPU_LS_MASK;
-                    uint32_t other = spu->job_bin_base[0];
-                    if (other && base < other + 0x9540u && other < base + 0x14C0u)
-                        spu->job_bin_base[0] = 0;
-                    spu->job_bin_base[1] = base;
-                    break;
-                }
-                default: break;
                 }
             }
         } else if (mfc_is_put(cmd)) {

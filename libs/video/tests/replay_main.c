@@ -3540,14 +3540,13 @@ static void fetch_one(sink_ctx* c, const rsx_dispatch* rsx, u32 base, u32 vert)
 static void fetch_batches(sink_ctx* c, const rsx_dispatch* rsx)
 {
     const u32 base = rsx_dsp_vertex_data_base_offset(rsx);
-    const u32 base_index = rsx_dsp_vertex_data_base_index(rsx);
-
     for (u32 r = 0; r < c->n_arr && c->fetch_ok; r++)
         for (u32 i = 0; i < c->arr[r].count && c->fetch_ok; i++)
-            fetch_one(c, rsx, base, base_index + c->arr[r].first + i);
+            fetch_one(c, rsx, base, c->arr[r].first + i);
 
     if (!c->n_idx)
         return;
+    const u32 base_index = rsx_dsp_vertex_data_base_index(rsx);
     rsx_dsp_index_array ia;
     rsx_dsp_get_index_array(rsx, &ia);
     /* Root cause (session s25c, oracle: RPCS3 Emu/RSX/RSXThread.cpp's
@@ -3588,7 +3587,8 @@ static void fetch_batches(sink_ctx* c, const rsx_dispatch* rsx)
                 }
                 continue;
             }
-            fetch_one(c, rsx, base, base_index + index);
+            fetch_one(c, rsx, base,
+                      rsx_dsp_resolve_vertex_index(index, base_index));
         }
     }
 }

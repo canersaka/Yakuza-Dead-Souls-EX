@@ -376,6 +376,19 @@ class PPULifter:
         # declaration but no no-op stub, so the linker binds the real function
         # instead of erroring on a duplicate definition.
         self.extern_funcs: set[int] = set()
+        # Function-override mechanism (--override-funcs): addresses whose
+        # lifted body is emitted under a renamed func_XXXXXXXX_lifted symbol
+        # instead of func_XXXXXXXX, so a hand-written implementation linked
+        # from the game project can own func_XXXXXXXX itself -- every existing
+        # reference to func_XXXXXXXX (direct bl-calls, cross-fragment b
+        # trampolines, the function table, fallthrough gotos) is built from
+        # the raw address rather than a LiftedFunction object, so they keep
+        # resolving to func_XXXXXXXX unchanged, i.e. to the override, with
+        # zero per-call-site changes. Distinct from extern_funcs above: that
+        # one is for a function lifted in a SEPARATE object entirely (a
+        # firmware PRX); this is for a locally lifted function whose
+        # original name is being handed off to hand-written code.
+        self.override_funcs: set[int] = set()
         # Trace mode (--trace): emit ppu_trace_pc(ctx, PC) before every instruction
         # for the PPU differential trace-diff (tools/tracediff.py). Off by default;
         # a trace-enabled build is kept aside (the emission bloats every function).
@@ -2701,6 +2714,13 @@ class PPULifter:
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
+            # Function-override mechanism (--override-funcs): func.name above
+            # is declared but deliberately left without a body in this object
+            # (a hand-written implementation linked from the game project
+            # owns it) -- also prototype the renamed lifted body so that
+            # override, and anything else, can still call through to it.
+            if func.start_addr in self.override_funcs:
+                lines.append(f"void {func.name}_lifted(ppu_context* ctx);")
         # Also declare any referenced targets (calls AND branch/trampoline
         # targets) that aren't defined, so the source always compiles.
         defined = {f.start_addr for f in self.functions}
@@ -2859,6 +2879,12 @@ class PPULifter:
 
     def _function_def_lines(self, func) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
+        # Function-override mechanism (--override-funcs): emit this body under
+        # a renamed symbol so func_XXXXXXXX itself stays undefined here (see
+        # emit_header for its extern declaration + this symbol's prototype).
+        emit_name = (f"{func.name}_lifted" if func.start_addr in self.override_funcs
+                     else func.name)
+
         # This statically linked strcmp is a major synchronous-load hot path in
         # the game image. Lifting its internal basic-block entries separately
         # preserves behavior but turns each short comparison into several
@@ -2867,7 +2893,7 @@ class PPULifter:
         if (self.header_name == "ppu_recomp.h" and
                 func.start_addr == 0x00FB574C):
             return [
-                f"void {func.name}(ppu_context* ctx) {{",
+                f"void {emit_name}(ppu_context* ctx) {{",
                 "    uint32_t lhs = (uint32_t)ctx->gpr[3];",
                 "    uint32_t rhs = (uint32_t)ctx->gpr[4];",
                 "    for (;;) {",
@@ -2890,7 +2916,7 @@ class PPULifter:
         label = self.name_map.get(func.start_addr)
         if label:
             lines.append(f"/* {label} */")
-        lines.append(f"void {func.name}(ppu_context* ctx) {{")
+        lines.append(f"void {emit_name}(ppu_context* ctx) {{")
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -3197,6 +3223,17 @@ def main() -> None:
                              "(e.g. the game's ppu_recomp.h); its func_XXXXXXXX "
                              "declarations get no no-op stubs here, avoiding "
                              "duplicate-symbol link errors")
+    parser.add_argument("--override-funcs", metavar="FILE", default=None,
+                        help="Text file of guest addresses (hex, one per line; "
+                             "blank lines and '#' comments ignored) to hand off "
+                             "to a hand-written implementation: each listed "
+                             "function's lifted body is emitted as "
+                             "func_XXXXXXXX_lifted, and func_XXXXXXXX itself is "
+                             "left as an extern declaration only, so every "
+                             "existing call site (direct calls, the function "
+                             "table, trampoline assignments) transparently "
+                             "resolves to the hand-written override. Addresses "
+                             "not encountered by the lifter produce a warning.")
     parser.add_argument("--table-name", default="function_table",
                         help="Function-table symbol name (a second lifted "
                              "object in one link needs a non-default name)")
@@ -3366,6 +3403,21 @@ def main() -> None:
         print(f"  extern-funcs: {len(lifter.extern_funcs)} symbols from "
               f"{args.extern_funcs} excluded from stub emission", flush=True)
 
+    if args.override_funcs:
+        with open(args.override_funcs) as of:
+            for raw_line in of:
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    lifter.override_funcs.add(int(line, 16))
+                except ValueError:
+                    print(f"Warning: --override-funcs: skipping unparseable "
+                          f"line {raw_line.strip()!r} in {args.override_funcs}",
+                          file=sys.stderr)
+        print(f"  override-funcs: {len(lifter.override_funcs)} addresses loaded "
+              f"from {args.override_funcs}", flush=True)
+
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
     if args.names:
@@ -3416,6 +3468,16 @@ def main() -> None:
               f"{len(lifter.functions)} total)", flush=True)
     if total_mid:
         print(f"  Discovery done: +{total_mid} functions ({len(lifter.functions)} total).", flush=True)
+
+    if lifter.override_funcs:
+        lifted_addrs = {f.start_addr for f in lifter.functions}
+        unmatched = sorted(a for a in lifter.override_funcs if a not in lifted_addrs)
+        if unmatched:
+            print(f"Warning: --override-funcs: {len(unmatched)} of "
+                  f"{len(lifter.override_funcs)} listed address(es) were not "
+                  f"encountered by the lifter (no lifted function starts "
+                  f"there): " + ", ".join(f"0x{a:08X}" for a in unmatched),
+                  file=sys.stderr)
 
     os.makedirs(args.output, exist_ok=True)
 

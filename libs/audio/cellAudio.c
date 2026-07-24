@@ -218,6 +218,19 @@ static inline float rd_be_f32(const float* p)
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
+/* Optional host-native movie stream. It is mixed by the same fixed 48 kHz
+ * audio heartbeat as guest ports, making the consumed sample count the movie
+ * clock. The movie player owns pcm and stops this stream before freeing it. */
+typedef struct {
+    const int16_t* pcm;
+    u64 frame_count;
+    u64 cursor;
+    int present;
+    int finished;
+    int mute_guest_ports;
+} HostAudioStream;
+static HostAudioStream s_host_audio;
+
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
@@ -436,6 +449,8 @@ static void audio_mix_one_block(void)
 
     mutex_lock(&s_audio_mutex);
 
+    const int mix_guest_ports =
+        !(s_host_audio.present && s_host_audio.mute_guest_ports);
     for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
         AudioPortSlot* port = &s_ports[p];
         if (!port->in_use || !port->running || !port->buffer)
@@ -479,8 +494,10 @@ static void audio_mix_one_block(void)
                 right += center + lfe + rr + sr;
             }
 
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
+            if (mix_guest_ports) {
+                s_mix_buffer[s * 2 + 0] += left;
+                s_mix_buffer[s * 2 + 1] += right;
+            }
         }
 
         /* s23 conformance fix: ZERO the consumed block. Spec: "When the
@@ -498,6 +515,20 @@ static void audio_mix_one_block(void)
         port->read_index++;
         if (port->read_idx_addr)
             audio_be_w64((u32)port->read_idx_addr, port->read_index % nblock);
+    }
+
+    if (s_host_audio.present) {
+        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+            if (s_host_audio.cursor >= s_host_audio.frame_count) {
+                s_host_audio.finished = 1;
+                break;
+            }
+            const int16_t* src = s_host_audio.pcm +
+                s_host_audio.cursor * 2;
+            s_mix_buffer[s * 2 + 0] += (float)src[0] / 32768.0f;
+            s_mix_buffer[s * 2 + 1] += (float)src[1] / 32768.0f;
+            s_host_audio.cursor++;
+        }
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -796,6 +827,7 @@ s32 cellAudioQuit(void)
 
     audio_stop_mix_thread();
     audio_backend_shutdown();
+    memset(&s_host_audio, 0, sizeof(s_host_audio));
 
     /* Free all port buffers */
     for (int i = 0; i < CELL_AUDIO_PORT_MAX; i++) {
@@ -807,6 +839,59 @@ s32 cellAudioQuit(void)
     mutex_destroy(&s_audio_mutex);
     s_audio_initialized = 0;
     return CELL_OK;
+}
+
+int cellAudioHostStreamStart(const int16_t* pcm, uint64_t frames,
+                             int mute_guest_ports)
+{
+    if (!s_audio_initialized || !pcm || !frames)
+        return -1;
+    mutex_lock(&s_audio_mutex);
+    s_host_audio.pcm = pcm;
+    s_host_audio.frame_count = frames;
+    s_host_audio.cursor = 0;
+    s_host_audio.present = 1;
+    s_host_audio.finished = 0;
+    s_host_audio.mute_guest_ports = mute_guest_ports ? 1 : 0;
+    mutex_unlock(&s_audio_mutex);
+    printf("[cellAudio] Host movie stream start: %llu frames, guest ports %s\n",
+           (unsigned long long)frames,
+           mute_guest_ports ? "muted" : "mixed");
+    return 0;
+}
+
+void cellAudioHostStreamStop(void)
+{
+    if (!s_audio_initialized)
+        return;
+    mutex_lock(&s_audio_mutex);
+    u64 played = s_host_audio.cursor;
+    int was_present = s_host_audio.present;
+    memset(&s_host_audio, 0, sizeof(s_host_audio));
+    mutex_unlock(&s_audio_mutex);
+    if (was_present)
+        printf("[cellAudio] Host movie stream stop: %llu frames played\n",
+               (unsigned long long)played);
+}
+
+uint64_t cellAudioHostStreamPositionFrames(void)
+{
+    if (!s_audio_initialized)
+        return 0;
+    mutex_lock(&s_audio_mutex);
+    u64 position = s_host_audio.cursor;
+    mutex_unlock(&s_audio_mutex);
+    return position;
+}
+
+int cellAudioHostStreamFinished(void)
+{
+    if (!s_audio_initialized)
+        return 0;
+    mutex_lock(&s_audio_mutex);
+    int finished = s_host_audio.present && s_host_audio.finished;
+    mutex_unlock(&s_audio_mutex);
+    return finished;
 }
 
 /* Guest structs are big-endian (PPC); the import bridge hands us a HOST pointer

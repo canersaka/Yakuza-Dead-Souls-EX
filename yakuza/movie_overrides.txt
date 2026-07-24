@@ -1,0 +1,17 @@
+# mwPly video-HLE override set (Route 1 vertical slice, 2026-07-23).
+# Passed to tools/ppu_lifter.py via --override-funcs: these guest functions are
+# emitted as func_XXXXXXXX_lifted bodies + extern func_XXXXXXXX declarations;
+# yakuza/mwply_hle.cpp owns the plain symbols (pass-through until armed).
+# Addresses from the verified movie symbol map.
+0x00F4E720  # mwPlyStartFname       (observe: session open, fname in r4)
+0x00F51658  # mwPlyStartFnameLp     (observe: loop variant)
+0x00F4D0A8  # mwPlyIsNextFrmReady   (HLE target: frame-ready predicate)
+0x00F4DA90  # mwPlyGetFrm           (HLE target; zero static callers, indirect only)
+0x00F4D878  # mwPlyGetCurFrm        (HLE target: the live frame fetch)
+0x00F4D134  # mwPlyRelCurFrm        (HLE target: 1-deep release)
+0x00F4D210  # mwPlyRelFrm           (HLE target: asymmetric release)
+0x00F4ED44  # mwPlyStop             (observe: game-owned teardown)
+0x00F4E608  # mwPlyRequestStop      (observe: shared stop-signal primitive)
+0x00F4A9AC  # mwPlyDestroy          (observe: session close; 78 direct callers)
+0x00F4FD3C  # GetStat wrapper       (direct HLE: PREP/PLAYING/PLAYEND)
+0x00F4F8D0  # mwPlyGetTime         (direct HLE: displayed-frame clock)

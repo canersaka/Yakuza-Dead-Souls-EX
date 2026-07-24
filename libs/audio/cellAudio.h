@@ -118,6 +118,15 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 /* NID: 0x96A7B2F4 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
+/* Host-native media injection used by the static-recomp movie backend.
+ * PCM is interleaved signed 16-bit stereo at 48 kHz. The caller owns the
+ * buffer and must keep it alive until cellAudioHostStreamStop(). */
+int  cellAudioHostStreamStart(const int16_t* pcm, uint64_t frames,
+                              int mute_guest_ports);
+void cellAudioHostStreamStop(void);
+uint64_t cellAudioHostStreamPositionFrames(void);
+int  cellAudioHostStreamFinished(void);
+
 #ifdef __cplusplus
 }
 #endif

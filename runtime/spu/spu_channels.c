@@ -3580,7 +3580,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
 static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
                                           spu_fn wildcard, int wildcard_img)
 {
-    /* Jobchain-family wildcard guard (2026-07-08). A query from images 13-15
+    /* Jobchain-family wildcard guard (2026-07-08). A query from the module or
+     * any of its lifted job images
      * at a JOB-SPAN address (>= 0x4880, past the module's end; kernel-yield
      * targets are all below 0xA00 and stay wildcard-served by design) that
      * misses its exact image would run ANOTHER image's code at the job site —
@@ -3590,7 +3591,9 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
      * instead; the job binaries are now lifted at both observed slot bases so
      * a legitimate dispatch always has an exact match. Kill-switch:
      * YZ_JOB_WILDCARD_OK=1 restores the old silent substitution. */
-    if (image_id >= 13 && image_id <= 15 && addr >= 0x4880u && wildcard) {
+    if ((image_id == 13 || image_id == 14 || image_id == 15
+            || image_id == 17 || image_id == 18)
+            && addr >= 0x4880u && wildcard) {
         static int ok = -1;
         if (ok < 0) ok = getenv("YZ_JOB_WILDCARD_OK") ? 1 : 0;
         static int wl = 0; if (wl < 32) { wl++;
@@ -4217,26 +4220,30 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
-    /* SPURS JOBCHAIN job dispatch (2026-07-03, images 14/15). The job module
+    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18). The job module
      * (image 13) loads each descriptor's binary into free LS past its own end
      * (module spans LS [0xA00,0x4880)) and `bisl`s to its entry. The DMA
      * recorder (spu_dma.h) captured WHERE each known binary is resident in
      * this context; switch to that lifted image so the job's code resolves.
-     * Spans are the measured descriptor sizeBinary values (jobA 0x9540 = the
-     * 14-way bulk worker, jobB 0x14C0 = the event-flag notify job). */
+     * Spans are the measured descriptor sizeBinary values. */
     {
-        static const uint32_t job_span[2] = { 0x9540u, 0x14C0u };
+        static const uint32_t job_span[4] = {
+            0x9540u, 0x14C0u, 0x7640u, 0x10610u
+        };
+        static const int job_image[4] = { 14, 15, 17, 18 };
         uint32_t jpc = ctx->pc & SPU_LS_MASK;
-        int family = (ctx->image_id >= 13 && ctx->image_id <= 15);
+        int family = ctx->image_id == 13 || ctx->image_id == 14
+                  || ctx->image_id == 15 || ctx->image_id == 17
+                  || ctx->image_id == 18;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
         } else {
-            for (int i = 0; i < 2; i++)
+            for (int i = 0; i < 4; i++)
                 if (ctx->job_bin_base[i]
                         && jpc >= ctx->job_bin_base[i]
                         && jpc <  ctx->job_bin_base[i] + job_span[i])
-                    { jimg = 14 + i; break; }
+                    { jimg = job_image[i]; break; }
             /* A span hit from OUTSIDE the jobchain family: an SPU that lost
              * its image to a mid-cycle kernel adoption (module code runs as
              * straight-line C, so a stale image_id only surfaces at the next
@@ -4251,7 +4258,18 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
         if (jimg > 0 && jimg != ctx->image_id) {
-            static int jl = 0; if (jl < 16) { jl++;
+            /* The ordinary launch census is intentionally capped and is
+             * normally exhausted by image 15 long before the post-a030 job.
+             * Always retain one image-17 witness so a deep boot can prove
+             * whether the gameplay-transition binary was actually selected. */
+            static int jl = 0, j17_seen = 0, j18_seen = 0;
+            int emit_launch = jl < 16
+                           || (jimg == 17 && !j17_seen)
+                           || (jimg == 18 && !j18_seen);
+            if (emit_launch) {
+                if (jl < 16) jl++;
+                if (jimg == 17) j17_seen = 1;
+                if (jimg == 18) j18_seen = 1;
                 fprintf(stderr, "[job-launch] spu=%X image %d -> %d at LS 0x%05X (lr=0x%05X)\n",
                         ctx->spu_id, ctx->image_id, jimg, jpc,
                         ctx->gpr[0]._u32[0] & SPU_LS_MASK);
@@ -4259,8 +4277,10 @@ void spu_indirect_branch(spu_context* ctx)
                  * bases + the RESIDENT head bytes at the branch target, so the log
                  * proves WHICH binary is loaded there (jobA head 43F79802..., jobB
                  * head 43494E02..., from the EBOOT at 0x01254500/0x01275A00). */
-                fprintf(stderr, "[job-launch]   jobbase A=0x%05X B=0x%05X ls@0x%05X:",
-                        ctx->job_bin_base[0], ctx->job_bin_base[1], jpc);
+                fprintf(stderr, "[job-launch]   jobbase A=0x%05X B=0x%05X C=0x%05X D=0x%05X "
+                        "ls@0x%05X:", ctx->job_bin_base[0],
+                        ctx->job_bin_base[1], ctx->job_bin_base[2],
+                        ctx->job_bin_base[3], jpc);
                 for (int bi = 0; bi < 16; bi++)
                     fprintf(stderr, " %02X", ctx->ls[(jpc + bi) & SPU_LS_MASK]);
                 fprintf(stderr, "\n");
@@ -4754,15 +4774,20 @@ void spu_indirect_branch(spu_context* ctx)
         uint32_t la = ctx->pc & SPU_LS_MASK;
         int foreign = 0, foreign_img = 0; spu_fn ffn = 0;
         int pol_seen = 0; spu_fn pol_fn = 0;
-        /* The jobchain job binaries (images 14/15) are only ever entered from
+        /* The jobchain job binaries are only ever entered from
          * the job module via the recorded-DMA switch above -- exclude them as
          * foreign owners for every other context so their addresses can't
          * push a previously exactly-one adoption into ambiguity. */
-        int from_jobworld = (ctx->image_id >= 13 && ctx->image_id <= 15);
+        int from_jobworld = ctx->image_id == 13 || ctx->image_id == 14
+                         || ctx->image_id == 15 || ctx->image_id == 17
+                         || ctx->image_id == 18;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
-                        && (s_registry[i].image_id == 14 || s_registry[i].image_id == 15))
+                        && (s_registry[i].image_id == 14
+                            || s_registry[i].image_id == 15
+                            || s_registry[i].image_id == 17
+                            || s_registry[i].image_id == 18))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
@@ -4900,11 +4925,14 @@ void spu_indirect_branch(spu_context* ctx)
             unk_log--;
             uint32_t a = ctx->pc & SPU_LS_MASK;
             fprintf(stderr, "[SPU] unknown branch full_pc=0x%08X LS 0x%05X (image %d) "
-                    "gpr0=%08X_%08X gpr1=%08X_%08X gpr2=%08X_%08X bytes:",
+                    "gpr0=%08X_%08X gpr1=%08X_%08X gpr2=%08X_%08X "
+                    "jobbase=[%05X %05X %05X %05X] bytes:",
                     ctx->pc, a, ctx->image_id,
                     ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[1],
                     ctx->gpr[1]._u32[0], ctx->gpr[1]._u32[1],
-                    ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1]);
+                    ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1],
+                    ctx->job_bin_base[0], ctx->job_bin_base[1],
+                    ctx->job_bin_base[2], ctx->job_bin_base[3]);
             for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[(a + i) & SPU_LS_MASK]);
             fprintf(stderr, "\n");
             /* s24 SOURCE ATTRIBUTION (the 0x2004 phantom-death race, DONT_RECHASE

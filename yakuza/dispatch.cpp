@@ -363,8 +363,16 @@ static uint32_t yz_active_movie_owner(uint32_t* slot_out)
     return yz_movie_heap_ptr(owner) ? owner : 0;
 }
 
+extern "C" int yz_movie_hle_armed(void);
+
 static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
 {
+    /* Route-1 HLE armed: movies run the native lifecycle + host frame leaves;
+     * none of this bridge-era machinery (capture, serials, injected Stop,
+     * owner completion) may act. */
+    if (yz_movie_hle_armed())
+        return;
+
     static void* start_fn = nullptr;
     static void* stop_fn = nullptr;
     static void* stop_wrapper_fn = nullptr;
@@ -372,6 +380,7 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
     static void* owner_cleanup_fn = nullptr;
     static void* ready_fn = nullptr;
     static void* frame_fn = nullptr;
+    static void* audio_fn = nullptr;
     if (!start_fn) start_fn = (void*)yz_lookup_func(0x00F4E720u);
     if (!stop_fn)  stop_fn  = (void*)yz_lookup_func(0x00F4ED44u);
     if (!stop_wrapper_fn) stop_wrapper_fn = (void*)yz_lookup_func(0x00F495DCu);
@@ -379,11 +388,20 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
     if (!owner_cleanup_fn) owner_cleanup_fn = (void*)yz_lookup_func(0x00D37980u);
     if (!ready_fn) ready_fn = (void*)yz_lookup_func(0x00F4D0A8u);
     if (!frame_fn) frame_fn = (void*)yz_lookup_func(0x00F4DA90u);
+    if (!audio_fn) audio_fn = (void*)yz_lookup_func(0x00F48E48u);
 
-    /* Diagnostic fallback for early boot movies that do not have the game
-     * movie owner registered. Never replace it from GetAudioPcmData: r3 is
-     * an output structure there, not an mwPly handle. */
-    if (fn == start_fn || fn == ready_fn || fn == frame_fn) {
+    /* Handle capture feeds the startup Stop-wrapper fallback. The 0x00F48E48
+     * probe (logged "GetAudioPcmData", its historical label) must stay in the
+     * capture set: measured on the 07-22/07-23 startup boots it is the ONLY
+     * probe that fires for host-presented startup movies (StartFname/
+     * IsNextFrmReady/GetFrm never hit), and the value it captures drives the
+     * wrapper for both startup serials. Removing it (d27c226) silently killed
+     * the fallback. Address 0x00F48E48 is a false functions.json boundary
+     * mid-body of func_00F48DA0, a SPURS taskset
+     * creator -- NOT mwPlyGetAudioPcmData_PS3 as FLAGS.md claims. The captured
+     * r3 is an accidental but boot-stable invariant that satisfies the Stop
+     * wrapper; retire it when the real mwPly ABI seam lands. */
+    if (fn == start_fn || fn == ready_fn || fn == frame_fn || fn == audio_fn) {
         const uint32_t handle = (uint32_t)ctx->gpr[3];
         if (handle && handle != g_yz_mwply_active_handle) {
             g_yz_mwply_active_handle = handle;
@@ -391,7 +409,7 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
                     handle,
                     fn == start_fn ? "StartFname" :
                     fn == ready_fn ? "IsNextFrmReady" :
-                    "GetFrm",
+                    fn == frame_fn ? "GetFrm" : "GetAudioPcmData",
                     yz_thread_current_id());
             fflush(stderr);
         }
@@ -407,9 +425,28 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
         g_yz_mwply_stop_injecting || fn == stop_fn)
         return;
 
+    /* The owner completion/cleanup path is only proven for post-title movies
+     * (a020 after New Game). The 2026-07-23 d27 boot showed startup movies
+     * ALSO register a manager owner (Sega serial 1, owner state 2) but its
+     * completion request never advances to state 4, stalling the transition.
+     * Gate on the confirmed title-to-menu phase bit instead of owner!=0. */
+    const bool post_title =
+        _InterlockedCompareExchange(&g_yz_cri_yield_phase, 0, 0) != 0;
+
     uint32_t owner_slot = 0;
     const uint32_t owner = yz_active_movie_owner(&owner_slot);
-    if (owner) {
+    if (owner && !post_title) {
+        static long logged_serial = 0;
+        if (logged_serial != serial) {
+            logged_serial = serial;
+            fprintf(stderr,
+                    "[movie] pre-title owner=%08X ignored; using wrapper "
+                    "fallback serial=%ld tid=1\n",
+                    owner, serial);
+            fflush(stderr);
+        }
+    }
+    if (owner && post_title) {
         const uint32_t state = vm_read32(owner + 0x104u);
         const uint32_t player = vm_read32(owner + 0xFCu);
 
@@ -461,8 +498,8 @@ static void yz_mwply_lifecycle_boundary(void* fn, ppu_context* ctx)
         return;
     }
 
-    /* Early boot fallback: those movies predate the owner registration used
-     * by gameplay sequences. Preserve their existing wrapper path. */
+    /* Startup movie path (pre-title, whether or not a manager owner is
+     * registered): the established mwPly Stop-wrapper. */
     const uint32_t handle = g_yz_mwply_active_handle;
     if (!handle)
         return;
