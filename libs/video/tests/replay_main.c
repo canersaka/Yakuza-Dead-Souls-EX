@@ -3681,6 +3681,61 @@ static int log_draw_index(u32 draw_index)
     return 0;
 }
 
+/* RSX_DRAW_CSV=path: emit the same core per-draw state signature used by
+ * the live renderer's YZ_RSX_DRAW_CSV probe.  This intentionally stays
+ * renderer-neutral: it records the draw after vertex expansion and PSO
+ * selection, without changing replay ordering or GPU work. */
+static void draw_csv_emit(sink_ctx* c, const rsx_dispatch* rsx, u32 target,
+                          u32 prim, u32 n_tri, u64 pso_key)
+{
+    static int inited = 0;
+    static FILE* file = NULL;
+    if (!inited) {
+        inited = 1;
+        const char* path = getenv("RSX_DRAW_CSV");
+        if (path && path[0]) {
+            file = fopen(path, "w");
+            if (file) {
+                fprintf(file,
+                    "draw,surf,prim,verts,pso_key,blend,dtest,dwrite,dfunc,"
+                    "cull,cullface,frontface,cmask,vpx,vpy,vpw,vph,"
+                    "sclx,scly,sclz,trnx,trny,trnz,clipw,cliph,"
+                    "zeta_off,zeta_pitch,zeta_loc\n");
+                printf("[replay] RSX_DRAW_CSV ARMED: %s\n", path);
+            } else {
+                printf("[replay] RSX_DRAW_CSV: cannot open %s\n", path);
+            }
+        }
+    }
+    if (!file)
+        return;
+
+    render_state_t rs;
+    decode_render_state(rsx, &rs);
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_viewport(rsx, &vp);
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(rsx, &sf);
+    const u32 surf =
+        target < g.n_surfaces ? g.surfaces[target].offset : 0;
+
+    fprintf(file,
+        "%u,0x%X,%u,%u,%016llx,"
+        "%u,%u,%u,0x%X,%u,0x%X,0x%X,0x%08X,"
+        "%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+        "%u,%u,0x%X,%u,%u\n",
+        c->draw_count, surf, prim, n_tri,
+        (unsigned long long)pso_key,
+        rs.blend_enable, rs.depth_test, rs.depth_write, rs.depth_func,
+        rs.cull_enable, rs.cull_face, rs.front_face, rs.color_mask,
+        vp.x, vp.y, vp.w, vp.h,
+        vp.scale[0], vp.scale[1], vp.scale[2],
+        vp.translate[0], vp.translate[1], vp.translate[2],
+        sf.clip_w, sf.clip_h, sf.zeta_offset, sf.zeta_pitch,
+        sf.zeta_location);
+    fflush(file);
+}
+
 /* Expand the accumulated primitive to a triangle/line list and record a draw. */
 static void sink_end(void* user, const rsx_dispatch* rsx)
 {
@@ -4022,6 +4077,7 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     }
 
     const u32 target = current_surface(rsx);
+    draw_csv_emit(c, rsx, target, prim, n_tri, dbg_vp_key);
 
     /* [skin] diag (scratch/s24_replay_fixes.md "The remaining defect"):
      * every draw whose VP was detected as 4-bone linear-blend skinning
