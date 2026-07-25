@@ -1127,6 +1127,36 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     return 0;
 }
 
+/* sys_spu_thread_group_disconnect_event_all_threads(group_id, spup)
+ * (syscall 252). The port binding installed by syscall 251 is shared by all
+ * threads in our group model, so clearing the group slot is equivalent to
+ * clearing that port on every member. RPCS3/CellOS return EINVAL for ports
+ * outside 0..63 and ESRCH for a stale group id. */
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(
+    ppu_context* ctx)
+{
+    const uint32_t group_id = (uint32_t)ctx->gpr[3];
+    const uint32_t spup = (uint32_t)ctx->gpr[4];
+    if (spup > 63u) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    spu_group_t* g = spu_find_group(group_id);
+    if (!g) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    const uint32_t queue_id = g->spup_queue[spup];
+    g->spup_queue[spup] = 0;
+    fprintf(stderr,
+            "[SPU] group_disconnect_event_all_threads group=0x%X "
+            "port=%u queue=0x%X\n",
+            group_id, spup, queue_id);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 /* sys_spu_thread_group_disconnect_event(id, et) -- takes et as its second
  * argument (same source-type enum as connect_event; oracle: RPCS3
  * sys_spu.cpp disconnect_event); s33 conformance fix: read gpr[4]=et and
@@ -2079,4 +2109,5 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_disconnect_event_all_threads_handler);
 }
