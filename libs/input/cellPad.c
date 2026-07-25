@@ -293,9 +293,18 @@ static void pad_merge_keyboard(void)
     hs->connected = 1;
 
     /* GetAsyncKeyState is system-wide. Ignore it unless a process window is
-     * foreground so background key state cannot reach guest input. */
-    if (!pad_keyboard_window_focused() && !pad_window_key_any_down())
-        return;
+     * foreground so background key state cannot reach guest input. The
+     * diagnostic unattended route below is process-local, not keyboard state,
+     * so it must remain eligible without a foreground window. */
+    {
+        extern volatile unsigned long long g_yz_auto_start_tick;
+        static int auto_ng_guard = -1;
+        if (auto_ng_guard < 0)
+            auto_ng_guard = getenv("YZ_AUTO_NEW_GAME") ? 1 : 0;
+        if (!pad_keyboard_window_focused() && !pad_window_key_any_down() &&
+            !(auto_ng_guard && g_yz_auto_start_tick))
+            return;
+    }
 
     u16 btns = hs->buttons;
     if (pad_key_down(VK_BACK))   btns |= CELL_PAD_CTRL_SELECT;
@@ -332,6 +341,73 @@ static void pad_merge_keyboard(void)
     hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
     hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
     hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+
+    /* Unattended a010 acceptance route. YZ_AUTO_NEW_GAME is diagnostic-only:
+     * after YZ_AUTO_START fires at the authoritative title callback, hold
+     * Confirm long enough for slow frames to observe it, then release it.
+     * Stop once a010 becomes active so scripted input cannot affect the scene
+     * itself. */
+    {
+        extern volatile unsigned long long g_yz_auto_start_tick;
+        extern volatile long g_yz_a010_root_active;
+        static int auto_ng = -1;
+        static int auto_ng_circle = -1;
+        static u16 prior_auto_accept = 0;
+        if (auto_ng < 0) {
+            auto_ng = getenv("YZ_AUTO_NEW_GAME") ? 1 : 0;
+            auto_ng_circle =
+                getenv("YZ_AUTO_NEW_GAME_CIRCLE") ? 1 : 0;
+        }
+        /* s_host_state is persistent when the keyboard is the only connected
+         * controller.  Remove our previous synthetic bit before evaluating
+         * this poll, otherwise the first "pulse" latches as a held button and
+         * the game never observes another rising edge. */
+        if (prior_auto_accept) {
+            hs->buttons &= (u16)~prior_auto_accept;
+            if (prior_auto_accept == CELL_PAD_CTRL_CIRCLE)
+                hs->press_circle = 0;
+            else if (prior_auto_accept == CELL_PAD_CTRL_CROSS)
+                hs->press_cross = 0;
+            else if (prior_auto_accept == CELL_PAD_CTRL_UP)
+                hs->press_up = 0;
+            prior_auto_accept = 0;
+        }
+        if (auto_ng && g_yz_auto_start_tick && !g_yz_a010_root_active) {
+            const unsigned long long elapsed =
+                GetTickCount64() - g_yz_auto_start_tick;
+            const unsigned long long period = 3000u;
+            /*
+             * The main-menu hook first moves Load Game -> New Game and accepts
+             * it through the game's cached input.  Do not begin the generic
+             * confirmation-screen pulses until that operation has completed;
+             * an earlier pulse selects Load Game while save data is present.
+             */
+            const unsigned long long first = 12000u;
+            if (elapsed >= first && elapsed < first + period * 30u) {
+                const unsigned pulse = (unsigned)((elapsed - first) / period);
+                const unsigned long long phase = (elapsed - first) % period;
+                static unsigned long long logged = 0;
+                const u16 accept = auto_ng_circle
+                    ? CELL_PAD_CTRL_CIRCLE : CELL_PAD_CTRL_CROSS;
+                if (phase < 2000u) {
+                    hs->buttons |= accept;
+                    prior_auto_accept = accept;
+                    if (auto_ng_circle)
+                        hs->press_circle = 255;
+                    else
+                        hs->press_cross = 255;
+                    if (pulse < 64u && !(logged & (1ull << pulse))) {
+                        logged |= 1ull << pulse;
+                        fprintf(stderr,
+                                "[auto-new-game] %s pulse %u/30 at +%llums\n",
+                                auto_ng_circle ? "Circle" : "Cross",
+                                pulse + 1u, elapsed);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void pad_init_backend(void)
