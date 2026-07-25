@@ -69,12 +69,30 @@ struct MwhleSession {
     bool eof = false;
     bool stopping = false;
     bool host_audio = false;
+    bool accept_fast = false;
+    bool rebase_on_first_time = false;
+    bool clock_anchored = false;
+    char host_path[320] = {};
     LARGE_INTEGER t0{}, freq{};
     unsigned long long tex_targets[2] = {0, 0};  /* observed ping-pong EAs */
     unsigned writes = 0, no_target_logged = 0;
 };
 
 MwhleSession g_sess;   /* the game runs one movie player instance (measured) */
+
+/* The title reuses its one mwPly handle as the clock source for subsequent
+ * in-engine AUTH scenes. A native Start normally resets that clock, but the
+ * direct host route intentionally skips native Start to avoid launching the
+ * broken PS3 decode pipeline. Keep a stopped-handle clock which begins on its
+ * first post-movie GetTime call, rather than at movie teardown: menu/loading
+ * time must not be charged to the next scene. */
+struct MwhleRetiredClock {
+    unsigned long long handle = 0;
+    bool running = false;
+    LARGE_INTEGER t0{}, freq{};
+};
+
+MwhleRetiredClock g_retired_clock;
 
 bool surface_mode()
 {
@@ -100,7 +118,9 @@ double now_sec(MwhleSession& s)
         return (double)cellAudioHostStreamPositionFrames() / 48000.0;
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (double)(t.QuadPart - s.t0.QuadPart) / (double)s.freq.QuadPart;
+    const double qpc =
+        (double)(t.QuadPart - s.t0.QuadPart) / (double)s.freq.QuadPart;
+    return s.accept_fast ? qpc * 32.0 : qpc;
 }
 
 /* Guest '/dev_bdvd/...' -> host 'gamedata/dev_bdvd/...' (mapping evident from
@@ -130,6 +150,7 @@ void session_close(MwhleSession& s)
 void session_open(unsigned long long handle, unsigned long long fname_ea)
 {
     session_close(g_sess);
+    g_retired_clock = MwhleRetiredClock{};
     char guest[256] = {};
     for (size_t i = 0; i + 1 < sizeof(guest); i++) {
         guest[i] = (char)vm_read8(fname_ea + i);
@@ -139,6 +160,10 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
     map_host_path(guest, host, sizeof(host));
     MwhleSession& s = g_sess;
     s.handle = handle;
+    snprintf(s.host_path, sizeof(s.host_path), "%s", host);
+    s.rebase_on_first_time =
+        strstr(host, "hd_sega_logo") == nullptr &&
+        strstr(host, "advertise.sfd") == nullptr;
     if (!surface_mode())
         s.direct_serial = yz_host_movie_start(host);
     if (s.direct_serial > 0) {
@@ -147,6 +172,10 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
         fprintf(stderr,
                 "[mwhle] direct host session OPEN handle=%08llX serial=%ld '%s'\n",
                 handle, s.direct_serial, host);
+        if (s.rebase_on_first_time)
+            fprintf(stderr,
+                    "[mwhle] scene movie clock REBASE PENDING serial=%ld "
+                    "(first GetTime)\n", s.direct_serial);
         fflush(stderr);
         return;
     }
@@ -164,7 +193,15 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
     s.fps_x1000 = (unsigned)(s.fps * 1000.0 + 0.5);
     QueryPerformanceFrequency(&s.freq);
     QueryPerformanceCounter(&s.t0);
-    if (movie_has_audio(s.mv)) {
+    s.accept_fast = getenv("YZ_A010_ACCEPT_FAST") &&
+        (strstr(host, "hd_sega_logo") || strstr(host, "advertise.sfd"));
+    if (s.accept_fast) {
+        fprintf(stderr,
+                "[mwhle] a010 acceptance fast-forward active for '%s' (32x, muted)\n",
+                host);
+        fflush(stderr);
+    }
+    if (movie_has_audio(s.mv) && !s.accept_fast) {
         const int mix_guest = getenv("YZ_MOVIE_HLE_MIX_GUEST") ? 1 : 0;
         s.host_audio = cellAudioHostStreamStart(
             movie_audio_s16(s.mv), movie_audio_frames(s.mv),
@@ -175,7 +212,7 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
             handle, host, s.w, s.h, s.fps,
             movie_has_audio(s.mv) ? "FFmpeg ADX" : "native fallback",
             (unsigned long long)movie_audio_frames(s.mv),
-            s.host_audio ? "audio" : "QPC");
+            s.host_audio ? "audio" : (s.accept_fast ? "QPCx32" : "QPC"));
     fflush(stderr);
 }
 
@@ -555,6 +592,12 @@ void func_00F4A9AC(ppu_context* ctx)   /* Destroy */
                 g_sess.handle, g_sess.frame_id);
         fflush(stderr);
         session_close(g_sess);
+        g_retired_clock.handle = handle;
+        QueryPerformanceFrequency(&g_retired_clock.freq);
+        fprintf(stderr,
+                "[mwhle] stopped-handle clock ARMED handle=%08llX "
+                "(starts on first post-movie GetTime)\n", handle);
+        fflush(stderr);
     }
 }
 
@@ -590,11 +633,37 @@ void func_00F4F8D0(ppu_context* ctx)   /* GetTime(handle, *ncount, *tscale) */
 {
     static call_counter c;
     log_call("GetTime", c, ctx);
-    if (yz_movie_hle_armed() && session_active(g_sess) &&
+    const int armed = yz_movie_hle_armed();
+    if (armed && session_active(g_sess) &&
         ctx->gpr[3] == g_sess.handle) {
         uint32_t count = 0, scale = 30;
         if (g_sess.direct_serial > 0) {
-            yz_host_movie_time(g_sess.direct_serial, &count, &scale);
+            if (g_sess.rebase_on_first_time && !g_sess.clock_anchored) {
+                const long old_serial = g_sess.direct_serial;
+                const long new_serial =
+                    yz_host_movie_start(g_sess.host_path);
+                if (new_serial > 0)
+                    g_sess.direct_serial = new_serial;
+                QueryPerformanceCounter(&g_sess.t0);
+                g_sess.clock_anchored = true;
+                fprintf(stderr,
+                        "[mwhle] scene movie clock REBASED old_serial=%ld "
+                        "new_serial=%ld handle=%08llX\n",
+                        old_serial, g_sess.direct_serial, g_sess.handle);
+                fflush(stderr);
+            }
+            if (g_sess.rebase_on_first_time && g_sess.clock_anchored) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                const double seconds =
+                    (double)(now.QuadPart - g_sess.t0.QuadPart) /
+                    (double)g_sess.freq.QuadPart;
+                scale = 30;
+                count = seconds > 0.0
+                    ? (uint32_t)(seconds * (double)scale) : 0;
+            } else {
+                yz_host_movie_time(g_sess.direct_serial, &count, &scale);
+            }
         } else {
             scale = (uint32_t)(g_sess.fps + 0.5);
             if (!scale) scale = 30;
@@ -606,6 +675,35 @@ void func_00F4F8D0(ppu_context* ctx)   /* GetTime(handle, *ncount, *tscale) */
             fprintf(stderr,
                     "[mwhle] GetTime value n=%lu count=%u scale=%u seconds=%.3f\n",
                     c.n, count, scale, scale ? (double)count / scale : 0.0);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (armed && !session_active(g_sess) && g_retired_clock.handle &&
+        ctx->gpr[3] == g_retired_clock.handle) {
+        if (!g_retired_clock.running) {
+            QueryPerformanceCounter(&g_retired_clock.t0);
+            g_retired_clock.running = true;
+            fprintf(stderr,
+                    "[mwhle] stopped-handle clock START handle=%08llX\n",
+                    g_retired_clock.handle);
+            fflush(stderr);
+        }
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const double seconds =
+            (double)(now.QuadPart - g_retired_clock.t0.QuadPart) /
+            (double)g_retired_clock.freq.QuadPart;
+        const uint32_t scale = 30;
+        const uint32_t count =
+            seconds > 0.0 ? (uint32_t)(seconds * (double)scale) : 0;
+        if (ctx->gpr[4]) vm_write32(ctx->gpr[4], count);
+        if (ctx->gpr[5]) vm_write32(ctx->gpr[5], scale);
+        if (c.n <= 16 || (c.n & 255u) == 0) {
+            fprintf(stderr,
+                    "[mwhle] GetTime rebased n=%lu count=%u scale=%u "
+                    "seconds=%.3f\n",
+                    c.n, count, scale, seconds);
             fflush(stderr);
         }
         return;
