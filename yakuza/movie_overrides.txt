@@ -15,3 +15,8 @@
 0x00F4A9AC  # mwPlyDestroy          (observe: session close; 78 direct callers)
 0x00F4FD3C  # GetStat wrapper       (direct HLE: PREP/PLAYING/PLAYEND)
 0x00F4F8D0  # mwPlyGetTime         (direct HLE: displayed-frame clock)
+0x00AFC178  # shared presentation clock (reject invalid audio-position jumps)
+0x00C970D4  # AUTH object update aggregation (a010 timeline diagnostic)
+0x00C97CE0  # AUTH presentation-clock update (a010 timeline diagnostic)
+0x00C98028  # AUTH state-16 update (a010 timeline diagnostic)
+0x00E7E1EC  # final camera-matrix consumer (a010 CMT camera repair)
