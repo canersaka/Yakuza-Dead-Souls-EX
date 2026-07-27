@@ -111,6 +111,7 @@ extern "C" void spu_recomp_register_jobbin_b(void);
  * event-flag wall, DONT_RECHASE #23). */
 extern "C" void spu_recomp_register_jobbin_a_e400(void);
 extern "C" void spu_recomp_register_jobbin_b_4c00(void);
+extern "C" void spu_recomp_register_jobbin_b_6c00(void);
 extern "C" void spu_recomp_register_jobbin_b_15800(void);
 /* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
  * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes);
@@ -119,6 +120,10 @@ extern "C" void spu_recomp_register_jobbin_c_17800(void);
 /* Sibling post-a030 job: its JOBCRT header declares a 0x10610-byte binary at
  * EBOOT EA 0x01265180; the live branch entered its head at LS 0xE400. */
 extern "C" void spu_recomp_register_jobbin_d_e400(void);
+/* Sunshine orphanage geometry worker. Its descriptor identifies the distinct
+ * EBOOT binary at 0x01252680; treating it as Job A ran the wrong program at the
+ * same LS 0x4C00 slot and produced malformed, incomplete scene commands. */
+extern "C" void spu_recomp_register_jobbin_orphanage(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -132,6 +137,8 @@ extern "C" void spu_begin_image(int image_id);
 extern "C" int g_spu_prof_on;
 extern "C" int g_yz_watch_dlist;
 extern "C" int g_yz_slotstore;   /* YZ_SLOTSTORE: wid4 record-store watch (spu_channels.c) */
+extern "C" int g_yz_a010_ppucmd = 0;
+extern "C" volatile LONG g_yz_a010_ppucmd_headers;
 
 /* YZ_HWWATCH (s26 ~04:25, the stager hunt's definitive tool): a HARDWARE
  * debug-register watchpoint (DR0, exact 4-byte write watch) on the wid4
@@ -418,6 +425,87 @@ static vm_stack_alloc g_stacks;
 
 extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp: caller's guest tid */
 
+static bool load_guest_dump_range(FILE* dump, uint32_t address, uint32_t size)
+{
+    if (_fseeki64(dump, address, SEEK_SET) != 0)
+        return false;
+    constexpr size_t chunk_size = 4u * 1024u * 1024u;
+    uint32_t done = 0;
+    while (done < size) {
+        const size_t chunk =
+            (size - done) < chunk_size ? (size - done) : chunk_size;
+        if (fread(vm_base + address + done, 1, chunk, dump) != chunk)
+            return false;
+        done += (uint32_t)chunk;
+    }
+    return true;
+}
+
+/*
+ * Deterministic, windowless replay of the shipped AUTH camera producer.
+ * This deliberately enters the actual lifted func_00C95F9C path against an
+ * RPCS3 sparse guest-memory dump.  It is an offline discriminator for the
+ * producer investigation, not a gameplay fallback.
+ */
+static int replay_camera_from_guest_dump(
+    const char* path, uint32_t root, const char* time_override)
+{
+    FILE* dump = fopen(path, "rb");
+    if (!dump) {
+        fprintf(stderr, "[camera-replay] cannot open %s\n", path);
+        return 2;
+    }
+
+    if (vm_commit(0x30000000u, 0x08000000u) != 0 ||
+        vm_commit(0x40000000u, 0x02F00000u) != 0 ||
+        vm_commit(0x50000000u, 0x00400000u) != 0 ||
+        !load_guest_dump_range(dump, 0x00010000u, 0x01960000u) ||
+        !load_guest_dump_range(dump, 0x30000000u, 0x08000000u) ||
+        !load_guest_dump_range(dump, 0x40000000u, 0x02F00000u) ||
+        !load_guest_dump_range(dump, 0x50000000u, 0x00400000u)) {
+        fprintf(stderr, "[camera-replay] failed to load dump ranges\n");
+        fclose(dump);
+        return 2;
+    }
+    fclose(dump);
+
+    if (time_override) {
+        const float value = strtof(time_override, nullptr);
+        uint32_t bits = 0;
+        memcpy(&bits, &value, sizeof(bits));
+        vm_write32(root + 0x210u, bits);
+    }
+
+    constexpr uint32_t output = 0xD1001000u;
+    memset(vm_base + output, 0xFC, 0x30u);
+
+    ppu_context ctx = {};
+    ctx.thread_id = 1;
+    ctx.gpr[1] = 0xD1000000u;
+    ctx.gpr[2] = 0x013618B8u;
+    ctx.gpr[3] = root;
+    ctx.gpr[4] = output;
+    vm_write64(ctx.gpr[1], 0);
+    g_yz_game_toc = 0x013618B8u;
+    g_yz_cur_ctx = &ctx;
+
+    func_00C95F9C(&ctx);
+    yz_drain_trampolines(&ctx);
+
+    fprintf(stdout,
+            "CAMERA_PRODUCER_REPLAY root=%08X time=%08X result=%u\n",
+            root, vm_read32(root + 0x210u), (uint32_t)ctx.gpr[3]);
+    for (uint32_t row = 0; row < 3u; ++row) {
+        fprintf(stdout, "raw%u=%08X/%08X/%08X/%08X\n", row,
+                vm_read32(output + row * 0x10u + 0x00u),
+                vm_read32(output + row * 0x10u + 0x04u),
+                vm_read32(output + row * 0x10u + 0x08u),
+                vm_read32(output + row * 0x10u + 0x0Cu));
+    }
+    g_yz_cur_ctx = nullptr;
+    return (uint32_t)ctx.gpr[3] == 1u ? 0 : 3;
+}
+
 static void guest_caller(uint32_t opd_addr,
                          uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -473,6 +561,7 @@ static void guest_caller(uint32_t opd_addr,
  * (~59.94x/s) updates. yz_rsx_vblank_tick (import_overrides.cpp) bumps those
  * counters and publishes any pending flip's done bit; it no-ops until sys_rsx
  * context_allocate has set up the driver_info, so starting early is safe. */
+extern "C" volatile LONG g_yz_a010_root_active;
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
     /* YZ_VBL_DIV=N (s21, H4 discriminator): divide the vblank rate by N so a
@@ -510,8 +599,21 @@ static DWORD WINAPI yz_vblank_thread(LPVOID)
             yz_rsx_vblank_tick();
         }
     }
+    static int acceptance_fast = -1;
+    if (acceptance_fast < 0)
+        acceptance_fast = getenv("YZ_ACCEPT_VBL_FAST") ? 1 : 0;
     for (;;) {
-        Sleep(16 * vdiv);     /* ~62.5 Hz (default); /N under YZ_VBL_DIV */
+        /*
+         * Headless a010 diagnostics spend most of each run waiting through
+         * the boot/title timeline.  Accelerate only that pre-scene interval;
+         * restore the normal 62.5 Hz clock at the a010 root marker so the
+         * AUTH scene and producer/consumer measurements retain real pacing.
+         */
+        const DWORD delay = acceptance_fast &&
+                            !InterlockedCompareExchange(
+                                &g_yz_a010_root_active, 0, 0)
+                          ? 2u : (DWORD)(16 * vdiv);
+        Sleep(delay);
         yz_rsx_vblank_tick();
     }
     return 0;
@@ -582,6 +684,43 @@ extern "C" uint32_t yz_guest_addr_from_host(const void* rip)
     return fe ? fe->addr : 0u;
 }
 
+extern "C" void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
+                                    void* ra, int width)
+{
+    struct source_count {
+        uint32_t guest;
+        uint32_t width;
+        unsigned long count;
+    };
+    static source_count sources[64] = {};
+    static unsigned used = 0;
+    static unsigned long total = 0;
+
+    InterlockedIncrement(&g_yz_a010_ppucmd_headers);
+    const uint32_t guest = yz_guest_addr_from_host(ra);
+    source_count* source = nullptr;
+    for (unsigned i = 0; i < used; i++) {
+        if (sources[i].guest == guest && sources[i].width == (uint32_t)width) {
+            source = &sources[i];
+            break;
+        }
+    }
+    if (!source && used < sizeof(sources) / sizeof(sources[0])) {
+        source = &sources[used++];
+        source->guest = guest;
+        source->width = (uint32_t)width;
+    }
+    const unsigned long n = source ? ++source->count : 0;
+    const unsigned long all = ++total;
+    if (all <= 256u || (source && (n <= 8u || (n & 0xFFu) == 0u))) {
+        fprintf(stderr,
+                "[a010-ppucmd] total=%lu source_n=%lu tid=%u guest=%08X "
+                "ea=%08X w=%d val=%08X host_ra=%p\n",
+                all, n, yz_thread_current_id(), guest, addr, width, val, ra);
+        fflush(stderr);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * TEMP DIAG: memory write-watch (page-guard + single-step) to find the wild
  * write that zeroes the gcm-state TOC global at guest 0x0135A5C0 (only when the
@@ -620,10 +759,56 @@ static LONG CALLBACK yz_watch_veh(EXCEPTION_POINTERS* ep)
              * the first N so a tight poll loop doesn't trap forever (we disarm
              * below once captured). Runs in the FAULTING thread's context, so the
              * dump names the real accessor + its reliable trampoline-ring chain. */
+            bool suppress_a010_auth_read = false;
+            if (g_watch_read && acc == 0) {
+                uint32_t filter_tid = yz_thread_current_id();
+                ppu_context* filter_ctx =
+                    (ppu_context*)yz_thread_context(filter_tid);
+                if (!filter_ctx) filter_ctx = g_yz_main_ctx;
+                const uint32_t guest_lr =
+                    filter_ctx ? (uint32_t)filter_ctx->lr : 0u;
+                /* The a010 model watch is intentionally after AUTH has bound
+                 * the model. Keep its finite sample budget for downstream
+                 * renderer readers, not the known animation/update family. */
+                suppress_a010_auth_read =
+                    guest_lr < 0x00020000u ||
+                    guest_lr == 0x00FCAF98u;
+                for (unsigned k = 0;
+                     !suppress_a010_auth_read &&
+                     k < 8 && k < g_yz_tramp_idx; k++) {
+                    const unsigned slot = (g_yz_tramp_idx - 1 - k) & 255;
+                    const yz_func_entry* chain_fn =
+                        yz_func_from_host(g_yz_tramp_ring[slot]);
+                    if (!chain_fn) continue;
+                    switch (chain_fn->addr) {
+                    case 0x00013000u:
+                    case 0x00013510u:
+                    case 0x00014848u:
+                    case 0x00015480u:
+                    case 0x000159C8u:
+                    case 0x00015B9Cu:
+                    case 0x00015E40u:
+                        suppress_a010_auth_read = true;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
             int do_dump = (tgt == (uintptr_t)g_watch_host) &&
+                          !suppress_a010_auth_read &&
                           (acc == 1 || g_watch_hits < 8);
             if (do_dump) {
                 if (acc == 0) g_watch_hits++;
+                /* A read-watch uses PAGE_NOACCESS. Make the page readable
+                 * before the diagnostic samples the watched value itself;
+                 * otherwise this memcpy recursively faults and consumes every
+                 * read sample on the logger rather than on guest execution. */
+                if (acc == 0) {
+                    DWORD readable_old;
+                    VirtualProtect((void*)page, 0x1000, PAGE_READWRITE,
+                                   &readable_old);
+                }
                 void* rip = (void*)ep->ContextRecord->Rip;
                 uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
                 uint64_t cur;
@@ -903,6 +1088,47 @@ extern "C" void yz_watch_wr_init(void)
     }
 }
 
+/* Dynamic guest heaps can recommit a page after yz_watch_wr_init(), replacing
+ * the diagnostic's PAGE_READONLY protection with PAGE_READWRITE.  Re-arm once
+ * the watched object has actually been published so writes made during its
+ * render-preparation lifetime cannot silently bypass the watch. */
+extern "C" void yz_watch_wr_rearm(void)
+{
+    if (g_wwr_n == 0)
+        return;
+
+    for (int i = 0; i < g_wwr_n; ++i) {
+        uint32_t cur;
+        memcpy(&cur, g_wwr_host[i], sizeof(cur));
+        g_wwr_old[i] = cur;
+    }
+
+    for (int i = 0; i < g_wwr_n; ++i) {
+        bool done_before = false;
+        for (int j = 0; j < i; ++j) {
+            if (g_wwr_page[j] == g_wwr_page[i]) {
+                done_before = true;
+                break;
+            }
+        }
+        if (done_before)
+            continue;
+
+        DWORD old;
+        if (!VirtualProtect((void*)g_wwr_page[i], 0x1000,
+                            PAGE_READONLY, &old)) {
+            fprintf(stderr,
+                    "[watch-wr] REARM failed ea=0x%08X err=%lu\n",
+                    g_wwr_ea[i], GetLastError());
+            fflush(stderr);
+            continue;
+        }
+    }
+
+    fprintf(stderr, "[watch-wr] rearmed after dynamic object publication\n");
+    fflush(stderr);
+}
+
 /* Map a guest code address back to its lifted function: the table entry whose
  * guest addr is the greatest one <= the address (the table is sorted by addr).
  * Used to symbolize back-chain return addresses in the crash handler. */
@@ -1131,6 +1357,17 @@ static thread_local uint32_t g_yz_arc_component_index = 0;
 static thread_local uint32_t g_yz_arc_out = 0;
 static thread_local char g_yz_arc_path[320];
 
+struct yz_stage_target_lookup {
+    uint32_t entry_sp;
+    uint32_t frame_sp;
+    uint32_t out;
+    unsigned searches;
+    char path[320];
+};
+static thread_local yz_stage_target_lookup g_yz_stage_targets[16];
+static thread_local unsigned g_yz_stage_target_next = 0;
+extern "C" void yz_stage_direct_probe_snapshot(const char* reason);
+
 static void yz_arc_read_cstr(uint32_t ea, char* dst, size_t cap)
 {
     if (!cap) return;
@@ -1148,14 +1385,82 @@ static void yz_arc_read_cstr(uint32_t ea, char* dst, size_t cap)
 extern "C" void yz_archive_lookup_probe(void* ctxv, unsigned phase)
 {
     static int enabled = -1;
+    static int stage_enabled = -1;
     if (enabled < 0) enabled = getenv("YZ_ARCLOOKUP") ? 1 : 0;
-    if (!enabled) return;
+    if (stage_enabled < 0)
+        stage_enabled = getenv("YZ_STAGE_LOOKUP") ? 1 : 0;
+    if (!enabled && !stage_enabled) return;
 
     ppu_context* c = (ppu_context*)ctxv;
+
+    /* Record the four large orphanage GMD lookups at their member-search
+     * frontier. Several generated early-return continuations bypass the final
+     * phase-3 hook, but every successful table search crosses phases 1 and 2. */
+    if (stage_enabled) {
+        if (phase == 0) {
+            char path[320];
+            yz_arc_read_cstr((uint32_t)c->gpr[3], path, sizeof(path));
+            const bool target =
+                strstr(path, "/stage/st_asagao/") != nullptr &&
+                (strstr(path, "st_asagao_e_house.gmd") != nullptr ||
+                 strstr(path, "st_asagao_e_tikei.gmd") != nullptr ||
+                 strstr(path, "st_asagao_e_freeze.gmd") != nullptr ||
+                 strstr(path, "st_asagao_e_enkei.gmd") != nullptr);
+            if (target) {
+                yz_stage_target_lookup* f =
+                    &g_yz_stage_targets[g_yz_stage_target_next++ & 15u];
+                memset(f, 0, sizeof(*f));
+                f->entry_sp = (uint32_t)c->gpr[1];
+                f->frame_sp = f->entry_sp - 0x1F0u;
+                memcpy(f->path, path, sizeof(f->path));
+                f->path[sizeof(f->path) - 1] = 0;
+                fprintf(stderr,
+                        "[stage-target] BEGIN tid=%u sp=%08X frame=%08X "
+                        "path=%s\n",
+                        yz_thread_current_id(), f->entry_sp, f->frame_sp,
+                        f->path);
+                fflush(stderr);
+                yz_stage_direct_probe_snapshot(f->path);
+            }
+        } else {
+            const uint32_t sp = (uint32_t)c->gpr[1];
+            for (auto& f : g_yz_stage_targets) {
+                if (!f.entry_sp)
+                    continue;
+                if (phase == 1 && f.frame_sp == sp) {
+                    f.out = (uint32_t)c->gpr[6];
+                    f.searches++;
+                    break;
+                }
+                if (phase == 2 && f.frame_sp == sp) {
+                    fprintf(stderr,
+                            "[stage-target] SEARCH-RET n=%u sp=%08X "
+                            "result=%08X out=%08X outval=%08X path=%s\n",
+                            f.searches, sp, (uint32_t)c->gpr[3], f.out,
+                            f.out ? vm_read32(f.out) : 0u, f.path);
+                    fflush(stderr);
+                    yz_stage_direct_probe_snapshot(f.path);
+                    break;
+                }
+                if (phase == 3 && f.entry_sp == sp) {
+                    fprintf(stderr,
+                            "[stage-target] END sp=%08X result=%08X "
+                            "path=%s\n",
+                            sp, (uint32_t)c->gpr[3], f.path);
+                    fflush(stderr);
+                    f.entry_sp = 0;
+                    break;
+                }
+            }
+        }
+        if (!enabled) return;
+    }
+
     if (phase == 0) {
         yz_arc_read_cstr((uint32_t)c->gpr[3], g_yz_arc_path,
                          sizeof(g_yz_arc_path));
-        g_yz_arc_active = strstr(g_yz_arc_path, "/auth/a010/") != nullptr;
+        g_yz_arc_active =
+            strstr(g_yz_arc_path, "/auth/a010/") != nullptr;
         g_yz_arc_subcall = 0;
         if (!g_yz_arc_active) return;
         uint32_t mgr = vm_read32((uint32_t)c->gpr[2] - 0x7AD4u);
@@ -1215,6 +1520,77 @@ extern "C" void yz_archive_lookup_probe(void* ctxv, unsigned phase)
         fflush(stderr);
         g_yz_arc_active = 0;
     }
+}
+
+/* Bounded a010-only request-state census.
+ *
+ * The clean generated lift used by the isolated worktree intentionally does
+ * not carry the old all-boot chain-probe patch. Calling this helper only at
+ * func_00068EDC's entry, and only while the a010 file-lifetime gate is active,
+ * gives us the asset request trajectory without spending the finite dedupe
+ * table on startup requests or perturbing the loader before New Game. */
+extern "C" volatile LONG g_yz_a010_root_active;
+
+extern "C" void yz_a010_request_probe(void* ctxv)
+{
+    if (!getenv("YZ_A010_REQ") ||
+        !InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0))
+        return;
+
+    ppu_context* c = (ppu_context*)ctxv;
+    const uint32_t mgr = (uint32_t)c->gpr[3];
+    const uint32_t idx = (uint32_t)c->gpr[4] & 0xFFFFu;
+    if (!mgr) return;
+
+    const uint32_t records = vm_read32(mgr + 0xCu);
+    if (!records) return;
+    const uint32_t rec = records + idx * 0x130u;
+    const uint32_t state = vm_read32(rec);
+
+    struct seen_rec {
+        uint32_t rec;
+        uint32_t state;
+        uint16_t changes;
+    };
+    static seen_rec seen[512] = {};
+    unsigned free_slot = 512;
+    unsigned slot = (rec >> 4) & 511u;
+    for (unsigned probe = 0; probe < 512; probe++) {
+        const unsigned k = (slot + probe) & 511u;
+        if (seen[k].rec == rec) {
+            slot = k;
+            break;
+        }
+        if (!seen[k].rec) {
+            free_slot = k;
+            break;
+        }
+    }
+    if (free_slot != 512) {
+        slot = free_slot;
+        seen[slot].rec = rec;
+        seen[slot].state = 0xFFFFFFFFu;
+    } else if (seen[slot].rec != rec) {
+        return;
+    }
+    if (seen[slot].state == state || seen[slot].changes >= 64)
+        return;
+    seen[slot].state = state;
+    seen[slot].changes++;
+
+    const uint32_t w0c = vm_read32(rec + 0xCu);
+    fprintf(stderr,
+            "[a010-req] idx=%u rec=%08X state=%u loader=%08X "
+            "f4=%08X f0c=%08X hold=%u f18=%08X f1c=%08X "
+            "f20=%08X cb=%08X f2c=%08X f30=%08X f34=%08X\n",
+            idx, rec, state, vm_read32(rec + 0x28u),
+            vm_read32(rec + 0x4u), w0c,
+            (unsigned)((w0c >> 16) & 0xFFu),
+            vm_read32(rec + 0x18u), vm_read32(rec + 0x1Cu),
+            vm_read32(rec + 0x20u), vm_read32(rec + 0x24u),
+            vm_read32(rec + 0x2Cu), vm_read32(rec + 0x30u),
+            vm_read32(rec + 0x34u));
+    fflush(stderr);
 }
 
 extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
@@ -1579,10 +1955,40 @@ extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
                 addr, n, yz_thread_current_id(),
                 (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                 (unsigned long long)ctx->gpr[5]);
+    if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0)) {
+        static volatile long long a010_ns[32];
+        const long long an = ++a010_ns[i];
+        if (an <= 8 || (an & (an - 1)) == 0) {
+            fprintf(stderr,
+                    "[a010-chain] 0x%08X hit#%lld tid=%u "
+                    "r3=0x%llX r4=0x%llX r5=0x%llX\n",
+                    addr, an, yz_thread_current_id(),
+                    (unsigned long long)ctx->gpr[3],
+                    (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5]);
+            fflush(stderr);
+        }
+    }
     unsigned long long now = GetTickCount64();
     if (now - lastms >= 5000) {
         lastms = now;
         yz_chain_census_dump("probe");
+    }
+}
+
+extern "C" void yz_a010_track_result(unsigned kind, unsigned result)
+{
+    if (!InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0))
+        return;
+    static volatile long counts[2][2] = {};
+    const unsigned k = kind ? 1u : 0u;
+    const unsigned r = result ? 1u : 0u;
+    const long n = InterlockedIncrement(&counts[k][r]);
+    if (n <= 16 || (n & (n - 1)) == 0) {
+        fprintf(stderr,
+                "[a010-track-result] kind=%s result=%u count=%ld\n",
+                k ? "character" : "camera", result, n);
+        fflush(stderr);
     }
 }
 
@@ -2886,7 +3292,9 @@ int main(int argc, char** argv)
      * Pin a 1ms timer, raise priority, and opt out of execution-speed throttling so every
      * boot sees the same scheduling regardless of window focus. */
     timeBeginPeriod(1);
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SetPriorityClass(
+        GetCurrentProcess(),
+        getenv("YZ_LOW_IMPACT") ? NORMAL_PRIORITY_CLASS : HIGH_PRIORITY_CLASS);
     {
         PROCESS_POWER_THROTTLING_STATE pt;
         memset(&pt, 0, sizeof(pt));
@@ -2906,6 +3314,13 @@ int main(int argc, char** argv)
         return 1;
     }
     vm_stack_alloc_init(&g_stacks);
+
+    if (argc >= 3 && strcmp(argv[1], "--replay-camera-dump") == 0) {
+        const uint32_t root =
+            argc >= 4 ? (uint32_t)strtoul(argv[3], nullptr, 0) : 0x308B0100u;
+        return replay_camera_from_guest_dump(
+            argv[2], root, argc >= 5 ? argv[4] : nullptr);
+    }
 
     /* Arm the YZ_WATCH_EA write-watch BEFORE any guest code runs -- the gcm
      * device-object corruptor (0x01622200) races _cellGcmInitBody, which is far
@@ -2980,9 +3395,11 @@ int main(int argc, char** argv)
     spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
     spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, slot base 0xE400) */
     spu_recomp_register_jobbin_b_4c00();                  /*   ...same binary lifted at the other slot base 0x4C00 (same image) */
+    spu_recomp_register_jobbin_b_6c00();                  /*   ...same binary relocated during a010 at slot base 0x6C00 */
     spu_recomp_register_jobbin_b_15800();                 /*   ...same binary relocated post-a030 at slot base 0x15800 */
     spu_begin_image(17); spu_recomp_register_jobbin_c_17800(); /* post-a030 transition job (EBOOT 0x0125DA80, LS 0x17800) */
     spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
+    spu_begin_image(19); spu_recomp_register_jobbin_orphanage(); /* a010 geometry job (EBOOT 0x01252680, LS 0x4C00) */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);
@@ -2996,6 +3413,12 @@ int main(int argc, char** argv)
     g_yz_slotstore = getenv("YZ_SLOTSTORE") ? 1 : 0;
     if (g_yz_slotstore) {
         fprintf(stderr, "[slotstore] ARMED: wid4 work-record store watch live\n");
+        fflush(stderr);
+    }
+    g_yz_a010_ppucmd = getenv("YZ_A010_PPUCMD") ? 1 : 0;
+    if (g_yz_a010_ppucmd) {
+        fprintf(stderr,
+                "[a010-ppucmd] ARMED: a010-only PPU draw-header writer census\n");
         fflush(stderr);
     }
     /* s28 (ledger #63 / s28_earlystall_diff): t1 host-liveness heartbeat needs
