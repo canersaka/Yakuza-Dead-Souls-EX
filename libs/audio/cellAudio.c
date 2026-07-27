@@ -218,6 +218,14 @@ static inline float rd_be_f32(const float* p)
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
+static int audio_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("YZ_AUDIO_TRACE") ? 1 : 0;
+    return cached;
+}
+
 /* Optional host-native movie stream. It is mixed by the same fixed 48 kHz
  * audio heartbeat as guest ports, making the consumed sample count the movie
  * clock. The movie player owns pcm and stops this stream before freeing it. */
@@ -384,7 +392,17 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    hr = s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    if (FAILED(hr)) {
+        printf("[cellAudio] WASAPI Start failed: 0x%08lX\n", hr);
+        return -1;
+    }
+    if (audio_trace_enabled()) {
+        printf("[cellAudio-trace] WASAPI active: 48000 Hz stereo float, "
+               "buffer=%u frames, mode=%s\n",
+               (unsigned)s_wasapi_buf_frames,
+               s_wasapi_event ? "event" : "poll");
+    }
     return 0;
 }
 
@@ -409,10 +427,21 @@ static void audio_backend_shutdown(void)
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
+    static int first_submit_logged = 0;
+    static int first_submit_failure_logged = 0;
     if (!s_wasapi_render) return;
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(
+        s_wasapi_client, &padding);
+    if (FAILED(hr)) {
+        if (audio_trace_enabled() && !first_submit_failure_logged) {
+            first_submit_failure_logged = 1;
+            printf("[cellAudio-trace] WASAPI GetCurrentPadding failed: "
+                   "0x%08lX\n", hr);
+        }
+        return;
+    }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available)
@@ -421,10 +450,21 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    hr = s_wasapi_render->lpVtbl->GetBuffer(
+        s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(
+            s_wasapi_render, num_samples, 0);
+        if (audio_trace_enabled() && !first_submit_logged &&
+            SUCCEEDED(hr)) {
+            first_submit_logged = 1;
+            printf("[cellAudio-trace] first block accepted by WASAPI "
+                   "(%u frames)\n", (unsigned)num_samples);
+        }
+    } else if (audio_trace_enabled() && !first_submit_failure_logged) {
+        first_submit_failure_logged = 1;
+        printf("[cellAudio-trace] WASAPI GetBuffer failed: 0x%08lX\n", hr);
     }
 }
 
@@ -471,6 +511,26 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+
+        if (audio_trace_enabled()) {
+            static int first_guest_word_logged = 0;
+            if (!first_guest_word_logged) {
+                const u32 words = CELL_AUDIO_BLOCK_SAMPLES * nch;
+                for (u32 i = 0; i < words; i++) {
+                    u32 raw = 0;
+                    memcpy(&raw, &src[i], sizeof(raw));
+                    if (raw != 0u) {
+                        first_guest_word_logged = 1;
+                        printf("[cellAudio-trace] first nonzero guest PCM "
+                               "word: port=%d block=%u sample=%u "
+                               "raw=0x%08X decoded=%.6f\n",
+                               p, block_idx, i, raw,
+                               (double)rd_be_f32(&src[i]));
+                        break;
+                    }
+                }
+            }
+        }
 
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
@@ -537,6 +597,27 @@ static void audio_mix_one_block(void)
     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+    }
+
+    if (audio_trace_enabled()) {
+        static int first_nonzero_logged = 0;
+        static int first_audible_logged = 0;
+        float peak = 0.0f;
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            float sample = s_mix_buffer[i];
+            if (sample < 0.0f) sample = -sample;
+            if (sample > peak) peak = sample;
+        }
+        if (!first_nonzero_logged && peak > 0.000001f) {
+            first_nonzero_logged = 1;
+            printf("[cellAudio-trace] first nonzero mixed block "
+                   "(peak=%.6f)\n", (double)peak);
+        }
+        if (!first_audible_logged && peak > 0.001f) {
+            first_audible_logged = 1;
+            printf("[cellAudio-trace] first audible-level mixed block "
+                   "(peak=%.6f)\n", (double)peak);
+        }
     }
 }
 
