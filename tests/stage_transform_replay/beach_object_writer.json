@@ -1,0 +1,86 @@
+{
+  "checkpoint_pc": "0x00113584",
+  "camera_track_producer": {
+    "entry_pc": "0x00eba570",
+    "conversion_pcs": [
+      "0x00eba630",
+      "0x00eba634"
+    ],
+    "classification": "different_generated_instruction_semantics",
+    "local_time": 0.0,
+    "track_count": 207,
+    "track_flags": "0x00000004",
+    "expected_raw_vectors": [
+      [
+        "0x408c094b",
+        "0x3e2fe401",
+        "0x4231af03",
+        "0x00000000"
+      ],
+      [
+        "0x402a1c66",
+        "0xbe6433bb",
+        "0x423fd532",
+        "0x00000000"
+      ],
+      [
+        "0xbdc31dd5",
+        "0x3f7e4ca0",
+        "0x3d842f5e",
+        "0x00000000"
+      ]
+    ]
+  },
+  "writer_chain": [
+    "0x00da4ca4",
+    "0x00da33b4",
+    "0x00112418",
+    "0x001122bc"
+  ],
+  "writer_stores": [
+    "0x00112348",
+    "0x0011234c",
+    "0x00112350",
+    "0x00112354",
+    "0x00112358",
+    "0x0011235c",
+    "0x00112360",
+    "0x00112364"
+  ],
+  "rpcs3_transform_words": [
+    "0xbf654000",
+    "0xbdc31dd6",
+    "0x3ede94c2",
+    "0x00000000",
+    "0xbd6a5538",
+    "0x3f7e4c9f",
+    "0x3dcc7cf1",
+    "0x00000000",
+    "0xbee1f911",
+    "0x3d842f60",
+    "0xbf651f50",
+    "0x00000000",
+    "0x41bc45a6",
+    "0xc027baf3",
+    "0x421759a2",
+    "0x3f800000"
+  ],
+  "recomp_poison_words": [
+    "0xffc00000",
+    "0xffc00000",
+    "0xffc00000",
+    "0x00000000",
+    "0xffc00000",
+    "0xffc00000",
+    "0xffc00000",
+    "0x00000000",
+    "0xffc00000",
+    "0xffc00000",
+    "0xffc00000",
+    "0x00000000",
+    "0x7fc00000",
+    "0x7fc00000",
+    "0x7fc00000",
+    "0x3f800000"
+  ]
+}
