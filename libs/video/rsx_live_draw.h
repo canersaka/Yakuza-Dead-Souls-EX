@@ -98,7 +98,16 @@ u32  rsx_live_draw_get_last_draws(void);
  * private WM_APP message immediately before New Game is confirmed. */
 #define RSX_LIVE_DRAW_WM_A010_PROBE (0x8000u + 0x2A0u)
 void rsx_live_draw_a010_probe_begin(void);
+
+/* Supply/clear a010's reconstructed view-projection matrix. The live backend
+ * uses it only when a draw's c108..c111 rows are NaNs, preserving finite
+ * constant uploads and all rendering outside the scoped AUTH repair. */
+void rsx_live_draw_set_a010_camera_matrix(const float* matrix16);
 int  rsx_live_draw_a010_probe_active(void);
+/* Becomes true after the first real orphanage character mesh has reached the
+ * live draw sink. AUTH playback uses this to avoid outrunning asynchronous
+ * model submission while the scene is still visually empty. */
+int  rsx_live_draw_a010_world_ready(void);
 
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
