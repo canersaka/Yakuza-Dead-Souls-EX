@@ -10,6 +10,7 @@
 #include "rsx_live_draw.h"
 #include "../input/cellPad.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Real game-frame counter from the Track B live-draw engine (rsx_live_draw.c).
@@ -307,6 +308,18 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     if (!s_state.hwnd) {
         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
         return -1;
+    }
+    /*
+     * CreateWindowEx(... WS_VISIBLE ...) performs the process's first show
+     * request, which Windows may replace with STARTUPINFO.wShowWindow.  A
+     * diagnostic launched through a hidden parent can therefore inherit
+     * SW_HIDE even though this window requested WS_VISIBLE.  The opt-in second
+     * request is authoritative and keeps normal/headless launchers unchanged.
+     */
+    if (getenv("YZ_FORCE_VISIBLE")) {
+        ShowWindow(s_state.hwnd, SW_SHOW);
+        UpdateWindow(s_state.hwnd);
+        printf("[RSX null] YZ_FORCE_VISIBLE: window explicitly shown\n");
     }
     {   /* WM_SETICON beats the shell's per-app taskbar icon cache (see the
          * d3d12 backend's create_window). */
