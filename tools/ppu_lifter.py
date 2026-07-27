@@ -1312,10 +1312,14 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             rn = 0 if mn_base.endswith("z") else 1
-            return (f"{{ uint32_t iv = ppu_f2i32(ctx->fpr[{frb}], {rn}); uint64_t tmp; "
-                    f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
-                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | iv; "
-                    f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+            # The word result occupies the low 32 bits of a SIGN-EXTENDED
+            # 64-bit integer in the FPR.  Preserving the destination's old
+            # high word is observably wrong when fctiw[z] feeds fcfid (as in
+            # Yakuza's camera-track evaluator): fcfid then converts a hybrid
+            # of stale IEEE-754 exponent bits and the new integer.
+            return (f"{{ int64_t iv = (int64_t)(int32_t)"
+                    f"ppu_f2i32(ctx->fpr[{frb}], {rn}); "
+                    f"memcpy(&ctx->fpr[{frd}], &iv, 8); }}")
 
         if mn_base in ("fctid", "fctidz"):
             frd = _reg_idx(ops[0])
