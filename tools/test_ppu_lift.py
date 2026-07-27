@@ -597,21 +597,45 @@ def build_cases():
         case(f"fcmpu {name}", fcmpu_form(0, F[1], F[2]), {},
              [], exp_cr=(nib, 28), in_fprs={F[1]: pa, F[2]: pb})
 
-    # fctiwz/fctiw: saturation + rounding (S2-3). fctiw uses nearest-even.
-    LOW32 = 0x00000000FFFFFFFF
+    # fctiwz/fctiw: saturation + rounding (S2-3), with the 32-bit result
+    # sign-extended across the complete 64-bit FPR payload.  The full-width
+    # assertion is essential because fcfid consumes all 64 bits.
     for name, v, zexp, nexp in [
         ("2.5", 2.5, 2, 2),                 # nearest-even: 2.5 -> 2
         ("1.5", 1.5, 1, 2),                 # nearest-even: 1.5 -> 2
-        ("-2.5", -2.5, -2 & 0xFFFFFFFF, -2 & 0xFFFFFFFF),
+        ("-2.5", -2.5, -2 & MASK64, -2 & MASK64),
         ("3e9", 3e9, 0x7FFFFFFF, 0x7FFFFFFF),      # positive SATURATES (old: sign-flip)
-        ("-3e9", -3e9, 0x80000000, 0x80000000),
-        ("nan", None, 0x80000000, 0x80000000),
+        ("-3e9", -3e9, 0xFFFFFFFF80000000, 0xFFFFFFFF80000000),
+        ("nan", None, 0xFFFFFFFF80000000, 0xFFFFFFFF80000000),
     ]:
         pv = NAN if v is None else dbits(v)
         case(f"fctiwz {name}", fp_x(63, F[0], 0, F[2], 15), {},
-             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], zexp, LOW32)])
+             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], zexp, MASK64)])
         case(f"fctiw {name}", fp_x(63, F[0], 0, F[2], 14), {},
-             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], nexp, LOW32)])
+             [], in_fprs={F[2]: pv}, exp_fprs=[(F[0], nexp, MASK64)])
+
+    # Exact camera-evaluator regression: EBA630 feeds fctiwz directly into
+    # fcfid.  The old lift preserved stale double bits in the destination's
+    # high word, so fcfid converted a hybrid ~0x4069... integer and poisoned
+    # every later camera vector.  Exercise the real instruction sequence,
+    # including its memory round-trip, rather than merely checking low 32 bits.
+    for name, value, expected in [
+        ("positive", 207.5, 207.0),
+        ("negative", -2.5, -2.0),
+    ]:
+        input_bytes = struct.pack(">d", value) + bytes(8)
+        expected_bytes = struct.pack(">d", expected) + bytes(8)
+        vcase(
+            f"camera fctiwz-fcfid {name}",
+            [
+                d_form(50, 2, 10, 0),              # lfd f2,0(r10)
+                fp_x(63, 13, 0, 2, 15),           # fctiwz f13,f2
+                fp_x(63, 12, 0, 13, 846),         # fcfid f12,f13
+                d_form(54, 12, 13, 0),             # stfd f12,0(r13)
+            ],
+            {A_ADDR: input_bytes},
+            {R_ADDR: expected_bytes},
+        )
 
     for name, v, zexp in [
         ("2.5", 2.5, 2), ("1e19", 1e19, 0x7FFFFFFFFFFFFFFF),
