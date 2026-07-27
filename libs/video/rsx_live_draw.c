@@ -39,6 +39,8 @@ void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
+int  rsx_live_draw_a010_world_ready(void) { return 1; }
+void rsx_live_draw_set_a010_camera_matrix(const float* m) { (void)m; }
 void rsx_live_draw_shutdown(void) {}
 
 #else /* _WIN32 */
@@ -68,6 +70,11 @@ void rsx_live_draw_shutdown(void) {}
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+/* Armed by the a010 AUTH repair only after its animation palette is resident. */
+extern volatile LONG g_yz_a010_reference_camera_active;
+/* Published when the Sunshine Orphanage AUTH root becomes live. */
+extern volatile LONG g_yz_a010_root_active;
+
 /* ---------------------------------------------------------------------------
  * Engine state (module-static; single live RSX)
  * -----------------------------------------------------------------------*/
@@ -77,7 +84,14 @@ void rsx_live_draw_shutdown(void) {}
 #define MAX_TEXTURES     128
 #define MAX_VTEX         64
 #define MAX_SAMPLERS     128
-#define MAX_PSOS         256
+/*
+ * A full live boot carries shader pairs from startup movies, menus, and AUTH
+ * into the orphanage.  The old 256-entry cap was already exhausted there,
+ * causing 155/328 sampled a010 groups to return NULL from get_pso().  The
+ * one-frame reference alone uses 197 pairs, so retain enough entries for the
+ * complete boot rather than treating normal scene growth as a draw failure.
+ */
+#define MAX_PSOS         2048
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
 
 #define SRV_WHITE        0
@@ -133,9 +147,18 @@ typedef struct {
 typedef struct {
     u32 location, offset;
     ID3D12Resource* tex;
+    ID3D12Resource* snapshot;
     u32 w, h;
+    u32 snapshot_w, snapshot_h;
+    D3D12_RESOURCE_STATES snapshot_state;
     int cleared;
     int had_write;
+    int snapshot_valid;
+    u64 draws;
+    u64 depth_test_draws;
+    u64 depth_write_draws;
+    u64 depth_both_draws;
+    int reject_logged;
 } zdepth_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap;
@@ -143,6 +166,7 @@ typedef struct {
     ID3D12Resource* tex;
     u64 content_hash;
     u32 last_hash_frame;
+    u64 last_use_serial;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -234,6 +258,8 @@ typedef struct {
 static ld_state g;
 static u32 g_ld_frames = 0;
 static u64 g_ld_texture_cache_full = 0;
+static u64 g_ld_texture_use_serial = 0;
+static u64 g_ld_texture_cache_evictions = 0;
 static u64 g_ld_texture_decode_fail = 0;
 static u64 g_ld_zdepth_srv_binds = 0;
 static u64 g_ld_zdepth_srv_reject_no_write = 0;
@@ -248,6 +274,9 @@ static volatile LONG g_ld_a010_probe_active = 0;
 static u32 g_ld_a010_probe_start_frame = 0;
 static u32 g_ld_a010_probe_sample = 0;
 static u64 g_ld_a010_probe_touched = 0;
+static volatile LONG g_ld_a010_camera_ready = 0;
+static volatile LONG g_ld_a010_world_ready = 0;
+static u32 g_ld_a010_camera_bits[16];
 /* Host movie presentation and the FIFO consumer live on different threads but
  * share one D3D12 command list. Normal gameplay remains single-producer and
  * bypasses this lock; the active-reader handshake closes the movie-mode
@@ -264,6 +293,7 @@ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
     return g.guest_ptr(g.guest_user, location, offset, min_bytes);
 }
 static u64 fnv1a(const void* data, u32 n, u64 h);
+static void ld_dump_surface_ppm(const char* path, const surface_t* surface);
 
 /* ---------------------------------------------------------------------------
  * enable gate
@@ -1057,39 +1087,67 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                 }
             }
         }
+        entry->last_use_serial = ++g_ld_texture_use_serial;
         return entry->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
     }
 
-    if (g.n_textures >= MAX_TEXTURES) {
+    u32 index;
+    ID3D12Resource* evicted = NULL;
+    const int cache_was_full = g.n_textures >= MAX_TEXTURES;
+    if (!cache_was_full) {
+        index = g.n_textures++;
+    } else {
+        /*
+         * A full boot plus a010 binds far more than 128 distinct guest
+         * texture descriptors. Returning SRV_WHITE after the fixed cache
+         * filled made the recovered orphanage render as flat green/black
+         * geometry. Reuse the least-recently-used descriptor while keeping
+         * its resource alive until the open command list reaches a fence.
+         * The shader-visible draw table already contains a descriptor copy,
+         * so rewriting this CPU cache slot cannot alter earlier draws.
+         */
         g_ld_texture_cache_full++;
+        index = 0;
+        for (u32 i = 1; i < g.n_textures; i++)
+            if (g.textures[i].last_use_serial <
+                g.textures[index].last_use_serial)
+                index = i;
+        evicted = g.textures[index].tex;
+        g_ld_texture_cache_evictions++;
         if (g_ld_texture_cache_full <= 16 ||
             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
             fprintf(stderr,
-                    "[texture-cache] FULL cap=%u white-fallbacks=%llu\n",
+                    "[texture-cache] FULL cap=%u lru-evictions=%llu\n",
                     MAX_TEXTURES,
-                    (unsigned long long)g_ld_texture_cache_full);
-        return SRV_WHITE;
+                    (unsigned long long)g_ld_texture_cache_evictions);
     }
-    const u32 index = g.n_textures++;
-    texcache_t* entry = &g.textures[index];
-    memset(entry, 0, sizeof(*entry));
-    entry->location = t->location;
-    entry->offset = t->offset;
-    entry->format = t->format;
-    entry->width = t->width;
-    entry->height = t->height;
-    entry->pitch = t->pitch;
-    entry->remap = remap;
-    entry->cubemap = t->cubemap;
-    entry->last_hash_frame = g_ld_frames;
+
+    texcache_t replacement;
+    memset(&replacement, 0, sizeof(replacement));
+    replacement.location = t->location;
+    replacement.offset = t->offset;
+    replacement.format = t->format;
+    replacement.width = t->width;
+    replacement.height = t->height;
+    replacement.pitch = t->pitch;
+    replacement.remap = remap;
+    replacement.cubemap = t->cubemap;
+    replacement.last_hash_frame = g_ld_frames;
+    replacement.last_use_serial = ++g_ld_texture_use_serial;
     {
         int readable = 0;
-        entry->content_hash = texture_content_hash(t, &readable);
+        replacement.content_hash = texture_content_hash(t, &readable);
     }
-    entry->tex = decode_guest_texture(t, remap);
-    if (entry->tex) {
+    replacement.tex = decode_guest_texture(t, remap);
+    if (replacement.tex) {
+        texcache_t* entry = &g.textures[index];
+        if (evicted)
+            retire_texture(evicted);
+        *entry = replacement;
         write_texture_srv(index, entry);
     } else {
+        if (!cache_was_full)
+            g.textures[index] = replacement;
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
@@ -1100,7 +1158,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     t->location, t->offset, t->format, t->width, t->height,
                     t->pitch);
     }
-    return entry->tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
+    return replacement.tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
 }
 
 static int vertex_texture_supported(const rsx_dsp_vertex_texture* vt)
@@ -1263,19 +1321,31 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h)
             slot = i;
             break;
         }
+    /* Never destroy a usable render target because a malformed live command
+     * briefly decoded a guest pointer as clip dimensions.  The known-good
+     * orphanage stream never exceeds 1280x1024; D3D12 rejects the observed
+     * 1280x16452 declaration and the old path then dereferenced a null
+     * resource.  Preserve the prior surface so diagnostics can capture the
+     * actual world pass while the bad command link is isolated. */
+    if (want_w > 8192u || want_h > 8192u) {
+        static u32 invalid_surface_logs = 0;
+        if (invalid_surface_logs++ < 32u)
+            fprintf(stderr,
+                    "[surface-guard] rejected implausible surface 0x%X "
+                    "%ux%u; preserving slot=%s\n",
+                    offset, want_w, want_h,
+                    slot < MAX_SURFACES ? "existing" : "none");
+        return slot < MAX_SURFACES ? slot : LD_INVALID_SURFACE;
+    }
     if (slot == MAX_SURFACES) {
         if (g.n_surfaces >= MAX_SURFACES) return LD_INVALID_SURFACE;
         slot = g.n_surfaces;
     } else {
-        surface_t* old = &g.surfaces[slot];
+        const surface_t* old = &g.surfaces[slot];
         fprintf(stderr,
                 "[surfsz] live surface 0x%X redeclared %ux%u -> %ux%u "
                 "(content dropped)\n",
                 offset, old->w, old->h, want_w, want_h);
-        if (old->tex) {
-            old->tex->lpVtbl->Release(old->tex);
-            old->tex = NULL;
-        }
     }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
@@ -1285,10 +1355,11 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h)
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = rd.Format;
     surface_t* s = &g.surfaces[slot];
+    ID3D12Resource* replacement = NULL;
     const HRESULT create_hr = g.dev->lpVtbl->CreateCommittedResource(
         g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
-        &IID_ID3D12Resource, (void**)&s->tex);
+        &IID_ID3D12Resource, (void**)&replacement);
     if (FAILED(create_hr)) {
         static u32 surface_fail_logs = 0;
         if (surface_fail_logs++ < 32) {
@@ -1300,8 +1371,15 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h)
                     (unsigned long)create_hr, (unsigned long)removed,
                     slot, g.n_surfaces);
         }
-        return LD_INVALID_SURFACE;
+        /* A resize failure must not poison an existing usable slot. */
+        return slot < g.n_surfaces && s->tex ? slot : LD_INVALID_SURFACE;
     }
+    /* Draws already recorded in the open command list can still reference
+     * the old render target.  Release it only after ld_flush fences that list,
+     * just like dynamic texture and zeta replacements. */
+    if (s->tex)
+        retire_texture(s->tex);
+    s->tex = replacement;
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
@@ -1350,9 +1428,9 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     if (!honor_zeta_track()) return 0;
     /* The DSV must cover the complete live framebuffer/viewport it is bound
      * with.  Some early passes declare a smaller clip than the active canvas;
-     * allocating only that clip caused the D3D device to fail subsequent
-     * surface and PSO creation.  Shadow-map sampling dimensions must therefore
-     * be represented separately from the backing DSV allocation. */
+     * allocating only that clip causes the D3D device to reject later
+     * surface/PSO creation.  Sampling a declared-size window from this padded
+     * backing remains a separate SRV concern. */
     u32 want_w = rt_w > g.width ? rt_w : g.width;
     u32 want_h = rt_h > g.height ? rt_h : g.height;
     u32 slot = MAX_SURFACES;
@@ -1378,8 +1456,16 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
                 "[zetatrack] live zeta %u:0x%X outgrown %ux%u -> %ux%u\n",
                 location, offset, old->w, old->h, want_w, want_h);
         if (old->tex) {
-            old->tex->lpVtbl->Release(old->tex);
+            /* Draws already recorded in the open command list may still
+             * reference this DSV.  D3D12 command lists do not retain resource
+             * lifetimes for the application, so release it only after the
+             * next submit/fence completes. */
+            retire_texture(old->tex);
             old->tex = NULL;
+        }
+        if (old->snapshot) {
+            retire_texture(old->snapshot);
+            old->snapshot = NULL;
         }
     }
 
@@ -1416,12 +1502,41 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->w = want_w;
     z->h = want_h;
     z->had_write = 0;
+    z->snapshot_valid = 0;
+    z->snapshot_w = rt_w ? rt_w : want_w;
+    z->snapshot_h = rt_h ? rt_h : want_h;
+    if (z->snapshot_w > want_w) z->snapshot_w = want_w;
+    if (z->snapshot_h > want_h) z->snapshot_h = want_h;
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvd = {0};
     dsvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     dsvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     g.dev->lpVtbl->CreateDepthStencilView(
         g.dev, z->tex, &dsvd, dsv_handle(1 + slot));
-    srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->tex);
+
+    /* Keep the live DSV padded to the active canvas, but expose an
+     * exact-declared-size snapshot to shaders.  Binding the padded resource
+     * directly skews 1024-wide zeta coordinates against a 1280-wide backing,
+     * while allocating the live DSV at 1024 causes D3D12 to reject later
+     * render-target/PSO combinations. */
+    D3D12_RESOURCE_DESC snapshot_rd = rd;
+    snapshot_rd.Width = z->snapshot_w;
+    snapshot_rd.Height = z->snapshot_h;
+    snapshot_rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    HRESULT snapshot_hr = g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &snapshot_rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&z->snapshot);
+    if (FAILED(snapshot_hr)) {
+        fprintf(stderr,
+                "[zetatrack] live snapshot create failed %u:0x%X "
+                "%ux%u hr=0x%08lX; guest fallback\n",
+                location, offset, z->snapshot_w, z->snapshot_h,
+                (unsigned long)snapshot_hr);
+        z->snapshot = NULL;
+    } else {
+        z->snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->snapshot);
+    }
     g.list->lpVtbl->ClearDepthStencilView(
         g.list, dsv_handle(1 + slot),
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
@@ -1434,6 +1549,72 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
             rt_w, rt_h, g.width, g.height);
     if (slot == g.n_zdepths) g.n_zdepths++;
     return 1 + slot;
+}
+
+/* Preserve the last completed depth-writing pass before the guest clears or
+ * reuses its live zeta.  The replay renderer gets these bytes from its
+ * captured cross-frame memory image; live rendering must explicitly retain
+ * the equivalent GPU result because the guest never reads it back to CPU
+ * VRAM. */
+static int zdepth_snapshot(u32 slot)
+{
+    if (!slot) return 0;
+    zdepth_t* z = &g.zdepths[slot - 1];
+    if (!z->snapshot) return 0;
+    if (!z->had_write) return z->snapshot_valid;
+
+    D3D12_RESOURCE_BARRIER bars[2] = {0};
+    u32 nbar = 0;
+    bars[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[nbar].Transition.pResource = z->tex;
+    bars[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bars[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    nbar++;
+    if (z->snapshot_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        bars[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[nbar].Transition.pResource = z->snapshot;
+        bars[nbar].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bars[nbar].Transition.StateBefore = z->snapshot_state;
+        bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        nbar++;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = z->snapshot;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    src.pResource = z->tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_BOX box = {
+        0, 0, 0,
+        z->snapshot_w, z->snapshot_h, 1
+    };
+    g.list->lpVtbl->CopyTextureRegion(
+        g.list, &dst, 0, 0, 0, &src, &box);
+
+    D3D12_RESOURCE_BARRIER done[2] = {0};
+    done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    done[0].Transition.pResource = z->tex;
+    done[0].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    done[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    done[1].Transition.pResource = z->snapshot;
+    done[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    done[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    done[1].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
+    z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    z->snapshot_valid = 1;
+    z->had_write = 0;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1843,12 +2024,46 @@ static ld_stats g_ld_stats;
 
 void rsx_live_draw_a010_probe_begin(void)
 {
-    if (!getenv("YZ_RSX_A010_PROBE") || !g.ready)
+    if ((!getenv("YZ_RSX_A010_PROBE") &&
+         !getenv("YZ_RSX_A010_SURFACE_DUMP")) || !g.ready)
         return;
+    /*
+     * Targeted surface readbacks submit and fence the open D3D12 list. When
+     * surface capture alone is requested, defer that cost until AUTH confirms
+     * that both the character palette and verified camera are synchronized.
+     * Explicit YZ_RSX_A010_PROBE retains its scene-open diagnostic behavior.
+     */
+    if (!getenv("YZ_RSX_A010_PROBE") &&
+        InterlockedCompareExchange(
+            &g_yz_a010_reference_camera_active, 0, 0) == 0)
+        return;
+    if (getenv("YZ_A010_START_REFERENCE")) {
+        /* Deterministic visual-verification camera derived from the shipped
+         * cam_Came_000_002.cmt frame 612. Install it on the RSX thread as soon
+         * as the a010 probe opens so a later blocked PPU scene update cannot
+         * prevent the reference matrix from reaching the first world draws. */
+        static const float reference_matrix_612[16] = {
+             3.18890834f,   -0.000270011135f,  0.08452246f,   5.81511511f,
+            -0.0102274104f,  5.65674844f,      0.403935942f, -18.5085361f,
+             0.0264371686f,  0.0712562195f,   -0.997207931f,  9.99292802f,
+             0.0264345249f,  0.0712490938f,   -0.99710821f,  10.0919287f,
+        };
+        static const float reference_matrix_874[16] = {
+             6.80647601f,   -0.00327668415f,  0.611324803f, -36.9135075f,
+             0.00523179535f, 12.1491076f,     0.00686819648f, -38.8146474f,
+             0.0894642733f,  0.000524588748f,-0.996090306f, -11.7467763f,
+             0.0894553268f,  0.000524536289f,-0.995990697f, -11.6456016f,
+        };
+        const float* reference_matrix =
+            getenv("YZ_A010_REFERENCE_874")
+                ? reference_matrix_874 : reference_matrix_612;
+        rsx_live_draw_set_a010_camera_matrix(reference_matrix);
+    }
     CreateDirectoryA("scratch\\a010_probe", NULL);
     g_ld_a010_probe_start_frame = g_ld_frames;
     g_ld_a010_probe_sample = 0;
     g_ld_a010_probe_touched = 0;
+    InterlockedExchange(&g_ld_a010_world_ready, 0);
     InterlockedExchange(&g_ld_a010_probe_active, 1);
     fprintf(stderr,
             "[a010-probe] BEGIN live_frame=%u surfaces=%u packets=%llu groups=%llu\n",
@@ -1860,6 +2075,11 @@ void rsx_live_draw_a010_probe_begin(void)
 int rsx_live_draw_a010_probe_active(void)
 {
     return InterlockedCompareExchange(&g_ld_a010_probe_active, 0, 0) != 0;
+}
+
+int rsx_live_draw_a010_world_ready(void)
+{
+    return InterlockedCompareExchange(&g_ld_a010_world_ready, 0, 0) != 0;
 }
 
 static unsigned long long ld_groups_accounted(void)
@@ -2166,12 +2386,393 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
     g_ld_stats.packets_queued++;
 }
 
+void rsx_live_draw_set_a010_camera_matrix(const float* matrix16)
+{
+    if (!matrix16) {
+        InterlockedExchange(&g_ld_a010_camera_ready, 0);
+        return;
+    }
+    memcpy(g_ld_a010_camera_bits, matrix16, sizeof(g_ld_a010_camera_bits));
+    MemoryBarrier();
+    InterlockedExchange(&g_ld_a010_camera_ready, 1);
+}
+
+/* Hash the same pre-cubemap/pre-VTF PSO inputs used by the reference replay's
+ * RSX_DRAW_CSV.  Keeping this legacy key lets a live draw be matched directly
+ * to the known-good a010 capture even though the current live PSO key contains
+ * additional feature masks. */
+static u64 live_legacy_pso_key(void)
+{
+    const u32 start = rsx_dsp_vp_start(&g.rsx);
+    if (start >= RSX_DSP_VP_INSTR)
+        return 0;
+    const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
+    const u32 vp_instrs = rsx_vp_program_size_instrs(
+        vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+    if (!vp_instrs)
+        return 0;
+
+    u32 fp_loc = 0;
+    const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+    const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
+    if (!fp_uc)
+        return 0;
+    const u32 fp_size = rsx_fp_program_size(fp_uc, 0x10000);
+    if (!fp_size)
+        return 0;
+    fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
+    if (!fp_uc)
+        return 0;
+
+    u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    key = fnv1a(fp_uc, fp_size, key);
+    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x40u;
+    key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+    render_state_t rs;
+    decode_render_state(&rs);
+    return fnv1a(&rs, sizeof(rs), key);
+}
+
+/* YZ_RSX_DRAW_CSV=path: uncapped per-draw fingerprints for direct comparison
+ * with the working RPCS3 .rxs replay.  Default-off and renderer-neutral. */
+static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+{
+    static int inited = 0;
+    static FILE* file = NULL;
+    static u64 draw = 0;
+    const int a010_only = getenv("YZ_RSX_DRAW_CSV_A010_ONLY") != NULL;
+    if (a010_only) {
+        if (InterlockedCompareExchange(
+                &g_ld_a010_world_ready, 0, 0) == 0)
+            return;
+    }
+    if (!inited) {
+        inited = 1;
+        const char* path = getenv("YZ_RSX_DRAW_CSV");
+        if (path && path[0]) {
+            file = fopen(path, "w");
+            if (file) {
+                fprintf(file,
+                    "draw,frame,outcome,surf,prim,verts,pso_key,regs_hash,vp_hash,"
+                    "const_hash,blend,dtest,dwrite,dfunc,cull,cullface,"
+                    "frontface,cmask,vpx,vpy,vpw,vph,sclx,scly,sclz,"
+                    "trnx,trny,trnz,clipw,cliph,zeta_off,zeta_pitch,zeta_loc,"
+                    "seen_vtex,seen_vtxfmt,seen_freqdiv\n");
+                fprintf(stderr, "[live-diff] YZ_RSX_DRAW_CSV armed: %s\n", path);
+            } else {
+                fprintf(stderr, "[live-diff] cannot open YZ_RSX_DRAW_CSV: %s\n",
+                        path);
+            }
+            fflush(stderr);
+        }
+    }
+    if (!file)
+        return;
+
+    const u32 target = current_surface();
+    const u32 surf = target < g.n_surfaces ? g.surfaces[target].offset : 0;
+    const u64 regs_hash = fnv1a(
+        g.rsx.regs, RSX_DSP_NUM_REGS * sizeof(g.rsx.regs[0]),
+        1469598103934665603ull);
+    const u64 vp_hash = fnv1a(
+        g.rsx.vp, sizeof(g.rsx.vp), 1469598103934665603ull);
+    const u64 const_hash = fnv1a(
+        g.rsx.constants, sizeof(g.rsx.constants), 1469598103934665603ull);
+    render_state_t rs;
+    decode_render_state(&rs);
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_viewport(&g.rsx, &vp);
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+
+    u32 seen_vtex = 0, seen_vtxfmt = 0;
+    for (u32 i = 0; i < 32; i++)
+        seen_vtex += g.rsx.seen[(0x0900u >> 2) + i];
+    for (u32 i = 0; i < 16; i++)
+        seen_vtxfmt += g.rsx.seen[(0x1740u >> 2) + i];
+    const u32 seen_freqdiv = g.rsx.seen[0x1FC0u >> 2];
+
+    fprintf(file,
+        "%llu,%u,%s,0x%X,%u,%u,%016llx,%016llx,%016llx,%016llx,"
+        "%u,%u,%u,0x%X,%u,0x%X,0x%X,0x%08X,"
+        "%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+        "%u,%u,0x%X,%u,%u,%u,%u,%u\n",
+        (unsigned long long)draw++, g_ld_frames, outcome, surf, prim, n_tri,
+        (unsigned long long)live_legacy_pso_key(),
+        (unsigned long long)regs_hash, (unsigned long long)vp_hash,
+        (unsigned long long)const_hash,
+        rs.blend_enable, rs.depth_test, rs.depth_write, rs.depth_func,
+        rs.cull_enable, rs.cull_face, rs.front_face, rs.color_mask,
+        vp.x, vp.y, vp.w, vp.h,
+        vp.scale[0], vp.scale[1], vp.scale[2],
+        vp.translate[0], vp.translate[1], vp.translate[2],
+        sf.clip_w, sf.clip_h, sf.zeta_offset, sf.zeta_pitch, sf.zeta_location,
+        seen_vtex, seen_vtxfmt, seen_freqdiv);
+    fflush(file);
+}
+
+/* YZ_RSX_A010_GEOM: trace one stable orphanage mesh.  This is draw 520 from
+ * the healthy a010 reference: a 270-vertex triangle strip on the main world
+ * surface with PSO 7d9f....  The model-initialization repair now reproduces
+ * this exact tuple in the live stream.  Keeping the tuple exact makes the gate
+ * quiet outside a010 while allowing capture/playback only after known-good
+ * world geometry has actually reached the backend. */
+static void live_a010_geom_trace(u32 prim, u32 n_tri)
+{
+    static int enabled = -1;
+    static u32 logged = 0;
+    static u32 reference_logged = 0;
+    if (enabled < 0)
+        enabled = getenv("YZ_RSX_A010_GEOM") ? 1 : 0;
+    if (prim != PRIM_TRIANGLE_STRIP || n_tri != 270)
+        return;
+
+    const u32 target = current_surface();
+    const u32 surf =
+        target < g.n_surfaces ? g.surfaces[target].offset : 0;
+    const u64 key = live_legacy_pso_key();
+    if (surf != 0x01800000u || key != 0x7d9f528329f20c52ull)
+        return;
+    /*
+     * This topology/PSO/surface tuple is the stable Kiryu mesh measured in
+     * the healthy a010 capture. Reaching this point means vertex fetch has
+     * completed and the scene has produced real world geometry, rather than
+     * only clears and fullscreen post-processing draws.
+     */
+    if (InterlockedCompareExchange(&g_ld_a010_world_ready, 1, 0) == 0) {
+        fprintf(stderr,
+                "[a010-world-ready] frame=%u surface=0x%X "
+                "pso=%016llx vertices=%u\n",
+                g_ld_frames, surf, (unsigned long long)key, n_tri);
+        fflush(stderr);
+    }
+    if (!enabled)
+        return;
+    if (InterlockedCompareExchange(
+            &g_yz_a010_reference_camera_active, 0, 0) != 0) {
+        if (reference_logged >= 8)
+            return;
+        reference_logged++;
+    } else {
+        if (logged >= 8)
+            return;
+        logged++;
+    }
+
+    float mn[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+    float mx[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+    u32 nan_count = 0;
+    for (u32 vi = 0; vi < dc.n_verts; vi++) {
+        const float* p = dc.verts[vi].a[0];
+        for (u32 k = 0; k < 4; k++) {
+            if (p[k] != p[k]) {
+                nan_count++;
+                continue;
+            }
+            if (p[k] < mn[k]) mn[k] = p[k];
+            if (p[k] > mx[k]) mx[k] = p[k];
+        }
+    }
+
+    const u32 base = rsx_dsp_vertex_data_base_offset(&g.rsx);
+    const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+    rsx_dsp_index_array ia;
+    rsx_dsp_get_index_array(&g.rsx, &ia);
+    rsx_dsp_vertex_attr a0, a7;
+    rsx_dsp_get_vertex_attr(&g.rsx, 0, &a0);
+    rsx_dsp_get_vertex_attr(&g.rsx, 7, &a7);
+
+    fprintf(stderr,
+        "[a010-geom] match=%u frame=%u fetched=%u expanded=%u cuts=%u "
+        "pos=[%.6g %.6g %.6g %.6g]-[%.6g %.6g %.6g %.6g] nan=%u "
+        "decoded_hash=%016llx\n",
+        logged, g_ld_frames, dc.n_verts, n_tri, dc.n_cuts,
+        mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
+        nan_count,
+        (unsigned long long)fnv1a(
+            dc.verts, (size_t)dc.n_verts * sizeof(vtx_t),
+            1469598103934665603ull));
+    fprintf(stderr,
+        "[a010-geom] base=0x%X base_index=%u "
+        "idx(loc=%u off=0x%X u32=%u first=%u count=%u) "
+        "a0(type=%u size=%u stride=%u loc=%u off=0x%X freq=%u) "
+        "a7(type=%u size=%u stride=%u loc=%u off=0x%X freq=%u)\n",
+        base, base_index,
+        ia.location, ia.offset, ia.is_u32,
+        dc.n_idx ? dc.idx[0].first : 0,
+        dc.n_idx ? dc.idx[0].count : 0,
+        a0.type, a0.size, a0.stride, a0.location, a0.offset, a0.frequency,
+        a7.type, a7.size, a7.stride, a7.location, a7.offset, a7.frequency);
+
+    for (u32 slot = 108; slot <= 115; slot++) {
+        const u32* c = rsx_dsp_constant(&g.rsx, slot);
+        union { u32 u; float f; } v[4];
+        for (u32 k = 0; k < 4; k++) v[k].u = c[k];
+        fprintf(stderr,
+            "[a010-geom] c%u=(%.6g %.6g %.6g %.6g) "
+            "raw=%08X/%08X/%08X/%08X\n",
+            slot, v[0].f, v[1].f, v[2].f, v[3].f,
+            v[0].u, v[1].u, v[2].u, v[3].u);
+    }
+    {
+        const u32* c = rsx_dsp_constant(&g.rsx, 467);
+        union { u32 u; float f; } v[4];
+        for (u32 k = 0; k < 4; k++) v[k].u = c[k];
+        fprintf(stderr,
+            "[a010-geom] c467=(%.6g %.6g %.6g %.6g)\n",
+            v[0].f, v[1].f, v[2].f, v[3].f);
+    }
+    {
+        float camera[4][4];
+        float c467[4];
+        for (u32 row = 0; row < 4; row++)
+            memcpy(camera[row], rsx_dsp_constant(&g.rsx, 108u + row),
+                   sizeof(camera[row]));
+        memcpy(c467, rsx_dsp_constant(&g.rsx, 467), sizeof(c467));
+        rsx_dsp_viewport vp;
+        rsx_dsp_get_viewport(&g.rsx, &vp);
+        float sx_min = 1e30f, sy_min = 1e30f;
+        float sx_max = -1e30f, sy_max = -1e30f;
+        float w_min = 1e30f, w_max = -1e30f;
+        u32 finite = 0, in_front = 0, in_view = 0;
+        for (u32 vi = 0; vi < dc.n_verts; vi++) {
+            const float* p = dc.verts[vi].a[0];
+            const float* weight = dc.verts[vi].a[1];
+            const float* bone = dc.verts[vi].a[7];
+            const float pw = p[3] != 0.0f ? p[3] : 1.0f;
+            /*
+             * Exact transform used by healthy PSO 7d9f...: ATTR7 selects
+             * four 3-row bone matrices at c112+, ATTR1.yzw supplies weights
+             * 1..3, and weight 0 is implicit.  The old probe incorrectly
+             * treated c112..c115 as one fixed 4x4 matrix.
+             */
+            const float influence[4] = {
+                c467[1] - weight[1] - weight[2] - weight[3],
+                weight[1], weight[2], weight[3]
+            };
+            float skin[3][4] = {{0}};
+            for (u32 inf = 0; inf < 4; inf++) {
+                const u32 base_slot =
+                    (u32)(bone[inf] * c467[0]);
+                for (u32 row = 0; row < 3; row++) {
+                    const float* palette = (const float*)
+                        rsx_dsp_constant(
+                            &g.rsx, (112u + base_slot + row) & 511u);
+                    for (u32 lane = 0; lane < 4; lane++)
+                        skin[row][lane] +=
+                            influence[inf] * palette[lane];
+                }
+            }
+            const float r7x =
+                p[0]*skin[0][0] + p[1]*skin[0][1] +
+                p[2]*skin[0][2] + pw*skin[0][3];
+            const float r7y =
+                p[0]*skin[1][0] + p[1]*skin[1][1] +
+                p[2]*skin[1][2] + pw*skin[1][3];
+            const float r7z =
+                p[0]*skin[2][0] + p[1]*skin[2][1] +
+                p[2]*skin[2][2] + pw*skin[2][3];
+            const float r4w =
+                c467[2] * (p[0] + p[1] + p[2]) + pw;
+            const float cx =
+                r7x*camera[0][0] + r7y*camera[0][1] +
+                r7z*camera[0][2] + r4w*camera[0][3];
+            const float cy =
+                r7x*camera[1][0] + r7y*camera[1][1] +
+                r7z*camera[1][2] + r4w*camera[1][3];
+            const float cw =
+                r7x*camera[3][0] + r7y*camera[3][1] +
+                r7z*camera[3][2] + r4w*camera[3][3];
+            if (cx != cx || cy != cy || cw != cw || cw == 0.0f)
+                continue;
+            finite++;
+            if (cw > 0.0f) in_front++;
+            if (cw < w_min) w_min = cw;
+            if (cw > w_max) w_max = cw;
+            const float sx = (cx / cw) * vp.scale[0] + vp.translate[0];
+            const float sy = (cy / cw) * vp.scale[1] + vp.translate[1];
+            if (sx < sx_min) sx_min = sx;
+            if (sx > sx_max) sx_max = sx;
+            if (sy < sy_min) sy_min = sy;
+            if (sy > sy_max) sy_max = sy;
+            if (cw > 0.0f && sx >= 0.0f && sx < (float)vp.w &&
+                sy >= 0.0f && sy < (float)vp.h)
+                in_view++;
+        }
+        fprintf(stderr,
+                "[a010-clip] frame=%u finite=%u/%u front=%u view=%u "
+                "screen=[%.3f %.3f]-[%.3f %.3f] w=[%.6g %.6g] "
+                "viewport=%ux%u\n",
+                g_ld_frames, finite, dc.n_verts, in_front, in_view,
+                sx_min, sy_min, sx_max, sy_max, w_min, w_max,
+                vp.w, vp.h);
+        if (InterlockedCompareExchange(
+                &g_yz_a010_reference_camera_active, 0, 0) != 0) {
+            static LONG acceptance_written = 0;
+            if (InterlockedCompareExchange(
+                    &acceptance_written, 1, 0) == 0) {
+                FILE* acceptance =
+                    fopen("scratch\\a010_acceptance.txt", "a");
+                if (acceptance) {
+                    fprintf(acceptance,
+                            "reference-mesh frame=%u finite=%u/%u "
+                            "front=%u view=%u screen=%.3f,%.3f,"
+                            "%.3f,%.3f viewport=%u,%u\n",
+                            g_ld_frames, finite, dc.n_verts,
+                            in_front, in_view, sx_min, sy_min,
+                            sx_max, sy_max, vp.w, vp.h);
+                    fclose(acceptance);
+                }
+            }
+        }
+    }
+    fflush(stderr);
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
     g_ld_stats.groups_seen++;
+    /*
+     * a010's native per-mesh constant builder can overwrite the otherwise
+     * valid reconstructed camera with NaNs after the ordinary camera upload.
+     * Repair at the last measured boundary, immediately before the draw
+     * consumes the constants. Once the synchronized a010 reference is armed,
+     * replace finite-but-wrong native uploads too: the measured failure
+     * matrix is finite, yet projects the model thousands of pixels offscreen.
+     */
+    if (InterlockedCompareExchange(&g_ld_a010_camera_ready, 0, 0) != 0) {
+        int camera_has_nan = 0;
+        for (u32 slot = 108; slot <= 111 && !camera_has_nan; slot++)
+            for (u32 lane = 0; lane < 4; lane++) {
+                const u32 bits = g.rsx.constants[slot][lane];
+                if ((bits & 0x7F800000u) == 0x7F800000u &&
+                    (bits & 0x007FFFFFu) != 0) {
+                    camera_has_nan = 1;
+                    break;
+                }
+            }
+        if (camera_has_nan || getenv("YZ_A010_START_REFERENCE") ||
+            InterlockedCompareExchange(
+                &g_yz_a010_reference_camera_active, 0, 0) != 0) {
+            for (u32 i = 0; i < 16; i++)
+                g.rsx.constants[108 + i / 4][i % 4] =
+                    g_ld_a010_camera_bits[i];
+            static u64 repairs = 0;
+            repairs++;
+            if (repairs <= 16 || (repairs & (repairs - 1)) == 0) {
+                fprintf(stderr,
+                        "[a010-rsx-camera-repair] n=%llu frame=%u "
+                        "c108=%08X/%08X/%08X/%08X\n",
+                        (unsigned long long)repairs, g_ld_frames,
+                        g.rsx.constants[108][0], g.rsx.constants[108][1],
+                        g.rsx.constants[108][2], g.rsx.constants[108][3]);
+                fflush(stderr);
+            }
+        }
+    }
     const u32 prim = g.rsx.current_primitive;
     fetch_batches();
     if (!dc.n_verts || !dc.fetch_ok) { g_ld_stats.group_drop_fetch++; return; }
@@ -2260,28 +2861,52 @@ static void sink_end(void* user, const rsx_dispatch* r)
         return;
     }
 
-    if (g.vb_used + n_tri * VERT_STRIDE > MAX_VERTS * VERT_STRIDE) {
+    live_a010_geom_trace(prim, n_tri);
+
+    const u64 draw_vb_bytes = (u64)n_tri * VERT_STRIDE;
+    const u64 vb_capacity = (u64)MAX_VERTS * VERT_STRIDE;
+    if (draw_vb_bytes > vb_capacity) {
+        live_draw_csv_emit(prim, n_tri, "drop_vbring_oversize");
         g_ld_stats.group_drop_ring++;
-        if (tri != dc.verts) free(tri); return;
+        if (tri != dc.verts) free(tri);
+        return;
+    }
+    if ((u64)g.vb_used + draw_vb_bytes > vb_capacity) {
+        /*
+         * The replay-proven renderer recycles this upload ring mid-frame.
+         * Live used to drop every remaining draw instead, which discarded
+         * 181/184 sampled a010 groups after the orphanage workload filled the
+         * 256K-vertex ring.  We are still before this draw's memcpy, so it is
+         * safe to submit/wait and reuse every transient draw ring here.
+         */
+        ld_flush();
+        g.vb_used = 0;
+        g.cb_used = 0;
+        g.srv_ring_used = 0;
+        g.smp_ring_used = 0;
     }
     memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
 
     ID3D12PipelineState* pso = get_pso();
     if (!pso) {
+        live_draw_csv_emit(prim, n_tri, "drop_pso");
         g_ld_stats.group_drop_pso++;
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
     if (g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
+        live_draw_csv_emit(prim, n_tri, "drop_cbring");
         g_ld_stats.group_drop_ring++;
         if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
     }
 
     const u32 target = current_surface();
     if (target == LD_INVALID_SURFACE) {
+        live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
         if (tri != dc.verts) free(tri);
         return;
     }
+    live_draw_csv_emit(prim, n_tri, "execute");
     if (rsx_live_draw_a010_probe_active() && target < 64)
         g_ld_a010_probe_touched |= 1ull << target;
     { static u32 last_target = LD_INVALID_SURFACE;
@@ -2323,10 +2948,29 @@ static void sink_end(void* user, const rsx_dispatch* r)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
                         current_zslot != 1 + i) {
-                        if (g.zdepths[i].had_write)
+                        if (zdepth_snapshot(1 + i))
                             sampled_depth = (int)i;
-                        else
+                        else {
                             g_ld_zdepth_srv_reject_no_write++;
+                            if (!g.zdepths[i].reject_logged &&
+                                rsx_live_draw_a010_probe_active()) {
+                                g.zdepths[i].reject_logged = 1;
+                                fprintf(stderr,
+                                    "[zetatrack] a010 reject #%u %u:0x%X "
+                                    "draws=%llu dtest=%llu dwrite=%llu "
+                                    "both=%llu snapshot=%d\n",
+                                    i, g.zdepths[i].location,
+                                    g.zdepths[i].offset,
+                                    (unsigned long long)g.zdepths[i].draws,
+                                    (unsigned long long)
+                                        g.zdepths[i].depth_test_draws,
+                                    (unsigned long long)
+                                        g.zdepths[i].depth_write_draws,
+                                    (unsigned long long)
+                                        g.zdepths[i].depth_both_draws,
+                                    g.zdepths[i].snapshot_valid);
+                            }
+                        }
                         break;
                     }
             if (sampled_depth >= 0) {
@@ -2352,13 +2996,6 @@ static void sink_end(void* user, const rsx_dispatch* r)
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
     }
-    for (u32 k = 0; k < n_zdepth_used; k++) {
-        bar.Transition.pResource = g.zdepths[zdepth_used[k]].tex;
-        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
-    }
-
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     D3D12_CPU_DESCRIPTOR_HANDLE dsv; int have_dsv = 0;
     if (g.depth) {
@@ -2449,11 +3086,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (current_zslot) {
         render_state_t depth_state;
         decode_render_state(&depth_state);
+        zdepth_t* z = &g.zdepths[current_zslot - 1];
+        z->draws++;
+        if (depth_state.depth_test) z->depth_test_draws++;
+        if (depth_state.depth_write) z->depth_write_draws++;
+        if (depth_state.depth_test && depth_state.depth_write)
+            z->depth_both_draws++;
         /* A write-enable bit alone does not prove that this draw produced a
          * usable depth map.  With depth testing disabled RSX does not execute
          * the depth pass represented by this tracked zeta. */
         if (depth_state.depth_test && depth_state.depth_write)
-            g.zdepths[current_zslot - 1].had_write = 1;
+            z->had_write = 1;
     }
     g_ld_stats.groups_executed++;
 
@@ -2463,11 +3106,43 @@ static void sink_end(void* user, const rsx_dispatch* r)
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
     }
-    for (u32 k = 0; k < n_zdepth_used; k++) {
-        bar.Transition.pResource = g.zdepths[zdepth_used[k]].tex;
-        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+    /* A guest-side failure can occur before the next flip even though useful
+     * orphanage draws have already reached internal world targets.  Preserve
+     * a few progressively later surface snapshots directly from the draw
+     * stream so presentation is not a prerequisite for visual diagnosis. */
+    if (getenv("YZ_RSX_A010_EAGER_DUMP") &&
+        InterlockedCompareExchange(&g_ld_a010_world_ready, 0, 0) != 0) {
+        static u64 eager_origin = 0;
+        static u32 eager_sample = 0;
+        if (!eager_origin)
+            eager_origin = g_ld_stats.groups_executed;
+        if (eager_sample < 4u &&
+            g_ld_stats.groups_executed >=
+                eager_origin + (u64)eager_sample * 32u) {
+            CreateDirectoryA("scratch\\a010_probe", NULL);
+            for (u32 i = 0; i < g.n_surfaces; i++) {
+                const u32 off = g.surfaces[i].offset;
+                if (off != 0x00E40000u && off != 0x01800000u &&
+                    off != 0x02D10000u && off != 0x02710000u &&
+                    off != 0x01440000u)
+                    continue;
+                char path[256];
+                snprintf(path, sizeof(path),
+                         "scratch\\a010_probe\\eager_%03u_group_%08llu_"
+                         "surface_%02u_off_%08X.ppm",
+                         eager_sample,
+                         (unsigned long long)g_ld_stats.groups_executed,
+                         i, off);
+                ld_dump_surface_ppm(path, &g.surfaces[i]);
+            }
+            fprintf(stderr,
+                    "[a010-eager-dump] sample=%u groups=%llu surfaces=%u\n",
+                    eager_sample,
+                    (unsigned long long)g_ld_stats.groups_executed,
+                    g.n_surfaces);
+            eager_sample++;
+            fflush(stderr);
+        }
     }
     g.vb_used += n_tri * VERT_STRIDE;
     if (tri != dc.verts) free(tri);
@@ -2520,6 +3195,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
+        if (zslot && (mask & RSX_CLEAR_DEPTH))
+            zdepth_snapshot(zslot);
         g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
             clear_flags, 1.0f, 0, 0, NULL);
         if (zslot) {
@@ -2779,6 +3456,33 @@ void rsx_live_draw_set_display_buffer(
 
 void rsx_live_draw_method(u32 method, u32 arg)
 {
+    /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+     * raw method (including its FIFO subchannel bits) visible: if an SPU-built
+     * command list binds NV4097 on a different subchannel, feeding the raw
+     * 0x2xxx-shifted method into the canonical dispatcher silently stores the
+     * state in the wrong register bank. */
+    static int state_trace = -1;
+    static u32 state_trace_lines = 0;
+    if (state_trace < 0)
+        state_trace = getenv("YZ_RSX_VERTEX_STATE_TRACE") ? 1 : 0;
+    if (state_trace && state_trace_lines < 512) {
+        const u32 canonical = method & 0x1FFCu;
+        const int vertex_texture =
+            canonical >= 0x0900u && canonical < 0x0980u;
+        const int vertex_format =
+            canonical >= 0x1740u && canonical < 0x1780u;
+        const int frequency_divider = canonical == 0x1FC0u;
+        if (vertex_texture || vertex_format || frequency_divider) {
+            fprintf(stderr,
+                    "[rsx-vstate] frame=%u raw=0x%04X sub=%u canonical=0x%04X "
+                    "arg=0x%08X\n",
+                    g_ld_frames, method & 0xFFFFu, (method >> 13) & 7u,
+                    canonical, arg);
+            fflush(stderr);
+            state_trace_lines++;
+        }
+    }
+
     const int composite = ld_movie_composite_ui_enabled();
     if (composite) {
         for (;;) {
@@ -2985,11 +3689,15 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 /* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
  * and write a binary PPM. Self-contained -- creates + releases its own readback
  * buffer, so no init/struct changes. Uses g.list which ld_flush leaves open. */
-static void ld_dump_surface_ppm(const char* path, ID3D12Resource* rt)
+static void ld_dump_surface_ppm(const char* path, const surface_t* surface)
 {
+    ID3D12Resource* rt = surface ? surface->tex : NULL;
     if (!rt) return;
-    const u32 pitch = (g.width * 4 + 255) & ~255u;              /* 256-align */
-    const UINT64 rb_size = (UINT64)pitch * g.height;
+    const u32 width = surface->w;
+    const u32 height = surface->h;
+    if (!width || !height) return;
+    const u32 pitch = (width * 4 + 255) & ~255u;                /* 256-align */
+    const UINT64 rb_size = (UINT64)pitch * height;
 
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC bd = {0};
@@ -3014,8 +3722,8 @@ static void ld_dump_surface_ppm(const char* path, ID3D12Resource* rt)
     src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
     dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = width;
+    dst.PlacedFootprint.Footprint.Height = height;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = pitch;
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
@@ -3030,10 +3738,10 @@ static void ld_dump_surface_ppm(const char* path, ID3D12Resource* rt)
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
         FILE* f = fopen(path, "wb");
         if (f) {
-            fprintf(f, "P6\n%u %u\n255\n", g.width, g.height);
-            for (u32 y = 0; y < g.height; y++) {
+            fprintf(f, "P6\n%u %u\n255\n", width, height);
+            for (u32 y = 0; y < height; y++) {
                 const u8* row = px + (SIZE_T)y * pitch;
-                for (u32 x = 0; x < g.width; x++) fwrite(row + x * 4, 1, 3, f);  /* RGBA->RGB */
+                for (u32 x = 0; x < width; x++) fwrite(row + x * 4, 1, 3, f);  /* RGBA->RGB */
             }
             fclose(f);
             fprintf(stderr, "[live-draw] wrote %s\n", path);
@@ -3168,39 +3876,89 @@ void rsx_live_draw_present(u32 buffer_id)
         if (cur != LD_INVALID_SURFACE) {
             char path[256];
             snprintf(path, sizeof(path), "scratch\\ld_frame_%02u.ppm", g_ld_frames);
-            ld_dump_surface_ppm(path, g.surfaces[cur].tex);
+            ld_dump_surface_ppm(path, &g.surfaces[cur]);
         }
     }
     if (rsx_live_draw_a010_probe_active()) {
         const u32 elapsed = g_ld_frames - g_ld_a010_probe_start_frame;
+        const int targeted = getenv("YZ_RSX_A010_SURFACE_DUMP") != NULL;
+        u32 sample_every = 16u;
+        const char *sample_every_env = getenv("YZ_RSX_A010_SURFACE_EVERY");
+        if (sample_every_env) {
+            const int parsed = atoi(sample_every_env);
+            if (parsed > 0 && parsed <= 64)
+                sample_every = (u32)parsed;
+        }
         /* Loading consumes roughly 150 fast flips before a010. Sampling every
          * 16 frames spans the load and complete AUTH window while keeping the
          * synchronous readbacks from becoming the scene's clock. */
-        if ((elapsed & 15u) == 0) {
+        const int world_ready =
+            InterlockedCompareExchange(&g_ld_a010_world_ready, 0, 0) != 0;
+        /* Targeted readbacks are intentionally expensive: each surface dump
+         * submits and fences the open D3D12 list.  Do not perturb the producer
+         * while it is still assembling the first a010 world command chain;
+         * begin targeted capture only after a real scene mesh was observed. */
+        if ((!targeted || world_ready) &&
+            (elapsed % sample_every) == 0 &&
+            (!targeted || elapsed <= 208u)) {
             u64 mask = g_ld_a010_probe_touched;
             const u32 cur = current_surface();
-            if (cur < 64) mask |= 1ull << cur;
+            if (targeted) {
+                mask = 0;
+                for (u32 i = 0; i < g.n_surfaces && i < 64; i++) {
+                    const u32 off = g.surfaces[i].offset;
+                    /* Working a010 replay: 0xE40000 and 0x1800000 carry
+                     * 1,481/1,727 scene draws; 0x2D10000 and 0x2710000 are
+                     * the two depth-derived color passes; 0x1440000 is the
+                     * final seven-draw composite. */
+                    if (off == 0x00E40000u || off == 0x01800000u ||
+                        off == 0x02D10000u || off == 0x02710000u ||
+                        off == 0x01440000u ||
+                        i == target)
+                        mask |= 1ull << i;
+                }
+            } else if (cur < 64) {
+                mask |= 1ull << cur;
+            }
             fprintf(stderr,
                     "[a010-probe] SAMPLE n=%u live_frame=%u elapsed=%u "
-                    "present=%u buffer=%u touched=0x%016llX surfaces=%u\n",
-                    g_ld_a010_probe_sample, g_ld_frames, elapsed, cur,
-                    buffer_id, (unsigned long long)mask, g.n_surfaces);
+                    "present=%u current=%u buffer=%u touched=0x%016llX "
+                    "surfaces=%u targeted=%d\n",
+                    g_ld_a010_probe_sample, g_ld_frames, elapsed, target, cur,
+                    buffer_id, (unsigned long long)mask, g.n_surfaces,
+                    targeted);
             for (u32 i = 0; i < g.n_surfaces && i < 64; i++) {
                 if (!(mask & (1ull << i))) continue;
                 char path[256];
                 snprintf(path, sizeof(path),
-                         "scratch\\a010_probe\\sample_%03u_frame_%05u_surface_%02u.ppm",
-                         g_ld_a010_probe_sample, g_ld_frames, i);
-                ld_dump_surface_ppm(path, g.surfaces[i].tex);
+                         "scratch\\a010_probe\\sample_%03u_frame_%05u_"
+                         "surface_%02u_off_%08X.ppm",
+                         g_ld_a010_probe_sample, g_ld_frames, i,
+                         g.surfaces[i].offset);
+                ld_dump_surface_ppm(path, &g.surfaces[i]);
                 fprintf(stderr,
                         "[a010-probe] SURFACE sample=%u index=%u location=%u "
-                        "offset=0x%08X role=%s\n",
+                        "offset=0x%08X size=%ux%u role=%s\n",
                         g_ld_a010_probe_sample, i, g.surfaces[i].location,
-                        g.surfaces[i].offset, i == cur ? "present" : "offscreen");
+                        g.surfaces[i].offset, g.surfaces[i].w,
+                        g.surfaces[i].h,
+                        i == target ? "present" : "offscreen");
             }
             g_ld_a010_probe_touched = 0;
             g_ld_a010_probe_sample++;
             fflush(stderr);
+            if (targeted && getenv("YZ_RSX_A010_CAPTURE_ONCE")) {
+                FILE* acceptance =
+                    fopen("scratch\\a010_acceptance.txt", "a");
+                if (acceptance) {
+                    fprintf(acceptance,
+                            "surface-capture sample=%u frame=%u mask=%016llX\n",
+                            g_ld_a010_probe_sample - 1u, g_ld_frames,
+                            (unsigned long long)mask);
+                    fclose(acceptance);
+                }
+                InterlockedExchange(&g_ld_a010_probe_active, 0);
+            }
         }
         if (elapsed >= 640) {
             fprintf(stderr,
@@ -3215,8 +3973,11 @@ void rsx_live_draw_present(u32 buffer_id)
     g.vb_used = 0; g.cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
     g.depth_cleared = 0;
-    for (u32 i = 0; i < g.n_zdepths; i++)
-        g.zdepths[i].cleared = 0;
+    /* Per-zeta resources model persistent RSX memory.  Do not mark them
+     * uncleared at a host-frame boundary: the implicit-clear branch would
+     * erase depth rendered in an earlier frame and demote had_write before a
+     * later pass can sample that zeta.  Only an actual guest depth clear may
+     * clear/demote a tracked zeta (sink_clear does that above). */
 }
 
 void rsx_live_draw_shutdown(void)
@@ -3229,7 +3990,13 @@ void rsx_live_draw_shutdown(void)
     for (u32 i = 0; i < g.n_textures; i++) if (g.textures[i].tex) g.textures[i].tex->lpVtbl->Release(g.textures[i].tex);
     for (u32 i = 0; i < g.n_vtex; i++) if (g.vtex[i].tex) g.vtex[i].tex->lpVtbl->Release(g.vtex[i].tex);
     for (u32 i = 0; i < g.n_surfaces; i++) if (g.surfaces[i].tex) g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
-    for (u32 i = 0; i < g.n_zdepths; i++) if (g.zdepths[i].tex) g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].tex)
+            g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
+        if (g.zdepths[i].snapshot)
+            g.zdepths[i].snapshot->lpVtbl->Release(
+                g.zdepths[i].snapshot);
+    }
     if (g.movie_upload) g.movie_upload->lpVtbl->Release(g.movie_upload);
     if (g.movie_overlay_readback) g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
     if (g.movie_overlay_rgba) free(g.movie_overlay_rgba);
