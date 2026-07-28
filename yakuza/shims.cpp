@@ -54,15 +54,45 @@ extern "C" uint8_t* vm_base = nullptr;
 static inline uint8_t* ea(uint64_t addr) { return vm_base + (uint32_t)addr; }
 
 static void yz_mem_guard(uint32_t a, unsigned w, int is_write);  /* DIAG (YZ_GUARD), def below */
+static void yz_a010_constsrc_read64(
+    uint32_t addr, uint64_t val, const void* retaddr);
+static void yz_a010_camera_read32(
+    uint32_t addr, uint32_t val, const void* retaddr);
 /* DIAG (env YZ_VMGUARD / YZ_VMGUARD_SURVIVE): returns 1 if `a` is OUTSIDE every
  * committed guest region (wild), def below. Named-caller logger + optional
  * survive (skip the deref) for the intermittent mixer/CRI wild-read crash. */
 static int yz_vmguard_check(uint32_t a, unsigned w, int is_write);
+extern "C" void yz_a010_cmt_capture(uint32_t address, uint32_t size);
+extern "C" void yz_stage_render_checkpoint(void* context, uint32_t phase);
+
+static inline void yz_stage_checkpoint_before_b0(uint32_t address)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_STAGE_RENDER_CHECKPOINT") ? 1 : 0;
+    ppu_context* const ctx = g_yz_cur_ctx;
+    if (enabled && ctx &&
+        address == (uint32_t)ctx->gpr[24] + 0xB0u &&
+        (uint32_t)ctx->lr == 0x00113508u)
+        yz_stage_render_checkpoint(ctx, 0u);
+}
+
+static inline void yz_stage_checkpoint_after_object(uint32_t address)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_STAGE_RENDER_CHECKPOINT") ? 1 : 0;
+    ppu_context* const ctx = g_yz_cur_ctx;
+    if (enabled && ctx &&
+        address == (uint32_t)ctx->gpr[1] + 0xB8u &&
+        (uint32_t)ctx->lr == 0x00113508u)
+        yz_stage_render_checkpoint(ctx, 1u);
+}
 
 extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
-extern "C" uint16_t vm_read16(uint64_t addr) { yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
-extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); return ps3_bswap32(v); }
-extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); return ps3_bswap64(v); }
+extern "C" uint16_t vm_read16(uint64_t addr) { yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
+extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
+extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
  * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
@@ -73,6 +103,9 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" uint32_t yz_thread_current_id(void);   /* threads.cpp; the mgmt-CAS diag */
+extern "C" volatile long g_yz_a010_root_active;
+extern "C" volatile long g_yz_a010_stage_generation;
+extern "C" uint32_t g_yz_game_toc;
 /* threads.cpp: sc45/46 handlers (batch fix item 1 -- yakuza_runner.h is out
  * of scope for this batch, so declared here at the call site instead). */
 extern "C" int64_t yz_sc_thread_detach(ppu_context* ctx);
@@ -90,6 +123,91 @@ extern "C" void spu_coh_notify_write(uint32_t addr);
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
         } else memcpy(ea(addr), (src), (n)); } while (0)
 extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
+extern "C" void yz_watch_arm(uint32_t guest_addr);
+extern "C" void yz_a010_reltrace_ppu_store(
+    uint32_t addr, uint32_t val, uint32_t guest_pc);
+extern "C" volatile long g_yz_a010_release_scene_active;
+
+/* YZ_A010_HANDOFF: name the last camera handoff gate without modifying the
+ * generated source. func_00011DF0 starts by reading object+34 then object+30;
+ * validate that pattern by its camera vtable and dump the active-list field.
+ * Reads by func_00011260 prove that an active camera node reached evaluation. */
+static void yz_a010_camera_read32(
+    uint32_t addr, uint32_t val, const void* retaddr)
+{
+    static int on = -1;
+    static unsigned object_hits = 0;
+    static unsigned apply_reads = 0;
+    static thread_local uint32_t previous_addr = 0;
+    static thread_local uint32_t previous_caller = 0;
+    if (on < 0) on = getenv("YZ_A010_HANDOFF") ? 1 : 0;
+    if (!on || !g_yz_a010_root_active) return;
+
+    const uint32_t caller = yz_guest_addr_from_host(retaddr);
+    if (val == 0x434D5450u) {
+        static unsigned cmt_magic_reads = 0;
+        if (cmt_magic_reads < 64u) {
+            cmt_magic_reads++;
+            fprintf(stderr,
+                    "[a010-cmt-read] n=%u addr=%08X caller=%08X tid=%u\n",
+                    cmt_magic_reads, addr, caller, yz_thread_current_id());
+            fflush(stderr);
+        }
+    }
+    if (caller == 0x00011DF0u &&
+        previous_caller == caller && addr + 4u == previous_addr) {
+        const uint32_t object = addr - 0x30u;
+        uint32_t raw_vtable = 0;
+        memcpy(&raw_vtable, ea(object), sizeof(raw_vtable));
+        if (ps3_bswap32(raw_vtable) == 0x011D3EA0u) {
+            object_hits++;
+            if (object_hits <= 32u ||
+                (object_hits & (object_hits - 1u)) == 0u) {
+                auto raw32 = [](uint32_t a) {
+                    uint32_t raw;
+                    memcpy(&raw, ea(a), sizeof(raw));
+                    return ps3_bswap32(raw);
+                };
+                fprintf(stderr,
+                        "[a010-camera-object] n=%u object=%08X "
+                        "inactive=%08X active=%08X enabled=%08X "
+                        "entries=%08X count=%u\n",
+                        object_hits, object,
+                        raw32(object + 0x1Cu), raw32(object + 0x20u),
+                        raw32(object + 0x24u), raw32(object + 0x30u),
+                        raw32(object + 0x34u));
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (caller == 0x00011260u && apply_reads < 96u) {
+        apply_reads++;
+        fprintf(stderr,
+                "[a010-camera-eval-read] n=%u addr=%08X val=%08X\n",
+                apply_reads, addr, val);
+        fflush(stderr);
+    }
+    previous_addr = addr;
+    previous_caller = caller;
+}
+
+static void yz_a010_camera_write(
+    uint32_t addr, uint64_t val, unsigned width, const void* retaddr)
+{
+    static unsigned writes = 0;
+    if (!g_yz_a010_root_active || writes >= 128u) return;
+    const uint64_t end = (uint64_t)addr + width;
+    if (end <= 0x01622650ull || addr >= 0x01622690u) return;
+    writes++;
+    fprintf(stderr,
+            "[a010-camera-write] n=%u addr=%08X width=%u value=%016llX "
+            "caller=%08X tid=%u\n",
+            writes, addr, width, (unsigned long long)val,
+            yz_guest_addr_from_host(retaddr), yz_thread_current_id());
+    fflush(stderr);
+}
+
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
     static int on = -1; if (on < 0) on = getenv("YZ_WATCH_BD") ? 1 : 0;
     if (!on) return;
@@ -471,6 +589,11 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           (uint32_t)ctx->lr, _ReturnAddress());
                   fflush(stderr); } } }
     }
+    if (ok && (uint32_t)addr >= 0x40400000u &&
+        (uint32_t)addr < 0x40C00000u)
+        yz_a010_reltrace_ppu_store(
+            (uint32_t)addr, val,
+            yz_guest_addr_from_host(_ReturnAddress()));
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -544,6 +667,17 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                   fflush(stderr);
               } } }
     }
+    if (ok && (uint32_t)addr < 0x40C00000u &&
+        (uint32_t)addr + 8u > 0x40400000u) {
+        if ((uint32_t)addr >= 0x40400000u)
+            yz_a010_reltrace_ppu_store(
+                (uint32_t)addr, (uint32_t)(val >> 32),
+                yz_guest_addr_from_host(_ReturnAddress()));
+        if ((uint32_t)addr + 4u >= 0x40400000u)
+            yz_a010_reltrace_ppu_store(
+                (uint32_t)addr + 4u, (uint32_t)val,
+                yz_guest_addr_from_host(_ReturnAddress()));
+    }
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -561,6 +695,53 @@ extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FI
  * compares behind a cached flag, on hits only. */
 static inline void yz_jobstream_watch(uint32_t a, uint64_t val, unsigned w, const void* retaddr)
 {
+    /*
+     * Focused a010 command-arena publication witness.  The nine static-stage
+     * records are present in this arena after FE70A0 but absent at gs_task
+     * dispatch.  Name the PPU instruction that advances or resets the arena
+     * head/count, without page guards or a broad memory trace.
+     */
+    static int stage_arena_on = -1;
+    if (stage_arena_on < 0)
+        stage_arena_on = getenv("YZ_A010_STAGE_ARENA") ? 1 : 0;
+    if (stage_arena_on && g_yz_a010_stage_generation != 0 &&
+        g_yz_game_toc != 0) {
+        const uint32_t arena = vm_read32(g_yz_game_toc - 0x72E8u);
+        const uint32_t head_ea = arena + 0x00u;
+        const uint32_t count_ea = arena + 0x1Cu;
+        const bool hits_head = a <= head_ea && a + w > head_ea;
+        const bool hits_count = a <= count_ea && a + w > count_ea;
+        if (arena >= 0x10000u && (hits_head || hits_count)) {
+            static volatile long stage_arena_n = 0;
+            const unsigned long n = (unsigned long)
+                _InterlockedIncrement(&stage_arena_n);
+            const uint32_t old_head = vm_read32(head_ea);
+            const uint32_t old_count = vm_read32(count_ea);
+            uint32_t new_word = (uint32_t)val;
+            if (w == 8u && hits_head && a != head_ea)
+                new_word = (uint32_t)(val >> 32);
+            if (w == 8u && hits_count && a != count_ea)
+                new_word = (uint32_t)(val >> 32);
+            const bool reset =
+                (hits_head && new_word < old_head) ||
+                (hits_count && new_word <= old_count);
+            if (n <= 256u || reset ||
+                (n & (n - 1u)) == 0u) {
+                fprintf(stderr,
+                        "[a010-stage-arena] n=%lu gen=%ld tid=%u "
+                        "store%u ea=%08X val=%016llX "
+                        "oldHead=%08X oldCount=%u caller=%08X%s\n",
+                        n, g_yz_a010_stage_generation,
+                        yz_thread_current_id(), w * 8u, a,
+                        (unsigned long long)val,
+                        old_head, old_count,
+                        yz_guest_addr_from_host(retaddr),
+                        reset ? " RESET" : "");
+                fflush(stderr);
+            }
+        }
+    }
+
     static int on = -1;
     if (on < 0) { on = getenv("YZ_JOBSTREAM_WATCH") ? 1 : 0;
         if (on) fprintf(stderr, "[jsw] ARMED (YZ_JOBSTREAM_WATCH): 0x4019CA88/0x4019CA90 store watch\n"); }
@@ -573,8 +754,221 @@ static inline void yz_jobstream_watch(uint32_t a, uint64_t val, unsigned w, cons
         fflush(stderr);
     }
 }
-extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
-extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+
+/* YZ_A010_CONSTSRC: follow the 17-word transform-constant packet while the
+ * PPU-side builder writes it.  This catches the source call stack before the
+ * gs_task SPU copies the packet into the live FIFO. */
+static void yz_a010_constsrc_read64(
+    uint32_t addr, uint64_t val, const void* retaddr)
+{
+    static int on = -1;
+    static int skin_trace = -1;
+    static int skin_watch = -1;
+    static unsigned hits = 0;
+    static unsigned skin_hits = 0;
+    if (on < 0) on = getenv("YZ_A010_CONSTSRC") ? 1 : 0;
+    if (skin_trace < 0)
+        skin_trace = getenv("YZ_A010_SKIN_TRACE") ? 1 : 0;
+    if (skin_watch < 0)
+        skin_watch = getenv("YZ_A010_SKIN_WATCH") ? 1 : 0;
+    if ((!on && !skin_trace) || !g_yz_a010_root_active)
+        return;
+    if (yz_guest_addr_from_host(retaddr) != 0x00EB9D84u) return;
+
+    const uint32_t hi = (uint32_t)(val >> 32);
+    const uint32_t lo = (uint32_t)val;
+    const bool hi_nan =
+        (hi & 0x7F800000u) == 0x7F800000u && (hi & 0x007FFFFFu);
+    const bool lo_nan =
+        (lo & 0x7F800000u) == 0x7F800000u && (lo & 0x007FFFFFu);
+    const bool skin_sentinel =
+        (hi & ~1u) == 0x461C3FFEu || (lo & ~1u) == 0x461C3FFEu;
+    if (on && (hi_nan || lo_nan) && hits < 64u) {
+        hits++;
+        void* bt[20];
+        const unsigned short got =
+            RtlCaptureStackBackTrace(1, 20, bt, nullptr);
+        fprintf(stderr,
+                "[a010-constsrc-read] hit=%u tid=%u src=%08X "
+                "val=%016llX caller=%08X stack:",
+                hits, yz_thread_current_id(), addr,
+                (unsigned long long)val,
+                yz_guest_addr_from_host(retaddr));
+        for (unsigned k = 0; k < got; k++) {
+            const uint32_t guest = yz_guest_addr_from_host(bt[k]);
+            if (guest) fprintf(stderr, " %08X", guest);
+        }
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+
+    /*
+     * func_00EB9D84 reads source+0x18 first.  In the broken orphanage skin
+     * palette that first read contains the exact 10000-unit sentinel seen in
+     * c113.w.  Recover and dump the source matrix, then arm the existing
+     * write-watch so the following frame names the routine that produces it.
+     */
+    if (skin_trace && skin_sentinel && skin_hits++ < 16u) {
+        const uint32_t source = addr - 0x18u;
+        fprintf(stderr, "[a010-skin-source] source=%08X", source);
+        for (unsigned row = 0; row < 4; ++row) {
+            fprintf(stderr, " c%u=", 112u + row);
+            for (unsigned column = 0; column < 4; ++column) {
+                const uint32_t bits =
+                    vm_read32(source + (row * 4u + column) * 4u);
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                fprintf(stderr, "%s%.7g",
+                    column == 0 ? "(" : " ", (double)value);
+            }
+            fputc(')', stderr);
+        }
+        fputc('\n', stderr);
+        fflush(stderr);
+
+        static bool watch_armed = false;
+        if (skin_watch && !watch_armed) {
+            watch_armed = true;
+            yz_watch_arm(source);
+        }
+    }
+}
+
+static inline void yz_a010_constsrc_write(
+    uint32_t addr, uint64_t val, unsigned width, const void* retaddr)
+{
+    static int on = -1;
+    static unsigned hits = 0;
+    static thread_local uint32_t packet = 0;
+    static thread_local int phase = 0;
+    if (on < 0) on = getenv("YZ_A010_CONSTSRC") ? 1 : 0;
+    if (!on || !g_yz_a010_root_active) return;
+
+    if (width == 4 && (uint32_t)val == 0x00441EFCu) {
+        /* The lifted builder stores the slot and one payload chunk before the
+         * header, then restores its frame and writes the remaining chunks.
+         * Capture the caller here when the already-written slot is 108. */
+        if (vm_read32((uint64_t)addr + 4u) == 108u && hits < 32u) {
+            hits++;
+            void* bt[20];
+            const unsigned short got =
+                RtlCaptureStackBackTrace(1, 20, bt, nullptr);
+            fprintf(stderr,
+                    "[a010-constsrc] header=%u tid=%u packet=%08X "
+                    "caller=%08X stack:",
+                    hits, yz_thread_current_id(), addr,
+                    yz_guest_addr_from_host(retaddr));
+            for (unsigned k = 0; k < got; k++) {
+                const uint32_t guest = yz_guest_addr_from_host(bt[k]);
+                if (guest) fprintf(stderr, " %08X", guest);
+            }
+            fputc('\n', stderr);
+            fflush(stderr);
+        }
+        packet = addr;
+        phase = 1;
+        return;
+    }
+    if (phase == 1) {
+        if (width == 4 && addr == packet + 4u && (uint32_t)val == 108u)
+            phase = 2;
+        else
+            phase = 0;
+        return;
+    }
+    if (phase != 2) return;
+    if (addr < packet + 8u || addr >= packet + 72u) {
+        phase = 0;
+        return;
+    }
+
+    const uint32_t hi = (uint32_t)(val >> 32);
+    const uint32_t lo = (uint32_t)val;
+    const bool hi_nan =
+        (hi & 0x7F800000u) == 0x7F800000u && (hi & 0x007FFFFFu);
+    const bool lo_nan =
+        (lo & 0x7F800000u) == 0x7F800000u && (lo & 0x007FFFFFu);
+    if ((hi_nan || lo_nan) && hits < 32u) {
+        hits++;
+        void* bt[20];
+        const unsigned short got =
+            RtlCaptureStackBackTrace(1, 20, bt, nullptr);
+        fprintf(stderr,
+                "[a010-constsrc] hit=%u tid=%u packet=%08X write=%08X "
+                "val=%016llX caller=%08X stack:",
+                hits, yz_thread_current_id(), packet, addr,
+                (unsigned long long)val,
+                yz_guest_addr_from_host(retaddr));
+        for (unsigned k = 0; k < got; k++) {
+            const uint32_t guest = yz_guest_addr_from_host(bt[k]);
+            if (guest) fprintf(stderr, " %08X", guest);
+        }
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+    if (addr + width >= packet + 72u)
+        phase = 0;
+}
+
+/*
+ * Exact, low-overhead producer attribution for the two transform banks and
+ * the shared matrix copied into stage objects.  Unlike the page-protection
+ * watch this does not single-step unrelated writes on the same 4 KB pages.
+ */
+static inline void yz_stage_transform_write(
+    uint32_t addr, uint64_t val, unsigned width, const void* retaddr)
+{
+    static int on = -1;
+    static unsigned hits = 0;
+    if (on < 0) on = getenv("YZ_STAGE_TRANSFORM_TRACE") ? 1 : 0;
+    if (!on || !g_yz_a010_root_active || hits >= 512u)
+        return;
+
+    const uint32_t end = addr + width;
+    const bool primary =
+        addr < 0x015BD080u && end > 0x015BCF40u;
+    const bool secondary =
+        addr < 0x015BD1C0u && end > 0x015BD080u;
+    const bool shared =
+        addr < 0x01622690u && end > 0x01622590u;
+    if (!primary && !secondary && !shared)
+        return;
+
+    uint64_t old = 0;
+    if (width == 4u) {
+        uint32_t raw = 0;
+        memcpy(&raw, vm_base + addr, sizeof(raw));
+        old = ps3_bswap32(raw);
+    } else if (width == 8u) {
+        uint64_t raw = 0;
+        memcpy(&raw, vm_base + addr, sizeof(raw));
+        old = ps3_bswap64(raw);
+    }
+    if (old == val)
+        return;
+
+    ++hits;
+    void* bt[20];
+    const unsigned short got =
+        RtlCaptureStackBackTrace(1, 20, bt, nullptr);
+    fprintf(stderr,
+            "[stage-transform-write] n=%u tid=%u region=%s ea=%08X "
+            "width=%u old=%016llX new=%016llX caller=%08X stack:",
+            hits, yz_thread_current_id(),
+            primary ? "primary" : secondary ? "secondary" : "shared",
+            addr, width,
+            (unsigned long long)old, (unsigned long long)val,
+            yz_guest_addr_from_host(retaddr));
+    for (unsigned k = 0; k < got; ++k) {
+        const uint32_t guest = yz_guest_addr_from_host(bt[k]);
+        if (guest) fprintf(stderr, " %08X", guest);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 4, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr >= 0x40400000u && (uint32_t)addr < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr, val, yz_guest_addr_from_host(_ReturnAddress())); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
+extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 8, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr < 0x40C00000u && (uint64_t)(uint32_t)addr + 8u > 0x40400000ull) { const uint32_t pc = yz_guest_addr_from_host(_ReturnAddress()); if ((uint32_t)addr >= 0x40400000u) yz_a010_reltrace_ppu_store((uint32_t)addr, (uint32_t)(val >> 32), pc); if ((uint32_t)addr + 4u >= 0x40400000u && (uint32_t)addr + 4u < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr + 4u, (uint32_t)val, pc); } uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED
