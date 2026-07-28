@@ -94,6 +94,14 @@ u32  rsx_live_draw_get_frames(void);
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
 
+/* Informational rolling presented FPS for the window title. The benchmark
+ * recomputes its selected interval from the preserved raw QPC samples. */
+double rsx_live_draw_get_present_fps(void);
+
+/* End-only persistence hook used by the window-close path. Safe to call more
+ * than once; it writes the fixed QPC ring at most once per renderer run. */
+void rsx_live_draw_dump_present_samples(void);
+
 /* Bounded live AUTH diagnostic. The null-backend window starts it from a
  * private WM_APP message immediately before New Game is confirmed. */
 #define RSX_LIVE_DRAW_WM_A010_PROBE (0x8000u + 0x2A0u)
