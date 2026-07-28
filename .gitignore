@@ -168,6 +168,7 @@ goldens/
 /*scratch_*.txt
 /rpcs3_guest_memory_dumper.zip
 /libs/video/tests/frame_*.ppm
+/frame_*.ppm
 functions_old.json
 functions_gapfill.json
 *.png
