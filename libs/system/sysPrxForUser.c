@@ -309,11 +309,33 @@ s32 _sys_vsnprintf(char* buf, u32 size, const char* fmt, u32 va_guest)
 
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
+    extern u8* vm_base;
+    extern volatile long g_yz_a010_release_scene_active;
+    extern void yz_a010_reltrace_ppu_bulk(
+        u32 dst, const u8* src, u32 size,
+        u32 guest_pc, u32 op, u8 fill);
+    const uintptr_t host = (uintptr_t)dst;
+    const uintptr_t base = (uintptr_t)vm_base;
+    if (g_yz_a010_release_scene_active && dst && vm_base &&
+        host >= base && host - base <= UINT32_MAX)
+        yz_a010_reltrace_ppu_bulk(
+            (u32)(host - base), NULL, size, 0u, 2u, (u8)val);
     return memset(dst, val, size);
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
+    extern u8* vm_base;
+    extern volatile long g_yz_a010_release_scene_active;
+    extern void yz_a010_reltrace_ppu_bulk(
+        u32 dst, const u8* src, u32 size,
+        u32 guest_pc, u32 op, u8 fill);
+    const uintptr_t host = (uintptr_t)dst;
+    const uintptr_t base = (uintptr_t)vm_base;
+    if (g_yz_a010_release_scene_active && dst && src && vm_base &&
+        host >= base && host - base <= UINT32_MAX)
+        yz_a010_reltrace_ppu_bulk(
+            (u32)(host - base), (const u8*)src, size, 0u, 1u, 0u);
     return memcpy(dst, src, size);
 }
 
