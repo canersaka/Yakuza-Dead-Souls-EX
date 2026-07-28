@@ -15,6 +15,7 @@
 
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
+#include "ps3emu/yz_runtime_config.h"
 #include "../runtime/memory/vm.h"
 #include "../include/ps3emu/guest_call.h"
 #include "../include/ps3emu/endian.h"   /* ps3_bswap32 -- YZ_WATCH_WR old/new dump */
@@ -3284,6 +3285,7 @@ int main(int argc, char** argv)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    yz_runtime_config_print_fingerprint();
 
     /* Boot determinism: the firmware boot is paced by Sleep()-based polls that quantize
      * to the ~15.6ms default Windows timer tick (so the SPU/RSX startup races shift

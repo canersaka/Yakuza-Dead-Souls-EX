@@ -16,8 +16,33 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
+option(YZ_PERF_FAST
+    "Build the clean benchmark lane: compile normal-path diagnostics and hot-path environment queries out."
+    OFF)
+option(YZ_PERF_PROFILE
+    "Build the symbolized aggregate-profile lane with the same diagnostic cleanup as the fast lane."
+    OFF)
+if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
+    message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
+endif()
+if(YZ_PERF_FAST OR YZ_PERF_PROFILE)
+    list(APPEND YZ_PERF_DEFINITIONS YZ_PERF_CLEAN=1)
+endif()
+if(YZ_PERF_PROFILE)
+    list(APPEND YZ_PERF_DEFINITIONS YZ_PERF_PROFILE=1)
+    if(MSVC)
+        # Optimized, symbolized sampling lane. Keep functions distinct so
+        # profiler samples resolve to the actual lifted/runtime function.
+        add_compile_options(/Zi)
+        add_link_options(/DEBUG:FULL /OPT:REF /OPT:NOICF /INCREMENTAL:NO)
+    endif()
+endif()
+
 # Build the runtime library in this tree (with the CRT setting above).
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_FROM_ALL)
+if(YZ_PERF_DEFINITIONS)
+    target_compile_definitions(ps3recomp_runtime PRIVATE ${YZ_PERF_DEFINITIONS})
+endif()
 
 # The lifted PPU code is split into ppu_recomp_NNN.cpp chunks (one giant file
 # exceeds the MSVC source-line limit). The chunks go into their own object
@@ -113,6 +138,7 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
 add_executable(yakuza_recomp
     main.cpp
     app.rc
+    runtime_config.cpp
     dispatch.cpp
     stage_render_checkpoint.cpp
     mwply_hle.cpp
@@ -127,6 +153,9 @@ add_executable(yakuza_recomp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )
+if(YZ_PERF_DEFINITIONS)
+    target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
+endif()
 
 target_include_directories(yakuza_recomp PRIVATE
     "${PS3RECOMP_DIR}/recomp"
