@@ -14,6 +14,7 @@
 
 #include "spu_dma.h"
 #include "spu_helpers.h"   /* spu_rotqbyi: the real spursTasksetStartTask gpr4 seed */
+#include "spu_job_dispatch.h"
 #include "../../include/ps3emu/error_codes.h"   /* CELL_EBUSY: send_event ack mapping */
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
@@ -2646,6 +2647,7 @@ void yz_lscw_check(spu_context* ctx, uint32_t lsa, uint32_t size,
  * a clean negative.
  * ===========================================================================*/
 volatile int g_yz_ms_on = -1;
+static int s_ms_a010_only = 0;
 
 #define YZ_MS_SLOTS 64
 static uint32_t      s_ms_obj[YZ_MS_SLOTS];      /* obj LS addr (quad addr - 0xB0), 0 = free */
@@ -2666,10 +2668,12 @@ int yz_mask_seal_arm(void)
     if (g_yz_ms_on < 0) {
         int on = getenv("YZ_MASK_SEAL") ? 1 : 0;
         if (on) {
+            s_ms_a010_only = getenv("YZ_MASK_SEAL_A010") ? 1 : 0;
             fprintf(stderr, "[maskseal] ARMED (gs_task item pending-DMA-tag mask *(OBJ+0xB8): "
                     "read gate img0 pc=0x624C change-only, write gate img0 pc in "
                     "{5B44,5D60,5F20,5F90,6000,66D8,6AA0=ARM 62D8=REAP 53F4=INIT "
-                    "535C,5164,54EC,568C,9A60=OTHER})\n");
+                    "535C,5164,54EC,568C,9A60=OTHER}, a010_only=%d)\n",
+                    s_ms_a010_only);
             fflush(stderr);
         }
         g_yz_ms_on = on;
@@ -2709,6 +2713,7 @@ void yz_ms_write(spu_context* ctx, uint32_t lsa, const uint32_t* w)
     const uint8_t* q;
 
     if (ctx->image_id != 0) return;
+    if (s_ms_a010_only && g_yz_a010_root_active == 0) return;
     switch (pc) {
     case 0x5B44: case 0x5D60: case 0x5F20: case 0x5F90: case 0x6000:
     case 0x66D8: case 0x6AA0: case 0x62D8: case 0x53F4: case 0x535C:
@@ -2751,7 +2756,10 @@ void yz_ms_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
     int s, i;
     char sb[64];
 
-    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x624Cu) return;
+    if (ctx->image_id != 0 ||
+        ((ctx->pc & SPU_LS_MASK) != 0x624Cu &&
+         (ctx->pc & SPU_LS_MASK) != 0x6248u)) return;
+    if (s_ms_a010_only && g_yz_a010_root_active == 0) return;
     if (lsa < 0xB0u) return;
     obj  = lsa - 0xB0u;
     base = v[0];
@@ -2850,17 +2858,31 @@ volatile int g_yz_tr_on = -1;
 
 #define YZ_TR_ARENA_LO  0x41F00000u
 #define YZ_TR_ARENA_HI  0x42200000u
+static int      s_tr_a010_only = 0;
+static int      s_tr_quiet = 0;
+static uint32_t s_tr_log_lo = YZ_TR_ARENA_LO;
+static uint32_t s_tr_log_hi = YZ_TR_ARENA_HI;
 
 int yz_tagread_arm(void)
 {
     if (g_yz_tr_on < 0) {
         int on = getenv("YZ_TAGREAD") ? 1 : 0;
         if (on) {
+            const char* lo = getenv("YZ_TAGREAD_LO");
+            const char* hi = getenv("YZ_TAGREAD_HI");
+            s_tr_a010_only = getenv("YZ_TAGREAD_A010") ? 1 : 0;
+            s_tr_quiet = getenv("YZ_TAGREAD_QUIET") ? 1 : 0;
+            if (lo && *lo)
+                s_tr_log_lo = (uint32_t)strtoul(lo, NULL, 0);
+            if (hi && *hi)
+                s_tr_log_hi = (uint32_t)strtoul(hi, NULL, 0);
             fprintf(stderr, "[tagread] ARMED (gs_task publish-by-tag gate: read leg img0 "
                     "pc=0x65E4 lq(r11+0x60) with host EA re-read, change-only; "
                     "fall-through leg img0 pc=0x624C mask!=0 -> 0x6258; "
-                    "fetch map over arena [0x%08X,0x%08X))\n",
-                    YZ_TR_ARENA_LO, YZ_TR_ARENA_HI);
+                    "fetch map over arena [0x%08X,0x%08X), log=[0x%08X,0x%08X) "
+                    "a010_only=%d quiet=%d)\n",
+                    YZ_TR_ARENA_LO, YZ_TR_ARENA_HI,
+                    s_tr_log_lo, s_tr_log_hi, s_tr_a010_only, s_tr_quiet);
             fflush(stderr);
         }
         g_yz_tr_on = on;
@@ -2876,6 +2898,13 @@ static unsigned long s_tr_mseq[YZ_TR_MAP];   /* fetch sequence */
 static uint64_t      s_tr_mms[YZ_TR_MAP];    /* host clock ms of the fetch */
 static unsigned long s_tr_fseq = 0;
 static int           s_tr_flive = 0, s_tr_rlive = 0, s_tr_tlive = 0;
+/*
+ * Shared arm for the focused post-dispatch publication trace.  The target
+ * batch is identified here, where its authoritative arena EA is still known;
+ * the later item/vtable and DMA legs live in different runtime helpers.
+ */
+volatile long g_yz_a010_target_fetch_seen = 0;
+static uint32_t yz_tr_be32(const uint8_t* p);
 
 static int yz_tr_slot(uint32_t lsline, int create)
 {
@@ -2895,10 +2924,28 @@ static int yz_tr_slot(uint32_t lsline, int create)
 /* Called from spu_dma.h on every arena-range GET / GETLLAR by image 0. */
 void yz_tr_fetch(spu_context* ctx, uint32_t lsa, unsigned long long ea, uint32_t size)
 {
+    extern volatile uint32_t g_yz_a010_cmd_batch_start;
+    extern volatile uint32_t g_yz_a010_cmd_batch_end;
+    extern volatile uint32_t g_yz_a010_cmd_batch_count;
+    static int census = -1;
+    static uint32_t last_line = 0xFFFFFFFFu;
+    static unsigned long unique_lines = 0;
+    static unsigned long target_lines = 0;
     uint32_t lsline, ealine;
     uint32_t off;
+    uint32_t ea32;
+    int dynamic_target_transfer;
     if (ctx->image_id != 0) return;
-    if ((uint32_t)ea < YZ_TR_ARENA_LO || (uint32_t)ea >= YZ_TR_ARENA_HI) return;
+    if (s_tr_a010_only && g_yz_a010_root_active == 0) return;
+    ea32 = (uint32_t)ea;
+    dynamic_target_transfer =
+        g_yz_a010_cmd_batch_start != 0u &&
+        ea32 < g_yz_a010_cmd_batch_end &&
+        (uint64_t)ea32 + size > g_yz_a010_cmd_batch_start;
+    if (!dynamic_target_transfer &&
+        (ea32 < YZ_TR_ARENA_LO || ea32 >= YZ_TR_ARENA_HI)) return;
+    if (census < 0)
+        census = getenv("YZ_ARENA_FETCH_CENSUS") ? 1 : 0;
     s_tr_fseq++;
     if (!s_tr_flive) {
         s_tr_flive = 1;
@@ -2916,6 +2963,55 @@ void yz_tr_fetch(spu_context* ctx, uint32_t lsa, unsigned long long ea, uint32_t
         s_tr_mea[s]  = ealine;
         s_tr_mseq[s] = s_tr_fseq;
         s_tr_mms[s]  = yz_host_clock_ms();
+        if (!g_yz_a010_target_fetch_seen &&
+            g_yz_a010_cmd_batch_start != 0u &&
+            ealine < g_yz_a010_cmd_batch_end &&
+            ealine + 128u > g_yz_a010_cmd_batch_start) {
+            _InterlockedExchange(&g_yz_a010_target_fetch_seen, 1);
+            fprintf(stderr,
+                    "[arena-target-arm] first orphanage batch fetch "
+                    "ea=0x%08X batch=%08X..%08X count=%u\n",
+                    ealine, g_yz_a010_cmd_batch_start,
+                    g_yz_a010_cmd_batch_end,
+                    g_yz_a010_cmd_batch_count);
+            fflush(stderr);
+        }
+
+        /*
+         * The journal cursor can poll one line many times.  Log only cursor
+         * movement, heavily sampled after the first 64 lines, while logging
+         * every line that overlaps the dynamically published orphanage batch.
+         * The four values are the 0x20-byte record tags in the fetched line.
+         */
+        if (census && ealine != last_line) {
+            const uint8_t* lp = &ctx->ls[lsline];
+            uint32_t tags[4];
+            uint32_t batch_start = g_yz_a010_cmd_batch_start;
+            uint32_t batch_end = g_yz_a010_cmd_batch_end;
+            int target;
+            for (int ti = 0; ti < 4; ++ti)
+                tags[ti] = yz_tr_be32(lp + ti * 0x20u);
+            last_line = ealine;
+            unique_lines++;
+            target = batch_start != 0u &&
+                     ealine < batch_end &&
+                     ealine + 128u > batch_start;
+            if (target)
+                target_lines++;
+            if (target || unique_lines <= 64u ||
+                (unique_lines & 0x3Fu) == 0u) {
+                fprintf(stderr,
+                        "%s n=%lu target_n=%lu ea=0x%08X ls=0x%05X "
+                        "tags=%02X/%02X/%02X/%02X "
+                        "batch=%08X..%08X count=%u\n",
+                        target ? "[arena-target]" : "[arena-fetch]",
+                        unique_lines, target_lines, ealine, lsline,
+                        tags[0], tags[1], tags[2], tags[3],
+                        batch_start, batch_end,
+                        g_yz_a010_cmd_batch_count);
+                fflush(stderr);
+            }
+        }
     }
 }
 
@@ -2927,6 +3023,8 @@ static uint32_t      s_tr_last_ls = 0xFFFFFFFFu, s_tr_last_ht = 0xFFFFFFFFu;
 static uint32_t      s_tr_zea = 0;          /* EA first seen with host_tag==0 */
 static uint64_t      s_tr_zms = 0;          /* when */
 static unsigned long s_tr_zn  = 0;          /* how many reads since */
+static int           s_tr_repair = -1;
+static unsigned long s_tr_repairs = 0;
 
 static uint32_t yz_tr_be32(const uint8_t* p)
 {
@@ -2944,8 +3042,14 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
     int s, i, mapped;
     uint64_t now;
 
-    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x65E4u) return;
-    s_tr_reads++;
+    static int fetch_only = -1;
+    if (fetch_only < 0)
+        fetch_only = getenv("YZ_TAGREAD_FETCH_ONLY") ? 1 : 0;
+    if (fetch_only || ctx->image_id != 0 ||
+        ((ctx->pc & SPU_LS_MASK) != 0x65E4u &&
+         (ctx->pc & SPU_LS_MASK) != 0x6550u &&
+         (ctx->pc & SPU_LS_MASK) != 0x6568u)) return;
+    if (s_tr_a010_only && g_yz_a010_root_active == 0) return;
     r3  = ctx->gpr[3]._u32[0];
     r11 = ctx->gpr[11]._u32[0];
     k   = r11 & 0xFu;
@@ -2964,6 +3068,8 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
     ea_line = mapped ? s_tr_mea[s] : 0;
     if (mapped) fseq = s_tr_mseq[s];
     tag_ea  = mapped ? (ea_line + tag_off_in_line) : 0;
+    if (!mapped || tag_ea < s_tr_log_lo || tag_ea >= s_tr_log_hi) return;
+    s_tr_reads++;
 
     /* host-side re-read of the SAME EA, at this instant */
     host_tag = 0;
@@ -2977,7 +3083,37 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
         }
     }
 
-    if (!s_tr_rlive) {
+    /*
+     * Optional timing repair: a synchronous host DMA can fetch a zero tag
+     * just before the PPU publishes that record, leaving the lifted consumer
+     * to poll its stale LS copy forever.  Hardware's later completion-visible
+     * fetch would expose the now-published tag.  Refresh exactly that one
+     * mapped word only when the LS copy is zero and the authoritative guest
+     * word is nonzero; never synthesize a value or touch the payload.
+     */
+    if (s_tr_repair < 0)
+        s_tr_repair = getenv("YZ_TAGREAD_REPAIR") ? 1 : 0;
+    if (s_tr_repair && mapped && ls_tag == 0u && host_tag != 0u &&
+        (k & 3u) == 0u && k <= 12u) {
+        uint32_t* mutable_v = (uint32_t*)(uintptr_t)v;
+        uint8_t* lp = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
+        mutable_v[k >> 2] = host_tag;
+        lp[k + 0u] = (uint8_t)(host_tag >> 24);
+        lp[k + 1u] = (uint8_t)(host_tag >> 16);
+        lp[k + 2u] = (uint8_t)(host_tag >> 8);
+        lp[k + 3u] = (uint8_t)host_tag;
+        s_tr_repairs++;
+        if (s_tr_repairs <= 64u ||
+            (s_tr_repairs & (s_tr_repairs - 1u)) == 0u) {
+            fprintf(stderr,
+                    "[tagread-repair] n=%lu ea=0x%08X ls=0x%05X "
+                    "lane=%u 00000000->%08X\n",
+                    s_tr_repairs, tag_ea, lsa, k >> 2, host_tag);
+            fflush(stderr);
+        }
+    }
+
+    if (!s_tr_quiet && !s_tr_rlive) {
         s_tr_rlive = 1;
         fprintf(stderr, "[tagread] live: READ leg firing at pc=0x65E4 (r11=0x%05X lsa=0x%05X "
                 "ls_tag=%08X mapped=%d)\n", r11, lsa, ls_tag, mapped);
@@ -2991,16 +3127,18 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
             if (s_tr_zea != tag_ea) { s_tr_zea = tag_ea; s_tr_zms = now; s_tr_zn = 0; }
             s_tr_zn++;
         } else if (s_tr_zea == tag_ea) {
+            if (!s_tr_quiet) {
             fprintf(stderr, "[tagread] PUBLISH-LAG ea=0x%08X host_tag 0 -> %08X after %llu ms "
                     "/ %lu reads\n", tag_ea, host_tag,
                     (unsigned long long)(now - s_tr_zms), s_tr_zn);
             fflush(stderr);
+            }
             s_tr_zea = 0; s_tr_zn = 0;
         }
     }
 
     if (tag_ea == s_tr_last_ea && ls_tag == s_tr_last_ls && host_tag == s_tr_last_ht) {
-        if ((s_tr_reads % 20000UL) == 0) {
+        if (!s_tr_quiet && (s_tr_reads % 20000UL) == 0) {
             fprintf(stderr, "[tagread] R heartbeat n=%lu ea=0x%08X ls_tag=%08X host_tag=%08X "
                     "(UNCHANGED) %s\n", s_tr_reads, tag_ea, ls_tag, host_tag,
                     (ls_tag == 0 && host_tag != 0) ? "STALE-LS" :
@@ -3010,7 +3148,7 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
         return;
     }
     s_tr_last_ea = tag_ea; s_tr_last_ls = ls_tag; s_tr_last_ht = host_tag;
-    if (s_tr_rlog < 8000) {
+    if (!s_tr_quiet && s_tr_rlog < 8000) {
         s_tr_rlog++;
         fprintf(stderr, "[tagread] R n=%lu r3=0x%05X r11=0x%05X k=%u win_ls=0x%05X "
                 "ea=0x%08X(+0x%02X) fseq=%lu ls_tag=%08X host_tag=%08X %s "
@@ -3032,10 +3170,16 @@ static unsigned long s_tr_tlog = 0, s_tr_thits = 0;
 void yz_tr_tag(spu_context* ctx, uint32_t lsa, const uint32_t* v)
 {
     uint32_t obj, mask;
-    if (ctx->image_id != 0 || (ctx->pc & SPU_LS_MASK) != 0x624Cu) return;
+    static int fetch_only = -1;
+    if (fetch_only < 0)
+        fetch_only = getenv("YZ_TAGREAD_FETCH_ONLY") ? 1 : 0;
+    if (fetch_only || ctx->image_id != 0 ||
+        ((ctx->pc & SPU_LS_MASK) != 0x624Cu &&
+         (ctx->pc & SPU_LS_MASK) != 0x6248u)) return;
+    if (s_tr_a010_only && g_yz_a010_root_active == 0) return;
     if (lsa < 0xB0u) return;
     mask = v[2];                       /* rotqbyi(r2,8) puts lane 8 in word0 */
-    if (!s_tr_tlive) {
+    if (!s_tr_quiet && !s_tr_tlive) {
         s_tr_tlive = 1;
         fprintf(stderr, "[tagread] live: FALLTHRU leg firing at pc=0x624C (first mask=%08X)\n", mask);
         fflush(stderr);
@@ -3043,7 +3187,7 @@ void yz_tr_tag(spu_context* ctx, uint32_t lsa, const uint32_t* v)
     if (mask == 0) return;             /* the 0x6254 early return -- the normal idle case */
     obj = lsa - 0xB0u;
     s_tr_thits++;
-    if (s_tr_tlog < 4000) {
+    if (!s_tr_quiet && s_tr_tlog < 4000) {
         s_tr_tlog++;
         fprintf(stderr, "[tagread] FALLTHRU n=%lu obj=0x%05X base=0x%05X cnt=%u mask=%08X "
                 "(-> 0x6258 tag-wait) reads=%lu lastea=0x%08X lastls=%08X lasthost=%08X\n",
@@ -3052,6 +3196,350 @@ void yz_tr_tag(spu_context* ctx, uint32_t lsa, const uint32_t* v)
         fflush(stderr);
     }
 }
+
+/*
+ * Record-dispatch leg for the same focused journal trace.  At pc 0x776C the
+ * gs_task consumer loads the 0x20-byte journal record whose type is then
+ * routed through the handler tree at 0x7770..0x7800.  Resolve that LS record
+ * back to the arena fetch map and count each type.  This distinguishes a
+ * correct fetch followed by a missing handler from a record that never
+ * reaches dispatch.  Default-off and bounded to the configured TAGREAD
+ * address window.
+ */
+/*
+ * Exact FE70A0 static-stage dispatch witness.  The nine top-level records are
+ * created on the PPU and later routed by gs_task.  Keep this separate from the
+ * command-arena trace below: the latter deliberately arms on a mature character
+ * batch, while these records are the missing environment workload.
+ */
+volatile long g_yz_a010_stage_dispatch_generation = 0;
+volatile long g_yz_a010_stage_dispatch_mask = 0;
+static volatile long g_yz_a010_record_output_on = -1;
+static volatile long g_yz_a010_record_output_tag[8] = {0};
+static volatile long g_yz_a010_record_output_seq[8] = {0};
+extern void yz_a010_reltrace_spu(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size,
+    const uint32_t* context);
+
+/*
+ * Attribute each gs_task command-group publication to the journal record
+ * whose handler is currently executing on that SPU.  The old producer census
+ * proved that record dispatch and command PUTs both happen, but it could not
+ * say which record families actually emit draws.  This deliberately watches
+ * only the real group-publication PUT at 0x5F70 and aggregates by record tag;
+ * it does not alter the command stream.
+ */
+void yz_a010_record_output_put(spu_context* ctx, uint32_t producer_pc,
+                               uint32_t ea, const uint8_t* payload,
+                               uint32_t size)
+{
+    static volatile long puts[256];
+    static volatile long bytes[256];
+    static volatile long headers[256];
+    static volatile long begin[256];
+    static volatile long end[256];
+    static volatile long arrays[256];
+    static volatile long indexes[256];
+    static volatile long total_puts = 0;
+    uint32_t wi, off, tag;
+    long local_headers = 0, local_begin = 0, local_end = 0;
+    long local_arrays = 0, local_indexes = 0;
+    long pn;
+    uint32_t trace_context[16] = {0};
+
+    if (g_yz_a010_release_scene_active != 0 &&
+        ctx->image_id == 0 &&
+        (producer_pc == 0x05F70u ||
+         (producer_pc >= 0x05EB8u && producer_pc <= 0x05F20u))) {
+        for (wi = 0; wi < 8u; ++wi)
+            trace_context[wi] = ctx->gpr[wi + 3u]._u32[0];
+        for (wi = 0; wi < 2u; ++wi) {
+            const uint32_t lsa =
+                trace_context[wi] & SPU_LS_MASK;
+            if (lsa + 16u > SPU_LS_SIZE)
+                continue;
+            for (off = 0; off < 16u; off += 4u) {
+                const uint8_t* const p = &ctx->ls[lsa + off];
+                trace_context[8u + wi * 4u + off / 4u] =
+                    ((uint32_t)p[0] << 24) |
+                    ((uint32_t)p[1] << 16) |
+                    ((uint32_t)p[2] << 8) |
+                    (uint32_t)p[3];
+            }
+        }
+    }
+
+    yz_a010_reltrace_spu(
+        ctx->spu_id, (uint32_t)ctx->image_id, producer_pc,
+        ea, payload, size, trace_context);
+
+    if (g_yz_a010_record_output_on < 0)
+        g_yz_a010_record_output_on =
+            getenv("YZ_A010_RECORD_OUTPUT") ? 1 : 0;
+    if (!g_yz_a010_record_output_on || g_yz_a010_root_active == 0 ||
+        ctx->image_id != 0 || producer_pc != 0x05F70u || !size)
+        return;
+
+    wi = ctx->spu_id & 7u;
+    tag = (uint32_t)g_yz_a010_record_output_tag[wi] & 0xFFu;
+    for (off = 0; off + 4u <= size; ) {
+        const uint32_t word =
+            ((uint32_t)payload[off + 0] << 24) |
+            ((uint32_t)payload[off + 1] << 16) |
+            ((uint32_t)payload[off + 2] << 8) |
+            (uint32_t)payload[off + 3];
+        if ((word & 0xE0000003u) == 0x20000000u ||
+            (word & 3u) == 1u || (word & 3u) == 2u ||
+            (word & 0xFFFF0003u) == 0x00020000u) {
+            off += 4u;
+            continue;
+        }
+        if ((word & 0xA0030003u) == 0u) {
+            const uint32_t narg = (word >> 18) & 0x7FFu;
+            const uint32_t method = word & 0x3FFFCu;
+            const uint32_t packet_bytes = 4u + narg * 4u;
+            const uint32_t noninc = word & 0x40000000u;
+            if (narg && off + packet_bytes <= size) {
+                local_headers++;
+                for (uint32_t ai = 0; ai < narg; ai++) {
+                    const uint32_t eff =
+                        noninc ? method : method + ai * 4u;
+                    const uint32_t canonical = eff & 0x1FFCu;
+                    const uint32_t ao = off + 4u + ai * 4u;
+                    const uint32_t av =
+                        ((uint32_t)payload[ao + 0] << 24) |
+                        ((uint32_t)payload[ao + 1] << 16) |
+                        ((uint32_t)payload[ao + 2] << 8) |
+                        (uint32_t)payload[ao + 3];
+                    if (canonical == 0x1808u) {
+                        if (av) local_begin++;
+                        else local_end++;
+                    } else if (canonical == 0x1814u) {
+                        local_arrays++;
+                    } else if (canonical == 0x1820u) {
+                        local_indexes++;
+                    }
+                }
+                off += packet_bytes;
+                continue;
+            }
+        }
+        off += 4u;
+    }
+
+    pn = _InterlockedIncrement(&puts[tag]);
+    _InterlockedExchangeAdd(&bytes[tag], (long)size);
+    _InterlockedExchangeAdd(&headers[tag], local_headers);
+    _InterlockedExchangeAdd(&begin[tag], local_begin);
+    _InterlockedExchangeAdd(&end[tag], local_end);
+    _InterlockedExchangeAdd(&arrays[tag], local_arrays);
+    _InterlockedExchangeAdd(&indexes[tag], local_indexes);
+    {
+        const long total = _InterlockedIncrement(&total_puts);
+        if (pn <= 4 || local_begin || local_end ||
+            (total & (total - 1)) == 0) {
+            fprintf(stderr,
+                    "[record-output] total=%ld tag=%02X tag_put=%ld "
+                    "seq=%ld spu=%X pc=%05X ea=%08X size=%X "
+                    "local(h/be/end/a/i)=%ld/%ld/%ld/%ld/%ld "
+                    "tag_sum=%ld/%ld/%ld/%ld/%ld bytes=%ld\n",
+                    total, tag, pn, g_yz_a010_record_output_seq[wi],
+                    ctx->spu_id, producer_pc, ea, size,
+                    local_headers, local_begin, local_end,
+                    local_arrays, local_indexes,
+                    headers[tag], begin[tag], end[tag],
+                    arrays[tag], indexes[tag], bytes[tag]);
+            fflush(stderr);
+        }
+    }
+}
+
+/*
+ * Follow the type-0x0E static-stage record after its gs_task handler rewrites
+ * it into the internal 0xBA68 form.  The first quadword is sufficient to tie
+ * the rewritten entry back to one of FE70A0's nine payloads:
+ *
+ *   word 0 = internal handler id (0xBA68)
+ *   word 1 = cleared by 0x4BA4
+ *   word 2 = original type-0x0E payload EA
+ *
+ * Log one write, later read, and DMA PUT per object.  This is deliberately an
+ * observation-only, opt-in trace; it does not alter queue contents or timing.
+ */
+void yz_a010_stage_ba68(spu_context* ctx, const char* phase,
+                        uint32_t lsa, const uint32_t* v,
+                        uint32_t dma_ea, uint32_t dma_size)
+{
+    static volatile long write_mask = 0;
+    static volatile long read_mask = 0;
+    static volatile long put_mask = 0;
+    static uint8_t house_read_pc_seen[0x10000];
+    extern volatile long g_yz_a010_stage_generation;
+    extern volatile uint32_t g_yz_a010_stage_payload_ea[9];
+    volatile long* phase_mask;
+    unsigned slot;
+    long bit;
+
+    if (ctx->image_id != 0 || g_yz_a010_root_active == 0 ||
+        g_yz_a010_stage_generation == 0 ||
+        (v[0] & 0x7FFFFFFFu) != 0x0000BA68u)
+        return;
+    /*
+     * 0x4B40 reads the partially rewritten quad back while filling/clearing
+     * its remaining words.  That is still construction, not downstream
+     * consumption.  FAST reports the region entry (0x4B40) for the whole
+     * block; DIAG reports each exact instruction.
+     */
+    if (phase[0] == 'R' &&
+        (ctx->pc & SPU_LS_MASK) >= 0x04B40u &&
+        (ctx->pc & SPU_LS_MASK) <= 0x04BACu)
+        return;
+
+    for (slot = 0; slot < 9u; ++slot)
+        if (g_yz_a010_stage_payload_ea[slot] != 0u &&
+            v[2] == g_yz_a010_stage_payload_ea[slot])
+            break;
+    if (slot == 9u)
+        return;
+
+    phase_mask = phase[0] == 'W' ? &write_mask :
+                 phase[0] == 'R' ? &read_mask : &put_mask;
+    bit = 1l << slot;
+    if (phase[0] == 'R' && slot == 1u) {
+        /*
+         * A single per-object READ bit hid every access after the cleanup
+         * callback at 0x3C78.  For the house, retain one sample per reader PC
+         * so the next run exposes the actual lifecycle routine that either
+         * publishes or retires the environment item.
+         */
+        const uint32_t pc_slot = (ctx->pc & SPU_LS_MASK) >> 2;
+        if (house_read_pc_seen[pc_slot])
+            return;
+        house_read_pc_seen[pc_slot] = 1;
+        _InterlockedOr(&read_mask, bit);
+    } else if ((_InterlockedOr(phase_mask, bit) & bit) != 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[a010-stage-ba68-%s] gen=%ld slot=%u%s spu=%X pc=%05X "
+            "lsa=%05X words=%08X/%08X/%08X/%08X "
+            "dmaEA=%08X size=%X masks=%03lX/%03lX/%03lX\n",
+            phase, g_yz_a010_stage_generation, slot + 1u,
+            slot == 1u ? " HOUSE" : "",
+            ctx->spu_id, ctx->pc & SPU_LS_MASK, lsa & SPU_LS_MASK,
+            v[0], v[1], v[2], v[3], dma_ea, dma_size,
+            write_mask, read_mask, put_mask);
+    fflush(stderr);
+}
+
+void yz_tr_record(spu_context* ctx, uint32_t lsa, const uint32_t* v)
+{
+    static int on = -1;
+    static int stage_on = -1;
+    static unsigned long total = 0;
+    static unsigned long by_tag[256];
+    uint32_t lsline, ea = 0, tag;
+    int s;
+
+    if (on < 0)
+        on = getenv("YZ_A010_RECORD_DISPATCH") ? 1 : 0;
+    if (stage_on < 0)
+        stage_on = getenv("YZ_A010_STAGE_KIND1") ? 1 : 0;
+    if (((ctx->pc & SPU_LS_MASK) != 0x776Cu &&
+         (ctx->pc & SPU_LS_MASK) != 0x7740u) ||
+        g_yz_a010_root_active == 0)
+        return;
+
+    tag = v[0];
+    if (g_yz_a010_record_output_on < 0)
+        g_yz_a010_record_output_on =
+            getenv("YZ_A010_RECORD_OUTPUT") ? 1 : 0;
+    if (g_yz_a010_record_output_on && g_yz_a010_target_fetch_seen) {
+        const uint32_t wi = ctx->spu_id & 7u;
+        _InterlockedExchange(&g_yz_a010_record_output_tag[wi],
+                             (long)(tag & 0xFFu));
+        _InterlockedIncrement(&g_yz_a010_record_output_seq[wi]);
+    }
+    if (stage_on && tag == 0x0Eu) {
+        extern volatile long g_yz_a010_stage_generation;
+        extern volatile uint32_t g_yz_a010_stage_record_ea[9];
+        extern volatile uint32_t g_yz_a010_stage_payload_ea[9];
+        const long generation = g_yz_a010_stage_generation;
+        long hit = 0;
+        unsigned hit_slot = 0;
+
+        lsline = lsa & (SPU_LS_MASK & ~127u);
+        s = yz_tr_slot(lsline, 0);
+        if (s >= 0 && s_tr_mea[s] != 0)
+            ea = s_tr_mea[s] + (lsa & 127u);
+
+        for (unsigned si = 0; si < 9u; ++si)
+            if ((g_yz_a010_stage_record_ea[si] != 0u &&
+                 ea == g_yz_a010_stage_record_ea[si]) ||
+                (g_yz_a010_stage_payload_ea[si] != 0u &&
+                 v[1] == g_yz_a010_stage_payload_ea[si])) {
+                hit |= 1l << si;
+                hit_slot = si;
+            }
+
+        if (hit) {
+            if (g_yz_a010_stage_dispatch_generation != generation) {
+                _InterlockedExchange(&g_yz_a010_stage_dispatch_mask, 0);
+                _InterlockedExchange(
+                    &g_yz_a010_stage_dispatch_generation, generation);
+            }
+            {
+                const long before =
+                    _InterlockedOr(&g_yz_a010_stage_dispatch_mask, hit);
+                if ((before & hit) == 0) {
+                    fprintf(stderr,
+                            "[a010-stage-dispatch] gen=%ld spu=%X img=%d "
+                            "slot=%u ea=%08X ls=%05X payload=%08X flags=%08X "
+                            "mask=%03lX\n",
+                            generation, ctx->spu_id, ctx->image_id,
+                            hit_slot + 1u,
+                            ea, lsa, v[1], v[2], before | hit);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+
+    if (!on || !g_yz_a010_target_fetch_seen)
+        return;
+
+    lsline = lsa & (SPU_LS_MASK & ~127u);
+    s = yz_tr_slot(lsline, 0);
+    if (s >= 0 && s_tr_mea[s] != 0)
+        ea = s_tr_mea[s] + (lsa & 127u);
+    total++;
+    if (tag < 256u)
+        by_tag[tag]++;
+    if (total <= 4000u) {
+        fprintf(stderr,
+                "[record-dispatch] n=%lu spu=%X img=%d "
+                "ea=0x%08X ls=0x%05X "
+                "tag=%02X tag_n=%lu words=%08X/%08X/%08X/%08X "
+                "r80=%05X r81=%05X r82=%05X\n",
+                total, ctx->spu_id, ctx->image_id, ea, lsa, tag,
+                tag < 256u ? by_tag[tag] : 0u,
+                v[0], v[1], v[2], v[3],
+                ctx->gpr[80]._u32[0], ctx->gpr[81]._u32[0],
+                ctx->gpr[82]._u32[0]);
+        fflush(stderr);
+    }
+}
+
+/*
+ * Exact a010 static-stage result addresses, published by Job A and consumed
+ * by whichever SPU owns the next handoff.  These shared globals deliberately
+ * live outside spu_dma.h: every lifted SPU image is a separate translation
+ * unit, so header-local statics would hide producer addresses from consumers.
+ */
+volatile uint32_t g_yz_a010_stage_result_ea[9] = {0};
+volatile long g_yz_a010_stage_result_get_mask = 0;
 
 /* ===========================================================================
  * Function-level SPU spin profiler (diagnostic, env YZ_SPU_PROF)
@@ -3275,6 +3763,56 @@ void spu_task_launch(spu_context* c)
  * this SPU is running the taskset policy (image 2) about to enter StartTask. */
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
+    /* a010 Job A sentinel witness.  SPU_DRAIN reaches this hook before every
+     * lifted instruction, including direct trampoline branches.  Observe the
+     * second descriptor at D824 and the rotated/compared value at D830 so the
+     * next replay can distinguish damaged LS bytes from a SIMD decode error. */
+    {
+        static int a010_job14_sentinel = -1;
+        static unsigned long sentinel_n = 0;
+        static unsigned long sentinel_bad_n = 0;
+        if (a010_job14_sentinel < 0)
+            a010_job14_sentinel = getenv("YZ_A010_JOBTRACE") ? 1 : 0;
+        if (a010_job14_sentinel && g_yz_a010_root_active != 0 &&
+            ctx->image_id == 14) {
+            const uint32_t pc = ctx->pc & SPU_LS_MASK;
+            const uint32_t table = ctx->gpr[8]._u32[0] & SPU_LS_MASK;
+            if ((pc == 0x0D824u || pc == 0x0D830u) &&
+                table == 0x0E128u) {
+                const int raw_ok =
+                    ctx->ls[0x0E128u] == 0xFFu &&
+                    ctx->ls[0x0E129u] == 0xFFu &&
+                    ctx->ls[0x0E12Au] == 0xFFu &&
+                    ctx->ls[0x0E12Bu] == 0xFFu;
+                const int result_ok =
+                    pc != 0x0D830u ||
+                    (ctx->gpr[6]._u32[0] == 0xFFFFFFFFu &&
+                     ctx->gpr[42]._u32[0] == 0xFFFFFFFFu);
+                const int bad = !raw_ok || !result_ok;
+                const unsigned long n = ++sentinel_n;
+                if (bad)
+                    sentinel_bad_n++;
+                if (n <= 16u || (bad && sentinel_bad_n <= 32u)) {
+                    fprintf(stderr,
+                            "[a010-job14-sentinel-%s] n=%lu bad=%lu "
+                            "spu=%X pc=0x%05X table=%05X raw="
+                            "%02X%02X%02X%02X_%02X%02X%02X%02X "
+                            "r6=%08X r42=%08X r43="
+                            "%08X_%08X_%08X_%08X\n",
+                            bad ? "BAD" : "ok", n, sentinel_bad_n,
+                            ctx->spu_id, pc, table,
+                            ctx->ls[0x0E128u], ctx->ls[0x0E129u],
+                            ctx->ls[0x0E12Au], ctx->ls[0x0E12Bu],
+                            ctx->ls[0x0E12Cu], ctx->ls[0x0E12Du],
+                            ctx->ls[0x0E12Eu], ctx->ls[0x0E12Fu],
+                            ctx->gpr[6]._u32[0], ctx->gpr[42]._u32[0],
+                            ctx->gpr[43]._u32[0], ctx->gpr[43]._u32[1],
+                            ctx->gpr[43]._u32[2], ctx->gpr[43]._u32[3]);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
     if (ctx->image_id != 2) return;
     /* FIX TEST (env YZ_FIXEXIT): the policy poll (0x2318: bisl LS[0x1E0]) yields via the
      * kernel-context exitToKernelAddr@LS 0x1E0, which MUST be 0x838 (CELL_SPURS_KERNEL2_
@@ -3592,7 +4130,7 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
      * a legitimate dispatch always has an exact match. Kill-switch:
      * YZ_JOB_WILDCARD_OK=1 restores the old silent substitution. */
     if ((image_id == 13 || image_id == 14 || image_id == 15
-            || image_id == 17 || image_id == 18)
+            || image_id == 17 || image_id == 18 || image_id == 19)
             && addr >= 0x4880u && wildcard) {
         static int ok = -1;
         if (ok < 0) ok = getenv("YZ_JOB_WILDCARD_OK") ? 1 : 0;
@@ -4015,6 +4553,67 @@ int g_spu_trace_evarm = 0;
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /*
+     * Focused a010 item-lifecycle census.  Start at the first static-stage
+     * record rather than the later mature 819-record batch: the top-level
+     * BA68 items are already retired before that later batch is fetched.
+     * First hits and powers of two identify which lifecycle method runs (or
+     * never runs) without a full SPU trace.
+     */
+    {
+        extern volatile long g_yz_a010_target_fetch_seen;
+        extern volatile long g_yz_a010_stage_generation;
+        static int a010_item_flow = -1;
+        static unsigned long by_pc[0x10000];
+        if (a010_item_flow < 0) {
+            a010_item_flow = getenv("YZ_A010_ITEM_FLOW") ? 1 : 0;
+            if (a010_item_flow) {
+                fprintf(stderr,
+                        "[a010-item-flow] ARMED: static-stage indirect "
+                        "destination/serving-image census\n");
+                fflush(stderr);
+            }
+        }
+        if (a010_item_flow &&
+            (g_yz_a010_stage_generation != 0 ||
+             g_yz_a010_target_fetch_seen != 0) &&
+            g_yz_a010_root_active != 0 &&
+            ctx->image_id == 0) {
+            const uint32_t target = ctx->pc & SPU_LS_MASK;
+            const uint32_t slot = target >> 2;
+            const unsigned long n = ++by_pc[slot];
+            if (n <= 8u || (n & (n - 1u)) == 0u) {
+                const uint32_t a3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+                const uint32_t a4 = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                int serve_img = ctx->image_id;
+                (void)spu_lookup(target, ctx->image_id, &serve_img);
+#define YZ_A010_FLOW_LSW(A)                                             \
+                (((uint32_t)ctx->ls[(A) & SPU_LS_MASK] << 24) |         \
+                 ((uint32_t)ctx->ls[((A) + 1u) & SPU_LS_MASK] << 16) |  \
+                 ((uint32_t)ctx->ls[((A) + 2u) & SPU_LS_MASK] << 8) |   \
+                  (uint32_t)ctx->ls[((A) + 3u) & SPU_LS_MASK])
+                fprintf(stderr,
+                        "[a010-item-flow] pc=0x%05X serve=%d n=%lu spu=%X "
+                        "r3=0x%05X r4=0x%05X r5=0x%08X lr=0x%05X "
+                        "r3w=%08X/%08X/%08X/%08X "
+                        "r4w=%08X/%08X/%08X/%08X\n",
+                        target, serve_img, n, ctx->spu_id, a3, a4,
+                        ctx->gpr[5]._u32[0],
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                        YZ_A010_FLOW_LSW(a3 + 0x00u),
+                        YZ_A010_FLOW_LSW(a3 + 0x04u),
+                        YZ_A010_FLOW_LSW(a3 + 0x08u),
+                        YZ_A010_FLOW_LSW(a3 + 0x0Cu),
+                        YZ_A010_FLOW_LSW(a4 + 0x00u),
+                        YZ_A010_FLOW_LSW(a4 + 0x04u),
+                        YZ_A010_FLOW_LSW(a4 + 0x08u),
+                        YZ_A010_FLOW_LSW(a4 + 0x0Cu));
+                fflush(stderr);
+#undef YZ_A010_FLOW_LSW
+            }
+        }
+    }
+
     /* HOST-CALL-DEPTH GUARD (2026-06-27): a never-returning SPU coroutine/poll
      * yield (gs_task's idle poll, etc.) leaks a host frame per iteration because
      * the lifter models SPU `brsl`/`bisl` as nested host calls. Once the host
@@ -4220,30 +4819,178 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
-    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18). The job module
+    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18/19). The job module
      * (image 13) loads each descriptor's binary into free LS past its own end
      * (module spans LS [0xA00,0x4880)) and `bisl`s to its entry. The DMA
      * recorder (spu_dma.h) captured WHERE each known binary is resident in
      * this context; switch to that lifted image so the job's code resolves.
      * Spans are the measured descriptor sizeBinary values. */
     {
-        static const uint32_t job_span[4] = {
-            0x9540u, 0x14C0u, 0x7640u, 0x10610u
+        static const uint32_t job_span[5] = {
+            0x9540u, 0x14C0u, 0x7640u, 0x10610u, 0x1E80u
         };
-        static const int job_image[4] = { 14, 15, 17, 18 };
+        static const int job_image[5] = { 14, 15, 17, 18, 19 };
         uint32_t jpc = ctx->pc & SPU_LS_MASK;
         int family = ctx->image_id == 13 || ctx->image_id == 14
                   || ctx->image_id == 15 || ctx->image_id == 17
-                  || ctx->image_id == 18;
+                  || ctx->image_id == 18 || ctx->image_id == 19;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
         } else {
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 5; i++)
                 if (ctx->job_bin_base[i]
                         && jpc >= ctx->job_bin_base[i]
                         && jpc <  ctx->job_bin_base[i] + job_span[i])
                     { jimg = job_image[i]; break; }
+            /*
+             * Sunshine orphanage job-launch census.
+             *
+             * The final RSX stream now proves that one middle stage object
+             * renders faithfully while the sibling objects never arrive.
+             * Record the authoritative launch descriptor at the exact
+             * job-module -> job-binary branch, before residency heuristics can
+             * select a lifted image.  This distinguishes:
+             *
+             *   - a sibling dispatched through another eaBinary,
+             *   - the right binary selected from stale LS residency, and
+             *   - a stage record that never becomes a worker launch at all.
+             *
+             * r4 is the module's LS launch record on every observed entry and
+             * +4 is its big-endian eaBinary field.  Keep a generous but finite
+             * census: the first 512 launches cover multiple complete a010
+             * batches; power-of-two witnesses preserve later evolution.
+             */
+            if (g_yz_a010_root_active != 0 &&
+                family && ctx->image_id == 13 && jpc >= 0x04880u) {
+                static int launch_map_on = -1;
+                static volatile long launch_map_n = 0;
+                if (launch_map_on < 0)
+                    launch_map_on =
+                        getenv("YZ_A010_JOB_LAUNCH_MAP") ? 1 : 0;
+                if (launch_map_on) {
+                    const unsigned long launch_n = (unsigned long)
+                        _InterlockedIncrement(&launch_map_n);
+                    const uint32_t record =
+                        ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                    const uint32_t binary_ea =
+                        ((uint32_t)ctx->ls[(record + 4u) & SPU_LS_MASK] << 24) |
+                        ((uint32_t)ctx->ls[(record + 5u) & SPU_LS_MASK] << 16) |
+                        ((uint32_t)ctx->ls[(record + 6u) & SPU_LS_MASK] << 8) |
+                        (uint32_t)ctx->ls[(record + 7u) & SPU_LS_MASK];
+                    if (launch_n <= 512u ||
+                        (launch_n & (launch_n - 1u)) == 0u) {
+                        fprintf(stderr,
+                                "[a010-job-launch-map] n=%lu spu=%X "
+                                "jpc=%05X lr=%05X record=%05X "
+                                "eaBinary=%08X "
+                                "r3=%08X r5=%08X r6=%08X "
+                                "r7=%08X r8=%08X r9=%08X bytes=",
+                                launch_n, ctx->spu_id, jpc,
+                                ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                                record, binary_ea,
+                                ctx->gpr[3]._u32[0],
+                                ctx->gpr[5]._u32[0],
+                                ctx->gpr[6]._u32[0],
+                                ctx->gpr[7]._u32[0],
+                                ctx->gpr[8]._u32[0],
+                                ctx->gpr[9]._u32[0]);
+                        for (unsigned bi = 0; bi < 0x80u; bi++)
+                            fprintf(stderr, "%s%02X",
+                                    (bi & 3u) ? "" : " ",
+                                    ctx->ls[(record + bi) & SPU_LS_MASK]);
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                    }
+                }
+            }
+            /* a010's orphanage job can take SPURS' shared-residency fast path
+             * on an SPU whose local store never received this binary.  In
+             * that case there is no DMA for the recorder above to observe,
+             * but the launch record at r4 still carries the authoritative
+             * eaBinary value at +4.  Select the matching lift from that
+             * descriptor and repair only this binary's exact LS span when its
+             * bytes are absent/stale.  Previously the generic Job A fallback
+             * below ran 0x01254500 code with a 0x01252680 descriptor, which
+             * produced the malformed orphanage polygons. */
+            if (family && ctx->image_id == 13 && jpc == 0x04C00u) {
+                const uint32_t record =
+                    ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                const uint32_t binary_ea =
+                    ((uint32_t)ctx->ls[(record + 4u) & SPU_LS_MASK] << 24) |
+                    ((uint32_t)ctx->ls[(record + 5u) & SPU_LS_MASK] << 16) |
+                    ((uint32_t)ctx->ls[(record + 6u) & SPU_LS_MASK] << 8) |
+                    (uint32_t)ctx->ls[(record + 7u) & SPU_LS_MASK];
+                const int descriptor_image =
+                    spu_job_descriptor_image(
+                        ctx->image_id, jpc, binary_ea);
+                if (descriptor_image == 19) {
+                    extern uint8_t* vm_base;
+                    extern volatile long g_yz_a010_stage_generation;
+                    const int stale =
+                        memcmp(ctx->ls + 0x04C00u,
+                               vm_base + 0x01252680u, 0x1E80u) != 0;
+                    if (stale)
+                        memcpy(ctx->ls + 0x04C00u,
+                               vm_base + 0x01252680u, 0x1E80u);
+                    ctx->job_bin_base[0] = 0;
+                    ctx->job_bin_base[4] = 0x04C00u;
+                    jimg = descriptor_image;
+                    if (getenv("YZ_A010_STAGE_KIND1") &&
+                        g_yz_a010_stage_generation != 0) {
+                        static volatile long stage_job_o_n = 0;
+                        const unsigned long stage_n = (unsigned long)
+                            _InterlockedIncrement(&stage_job_o_n);
+                        if (stage_n <= 128u ||
+                            (stage_n & (stage_n - 1u)) == 0u) {
+                            fprintf(stderr,
+                                    "[a010-stage-jobO-begin] n=%lu spu=%X "
+                                    "gen=%ld record=%05X words=",
+                                    stage_n, ctx->spu_id,
+                                    g_yz_a010_stage_generation, record);
+                            for (unsigned wi = 0; wi < 32u; ++wi) {
+                                const uint32_t off =
+                                    (record + wi * 4u) & SPU_LS_MASK;
+                                const uint32_t word =
+                                    ((uint32_t)ctx->ls[off + 0u] << 24) |
+                                    ((uint32_t)ctx->ls[off + 1u] << 16) |
+                                    ((uint32_t)ctx->ls[off + 2u] << 8) |
+                                    (uint32_t)ctx->ls[off + 3u];
+                                fprintf(stderr, "%s%08X",
+                                        wi == 0u ? "" : "/", word);
+                            }
+                            fprintf(stderr, "\n");
+                            fflush(stderr);
+                        }
+                    }
+                    if (getenv("YZ_A010_JOBTRACE") ||
+                        getenv("YZ_A010_STAGE_KIND1")) {
+                        static volatile long job_o_select_n = 0;
+                        const unsigned long select_n = (unsigned long)
+                            _InterlockedIncrement(&job_o_select_n);
+                        if (select_n <= 32u ||
+                            (select_n & (select_n - 1u)) == 0u) {
+                            fprintf(stderr,
+                                    "[a010-jobO-select] n=%lu spu=%X "
+                                    "record=%05X eaBinary=%08X repaired=%d "
+                                    "-> image 19\n",
+                                    select_n, ctx->spu_id, record,
+                                    binary_ea, stale);
+                            fflush(stderr);
+                        }
+                    }
+                }
+            }
+            /* a010 can move the jobchain to a different SPU after the module's
+             * shared residency bit says Job A is already loaded.  Residency is
+             * actually per local store: the new SPU may have neither the
+             * per-context base record nor the binary bytes.  The branch itself
+             * is unambiguous while executing the resident job module, so select
+             * Job A here and let the immutable-tail check below restore the
+             * complete binary before its first instruction executes. */
+            if (jimg < 0 && g_yz_a010_root_active != 0 &&
+                family && ctx->image_id == 13 && jpc == 0x04C00u)
+                jimg = 14;
             /* A span hit from OUTSIDE the jobchain family: an SPU that lost
              * its image to a mid-cycle kernel adoption (module code runs as
              * straight-line C, so a stale image_id only surfaces at the next
@@ -4257,7 +5004,324 @@ void spu_indirect_branch(spu_context* ctx)
                     jimg = -1;
             }
         }
+        /*
+         * Snapshot Job A's descriptor outside the image-switch condition.
+         * Some lifted return brackets restore image 13 before the next job
+         * branch reaches this dispatcher, so completion-only accounting can
+         * miss the boundary even though the launch itself is unambiguous.
+         */
+        {
+            static int output_map_on = -1;
+            static int stage_kind1_on = -1;
+            if (output_map_on < 0)
+                output_map_on =
+                    getenv("YZ_A010_JOB_OUTPUT_MAP") ? 1 : 0;
+            if (stage_kind1_on < 0)
+                stage_kind1_on =
+                    getenv("YZ_A010_STAGE_KIND1") ? 1 : 0;
+            if (output_map_on &&
+                g_yz_a010_root_active != 0 &&
+                ctx->image_id == 13 && jimg == 14 &&
+                jpc >= 0x04880u) {
+                const uint32_t record =
+                    ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                uint32_t words[32];
+                for (unsigned wi = 0; wi < 32u; wi++) {
+                    const uint32_t off =
+                        (record + wi * 4u) & SPU_LS_MASK;
+                    words[wi] =
+                        ((uint32_t)ctx->ls[off + 0u] << 24) |
+                        ((uint32_t)ctx->ls[off + 1u] << 16) |
+                        ((uint32_t)ctx->ls[off + 2u] << 8) |
+                        (uint32_t)ctx->ls[off + 3u];
+                }
+
+                /*
+                 * Kind 5 is the skinned-character workload.  The FE70A0 stage
+                 * dispatcher instead expands the static environment into Kind
+                 * 1 Job A descriptors.  YZ_A010_STAGE_KIND1 switches this
+                 * focused accounting to those descriptors, but only after an
+                 * exact one-of-nine stage record reached gs_task.
+                 */
+                if ((!stage_kind1_on && words[4] == 5u) ||
+                    (stage_kind1_on && words[4] == 1u &&
+                     g_yz_a010_stage_dispatch_mask != 0)) {
+                    uint32_t stage_object = 0u;
+                    uint32_t stage_input =
+                        stage_kind1_on ? words[15] : words[13];
+                    for (unsigned wi = 0; wi < 32u; wi++) {
+                        const uint32_t word = words[wi];
+                        if (word >= 0x61574600u &&
+                            word <  0x61574620u) {
+                            stage_object = 1u; stage_input = word;
+                        } else if (word >= 0x615C5420u &&
+                                   word <  0x615C6BC0u) {
+                            stage_object = 2u; stage_input = word;
+                        } else if (word >= 0x615960C0u &&
+                                   word <  0x61596720u) {
+                            stage_object = 3u; stage_input = word;
+                        } else if (word >= 0x61588CA0u &&
+                                   word <  0x61588DC0u) {
+                            stage_object = 4u; stage_input = word;
+                        } else if (word >= 0x6157E190u &&
+                                   word <  0x6157E230u) {
+                            stage_object = 5u; stage_input = word;
+                        } else if (word >= 0x6157CDA0u &&
+                                   word <  0x6157CDC0u) {
+                            stage_object = 6u; stage_input = word;
+                        } else if (word >= 0x61577F50u &&
+                                   word <  0x61577FB0u) {
+                            stage_object = 7u; stage_input = word;
+                        } else if (word >= 0x61576570u &&
+                                   word <  0x61576590u) {
+                            stage_object = 8u; stage_input = word;
+                        } else if (word >= 0x6153E850u &&
+                                   word <  0x6153E890u) {
+                            stage_object = 9u; stage_input = word;
+                        }
+                    }
+
+                    static volatile long begin_n = 0;
+                    const unsigned long n = (unsigned long)
+                        _InterlockedIncrement(&begin_n);
+                    if (ctx->a010_job_active &&
+                        (n <= 512u ||
+                         (n & (n - 1u)) == 0u)) {
+                        fprintf(stderr,
+                                "[a010-stage-job-output] n=%lu spu=%X "
+                                "object=%u input=%08X kind=%08X "
+                                "record=%05X get=%u/%u put=%u/%u "
+                                "putEA=%08X..%08X rollover\n",
+                                n, ctx->spu_id,
+                                ctx->a010_job_stage_object,
+                                ctx->a010_job_stage_input,
+                                ctx->a010_job_desc_kind,
+                                ctx->a010_job_record,
+                                ctx->a010_job_get_count,
+                                ctx->a010_job_get_bytes,
+                                ctx->a010_job_put_count,
+                                ctx->a010_job_put_bytes,
+                                ctx->a010_job_first_put_ea,
+                                ctx->a010_job_last_put_ea);
+                        fflush(stderr);
+                    }
+
+                    ctx->a010_job_active = 1u;
+                    ctx->a010_job_stage_object = stage_object;
+                    ctx->a010_job_stage_input = stage_input;
+                    ctx->a010_job_desc_kind = words[4];
+                    ctx->a010_job_record = record;
+                    ctx->a010_job_get_count = 0u;
+                    ctx->a010_job_get_bytes = 0u;
+                    ctx->a010_job_put_count = 0u;
+                    ctx->a010_job_put_bytes = 0u;
+                    ctx->a010_job_first_put_ea = 0u;
+                    ctx->a010_job_last_put_ea = 0u;
+                    if (n <= 512u ||
+                        (n & (n - 1u)) == 0u) {
+                        fprintf(stderr,
+                                "[a010-stage-job-begin] n=%lu spu=%X "
+                                "object=%u input=%08X kind=%08X record=%05X "
+                                "stageMask=%03lX "
+                                "dmaWords=%08X/%08X/%08X/%08X "
+                                "outWords=%08X/%08X/%08X/%08X\n",
+                                n, ctx->spu_id, stage_object, stage_input,
+                                words[4], record,
+                                g_yz_a010_stage_dispatch_mask,
+                                words[12], words[13],
+                                words[16], words[17],
+                                words[20], words[22],
+                                words[23], words[28]);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
         if (jimg > 0 && jimg != ctx->image_id) {
+            extern uint8_t* vm_base;
+            {
+                static int output_map_on = -1;
+                static int stage_kind1_on = -1;
+                if (output_map_on < 0)
+                    output_map_on =
+                        getenv("YZ_A010_JOB_OUTPUT_MAP") ? 1 : 0;
+                if (stage_kind1_on < 0)
+                    stage_kind1_on =
+                        getenv("YZ_A010_STAGE_KIND1") ? 1 : 0;
+
+                /*
+                 * A completed Job A is crossing back into the resident job
+                 * module.  Emit one compact result for every descriptor that
+                 * consumed one of the nine known orphanage stage-object mesh
+                 * ranges.  A zero/short PUT result identifies the first
+                 * post-launch loss directly.
+                 */
+                if (output_map_on &&
+                    (ctx->image_id == 14 || ctx->image_id == 19) &&
+                    jimg == 13 &&
+                    ctx->a010_job_active) {
+                    static volatile long output_n = 0;
+                    const unsigned long n = (unsigned long)
+                        _InterlockedIncrement(&output_n);
+                    if (n <= 512u ||
+                        (n & (n - 1u)) == 0u) {
+                        fprintf(stderr,
+                                "[a010-stage-job-output] n=%lu spu=%X "
+                                "object=%u input=%08X kind=%08X "
+                                "record=%05X get=%u/%u put=%u/%u "
+                                "putEA=%08X..%08X\n",
+                                n, ctx->spu_id,
+                                ctx->a010_job_stage_object,
+                                ctx->a010_job_stage_input,
+                                ctx->a010_job_desc_kind,
+                                ctx->a010_job_record,
+                                ctx->a010_job_get_count,
+                                ctx->a010_job_get_bytes,
+                                ctx->a010_job_put_count,
+                                ctx->a010_job_put_bytes,
+                                ctx->a010_job_first_put_ea,
+                                ctx->a010_job_last_put_ea);
+                        fflush(stderr);
+                    }
+                    ctx->a010_job_active = 0u;
+                }
+
+                /*
+                 * The orphanage-specific 0x01252680 worker (image 19) starts
+                 * immediately after the nine FE70A0 records are published.
+                 * Account it beside Kind-1 Job A so a single run identifies
+                 * which of the two expansion layers loses the environment.
+                 */
+                if (output_map_on && stage_kind1_on &&
+                    ctx->image_id == 13 && jimg == 19 &&
+                    g_yz_a010_root_active != 0) {
+                    const uint32_t record =
+                        ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                    ctx->a010_job_active = 1u;
+                    ctx->a010_job_stage_object = 0u;
+                    ctx->a010_job_stage_input = 0u;
+                    ctx->a010_job_desc_kind = 0x19u;
+                    ctx->a010_job_record = record;
+                    ctx->a010_job_get_count = 0u;
+                    ctx->a010_job_get_bytes = 0u;
+                    ctx->a010_job_put_count = 0u;
+                    ctx->a010_job_put_bytes = 0u;
+                    ctx->a010_job_first_put_ea = 0u;
+                    ctx->a010_job_last_put_ea = 0u;
+                }
+
+                /*
+                 * Snapshot a new Job A launch after image selection but
+                 * before its first lifted instruction.  Stage object identity
+                 * is recovered from any main-memory word in the 0x80-byte
+                 * descriptor that falls inside an object's mesh-record range.
+                 */
+                if (output_map_on &&
+                    ctx->image_id == 13 && jimg == 14 &&
+                    g_yz_a010_root_active != 0) {
+                    const uint32_t record =
+                        ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                    uint32_t stage_object = 0u;
+                    uint32_t stage_input = 0u;
+                    uint32_t desc_kind = 0u;
+                    uint32_t words[32];
+                    for (unsigned wi = 0; wi < 32u; wi++) {
+                        const uint32_t off =
+                            (record + wi * 4u) & SPU_LS_MASK;
+                        const uint32_t word =
+                            ((uint32_t)ctx->ls[off + 0u] << 24) |
+                            ((uint32_t)ctx->ls[off + 1u] << 16) |
+                            ((uint32_t)ctx->ls[off + 2u] << 8) |
+                            (uint32_t)ctx->ls[off + 3u];
+                        words[wi] = word;
+                        if (wi == 4u)
+                            desc_kind = word;
+                        if (word >= 0x61574600u &&
+                            word <  0x61574620u) {
+                            stage_object = 1u; stage_input = word;
+                        } else if (word >= 0x615C5420u &&
+                                   word <  0x615C6BC0u) {
+                            stage_object = 2u; stage_input = word;
+                        } else if (word >= 0x615960C0u &&
+                                   word <  0x61596720u) {
+                            stage_object = 3u; stage_input = word;
+                        } else if (word >= 0x61588CA0u &&
+                                   word <  0x61588DC0u) {
+                            stage_object = 4u; stage_input = word;
+                        } else if (word >= 0x6157E190u &&
+                                   word <  0x6157E230u) {
+                            stage_object = 5u; stage_input = word;
+                        } else if (word >= 0x6157CDA0u &&
+                                   word <  0x6157CDC0u) {
+                            stage_object = 6u; stage_input = word;
+                        } else if (word >= 0x61577F50u &&
+                                   word <  0x61577FB0u) {
+                            stage_object = 7u; stage_input = word;
+                        } else if (word >= 0x61576570u &&
+                                   word <  0x61576590u) {
+                            stage_object = 8u; stage_input = word;
+                        } else if (word >= 0x6153E850u &&
+                                   word <  0x6153E890u) {
+                            stage_object = 9u; stage_input = word;
+                        }
+                    }
+                    if (stage_kind1_on && desc_kind == 1u &&
+                        g_yz_a010_stage_dispatch_mask != 0) {
+                        stage_input = words[15];
+                        ctx->a010_job_active = 1u;
+                    } else {
+                        ctx->a010_job_active =
+                            !stage_kind1_on && stage_object != 0u ? 1u : 0u;
+                    }
+                    ctx->a010_job_stage_object = stage_object;
+                    ctx->a010_job_stage_input = stage_input;
+                    ctx->a010_job_desc_kind = desc_kind;
+                    ctx->a010_job_record = record;
+                    ctx->a010_job_get_count = 0u;
+                    ctx->a010_job_get_bytes = 0u;
+                    ctx->a010_job_put_count = 0u;
+                    ctx->a010_job_put_bytes = 0u;
+                    ctx->a010_job_first_put_ea = 0u;
+                    ctx->a010_job_last_put_ea = 0u;
+                }
+            }
+            /* a010 Job A stale-residency repair.
+             *
+             * The JOB module is allowed to skip a binary DMA when its
+             * residency state says Job A is already present.  In the broken
+             * orphanage transition, another workload has reused that same LS
+             * span while the residency state survives: at the branch to
+             * 0x4C00 the immutable descriptor tail at 0xE120 contains the
+             * other workload's 0A000000 / 0000FFFF / 80000028 patterns.
+             *
+             * Validate that immutable 0x20-byte tail against the original
+             * eaBinary blob at the exact job-entry boundary.  On mismatch,
+             * replay the guest's complete 0x9540-byte Job A deployment before
+             * executing any lifted Job A instruction. */
+            if (g_yz_a010_root_active != 0 &&
+                jimg == 14 && jpc == 0x04C00u &&
+                memcmp(ctx->ls + 0x0E120u,
+                       vm_base + 0x0125DA20u, 0x20u) != 0) {
+                uint32_t first_diff = 0;
+                while (first_diff < 0x9540u &&
+                       ctx->ls[0x04C00u + first_diff] ==
+                           vm_base[0x01254500u + first_diff])
+                    first_diff++;
+                static unsigned long repair_n = 0;
+                repair_n++;
+                fprintf(stderr,
+                        "[a010-job14-residency-repair] n=%lu spu=%X "
+                        "first-diff=0x%04X stale-tail=",
+                        repair_n, ctx->spu_id, first_diff);
+                for (unsigned bi = 0; bi < 16u; bi++)
+                    fprintf(stderr, "%s%02X", (bi & 3u) ? "" : " ",
+                            ctx->ls[0x0E120u + bi]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                memcpy(ctx->ls + 0x04C00u,
+                       vm_base + 0x01254500u, 0x9540u);
+                ctx->job_bin_base[0] = 0x04C00u;
+            }
             /* The ordinary launch census is intentionally capped and is
              * normally exhausted by image 15 long before the post-a030 job.
              * Always retain one image-17 witness so a deep boot can prove
@@ -4285,6 +5349,78 @@ void spu_indirect_branch(spu_context* ctx)
                     fprintf(stderr, " %02X", ctx->ls[(jpc + bi) & SPU_LS_MASK]);
                 fprintf(stderr, "\n");
                 fflush(stderr); }
+            {
+                static int a010_job_launch = -1;
+                static int a010_job_launch_n = 0;
+                if (a010_job_launch < 0)
+                    a010_job_launch = getenv("YZ_A010_JOBTRACE") ? 1 : 0;
+                if (a010_job_launch && g_yz_a010_root_active != 0 &&
+                    jimg == 15 && jpc == 0x06C00u &&
+                    a010_job_launch_n < 64) {
+                    a010_job_launch_n++;
+                    fprintf(stderr,
+                            "[a010-job15-6c-launch] n=%d spu=%X image %d -> %d "
+                            "at LS 0x%05X lr=0x%05X "
+                            "bases=%05X/%05X/%05X/%05X\n",
+                            a010_job_launch_n, ctx->spu_id, ctx->image_id,
+                            jimg, jpc,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                            ctx->job_bin_base[0], ctx->job_bin_base[1],
+                            ctx->job_bin_base[2], ctx->job_bin_base[3]);
+                    fflush(stderr);
+                }
+                if (a010_job_launch && g_yz_a010_root_active != 0 &&
+                    jimg == 14 && a010_job_launch_n < 64) {
+                    a010_job_launch_n++;
+                    fprintf(stderr,
+                            "[a010-job14-launch] n=%d spu=%X image %d -> %d "
+                            "at LS 0x%05X lr=0x%05X "
+                            "r3=%08X r4=%08X r5=%08X r6=%08X "
+                            "r14=%08X r16=%08X r17=%08X "
+                            "bases=%05X/%05X/%05X/%05X\n",
+                            a010_job_launch_n, ctx->spu_id, ctx->image_id,
+                            jimg, jpc,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                            ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                            ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0],
+                            ctx->gpr[14]._u32[0], ctx->gpr[16]._u32[0],
+                            ctx->gpr[17]._u32[0],
+                            ctx->job_bin_base[0], ctx->job_bin_base[1],
+                            ctx->job_bin_base[2], ctx->job_bin_base[3]);
+                    fflush(stderr);
+                }
+                if (a010_job_launch && g_yz_a010_root_active != 0 &&
+                    jimg == 14) {
+                    static unsigned long a010_job14_bad_launch_n = 0;
+                    const int tail_ok =
+                        ctx->ls[0x0E120u] == 0x00u &&
+                        ctx->ls[0x0E121u] == 0x00u &&
+                        ctx->ls[0x0E122u] == 0x93u &&
+                        ctx->ls[0x0E123u] == 0x00u &&
+                        ctx->ls[0x0E124u] == 0x00u &&
+                        ctx->ls[0x0E125u] == 0x00u &&
+                        ctx->ls[0x0E126u] == 0x00u &&
+                        ctx->ls[0x0E127u] == 0x20u &&
+                        ctx->ls[0x0E128u] == 0xFFu &&
+                        ctx->ls[0x0E129u] == 0xFFu &&
+                        ctx->ls[0x0E12Au] == 0xFFu &&
+                        ctx->ls[0x0E12Bu] == 0xFFu;
+                    if (!tail_ok && a010_job14_bad_launch_n < 32u) {
+                        a010_job14_bad_launch_n++;
+                        fprintf(stderr,
+                                "[a010-job14-launch-BAD] n=%lu spu=%X "
+                                "from-img=%d pc=0x%05X tail=",
+                                a010_job14_bad_launch_n, ctx->spu_id,
+                                ctx->image_id, jpc);
+                        for (unsigned bi = 0; bi < 32u; bi++)
+                            fprintf(stderr, "%s%02X",
+                                    (bi & 3u) ? "" : " ",
+                                    ctx->ls[0x0E120u + bi]);
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                    }
+                }
+            }
             ctx->image_id = jimg;
         }
     }
@@ -4303,6 +5439,26 @@ void spu_indirect_branch(spu_context* ctx)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                       ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1]);
               fflush(stderr); } } }
+    {
+        static int ajt = -1;
+        static int ajn = 0;
+        if (ajt < 0)
+            ajt = getenv("YZ_A010_JOBTRACE") ? 1 : 0;
+        if (ajt && g_yz_a010_root_active != 0 &&
+            ctx->image_id == 15 &&
+            ctx->job_bin_base[1] == 0x06C00u &&
+            ajn < 1200) {
+            ajn++;
+            fprintf(stderr,
+                    "[a010-job15-6c-trace] n=%d spu=%X img=%d -> 0x%05X "
+                    "lr=0x%05X r3=%08X_%08X\n",
+                    ajn, ctx->spu_id, ctx->image_id,
+                    ctx->pc & SPU_LS_MASK,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1]);
+            fflush(stderr);
+        }
+    }
     /* THROWAWAY DIAG (env YZ_POLTRACE): raw PC path of the taskset POLICY (image 2)
      * on every indirect branch -- pc, link(gpr0), wklCurrentId(LS 0x1DC). Shows where
      * the dispatched policy goes and where it yields (vs the oracle: 0xA00 entry ->
@@ -4780,14 +5936,15 @@ void spu_indirect_branch(spu_context* ctx)
          * push a previously exactly-one adoption into ambiguity. */
         int from_jobworld = ctx->image_id == 13 || ctx->image_id == 14
                          || ctx->image_id == 15 || ctx->image_id == 17
-                         || ctx->image_id == 18;
+                         || ctx->image_id == 18 || ctx->image_id == 19;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
                         && (s_registry[i].image_id == 14
                             || s_registry[i].image_id == 15
                             || s_registry[i].image_id == 17
-                            || s_registry[i].image_id == 18))
+                            || s_registry[i].image_id == 18
+                            || s_registry[i].image_id == 19))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
