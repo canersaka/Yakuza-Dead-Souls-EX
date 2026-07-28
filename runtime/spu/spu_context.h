@@ -23,6 +23,13 @@
 extern "C" {
 #endif
 
+/* Scene marker owned by the Yakuza auth instrumentation. */
+extern volatile long g_yz_a010_root_active;
+void yz_a010_reltrace_gate(
+    uint32_t spu_id, uint32_t code, uint32_t key,
+    uint32_t witness, uint32_t descriptor,
+    uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+
 /* Portable 16-byte alignment (MSVC __declspec vs GCC/clang __attribute__). */
 #if defined(_MSC_VER)
 #  define SPU_ALIGN16 __declspec(align(16))
@@ -181,11 +188,40 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
-    /* Runtime LS bases for the four EBOOT-resident SPURS job binaries reached
+    /* Runtime LS bases for the five EBOOT-resident SPURS job binaries reached
      * on the path to gameplay. mfc_do_transfer records descriptor eaBinary
      * loads here; spu_indirect_branch uses the recorded residency to select
-     * images 14, 15, 17, or 18. Zero means that binary is not resident. */
-    uint32_t job_bin_base[4];
+     * images 14, 15, 17, 18, or 19. Zero means that binary is not resident. */
+    uint32_t job_bin_base[5];
+
+    /*
+     * Focused Sunshine-orphanage Job A accounting.  The job-module entry
+     * snapshots which static-stage mesh record a descriptor consumes;
+     * mfc_do_transfer accumulates that job's GET/PUT traffic until the binary
+     * returns to the module.  Diagnostic only, armed by
+     * YZ_A010_JOB_OUTPUT_MAP.
+     */
+    uint32_t a010_job_active;
+    uint32_t a010_job_stage_object;
+    uint32_t a010_job_stage_input;
+    uint32_t a010_job_desc_kind;
+    uint32_t a010_job_record;
+    uint32_t a010_job_get_count;
+    uint32_t a010_job_get_bytes;
+    uint32_t a010_job_put_count;
+    uint32_t a010_job_put_bytes;
+    uint32_t a010_job_first_put_ea;
+    uint32_t a010_job_last_put_ea;
+
+    /* Dynamic a010 stage-record consumption map for gs_task (image 0). */
+    uint32_t a010_stage_generation;
+    uint32_t a010_stage_fetch_mask;
+    uint32_t a010_stage_get_count;
+    uint32_t a010_stage_get_bytes;
+    uint32_t a010_stage_put_count;
+    uint32_t a010_stage_put_bytes;
+    uint32_t a010_stage_first_put_ea;
+    uint32_t a010_stage_last_put_ea;
 
     /* Decrementer (a free-running down counter) */
     uint32_t decrementer;
@@ -448,11 +484,93 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
       extern int yz_tagread_arm(void);
       extern void yz_tr_read(spu_context*, uint32_t, const uint32_t*);
       extern void yz_tr_tag(spu_context*, uint32_t, const uint32_t*);
+      extern void yz_tr_record(spu_context*, uint32_t, const uint32_t*);
+      extern volatile long g_yz_a010_stage_generation;
       int trr = g_yz_tr_on; if (trr < 0) trr = yz_tagread_arm();
       if (trr) {
           uint32_t tpc = ctx->pc & SPU_LS_MASK;
-          if (tpc == 0x65E4u)      yz_tr_read((spu_context*)ctx, lsa, v._u32);
-          else if (tpc == 0x624Cu) yz_tr_tag((spu_context*)ctx, lsa, v._u32);
+          /*
+           * DIAG keeps the precise instruction PC. FAST keeps the containing
+           * region entry in ctx->pc, so qualify its read by the decoded
+           * effective address to recover the same exact instruction.
+           */
+          if (tpc == 0x65E4u ||
+              ((tpc == 0x6550u || tpc == 0x6568u) &&
+               (lsa & (SPU_LS_MASK & ~0xFu)) ==
+                   ((ctx->gpr[11]._u32[0] + 0x60u) &
+                    (SPU_LS_MASK & ~0xFu))))
+              yz_tr_read((spu_context*)ctx, lsa, v._u32);
+          else if (tpc == 0x624Cu ||
+                   (tpc == 0x6248u &&
+                    (lsa & (SPU_LS_MASK & ~0xFu)) ==
+                        ((ctx->gpr[3]._u32[0] + 0xB0u) &
+                         (SPU_LS_MASK & ~0xFu))))
+              yz_tr_tag((spu_context*)ctx, lsa, v._u32);
+          /*
+           * The internal 0x776C record load executes immediately after the
+           * inlined memset helper at 0xB3D8.  SPU_RET writes that helper's
+           * link target (0x7740) to ctx->pc; no later operation changes it
+           * before the load.  The record pointer in r82 disambiguates it.
+           */
+          else if (tpc == 0x776Cu ||
+                   (tpc == 0x7740u &&
+                    (lsa & (SPU_LS_MASK & ~0xFu)) ==
+                        (ctx->gpr[82]._u32[0] &
+                         (SPU_LS_MASK & ~0xFu))))
+              yz_tr_record((spu_context*)ctx, lsa, v._u32);
+      } else if (g_yz_a010_stage_generation != 0) {
+          /*
+           * The focused a010 stage witness deliberately runs without the
+           * broad TAGREAD diagnostic.  Preserve only its exact record-load
+           * callback; otherwise the stage address map can be populated while
+           * the dispatch witness itself remains unreachable.
+           */
+          const uint32_t tpc = ctx->pc & SPU_LS_MASK;
+          if (tpc == 0x776Cu ||
+              (tpc == 0x7740u &&
+               (lsa & (SPU_LS_MASK & ~0xFu)) ==
+                   (ctx->gpr[82]._u32[0] &
+                    (SPU_LS_MASK & ~0xFu))))
+              yz_tr_record((spu_context*)ctx, lsa, v._u32);
+      } }
+    if (ctx->image_id == 0 && lsa == 0xBD70u &&
+        g_yz_a010_root_active != 0) {
+        const uint32_t desc =
+            ctx->gpr[80]._u32[0] & (SPU_LS_MASK & ~0xFu);
+        const uint8_t* const d = &ctx->ls[desc];
+        const uint32_t d0 =
+            ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
+            ((uint32_t)d[2] << 8) | (uint32_t)d[3];
+        const uint32_t d1 =
+            ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+            ((uint32_t)d[6] << 8) | (uint32_t)d[7];
+        const uint32_t d2 =
+            ((uint32_t)d[8] << 24) | ((uint32_t)d[9] << 16) |
+            ((uint32_t)d[10] << 8) | (uint32_t)d[11];
+        const uint32_t d3 =
+            ((uint32_t)d[12] << 24) | ((uint32_t)d[13] << 16) |
+            ((uint32_t)d[14] << 8) | (uint32_t)d[15];
+        yz_a010_reltrace_gate(
+            ctx->spu_id, ctx->gpr[3]._u32[0],
+            ctx->gpr[11]._u32[0], v._u32[0], desc,
+            d0, d1, d2, d3);
+    }
+    /*
+     * Focused a010 post-dispatch witness.  A type-0x0E environment record is
+     * rewritten to the internal 0xBA68 layout before being queued.  Catch its
+     * first later LS read so the trace distinguishes a locally committed
+     * record from one that is never consumed or published.
+     */
+    { static int a010_ba68_read = -1;
+      if (a010_ba68_read < 0)
+          a010_ba68_read = getenv("YZ_A010_STAGE_BA68") ? 1 : 0;
+      if (a010_ba68_read && ctx->image_id == 0 &&
+          g_yz_a010_root_active != 0 &&
+          (v._u32[0] & 0x7FFFFFFFu) == 0x0000BA68u) {
+          extern void yz_a010_stage_ba68(
+              spu_context*, const char*, uint32_t, const uint32_t*,
+              uint32_t, uint32_t);
+          yz_a010_stage_ba68((spu_context*)ctx, "READ", lsa, v._u32, 0u, 0u);
       } }
     return v;
 }
@@ -460,6 +578,45 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+    /*
+     * Write leg of the focused a010 0xBA68 witness.  At handler pc 0x4B70
+     * word 0 first becomes 0xBA68; the later 0x4B84 write fills word 2 with
+     * the original static-stage payload EA.
+     */
+    { static int a010_ba68_write = -1;
+      if (a010_ba68_write < 0)
+          a010_ba68_write = getenv("YZ_A010_STAGE_BA68") ? 1 : 0;
+      if (a010_ba68_write && ctx->image_id == 0 &&
+          g_yz_a010_root_active != 0 &&
+          (val._u32[0] & 0x7FFFFFFFu) == 0x0000BA68u) {
+          extern void yz_a010_stage_ba68(
+              spu_context*, const char*, uint32_t, const uint32_t*,
+              uint32_t, uint32_t);
+          yz_a010_stage_ba68(ctx, "WRITE", lsa, val._u32, 0u, 0u);
+      } }
+    /* Focused geometry-job sentinel witness.  Job A's built-in DMA-list
+     * terminator lives in its relocated tail at LS 0xE120..0xE13F.  A later
+     * invocation sometimes observes that tail as ordinary descriptor data
+     * and walks off the list, so record the first lifted stores that can
+     * replace it.  The trace is opt-in and bounded; no behavior changes. */
+    { static int a010_job_tail = -1;
+      if (a010_job_tail < 0)
+          a010_job_tail = getenv("YZ_A010_JOBTRACE") ? 1 : 0;
+      if (a010_job_tail && g_yz_a010_root_active != 0 &&
+          lsa >= 0x0E100u && lsa < 0x0E140u) {
+          static unsigned long n = 0;
+          if (n < 128u) {
+              n++;
+              fprintf(stderr,
+                      "[a010-job14-tail-store] n=%lu spu=%X img=%d pc=0x%05X "
+                      "lsa=0x%05X value=%08X_%08X_%08X_%08X\n",
+                      n, ctx->spu_id, ctx->image_id,
+                      ctx->pc & SPU_LS_MASK, lsa,
+                      val._u32[0], val._u32[1],
+                      val._u32[2], val._u32[3]);
+              fflush(stderr);
+          }
+      } }
     /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
      * SPU LS stores are quadword-only (no scalar LS store in the ISA), so
      * this is the dominant STORE event source -- logged as 4 fixed-size
