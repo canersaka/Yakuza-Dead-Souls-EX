@@ -792,6 +792,24 @@ work-record GET (EA + full record bytes, single-write print). Decoded the wid4 r
 economy: five 0x40-stride slots at 0x424528A0-0x424529A0, word0=publish value, word1=target
 EA guard (0 ⇒ legal no-op).
 
+`YZ_A010_ROOT` (yakuza/import_overrides.cpp + runtime/spu/spu_dma.h, a010 root-cause
+probe, diag, default OFF): gates itself from `/auth/a010/a010.par` until
+`/movie/a020.sfd`, summarizes the live FIFO packet/flow workload at each flip, logs
+successful a010-only command-list JUMP/CALL/RETURN targets, and records bounded SPU PUT
+payload fingerprints in the 0x40000000-0x43000000 SPURS/EDGE work region. It distinguishes
+"scene workload never produced" from "produced but never published/consumed" without
+carrying an all-boot FIFO trace.
+
+`YZ_AUTO_NEW_GAME` (yakuza/dispatch.cpp + libs/input/cellPad.c, diagnostic,
+default OFF): with `YZ_AUTO_START`, pulses Cross every ten seconds after the title
+transition to select the default New Game path unattended, then stops as soon as
+`YZ_A010_ROOT` marks a010 active. Acceptance automation only; never enable for normal play.
+
+`YZ_A010_ACCEPT_FAST` (yakuza/mwply_hle.cpp, diagnostic, default OFF): for unattended
+a010 acceptance boots only, advances the Sega and advertise SFD clocks at 32x and mutes
+their host audio. It preserves the ordinary game-owned PLAYEND/Stop/Destroy lifecycle but
+must never be used to assess movie playback.
+
 `YZ_W4REC_POLL` (yakuza/import_overrides.cpp vblank tick, s26, diag, default OFF):
 non-faulting poll of the five record slots (word0/word1 on change) — replaced the page-guard
 write-watch, which was BOTH invasive (shares the ctx-save page) and silently defeated by the
@@ -913,6 +931,10 @@ byte-for-byte on cap_user3d.rxs (verified 22/22 surface dumps).
 | `YZ_FS_LAT` | diag | OFF | s29 (2026-07-10): cellFs latency-model/discriminator knob for the ledger-#67 staging race. `<usec>` = QPC busy-wait floor per data call (Open/Read/Fstat/Lseek/Close; Read waits POST-fread); `-1` = stderr lock-touch mode (rendezvous discriminator); `-3` = STDOUT lock-touch (s30 fresh-eyes: -1 tested the wrong stream). All four s29 modes measured NOT the FS_TRACE-flip mechanism (STATUS ⚡2) - kept as the probe kit. Armed banner `[fs-lat]`. |
 | `YZ_FS_TRACE` | diag | OFF | extended s30: `=2` DARK mode — identical trace work (per-read ftell + same formatting) but written to a private 4KB-buffered scratch/fs_darktrace.log, ZERO stdout — splits the #67 flip-flag into local-work vs stdout-output atoms. `=1` (or any non-numeric value) = the legacy stdout trace. Banner `[fs-trace] ARMED: DARK mode 2`. |
 | `YZ_SEM_TRACE` | diag | OFF | s30: bounded (4000-line) stderr trace of sys_semaphore wait/trywait/post on sem ids ≤ 8, with tid/value/caller-lr — built for the staging-race handoff hunt (measured: t1 stops posting the FS request sem 1 at the death; sem layer exonerated). Two ALWAYS-ON capped tripwires ride the post path regardless of the flag: `[sem-post] EBUSY refused` (the shadow-counter max check can spuriously refuse for small-max sems) and `[sem-post] RELEASE-FAILED` (handle/shadow desync = a silently lost wake). Banner `[sem-trace] ARMED`. |
+| `YZ_RSX_SEM_TRACE` | diag | OFF | Logs RSX semaphore acquire/retry/release traffic. This was formerly always on and is now gated because retry heartbeats materially slow diagnostic scene playback. |
+| `YZ_VBL_TRACE` | diag | OFF | Logs the periodic vblank/flip heartbeat. |
+| `YZ_LS_WIPE` | diag | OFF | Enables the legacy broad SPU DMA zero-run scan and `[ls-wipe]` output. |
+| `YZ_SPU_SWEEP_TIMING` | diag | OFF | Enables the hand-instrumented gs_task `0x30C8` call counter and `0x32E8` sweep timing logs. |
 | `YZ_STAGE_DECIDE` | diag | OFF | s30: 5 s stderr peek of the CRI FS DRIVER POOL (base vm[0x135CDFC], 40×0x4D0 slots at +0x868; per-live-slot open/status/mode/tot/cons/take/seq/phase/name) + staging header (w474/stagedSeq/exit/pathOps/P2) — the decision-input camera for the staging-race death (spec scratch/s30_staging_decision.md §6; caught the two wedged status=1/phase=0 slots). Reads only, no page watches. Banner `[stagedec] ARMED`. The `[cellFs] FIRST-READ tms=` stderr markers (once per open) are always-on companions. |
 
 ## s35 preload/render diagnostic flags (2026-07-12)
