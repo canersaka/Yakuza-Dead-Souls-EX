@@ -152,6 +152,7 @@ if(PS3RECOMP_BUILD_TESTS)
 
     add_subdirectory(tests/sync_stress)
     add_subdirectory(tests/spu_atomics_stress)
+    add_subdirectory(tests/spu_job_dispatch)
     add_subdirectory(tests/edge_journal_hle)
     add_subdirectory(libs/system/tests)
 
@@ -168,6 +169,10 @@ if(PS3RECOMP_BUILD_TESTS)
             NAME spu_lifter_conformance
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lift.py"
         )
+        add_test(
+            NAME stage_transform_producer_replay
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_stage_transform_producer.py"
+        )
         set_tests_properties(
             ppu_lifter_conformance
             spu_lifter_conformance
@@ -175,6 +180,13 @@ if(PS3RECOMP_BUILD_TESTS)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 300
                 LABELS "conformance;lifter"
+        )
+        set_tests_properties(
+            stage_transform_producer_replay
+            PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 30
+                LABELS "regression;renderer"
         )
     endif()
 endif()
