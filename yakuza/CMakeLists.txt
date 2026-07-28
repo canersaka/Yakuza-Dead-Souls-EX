@@ -48,6 +48,9 @@ target_include_directories(ppu_recomp_objs PRIVATE
 option(YZ_RECOMP_OPT
     "Optimize the lifted recomp chunks (/O1). Costly compile; default OFF keeps the fast-iteration /Od build. s31: /Od measured as a prime suspect in the guest-code slowness that loses the boot-preload race (STATUS ⚡2)."
     OFF)
+option(YZ_A010_FUNC_TRACE
+    "Instrument the AUTH renderer chunk with MSVC /Gh for YZ_A010_MODELREAD diagnostics."
+    OFF)
 if(MSVC)
     if(YZ_RECOMP_OPT)
         # /O1 not /O2: MSVC on 400k-line machine-generated TUs — favor-size
@@ -57,6 +60,15 @@ if(MSVC)
     else()
         # /Od: fast iteration; optimizing costs minutes and gigabytes per chunk.
         target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
+    endif()
+
+    # a010 orphanage render-path probe. Instrument only diagnostic builds:
+    # even an immediately-returning _penter call on every generated function
+    # is measurable in the normal renderer.
+    if(YZ_A010_FUNC_TRACE)
+        set_source_files_properties(
+            "${PS3RECOMP_DIR}/recomp/ppu_recomp_000.cpp"
+            PROPERTIES COMPILE_OPTIONS "/Gh")
     endif()
 endif()
 
@@ -92,15 +104,20 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b.c"   # jobchain notify JOB binary (EBOOT 0x01275A00 -> ~LS 0xE400, image 15)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_a_e400.c"   # jobA lifted at the ALTERNATE slot base 0xE400 (jobs are relocatable; measured 2026-07-08)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_4c00.c"   # jobB lifted at the ALTERNATE slot base 0x4C00 (round-1 loads jobB there; measured 2026-07-08)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_6c00.c"   # jobB relocated to LS 0x6C00 during the a010 orphanage handoff (measured 2026-07-26)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_15800.c"  # jobB relocated to LS 0x15800 at the post-a030 handoff (measured 2026-07-24)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_c_17800.c"  # post-a030 transition job (EBOOT 0x0125DA80, observed LS 0x17800, image 17)
-    "${PS3RECOMP_DIR}/recomp_prx/job_bin_d_e400.c")  # sibling post-a030 job (EBOOT 0x01265180, declared 0x10610 B, LS 0xE400, image 18)
+    "${PS3RECOMP_DIR}/recomp_prx/job_bin_d_e400.c"   # sibling post-a030 job (EBOOT 0x01265180, declared 0x10610 B, LS 0xE400, image 18)
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage.c") # a010 worker (EBOOT 0x01252680, 0x1E80 B, LS 0x4C00, image 19)
 
 add_executable(yakuza_recomp
     main.cpp
     app.rc
     dispatch.cpp
+    stage_render_checkpoint.cpp
     mwply_hle.cpp
+    presentation_clock_hle.cpp
+    auth_clock_probe.cpp
     shims.cpp
     threads.cpp
     func_table_gen.cpp
