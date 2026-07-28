@@ -33,13 +33,930 @@
 #include <windows.h>
 
 extern "C" uint8_t* vm_base;
+extern "C" uint32_t g_yz_game_toc;
+extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 extern "C" void yz_fltrec_dump(const char*);   /* s41 flight recorder (runtime/spu/spu_fltrec.c) */
 extern "C" int  yz_bdrain_fire_ea(uint32_t parked_ea, uint32_t io_off);  /* s42 park-time boundary drain (runtime/spu/spu_channels.c) */
 extern "C" void yz_fltrec_dump(const char* reason);                      /* s42 broken-phase dump rides the drain fire */
 /* s40b v2: the GPU-parked stopper EA, published by the FIFO park tracker below for
  * the SPU-side targeted unstick (gs_task.c YZ_QROT_UNSTICK). 0 = not parked >2s. */
-extern "C" { uint32_t g_yz_parked_pub_ea = 0; }
+extern "C" {
+uint32_t g_yz_parked_pub_ea = 0;
+/* YZ_A010_ROOT: authoritative lifetime gate shared with the SPU DMA trace.
+ * Set when the orphanage AUTH package opens and cleared when the following
+ * a020 SFD opens.  LONG keeps Interlocked reads/writes well-defined. */
+volatile LONG g_yz_a010_root_active = 0;
+/* Focused release-word tracing needs the same authoritative a010 lifetime
+ * boundary without enabling the broad, expensive root diagnostics. */
+volatile LONG g_yz_a010_release_scene_active = 0;
+/* Set after an authored character pose has reached its live model palette.
+ * The repaired AUTH clock waits for this publication instead of outrunning
+ * the asynchronous animation loads with every actor still at Y=10000. */
+volatile LONG g_yz_a010_animation_ready = 0;
+volatile LONG g_yz_a010_spu_puts = 0;
+volatile LONG g_yz_a010_spu_put_bytes = 0;
+volatile LONG g_yz_a010_spu_groups = 0;
+volatile LONG g_yz_a010_spu_group_bytes = 0;
+volatile LONG g_yz_a010_spu_headers = 0;
+volatile LONG g_yz_a010_spu_args = 0;
+volatile LONG g_yz_a010_spu_begin = 0;
+volatile LONG g_yz_a010_spu_end = 0;
+volatile LONG g_yz_a010_spu_array = 0;
+volatile LONG g_yz_a010_spu_index = 0;
+volatile LONG g_yz_a010_spu_vp = 0;
+volatile LONG g_yz_a010_spu_const = 0;
+volatile LONG g_yz_a010_spu_unparsed = 0;
+/* Draw-method headers seen at their actual publication sites.  The FIFO
+ * consumer drains these at each flip, giving us a producer-vs-consumer count
+ * without confusing command packets with executed draws. */
+volatile LONG g_yz_a010_ppucmd_headers = 0;
+volatile LONG g_yz_a010_spucmd_headers = 0;
+}
+
+/*
+ * A010 stopper-release flight recorder.
+ *
+ * The producer-side release choice and any gs_task DMA attempt have already
+ * happened by the time GET is observed parked on an old self-jump.  Keep the
+ * relevant events in a bounded memory ring and print them only if the guarded
+ * missing-release detector fires.  This is observation-only.
+ */
+namespace {
+enum : uint32_t {
+    YZ_A010_RELTRACE_PPU = 1u,
+    YZ_A010_RELTRACE_SPU = 2u,
+    YZ_A010_RELTRACE_GATE = 3u,
+    YZ_A010_RELTRACE_SPU_COMMIT = 4u,
+    YZ_A010_RELTRACE_PPU_STORE = 5u,
+    YZ_A010_RELTRACE_SPU_ATOMIC = 6u,
+    YZ_A010_RELTRACE_PPU_BULK = 7u,
+    YZ_A010_RELTRACE_STOP_CREATE = 8u,
+};
+
+struct yz_a010_reltrace_event {
+    volatile LONG64 published_seq;
+    ULONGLONG tick_ms;
+    uint32_t kind;
+    uint32_t actor;
+    uint32_t pc;
+    uint32_t ea;
+    uint32_t size;
+    uint32_t aux;
+    uint32_t words[4];
+    uint32_t state[4];
+};
+
+constexpr LONG64 YZ_A010_RELTRACE_CAP = 16384;
+static yz_a010_reltrace_event
+    g_yz_a010_reltrace[YZ_A010_RELTRACE_CAP] = {};
+static volatile LONG64 g_yz_a010_reltrace_seq = 0;
+static volatile LONG g_yz_a010_reltrace_mode = -1;
+static volatile LONG g_yz_a010_reltrace_banner = 0;
+constexpr uint32_t YZ_A010_RELWATCH_CAP = 65536u;
+struct yz_a010_relwatch {
+    volatile LONG ea;
+    volatile LONG expected;
+    volatile LONG64 source_seq;
+};
+static yz_a010_relwatch
+    g_yz_a010_relwatch[YZ_A010_RELWATCH_CAP] = {};
+static volatile LONG
+    g_yz_a010_relwatch_lines[0x800000u / 128u] = {};
+
+/*
+ * Ring addresses are reused many times during a scene.  The original release
+ * trace keyed only by EA, so a release from an older occupant could be
+ * mistaken for the release of the stopper currently blocking GET.  Retain a
+ * compact generation record for every self-jump emitted by the real gs_task
+ * group publisher.  No guest state is changed.
+ */
+struct yz_a010_stop_generation {
+    volatile LONG ea;
+    volatile LONG generation;
+    volatile LONG release_generation;
+    volatile LONG commit_generation;
+    volatile LONG creator_actor;
+    volatile LONG creator_pc;
+    volatile LONG create_size;
+    volatile LONG create_offset;
+    volatile LONG payload_hash;
+    volatile LONG context[16];
+    volatile LONG64 create_seq;
+    volatile LONG64 release_seq;
+    volatile LONG64 commit_seq;
+};
+static yz_a010_stop_generation
+    g_yz_a010_stop_generation[YZ_A010_RELWATCH_CAP] = {};
+static SRWLOCK g_yz_a010_stop_generation_lock = SRWLOCK_INIT;
+
+static const char* yz_a010_reltrace_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case YZ_A010_RELTRACE_PPU: return "ppu-choice";
+    case YZ_A010_RELTRACE_SPU: return "spu-attempt";
+    case YZ_A010_RELTRACE_GATE: return "gate";
+    case YZ_A010_RELTRACE_SPU_COMMIT: return "spu-commit";
+    case YZ_A010_RELTRACE_PPU_STORE: return "ppu-store";
+    case YZ_A010_RELTRACE_SPU_ATOMIC: return "spu-atomic";
+    case YZ_A010_RELTRACE_PPU_BULK: return "ppu-bulk";
+    case YZ_A010_RELTRACE_STOP_CREATE: return "stop-create";
+    default: return "unknown";
+    }
+}
+
+static yz_a010_relwatch* yz_a010_relwatch_slot(uint32_t ea)
+{
+    return &g_yz_a010_relwatch[(ea >> 2) &
+                              (YZ_A010_RELWATCH_CAP - 1u)];
+}
+
+static uint32_t yz_a010_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static uint32_t yz_a010_hash32(const uint8_t* p, uint32_t size)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static yz_a010_stop_generation* yz_a010_stop_generation_slot(
+    uint32_t ea)
+{
+    return &g_yz_a010_stop_generation[
+        (ea >> 2) & (YZ_A010_RELWATCH_CAP - 1u)];
+}
+
+static uint32_t yz_a010_stop_generation_create(
+    uint32_t actor, uint32_t pc, uint32_t ea, uint32_t size,
+    uint32_t offset, uint32_t payload_hash,
+    const uint32_t* context)
+{
+    yz_a010_stop_generation* const slot =
+        yz_a010_stop_generation_slot(ea);
+    AcquireSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+    const uint32_t prior_ea =
+        (uint32_t)InterlockedCompareExchange(&slot->ea, 0, 0);
+    uint32_t generation = prior_ea == ea
+        ? (uint32_t)InterlockedCompareExchange(
+              &slot->generation, 0, 0) + 1u
+        : 1u;
+    if (!generation)
+        generation = 1u;
+    slot->ea = (LONG)ea;
+    slot->generation = (LONG)generation;
+    slot->release_generation = 0;
+    slot->commit_generation = 0;
+    slot->creator_actor = (LONG)actor;
+    slot->creator_pc = (LONG)pc;
+    slot->create_size = (LONG)size;
+    slot->create_offset = (LONG)offset;
+    slot->payload_hash = (LONG)payload_hash;
+    for (unsigned i = 0; i < 16u; ++i)
+        slot->context[i] = (LONG)(context ? context[i] : 0u);
+    slot->create_seq = 0;
+    slot->release_seq = 0;
+    slot->commit_seq = 0;
+    ReleaseSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+    return generation;
+}
+
+static uint32_t yz_a010_stop_generation_mark(
+    uint32_t ea, int committed, LONG64 seq)
+{
+    yz_a010_stop_generation* const slot =
+        yz_a010_stop_generation_slot(ea);
+    uint32_t generation = 0;
+    AcquireSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+    if ((uint32_t)slot->ea == ea) {
+        generation = (uint32_t)slot->generation;
+        if (committed) {
+            slot->commit_generation = (LONG)generation;
+            slot->commit_seq = seq;
+        } else {
+            slot->release_generation = (LONG)generation;
+            slot->release_seq = seq;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+    return generation;
+}
+
+static void yz_a010_stop_generation_set_create_seq(
+    uint32_t ea, uint32_t generation, LONG64 seq)
+{
+    yz_a010_stop_generation* const slot =
+        yz_a010_stop_generation_slot(ea);
+    AcquireSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+    if ((uint32_t)slot->ea == ea &&
+        (uint32_t)slot->generation == generation)
+        slot->create_seq = seq;
+    ReleaseSRWLockExclusive(&g_yz_a010_stop_generation_lock);
+}
+
+static void yz_a010_stop_generation_dump(uint32_t ea)
+{
+    yz_a010_stop_generation* const slot =
+        yz_a010_stop_generation_slot(ea);
+    AcquireSRWLockShared(&g_yz_a010_stop_generation_lock);
+    if ((uint32_t)slot->ea != ea) {
+        fprintf(stderr,
+                "[a010-stopgen] ea=0x%08X current-generation=ABSENT\n",
+                ea);
+        ReleaseSRWLockShared(&g_yz_a010_stop_generation_lock);
+        return;
+    }
+    fprintf(stderr,
+            "[a010-stopgen] ea=0x%08X gen=%u create-seq=%lld "
+            "release-gen=%u release-seq=%lld commit-gen=%u "
+            "commit-seq=%lld creator=%08X pc=%08X size=%X off=%X "
+            "hash=%08X\n",
+            ea, (uint32_t)slot->generation,
+            (long long)slot->create_seq,
+            (uint32_t)slot->release_generation,
+            (long long)slot->release_seq,
+            (uint32_t)slot->commit_generation,
+            (long long)slot->commit_seq,
+            (uint32_t)slot->creator_actor,
+            (uint32_t)slot->creator_pc,
+            (uint32_t)slot->create_size,
+            (uint32_t)slot->create_offset,
+            (uint32_t)slot->payload_hash);
+    if ((uint32_t)slot->creator_actor & 0x80000000u) {
+        fprintf(stderr,
+                "[a010-stopgen] ppu state=%08X "
+                "head=%08X journal-count=%08X pending=%08X "
+                "limit=%08X guest-pc=%08X tid=%u old=%08X\n",
+                (uint32_t)slot->context[0],
+                (uint32_t)slot->context[1],
+                (uint32_t)slot->context[2],
+                (uint32_t)slot->context[3],
+                (uint32_t)slot->context[4],
+                (uint32_t)slot->context[5],
+                (uint32_t)slot->context[6],
+                (uint32_t)slot->context[7]);
+        fprintf(stderr,
+                "[a010-stopgen] ppu-stack="
+                "%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                (uint32_t)slot->context[8],
+                (uint32_t)slot->context[9],
+                (uint32_t)slot->context[10],
+                (uint32_t)slot->context[11],
+                (uint32_t)slot->context[12],
+                (uint32_t)slot->context[13],
+                (uint32_t)slot->context[14],
+                (uint32_t)slot->context[15]);
+    } else {
+        fprintf(stderr,
+                "[a010-stopgen] regs "
+                "r3=%08X r4=%08X r5=%08X r6=%08X "
+                "r7=%08X r8=%08X r9=%08X r10=%08X\n",
+                (uint32_t)slot->context[0],
+                (uint32_t)slot->context[1],
+                (uint32_t)slot->context[2],
+                (uint32_t)slot->context[3],
+                (uint32_t)slot->context[4],
+                (uint32_t)slot->context[5],
+                (uint32_t)slot->context[6],
+                (uint32_t)slot->context[7]);
+        fprintf(stderr,
+                "[a010-stopgen] ls-r3=%08X/%08X/%08X/%08X "
+                "ls-r4=%08X/%08X/%08X/%08X\n",
+                (uint32_t)slot->context[8],
+                (uint32_t)slot->context[9],
+                (uint32_t)slot->context[10],
+                (uint32_t)slot->context[11],
+                (uint32_t)slot->context[12],
+                (uint32_t)slot->context[13],
+                (uint32_t)slot->context[14],
+                (uint32_t)slot->context[15]);
+    }
+    ReleaseSRWLockShared(&g_yz_a010_stop_generation_lock);
+}
+
+static LONG64 yz_a010_stop_generation_create_seq(uint32_t ea)
+{
+    yz_a010_stop_generation* const slot =
+        yz_a010_stop_generation_slot(ea);
+    LONG64 seq = 0;
+    AcquireSRWLockShared(&g_yz_a010_stop_generation_lock);
+    if ((uint32_t)slot->ea == ea)
+        seq = slot->create_seq;
+    ReleaseSRWLockShared(&g_yz_a010_stop_generation_lock);
+    return seq;
+}
+
+static int yz_a010_relwatch_range(uint32_t ea, uint32_t size)
+{
+    if (!size || ea >= 0x40C00000u ||
+        (uint64_t)ea + size <= 0x40400000ull)
+        return 0;
+    uint32_t first = ea < 0x40400000u ? 0u :
+        ((ea - 0x40400000u) >> 7);
+    uint64_t last_byte = (uint64_t)ea + size - 1u;
+    uint32_t last = last_byte >= 0x40C00000ull
+        ? ((0x800000u - 1u) >> 7)
+        : (((uint32_t)last_byte - 0x40400000u) >> 7);
+    for (uint32_t line = first; line <= last; ++line) {
+        if (InterlockedCompareExchange(
+                &g_yz_a010_relwatch_lines[line], 0, 0) != 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int yz_a010_relwatch_first(
+    uint32_t ea, uint32_t size, uint32_t* target_out,
+    uint32_t* expected_out, uint32_t* source_seq_out)
+{
+    if (!size)
+        return 0;
+    const uint64_t end = (uint64_t)ea + size;
+    uint32_t word = (ea + 3u) & ~3u;
+    for (; (uint64_t)word + 4u <= end; word += 4u) {
+        yz_a010_relwatch* const watch = yz_a010_relwatch_slot(word);
+        if ((uint32_t)InterlockedCompareExchange(
+                &watch->ea, 0, 0) != word)
+            continue;
+        if (target_out) *target_out = word;
+        if (expected_out)
+            *expected_out = (uint32_t)InterlockedCompareExchange(
+                &watch->expected, 0, 0);
+        if (source_seq_out)
+            *source_seq_out = (uint32_t)InterlockedCompareExchange64(
+                &watch->source_seq, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
+static int yz_a010_reltrace_on()
+{
+    LONG mode = InterlockedCompareExchange(
+        &g_yz_a010_reltrace_mode, -1, -1);
+    if (mode < 0) {
+        const LONG requested =
+            getenv("YZ_A010_RELEASE_TRACE") ? 1 : 0;
+        const LONG prior = InterlockedCompareExchange(
+            &g_yz_a010_reltrace_mode, requested, -1);
+        mode = prior < 0 ? requested : prior;
+    }
+    if (mode && InterlockedCompareExchange(
+            &g_yz_a010_reltrace_banner, 1, 0) == 0) {
+        fprintf(stderr,
+                "[a010-reltrace] ARMED: in-memory PPU release-choice + "
+                "gs_task DMA flight recorder\n");
+        fflush(stderr);
+    }
+    return mode != 0;
+}
+
+static yz_a010_reltrace_event* yz_a010_reltrace_reserve(
+    uint32_t kind, uint32_t actor, uint32_t pc)
+{
+    const LONG64 seq = InterlockedIncrement64(
+        &g_yz_a010_reltrace_seq);
+    yz_a010_reltrace_event* const ev =
+        &g_yz_a010_reltrace[seq % YZ_A010_RELTRACE_CAP];
+    InterlockedExchange64(&ev->published_seq, 0);
+    ev->tick_ms = GetTickCount64();
+    ev->kind = kind;
+    ev->actor = actor;
+    ev->pc = pc;
+    ev->ea = 0;
+    ev->size = 0;
+    ev->aux = 0;
+    memset(ev->words, 0, sizeof(ev->words));
+    memset(ev->state, 0, sizeof(ev->state));
+    MemoryBarrier();
+    ev->published_seq = -seq;
+    return ev;
+}
+
+static void yz_a010_reltrace_publish(yz_a010_reltrace_event* ev)
+{
+    const LONG64 reserved = ev->published_seq;
+    MemoryBarrier();
+    InterlockedExchange64(&ev->published_seq, -reserved);
+}
+
+static void yz_a010_reltrace_dump(uint32_t stopper_ea)
+{
+    if (!yz_a010_reltrace_on())
+        return;
+
+    const LONG64 end = InterlockedCompareExchange64(
+        &g_yz_a010_reltrace_seq, 0, 0);
+    const LONG64 begin =
+        end > YZ_A010_RELTRACE_CAP ? end - YZ_A010_RELTRACE_CAP + 1 : 1;
+    unsigned exact = 0;
+    unsigned recent = 0;
+
+    fprintf(stderr,
+            "[a010-reltrace] FAILURE stopper=0x%08X seq=%lld; "
+            "matching producer history follows\n",
+            stopper_ea, (long long)end);
+    yz_a010_stop_generation_dump(stopper_ea);
+    const LONG64 create_seq =
+        yz_a010_stop_generation_create_seq(stopper_ea);
+
+    for (LONG64 seq = begin; seq <= end; ++seq) {
+        const yz_a010_reltrace_event* const ev =
+            &g_yz_a010_reltrace[seq % YZ_A010_RELTRACE_CAP];
+        if (InterlockedCompareExchange64(
+                const_cast<volatile LONG64*>(&ev->published_seq),
+                0, 0) != seq)
+            continue;
+        const uint64_t dma_end =
+            (uint64_t)ev->ea + (uint64_t)ev->size;
+        const int match =
+            ((ev->kind == YZ_A010_RELTRACE_PPU ||
+              ev->kind == YZ_A010_RELTRACE_PPU_STORE ||
+              ev->kind == YZ_A010_RELTRACE_PPU_BULK) &&
+             ev->ea == stopper_ea) ||
+            ((ev->kind == YZ_A010_RELTRACE_SPU ||
+              ev->kind == YZ_A010_RELTRACE_SPU_COMMIT ||
+              ev->kind == YZ_A010_RELTRACE_SPU_ATOMIC) &&
+             ev->ea <= stopper_ea && dma_end > stopper_ea);
+        if (!match)
+            continue;
+        exact++;
+        fprintf(stderr,
+                "[a010-reltrace] EXACT seq=%lld t=%llums kind=%s "
+                "actor=%08X pc=%08X ea=%08X size=%X aux=%08X "
+                "words=%08X/%08X/%08X/%08X "
+                "state=%08X/%08X/%08X/%08X\n",
+                (long long)seq,
+                (unsigned long long)ev->tick_ms,
+                yz_a010_reltrace_kind_name(ev->kind),
+                ev->actor, ev->pc, ev->ea, ev->size, ev->aux,
+                ev->words[0], ev->words[1], ev->words[2], ev->words[3],
+                ev->state[0], ev->state[1], ev->state[2], ev->state[3]);
+    }
+
+    if (create_seq > 0) {
+        const LONG64 window_begin =
+            create_seq > 16 ? create_seq - 16 : begin;
+        const LONG64 window_end =
+            create_seq + 32 < end ? create_seq + 32 : end;
+        for (LONG64 seq = window_begin; seq <= window_end; ++seq) {
+            const yz_a010_reltrace_event* const ev =
+                &g_yz_a010_reltrace[
+                    seq % YZ_A010_RELTRACE_CAP];
+            if (InterlockedCompareExchange64(
+                    const_cast<volatile LONG64*>(
+                        &ev->published_seq), 0, 0) != seq)
+                continue;
+            fprintf(stderr,
+                    "[a010-reltrace] GENWINDOW seq=%lld kind=%s "
+                    "actor=%08X pc=%08X ea=%08X size=%X aux=%08X "
+                    "words=%08X/%08X/%08X/%08X "
+                    "state=%08X/%08X/%08X/%08X\n",
+                    (long long)seq,
+                    yz_a010_reltrace_kind_name(ev->kind),
+                    ev->actor, ev->pc, ev->ea, ev->size, ev->aux,
+                    ev->words[0], ev->words[1],
+                    ev->words[2], ev->words[3],
+                    ev->state[0], ev->state[1],
+                    ev->state[2], ev->state[3]);
+        }
+    }
+
+    const LONG64 tail_begin = end > 96 ? end - 95 : begin;
+    for (LONG64 seq = tail_begin; seq <= end; ++seq) {
+        const yz_a010_reltrace_event* const ev =
+            &g_yz_a010_reltrace[seq % YZ_A010_RELTRACE_CAP];
+        if (InterlockedCompareExchange64(
+                const_cast<volatile LONG64*>(&ev->published_seq),
+                0, 0) != seq)
+            continue;
+        recent++;
+        fprintf(stderr,
+                "[a010-reltrace] TAIL seq=%lld kind=%s actor=%08X "
+                "pc=%08X ea=%08X size=%X aux=%08X "
+                "words=%08X/%08X/%08X/%08X "
+                "state=%08X/%08X/%08X/%08X\n",
+                (long long)seq,
+                yz_a010_reltrace_kind_name(ev->kind),
+                ev->actor, ev->pc, ev->ea, ev->size, ev->aux,
+                ev->words[0], ev->words[1], ev->words[2], ev->words[3],
+                ev->state[0], ev->state[1], ev->state[2], ev->state[3]);
+    }
+    fprintf(stderr,
+            "[a010-reltrace] SUMMARY exact=%u recent=%u\n",
+            exact, recent);
+    fflush(stderr);
+}
+}  // namespace
+
+extern "C" void yz_a010_reltrace_ppu(uint32_t pc,
+                                      const ppu_context* ctx)
+{
+    if (!ctx ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on())
+        return;
+
+    yz_a010_reltrace_event* const ev =
+        yz_a010_reltrace_reserve(
+            YZ_A010_RELTRACE_PPU,
+            (uint32_t)yz_thread_current_id(), pc);
+    const uint32_t state = (uint32_t)ctx->gpr[31];
+    const uint32_t stopper = (uint32_t)ctx->gpr[10];
+    ev->ea = stopper;
+    ev->size = 4;
+    ev->aux = (uint32_t)ctx->gpr[11];
+    if (stopper >= 0x40400000u && stopper < 0x40C00000u)
+        ev->words[0] = vm_read32(stopper);
+    if (state >= 0x10000u && state < 0xE0000000u) {
+        ev->state[0] = vm_read32(state + 0x00u);
+        ev->state[1] = vm_read32(state + 0x1Cu);
+        ev->state[2] = vm_read32(state + 0x20u);
+        ev->state[3] = vm_read32(state + 0x24u);
+    }
+    yz_a010_reltrace_publish(ev);
+}
+
+extern "C" void yz_a010_reltrace_spu(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size,
+    const uint32_t* context)
+{
+    if (!payload || !size ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on())
+        return;
+
+    const int fifo = ea >= 0x40400000u && ea < 0x40C00000u;
+    if (!fifo)
+        return;
+
+    /*
+     * The group publisher can place one or more terminal self-jumps anywhere
+     * in a bulk PUT.  Detect those words by comparing their encoded target
+     * with their own destination, then start a new lifecycle generation
+     * before considering any release record at the same reused ring address.
+     */
+    if (image_id == 0u && pc == 0x05F70u) {
+        const uint32_t payload_hash = yz_a010_hash32(payload, size);
+        for (uint32_t off = 0; off + 4u <= size; off += 4u) {
+            const uint32_t word_ea = ea + off;
+            if (word_ea < 0x40400000u || word_ea >= 0x40C00000u)
+                continue;
+            const uint32_t word = yz_a010_be32(payload + off);
+            const uint32_t self =
+                0x20000000u |
+                ((word_ea - 0x40400000u) & 0x1FFFFFFCu);
+            if (word != self)
+                continue;
+            const uint32_t actor =
+                (image_id << 16) | (spu_id & 0xFFFFu);
+            const uint32_t generation =
+                yz_a010_stop_generation_create(
+                    actor, pc, word_ea, size, off,
+                    payload_hash, context);
+            yz_a010_reltrace_event* const create_ev =
+                yz_a010_reltrace_reserve(
+                    YZ_A010_RELTRACE_STOP_CREATE, actor, pc);
+            create_ev->ea = word_ea;
+            create_ev->size = 4u;
+            create_ev->aux = generation;
+            create_ev->words[0] = word;
+            create_ev->words[1] = vm_read32(word_ea);
+            create_ev->words[2] = off;
+            create_ev->words[3] = payload_hash;
+            for (unsigned i = 0; i < 4u; ++i)
+                create_ev->state[i] = context ? context[i] : 0u;
+            yz_a010_reltrace_publish(create_ev);
+            yz_a010_stop_generation_set_create_seq(
+                word_ea, generation,
+                InterlockedCompareExchange64(
+                    &create_ev->published_seq, 0, 0));
+
+            yz_a010_relwatch* const watch =
+                yz_a010_relwatch_slot(word_ea);
+            InterlockedExchange(&watch->expected, (LONG)self);
+            InterlockedExchange64(
+                &watch->source_seq,
+                InterlockedCompareExchange64(
+                    &create_ev->published_seq, 0, 0));
+            MemoryBarrier();
+            InterlockedExchange(&watch->ea, (LONG)word_ea);
+            InterlockedExchange(
+                &g_yz_a010_relwatch_lines[
+                    (word_ea - 0x40400000u) >> 7], 1);
+        }
+    }
+
+    const uint32_t first_word =
+        size >= 4u ? yz_a010_be32(payload) : 0u;
+    const uint32_t expected_release =
+        0x20000000u |
+        (((ea - 0x40400000u) + 4u) & 0x1FFFFFFCu);
+    const int arm_release =
+        image_id == 0u && pc >= 0x05EB8u && pc <= 0x05F20u &&
+        size == 4u && first_word == expected_release;
+    if (!arm_release && !yz_a010_relwatch_range(ea, size))
+        return;
+
+    yz_a010_reltrace_event* const ev =
+        yz_a010_reltrace_reserve(
+            YZ_A010_RELTRACE_SPU,
+            (image_id << 16) | (spu_id & 0xFFFFu), pc);
+    ev->ea = ea;
+    ev->size = size;
+    for (unsigned wi = 0; wi < 4u && wi * 4u + 4u <= size; ++wi) {
+        const uint32_t off = wi * 4u;
+        ev->words[wi] =
+            ((uint32_t)payload[off + 0] << 24) |
+            ((uint32_t)payload[off + 1] << 16) |
+            ((uint32_t)payload[off + 2] << 8) |
+            (uint32_t)payload[off + 3];
+    }
+    if (!arm_release) {
+        uint32_t target = 0, expected = 0, source_seq = 0;
+        if (yz_a010_relwatch_first(
+                ea, size, &target, &expected, &source_seq)) {
+            const uint32_t off = target - ea;
+            ev->state[0] = target;
+            ev->state[1] = vm_read32(target);
+            ev->state[2] = yz_a010_be32(payload + off);
+            ev->state[3] = source_seq;
+            ev->aux = expected;
+        }
+    }
+    if (arm_release) {
+        ev->state[3] = yz_a010_stop_generation_mark(
+            ea, 0, -ev->published_seq);
+        yz_a010_relwatch* const watch = yz_a010_relwatch_slot(ea);
+        InterlockedExchange(&watch->expected, (LONG)ev->words[0]);
+        InterlockedExchange64(&watch->source_seq, -ev->published_seq);
+        MemoryBarrier();
+        InterlockedExchange(&watch->ea, (LONG)ea);
+        InterlockedExchange(
+            &g_yz_a010_relwatch_lines[
+                (ea - 0x40400000u) >> 7], 1);
+    }
+    yz_a010_reltrace_publish(ev);
+}
+
+extern "C" void yz_a010_reltrace_spu_commit(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size)
+{
+    if (!payload || size < 4u ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on())
+        return;
+    const uint32_t expected_release =
+        0x20000000u |
+        (((ea - 0x40400000u) + 4u) & 0x1FFFFFFCu);
+    const int release =
+        image_id == 0u && pc >= 0x05EB8u && pc <= 0x05F20u &&
+        size == 4u && yz_a010_be32(payload) == expected_release;
+    if (ea < 0x40400000u || ea >= 0x40C00000u || !release)
+        return;
+
+    yz_a010_reltrace_event* const ev =
+        yz_a010_reltrace_reserve(
+            YZ_A010_RELTRACE_SPU_COMMIT,
+            (image_id << 16) | (spu_id & 0xFFFFu), pc);
+    ev->ea = ea;
+    ev->size = size;
+    ev->aux = yz_a010_be32(payload);
+    ev->words[0] = vm_read32(ea);
+    ev->state[0] = ev->words[0] == ev->aux;
+    ev->state[1] = yz_a010_stop_generation_mark(
+        ea, 1, -ev->published_seq);
+    yz_a010_reltrace_publish(ev);
+}
+
+extern "C" void yz_a010_reltrace_spu_atomic(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t line_ea, const uint8_t* new_line, uint32_t cmd)
+{
+    if (!new_line || line_ea < 0x40400000u ||
+        line_ea >= 0x40C00000u ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on() ||
+        !yz_a010_relwatch_range(line_ea, 128u))
+        return;
+
+    for (uint32_t off = 0; off < 128u; off += 4u) {
+        const uint32_t target = line_ea + off;
+        yz_a010_relwatch* const watch = yz_a010_relwatch_slot(target);
+        if ((uint32_t)InterlockedCompareExchange(
+                &watch->ea, 0, 0) != target)
+            continue;
+        yz_a010_reltrace_event* const ev =
+            yz_a010_reltrace_reserve(
+                YZ_A010_RELTRACE_SPU_ATOMIC,
+                (image_id << 16) | (spu_id & 0xFFFFu), pc);
+        ev->ea = target;
+        ev->size = 4u;
+        ev->aux = cmd;
+        ev->words[0] = vm_read32(target);
+        ev->words[1] = yz_a010_be32(new_line + off);
+        ev->state[0] = (uint32_t)InterlockedCompareExchange64(
+            &watch->source_seq, 0, 0);
+        yz_a010_reltrace_publish(ev);
+    }
+}
+
+extern "C" void yz_a010_reltrace_ppu_store(
+    uint32_t addr, uint32_t val, uint32_t guest_pc)
+{
+    if (addr < 0x40400000u || addr >= 0x40C00000u ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on())
+        return;
+
+    const uint32_t io =
+        (addr - 0x40400000u) & 0x1FFFFFFCu;
+    const uint32_t self = 0x20000000u | io;
+    uint32_t generation = 0;
+    if (val == self) {
+        uint32_t context[16] = {};
+        const uint32_t state = g_yz_game_toc
+            ? vm_read32(g_yz_game_toc - 0x7410u) : 0u;
+        context[0] = state;
+        if (state >= 0x10000u && state < 0xE0000000u) {
+            context[1] = vm_read32(state + 0x00u);
+            context[2] = vm_read32(state + 0x1Cu);
+            context[3] = vm_read32(state + 0x20u);
+            context[4] = vm_read32(state + 0x24u);
+        }
+        context[5] = guest_pc;
+        context[6] = (uint32_t)yz_thread_current_id();
+        context[7] = vm_read32(addr);
+        void* stack[8] = {};
+        const USHORT frames =
+            RtlCaptureStackBackTrace(1, 8, stack, nullptr);
+        for (USHORT i = 0; i < frames; ++i)
+            context[8u + i] =
+                yz_guest_addr_from_host(stack[i]);
+
+        const uint32_t actor =
+            0x80000000u |
+            ((uint32_t)yz_thread_current_id() & 0x7FFFFFFFu);
+        generation = yz_a010_stop_generation_create(
+            actor, guest_pc, addr, 4u, 0u, val, context);
+        yz_a010_reltrace_event* const create_ev =
+            yz_a010_reltrace_reserve(
+                YZ_A010_RELTRACE_STOP_CREATE,
+                actor, guest_pc);
+        create_ev->ea = addr;
+        create_ev->size = 4u;
+        create_ev->aux = generation;
+        create_ev->words[0] = val;
+        create_ev->words[1] = context[7];
+        create_ev->words[2] = state;
+        create_ev->words[3] = context[3];
+        for (unsigned i = 0; i < 4u; ++i)
+            create_ev->state[i] = context[1u + i];
+        yz_a010_reltrace_publish(create_ev);
+        const LONG64 create_seq =
+            InterlockedCompareExchange64(
+                &create_ev->published_seq, 0, 0);
+        yz_a010_stop_generation_set_create_seq(
+            addr, generation, create_seq);
+
+        yz_a010_relwatch* const create_watch =
+            yz_a010_relwatch_slot(addr);
+        InterlockedExchange(
+            &create_watch->expected, (LONG)self);
+        InterlockedExchange64(
+            &create_watch->source_seq, create_seq);
+        MemoryBarrier();
+        InterlockedExchange(
+            &create_watch->ea, (LONG)addr);
+        InterlockedExchange(
+            &g_yz_a010_relwatch_lines[
+                (addr - 0x40400000u) >> 7], 1);
+    }
+
+    yz_a010_relwatch* const watch = yz_a010_relwatch_slot(addr);
+    if ((uint32_t)InterlockedCompareExchange(
+            &watch->ea, 0, 0) != addr)
+        return;
+
+    yz_a010_reltrace_event* const ev =
+        yz_a010_reltrace_reserve(
+            YZ_A010_RELTRACE_PPU_STORE,
+            (uint32_t)yz_thread_current_id(), guest_pc);
+    ev->ea = addr;
+    ev->size = 4u;
+    ev->aux = (uint32_t)InterlockedCompareExchange(
+        &watch->expected, 0, 0);
+    ev->words[0] = vm_read32(addr);
+    ev->words[1] = val;
+    ev->state[0] = (uint32_t)InterlockedCompareExchange64(
+        &watch->source_seq, 0, 0);
+    if (val != self &&
+        (val & 0xE0000003u) == 0x20000000u)
+        ev->state[3] = yz_a010_stop_generation_mark(
+            addr, 0, -ev->published_seq);
+    yz_a010_reltrace_publish(ev);
+}
+
+extern "C" void yz_a010_reltrace_ppu_bulk(
+    uint32_t dst, const uint8_t* src, uint32_t size,
+    uint32_t guest_pc, uint32_t op, uint8_t fill)
+{
+    if (!size ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on() ||
+        !yz_a010_relwatch_range(dst, size))
+        return;
+
+    const uint64_t end = (uint64_t)dst + size;
+    uint32_t word = (dst + 3u) & ~3u;
+    for (; (uint64_t)word + 4u <= end; word += 4u) {
+        yz_a010_relwatch* const watch = yz_a010_relwatch_slot(word);
+        if ((uint32_t)InterlockedCompareExchange(
+                &watch->ea, 0, 0) != word)
+            continue;
+
+        yz_a010_reltrace_event* const ev =
+            yz_a010_reltrace_reserve(
+                YZ_A010_RELTRACE_PPU_BULK,
+                (uint32_t)yz_thread_current_id(), guest_pc);
+        ev->ea = word;
+        ev->size = 4u;
+        ev->aux = (uint32_t)InterlockedCompareExchange(
+            &watch->expected, 0, 0);
+        ev->words[0] = vm_read32(word);
+        ev->words[1] = op == 1u
+            ? yz_a010_be32(src + (word - dst))
+            : (uint32_t)fill * 0x01010101u;
+        ev->state[0] = (uint32_t)InterlockedCompareExchange64(
+            &watch->source_seq, 0, 0);
+        const uint64_t src_host = (uint64_t)(uintptr_t)src;
+        const uint64_t vm_host = (uint64_t)(uintptr_t)vm_base;
+        ev->state[1] =
+            op == 1u && src_host >= vm_host &&
+            src_host - vm_host <= UINT32_MAX
+                ? (uint32_t)(src_host - vm_host)
+                : (op == 2u ? (uint32_t)fill : UINT32_MAX);
+        ev->state[2] = size;
+        ev->state[3] = op;
+        yz_a010_reltrace_publish(ev);
+    }
+}
+
+extern "C" void yz_a010_reltrace_gate(
+    uint32_t spu_id, uint32_t code, uint32_t key,
+    uint32_t witness, uint32_t descriptor,
+    uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
+{
+    /*
+     * The first trace proved the release handler reached its final PUT.  Gate
+     * traffic is extremely hot, so retain it only behind a separate opt-in
+     * flag while the focused publication trace is active.
+     */
+    static volatile LONG gate_mode = -1;
+    LONG gate_on = InterlockedCompareExchange(&gate_mode, -1, -1);
+    if (gate_on < 0) {
+        const LONG requested =
+            getenv("YZ_A010_RELEASE_GATE_TRACE") ? 1 : 0;
+        const LONG prior = InterlockedCompareExchange(
+            &gate_mode, requested, -1);
+        gate_on = prior < 0 ? requested : prior;
+    }
+    if (!gate_on || !yz_a010_reltrace_on() ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0)
+        return;
+
+    yz_a010_reltrace_event* const ev =
+        yz_a010_reltrace_reserve(
+            YZ_A010_RELTRACE_GATE, spu_id & 0xFFFFu, 0x0000B0C4u);
+    ev->ea = descriptor;
+    ev->words[0] = code;
+    ev->words[1] = key;
+    ev->words[2] = witness;
+    ev->words[3] = descriptor;
+    ev->state[0] = d0;
+    ev->state[1] = d1;
+    ev->state[2] = d2;
+    ev->state[3] = d3;
+    yz_a010_reltrace_publish(ev);
+}
 
 /* lv2 sys_event handlers (runtime/syscalls/sys_event.c) -- driven directly from
  * sys_rsx_context_allocate to set up libgcm's RSX event port/queue. */
@@ -57,6 +974,7 @@ extern "C" void yz_rsx_fifo_acquire(void);
 extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
+extern "C" void yz_a010_auth_probe_poll(void);
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
@@ -500,14 +1418,56 @@ static void yz_ft_start(void)   /* called from the vblank tick (ctx is up) */
 static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
                                        u32 min_bytes)
 {
-    (void)user; (void)min_bytes;
+    (void)user;
+    /*
+     * The live renderer promises its callers that the returned host pointer
+     * covers min_bytes, so validate the whole interval rather than only its
+     * first byte.  Texture hashing exposed the old bug when a mip span began
+     * inside local VRAM but ended exactly at 0xCF900000, the first uncommitted
+     * byte after the console's 249 MB local-memory carve.
+     */
+    const uint64_t end = (uint64_t)offset + (uint64_t)min_bytes;
+    if (end > 0x100000000ull)
+        return nullptr;
+
     uint32_t ea;
     if (location == 0) {                         /* RSX local VRAM */
-        if (offset >= YZ_GCM_LOCAL_SIZE) return nullptr;
+        const uint32_t local_size =
+            g_rsx_local_mem_size < YZ_GCM_LOCAL_SIZE
+                ? g_rsx_local_mem_size : YZ_GCM_LOCAL_SIZE;
+        if (offset >= local_size || end > local_size)
+            return nullptr;
         ea = YZ_GCM_LOCAL_BASE + offset;
-    } else {                                     /* main memory via io map */
+    } else if (location == 1) {                  /* main memory via io map */
         ea = yz_rsx_io_to_ea(offset);
         if (!ea) return nullptr;
+        if (min_bytes) {
+            const uint64_t last_io64 = end - 1u;
+            if (last_io64 > UINT32_MAX)
+                return nullptr;
+            const uint32_t last_ea =
+                yz_rsx_io_to_ea((uint32_t)last_io64);
+            if (!last_ea ||
+                (uint64_t)last_ea !=
+                    (uint64_t)ea + (uint64_t)min_bytes - 1u)
+                return nullptr;
+
+            /* IO pages are independently mapped.  Matching endpoints are not
+             * sufficient when a multi-page texture crosses a discontiguous or
+             * unmapped page in between. */
+            uint64_t boundary =
+                ((uint64_t)offset + 0x100000ull) & ~0xFFFFFull;
+            for (; boundary < end; boundary += 0x100000ull) {
+                const uint32_t boundary_ea =
+                    yz_rsx_io_to_ea((uint32_t)boundary);
+                if (!boundary_ea ||
+                    (uint64_t)boundary_ea !=
+                        (uint64_t)ea + boundary - offset)
+                    return nullptr;
+            }
+        }
+    } else {
+        return nullptr;
     }
     return (const u8*)(vm_base + ea);
 }
@@ -529,6 +1489,7 @@ static LONG g_movie_played_serial = 0;
 static volatile LONG g_movie_presenting_serial = 0;
 static volatile LONG g_movie_presented_frames = 0;
 static volatile LONG g_movie_present_timescale = 30;
+static volatile LONG g_movie_playing_observed_serial = 0;
 /* Consumed by dispatch.cpp on guest PPU thread 1. The host presenter may
  * detect EOS, but CRI player lifecycle calls must execute on the guest thread
  * that owns the mwPly handle. */
@@ -572,8 +1533,10 @@ extern "C" int yz_host_movie_status(long serial)
     if (serial <= 0) return 0;
     if (InterlockedCompareExchange(&g_movie_completed_serial, 0, 0) >= serial)
         return 3; /* MWSFD_STAT_PLAYEND */
-    if (InterlockedCompareExchange(&g_movie_presenting_serial, 0, 0) == serial)
+    if (InterlockedCompareExchange(&g_movie_presenting_serial, 0, 0) == serial) {
+        InterlockedExchange(&g_movie_playing_observed_serial, serial);
         return 2; /* MWSFD_STAT_PLAYING */
+    }
     return 1;     /* MWSFD_STAT_PREP */
 }
 
@@ -626,14 +1589,662 @@ static int yz_has_sfd_suffix(const char* path)
 }
 
 extern "C" int yz_movie_hle_armed(void);
+extern "C" void yz_stage_direct_probe_snapshot(const char* reason);
+
+static bool yz_stage_host_region_readable(const MEMORY_BASIC_INFORMATION& mbi)
+{
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
+        return false;
+    const DWORD p = mbi.Protect & 0xFFu;
+    return p == PAGE_READONLY || p == PAGE_READWRITE ||
+           p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READ ||
+           p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
+static unsigned yz_stage_find_bytes(const void* needle, size_t needle_size,
+                                    uint32_t* found, unsigned found_cap)
+{
+    static const uint32_t ranges[][2] = {
+        {0x00010000u, 0x10010000u}, /* committed 256 MiB main memory */
+        {0x40000000u, 0x80000000u}, /* sys_memory/sys_vm allocations */
+    };
+    unsigned count = 0;
+    for (const auto& range : ranges) {
+        uint8_t* cursor = vm_base + range[0];
+        uint8_t* limit = vm_base + range[1];
+        while (cursor < limit) {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (!VirtualQuery(cursor, &mbi, sizeof(mbi)))
+                break;
+            uint8_t* region_begin = (uint8_t*)mbi.BaseAddress;
+            uint8_t* region_end = region_begin + mbi.RegionSize;
+            uint8_t* scan = region_begin > cursor ? region_begin : cursor;
+            uint8_t* scan_end = region_end < limit ? region_end : limit;
+            if (yz_stage_host_region_readable(mbi) &&
+                scan_end > scan &&
+                (size_t)(scan_end - scan) >= needle_size) {
+                const uint8_t first = *(const uint8_t*)needle;
+                while (scan + needle_size <= scan_end) {
+                    uint8_t* hit = (uint8_t*)memchr(
+                        scan, first, (size_t)(scan_end - scan));
+                    if (!hit || hit + needle_size > scan_end)
+                        break;
+                    if (memcmp(hit, needle, needle_size) == 0) {
+                        if (count < found_cap)
+                            found[count] = (uint32_t)(hit - vm_base);
+                        count++;
+                    }
+                    scan = hit + 1;
+                }
+            }
+            cursor = region_end > cursor ? region_end : cursor + 0x1000;
+        }
+    }
+    return count;
+}
+
+static unsigned yz_stage_find_pointer(uint32_t value, uint32_t* found,
+                                      unsigned found_cap)
+{
+    uint8_t be[4] = {
+        (uint8_t)(value >> 24), (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8), (uint8_t)value
+    };
+    uint32_t byte_hits[256] = {};
+    const unsigned total = yz_stage_find_bytes(
+        be, sizeof(be), byte_hits,
+        sizeof(byte_hits) / sizeof(byte_hits[0]));
+    unsigned count = 0;
+    const unsigned retained =
+        total < sizeof(byte_hits) / sizeof(byte_hits[0])
+            ? total : (unsigned)(sizeof(byte_hits) / sizeof(byte_hits[0]));
+    for (unsigned i = 0; i < retained; i++) {
+        if ((byte_hits[i] & 3u) != 0)
+            continue;
+        if (count < found_cap)
+            found[count] = byte_hits[i];
+        count++;
+    }
+    return count;
+}
+
+/* Find aligned guest pointers while discarding references stored inside the
+ * converted GMD itself.  The original two-stage helper retained only its first
+ * 256 byte matches, which for the house were all self-references and hid the
+ * manager/instance owners that follow them in memory. */
+static unsigned yz_stage_find_external_pointer(
+    uint32_t value, uint32_t excluded_begin, uint32_t excluded_size,
+    uint32_t* found, unsigned found_cap)
+{
+    static const uint32_t ranges[][2] = {
+        {0x00010000u, 0x10010000u},
+        {0x40000000u, 0x80000000u},
+    };
+    const uint8_t be[4] = {
+        (uint8_t)(value >> 24), (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8), (uint8_t)value
+    };
+    const uint64_t excluded_end =
+        (uint64_t)excluded_begin + (uint64_t)excluded_size;
+    unsigned count = 0;
+
+    for (const auto& range : ranges) {
+        uint8_t* cursor = vm_base + range[0];
+        uint8_t* limit = vm_base + range[1];
+        while (cursor < limit) {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (!VirtualQuery(cursor, &mbi, sizeof(mbi)))
+                break;
+            uint8_t* region_begin = (uint8_t*)mbi.BaseAddress;
+            uint8_t* region_end = region_begin + mbi.RegionSize;
+            uint8_t* scan = region_begin > cursor ? region_begin : cursor;
+            uint8_t* scan_end = region_end < limit ? region_end : limit;
+            if (yz_stage_host_region_readable(mbi) &&
+                scan_end >= scan + sizeof(be)) {
+                uintptr_t guest =
+                    (uintptr_t)(scan - vm_base);
+                scan += (4u - (guest & 3u)) & 3u;
+                for (; scan + sizeof(be) <= scan_end; scan += 4u) {
+                    if (memcmp(scan, be, sizeof(be)) != 0)
+                        continue;
+                    const uint32_t address =
+                        (uint32_t)(scan - vm_base);
+                    if ((uint64_t)address >= excluded_begin &&
+                        (uint64_t)address < excluded_end)
+                        continue;
+                    if (count < found_cap)
+                        found[count] = address;
+                    ++count;
+                }
+            }
+            cursor = region_end > cursor
+                ? region_end : cursor + 0x1000;
+        }
+    }
+    return count;
+}
+
+extern "C" uint32_t g_yz_game_toc;
+extern "C" volatile uint32_t g_yz_stage_house_raw;
+extern "C" volatile uint32_t g_yz_stage_house_allocation;
+extern "C" volatile uint32_t g_yz_stage_house_bytes;
+extern "C" volatile uint32_t g_yz_stage_house_slot;
+extern "C" volatile uint32_t g_yz_stage_house_published;
+extern "C" volatile uint32_t g_yz_stage_house_instance = 0;
+extern "C" void yz_watch_wr_rearm(void);
+
+extern "C" void yz_stage_house_external_snapshot(void)
+{
+    /*
+     * YZ_WATCH_WR may target a dynamic stage allocation.  The heap can
+     * recommit that page after the early main() arm, restoring write access.
+     * Re-arm independently of the much heavier YZ_STAGE_MEMORY snapshot.
+     */
+    if (getenv("YZ_WATCH_WR"))
+        yz_watch_wr_rearm();
+    if (!getenv("YZ_STAGE_MEMORY"))
+        return;
+
+    const uint32_t converted =
+        (uint32_t)InterlockedCompareExchange(
+            (volatile LONG*)&g_yz_stage_house_allocation, 0, 0);
+    const uint32_t converted_bytes =
+        (uint32_t)InterlockedCompareExchange(
+            (volatile LONG*)&g_yz_stage_house_bytes, 0, 0);
+    if (!converted || !converted_bytes)
+        return;
+
+    static LONG once;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0)
+        return;
+
+    uint32_t refs[1024] = {};
+    const unsigned ref_count = yz_stage_find_external_pointer(
+        converted, converted, converted_bytes, refs,
+        sizeof(refs) / sizeof(refs[0]));
+    const uint32_t table =
+        g_yz_game_toc
+            ? vm_read32(g_yz_game_toc - 0x7680u) : 0u;
+    fprintf(stderr,
+            "[stage-owner] house=%08X bytes=%08X table=%08X "
+            "externalRefs=%u\n",
+            converted, converted_bytes, table, ref_count);
+
+    const unsigned retained =
+        ref_count < sizeof(refs) / sizeof(refs[0])
+            ? ref_count
+            : (unsigned)(sizeof(refs) / sizeof(refs[0]));
+    for (unsigned i = 0; i < retained; ++i) {
+        const uint32_t ref = refs[i];
+        const bool in_table =
+            table && ref >= table && ref < table + 0x4000u;
+        const uint32_t object =
+            !in_table && (ref & 0xFFFu) >= 4u ? ref - 4u : 0u;
+        const uint32_t vtable = object ? vm_read32(object) : 0u;
+        if (vtable == 0x011D6948u)
+            InterlockedExchange(
+                (volatile LONG*)&g_yz_stage_house_instance,
+                (LONG)object);
+        fprintf(stderr,
+                "[stage-owner] ref=%08X%s object=%08X vtable=%08X",
+                ref, in_table ? " TABLE" : "", object, vtable);
+        if (in_table)
+            fprintf(stderr, " slot=%u",
+                    (unsigned)((ref - table) / 4u));
+
+        if (vtable == 0x011D6948u) {
+            fprintf(stderr,
+                    " words="
+                    "%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X "
+                    "b0=%04X b2=%02X b3=%02X "
+                    "f0=%08X f4=%08X f8=%08X fc=%08X "
+                    "f168=%08X f16c=%08X f170=%08X",
+                    vm_read32(object + 0x00u),
+                    vm_read32(object + 0x04u),
+                    vm_read32(object + 0x08u),
+                    vm_read32(object + 0x0Cu),
+                    vm_read32(object + 0x10u),
+                    vm_read32(object + 0x14u),
+                    vm_read32(object + 0x18u),
+                    vm_read32(object + 0x1Cu),
+                    (unsigned)vm_read16(object + 0xB0u),
+                    (unsigned)vm_read8(object + 0xB2u),
+                    (unsigned)vm_read8(object + 0xB3u),
+                    vm_read32(object + 0xF0u),
+                    vm_read32(object + 0xF4u),
+                    vm_read32(object + 0xF8u),
+                    vm_read32(object + 0xFCu),
+                    vm_read32(object + 0x168u),
+                    vm_read32(object + 0x16Cu),
+                    vm_read32(object + 0x170u));
+
+            uint32_t owner_refs[256] = {};
+            const unsigned owner_ref_count =
+                yz_stage_find_external_pointer(
+                    object, object, 0x180u, owner_refs,
+                    sizeof(owner_refs) / sizeof(owner_refs[0]));
+            fprintf(stderr, " ownerRefs=%u", owner_ref_count);
+            const unsigned retained_owner =
+                owner_ref_count <
+                    sizeof(owner_refs) / sizeof(owner_refs[0])
+                    ? owner_ref_count
+                    : (unsigned)(sizeof(owner_refs) /
+                                 sizeof(owner_refs[0]));
+            for (unsigned j = 0; j < retained_owner && j < 16u; ++j)
+                fprintf(stderr, " ownerRef%u=%08X",
+                        j, owner_refs[j]);
+        }
+        fputc('\n', stderr);
+    }
+
+    /* Enumerate the sibling static-stage render objects as a control group.
+     * If F11/F10/F0D have an instance but F12 does not, construction or
+     * registration is the first broken checkpoint; if F12 exists, its mask
+     * and owner links can be compared directly with those live siblings. */
+    uint32_t instances[512] = {};
+    const unsigned instance_count = yz_stage_find_pointer(
+        0x011D6948u, instances,
+        sizeof(instances) / sizeof(instances[0]));
+    fprintf(stderr,
+            "[stage-owner] stage-instance-vtable matches=%u\n",
+            instance_count);
+    const unsigned retained_instances =
+        instance_count < sizeof(instances) / sizeof(instances[0])
+            ? instance_count
+            : (unsigned)(sizeof(instances) / sizeof(instances[0]));
+    for (unsigned i = 0; i < retained_instances; ++i) {
+        const uint32_t object = instances[i];
+        const uint32_t gmd = vm_read32(object + 0x04u);
+        unsigned table_slot = 0xFFFFFFFFu;
+        if (table) {
+            for (unsigned slot = 0; slot < 4096u; ++slot) {
+                if (vm_read32(table + slot * 4u) == gmd) {
+                    table_slot = slot;
+                    break;
+                }
+            }
+        }
+        if (table_slot != 0xF0Du && table_slot != 0xF10u &&
+            table_slot != 0xF11u && table_slot != 0xF12u)
+            continue;
+        fprintf(stderr,
+                "[stage-owner] stage-instance object=%08X "
+                "gmd=%08X slot=%08X mask=%08X "
+                "f0C=%08X f10=%08X f14=%08X f18=%08X "
+                "f1C=%08X f20=%08X f24=%08X "
+                "b0=%04X b2=%02X b3=%02X\n",
+                object, gmd, table_slot,
+                vm_read32(object + 0x08u),
+                vm_read32(object + 0x0Cu),
+                vm_read32(object + 0x10u),
+                vm_read32(object + 0x14u),
+                vm_read32(object + 0x18u),
+                vm_read32(object + 0x1Cu),
+                vm_read32(object + 0x20u),
+                vm_read32(object + 0x24u),
+                (unsigned)vm_read16(object + 0xB0u),
+                (unsigned)vm_read8(object + 0xB2u),
+                (unsigned)vm_read8(object + 0xB3u));
+    }
+    yz_watch_wr_rearm();
+    fflush(stderr);
+}
+
+static void yz_stage_house_memory_snapshot(void)
+{
+    if (!getenv("YZ_STAGE_MEMORY"))
+        return;
+
+    static LONG once;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0)
+        return;
+
+    static const char house_name[] = "st_asagao_e_house";
+    uint32_t names[16] = {};
+    const unsigned name_count = yz_stage_find_bytes(
+        house_name, sizeof(house_name) - 1, names,
+        sizeof(names) / sizeof(names[0]));
+    fprintf(stderr, "[stage-memory] house-name matches=%u\n", name_count);
+
+    const unsigned retained_names =
+        name_count < sizeof(names) / sizeof(names[0])
+            ? name_count : (unsigned)(sizeof(names) / sizeof(names[0]));
+    for (unsigned i = 0; i < retained_names; i++) {
+        const uint32_t name = names[i];
+        const uint32_t header = name >= 0x12u ? name - 0x12u : 0u;
+        fprintf(stderr,
+                "[stage-memory] house-name=%08X candidate-header=%08X "
+                "tag=%08X pre10=%08X pre0C=%08X\n",
+                name, header, header ? vm_read32(header) : 0u,
+                name >= 0x10u ? vm_read32(name - 0x10u) : 0u,
+                name >= 0xCu ? vm_read32(name - 0xCu) : 0u);
+        if (!header || memcmp(vm_base + header, "GSGM", 4) != 0)
+            continue;
+
+        uint32_t header_refs[64] = {};
+        const unsigned header_ref_count = yz_stage_find_pointer(
+            header, header_refs,
+            sizeof(header_refs) / sizeof(header_refs[0]));
+        fprintf(stderr,
+                "[stage-memory] house header=%08X refs=%u "
+                "u16@32=%u\n",
+                header, header_ref_count,
+                (unsigned)vm_read16(header + 0x32u));
+
+        const unsigned retained_refs =
+            header_ref_count < sizeof(header_refs) / sizeof(header_refs[0])
+                ? header_ref_count
+                : (unsigned)(sizeof(header_refs) / sizeof(header_refs[0]));
+        for (unsigned j = 0; j < retained_refs; j++) {
+            const uint32_t data_field = header_refs[j];
+            if (data_field < 4u)
+                continue;
+            const uint32_t resource = data_field - 4u;
+            const uint32_t resource_vtable = vm_read32(resource);
+            fprintf(stderr,
+                    "[stage-memory] header-ref=%08X resource=%08X "
+                    "vtable=%08X f08=%08X f0C=%08X\n",
+                    data_field, resource, resource_vtable,
+                    vm_read32(resource + 8u), vm_read32(resource + 0xCu));
+            if (resource_vtable != 0x011F7330u)
+                continue;
+
+            uint32_t resource_refs[128] = {};
+            const unsigned resource_ref_count = yz_stage_find_pointer(
+                resource, resource_refs,
+                sizeof(resource_refs) / sizeof(resource_refs[0]));
+            fprintf(stderr,
+                    "[stage-memory] resource=%08X refs=%u\n",
+                    resource, resource_ref_count);
+            const unsigned retained_resource_refs =
+                resource_ref_count <
+                    sizeof(resource_refs) / sizeof(resource_refs[0])
+                    ? resource_ref_count
+                    : (unsigned)(sizeof(resource_refs) /
+                                 sizeof(resource_refs[0]));
+            for (unsigned k = 0; k < retained_resource_refs; k++) {
+                const uint32_t resource_field = resource_refs[k];
+                if (resource_field < 0x20Cu)
+                    continue;
+                const uint32_t model = resource_field - 0x20Cu;
+                fprintf(stderr,
+                        "[stage-memory] model-candidate=%08X "
+                        "resource-field=%08X vtable=%08X "
+                        "f030=%02X f0C0=%08X f208=%08X "
+                        "f20C=%08X f218=%08X f248=%08X\n",
+                        model, resource_field, vm_read32(model),
+                        (unsigned)vm_read8(model + 0x30u),
+                        vm_read32(model + 0xC0u),
+                        vm_read32(model + 0x208u),
+                        vm_read32(model + 0x20Cu),
+                        vm_read32(model + 0x218u),
+                        vm_read32(model + 0x248u));
+            }
+        }
+    }
+
+    /* This 32-byte index run begins at file offset 0x8BFB28 in the house GMD.
+     * It is absent from the other three large stage models and survives the
+     * healthy capture's mesh conversion in shorter runs, so it can locate
+     * retained house geometry even if the parser released its file header. */
+    static const uint8_t house_index_run[] = {
+        0x00,0x6B, 0x00,0x6C, 0x00,0x6D, 0x00,0x6E,
+        0x00,0x6F, 0x00,0x72, 0x00,0x70, 0x00,0x71,
+        0x00,0x71, 0x00,0x73, 0x00,0x72, 0x00,0x74,
+        0x00,0x72, 0x00,0x73, 0x00,0x73, 0x00,0x75
+    };
+    uint32_t index_hits[32] = {};
+    const unsigned index_count = yz_stage_find_bytes(
+        house_index_run, sizeof(house_index_run), index_hits,
+        sizeof(index_hits) / sizeof(index_hits[0]));
+    fprintf(stderr, "[stage-memory] house-index matches=%u\n", index_count);
+    const unsigned retained_index =
+        index_count < sizeof(index_hits) / sizeof(index_hits[0])
+            ? index_count
+            : (unsigned)(sizeof(index_hits) / sizeof(index_hits[0]));
+    for (unsigned i = 0; i < retained_index; i++) {
+        const uint32_t hit = index_hits[i];
+        const uint32_t candidate_base =
+            hit >= 0x008BFB28u ? hit - 0x008BFB28u : 0u;
+        fprintf(stderr,
+                "[stage-memory] house-index=%08X candidate-base=%08X "
+                "tag=%08X\n",
+                hit, candidate_base,
+                candidate_base ? vm_read32(candidate_base) : 0u);
+        if (!candidate_base ||
+            vm_read32(candidate_base) != 0x4753474Du)
+            continue;
+
+        for (uint32_t off = 0; off < 0x100u; off += 0x20u) {
+            fprintf(stderr,
+                    "[stage-memory] house-gsgm +%03X:"
+                    " %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    off,
+                    vm_read32(candidate_base + off + 0x00u),
+                    vm_read32(candidate_base + off + 0x04u),
+                    vm_read32(candidate_base + off + 0x08u),
+                    vm_read32(candidate_base + off + 0x0Cu),
+                    vm_read32(candidate_base + off + 0x10u),
+                    vm_read32(candidate_base + off + 0x14u),
+                    vm_read32(candidate_base + off + 0x18u),
+                    vm_read32(candidate_base + off + 0x1Cu));
+        }
+
+        uint32_t base_refs[256] = {};
+        const unsigned base_ref_count = yz_stage_find_pointer(
+            candidate_base, base_refs,
+            sizeof(base_refs) / sizeof(base_refs[0]));
+        uint32_t index_refs[256] = {};
+        const unsigned index_ref_count = yz_stage_find_pointer(
+            hit, index_refs,
+            sizeof(index_refs) / sizeof(index_refs[0]));
+        const uint32_t table =
+            g_yz_game_toc
+                ? vm_read32(g_yz_game_toc - 0x7680u) : 0u;
+        fprintf(stderr,
+                "[stage-memory] house-gsgm base=%08X baseRefs=%u "
+                "index=%08X indexRefs=%u toc=%08X table=%08X\n",
+                candidate_base, base_ref_count, hit, index_ref_count,
+                g_yz_game_toc, table);
+
+        const unsigned retained_base_refs =
+            base_ref_count <
+                sizeof(base_refs) / sizeof(base_refs[0])
+                    ? base_ref_count
+                    : (unsigned)(sizeof(base_refs) /
+                                 sizeof(base_refs[0]));
+        for (unsigned j = 0; j < retained_base_refs; ++j) {
+            const uint32_t ref = base_refs[j];
+            const bool in_table =
+                table && ref >= table && ref < table + 0x4000u;
+            fprintf(stderr,
+                    "[stage-memory] house-base-ref=%08X%s",
+                    ref, in_table ? " TABLE" : "");
+            if (in_table)
+                fprintf(stderr, " slot=%u",
+                        (unsigned)((ref - table) / 4u));
+            if (ref >= 8u) {
+                fprintf(stderr,
+                        " context[-8..+28]="
+                        "%08X/%08X/%08X/%08X/%08X/%08X/"
+                        "%08X/%08X/%08X/%08X/%08X/%08X/%08X",
+                        vm_read32(ref - 0x08u),
+                        vm_read32(ref - 0x04u),
+                        vm_read32(ref + 0x00u),
+                        vm_read32(ref + 0x04u),
+                        vm_read32(ref + 0x08u),
+                        vm_read32(ref + 0x0Cu),
+                        vm_read32(ref + 0x10u),
+                        vm_read32(ref + 0x14u),
+                        vm_read32(ref + 0x18u),
+                        vm_read32(ref + 0x1Cu),
+                        vm_read32(ref + 0x20u),
+                        vm_read32(ref + 0x24u),
+                        vm_read32(ref + 0x28u));
+            }
+            fprintf(stderr, "\n");
+        }
+        const unsigned retained_index_refs =
+            index_ref_count <
+                sizeof(index_refs) / sizeof(index_refs[0])
+                    ? index_ref_count
+                    : (unsigned)(sizeof(index_refs) /
+                                 sizeof(index_refs[0]));
+        for (unsigned j = 0; j < retained_index_refs; ++j) {
+            const uint32_t ref = index_refs[j];
+            const bool in_table =
+                table && ref >= table && ref < table + 0x4000u;
+            fprintf(stderr,
+                    "[stage-memory] house-index-ref=%08X%s",
+                    ref, in_table ? " TABLE" : "");
+            if (in_table)
+                fprintf(stderr, " slot=%u",
+                        (unsigned)((ref - table) / 4u));
+            fprintf(stderr, "\n");
+        }
+
+        if (table) {
+            unsigned exact_slots = 0;
+            for (unsigned slot = 0; slot < 4096u; ++slot) {
+                const uint32_t value = vm_read32(table + slot * 4u);
+                if (value != candidate_base && value != hit)
+                    continue;
+                fprintf(stderr,
+                        "[stage-memory] house-table slot=%u value=%08X "
+                        "kind=%s\n",
+                        slot, value,
+                        value == candidate_base ? "base" : "index");
+                ++exact_slots;
+            }
+            fprintf(stderr,
+                    "[stage-memory] house-table exactSlots=%u\n",
+                    exact_slots);
+        }
+
+        const uint32_t converted =
+            (uint32_t)InterlockedCompareExchange(
+                (volatile LONG*)&g_yz_stage_house_allocation, 0, 0);
+        if (converted) {
+            const uint32_t converted_bytes =
+                (uint32_t)InterlockedCompareExchange(
+                    (volatile LONG*)&g_yz_stage_house_bytes, 0, 0);
+            uint32_t converted_refs[1024] = {};
+            const unsigned converted_ref_count =
+                yz_stage_find_external_pointer(
+                    converted, converted, converted_bytes,
+                    converted_refs,
+                    sizeof(converted_refs) /
+                        sizeof(converted_refs[0]));
+            fprintf(stderr,
+                    "[stage-memory] house-converted raw=%08X "
+                    "allocation=%08X bytes=%08X slot=%08X "
+                    "published=%08X externalRefs=%u\n",
+                    (uint32_t)InterlockedCompareExchange(
+                        (volatile LONG*)&g_yz_stage_house_raw, 0, 0),
+                    converted, converted_bytes,
+                    (uint32_t)InterlockedCompareExchange(
+                        (volatile LONG*)&g_yz_stage_house_slot, 0, 0),
+                    (uint32_t)InterlockedCompareExchange(
+                        (volatile LONG*)&g_yz_stage_house_published, 0, 0),
+                    converted_ref_count);
+            const unsigned retained_converted =
+                converted_ref_count <
+                    sizeof(converted_refs) /
+                        sizeof(converted_refs[0])
+                    ? converted_ref_count
+                    : (unsigned)(sizeof(converted_refs) /
+                                 sizeof(converted_refs[0]));
+            for (unsigned j = 0; j < retained_converted; ++j) {
+                const uint32_t ref = converted_refs[j];
+                const bool in_table =
+                    table && ref >= table && ref < table + 0x4000u;
+                fprintf(stderr,
+                        "[stage-memory] house-converted-ref=%08X%s",
+                        ref, in_table ? " TABLE" : "");
+                if (in_table)
+                    fprintf(stderr, " slot=%u",
+                            (unsigned)((ref - table) / 4u));
+                if (ref >= 0x10u) {
+                    fprintf(stderr,
+                            " context[-10..+20]="
+                            "%08X/%08X/%08X/%08X/"
+                            "%08X/%08X/%08X/%08X/"
+                            "%08X/%08X/%08X/%08X/%08X",
+                            vm_read32(ref - 0x10u),
+                            vm_read32(ref - 0x0Cu),
+                            vm_read32(ref - 0x08u),
+                            vm_read32(ref - 0x04u),
+                            vm_read32(ref + 0x00u),
+                            vm_read32(ref + 0x04u),
+                            vm_read32(ref + 0x08u),
+                            vm_read32(ref + 0x0Cu),
+                            vm_read32(ref + 0x10u),
+                            vm_read32(ref + 0x14u),
+                            vm_read32(ref + 0x18u),
+                            vm_read32(ref + 0x1Cu),
+                            vm_read32(ref + 0x20u));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    fflush(stderr);
+}
 
 static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
                                const char* host_path)
 {
+    const int a010_auth_diag = getenv("YZ_A010_AUTH") != nullptr;
+    const int a010_release_trace =
+        getenv("YZ_A010_RELEASE_TRACE") != nullptr;
+    if (a010_release_trace && guest_path) {
+        if (strstr(guest_path, "/auth/a010/a010.par")) {
+            if (InterlockedCompareExchange(
+                    &g_yz_a010_release_scene_active, 1, 0) == 0) {
+                fprintf(stderr,
+                        "[a010-reltrace] SCENE BEGIN on open '%s'\n",
+                        guest_path);
+                fflush(stderr);
+            }
+        } else if (strstr(guest_path, "/movie/a020.sfd") ||
+                   strstr(guest_path, "/auth/a020/a020.par")) {
+            if (InterlockedExchange(
+                    &g_yz_a010_release_scene_active, 0) != 0) {
+                fprintf(stderr,
+                        "[a010-reltrace] SCENE END on open '%s'\n",
+                        guest_path);
+                fflush(stderr);
+            }
+        }
+    }
+    if ((getenv("YZ_A010_ROOT") || getenv("YZ_A010_REQ") ||
+         a010_auth_diag) && guest_path) {
+        if (strstr(guest_path, "/auth/a010/a010.par")) {
+            if (InterlockedCompareExchange(&g_yz_a010_root_active, 1, 0) == 0) {
+                InterlockedExchange(&g_yz_a010_animation_ready, 0);
+                fprintf(stderr, "[a010-root] BEGIN on open '%s'\n", guest_path);
+                fflush(stderr);
+                yz_stage_direct_probe_snapshot("a010-root-begin");
+                yz_stage_house_memory_snapshot();
+            }
+        } else if ((!a010_auth_diag &&
+                    (strstr(guest_path, "/movie/a020.sfd") ||
+                     strstr(guest_path, "/auth/a020/a020.par"))) ||
+                   (a010_auth_diag &&
+                    (strstr(guest_path, "/movie/a030.sfd") ||
+                     strstr(guest_path, "/auth/a030/a030.par")))) {
+            if (InterlockedExchange(&g_yz_a010_root_active, 0) != 0) {
+                InterlockedExchange(&g_yz_a010_animation_ready, 0);
+                fprintf(stderr, "[a010-root] END on open '%s'\n", guest_path);
+                fflush(stderr);
+            }
+        }
+    }
     /* Arm the bounded live-renderer capture at the authoritative scene-file
      * boundary.  This runs before the Route-1 early return because a010 is an
      * in-engine AUTH scene, not an SFD movie. */
-    if (getenv("YZ_RSX_A010_PROBE") && guest_path &&
+    if ((getenv("YZ_RSX_A010_PROBE") ||
+         getenv("YZ_RSX_A010_SURFACE_DUMP")) && guest_path &&
         strstr(guest_path, "/auth/a010/a010.par")) {
         static volatile LONG a010_probe_armed = 0;
         if (InterlockedCompareExchange(&a010_probe_armed, 1, 0) == 0) {
@@ -761,6 +2372,8 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int fps = (int)(movie_framerate(mv) + 0.5);
     if (fps <= 0) fps = 30;
     const int mwply_hle = yz_movie_hle_armed();
+    const int accept_fast = getenv("YZ_A010_ACCEPT_FAST") &&
+        (strstr(path, "hd_sega_logo") || strstr(path, "advertise.sfd"));
     /* Decode the first picture before starting the audio clock. MPEG frame
      * startup can cost roughly one frame, which otherwise makes audio lead
      * from the first visible image even though steady-state cadence is sound. */
@@ -779,7 +2392,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
      * but honor the same A/B switch as mwPly's non-direct host path so those
      * independent voices can be mixed during direct presentation. */
     const int mix_guest = getenv("YZ_MOVIE_HLE_MIX_GUEST") ? 1 : 0;
-    const int host_audio = movie_has_audio(mv) &&
+    const int host_audio = !accept_fast && movie_has_audio(mv) &&
         cellAudioHostStreamStart(movie_audio_s16(mv),
                                  movie_audio_frames(mv),
                                  mix_guest ? 0 : 1) == 0;
@@ -795,9 +2408,10 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     InterlockedExchange(&g_movie_present_timescale, fps);
     InterlockedExchange(&g_movie_presenting_serial, serial);
     fprintf(stderr,
-            "[movie] presenting '%s' (%ux%u @ %d fps, audio=%s, owner=%s)\n",
+            "[movie] presenting '%s' (%ux%u @ %d fps, audio=%s, owner=%s%s)\n",
             path, w, h, fps, host_audio ? "FFmpeg ADX" : "native/none",
-            mwply_hle ? "mwPly HLE" : "fd bridge");
+            mwply_hle ? "mwPly HLE" : "fd bridge",
+            accept_fast ? ", acceptance=single-frame" : "");
     fflush(stderr);
     rsx_live_draw_set_movie_mode(1);
     cellPad_host_movie_skip_begin();
@@ -889,7 +2503,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
              * after audio EOS, continue that tail on the same wall clock. */
             const double clock = host_audio && !audio_finished
                 ? (double)audio_cursor / 48000.0
-                : wall_clock;
+                : wall_clock * (accept_fast ? 32.0 : 1.0);
             if (clock + 0.001 >= target) break;
             const ULONGLONG now_ms = GetTickCount64();
             if (now_ms - last_clock_log_ms >= 1000) {
@@ -924,6 +2538,34 @@ static void yz_play_queued_movie(const char* path, LONG serial)
                     (unsigned long long)(host_audio
                         ? cellAudioHostStreamPositionFrames() : 0));
             fflush(stderr);
+        }
+        if (accept_fast) {
+            /* Acceptance automation only: decoding every picture is still
+             * CPU-bound even when its presentation clock is accelerated.
+             * One decoded frame proves the stream opened, then use the same
+             * natural-completion publication below so the game retains its
+             * ordinary PLAYEND/Stop/Destroy ownership sequence. */
+            const ULONGLONG observe_deadline = GetTickCount64() + 10000u;
+            while (InterlockedCompareExchange(
+                       &g_movie_playing_observed_serial, 0, 0) < serial &&
+                   InterlockedCompareExchange(
+                       &g_movie_cancelled_serial, 0, 0) < serial &&
+                   InterlockedCompareExchange(
+                       &g_movie_open_serial, 0, 0) == serial &&
+                   GetTickCount64() < observe_deadline) {
+                if (rsx_null_backend_pump_messages() < 0)
+                    break;
+                Sleep(1);
+            }
+            natural_completion = 1;
+            fprintf(stderr,
+                    "[movie] acceptance shortcut: publishing natural EOS "
+                    "after one decoded frame serial=%ld playing_seen=%d\n",
+                    serial,
+                    InterlockedCompareExchange(
+                        &g_movie_playing_observed_serial, 0, 0) >= serial);
+            fflush(stderr);
+            break;
         }
         if (rsx_null_backend_pump_messages() < 0) break;
     }
@@ -1230,8 +2872,28 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     if (method >= 0xA400 && method < 0xAB00) {     /* NV308A_COLOR window */
         uint32_t index = (method - 0xA400) >> 2;
         uint32_t out_x = yz_rsx_blit_size_out & 0xFFFFu;
+        static int a010_blit_trace = -1;
+        static unsigned a010_blit_n = 0;
+        if (a010_blit_trace < 0)
+            a010_blit_trace = getenv("YZ_A010_BLIT") ? 1 : 0;
+        const int trace_a010_blit =
+            a010_blit_trace &&
+            InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
+            a010_blit_n < 128u;
         if (index >= out_x)
+        {
+            if (trace_a010_blit) {
+                a010_blit_n++;
+                fprintf(stderr,
+                        "[a010-blit] n=%u method=0x%X index=%u/%u "
+                        "CLIPPED dma=%08X off=%08X point=%08X arg=%08X\n",
+                        a010_blit_n, method, index, out_x,
+                        yz_rsx_blit_dst_dma, yz_rsx_blit_dst_off,
+                        yz_rsx_blit_point, arg);
+                fflush(stderr);
+            }
             return 0;                              /* clipped: skip */
+        }
         if (yz_rsx_blit_fmt != 0xB && yz_rsx_blit_fmt != 0x8 /* y32 */) {
             static int warned = 0;
             if (!warned) {
@@ -1248,6 +2910,18 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                                         yz_rsx_blit_dst_off + x * 4 + y * pitch);
         if (addr)
             yz_rsx_w32(addr, arg);
+        if (trace_a010_blit) {
+            a010_blit_n++;
+            fprintf(stderr,
+                    "[a010-blit] n=%u method=0x%X index=%u/%u "
+                    "dma=%08X off=%08X point=%08X pitch=%08X "
+                    "addr=%08X arg=%08X readback=%08X\n",
+                    a010_blit_n, method, index, out_x,
+                    yz_rsx_blit_dst_dma, yz_rsx_blit_dst_off,
+                    yz_rsx_blit_point, yz_rsx_blit_pitch,
+                    addr, arg, addr ? vm_read32(addr) : 0u);
+            fflush(stderr);
+        }
         return 0;
     }
 
@@ -1348,6 +3022,27 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             fprintf(stderr, "[ucmd] armed (user-interrupt dispatch %s)\n",
                     nu ? "DISABLED by YZ_NO_UCMD" : "on"); fflush(stderr); }
         if (nu) break;
+        /* The a010 missing-link recovery can traverse valid older command
+         * chains still resident in the ring.  Their user-command causes must
+         * not move the monotonic decode-completion label backwards after a
+         * newer cause has already completed. */
+        if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
+            getenv("YZ_A010_MISSING_REL")) {
+            const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
+            const uint32_t behind = have - arg;
+            if (behind < 0x10000u && arg <= have) {
+                static unsigned long stale_ucmd = 0;
+                stale_ucmd++;
+                if (stale_ucmd <= 16 || (stale_ucmd & 0xFFu) == 0u) {
+                    fprintf(stderr,
+                            "[a010-stale-ucmd] skipped n=%lu cause=0x%08X "
+                            "completed=0x%08X\n",
+                            stale_ucmd, arg, have);
+                    fflush(stderr);
+                }
+                break;
+            }
+        }
         vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
         if (g_rsx_event_port) {
             /* A newer cause supersedes any latched one (lv1 coalescing: ONE
@@ -1386,11 +3081,39 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         yz_rsx_sem_off_406e = arg;
         break;
     case 0x068:                                   /* NV406E SEMAPHORE_ACQUIRE */
+        /*
+         * The a010 missing-release recovery resumes a linked display-list
+         * chain after an old self-stop.  That chain's FE0 completion wait can
+         * be reached before its usual SET_CONTEXT_DMA_SEMAPHORE packet, while
+         * the inherited selector still names DEVICE_R from the preceding
+         * flip-credit wait.  FE0 is the monotonic reports-label counter; the
+         * only legitimate device-memory semaphore in this protocol is +0x30.
+         * Restore the reports selector at this exact recovered boundary.
+         */
+        if (yz_rsx_sem_off_406e == 0xFE0u &&
+            (yz_rsx_sem_dma_406e == 0x56616660u ||
+             yz_rsx_sem_dma_406e == 0x56616661u) &&
+            InterlockedCompareExchange(
+                &g_yz_a010_root_active, 0, 0) != 0 &&
+            getenv("YZ_A010_MISSING_REL")) {
+            static unsigned long context_repairs = 0;
+            yz_rsx_sem_dma_406e = 0x66616661u;
+            context_repairs++;
+            if (context_repairs <= 16 ||
+                (context_repairs & (context_repairs - 1u)) == 0u) {
+                fprintf(stderr,
+                        "[a010-sem-context-repair] n=%lu "
+                        "off=0x%X DEVICE_R -> SEMAPHORE_R\n",
+                        context_repairs, yz_rsx_sem_off_406e);
+                fflush(stderr);
+            }
+        }
         addr = yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
         /* Dedup: log only when the (addr,want) pair changes, so a NEW stall
          * surfaces without flooding on the per-poll retries. */
-        { static uint32_t la=0xDEAD, lw=0xDEAD;
-          if (addr != la || arg != lw) { la = addr; lw = arg;
+        { static int st=-1; static uint32_t la=0xDEAD, lw=0xDEAD;
+          if (st < 0) st = getenv("YZ_RSX_SEM_TRACE") ? 1 : 0;
+          if (st && (addr != la || arg != lw)) { la = addr; lw = arg;
             fprintf(stderr, "[sem] ACQUIRE off=0x%X addr=0x%08X want=0x%08X have=0x%08X %s\n",
                     yz_rsx_sem_off_406e, addr, arg, addr?vm_read32(addr):0,
                     (addr && vm_read32(addr)!=arg)?"STALL":"pass"); } }
@@ -1410,19 +3133,43 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                       addr, arg, have, ok ? "pass" : "STALL-enter"); }
         }
         if (addr && vm_read32(addr) != arg) {
+            /* 0xFE0 is a monotonic completion counter.  During a010 recovery,
+             * a wait older than the already-completed value is satisfied by
+             * definition; requiring exact equality would deadlock forever on
+             * resident pre-handoff ring history (measured 0x44B vs 0x479). */
+            if (addr == RSX_REPORTS + 0xFE0u &&
+                InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
+                getenv("YZ_A010_MISSING_REL")) {
+                const uint32_t have = vm_read32(addr);
+                const uint32_t ahead = have - arg;
+                if (ahead != 0u && ahead < 0x10000u) {
+                    static unsigned long stale_acquire = 0;
+                    stale_acquire++;
+                    if (stale_acquire <= 16 ||
+                        (stale_acquire & 0xFFu) == 0u) {
+                        fprintf(stderr,
+                                "[a010-stale-acquire] passed n=%lu "
+                                "want=0x%08X completed=0x%08X\n",
+                                stale_acquire, arg, have);
+                        fflush(stderr);
+                    }
+                    break;
+                }
+            }
             /* This recomp runtime cannot block while holding g_rsx_fifo_lock:
              * unlike RPCS3's thread model, the runtime vblank/event publisher may need
              * work that is serialized behind this consumer. Leave GET on the
              * packet and retry later so the external publisher remains free to
              * satisfy the acquire. Movie output EOS is synchronized separately
              * at the host/guest lifecycle boundary. */
-            { static uint32_t ha=0, hw=0; static unsigned long hn=0;
-              if (addr==ha && arg==hw) { hn++;
+            { static int st=-1; static uint32_t ha=0, hw=0; static unsigned long hn=0;
+              if (st < 0) st = getenv("YZ_RSX_SEM_TRACE") ? 1 : 0;
+              if (st && addr==ha && arg==hw) { hn++;
                   if ((hn & 0xFFFFu)==0) {
                       fprintf(stderr, "[sem-hb] addr=0x%08X want=0x%08X read=0x%08X retries=%lu\n",
                               addr, arg, vm_read32(addr), hn);
                       fflush(stderr); } }
-              else { ha=addr; hw=arg; hn=0; } }
+              else if (st) { ha=addr; hw=arg; hn=0; } }
             return 1;                             /* not yet satisfied: stall, retry later */
         }
         break;
@@ -1431,7 +3178,9 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         /* HW flip-sync: a release of 0 to device+0x30 is written as 1 (the RSX
          * never writes 0 there without a display-queue command). nv406e.cpp:130 */
         if (addr == RSX_DEVICE_ADDR + 0x30 && arg == 0) arg = 1;
-        { static int sl=0; if (sl<60){ sl++;
+        { static int st=-1; static int sl=0;
+          if (st < 0) st = getenv("YZ_RSX_SEM_TRACE") ? 1 : 0;
+          if (st && sl<60){ sl++;
             fprintf(stderr, "[sem] RELEASE off=0x%X addr=0x%08X val=0x%08X\n",
                     yz_rsx_sem_off_406e, addr, arg); } }
         if (yz_ft_on() &&
@@ -1810,6 +3559,825 @@ static uint32_t yz_gcm_stopper_release_entry(uint32_t stopper_ea)
         if (vm_read32(e + 0x00u) == 0x7Fu && vm_read32(e + 0x04u) == stopper_ea)
             return e;
     return 0;
+}
+
+/*
+ * a010 missed-immediate-release recovery.
+ *
+ * A committed stopper has exactly two legitimate release paths in the game's
+ * flush routine: a direct patch of the self-jump, or a tag-0x7F journal entry.
+ * The orphanage failure reaches a third, impossible state: GET remains parked
+ * on the old self-jump, PUT is already beyond it, no matching 0x7F exists, and
+ * S[0x20] names the newer stopper exactly at PUT.  That last condition proves
+ * the producer finished the old commit and moved its pending-stopper cursor;
+ * this is not the normal case where RSX merely caught up with an unfinished
+ * producer.
+ *
+ * Re-issue only the missing direct patch after the journal head, pending
+ * stopper, and PUT remain unchanged for 32 ms.  The feature is opt-in and
+ * additionally restricted to the active a010 AUTH root while it is being
+ * validated.  It deliberately does not consume or retire any journal entry.
+ *
+ * A direct release is not invariably "old stopper -> old + 4".  EDGE reserves
+ * data islands in the FIFO and links around them; in a010, treating two such
+ * releases as +4 parked GET in vertex-program/geometry data (0x004E0008 and
+ * 0x4006954B).
+ *
+ * The generated draw substreams have a measured, exact eight-word prologue:
+ * SET_VERTEX_DATA_ARRAY_OFFSET(0), three SET_VERTEX_DATA_BASE_OFFSET(0)
+ * packets, followed by the generated vertex-array declarations.  The bytes
+ * immediately before that prologue are vertex payload, while following the
+ * substream's own jumps reaches the later user-command/fence packets.  The
+ * correct pending chain is the earliest prologue whose flow graph reaches
+ * USER_COMMAND(label[0xFE0] + 1).  This matters because the committed window
+ * also contains older, still-valid command chains: taking the first prologue
+ * replayed waits 0x458..0x475, while the live label was already 0x475.  The
+ * pending-cause anchor selects the chain that ends in cause 0x476 instead.
+ */
+static int yz_a010_generated_prologue_at(uint32_t io)
+{
+    const uint32_t ea = yz_rsx_io_to_ea(io);
+    return ea &&
+           vm_read32(ea + 0x00u) == 0x00041710u &&
+           vm_read32(ea + 0x04u) == 0u &&
+           vm_read32(ea + 0x08u) == 0x00041714u &&
+           vm_read32(ea + 0x0Cu) == 0u &&
+           vm_read32(ea + 0x10u) == 0x00041714u &&
+           vm_read32(ea + 0x14u) == 0u &&
+           vm_read32(ea + 0x18u) == 0x00041714u &&
+           vm_read32(ea + 0x1Cu) == 0u &&
+           (vm_read32(ea + 0x20u) & 0x3FFFCu) == 0x1740u &&
+           (vm_read32(ea + 0x28u) & 0x3FFFCu) == 0x1680u;
+}
+
+static uint32_t yz_a010_find_generated_prologue(uint32_t start, uint32_t put)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t ahead = (put - start + ring) & mask;
+    if (ahead == 0u || ahead >= (ring >> 1))
+        return 0u;
+
+    for (uint32_t delta = 0u; delta + 0x30u <= ahead; delta += 4u) {
+        const uint32_t candidate = (start + delta) & mask;
+        if (yz_a010_generated_prologue_at(candidate))
+            return candidate;
+    }
+    return 0u;
+}
+
+/* Dry-run an RSX command chain without applying a single method.  The recovery
+ * is allowed to release an old stopper only when the proposed entry reaches
+ * BOTH the next monotonic USER_COMMAND packet and a subsequent jump-to-self
+ * stopper inside the producer's committed window.  This rejects a valid prefix
+ * that later falls through into an EDGE data island -- the failure mode of the
+ * earlier path_reaches(target) test. */
+static int yz_a010_chain_complete(uint32_t start,
+                                  uint32_t target,
+                                  uint32_t window_start,
+                                  uint32_t put,
+                                  uint32_t* out_steps,
+                                  uint32_t* out_end)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = 0x7FFFFFu;
+    uint32_t pc = start;
+    uint32_t ret = ~0u;
+    int reached_target = 0;
+    const uint32_t committed = (put - window_start + ring) & mask;
+    if (committed == 0u || committed >= (ring >> 1))
+        return 0;
+
+    for (uint32_t step = 0; step < 0x40000u; step++) {
+        if (pc == target)
+            reached_target = 1;
+
+        /* Fixed RSX subroutines live outside the 8 MiB FIFO ring and are
+         * reachable only while a CALL return is live.  Every ring address must
+         * remain inside the producer-published [window_start, PUT] window. */
+        if (pc < ring) {
+            const uint32_t delta = (pc - window_start + ring) & mask;
+            if (delta > committed)
+                return 0;
+        } else if (ret == ~0u) {
+            return 0;
+        }
+
+        const uint32_t ea = yz_rsx_io_to_ea(pc);
+        if (!ea)
+            return 0;
+        const uint32_t cmd = vm_read32(ea);
+        if ((cmd & 0xE0000003u) == 0x20000000u ||
+            (cmd & 3u) == 1u) {
+            const uint32_t next =
+                (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)
+                                 : (cmd & 0x1FFFFFFCu);
+            if (next == pc) {
+                /* PUT can be several complete frame batches ahead while GET is
+                 * stuck.  The first self-stop reached after the exact next
+                 * completion packet is a finalized batch boundary and is the
+                 * safe end of this one recovery step. */
+                if (!reached_target || ret != ~0u)
+                    return 0;
+                if (out_steps)
+                    *out_steps = step + 1u;
+                if (out_end)
+                    *out_end = pc;
+                return 1;
+            }
+            if (!yz_rsx_io_to_ea(next))
+                return 0;
+            pc = next;
+            continue;
+        }
+        if ((cmd & 3u) == 2u) {
+            const uint32_t next = cmd & 0x1FFFFFFCu;
+            if (ret != ~0u || !yz_rsx_io_to_ea(next))
+                return 0;
+            ret = (pc + 4u) & mask;
+            pc = next;
+            continue;
+        }
+        if ((cmd & 0xFFFF0003u) == 0x00020000u) {
+            if (ret == ~0u)
+                return 0;
+            pc = ret;
+            ret = ~0u;
+            continue;
+        }
+        if (cmd & 0xA0030003u)
+            return 0;
+        const uint32_t count = (cmd >> 18) & 0x7FFu;
+        const uint32_t bytes = 4u + count * 4u;
+        pc = pc < ring ? ((pc + bytes) & mask) : (pc + bytes);
+    }
+    return 0;
+}
+
+/* The producer intentionally leaves the tail of a frame batch unpublished
+ * until RSX consumes its USER_COMMAND completion marker.  Therefore the first
+ * release must sometimes be proven only through that marker; consuming it
+ * wakes the producer, which publishes the remainder and its next stopper.
+ * Keep the same committed-window and one-level CALL checks as the full proof. */
+static int yz_a010_chain_reaches_completion(uint32_t start,
+                                            uint32_t target,
+                                            uint32_t window_start,
+                                            uint32_t put,
+                                            uint32_t* out_steps)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t committed = (put - window_start + ring) & mask;
+    uint32_t pc = start;
+    uint32_t ret = ~0u;
+    if (committed == 0u || committed >= (ring >> 1))
+        return 0;
+
+    for (uint32_t step = 0; step < 0x40000u; step++) {
+        if (pc == target) {
+            if (ret != ~0u)
+                return 0;
+            if (out_steps)
+                *out_steps = step;
+            return 1;
+        }
+        if (pc < ring) {
+            const uint32_t delta = (pc - window_start + ring) & mask;
+            if (delta > committed)
+                return 0;
+        } else if (ret == ~0u) {
+            return 0;
+        }
+
+        const uint32_t ea = yz_rsx_io_to_ea(pc);
+        if (!ea)
+            return 0;
+        const uint32_t cmd = vm_read32(ea);
+        if ((cmd & 0xE0000003u) == 0x20000000u ||
+            (cmd & 3u) == 1u) {
+            const uint32_t next =
+                (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)
+                                 : (cmd & 0x1FFFFFFCu);
+            if (next == pc || !yz_rsx_io_to_ea(next))
+                return 0;
+            pc = next;
+            continue;
+        }
+        if ((cmd & 3u) == 2u) {
+            const uint32_t next = cmd & 0x1FFFFFFCu;
+            if (ret != ~0u || !yz_rsx_io_to_ea(next))
+                return 0;
+            ret = pc + 4u;
+            pc = next;
+            continue;
+        }
+        if ((cmd & 0xFFFF0003u) == 0x00020000u) {
+            if (ret == ~0u)
+                return 0;
+            pc = ret;
+            ret = ~0u;
+            continue;
+        }
+        if (cmd & 0xA0030003u)
+            return 0;
+        const uint32_t count = (cmd >> 18) & 0x7FFu;
+        const uint32_t bytes = 4u + count * 4u;
+        pc = pc < ring ? ((pc + bytes) & mask) : (pc + bytes);
+    }
+    return 0;
+}
+
+enum yz_a010_chain_probe_stop {
+    YZ_A010_PROBE_COMPLETE,
+    YZ_A010_PROBE_BAD_WINDOW,
+    YZ_A010_PROBE_OUTSIDE_WINDOW,
+    YZ_A010_PROBE_UNMAPPED,
+    YZ_A010_PROBE_SELF_BEFORE_TARGET,
+    YZ_A010_PROBE_BAD_JUMP,
+    YZ_A010_PROBE_NESTED_CALL,
+    YZ_A010_PROBE_RETURN_WITHOUT_CALL,
+    YZ_A010_PROBE_MALFORMED,
+    YZ_A010_PROBE_STEP_LIMIT
+};
+
+struct yz_a010_chain_probe {
+    enum yz_a010_chain_probe_stop stop;
+    uint32_t stop_pc;
+    uint32_t stop_cmd;
+    uint32_t steps;
+    uint32_t packets;
+    uint32_t jumps;
+    uint32_t calls;
+    uint32_t returns;
+    uint32_t begin;
+    uint32_t end;
+    uint32_t arrays;
+    uint32_t indices;
+    int reached_target;
+};
+
+static const char* yz_a010_chain_probe_stop_name(
+    enum yz_a010_chain_probe_stop stop)
+{
+    switch (stop) {
+    case YZ_A010_PROBE_COMPLETE: return "complete";
+    case YZ_A010_PROBE_BAD_WINDOW: return "bad-window";
+    case YZ_A010_PROBE_OUTSIDE_WINDOW: return "outside-window";
+    case YZ_A010_PROBE_UNMAPPED: return "unmapped";
+    case YZ_A010_PROBE_SELF_BEFORE_TARGET: return "self-before-target";
+    case YZ_A010_PROBE_BAD_JUMP: return "bad-jump";
+    case YZ_A010_PROBE_NESTED_CALL: return "nested-call";
+    case YZ_A010_PROBE_RETURN_WITHOUT_CALL: return "return-without-call";
+    case YZ_A010_PROBE_MALFORMED: return "malformed";
+    case YZ_A010_PROBE_STEP_LIMIT: return "step-limit";
+    default: return "unknown";
+    }
+}
+
+/* Diagnostic-only dry run for the candidate chains rejected by the missing
+ * release recovery.  Besides the exact stop reason, count the draw methods
+ * reachable through the candidate's real JUMP/CALL flow.  This answers the
+ * important question the recovery itself cannot: whether its safe resume
+ * point is skipping a large, otherwise usable environment command stream, or
+ * whether the producer never linked such a stream in the first place. */
+static void yz_a010_probe_chain(uint32_t start,
+                               uint32_t target,
+                               uint32_t window_start,
+                               uint32_t put,
+                               struct yz_a010_chain_probe* out)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t committed = (put - window_start + ring) & mask;
+    uint32_t pc = start;
+    uint32_t ret = ~0u;
+    memset(out, 0, sizeof(*out));
+    out->stop = YZ_A010_PROBE_STEP_LIMIT;
+
+    if (committed == 0u || committed >= (ring >> 1)) {
+        out->stop = YZ_A010_PROBE_BAD_WINDOW;
+        return;
+    }
+
+    for (uint32_t step = 0; step < 0x40000u; step++) {
+        out->steps = step + 1u;
+        out->stop_pc = pc;
+        if (pc == target)
+            out->reached_target = 1;
+
+        if (pc < ring) {
+            const uint32_t delta = (pc - window_start + ring) & mask;
+            if (delta > committed) {
+                out->stop = YZ_A010_PROBE_OUTSIDE_WINDOW;
+                return;
+            }
+        } else if (ret == ~0u) {
+            out->stop = YZ_A010_PROBE_OUTSIDE_WINDOW;
+            return;
+        }
+
+        const uint32_t ea = yz_rsx_io_to_ea(pc);
+        if (!ea) {
+            out->stop = YZ_A010_PROBE_UNMAPPED;
+            return;
+        }
+        const uint32_t cmd = vm_read32(ea);
+        out->stop_cmd = cmd;
+
+        if ((cmd & 0xE0000003u) == 0x20000000u ||
+            (cmd & 3u) == 1u) {
+            const uint32_t next =
+                (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)
+                                 : (cmd & 0x1FFFFFFCu);
+            out->jumps++;
+            if (next == pc) {
+                out->stop = out->reached_target && ret == ~0u
+                                ? YZ_A010_PROBE_COMPLETE
+                                : YZ_A010_PROBE_SELF_BEFORE_TARGET;
+                return;
+            }
+            if (!yz_rsx_io_to_ea(next)) {
+                out->stop = YZ_A010_PROBE_BAD_JUMP;
+                return;
+            }
+            pc = next;
+            continue;
+        }
+        if ((cmd & 3u) == 2u) {
+            const uint32_t next = cmd & 0x1FFFFFFCu;
+            out->calls++;
+            if (ret != ~0u) {
+                out->stop = YZ_A010_PROBE_NESTED_CALL;
+                return;
+            }
+            if (!yz_rsx_io_to_ea(next)) {
+                out->stop = YZ_A010_PROBE_BAD_JUMP;
+                return;
+            }
+            ret = (pc + 4u) & mask;
+            pc = next;
+            continue;
+        }
+        if ((cmd & 0xFFFF0003u) == 0x00020000u) {
+            out->returns++;
+            if (ret == ~0u) {
+                out->stop = YZ_A010_PROBE_RETURN_WITHOUT_CALL;
+                return;
+            }
+            pc = ret;
+            ret = ~0u;
+            continue;
+        }
+        if (cmd & 0xA0030003u) {
+            out->stop = YZ_A010_PROBE_MALFORMED;
+            return;
+        }
+
+        const uint32_t count = (cmd >> 18) & 0x7FFu;
+        const uint32_t noninc = cmd & 0x40000000u;
+        const uint32_t method = cmd & 0x3FFFCu;
+        out->packets++;
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t arg_io =
+                pc < ring ? ((pc + 4u + i * 4u) & mask)
+                          : (pc + 4u + i * 4u);
+            const uint32_t arg_ea = yz_rsx_io_to_ea(arg_io);
+            if (!arg_ea) {
+                out->stop_pc = arg_io;
+                out->stop = YZ_A010_PROBE_UNMAPPED;
+                return;
+            }
+            const uint32_t eff = noninc ? method : method + i * 4u;
+            const uint32_t canonical = eff & 0x1FFCu;
+            const uint32_t value = vm_read32(arg_ea);
+            if (canonical == 0x1808u) {
+                if (value) out->begin++;
+                else       out->end++;
+            } else if (canonical == 0x1814u) {
+                out->arrays++;
+            } else if (canonical == 0x1820u) {
+                out->indices++;
+            }
+        }
+        const uint32_t bytes = 4u + count * 4u;
+        pc = pc < ring ? ((pc + bytes) & mask) : (pc + bytes);
+    }
+}
+
+/* A generated batch may be fully formed and draw-balanced even though its
+ * terminal self-stop has not yet been linked to the next generated batch.
+ * Releasing one such prefix at a time preserves producer order: RSX consumes
+ * the batch, parks at its terminal stop, and the next recovery begins strictly
+ * after that stop.  This is deliberately narrower than accepting an arbitrary
+ * prefix; malformed flow, live calls, and unbalanced draws remain fail-closed. */
+static int yz_a010_probe_is_safe_prefix(
+    const struct yz_a010_chain_probe* probe,
+    uint32_t candidate,
+    uint32_t window_start,
+    uint32_t put)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t committed = (put - window_start + ring) & mask;
+    const uint32_t candidate_delta =
+        (candidate - window_start + ring) & mask;
+    const uint32_t stop_delta =
+        (probe->stop_pc - window_start + ring) & mask;
+    const uint32_t self_target =
+        (probe->stop_cmd & 3u) == 1u
+            ? (probe->stop_cmd & 0xFFFFFFFCu)
+            : (probe->stop_cmd & 0x1FFFFFFCu);
+
+    return probe->stop == YZ_A010_PROBE_SELF_BEFORE_TARGET &&
+           !probe->reached_target &&
+           probe->stop_pc < ring &&
+           self_target == probe->stop_pc &&
+           candidate_delta < stop_delta &&
+           stop_delta <= committed &&
+           probe->calls == probe->returns &&
+           probe->begin != 0u &&
+           probe->begin == probe->end &&
+           (probe->arrays != 0u || probe->indices != 0u);
+}
+
+/* Find the next user-interrupt packet the guest is waiting to consume, then
+ * find the earliest exact generated block that is safe to execute.  A complete
+ * chain may reach the interrupt directly; otherwise a balanced prefix can run
+ * up to its own self-stop and recovery resumes from there.  Never jump over a
+ * validated prefix merely because a later tail already reaches completion. */
+static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
+{
+    static int trace_enabled = -1;
+    static int trace_done = 0;
+    static uint32_t trace_label_min = 0u;
+    if (trace_enabled < 0) {
+        trace_enabled = getenv("YZ_A010_MISSING_REL_TRACE") ? 1 : 0;
+        if (trace_enabled) {
+            const char* const label_env =
+                getenv("YZ_A010_MISSING_REL_TRACE_LABEL");
+            if (label_env && *label_env)
+                trace_label_min =
+                    (uint32_t)strtoul(label_env, nullptr, 0);
+            fprintf(stderr,
+                    "[a010-chain-trace] ARMED: inventory the first matching "
+                    "generated-command region without executing it "
+                    "(label >= 0x%08X)\n",
+                    trace_label_min);
+            fflush(stderr);
+        }
+    }
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t ahead = (put - start + ring) & mask;
+    if (ahead == 0u || ahead >= (ring >> 1))
+        return 0u;
+
+    const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
+    const uint32_t want = have + 1u;
+    const int trace =
+        trace_enabled && !trace_done && have >= trace_label_min;
+    uint32_t ucmd = 0u;
+    for (uint32_t delta = 0u; delta + 8u <= ahead; delta += 4u) {
+        const uint32_t candidate = (start + delta) & mask;
+        const uint32_t ea = yz_rsx_io_to_ea(candidate);
+        if (!ea)
+            continue;
+        const uint32_t cmd = vm_read32(ea);
+        const uint32_t method = cmd & 0x3FFFCu;
+        const uint32_t count = (cmd >> 18) & 0x7FFu;
+        const uint32_t arg_ea =
+            yz_rsx_io_to_ea((candidate + 4u) & mask);
+        if ((method == 0xEB00u || method == 0xEB04u) &&
+            count != 0u && arg_ea && vm_read32(arg_ea) == want) {
+            ucmd = candidate;
+            break;
+        }
+    }
+    if (!ucmd)
+        return 0u;
+
+    if (trace) {
+        fprintf(stderr,
+                "[a010-chain-trace] window start=0x%06X target=0x%06X "
+                "PUT=0x%06X bytes=0x%X\n",
+                start, ucmd, put, ahead);
+        fflush(stderr);
+    }
+
+    uint32_t steps = 0u;
+    uint32_t chain_end = 0u;
+    if (yz_a010_chain_complete(start, ucmd, start, put,
+                               &steps, &chain_end)) {
+        if (trace) {
+            struct yz_a010_chain_probe probe;
+            yz_a010_probe_chain(start, ucmd, start, put, &probe);
+            fprintf(stderr,
+                    "[a010-chain-trace] direct entry=0x%06X stop=%s "
+                    "pc=0x%06X cmd=0x%08X reached=%d steps=%u packets=%u "
+                    "flow=%u/%u/%u draw=%u/%u/%u/%u\n",
+                    start, yz_a010_chain_probe_stop_name(probe.stop),
+                    probe.stop_pc, probe.stop_cmd, probe.reached_target,
+                    probe.steps, probe.packets, probe.jumps, probe.calls,
+                    probe.returns, probe.begin, probe.end, probe.arrays,
+                    probe.indices);
+            trace_done = 1;
+            fflush(stderr);
+        }
+        fprintf(stderr,
+                "[a010-pending-chain] label=0x%08X next=0x%08X "
+                "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                "chain-end=0x%06X PUT=0x%06X complete-steps=%u direct\n",
+                have, want, ucmd, start, start, chain_end, put, steps);
+        fflush(stderr);
+        return start;
+    }
+
+    steps = 0u;
+    if (yz_a010_chain_reaches_completion(start, ucmd, start, put, &steps)) {
+        if (trace) {
+            struct yz_a010_chain_probe probe;
+            yz_a010_probe_chain(start, ucmd, start, put, &probe);
+            fprintf(stderr,
+                    "[a010-chain-trace] direct-staged entry=0x%06X stop=%s "
+                    "pc=0x%06X cmd=0x%08X reached=%d steps=%u packets=%u "
+                    "flow=%u/%u/%u draw=%u/%u/%u/%u\n",
+                    start, yz_a010_chain_probe_stop_name(probe.stop),
+                    probe.stop_pc, probe.stop_cmd, probe.reached_target,
+                    probe.steps, probe.packets, probe.jumps, probe.calls,
+                    probe.returns, probe.begin, probe.end, probe.arrays,
+                    probe.indices);
+            trace_done = 1;
+            fflush(stderr);
+        }
+        fprintf(stderr,
+                "[a010-pending-chain] label=0x%08X next=0x%08X "
+                "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                "PUT=0x%06X prefix-steps=%u staged-direct\n",
+                have, want, ucmd, start, start, put, steps);
+        fflush(stderr);
+        return start;
+    }
+
+    unsigned rejected = 0u;
+    unsigned trace_logged = 0u;
+    for (uint32_t delta = 0u; delta + 0x30u <= ahead; delta += 4u) {
+        const uint32_t candidate = (start + delta) & mask;
+        if (candidate == ucmd)
+            break;
+        if (!yz_a010_generated_prologue_at(candidate))
+            continue;
+        struct yz_a010_chain_probe prefix_probe;
+        yz_a010_probe_chain(candidate, ucmd, start, put, &prefix_probe);
+        if (yz_a010_probe_is_safe_prefix(&prefix_probe, candidate,
+                                         start, put)) {
+            if (trace) {
+                fprintf(stderr,
+                        "[a010-chain-trace] selected-prefix entry=0x%06X "
+                        "delta=0x%X stop=%s pc=0x%06X cmd=0x%08X "
+                        "steps=%u packets=%u flow=%u/%u/%u "
+                        "draw=%u/%u/%u/%u skipped-prologues=%u\n",
+                        candidate, delta,
+                        yz_a010_chain_probe_stop_name(prefix_probe.stop),
+                        prefix_probe.stop_pc, prefix_probe.stop_cmd,
+                        prefix_probe.steps, prefix_probe.packets,
+                        prefix_probe.jumps, prefix_probe.calls,
+                        prefix_probe.returns, prefix_probe.begin,
+                        prefix_probe.end, prefix_probe.arrays,
+                        prefix_probe.indices, rejected);
+                trace_done = 1;
+                fflush(stderr);
+            }
+            fprintf(stderr,
+                    "[a010-pending-chain] label=0x%08X next=0x%08X "
+                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                    "segment-stop=0x%06X PUT=0x%06X "
+                    "draw=%u/%u/%u/%u ordered-prefix\n",
+                    have, want, ucmd, candidate, start,
+                    prefix_probe.stop_pc, put, prefix_probe.begin,
+                    prefix_probe.end, prefix_probe.arrays,
+                    prefix_probe.indices);
+            fflush(stderr);
+            return candidate;
+        }
+        steps = 0u;
+        chain_end = 0u;
+        if (yz_a010_chain_complete(candidate, ucmd, start, put,
+                                   &steps, &chain_end)) {
+            if (trace) {
+                struct yz_a010_chain_probe probe;
+                yz_a010_probe_chain(candidate, ucmd, start, put, &probe);
+                fprintf(stderr,
+                        "[a010-chain-trace] selected entry=0x%06X "
+                        "delta=0x%X stop=%s pc=0x%06X cmd=0x%08X "
+                        "reached=%d steps=%u packets=%u flow=%u/%u/%u "
+                        "draw=%u/%u/%u/%u skipped-prologues=%u\n",
+                        candidate, delta,
+                        yz_a010_chain_probe_stop_name(probe.stop),
+                        probe.stop_pc, probe.stop_cmd, probe.reached_target,
+                        probe.steps, probe.packets, probe.jumps, probe.calls,
+                        probe.returns, probe.begin, probe.end, probe.arrays,
+                        probe.indices, rejected);
+                trace_done = 1;
+                fflush(stderr);
+            }
+            fprintf(stderr,
+                    "[a010-pending-chain] label=0x%08X next=0x%08X "
+                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                    "chain-end=0x%06X PUT=0x%06X complete-steps=%u\n",
+                    have, want, ucmd, candidate, start,
+                    chain_end, put, steps);
+            fflush(stderr);
+            return candidate;
+        }
+        steps = 0u;
+        if (yz_a010_chain_reaches_completion(candidate, ucmd, start, put,
+                                             &steps)) {
+            if (trace) {
+                struct yz_a010_chain_probe probe;
+                yz_a010_probe_chain(candidate, ucmd, start, put, &probe);
+                fprintf(stderr,
+                        "[a010-chain-trace] selected-staged entry=0x%06X "
+                        "delta=0x%X stop=%s pc=0x%06X cmd=0x%08X "
+                        "reached=%d steps=%u packets=%u flow=%u/%u/%u "
+                        "draw=%u/%u/%u/%u skipped-prologues=%u\n",
+                        candidate, delta,
+                        yz_a010_chain_probe_stop_name(probe.stop),
+                        probe.stop_pc, probe.stop_cmd, probe.reached_target,
+                        probe.steps, probe.packets, probe.jumps, probe.calls,
+                        probe.returns, probe.begin, probe.end, probe.arrays,
+                        probe.indices, rejected);
+                trace_done = 1;
+                fflush(stderr);
+            }
+            fprintf(stderr,
+                    "[a010-pending-chain] label=0x%08X next=0x%08X "
+                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                    "PUT=0x%06X prefix-steps=%u staged\n",
+                    have, want, ucmd, candidate, start, put, steps);
+            fflush(stderr);
+            return candidate;
+        }
+        if (trace && trace_logged < 128u) {
+            struct yz_a010_chain_probe probe;
+            yz_a010_probe_chain(candidate, ucmd, start, put, &probe);
+            fprintf(stderr,
+                    "[a010-chain-trace] rejected entry=0x%06X delta=0x%X "
+                    "stop=%s pc=0x%06X cmd=0x%08X reached=%d steps=%u "
+                    "packets=%u flow=%u/%u/%u draw=%u/%u/%u/%u\n",
+                    candidate, delta,
+                    yz_a010_chain_probe_stop_name(probe.stop),
+                    probe.stop_pc, probe.stop_cmd, probe.reached_target,
+                    probe.steps, probe.packets, probe.jumps, probe.calls,
+                    probe.returns, probe.begin, probe.end, probe.arrays,
+                    probe.indices);
+            trace_logged++;
+        }
+        rejected++;
+    }
+    if (trace) {
+        fprintf(stderr,
+                "[a010-chain-trace] no-safe-entry skipped-prologues=%u "
+                "logged=%u\n",
+                rejected, trace_logged);
+        trace_done = 1;
+        fflush(stderr);
+    }
+    fprintf(stderr,
+            "[a010-pending-chain] REFUSED label=0x%08X next=0x%08X "
+            "ucmd=0x%06X scan-start=0x%06X PUT=0x%06X "
+            "incomplete-prologues=%u\n",
+            have, want, ucmd, start, put, rejected);
+    fflush(stderr);
+    return 0u;
+}
+
+static uint32_t yz_a010_missing_release_resume(uint32_t get, uint32_t put)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t ahead = (put - get + ring) & mask;
+    const uint32_t sequential = (get + 4u) & mask;
+
+    const uint32_t pending_chain =
+        yz_a010_find_pending_chain(sequential, put);
+    if (pending_chain)
+        return pending_chain;
+
+    /* Fail closed.  Only a complete chain or a draw-balanced generated prefix
+     * with a forward terminal self-stop can be released. */
+    return 0u;
+}
+
+static int yz_a010_missing_release_try(uint32_t stopper_ea,
+                                       uint32_t get,
+                                       uint32_t put)
+{
+    static int enabled = -1;
+    static uint32_t last_stopper = 0;
+    static uint32_t last_put = 0;
+    static uint32_t last_head = 0;
+    static uint32_t last_pending = 0;
+    static uint32_t last_dump_stopper = 0;
+    static uint32_t last_dump_put = 0;
+    static uint32_t last_dump_pending = 0;
+    static ULONGLONG stable_since = 0;
+    static unsigned long repairs = 0;
+
+    if (enabled < 0) {
+        enabled = getenv("YZ_A010_MISSING_REL") ? 1 : 0;
+        if (enabled) {
+            fprintf(stderr,
+                    "[a010-missing-rel] ARMED: recover only an old unjournaled "
+                    "self-stop after the producer has published a newer "
+                    "stopper exactly at PUT\n");
+            fflush(stderr);
+        }
+    }
+    const int trace = yz_a010_reltrace_on();
+    if ((!enabled && !trace) ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !g_yz_game_toc)
+        return 0;
+
+    const uint32_t ring = 0x800000u;
+    const uint32_t ahead = (put - get + ring) % ring;
+    if (ahead == 0u || ahead >= (ring >> 1))
+        return 0;
+
+    const uint32_t state = vm_read32(g_yz_game_toc - 0x7410u);
+    if (state < 0x10000u || state >= 0xE0000000u)
+        return 0;
+    const uint32_t base = vm_read32(state + 0x08u);
+    const uint32_t end = vm_read32(state + 0x0Cu);
+    const uint32_t head = vm_read32(state + 0x00u);
+    const uint32_t pending = vm_read32(state + 0x20u);
+    if (base < 0x10000u || end <= base || end - base > 0x1000000u ||
+        head < base || head >= end)
+        return 0;
+
+    const uint32_t put_ea = yz_rsx_io_to_ea(put);
+    if (!put_ea || pending != put_ea || pending == stopper_ea)
+        return 0;
+
+    const ULONGLONG now = GetTickCount64();
+    if (stopper_ea != last_stopper || put != last_put ||
+        head != last_head || pending != last_pending) {
+        last_stopper = stopper_ea;
+        last_put = put;
+        last_head = head;
+        last_pending = pending;
+        stable_since = now;
+        return 0;
+    }
+    if (now - stable_since < 32u)
+        return 0;
+
+    /* A deferred release owns this stopper if it appears at any point before
+     * the stable producer head.  In that case the ordered journal consumer,
+     * not this direct-release recovery, must apply it. */
+    if (yz_gcm_stopper_release_entry(stopper_ea) != 0u)
+        return 0;
+
+    const uint32_t expected = 0x20000000u | (get & 0x1FFFFFFCu);
+    if (vm_read32(stopper_ea) != expected)
+        return 0;
+
+    /*
+     * A release-trace-only run must be able to report the current generation
+     * without enabling the recovery bridge.  Dump once per stable
+     * (stopper, PUT, pending-stopper) tuple, then leave GET untouched.
+     */
+    if (trace &&
+        (last_dump_stopper != stopper_ea ||
+         last_dump_put != put ||
+         last_dump_pending != pending)) {
+        last_dump_stopper = stopper_ea;
+        last_dump_put = put;
+        last_dump_pending = pending;
+        yz_a010_reltrace_dump(stopper_ea);
+    }
+    if (!enabled)
+        return 0;
+
+    const uint32_t resume = yz_a010_missing_release_resume(get, put);
+    if (!resume)
+        return 0;
+
+    vm_write32(stopper_ea,
+               0x20000000u | (resume & 0x1FFFFFFCu));
+    vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, resume);
+    repairs++;
+    fprintf(stderr,
+            "[a010-missing-rel] repaired n=%lu old=0x%08X "
+            "GET=0x%06X -> resume=0x%06X (%s) PUT=0x%06X ahead=0x%X "
+            "new-pending=0x%08X head=0x%08X stable=%llums\n",
+            repairs, stopper_ea, get, resume,
+            resume == ((get + 4u) & (ring - 1u)) ? "sequential" : "linked",
+            put, ahead, pending, head,
+            (unsigned long long)(now - stable_since));
+    fflush(stderr);
+    return 1;
 }
 
 /* ============================================================================
@@ -2426,14 +4994,21 @@ extern "C" int yz_rsx_flip_pending_any(void)
  * pre-existing vblank-thread retire. */
 static int yz_flip_on_consumer(void)
 {
-    static int on = -1;
-    if (on < 0) { on = getenv("YZ_FLIP_ON_CONSUMER") ? 1 : 0;
-        fprintf(stderr, "[flip-consumer] armed: flip completion runs on %s (YZ_FLIP_ON_CONSUMER=%s)\n",
-                on ? "the FIFO consumer thread" : "the vblank timer (default, unchanged)",
-                on ? "1" : "0");
+    /* Keep the whole-boot A/B, and add an a010-scoped form so the render-order
+     * experiment does not perturb the already-working movie/title path. */
+    static int mode = -1; /* 0=vblank, 1=consumer always, 2=consumer during a010 */
+    if (mode < 0) {
+        mode = getenv("YZ_FLIP_ON_CONSUMER") ? 1 :
+               getenv("YZ_A010_FLIP_ON_CONSUMER") ? 2 : 0;
+        fprintf(stderr,
+                "[flip-consumer] armed: mode=%s "
+                "(YZ_FLIP_ON_CONSUMER=%s YZ_A010_FLIP_ON_CONSUMER=%s)\n",
+                mode == 1 ? "consumer-always" :
+                mode == 2 ? "consumer-during-a010" : "vblank-default",
+                mode == 1 ? "1" : "0", mode == 2 ? "1" : "0");
         fflush(stderr);
     }
-    return on;
+    return mode == 1 || (mode == 2 && g_yz_a010_root_active);
 }
 
 /* Faithful rules (NO heuristics, NO deferred-release, NO GET-forcing):
@@ -2552,6 +5127,46 @@ static int yz_rsx_fifo_step(void)
     EnterCriticalSection(&g_rsx_fifo_lock);
     uint32_t       get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
     const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
+    const int a010_root =
+        InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0;
+    static unsigned long a010_packet_n = 0;
+    static unsigned long a010_arg_n = 0;
+    static unsigned long a010_jump_n = 0;
+    static unsigned long a010_call_n = 0;
+    static unsigned long a010_ret_n = 0;
+    static unsigned long a010_sub_args[8] = {};
+    static unsigned long a010_begin_n = 0;
+    static unsigned long a010_end_n = 0;
+    static unsigned long a010_array_n = 0;
+    static unsigned long a010_index_n = 0;
+    static unsigned long a010_vp_n = 0;
+    static unsigned long a010_const_n = 0;
+    static uint32_t a010_last_counted_get = 0xFFFFFFFFu;
+    static uint32_t a010_src_min = 0xFFFFFFFFu;
+    static uint32_t a010_src_max = 0;
+    static int a010_flow_trace = -1;
+    static int a010_const_trace = -1;
+    struct yz_a010_draw_source {
+        uint32_t index;
+        uint32_t io;
+        uint32_t ea;
+        uint32_t ret_io;
+        uint32_t header;
+        uint32_t primitive;
+    };
+    static yz_a010_draw_source a010_draw_sources[2048] = {};
+    static uint32_t a010_draw_source_n = 0;
+    static int a010_draw_source_trace = -1;
+    static int a010_draw_source_written = 0;
+    static unsigned long a010_const_trace_n = 0;
+    static uint32_t a010_const_load[8] = {};
+    if (a010_flow_trace < 0)
+        a010_flow_trace = getenv("YZ_A010_FLOW") ? 1 : 0;
+    if (a010_const_trace < 0)
+        a010_const_trace = getenv("YZ_A010_CONST") ? 1 : 0;
+    if (a010_draw_source_trace < 0)
+        a010_draw_source_trace =
+            getenv("YZ_A010_DRAW_SOURCE") ? 1 : 0;
 
     /* s33 [fifo-hb] (env YZ_FIFO_HB): uncapped 5 s GET/PUT heartbeat. Every
      * deep-boot terminal FIFO state so far was invisible because the apply/
@@ -2606,8 +5221,8 @@ static int yz_rsx_fifo_step(void)
 
     /* ---- control transfer ---- */
     if ((cmd & 0xE0000003u) == 0x20000000u || (cmd & 3u) == 1u) {   /* old | new jump */
-        const uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
-                                              : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
+        uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
+                                       : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
             /* Jump-to-self stopper. DEFERRED-RELEASE APPLY -- RETIRED (default
              * OFF 2026-07-02, layer-1 root-cause session; opt back in with
@@ -2842,6 +5457,10 @@ static int yz_rsx_fifo_step(void)
              * wrong size into the wrap arithmetic. */
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
+            if (yz_a010_missing_release_try(ea, get, put)) {
+                LeaveCriticalSection(&g_rsx_fifo_lock);
+                return 1;
+            }
             if (journal_hle) {
                 if (ahead != 0u && ahead < (ring >> 1) &&
                     yz_jrnl_hle_try(ea) == yz_jrnl_hle_park_result::applied) {
@@ -2919,6 +5538,46 @@ static int yz_rsx_fifo_step(void)
             LeaveCriticalSection(&g_rsx_fifo_lock);
             return 0;
         }
+        /* a010 missing generated-link patch.  A clean replay followed
+         * 0x205E1BA0 directly into vertex-program payload (0x60405F80);
+         * the first complete EDGE command prologue was 0xD0 bytes later at
+         * 0x5E1C70.  This is the same missing-patch family as the stale outer
+         * stopper, but it is visible only after following the inner link.
+         * Repair only an immediate non-command target inside the committed
+         * a010 window, and only to the exact measured prologue. */
+        static int a010_bad_link = -1;
+        if (a010_bad_link < 0)
+            a010_bad_link = getenv("YZ_A010_MISSING_REL") ? 1 : 0;
+        if (a010_root && a010_bad_link) {
+            const uint32_t te = yz_rsx_io_to_ea(tgt);
+            const uint32_t tw = te ? vm_read32(te) : 0u;
+            const int target_flow =
+                ((tw & 0xE0000003u) == 0x20000000u) ||
+                ((tw & 3u) == 1u) || ((tw & 3u) == 2u) ||
+                ((tw & 0xFFFF0003u) == 0x00020000u);
+            const int target_method = (tw & 0xA0030003u) == 0u;
+            if (te && !target_flow && !target_method) {
+                const uint32_t resume =
+                    yz_a010_find_pending_chain((tgt + 4u) & 0x7FFFFFu,
+                                               put);
+                if (resume) {
+                    const uint32_t repaired =
+                        (cmd & 3u) == 1u
+                            ? (resume | 1u)
+                            : (0x20000000u | (resume & 0x1FFFFFFCu));
+                    vm_write32(ea, repaired);
+                    static unsigned long repairs = 0;
+                    repairs++;
+                    fprintf(stderr,
+                            "[a010-bad-link] repaired n=%lu source=0x%06X "
+                            "word=0x%08X target=0x%06X head=0x%08X "
+                            "-> prologue=0x%06X PUT=0x%06X\n",
+                            repairs, get, cmd, tgt, tw, resume, put);
+                    fflush(stderr);
+                    tgt = resume;
+                }
+            }
+        }
         if (!yz_rsx_io_to_ea(tgt)) {
             const uint32_t pea = yz_rsx_io_to_ea(put);
             if (put != get && pea) {
@@ -2932,6 +5591,20 @@ static int yz_rsx_fifo_step(void)
         }
         if (yz_fifo_flowlog()) {
             fprintf(stderr, "[fifo-flow] JUMP io=0x%08X -> 0x%08X (word 0x%08X)\n", get, tgt, cmd);
+            fflush(stderr);
+        }
+        if (a010_root)
+            a010_jump_n++;
+        if (a010_root && a010_flow_trace) {
+            const uint32_t te = yz_rsx_io_to_ea(tgt);
+            fprintf(stderr,
+                    "[a010-flow] JUMP io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X "
+                    "head=%08X %08X %08X %08X\n",
+                    get, ea, tgt, te,
+                    te ? vm_read32(te + 0u) : 0u,
+                    te ? vm_read32(te + 4u) : 0u,
+                    te ? vm_read32(te + 8u) : 0u,
+                    te ? vm_read32(te + 12u) : 0u);
             fflush(stderr);
         }
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
@@ -2970,6 +5643,20 @@ static int yz_rsx_fifo_step(void)
             fprintf(stderr, "[fifo-flow] CALL io=0x%08X -> 0x%08X (ret=0x%08X)\n", get, ctgt, get + 4u);
             fflush(stderr);
         }
+        if (a010_root)
+            a010_call_n++;
+        if (a010_root && a010_flow_trace) {
+            const uint32_t ce = yz_rsx_io_to_ea(ctgt);
+            fprintf(stderr,
+                    "[a010-flow] CALL io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X "
+                    "ret=0x%08X head=%08X %08X %08X %08X\n",
+                    get, ea, ctgt, ce, get + 4u,
+                    ce ? vm_read32(ce + 0u) : 0u,
+                    ce ? vm_read32(ce + 4u) : 0u,
+                    ce ? vm_read32(ce + 8u) : 0u,
+                    ce ? vm_read32(ce + 12u) : 0u);
+            fflush(stderr);
+        }
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -2979,6 +5666,14 @@ static int yz_rsx_fifo_step(void)
         if (g_fifo_ret != ~0u) {
             if (yz_fifo_flowlog()) {
                 fprintf(stderr, "[fifo-flow] RET  io=0x%08X -> 0x%08X\n", get, g_fifo_ret);
+                fflush(stderr);
+            }
+            if (a010_root)
+                a010_ret_n++;
+            if (a010_root && a010_flow_trace) {
+                fprintf(stderr,
+                        "[a010-flow] RET io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X\n",
+                        get, ea, g_fifo_ret, yz_rsx_io_to_ea(g_fifo_ret));
                 fflush(stderr);
             }
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
@@ -3120,6 +5815,16 @@ static int yz_rsx_fifo_step(void)
     const uint32_t method  = cmd & 0x3FFFCu;
     const uint32_t pkt_end = get + 4u + count * 4u;
 
+    const int a010_count_packet =
+        a010_root && get != a010_last_counted_get;
+    if (a010_count_packet) {
+        a010_last_counted_get = get;
+        a010_packet_n++;
+        a010_arg_n += count;
+        if (get < a010_src_min) a010_src_min = get;
+        if (pkt_end > a010_src_max) a010_src_max = pkt_end;
+    }
+
     /* The whole packet (header + count args) must be committed before we
      * dispatch (RPCS3 inc_get waits for PUT to cover each arg; PUT points one
      * past the last committed word). Linear within a segment; wrap is handled
@@ -3135,6 +5840,210 @@ static int yz_rsx_fifo_step(void)
         if (!op_ea) break;
         const uint32_t eff = noninc ? method : method + i * 4u;
         const uint32_t val = vm_read32(op_ea);
+        const uint32_t canonical = eff & 0x1FFCu;
+        const uint32_t subchannel = (eff >> 13) & 7u;
+        if (canonical == 0x1EFCu)
+            a010_const_load[subchannel] = val;
+        else if (a010_root && a010_const_trace &&
+                 canonical >= 0x1F00u && canonical < 0x2000u) {
+            const uint32_t word = (canonical - 0x1F00u) >> 2;
+            const uint32_t slot =
+                a010_const_load[subchannel] + (word >> 2);
+            const int is_nan =
+                (val & 0x7F800000u) == 0x7F800000u &&
+                (val & 0x007FFFFFu) != 0;
+            if (slot >= 108u && slot <= 111u && is_nan &&
+                a010_const_trace_n < 128) {
+                a010_const_trace_n++;
+                fprintf(stderr,
+                        "[a010-const] n=%lu io=0x%08X ea=0x%08X "
+                        "hdr=0x%08X count=%u i=%u noninc=%u "
+                        "raw=0x%05X sub=%u load=%u slot=%u lane=%u "
+                        "val=0x%08X ret=0x%08X\n",
+                        a010_const_trace_n, get + 4u + i * 4u, op_ea,
+                        cmd, count, i, noninc ? 1u : 0u,
+                        eff, subchannel, a010_const_load[subchannel],
+                        slot, word & 3u, val, g_fifo_ret);
+                if (a010_const_trace_n == 1) {
+                    fprintf(stderr,
+                            "[a010-const] first-NaN packet io=0x%08X "
+                            "ea=0x%08X words:",
+                            get, ea);
+                    for (uint32_t j = 0; j <= count && j < 32u; j++)
+                        fprintf(stderr, " %08X", vm_read32(ea + j * 4u));
+                    fputc('\n', stderr);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (a010_count_packet) {
+            a010_sub_args[(eff >> 13) & 7u]++;
+            if (canonical == 0x1808u) {
+                if (val) {
+                    if (a010_draw_source_trace &&
+                        !a010_draw_source_written &&
+                        a010_draw_source_n <
+                            sizeof(a010_draw_sources) /
+                                sizeof(a010_draw_sources[0])) {
+                        yz_a010_draw_source* source =
+                            &a010_draw_sources[a010_draw_source_n];
+                        source->index = a010_draw_source_n;
+                        source->io = get;
+                        source->ea = ea;
+                        source->ret_io = g_fifo_ret;
+                        source->header = cmd;
+                        source->primitive = val;
+                        ++a010_draw_source_n;
+                    }
+                    a010_begin_n++;
+                } else {
+                    a010_end_n++;
+                }
+            } else if (canonical == 0x1814u) {
+                a010_array_n++;
+            } else if (canonical == 0x1820u) {
+                a010_index_n++;
+            }
+            if (canonical >= 0x0B80u && canonical < 0x0C00u)
+                a010_vp_n++;
+            if (canonical >= 0x1F00u && canonical < 0x2000u)
+                a010_const_n++;
+        }
+        /* The shipped a010 capture has no render-target clip dimension above
+         * 1280x1024.  A recovered chain has emitted 0x4044 as the vertical
+         * extent, which is the high half of a guest pointer rather than an RSX
+         * dimension.  Record its exact source packet and keep the last valid
+         * clip state; allowing it through makes D3D12 reject the surface and
+         * hides the command-link failure behind a host crash. */
+        if (a010_root &&
+            ((canonical == 0x0200u && (val >> 16) > 8192u) ||
+             (canonical == 0x0204u && (val >> 16) > 8192u))) {
+            static unsigned long invalid_clip = 0;
+            invalid_clip++;
+            fprintf(stderr,
+                    "[a010-invalid-clip] n=%lu packet-io=0x%06X "
+                    "arg-io=0x%06X header=0x%08X count=%u i=%u "
+                    "eff=0x%05X val=0x%08X extent=%u ret=0x%08X\n",
+                    invalid_clip, get, get + 4u + i * 4u,
+                    cmd, count, i, eff, val, val >> 16, g_fifo_ret);
+            if (invalid_clip <= 4u) {
+                fprintf(stderr, "[a010-invalid-clip] packet words:");
+                for (uint32_t j = 0; j <= count && j < 32u; j++)
+                    fprintf(stderr, " %08X", vm_read32(ea + j * 4u));
+                fputc('\n', stderr);
+            }
+            fflush(stderr);
+            continue;
+        }
+        if (a010_root && (eff == 0xE920u || eff == 0xE924u)) {
+            if (a010_draw_source_trace &&
+                !a010_draw_source_written &&
+                a010_draw_source_n >= 400u) {
+                const char* path = getenv("YZ_A010_DRAW_SOURCE");
+                FILE* source_file =
+                    path && path[0] ? fopen(path, "w") : nullptr;
+                if (source_file) {
+                    fprintf(source_file,
+                            "draw,io,ea,ret_io,ret_ea,header,primitive\n");
+                    for (uint32_t source_i = 0;
+                         source_i < a010_draw_source_n; ++source_i) {
+                        const yz_a010_draw_source* source =
+                            &a010_draw_sources[source_i];
+                        fprintf(source_file,
+                                "%u,0x%08X,0x%08X,0x%08X,0x%08X,"
+                                "0x%08X,%u\n",
+                                source->index, source->io, source->ea,
+                                source->ret_io,
+                                source->ret_io == ~0u
+                                    ? 0u
+                                    : yz_rsx_io_to_ea(source->ret_io),
+                                source->header, source->primitive);
+                    }
+                    fclose(source_file);
+                    fprintf(stderr,
+                            "[a010-draw-source] wrote %u draw origins to %s\n",
+                            a010_draw_source_n, path);
+                } else {
+                    fprintf(stderr,
+                            "[a010-draw-source] failed to open %s\n",
+                            path ? path : "<empty>");
+                }
+                fflush(stderr);
+                a010_draw_source_written = 1;
+            }
+            const LONG prod_puts =
+                InterlockedExchange(&g_yz_a010_spu_puts, 0);
+            const LONG prod_put_bytes =
+                InterlockedExchange(&g_yz_a010_spu_put_bytes, 0);
+            const LONG prod_groups =
+                InterlockedExchange(&g_yz_a010_spu_groups, 0);
+            const LONG prod_group_bytes =
+                InterlockedExchange(&g_yz_a010_spu_group_bytes, 0);
+            const LONG prod_headers =
+                InterlockedExchange(&g_yz_a010_spu_headers, 0);
+            const LONG prod_args =
+                InterlockedExchange(&g_yz_a010_spu_args, 0);
+            const LONG prod_begin =
+                InterlockedExchange(&g_yz_a010_spu_begin, 0);
+            const LONG prod_end =
+                InterlockedExchange(&g_yz_a010_spu_end, 0);
+            const LONG prod_array =
+                InterlockedExchange(&g_yz_a010_spu_array, 0);
+            const LONG prod_index =
+                InterlockedExchange(&g_yz_a010_spu_index, 0);
+            const LONG prod_vp =
+                InterlockedExchange(&g_yz_a010_spu_vp, 0);
+            const LONG prod_const =
+                InterlockedExchange(&g_yz_a010_spu_const, 0);
+            const LONG prod_unparsed =
+                InterlockedExchange(&g_yz_a010_spu_unparsed, 0);
+            const LONG prod_ppucmd =
+                InterlockedExchange(&g_yz_a010_ppucmd_headers, 0);
+            const LONG prod_spucmd =
+                InterlockedExchange(&g_yz_a010_spucmd_headers, 0);
+            fprintf(stderr,
+                    "[a010-fifo] FLIP head=%u buf=%u packets=%lu args=%lu "
+                    "flow(j/c/r)=%lu/%lu/%lu io-span=0x%08X..0x%08X "
+                    "draw(be/end/a/i)=%lu/%lu/%lu/%lu upload(vp/c)=%lu/%lu "
+                    "subargs=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu "
+                    "GET=0x%08X PUT=0x%08X\n",
+                    (eff - 0xE920u) >> 2, val,
+                    a010_packet_n, a010_arg_n,
+                    a010_jump_n, a010_call_n, a010_ret_n,
+                    a010_src_min == 0xFFFFFFFFu ? 0u : a010_src_min,
+                    a010_src_max,
+                    a010_begin_n, a010_end_n, a010_array_n, a010_index_n,
+                    a010_vp_n, a010_const_n,
+                    a010_sub_args[0], a010_sub_args[1],
+                    a010_sub_args[2], a010_sub_args[3],
+                    a010_sub_args[4], a010_sub_args[5],
+                    a010_sub_args[6], a010_sub_args[7],
+                    get, put);
+            fprintf(stderr,
+                    "[a010-prod] img0 puts=%ld bytes=%ld "
+                    "groups=%ld group_bytes=%ld headers=%ld args=%ld "
+                    "draw(be/end/a/i)=%ld/%ld/%ld/%ld "
+                    "upload(vp/c)=%ld/%ld unparsed=%ld "
+                    "draw-writers(ppu/spu)=%ld/%ld\n",
+                    prod_puts, prod_put_bytes,
+                    prod_groups, prod_group_bytes, prod_headers, prod_args,
+                    prod_begin, prod_end, prod_array, prod_index,
+                    prod_vp, prod_const, prod_unparsed,
+                    prod_ppucmd, prod_spucmd);
+            yz_a010_auth_probe_poll();
+            fflush(stderr);
+            a010_packet_n = a010_arg_n = 0;
+            a010_jump_n = a010_call_n = a010_ret_n = 0;
+            memset(a010_sub_args, 0, sizeof(a010_sub_args));
+            a010_begin_n = a010_end_n = 0;
+            a010_array_n = a010_index_n = 0;
+            a010_vp_n = a010_const_n = 0;
+            a010_last_counted_get = 0xFFFFFFFFu;
+            a010_src_min = 0xFFFFFFFFu;
+            a010_src_max = 0;
+            if (!a010_draw_source_written)
+                a010_draw_source_n = 0;
+        }
         stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
     }
     if (stalled) {
@@ -3922,10 +6831,12 @@ extern "C" void yz_rsx_vblank_tick(void)
      * value) + word1 (target EA guard) on change. No faults, ~16 ms
      * resolution; records persist between stagings so transitions are
      * caught. Correlate with [w4rec] fetch-time dumps. */
-    { static int wp = -1;
+    { static int wp = -1; static int wproot = -1;
       if (wp < 0) { wp = getenv("YZ_W4REC_POLL") ? 1 : 0;
           if (wp) { fprintf(stderr, "[w4poll] ARMED: record-slot poll live\n"); fflush(stderr); } }
-      if (wp) {
+      if (wproot < 0) wproot = getenv("YZ_A010_ROOT") ? 1 : 0;
+      if (wp && (!wproot ||
+          InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0)) {
           /* s26 ride17 addition: slot[5] = the decode label itself — [fe0]
            * proved publish-8 ISSUED while the acquire read 7 forever; this
            * poll discriminates lost-write (never becomes 8) vs reverted-write
@@ -4008,8 +6919,9 @@ extern "C" void yz_rsx_vblank_tick(void)
     /* DIAG (TEMP): heartbeat -- proves the vblank thread is live and shows the
      * flip-completion state (pending bits + the flip label the consumer waits
      * on). Once/sec. */
-    { static unsigned vt = 0;
-      if ((vt++ & 63u) == 0)
+    { static int vbt=-1; static unsigned vt = 0;
+      if (vbt < 0) vbt = getenv("YZ_VBL_TRACE") ? 1 : 0;
+      if (vbt && (vt++ & 63u) == 0)
           fprintf(stderr, "[vbl] tick=%u pending=[%ld %ld] label@0x10200010=0x%08X qhead=%u\n",
                   vt, g_rsx_flip_pending[0], g_rsx_flip_pending[1],
                   vm_read32(RSX_REPORTS + 0x10), g_rsx_queued_head); }
