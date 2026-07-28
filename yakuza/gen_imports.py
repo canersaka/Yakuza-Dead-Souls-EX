@@ -293,6 +293,17 @@ def main():
         "_sys_snprintf",
     }
 
+    # Several context-aware overrides live in yakuza/*.cpp rather than the
+    # libs/ and runtime/ trees scanned above.  Resolve their NIDs explicitly
+    # after the override set exists; otherwise regenerating the bridge table
+    # silently turns essential TLS/thread/time/SPU-image imports into ENOSYS
+    # stubs even though their hand-written implementations are present.
+    override_by_nid = {compute_nid(name): name for name in OVERRIDES}
+    imports = [
+        (module, nid, name or override_by_nid.get(nid), slot)
+        for module, nid, name, slot in imports
+    ]
+
     # cellSpurs functions to HLE as CELL_OK no-ops EVEN THOUGH libsre exports
     # them (LLE). This mirrors RPCS3 exactly: it runs the real SPURS SPU
     # kernel but leaves these PPU-side entries as UNIMPLEMENTED_FUNC stubs
