@@ -11,8 +11,8 @@
  *   cl /nologo /std:c17 /I..\..\..\include test_fp_cube.c ../rsx_fp_decompiler.c \
  *      /Fe:test_fp_cube.exe /link d3dcompiler.lib
  * Run:
- *   ./test_fp_cube.exe <path-to.fp> <cube-unit>
- *   (defaults: scratch a010 draw-130 fp, unit 6)
+ *   ./test_fp_cube.exe <path-to.fp> [cube-unit]
+ *   (cube-unit defaults to 6)
  */
 #include "../rsx_fp_decompiler.h"
 #include <stdio.h>
@@ -51,8 +51,12 @@ static int compile(const char* label, const char* src)
 
 int main(int argc, char** argv)
 {
-    const char* path = (argc > 1) ? argv[1]
-        : "C:/Users/csaka/Projects/ps3recomp/scratch/a010_reports/fragment/shd_dump/fp_c4a1828035dbe537.fp";
+    if (argc < 2) {
+        printf("usage: %s <path-to.fp> [cube-unit]\n", argv[0]);
+        return 2;
+    }
+
+    const char* path = argv[1];
     u32 cube_unit = (argc > 2) ? (u32)atoi(argv[2]) : 6u;
 
     long n = read_file(path, filebuf, (long)sizeof(filebuf));
