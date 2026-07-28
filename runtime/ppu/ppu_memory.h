@@ -131,6 +131,51 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
+    /*
+     * Focused a010 stopper lifecycle watch.  Runtime-side PPU helpers use this
+     * inline accessor rather than yakuza/shims.cpp's exported vm_write32, so
+     * cover it as well.  The callee is a single env/root/arena gate unless a
+     * real gs_task release has armed this exact word.
+     */
+    extern volatile long g_yz_a010_release_scene_active;
+    if (g_yz_a010_release_scene_active &&
+        addr >= 0x40400000u && addr < 0x40C00000u) {
+        extern void yz_a010_reltrace_ppu_store(
+            uint32_t addr, uint32_t val, uint32_t guest_pc);
+        yz_a010_reltrace_ppu_store(addr, val, 0u);
+    }
+    /* a010 object-batch source probe. Restrict it to mapped RSX command
+     * arenas and headers whose method span contains a draw command. */
+    if (addr >= 0x40400000u && addr < 0x43000000u &&
+        (val & 0xA0030003u) == 0u) {
+        const uint32_t first = val & 0x3FFFCu;
+        const uint32_t canonical_first = first & 0x1FFCu;
+        const uint32_t count = (val >> 18) & 0x7FFu;
+        const uint32_t canonical_last =
+            canonical_first + (count ? (count - 1u) * 4u : 0u);
+        const int noninc = (val & 0x40000000u) != 0;
+        const int draw_header =
+            count && count <= 64u && ((noninc &&
+                       (canonical_first == 0x1808u ||
+                        canonical_first == 0x1814u ||
+                        canonical_first == 0x1820u)) ||
+                      (!noninc &&
+                       ((canonical_first <= 0x1808u &&
+                         canonical_last >= 0x1808u) ||
+                        (canonical_first <= 0x1814u &&
+                         canonical_last >= 0x1814u) ||
+                        (canonical_first <= 0x1820u &&
+                         canonical_last >= 0x1820u))));
+        if (draw_header) {
+            extern int g_yz_a010_ppucmd;
+            extern volatile long g_yz_a010_root_active;
+            if (g_yz_a010_ppucmd && g_yz_a010_root_active) {
+                extern void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
+                                                void* ra, int width);
+                yz_a010_ppucmd_log(addr, val, _ReturnAddress(), 32);
+            }
+        }
+    }
     /* DIAG (env YZ_WATCH_DLIST): watch PPU writes to the io 0x1104D00 display
      * list (EA 0x41504D00). Tells whether the PPU producer (t1) ever writes the
      * REAL contents over the 0xA2000500 placeholder -> it's the producer and the
@@ -177,6 +222,20 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
+    extern volatile long g_yz_a010_release_scene_active;
+    if (g_yz_a010_release_scene_active &&
+        addr < 0x40C00000u &&
+        (uint64_t)addr + 8u > 0x40400000ull) {
+        extern void yz_a010_reltrace_ppu_store(
+            uint32_t addr, uint32_t val, uint32_t guest_pc);
+        if (addr >= 0x40400000u)
+            yz_a010_reltrace_ppu_store(
+                addr, (uint32_t)(val >> 32), 0u);
+        if (addr + 4u >= 0x40400000u &&
+            addr + 4u < 0x40C00000u)
+            yz_a010_reltrace_ppu_store(
+                addr + 4u, (uint32_t)val, 0u);
+    }
     if (addr >= 0x42452880u && addr < 0x424529E0u) {   /* see vm_write32 */
         extern int g_yz_slotstore;
         if (g_yz_slotstore) {
@@ -213,6 +272,60 @@ static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len
 
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
+    extern volatile long g_yz_a010_release_scene_active;
+    if (g_yz_a010_release_scene_active && len <= UINT32_MAX) {
+        extern void yz_a010_reltrace_ppu_bulk(
+            uint32_t dst, const uint8_t* src, uint32_t size,
+            uint32_t guest_pc, uint32_t op, uint8_t fill);
+        yz_a010_reltrace_ppu_bulk(
+            guest_dst, (const uint8_t*)host_src, (uint32_t)len,
+            0u, 1u, 0u);
+    }
+    /* Graphics helpers can assemble an entire command block in host memory
+     * and publish it with one bulk copy, bypassing vm_write32. Scan only bulk
+     * copies that land in the RSX command arenas and only report structurally
+     * valid headers whose normalized method span reaches a draw method. */
+    if (guest_dst < 0x43000000u && len &&
+        (uint64_t)guest_dst + (uint64_t)len > 0x40400000ull) {
+        extern int g_yz_a010_ppucmd;
+        extern volatile long g_yz_a010_root_active;
+        if (g_yz_a010_ppucmd && g_yz_a010_root_active) {
+            const uint8_t* src = (const uint8_t*)host_src;
+            for (size_t off = 0; off + 4u <= len; off += 4u) {
+                const uint32_t word =
+                    ((uint32_t)src[off + 0] << 24) |
+                    ((uint32_t)src[off + 1] << 16) |
+                    ((uint32_t)src[off + 2] << 8) |
+                    (uint32_t)src[off + 3];
+                if ((word & 0xA0030003u) != 0u)
+                    continue;
+                const uint32_t first = word & 0x3FFFCu;
+                const uint32_t canonical_first = first & 0x1FFCu;
+                const uint32_t count = (word >> 18) & 0x7FFu;
+                const uint32_t canonical_last =
+                    canonical_first + (count ? (count - 1u) * 4u : 0u);
+                const int noninc = (word & 0x40000000u) != 0;
+                const int draw_header =
+                    count && count <= 64u && ((noninc &&
+                               (canonical_first == 0x1808u ||
+                                canonical_first == 0x1814u ||
+                                canonical_first == 0x1820u)) ||
+                              (!noninc &&
+                               ((canonical_first <= 0x1808u &&
+                                 canonical_last >= 0x1808u) ||
+                                (canonical_first <= 0x1814u &&
+                                 canonical_last >= 0x1814u) ||
+                                (canonical_first <= 0x1820u &&
+                                 canonical_last >= 0x1820u))));
+                if (draw_header) {
+                    extern void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
+                                                   void* ra, int width);
+                    yz_a010_ppucmd_log(guest_dst + (uint32_t)off, word,
+                                       _ReturnAddress(), 99);
+                }
+            }
+        }
+    }
     /* s26 stager hunt (STATUS ⚡ ~03:25): the wid4 work-record slots are
      * written by NEITHER lifted PPU stores (YZ_SLOTSTORE zero) NOR SPU DMA
      * ([w4stage] zero) ⇒ this bulk path is the remaining candidate. Same env
@@ -232,6 +345,15 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
+    extern volatile long g_yz_a010_release_scene_active;
+    if (g_yz_a010_release_scene_active && len <= UINT32_MAX) {
+        extern void yz_a010_reltrace_ppu_bulk(
+            uint32_t dst, const uint8_t* src, uint32_t size,
+            uint32_t guest_pc, uint32_t op, uint8_t fill);
+        yz_a010_reltrace_ppu_bulk(
+            guest_dst, (const uint8_t*)0, (uint32_t)len,
+            0u, 2u, (uint8_t)val);
+    }
     if (guest_dst < 0x424529E0u && guest_dst + len > 0x42452880u) {
         extern int g_yz_slotstore;
         if (g_yz_slotstore) {
