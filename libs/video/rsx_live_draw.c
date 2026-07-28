@@ -37,6 +37,10 @@ void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
+u32  rsx_live_draw_get_frames(void) { return 0; }
+u32  rsx_live_draw_get_last_draws(void) { return 0; }
+double rsx_live_draw_get_present_fps(void) { return 0.0; }
+void rsx_live_draw_dump_present_samples(void) {}
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
 int  rsx_live_draw_a010_world_ready(void) { return 1; }
@@ -257,6 +261,85 @@ typedef struct {
 
 static ld_state g;
 static u32 g_ld_frames = 0;
+
+/*
+ * Isolated pre-cleanup benchmark measurement. Record only successful
+ * swap-chain presents: one QPC call and fixed-ring stores, with no allocation,
+ * configuration lookup, sorting, or logging in the presentation path.
+ */
+#define LD_PRESENT_RING_CAP 16384u
+typedef struct {
+    u64 present_id;
+    u32 guest_frame;
+    LONGLONG qpc;
+} ld_present_sample;
+static ld_present_sample g_ld_present_ring[LD_PRESENT_RING_CAP];
+static u64 g_ld_present_total = 0;
+static LONGLONG g_ld_qpc_frequency = 0;
+static int g_ld_present_dumped = 0;
+
+static void ld_present_measure_init(void)
+{
+    LARGE_INTEGER frequency;
+    memset(g_ld_present_ring, 0, sizeof(g_ld_present_ring));
+    g_ld_present_total = 0;
+    g_ld_present_dumped = 0;
+    if (QueryPerformanceFrequency(&frequency))
+        g_ld_qpc_frequency = frequency.QuadPart;
+    else
+        g_ld_qpc_frequency = 0;
+}
+
+static void ld_present_measure_record(u32 guest_frame)
+{
+    LARGE_INTEGER now;
+    if (!QueryPerformanceCounter(&now))
+        return;
+    const u64 present_id = g_ld_present_total + 1u;
+    ld_present_sample* sample =
+        &g_ld_present_ring[(present_id - 1u) & (LD_PRESENT_RING_CAP - 1u)];
+    sample->present_id = present_id;
+    sample->guest_frame = guest_frame;
+    sample->qpc = now.QuadPart;
+    g_ld_present_total = present_id;
+}
+
+static void ld_present_measure_dump(void)
+{
+    if (g_ld_present_dumped || g_ld_present_total == 0 ||
+        g_ld_qpc_frequency <= 0)
+        return;
+    g_ld_present_dumped = 1;
+
+    char path[256];
+    snprintf(path, sizeof(path), "scratch\\present_qpc_%lu.csv",
+             (unsigned long)GetCurrentProcessId());
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return;
+
+    fprintf(f, "# qpc_frequency=%lld\n", g_ld_qpc_frequency);
+    fprintf(f, "present_id,guest_frame,qpc\n");
+    const u64 first =
+        g_ld_present_total > LD_PRESENT_RING_CAP
+            ? g_ld_present_total - LD_PRESENT_RING_CAP + 1u : 1u;
+    for (u64 present_id = first; present_id <= g_ld_present_total;
+         ++present_id) {
+        const ld_present_sample* sample =
+            &g_ld_present_ring[(present_id - 1u) &
+                               (LD_PRESENT_RING_CAP - 1u)];
+        if (sample->present_id == present_id)
+            fprintf(f, "%llu,%u,%lld\n",
+                    (unsigned long long)sample->present_id,
+                    sample->guest_frame, sample->qpc);
+    }
+    fclose(f);
+    fprintf(stderr,
+            "[present-qpc] preserved %llu successful presents at %lld Hz in %s\n",
+            (unsigned long long)(g_ld_present_total - first + 1u),
+            g_ld_qpc_frequency, path);
+}
+
 static u64 g_ld_texture_cache_full = 0;
 static u64 g_ld_texture_use_serial = 0;
 static u64 g_ld_texture_cache_evictions = 0;
@@ -3282,6 +3365,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    ld_present_measure_init();
     g.width = width; g.height = height;
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
 
@@ -3584,6 +3668,52 @@ static u32 g_ld_last_frame_draws = 0;
  * journal-consumer limp state renders ~0 draws/frame while flips tick). */
 u32 rsx_live_draw_get_last_draws(void) { return g_ld_last_frame_draws; }
 
+double rsx_live_draw_get_present_fps(void)
+{
+    const u64 total = g_ld_present_total;
+    if (total < 2u || g_ld_qpc_frequency <= 0)
+        return 0.0;
+
+    const u64 available =
+        total < LD_PRESENT_RING_CAP ? total : LD_PRESENT_RING_CAP;
+    const ld_present_sample* newest =
+        &g_ld_present_ring[(total - 1u) & (LD_PRESENT_RING_CAP - 1u)];
+    if (newest->present_id != total)
+        return 0.0;
+
+    const ld_present_sample* oldest = newest;
+    u64 intervals = 0;
+    for (u64 back = 1u; back < available; ++back) {
+        const u64 present_id = total - back;
+        const ld_present_sample* candidate =
+            &g_ld_present_ring[(present_id - 1u) &
+                               (LD_PRESENT_RING_CAP - 1u)];
+        if (candidate->present_id != present_id)
+            break;
+        oldest = candidate;
+        intervals = back;
+        const double elapsed =
+            (double)(newest->qpc - oldest->qpc) /
+            (double)g_ld_qpc_frequency;
+        /*
+         * Keep at least a 15-second view and about 30 intervals when possible;
+         * cap at 30 seconds so sub-1-FPS operation still updates usefully.
+         */
+        if (elapsed >= 30.0 || (elapsed >= 15.0 && intervals >= 30u))
+            break;
+    }
+
+    const LONGLONG ticks = newest->qpc - oldest->qpc;
+    return intervals != 0u && ticks > 0
+        ? (double)intervals * (double)g_ld_qpc_frequency / (double)ticks
+        : 0.0;
+}
+
+void rsx_live_draw_dump_present_samples(void)
+{
+    ld_present_measure_dump();
+}
+
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
  * swap-chain backbuffer (both R8G8B8A8_UNORM at the swap size) and Present.
  * The frame is clamped to the backbuffer size. Call from a single thread with
@@ -3679,7 +3809,11 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     ld_flush();
-    g.swap->lpVtbl->Present(g.swap, 1, 0);
+    {
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        if (SUCCEEDED(present_hr))
+            ld_present_measure_record(g_ld_frames);
+    }
     if (composite) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         InterlockedExchange(&g_ld_host_waiting, 0);
@@ -3813,7 +3947,11 @@ void rsx_live_draw_present(u32 buffer_id)
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
     ld_flush();
-    g.swap->lpVtbl->Present(g.swap, 1, 0);
+    {
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        if (SUCCEEDED(present_hr))
+            ld_present_measure_record(g_ld_frames + 1u);
+    }
 
     { static unsigned long long packets_at_last_frame = 0;
       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
@@ -3983,6 +4121,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush();

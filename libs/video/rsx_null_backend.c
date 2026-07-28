@@ -18,6 +18,7 @@
  * count, so a stall (frames frozen while flips keep climbing) is visible. */
 extern u32 rsx_live_draw_get_frames(void);
 extern u32 rsx_live_draw_get_last_draws(void);
+extern double rsx_live_draw_get_present_fps(void);
 
 #ifdef _WIN32
 
@@ -70,6 +71,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        rsx_live_draw_dump_present_samples();
         PostQuitMessage(0);
         return 0;
 
@@ -152,27 +154,26 @@ static void null_end_frame(void* ud)
     (void)ud;
     s_state.frame_count++;
 
-    /* Real FPS: frames counted in the last ~1 s window. */
+    /* Update the informational title no more than once per second. Presented
+     * FPS comes from a 15-30 second / about-30-present QPC window so sub-1-FPS
+     * operation does not quantize to zero. Benchmark results use the raw CSV,
+     * not this title value. */
     static u64 frames_at_mark = 0;
     ULONGLONG now = GetTickCount64();
     if (now - s_state.last_fps_time >= 1000) {
         s_state.fps = (u32)(s_state.frame_count - frames_at_mark);
         frames_at_mark = s_state.frame_count;
         s_state.last_fps_time = now;
-    }
-
-    /* Flip count + FPS live in the window title so they show even when the GPU
-     * backend owns the surface and the GDI overlay is suppressed. The internal
-     * renderer label (live-draw D3D12 vs GDI fallback) stays out of the title
-     * (user request 2026-07-10); it is still visible in the boot log banner. */
-    if (s_state.hwnd) {
-        char title[192];
-        snprintf(title, sizeof(title),
-                 "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  draws %u  |  %u FPS",
-                 (unsigned long long)s_state.frame_count,
-                 rsx_live_draw_get_frames(), rsx_live_draw_get_last_draws(),
-                 s_state.fps);
-        SetWindowTextA(s_state.hwnd, title);
+        if (s_state.hwnd) {
+            char title[224];
+            snprintf(title, sizeof(title),
+                     "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  draws %u  |  %.2f presented FPS",
+                     (unsigned long long)s_state.frame_count,
+                     rsx_live_draw_get_frames(),
+                     rsx_live_draw_get_last_draws(),
+                     rsx_live_draw_get_present_fps());
+            SetWindowTextA(s_state.hwnd, title);
+        }
     }
 }
 
