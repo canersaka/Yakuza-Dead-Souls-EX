@@ -18,6 +18,7 @@
  * game-initiated. The old fd bridge disables itself while this route is armed.
  */
 #include "ppu_recomp.h"
+#include "ps3emu/yz_runtime_config.h"
 #include "../libs/codec/movie_ffmpeg.h"
 #include "../libs/audio/cellAudio.h"
 #include <cstdio>
@@ -39,15 +40,16 @@ extern "C" void     yz_host_movie_time(long serial, uint32_t* count,
 
 extern "C" int yz_movie_hle_armed(void)
 {
-    static int armed = -1;
-    if (armed < 0) {
-        armed = getenv("YZ_MOVIE_HLE") ? 1 : 0;
+    static int banner_printed = 0;
+    if (!banner_printed) {
+        banner_printed = 1;
+        const int armed = g_yz_runtime_config.movie_hle;
         fprintf(stderr, "[mwhle] ARMED banner: YZ_MOVIE_HLE=%d (%s)\n", armed,
                 armed ? "frame-leaf HLE ACTIVE, fd-bridge disabled"
                       : "pass-through only, fd-bridge default");
         fflush(stderr);
     }
-    return armed;
+    return g_yz_runtime_config.movie_hle;
 }
 
 /* --------------------------------------------------------------- session -- */
@@ -70,8 +72,6 @@ struct MwhleSession {
     bool stopping = false;
     bool host_audio = false;
     bool accept_fast = false;
-    bool rebase_on_first_time = false;
-    bool clock_anchored = false;
     char host_path[320] = {};
     LARGE_INTEGER t0{}, freq{};
     unsigned long long tex_targets[2] = {0, 0};  /* observed ping-pong EAs */
@@ -161,9 +161,6 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
     MwhleSession& s = g_sess;
     s.handle = handle;
     snprintf(s.host_path, sizeof(s.host_path), "%s", host);
-    s.rebase_on_first_time =
-        strstr(host, "hd_sega_logo") == nullptr &&
-        strstr(host, "advertise.sfd") == nullptr;
     if (!surface_mode())
         s.direct_serial = yz_host_movie_start(host);
     if (s.direct_serial > 0) {
@@ -172,10 +169,6 @@ void session_open(unsigned long long handle, unsigned long long fname_ea)
         fprintf(stderr,
                 "[mwhle] direct host session OPEN handle=%08llX serial=%ld '%s'\n",
                 handle, s.direct_serial, host);
-        if (s.rebase_on_first_time)
-            fprintf(stderr,
-                    "[mwhle] scene movie clock REBASE PENDING serial=%ld "
-                    "(first GetTime)\n", s.direct_serial);
         fflush(stderr);
         return;
     }
@@ -638,32 +631,14 @@ void func_00F4F8D0(ppu_context* ctx)   /* GetTime(handle, *ncount, *tscale) */
         ctx->gpr[3] == g_sess.handle) {
         uint32_t count = 0, scale = 30;
         if (g_sess.direct_serial > 0) {
-            if (g_sess.rebase_on_first_time && !g_sess.clock_anchored) {
-                const long old_serial = g_sess.direct_serial;
-                const long new_serial =
-                    yz_host_movie_start(g_sess.host_path);
-                if (new_serial > 0)
-                    g_sess.direct_serial = new_serial;
-                QueryPerformanceCounter(&g_sess.t0);
-                g_sess.clock_anchored = true;
-                fprintf(stderr,
-                        "[mwhle] scene movie clock REBASED old_serial=%ld "
-                        "new_serial=%ld handle=%08llX\n",
-                        old_serial, g_sess.direct_serial, g_sess.handle);
-                fflush(stderr);
-            }
-            if (g_sess.rebase_on_first_time && g_sess.clock_anchored) {
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-                const double seconds =
-                    (double)(now.QuadPart - g_sess.t0.QuadPart) /
-                    (double)g_sess.freq.QuadPart;
-                scale = 30;
-                count = seconds > 0.0
-                    ? (uint32_t)(seconds * (double)scale) : 0;
-            } else {
-                yz_host_movie_time(g_sess.direct_serial, &count, &scale);
-            }
+            /*
+             * The direct presenter starts exactly once at StartFname and owns
+             * the same playback clock the guest observes here.  Restarting it
+             * on the first GetTime visibly replayed the first several seconds
+             * of scene movies (a020: serial 3 was superseded by serial 4 after
+             * 125 frames).  Report the active presenter's real clock instead.
+             */
+            yz_host_movie_time(g_sess.direct_serial, &count, &scale);
         } else {
             scale = (uint32_t)(g_sess.fps + 0.5);
             if (!scale) scale = 30;

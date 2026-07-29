@@ -26,6 +26,7 @@
 
 #include "../include/ps3emu/endian.h"
 #include "../include/ps3emu/guest_call.h"
+#include "../include/ps3emu/yz_runtime_config.h"
 #include "../runtime/memory/vm.h"
 #include "yakuza_runner.h"
 
@@ -1166,10 +1167,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * readiness predicate the broken codec never sets. Diagnose the candidate
      * handles t1 polls; with YZ_SKIP_VOICE set, poke them "ready" so t1 proceeds
      * and the NEXT wall surfaces. OFF by default; experiment only. === */
-    if (num == 107 && (uint32_t)ctx->gpr[3] == 9 && yz_thread_current_id() == 1) {
+    if (
+#if defined(YZ_PERF_CLEAN)
+        g_yz_runtime_config.skip_voice &&
+#endif
+        num == 107 && (uint32_t)ctx->gpr[3] == 9 &&
+        yz_thread_current_id() == 1) {
         static long vw = 0; long n = ++vw;
         uint32_t r31 = (uint32_t)ctx->gpr[31];
         uint32_t adxm = 0x01613368u, blk = 0x01654294u;   /* ADXM handle / cond block (pt47) */
+#if !defined(YZ_PERF_CLEAN)
         if (n <= 3 || (n % 500) == 0) {
             fprintf(stderr, "[voice-wait] n=%ld r31=0x%08X [r31+298]=%08X "
                     "adxm[+294]=%08X [+298]=%08X [+29C]=%08X blk[+00]=%08X [+10]=%08X\n",
@@ -1178,7 +1185,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     vm_read32(blk + 0x00), vm_read32(blk + 0x10));
             fflush(stderr);
         }
-        if (getenv("YZ_SKIP_VOICE") && n >= 700) {
+#endif
+        if (g_yz_runtime_config.skip_voice && n >= 700) {
             static int once = 0;
             vm_write32(r31  + 0x298, 0xFFFFFFFFu);   /* innermost-frame predicate candidate */
             vm_write32(adxm + 0x298, 0xFFFFFFFFu);   /* ADXM handle predicate candidate */
@@ -1189,6 +1197,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
     }
 
+#if !defined(YZ_PERF_CLEAN)
     /* [t1-spin] (clean binary): t1 spins signaling cond-4 forever at the movie
      * gate. Log the caller (lr) + working regs to locate its loop + the object
      * it polls, so we can force it forward. YZ_T1SPIN to enable. */
@@ -1227,7 +1236,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * predicate stays 0 → t1 spins here forever. Experiment: force the candidate
      * readiness fields on this spin (after init settles) to see if t1 advances
      * past the voice gate and the NEXT wall surfaces. OFF by default. === */
-    if (getenv("YZ_SKIP_VOICE") && num == 108 && (uint32_t)ctx->gpr[3] == 4 &&
+    if (g_yz_runtime_config.skip_voice &&
+        num == 108 && (uint32_t)ctx->gpr[3] == 4 &&
         yz_thread_current_id() == 1) {
         static long sn = 0; long n = ++sn;
         const uint32_t adxm = 0x01613368u, blk = 0x01654294u;
@@ -1254,6 +1264,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * our default ENOSYS spams the log. Match the oracle: succeed silently. */
     if (num == 972) { ctx->gpr[3] = 0; return; }
 
+#if !defined(YZ_PERF_CLEAN)
     /* DIAG (flip-wait hunt): where does the render thread (t1) call usleep from?
      * lr = caller of the usleep loop = t1's actual spin. r4/r5 carry the address
      * it is polling. This pins t1's loop (the global indirect ring is not
@@ -1301,7 +1312,9 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             }
         }
     }
+#endif
 
+#if !defined(YZ_PERF_CLEAN)
     static unsigned char seen[1100];
     int first = (num < sizeof(seen)) && !seen[num];
     /* YZ_LV2_LOG (SPU-SPEED item 2): the spu_range/intr clauses below log
@@ -1323,7 +1336,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * thread). usleep-class excluded to avoid drowning the signal. */
     int intr = (yz_thread_current_id() == 7) && num != 141 && num != 145 &&
                num != 147 && num != 130;  /* drop sc130 receive spam */
-    uint64_t a3 = ctx->gpr[3], a4 = ctx->gpr[4], a5 = ctx->gpr[5], a6 = ctx->gpr[6];
+#endif
+    uint64_t a3 = ctx->gpr[3], a4 = ctx->gpr[4], a5 = ctx->gpr[5];
+#if !defined(YZ_PERF_CLEAN)
+    uint64_t a6 = ctx->gpr[6];
+#endif
 
     /* Record the in-flight syscall so a stall dump can name exactly what each
      * blocked thread is parked in (object-id args survive in the GPRs while the
@@ -1339,6 +1356,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     yz_gate_syscall_acquire();
     yz_wait_exit();
 
+#if !defined(YZ_PERF_CLEAN)
     if (first || (lv2_log_full && (spu_range || intr))) {
         seen[num] = 1;
         fprintf(stderr, "[LV2%s t%u] sc %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)"

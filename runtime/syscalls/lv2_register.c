@@ -522,7 +522,8 @@ static void* spu_exec_thread_proc(void* arg)
     /* s42 YZ_SPU_LOCKSTEP: register at thread entry, BEFORE any lifted SPU
      * code runs -- yz_lockstep_register blocks until this ctx actually holds
      * the run token. No-op when YZ_SPU_LOCKSTEP is unset. */
-    yz_lockstep_register(sctx);
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_register(sctx);
 
 #ifdef _WIN32
     /* pt35e: reserve stack so the unhandled-exception filter (yz_crash_handler) can
@@ -565,7 +566,8 @@ static void* spu_exec_thread_proc(void* arg)
      * really done running lifted SPU code (the context-replacement/restart
      * longjmp above re-enters at `restart_jb`, INSIDE the setjmp block, so it
      * never reaches here without a genuine halt/stop). No-op when unset. */
-    yz_lockstep_unregister(sctx);
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_unregister(sctx);
 
     fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X)\n",
             t->tid, sctx->status, sctx->pc, sctx->stop_code);

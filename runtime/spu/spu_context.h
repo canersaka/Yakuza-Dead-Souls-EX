@@ -18,6 +18,18 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>     /* FIX 2 (2026-07-17): channel/event cross-thread atomics */
+#include "ps3emu/yz_runtime_config.h"
+
+/*
+ * Profiling itself is observation-only and disappears from clean lanes.
+ * Do not redefine getenv here: this header also reaches behavior/repair
+ * controls, which must retain their startup-selected semantics.
+ */
+#if defined(YZ_PERF_CLEAN)
+#  define YZ_SPU_PROF_ACTIVE() 0
+#else
+#  define YZ_SPU_PROF_ACTIVE() (g_spu_prof_on)
+#endif
 
 #ifdef __cplusplus
 extern "C" {

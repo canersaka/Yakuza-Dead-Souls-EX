@@ -41,6 +41,13 @@
 #include "spu_dma.h"
 #include "spu_context.h"
 
+/*
+ * The standalone clean-lane harness links the SPU runtime without the Yakuza
+ * executable's startup module. All optional runtime repairs are deliberately
+ * off for this conformance test, matching an empty environment snapshot.
+ */
+const yz_runtime_config g_yz_runtime_config = {0};
+
 /* ---------------------------------------------------------------------------
  * Guest memory: reserve a full 4GB address space (like the real runtime's
  * vm_base -- yakuza/shims.cpp/main.cpp reserve+commit the same way) and commit

@@ -1,4 +1,5 @@
 #include "ppu_recomp.h"
+#include "ps3emu/yz_runtime_config.h"
 #include "rsx_live_draw.h"
 
 #include <atomic>
@@ -120,7 +121,7 @@ bool readable_cmt(const cmt_clip& clip)
 bool a010_camera_available(float timeline)
 {
     if (g_yz_a010_reference_camera_active != 0 ||
-        (std::getenv("YZ_A010_START_REFERENCE") &&
+        (g_yz_runtime_config.a010_start_reference &&
          timeline >= 612.0f && timeline < 613.0f))
         return true;
 
@@ -176,7 +177,7 @@ void apply_a010_cmt_camera(float timeline)
 {
     if (!std::getenv("YZ_A010_NATURAL_SYNC") &&
         (g_yz_a010_reference_camera_active != 0 ||
-        (std::getenv("YZ_A010_START_REFERENCE") &&
+        (g_yz_runtime_config.a010_start_reference &&
          timeline >= 612.0f && timeline < 613.0f))) {
         /*
          * This is the frame-612 matrix derived from the shipped
@@ -199,7 +200,7 @@ void apply_a010_cmt_camera(float timeline)
              0.0894553268f,  0.000524536289f,-0.995990697f, -11.6456016f,
         };
         const bool use_874 =
-            std::getenv("YZ_A010_REFERENCE_874") != nullptr;
+            g_yz_runtime_config.a010_reference_874 != 0;
         const float* reference_matrix =
             use_874 ? reference_matrix_874 : reference_matrix_612;
         for (unsigned i = 0; i < 16; i++)
@@ -484,7 +485,7 @@ void func_00C97CE0(ppu_context* ctx)
             rsx_live_draw_a010_world_ready()) {
             g_a010_clock.anchor = now;
             g_a010_clock.playback_frame =
-                std::getenv("YZ_A010_START_REFERENCE") ? 612.0f : 0.0f;
+                g_yz_runtime_config.a010_start_reference ? 612.0f : 0.0f;
             g_a010_clock.world_ready_seen = true;
             if (probe_enabled()) {
                 std::fprintf(stderr,
@@ -549,7 +550,7 @@ void func_00C97CE0(ppu_context* ctx)
             }
             if (g_a010_clock.world_ready_seen &&
                 a010_camera_available(corrected_value) &&
-                !std::getenv("YZ_A010_START_REFERENCE")) {
+                !g_yz_runtime_config.a010_start_reference) {
                 if (!g_a010_clock.animation_ready_seen) {
                     /*
                      * Bounded hidden warm-up: this is the minimum forward
