@@ -37,6 +37,12 @@ extern "C" {
 
 /* Scene marker owned by the Yakuza auth instrumentation. */
 extern volatile long g_yz_a010_root_active;
+struct spu_context;
+void yz_tagread_repair_fetch(
+    struct spu_context* ctx, uint32_t lsa,
+    unsigned long long ea, uint32_t size);
+void yz_tagread_repair_read(
+    struct spu_context* ctx, uint32_t lsa, uint32_t* value);
 void yz_a010_reltrace_gate(
     uint32_t spu_id, uint32_t code, uint32_t key,
     uint32_t witness, uint32_t descriptor,
@@ -203,7 +209,8 @@ typedef struct spu_context {
     /* Runtime LS bases for the five EBOOT-resident SPURS job binaries reached
      * on the path to gameplay. mfc_do_transfer records descriptor eaBinary
      * loads here; spu_indirect_branch uses the recorded residency to select
-     * images 14, 15, 17, 18, or 19. Zero means that binary is not resident. */
+     * images 14-15, 17-38 as applicable. Zero means that binary is not
+     * resident. */
     uint32_t job_bin_base[5];
 
     /*
@@ -367,6 +374,25 @@ typedef struct spu_context {
      * bits surviving fscrrd/fscrwr round trips. */
     SPU_ALIGN16 u128 fpscr;
 
+#if defined(YZ_PERF_PROFILE)
+    /*
+     * Aggregate-only profile lane counters. Each context is driven by one SPU
+     * host thread, so its hot-path increments require no atomics. The exit dump
+     * may observe a counter between increments, which is acceptable for a
+     * terminal diagnostic snapshot and avoids perturbing the benchmark.
+     */
+    volatile uint64_t perf_hops[32];
+    volatile uint64_t perf_dma_get[32];
+    volatile uint64_t perf_dma_put[32];
+    volatile uint64_t perf_dma_atomic[32];
+    volatile uint64_t perf_ch_read[32];
+    volatile uint64_t perf_ch_write[32];
+    volatile uint64_t perf_ch_count[32];
+    volatile uint64_t perf_wait_count[32];
+    volatile uint64_t perf_wait_qpc[32];
+    volatile uint64_t perf_reservation_invalidations;
+#endif
+
 } spu_context;
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
@@ -452,6 +478,10 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
                     ((uint32_t)p[i*4 + 2] <<  8) |
                     (uint32_t)p[i*4 + 3];
     }
+    yz_tagread_repair_read((spu_context*)ctx, lsa, v._u32);
+#if defined(YZ_PERF_CLEAN)
+    return v;
+#else
     /* s38 arm-gate witness read-watch (env YZ_ARMGATE). The gs_task release state
      * machine apply_entry (LS 0xB088) emits a stopper release (0xB170->0x5EB8->0x5F00)
      * for a CODE==0 descriptor ONLY if LS[0xBD70]==key(r11) at the gate 0xB0C4/0xB0CC
@@ -478,6 +508,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
               fflush(stderr);
           }
       } }
+#if !defined(YZ_PERF_CLEAN)
     /* s49 MASK-SEAL read leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_read):
      * the gs_task pending-DMA-tag mask gate. pc 0x624C is the `lqd $r2,0xB0($r3)`
      * immediately before the `biz $r2,$r0` early return at 0x6254, so this fires
@@ -567,6 +598,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
             ctx->gpr[11]._u32[0], v._u32[0], desc,
             d0, d1, d2, d3);
     }
+#endif
     /*
      * Focused a010 post-dispatch witness.  A type-0x0E environment record is
      * rewritten to the internal 0xBA68 layout before being queued.  Catch its
@@ -584,12 +616,14 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
               uint32_t, uint32_t);
           yz_a010_stage_ba68((spu_context*)ctx, "READ", lsa, v._u32, 0u, 0u);
       } }
+#endif
     return v;
 }
 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+#if !defined(YZ_PERF_CLEAN)
     /*
      * Write leg of the focused a010 0xBA68 witness.  At handler pc 0x4B70
      * word 0 first becomes 0xBA68; the later 0x4B84 write fills word 2 with
@@ -853,6 +887,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
               fflush(stderr);
           }
       } }
+#if !defined(YZ_PERF_CLEAN)
     /* s48 LS-CODE-WATCH store leg (env YZ_LS_CODE_WATCH, spu_channels.c
      * yz_lscw_check): the self-modifying-code tripwire -- flags lifted stores
      * that CHANGE bytes inside the resident image's registry-derived text
@@ -873,15 +908,19 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
           }
           yz_lscw_check(ctx, lsa, 16, nb, 0, "st");
       } }
+#endif
     /* s49 MASK-SEAL write leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_write):
      * records the last writer pc/value of every gs_task *(OBJ+0xB0) quad (the
      * lane-8 word is the pending-DMA-tag mask). Must run BEFORE the store so the
      * old mask is still readable for the old->new report. */
+#if !defined(YZ_PERF_CLEAN)
     { extern volatile int g_yz_ms_on;
       extern int yz_mask_seal_arm(void);
       extern void yz_ms_write(spu_context*, uint32_t, const uint32_t*);
       int msw = g_yz_ms_on; if (msw < 0) msw = yz_mask_seal_arm();
       if (msw) yz_ms_write(ctx, lsa, val._u32); }
+#endif
+#endif
     uint8_t* p = &ctx->ls[lsa];
     for (int i = 0; i < 4; i++) {
         uint32_t w = val._u32[i];
@@ -890,6 +929,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+#if !defined(YZ_PERF_CLEAN)
     /* DIAG (YZ_SPU_PROF): watch ActivateWorkload's write to the kernel-context
      * wklRunnable1 field (LS 0x1EC, word2 of the 0x1E0 quadword). Logs when the
      * rebuilt runnable mask is nonzero -- proves whether the rebuild produced
@@ -898,7 +938,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     /* DIAG: ActivateWorkload's wklStatus1 writeback (LS 0x2D90) is rare and
      * unique to ActivateWorkload. Dump the wklState1 line (0x2D80) it sees and
      * the status it computes, to tell whether it saw RUNNABLE(2) and rebuilt. */
-    if (g_spu_prof_on && lsa == 0x2D90u) {
+    if (YZ_SPU_PROF_ACTIVE() && lsa == 0x2D90u) {
         extern unsigned long g_spu_wrun_log;
         if (g_spu_wrun_log < 40) {
             g_spu_wrun_log++;
@@ -911,6 +951,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
             fflush(stderr);
         }
     }
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -1025,7 +1066,8 @@ void spu_prof_hop(void* fn);
 /* Default-boot SPU taskset task launcher (spu_channels.c). On the non-prof path
  * it intercepts the policy's StartTask hop so cri_audio/gs_task launch without
  * YZ_SPU_PROF. Cheap: early-out unless the SPU's active image is the policy (2). */
-void spu_task_launch_check(spu_context* ctx, void* fn);
+void spu_task_launch_check(spu_context* ctx, uint32_t pc);
+void spu_task_launch_behavior_check(spu_context* ctx, uint32_t pc);
 /* Stop the SPU (spu_channels.c): sets ctx->status and longjmps to the host
  * thread driver's setjmp target, fully unwinding the lifted call stack. Used by
  * the lifter for self-loop traps (`br .`/`brsl .`), which hang the SPU forever
@@ -1053,6 +1095,32 @@ void spu_ch_wake(spu_context* ctx);
  * dispatch time from ctx->module_img_a00. Kill-switch: YZ_NO_IMGSTACK. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 
+#if defined(YZ_PERF_PROFILE)
+#  define YZ_PERF_NOTE_HOP(ctx) do {                            \
+        const int _pi = (ctx)->image_id;                        \
+        if ((unsigned)_pi < 32u) (ctx)->perf_hops[_pi]++;       \
+    } while (0)
+#else
+#  define YZ_PERF_NOTE_HOP(ctx) ((void)0)
+#endif
+
+#if defined(YZ_PERF_CLEAN)
+#define SPU_DRAIN(ctx) do {                                   \
+        while (g_spu_trampoline_fn) {                          \
+            void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
+            g_spu_trampoline_fn = 0;                           \
+            /* Aggregate only: no target lookup and no timestamp per hop. */ \
+            /* The profile definition disappears entirely in the fast lane. */ \
+            YZ_PERF_NOTE_HOP(ctx);                              \
+            if (g_yz_runtime_config.spu_lockstep)                \
+                yz_lockstep_tick(ctx);                           \
+            spu_task_launch_behavior_check((ctx), (ctx)->pc);   \
+            if (g_yz_runtime_config.sentinel_guard &&            \
+                yz_sguard_check((ctx), (void*)_tf)) continue;    \
+            _tf(ctx);                                          \
+        }                                                     \
+    } while (0)
+#else
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
@@ -1068,7 +1136,7 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img);
              * spu_indirect_branch -- see spu_lockstep.h. No-op when unset. */ \
             yz_lockstep_tick(ctx);                                          \
             if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
-            else spu_task_launch_check((ctx), (void*)_tf);     \
+            else spu_task_launch_check((ctx), (ctx)->pc);      \
             /* s47 SENTINEL-GUARD drain leg (direct tail-chains never reach   \
              * spu_indirect_branch): on defer the helper set pc+trampoline    \
              * per SPU_RET semantics -- re-loop (dispatches the return, or    \
@@ -1077,6 +1145,7 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img);
             _tf(ctx);                                          \
         }                                                     \
     } while (0)
+#endif
 
 /* Depth-aware SPU link return (`bi $r0` / conditional `biz $r0` family).
  * $r0 is the ABI link register; the lifter models a matched brsl/bisl call as

@@ -52,7 +52,10 @@ extern volatile long g_yz_a010_spu_vp;
 extern volatile long g_yz_a010_spu_const;
 extern volatile long g_yz_a010_spu_unparsed;
 extern volatile long g_yz_a010_spucmd_headers;
+extern volatile long g_yz_ucmd_handler_arg;
+extern volatile long g_yz_ucmd_handler_completed;
 extern int g_yz_a010_ppucmd;
+void yz_ucmd_wait_for_handler_completion(void);
 void yz_a010_record_output_put(spu_context* ctx, uint32_t producer_pc,
                                uint32_t ea, const uint8_t* payload,
                                uint32_t size);
@@ -348,6 +351,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* Mask LSA to local store range */
     lsa &= SPU_LS_MASK;
 
+#if !defined(YZ_PERF_CLEAN)
     /*
      * SPU half of YZ_STAGE_TRANSFORM_TRACE.  This exact range check complements
      * the PPU vm_write observer, so a worker DMA can be identified without a
@@ -839,6 +843,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
     }
 
+#endif
     /* An MFC transfer may not cross the 256 KiB local-store boundary.  Masking
      * the start address alone is insufficient: a large transfer near the end
      * of LS would otherwise overwrite the spu_context fields that immediately
@@ -934,6 +939,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 #ifdef _WIN32
     __try {
 #endif
+#if !defined(YZ_PERF_CLEAN)
         /*
          * The broken orphanage draw uploads a skin palette whose c113.w is
          * the engine's 10000-unit offscreen sentinel (0x461C3FFE/FFF).
@@ -1031,7 +1037,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+#endif
         if (mfc_is_get(cmd)) {
+#if !defined(YZ_PERF_CLEAN)
             /* a010 Job A source witness.  The resident image is loaded from
              * [0x0125C500,0x0125DA40); its descriptor and sentinel occupy the
              * last 0x20 bytes.  Check the main-memory bytes immediately before
@@ -1081,6 +1089,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     }
                 }
             }
+#if !defined(YZ_PERF_CLEAN)
             /* s48 LS-CODE-WATCH DMA leg (env YZ_LS_CODE_WATCH, spu_channels.c
              * yz_lscw_check): pre-copy so current LS bytes are still comparable
              * against the incoming ea bytes; inside the __try (ea may point at
@@ -1096,8 +1105,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
               if (lcw) yz_lscw_check(spu, lsa, size, ea_ptr,
                                      (unsigned long long)ea, "dma-get"); }
+#endif
+#endif
             /* GET: main memory -> local store */
             memcpy(ls_ptr, ea_ptr, size);
+            yz_tagread_repair_fetch(
+                spu, lsa, (unsigned long long)ea, size);
+#if !defined(YZ_PERF_CLEAN)
             /* s49 TAG-READ fetch map (env YZ_TAGREAD, spu_channels.c yz_tr_fetch):
              * record LS-line -> arena-EA-line so the tag-read leg can name the
              * journal line EA it is reading instead of inferring it. */
@@ -1111,6 +1125,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   stage_map = getenv("YZ_A010_STAGE_KIND1") ? 1 : 0;
               if (trf || (stage_map && g_yz_a010_stage_generation != 0))
                   yz_tr_fetch(spu, lsa, (unsigned long long)ea, size); }
+#endif
+#if !defined(YZ_PERF_CLEAN)
             /* s38 arm-gate witness DMA-watch (env YZ_ARMGATE): a GET landing on LS
              * 0xBD70 would be the (non-store) writer of the apply_entry arm-gate witness.
              * Complements the spu_ls_write128 store-watch -- if BOTH stay silent the
@@ -1214,35 +1230,56 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * EA armed at +4, value word still 0 → publishes 0/nothing → the
              * exact-equality acquire wedges the boot at a varying round).
              * Absorb the race where real hardware does — in the transfer
-             * latency: when a wid4 record fetch shows the half-staged
-             * signature, re-copy briefly until the value lands (bounded; the
-             * measured gap is <2 vblank ticks). Timeout ⇒ keep the fetched
-             * bytes (current behavior). Kill-switch YZ_NO_RECWAIT. */
+             * latency: order every wid4 work-record fetch after the callback
+             * finishes staging, then re-copy. This covers both zero and stale
+             * nonzero payloads without a timing loop. Kill-switch
+             * YZ_NO_RECWAIT. */
+#endif
             if (spu->image_id == 4 && size == 0x40u && cmd != MFC_GETLLAR_CMD) {
                 uint32_t rea = (uint32_t)ea;
                 if (rea >= 0x42452880u && rea < 0x424529E0u) {
-                    static int nrw = -1;
-                    if (nrw < 0) { nrw = getenv("YZ_NO_RECWAIT") ? 1 : 0;
-                        if (!nrw) { fprintf(stderr, "[recwait] ARMED: half-staged record absorber live\n"); fflush(stderr); } }
+                    const int nrw = g_yz_runtime_config.no_recwait;
+#if !defined(YZ_PERF_CLEAN)
+                    { static int announced = 0;
+                      if (!announced && !nrw) { announced = 1;
+                          fprintf(stderr, "[recwait] ARMED: half-staged record absorber live\n");
+                          fflush(stderr); } }
+#endif
                     if (!nrw) {
-                        uint32_t w0, w1;
-                        memcpy(&w0, ls_ptr, 4); memcpy(&w1, ls_ptr + 4, 4);
-                        if (w0 == 0 && w1 != 0) {          /* guard armed, value empty */
-                            volatile const uint32_t* vw = (volatile const uint32_t*)ea_ptr;
-                            for (long spin = 0; spin < 4000000 && *vw == 0; spin++)
-                                ;                            /* bounded ~ms-scale spin */
-                            memcpy(ls_ptr, ea_ptr, size);    /* re-copy the settled record */
+                        /*
+                         * The GCM callback raises the SPU signal before
+                         * publishing this record.  Order every wid4 record
+                         * fetch after callback completion, then re-copy.
+                         * Looking only for value==0 missed the stale-nonzero
+                         * form where round N-1 remains while N is staged.
+                         */
+#if !defined(YZ_PERF_CLEAN)
+                        uint32_t before_value;
+                        memcpy(&before_value, ls_ptr, sizeof(before_value));
+#endif
+#ifdef _WIN32
+                        yz_ucmd_wait_for_handler_completion();
+#endif
+                        memcpy(ls_ptr, ea_ptr, size);
+#if !defined(YZ_PERF_CLEAN)
+                        uint32_t after_value;
+                        memcpy(&after_value, ls_ptr, sizeof(after_value));
+                        if (before_value != after_value) {
                             static unsigned long rwn = 0; rwn++;
                             if (rwn <= 20 || (rwn & 0xFFu) == 0) {
-                                fprintf(stderr, "[recwait] n=%lu spu=%X ea=0x%08X settled val(be)=%02X%02X%02X%02X\n",
+                                fprintf(stderr,
+                                        "[recwait] n=%lu spu=%X ea=0x%08X "
+                                        "stale=%08X settled=%08X\n",
                                         rwn, spu->spu_id, rea,
-                                        ls_ptr[0], ls_ptr[1], ls_ptr[2], ls_ptr[3]);
+                                        before_value, after_value);
                                 fflush(stderr);
                             }
                         }
+#endif
                     }
                 }
             }
+#if !defined(YZ_PERF_CLEAN)
             /* DIAG (env YZ_JOBDESC, 2026-07-08, capped): payload dump of every
              * GET from the CRI jobchain object area (0x4019xxxx) — the jobchain
              * header/commands/JOB DESCRIPTORS the module stages before calling
@@ -1277,6 +1314,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       fprintf(stderr, "%s\n", jb); fflush(stderr);
                   }
               } }
+#endif
             /* SPURS workload dispatch: the kernel DMAs the selected workload's code
              * to LS 0xA00, then branches there. The system service and the taskset
              * POLICY module both live at LS 0xA00, so pick which lifted image
@@ -1319,7 +1357,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                      * image switch so we can tell if the SELECT actually DISPATCHES the
                      * taskset policy (image 2) -- without YZ_SPU_PROF's gs_task band-aid. */
                     static int imglog = -1; if (imglog < 0) imglog = getenv("YZ_IMGLOG") ? 1 : 0;
-                    if (g_spu_prof_on || imglog)
+                    if (YZ_SPU_PROF_ACTIVE() || imglog)
                         fprintf(stderr, "[spu-img] spu=%X LS0xA00 <- ea=0x%08X size=0x%X => image %d (%s)\n",
                                 spu->spu_id, (uint32_t)ea, size, img, img==2?"POLICY":"SERVICE");
                     spu->image_id = img;
@@ -1359,9 +1397,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
         } else if (mfc_is_put(cmd)) {
             /* PUT: local store -> main memory */
+#if !defined(YZ_PERF_CLEAN)
             yz_a010_record_output_put(spu, spu->pc & SPU_LS_MASK,
                                       (uint32_t)(ea & ~0x80000000ull),
                                       ls_ptr, size);
+#endif
+#if !defined(YZ_PERF_CLEAN)
             /* First-writer witness for Job A's main-memory descriptor tail.
              * This runs before the PUT while both the old destination bytes
              * and the incoming LS bytes are available. */
@@ -1431,6 +1472,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   static int n = 0; if (n < 60) { n++;
                     fprintf(stderr, "[put-wild] spu=%X pc=0x%05X PUT ea=0x%08X size=0x%X lsa=0x%05X (policy -> GAME region)\n",
                             spu->spu_id, spu->pc & SPU_LS_MASK, (uint32_t)ea, size, lsa); fflush(stderr); } } }
+#endif
             /* s25 (atomics-conformance harness, CONFIRMED-BUG invariant 2,
              * scratch/s25_atomics_conformance.md): this payload copy ran
              * UNLOCKED while GETLLAR snapshots the same line under the
@@ -1490,10 +1532,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * real PUT has completed.  It is a no-op unless
              * YZ_A010_RELEASE_TRACE is enabled.
              */
+#if !defined(YZ_PERF_CLEAN)
             yz_a010_reltrace_spu_commit(
                 spu->spu_id, (uint32_t)spu->image_id,
                 spu->pc & SPU_LS_MASK,
                 (uint32_t)(ea & ~0x80000000ull), ls_ptr, size);
+#endif
+#if !defined(YZ_PERF_CLEAN)
             /* The a010-specific 0x01252680 job was previously executed as
              * Job A.  Count its actual publications independently of the
              * broad producer census, whose bounded log is normally exhausted
@@ -1725,6 +1770,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     }
                 }
             }
+#endif
             /* s26 ~04:30 (ride17/25 lost-publish hunt): VERIFY-AFTER-WRITE for
              * any PUT covering the decode label 0x10200FE0 — ride17 PROVED an
              * issued publish ([fe0] val=8) that never became visible (5.2M
@@ -1922,12 +1968,29 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    extern unsigned long g_spu_getllar_n;
+    extern uint32_t g_spu_getllar_ea;
     uint32_t lsa  = spu->mfc_lsa;
     uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int tagged = mfc_uses_tag(cmd);
     int rc = 0;
+
+#if defined(YZ_PERF_PROFILE)
+    {
+        const int image = spu->image_id;
+        if ((unsigned)image < 32u) {
+            if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+                cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)
+                spu->perf_dma_atomic[image]++;
+            else if (mfc_is_get(cmd))
+                spu->perf_dma_get[image]++;
+            else if (mfc_is_put(cmd))
+                spu->perf_dma_put[image]++;
+        }
+    }
+#endif
 
     if (tagged && !mfc->draining_deferred && mfc_tag_accept(mfc, tag) != 0)
         return -1;
@@ -1952,6 +2015,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
+#if !defined(YZ_PERF_CLEAN)
     /* s44: durable consumer-identity publish (replaces the gs_task.c 0x6380
      * hand-edit the s43 relift wiped -- generated-file edits die on relift).
      * The journal consumer = the image-0 (gs_task) context GETting from the
@@ -1989,7 +2053,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             fflush(stderr);
         }
     }
+#endif
 
+#if !defined(YZ_PERF_CLEAN)
     /* DIAG (YZ_SPU_PROF): gs_task LAUNCH DMAs. The taskset policy, once it
      * selects a task, DMAs the task_info (to LS 0x2780), then spursTasksetLoadElf
      * DMAs the task ELF header + segments (GET from the gs_task ELF EA ~0x0127xxxx
@@ -2672,7 +2738,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               }
           }
       } }
-    if (g_spu_prof_on && cmd == MFC_GET_CMD          /* regular GET only (NOT GETLLAR 0xD0) */
+    if (YZ_SPU_PROF_ACTIVE() && cmd == MFC_GET_CMD          /* regular GET only (NOT GETLLAR 0xD0) */
             && ((((lsa & SPU_LS_MASK) >= 0x2780u) && ((lsa & SPU_LS_MASK) < 0xC000u))
                 || ((uint32_t)ea >= 0x01200000u && (uint32_t)ea < 0x01300000u))) {
         /* Arm the dispatch-tail hop trace (spu_channels.c spu_prof_hop) on the
@@ -2687,11 +2753,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             fflush(stderr);
         }
     }
+#endif
 
     /* Lock-line atomics: a 128-byte line, EA implicitly 128-aligned, the
      * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+        int post_unlock_idle_level = -1;
         /* Sony's SPURS kernel/system-service tags lock-line atomic EAs with
          * bit 31 (a memory coherency/cache attribute the Cell MFC strips when
          * resolving the real address). The SPURS management area lives at the
@@ -2707,6 +2775,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * Print the issuer's identity BEFORE the fault so the crash names its
          * own root (who computed a zero EA), then proceed -- the fault itself
          * stays visible; don't mask the symptom. */
+#if !defined(YZ_PERF_CLEAN)
         if ((uint32_t)(ea & ~127ull) < 0x10000u) {
             static int nn = 0;
             if (nn < 8) { nn++;
@@ -2745,6 +2814,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 fflush(stderr);
             }
         }
+#endif
         /* ---- s31 §13 GUARD (ledger #74; scratch/s31_t1_crash.md): COMPLETE the
          * null-page atomic instead of letting the unguarded 128-byte copies AV
          * the whole process. The 2026-07-03 diag above chose "print then
@@ -2765,8 +2835,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * tracked bug, ledger #74). Kill-switch: YZ_NO_DMAGUARD=1 restores the
          * fatal proceed. */
         if ((uint32_t)(ea & ~127ull) < 0x10000u) {
-            static int ng = -1;
-            if (ng < 0) ng = getenv("YZ_NO_DMAGUARD") ? 1 : 0;
+            const int ng = g_yz_runtime_config.no_dmaguard;
             if (!ng) {
                 /* s46 REVISION (scratch/s46_1c0_writers.py + the s46 section of
                  * scratch/s44_selfdiff_verdict.md): the conservative
@@ -2785,10 +2854,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                  * restores the old always-fail completion; YZ_NO_DMAGUARD=1
                  * still restores the fatal proceed. */
                 static uint8_t s_lowmem[0x10000];
-                static int npf = -1;
-                if (npf < 0) npf = getenv("YZ_NULLPAGE_FAIL") ? 1 : 0;
+                const int npf = g_yz_runtime_config.nullpage_fail;
                 { uint32_t loff = (uint32_t)ea & 0xFFFFu & ~127u;
                   uint8_t* lls = &spu->ls[lsa & SPU_LS_MASK & ~127u];
+#if !defined(YZ_PERF_CLEAN)
                   static unsigned long gn = 0; gn++;
                   if (gn <= 16 || (gn & 63u) == 0) {
                       fprintf(stderr, "[dma-guard] n=%lu spu=%X img=%d pc=0x%05X cmd=0x%02X "
@@ -2799,6 +2868,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                                   : "completed vs low-mem backing (CAS terminates)");
                       fflush(stderr);
                   }
+#endif
                   if (cmd == MFC_GETLLAR_CMD) {
                       if (npf) {
                           memset(lls, 0, 128);
@@ -2828,6 +2898,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 return 0;
             }
         }
+#if !defined(YZ_PERF_CLEAN)
         /* jobchain header-CAS watch (2026-07-03 s7, parked-SYNC frontier;
          * YZ_OVL, REMOVE with the frontier): every PUTLLC commit on the
          * CellSpursJobChain line 0x4019C880 -- pc + the +0x20..0x2F bytes
@@ -2855,6 +2926,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   }
               }
           } }
+#endif
         uint8_t* line = vm_base + ((uint32_t)ea & ~127u);
         uint8_t* ls_ptr = &spu->ls[lsa & SPU_LS_MASK & ~127u];
         /* s21 SPEED (workpackage item 3; profiled 2026-07-09: five SPURS kernels
@@ -2872,8 +2944,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * resv_active read here still fails the generation check. Kill-switch
          * YZ_NO_LLFAST restores the locked path for A/B. */
         if (cmd == MFC_GETLLAR_CMD) {
-            static int llfast = -1;
-            if (llfast < 0) llfast = getenv("YZ_NO_LLFAST") ? 0 : 1;
+            const int llfast = !g_yz_runtime_config.no_llfast;
             uint64_t le = ea & ~127ull;
             extern uint32_t spu_coh_gen(uint32_t);
             /* WHITELIST (s21 boot-14 regression): host-side bulk writers (HLE
@@ -2888,6 +2959,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * reservation). */
             if (llfast && le == 0x40197C80ull && mfc->resv_active && mfc->resv_ea == le
                 && spu_coh_gen((uint32_t)le) == mfc->resv_gen) {
+#if !defined(YZ_PERF_CLEAN)
                 extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
                 g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
                 /* s48 LS-CODE-WATCH (fast cached GETLLAR leg): a lock line
@@ -2899,6 +2971,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
                   if (lcw) yz_lscw_check(spu, (uint32_t)(ls_ptr - spu->ls), 128,
                                          mfc->resv_data, (unsigned long long)le, "getllar"); }
+#endif
                 memcpy(ls_ptr, mfc->resv_data, 128);
                 mfc->resv_poll_n++;
                 /* s42 YZ_SPU_LOCKSTEP (★REVIEW D/E): the fast cached GETLLAR leg is
@@ -2906,13 +2979,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                  * s21 profile above) -- tick BEFORE the idle-yield backoff below, so a
                  * quantum-expiry token pass never races a Sleep that would hold the
                  * token through it. No-op when YZ_SPU_LOCKSTEP is unset. */
-                yz_lockstep_tick(spu);
-                { static int nb = -1;
-                  if (nb < 0) nb = getenv("YZ_NO_SPUBACKOFF") ? 1 : 0;
+                if (g_yz_runtime_config.spu_lockstep)
+                    yz_lockstep_tick(spu);
+                {
+                  const int nb = g_yz_runtime_config.no_spubackoff;
                   if (!nb && mfc->resv_poll_n > 16)
                       spu_idle_yield(mfc->resv_poll_n > (1u << 20) ? 2
                                    : mfc->resv_poll_n > 256       ? 1 : 0); }
-                { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
+                {
+                  const int lw = !g_yz_runtime_config.no_lrwake;
                   if (lw && (uint32_t)le == 0x40197C80u
                       && (mfc->resv_data[0x70] | mfc->resv_data[0x71])) {
                       /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
@@ -2933,16 +3008,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * watchdog / zero ch-block). The fast cached leg above already ticks
          * outside the lock. Guarded on GETLLAR so only that command ticks here,
          * preserving the prior in-switch semantics. No-op when unset. */
-        if (cmd == MFC_GETLLAR_CMD) yz_lockstep_tick(spu);
+        if (cmd == MFC_GETLLAR_CMD &&
+            g_yz_runtime_config.spu_lockstep)
+            yz_lockstep_tick(spu);
         spu_lockline_lock();
         switch (cmd) {
         case MFC_GETLLAR_CMD: {
-            extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
             extern void spu_coh_reserve(uint32_t);   /* mark this line for PPU-write coherence */
+#if !defined(YZ_PERF_CLEAN)
+            extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
             g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)(ea & ~127ull);
             { extern void spu_llar_note(uint32_t); extern int g_spu_prof_on;
-              if (g_spu_prof_on) spu_llar_note((uint32_t)(ea & ~127ull)); }
+              if (YZ_SPU_PROF_ACTIVE()) spu_llar_note((uint32_t)(ea & ~127ull)); }
+#endif
             spu_coh_reserve((uint32_t)(ea & ~127ull));
+#if !defined(YZ_PERF_CLEAN)
             /* s48 LS-CODE-WATCH (locked GETLLAR leg): companion of the fast
              * cached leg's check above. */
             { extern volatile int g_yz_lscw_on;
@@ -2953,7 +3033,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               if (lcw) yz_lscw_check(spu, (uint32_t)(ls_ptr - spu->ls), 128,
                                      (const uint8_t*)line, (unsigned long long)(ea & ~127ull),
                                      "getllar"); }
+#endif
             memcpy(ls_ptr, line, 128);
+            yz_tagread_repair_fetch(
+                spu, (uint32_t)(ls_ptr - spu->ls),
+                (unsigned long long)(ea & ~127ull), 128u);
+#if !defined(YZ_PERF_CLEAN)
             /* s49 TAG-READ fetch map (GETLLAR leg -- the consumer's journal
              * window arrives here, pc 0x638C). Same helper as the plain-GET leg. */
             { extern volatile int g_yz_tr_on;
@@ -2967,6 +3052,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               if (trf || (stage_map && g_yz_a010_stage_generation != 0))
                   yz_tr_fetch(spu, (uint32_t)(ls_ptr - spu->ls),
                               (unsigned long long)(ea & ~127ull), 128u); }
+#endif
             /* s45 RESUME-HOLD v3 consumption (DIAGNOSTIC LEVER, default OFF --
              * s46 verdict: the switch-replay theory refuted, terminal park
              * unchanged ON vs OFF; see yz_resume_hold_arm's comment in
@@ -3023,6 +3109,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       }
                   }
               } }
+#if !defined(YZ_PERF_CLEAN)
             /* THROWAWAY DIAG (env YZ_SIGCNT): NON-SAMPLED count of GETLLARs whose
              * snapshot of the SPURS mgmt line (0x40197C80) has ANY wklSignal1 bit set
              * (signal half @ +0x70..71). Decisive bisection: if this stays 0 the whole
@@ -3058,15 +3145,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                               "pend=%08X enb=%08X sig=%08X wait=%08X\n",
                               spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
                               w[0], w[1], w[2], w[3], w[4], w[5]);
-                      fflush(stderr); } } }
+                       fflush(stderr); } } }
+#endif
             /* CONFIRMATION EXPERIMENT (env YZ_FRC): force wklReadyCount1[2]=1 (the
              * gs_task taskset, wid=2) in the SPURS mgmt line so the kernel select's
              * `readyCount > contention` gate passes. Proves whether readyCount is
              * the sole remaining block to dispatching wid=2 -> the taskset policy
              * module -> gs_task. Patches the source line too so it persists across
              * the kernel's PUTLLC. */
-            { static int frc = -1; if (frc < 0) frc = getenv("YZ_FRC") ? 1 : 0;
-              if (frc && (ea & ~127ull) == 0x40197C80ull) { line[0x02] = 1; ls_ptr[0x02] = 1; } }
+            { if (g_yz_runtime_config.frc &&
+                  (ea & ~127ull) == 0x40197C80ull) {
+                  line[0x02] = 1; ls_ptr[0x02] = 1;
+              } }
             /* pt35 CONFIRMATION (env YZ_FRC3): bootstrap the cri_audio codec
              * workload (wid 3) by clearing its wklCurrentContention[3] (+0x23) and
              * pendingContention (+0x33) and asserting readyCount[3] (+0x03) DIRECTLY
@@ -3076,8 +3166,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * the vblank force) should let the kernel select wid3 -> policy dispatch
              * -> StartTask(codec) -> spu_task_launch runs cri_audio. Proves the
              * contention bootstrap is the gate. */
-            { static int frc3 = -1; if (frc3 < 0) frc3 = getenv("YZ_FRC3") ? 1 : 0;
-              if (frc3 && (ea & ~127ull) == 0x40197C80ull) {
+            { if (g_yz_runtime_config.frc3 &&
+                  (ea & ~127ull) == 0x40197C80ull) {
                   line[0x23] = 0; ls_ptr[0x23] = 0;   /* wklCurrentContention[3] = 0 */
                   line[0x33] = 0; ls_ptr[0x33] = 0;   /* wklPendingContention[3] = 0 */
                   line[0x03] = 1; ls_ptr[0x03] = 1;   /* wklReadyCount1[3]        = 1 */
@@ -3101,28 +3191,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * supplied). Report MEASURED effect; if wid0 forcing doesn't move t1,
              * retest with YZ_FORCE_WID1 (below) instead -- whichever produces the
              * heartbeat is the confirmed producer. */
-            { static int fw0 = -1; if (fw0 < 0) fw0 = getenv("YZ_FORCE_WID0") ? 1 : 0;
-              if (fw0 && (ea & ~127ull) == 0x40197C80ull) {
+            { if (g_yz_runtime_config.force_wid0 &&
+                  (ea & ~127ull) == 0x40197C80ull) {
                   line[0x00] = 1; ls_ptr[0x00] = 1;         /* wklReadyCount1[0] = 1 */
                   line[0x70] |= 0x80; ls_ptr[0x70] |= 0x80; /* wklSignal1 bit0 (0x8000) */
-                  extern int g_spu_prof_on;
-                  if (g_spu_prof_on || getenv("YZ_WID01")) {
-                      static int n = 0; if (n < 8) { n++;
-                          fprintf(stderr, "[force-wid0] forced rc0=1 sig0 @mgmt 0x40197C80\n");
-                          fflush(stderr); } }
+                  static int n = 0; if (n < 8) { n++;
+                      fprintf(stderr, "[force-wid0] forced rc0=1 sig0 @mgmt 0x40197C80\n");
+                      fflush(stderr); }
               } }
             /* Same mechanism, wid1 (the pxd jobchain taskset, main.cpp:86) --
              * fallback probe if YZ_FORCE_WID0 does not produce the port-17
              * heartbeat. wklReadyCount1[1]=line[0x01], wklSignal1 bit1=0x4000. */
-            { static int fw1 = -1; if (fw1 < 0) fw1 = getenv("YZ_FORCE_WID1") ? 1 : 0;
-              if (fw1 && (ea & ~127ull) == 0x40197C80ull) {
+            { if (g_yz_runtime_config.force_wid1 &&
+                  (ea & ~127ull) == 0x40197C80ull) {
                   line[0x01] = 1; ls_ptr[0x01] = 1;         /* wklReadyCount1[1] = 1 */
                   line[0x70] |= 0x40; ls_ptr[0x70] |= 0x40; /* wklSignal1 bit1 (0x4000) */
-                  extern int g_spu_prof_on;
-                  if (g_spu_prof_on || getenv("YZ_WID01")) {
-                      static int n = 0; if (n < 8) { n++;
-                          fprintf(stderr, "[force-wid1] forced rc1=1 sig1 @mgmt 0x40197C80\n");
-                          fflush(stderr); } }
+                  static int n = 0; if (n < 8) { n++;
+                      fprintf(stderr, "[force-wid1] forced rc1=1 sig1 @mgmt 0x40197C80\n");
+                      fflush(stderr); }
               } }
             /* BOOTSTRAP (env YZ_CLEARRUN): gs_task (task 0) is stuck `running`
              * (taskset running@0x00 bit 0x80) but never launched, so SELECT_TASK
@@ -3132,12 +3218,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * kernel resume above completes the poll) -> bi savedContextLr=0x3050
              * launches gs_task. Decisive test of the task-level bootstrap. */
             { extern uint32_t g_yz_taskset_ea;
-              static int cr = -1; if (cr < 0) cr = getenv("YZ_CLEARRUN") ? 1 : 0;
-              if (cr && g_yz_taskset_ea && (uint32_t)(ea & ~127ull) == g_yz_taskset_ea
+              if (g_yz_runtime_config.clearrun &&
+                  g_yz_taskset_ea &&
+                  (uint32_t)(ea & ~127ull) == g_yz_taskset_ea
                   && (line[0x00] & 0x80u)) {
                   line[0x00] &= ~0x80u; ls_ptr[0x00] &= ~0x80u;   /* clear running task 0 */
                   extern int g_spu_prof_on;
-                  if (g_spu_prof_on) { static int n=0; if (n<8){n++;
+                  if (YZ_SPU_PROF_ACTIVE()) { static int n=0; if (n<8){n++;
                       fprintf(stderr, "[yz-clearrun] cleared gs_task running bit @taskset 0x%08X -> selectable\n", g_yz_taskset_ea);
                       fflush(stderr);} }
               } }
@@ -3149,8 +3236,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * re-selects it -> StartTask(0x012B4980) -> spu_task_launch runs cri_audio.
              * Env YZ_CLEARRUN3 (separate so the codec can be tested alone). */
             { extern uint32_t g_yz_codec_taskset;
-              static int cr3 = -1; if (cr3 < 0) cr3 = getenv("YZ_CLEARRUN3") ? 1 : 0;
-              if (cr3 && g_yz_codec_taskset && (uint32_t)(ea & ~127ull) == g_yz_codec_taskset
+              if (g_yz_runtime_config.clearrun3 &&
+                  g_yz_codec_taskset &&
+                  (uint32_t)(ea & ~127ull) == g_yz_codec_taskset
                   && (line[0x00] & 0x80u)) {
                   line[0x00] &= ~0x80u; ls_ptr[0x00] &= ~0x80u;   /* clear running task 0 */
                   { static int n=0; if (n<8){n++;
@@ -3176,14 +3264,16 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                * and boot pacing collapses (the post-voice asset phase made
                * less progress in 900 s than a lucky run made in 300 s).
                * Faithful: polling continues; but when the SAME line is re-read
-               * and its write-generation has not moved, yield the host core
-               * with escalation. Any observed change (or a different line)
-               * resets the ladder, so reaction latency to real writes stays
-               * one poll deep. */
+               * and its write-generation has not moved, arrange to yield the
+               * host core with escalation AFTER releasing the process-wide
+               * lock-line lock. Yielding here while still owning that lock
+               * can starve every SPU/PPU reservation user behind a sleeping
+               * poller. Any observed change (or a different line) resets the
+               * ladder, so reaction latency to real writes stays one poll
+               * deep. */
               if (mfc->resv_ea == le && g == mfc->resv_gen) {
                   mfc->resv_poll_n++;
-                  static int nb = -1;
-                  if (nb < 0) nb = getenv("YZ_NO_SPUBACKOFF") ? 1 : 0;
+                  const int nb = g_yz_runtime_config.no_spubackoff;
                   /* Rung 3 (real sleep) only after ~seconds of continuous
                    * idleness: at yield pacing 1M unchanged polls is a long
                    * quiet stretch. A 16k threshold measurably taxed boot
@@ -3191,8 +3281,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                    * resolution, and the boot is a chain of idle-then-
                    * handshake moments). */
                   if (!nb && mfc->resv_poll_n > 16)
-                      spu_idle_yield(mfc->resv_poll_n > (1u << 20) ? 2
-                                   : mfc->resv_poll_n > 256       ? 1 : 0);
+                      post_unlock_idle_level =
+                          mfc->resv_poll_n > (1u << 20) ? 2
+                        : mfc->resv_poll_n > 256        ? 1 : 0;
               } else {
                   mfc->resv_poll_n = 0;
               }
@@ -3218,12 +3309,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * dispatches the workload). This is the HW edge our emulation dropped, not a
              * game-logic force; it self-limits (once dispatched the kernel is busy, not
              * idle-GETLLARing). */
-            { static int lw = -1; if (lw < 0) lw = getenv("YZ_NO_LRWAKE") ? 0 : 1;
+            {
+              const int lw = !g_yz_runtime_config.no_lrwake;
               if (lw && (uint32_t)(ea & ~127ull) == 0x40197C80u
                   && (line[0x70] | line[0x71])) {
                   /* FIX 2 (2026-07-17): atomic_fetch_or_explicit, not `|=` -- see the SN-raise
                        * site above; same-thread self-raise, relaxed order. */
                       atomic_fetch_or_explicit(&spu->event_status, 0x400u, memory_order_relaxed); spu_ch_wake(spu); /* s39 */ } }
+#if !defined(YZ_PERF_CLEAN)
             /* THROWAWAY DIAG (env YZ_SIGW): does the SPU kernel's GETLLAR of the SPURS
              * mgmt line ever SEE a nonzero wklSignal1 (offset 0x70)? Unconditional (not
              * gated by the wid3-present sampler) so it can't miss the transient signal. */
@@ -3238,7 +3331,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * SPU's own sysSrvMsgUpdateWorkload bit (line[0x3D]) is SET, the SPU is
              * about to process a workload-update kick -- log the state it sees. This
              * tells us whether the kicks reach the SPU with RUNNABLE state. */
-            if (g_spu_prof_on && (ea & ~127ull) == 0x40197D00ull) {
+            if (YZ_SPU_PROF_ACTIVE() && (ea & ~127ull) == 0x40197D00ull) {
                 uint32_t spuNum = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)
                                 | ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
                 if (line[0x3D] & (1u << (spuNum & 31))) {
@@ -3265,7 +3358,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * With YZ_LS_DUMP alone, the default boot reaches the movie + creates
              * the codec taskset, so we can read wid3's real kernel context. */
             static int ls_dump_on = -1;
-            if (ls_dump_on < 0) ls_dump_on = (g_spu_prof_on || getenv("YZ_LS_DUMP")) ? 1 : 0;
+            if (ls_dump_on < 0) ls_dump_on = (YZ_SPU_PROF_ACTIVE() || getenv("YZ_LS_DUMP")) ? 1 : 0;
             if (ls_dump_on && (ea & ~127ull) == 0x40197C80ull) {
                 extern unsigned long g_spu_lsdump_n;
                 const uint8_t* k0 = spu->ls;
@@ -3355,7 +3448,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     unsigned prio1 = k[0x1A1] & 0x0F, run1 = (wrun1 & 0x4000) ? 1 : 0;
                     int sel1 = run1 && prio1 > 0 && maxc1 > realcont1 && (sig1 || rc1 > realcont1);
                     static int wid01_on = -1;
-                    if (wid01_on < 0) wid01_on = (g_spu_prof_on || getenv("YZ_WID01")) ? 1 : 0;
+                    if (wid01_on < 0) wid01_on = (YZ_SPU_PROF_ACTIVE() || getenv("YZ_WID01")) ? 1 : 0;
                     fprintf(stderr, "[spu-ls] spu=%X n%u wklCur=0x%X wklRun1=0x%04X idle=%u "
                             "| state1[0..3]=%02X%02X%02X%02X msgUpd=0x%02X msg72=0x%02X "
                             "| wid2: run=%u prio=%u maxc=%u cont=%u(loc=%u real=%u) rc=%u sig=%u SELECT=%d "
@@ -3385,7 +3478,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * that's the state that matters for the fix (does it ever change?). */
             if (ls_dump_on && (ea & ~127ull) == 0x40197C80ull) {
                 static int wid01_on2 = -1;
-                if (wid01_on2 < 0) wid01_on2 = (g_spu_prof_on || getenv("YZ_WID01")) ? 1 : 0;
+                if (wid01_on2 < 0) wid01_on2 = (YZ_SPU_PROF_ACTIVE() || getenv("YZ_WID01")) ? 1 : 0;
                 if (wid01_on2) {
                     extern unsigned long g_spu_getllar_n;
                     static unsigned long n01 = 0;
@@ -3454,8 +3547,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       fflush(stderr);
                   }
               } }
+#endif
             break; }
         case MFC_PUTLLC_CMD:
+#if !defined(YZ_PERF_CLEAN)
             /* s46 TRIPWIRE (resume-hold review change #4): the hold's safety
              * argument rests on the MEASURED invariant that nothing ever
              * PUTLLCs the journal-record arena (it is consumed read-only via
@@ -3488,7 +3583,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       fflush(stderr);
                   }
               } }
-            if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
+            if (YZ_SPU_PROF_ACTIVE() && (ea & ~127ull) == 0x40197C80ull) {
                 extern unsigned long g_spu_mgmt_put_ok, g_spu_mgmt_put_fail;
                 if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                     memcmp(line, mfc->resv_data, 128) == 0) g_spu_mgmt_put_ok++;
@@ -3543,18 +3638,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                           ok ? "COMMIT" : "FAIL", o ? diff : " (no bitset change)");
                   fflush(stderr);
               } }
+#endif
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                 memcmp(line, mfc->resv_data, 128) == 0) {
+#if !defined(YZ_PERF_CLEAN)
                 yz_a010_reltrace_spu_atomic(
                     spu->spu_id, (uint32_t)spu->image_id,
                     spu->pc & SPU_LS_MASK,
                     (uint32_t)(ea & ~127ull), ls_ptr, cmd);
+#endif
+#if !defined(YZ_PERF_CLEAN)
                 /* DIAG (YZ_SPU_PROF): on a successful CAS of the SPURS mgmt
                  * line (0x40197C80), log mutations to the fields that gate
                  * workload selection -- sysSrvMessage@0x72 and wklReadyCount1
                  * [0..3]@0x00. Pins whether the SERVICE itself makes wid=2
                  * selectable, or whether that must come from the PPU side. */
-                if (g_spu_prof_on && (ea & ~127ull) == 0x40197C80ull) {
+                if (YZ_SPU_PROF_ACTIVE() && (ea & ~127ull) == 0x40197C80ull) {
                     extern unsigned long g_spu_putllc_log;
                     const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
                     int changed = (b[0x72] != a[0x72]) || (b[0] != a[0]) ||
@@ -3571,7 +3670,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 /* DIAG (YZ_SPU_PROF): the SPURS wklState1 line CAS (0x40197D00).
                  * Show how ProcessRequests/ActivateWorkload mutate the gating
                  * bytes: msgUpd(0x3D), wklState1[0..3]@0x00, wklStatus1[0..3]@0x10. */
-                if (g_spu_prof_on && (ea & ~127ull) == 0x40197D00ull) {
+                if (YZ_SPU_PROF_ACTIVE() && (ea & ~127ull) == 0x40197D00ull) {
                     extern unsigned long g_spu_putllc_log;
                     const uint8_t* b = mfc->resv_data; const uint8_t* a = ls_ptr;
                     int changed = memcmp(b, a, 128) != 0;
@@ -3612,6 +3711,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       unsigned sa = ((unsigned)ls_ptr[0x70] << 8) | ls_ptr[0x71];
                       if (sb != sa) { static int n = 0; if (n < 80) { n++;
                           fprintf(stderr, "[sig-chg] PUTLLC mgmt wklSignal1 0x%04X -> 0x%04X\n", sb, sa); fflush(stderr); } } } }
+#endif
                 memcpy(line, ls_ptr, 128);
                 /* s21: a committing PUTLLC is a line WRITE -- bump the coherence
                  * generation and kill PEER reservations (CBEA reservation-lost;
@@ -3633,16 +3733,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   * (RPCS3 do_putlluc) this invalidates EVERY reservation on the line
                   * (this SPU + all others) and raises SPU_EVENT_LR -- else another SPU's
                   * pending PUTLLC can spuriously succeed against a now-stale snapshot. */
+#if !defined(YZ_PERF_CLEAN)
             yz_a010_reltrace_spu_atomic(
                 spu->spu_id, (uint32_t)spu->image_id,
                 spu->pc & SPU_LS_MASK,
                 (uint32_t)(ea & ~127ull), ls_ptr, cmd);
+#endif
             memcpy(line, ls_ptr, 128);
             { extern void spu_coh_notify_write(uint32_t);
               spu_coh_notify_write((uint32_t)(ea & ~127ull)); }  /* clears resv_active + raises LR for all matching ctxs */
             mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
             break;
         }
+#if !defined(YZ_PERF_CLEAN)
         /* TS-WATCH (env YZ_TS_WATCH, 2026-06-20 pt27): log every SPU atomic touch of
          * the CRI taskset bitset line -> who clears the created task's enabled/ready
          * bits and via PUTLLC(CAS) vs PUTLLUC(unconditional). resv_data = the GETLLAR
@@ -3673,18 +3776,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               }
               #undef TW_W
           } }
+#endif
         spu_lockline_unlock();
+        if (post_unlock_idle_level >= 0)
+            spu_idle_yield(post_unlock_idle_level);
         if (tagged) mfc_tag_finish(mfc, spu, tag);
         return 0;
     }
 
+#if !defined(YZ_PERF_CLEAN)
     /* DIAG (YZ_SPU_PROF): steady-state sampler for GETs that read the SPURS
      * mgmt struct BEYOND the poll line (offset >= 0x80: wklState1@0x80,
      * wklInfo1@0xB00). The service's UpdateWorkload refreshes wklInfo here and
      * rebuilds wklRunnable1. Logging the first 40 such GETs AFTER 20M GETLLARs
      * (well into the steady-state deadlock) tests whether UpdateWorkload still
      * runs post-init, or whether the service stopped processing the update. */
-    if (g_spu_prof_on && mfc_is_get(cmd) && !mfc_is_list(cmd)) {
+    if (YZ_SPU_PROF_ACTIVE() && mfc_is_get(cmd) && !mfc_is_list(cmd)) {
         uint32_t off = (uint32_t)ea - 0x40197C80u;
         if (off >= 0x80 && off < 0x2000) {
             extern unsigned long g_spu_getllar_n, g_spu_getn2;
@@ -3696,6 +3803,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             }
         }
     }
+#endif
 
     /* Execute the transfer */
     if (mfc_is_list(cmd)) {
@@ -3709,6 +3817,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * and finishes it, so RdTagStat/WrTagUpdate must not report this tag done
      * yet (CBEA: a stalled list is not "completed", it is paused). */
     if (rc != 1) {
+#if !defined(YZ_PERF_CLEAN)
         if (rc < 0) {
             static unsigned error_count = 0;
             if (error_count++ < 24) {
@@ -3718,6 +3827,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 fflush(stderr);
             }
         }
+#endif
         /* Command retirement and fault reporting are independent. A retired
          * command must not leave an ALL tag-status request pending forever. */
         if (tagged) mfc_tag_finish(mfc, spu, tag);

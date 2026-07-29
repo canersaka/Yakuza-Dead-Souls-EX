@@ -60,6 +60,7 @@ if(MSVC)
         /experimental:c11atomics   # spu_channels.c's lock-line spinlock needs <stdatomic.h>
     )
     target_compile_definitions(spu_atomics_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(spu_atomics_stress PRIVATE synchronization)
 else()
     target_compile_options(spu_atomics_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(spu_atomics_stress PRIVATE pthread)

@@ -43,7 +43,7 @@
 
 /*
  * The standalone clean-lane harness links the SPU runtime without the Yakuza
- * executable's startup module. All optional runtime repairs are deliberately
+ * executable's startup module.  All optional runtime repairs are deliberately
  * off for this conformance test, matching an empty environment snapshot.
  */
 const yz_runtime_config g_yz_runtime_config = {0};
@@ -108,6 +108,8 @@ extern uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 uint32_t g_yz_spurs_taskset = 0;
 uint32_t g_yz_codec_taskset = 0;
 uint32_t g_yz_parked_pub_ea = 0;
+volatile long g_yz_a010_root_active = 0;
+volatile long g_yz_a010_stage_generation = 0;
 uint32_t yz_guest_addr_from_host(const void* rip) { (void)rip; return 0; }
 uint32_t yz_thread_current_id(void) { return 0; }
 uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
