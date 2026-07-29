@@ -85,12 +85,9 @@ static volatile int s_init_complete = 0;
 
 static void ls_arm_now(void)
 {
-    const char* e = getenv("YZ_SPU_LOCKSTEP");
-    int on = (e && *e && *e != '0') ? 1 : 0;
+    int on = g_yz_runtime_config.spu_lockstep;
     if (on) {
-        const char* qs = getenv("YZ_LOCKSTEP_QUANTUM");
-        uint64_t q = (qs && *qs) ? strtoull(qs, NULL, 10) : YZ_LOCKSTEP_DEFAULT_QUANTUM;
-        if (q < 1) q = 1;
+        uint64_t q = g_yz_runtime_config.lockstep_quantum;
         s_quantum = q;
         fprintf(stderr,
                 "[lockstep] ARMED quantum=%llu (YZ_SPU_LOCKSTEP=1; unset to disable) -- "

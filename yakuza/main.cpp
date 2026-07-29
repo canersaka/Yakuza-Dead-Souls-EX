@@ -3410,7 +3410,11 @@ int main(int argc, char** argv)
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted
      * SPURS functions the SPU threads spin in (the scheduler loops via
      * trampolines, invisible to spu_indirect_branch). Set before threads run. */
+#if defined(YZ_PERF_CLEAN)
+    g_spu_prof_on = 0;
+#else
     g_spu_prof_on = getenv("YZ_SPU_PROF") ? 1 : 0;
+#endif
     g_yz_watch_dlist = getenv("YZ_WATCH_DLIST") ? 1 : 0;
     g_yz_slotstore = getenv("YZ_SLOTSTORE") ? 1 : 0;
     if (g_yz_slotstore) {

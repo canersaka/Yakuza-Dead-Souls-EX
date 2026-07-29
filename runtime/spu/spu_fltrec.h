@@ -169,12 +169,17 @@ int yz_fltrec_enabled(void);
  * SPU_DRAIN, spu_img_restore, the cross-image adopt site). */
 static inline int yz_fltrec_hot(const void* ctx)
 {
+#if defined(YZ_PERF_CLEAN)
+    (void)ctx;
+    return 0;
+#else
     int on = g_yz_fltrec_on;
     if (on == 0) return 0;
     if (on < 0) { if (!yz_fltrec_enabled()) return 0; }
     if (ctx == 0) return 0;
     if (g_yz_fltrec_allctx) return 1;
     return ctx == (const void*)g_yz_consumer_ctx;
+#endif
 }
 
 void yz_fltrec_store32(struct spu_context* ctx, uint32_t lsa, uint32_t val);

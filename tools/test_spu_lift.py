@@ -828,6 +828,7 @@ def emit_driver(kept):
            '',
            '/* Runtime stubs: the cases are pure register->register data ops,',
            ' * so channel/dispatch/trampoline machinery is inert. */',
+           'const yz_runtime_config g_yz_runtime_config = {0};',
            'SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;',
            'SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx = 0;',
            'int g_spu_prof_on = 0;',
@@ -906,7 +907,7 @@ def run_suite():
         # safe to always pass.
         # /experimental:c11atomics: spu_context.h carries _Atomic fields
         # (s43 channel-atomicity fix); matches CMakeLists' runtime target.
-        f.write(f'cl /nologo /O1 /W3 /std:c17 /experimental:c11atomics /bigobj /I {OUTDIR} /I runtime\\spu '
+        f.write(f'cl /nologo /O1 /W3 /std:c17 /experimental:c11atomics /bigobj /I {OUTDIR} /I runtime\\spu /I include '
                 f'/Fo{OUTDIR}\\ /Fe:{exe} '
                 f'{OUTDIR}\\spu_conf_driver.c {OUTDIR}\\spu_recomp.c '
                 f'> "{log}" 2>&1\n')

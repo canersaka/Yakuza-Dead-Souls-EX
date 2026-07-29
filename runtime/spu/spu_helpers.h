@@ -331,9 +331,7 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
  * getenv declaration for static and dynamic MSVC runtime builds alike. */
 static inline int yz_xf_ieee(void)
 {
-    static int v = -1;
-    if (v < 0) v = getenv("YZ_XF_IEEE") ? 1 : 0;
-    return v;
+    return g_yz_runtime_config.xf_ieee;
 }
 
 #define SPU_XF_SMAX_MAG   0x7FFFFFFFu   /* Smax magnitude bits (sign OR'd in by the caller) */
