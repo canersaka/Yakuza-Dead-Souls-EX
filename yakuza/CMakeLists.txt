@@ -133,7 +133,11 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_15800.c"  # jobB relocated to LS 0x15800 at the post-a030 handoff (measured 2026-07-24)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_c_17800.c"  # post-a030 transition job (EBOOT 0x0125DA80, observed LS 0x17800, image 17)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_d_e400.c"   # sibling post-a030 job (EBOOT 0x01265180, declared 0x10610 B, LS 0xE400, image 18)
-    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage.c") # a010 worker (EBOOT 0x01252680, 0x1E80 B, LS 0x4C00, image 19)
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage.c"       # a010 worker (EBOOT 0x01252680, 0x1E80 B, LS 0x4C00, image 19)
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_e400.c"  #   ...same binary at the shared alternate slot 0xE400
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_2d800.c" #   ...same binary at the live Kamurocho slot 0x2D800
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_3b000.c" #   ...same binary at the live post-a030 slot 0x3B000
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_37c00.c")#   ...same binary at the live Kamurocho slot 0x37C00
 
 add_executable(yakuza_recomp
     main.cpp

@@ -125,6 +125,10 @@ extern "C" void spu_recomp_register_jobbin_d_e400(void);
  * EBOOT binary at 0x01252680; treating it as Job A ran the wrong program at the
  * same LS 0x4C00 slot and produced malformed, incomplete scene commands. */
 extern "C" void spu_recomp_register_jobbin_orphanage(void);
+extern "C" void spu_recomp_register_jobbin_orphanage_e400(void);
+extern "C" void spu_recomp_register_jobbin_orphanage_2d800(void);
+extern "C" void spu_recomp_register_jobbin_orphanage_3b000(void);
+extern "C" void spu_recomp_register_jobbin_orphanage_37c00(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
  * (cri_audio_ps3spurs.elf, EBOOT SPU img #7 @0x012B4980, LS base 0x3000, entry
  * 0x3070). It OVERLAPS gs_task in LS, so it registers under a DISTINCT image (3)
@@ -3402,6 +3406,10 @@ int main(int argc, char** argv)
     spu_begin_image(17); spu_recomp_register_jobbin_c_17800(); /* post-a030 transition job (EBOOT 0x0125DA80, LS 0x17800) */
     spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
     spu_begin_image(19); spu_recomp_register_jobbin_orphanage(); /* a010 geometry job (EBOOT 0x01252680, LS 0x4C00) */
+    spu_recomp_register_jobbin_orphanage_e400();                  /*   ...same binary at the shared alternate slot 0xE400 */
+    spu_recomp_register_jobbin_orphanage_2d800();                 /*   ...same binary at the live Kamurocho slot 0x2D800 */
+    spu_recomp_register_jobbin_orphanage_3b000();                 /*   ...same binary at the live post-a030 slot 0x3B000 */
+    spu_recomp_register_jobbin_orphanage_37c00();                 /*   ...same binary at the live Kamurocho slot 0x37C00 */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);
