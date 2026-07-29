@@ -87,6 +87,7 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
         winmm       # timeBeginPeriod (runtime/syscalls/sys_timer.c, audit item 6)
+        synchronization # WaitOnAddress/WakeByAddressAll for staged SPU work publication
     )
 endif()
 

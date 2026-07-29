@@ -31,6 +31,46 @@
 #  define SPU_CPU_RELAX() ((void)0)
 #endif
 
+/*
+ * Publication acknowledgement for the GCM user callback that stages wid4
+ * work after raising the SPU signal.  Runtime-owned so standalone SPU tests
+ * and the full runner share the same synchronization object.
+ */
+volatile long g_yz_ucmd_handler_arg = -1;
+volatile long g_yz_ucmd_handler_completed = -1;
+volatile long g_yz_ucmd_handler_epoch = 0;
+volatile long g_yz_ucmd_handler_completed_epoch = 0;
+
+#if defined(YZ_PERF_PROFILE)
+#if defined(_MSC_VER)
+typedef union yz_perf_large_int {
+    long long QuadPart;
+    struct { unsigned long LowPart; long HighPart; } s;
+} yz_perf_large_int;
+extern int __stdcall QueryPerformanceCounter(yz_perf_large_int*);
+extern int __stdcall QueryPerformanceFrequency(yz_perf_large_int*);
+static uint64_t s_perf_qpc_frequency;
+static uint64_t yz_perf_qpc_now(void)
+{
+    yz_perf_large_int value;
+    if (!s_perf_qpc_frequency) {
+        QueryPerformanceFrequency(&value);
+        s_perf_qpc_frequency = (uint64_t)value.QuadPart;
+    }
+    QueryPerformanceCounter(&value);
+    return (uint64_t)value.QuadPart;
+}
+#else
+static uint64_t s_perf_qpc_frequency = 1000000000ull;
+static uint64_t yz_perf_qpc_now(void)
+{
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return (uint64_t)value.tv_sec * 1000000000ull + (uint64_t)value.tv_nsec;
+}
+#endif
+#endif
+
 /* s41 FLIGHT RECORDER Probe 1 (scratch/s41_upstream_audit.md): a second dump
  * trigger alongside the existing [stop-jrnl] park trigger
  * (yakuza/import_overrides.cpp). Fires once, on the 8th "[spu-ximg] cross-
@@ -430,9 +470,7 @@ static uint32_t yz_ctxsh_key(const unsigned char* ls, uint32_t* region_len,
 int yz_task_segment_guard(spu_context* ctx, const spu_image_desc* imd)
 {
     int any_stale = 0;
-    static int off = -1;
-    if (off < 0) off = getenv("YZ_NO_TASKRELOAD") ? 1 : 0;
-    if (off || !imd) return 0;
+    if (g_yz_runtime_config.no_taskreload || !imd) return 0;
     {
         extern uint8_t* vm_base;
         const uint8_t* e = vm_base + imd->elf_ea;
@@ -589,9 +627,8 @@ static int yz_ctxsh_off(void)
      * stale restored over live state), and its write-through can fight the
      * guest's own saves. Kept as an evidence tool / contingency for the
      * [exit-unsaved] probe's findings. */
-    static int off = -1;
-    if (off < 0) off = (getenv("YZ_CTXSHADOW") && !getenv("YZ_NO_CTXSHADOW")) ? 0 : 1;
-    return off;
+    return (g_yz_runtime_config.ctxshadow &&
+            !g_yz_runtime_config.no_ctxshadow) ? 0 : 1;
 }
 
 /* Parse the CURRENT task's ctxsave EA + saved-LS window from the resident
@@ -896,8 +933,9 @@ void yz_bdrain_maybe(spu_context* ctx)
 
 static int yz_ctxsave_off(void)
 {
-    static int off = -1;
-    if (off < 0) { off = getenv("YZ_NO_CTXSAVE") ? 1 : 0;
+    const int off = g_yz_runtime_config.no_ctxsave;
+    static int announced = 0;
+    if (!announced) { announced = 1;
         if (!off) { fprintf(stderr, "[ctxsv] ARMED: resident-record task ctxsave (kill: YZ_NO_CTXSAVE)\n");
                     fflush(stderr); } }
     return off;
@@ -936,8 +974,9 @@ static int yz_we_saved(uint32_t ea)
 static mfc_engine* mfc_for(spu_context* ctx);
 static void yz_resv_ctxswitch_clear(spu_context* ctx, const char* seam)
 {
-    static int off = -1;
-    if (off < 0) { off = getenv("YZ_NO_RESVSW") ? 1 : 0;
+    const int off = g_yz_runtime_config.no_resvsw;
+    static int announced = 0;
+    if (!announced) { announced = 1;
         if (!off) { fprintf(stderr, "[resv-sw] ARMED: reservations cleared at task-switch seams (kill: YZ_NO_RESVSW)\n");
                     fflush(stderr); } }
     if (off) return;
@@ -1088,9 +1127,9 @@ void yz_ctx_shadow_save(spu_context* ctx, const char* site)
  * retire when the premature transition-apply divergence is rooted. */
 static void yz_resume_hold_arm(spu_context* ctx, const char* path)
 {
-    static int rhn = -2;
-    if (rhn == -2) { const char* e = getenv("YZ_RESUME_HOLD");
-        rhn = e ? atoi(e) : 0;   /* s46: default OFF (diagnostic lever, not the root fix --
+    const int rhn = g_yz_runtime_config.resume_hold_ms;
+    static int announced = 0;
+    if (!announced) { announced = 1; /* s46: default OFF (diagnostic lever, not the root fix --
                                   * matrix s46mx: terminal park identical ON vs OFF 4+2 boots;
                                   * the switch-replay theory it was built on is refuted,
                                   * scratch/s46_seam_verdict.md + s46_walktime_tiebreak.py) */
@@ -1130,8 +1169,7 @@ static void yz_resume_hold_arm(spu_context* ctx, const char* path)
 void yz_task_ctx_restore(spu_context* ctx, int is_resume, int ro_was_stale)
 {
     yz_resv_ctxswitch_clear(ctx, is_resume ? "task-restore-resume" : "task-restore");
-    static int off = -1;
-    if (off < 0) off = getenv("YZ_NO_CTXRESTORE") ? 1 : 0;
+    const int off = g_yz_runtime_config.no_ctxrestore;
     {
         uint32_t region_len = 0, region_base = 0;
         uint32_t ea = yz_ctxsh_key(ctx->ls, &region_len, &region_base);
@@ -1432,10 +1470,26 @@ void spu_halt(spu_context* ctx, int status)
 #include <stdatomic.h>   /* MSVC: needs /experimental:c11atomics (set by the
                             runtime CMake flags) */
 static atomic_flag s_lockline = ATOMIC_FLAG_INIT;
+#if defined(YZ_PERF_PROFILE)
+static volatile long long s_perf_lock_contended = 0;
+static volatile long long s_perf_lock_spins = 0;
+#endif
 void spu_lockline_lock(void)
 {
+#if defined(YZ_PERF_PROFILE)
+    unsigned long long spins = 0;
+    while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire)) {
+        spins++;
+        SPU_CPU_RELAX();
+    }
+    if (spins) {
+        _InterlockedIncrement64(&s_perf_lock_contended);
+        _InterlockedExchangeAdd64(&s_perf_lock_spins, (long long)spins);
+    }
+#else
     while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire))
         SPU_CPU_RELAX();   /* don't saturate the cache line while spinning */
+#endif
 }
 void spu_lockline_unlock(void)
 {
@@ -1465,12 +1519,34 @@ __declspec(dllimport) void __stdcall WakeAllConditionVariable(void* cv);
 __declspec(dllimport) int  __stdcall SleepConditionVariableSRW(void* cv, void* lock,
                                                                unsigned long ms,
                                                                unsigned long flags);
+__declspec(dllimport) int  __stdcall WaitOnAddress(
+    volatile void* address, void* compare_address,
+    size_t address_size, unsigned long milliseconds);
 __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 #else
 #include <sched.h>
 #include <unistd.h>
 #include <time.h>
 #endif
+
+void yz_ucmd_wait_for_handler_completion(void)
+{
+#if defined(_WIN32)
+    for (;;) {
+        const long entered = _InterlockedCompareExchange(
+            &g_yz_ucmd_handler_epoch, 0, 0);
+        const long completed = _InterlockedCompareExchange(
+            &g_yz_ucmd_handler_completed_epoch, 0, 0);
+        if (entered == completed)
+            return;
+        long observed = completed;
+        WaitOnAddress(
+            &g_yz_ucmd_handler_completed_epoch, &observed,
+            sizeof(observed), 0xFFFFFFFFul);
+    }
+#endif
+}
+
 void spu_idle_yield(int level)
 {
     if (level == 0) {
@@ -1522,15 +1598,11 @@ extern "C" {
  * ===========================================================================*/
 static int yz_ch_nonblock(void)
 {
-    static int v = -1;
-    if (v < 0) v = getenv("YZ_CH_NONBLOCK") ? 1 : 0;
-    return v;
+    return g_yz_runtime_config.ch_nonblock;
 }
 static int yz_ch_strict(void)
 {
-    static int v = -1;
-    if (v < 0) v = getenv("YZ_CH_STRICT") ? 1 : 0;
-    return v;
+    return g_yz_runtime_config.ch_strict;
 }
 
 /* Predicate: is `channel` readable right now (would rdch complete)?
@@ -1611,6 +1683,13 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
     if (spu_ch_ready(ctx, channel)) return;   /* fast path: no stall */
 
+#if defined(YZ_PERF_PROFILE)
+    const int perf_image = ctx->image_id;
+    const uint64_t perf_wait_begin = yz_perf_qpc_now();
+    if ((unsigned)perf_image < 32u)
+        ctx->perf_wait_count[perf_image]++;
+#endif
+#if !defined(YZ_PERF_CLEAN)
     /* Witness (always-on, cheap): does the wedge involve zero-capacity
      * channel attempts at all? */
     {
@@ -1626,16 +1705,20 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             fflush(stderr);
         }
     }
+#endif
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     /* s42 YZ_SPU_LOCKSTEP: release the run token before this OS-level block --
      * a waker that itself needs the token to proceed (another SPU) must never
      * be blocked on this ctx holding it. No-op when unset. */
-    yz_lockstep_block_begin(ctx);
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_block_begin(ctx);
 #if defined(_WIN32)
     {
+#if !defined(YZ_PERF_CLEAN)
         unsigned long long start   = GetTickCount64();
         unsigned long long next_hb = 2000;
+#endif
         while (!spu_ch_ready(ctx, channel)) {
             /* The SRWLOCK only satisfies SleepConditionVariableSRW's API
              * contract; the predicate lives in shared channel state, re-checked
@@ -1645,6 +1728,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 SleepConditionVariableSRW(&ctx->ch_wait_cv, &ctx->ch_wait_lock, 10, 0);
             ReleaseSRWLockExclusive(&ctx->ch_wait_lock);
 
+#if !defined(YZ_PERF_CLEAN)
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb) {
                 fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums\n",
@@ -1652,6 +1736,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 fflush(stderr);
                 next_hb = ((waited / 2000) + 1) * 2000;
             }
+#endif
         }
     }
 #else
@@ -1673,8 +1758,14 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     /* s42 YZ_SPU_LOCKSTEP: rejoin the rotation and reacquire the token after
      * the wake (block_end blocks until granted, same as a fresh registrant).
      * No-op when unset. */
-    yz_lockstep_block_end(ctx);
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_block_end(ctx);
     ctx->status = SPU_STATUS_RUNNING;
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)perf_image < 32u)
+        ctx->perf_wait_qpc[perf_image] +=
+            yz_perf_qpc_now() - perf_wait_begin;
+#endif
 }
 
 /* ===========================================================================
@@ -1770,6 +1861,243 @@ typedef struct {
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 
+/*
+ * Frontier-only, read-only snapshot for the post-a030 RSX segment-finalisation
+ * stall. The FIFO consumer calls this after it has remained on an
+ * unjournaled self-jump for five seconds. Keep it environment-gated at the
+ * caller: this walks live SPU state without taking emulated MFC locks and is
+ * intended only as a diagnostic witness, never as a correctness input.
+ */
+void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
+{
+    fprintf(stderr,
+            "[frontier-edge] BEGIN parked_ea=0x%08X get=0x%08X put=0x%08X "
+            "consumer=%p cursor=0x%08X\n",
+            parked_ea, get, put, (void*)g_yz_consumer_ctx,
+            yz_consumer_cursor());
+
+    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
+        const spu_context* ctx = s_mfc_slots[slot].ctx;
+        const mfc_engine* m = &s_mfc_slots[slot].mfc;
+        if (!ctx) continue;
+
+        uint32_t outstanding_mask = 0;
+        for (uint32_t tag = 0; tag < 32; tag++) {
+            if (m->tag_outstanding[tag])
+                outstanding_mask |= 1u << tag;
+        }
+
+        fprintf(stderr,
+                "[frontier-edge] slot=%d ctx=%p spu=%04X image=%d "
+                "pc=0x%05X status=0x%X host_depth=%u module_a00=%d "
+                "module_src=0x%08X/0x%X event=0x%08X/0x%08X\n",
+                slot, (const void*)ctx, ctx->spu_id, ctx->image_id,
+                ctx->pc, ctx->status, ctx->host_depth, ctx->module_img_a00,
+                ctx->module_src_ea, ctx->module_src_size,
+                atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
+                ctx->event_mask);
+        fprintf(stderr,
+                "[frontier-edge] slot=%d stage{lsa=0x%05X eah=0x%08X "
+                "eal=0x%08X size=0x%X tag=%u mask=0x%08X status=0x%08X} "
+                "mfc{queue=%u deferred=%u completed=0x%08X "
+                "outstanding=0x%08X stall=0x%08X resv=%d@0x%08X "
+                "gen=%u polls=%u atomic=%u/%u}\n",
+                slot, ctx->mfc_lsa, ctx->mfc_eah, ctx->mfc_eal,
+                ctx->mfc_size, ctx->mfc_tag, ctx->mfc_tag_mask,
+                ctx->mfc_tag_status, m->queue_count, m->deferred_count,
+                m->tag_completed, outstanding_mask, m->stall_mask,
+                m->resv_active, (uint32_t)m->resv_ea, m->resv_gen,
+                m->resv_poll_n, m->atomic_stat, m->atomic_stat_ready);
+        fprintf(stderr,
+                "[frontier-edge] slot=%d gpr{r0=%08X r1=%08X r2=%08X "
+                "r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X "
+                "r9=%08X r10=%08X r11=%08X r12=%08X r13=%08X} "
+                "jobbase{%05X,%05X,%05X,%05X,%05X}\n",
+                slot,
+                ctx->gpr[0]._u32[0], ctx->gpr[1]._u32[0],
+                ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0],
+                ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
+                ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0],
+                ctx->gpr[8]._u32[0], ctx->gpr[9]._u32[0],
+                ctx->gpr[10]._u32[0], ctx->gpr[11]._u32[0],
+                ctx->gpr[12]._u32[0], ctx->gpr[13]._u32[0],
+                ctx->job_bin_base[0], ctx->job_bin_base[1],
+                ctx->job_bin_base[2], ctx->job_bin_base[3],
+                ctx->job_bin_base[4]);
+
+        if ((const void*)ctx == (const void*)g_yz_consumer_ctx &&
+            ctx->image_id == 0) {
+            fprintf(stderr,
+                    "[frontier-edge] consumer-ls anchor=0x%05X "
+                    "cursor=0x%08X manager[0xBC90..0xBE10):\n",
+                    g_yz_anch_home,
+                    yz_ls_w32((const uint8_t*)ctx->ls + g_yz_anch_home));
+            for (uint32_t lsa = 0xBC90u; lsa < 0xBE10u; lsa += 0x20u) {
+                fprintf(stderr,
+                        "[frontier-edge] LS 0x%05X: "
+                        "%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                        lsa,
+                        yz_ls_w32(ctx->ls + lsa + 0x00u),
+                        yz_ls_w32(ctx->ls + lsa + 0x04u),
+                        yz_ls_w32(ctx->ls + lsa + 0x08u),
+                        yz_ls_w32(ctx->ls + lsa + 0x0Cu),
+                        yz_ls_w32(ctx->ls + lsa + 0x10u),
+                        yz_ls_w32(ctx->ls + lsa + 0x14u),
+                        yz_ls_w32(ctx->ls + lsa + 0x18u),
+                        yz_ls_w32(ctx->ls + lsa + 0x1Cu));
+            }
+        }
+    }
+    fprintf(stderr, "[frontier-edge] END\n");
+    fflush(stderr);
+}
+
+#if defined(YZ_PERF_PROFILE)
+typedef struct spu_perf_totals {
+    uint64_t hops[32];
+    uint64_t dma_get[32], dma_put[32], dma_atomic[32];
+    uint64_t ch_read[32], ch_write[32], ch_count[32];
+    uint64_t waits[32], wait_qpc[32];
+    uint64_t invalidations;
+    long long lock_contended;
+    long long lock_spins;
+} spu_perf_totals;
+
+static const char* const s_perf_image_names[32] = {
+    "gs_task", "spurs_sysservice", "policy_module", "cri_audio",
+    "wkl4_task", "spuimg_00", "spuimg_01", "spuimg_02",
+    "spuimg_04", "spuimg_06", "spuimg_08", "spuimg_09",
+    "ts_exit", "job_module", "job_a", "job_b",
+    "spurs_kernel2", "job_c", "job_d", "orphanage_worker",
+    "job_c_1a800", "job_d_4c00", "job_c_1d800", "job_c_1b800",
+    "job_b_15400", "job_d_15800", "job_d_5000", "job_c_1ac00",
+    "job_c_1e800"
+};
+static spu_perf_totals s_perf_window_start;
+static uint32_t s_perf_window_start_frame;
+static int s_perf_window_started;
+
+static void spu_perf_collect(spu_perf_totals* totals)
+{
+    memset(totals, 0, sizeof(*totals));
+    totals->lock_contended =
+        _InterlockedCompareExchange64(&s_perf_lock_contended, 0, 0);
+    totals->lock_spins =
+        _InterlockedCompareExchange64(&s_perf_lock_spins, 0, 0);
+
+    (void)yz_perf_qpc_now();
+    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
+        const spu_context* ctx = s_mfc_slots[slot].ctx;
+        if (!ctx) continue;
+        totals->invalidations += ctx->perf_reservation_invalidations;
+        for (int image = 0; image < 32; image++) {
+            totals->hops[image] += ctx->perf_hops[image];
+            totals->dma_get[image] += ctx->perf_dma_get[image];
+            totals->dma_put[image] += ctx->perf_dma_put[image];
+            totals->dma_atomic[image] += ctx->perf_dma_atomic[image];
+            totals->ch_read[image] += ctx->perf_ch_read[image];
+            totals->ch_write[image] += ctx->perf_ch_write[image];
+            totals->ch_count[image] += ctx->perf_ch_count[image];
+            totals->waits[image] += ctx->perf_wait_count[image];
+            totals->wait_qpc[image] += ctx->perf_wait_qpc[image];
+        }
+    }
+}
+
+static void spu_perf_print(const char* header, const char* image_header,
+                           const spu_perf_totals* totals)
+{
+    fprintf(stderr,
+            "[%s] qpc_frequency=%llu lock_contended=%lld "
+            "lock_spins=%lld reservation_invalidations=%llu\n",
+            header,
+            (unsigned long long)s_perf_qpc_frequency,
+            totals->lock_contended, totals->lock_spins,
+            (unsigned long long)totals->invalidations);
+    for (int image = 0; image < 32; image++) {
+        if (!(totals->hops[image] || totals->dma_get[image] ||
+              totals->dma_put[image] || totals->dma_atomic[image] ||
+              totals->ch_read[image] || totals->ch_write[image] ||
+              totals->ch_count[image] || totals->waits[image]))
+            continue;
+        fprintf(stderr,
+                "[%s] id=%d name=%s hops=%llu "
+                "dma_get=%llu dma_put=%llu dma_atomic=%llu "
+                "ch_read=%llu ch_write=%llu ch_count=%llu "
+                "waits=%llu wait_qpc=%llu wait_ms=%.3f\n",
+                image_header, image,
+                s_perf_image_names[image]
+                    ? s_perf_image_names[image] : "unknown",
+                (unsigned long long)totals->hops[image],
+                (unsigned long long)totals->dma_get[image],
+                (unsigned long long)totals->dma_put[image],
+                (unsigned long long)totals->dma_atomic[image],
+                (unsigned long long)totals->ch_read[image],
+                (unsigned long long)totals->ch_write[image],
+                (unsigned long long)totals->ch_count[image],
+                (unsigned long long)totals->waits[image],
+                (unsigned long long)totals->wait_qpc[image],
+                s_perf_qpc_frequency
+                    ? (double)totals->wait_qpc[image] * 1000.0 /
+                          (double)s_perf_qpc_frequency
+                    : 0.0);
+    }
+    fflush(stderr);
+}
+
+void spu_perf_dump(void)
+{
+    spu_perf_totals totals;
+    spu_perf_collect(&totals);
+    spu_perf_print("spu-perf", "spu-perf-image", &totals);
+}
+
+void spu_perf_window_begin(uint32_t guest_frame)
+{
+    spu_perf_collect(&s_perf_window_start);
+    s_perf_window_start_frame = guest_frame;
+    s_perf_window_started = 1;
+    fprintf(stderr, "[spu-perf-window-begin] guest_frame=%u\n", guest_frame);
+    fflush(stderr);
+}
+
+void spu_perf_window_dump(uint32_t guest_frame)
+{
+    if (!s_perf_window_started)
+        return;
+    spu_perf_totals end;
+    spu_perf_collect(&end);
+    for (int image = 0; image < 32; image++) {
+#define SPU_PERF_DELTA(field) \
+        end.field[image] = end.field[image] >= s_perf_window_start.field[image] \
+            ? end.field[image] - s_perf_window_start.field[image] : 0
+        SPU_PERF_DELTA(hops);
+        SPU_PERF_DELTA(dma_get);
+        SPU_PERF_DELTA(dma_put);
+        SPU_PERF_DELTA(dma_atomic);
+        SPU_PERF_DELTA(ch_read);
+        SPU_PERF_DELTA(ch_write);
+        SPU_PERF_DELTA(ch_count);
+        SPU_PERF_DELTA(waits);
+        SPU_PERF_DELTA(wait_qpc);
+#undef SPU_PERF_DELTA
+    }
+    end.invalidations =
+        end.invalidations >= s_perf_window_start.invalidations
+            ? end.invalidations - s_perf_window_start.invalidations : 0;
+    end.lock_contended =
+        end.lock_contended >= s_perf_window_start.lock_contended
+            ? end.lock_contended - s_perf_window_start.lock_contended : 0;
+    end.lock_spins =
+        end.lock_spins >= s_perf_window_start.lock_spins
+            ? end.lock_spins - s_perf_window_start.lock_spins : 0;
+    fprintf(stderr, "[spu-perf-window-range] guest_frames=%u-%u\n",
+            s_perf_window_start_frame, guest_frame);
+    spu_perf_print("spu-perf-window", "spu-perf-window-image", &end);
+    s_perf_window_started = 0;
+}
+#endif
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
     spu_mfc_slot* free_slot = NULL;
@@ -1856,7 +2184,11 @@ void spu_coh_notify_write(uint32_t ea)
              * as before. */
             atomic_fetch_or_explicit(&c->event_status, 0x400u, memory_order_relaxed);
             m->resv_active = 0;          /* reservation lost */
+#if defined(YZ_PERF_PROFILE)
+            c->perf_reservation_invalidations++;
+#elif !defined(YZ_PERF_CLEAN)
             g_spu_lr_raise++;
+#endif
             /* s39: the event_status store above must be visible before the wake.
              * On x86 TSO the plain store is globally ordered ahead of the
              * WakeAll call's own writes; the blocked RdEventStat waiter also
@@ -1886,7 +2218,10 @@ static int channel_is_mfc(uint32_t ch)
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
-
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_write[ctx->image_id]++;
+#endif
     /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). Fires for
      * every channel write, including the MFC parameter channels (LSA/EAH/
      * EAL/Size/TagID/Cmd) -- the DMA itself is recorded separately at
@@ -2015,9 +2350,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                    * visible whenever this actually fires. Kill-switch
                    * YZ_NO_THROW_RETRY restores the faithful drop. */
                   if (code >= 64 && rc != 0) {
-                      static int ntr = -1;
-                      if (ntr < 0) ntr = getenv("YZ_NO_THROW_RETRY") ? 1 : 0;
-                      if (!ntr) {
+                      if (!g_yz_runtime_config.no_throw_retry) {
                           int ok = yz_throw_latch_add(qid,
                                       0xFFFFFFFF53505501ULL, ctx->spu_id,
                                       ((uint64_t)spup << 32) | (v & 0xFFFFFFu), data);
@@ -2189,7 +2522,13 @@ void spu_llar_note(uint32_t ea)
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
     uint32_t v = 0;
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_read[ctx->image_id]++;
+#endif
+#if !defined(YZ_PERF_CLEAN)
     if (channel < 128) g_spu_ch_rd[channel]++;
+#endif
     /* s42 YZ_SPU_LOCKSTEP token pass (deadlock fix): a channel READ is a
      * per-iteration touchpoint of the SPU idle/poll loops. The blocking rdch
      * cases below release the token via spu_ch_wait, but the NON-blocking reads
@@ -2200,10 +2539,11 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * never rotated the token (the s42ls* wedge: 5 SPUs up, zero heartbeat, zero
      * watchdog, zero ch-block). Tick here so every channel poll advances the
      * quantum. No-op when YZ_SPU_LOCKSTEP is unset (single predicted branch). */
-    yz_lockstep_tick(ctx);
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_tick(ctx);
     /* DIAG: what channel does gs_task (LS 0x3000..0xBC00) read while it stalls
      * in init? (29=RdInMbox 3/4=RdSigNotify1/2 23=MFC_RdTagStat 0=RdEventStat) */
-    if (g_spu_prof_on && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
+    if (YZ_SPU_PROF_ACTIVE() && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
         static int n = 0;
         if (n < 50) { n++; fprintf(stderr, "[gst-ch] rdch ch%u pc=0x%05X\n", channel, ctx->pc & SPU_LS_MASK); }
     }
@@ -2295,7 +2635,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
          * STEADY STATE? If RdEventStat fires after 20M GETLLARs, the LR-event
          * (Loop A) is live and worth implementing; if never, the spin is the
          * poll loop (Loop B) and LR is a red herring. */
-        if (g_spu_prof_on) {
+        if (YZ_SPU_PROF_ACTIVE()) {
             extern unsigned long g_spu_getllar_n, g_spu_evstat_rd;
             if (g_spu_getllar_n > 20000000UL) {
                 if (g_spu_evstat_rd < 20)
@@ -2341,15 +2681,22 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_count[ctx->image_id]++;
+#endif
+#if !defined(YZ_PERF_CLEAN)
     if (channel < 128) g_spu_ch_cnt[channel]++;
+#endif
     /* s42 YZ_SPU_LOCKSTEP token pass (deadlock fix): rchcnt is THE hot poll
      * touchpoint of the SPU wait idiom `while (!rchcnt(ch)) ;` -- it is
      * non-blocking and emitted as an intra-region `goto` backedge, so it reaches
      * neither SPU_DRAIN nor GETLLAR nor the blocking spu_ch_wait. Without a tick
      * here a holder busy-polling rchcnt starves every other SPU forever (the
      * measured s42ls* wedge). No-op when YZ_SPU_LOCKSTEP is unset. */
-    yz_lockstep_tick(ctx);
-    if (g_spu_prof_on && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
+    if (g_yz_runtime_config.spu_lockstep)
+        yz_lockstep_tick(ctx);
+    if (YZ_SPU_PROF_ACTIVE() && (ctx->pc & SPU_LS_MASK) >= 0x3000u && (ctx->pc & SPU_LS_MASK) < 0xBC00u) {
         static int n = 0;
         if (n < 50) { n++; fprintf(stderr, "[gst-ch] rchcnt ch%u pc=0x%05X\n", channel, ctx->pc & SPU_LS_MASK); }
     }
@@ -2429,10 +2776,12 @@ typedef struct {
     int      image_id;   /* which recompiled image this function belongs to */
 } spu_reg_entry;
 
-/* All 10 EBOOT task images + kernel/service/policy total ~150k lifted
- * functions (cri_audio alone is 35k); the old 64k cap silently dropped
- * whoever registered last. ~3 MB at 262144 -- cheap. */
-#define SPU_FN_REGISTRY_MAX 262144
+/* All EBOOT task images + kernel/service/policy and the observed fixed-base
+ * job relocations now exceed 262144 lifted functions.  Hitting the old cap
+ * dropped the later gs_task registration and parked the renderer at its first
+ * PRESENT.  Keep one power-of-two tier of headroom for additional measured
+ * relocations; this table is static process memory and remains cheap. */
+#define SPU_FN_REGISTRY_MAX 524288
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
 
@@ -2646,6 +2995,114 @@ void yz_lscw_check(spu_context* ctx, uint32_t lsa, uint32_t size,
  * "live" line from each leg. Zero hits WITHOUT those lines = dead probe, NOT
  * a clean negative.
  * ===========================================================================*/
+
+/*
+ * The optional TAGREAD repair shares this bounded LS-line -> guest-EA map
+ * with the diagnostic probe below.  Keep the map and behavior-only helpers
+ * outside the diagnostic compile guard: clean builds must preserve an
+ * explicitly enabled repair without carrying the probe, clocks, or logging.
+ */
+#define YZ_TR_ARENA_LO  0x41F00000u
+#define YZ_TR_ARENA_HI  0x42200000u
+#define YZ_TR_MAP 128
+static uint32_t s_tr_mls[YZ_TR_MAP]; /* LS line addr | 1 in bit0 = occupied */
+static uint32_t s_tr_mea[YZ_TR_MAP]; /* guest EA line addr */
+
+#if !defined(YZ_PERF_CLEAN)
+extern volatile long g_yz_a010_target_fetch_seen;
+extern volatile long g_yz_a010_stage_dispatch_generation;
+extern volatile long g_yz_a010_stage_dispatch_mask;
+#endif
+
+static int yz_tr_slot(uint32_t lsline, int create)
+{
+    unsigned h = (lsline >> 7) & (YZ_TR_MAP - 1);
+    for (unsigned i = 0; i < YZ_TR_MAP; i++) {
+        unsigned s = (h + i) & (YZ_TR_MAP - 1);
+        if (s_tr_mls[s] == (lsline | 1u)) return (int)s;
+        if (s_tr_mls[s] == 0) {
+            if (!create) return -1;
+            s_tr_mls[s] = lsline | 1u;
+            return (int)s;
+        }
+    }
+    return -1;
+}
+
+void yz_tagread_repair_fetch(
+    spu_context* ctx, uint32_t lsa,
+    unsigned long long ea, uint32_t size)
+{
+    if (!g_yz_runtime_config.tagread_repair ||
+        ctx->image_id != 0)
+        return;
+    const uint32_t ea32 = (uint32_t)ea;
+    if (ea32 < YZ_TR_ARENA_LO || ea32 >= YZ_TR_ARENA_HI)
+        return;
+    for (uint32_t off = 0; off < size && off < 0x4000u;
+         off += 128u) {
+        const uint32_t lsline =
+            (lsa + off) & (SPU_LS_MASK & ~127u);
+        const int slot = yz_tr_slot(lsline, 1);
+        if (slot >= 0)
+            s_tr_mea[slot] = (ea32 + off) & ~127u;
+    }
+}
+
+void yz_tagread_repair_read(
+    spu_context* ctx, uint32_t lsa, uint32_t* value)
+{
+    extern uint8_t* vm_base;
+    if (!g_yz_runtime_config.tagread_repair ||
+        ctx->image_id != 0)
+        return;
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    if (pc != 0x65E4u && pc != 0x6550u && pc != 0x6568u)
+        return;
+
+    const uint32_t k = ctx->gpr[11]._u32[0] & 0xFu;
+    if ((k & 3u) != 0u || k > 12u)
+        return;
+    const uint32_t lsline = lsa & (SPU_LS_MASK & ~127u);
+    const int slot = yz_tr_slot(lsline, 0);
+    if (slot < 0 || s_tr_mea[slot] == 0u)
+        return;
+    const uint32_t tag_ea =
+        s_tr_mea[slot] + (((lsa & 127u) + k) & 127u);
+    if (tag_ea < YZ_TR_ARENA_LO ||
+        tag_ea + 3u >= YZ_TR_ARENA_HI)
+        return;
+
+    const uint32_t lane = k >> 2;
+    const uint32_t ls_tag = value[lane];
+    const uint8_t* hp = vm_base + tag_ea;
+    const uint32_t host_tag =
+        ((uint32_t)hp[0] << 24) | ((uint32_t)hp[1] << 16) |
+        ((uint32_t)hp[2] << 8) | (uint32_t)hp[3];
+    if (ls_tag != 0u || host_tag == 0u)
+        return;
+
+    value[lane] = host_tag;
+    uint8_t* lp = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
+    lp[k + 0u] = (uint8_t)(host_tag >> 24);
+    lp[k + 1u] = (uint8_t)(host_tag >> 16);
+    lp[k + 2u] = (uint8_t)(host_tag >> 8);
+    lp[k + 3u] = (uint8_t)host_tag;
+#if !defined(YZ_PERF_CLEAN)
+    static unsigned long repairs = 0;
+    ++repairs;
+    if (repairs <= 16u ||
+        (repairs & (repairs - 1u)) == 0u) {
+        fprintf(stderr,
+                "[tagread-repair] n=%lu ea=0x%08X "
+                "ls=0x%05X lane=%u 00000000->%08X\n",
+                repairs, tag_ea, lsa, lane, host_tag);
+        fflush(stderr);
+    }
+#endif
+}
+
+#if !defined(YZ_PERF_CLEAN)
 volatile int g_yz_ms_on = -1;
 static int s_ms_a010_only = 0;
 
@@ -2856,8 +3313,6 @@ void yz_ms_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
  * ===========================================================================*/
 volatile int g_yz_tr_on = -1;
 
-#define YZ_TR_ARENA_LO  0x41F00000u
-#define YZ_TR_ARENA_HI  0x42200000u
 static int      s_tr_a010_only = 0;
 static int      s_tr_quiet = 0;
 static uint32_t s_tr_log_lo = YZ_TR_ARENA_LO;
@@ -2891,9 +3346,6 @@ int yz_tagread_arm(void)
 }
 
 /* --- fetch map: LS 128-byte line -> arena EA line ------------------------ */
-#define YZ_TR_MAP 128
-static uint32_t      s_tr_mls[YZ_TR_MAP];    /* LS line addr | 1 in bit0 = occupied */
-static uint32_t      s_tr_mea[YZ_TR_MAP];    /* EA line addr */
 static unsigned long s_tr_mseq[YZ_TR_MAP];   /* fetch sequence */
 static uint64_t      s_tr_mms[YZ_TR_MAP];    /* host clock ms of the fetch */
 static unsigned long s_tr_fseq = 0;
@@ -2903,23 +3355,7 @@ static int           s_tr_flive = 0, s_tr_rlive = 0, s_tr_tlive = 0;
  * batch is identified here, where its authoritative arena EA is still known;
  * the later item/vtable and DMA legs live in different runtime helpers.
  */
-volatile long g_yz_a010_target_fetch_seen = 0;
 static uint32_t yz_tr_be32(const uint8_t* p);
-
-static int yz_tr_slot(uint32_t lsline, int create)
-{
-    unsigned h = (lsline >> 7) & (YZ_TR_MAP - 1);
-    for (unsigned i = 0; i < YZ_TR_MAP; i++) {
-        unsigned s = (h + i) & (YZ_TR_MAP - 1);
-        if (s_tr_mls[s] == (lsline | 1u)) return (int)s;
-        if (s_tr_mls[s] == 0) {
-            if (!create) return -1;
-            s_tr_mls[s] = lsline | 1u;
-            return (int)s;
-        }
-    }
-    return -1;
-}
 
 /* Called from spu_dma.h on every arena-range GET / GETLLAR by image 0. */
 void yz_tr_fetch(spu_context* ctx, uint32_t lsa, unsigned long long ea, uint32_t size)
@@ -3092,7 +3528,7 @@ void yz_tr_read(spu_context* ctx, uint32_t lsa, const uint32_t* v)
      * word is nonzero; never synthesize a value or touch the payload.
      */
     if (s_tr_repair < 0)
-        s_tr_repair = getenv("YZ_TAGREAD_REPAIR") ? 1 : 0;
+        s_tr_repair = g_yz_runtime_config.tagread_repair;
     if (s_tr_repair && mapped && ls_tag == 0u && host_tag != 0u &&
         (k & 3u) == 0u && k <= 12u) {
         uint32_t* mutable_v = (uint32_t*)(uintptr_t)v;
@@ -3212,8 +3648,6 @@ void yz_tr_tag(spu_context* ctx, uint32_t lsa, const uint32_t* v)
  * command-arena trace below: the latter deliberately arms on a mature character
  * batch, while these records are the missing environment workload.
  */
-volatile long g_yz_a010_stage_dispatch_generation = 0;
-volatile long g_yz_a010_stage_dispatch_mask = 0;
 static volatile long g_yz_a010_record_output_on = -1;
 static volatile long g_yz_a010_record_output_tag[8] = {0};
 static volatile long g_yz_a010_record_output_seq[8] = {0};
@@ -3531,6 +3965,7 @@ void yz_tr_record(spu_context* ctx, uint32_t lsa, const uint32_t* v)
         fflush(stderr);
     }
 }
+#endif
 
 /*
  * Exact a010 static-stage result addresses, published by Job A and consumed
@@ -3540,6 +3975,9 @@ void yz_tr_record(spu_context* ctx, uint32_t lsa, const uint32_t* v)
  */
 volatile uint32_t g_yz_a010_stage_result_ea[9] = {0};
 volatile long g_yz_a010_stage_result_get_mask = 0;
+volatile long g_yz_a010_target_fetch_seen = 0;
+volatile long g_yz_a010_stage_dispatch_generation = 0;
+volatile long g_yz_a010_stage_dispatch_mask = 0;
 
 /* ===========================================================================
  * Function-level SPU spin profiler (diagnostic, env YZ_SPU_PROF)
@@ -3655,9 +4093,7 @@ void spu_task_launch(spu_context* c)
      * REGRESSES movie frame progress (fence 28->14 measured) -- it still helps the
      * ongoing dispatch/execution that produces frames, so it stays default-ON.
      * Off-switch: YZ_NOLAUNCH. */
-    static int nolaunch = -1;
-    if (nolaunch < 0) nolaunch = getenv("YZ_NOLAUNCH") ? 1 : 0;
-    if (nolaunch) return;
+    if (g_yz_runtime_config.nolaunch) return;
     const unsigned char* ls = c->ls;
     uint32_t scl = ((uint32_t)ls[0x2C80]<<24)|((uint32_t)ls[0x2C81]<<16)
                  |((uint32_t)ls[0x2C82]<<8)|ls[0x2C83];      /* savedContextLr = task entry */
@@ -3742,7 +4178,7 @@ void spu_task_launch(spu_context* c)
         fprintf(stderr, "[task-resume] %s scl=0x%04X restored gpr81=%08X gpr80=%08X\n",
                 image==3?"cri_audio":"gs_task", scl,
                 c->gpr[81]._u32[0], c->gpr[80]._u32[0]); fflush(stderr); } }
-    if (!getenv("YZ_NO_MGMT")) {              /* SpursTasksetContext.tasksetMgmtAddr@0x2FB8=0x2700 */
+    if (!g_yz_runtime_config.no_mgmt) {        /* SpursTasksetContext.tasksetMgmtAddr@0x2FB8=0x2700 */
         c->ls[0x2FB8]=0x00; c->ls[0x2FB9]=0x00; c->ls[0x2FBA]=0x27; c->ls[0x2FBB]=0x00;
     }
     { static int n[8] = {0};
@@ -3758,11 +4194,109 @@ void spu_task_launch(spu_context* c)
         fflush(stderr); } }
 }
 
+/*
+ * Frontier JobChain halt trace.  The Sony job module returns
+ * CELL_SPURS_JOB_ERROR_PERM at 0x24F4 only when its per-SPU ownership token
+ * (loaded from LS[gpr86+0x10]) matches neither accepted token at LS
+ * 0x46D0/0x46E0.  This helper is called by both clean and diagnostic drains.
+ */
+static void yz_job_perm_root_check(spu_context* ctx, uint32_t pc)
+{
+    static int job_perm_trace = -1;
+    static volatile long job_perm_n = 0;
+    if (job_perm_trace < 0)
+        job_perm_trace = getenv("YZ_JOB_PERM_TRACE") ? 1 : 0;
+    if (!job_perm_trace || ctx->image_id != 13 ||
+        (pc & SPU_LS_MASK) != 0x024F0u ||
+        ctx->gpr[22]._u32[0] != 0)
+        return;
+
+    const unsigned long n =
+        (unsigned long)_InterlockedIncrement(&job_perm_n);
+    fprintf(stderr,
+            "[job-perm-root] n=%lu spu=%X pc=%05X "
+            "slot=%05X host_depth=%u\n",
+            n, ctx->spu_id, pc & SPU_LS_MASK,
+            (ctx->gpr[86]._u32[0] + 0x10u) & SPU_LS_MASK,
+            ctx->host_depth);
+    for (unsigned reg = 0; reg < 128; ++reg) {
+        fprintf(stderr,
+                "[job-perm-root] r%-3u=%08X_%08X_%08X_%08X\n",
+                reg, ctx->gpr[reg]._u32[0],
+                ctx->gpr[reg]._u32[1],
+                ctx->gpr[reg]._u32[2],
+                ctx->gpr[reg]._u32[3]);
+    }
+    {
+        const uint32_t addrs[] = {
+            0x046D0u, 0x046E0u, 0x04960u,
+            (ctx->gpr[86]._u32[0] + 0x10u) & SPU_LS_MASK
+        };
+        for (unsigned row = 0;
+             row < sizeof(addrs) / sizeof(addrs[0]); ++row) {
+            const uint32_t a = addrs[row] & SPU_LS_MASK;
+            fprintf(stderr, "[job-perm-root] LS[%05X]=", a);
+            for (unsigned i = 0; i < 16; ++i)
+                fprintf(stderr, "%02X", ctx->ls[(a + i) & SPU_LS_MASK]);
+            fprintf(stderr, "\n");
+        }
+    }
+    fflush(stderr);
+}
+
+/*
+ * Behavior-only portion of the per-hop task-policy seam. Clean lanes retain
+ * this tiny cached-option gate while compiling the large diagnostic census
+ * below out.
+ */
+void spu_task_launch_behavior_check(spu_context* ctx, uint32_t pc)
+{
+    yz_job_perm_root_check(ctx, pc);
+    if (ctx->image_id != 2) return;
+
+    if (g_yz_runtime_config.fixexit) {
+        unsigned char* L = ctx->ls;
+        uint32_t e = ((uint32_t)L[0x1E0]<<24) |
+                     ((uint32_t)L[0x1E1]<<16) |
+                     ((uint32_t)L[0x1E2]<<8) | L[0x1E3];
+        if (e != 0x838u) {
+            L[0x1E0]=0; L[0x1E1]=0; L[0x1E2]=0x08; L[0x1E3]=0x38;
+            static int n = 0;
+            if (n < 8) {
+                n++;
+                fprintf(stderr,
+                        "[fixexit] LS0x1E0 0x%08X -> 0x838\n", e);
+                fflush(stderr);
+            }
+        }
+        uint32_t s = ((uint32_t)L[0x1E4]<<24) |
+                     ((uint32_t)L[0x1E5]<<16) |
+                     ((uint32_t)L[0x1E6]<<8) | L[0x1E7];
+        if (s != 0x290u) {
+            L[0x1E4]=0; L[0x1E5]=0; L[0x1E6]=0x02; L[0x1E7]=0x90;
+        }
+    }
+
+    if ((pc & SPU_LS_MASK) == 0x1CC0u &&
+        g_yz_runtime_config.starttask_hook) {
+        const unsigned char* ls = ctx->ls;
+        uint32_t elf =
+            (((uint32_t)ls[0x2794]<<24) |
+             ((uint32_t)ls[0x2795]<<16) |
+             ((uint32_t)ls[0x2796]<<8) | ls[0x2797]) &
+            0xFFFFFFF8u;
+        if (elf == 0x012B4980u || elf == 0x0127A580u)
+            spu_task_launch(ctx);
+    }
+}
+
 /* DEFAULT-boot launch interception (replaces the prof-gated path). Called from
  * SPU_DRAIN on each trampoline hop when profiling is OFF; cheap early-out unless
  * this SPU is running the taskset policy (image 2) about to enter StartTask. */
-void spu_task_launch_check(spu_context* ctx, void* fn)
+void spu_task_launch_check(spu_context* ctx, uint32_t pc)
 {
+    yz_job_perm_root_check(ctx, pc);
+
     /* a010 Job A sentinel witness.  SPU_DRAIN reaches this hook before every
      * lifted instruction, including direct trampoline branches.  Observe the
      * second descriptor at D824 and the rotated/compared value at D830 so the
@@ -3814,19 +4348,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         }
     }
     if (ctx->image_id != 2) return;
+    spu_task_launch_behavior_check(ctx, pc);
     /* FIX TEST (env YZ_FIXEXIT): the policy poll (0x2318: bisl LS[0x1E0]) yields via the
      * kernel-context exitToKernelAddr@LS 0x1E0, which MUST be 0x838 (CELL_SPURS_KERNEL2_
      * EXIT_ADDR) + selectWorkloadAddr@0x1E4 = 0x290. Reliable trace shows ours is 0xA00 (the
      * policy ENTRY) so the poll re-enters the policy instead of yielding -> infinite poll,
      * never reaching the kernel. Force the correct addrs to test if THAT is the blocker. */
-    { static int fe = -1; if (fe < 0) fe = getenv("YZ_FIXEXIT") ? 1 : 0;
-      if (fe) { unsigned char* L = ctx->ls;
-          uint32_t e = ((uint32_t)L[0x1E0]<<24)|((uint32_t)L[0x1E1]<<16)|((uint32_t)L[0x1E2]<<8)|L[0x1E3];
-          if (e != 0x838u) { L[0x1E0]=0;L[0x1E1]=0;L[0x1E2]=0x08;L[0x1E3]=0x38;
-              static int n=0; if(n<8){n++; fprintf(stderr,"[fixexit] LS0x1E0 0x%08X -> 0x838\n", e); fflush(stderr);} }
-          uint32_t s = ((uint32_t)L[0x1E4]<<24)|((uint32_t)L[0x1E5]<<16)|((uint32_t)L[0x1E6]<<8)|L[0x1E7];
-          if (s != 0x290u) { L[0x1E4]=0;L[0x1E5]=0;L[0x1E6]=0x02;L[0x1E7]=0x90; } } }
-    uint32_t a = spu_prof_addr_of(fn);
+    uint32_t a = pc & SPU_LS_MASK;
     /* THROWAWAY DIAG (env YZ_POLHOP): full control-flow path of the taskset POLICY
      * (image 2). Locks onto the first image-2 SPU and logs its NON-SEQUENTIAL hops
      * (real branches, a != prev+4) from entry 0xA00 onward -- shows exactly where the
@@ -3990,8 +4518,6 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * With the hook off, the real case handlers + dispatch run lifted, and
      * task entries/resumes are caught by the natural-launch interception in
      * spu_indirect_branch (bi savedContextLr, pc>=0x3000 under image 2). */
-    { static int sth = -1; if (sth < 0) sth = getenv("YZ_STARTTASK_HOOK") ? 1 : 0;
-      if (sth && (elf == 0x012B4980u || elf == 0x0127A580u)) spu_task_launch(ctx); }
 }
 
 void spu_prof_hop(void* fn)
@@ -4043,8 +4569,9 @@ void spu_prof_hop(void* fn)
     /* RETIRED DEFAULT-OFF (2026-07-02): LS 0x1CC0 is the taskset-SYSCALL switch,
      * not StartTask -- see spu_task_launch_check. YZ_STARTTASK_HOOK=1 re-enables
      * the legacy hijack for A/B. */
-    { static int sth = -1; if (sth < 0) sth = getenv("YZ_STARTTASK_HOOK") ? 1 : 0;
-      if (sth && a == 0x1CC0u && g_spu_cur_ctx && g_spu_cur_ctx->image_id == 2)
+    { if (g_yz_runtime_config.starttask_hook &&
+          a == 0x1CC0u && g_spu_cur_ctx &&
+          g_spu_cur_ctx->image_id == 2)
         spu_task_launch(g_spu_cur_ctx); }
     /* DIAG: the policy's post-select gate at LS 0x2468 polls a byte in the kernel
      * context tempArea (LS 0x100..0x180) and bails unless ==1. Dump that region
@@ -4130,10 +4657,17 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
      * a legitimate dispatch always has an exact match. Kill-switch:
      * YZ_JOB_WILDCARD_OK=1 restores the old silent substitution. */
     if ((image_id == 13 || image_id == 14 || image_id == 15
-            || image_id == 17 || image_id == 18 || image_id == 19)
+            || image_id == 17 || image_id == 18 || image_id == 19
+            || image_id == 20 || image_id == 21 || image_id == 22
+            || image_id == 23 || image_id == 24 || image_id == 25
+            || image_id == 26 || image_id == 27 || image_id == 28
+            || image_id == 29 || image_id == 30 || image_id == 31
+            || image_id == 32 || image_id == 33 || image_id == 34
+            || image_id == 35 || image_id == 36 || image_id == 37
+            || image_id == 38 || image_id == 39 || image_id == 40
+            || image_id == 41)
             && addr >= 0x4880u && wildcard) {
-        static int ok = -1;
-        if (ok < 0) ok = getenv("YZ_JOB_WILDCARD_OK") ? 1 : 0;
+        const int ok = g_yz_runtime_config.job_wildcard_ok;
         static int wl = 0; if (wl < 32) { wl++;
             fprintf(stderr, "[job-wildcard] query img=%d addr=0x%05X exact-miss; wildcard img=%d %s\n",
                     image_id, addr, wildcard_img,
@@ -4151,8 +4685,7 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
      * misses exact is a bug by definition. Fail loud; kill-switch
      * YZ_KERN_WILDCARD_OK restores the old masking. */
     if (image_id == 16 && wildcard) {
-        static int kok = -1;
-        if (kok < 0) kok = getenv("YZ_KERN_WILDCARD_OK") ? 1 : 0;
+        const int kok = g_yz_runtime_config.kern_wildcard_ok;
         static int kl = 0; if (kl < 32) { kl++;
             fprintf(stderr, "[kern-wildcard] KERNEL ctx query addr=0x%05X exact-miss; wildcard img=%d %s\n",
                     addr, wildcard_img,
@@ -4331,8 +4864,7 @@ int g_yz_sguard_on = -1;
 int yz_sguard_check(spu_context* ctx, void* tf)
 {
     if (g_yz_sguard_on < 0) {
-        const char* e = getenv("YZ_SENTINEL_GUARD");
-        int on = (e && *e && *e != '0') ? 1 : 0;
+        int on = g_yz_runtime_config.sentinel_guard;
         if (on) {
             fprintf(stderr, "[sguard] ARMED: defer sentinel-less state-5 "
                     "Driver-B walks (gs_task 0x4DC4/0x4DC8, tail scan "
@@ -4504,7 +5036,7 @@ void yz_throw_retry_flush(void)
 
 void spu_img_restore(spu_context* ctx, int32_t saved_img)
 {
-    static int off = -1;
+#if !defined(YZ_PERF_CLEAN)
     /* s42 FLIGHT RECORDER v2 (gap 3, closest runtime-visible approximation
      * for direct-call coverage): every lifted call site's return bracket
      * calls this function unconditionally (tools/spu_lifter.py ~726-831),
@@ -4518,19 +5050,27 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
      * happened inside the call. */
     if (yz_fltrec_hot(ctx)) yz_fltrec_call_ret(ctx, saved_img, ctx->image_id);
 
-    if (off < 0) {
-        off = getenv("YZ_NO_IMGSTACK") ? 1 : 0;
+    {
+        static int announced = 0;
+        if (!announced) {
+        announced = 1;
         fprintf(stderr, "[img-ret] %s: restore-on-host-return image model %s\n",
-                off ? "OFF (YZ_NO_IMGSTACK)" : "ARMED",
-                off ? "disabled" : "live");
+                g_yz_runtime_config.no_imgstack
+                    ? "OFF (YZ_NO_IMGSTACK)" : "ARMED",
+                g_yz_runtime_config.no_imgstack
+                    ? "disabled" : "live");
         fflush(stderr);
+        }
     }
-    if (off) return;
+#endif
+    if (g_yz_runtime_config.no_imgstack) return;
     if (ctx->image_id != saved_img) {
+#if !defined(YZ_PERF_CLEAN)
         static int rl = 0; if (rl < 24) { rl++;
             fprintf(stderr, "[img-ret] spu=%X host-return restore image %d -> %d (pc=0x%05X)\n",
                     ctx->spu_id, ctx->image_id, saved_img, ctx->pc & SPU_LS_MASK);
             fflush(stderr); }
+#endif
         ctx->image_id = saved_img;
     }
 }
@@ -4676,8 +5216,7 @@ void spu_indirect_branch(spu_context* ctx)
      * context is rebuilt from the taskset EA at entry, so the guard stops
      * short of 0x2700. Kill-switch YZ_NO_MODRELOAD. */
     if ((ctx->pc & SPU_LS_MASK) == 0xA00u && ctx->module_src_ea) {
-        static int moff = -1;
-        if (moff < 0) moff = getenv("YZ_NO_MODRELOAD") ? 1 : 0;
+        const int moff = g_yz_runtime_config.no_modreload;
         if (!moff) {
             extern uint8_t* vm_base;
             uint32_t mlen = ctx->module_src_size;
@@ -4810,16 +5349,15 @@ void spu_indirect_branch(spu_context* ctx)
                  * same footing cri_audio's spu_task_launch resume already runs on).
                  * The policy re-enters on the task's 0xA70 cross-image yield. Env
                  * kill-switch YZ_NO_LAUNCH_UNWIND. */
-                static int no_unwind = -1;
-                if (no_unwind < 0) no_unwind = getenv("YZ_NO_LAUNCH_UNWIND") ? 1 : 0;
-                if (g_spu_restart_jmp && !no_unwind) {
+                if (g_spu_restart_jmp &&
+                    !g_yz_runtime_config.no_launch_unwind) {
                     g_spu_trampoline_fn = 0;
                     longjmp(*g_spu_restart_jmp, 1);
                 }
             }
         }
     }
-    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18/19). The job module
+    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/33/34/35/36). The job module
      * (image 13) loads each descriptor's binary into free LS past its own end
      * (module spans LS [0xA00,0x4880)) and `bisl`s to its entry. The DMA
      * recorder (spu_dma.h) captured WHERE each known binary is resident in
@@ -4829,11 +5367,21 @@ void spu_indirect_branch(spu_context* ctx)
         static const uint32_t job_span[5] = {
             0x9540u, 0x14C0u, 0x7640u, 0x10610u, 0x1E80u
         };
-        static const int job_image[5] = { 14, 15, 17, 18, 19 };
         uint32_t jpc = ctx->pc & SPU_LS_MASK;
         int family = ctx->image_id == 13 || ctx->image_id == 14
                   || ctx->image_id == 15 || ctx->image_id == 17
-                  || ctx->image_id == 18 || ctx->image_id == 19;
+                  || ctx->image_id == 18 || ctx->image_id == 19
+                  || ctx->image_id == 20 || ctx->image_id == 21
+                  || ctx->image_id == 22 || ctx->image_id == 23
+                  || ctx->image_id == 24 || ctx->image_id == 25
+                  || ctx->image_id == 26 || ctx->image_id == 27
+                  || ctx->image_id == 28 || ctx->image_id == 29
+                  || ctx->image_id == 30 || ctx->image_id == 31
+                  || ctx->image_id == 32 || ctx->image_id == 33
+                  || ctx->image_id == 34 || ctx->image_id == 35
+                  || ctx->image_id == 36 || ctx->image_id == 37
+                  || ctx->image_id == 38 || ctx->image_id == 39
+                  || ctx->image_id == 40 || ctx->image_id == 41;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
@@ -4842,7 +5390,11 @@ void spu_indirect_branch(spu_context* ctx)
                 if (ctx->job_bin_base[i]
                         && jpc >= ctx->job_bin_base[i]
                         && jpc <  ctx->job_bin_base[i] + job_span[i])
-                    { jimg = job_image[i]; break; }
+                    {
+                        jimg = spu_job_resident_image(
+                            i, ctx->job_bin_base[i]);
+                        break;
+                    }
             /*
              * Sunshine orphanage job-launch census.
              *
@@ -4901,6 +5453,89 @@ void spu_indirect_branch(spu_context* ctx)
                                     ctx->ls[(record + bi) & SPU_LS_MASK]);
                         fprintf(stderr, "\n");
                         fflush(stderr);
+                    }
+                }
+            }
+            /*
+             * Exact job-descriptor handoff.
+             *
+             * SPURS may omit a binary DMA when its shared jobchain residency
+             * state says that binary is already loaded.  Residency is actually
+             * per local store, and a lifted call bracket can restore the prior
+             * job's image tag before the next job-entry branch.  The launch
+             * descriptor at r4 is therefore the source of truth at each known
+             * fixed entry, even when the current tag is another job image.
+             *
+             * Reconcile the per-context residency map with that exact
+             * descriptor.  The branch target is the binary's actual LS base:
+             * the job module validates the JOBCRT prologue at target + 0x10
+             * immediately before branching.  Do not infer a different base
+             * merely because the target lies inside an older residency range;
+             * the post-Kamurocho Job D launch at 0x5000 overlaps a stale
+             * 0x4C00 record, and treating it as an internal entry overwrites
+             * the valid prologue with source bytes from offset 0x410.
+             *
+             * The first four instructions are immutable and distinguish every
+             * known binary; do not compare the full span, because job-private
+             * writable state legitimately changes there.  Restore the binary
+             * only when that code header is stale.  Job A's known partial-tail
+             * corruption remains covered by its separate immutable-tail check
+             * below.  Clearing overlapping records is required: Job A, Job B,
+             * Job D, and the orphanage worker reuse shared slots.
+             */
+            if (family && jpc >= 0x04880u) {
+                const uint32_t record =
+                    ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                const uint32_t binary_ea =
+                    ((uint32_t)ctx->ls[(record + 4u) & SPU_LS_MASK] << 24) |
+                    ((uint32_t)ctx->ls[(record + 5u) & SPU_LS_MASK] << 16) |
+                    ((uint32_t)ctx->ls[(record + 6u) & SPU_LS_MASK] << 8) |
+                    (uint32_t)ctx->ls[(record + 7u) & SPU_LS_MASK];
+                uint32_t descriptor_base = jpc;
+                int descriptor_image =
+                    spu_job_descriptor_image(
+                        ctx->image_id, jpc, binary_ea);
+                const int descriptor_slot =
+                    spu_job_descriptor_slot(descriptor_image);
+                const uint32_t descriptor_span =
+                    spu_job_descriptor_span(descriptor_image);
+
+                if (descriptor_slot >= 0 && descriptor_span != 0) {
+                    extern uint8_t* vm_base;
+                    const int stale =
+                        memcmp(ctx->ls + descriptor_base,
+                               vm_base + binary_ea,
+                               16u) != 0;
+                    if (stale)
+                        memcpy(ctx->ls + descriptor_base,
+                               vm_base + binary_ea,
+                               descriptor_span);
+
+                    for (int i = 0; i < 5; i++) {
+                        const uint32_t base = ctx->job_bin_base[i];
+                        if (i != descriptor_slot && base != 0 &&
+                            base < descriptor_base + descriptor_span &&
+                            descriptor_base < base + job_span[i])
+                            ctx->job_bin_base[i] = 0;
+                    }
+                    ctx->job_bin_base[descriptor_slot] = descriptor_base;
+                    jimg = descriptor_image;
+
+                    if (stale) {
+                        static volatile long repair_n = 0;
+                        const unsigned long n = (unsigned long)
+                            _InterlockedIncrement(&repair_n);
+                        if (n <= 32u || (n & (n - 1u)) == 0u) {
+                            fprintf(stderr,
+                                    "[job-descriptor-repair] n=%lu spu=%X "
+                                    "image %d -> %d entry=%05X base=%05X "
+                                    "eaBinary=%08X size=%05X\n",
+                                    n, ctx->spu_id, ctx->image_id,
+                                    descriptor_image, jpc, descriptor_base,
+                                    binary_ea,
+                                    descriptor_span);
+                            fflush(stderr);
+                        }
                     }
                 }
             }
@@ -4979,6 +5614,17 @@ void spu_indirect_branch(spu_context* ctx)
                             fflush(stderr);
                         }
                     }
+                } else if (descriptor_image == 14) {
+                    /*
+                     * The orphanage worker and Job A both occupy LS 0x4C00.
+                     * After image 19 has run, SPURS may reuse its shared
+                     * residency decision and omit Job A's DMA.  The launch
+                     * descriptor is authoritative: discard the stale image-19
+                     * residency now, select Job A, and let the immutable-tail
+                     * check below restore its complete binary before entry.
+                     */
+                    ctx->job_bin_base[4] = 0;
+                    jimg = descriptor_image;
                 }
             }
             /* a010 can move the jobchain to a different SPU after the module's
@@ -5320,6 +5966,7 @@ void spu_indirect_branch(spu_context* ctx)
                 fflush(stderr);
                 memcpy(ctx->ls + 0x04C00u,
                        vm_base + 0x01254500u, 0x9540u);
+                ctx->job_bin_base[4] = 0;
                 ctx->job_bin_base[0] = 0x04C00u;
             }
             /* The ordinary launch census is intentionally capped and is
@@ -5327,13 +5974,69 @@ void spu_indirect_branch(spu_context* ctx)
              * Always retain one image-17 witness so a deep boot can prove
              * whether the gameplay-transition binary was actually selected. */
             static int jl = 0, j17_seen = 0, j18_seen = 0;
+            static int j20c_seen = 0, j230_seen = 0, j158_seen = 0;
+            static int j274_seen = 0, j2a8_seen = 0, j2b4_seen = 0;
+            static int j2c4_seen = 0, j2d4_seen = 0, j2e8_seen = 0;
+            static int j24_seen = 0, j1ec_seen = 0, j3bc_seen = 0;
+            static int j3dc_seen = 0;
+            static int j37c_seen = 0, j3b0_seen = 0, j4c_seen = 0;
             int emit_launch = jl < 16
-                           || (jimg == 17 && !j17_seen)
-                           || (jimg == 18 && !j18_seen);
+                           || ((jimg == 17 || jimg == 20 || jimg == 22 ||
+                                jimg == 23)
+                               && !j17_seen)
+                           || ((jimg == 18 || jimg == 21) && !j18_seen)
+                           || (jimg == 18 && jpc == 0x20C00u &&
+                               !j20c_seen)
+                           || (jimg == 21 && jpc == 0x23000u &&
+                               !j230_seen)
+                           || (jimg == 25 && jpc == 0x15800u &&
+                               !j158_seen)
+                           || (jimg == 32 && jpc == 0x27400u &&
+                               !j274_seen)
+                           || (jimg == 33 && jpc == 0x2A800u &&
+                               !j2a8_seen)
+                           || (jimg == 29 && jpc == 0x2B400u &&
+                               !j2b4_seen)
+                           || (jimg == 36 && jpc == 0x2C400u &&
+                               !j2c4_seen)
+                           || (jimg == 31 && jpc == 0x2D400u &&
+                               !j2d4_seen)
+                           || (jimg == 30 && jpc == 0x2E800u &&
+                               !j2e8_seen)
+                           || (jimg == 24 && !j24_seen)
+                           || (jimg == 15 && jpc == 0x1EC00u &&
+                               !j1ec_seen)
+                           || (jimg == 15 && jpc == 0x3BC00u &&
+                               !j3bc_seen)
+                           || (jimg == 15 && jpc == 0x3DC00u &&
+                               !j3dc_seen)
+                           || (jimg == 35 && jpc == 0x37C00u &&
+                               !j37c_seen)
+                           || (jimg == 37 && jpc == 0x3B000u &&
+                               !j3b0_seen)
+                           || (jimg == 38 && jpc == 0x04C00u &&
+                               !j4c_seen);
             if (emit_launch) {
                 if (jl < 16) jl++;
-                if (jimg == 17) j17_seen = 1;
-                if (jimg == 18) j18_seen = 1;
+                if (jimg == 17 || jimg == 20 || jimg == 22 || jimg == 23)
+                    j17_seen = 1;
+                if (jimg == 18 || jimg == 21) j18_seen = 1;
+                if (jimg == 18 && jpc == 0x20C00u) j20c_seen = 1;
+                if (jimg == 21 && jpc == 0x23000u) j230_seen = 1;
+                if (jimg == 25 && jpc == 0x15800u) j158_seen = 1;
+                if (jimg == 32 && jpc == 0x27400u) j274_seen = 1;
+                if (jimg == 33 && jpc == 0x2A800u) j2a8_seen = 1;
+                if (jimg == 29 && jpc == 0x2B400u) j2b4_seen = 1;
+                if (jimg == 36 && jpc == 0x2C400u) j2c4_seen = 1;
+                if (jimg == 31 && jpc == 0x2D400u) j2d4_seen = 1;
+                if (jimg == 30 && jpc == 0x2E800u) j2e8_seen = 1;
+                if (jimg == 24) j24_seen = 1;
+                if (jimg == 15 && jpc == 0x1EC00u) j1ec_seen = 1;
+                if (jimg == 15 && jpc == 0x3BC00u) j3bc_seen = 1;
+                if (jimg == 15 && jpc == 0x3DC00u) j3dc_seen = 1;
+                if (jimg == 35 && jpc == 0x37C00u) j37c_seen = 1;
+                if (jimg == 37 && jpc == 0x3B000u) j3b0_seen = 1;
+                if (jimg == 38 && jpc == 0x04C00u) j4c_seen = 1;
                 fprintf(stderr, "[job-launch] spu=%X image %d -> %d at LS 0x%05X (lr=0x%05X)\n",
                         ctx->spu_id, ctx->image_id, jimg, jpc,
                         ctx->gpr[0]._u32[0] & SPU_LS_MASK);
@@ -5599,7 +6302,7 @@ void spu_indirect_branch(spu_context* ctx)
          * the system service's intervening LS clobber (kernel/service/taskset share
          * LS 0xA00+) can't leak in. RPCS3 (pt11) does this via the kernel<->workload
          * context switch (reaches ResumeTask 0xB60). */
-        static int off = -1; if (off < 0) off = getenv("YZ_NORESUME") ? 1 : 0;
+        const int off = g_yz_runtime_config.noresume;
         /* image 13 = the JOB policy module (jobchain, wid 1) -- it shares the
          * kernel2 poll/exit convention (bisl 0x838, poll link 0x231C). Without
          * the clean coroutine return its idle poll-yields hit the destructive
@@ -5648,10 +6351,8 @@ void spu_indirect_branch(spu_context* ctx)
              * wcl==2 real-kernel branch) modeled a coroutine seam that does
              * not exist on silicon. Retained ONLY under YZ_CORET_LEGACY=1
              * for A/B. */
-            static int coret_gen = -1;
-            if (coret_gen < 0) coret_gen = getenv("YZ_CORET_GEN") ? 1 : 0;
-            static int legacy_seam = -1;
-            if (legacy_seam < 0) legacy_seam = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+            const int coret_gen = g_yz_runtime_config.coret_gen;
+            const int legacy_seam = g_yz_runtime_config.coret_legacy;
             if (legacy_seam && lpc == 0x838u && link == 0x231Cu
                     && (wcl == 2u || ctx->image_id == 13 || coret_gen)) {
                 /* s31 iteration 2 (ledger #71; MEASURED scratch/s31cure1.err): for
@@ -5678,8 +6379,7 @@ void spu_indirect_branch(spu_context* ctx)
                  * and its later resume is the acfccf6 cross-context class. The
                  * fake is retained for image 13/coret_gen (measured ZERO hits in
                  * current boots) and under YZ_CORET_LEGACY=1. */
-                static int legacy2 = -1;
-                if (legacy2 < 0) legacy2 = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+                const int legacy2 = g_yz_runtime_config.coret_legacy;
                 if (!legacy2 && wcl == 2u) {
                     /* s32: the kernel may switch this workload away -- shadow
                      * the parked task's writable state FIRST (the save leg the
@@ -5722,7 +6422,7 @@ void spu_indirect_branch(spu_context* ctx)
              * is 0 (proceed -> StartTask -> bi savedContextLr=0x3050 launches
              * gs_task), and return to 0x2344 without re-running SelectWorkload (its
              * pick would yield to a higher-weight workload and loop forever). */
-            else if (getenv("YZ_POLLFORCE") && lpc == 0x290u
+            else if (g_yz_runtime_config.pollforce && lpc == 0x290u
                      && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) == 0x2344u) {
                 /* OFF by default: forcing the poll to proceed does NOT launch
                  * gs_task (verified -- the policy loops regardless of the poll
@@ -5771,8 +6471,7 @@ void spu_indirect_branch(spu_context* ctx)
      * Kill-switch: YZ_CORET_LEGACY=1 restores the pre-s31 nested-exit behavior
      * exactly. */
     {
-        static int legacy = -1;
-        if (legacy < 0) legacy = getenv("YZ_CORET_LEGACY") ? 1 : 0;
+        const int legacy = g_yz_runtime_config.coret_legacy;
         if (!legacy && (ctx->pc & SPU_LS_MASK) == 0x838u
                 && ctx->host_depth > 0 && g_spu_restart_jmp) {
             uint32_t wcl = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16)
@@ -5836,7 +6535,7 @@ void spu_indirect_branch(spu_context* ctx)
      * window; every task launch logs exactly once. Own lean flag (YZ_TASKARG)
      * because YZ_SPU_PROF's per-branch overhead crawls the whole boot. */
     { static int ta = -1; if (ta < 0) ta = getenv("YZ_TASKARG") ? 1 : 0;
-    if ((g_spu_prof_on || ta) && (ctx->pc & SPU_LS_MASK) == 0x3050u) {
+    if ((YZ_SPU_PROF_ACTIVE() || ta) && (ctx->pc & SPU_LS_MASK) == 0x3050u) {
         static int gst = 0;
         if (gst < 400) { gst++;
             fprintf(stderr, "[gstask] ib pc=0x%05X arg(gpr3)=%08X_%08X_%08X_%08X "
@@ -5856,7 +6555,8 @@ void spu_indirect_branch(spu_context* ctx)
      * unwinds back to the C caller (StartTask 0x1C50 -> 0x1C54 -> ... -> 0x1CC0
      * `bi savedContextLr=0x3050` = the gs_task launch). Without this the policy SPU
      * halts at 0x10000 and gs_task never executes. Env off-switch: YZ_NOHELPRET. */
-    if ((ctx->pc & SPU_LS_MASK) == 0x10000u && ctx->image_id == 2 && !getenv("YZ_NOHELPRET")) {
+    if ((ctx->pc & SPU_LS_MASK) == 0x10000u &&
+        ctx->image_id == 2 && !g_yz_runtime_config.nohelpret) {
         g_spu_trampoline_fn = 0;   /* C-unwind: SPU_DRAIN returns to StartTask 0x1C54 */
         static int rr = 0; if (rr < 16) { rr++;
             fprintf(stderr, "[yz-helpret] StartTask helper bi gpr7=0x10000 (clobbered) "
@@ -5873,7 +6573,8 @@ void spu_indirect_branch(spu_context* ctx)
      * the banner-armed guard at 0 fires while the wall reproduced, proving
      * this leg alone does not see the dispatch). On defer the helper has
      * already set pc/trampoline per SPU_RET semantics; just return. */
-    if (g_yz_sguard_on && fn && yz_sguard_check(ctx, (void*)fn))
+    if (g_yz_runtime_config.sentinel_guard &&
+        fn && yz_sguard_check(ctx, (void*)fn))
         return;
 
     if (fn) {
@@ -5886,8 +6587,7 @@ void spu_indirect_branch(spu_context* ctx)
          * host return; without the brackets this adoption would be the
          * ledger-#51 mislabel trap, so it shares the YZ_NO_IMGSTACK switch. */
         if (serve_img != ctx->image_id) {
-            static int noadopt = -1;
-            if (noadopt < 0) noadopt = getenv("YZ_NO_IMGSTACK") ? 1 : 0;
+            const int noadopt = g_yz_runtime_config.no_imgstack;
             if (!noadopt) {
                 static int al = 0; if (al < 16) { al++;
                     fprintf(stderr, "[img-serve] spu=%X 0x%05X served by image %d (ctx was %d)\n",
@@ -5900,7 +6600,7 @@ void spu_indirect_branch(spu_context* ctx)
          * scheduler loop indirect-branches between the kernel, system service
          * and (unexpectedly) the geometry task -- log target + apparent caller
          * (SPU lr = gpr0) + image class to pin where it crosses images. */
-        if (g_spu_prof_on) {
+        if (YZ_SPU_PROF_ACTIVE()) {
             static unsigned long ib_n = 0;
             unsigned long n = ib_n++;
             if (n < 160 || (n % 2000000UL) == 0)
@@ -5936,7 +6636,18 @@ void spu_indirect_branch(spu_context* ctx)
          * push a previously exactly-one adoption into ambiguity. */
         int from_jobworld = ctx->image_id == 13 || ctx->image_id == 14
                          || ctx->image_id == 15 || ctx->image_id == 17
-                         || ctx->image_id == 18 || ctx->image_id == 19;
+                         || ctx->image_id == 18 || ctx->image_id == 19
+                         || ctx->image_id == 20 || ctx->image_id == 21
+                         || ctx->image_id == 22 || ctx->image_id == 23
+                         || ctx->image_id == 24 || ctx->image_id == 25
+                         || ctx->image_id == 26 || ctx->image_id == 27
+                         || ctx->image_id == 28 || ctx->image_id == 29
+                         || ctx->image_id == 30 || ctx->image_id == 31
+                         || ctx->image_id == 32 || ctx->image_id == 33
+                         || ctx->image_id == 34 || ctx->image_id == 35
+                         || ctx->image_id == 36 || ctx->image_id == 37
+                         || ctx->image_id == 38 || ctx->image_id == 39
+                         || ctx->image_id == 40 || ctx->image_id == 41;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
@@ -5944,7 +6655,29 @@ void spu_indirect_branch(spu_context* ctx)
                             || s_registry[i].image_id == 15
                             || s_registry[i].image_id == 17
                             || s_registry[i].image_id == 18
-                            || s_registry[i].image_id == 19))
+                            || s_registry[i].image_id == 19
+                            || s_registry[i].image_id == 20
+                            || s_registry[i].image_id == 21
+                            || s_registry[i].image_id == 22
+                            || s_registry[i].image_id == 23
+                            || s_registry[i].image_id == 24
+                            || s_registry[i].image_id == 25
+                            || s_registry[i].image_id == 26
+                            || s_registry[i].image_id == 27
+                            || s_registry[i].image_id == 28
+                            || s_registry[i].image_id == 29
+                            || s_registry[i].image_id == 30
+                            || s_registry[i].image_id == 31
+                            || s_registry[i].image_id == 32
+                            || s_registry[i].image_id == 33
+                            || s_registry[i].image_id == 34
+                            || s_registry[i].image_id == 35
+                            || s_registry[i].image_id == 36
+                            || s_registry[i].image_id == 37
+                            || s_registry[i].image_id == 38
+                            || s_registry[i].image_id == 39
+                            || s_registry[i].image_id == 40
+                            || s_registry[i].image_id == 41))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
@@ -5989,8 +6722,7 @@ void spu_indirect_branch(spu_context* ctx)
          * query landing here is a wild branch by definition — fall through
          * to the loud halt. Shares the kern-guard kill-switch. */
         if (foreign == 1 && ffn && ctx->image_id == 16) {
-            static int kok = -1;
-            if (kok < 0) kok = getenv("YZ_KERN_WILDCARD_OK") ? 1 : 0;
+            const int kok = g_yz_runtime_config.kern_wildcard_ok;
             if (!kok) {
                 static int kf = 0; if (kf < 16) { kf++;
                     fprintf(stderr, "[spu-ximg] KERNEL ctx branch LS 0x%05X owned only by image %d "
@@ -6276,7 +7008,7 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
             return;
         }
     }
-    if (!g_spu_prof_on) return;
+    if (!YZ_SPU_PROF_ACTIVE()) return;
     if (ctx->spu_id != 0x2000u) return;          /* one SPU, no interleave */
     if (!s_trace_armed) {
         if (g_spu_getllar_n < 8000000UL) return; /* wait for post-CreateTask2 steady state */
