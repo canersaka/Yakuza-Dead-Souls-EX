@@ -22,7 +22,11 @@ struct fallback_clock {
     uint32_t object = 0;
     float value = 0.0f;
     std::chrono::steady_clock::time_point sampled{};
+    std::chrono::steady_clock::time_point reported_changed{};
+    float last_reported = 0.0f;
     bool active = false;
+    bool reported_seen = false;
+    bool stalled_source = false;
 };
 
 fallback_clock g_fallback[4];
@@ -67,6 +71,9 @@ bool valid_position(float value)
 
 } // namespace
 
+extern "C" volatile long g_yz_a010_root_active;
+extern "C" volatile long g_yz_a010_animation_ready;
+
 void func_00AFC178(ppu_context* ctx)
 {
     const uint32_t object = (uint32_t)ctx->gpr[3];
@@ -76,27 +83,77 @@ void func_00AFC178(ppu_context* ctx)
 
     const float reported = (float)ctx->fpr[1];
     fallback_clock& fallback = slot_for(object);
-    if (valid_position(reported)) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool valid_report = valid_position(reported);
+    const bool a010_tail =
+        g_yz_a010_root_active != 0 &&
+        g_yz_a010_animation_ready != 0 &&
+        vm_read32(object + 0x20u) == 0x61303130u &&
+        valid_report && reported >= 1000.0f;
+
+    if (valid_report &&
+        (!fallback.reported_seen ||
+         std::fabs(reported - fallback.last_reported) > 0.001f)) {
+        fallback.last_reported = reported;
+        fallback.reported_changed = now;
+        fallback.reported_seen = true;
+    }
+
+    /*
+     * The a010 voice is 1156 presentation frames long, while the AUTH has a
+     * short authored tail after that point.  The CRI position callback keeps
+     * returning the finite final frame, so the generic validity check above
+     * cannot distinguish end-of-voice from a healthy clock.  Continue only
+     * after the late a010 position has remained bit-stable for two seconds.
+     * This preserves the entire audio-synchronized portion and lets the
+     * game's ordinary state machine consume its silent tail.
+     */
+    const bool stalled_a010_position =
+        a010_tail && fallback.reported_seen &&
+        now - fallback.reported_changed >= std::chrono::seconds(2);
+
+    if (valid_report && fallback.active && fallback.stalled_source) {
+        /*
+         * Do not rewind if a backend resumes behind the monotonic tail.
+         * Rejoin it only once it has caught up with the fallback.
+         */
+        if (reported > fallback.value + 0.5f) {
+            fallback.value = reported;
+            fallback.sampled = now;
+            fallback.active = false;
+            fallback.stalled_source = false;
+            return;
+        }
+    } else if (valid_report && !stalled_a010_position) {
         fallback.value = reported;
-        fallback.sampled = std::chrono::steady_clock::now();
+        fallback.sampled = now;
         fallback.active = false;
+        fallback.stalled_source = false;
         return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
     if (!fallback.active || !valid_position(fallback.value) ||
-        (valid_position(previous) &&
+        (!stalled_a010_position && valid_position(previous) &&
          std::fabs(previous - fallback.value) > 90.0f)) {
         fallback.value = valid_position(previous) && previous >= 0.0f
                        ? previous : 0.0f;
         fallback.sampled = now;
         fallback.active = true;
-        fprintf(stderr,
-                "[present-clock] rejected invalid position object=%08X "
-                "reported=%g previous=%g source=%08X mode=%08X; "
-                "using monotonic 30 Hz fallback\n",
-                object, (double)reported, (double)previous,
-                vm_read32(object + 0x120u), vm_read32(object + 0x04u));
+        fallback.stalled_source = stalled_a010_position;
+        if (stalled_a010_position) {
+            fprintf(stderr,
+                    "[present-clock] a010 audio position stalled at %.3f "
+                    "object=%08X source=%08X; continuing silent AUTH tail "
+                    "with monotonic 30 Hz fallback\n",
+                    (double)reported, object, vm_read32(object + 0x120u));
+        } else {
+            fprintf(stderr,
+                    "[present-clock] rejected invalid position object=%08X "
+                    "reported=%g previous=%g source=%08X mode=%08X; "
+                    "using monotonic 30 Hz fallback\n",
+                    object, (double)reported, (double)previous,
+                    vm_read32(object + 0x120u), vm_read32(object + 0x04u));
+        }
         fflush(stderr);
     } else {
         const double elapsed =
