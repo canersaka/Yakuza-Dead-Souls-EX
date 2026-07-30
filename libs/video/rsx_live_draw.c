@@ -107,7 +107,8 @@ extern volatile LONG g_yz_a010_root_active;
  * the first presentation stall, so use the next power of two with headroom.
  */
 #define MAX_PSOS         8192
-#define MAX_SHADER_BLOBS 2048
+#define FORMER_MAX_SHADER_BLOBS 2048
+#define MAX_SHADER_BLOBS 8192
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
 
@@ -201,6 +202,8 @@ typedef struct {
 typedef struct {
     shader_blob_t entries[MAX_SHADER_BLOBS];
     u32 count;
+    u64 retained_source_bytes;
+    u64 retained_blob_bytes;
 } shader_blob_cache_t;
 
 typedef struct {
@@ -784,14 +787,26 @@ typedef struct {
     u64 pso_full;
     u64 vs_blob_lookups;
     u64 vs_blob_hits;
+    u64 vs_blob_misses;
+    u64 vs_blob_inserts;
+    u64 vs_blob_full_rejects;
     u64 ps_blob_lookups;
     u64 ps_blob_hits;
+    u64 ps_blob_misses;
+    u64 ps_blob_inserts;
+    u64 ps_blob_full_rejects;
     u64 vs_compile_calls;
     u64 ps_compile_calls;
     u64 vs_unique;
     u64 ps_unique;
+    u64 vs_post_boundary_distinct;
+    u64 vs_post_boundary_repeats;
+    u64 ps_post_boundary_distinct;
+    u64 ps_post_boundary_repeats;
     u64 create_pso_calls;
     u64 decompile_qpc;
+    u64 vs_blob_lookup_qpc;
+    u64 ps_blob_lookup_qpc;
     u64 vs_compile_qpc;
     u64 ps_compile_qpc;
     u64 create_pso_qpc;
@@ -2360,29 +2375,47 @@ static u64 fnv1a(const void* data, u32 n, u64 h)
  */
 static ID3DBlob* shader_blob_cache_find(
     shader_blob_cache_t* cache, const char* source, u32 source_length,
-    u64 hash)
+    u64 hash, int* post_boundary_hit, int* hash_seen)
 {
+    if (post_boundary_hit)
+        *post_boundary_hit = 0;
+    if (hash_seen)
+        *hash_seen = 0;
     for (u32 i = 0; i < cache->count; i++) {
         shader_blob_t* entry = &cache->entries[i];
-        if (entry->hash != hash ||
+        if (entry->hash != hash)
+            continue;
+        if (hash_seen)
+            *hash_seen = 1;
+        if (
             entry->source_length != source_length ||
             memcmp(entry->source, source, source_length) != 0)
             continue;
+        if (post_boundary_hit && i >= FORMER_MAX_SHADER_BLOBS)
+            *post_boundary_hit = 1;
         entry->blob->lpVtbl->AddRef(entry->blob);
         return entry->blob;
     }
     return NULL;
 }
 
-static void shader_blob_cache_insert(
+typedef enum {
+    SHADER_BLOB_INSERT_SKIPPED = 0,
+    SHADER_BLOB_INSERTED,
+    SHADER_BLOB_INSERT_FULL
+} shader_blob_insert_result;
+
+static shader_blob_insert_result shader_blob_cache_insert(
     shader_blob_cache_t* cache, const char* source, u32 source_length,
     u64 hash, ID3DBlob* blob)
 {
-    if (!blob || cache->count >= MAX_SHADER_BLOBS)
-        return;
+    if (!blob)
+        return SHADER_BLOB_INSERT_SKIPPED;
+    if (cache->count >= MAX_SHADER_BLOBS)
+        return SHADER_BLOB_INSERT_FULL;
     char* source_copy = (char*)malloc((size_t)source_length + 1u);
     if (!source_copy)
-        return;
+        return SHADER_BLOB_INSERT_SKIPPED;
     memcpy(source_copy, source, source_length);
     source_copy[source_length] = '\0';
     shader_blob_t* entry = &cache->entries[cache->count++];
@@ -2391,6 +2424,9 @@ static void shader_blob_cache_insert(
     entry->source = source_copy;
     entry->blob = blob;
     blob->lpVtbl->AddRef(blob);
+    cache->retained_source_bytes += source_length;
+    cache->retained_blob_bytes += blob->lpVtbl->GetBufferSize(blob);
+    return SHADER_BLOB_INSERTED;
 }
 
 static void shader_blob_cache_release(shader_blob_cache_t* cache)
@@ -2456,16 +2492,27 @@ static ID3D12PipelineState* build_pso(
         ps_hlsl, g_ld_profile.ps_hashes, &g_ld_profile.n_ps_hashes,
         &g_ld_profile.total.ps_unique);
     g_ld_profile.total.vs_blob_lookups++;
+    const LONGLONG vs_lookup_begin = ld_profile_qpc();
 #endif
+    int vs_post_boundary_hit = 0;
+    int vs_hash_seen = 0;
     vs = shader_blob_cache_find(
-        &g.vs_blobs, vs_hlsl, vs_length, vs_hash);
+        &g.vs_blobs, vs_hlsl, vs_length, vs_hash,
+        &vs_post_boundary_hit, &vs_hash_seen);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vs_blob_lookup_qpc +=
+        (u64)(ld_profile_qpc() - vs_lookup_begin);
+#endif
     HRESULT vs_hr = S_OK;
     if (vs) {
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.vs_blob_hits++;
+        if (vs_post_boundary_hit)
+            g_ld_profile.total.vs_post_boundary_repeats++;
 #endif
     } else {
 #if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.vs_blob_misses++;
         g_ld_profile.total.vs_compile_calls++;
         const LONGLONG compile_begin = ld_profile_qpc();
 #endif
@@ -2476,9 +2523,25 @@ static ID3D12PipelineState* build_pso(
         g_ld_profile.total.vs_compile_qpc +=
             (u64)(ld_profile_qpc() - compile_begin);
 #endif
-        if (SUCCEEDED(vs_hr))
-            shader_blob_cache_insert(
+        if (SUCCEEDED(vs_hr)) {
+            const u32 count_before = g.vs_blobs.count;
+            const shader_blob_insert_result insert_result =
+                shader_blob_cache_insert(
                 &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs);
+#if defined(YZ_PERF_PROFILE)
+            if (insert_result == SHADER_BLOB_INSERTED) {
+                g_ld_profile.total.vs_blob_inserts++;
+                if (count_before >= FORMER_MAX_SHADER_BLOBS &&
+                    !vs_hash_seen)
+                    g_ld_profile.total.vs_post_boundary_distinct++;
+            } else if (insert_result == SHADER_BLOB_INSERT_FULL) {
+                g_ld_profile.total.vs_blob_full_rejects++;
+            }
+#else
+            (void)count_before;
+            (void)insert_result;
+#endif
+        }
     }
     if (FAILED(vs_hr)) {
         if (compile_fail_logs++ < 32) {
@@ -2494,16 +2557,27 @@ static ID3D12PipelineState* build_pso(
     }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.ps_blob_lookups++;
+    const LONGLONG ps_lookup_begin = ld_profile_qpc();
 #endif
+    int ps_post_boundary_hit = 0;
+    int ps_hash_seen = 0;
     ps = shader_blob_cache_find(
-        &g.ps_blobs, ps_hlsl, ps_length, ps_hash);
+        &g.ps_blobs, ps_hlsl, ps_length, ps_hash,
+        &ps_post_boundary_hit, &ps_hash_seen);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.ps_blob_lookup_qpc +=
+        (u64)(ld_profile_qpc() - ps_lookup_begin);
+#endif
     HRESULT ps_hr = S_OK;
     if (ps) {
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.ps_blob_hits++;
+        if (ps_post_boundary_hit)
+            g_ld_profile.total.ps_post_boundary_repeats++;
 #endif
     } else {
 #if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.ps_blob_misses++;
         g_ld_profile.total.ps_compile_calls++;
         const LONGLONG compile_begin = ld_profile_qpc();
 #endif
@@ -2514,9 +2588,25 @@ static ID3D12PipelineState* build_pso(
         g_ld_profile.total.ps_compile_qpc +=
             (u64)(ld_profile_qpc() - compile_begin);
 #endif
-        if (SUCCEEDED(ps_hr))
-            shader_blob_cache_insert(
+        if (SUCCEEDED(ps_hr)) {
+            const u32 count_before = g.ps_blobs.count;
+            const shader_blob_insert_result insert_result =
+                shader_blob_cache_insert(
                 &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps);
+#if defined(YZ_PERF_PROFILE)
+            if (insert_result == SHADER_BLOB_INSERTED) {
+                g_ld_profile.total.ps_blob_inserts++;
+                if (count_before >= FORMER_MAX_SHADER_BLOBS &&
+                    !ps_hash_seen)
+                    g_ld_profile.total.ps_post_boundary_distinct++;
+            } else if (insert_result == SHADER_BLOB_INSERT_FULL) {
+                g_ld_profile.total.ps_blob_full_rejects++;
+            }
+#else
+            (void)count_before;
+            (void)insert_result;
+#endif
+        }
     }
     if (FAILED(ps_hr)) {
         if (compile_fail_logs++ < 32) {
@@ -3444,6 +3534,45 @@ static void ld_profile_present(u32 frame)
                 (double)memory.CurrentUsage / (1024.0 * 1024.0),
                 (double)memory.Budget / (1024.0 * 1024.0),
                 (double)memory.CurrentReservation / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "[shader-cache-perf] frame=%u "
+                "vs{count=%u capacity=%u lookups=%llu hits=%llu "
+                "misses=%llu inserts=%llu full_rejects=%llu "
+                "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
+                "post2048_distinct=%llu post2048_repeats=%llu "
+                "source_bytes=%llu blob_bytes=%llu} "
+                "ps{count=%u capacity=%u lookups=%llu hits=%llu "
+                "misses=%llu inserts=%llu full_rejects=%llu "
+                "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
+                "post2048_distinct=%llu post2048_repeats=%llu "
+                "source_bytes=%llu blob_bytes=%llu}\n",
+                frame,
+                g.vs_blobs.count, MAX_SHADER_BLOBS,
+                (unsigned long long)total->vs_blob_lookups,
+                (unsigned long long)total->vs_blob_hits,
+                (unsigned long long)total->vs_blob_misses,
+                (unsigned long long)total->vs_blob_inserts,
+                (unsigned long long)total->vs_blob_full_rejects,
+                (unsigned long long)total->vs_compile_calls,
+                ld_profile_ticks_ms(total->vs_blob_lookup_qpc),
+                ld_profile_ticks_ms(total->vs_compile_qpc),
+                (unsigned long long)total->vs_post_boundary_distinct,
+                (unsigned long long)total->vs_post_boundary_repeats,
+                (unsigned long long)g.vs_blobs.retained_source_bytes,
+                (unsigned long long)g.vs_blobs.retained_blob_bytes,
+                g.ps_blobs.count, MAX_SHADER_BLOBS,
+                (unsigned long long)total->ps_blob_lookups,
+                (unsigned long long)total->ps_blob_hits,
+                (unsigned long long)total->ps_blob_misses,
+                (unsigned long long)total->ps_blob_inserts,
+                (unsigned long long)total->ps_blob_full_rejects,
+                (unsigned long long)total->ps_compile_calls,
+                ld_profile_ticks_ms(total->ps_blob_lookup_qpc),
+                ld_profile_ticks_ms(total->ps_compile_qpc),
+                (unsigned long long)total->ps_post_boundary_distinct,
+                (unsigned long long)total->ps_post_boundary_repeats,
+                (unsigned long long)g.ps_blobs.retained_source_bytes,
+                (unsigned long long)g.ps_blobs.retained_blob_bytes);
         fflush(stderr);
     }
 
@@ -6147,6 +6276,48 @@ void rsx_live_draw_shutdown(void)
             (double)g_ld_profile.total_upload_high / (1024.0 * 1024.0),
             (double)g_ld_profile.total_vb_high / (1024.0 * 1024.0),
             g_ld_profile.total_retired_high);
+    fprintf(stderr,
+            "[shader-cache-summary] "
+            "vs{count=%u capacity=%u lookups=%llu hits=%llu "
+            "misses=%llu inserts=%llu full_rejects=%llu "
+            "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
+            "post2048_distinct=%llu post2048_repeats=%llu "
+            "source_bytes=%llu blob_bytes=%llu} "
+            "ps{count=%u capacity=%u lookups=%llu hits=%llu "
+            "misses=%llu inserts=%llu full_rejects=%llu "
+            "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
+            "post2048_distinct=%llu post2048_repeats=%llu "
+            "source_bytes=%llu blob_bytes=%llu}\n",
+            g.vs_blobs.count, MAX_SHADER_BLOBS,
+            (unsigned long long)g_ld_profile.total.vs_blob_lookups,
+            (unsigned long long)g_ld_profile.total.vs_blob_hits,
+            (unsigned long long)g_ld_profile.total.vs_blob_misses,
+            (unsigned long long)g_ld_profile.total.vs_blob_inserts,
+            (unsigned long long)g_ld_profile.total.vs_blob_full_rejects,
+            (unsigned long long)g_ld_profile.total.vs_compile_calls,
+            ld_profile_ticks_ms(g_ld_profile.total.vs_blob_lookup_qpc),
+            ld_profile_ticks_ms(g_ld_profile.total.vs_compile_qpc),
+            (unsigned long long)
+                g_ld_profile.total.vs_post_boundary_distinct,
+            (unsigned long long)
+                g_ld_profile.total.vs_post_boundary_repeats,
+            (unsigned long long)g.vs_blobs.retained_source_bytes,
+            (unsigned long long)g.vs_blobs.retained_blob_bytes,
+            g.ps_blobs.count, MAX_SHADER_BLOBS,
+            (unsigned long long)g_ld_profile.total.ps_blob_lookups,
+            (unsigned long long)g_ld_profile.total.ps_blob_hits,
+            (unsigned long long)g_ld_profile.total.ps_blob_misses,
+            (unsigned long long)g_ld_profile.total.ps_blob_inserts,
+            (unsigned long long)g_ld_profile.total.ps_blob_full_rejects,
+            (unsigned long long)g_ld_profile.total.ps_compile_calls,
+            ld_profile_ticks_ms(g_ld_profile.total.ps_blob_lookup_qpc),
+            ld_profile_ticks_ms(g_ld_profile.total.ps_compile_qpc),
+            (unsigned long long)
+                g_ld_profile.total.ps_post_boundary_distinct,
+            (unsigned long long)
+                g_ld_profile.total.ps_post_boundary_repeats,
+            (unsigned long long)g.ps_blobs.retained_source_bytes,
+            (unsigned long long)g.ps_blobs.retained_blob_bytes);
     fflush(stderr);
 #endif
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
