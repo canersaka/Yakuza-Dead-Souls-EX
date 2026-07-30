@@ -19,13 +19,14 @@
  */
 
 #include "rsx_fp_decompiler.h"
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <d3dcompiler.h>
+#else
+#include <dirent.h>
 #endif
 
 /* NV40 FP opcode field + END bit + CONST-source detection (mirrors the
@@ -73,31 +74,69 @@ int main(int argc, char** argv)
 {
     if (argc < 2) { printf("usage: %s <dir-of-.fp>\n", argv[0]); return 2; }
     const char* dir = argv[1];
-
-    DIR* d = opendir(dir);
-    if (!d) { printf("cannot open dir: %s\n", dir); return 1; }
+    const char* constant_mode = getenv("RSX_FP_CONSTANT_MODE");
+    const int buffered =
+        constant_mode &&
+        (constant_mode[0] == 'B' || constant_mode[0] == 'b');
 
     int total = 0, clean = 0, with_unhandled = 0, decode_err = 0, no_end = 0;
     int compiled = 0, compile_fail = 0, shown = 0;
-    struct dirent* e;
     char path[1024];
 
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*.fp", dir);
+    WIN32_FIND_DATAA find_data;
+    HANDLE find = FindFirstFileA(pattern, &find_data);
+    if (find == INVALID_HANDLE_VALUE) {
+        printf("cannot open dir: %s\n", dir);
+        return 1;
+    }
+    int have_file = 1;
+    while (have_file) {
+        const char* name = find_data.cFileName;
+#else
+    DIR* d = opendir(dir);
+    if (!d) { printf("cannot open dir: %s\n", dir); return 1; }
+    struct dirent* e;
     while ((e = readdir(d)) != NULL) {
         const char* name = e->d_name;
+#endif
         size_t L = strlen(name);
-        if (L < 3 || strcmp(name + L - 3, ".fp") != 0) continue;
+        if (L < 3 || strcmp(name + L - 3, ".fp") != 0) {
+#ifdef _WIN32
+            have_file = FindNextFileA(find, &find_data);
+#endif
+            continue;
+        }
 
         snprintf(path, sizeof(path), "%s/%s", dir, name);
         long n = read_file(path, filebuf, (long)sizeof(filebuf));
-        if (n < 16) continue;
+        if (n < 16) {
+#ifdef _WIN32
+            have_file = FindNextFileA(find, &find_data);
+#endif
+            continue;
+        }
         total++;
 
         u32 size = rsx_fp_program_size(filebuf, (u32)n);
         if (size == 0) { no_end++; size = (u32)n; }
         tally_opcodes(filebuf, size);
 
-        int instrs = rsx_fp_decompile(filebuf, size, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
-        if (instrs < 0) { decode_err++; continue; }
+        int instrs = buffered
+            ? rsx_fp_decompile_buffered_ex(
+                filebuf, size, RSX_FP_CTRL_AUTO, 0, hlsl,
+                sizeof(hlsl), NULL)
+            : rsx_fp_decompile(
+                filebuf, size, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+        if (instrs < 0) {
+            decode_err++;
+#ifdef _WIN32
+            have_file = FindNextFileA(find, &find_data);
+#endif
+            continue;
+        }
 
         /* Scan for unhandled-opcode markers the decompiler emits. */
         int file_unhandled = 0;
@@ -136,10 +175,18 @@ int main(int argc, char** argv)
             if (err) err->lpVtbl->Release(err);
         }
 #endif
+#ifdef _WIN32
+        have_file = FindNextFileA(find, &find_data);
+#endif
     }
+#ifdef _WIN32
+    FindClose(find);
+#else
     closedir(d);
+#endif
 
-    printf("=== fragment-program corpus: %s ===\n", dir);
+    printf("=== fragment-program corpus: %s (%s constants) ===\n",
+           dir, buffered ? "buffered" : "literal");
     printf("total .fp        : %d\n", total);
     printf("fully decoded    : %d  (%.1f%%)\n", clean, total ? 100.0*clean/total : 0);
     printf("with unhandled op: %d\n", with_unhandled);
