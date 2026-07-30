@@ -104,7 +104,7 @@ extern volatile LONG g_yz_a010_root_active;
  * orphanage and into Akiyama measured 2,296 distinct requested PSO keys before
  * the first presentation stall, so use the next power of two with headroom.
  */
-#define MAX_PSOS         4096
+#define MAX_PSOS         8192
 #define MAX_SHADER_BLOBS 2048
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
