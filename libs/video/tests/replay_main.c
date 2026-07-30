@@ -241,6 +241,7 @@ static void apply_block(const rxs_stream* s, u32 index)
 #define CB_BLOCK_BYTES   ((512 + 2) * 16)
 #define CB_BLOCK_ALIGNED ((CB_BLOCK_BYTES + 255) & ~255u)
 #define CB_RING_BYTES    (CB_BLOCK_ALIGNED * SRV_RING_TABLES)
+#define PS_CB_RING_BYTES CB_RING_BYTES
 
 /* Translated-shader PSO cache */
 #define MAX_PSOS         256
@@ -396,6 +397,12 @@ typedef struct {
     ID3D12Resource*            cb;         /* per-draw constant ring         */
     u8*                        cb_mapped;
     u32                        cb_used;
+    ID3D12Resource*            ps_cb;      /* buffered FP constants at b1    */
+    u8*                        ps_cb_mapped;
+    u32                        ps_cb_used;
+    rsx_fp_constant_block      fp_constants;
+    float                      fp_alpha_ref;
+    int                        fp_constants_buffered;
 
     ID3D12Resource*            vb;
     u8*                        vb_mapped;
@@ -612,6 +619,14 @@ static int gpu_init(u32 width, u32 height, int use_hw)
                                                       &IID_ID3D12Resource, (void**)&g.cb)))
         return -1;
     g.cb->lpVtbl->Map(g.cb, 0, &rr, (void**)&g.cb_mapped);
+    bd.Width = PS_CB_RING_BYTES;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&g.ps_cb)))
+        return -1;
+    g.ps_cb->lpVtbl->Map(
+        g.ps_cb, 0, &rr, (void**)&g.ps_cb_mapped);
 
     /* root signature: 16 root constants = 4x4 transform at b0 (VS),
      * one SRV table at t0 (PS), one static linear-clamp sampler at s0 */
@@ -662,7 +677,7 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         D3D12_DESCRIPTOR_RANGE srange = {0};
         srange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
         srange.NumDescriptors = SMP_TABLE_SIZE;
-        D3D12_ROOT_PARAMETER xp[3] = {0};
+        D3D12_ROOT_PARAMETER xp[4] = {0};
         xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         xp[0].Descriptor.ShaderRegister = 0;
         xp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -674,8 +689,11 @@ static int gpu_init(u32 width, u32 height, int use_hw)
         xp[2].DescriptorTable.NumDescriptorRanges = 1;
         xp[2].DescriptorTable.pDescriptorRanges = &srange;
         xp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        xp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        xp[3].Descriptor.ShaderRegister = 1;
+        xp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC xrsd = {0};
-        xrsd.NumParameters = 3;
+        xrsd.NumParameters = 4;
         xrsd.pParameters = xp;
         xrsd.NumStaticSamplers = 0;
         xrsd.pStaticSamplers = NULL;
@@ -1219,6 +1237,7 @@ static ID3D12Resource* surface_crop_flush(u32 phys_idx, u32 log_w, u32 log_h)
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.upload_used = 0;
 
@@ -1528,6 +1547,7 @@ static void depth_snapshot_flush(u32 location, u32 offset)
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.upload_used = 0;
 
@@ -1720,6 +1740,7 @@ static void dump_depth_raw(const char* path)
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.upload_used = 0;
 }
@@ -1797,6 +1818,7 @@ static void gpu_readback_surface(u32 surf_idx, const char* path)
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.upload_used = 0;   /* copies completed; recycle the staging arena */
 }
@@ -1824,6 +1846,7 @@ static void gpu_flush(void)
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     /* All texture-upload copies recorded before this flush have completed on
      * the GPU (gpu_wait above), so the staging arena can be recycled. Without
@@ -3068,6 +3091,31 @@ static u64 fnv1a(const void* data, u32 n, u64 h)
     return h;
 }
 
+static u64 hash_structural_render_state(
+    const render_state_t* state, u64 hash)
+{
+#define HASH_RENDER_FIELD(name) \
+    hash = fnv1a(&state->name, sizeof(state->name), hash)
+    HASH_RENDER_FIELD(alpha_test_enable);
+    HASH_RENDER_FIELD(alpha_func);
+    HASH_RENDER_FIELD(blend_enable);
+    HASH_RENDER_FIELD(sf_rgb);
+    HASH_RENDER_FIELD(df_rgb);
+    HASH_RENDER_FIELD(sf_a);
+    HASH_RENDER_FIELD(df_a);
+    HASH_RENDER_FIELD(eq_rgb);
+    HASH_RENDER_FIELD(eq_a);
+    HASH_RENDER_FIELD(depth_test);
+    HASH_RENDER_FIELD(depth_write);
+    HASH_RENDER_FIELD(depth_func);
+    HASH_RENDER_FIELD(cull_enable);
+    HASH_RENDER_FIELD(cull_face);
+    HASH_RENDER_FIELD(front_face);
+    HASH_RENDER_FIELD(color_mask);
+#undef HASH_RENDER_FIELD
+    return hash;
+}
+
 static void dump_text(const char* stem, u64 key, const char* ext, const void* data, u32 n)
 {
     char path[MAX_PATH];
@@ -3174,14 +3222,26 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
      * program reused under a different export mode gets its own PSO. */
     const u32 fp_ctrl = rsx_dsp_shader_control(rsx);
 
-    u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
-    key = fnv1a(fp_uc, fp_size, key);
+    if (rsx_fp_collect_constants(
+            fp_uc, fp_size, &g.fp_constants) < 0)
+        return NULL;
+    u64 key = fnv1a(
+        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    if (g.fp_constants_buffered)
+        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+    else
+        key = fnv1a(fp_uc, fp_size, key);
     const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     /* B1: the PSO bakes the render state, so it must be part of the cache key */
     render_state_t rs;
     decode_render_state(rsx, &rs);
-    key = fnv1a(&rs, sizeof(rs), key);
+    g.fp_alpha_ref = rsx_fp_alpha_ref(
+        rs.alpha_ref_raw, rs.alpha_ref_format);
+    if (g.fp_constants_buffered)
+        key = hash_structural_render_state(&rs, key);
+    else
+        key = fnv1a(&rs, sizeof(rs), key);
 
     if (out_key) *out_key = key;
 
@@ -3199,7 +3259,16 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
     static char ps_hlsl[256 * 1024];
     ID3D12PipelineState* pso = NULL;
     const int vi = rsx_vp_decompile(vp_uc, vp_instrs * 16, vs_hlsl, sizeof(vs_hlsl));
-    int fi = rsx_fp_decompile(fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    u32 decompiled_constants = 0;
+    int fi = g.fp_constants_buffered
+        ? rsx_fp_decompile_buffered_ex(
+            fp_uc, fp_size, fp_ctrl, 0, ps_hlsl, sizeof(ps_hlsl),
+            &decompiled_constants)
+        : rsx_fp_decompile(
+            fp_uc, fp_size, fp_ctrl, ps_hlsl, sizeof(ps_hlsl));
+    if (g.fp_constants_buffered &&
+        decompiled_constants != g.fp_constants.count)
+        fi = -1;
     if (fi > 0 && g_fp_force_stage >= 0 && key == FP_FORCE_TARGET_KEY)
         fp_apply_force_stage(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage);
     if (fi > 0 && g_fp_force_stage2 >= 0 && key == FP_FORCE_TARGET_KEY2)
@@ -3213,8 +3282,12 @@ static ID3D12PipelineState* get_translated_pso(const rsx_dispatch* rsx, u64* out
     if (fi > 0 && g_fp_force_stage6 >= 0 && key == FP_FORCE_TARGET_KEY6)
         fp_apply_force_stage6(ps_hlsl, sizeof(ps_hlsl), g_fp_force_stage6);
     if (fi > 0 && rs.alpha_test_enable &&
-        rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
-            rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format)) < 0) {
+        (g.fp_constants_buffered
+             ? rsx_fp_apply_alpha_test_buffered(
+                   ps_hlsl, sizeof(ps_hlsl), rs.alpha_func)
+             : rsx_fp_apply_alpha_test(
+                   ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+                   g.fp_alpha_ref)) < 0) {
         printf("[xlat] alpha-test injection failed key=%016llx\n",
                (unsigned long long)key);
         fi = -1;
@@ -4051,6 +4124,19 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         printf("[xlat] constant ring full, draw falls back\n");
         xpso = NULL;
     }
+    u32 ps_cb_offset = 0;
+    u32 ps_cb_allocation = 0;
+    const u32 ps_value_slots =
+        g.fp_constants.count ? g.fp_constants.count : 1u;
+    if (xpso && g.fp_constants_buffered) {
+        const u32 ps_data_bytes = (ps_value_slots + 1u) * 16u;
+        if (rsx_fp_constant_ring_plan(
+                g.ps_cb_used, PS_CB_RING_BYTES, ps_data_bytes,
+                &ps_cb_offset, &ps_cb_allocation) != 1) {
+            printf("[xlat] pixel constant ring full, draw falls back\n");
+            xpso = NULL;
+        }
+    }
 
     /* Fallback transform columns: uploaded constants c0..c3 as the MVP when
      * present, else the RSX viewport scale/translate inverse (stage 2). */
@@ -4551,6 +4637,18 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
         u8* dst = g.cb_mapped + g.cb_used;
         memcpy(dst, rsx->constants, RSX_DSP_NUM_CONSTANTS * 16);
         memcpy(dst + 512 * 16, xf, sizeof(xf));
+        if (g.fp_constants_buffered) {
+            const u32 ps_data_bytes = (ps_value_slots + 1u) * 16u;
+            u8* ps_dst = g.ps_cb_mapped + ps_cb_offset;
+            memset(ps_dst, 0, ps_data_bytes);
+            if (g.fp_constants.count)
+                memcpy(
+                    ps_dst, g.fp_constants.values,
+                    (size_t)g.fp_constants.count * 16u);
+            memcpy(
+                ps_dst + ps_value_slots * 16u,
+                &g.fp_alpha_ref, sizeof(g.fp_alpha_ref));
+        }
 
         if (c->draw_count < 40 || dbg_force_log)
             printf("          vp=(%u,%u %ux%u) scale=(%.2f %.2f %.4f)"
@@ -4587,7 +4685,14 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
             g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, smp_tbl); /* B1 samplers */
+        if (g.fp_constants_buffered)
+            g.list->lpVtbl->SetGraphicsRootConstantBufferView(
+                g.list, 3,
+                g.ps_cb->lpVtbl->GetGPUVirtualAddress(g.ps_cb) +
+                    ps_cb_offset);
         g.cb_used += CB_BLOCK_ALIGNED;
+        if (g.fp_constants_buffered)
+            g.ps_cb_used += ps_cb_allocation;
         dvp.Width = W;
         dvp.Height = H;
         c->draws_xlat++;
@@ -4768,6 +4873,14 @@ int main(int argc, char** argv)
     b1_read_env();
     printf("[b1] state: blend=%d depth=%d cull=%d samp=%d\n",
            g_b1_blend, g_b1_depth, g_b1_cull, g_b1_samp);
+    {
+        const char* mode = getenv("RSX_FP_CONSTANT_MODE");
+        g.fp_constants_buffered =
+            mode && (mode[0] == 'B' || mode[0] == 'b');
+        printf(
+            "[fp-constants] replay mode=%s\n",
+            g.fp_constants_buffered ? "buffered" : "literal");
+    }
 
     {
         const char* e = getenv("RSX_FP_FORCE_STAGE");

@@ -133,6 +133,8 @@ extern volatile LONG g_yz_a010_root_active;
 #define CB_BLOCK_BYTES   ((512 + 2) * 16)
 #define CB_BLOCK_ALIGNED ((CB_BLOCK_BYTES + 255) & ~255u)
 #define CB_RING_BYTES    (CB_BLOCK_ALIGNED * SRV_RING_TABLES)
+#define PS_CB_RING_BYTES CB_RING_BYTES
+#define LD_VARIANT_SET_CAPACITY (MAX_SHADER_BLOBS * 2u)
 
 #define VERT_STRIDE      (16 * 4 * 4)   /* 16 attrs * float4                  */
 #define MAX_VERTS        (256 * 1024)
@@ -276,6 +278,16 @@ typedef struct {
     u8*                        cb_mapped;
     u32                        cb_used;
 
+    /* Separate transient b1 arena for buffered fragment constants. It uses
+     * the existing constant-buffer ring budget rather than changing any
+     * texture or vertex upload-ring capacity. */
+    ID3D12Resource*            ps_cb;
+    u8*                        ps_cb_mapped;
+    u32                        ps_cb_used;
+    rsx_fp_constant_block      fp_constants;
+    float                      fp_alpha_ref;
+    char                       fp_constant_mode;
+
     ID3D12Resource*            vb;
     u8*                        vb_mapped;
     u32                        vb_used;
@@ -328,6 +340,16 @@ static const char* ld_vertex_mode_name(void)
     case 'C': return "C-compact";
     default:  return "L-legacy";
     }
+}
+
+static int ld_fp_constants_buffered(void)
+{
+    return g.fp_constant_mode == 'B';
+}
+
+static const char* ld_fp_constant_mode_name(void)
+{
+    return ld_fp_constants_buffered() ? "buffered" : "literal";
 }
 
 static int g_ld_dred_dumped = 0;
@@ -766,6 +788,7 @@ typedef enum {
     LD_FLUSH_MOVIE,
     LD_FLUSH_MOVIE_PRESENT,
     LD_FLUSH_READBACK,
+    LD_FLUSH_PIXEL_CONSTANT_RING,
     LD_FLUSH_SHUTDOWN,
     LD_FLUSH_REASON_COUNT
 } ld_flush_reason;
@@ -823,6 +846,10 @@ typedef struct {
     u64 vertex_upload_bytes;
     u64 vertex_fetch_pack_qpc;
     u64 texture_upload_bytes;
+    u64 ps_constant_allocations;
+    u64 ps_constant_upload_bytes;
+    u64 ps_constant_upload_qpc;
+    u64 ps_constant_capacity_failures;
 } ld_profile_counts;
 
 typedef struct {
@@ -830,8 +857,19 @@ typedef struct {
     ld_profile_counts previous;
     u64 vs_hashes[MAX_SHADER_BLOBS];
     u64 ps_hashes[MAX_SHADER_BLOBS];
+    u64 ps_raw_exact_hashes[LD_VARIANT_SET_CAPACITY];
+    u64 ps_raw_constant_hashes[LD_VARIANT_SET_CAPACITY];
+    u64 ps_exact_source_hashes[LD_VARIANT_SET_CAPACITY];
+    u64 ps_constant_specialized_hashes[LD_VARIANT_SET_CAPACITY];
+    u64 ps_canonical_hashes[LD_VARIANT_SET_CAPACITY];
+    u32 n_ps_raw_exact_hashes;
+    u32 n_ps_raw_constant_hashes;
     u32 n_vs_hashes;
     u32 n_ps_hashes;
+    u32 n_ps_exact_source_hashes;
+    u32 n_ps_constant_specialized_hashes;
+    u32 n_ps_canonical_hashes;
+    u64 ps_variant_tracking_overflow;
     u32 frame_upload_high;
     u32 frame_vb_high;
     u32 frame_retired_high;
@@ -2366,6 +2404,34 @@ static u64 fnv1a(const void* data, u32 n, u64 h)
     return h;
 }
 
+static u64 ld_hash_structural_render_state(
+    const render_state_t* state, u64 hash)
+{
+#define LD_HASH_RENDER_FIELD(name) \
+    hash = fnv1a(&state->name, sizeof(state->name), hash)
+    /* Alpha payload is deliberately absent. Enable and compare mode still
+     * select distinct shader/PSO behavior. Every other D3D12 render-state
+     * field is listed explicitly so struct padding can never become identity. */
+    LD_HASH_RENDER_FIELD(alpha_test_enable);
+    LD_HASH_RENDER_FIELD(alpha_func);
+    LD_HASH_RENDER_FIELD(blend_enable);
+    LD_HASH_RENDER_FIELD(sf_rgb);
+    LD_HASH_RENDER_FIELD(df_rgb);
+    LD_HASH_RENDER_FIELD(sf_a);
+    LD_HASH_RENDER_FIELD(df_a);
+    LD_HASH_RENDER_FIELD(eq_rgb);
+    LD_HASH_RENDER_FIELD(eq_a);
+    LD_HASH_RENDER_FIELD(depth_test);
+    LD_HASH_RENDER_FIELD(depth_write);
+    LD_HASH_RENDER_FIELD(depth_func);
+    LD_HASH_RENDER_FIELD(cull_enable);
+    LD_HASH_RENDER_FIELD(cull_face);
+    LD_HASH_RENDER_FIELD(front_face);
+    LD_HASH_RENDER_FIELD(color_mask);
+#undef LD_HASH_RENDER_FIELD
+    return hash;
+}
+
 /*
  * PSO identity includes render state, but D3DCompile only consumes the final
  * generated shader text.  Keep those cache boundaries separate: one exact
@@ -2453,6 +2519,104 @@ static void ld_profile_note_hlsl(
     if (*count < MAX_SHADER_BLOBS)
         hashes[(*count)++] = hash;
     (*unique)++;
+}
+
+static int ld_profile_note_hash(
+    u64 hash, u64 hashes[LD_VARIANT_SET_CAPACITY], u32* count)
+{
+    if (!hash)
+        hash = 1;
+    u32 slot = (u32)hash & (LD_VARIANT_SET_CAPACITY - 1u);
+    for (u32 probe = 0; probe < LD_VARIANT_SET_CAPACITY; ++probe) {
+        if (hashes[slot] == hash)
+            return 0;
+        if (hashes[slot] == 0) {
+            hashes[slot] = hash;
+            (*count)++;
+            return 1;
+        }
+        slot = (slot + 1u) & (LD_VARIANT_SET_CAPACITY - 1u);
+    }
+    g_ld_profile.ps_variant_tracking_overflow++;
+    return 0;
+}
+
+static void ld_profile_note_fp_variants(
+    const u8* fp_uc, u32 fp_size, u32 fp_ctrl_key, u32 cube_mask,
+    const render_state_t* state)
+{
+    const u64 seed = 1469598103934665603ull;
+    u64 raw_constant = fnv1a(fp_uc, fp_size, seed);
+    u64 raw_exact = raw_constant;
+    u64 canonical = rsx_fp_structural_hash(fp_uc, fp_size, seed);
+    if (!canonical)
+        return;
+
+    const u32 alpha_enable = state->alpha_test_enable ? 1u : 0u;
+    const u32 alpha_func = alpha_enable ? state->alpha_func : 0u;
+#define LD_HASH_FP_SOURCE_FIELD(value) do { \
+    const u32 _field = (value); \
+    raw_exact = fnv1a(&_field, sizeof(_field), raw_exact); \
+    raw_constant = fnv1a( \
+        &_field, sizeof(_field), raw_constant); \
+    canonical = fnv1a(&_field, sizeof(_field), canonical); \
+} while (0)
+    LD_HASH_FP_SOURCE_FIELD(fp_ctrl_key);
+    LD_HASH_FP_SOURCE_FIELD(cube_mask);
+    LD_HASH_FP_SOURCE_FIELD(alpha_enable);
+    LD_HASH_FP_SOURCE_FIELD(alpha_func);
+#undef LD_HASH_FP_SOURCE_FIELD
+
+    float alpha_ref = 0.0f;
+    if (alpha_enable && alpha_func != 0x0207u) {
+        alpha_ref = rsx_fp_alpha_ref(
+            state->alpha_ref_raw, state->alpha_ref_format);
+        raw_exact = fnv1a(
+            &alpha_ref, sizeof(alpha_ref), raw_exact);
+    }
+
+    const int new_raw_constant = ld_profile_note_hash(
+        raw_constant, g_ld_profile.ps_raw_constant_hashes,
+        &g_ld_profile.n_ps_raw_constant_hashes);
+    const int new_raw_exact = ld_profile_note_hash(
+        raw_exact, g_ld_profile.ps_raw_exact_hashes,
+        &g_ld_profile.n_ps_raw_exact_hashes);
+    if (new_raw_constant || new_raw_exact) {
+        u64 literal = rsx_fp_literal_source_hash(
+            fp_uc, fp_size, seed);
+        literal = fnv1a(
+            &fp_ctrl_key, sizeof(fp_ctrl_key), literal);
+        literal = fnv1a(
+            &cube_mask, sizeof(cube_mask), literal);
+        literal = fnv1a(
+            &alpha_enable, sizeof(alpha_enable), literal);
+        literal = fnv1a(
+            &alpha_func, sizeof(alpha_func), literal);
+        if (new_raw_constant)
+            ld_profile_note_hash(
+                literal,
+                g_ld_profile.ps_constant_specialized_hashes,
+                &g_ld_profile.n_ps_constant_specialized_hashes);
+        if (new_raw_exact) {
+            u64 exact_source = literal;
+            if (alpha_enable && alpha_func != 0x0207u) {
+                char alpha_literal[64];
+                const int length = snprintf(
+                    alpha_literal, sizeof(alpha_literal), "%.9g",
+                    (double)alpha_ref);
+                if (length > 0 &&
+                    (u32)length < sizeof(alpha_literal))
+                    exact_source = fnv1a(
+                        alpha_literal, (u32)length, exact_source);
+            }
+            ld_profile_note_hash(
+                exact_source, g_ld_profile.ps_exact_source_hashes,
+                &g_ld_profile.n_ps_exact_source_hashes);
+        }
+    }
+    ld_profile_note_hash(
+        canonical, g_ld_profile.ps_canonical_hashes,
+        &g_ld_profile.n_ps_canonical_hashes);
 }
 #endif
 
@@ -2758,8 +2922,22 @@ static ID3D12PipelineState* get_pso(
         }
     }
 
-    u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
-    key = fnv1a(fp_uc, fp_size, key);
+    render_state_t rs;
+    decode_render_state(&rs);
+    if (rsx_fp_collect_constants(
+            fp_uc, fp_size, &g.fp_constants) < 0)
+        return NULL;
+    g.fp_alpha_ref = rsx_fp_alpha_ref(
+        rs.alpha_ref_raw, rs.alpha_ref_format);
+
+    u64 key = fnv1a(
+        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    if (ld_fp_constants_buffered())
+        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+    else
+        key = fnv1a(fp_uc, fp_size, key);
+    if (!key)
+        return NULL;
     const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
@@ -2777,8 +2955,14 @@ static ID3D12PipelineState* get_pso(
         key = fnv1a(
             &packed_payload, sizeof(packed_payload), key);
     }
-    render_state_t rs; decode_render_state(&rs);
-    key = fnv1a(&rs, sizeof(rs), key);
+    if (ld_fp_constants_buffered())
+        key = ld_hash_structural_render_state(&rs, key);
+    else
+        key = fnv1a(&rs, sizeof(rs), key);
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_note_fp_variants(
+        fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
+#endif
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
     g_ld_current_pso.vp_hash = fnv1a(
@@ -2836,12 +3020,29 @@ static ID3D12PipelineState* get_pso(
             vs_hlsl, sizeof(vs_hlsl))
         : rsx_vp_decompile_ex(
             vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
-    int fi = rsx_fp_decompile_ex(
-        fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl, sizeof(ps_hlsl));
-    if (fi > 0 && rs.alpha_test_enable &&
-        rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
-            rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format)) < 0)
-        fi = -1;
+    u32 decompiled_constant_count = 0;
+    int fi;
+    if (ld_fp_constants_buffered()) {
+        fi = rsx_fp_decompile_buffered_ex(
+            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+            sizeof(ps_hlsl), &decompiled_constant_count);
+        if (fi > 0 &&
+            decompiled_constant_count != g.fp_constants.count)
+            fi = -1;
+        if (fi > 0 && rs.alpha_test_enable &&
+            rsx_fp_apply_alpha_test_buffered(
+                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
+            fi = -1;
+    } else {
+        fi = rsx_fp_decompile_ex(
+            fp_uc, fp_size, fp_ctrl, cube_mask,
+            ps_hlsl, sizeof(ps_hlsl));
+        if (fi > 0 && rs.alpha_test_enable &&
+            rsx_fp_apply_alpha_test(
+                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+                g.fp_alpha_ref) < 0)
+            fi = -1;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
@@ -2854,6 +3055,71 @@ static ID3D12PipelineState* get_pso(
     g.psos[g.n_psos].pso = pso;
     g.n_psos++;
     return pso;
+}
+
+static int ld_upload_pixel_constants(u32* out_offset)
+{
+    if (out_offset)
+        *out_offset = 0;
+    if (!ld_fp_constants_buffered())
+        return 1;
+    if (!g.ps_cb || !g.ps_cb_mapped)
+        return 0;
+
+    /* HLSL uses a one-element placeholder array for programs with no inline
+     * constants so fp_alpha retains a valid 16-byte slot. */
+    const u32 value_slots =
+        g.fp_constants.count ? g.fp_constants.count : 1u;
+    const u32 data_bytes = (value_slots + 1u) * 16u;
+    u32 offset = 0;
+    u32 allocation_bytes = 0;
+    int plan = rsx_fp_constant_ring_plan(
+        g.ps_cb_used, PS_CB_RING_BYTES, data_bytes,
+        &offset, &allocation_bytes);
+    if (plan < 0) {
+#if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.ps_constant_capacity_failures++;
+#endif
+        return 0;
+    }
+    if (plan == 0) {
+        ld_flush(LD_FLUSH_PIXEL_CONSTANT_RING);
+        if (!g.ready)
+            return 0;
+        g.ps_cb_used = 0;
+        plan = rsx_fp_constant_ring_plan(
+            g.ps_cb_used, PS_CB_RING_BYTES, data_bytes,
+            &offset, &allocation_bytes);
+        if (plan != 1) {
+#if defined(YZ_PERF_PROFILE)
+            g_ld_profile.total.ps_constant_capacity_failures++;
+#endif
+            return 0;
+        }
+    }
+
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG upload_begin = ld_profile_qpc();
+#endif
+    u8* destination = g.ps_cb_mapped + offset;
+    memset(destination, 0, data_bytes);
+    if (g.fp_constants.count)
+        memcpy(
+            destination, g.fp_constants.values,
+            (size_t)g.fp_constants.count * 16u);
+    memcpy(
+        destination + value_slots * 16u,
+        &g.fp_alpha_ref, sizeof(g.fp_alpha_ref));
+    g.ps_cb_used += allocation_bytes;
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.ps_constant_allocations++;
+    g_ld_profile.total.ps_constant_upload_bytes += data_bytes;
+    g_ld_profile.total.ps_constant_upload_qpc +=
+        (u64)(ld_profile_qpc() - upload_begin);
+#endif
+    if (out_offset)
+        *out_offset = offset;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3402,7 +3668,10 @@ static void ld_profile_present(u32 frame)
         LD_PROFILE_DELTA(pso_misses) != 0 ||
         LD_PROFILE_DELTA(pso_full) != 0 ||
         LD_PROFILE_DELTA(flush_reason[LD_FLUSH_VERTEX_RING]) != 0 ||
-        LD_PROFILE_DELTA(flush_reason[LD_FLUSH_RETIRE_QUEUE]) != 0;
+        LD_PROFILE_DELTA(flush_reason[LD_FLUSH_RETIRE_QUEUE]) != 0 ||
+        LD_PROFILE_DELTA(
+            flush_reason[LD_FLUSH_PIXEL_CONSTANT_RING]) != 0 ||
+        LD_PROFILE_DELTA(ps_constant_capacity_failures) != 0;
 
     if (emit) {
         DXGI_QUERY_VIDEO_MEMORY_INFO memory = {0};
@@ -3571,8 +3840,51 @@ static void ld_profile_present(u32 frame)
                 ld_profile_ticks_ms(total->ps_compile_qpc),
                 (unsigned long long)total->ps_post_boundary_distinct,
                 (unsigned long long)total->ps_post_boundary_repeats,
-                (unsigned long long)g.ps_blobs.retained_source_bytes,
-                (unsigned long long)g.ps_blobs.retained_blob_bytes);
+                 (unsigned long long)g.ps_blobs.retained_source_bytes,
+                 (unsigned long long)g.ps_blobs.retained_blob_bytes);
+        const u32 collapsed_by_constants =
+            g_ld_profile.n_ps_constant_specialized_hashes >=
+                    g_ld_profile.n_ps_canonical_hashes
+                ? g_ld_profile.n_ps_constant_specialized_hashes -
+                      g_ld_profile.n_ps_canonical_hashes
+                : 0;
+        const u32 collapsed_by_alpha =
+            g_ld_profile.n_ps_exact_source_hashes >=
+                    g_ld_profile.n_ps_constant_specialized_hashes
+                ? g_ld_profile.n_ps_exact_source_hashes -
+                      g_ld_profile.n_ps_constant_specialized_hashes
+                : 0;
+        fprintf(
+            stderr,
+            "[fp-constant-perf] frame=%u mode=%s "
+            "variants{exact_source=%u constant_specialized=%u "
+            "canonical=%u collapsed_constants=%u collapsed_alpha=%u "
+            "tracking_overflow=%llu} "
+            "cb{allocations=%llu upload_bytes=%llu upload_ms=%.3f "
+            "ring_used=%u ring_capacity=%u capacity_failures=%llu "
+            "flushes=%llu flush_ms=%.3f wait_ms=%.3f}\n",
+            frame, ld_fp_constant_mode_name(),
+            g_ld_profile.n_ps_exact_source_hashes,
+            g_ld_profile.n_ps_constant_specialized_hashes,
+            g_ld_profile.n_ps_canonical_hashes,
+            collapsed_by_constants, collapsed_by_alpha,
+            (unsigned long long)
+                g_ld_profile.ps_variant_tracking_overflow,
+            (unsigned long long)
+                LD_PROFILE_DELTA(ps_constant_allocations),
+            (unsigned long long)
+                LD_PROFILE_DELTA(ps_constant_upload_bytes),
+            ld_profile_ticks_ms(
+                LD_PROFILE_DELTA(ps_constant_upload_qpc)),
+            g.ps_cb_used, PS_CB_RING_BYTES,
+            (unsigned long long)
+                LD_PROFILE_DELTA(ps_constant_capacity_failures),
+            (unsigned long long)LD_PROFILE_DELTA(
+                flush_reason[LD_FLUSH_PIXEL_CONSTANT_RING]),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(
+                flush_reason_qpc[LD_FLUSH_PIXEL_CONSTANT_RING])),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(
+                fence_reason_qpc[LD_FLUSH_PIXEL_CONSTANT_RING])));
         fflush(stderr);
     }
 
@@ -3739,6 +4051,7 @@ static void ld_movie_reset_rings(void)
 {
     g.vb_used = 0;
     g.cb_used = 0;
+    g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.smp_ring_used = 0;
     g.depth_cleared = 0;
@@ -4685,6 +4998,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         ld_flush(LD_FLUSH_VERTEX_RING);
         g.vb_used = 0;
         g.cb_used = 0;
+        g.ps_cb_used = 0;
         g.srv_ring_used = 0;
         g.smp_ring_used = 0;
     }
@@ -4710,6 +5024,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_ring++;
         if (triangle_data_owned) free(triangle_data);
         return;   /* no fallback in live path */
+    }
+    u32 ps_cb_offset = 0;
+    if (!ld_upload_pixel_constants(&ps_cb_offset)) {
+        live_draw_csv_emit(prim, n_tri, "drop_ps_cbring");
+        g_ld_stats.group_drop_ring++;
+        if (triangle_data_owned) free(triangle_data);
+        return;
     }
 
     const u32 target = current_surface();
@@ -4863,6 +5184,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
     g.list->lpVtbl->SetGraphicsRootConstantBufferView(
         g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
+    if (ld_fp_constants_buffered())
+        g.list->lpVtbl->SetGraphicsRootConstantBufferView(
+            g.list, 4,
+            g.ps_cb->lpVtbl->GetGPUVirtualAddress(g.ps_cb) +
+                ps_cb_offset);
     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, stbl);
     const u32 vtex_mask = vertex_texture_mask();
@@ -5105,7 +5431,7 @@ static int make_root_signature(void)
     vrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     vrange.NumDescriptors = RSX_DSP_NUM_VERTEX_TEXTURES;
     vrange.BaseShaderRegister = 16;
-    D3D12_ROOT_PARAMETER xp[4] = {0};
+    D3D12_ROOT_PARAMETER xp[5] = {0};
     xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     xp[0].Descriptor.ShaderRegister = 0;
     xp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -5121,6 +5447,9 @@ static int make_root_signature(void)
     xp[3].DescriptorTable.NumDescriptorRanges = 1;
     xp[3].DescriptorTable.pDescriptorRanges = &vrange;
     xp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    xp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    xp[4].Descriptor.ShaderRegister = 1;
+    xp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC vsmp[RSX_DSP_NUM_VERTEX_TEXTURES] = {0};
     for (u32 i = 0; i < RSX_DSP_NUM_VERTEX_TEXTURES; i++) {
         vsmp[i].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -5132,7 +5461,7 @@ static int make_root_signature(void)
         vsmp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-    rsd.NumParameters = 4; rsd.pParameters = xp;
+    rsd.NumParameters = 5; rsd.pParameters = xp;
     rsd.NumStaticSamplers = RSX_DSP_NUM_VERTEX_TEXTURES;
     rsd.pStaticSamplers = vsmp;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -5164,6 +5493,32 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 #endif
     g.width = width; g.height = height;
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
+    {
+        const char* requested = getenv("YZ_RSX_FP_CONSTANT_MODE");
+        char mode = 'B';
+        if (requested && requested[0]) {
+            if ((requested[0] == 'L' || requested[0] == 'l') &&
+                (!requested[1] ||
+                 _stricmp(requested, "literal") == 0))
+                mode = 'L';
+            else if ((requested[0] == 'B' || requested[0] == 'b') &&
+                     (!requested[1] ||
+                      _stricmp(requested, "buffered") == 0))
+                mode = 'B';
+            else
+                fprintf(
+                    stderr,
+                    "[rsx-fp-constants] unknown "
+                    "YZ_RSX_FP_CONSTANT_MODE='%s'; using buffered\n",
+                    requested);
+        }
+        g.fp_constant_mode = mode;
+        fprintf(
+            stderr,
+            "[rsx-fp-constants] mode=%s (startup-selected) "
+            "d3dcompile_flags1=0x0 d3dcompile_flags2=0x0\n",
+            ld_fp_constant_mode_name());
+    }
     {
         const char* requested = getenv("YZ_RSX_VERTEX_MODE");
         const char* old_path = getenv("YZ_RSX_VERTEX_PATH");
@@ -5295,6 +5650,15 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.cb);
     g.cb->lpVtbl->Map(g.cb, 0, &rr, (void**)&g.cb_mapped);
+
+    bd.Width = PS_CB_RING_BYTES;
+    g.dev->lpVtbl->CreateCommittedResource(
+        g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource, (void**)&g.ps_cb);
+    if (g.ps_cb)
+        g.ps_cb->lpVtbl->Map(
+            g.ps_cb, 0, &rr, (void**)&g.ps_cb_mapped);
 
     /* SRV heaps */
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -6160,7 +6524,7 @@ void rsx_live_draw_present(u32 buffer_id)
     }
 
     /* new frame: reset per-frame ring cursors */
-    g.vb_used = 0; g.cb_used = 0;
+    g.vb_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
     g.depth_cleared = 0;
     /* Per-zeta resources model persistent RSX memory.  Do not mark them
@@ -6318,6 +6682,46 @@ void rsx_live_draw_shutdown(void)
                 g_ld_profile.total.ps_post_boundary_repeats,
             (unsigned long long)g.ps_blobs.retained_source_bytes,
             (unsigned long long)g.ps_blobs.retained_blob_bytes);
+    fprintf(
+        stderr,
+        "[fp-constant-summary] mode=%s "
+        "variants{exact_source=%u constant_specialized=%u canonical=%u "
+        "collapsed_constants=%u collapsed_alpha=%u "
+        "tracking_overflow=%llu} "
+        "cb{allocations=%llu upload_bytes=%llu upload_ms=%.3f "
+        "ring_capacity=%u capacity_failures=%llu "
+        "flushes=%llu flush_ms=%.3f wait_ms=%.3f}\n",
+        ld_fp_constant_mode_name(),
+        g_ld_profile.n_ps_exact_source_hashes,
+        g_ld_profile.n_ps_constant_specialized_hashes,
+        g_ld_profile.n_ps_canonical_hashes,
+        g_ld_profile.n_ps_constant_specialized_hashes >=
+                g_ld_profile.n_ps_canonical_hashes
+            ? g_ld_profile.n_ps_constant_specialized_hashes -
+                  g_ld_profile.n_ps_canonical_hashes
+            : 0,
+        g_ld_profile.n_ps_exact_source_hashes >=
+                g_ld_profile.n_ps_constant_specialized_hashes
+            ? g_ld_profile.n_ps_exact_source_hashes -
+                  g_ld_profile.n_ps_constant_specialized_hashes
+            : 0,
+        (unsigned long long)
+            g_ld_profile.ps_variant_tracking_overflow,
+        (unsigned long long)
+            g_ld_profile.total.ps_constant_allocations,
+        (unsigned long long)
+            g_ld_profile.total.ps_constant_upload_bytes,
+        ld_profile_ticks_ms(
+            g_ld_profile.total.ps_constant_upload_qpc),
+        PS_CB_RING_BYTES,
+        (unsigned long long)
+            g_ld_profile.total.ps_constant_capacity_failures,
+        (unsigned long long)g_ld_profile.total.flush_reason[
+            LD_FLUSH_PIXEL_CONSTANT_RING],
+        ld_profile_ticks_ms(g_ld_profile.total.flush_reason_qpc[
+            LD_FLUSH_PIXEL_CONSTANT_RING]),
+        ld_profile_ticks_ms(g_ld_profile.total.fence_reason_qpc[
+            LD_FLUSH_PIXEL_CONSTANT_RING]));
     fflush(stderr);
 #endif
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
@@ -6339,6 +6743,7 @@ void rsx_live_draw_shutdown(void)
     if (g.movie_overlay_mask) free(g.movie_overlay_mask);
     if (g.white_tex) g.white_tex->lpVtbl->Release(g.white_tex);
     if (g.depth) g.depth->lpVtbl->Release(g.depth);
+    if (g.ps_cb) g.ps_cb->lpVtbl->Release(g.ps_cb);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
     if (g.swap) g.swap->lpVtbl->Release(g.swap);
     if (g_ld_info_queue) {

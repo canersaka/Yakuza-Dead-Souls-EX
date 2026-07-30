@@ -127,6 +127,139 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
     return 0;
 }
 
+static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
+{
+    return
+        ((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
+            FP_REG_TYPE_CONST ||
+        ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
+            FP_REG_TYPE_CONST ||
+        ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
+            FP_REG_TYPE_CONST;
+}
+
+int rsx_fp_collect_constants(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
+{
+    if (!ucode || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+
+    u32 off = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        if (fp_instruction_has_constant(w1, w2, w3)) {
+            if (off + 16 > max_bytes ||
+                out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
+                return -1;
+            for (u32 component = 0; component < 4; ++component)
+                out->values[out->count][component] =
+                    rsx_fp_read_word(ucode + off + component * 4);
+            out->count++;
+            off += 16;
+        }
+        if (w0 & FP_END)
+            return (int)out->count;
+    }
+    return -1;
+}
+
+static u64 fp_hash_bytes(const void* data, u32 size, u64 hash)
+{
+    const u8* bytes = (const u8*)data;
+    for (u32 i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
+{
+    if (!ucode)
+        return 0;
+    static const u32 structural_tag = 0x31535046u; /* "FPS1" */
+    u64 hash = fp_hash_bytes(&structural_tag, sizeof(structural_tag), seed);
+    u32 off = 0;
+    u32 instruction_count = 0;
+    u32 constant_count = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        hash = fp_hash_bytes(ucode + off, 16, hash);
+        instruction_count++;
+        off += 16;
+        if (fp_instruction_has_constant(w1, w2, w3)) {
+            if (off + 16 > max_bytes ||
+                constant_count >= RSX_FP_MAX_INLINE_CONSTANTS)
+                return 0;
+            constant_count++;
+            off += 16;
+        }
+        if (w0 & FP_END) {
+            hash = fp_hash_bytes(
+                &instruction_count, sizeof(instruction_count), hash);
+            hash = fp_hash_bytes(
+                &constant_count, sizeof(constant_count), hash);
+            return hash;
+        }
+    }
+    return 0;
+}
+
+u64 rsx_fp_literal_source_hash(
+    const u8* ucode, u32 max_bytes, u64 seed)
+{
+    const u64 structural =
+        rsx_fp_structural_hash(ucode, max_bytes, seed);
+    if (!structural)
+        return 0;
+    rsx_fp_constant_block constants;
+    if (rsx_fp_collect_constants(ucode, max_bytes, &constants) < 0)
+        return 0;
+    u64 hash = structural;
+    for (u32 slot = 0; slot < constants.count; ++slot) {
+        float value[4];
+        for (u32 component = 0; component < 4; ++component)
+            memcpy(
+                &value[component],
+                &constants.values[slot][component],
+                sizeof(value[component]));
+        char literal[128];
+        const int length = snprintf(
+            literal, sizeof(literal), "float4(%g,%g,%g,%g)",
+            value[0], value[1], value[2], value[3]);
+        if (length < 0 || (u32)length >= sizeof(literal))
+            return 0;
+        hash = fp_hash_bytes(literal, (u32)length, hash);
+    }
+    return hash;
+}
+
+int rsx_fp_constant_ring_plan(
+    u32 used, u32 capacity, u32 data_bytes,
+    u32* out_offset, u32* out_allocation_bytes)
+{
+    if (!out_offset || !out_allocation_bytes || data_bytes == 0)
+        return -1;
+    if (data_bytes > 0xFFFFFF00u)
+        return -1;
+    const u32 allocation = (data_bytes + 255u) & ~255u;
+    if (allocation > capacity)
+        return -1;
+    if (used > capacity || allocation > capacity - used)
+        return 0;
+    *out_offset = used;
+    *out_allocation_bytes = allocation;
+    return 1;
+}
+
 /* Bounded string appender. */
 typedef struct { char* p; u32 cap; u32 len; int ok; } Out;
 
@@ -184,7 +317,7 @@ static const char* input_expr(u32 input_src)
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
-                     char* buf, u32 bufsz)
+                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
@@ -192,7 +325,10 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
-        if (has_k)
+        if (buffered && has_k)
+            snprintf(
+                base, sizeof(base), "fp_constants[%u]", constant_slot);
+        else if (has_k)
             snprintf(base, sizeof(base), "float4(%g,%g,%g,%g)",
                      k[0], k[1], k[2], k[3]);
         else
@@ -231,10 +367,23 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
-int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
-                        u32 tex_cube_mask, char* out, u32 out_size)
+static int rsx_fp_decompile_internal(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    int buffered, char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
+
+    u32 buffered_constant_count = 0;
+    if (buffered) {
+        rsx_fp_constant_block constants;
+        const int result =
+            rsx_fp_collect_constants(ucode, max_bytes, &constants);
+        if (result < 0)
+            return -1;
+        buffered_constant_count = constants.count;
+    }
+    if (out_constant_count)
+        *out_constant_count = buffered_constant_count;
 
     Out o = { out, out_size, 0, 1 };
 
@@ -263,6 +412,19 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
     }
     out_puts(&o,
         "SamplerState rsx_samp[16] : register(s0);\n"
+    );
+    if (buffered) {
+        char constants_decl[192];
+        snprintf(
+            constants_decl, sizeof(constants_decl),
+            "cbuffer PSConstants : register(b1) {\n"
+            "    float4 fp_constants[%u];\n"
+            "    float4 fp_alpha;\n"
+            "};\n",
+            buffered_constant_count ? buffered_constant_count : 1u);
+        out_puts(&o, constants_decl);
+    }
+    out_puts(&o,
         "float4 main(PSInput input) : SV_TARGET {\n"
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
@@ -276,6 +438,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
     int wrote_r0 = 0, wrote_h0 = 0;
     int count = 0;
     u32 off = 0;
+    u32 constant_slot = 0;
 
     while (off + 16 <= max_bytes) {
         u32 w0 = rsx_fp_read_word(ucode + off + 0);
@@ -340,9 +503,17 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
         }
 
         char a[200], b[200], c[200];
-        emit_src(&s0, input_src, k, has_k, a, sizeof(a));
-        emit_src(&s1, input_src, k, has_k, b, sizeof(b));
-        emit_src(&s2, input_src, k, has_k, c, sizeof(c));
+        emit_src(
+            &s0, input_src, k, has_k, buffered, constant_slot,
+            a, sizeof(a));
+        emit_src(
+            &s1, input_src, k, has_k, buffered, constant_slot,
+            b, sizeof(b));
+        emit_src(
+            &s2, input_src, k, has_k, buffered, constant_slot,
+            c, sizeof(c));
+        if (has_k)
+            constant_slot++;
 
         if (is_branch) {
             out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
@@ -550,6 +721,22 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
     return count;
 }
 
+int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                        u32 tex_cube_mask, char* out, u32 out_size)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+}
+
+int rsx_fp_decompile_buffered_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        out_constant_count);
+}
+
 static float fp_half_to_float(u16 h)
 {
     const u32 sign = (u32)(h & 0x8000u) << 16;
@@ -629,6 +816,55 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
         "    if (!(%s)) discard;\n"
         "    return _rsx_out;\n}\n",
         output, (double)ref, pass_expr[cmp]);
+    if (n < 0 || (u32)n >= sizeof(suffix))
+        return -1;
+    const size_t prefix = (size_t)(marker - hlsl);
+    if (prefix + (size_t)n + 1 > out_size)
+        return -1;
+    memcpy(marker, suffix, (size_t)n + 1);
+    return 1;
+}
+
+int rsx_fp_apply_alpha_test_buffered(
+    char* hlsl, u32 out_size, u32 func)
+{
+    if (!hlsl || out_size == 0)
+        return -1;
+
+    const u32 cmp =
+        func >= 0x0200u && func <= 0x0207u ? func - 0x0200u : 7u;
+    if (cmp == 7u)
+        return 0;
+
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p;
+         p = strstr(p + 1, "    return "))
+        marker = p;
+    if (!marker)
+        return -1;
+    char* expression = marker + strlen("    return ");
+    char* terminator = strstr(expression, ";\n}\n");
+    if (!terminator || terminator == expression ||
+        (size_t)(terminator - expression) >= 96)
+        return -1;
+    char output[96];
+    memcpy(output, expression, (size_t)(terminator - expression));
+    output[terminator - expression] = '\0';
+
+    static const char* pass_expr[8] = {
+        "false", "_rsx_out.a < _rsx_alpha_ref",
+        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
+        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
+        "_rsx_out.a >= _rsx_alpha_ref", "true"
+    };
+    char suffix[512];
+    const int n = snprintf(
+        suffix, sizeof(suffix),
+        "    float4 _rsx_out = %s;\n"
+        "    const float _rsx_alpha_ref = fp_alpha.x;\n"
+        "    if (!(%s)) discard;\n"
+        "    return _rsx_out;\n}\n",
+        output, pass_expr[cmp]);
     if (n < 0 || (u32)n >= sizeof(suffix))
         return -1;
     const size_t prefix = (size_t)(marker - hlsl);

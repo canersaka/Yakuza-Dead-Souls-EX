@@ -18,6 +18,19 @@
 extern "C" {
 #endif
 
+#define RSX_FP_BUFFERED_CONSTANTS_API 1
+#define RSX_FP_MAX_INLINE_CONSTANTS 2048u
+
+/* Runtime payload for a structurally decompiled fragment program. Values are
+ * retained as host-order IEEE-754 bit patterns so signed zero, infinities,
+ * NaNs, and NaN payloads survive the guest-word conversion exactly. One slot
+ * is consumed per instruction that references CONST; multiple CONST operands
+ * in that instruction share the slot, matching the RSX encoding. */
+typedef struct rsx_fp_constant_block {
+    u32 count;
+    u32 values[RSX_FP_MAX_INLINE_CONSTANTS][4];
+} rsx_fp_constant_block;
+
 /* Read one fragment-program word from guest (PS3) memory: big-endian load
  * followed by a 16-bit half-word swap, yielding a host-order instruction
  * word. The decoder operates on host-order words. */
@@ -80,6 +93,42 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * call-site guidance. */
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
+
+/* Buffered-constant variant of rsx_fp_decompile_ex. Inline CONST payloads are
+ * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
+ * printed as HLSL literals. `out_constant_count` receives the exact slot
+ * count and may be NULL. */
+int rsx_fp_decompile_buffered_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count);
+
+/* Extract the exact runtime inline-CONST payload. Returns the slot count on
+ * success or -1 for an unterminated/truncated/oversized program. */
+int rsx_fp_collect_constants(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
+
+/* Canonical structural fragment-program hash. Instruction bytes and their
+ * order are hashed; inline CONST payload bytes are skipped. Returns zero for
+ * malformed input. */
+u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
+
+/* Hash the exact legacy HLSL literal spellings (%g) for a program while also
+ * retaining structural identity. This is intended for aggregate diagnostics;
+ * PSO identity should use rsx_fp_structural_hash in buffered mode. */
+u64 rsx_fp_literal_source_hash(
+    const u8* ucode, u32 max_bytes, u64 seed);
+
+/* Buffered-alpha counterpart to rsx_fp_apply_alpha_test. It emits the compare
+ * against fp_alpha.x from PSConstants instead of embedding a numeric value. */
+int rsx_fp_apply_alpha_test_buffered(
+    char* hlsl, u32 out_size, u32 func);
+
+/* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
+ * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
+ * -1 when one allocation can never fit. */
+int rsx_fp_constant_ring_plan(
+    u32 used, u32 capacity, u32 data_bytes,
+    u32* out_offset, u32* out_allocation_bytes);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
