@@ -131,6 +131,98 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
     emit(b, line);
 }
 
+static u32 vec_source_use(u32 op, int* exact)
+{
+    switch (op) {
+    case 0x00: return 0;       /* NOP */
+    case 0x01: return 1u;      /* src0 */
+    case 0x02: return 3u;      /* src0, src1 */
+    case 0x03: return 5u;      /* src0, src2 */
+    case 0x04: return 7u;      /* src0, src1, src2 */
+    case 0x05: case 0x06: case 0x07: case 0x08:
+    case 0x09: case 0x0A: case 0x0B: case 0x0C:
+    case 0x10: case 0x12: case 0x13: case 0x14:
+        return 3u;             /* src0, src1 */
+    case 0x0D: case 0x0E: case 0x0F: case 0x16: case 0x19:
+        return 1u;             /* src0 */
+    case 0x11: case 0x15:
+        return 0;              /* source-independent constants */
+    default:
+        *exact = 0;
+        return 0;
+    }
+}
+
+static u32 sca_source_use(u32 op, int* exact)
+{
+    switch (op) {
+    case 0x00:
+        return 0;
+    case 0x01: case 0x02: case 0x03: case 0x04:
+    case 0x05: case 0x06: case 0x07:
+    case 0x0D: case 0x0E: case 0x0F: case 0x10:
+        return 4u;             /* scalar ALU reads src2 */
+    default:
+        /* Flow control and currently unsupported scalar opcodes make a
+         * narrowed data-flow result unsafe. */
+        *exact = 0;
+        return 0;
+    }
+}
+
+int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
+                          rsx_vp_input_analysis* analysis)
+{
+    if (!ucode || !analysis) return -1;
+    analysis->input_mask = 0;
+    analysis->exact = 1;
+    u32 off = 0;
+    int instrs = 0;
+    int ended = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 d1 = rd_le(ucode + off + 4);
+        const u32 d2 = rd_le(ucode + off + 8);
+        const u32 d3 = rd_le(ucode + off + 12);
+        off += 16;
+        instrs++;
+
+        const u32 vec_op = (d1 >> 22) & 0x1F;
+        const u32 sca_op = (d1 >> 27) & 0x1F;
+        const u32 input_src = (d1 >> 8) & 0xF;
+        const u32 src0 = ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9);
+        const u32 src1 = (d2 >> 6) & 0x1FFFF;
+        const u32 src2 = ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11);
+        const u32 sources[3] = {src0, src1, src2};
+        const int vec_writes = ((d3 >> 13) & 0xFu) != 0;
+        const int sca_writes = ((d3 >> 17) & 0xFu) != 0;
+        u32 use = 0;
+        if (vec_writes && vec_op)
+            use |= vec_source_use(vec_op, &analysis->exact);
+        if (sca_writes && sca_op)
+            use |= sca_source_use(sca_op, &analysis->exact);
+        for (u32 source = 0; source < 3; source++)
+            if ((use & (1u << source)) && (sources[source] & 3u) == 2u)
+                analysis->input_mask |= 1u << input_src;
+
+        if (d3 & 1u) {
+            ended = 1;
+            break;
+        }
+    }
+    if (!ended) {
+        analysis->input_mask = 0xFFFFu;
+        analysis->exact = 0;
+        return -1;
+    }
+    if (!analysis->exact)
+        analysis->input_mask = 0xFFFFu;
+    return instrs;
+}
+
+static int rsx_vp_decompile_impl(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    u32 input_mask, char* out, u32 out_size);
+
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
     return rsx_vp_decompile_ex(ucode, max_bytes, 0u, out, out_size);
@@ -138,6 +230,29 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 
 int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
+{
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
+}
+
+int rsx_vp_decompile_compact_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    char* out, u32 out_size)
+{
+    rsx_vp_input_analysis analysis;
+    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
+        !analysis.exact ||
+        (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
+        input_mask = 0xFFFFu;
+    else
+        input_mask = analysis.input_mask;
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
+}
+
+static int rsx_vp_decompile_impl(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    u32 input_mask, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -311,15 +426,30 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
+    if (!compact_inputs) {
+        emit(&o,
+            /* All 16 RSX vertex attributes arrive as float4 (the harness
+             * fetches and converts them on the CPU). */
+            "struct VSInput {\n"
+            "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
+            "    float4 a4:ATTR4;  float4 a5:ATTR5;  float4 a6:ATTR6;  float4 a7:ATTR7;\n"
+            "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
+            "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
+            "};\n");
+    } else {
+        emit(&o, "struct VSInput {\n");
+        if (!(input_mask & 0xFFFFu))
+            emit(&o, "    uint vertex_id:SV_VertexID;\n");
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (!(input_mask & (1u << attr))) continue;
+            char declaration[64];
+            snprintf(declaration, sizeof(declaration),
+                     "    float4 a%u:ATTR%u;\n", attr, attr);
+            emit(&o, declaration);
+        }
+        emit(&o, "};\n");
+    }
     emit(&o,
-        /* All 16 RSX vertex attributes arrive as float4 (the harness fetches
-         * and converts them on the CPU). */
-        "struct VSInput {\n"
-        "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
-        "    float4 a4:ATTR4;  float4 a5:ATTR5;  float4 a6:ATTR6;  float4 a7:ATTR7;\n"
-        "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
-        "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
-        "};\n"
         "struct VSOutput {\n"
         "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
         "    float4 fog:FOG;\n"
@@ -345,13 +475,27 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
         emit(&o, decl);
     }
 
+    emit(&o, "VSOutput main(VSInput input) {\n");
+    if (!compact_inputs) {
+        emit(&o,
+            "    float4 v[16];\n"
+            "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
+            "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
+            "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
+            "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n");
+    } else {
+        emit(&o,
+            "    float4 v[16];\n"
+            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (!(input_mask & (1u << attr))) continue;
+            char assignment[64];
+            snprintf(assignment, sizeof(assignment),
+                     "    v[%u]=input.a%u;\n", attr, attr);
+            emit(&o, assignment);
+        }
+    }
     emit(&o,
-        "VSOutput main(VSInput input) {\n"
-        "    float4 v[16];\n"
-        "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
-        "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
-        "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
-        "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n"
         "    float4 r[32]; float4 o[16];\n"
         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
