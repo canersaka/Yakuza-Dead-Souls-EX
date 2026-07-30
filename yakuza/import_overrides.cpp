@@ -32,12 +32,17 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#if defined(YZ_PERF_PROFILE)
+extern "C" void spu_perf_dump(void);
+#endif
+
 extern "C" uint8_t* vm_base;
 extern "C" uint32_t g_yz_game_toc;
 extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 extern "C" void yz_fltrec_dump(const char*);   /* s41 flight recorder (runtime/spu/spu_fltrec.c) */
 extern "C" int  yz_bdrain_fire_ea(uint32_t parked_ea, uint32_t io_off);  /* s42 park-time boundary drain (runtime/spu/spu_channels.c) */
+extern "C" void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put);
 extern "C" void yz_fltrec_dump(const char* reason);                      /* s42 broken-phase dump rides the drain fire */
 /* s40b v2: the GPU-parked stopper EA, published by the FIFO park tracker below for
  * the SPU-side targeted unstick (gs_task.c YZ_QROT_UNSTICK). 0 = not parked >2s. */
@@ -2194,29 +2199,51 @@ static void yz_stage_house_memory_snapshot(void)
 static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
                                const char* host_path)
 {
+#if defined(YZ_PERF_CLEAN)
+    const int a010_auth_diag = 0;
+    const int a010_release_trace = 0;
+#else
     const int a010_auth_diag = getenv("YZ_A010_AUTH") != nullptr;
     const int a010_release_trace =
         getenv("YZ_A010_RELEASE_TRACE") != nullptr;
-    if (a010_release_trace && guest_path) {
+#endif
+    /*
+     * The release-scene lifetime is behavior state used by the clean FIFO
+     * publication repair.  It must not disappear when observation-only
+     * release tracing is compiled out or left disabled.
+     */
+    if (guest_path) {
         if (strstr(guest_path, "/auth/a010/a010.par")) {
+#if defined(YZ_PERF_CLEAN)
+            InterlockedExchange(&g_yz_a010_root_active, 1);
+            InterlockedExchange(&g_yz_a010_animation_ready, 0);
+#endif
             if (InterlockedCompareExchange(
                     &g_yz_a010_release_scene_active, 1, 0) == 0) {
-                fprintf(stderr,
-                        "[a010-reltrace] SCENE BEGIN on open '%s'\n",
-                        guest_path);
-                fflush(stderr);
+                if (a010_release_trace) {
+                    fprintf(stderr,
+                            "[a010-reltrace] SCENE BEGIN on open '%s'\n",
+                            guest_path);
+                    fflush(stderr);
+                }
             }
         } else if (strstr(guest_path, "/movie/a020.sfd") ||
                    strstr(guest_path, "/auth/a020/a020.par")) {
+#if defined(YZ_PERF_CLEAN)
+            InterlockedExchange(&g_yz_a010_root_active, 0);
+#endif
             if (InterlockedExchange(
                     &g_yz_a010_release_scene_active, 0) != 0) {
-                fprintf(stderr,
-                        "[a010-reltrace] SCENE END on open '%s'\n",
-                        guest_path);
-                fflush(stderr);
+                if (a010_release_trace) {
+                    fprintf(stderr,
+                            "[a010-reltrace] SCENE END on open '%s'\n",
+                            guest_path);
+                    fflush(stderr);
+                }
             }
         }
     }
+#if !defined(YZ_PERF_CLEAN)
     if ((getenv("YZ_A010_ROOT") || getenv("YZ_A010_REQ") ||
          a010_auth_diag) && guest_path) {
         if (strstr(guest_path, "/auth/a010/a010.par")) {
@@ -2240,6 +2267,7 @@ static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
             }
         }
     }
+#endif
     /* Arm the bounded live-renderer capture at the authoritative scene-file
      * boundary.  This runs before the Route-1 early return because a010 is an
      * in-engine AUTH scene, not an SFD movie. */
@@ -2691,6 +2719,9 @@ static DWORD WINAPI yz_window_thread(LPVOID)
      * all audio/worker threads alive after DestroyWindow, leaving an
      * invisible process playing sound. End the host process when its window
      * pump observes WM_CLOSE/WM_QUIT. */
+#if defined(YZ_PERF_PROFILE)
+    spu_perf_dump();
+#endif
     fprintf(stderr, "[window] closed; terminating host process\n");
     fflush(stderr);
     ExitProcess(0);
@@ -2800,6 +2831,20 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context*);   /* defined belo
  * atomic: one thread wins the exchange, a failed send re-ORs the bits back.
  * Prevents double-delivery of the same latched cause. */
 static volatile long long g_rsx_ev_pending = 0;
+extern "C" volatile long g_yz_ucmd_handler_arg;
+extern "C" volatile long g_yz_ucmd_handler_completed;
+extern "C" volatile long g_yz_ucmd_handler_completed_epoch;
+
+static int yz_a010_fifo_publication_repair_enabled(void)
+{
+#if defined(YZ_PERF_CLEAN)
+    return 1;
+#else
+    static const int enabled =
+        getenv("YZ_A010_MISSING_REL") ? 1 : 0;
+    return enabled;
+#endif
+}
 
 static int64_t yz_rsx_ev_send(uint64_t bits)
 {
@@ -3027,7 +3072,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
          * not move the monotonic decode-completion label backwards after a
          * newer cause has already completed. */
         if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
-            getenv("YZ_A010_MISSING_REL")) {
+            yz_a010_fifo_publication_repair_enabled()) {
             const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
             const uint32_t behind = have - arg;
             if (behind < 0x10000u && arg <= have) {
@@ -3095,7 +3140,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
              yz_rsx_sem_dma_406e == 0x56616661u) &&
             InterlockedCompareExchange(
                 &g_yz_a010_root_active, 0, 0) != 0 &&
-            getenv("YZ_A010_MISSING_REL")) {
+            yz_a010_fifo_publication_repair_enabled()) {
             static unsigned long context_repairs = 0;
             yz_rsx_sem_dma_406e = 0x66616661u;
             context_repairs++;
@@ -3138,11 +3183,72 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
              * definition; requiring exact equality would deadlock forever on
              * resident pre-handoff ring history (measured 0x44B vs 0x479). */
             if (addr == RSX_REPORTS + 0xFE0u &&
-                InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
-                getenv("YZ_A010_MISSING_REL")) {
+                yz_a010_fifo_publication_repair_enabled()) {
                 const uint32_t have = vm_read32(addr);
                 const uint32_t ahead = have - arg;
-                if (ahead != 0u && ahead < 0x10000u) {
+                /*
+                 * Reduced-overhead runs exposed a lost wid4 wake after the
+                 * user callback had fully staged the requested round.  This
+                 * protocol is active during boot as well as a010, so its exact
+                 * lost-wake repair must not be scene-gated. Retry exactly once
+                 * only when the acquire is one round ahead, the callback
+                 * completed that exact cause, and the taskset has no running,
+                 * ready, or signalled task (all workers are parked). Replaying
+                 * the cause is then idempotent: no wake remains to duplicate
+                 * and the staged record is already authoritative.
+                 */
+                if (arg - have == 1u &&
+                    vm_read32(RSX_DRIVER_INFO + 0x12CCu) == arg &&
+                    (uint32_t)_InterlockedCompareExchange(
+                        &g_yz_ucmd_handler_completed, 0, 0) == arg &&
+                    vm_read32(0x42450E00u + 0x00u) == 0u &&
+                    vm_read32(0x42450E00u + 0x10u) == 0u &&
+                    vm_read32(0x42450E00u + 0x40u) == 0u &&
+                    vm_read32(0x42450E00u + 0x50u) != 0u &&
+                    (vm_read32(RSX_DRIVER_INFO + 0x12C0u) & 0x80u) != 0u &&
+                    g_rsx_event_port != 0u) {
+                    static uint32_t last_reissued_cause = 0xFFFFFFFFu;
+                    static uint32_t last_reissued_epoch = 0xFFFFFFFFu;
+                    static unsigned reissue_attempt = 0;
+                    const uint32_t completed_epoch =
+                        (uint32_t)_InterlockedCompareExchange(
+                            &g_yz_ucmd_handler_completed_epoch, 0, 0);
+                    if (last_reissued_cause != arg) {
+                        last_reissued_cause = arg;
+                        last_reissued_epoch = 0xFFFFFFFFu;
+                        reissue_attempt = 0;
+                    }
+                    /*
+                     * A completed replay is a negative acknowledgement when
+                     * the label is still one behind and every task is parked
+                     * again. Allow the next replay only after that completion
+                     * epoch changes; FIFO polling alone cannot generate
+                     * duplicates. The small cap keeps a genuinely broken
+                     * protocol loud and bounded.
+                     */
+                    if (last_reissued_epoch != completed_epoch &&
+                        reissue_attempt < 8u) {
+                        last_reissued_epoch = completed_epoch;
+                        reissue_attempt++;
+                        const int64_t retry = yz_rsx_ev_send(0x80ull);
+#if !defined(YZ_PERF_CLEAN)
+                        fprintf(stderr,
+                                "[fifo-sync] redelivered staged cause="
+                                "0x%08X have=0x%08X epoch=%u attempt=%u "
+                                "waiting=0x%08X send=%lld\n",
+                                arg, have,
+                                completed_epoch, reissue_attempt,
+                                vm_read32(0x42450E00u + 0x50u),
+                                (long long)retry);
+                        fflush(stderr);
+#else
+                        (void)retry;
+#endif
+                    }
+                }
+                if (InterlockedCompareExchange(
+                        &g_yz_a010_root_active, 0, 0) != 0 &&
+                    ahead != 0u && ahead < 0x10000u) {
                     static unsigned long stale_acquire = 0;
                     stale_acquire++;
                     if (stale_acquire <= 16 ||
@@ -3568,15 +3674,18 @@ static uint32_t yz_gcm_stopper_release_entry(uint32_t stopper_ea)
  * flush routine: a direct patch of the self-jump, or a tag-0x7F journal entry.
  * The orphanage failure reaches a third, impossible state: GET remains parked
  * on the old self-jump, PUT is already beyond it, no matching 0x7F exists, and
- * S[0x20] names the newer stopper exactly at PUT.  That last condition proves
- * the producer finished the old commit and moved its pending-stopper cursor;
- * this is not the normal case where RSX merely caught up with an unfinished
+ * S[0x20] names the newer stopper exactly at PUT.  The same state was later
+ * captured after the a020 movie at frame 3214.  That last condition proves the
+ * producer finished the old commit and moved its pending-stopper cursor; this
+ * is a FIFO publication invariant, not an a010 scene-lifetime invariant, and
+ * it is not the normal case where RSX merely caught up with an unfinished
  * producer.
  *
  * Re-issue only the missing direct patch after the journal head, pending
- * stopper, and PUT remain unchanged for 32 ms.  The feature is opt-in and
- * additionally restricted to the active a010 AUTH root while it is being
- * validated.  It deliberately does not consume or retire any journal entry.
+ * stopper, and PUT form a stable snapshot.  The clean FIFO publication repair
+ * applies wherever this exact proof holds; observation-only release tracing
+ * remains restricted to the active a010 AUTH root.  It deliberately does not
+ * consume or retire any journal entry.
  *
  * A direct release is not invariably "old stopper -> old + 4".  EDGE reserves
  * data islands in the FIFO and links around them; in a010, treating two such
@@ -4272,31 +4381,48 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
                                        uint32_t get,
                                        uint32_t put)
 {
-    static int enabled = -1;
-    static uint32_t last_stopper = 0;
-    static uint32_t last_put = 0;
-    static uint32_t last_head = 0;
-    static uint32_t last_pending = 0;
     static uint32_t last_dump_stopper = 0;
     static uint32_t last_dump_put = 0;
     static uint32_t last_dump_pending = 0;
-    static ULONGLONG stable_since = 0;
     static unsigned long repairs = 0;
 
-    if (enabled < 0) {
-        enabled = getenv("YZ_A010_MISSING_REL") ? 1 : 0;
-        if (enabled) {
+    const int enabled = yz_a010_fifo_publication_repair_enabled();
+    {
+        static int announced = 0;
+        if (enabled && !announced) {
+            announced = 1;
+            /*
+             * Reduced normal-path overhead made the already-published/new-
+             * pending versus old-unreleased stopper race reproducible.  The
+             * recovery is part of the clean lane's FIFO publication contract,
+             * not an opt-in timing crutch.  Validation below is snapshot based
+             * and fail-closed; it does not wait or sleep.
+             */
             fprintf(stderr,
-                    "[a010-missing-rel] ARMED: recover only an old unjournaled "
-                    "self-stop after the producer has published a newer "
-                    "stopper exactly at PUT\n");
+                    "[a010-missing-rel] ARMED%s: recover only an old "
+                    "unjournaled self-stop after the producer has published "
+                    "a newer stopper exactly at PUT; snapshot validated, "
+                    "no dwell\n",
+#if defined(YZ_PERF_CLEAN)
+                    " (clean FIFO publication repair)"
+#else
+                    ""
+#endif
+                    );
             fflush(stderr);
         }
     }
     const int trace = yz_a010_reltrace_on();
-    if ((!enabled && !trace) ||
+    const int release_scene_active =
         InterlockedCompareExchange(
-            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+            &g_yz_a010_release_scene_active, 0, 0) != 0;
+    /*
+     * The repair's complete structural proof is protocol-wide.  Only the
+     * observation-only trace is scene-gated; otherwise the identical
+     * post-a020 failure captured at frame 3214 can never reach the proof.
+     */
+    if ((!enabled && !trace) ||
+        (!enabled && !release_scene_active) ||
         !g_yz_game_toc)
         return 0;
 
@@ -4305,6 +4431,7 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
     if (ahead == 0u || ahead >= (ring >> 1))
         return 0;
 
+    MemoryBarrier();
     const uint32_t state = vm_read32(g_yz_game_toc - 0x7410u);
     if (state < 0x10000u || state >= 0xE0000000u)
         return 0;
@@ -4318,19 +4445,6 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
 
     const uint32_t put_ea = yz_rsx_io_to_ea(put);
     if (!put_ea || pending != put_ea || pending == stopper_ea)
-        return 0;
-
-    const ULONGLONG now = GetTickCount64();
-    if (stopper_ea != last_stopper || put != last_put ||
-        head != last_head || pending != last_pending) {
-        last_stopper = stopper_ea;
-        last_put = put;
-        last_head = head;
-        last_pending = pending;
-        stable_since = now;
-        return 0;
-    }
-    if (now - stable_since < 32u)
         return 0;
 
     /* A deferred release owns this stopper if it appears at any point before
@@ -4364,6 +4478,20 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
     if (!resume)
         return 0;
 
+    /*
+     * PUT is the producer's publication boundary.  Recheck the entire
+     * producer snapshot after validating the candidate chain so concurrent
+     * publication cannot turn a sound repair into a stale one.  This replaces
+     * the old 32 ms timing debounce with an actual synchronization invariant.
+     */
+    MemoryBarrier();
+    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+        vm_read32(g_yz_game_toc - 0x7410u) != state ||
+        vm_read32(state + 0x00u) != head ||
+        vm_read32(state + 0x20u) != pending ||
+        vm_read32(stopper_ea) != expected)
+        return 0;
+
     vm_write32(stopper_ea,
                0x20000000u | (resume & 0x1FFFFFFCu));
     vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, resume);
@@ -4371,11 +4499,10 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
     fprintf(stderr,
             "[a010-missing-rel] repaired n=%lu old=0x%08X "
             "GET=0x%06X -> resume=0x%06X (%s) PUT=0x%06X ahead=0x%X "
-            "new-pending=0x%08X head=0x%08X stable=%llums\n",
+            "new-pending=0x%08X head=0x%08X snapshot=stable\n",
             repairs, stopper_ea, get, resume,
             resume == ((get + 4u) & (ring - 1u)) ? "sequential" : "linked",
-            put, ahead, pending, head,
-            (unsigned long long)(now - stable_since));
+            put, ahead, pending, head);
     fflush(stderr);
     return 1;
 }
@@ -5160,6 +5287,10 @@ static int yz_rsx_fifo_step(void)
     static int a010_draw_source_written = 0;
     static unsigned long a010_const_trace_n = 0;
     static uint32_t a010_const_load[8] = {};
+#if defined(YZ_PERF_CLEAN)
+    const int a010_diag_root = 0;
+#else
+    const int a010_diag_root = a010_root;
     if (a010_flow_trace < 0)
         a010_flow_trace = getenv("YZ_A010_FLOW") ? 1 : 0;
     if (a010_const_trace < 0)
@@ -5167,6 +5298,7 @@ static int yz_rsx_fifo_step(void)
     if (a010_draw_source_trace < 0)
         a010_draw_source_trace =
             getenv("YZ_A010_DRAW_SOURCE") ? 1 : 0;
+#endif
 
     /* s33 [fifo-hb] (env YZ_FIFO_HB): uncapped 5 s GET/PUT heartbeat. Every
      * deep-boot terminal FIFO state so far was invisible because the apply/
@@ -5190,7 +5322,9 @@ static int yz_rsx_fifo_step(void)
               uint32_t jS = g_yz_game_toc ? vm_read32(g_yz_game_toc - 0x7410u) : 0u;
               uint32_t jhead = (jS >= 0x10000u && jS < 0xE0000000u) ? vm_read32(jS + 0x00u) : 0u;
               uint32_t jbase = (jS >= 0x10000u && jS < 0xE0000000u) ? vm_read32(jS + 0x08u) : 0u;
-              uint32_t jcur  = g_yz_jrnl_cur_ea;
+              /* Read the consumer's live LS cursor directly so this low-rate
+               * heartbeat does not require the high-volume YZ_JRNL_WATCH. */
+              uint32_t jcur  = yz_consumer_cursor();
               fprintf(stderr, "[fifo-hb] get=0x%08X put=0x%08X word=0x%08X ret=0x%08X | jhead=0x%08X jcur=0x%08X behind=0x%X jbase=0x%08X\n",
                       get, put, hea ? vm_read32(hea) : 0xDEADDEADu, g_fifo_ret,
                       jhead, jcur, (jhead > jcur) ? (jhead - jcur) : 0u, jbase);
@@ -5361,6 +5495,18 @@ static int yz_rsx_fifo_step(void)
                   fprintf(stderr, "[stop-jrnl] parked %llums @io 0x%06X ea=0x%08X journal-entry=%s (0x%08X)\n",
                           (unsigned long long)parked_ms, get, ea, je ? "PRESENT" : "ABSENT", je);
                   fflush(stderr);
+                  /* Frontier diagnosis: one read-only snapshot of every live
+                   * SPU/MFC context at an unjournaled five-second park. */
+                  { static int edge_mode = -1;
+                    static int edge_dumped = 0;
+                    if (edge_mode < 0) {
+                        const char* e = getenv("YZ_FRONTIER_EDGE");
+                        edge_mode = (e && *e == '1') ? 1 : 0;
+                    }
+                    if (edge_mode && !edge_dumped && !je) {
+                        edge_dumped = 1;
+                        yz_frontier_edge_dump(ea, get, put);
+                    } }
                   /* s34 CONSUME-GAP HEXDUMP — fires ONCE at the 2nd park
                    * sample (>15s), anchored on the STABLE release entry (NOT
                    * the cursor). The consumer cursor has two measured steady
@@ -5545,9 +5691,8 @@ static int yz_rsx_fifo_step(void)
          * stopper, but it is visible only after following the inner link.
          * Repair only an immediate non-command target inside the committed
          * a010 window, and only to the exact measured prologue. */
-        static int a010_bad_link = -1;
-        if (a010_bad_link < 0)
-            a010_bad_link = getenv("YZ_A010_MISSING_REL") ? 1 : 0;
+        const int a010_bad_link =
+            yz_a010_fifo_publication_repair_enabled();
         if (a010_root && a010_bad_link) {
             const uint32_t te = yz_rsx_io_to_ea(tgt);
             const uint32_t tw = te ? vm_read32(te) : 0u;
@@ -5593,9 +5738,9 @@ static int yz_rsx_fifo_step(void)
             fprintf(stderr, "[fifo-flow] JUMP io=0x%08X -> 0x%08X (word 0x%08X)\n", get, tgt, cmd);
             fflush(stderr);
         }
-        if (a010_root)
+        if (a010_diag_root)
             a010_jump_n++;
-        if (a010_root && a010_flow_trace) {
+        if (a010_diag_root && a010_flow_trace) {
             const uint32_t te = yz_rsx_io_to_ea(tgt);
             fprintf(stderr,
                     "[a010-flow] JUMP io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X "
@@ -5643,9 +5788,9 @@ static int yz_rsx_fifo_step(void)
             fprintf(stderr, "[fifo-flow] CALL io=0x%08X -> 0x%08X (ret=0x%08X)\n", get, ctgt, get + 4u);
             fflush(stderr);
         }
-        if (a010_root)
+        if (a010_diag_root)
             a010_call_n++;
-        if (a010_root && a010_flow_trace) {
+        if (a010_diag_root && a010_flow_trace) {
             const uint32_t ce = yz_rsx_io_to_ea(ctgt);
             fprintf(stderr,
                     "[a010-flow] CALL io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X "
@@ -5668,9 +5813,9 @@ static int yz_rsx_fifo_step(void)
                 fprintf(stderr, "[fifo-flow] RET  io=0x%08X -> 0x%08X\n", get, g_fifo_ret);
                 fflush(stderr);
             }
-            if (a010_root)
+            if (a010_diag_root)
                 a010_ret_n++;
-            if (a010_root && a010_flow_trace) {
+            if (a010_diag_root && a010_flow_trace) {
                 fprintf(stderr,
                         "[a010-flow] RET io=0x%08X ea=0x%08X -> io=0x%08X ea=0x%08X\n",
                         get, ea, g_fifo_ret, yz_rsx_io_to_ea(g_fifo_ret));
@@ -5816,7 +5961,7 @@ static int yz_rsx_fifo_step(void)
     const uint32_t pkt_end = get + 4u + count * 4u;
 
     const int a010_count_packet =
-        a010_root && get != a010_last_counted_get;
+        a010_diag_root && get != a010_last_counted_get;
     if (a010_count_packet) {
         a010_last_counted_get = get;
         a010_packet_n++;
@@ -5842,9 +5987,9 @@ static int yz_rsx_fifo_step(void)
         const uint32_t val = vm_read32(op_ea);
         const uint32_t canonical = eff & 0x1FFCu;
         const uint32_t subchannel = (eff >> 13) & 7u;
-        if (canonical == 0x1EFCu)
+        if (a010_diag_root && canonical == 0x1EFCu)
             a010_const_load[subchannel] = val;
-        else if (a010_root && a010_const_trace &&
+        else if (a010_diag_root && a010_const_trace &&
                  canonical >= 0x1F00u && canonical < 0x2000u) {
             const uint32_t word = (canonical - 0x1F00u) >> 2;
             const uint32_t slot =
@@ -5935,7 +6080,7 @@ static int yz_rsx_fifo_step(void)
             fflush(stderr);
             continue;
         }
-        if (a010_root && (eff == 0xE920u || eff == 0xE924u)) {
+        if (a010_diag_root && (eff == 0xE920u || eff == 0xE924u)) {
             if (a010_draw_source_trace &&
                 !a010_draw_source_written &&
                 a010_draw_source_n >= 400u) {
@@ -6163,10 +6308,34 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
             idle_t0 = now;
             const uint32_t p  = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
             const uint32_t ea = yz_rsx_io_to_ea(g);
-            fprintf(stderr, "[rsx-idle] 10s no-advance GET=0x%08X PUT=0x%08X ea=0x%08X words=%08X %08X %08X %08X\n",
+            const uint32_t sem_addr =
+                yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
+            const uint32_t user_cmd =
+                vm_read32(RSX_DRIVER_INFO + 0x12CCu);
+            const uint32_t handlers =
+                vm_read32(RSX_DRIVER_INFO + 0x12C0u);
+            const uint32_t handler_arg =
+                (uint32_t)_InterlockedCompareExchange(
+                    &g_yz_ucmd_handler_arg, 0, 0);
+            const uint32_t handler_completed =
+                (uint32_t)_InterlockedCompareExchange(
+                    &g_yz_ucmd_handler_completed, 0, 0);
+            const uint64_t pending_events =
+                (uint64_t)_InterlockedCompareExchange64(
+                    &g_rsx_ev_pending, 0, 0);
+            fprintf(stderr, "[rsx-idle] 10s no-advance GET=0x%08X PUT=0x%08X "
+                    "ea=0x%08X words=%08X %08X %08X %08X "
+                    "sem406e{dma=%08X off=%08X addr=%08X have=%08X} "
+                    "ucmd{latest=%08X entered=%08X completed=%08X "
+                    "handlers=%08X "
+                    "pending=%016llX}\n",
                     g, p, ea,
                     ea ? vm_read32(ea) : 0, ea ? vm_read32(ea + 4) : 0,
-                    ea ? vm_read32(ea + 8) : 0, ea ? vm_read32(ea + 12) : 0);
+                    ea ? vm_read32(ea + 8) : 0, ea ? vm_read32(ea + 12) : 0,
+                    yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e, sem_addr,
+                    sem_addr ? vm_read32(sem_addr) : 0,
+                    user_cmd, handler_arg, handler_completed, handlers,
+                    (unsigned long long)pending_events);
             fflush(stderr);
         }
         SwitchToThread();
