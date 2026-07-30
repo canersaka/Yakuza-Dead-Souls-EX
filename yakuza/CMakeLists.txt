@@ -131,6 +131,7 @@ file(GLOB SPU_KERNELS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_4c00.c"   # jobB lifted at the ALTERNATE slot base 0x4C00 (round-1 loads jobB there; measured 2026-07-08)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_6c00.c"   # jobB relocated to LS 0x6C00 during the a010 orphanage handoff (measured 2026-07-26)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_b_15800.c"  # jobB relocated to LS 0x15800 at the post-a030 handoff (measured 2026-07-24)
+    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_b_3d000.c" # exact dialogue-completion placement (image 43)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_c_17800.c"  # post-a030 transition job (EBOOT 0x0125DA80, observed LS 0x17800, image 17)
     "${PS3RECOMP_DIR}/recomp_prx/job_bin_d_e400.c"   # sibling post-a030 job (EBOOT 0x01265180, declared 0x10610 B, LS 0xE400, image 18)
     "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" # same job at LS 0xC400 (image 42; overlaps existing Job D and Job A lifts)

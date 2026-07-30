@@ -113,6 +113,8 @@ int main(void)
                  15, 0x37C00u, 0x01275A00u, 35);
     expect_image("job B live 3B000 frontier slot",
                  15, 0x3B000u, 0x01275A00u, 37);
+    expect_image("job B dialogue completion 3D000 slot",
+                 15, 0x3D000u, 0x01275A00u, 43);
     expect_image("job A alternate E400 slot after Job B",
                  15, 0x0E400u, 0x01254500u, 14);
     expect_image("job A post-Kamurocho C400 slot",
@@ -204,6 +206,8 @@ int main(void)
                           1, 0x37C00u, 35);
     expect_resident_image("job B internal call at 3B000",
                           1, 0x3B000u, 37);
+    expect_resident_image("job B internal call at 3D000",
+                          1, 0x3D000u, 43);
     expect_resident_image("job B internal call at 39C00",
                           1, 0x39C00u, 15);
     expect_resident_image("orphanage internal call at 3B000",
