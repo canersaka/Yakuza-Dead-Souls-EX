@@ -17,6 +17,7 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "rsx_live_draw.h"
+#include "ps3emu/yz_runtime_config.h"
 
 #include <cstdio>
 #include <chrono>
@@ -26,12 +27,21 @@
 #include <cstring>
 #include <intrin.h>
 
+#if defined(YZ_PERF_CLEAN)
+#define YZ_DIAG_ENABLED(name) false
+#define YZ_DIAG_VALUE(name) nullptr
+#else
+#define YZ_DIAG_ENABLED(name) (std::getenv(name) != nullptr)
+#define YZ_DIAG_VALUE(name) std::getenv(name)
+#endif
+
 /* ntdll/kernel32 stack-walk (no windows.h here); links via kernel32.lib. */
 extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
     unsigned long FramesToSkip, unsigned long FramesToCapture,
     void** BackTrace, unsigned long* BackTraceHash);
 extern "C" unsigned long long __stdcall GetTickCount64(void);
 extern "C" __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+extern "C" __declspec(dllimport) void __stdcall WakeByAddressAll(void*);
 
 /* TLS trampoline slot -- the generated code declares this extern and both
  * sets it (direct tail branches) and drains it. */
@@ -39,6 +49,13 @@ extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
 extern "C" volatile long g_yz_cri_yield_phase;
 extern "C" volatile long g_yz_movie_stop_pending_serial;
 extern "C" volatile long g_yz_movie_stop_applied_serial;
+/* Latest GCM user-command cause whose game callback actually began running.
+ * The FIFO consumer uses this acknowledgement to distinguish a queued event
+ * from one that was lost before callback dispatch. */
+extern "C" volatile long g_yz_ucmd_handler_arg;
+extern "C" volatile long g_yz_ucmd_handler_completed;
+extern "C" volatile long g_yz_ucmd_handler_epoch;
+extern "C" volatile long g_yz_ucmd_handler_completed_epoch;
 extern "C" uint8_t* vm_base;
 extern "C" void yz_a010_reltrace_ppu(uint32_t pc,
                                       const ppu_context* ctx);
@@ -826,7 +843,6 @@ static uint32_t g_yz_auto_input_mask;
  * follows the same title-state-machine path as a real Start press. */
 static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
 {
-    static int enabled = -1;
     static int state;
     static std::chrono::steady_clock::time_point deadline;
     const auto guest_readable = [](uint32_t a) {
@@ -834,8 +850,8 @@ static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
                (a >= 0xD0000000u && a < 0xE0000000u);
     };
 
-    if (enabled < 0) enabled = getenv("YZ_AUTO_START") ? 1 : 0;
-    if (!enabled || state == 2 || address != 0x00AF1DD0u) return;
+    if (!g_yz_runtime_config.auto_start ||
+        state == 2 || address != 0x00AF1DD0u) return;
 
     if (state == 0) {
         state = 1;
@@ -879,10 +895,9 @@ static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
  * diagnostic-only and stops as soon as the a010 root marker is active. */
 static void yz_auto_new_game_cached_input()
 {
-    static int enabled = -1;
     static unsigned long long logged;
-    if (enabled < 0) enabled = getenv("YZ_AUTO_NEW_GAME") ? 1 : 0;
-    if (!enabled || !g_yz_auto_start_tick || !g_yz_auto_input_cached ||
+    if (!g_yz_runtime_config.auto_new_game ||
+        !g_yz_auto_start_tick || !g_yz_auto_input_cached ||
         !g_yz_auto_input_mask || g_yz_a010_root_active)
         return;
 
@@ -890,7 +905,8 @@ static void yz_auto_new_game_cached_input()
         GetTickCount64() - g_yz_auto_start_tick;
     const unsigned long long first = 12000u;
     const unsigned long long period = 3000u;
-    if (elapsed < first || elapsed >= first + period * 30u)
+    const unsigned attempts = 5u;
+    if (elapsed < first || elapsed >= first + period * attempts)
         return;
 
     const unsigned pulse = (unsigned)((elapsed - first) / period);
@@ -918,8 +934,8 @@ static void yz_auto_new_game_cached_input()
             !(logged & (1ull << pulse))) {
             logged |= 1ull << pulse;
             fprintf(stderr,
-                    "[auto-new-game] cached Confirm pulse %u/30 at +%llums\n",
-                    pulse + 1u, elapsed);
+                    "[auto-new-game] cached Confirm pulse %u/%u at +%llums\n",
+                    pulse + 1u, attempts, elapsed);
             fflush(stderr);
         }
     }
@@ -933,12 +949,11 @@ static void yz_auto_new_game_cached_input()
  * clearing the synthetic edge before the menu consumes it. */
 static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
 {
-    static int enabled = -1;
     static unsigned long long first_seen;
     static bool selected_new_game;
     static unsigned logged_pulse = ~0u;
-    if (enabled < 0) enabled = getenv("YZ_AUTO_NEW_GAME") ? 1 : 0;
-    if (!enabled || g_yz_a010_root_active) return;
+    if (!g_yz_runtime_config.auto_new_game ||
+        g_yz_a010_root_active) return;
 
     const uint32_t menu = (uint32_t)ctx->gpr[3];
     if (!addr_readable(menu + 0x13Cu)) return;
@@ -1010,6 +1025,16 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
     const unsigned long long accept_elapsed = now - first_seen - 3500u;
     const unsigned pulse = (unsigned)(accept_elapsed / 3000u);
     const bool pressed = (accept_elapsed % 3000u) < 1000u;
+    /*
+     * Do not own the live menu input cache forever when the synthetic
+     * selection/accept route fails.  An unbounded retry continuously clears
+     * the real Confirm edge during each release phase, which makes the
+     * visible menu impossible to operate manually.  Five attempts retain
+     * unattended startup while handing the cache back after 15 seconds.
+     */
+    if (pulse >= 5u) {
+        return;
+    }
     if (pressed) {
         vm_write32(mask, vm_read32(mask) | bit);
         vm_write32(cached + 0x4u, vm_read32(cached + 0x4u) | bit);
@@ -1299,7 +1324,7 @@ extern "C" void yz_a010_common_builder_entry(void* ctxv)
 {
     auto& scope = g_yz_a010_building_pass_scope;
     ppu_context* ctx = static_cast<ppu_context*>(ctxv);
-    if (!scope.active || !getenv("YZ_A010_HOUSE_MESH_TRACE")) {
+    if (!scope.active || !YZ_DIAG_ENABLED("YZ_A010_HOUSE_MESH_TRACE")) {
         /*
          * The scene manager contains an inlined copy of FE5DB8 rather than
          * entering the virtual method. Count those direct EA1E78 calls after
@@ -1308,7 +1333,7 @@ extern "C" void yz_a010_common_builder_entry(void* ctxv)
          */
         const uint32_t caller = (uint32_t)ctx->lr;
         if (g_yz_a010_stage_main_repaired &&
-            getenv("YZ_A010_HOUSE_MESH_TRACE") &&
+            YZ_DIAG_ENABLED("YZ_A010_HOUSE_MESH_TRACE") &&
             caller >= 0x00113484u &&
             caller <= 0x0011716Cu) {
             static unsigned inlined_builder_calls = 0u;
@@ -1364,7 +1389,7 @@ extern "C" void yz_a010_house_mesh_probe(
     void* ctxv, unsigned stage_object, unsigned group_slot,
     unsigned mesh_index, unsigned site, unsigned phase)
 {
-    if (!getenv("YZ_A010_HOUSE_MESH_TRACE"))
+    if (!YZ_DIAG_ENABLED("YZ_A010_HOUSE_MESH_TRACE"))
         return;
 
     auto& probe = g_yz_a010_house_mesh_probe_state;
@@ -1964,7 +1989,7 @@ static yz_stage_gmd_trace_record*
 yz_stage_gmd_allocator_enter(ppu_context* ctx, uint32_t target)
 {
     const uint32_t callsite = (uint32_t)ctx->lr;
-    if (!getenv("YZ_STAGE_GMD_TRACE") ||
+    if (!YZ_DIAG_ENABLED("YZ_STAGE_GMD_TRACE") ||
         (callsite != 0x00E7287Cu &&
          callsite != 0x00E72AC4u))
         return nullptr;
@@ -2055,7 +2080,7 @@ static void yz_stage_gmd_publication_poll(ppu_context* ctx,
                                           uint32_t active_a010_root)
 {
     static bool printed = false;
-    if (printed || !getenv("YZ_STAGE_GMD_TRACE") ||
+    if (printed || !YZ_DIAG_ENABLED("YZ_STAGE_GMD_TRACE") ||
         active_a010_root == 0u)
         return;
     if (g_yz_stage_gmd_records[0].raw == 0u)
@@ -2176,7 +2201,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     yz_stage_gmd_trace_record* const stage_gmd_allocator =
         yz_stage_gmd_allocator_enter(ctx, target);
     yz_stage_gmd_publication_poll(ctx, active_a010_root);
-    if (getenv("YZ_STAGE_INSTANCE_TRACE") &&
+    if (YZ_DIAG_ENABLED("YZ_STAGE_INSTANCE_TRACE") &&
         active_a010_root != 0u) {
         constexpr uint32_t stage_instance_vtable = 0x011D6948u;
         uint32_t instance = 0u;
@@ -2252,7 +2277,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * authored value at that final render gate; the normal update and render
      * implementations otherwise run unchanged.
      */
-    if (getenv("YZ_A010_RENDER_ENABLE") &&
+    if (g_yz_runtime_config.a010_render_enable &&
         target == 0x00015480u &&
         addr_readable(dispatch_object) &&
         vm_read32(dispatch_object) == 0x011D3F78u &&
@@ -2290,7 +2315,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * -> func_00092CE0 path with the original object+0xA64 arguments, which
      * allocates and populates the section buffers.
      */
-    if (getenv("YZ_A010_MODEL_RETRY") &&
+    if (g_yz_runtime_config.a010_model_retry &&
         target == 0x00015480u &&
         addr_readable(dispatch_object + 0x48u) &&
         vm_read32(dispatch_object) == 0x011D3F78u &&
@@ -2372,7 +2397,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * walks passes in descending order. Publish any missing authored palette
      * immediately before pass 0 consumes it.
      */
-    if (getenv("YZ_A010_PALETTE_REPAIR") &&
+    if (g_yz_runtime_config.a010_palette_repair &&
         target == 0x00015480u &&
         (uint32_t)ctx->gpr[4] == 0u &&
         active_a010_root != 0u) {
@@ -2387,7 +2412,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * topology and repair only the active node's track pointer when the
      * pending track owns the current scene frame.
      */
-    if (getenv("YZ_A010_CAMERA_HANDOFF") &&
+    if (g_yz_runtime_config.a010_camera_handoff &&
         target == 0x00011DF0u &&
         active_a010_root != 0u &&
         addr_readable(dispatch_object + 0x20u) &&
@@ -3523,7 +3548,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * an oscillation == flat loop (overflow is elsewhere). After N hits, dump the
      * guest back-chain (r1 -> *(r1)=caller SP, saved LR at SP+0x10) = the exact
      * recursive cycle, captured BEFORE the host stack dies. One-shot. */
-    if (target == 0x00F83AECu && getenv("YZ_RECPROBE")) {
+    if (target == 0x00F83AECu && YZ_DIAG_ENABLED("YZ_RECPROBE")) {
         static __declspec(thread) uint32_t prev_r1 = 0;
         static __declspec(thread) uint32_t hits = 0, dec_run = 0;
         static __declspec(thread) int dumped = 0;
@@ -3830,6 +3855,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         return;
     }
 
+    uint32_t resolved_code = target;
     yz_ppu_fn fn = yz_lookup_func(target);
     /* TOC repair: a gcm callback invoked by its bare code address (target is a
      * game function found directly, no OPD) keeps the CALLER's TOC (libgcm's, or
@@ -3842,6 +3868,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * (our synthetic OPDs, or game-held pointers to import slots). */
         uint32_t code = vm_read32(target);
         uint32_t toc  = vm_read32(target + 4);
+        resolved_code = code;
         if (yz_ppu_fn bridge = import_bridge_for(code)) {
             bridge(ctx);
             yz_stage_gmd_allocator_return(stage_gmd_allocator, ctx);
@@ -3866,6 +3893,28 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                 (unsigned long long)ctx->gpr[2],
                 (unsigned long long)ctx->gpr[3]);
         exit(2);
+    }
+
+    if (resolved_code == 0x00E7DB10u) {
+        /*
+         * The callback signals the wid4 SPU before it finishes staging that
+         * signal's work record.  Execute this one callback to return here so
+         * the DMA side can wait for a real publication acknowledgement rather
+         * than an arbitrary spin count.
+        */
+        const long cause = (long)(uint32_t)ctx->gpr[3];
+        const long epoch = _InterlockedIncrement(&g_yz_ucmd_handler_epoch);
+        _InterlockedExchange(&g_yz_ucmd_handler_arg, cause);
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+        _InterlockedExchange(&g_yz_ucmd_handler_completed, cause);
+        _InterlockedExchange(&g_yz_ucmd_handler_completed_epoch, epoch);
+        WakeByAddressAll(
+            const_cast<long*>(&g_yz_ucmd_handler_completed_epoch));
+        g_trampoline_fn = saved_trampoline;
+        return;
     }
 
     yz_mwply_lifecycle_boundary((void*)fn, ctx);
@@ -3897,7 +3946,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * to a finite authored pose.  This preserves the normal guest routine and
      * avoids another enormous per-call boot log.
      */
-    if (getenv("YZ_A010_TRANSITION_TRACE") &&
+    if (YZ_DIAG_ENABLED("YZ_A010_TRANSITION_TRACE") &&
         target == 0x00014848u &&
         active_a010_root != 0u &&
         addr_readable(dispatch_object + 0x2Cu) &&
@@ -4022,8 +4071,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * code nor affects non-a010 scenes or non-stage objects.
      */
     if (target == 0x00DA45E8u &&
-        (getenv("YZ_STAGE_CLASSIFY_TRACE") ||
-         getenv("YZ_A010_STAGE_CLASSIFY_REPAIR"))) {
+        (YZ_DIAG_ENABLED("YZ_STAGE_CLASSIFY_TRACE") ||
+         g_yz_runtime_config.a010_stage_classify_repair)) {
         const uint32_t object_array = (uint32_t)ctx->gpr[4];
         const uint32_t object_index = (uint32_t)ctx->gpr[5];
         const uint64_t object_slot64 =
@@ -4046,14 +4095,14 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
 
             const uint16_t classified = vm_read16(object + 0xB0u);
             uint16_t repaired = classified;
-            if (getenv("YZ_A010_STAGE_CLASSIFY_REPAIR") &&
+            if (g_yz_runtime_config.a010_stage_classify_repair &&
                 active_a010_root != 0u &&
                 (classified & 0x0508u) == 0u) {
                 repaired = (uint16_t)(classified | 0x0508u);
                 vm_write16(object + 0xB0u, repaired);
             }
 
-            if (getenv("YZ_STAGE_CLASSIFY_TRACE")) {
+            if (YZ_DIAG_ENABLED("YZ_STAGE_CLASSIFY_TRACE")) {
                 struct yz_stage_classify_record {
                     uint32_t gmd;
                     unsigned hits;
@@ -4125,16 +4174,17 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * comparing its head before/after each synchronous virtual call tells us
      * whether the house diverges inside the method or only downstream.
      */
-    if ((getenv("YZ_STAGE_CALL_TRACE") ||
-         getenv("YZ_A010_STAGE_DMA_MAP") ||
-         getenv("YZ_A010_STAGE_READ_WATCH") ||
-         getenv("YZ_A010_CMD_ARENA_DUMP") ||
-         getenv("YZ_A010_STAGE_GROUP_TRACE") ||
-         getenv("YZ_A010_FORCE_STAGE_MESHES") ||
-         getenv("YZ_A010_FORCE_STAGE_MAIN") ||
-         getenv("YZ_A010_STAGE_KIND1") ||
-         getenv("YZ_A010_ITEM_FLOW") ||
-         getenv("YZ_A010_PUBLISH_FLOW")) &&
+    if ((YZ_DIAG_ENABLED("YZ_STAGE_CALL_TRACE") ||
+         YZ_DIAG_ENABLED("YZ_A010_STAGE_DMA_MAP") ||
+         YZ_DIAG_ENABLED("YZ_A010_STAGE_READ_WATCH") ||
+         YZ_DIAG_ENABLED("YZ_A010_CMD_ARENA_DUMP") ||
+         YZ_DIAG_ENABLED("YZ_A010_STAGE_GROUP_TRACE") ||
+         g_yz_runtime_config.a010_force_stage_meshes ||
+         g_yz_runtime_config.a010_force_stage_main ||
+         g_yz_runtime_config.a010_stage_group_wait ||
+         YZ_DIAG_ENABLED("YZ_A010_STAGE_KIND1") ||
+         YZ_DIAG_ENABLED("YZ_A010_ITEM_FLOW") ||
+         YZ_DIAG_ENABLED("YZ_A010_PUBLISH_FLOW")) &&
         active_a010_root != 0u &&
         yz_stage_render_method(target) &&
         yz_stage_render_instance(dispatch_object)) {
@@ -4172,11 +4222,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * than the geometry worker or GPU list linker.  Default-off until the
          * source-map run identifies the surviving list.
          */
-        static int a010_force_stage_meshes = -1;
-        if (a010_force_stage_meshes < 0)
-            a010_force_stage_meshes =
-                getenv("YZ_A010_FORCE_STAGE_MESHES") ? 1 : 0;
-        if (a010_force_stage_meshes) {
+        if (g_yz_runtime_config.a010_force_stage_meshes) {
             const uint32_t mesh_flags =
                 vm_read32(dispatch_object + 0x10u);
             const uint32_t mesh_flags_end =
@@ -4203,11 +4249,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * range, camera, or draw is fabricated; this only enables the shipped
          * renderer that consumes the already-authored worker output.
          */
-        static int a010_force_stage_main = -1;
-        if (a010_force_stage_main < 0)
-            a010_force_stage_main =
-                getenv("YZ_A010_FORCE_STAGE_MAIN") ? 1 : 0;
-        if (a010_force_stage_main &&
+        if (g_yz_runtime_config.a010_force_stage_main &&
             target == 0x00FE4508u &&
             gmd == 0x429D8A00u) {
             const uint16_t before_flags =
@@ -4355,7 +4397,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * empty visibility result from a bad descriptor pointer without
          * tracing another whole frame.
          */
-        if (getenv("YZ_A010_STAGE_GROUP_TRACE") &&
+        if (YZ_DIAG_ENABLED("YZ_A010_STAGE_GROUP_TRACE") &&
             record && record->hits == 1u &&
             target == 0x00FE4508u &&
             gmd == 0x429D8A00u) {
@@ -4465,7 +4507,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * while the handoff is validated; no camera, mesh, or draw data is
          * fabricated.  The worker still authors every list entry.
          */
-        if (getenv("YZ_A010_STAGE_GROUP_WAIT") &&
+        if (g_yz_runtime_config.a010_stage_group_wait &&
             target == 0x00FE4508u &&
             gmd == 0x429D8A00u) {
             const uint32_t group_table =
@@ -4590,7 +4632,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         const unsigned long long started = GetTickCount64();
         const yz_a010_building_pass_scope saved_building_scope =
             g_yz_a010_building_pass_scope;
-        if (getenv("YZ_A010_HOUSE_MESH_TRACE") &&
+        if (YZ_DIAG_ENABLED("YZ_A010_HOUSE_MESH_TRACE") &&
             (target == 0x00FE4508u ||
              target == 0x00FE5DB8u) &&
             gmd == 0x429D8A00u) {
@@ -4655,7 +4697,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * identifies which record class/objects vanish at the next consumer.
          * Bounded to one CSV per process and default-off.
          */
-        if (getenv("YZ_A010_CMD_ARENA_DUMP") &&
+        if (YZ_DIAG_ENABLED("YZ_A010_CMD_ARENA_DUMP") &&
             target == 0x00FE4508u &&
             gmd == 0x42AA7D00u &&
             before_command_count >= 800u &&
@@ -4664,7 +4706,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             if (!command_arena_dumped) {
                 command_arena_dumped = true;
                 const char* dump_path =
-                    getenv("YZ_A010_CMD_ARENA_DUMP");
+                    YZ_DIAG_VALUE("YZ_A010_CMD_ARENA_DUMP");
                 FILE* dump =
                     dump_path && dump_path[0]
                         ? fopen(dump_path, "w") : nullptr;
@@ -4738,7 +4780,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                 g_yz_a010_stage_payload_ea[pending_stage_slot] =
                     vm_read32(before_command_head + 0x04u);
                 if (pending_stage_slot == 8u &&
-                    getenv("YZ_A010_STAGE_READ_WATCH")) {
+                    YZ_DIAG_ENABLED("YZ_A010_STAGE_READ_WATCH")) {
                     static bool stage_read_watch_armed = false;
                     if (!stage_read_watch_armed &&
                         g_yz_a010_stage_record_ea[0] != 0u) {
