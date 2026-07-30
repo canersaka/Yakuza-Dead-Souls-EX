@@ -6,6 +6,7 @@
 #include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (audit sec.5 item 3, queue-create validation) */
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
+#include "ps3emu/yz_frontier_trace.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,22 @@ extern uint32_t yz_thread_current_id(void);
 sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
+
+static void yz_frontier_queue_record(uint32_t phase, uint32_t queue_id,
+                                     const sys_event_queue_info* q,
+                                     const sys_event_t* evt)
+{
+    if (queue_id != 2 || !yz_frontier_trace_is_armed())
+        return;
+    yz_frontier_trace_emit(
+        YZ_FT_EVENT_QUEUE, yz_thread_current_id(), phase,
+        queue_id,
+        ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
+        ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
+        evt ? (uint32_t)evt->source : 0u,
+        evt ? (uint32_t)evt->data1 : 0u,
+        evt ? (uint32_t)evt->data2 : 0u);
+}
 
 /* Table lock for allocation */
 #ifdef _WIN32
@@ -312,6 +329,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
+    yz_frontier_queue_record(
+        YZ_FT_QUEUE_RECEIVE_ENTER, queue_id, q, NULL);
     q->waiters++;   /* audit sec.5 item 4: destroy's EBUSY check needs this */
 
     if (timeout_us == 0) {
@@ -366,10 +385,14 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
     q->count--;
+    yz_frontier_queue_record(
+        YZ_FT_QUEUE_RECEIVE_POP, queue_id, q, &evt);
 
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
+    yz_frontier_queue_record(
+        YZ_FT_QUEUE_RECEIVE_ENTER, queue_id, q, NULL);
     q->waiters++;
 
     if (timeout_us == 0) {
@@ -407,6 +430,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
     q->count--;
+    yz_frontier_queue_record(
+        YZ_FT_QUEUE_RECEIVE_POP, queue_id, q, &evt);
 
     pthread_mutex_unlock(&q->lock);
 #endif
@@ -522,6 +547,8 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    const uint32_t queue_id =
+        (uint32_t)(q - &g_sys_event_queues[0]) + 1u;
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 #else
@@ -529,6 +556,8 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 #endif
 
     if (q->count >= q->capacity) {
+        yz_frontier_queue_record(
+            YZ_FT_QUEUE_PUSH_FULL, queue_id, q, evt);
 #ifdef _WIN32
         LeaveCriticalSection(&q->lock);
 #else
@@ -540,6 +569,8 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
+    yz_frontier_queue_record(
+        YZ_FT_QUEUE_PUSH_OK, queue_id, q, evt);
 
 #ifdef _WIN32
     WakeConditionVariable(&q->not_empty);

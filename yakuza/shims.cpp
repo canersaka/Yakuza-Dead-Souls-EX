@@ -27,6 +27,7 @@
 #include "../include/ps3emu/endian.h"
 #include "../include/ps3emu/guest_call.h"
 #include "../include/ps3emu/yz_runtime_config.h"
+#include "../include/ps3emu/yz_frontier_trace.h"
 #include "../runtime/memory/vm.h"
 #include "yakuza_runner.h"
 
@@ -740,6 +741,21 @@ static inline void yz_jobstream_watch(uint32_t a, uint64_t val, unsigned w, cons
                         reset ? " RESET" : "");
                 fflush(stderr);
             }
+        }
+    }
+
+    /*
+     * The frontier recorder replaces per-store diagnostic output. Test the
+     * narrow address ranges first so ordinary vm_write32/64 calls do not pay
+     * even an atomic armed-state read.
+     */
+    if ((a + w > 0x4019CA80u && a < 0x4019CB40u) ||
+        (a + w > 0x10200FE0u && a < 0x10200FF0u)) {
+        if (yz_frontier_trace_is_armed()) {
+            yz_frontier_trace_emit(
+                YZ_FT_PPU_STORE, yz_thread_current_id(),
+                yz_guest_addr_from_host(retaddr),
+                a, w, (uint32_t)(val >> 32), (uint32_t)val, 0, 0);
         }
     }
 
