@@ -141,6 +141,7 @@ extern "C" void spu_recomp_register_jobbin_a_e400(void);
 extern "C" void spu_recomp_register_jobbin_b_4c00(void);
 extern "C" void spu_recomp_register_jobbin_b_6c00(void);
 extern "C" void spu_recomp_register_jobbin_b_15800(void);
+extern "C" void spu_recomp_register_jobbin_b_3d000(void);
 /* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
  * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes);
  * the observed job-manager launch loads it at LS 0x17800. */
@@ -3489,6 +3490,7 @@ int main(int argc, char** argv)
     spu_recomp_register_jobbin_b_4c00();                  /*   ...same binary lifted at the other slot base 0x4C00 (same image) */
     spu_recomp_register_jobbin_b_6c00();                  /*   ...same binary relocated during a010 at slot base 0x6C00 */
     spu_recomp_register_jobbin_b_15800();                 /*   ...same binary relocated post-a030 at slot base 0x15800 */
+    spu_begin_image(43); spu_recomp_register_jobbin_b_3d000(); /* exact dialogue-completion placement; overlaps other Job B lifts */
     spu_begin_image(17); spu_recomp_register_jobbin_c_17800(); /* post-a030 transition job (EBOOT 0x0125DA80, LS 0x17800) */
     spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
     spu_begin_image(42); spu_recomp_register_jobbin_d_c400();  /* same binary at LS 0xC400; overlaps Job D E400 and Job A C400 */
