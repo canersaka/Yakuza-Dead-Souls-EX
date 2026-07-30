@@ -16,6 +16,7 @@
 #include "spu_helpers.h"   /* spu_rotqbyi: the real spursTasksetStartTask gpr4 seed */
 #include "spu_job_dispatch.h"
 #include "../../include/ps3emu/error_codes.h"   /* CELL_EBUSY: send_event ack mapping */
+#include "../../include/ps3emu/yz_frontier_trace.h"
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
@@ -1449,6 +1450,13 @@ int g_yz_codec_dispatch_spu = -1;  /* pt35: spu_id running the codec policy disp
 void spu_halt(spu_context* ctx, int status)
 {
     ctx->status = (uint32_t)status;
+    if (yz_frontier_trace_is_armed()) {
+        yz_frontier_trace_emit(
+            YZ_FT_SPU_HALT, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            (uint32_t)status, (uint32_t)ctx->image_id,
+            ctx->job_bin_base[0], ctx->job_bin_base[1],
+            ctx->gpr[0]._u32[0] & SPU_LS_MASK, 0);
+    }
     /* pt35 (env YZ_HALT_LOG): log SPU halts -- spursTasksetLoadElf/dispatch failures
      * call spursHalt(spu), which lands here. Shows whether the codec policy SPU halts
      * after LoadElf (the stuck-running symptom) and at what PC. */
@@ -2215,6 +2223,25 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+static int yz_frontier_dma_is_relevant(const spu_context* ctx)
+{
+    const uint64_t begin = ctx->mfc_eal;
+    const uint64_t end = begin + (ctx->mfc_size ? ctx->mfc_size : 1u);
+
+    /*
+     * Keep the selected completion job itself, plus DMA touching the narrow
+     * event/command/label ranges already watched by the PPU-side recorder.
+     * In particular, do not retain the SPURS kernel's continuous B4/D0
+     * management-line polling at 0x40197C80: it can overwrite the causal
+     * history before a stalled frontier is dumped.
+     */
+    return (ctx->image_id == 15 &&
+            ctx->job_bin_base[1] == 0x1EC00u) ||
+           (begin < 0x4019C700ull && end > 0x4019C680ull) ||
+           (begin < 0x4019CB40ull && end > 0x4019CA80ull) ||
+           (begin < 0x10200FF0ull && end > 0x10200FE0ull);
+}
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
@@ -2229,6 +2256,16 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     if (yz_fltrec_hot(ctx)) yz_fltrec_wrch(ctx, channel, v);
 
     if (channel_is_mfc(channel)) {
+        if (channel == MFC_Cmd &&
+            yz_frontier_trace_is_armed() &&
+            yz_frontier_dma_is_relevant(ctx)) {
+            yz_frontier_trace_emit(
+                YZ_FT_SPU_DMA_CMD, ctx->spu_id,
+                ctx->pc & SPU_LS_MASK,
+                v & 0xFFu, ctx->mfc_lsa & SPU_LS_MASK,
+                ctx->mfc_eal, ctx->mfc_size,
+                ctx->mfc_tag, (uint32_t)ctx->image_id);
+        }
         if (channel == MFC_Cmd && !yz_ch_nonblock())
             spu_ch_wait(ctx, MFC_Cmd, "wrch");
         if (channel == MFC_WrTagUpdate && !yz_ch_nonblock())
@@ -2239,6 +2276,15 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 
     switch (channel) {
     case SPU_WrOutMbox:
+        if (yz_frontier_trace_is_armed()) {
+            yz_frontier_trace_emit(
+                YZ_FT_SPU_OUT_MBOX, ctx->spu_id,
+                ctx->pc & SPU_LS_MASK,
+                v, (uint32_t)ctx->image_id,
+                ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                ctx->job_bin_base[1]);
+        }
         /* s39 DEADLOCK CARVE-OUT: the ISA stalls wrch on a FULL out-mbox until
          * the PPU reads it. This runtime has NO cross-thread out-mbox drainer --
          * the regular out-mbox is read only same-thread (thread-exit status pop
@@ -2252,6 +2298,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * fidelity gap, not a silent one. */
         spu_channel_write(&ctx->ch_out_mbox, v);       break;
     case SPU_WrOutIntrMbox:
+        if (yz_frontier_trace_is_armed()) {
+            yz_frontier_trace_emit(
+                YZ_FT_SPU_INTR_MBOX, ctx->spu_id,
+                ctx->pc & SPU_LS_MASK,
+                v, v >> 24, (v >> 24) & 63u,
+                ctx->ch_out_mbox.value, ctx->ch_out_mbox.count,
+                (uint32_t)ctx->image_id);
+        }
         /* s39: same deadlock carve-out as SPU_WrOutMbox -- the interrupt mbox has
          * NO drainer at all in this runtime (spu_channel_write below is the only
          * toucher of ch_out_intr_mbox), so block-while-full is a guaranteed hang.
@@ -5784,6 +5838,27 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
         if (jimg > 0 && jimg != ctx->image_id) {
+            const uint32_t frontier_record =
+                ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+            const uint32_t frontier_binary =
+                ((uint32_t)ctx->ls[(frontier_record + 4u) & SPU_LS_MASK] << 24) |
+                ((uint32_t)ctx->ls[(frontier_record + 5u) & SPU_LS_MASK] << 16) |
+                ((uint32_t)ctx->ls[(frontier_record + 6u) & SPU_LS_MASK] << 8) |
+                (uint32_t)ctx->ls[(frontier_record + 7u) & SPU_LS_MASK];
+            if (jimg == 15 && jpc == 0x1EC00u) {
+                yz_frontier_trace_arm(
+                    ctx->spu_id, ctx->pc & SPU_LS_MASK,
+                    frontier_binary, jpc, (uint32_t)jimg,
+                    frontier_record);
+            }
+            if (yz_frontier_trace_is_armed()) {
+                yz_frontier_trace_emit(
+                    YZ_FT_SPU_JOB_SELECT, ctx->spu_id,
+                    ctx->pc & SPU_LS_MASK,
+                    (uint32_t)ctx->image_id, (uint32_t)jimg, jpc,
+                    frontier_record, frontier_binary,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+            }
             extern uint8_t* vm_base;
             {
                 static int output_map_on = -1;

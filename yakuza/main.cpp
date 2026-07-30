@@ -15,7 +15,9 @@
 
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
+#include "rsx_live_draw.h"
 #include "ps3emu/yz_runtime_config.h"
+#include "ps3emu/yz_frontier_trace.h"
 #include "../runtime/memory/vm.h"
 #include "../include/ps3emu/guest_call.h"
 #include "../include/ps3emu/endian.h"   /* ps3_bswap32 -- YZ_WATCH_WR old/new dump */
@@ -30,10 +32,35 @@
  * the host return-address scan alone misses most of the guest chain). */
 thread_local ppu_context* g_yz_cur_ctx = nullptr;
 
+extern "C" void yz_frontier_ppu_site(ppu_context* ctx, uint32_t site)
+{
+    if (!yz_frontier_trace_is_armed())
+        return;
+    yz_frontier_trace_emit(
+        YZ_FT_PPU_SITE, yz_thread_current_id(), site,
+        (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+        (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[31],
+        (uint32_t)ctx->lr, (uint32_t)ctx->ctr);
+}
+
+extern "C" void yz_frontier_ppu_value(
+    ppu_context* ctx, uint32_t site, uint32_t tag,
+    uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, uint32_t v4)
+{
+    (void)ctx;
+    if (!yz_frontier_trace_is_armed())
+        return;
+    yz_frontier_trace_emit(
+        YZ_FT_PPU_VALUE, yz_thread_current_id(), site,
+        tag, v0, v1, v2, v3, v4);
+}
+
 /* Game module TOC (set from the entry OPD); used by the dispatcher's TOC repair
  * (dispatch.cpp yz_tramp_guard). */
 extern "C" uint32_t g_yz_game_toc;
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
+extern "C" void yz_frontier_edge_dump(
+    uint32_t parked_ea, uint32_t get, uint32_t put);
 extern "C" void yz_spu_crash_note(void);       /* s31 §13 crash attribution (spu_channels.c) */
 
 /* ---------------------------------------------------------------------------
@@ -3147,6 +3174,63 @@ extern "C" __declspec(thread) uint64_t g_yz_tramp_r31[256];
 extern "C" __declspec(thread) uint64_t g_yz_tramp_r1[256];
 extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 
+/*
+ * Non-formatting frontier stall detector. It is dormant until the semantic
+ * completion-job arm and records only state changes. A five-second quiet
+ * interval produces one read-only worker snapshot and one ring dump.
+ */
+static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
+{
+    uint32_t last_get = ~0u;
+    uint32_t last_put = ~0u;
+    uint32_t last_fence = ~0u;
+    uint32_t last_frame = ~0u;
+    DWORD unchanged_since = 0;
+
+    for (;;) {
+        Sleep(50);
+        if (!yz_frontier_trace_is_armed() || !vm_base)
+            continue;
+
+        const uint32_t put = vm_read32(0x10000040u);
+        const uint32_t get = vm_read32(0x10000044u);
+        const uint32_t fence = vm_read32(0x40C00000u);
+        const uint32_t frame = rsx_live_draw_get_frames();
+        const DWORD now = GetTickCount();
+
+        if (get != last_get || put != last_put ||
+            fence != last_fence || frame != last_frame) {
+            yz_frontier_trace_emit(
+                YZ_FT_RSX_STATE, 0, 0,
+                get, put, fence, frame,
+                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u,
+                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u);
+            last_get = get;
+            last_put = put;
+            last_fence = fence;
+            last_frame = frame;
+            unchanged_since = now;
+            continue;
+        }
+
+        if (!unchanged_since) {
+            unchanged_since = now;
+            continue;
+        }
+
+        if (now - unchanged_since >= 5000u) {
+            yz_frontier_trace_emit(
+                YZ_FT_STALL, 0, 0,
+                get, put, fence, frame,
+                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u,
+                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u);
+            yz_frontier_edge_dump(0u, get, put);
+            yz_frontier_trace_dump(1u);
+            return 0;
+        }
+    }
+}
+
 static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
@@ -3289,6 +3373,7 @@ int main(int argc, char** argv)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    yz_frontier_trace_init();
     yz_runtime_config_print_fingerprint();
 
     /* Boot determinism: the firmware boot is paced by Sleep()-based polls that quantize
@@ -3541,6 +3626,8 @@ int main(int argc, char** argv)
      * clean; on for the deadlock investigation. */
     if (getenv("YZ_TRACE_RSX"))
         CreateThread(NULL, 0, yz_rsx_state_trace, NULL, 0, NULL);
+    if (yz_frontier_trace_enabled())
+        CreateThread(NULL, 0, yz_frontier_ring_watchdog, NULL, 0, NULL);
     /* Non-suspending t1 PC/LR sampler (env YZ_T1SAMPLE, 2026-07-04) -- see the
      * comment above yz_t1_sample_thread. Pins the exact poll site for a
      * silent (no-syscall) t1 stall without perturbing the thread. */

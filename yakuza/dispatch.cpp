@@ -18,6 +18,7 @@
 #include "yakuza_runner.h"
 #include "rsx_live_draw.h"
 #include "ps3emu/yz_runtime_config.h"
+#include "ps3emu/yz_frontier_trace.h"
 
 #include <cstdio>
 #include <chrono>
@@ -3362,6 +3363,29 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      *     scratch/libsre_lle_map.txt (both names) and the ADX_SPURS_EVENTFLAG_*
      *     defines in libs/filesystem/cellFs.c (which independently arrived at
      *     the same two addresses). */
+    if ((target == 0x02015F74u || target == 0x02016010u) &&
+        yz_frontier_trace_is_armed()) {
+        const uint32_t ea = (uint32_t)ctx->gpr[3];
+        if (target == 0x02015F74u && yz_thread_current_id() == 1) {
+            const uint32_t out = (uint32_t)ctx->gpr[4];
+            const uint32_t mode = (uint32_t)ctx->gpr[5];
+            const int ea_ok = ea >= 0x00010000u && ea < 0xE0000000u;
+            const int out_ok = out >= 0x00010000u && out < 0xE0000000u;
+            const uint64_t bits = ea_ok ? vm_read64(ea) : ~0ull;
+            const uint32_t requested =
+                out_ok ? (uint32_t)vm_read16(out) : 0xFFFFFFFFu;
+            yz_frontier_trace_emit(
+                YZ_FT_EVENT_WAIT, yz_thread_current_id(), target,
+                ea, out, requested, mode,
+                (uint32_t)(bits >> 32), (uint32_t)bits);
+        } else if (target == 0x02016010u) {
+            yz_frontier_trace_emit(
+                YZ_FT_EVENT_SET, yz_thread_current_id(), target,
+                ea, (uint32_t)ctx->gpr[4], (uint32_t)ctx->lr,
+                0, 0, 0);
+        }
+    }
+
     { static int ew = -1; if (ew < 0) ew = getenv("YZ_EVFLAG_WATCH") ? 1 : 0;
       if (ew) {
           /* addr_readable() above only covers main-mem [0x10000,0x10000000) and
