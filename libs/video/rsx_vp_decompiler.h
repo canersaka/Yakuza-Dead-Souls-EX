@@ -25,6 +25,18 @@ extern "C" {
  * including the one with the D3.end bit, bounded by max_bytes. 0 if none. */
 u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
 
+typedef struct rsx_vp_input_analysis {
+    u32 input_mask;
+    int exact;
+} rsx_vp_input_analysis;
+
+/* Report the guest input registers statically read by the program.  `exact`
+ * is zero and input_mask is 0xFFFF when an unsupported opcode/control-flow
+ * construct makes the result unsafe to narrow.  Returns the instruction
+ * count, or -1 for invalid/non-terminated input. */
+int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
+                          rsx_vp_input_analysis* analysis);
+
 /* Decompile an NV40 vertex program into an HLSL vertex shader.
  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
  *   max_bytes: safety bound.
@@ -45,6 +57,14 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
  * Unmasked units retain the defined-zero fallback. */
 int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size);
+
+/* Compact-input variant.  The generated VSInput declares only the original
+ * ATTRn semantics selected by input_mask.  The mask is checked against a
+ * fresh static analysis; any uncertainty or missing referenced bit falls
+ * back to all 16 inputs. */
+int rsx_vp_decompile_compact_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);

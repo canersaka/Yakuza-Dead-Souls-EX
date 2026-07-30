@@ -161,6 +161,24 @@ if(PS3RECOMP_BUILD_TESTS)
     # Keep them visible to CTest where that harness is supported; the native
     # stress tests above remain portable across the other toolchains.
     if(MSVC)
+        add_executable(rsx_vertex_compact_tests
+            libs/video/tests/test_vertex_compact.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vp_decompiler.c
+        )
+        target_include_directories(rsx_vertex_compact_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_vertex_compact_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_vertex_compact
+            COMMAND rsx_vertex_compact_tests
+        )
+
         find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
         add_test(
             NAME ppu_lifter_conformance

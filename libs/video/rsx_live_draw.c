@@ -55,8 +55,10 @@ void rsx_live_draw_shutdown(void) {}
 #include "rsx_dispatch.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_restart_cuts.h"
+#include "rsx_vertex_compact.h"
 #include "rsx_vp_decompiler.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -280,9 +282,51 @@ typedef struct {
     void*                      guest_user;
 
     rsx_dispatch               rsx;
+    /*
+     * Startup-selected Stage-1 isolation mode.  The hot draw path only reads
+     * these bits; environment parsing is completed once in init.
+     *
+     * L = legacy
+     * H = hoisted descriptor/base fetch
+     * M = H + masked shader signature/input layout
+     * C = M + compact payload/stride
+     */
+    u32                        vertex_features;
+    char                       vertex_mode;
+    char                       vertex_diag_dir[MAX_PATH];
 } ld_state;
 
 static ld_state g;
+
+#define LD_VERTEX_HOIST_FETCH       (1u << 0)
+#define LD_VERTEX_MASK_SIGNATURE    (1u << 1)
+#define LD_VERTEX_COMPACT_PAYLOAD   (1u << 2)
+
+static int ld_vertex_hoist_fetch(void)
+{
+    return (g.vertex_features & LD_VERTEX_HOIST_FETCH) != 0;
+}
+
+static int ld_vertex_mask_signature(void)
+{
+    return (g.vertex_features & LD_VERTEX_MASK_SIGNATURE) != 0;
+}
+
+static int ld_vertex_compact_payload(void)
+{
+    return (g.vertex_features & LD_VERTEX_COMPACT_PAYLOAD) != 0;
+}
+
+static const char* ld_vertex_mode_name(void)
+{
+    switch (g.vertex_mode) {
+    case 'H': return "H-hoist";
+    case 'M': return "M-mask";
+    case 'C': return "C-compact";
+    default:  return "L-legacy";
+    }
+}
+
 static int g_ld_dred_dumped = 0;
 static u32 g_ld_frames = 0;
 static ID3D12InfoQueue* g_ld_info_queue = NULL;
@@ -291,12 +335,50 @@ static int g_ld_debug_layer_enabled = 0;
 typedef struct {
     int valid;
     u64 key;
+    u64 vp_hash;
     u32 vp_start, vp_instrs;
     u32 fp_location, fp_offset, fp_size, fp_control;
     u32 cube_mask, vtex_mask, txl_mask;
+    u32 input_mask, input_stride;
+    u32 packed_offsets;
 } ld_pso_metadata;
 
 static ld_pso_metadata g_ld_current_pso;
+static u64 g_ld_flip_requested = 0;
+static u64 g_ld_flip_consumed = 0;
+static u32 g_ld_last_requested_buffer = UINT32_MAX;
+static u32 g_ld_last_consumed_buffer = UINT32_MAX;
+static u32 g_ld_last_present_target = UINT32_MAX;
+static volatile LONG g_ld_diag_post_movie_pending = 0;
+static volatile LONG g_ld_diag_post_movie_presents = 0;
+
+#define LD_LAYOUT_CACHE_CAP 256u
+typedef struct {
+    int valid;
+    rsx_vertex_layout_plan plan;
+} ld_layout_cache_entry;
+
+static ld_layout_cache_entry g_ld_layout_cache[LD_LAYOUT_CACHE_CAP];
+static u32 g_ld_layout_cache_count = 0;
+
+static void ld_layout_plan_get(u32 mask, rsx_vertex_layout_plan* out)
+{
+    mask &= 0xFFFFu;
+    for (u32 i = 0; i < g_ld_layout_cache_count; i++) {
+        if (g_ld_layout_cache[i].valid &&
+            g_ld_layout_cache[i].plan.mask == mask) {
+            *out = g_ld_layout_cache[i].plan;
+            return;
+        }
+    }
+    rsx_vertex_layout_plan_init(out, mask);
+    if (g_ld_layout_cache_count < LD_LAYOUT_CACHE_CAP) {
+        ld_layout_cache_entry* entry =
+            &g_ld_layout_cache[g_ld_layout_cache_count++];
+        entry->valid = 1;
+        entry->plan = *out;
+    }
+}
 
 #define LD_RECENT_DRAW_CAP 128u
 typedef struct {
@@ -716,9 +798,15 @@ typedef struct {
     u64 flush_qpc;
     u64 fence_wait_qpc;
     u64 flush_reason[LD_FLUSH_REASON_COUNT];
+    u64 flush_reason_qpc[LD_FLUSH_REASON_COUNT];
+    u64 fence_reason_qpc[LD_FLUSH_REASON_COUNT];
     u64 input_vertices;
     u64 expanded_vertices;
+    u64 used_attribute_draws;
+    u64 used_attribute_sum;
+    u64 legacy_vertex_upload_bytes;
     u64 vertex_upload_bytes;
+    u64 vertex_fetch_pack_qpc;
     u64 texture_upload_bytes;
 } ld_profile_counts;
 
@@ -735,6 +823,12 @@ typedef struct {
     u32 total_upload_high;
     u32 total_vb_high;
     u32 total_retired_high;
+    u32 frame_used_attribute_max;
+    u32 total_used_attribute_max;
+    u64 measured_frames;
+    u64 compile_free_frames;
+    double total_frame_ms;
+    double compile_free_frame_ms;
     u64 previous_packets;
     u64 previous_groups;
     u64 previous_executed;
@@ -802,7 +896,8 @@ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
     return g.guest_ptr(g.guest_user, location, offset, min_bytes);
 }
 static u64 fnv1a(const void* data, u32 n, u64 h);
-static void ld_dump_surface_ppm(const char* path, const surface_t* surface);
+static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface);
+static void ld_vertex_diag_emit(const char* reason, int dump_surface);
 
 /* ---------------------------------------------------------------------------
  * enable gate
@@ -1152,8 +1247,9 @@ static void ld_flush(ld_flush_reason reason)
         }
         WaitForSingleObject(g.fence_event, INFINITE);
 #if defined(YZ_PERF_PROFILE)
-        g_ld_profile.total.fence_wait_qpc +=
-            (u64)(ld_profile_qpc() - wait_begin);
+        const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+        g_ld_profile.total.fence_wait_qpc += wait_ticks;
+        g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
     }
     ld_drain_info_queue("flush");
@@ -1168,8 +1264,9 @@ static void ld_flush(ld_flush_reason reason)
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
-    g_ld_profile.total.flush_qpc +=
-        (u64)(ld_profile_qpc() - flush_begin);
+    const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
+    g_ld_profile.total.flush_qpc += flush_ticks;
+    g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
 }
 
@@ -2338,8 +2435,9 @@ static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
     return mask;
 }
 
-static ID3D12PipelineState* build_pso(const char* vs_hlsl, const char* ps_hlsl,
-                                      const render_state_t* rs)
+static ID3D12PipelineState* build_pso(
+    const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
+    const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
 {
     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
     static u32 compile_fail_logs = 0;
@@ -2434,10 +2532,17 @@ static ID3D12PipelineState* build_pso(const char* vs_hlsl, const char* ps_hlsl,
         err = NULL;
     }
     D3D12_INPUT_ELEMENT_DESC il[16];
-    for (u32 i = 0; i < 16; i++) {
-        D3D12_INPUT_ELEMENT_DESC e = {"ATTR", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
-                                      i * 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
-        il[i] = e;
+    const u32 input_count =
+        masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR;
+    for (u32 slot = 0; slot < input_count; slot++) {
+        const u32 attr =
+            masked_layout ? masked_layout->attrs[slot] : slot;
+        D3D12_INPUT_ELEMENT_DESC e = {
+            "ATTR", attr, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+            masked_layout && !packed_offsets ? attr * 16u : slot * 16u,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
+        };
+        il[slot] = e;
     }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
     pd.pRootSignature = g.rootsig_x;
@@ -2445,7 +2550,8 @@ static ID3D12PipelineState* build_pso(const char* vs_hlsl, const char* ps_hlsl,
     pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
     pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
-    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
+    pd.InputLayout.pInputElementDescs = input_count ? il : NULL;
+    pd.InputLayout.NumElements = input_count;
     apply_render_state(&pd, rs);
     pd.SampleMask = 0xFFFFFFFFu;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -2479,7 +2585,28 @@ static ID3D12PipelineState* build_pso(const char* vs_hlsl, const char* ps_hlsl,
     return SUCCEEDED(hr) ? pso : NULL;
 }
 
-static ID3D12PipelineState* get_pso(void)
+static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
+{
+    const u32 start = rsx_dsp_vp_start(&g.rsx);
+    if (start >= RSX_DSP_VP_INSTR) {
+        ld_layout_plan_get(0xFFFFu, layout);
+        return 0;
+    }
+    const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
+    const u32 vp_instrs = rsx_vp_program_size_instrs(
+        vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+    rsx_vp_input_analysis analysis = {0xFFFFu, 0};
+    if (!vp_instrs ||
+        rsx_vp_analyze_inputs(
+            vp_uc, vp_instrs * 16, &analysis) != (int)vp_instrs ||
+        !analysis.exact)
+        analysis.input_mask = 0xFFFFu;
+    ld_layout_plan_get(analysis.input_mask, layout);
+    return vp_instrs != 0;
+}
+
+static ID3D12PipelineState* get_pso(
+    const rsx_vertex_layout_plan* masked_layout, int packed_payload)
 {
     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
     const u32 start = rsx_dsp_vp_start(&g.rsx);
@@ -2547,10 +2674,25 @@ static ID3D12PipelineState* get_pso(void)
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+    if (masked_layout) {
+        static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+        const u32 payload_stride =
+            packed_payload ? masked_layout->stride : VERT_STRIDE;
+        key = fnv1a(
+            &masked_layout_tag, sizeof(masked_layout_tag), key);
+        key = fnv1a(
+            &masked_layout->mask, sizeof(masked_layout->mask), key);
+        key = fnv1a(
+            &payload_stride, sizeof(payload_stride), key);
+        key = fnv1a(
+            &packed_payload, sizeof(packed_payload), key);
+    }
     render_state_t rs; decode_render_state(&rs);
     key = fnv1a(&rs, sizeof(rs), key);
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
+    g_ld_current_pso.vp_hash = fnv1a(
+        vp_uc, vp_instrs * 16, 1469598103934665603ull);
     g_ld_current_pso.vp_start = start;
     g_ld_current_pso.vp_instrs = vp_instrs;
     g_ld_current_pso.fp_location = fp_loc;
@@ -2560,6 +2702,13 @@ static ID3D12PipelineState* get_pso(void)
     g_ld_current_pso.cube_mask = cube_mask;
     g_ld_current_pso.vtex_mask = vtex_mask;
     g_ld_current_pso.txl_mask = txl_mask;
+    g_ld_current_pso.input_mask =
+        masked_layout ? masked_layout->mask : 0xFFFFu;
+    g_ld_current_pso.input_stride =
+        masked_layout && packed_payload
+            ? masked_layout->stride : VERT_STRIDE;
+    g_ld_current_pso.packed_offsets =
+        masked_layout && packed_payload;
 
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_lookups++;
@@ -2591,8 +2740,12 @@ static ID3D12PipelineState* get_pso(void)
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
-    const int vi = rsx_vp_decompile_ex(
-        vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
+    const int vi = masked_layout
+        ? rsx_vp_decompile_compact_ex(
+            vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
+            vs_hlsl, sizeof(vs_hlsl))
+        : rsx_vp_decompile_ex(
+            vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
     int fi = rsx_fp_decompile_ex(
         fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl, sizeof(ps_hlsl));
     if (fi > 0 && rs.alpha_test_enable &&
@@ -2603,7 +2756,9 @@ static ID3D12PipelineState* get_pso(void)
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
 #endif
-    if (vi > 0 && fi > 0) pso = build_pso(vs_hlsl, ps_hlsl, &rs);
+    if (vi > 0 && fi > 0)
+        pso = build_pso(
+            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
 
     g.psos[g.n_psos].key = key;
     g.psos[g.n_psos].pso = pso;
@@ -2622,6 +2777,10 @@ typedef struct {
     batch_t idx[256]; u32 n_idx;
     u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
+    rsx_vertex_ref* refs; u32 n_refs, cap_refs;
+    u8* compact_verts; u64 compact_capacity;
+    rsx_vertex_layout_plan layout;
+    rsx_vertex_fetch_plan fetch_plan;
     int     fetch_ok;
     /* Primitive-restart cut points (s25 port of the replay-harness fix):
      * a guest index equal to the RSX restart sentinel is a cut marker, not
@@ -2635,7 +2794,7 @@ static draw_ctx dc;
 
 static void dc_reset(void)
 {
-    dc.n_arr = dc.n_idx = dc.n_verts = 0;
+    dc.n_arr = dc.n_idx = dc.n_verts = dc.n_refs = 0;
     dc.n_packets = 0;
     dc.n_cuts = 0;
     dc.fetch_ok = 1;
@@ -2649,6 +2808,64 @@ static void push_vert(const vtx_t* v)
         dc.verts = nv; dc.cap_verts = nc;
     }
     dc.verts[dc.n_verts++] = *v;
+}
+
+static void push_compact_ref(u32 vertex_id, u32 base_index)
+{
+    if (dc.n_refs >= dc.cap_refs) {
+        const u32 next_capacity = dc.cap_refs ? dc.cap_refs * 2u : 4096u;
+        rsx_vertex_ref* refs = (rsx_vertex_ref*)realloc(
+            dc.refs, (size_t)next_capacity * sizeof(*refs));
+        if (!refs) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        dc.refs = refs;
+        dc.cap_refs = next_capacity;
+    }
+    dc.refs[dc.n_refs].vertex_id = vertex_id;
+    dc.refs[dc.n_refs].base_index = base_index;
+    dc.n_refs++;
+}
+
+static int reserve_compact_vertices(u64 bytes)
+{
+    if (bytes <= dc.compact_capacity)
+        return 1;
+    if (bytes > SIZE_MAX)
+        return 0;
+    u64 next_capacity = dc.compact_capacity ? dc.compact_capacity : 1u << 20;
+    while (next_capacity < bytes) {
+        if (next_capacity > SIZE_MAX / 2u)
+            return 0;
+        next_capacity *= 2u;
+    }
+    u8* vertices = (u8*)realloc(
+        dc.compact_verts, (size_t)next_capacity);
+    if (!vertices)
+        return 0;
+    dc.compact_verts = vertices;
+    dc.compact_capacity = next_capacity;
+    return 1;
+}
+
+static int reserve_legacy_vertices(u32 count)
+{
+    if (count <= dc.cap_verts)
+        return 1;
+    u32 next_capacity = dc.cap_verts ? dc.cap_verts : 4096u;
+    while (next_capacity < count) {
+        if (next_capacity > UINT32_MAX / 2u)
+            return 0;
+        next_capacity *= 2u;
+    }
+    vtx_t* vertices = (vtx_t*)realloc(
+        dc.verts, (size_t)next_capacity * sizeof(*vertices));
+    if (!vertices)
+        return 0;
+    dc.verts = vertices;
+    dc.cap_verts = next_capacity;
+    return 1;
 }
 
 static float ld_be_f32(const u8* p)
@@ -2794,6 +3011,140 @@ static void fetch_batches(void)
         }
 }
 
+static void fetch_batches_hoisted(
+    const rsx_vertex_layout_plan* layout, int packed_payload)
+{
+    for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
+        for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
+            push_compact_ref(dc.arr[batch].first + i, 0);
+
+    if (dc.n_idx && dc.fetch_ok) {
+        const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        rsx_dsp_index_array index_array;
+        rsx_dsp_get_index_array(&g.rsx, &index_array);
+        const u32 element_size = index_array.is_u32 ? 4u : 2u;
+        static int no_restart = -1;
+        if (no_restart < 0)
+            no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+        const int restart_enabled =
+            !no_restart &&
+            rsx_dsp_restart_index_enabled(&g.rsx, index_array.is_u32);
+        const u32 restart_value = rsx_dsp_restart_index(&g.rsx);
+
+        for (u32 batch = 0; batch < dc.n_idx && dc.fetch_ok; batch++) {
+            const u32 first = dc.idx[batch].first;
+            const u32 count = dc.idx[batch].count;
+            const u64 start64 =
+                (u64)index_array.offset + (u64)first * element_size;
+            const u64 bytes64 = (u64)count * element_size;
+            const u8* contiguous = NULL;
+            if (count && start64 <= UINT32_MAX &&
+                bytes64 <= UINT32_MAX &&
+                start64 + bytes64 <= 0x100000000ull) {
+                contiguous = guest_ptr(
+                    index_array.location, (u32)start64, (u32)bytes64);
+            }
+            for (u32 i = 0; i < count && dc.fetch_ok; i++) {
+                const u32 source_offset =
+                    index_array.offset + (first + i) * element_size;
+                const u8* source = contiguous
+                    ? contiguous + (size_t)i * element_size
+                    : guest_ptr(
+                        index_array.location, source_offset, element_size);
+                if (!source) {
+                    dc.fetch_ok = 0;
+                    break;
+                }
+                const u32 index = index_array.is_u32
+                    ? (((u32)source[0] << 24) |
+                       ((u32)source[1] << 16) |
+                       ((u32)source[2] << 8) | source[3])
+                    : (u32)((source[0] << 8) | source[1]);
+                if (restart_enabled && index == restart_value) {
+                    if (!rsx_restart_cut_push(
+                            &dc.cuts, &dc.n_cuts, &dc.cap_cuts,
+                            dc.n_refs)) {
+                        dc.fetch_ok = 0;
+                        break;
+                    }
+                    continue;
+                }
+                push_compact_ref(index, base_index);
+            }
+        }
+    }
+
+    if (!dc.fetch_ok)
+        return;
+    dc.layout = *layout;
+    rsx_vertex_fetch_plan_init(
+        &dc.fetch_plan, &g.rsx, layout,
+        (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
+    rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 attr = layout->attrs[slot];
+        if (dc.fetch_plan.attr[attr].desc.frequency >= 2)
+            g_ld_divider_fetches += dc.n_refs;
+    }
+    if (packed_payload) {
+        const u64 required = (u64)dc.n_refs * layout->stride;
+        if (!reserve_compact_vertices(required)) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        for (u32 i = 0; i < dc.n_refs; i++) {
+            u8* destination = layout->stride
+                ? dc.compact_verts + (u64)i * layout->stride : NULL;
+            if (!rsx_vertex_fetch_one(
+                    &dc.fetch_plan, &dc.refs[i], destination)) {
+                dc.fetch_ok = 0;
+                return;
+            }
+        }
+    } else {
+        /*
+         * H and M deliberately retain the complete legacy payload.  With an
+         * all-attribute layout, slot order is register order, so the helper
+         * writes exactly the original attribute*16 byte offsets.
+         */
+        if (!reserve_legacy_vertices(dc.n_refs)) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        /* Legacy treats an absent ATTR0 as a failed group, even though other
+         * absent attributes use their RSX current/default value. */
+        if (dc.n_refs &&
+            (!dc.fetch_plan.attr[0].desc.type ||
+             !dc.fetch_plan.attr[0].desc.size)) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        for (u32 i = 0; i < dc.n_refs; i++) {
+            if (!rsx_vertex_fetch_one(
+                    &dc.fetch_plan, &dc.refs[i],
+                    (u8*)&dc.verts[i])) {
+                dc.fetch_ok = 0;
+                return;
+            }
+        }
+    }
+    dc.n_verts = dc.n_refs;
+}
+
+static const float* dc_vertex_attr(
+    u32 vertex, u32 attr, float fallback[4])
+{
+    if (!ld_vertex_compact_payload())
+        return dc.verts[vertex].a[attr];
+    const s8 slot = dc.layout.slot_by_attr[attr];
+    if (slot >= 0 && vertex < dc.n_verts)
+        return (const float*)(
+            dc.compact_verts + (u64)vertex * dc.layout.stride +
+            (u32)slot * 16u);
+    memcpy(fallback, dc.fetch_plan.attr[attr].default_value, 16);
+    return fallback;
+}
+
 /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
  * matches the replay harness). These were off by one (4/5/6/7), which dropped
  * EVERY quad/triangle draw through the switch's default: return -> black. */
@@ -2930,8 +3281,34 @@ static void ld_profile_present(u32 frame)
         g_ld_texture_cache_evictions - g_ld_profile.previous_evictions;
     const u64 refreshes =
         g_ld_vtex_refreshes - g_ld_profile.previous_refreshes;
+    const u64 used_attribute_draws =
+        LD_PROFILE_DELTA(used_attribute_draws);
+    const double used_attribute_average = used_attribute_draws
+        ? (double)LD_PROFILE_DELTA(used_attribute_sum) /
+              (double)used_attribute_draws
+        : 0.0;
+    const int compile_free =
+        LD_PROFILE_DELTA(vs_compile_calls) == 0 &&
+        LD_PROFILE_DELTA(ps_compile_calls) == 0;
+    g_ld_profile.measured_frames++;
+    g_ld_profile.total_frame_ms += frame_ms;
+    if (compile_free) {
+        g_ld_profile.compile_free_frames++;
+        g_ld_profile.compile_free_frame_ms += frame_ms;
+    }
+    /*
+     * The two matched visual-validation windows are deliberately small.
+     * Emit one aggregate line per presented frame there so an improvement
+     * below the generic 250 ms slow-frame threshold remains measurable.
+     * Scene identity is still established by the run driver's asset marker
+     * and screenshots; these values are only run-local capture locators.
+     */
+    const int matched_window =
+        (frame >= 2240u && frame <= 2300u) ||
+        (frame >= 4800u && frame <= 4900u);
     const int emit =
-        frame <= 16u || (frame & 63u) == 0u || frame_ms >= 250.0 ||
+        frame <= 16u || matched_window || (frame & 63u) == 0u ||
+        frame_ms >= 250.0 ||
         LD_PROFILE_DELTA(pso_misses) != 0 ||
         LD_PROFILE_DELTA(pso_full) != 0 ||
         LD_PROFILE_DELTA(flush_reason[LD_FLUSH_VERTEX_RING]) != 0 ||
@@ -2955,6 +3332,10 @@ static void ld_profile_present(u32 frame)
                 "ps_compile=%llu ps_new=%llu ps_unique=%u} "
                 "time_ms{decompile=%.3f vs_compile=%.3f ps_compile=%.3f "
                 "create_pso=%.3f flush=%.3f fence=%.3f} "
+                "vertex{path=%s used_avg=%.3f used_draws=%llu used_max=%u "
+                "legacy_mb=%.3f actual_mb=%.3f fetch_pack_ms=%.3f} "
+                "vb_sync{flushes=%llu flush_ms=%.3f wait_ms=%.3f} "
+                "frame{compile_free=%u} "
                 "draw{packets=%llu groups=%llu exec=%llu "
                 "input_v=%llu expanded_v=%llu vb_mb=%.3f} "
                 "flush{present=%llu ref=%llu vb=%llu retire=%llu "
@@ -3004,6 +3385,26 @@ static void ld_profile_present(u32 frame)
                 ld_profile_ticks_ms(LD_PROFILE_DELTA(create_pso_qpc)),
                 ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
                 ld_profile_ticks_ms(LD_PROFILE_DELTA(fence_wait_qpc)),
+                ld_vertex_mode_name(),
+                used_attribute_average,
+                (unsigned long long)used_attribute_draws,
+                g_ld_profile.frame_used_attribute_max,
+                (double)LD_PROFILE_DELTA(legacy_vertex_upload_bytes) /
+                    (1024.0 * 1024.0),
+                (double)LD_PROFILE_DELTA(vertex_upload_bytes) /
+                    (1024.0 * 1024.0),
+                ld_profile_ticks_ms(
+                    LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
+                (unsigned long long)
+                    LD_PROFILE_DELTA(
+                        flush_reason[LD_FLUSH_VERTEX_RING]),
+                ld_profile_ticks_ms(
+                    LD_PROFILE_DELTA(
+                        flush_reason_qpc[LD_FLUSH_VERTEX_RING])),
+                ld_profile_ticks_ms(
+                    LD_PROFILE_DELTA(
+                        fence_reason_qpc[LD_FLUSH_VERTEX_RING])),
+                compile_free ? 1u : 0u,
                 (unsigned long long)packets,
                 (unsigned long long)groups,
                 (unsigned long long)executed,
@@ -3056,6 +3457,7 @@ static void ld_profile_present(u32 frame)
     g_ld_profile.frame_upload_high = 0;
     g_ld_profile.frame_vb_high = 0;
     g_ld_profile.frame_retired_high = 0;
+    g_ld_profile.frame_used_attribute_max = 0;
 #undef LD_PROFILE_DELTA
 }
 #endif
@@ -3646,7 +4048,8 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
     float mx[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
     u32 nan_count = 0;
     for (u32 vi = 0; vi < dc.n_verts; vi++) {
-        const float* p = dc.verts[vi].a[0];
+        float fallback[4];
+        const float* p = dc_vertex_attr(vi, 0, fallback);
         for (u32 k = 0; k < 4; k++) {
             if (p[k] != p[k]) {
                 nan_count++;
@@ -3673,7 +4076,12 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
         mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
         nan_count,
         (unsigned long long)fnv1a(
-            dc.verts, (size_t)dc.n_verts * sizeof(vtx_t),
+            ld_vertex_compact_payload()
+                ? (const void*)dc.compact_verts
+                : (const void*)dc.verts,
+            ld_vertex_compact_payload()
+                ? (u32)((u64)dc.n_verts * dc.layout.stride)
+                : (u32)((u64)dc.n_verts * sizeof(vtx_t)),
             1469598103934665603ull));
     fprintf(stderr,
         "[a010-geom] base=0x%X base_index=%u "
@@ -3719,9 +4127,12 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
         float w_min = 1e30f, w_max = -1e30f;
         u32 finite = 0, in_front = 0, in_view = 0;
         for (u32 vi = 0; vi < dc.n_verts; vi++) {
-            const float* p = dc.verts[vi].a[0];
-            const float* weight = dc.verts[vi].a[1];
-            const float* bone = dc.verts[vi].a[7];
+            float p_fallback[4], weight_fallback[4], bone_fallback[4];
+            const float* p = dc_vertex_attr(vi, 0, p_fallback);
+            const float* weight =
+                dc_vertex_attr(vi, 1, weight_fallback);
+            const float* bone =
+                dc_vertex_attr(vi, 7, bone_fallback);
             const float pw = p[3] != 0.0f ? p[3] : 1.0f;
             /*
              * Exact transform used by healthy PSO 7d9f...: ATTR7 selects
@@ -3812,6 +4223,138 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
     fflush(stderr);
 }
 
+typedef enum {
+    LD_COMPACT_EXPAND_OK = 1,
+    LD_COMPACT_EXPAND_DEGENERATE = 0,
+    LD_COMPACT_EXPAND_ALLOC = -1,
+    LD_COMPACT_EXPAND_PRIMITIVE = -2
+} ld_compact_expand_result;
+
+static void compact_vertex_copy(
+    u8* destination, u32 destination_vertex, u32 source_vertex)
+{
+    if (!dc.layout.stride)
+        return;
+    memcpy(
+        destination + (u64)destination_vertex * dc.layout.stride,
+        dc.compact_verts + (u64)source_vertex * dc.layout.stride,
+        dc.layout.stride);
+}
+
+static ld_compact_expand_result expand_compact_topology(
+    u32 prim, u8** expanded, u32* expanded_vertices, int* owned)
+{
+    *expanded = dc.compact_verts;
+    *expanded_vertices = 0;
+    *owned = 0;
+    const u32 segment_count = dc.n_cuts + 1;
+    switch (prim) {
+    case PRIM_TRIANGLES:
+        *expanded_vertices = dc.n_verts - dc.n_verts % 3;
+        break;
+    case PRIM_TRIANGLE_STRIP: {
+        if (dc.n_verts < 3)
+            return LD_COMPACT_EXPAND_DEGENERATE;
+        u32 total = 0;
+        for (u32 segment = 0; segment < segment_count; segment++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(
+                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
+            if (count >= 3) total += (count - 2) * 3;
+        }
+        if (!total)
+            return LD_COMPACT_EXPAND_DEGENERATE;
+        *expanded_vertices = total;
+        if (!dc.layout.stride)
+            break;
+        *expanded = (u8*)malloc((size_t)total * dc.layout.stride);
+        if (!*expanded)
+            return LD_COMPACT_EXPAND_ALLOC;
+        *owned = 1;
+        u32 write = 0;
+        for (u32 segment = 0; segment < segment_count; segment++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(
+                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
+            if (count < 3) continue;
+            for (u32 i = 0; i + 2 < count; i++) {
+                if (i & 1) {
+                    compact_vertex_copy(*expanded, write++, begin + i + 1);
+                    compact_vertex_copy(*expanded, write++, begin + i);
+                    compact_vertex_copy(*expanded, write++, begin + i + 2);
+                } else {
+                    compact_vertex_copy(*expanded, write++, begin + i);
+                    compact_vertex_copy(*expanded, write++, begin + i + 1);
+                    compact_vertex_copy(*expanded, write++, begin + i + 2);
+                }
+            }
+        }
+        break;
+    }
+    case PRIM_TRIANGLE_FAN: {
+        if (dc.n_verts < 3)
+            return LD_COMPACT_EXPAND_DEGENERATE;
+        u32 total = 0;
+        for (u32 segment = 0; segment < segment_count; segment++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(
+                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
+            if (count >= 3) total += (count - 2) * 3;
+        }
+        if (!total)
+            return LD_COMPACT_EXPAND_DEGENERATE;
+        *expanded_vertices = total;
+        if (!dc.layout.stride)
+            break;
+        *expanded = (u8*)malloc((size_t)total * dc.layout.stride);
+        if (!*expanded)
+            return LD_COMPACT_EXPAND_ALLOC;
+        *owned = 1;
+        u32 write = 0;
+        for (u32 segment = 0; segment < segment_count; segment++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(
+                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
+            if (count < 3) continue;
+            for (u32 i = 1; i + 1 < count; i++) {
+                compact_vertex_copy(*expanded, write++, begin);
+                compact_vertex_copy(*expanded, write++, begin + i);
+                compact_vertex_copy(*expanded, write++, begin + i + 1);
+            }
+        }
+        break;
+    }
+    case PRIM_QUADS: {
+        const u32 quads = dc.n_verts / 4;
+        if (!quads)
+            return LD_COMPACT_EXPAND_DEGENERATE;
+        *expanded_vertices = quads * 6;
+        if (!dc.layout.stride)
+            break;
+        *expanded = (u8*)malloc(
+            (size_t)*expanded_vertices * dc.layout.stride);
+        if (!*expanded)
+            return LD_COMPACT_EXPAND_ALLOC;
+        *owned = 1;
+        u32 write = 0;
+        for (u32 quad = 0; quad < quads; quad++) {
+            const u32 base = quad * 4;
+            compact_vertex_copy(*expanded, write++, base);
+            compact_vertex_copy(*expanded, write++, base + 1);
+            compact_vertex_copy(*expanded, write++, base + 2);
+            compact_vertex_copy(*expanded, write++, base + 2);
+            compact_vertex_copy(*expanded, write++, base + 3);
+            compact_vertex_copy(*expanded, write++, base);
+        }
+        break;
+    }
+    default:
+        return LD_COMPACT_EXPAND_PRIMITIVE;
+    }
+    return *expanded_vertices
+        ? LD_COMPACT_EXPAND_OK : LD_COMPACT_EXPAND_DEGENERATE;
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3857,7 +4400,30 @@ static void sink_end(void* user, const rsx_dispatch* r)
         }
     }
     const u32 prim = g.rsx.current_primitive;
-    fetch_batches();
+    rsx_vertex_layout_plan used_layout;
+    ld_current_vertex_layout(&used_layout);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.used_attribute_draws++;
+    g_ld_profile.total.used_attribute_sum += used_layout.count;
+    if (used_layout.count > g_ld_profile.frame_used_attribute_max)
+        g_ld_profile.frame_used_attribute_max = used_layout.count;
+    if (used_layout.count > g_ld_profile.total_used_attribute_max)
+        g_ld_profile.total_used_attribute_max = used_layout.count;
+    const LONGLONG fetch_pack_begin = ld_profile_qpc();
+#endif
+    if (ld_vertex_compact_payload()) {
+        fetch_batches_hoisted(&used_layout, 1);
+    } else if (ld_vertex_hoist_fetch()) {
+        rsx_vertex_layout_plan legacy_layout;
+        ld_layout_plan_get(0xFFFFu, &legacy_layout);
+        fetch_batches_hoisted(&legacy_layout, 0);
+    } else {
+        fetch_batches();
+    }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vertex_fetch_pack_qpc +=
+        (u64)(ld_profile_qpc() - fetch_pack_begin);
+#endif
     if (!dc.n_verts || !dc.fetch_ok) { g_ld_stats.group_drop_fetch++; return; }
 
     /* Segment table from the restart cuts (port of the replay-harness s25c/
@@ -3865,93 +4431,118 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * per LOCAL triangle index (odd triangles flip vertex order to keep
      * face orientation under backface culling), fans anchor to their OWN
      * segment's first vertex. */
-    const u32 n_seg = dc.n_cuts + 1;
-
-    vtx_t* tri = NULL; u32 n_tri = 0;
-    switch (prim) {
-    case PRIM_TRIANGLES: tri = dc.verts; n_tri = dc.n_verts - dc.n_verts % 3; break;
-    case PRIM_TRIANGLE_STRIP: {
-        if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
-        u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++) {
-            u32 sb, cnt;
-            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
-                                       s, &sb, &cnt);
-            if (cnt >= 3) total += (cnt - 2) * 3;
+    void* triangle_data = NULL;
+    int triangle_data_owned = 0;
+    u32 n_tri = 0;
+    if (ld_vertex_compact_payload()) {
+        u8* compact_triangles = NULL;
+        const ld_compact_expand_result result = expand_compact_topology(
+            prim, &compact_triangles, &n_tri, &triangle_data_owned);
+        if (result == LD_COMPACT_EXPAND_DEGENERATE) {
+            g_ld_stats.group_drop_degenerate++;
+            return;
         }
-        if (!total) { g_ld_stats.group_drop_degenerate++; return; }
-        n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
-        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
-        u32 w = 0;
-        for (u32 s = 0; s < n_seg; s++) {
-            u32 sb, cnt;
-            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
-                                       s, &sb, &cnt);
-            if (cnt < 3) continue;
-            for (u32 i = 0; i + 2 < cnt; i++) {
-                if (i & 1) {
-                    tri[w*3+0] = dc.verts[sb+i+1]; tri[w*3+1] = dc.verts[sb+i];   tri[w*3+2] = dc.verts[sb+i+2];
-                } else {
-                    tri[w*3+0] = dc.verts[sb+i];   tri[w*3+1] = dc.verts[sb+i+1]; tri[w*3+2] = dc.verts[sb+i+2];
+        if (result == LD_COMPACT_EXPAND_ALLOC) {
+            g_ld_stats.group_drop_alloc++;
+            return;
+        }
+        if (result == LD_COMPACT_EXPAND_PRIMITIVE) {
+            g_ld_stats.group_drop_primitive++;
+            return;
+        }
+        triangle_data = compact_triangles;
+    } else {
+        const u32 n_seg = dc.n_cuts + 1;
+        vtx_t* tri = NULL;
+        switch (prim) {
+        case PRIM_TRIANGLES: tri = dc.verts; n_tri = dc.n_verts - dc.n_verts % 3; break;
+        case PRIM_TRIANGLE_STRIP: {
+            if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
+            u32 total = 0;
+            for (u32 s = 0; s < n_seg; s++) {
+                u32 sb, cnt;
+                rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                           s, &sb, &cnt);
+                if (cnt >= 3) total += (cnt - 2) * 3;
+            }
+            if (!total) { g_ld_stats.group_drop_degenerate++; return; }
+            n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+            if (!tri) { g_ld_stats.group_drop_alloc++; return; }
+            u32 w = 0;
+            for (u32 s = 0; s < n_seg; s++) {
+                u32 sb, cnt;
+                rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                           s, &sb, &cnt);
+                if (cnt < 3) continue;
+                for (u32 i = 0; i + 2 < cnt; i++) {
+                    if (i & 1) {
+                        tri[w*3+0] = dc.verts[sb+i+1]; tri[w*3+1] = dc.verts[sb+i];   tri[w*3+2] = dc.verts[sb+i+2];
+                    } else {
+                        tri[w*3+0] = dc.verts[sb+i];   tri[w*3+1] = dc.verts[sb+i+1]; tri[w*3+2] = dc.verts[sb+i+2];
+                    }
+                    w++;
                 }
-                w++;
             }
+            break;
         }
-        break;
-    }
-    case PRIM_TRIANGLE_FAN: {
-        if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
-        u32 total = 0;
-        for (u32 s = 0; s < n_seg; s++) {
-            u32 sb, cnt;
-            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
-                                       s, &sb, &cnt);
-            if (cnt >= 3) total += (cnt - 2) * 3;
-        }
-        if (!total) { g_ld_stats.group_drop_degenerate++; return; }
-        n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
-        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
-        u32 w = 0;
-        for (u32 s = 0; s < n_seg; s++) {
-            u32 sb, cnt;
-            rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
-                                       s, &sb, &cnt);
-            if (cnt < 3) continue;
-            for (u32 i = 1; i + 1 < cnt; i++) {
-                tri[w*3+0] = dc.verts[sb]; tri[w*3+1] = dc.verts[sb+i]; tri[w*3+2] = dc.verts[sb+i+1];
-                w++;
+        case PRIM_TRIANGLE_FAN: {
+            if (dc.n_verts < 3) { g_ld_stats.group_drop_degenerate++; return; }
+            u32 total = 0;
+            for (u32 s = 0; s < n_seg; s++) {
+                u32 sb, cnt;
+                rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                           s, &sb, &cnt);
+                if (cnt >= 3) total += (cnt - 2) * 3;
             }
+            if (!total) { g_ld_stats.group_drop_degenerate++; return; }
+            n_tri = total; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+            if (!tri) { g_ld_stats.group_drop_alloc++; return; }
+            u32 w = 0;
+            for (u32 s = 0; s < n_seg; s++) {
+                u32 sb, cnt;
+                rsx_restart_segment_bounds(dc.cuts, dc.n_cuts, dc.n_verts,
+                                           s, &sb, &cnt);
+                if (cnt < 3) continue;
+                for (u32 i = 1; i + 1 < cnt; i++) {
+                    tri[w*3+0] = dc.verts[sb]; tri[w*3+1] = dc.verts[sb+i]; tri[w*3+2] = dc.verts[sb+i+1];
+                    w++;
+                }
+            }
+            break;
         }
-        break;
-    }
-    case PRIM_QUADS: {
-        const u32 quads = dc.n_verts / 4;
-        if (!quads) { g_ld_stats.group_drop_degenerate++; return; }
-        n_tri = quads * 6; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
-        if (!tri) { g_ld_stats.group_drop_alloc++; return; }
-        for (u32 q = 0; q < quads; q++) {
-            const vtx_t* v = &dc.verts[q*4]; vtx_t* t = &tri[q*6];
-            t[0]=v[0]; t[1]=v[1]; t[2]=v[2]; t[3]=v[2]; t[4]=v[3]; t[5]=v[0];
+        case PRIM_QUADS: {
+            const u32 quads = dc.n_verts / 4;
+            if (!quads) { g_ld_stats.group_drop_degenerate++; return; }
+            n_tri = quads * 6; tri = (vtx_t*)malloc(n_tri * sizeof(vtx_t));
+            if (!tri) { g_ld_stats.group_drop_alloc++; return; }
+            for (u32 q = 0; q < quads; q++) {
+                const vtx_t* v = &dc.verts[q*4]; vtx_t* t = &tri[q*6];
+                t[0]=v[0]; t[1]=v[1]; t[2]=v[2]; t[3]=v[2]; t[4]=v[3]; t[5]=v[0];
+            }
+            break;
         }
-        break;
-    }
-    default: g_ld_stats.group_drop_primitive++; return;
+        default: g_ld_stats.group_drop_primitive++; return;
+        }
+        triangle_data = tri;
+        triangle_data_owned = tri != dc.verts;
     }
 
     if (!n_tri) {
         g_ld_stats.group_drop_degenerate++;
-        if (tri != dc.verts) free(tri);
+        if (triangle_data_owned) free(triangle_data);
         return;
     }
 
     live_a010_geom_trace(prim, n_tri);
 
-    const u64 draw_vb_bytes = (u64)n_tri * VERT_STRIDE;
+    const u32 vertex_stride =
+        ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
+    const u64 draw_vb_bytes = (u64)n_tri * vertex_stride;
     const u64 vb_capacity = (u64)MAX_VERTS * VERT_STRIDE;
     if (draw_vb_bytes > vb_capacity) {
         live_draw_csv_emit(prim, n_tri, "drop_vbring_oversize");
         g_ld_stats.group_drop_ring++;
-        if (tri != dc.verts) free(tri);
+        if (triangle_data_owned) free(triangle_data);
         return;
     }
     if ((u64)g.vb_used + draw_vb_bytes > vb_capacity) {
@@ -3968,28 +4559,35 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.srv_ring_used = 0;
         g.smp_ring_used = 0;
     }
-    memcpy(g.vb_mapped + g.vb_used, tri, (size_t)n_tri * VERT_STRIDE);
+    if (draw_vb_bytes)
+        memcpy(
+            g.vb_mapped + g.vb_used, triangle_data,
+            (size_t)draw_vb_bytes);
 
-    ID3D12PipelineState* pso = get_pso();
+    ID3D12PipelineState* pso = get_pso(
+        ld_vertex_mask_signature() ? &used_layout : NULL,
+        ld_vertex_compact_payload());
     if (!pso) {
 #if defined(YZ_PERF_PROFILE)
         ld_profile_note_rejected_pso();
 #endif
         live_draw_csv_emit(prim, n_tri, "drop_pso");
         g_ld_stats.group_drop_pso++;
-        if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
+        if (triangle_data_owned) free(triangle_data);
+        return;   /* no fallback in live path */
     }
     if (g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
         live_draw_csv_emit(prim, n_tri, "drop_cbring");
         g_ld_stats.group_drop_ring++;
-        if (tri != dc.verts) free(tri); return;   /* no fallback in live path */
+        if (triangle_data_owned) free(triangle_data);
+        return;   /* no fallback in live path */
     }
 
     const u32 target = current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
-        if (tri != dc.verts) free(tri);
+        if (triangle_data_owned) free(triangle_data);
         return;
     }
     live_draw_csv_emit(prim, n_tri, "execute");
@@ -4173,8 +4771,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
-    vbv.StrideInBytes = VERT_STRIDE; vbv.SizeInBytes = n_tri * VERT_STRIDE;
-    g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
+    vbv.StrideInBytes = vertex_stride;
+    vbv.SizeInBytes = (u32)draw_vb_bytes;
+    if (vertex_stride)
+        g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     {
         const u64 serial = ++g_ld_recent_draw_total;
@@ -4228,8 +4828,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.input_vertices += dc.n_verts;
     g_ld_profile.total.expanded_vertices += n_tri;
-    g_ld_profile.total.vertex_upload_bytes +=
+    g_ld_profile.total.legacy_vertex_upload_bytes +=
         (u64)n_tri * VERT_STRIDE;
+    g_ld_profile.total.vertex_upload_bytes += draw_vb_bytes;
 #endif
 
     for (u32 k = 0; k < n_surf_used; k++) {
@@ -4276,9 +4877,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
             fflush(stderr);
         }
     }
-    g.vb_used += n_tri * VERT_STRIDE;
+    g.vb_used += (u32)draw_vb_bytes;
     ld_profile_note_ring_highwater();
-    if (tri != dc.verts) free(tri);
+    if (triangle_data_owned) free(triangle_data);
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -4346,11 +4947,18 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
+    const u32 buffer_id = arg & 7u;
+    g_ld_flip_requested++;
+    g_ld_last_requested_buffer = buffer_id;
     if (g_ld_movie_mode) {
         if (ld_movie_composite_ui_enabled()) ld_movie_capture_overlay();
+        g_ld_flip_consumed++;
+        g_ld_last_consumed_buffer = buffer_id;
         return;
     }
-    rsx_live_draw_present(arg & 7);
+    rsx_live_draw_present(buffer_id);
+    g_ld_flip_consumed++;
+    g_ld_last_consumed_buffer = buffer_id;
 }
 
 /* ---------------------------------------------------------------------------
@@ -4427,6 +5035,62 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 #endif
     g.width = width; g.height = height;
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
+    {
+        const char* requested = getenv("YZ_RSX_VERTEX_MODE");
+        const char* old_path = getenv("YZ_RSX_VERTEX_PATH");
+        char mode = 'L';
+        if (requested && requested[0] && !requested[1]) {
+            mode = (char)toupper((unsigned char)requested[0]);
+        } else if (!requested && old_path) {
+            mode = strcmp(old_path, "compact") == 0 ? 'C' : 'L';
+        }
+        switch (mode) {
+        case 'L':
+            g.vertex_features = 0;
+            break;
+        case 'H':
+            g.vertex_features = LD_VERTEX_HOIST_FETCH;
+            break;
+        case 'M':
+            g.vertex_features =
+                LD_VERTEX_HOIST_FETCH | LD_VERTEX_MASK_SIGNATURE;
+            break;
+        case 'C':
+            g.vertex_features =
+                LD_VERTEX_HOIST_FETCH | LD_VERTEX_MASK_SIGNATURE |
+                LD_VERTEX_COMPACT_PAYLOAD;
+            break;
+        default:
+            fprintf(stderr,
+                    "[rsx-vertex] unknown YZ_RSX_VERTEX_MODE='%s'; "
+                    "using L\n",
+                    requested ? requested : "");
+            mode = 'L';
+            g.vertex_features = 0;
+            break;
+        }
+        g.vertex_mode = mode;
+        const char* diag_dir = getenv("YZ_RSX_VERTEX_DIAG_DIR");
+        if (diag_dir && diag_dir[0]) {
+            strncpy(
+                g.vertex_diag_dir, diag_dir,
+                sizeof(g.vertex_diag_dir) - 1u);
+            g.vertex_diag_dir[sizeof(g.vertex_diag_dir) - 1u] = '\0';
+        }
+        fprintf(stderr,
+                "[rsx-vertex] mode=%s features=0x%X "
+                "(startup-selected)\n",
+                ld_vertex_mode_name(), g.vertex_features);
+    }
+    g_ld_flip_requested = 0;
+    g_ld_flip_consumed = 0;
+    g_ld_last_requested_buffer = UINT32_MAX;
+    g_ld_last_consumed_buffer = UINT32_MAX;
+    g_ld_last_present_target = UINT32_MAX;
+    InterlockedExchange(&g_ld_diag_post_movie_pending, 0);
+    InterlockedExchange(&g_ld_diag_post_movie_presents, 0);
+    memset(g_ld_layout_cache, 0, sizeof(g_ld_layout_cache));
+    g_ld_layout_cache_count = 0;
 
     ld_enable_debug_layer();
     ld_enable_dred();
@@ -4737,7 +5401,12 @@ void rsx_live_draw_set_movie_mode(int on)
                     g_ld_stats.packets_movie - suppressed_at_start);
             fflush(stderr);
         }
+        if (g.vertex_diag_dir[0]) {
+            InterlockedExchange(&g_ld_diag_post_movie_presents, 0);
+            InterlockedExchange(&g_ld_diag_post_movie_pending, 1);
+        }
     }
+    ld_vertex_diag_emit(on ? "movie-begin" : "movie-end", 0);
     if (serialized) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         InterlockedExchange(&g_ld_host_waiting, 0);
@@ -4915,13 +5584,13 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 /* Env-gated (YZ_RSX_DUMP) framebuffer dump: read the current color surface back
  * and write a binary PPM. Self-contained -- creates + releases its own readback
  * buffer, so no init/struct changes. Uses g.list which ld_flush leaves open. */
-static void ld_dump_surface_ppm(const char* path, const surface_t* surface)
+static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 {
     ID3D12Resource* rt = surface ? surface->tex : NULL;
-    if (!rt) return;
+    if (!rt) return UINT64_MAX;
     const u32 width = surface->w;
     const u32 height = surface->h;
-    if (!width || !height) return;
+    if (!width || !height) return UINT64_MAX;
     const u32 pitch = (width * 4 + 255) & ~255u;                /* 256-align */
     const UINT64 rb_size = (UINT64)pitch * height;
 
@@ -4934,7 +5603,7 @@ static void ld_dump_surface_ppm(const char* path, const surface_t* surface)
     ID3D12Resource* rb = NULL;
     if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)))
-        return;
+        return UINT64_MAX;
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4960,22 +5629,142 @@ static void ld_dump_surface_ppm(const char* path, const surface_t* surface)
 
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
 
+    u64 nonblack = UINT64_MAX;
     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
+        nonblack = 0;
         FILE* f = fopen(path, "wb");
         if (f) {
             fprintf(f, "P6\n%u %u\n255\n", width, height);
             for (u32 y = 0; y < height; y++) {
                 const u8* row = px + (SIZE_T)y * pitch;
-                for (u32 x = 0; x < width; x++) fwrite(row + x * 4, 1, 3, f);  /* RGBA->RGB */
+                for (u32 x = 0; x < width; x++) {
+                    const u8* pixel = row + x * 4;
+                    if (pixel[0] || pixel[1] || pixel[2])
+                        nonblack++;
+                    fwrite(pixel, 1, 3, f);  /* RGBA->RGB */
+                }
             }
             fclose(f);
             fprintf(stderr, "[live-draw] wrote %s\n", path);
+        } else {
+            for (u32 y = 0; y < height; y++) {
+                const u8* row = px + (SIZE_T)y * pitch;
+                for (u32 x = 0; x < width; x++) {
+                    const u8* pixel = row + x * 4;
+                    if (pixel[0] || pixel[1] || pixel[2])
+                        nonblack++;
+                }
+            }
         }
         D3D12_RANGE wr = {0, 0};
         rb->lpVtbl->Unmap(rb, 0, &wr);
     }
     rb->lpVtbl->Release(rb);
+    return nonblack;
+}
+
+static void ld_vertex_diag_emit(const char* reason, int dump_surface)
+{
+    if (!g.ready || !g.vertex_diag_dir[0])
+        return;
+    rsx_dsp_surface state_surface;
+    rsx_dsp_get_surface(&g.rsx, &state_surface);
+    u32 current = LD_INVALID_SURFACE;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        if (g.surfaces[i].location == state_surface.color_location[0] &&
+            g.surfaces[i].offset == state_surface.color_offset[0]) {
+            current = i;
+            break;
+        }
+    }
+    const u32 presented = g_ld_last_present_target;
+    const surface_t* presented_surface =
+        presented < g.n_surfaces ? &g.surfaces[presented] : NULL;
+    char attrs[80];
+    size_t used = 0;
+    attrs[0] = '\0';
+    for (u32 attr = 0; attr < 16; attr++) {
+        if (!(g_ld_current_pso.input_mask & (1u << attr)))
+            continue;
+        const int written = snprintf(
+            attrs + used, sizeof(attrs) - used,
+            "%s%u", used ? "," : "", attr);
+        if (written < 0 || (size_t)written >= sizeof(attrs) - used)
+            break;
+        used += (size_t)written;
+    }
+    const UINT64 d3d_messages = g_ld_info_queue
+        ? g_ld_info_queue->lpVtbl->GetNumStoredMessages(g_ld_info_queue)
+        : 0;
+#if defined(YZ_PERF_PROFILE)
+    const u64 pso_lookups = g_ld_profile.total.pso_lookups;
+    const u64 pso_hits = g_ld_profile.total.pso_hits;
+    const u64 pso_misses = g_ld_profile.total.pso_misses;
+    const u64 pso_full = g_ld_profile.total.pso_full;
+#else
+    const u64 pso_lookups = 0, pso_hits = 0, pso_misses = 0, pso_full = 0;
+#endif
+    fprintf(stderr,
+            "[rsx-vertex-state] reason=%s mode=%s frame=%u "
+            "flip{requested=%llu last_req=%u consumed=%llu last_cons=%u} "
+            "surface{present=%u off=0x%08X size=%ux%u current=%u} "
+            "draw{packets=%llu groups=%llu exec=%llu "
+            "drop_fetch=%llu drop_pso=%llu drop_ring=%llu} "
+            "pso{look=%llu hit=%llu miss=%llu full=%llu "
+            "cached=%u capacity=%u} "
+            "vp{hash=%016llX start=%u instrs=%u mask=0x%04X "
+            "attrs=[%s] stride=%u packed=%u} "
+            "d3d{debug=%d queued_messages=%llu}\n",
+            reason ? reason : "unknown", ld_vertex_mode_name(), g_ld_frames,
+            (unsigned long long)g_ld_flip_requested,
+            g_ld_last_requested_buffer,
+            (unsigned long long)g_ld_flip_consumed,
+            g_ld_last_consumed_buffer,
+            presented,
+            presented_surface ? presented_surface->offset : 0,
+            presented_surface ? presented_surface->w : 0,
+            presented_surface ? presented_surface->h : 0,
+            current,
+            (unsigned long long)g_ld_stats.packets_seen,
+            (unsigned long long)g_ld_stats.groups_seen,
+            (unsigned long long)g_ld_stats.groups_executed,
+            (unsigned long long)g_ld_stats.group_drop_fetch,
+            (unsigned long long)g_ld_stats.group_drop_pso,
+            (unsigned long long)g_ld_stats.group_drop_ring,
+            (unsigned long long)pso_lookups,
+            (unsigned long long)pso_hits,
+            (unsigned long long)pso_misses,
+            (unsigned long long)pso_full,
+            g.n_psos, MAX_PSOS,
+            (unsigned long long)g_ld_current_pso.vp_hash,
+            g_ld_current_pso.vp_start,
+            g_ld_current_pso.vp_instrs,
+            g_ld_current_pso.input_mask,
+            attrs,
+            g_ld_current_pso.input_stride,
+            g_ld_current_pso.packed_offsets,
+            g_ld_debug_layer_enabled,
+            (unsigned long long)d3d_messages);
+    if (dump_surface && presented_surface && g.vertex_diag_dir[0]) {
+        char path[MAX_PATH * 2];
+        snprintf(
+            path, sizeof(path), "%s\\last_present_surface.ppm",
+            g.vertex_diag_dir);
+        const u64 nonblack =
+            ld_dump_surface_ppm(path, presented_surface);
+        fprintf(stderr,
+                "[rsx-vertex-surface] mode=%s target=%u "
+                "pixels=%llu nonblack=%s%llu path=%s\n",
+                ld_vertex_mode_name(), presented,
+                (unsigned long long)presented_surface->w *
+                    presented_surface->h,
+                nonblack == UINT64_MAX ? "unknown:" : "",
+                (unsigned long long)(
+                    nonblack == UINT64_MAX ? 0 : nonblack),
+                path);
+    }
+    fflush(stderr);
 }
 
 void rsx_live_draw_present(u32 buffer_id)
@@ -5008,6 +5797,7 @@ void rsx_live_draw_present(u32 buffer_id)
         fprintf(stderr, "[live-draw] frame present skipped: no color surface\n");
         return;
     }
+    g_ld_last_present_target = target;
     { static u32 last_present_target = LD_INVALID_SURFACE;
       if (target != last_present_target) {
           ld_trace_target("present", target, buffer_id);
@@ -5052,6 +5842,34 @@ void rsx_live_draw_present(u32 buffer_id)
                     g.width, g.height);
             ld_dump_dred("Present", present_hr);
             g.ready = 0;
+        }
+    }
+    if (InterlockedCompareExchange(
+            &g_ld_diag_post_movie_pending, 0, 0) != 0) {
+        const LONG post_movie_present =
+            InterlockedIncrement(&g_ld_diag_post_movie_presents);
+        if (post_movie_present == 32 &&
+            InterlockedCompareExchange(
+                &g_ld_diag_post_movie_pending, 0, 1) == 1) {
+            char path[MAX_PATH * 2];
+            snprintf(
+                path, sizeof(path),
+                "%s\\semantic_checkpoint_surface.ppm",
+                g.vertex_diag_dir);
+            const u64 nonblack =
+                ld_dump_surface_ppm(path, &g.surfaces[target]);
+            fprintf(stderr,
+                    "[rsx-vertex-surface] reason=post-movie-32 "
+                    "mode=%s target=%u pixels=%llu "
+                    "nonblack=%s%llu path=%s\n",
+                    ld_vertex_mode_name(), target,
+                    (unsigned long long)g.surfaces[target].w *
+                        g.surfaces[target].h,
+                    nonblack == UINT64_MAX ? "unknown:" : "",
+                    (unsigned long long)(
+                        nonblack == UINT64_MAX ? 0 : nonblack),
+                    path);
+            fflush(stderr);
         }
     }
 
@@ -5226,6 +6044,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
@@ -5242,6 +6061,11 @@ void rsx_live_draw_shutdown(void)
             "ps_lookup=%llu ps_hit=%llu ps_compile=%llu ps_unique=%u} "
             "time_ms{decompile=%.3f vs_compile=%.3f ps_compile=%.3f "
             "create_pso=%.3f flush=%.3f fence=%.3f} "
+            "vertex{path=%s used_avg=%.3f used_max=%u "
+            "legacy_mb=%.3f actual_mb=%.3f fetch_pack_ms=%.3f} "
+            "vb_sync{flushes=%llu flush_ms=%.3f wait_ms=%.3f} "
+            "frame{count=%llu avg_ms=%.3f compile_free=%llu "
+            "compile_free_avg_ms=%.3f} "
             "draw{input_v=%llu expanded_v=%llu vb_mb=%.3f} "
             "tex{cached=%u evictions=%llu upload_mb=%.3f} "
             "high{upload_mb=%.3f vb_mb=%.3f retired=%u}\n",
@@ -5282,6 +6106,36 @@ void rsx_live_draw_shutdown(void)
             ld_profile_ticks_ms(g_ld_profile.total.create_pso_qpc),
             ld_profile_ticks_ms(g_ld_profile.total.flush_qpc),
             ld_profile_ticks_ms(g_ld_profile.total.fence_wait_qpc),
+            ld_vertex_mode_name(),
+            g_ld_profile.total.used_attribute_draws
+                ? (double)g_ld_profile.total.used_attribute_sum /
+                      (double)g_ld_profile.total.used_attribute_draws
+                : 0.0,
+            g_ld_profile.total_used_attribute_max,
+            (double)g_ld_profile.total.legacy_vertex_upload_bytes /
+                (1024.0 * 1024.0),
+            (double)g_ld_profile.total.vertex_upload_bytes /
+                (1024.0 * 1024.0),
+            ld_profile_ticks_ms(
+                g_ld_profile.total.vertex_fetch_pack_qpc),
+            (unsigned long long)
+                g_ld_profile.total.flush_reason[LD_FLUSH_VERTEX_RING],
+            ld_profile_ticks_ms(
+                g_ld_profile.total
+                    .flush_reason_qpc[LD_FLUSH_VERTEX_RING]),
+            ld_profile_ticks_ms(
+                g_ld_profile.total
+                    .fence_reason_qpc[LD_FLUSH_VERTEX_RING]),
+            (unsigned long long)g_ld_profile.measured_frames,
+            g_ld_profile.measured_frames
+                ? g_ld_profile.total_frame_ms /
+                      (double)g_ld_profile.measured_frames
+                : 0.0,
+            (unsigned long long)g_ld_profile.compile_free_frames,
+            g_ld_profile.compile_free_frames
+                ? g_ld_profile.compile_free_frame_ms /
+                      (double)g_ld_profile.compile_free_frames
+                : 0.0,
             (unsigned long long)g_ld_profile.total.input_vertices,
             (unsigned long long)g_ld_profile.total.expanded_vertices,
             (double)g_ld_profile.total.vertex_upload_bytes /
@@ -5329,6 +6183,12 @@ void rsx_live_draw_shutdown(void)
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
+    if (dc.refs) { free(dc.refs); dc.refs = NULL; dc.cap_refs = 0; }
+    if (dc.compact_verts) {
+        free(dc.compact_verts);
+        dc.compact_verts = NULL;
+        dc.compact_capacity = 0;
+    }
     if (dc.cuts) { free(dc.cuts); dc.cuts = NULL; dc.cap_cuts = 0; }
 }
 
