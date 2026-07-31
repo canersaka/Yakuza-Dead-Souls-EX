@@ -63,6 +63,9 @@ volatile int g_yz_lscw_on = 0;
 volatile int g_yz_ms_on = 0;
 int g_yz_sguard_on = 0;
 uint64_t g_tb_counter = 0;
+const yz_runtime_config g_yz_runtime_config = {0};
+volatile long g_yz_a010_root_active = 0;
+volatile long g_yz_a010_stage_generation = 0;
 /* fltrec gates: 0 = off and NEVER self-arms (yz_fltrec_hot() only arms when
  * it reads the unarmed value -1), so no recorder is ever invoked. */
 volatile int g_yz_fltrec_on = 0;
@@ -70,6 +73,23 @@ volatile int g_yz_fltrec_allctx = 0;
 volatile void* g_yz_consumer_ctx = 0;
 volatile int g_yz_tr_on = 0;
 uint32_t g_yz_anch_home = 0;
+
+void yz_tagread_repair_fetch(spu_context* c, uint32_t lsa,
+                             unsigned long long ea, uint32_t size)
+{ (void)c; (void)lsa; (void)ea; (void)size; }
+void yz_tagread_repair_read(spu_context* c, uint32_t lsa, uint32_t* v)
+{ (void)c; (void)lsa; (void)v; }
+void yz_a010_reltrace_gate(uint32_t spu, uint32_t code, uint32_t key,
+                           uint32_t witness, uint32_t descriptor,
+                           uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
+{ (void)spu; (void)code; (void)key; (void)witness; (void)descriptor;
+  (void)d0; (void)d1; (void)d2; (void)d3; }
+void yz_tr_record(spu_context* c, uint32_t lsa, const uint32_t* v)
+{ (void)c; (void)lsa; (void)v; }
+void yz_a010_stage_ba68(spu_context* c, const char* phase,
+                        uint32_t lsa, const uint32_t* v,
+                        uint32_t dma_ea, uint32_t dma_size)
+{ (void)c; (void)phase; (void)lsa; (void)v; (void)dma_ea; (void)dma_size; }
 
 int yz_tagread_arm(void) { g_yz_tr_on = 0; return 0; }
 void yz_ms_read(spu_context* c, uint32_t lsa, const uint32_t* v)

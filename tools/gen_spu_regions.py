@@ -19,8 +19,8 @@ tools/spu_region_manifest.json this driver:
      gen_spu_images.py shape) and S2 <raw> --base B --seed-all;
   3. runs the REGION lift (--regions --regions-strict --metrics-json) with
      the SAME input shape that reproduced, emitting <stem>_fast.c/.h into
-     recomp_prx/fast/ (never touching the shipped twins, including the
-     validated hand-edited recomp_prx/gs_task_fast.c);
+     yakuza/generated/fast/. Hand-edited entries emit a comparison oracle in
+     scratch/regionlift/oracle instead of overwriting their accepted twin;
   4. aggregates a machine-readable report.
 
 Symbol prefixes / register names are extracted from the shipped twin
@@ -49,7 +49,8 @@ sys.path.insert(0, TOOLS)
 from wrap_spu_elf import wrap  # noqa: E402
 
 MANIFEST = os.path.join(TOOLS, "spu_region_manifest.json")
-OUT_FAST = os.path.join(ROOT, "recomp_prx", "fast")
+OUT_FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
+TRACKED_DIAG = os.path.join(ROOT, "yakuza", "generated", "diag")
 WORK = os.path.join(ROOT, "scratch", "regionlift")
 
 
@@ -150,6 +151,9 @@ def process_placement(famname, fam, plc, args, report):
         return
     if plc.get("diag"):
         diag_c = os.path.join(ROOT, plc["diag"])
+        tracked_diag = os.path.join(TRACKED_DIAG, f"{stem}.c")
+        if os.path.exists(tracked_diag):
+            diag_c = tracked_diag
         prefix, register, h_path = read_header_identity(diag_c)
     else:
         # New placement with NO shipped instruction twin (e.g. the 07-30
@@ -256,14 +260,16 @@ def process_placement(famname, fam, plc, args, report):
         ent["repro"] = "SKIPPED"
 
     # ---- region lift ----------------------------------------------------
-    os.makedirs(OUT_FAST, exist_ok=True)
+    region_out = (os.path.join(WORK, "oracle")
+                  if plc.get("expect_handedit") else OUT_FAST)
+    os.makedirs(region_out, exist_ok=True)
     os.makedirs(os.path.join(WORK, "metrics"), exist_ok=True)
     metrics_path = os.path.join(WORK, "metrics", f"{stem}.json")
     common = ["--regions", "--regions-strict",
               "--region-cap", str(args.region_cap),
               "--func-prefix", prefix, "--register-name", register,
               "--metrics-json", metrics_path,
-              "--output", OUT_FAST,
+              "--output", region_out,
               "--source-name", f"{stem}_fast.c", "--header-name", f"{stem}_fast.h"]
     if shape == "S2-raw-base":
         argv = [raw_path, "--base", hex(elf_base)] + common
@@ -271,6 +277,7 @@ def process_placement(famname, fam, plc, args, report):
         argv = ["--auto-functions", elf_path] + common
     rc = run_lift(argv, os.path.join(WORK, "liftlogs", f"{stem}.region.log"))
     ent["region_rc"] = rc
+    ent["region_output"] = os.path.relpath(region_out, ROOT)
     ent["shape"] = shape
     if rc == 0 and os.path.exists(metrics_path):
         m = json.load(open(metrics_path))

@@ -20,9 +20,10 @@
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
-#include "../../recomp_prx/spu_image_table.h"
+#include "../../yakuza/generated/spu_image_table.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <setjmp.h>
 #if defined(_MSC_VER)
 #  include <intrin.h>
@@ -4742,9 +4743,10 @@ void spu_register_function(uint32_t addr, spu_fn fn)
         static int warned = 0;
         if (!warned) { warned = 1;
             fprintf(stderr, "[SPU] FATAL: function registry FULL (%u) -- raise "
-                    "SPU_FN_REGISTRY_MAX; later images are DROPPED\n",
+                    "SPU_FN_REGISTRY_MAX; refusing a partial registry\n",
                     s_registry_count);
             fflush(stderr); }
+        abort();
     }
     spu_prof_insert(addr, fn);
 }

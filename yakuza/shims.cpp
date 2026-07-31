@@ -1245,6 +1245,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             fflush(stderr);
         }
     }
+#endif
 
     /* === YZ_SKIP_VOICE (re-keyed 2026-07-05): the real t1 movie-gate spin is
      * cond_signal(4), NOT cond_wait(9) (which fires only ~1-4x). The CRI voice
@@ -1383,6 +1384,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 (unsigned long long)ctx->gpr[3]);
         fflush(stderr);
     }
+#endif
 }
 
 /* Guest-callback hook g_ps3_guest_caller: defined by the runtime

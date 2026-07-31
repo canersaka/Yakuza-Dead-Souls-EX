@@ -9,7 +9,7 @@ processed, this runner:
      one linking the freshly re-generated INSTRUCTION twin
      (scratch/regionlift/repro/<stem>.c -- same-lifter-version twin, so
      classification is provably shared), one linking the REGION twin
-     (recomp_prx/fast/<stem>_fast.c). Compile wall time + object size are
+     (yakuza/generated/fast/<stem>_fast.c). Compile wall time + object size are
      recorded: these ARE the Release compile sweep for every generated TU.
   2. runs both over an identical deterministic environment from a matrix of
      entry pcs -- the image entry, the load base, evenly-sampled region
@@ -52,7 +52,7 @@ import spu_disasm                     # noqa: E402
 WORK = os.path.join(ROOT, "scratch", "regionlift")
 DIFFD = os.path.join(WORK, "diff")
 REPRO = os.path.join(WORK, "repro")
-FAST = os.path.join(ROOT, "recomp_prx", "fast")
+FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 HARNESS = os.path.join(TOOLS, "spu_diff_harness.c")
 
 CLFLAGS = ["/nologo", "/O2", "/Ob2", "/DNDEBUG", "/MT", "/W3",
@@ -69,7 +69,8 @@ def compile_twin(stem, twin_c, twin_h_dir, twin_h_name, register, outdir, tag):
     objdir = os.path.join(outdir, f"obj_{tag}")
     os.makedirs(objdir, exist_ok=True)
     cmd = (["cl"] + CLFLAGS +
-           ["/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_h_dir,
+           ["/I", os.path.join(ROOT, "include"),
+            "/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_h_dir,
             f"/DTWIN_HEADER={twin_h_name}", f"/DREGISTER_FN={register}",
             f"/Fo{objdir}\\", f"/Fe:{exe}", HARNESS, twin_c])
     t0 = time.time()

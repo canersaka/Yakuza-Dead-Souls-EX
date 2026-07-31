@@ -125,7 +125,7 @@ def build_and_run():
         f.write(f'call "{VCVARS}" >nul 2>nul\n')
         f.write(f'cd /d "{ROOT}"\n')
         f.write(f'cl /nologo /O1 /W3 /std:c17 /experimental:c11atomics /bigobj '
-                f'/I {OUTDIR} /I runtime\\spu '
+                f'/I {OUTDIR} /I include /I runtime\\spu '
                 f'/Fo{OUTDIR}\\ /Fe:{exe} '
                 f'{OUTDIR}\\spu_rconf_driver.c {OUTDIR}\\spu_rcase_recomp.c '
                 f'> "{log}" 2>&1\n')

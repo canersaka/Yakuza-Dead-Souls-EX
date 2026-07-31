@@ -38,7 +38,7 @@ import spu_region_diff as D           # noqa: E402
 
 WORK = os.path.join(ROOT, "scratch", "regionlift", "collision")
 REPRO = os.path.join(ROOT, "scratch", "regionlift", "repro")
-FAST = os.path.join(ROOT, "recomp_prx", "fast")
+FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 HARNESS = os.path.join(TOOLS, "spu_diff_harness.c")
 
 BASE_A, BASE_B = 0x3B000, 0x3BC00
@@ -122,7 +122,8 @@ def build(tag, twin_dir, hdr_a, hdr_b, src_a, src_b):
     objd = os.path.join(WORK, f"obj_{tag}")
     os.makedirs(objd, exist_ok=True)
     cmd = (["cl"] + D.CLFLAGS +
-           ["/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_dir,
+           ["/I", os.path.join(ROOT, "include"),
+            "/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_dir,
             "/I", TOOLS,
             f"/DTWIN_HEADER={hdr_a}", f"/DCOLLISION_SECOND_HEADER={hdr_b}",
             f"/DREGISTER_FN={REG_A}", f"/DREG_B={REG_B}",
