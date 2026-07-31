@@ -45,6 +45,7 @@ add_executable(spu_atomics_stress
     "${RUNTIME_SPU_DIR}/spu_channels.c"
     "${RUNTIME_SPU_DIR}/spu_fltrec.c"
     "${RUNTIME_SPU_DIR}/spu_lockstep.c"
+    "${PS3RECOMP_TREE_ROOT}/runtime/diag/yz_frontier_trace.c"
 )
 
 target_include_directories(spu_atomics_stress PRIVATE
@@ -59,7 +60,10 @@ if(MSVC)
         /Zc:__cplusplus
         /experimental:c11atomics   # spu_channels.c's lock-line spinlock needs <stdatomic.h>
     )
-    target_compile_definitions(spu_atomics_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(spu_atomics_stress PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        YZ_PERF_CLEAN=1
+    )
     target_link_libraries(spu_atomics_stress PRIVATE synchronization)
 else()
     target_compile_options(spu_atomics_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)

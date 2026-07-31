@@ -1473,12 +1473,18 @@ void spu_halt(spu_context* ctx, int status)
 
 /* ===========================================================================
  * Global lock-line lock (GETLLAR/PUTLLC transactions across all SPU host
- * threads). A C11 atomic_flag spinlock keeps this portable; the critical
- * sections are tiny (two 128-byte memcpy + memcmp).
+ * threads). The critical sections are tiny (two 128-byte memcpy + memcmp),
+ * but SPURS can make several host SPU threads contend on the same line at
+ * once. Use a test-test-and-set lock: only an actual acquisition attempt
+ * writes the lock word, while waiters poll it read-only. A plain
+ * atomic_flag_test_and_set loop makes every waiter take exclusive ownership
+ * of the cache line on every spin and measured 27% of all CPU samples in the
+ * fixed Akiyama dialogue. This changes only the host locking algorithm; the
+ * process-wide serialization and acquire/release ordering stay identical.
  * ===========================================================================*/
 #include <stdatomic.h>   /* MSVC: needs /experimental:c11atomics (set by the
                             runtime CMake flags) */
-static atomic_flag s_lockline = ATOMIC_FLAG_INIT;
+static atomic_int s_lockline = 0;
 #if defined(YZ_PERF_PROFILE)
 static volatile long long s_perf_lock_contended = 0;
 static volatile long long s_perf_lock_spins = 0;
@@ -1487,22 +1493,30 @@ void spu_lockline_lock(void)
 {
 #if defined(YZ_PERF_PROFILE)
     unsigned long long spins = 0;
-    while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire)) {
-        spins++;
-        SPU_CPU_RELAX();
+    while (atomic_exchange_explicit(
+               &s_lockline, 1, memory_order_acquire)) {
+        do {
+            spins++;
+            SPU_CPU_RELAX();
+        } while (atomic_load_explicit(
+                     &s_lockline, memory_order_relaxed));
     }
     if (spins) {
         _InterlockedIncrement64(&s_perf_lock_contended);
         _InterlockedExchangeAdd64(&s_perf_lock_spins, (long long)spins);
     }
 #else
-    while (atomic_flag_test_and_set_explicit(&s_lockline, memory_order_acquire))
-        SPU_CPU_RELAX();   /* don't saturate the cache line while spinning */
+    while (atomic_exchange_explicit(
+               &s_lockline, 1, memory_order_acquire)) {
+        while (atomic_load_explicit(
+                   &s_lockline, memory_order_relaxed))
+            SPU_CPU_RELAX();
+    }
 #endif
 }
 void spu_lockline_unlock(void)
 {
-    atomic_flag_clear_explicit(&s_lockline, memory_order_release);
+    atomic_store_explicit(&s_lockline, 0, memory_order_release);
 }
 
 /* Host-core yield for SPU idle-poll loops (the spu_dma.h GETLLAR backoff;

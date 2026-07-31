@@ -131,6 +131,7 @@ int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat)
     fprintf(stderr, "FATAL: sys_event_flag_set_by_id stub called unexpectedly\n");
     abort();
 }
+void yz_event_frontier_trace_arm(void) {}
 
 /* ---------------------------------------------------------------------------
  * PPU-side writer helpers -- mirror yakuza/shims.cpp's VM_WRITE_COH macro and

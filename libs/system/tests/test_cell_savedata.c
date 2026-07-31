@@ -9,9 +9,20 @@ ps3_guest_caller_fn g_ps3_guest_caller = NULL;
 int g_yz_watch_dlist = 0;
 unsigned long g_yz_dlist_w = 0;
 int g_yz_slotstore = 0;
+volatile long g_yz_a010_release_scene_active = 0;
+volatile long g_yz_a010_root_active = 0;
+int g_yz_a010_ppucmd = 0;
 void yz_slotstore_log(uint32_t addr, unsigned long long value, int width, void* ra)
 {
     (void)addr; (void)value; (void)width; (void)ra;
+}
+void yz_a010_reltrace_ppu_store(uint32_t addr, uint32_t value, uint32_t guest_pc)
+{
+    (void)addr; (void)value; (void)guest_pc;
+}
+void yz_a010_ppucmd_log(uint32_t addr, uint32_t value, void* ra, int width)
+{
+    (void)addr; (void)value; (void)ra; (void)width;
 }
 
 /* Keep the format/parser/enumerator tests coupled to the implementation's
