@@ -4777,7 +4777,8 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
             || image_id == 32 || image_id == 33 || image_id == 34
             || image_id == 35 || image_id == 36 || image_id == 37
             || image_id == 38 || image_id == 39 || image_id == 40
-            || image_id == 41 || image_id == 44 || image_id == 45)
+            || image_id == 41 || image_id == 44 || image_id == 45
+            || image_id == 46)
             && addr >= 0x4880u && wildcard) {
         const int ok = g_yz_runtime_config.job_wildcard_ok;
         static int wl = 0; if (wl < 32) { wl++;
@@ -5494,7 +5495,8 @@ void spu_indirect_branch(spu_context* ctx)
                   || ctx->image_id == 36 || ctx->image_id == 37
                   || ctx->image_id == 38 || ctx->image_id == 39
                   || ctx->image_id == 40 || ctx->image_id == 41
-                  || ctx->image_id == 44 || ctx->image_id == 45;
+                  || ctx->image_id == 44 || ctx->image_id == 45
+                  || ctx->image_id == 46;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
@@ -6785,7 +6787,8 @@ void spu_indirect_branch(spu_context* ctx)
                          || ctx->image_id == 36 || ctx->image_id == 37
                          || ctx->image_id == 38 || ctx->image_id == 39
                          || ctx->image_id == 40 || ctx->image_id == 41
-                         || ctx->image_id == 44 || ctx->image_id == 45;
+                         || ctx->image_id == 44 || ctx->image_id == 45
+                         || ctx->image_id == 46;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
@@ -6817,7 +6820,8 @@ void spu_indirect_branch(spu_context* ctx)
                             || s_registry[i].image_id == 40
                             || s_registry[i].image_id == 41
                             || s_registry[i].image_id == 44
-                            || s_registry[i].image_id == 45))
+                            || s_registry[i].image_id == 45
+                            || s_registry[i].image_id == 46))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }

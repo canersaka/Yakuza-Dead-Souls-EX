@@ -99,6 +99,10 @@ int main(void)
                  19, 0x3BC00u, 0x01252680u, 44);
     expect_image("orphanage 3BC00 descriptor remains authoritative",
                  44, 0x3BC00u, 0x01252680u, 44);
+    expect_image("orphanage descriptor in failed-dialogue 3CC00 slot",
+                 13, 0x3CC00u, 0x01252680u, 46);
+    expect_image("orphanage 3CC00 descriptor remains authoritative",
+                 19, 0x3CC00u, 0x01252680u, 46);
     expect_image("orphanage descriptor in Kamurocho 37C00 slot",
                  35, 0x37C00u, 0x01252680u, 19);
     expect_image("orphanage descriptor in Kamurocho 2D800 slot",
@@ -123,6 +127,8 @@ int main(void)
                  15, 0x3D000u, 0x01275A00u, 43);
     expect_image("job B follows orphanage 3BC00 completion",
                  44, 0x3D000u, 0x01275A00u, 43);
+    expect_image("job B follows orphanage 3CC00 completion",
+                 46, 0x04C00u, 0x01275A00u, 15);
     expect_image("job A alternate E400 slot after Job B",
                  15, 0x0E400u, 0x01254500u, 14);
     expect_image("job A post-Kamurocho C400 slot",
@@ -224,6 +230,8 @@ int main(void)
                           4, 0x3B000u, 19);
     expect_resident_image("orphanage internal call at 3BC00",
                           4, 0x3BC00u, 44);
+    expect_resident_image("orphanage internal call at 3CC00",
+                          4, 0x3CC00u, 46);
 
     if (failures)
         return 1;
