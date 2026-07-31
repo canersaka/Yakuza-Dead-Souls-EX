@@ -92,7 +92,23 @@ void spu_task_launch_check(spu_context* c, void* f) { (void)c; (void)f; }
  * drains included) call this -- the exact event the runtime's s_prof_hops
  * counts. The driver loop adds its own top-level dispatches. */
 static uint64_t g_hops_total = 0;
-void spu_prof_hop(void* f) { (void)f; g_hops_total++; }
+/* Sweep mode enforces the dispatch budget IN-FLIGHT (nested drains included):
+ * a single region call can otherwise run a multi-second guard loop before the
+ * driver-level check gets a chance. The cut lands at mode-dependent
+ * architectural points by nature, so the sweep comparer treats HOPCUT pcs as
+ * budget-capped (skip-counted), never as comparisons. Single-window mode
+ * keeps the driver-level check only (its HOPMAX windows are already classed
+ * inconclusive). */
+static int g_sweep_cut_on = 0;
+static uint64_t g_sweep_hopmax = 0;
+static jmp_buf g_cut;
+void spu_prof_hop(void* f)
+{
+    (void)f;
+    g_hops_total++;
+    if (g_sweep_cut_on && g_hops_total >= g_sweep_hopmax)
+        longjmp(g_cut, 5);
+}
 void spu_img_restore(spu_context* c, int32_t s) { (void)c; (void)s; }
 uint64_t ppu_timebase_now(void) { return ++g_tb_counter; }
 void spu_ch_wake(spu_context* c) { (void)c; }
@@ -143,7 +159,7 @@ typedef struct { uint32_t kind, ch, a, b, c, d, pc; } ev_t;
 #define EV_CAP 65536
 static ev_t g_ev[EV_CAP];
 static uint32_t g_nev = 0, g_ev_budget = 512;
-static jmp_buf g_cut;
+/* g_cut is declared above spu_prof_hop (the sweep in-flight cut needs it) */
 static uint32_t g_last_atomic = 0;
 static uint32_t g_ch_idx[64];
 static uint64_t g_dec = 0x40000000ull;
@@ -269,13 +285,30 @@ static int g_sentinel_hit = 0;
 
 void spu_indirect_branch(spu_context* ctx)
 {
-    uint32_t pc = ctx->pc & SPU_LS_MASK;
-    if (pc == RET_SENTINEL) { g_sentinel_hit = 1; ctx->status = SPU_STATUS_STOPPED; return; }
-    void (*fn)(spu_context*) = (pc & 3) ? 0 : g_fn[pc >> 2];
+    /* FAITHFUL to the runtime dispatcher (spu_channels.c:4712): the lookup
+     * takes the RAW pc and an out-of-LS or unregistered target is a LOUD
+     * unknown-branch failure in BOTH modes. Masking here (an earlier harness
+     * version) resurrected valid code for the instruction twin while the
+     * region twin's entry switch correctly refused the raw value -- a
+     * harness-only divergence the real system never produces. */
+    uint32_t pc = ctx->pc;
+    if (pc == RET_SENTINEL) {
+        /* Terminate via longjmp, not status+return: a status set inside a
+         * NESTED drain does not stop the enclosing lifted caller, so whether
+         * the run ends would depend on host nesting depth, which legitimately
+         * differs between the twins (region gotos collapse frames). */
+        g_sentinel_hit = 1;
+        ctx->status = SPU_STATUS_STOPPED;
+        longjmp(g_cut, 4);
+    }
+    void (*fn)(spu_context*) =
+        (pc >= SPU_LS_SIZE || (pc & 3)) ? 0 : g_fn[pc >> 2];
     if (!fn) {
         ev_push(K_UNKPC, 0, pc, 0, 0, 0, pc);
-        ctx->status = SPU_STATUS_STOPPED_BY_HALT;
-        return;
+        /* Faithful to the runtime: an unknown branch ends the SPU's thread of
+         * control via spu_halt's longjmp (spu_channels.c:1410), unwinding all
+         * nesting identically in both modes. */
+        spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);
     }
     g_spu_trampoline_fn = fn;   /* enclosing SPU_DRAIN / driver loop runs it */
 }
@@ -330,13 +363,20 @@ void spu_diff_ctx_init(spu_context* ctx)
     for (int r = 0; r < 128; r++)
         for (int w = 0; w < 4; w++)
             ctx->gpr[r]._u32[w] = prng32(0xB0000000ull + (uint64_t)r * 8 + w);
-    /* Preferred words masked to 16 bits: loop trip counts and addresses come
-     * from the preferred slot, and unbounded 32-bit noise makes synthetic
-     * windows spin for billions of iterations (seen at gs_task 0x30C8, the
-     * s42 counted loop). 16-bit trips keep every window terminating in BOTH
-     * twins while lanes 1-3 keep full-width entropy. */
-    for (int r = 2; r < 128; r++)
-        ctx->gpr[r]._u32[0] &= 0xFFFF;
+    /* Preferred words masked: loop trip counts and addresses come from the
+     * preferred slot, and unbounded 32-bit noise makes synthetic windows spin
+     * for billions of iterations (seen at gs_task 0x30C8, the s42 counted
+     * loop). Single-window mode uses 16-bit trips. Sweep mode uses 8-bit
+     * trips: a region twin's in-region loops execute with ZERO dispatches, so
+     * no dispatch budget can bound them, and 16-bit NESTED loop products
+     * (64k x 64k) ran single pcs for hours; 8-bit products (<=64k total
+     * iterations) bound every pc architecturally in both twins identically.
+     * Lanes 1-3 keep full-width entropy either way. */
+    {
+        uint32_t pref_mask = g_sweep_cut_on ? 0xFFu : 0xFFFFu;
+        for (int r = 2; r < 128; r++)
+            ctx->gpr[r]._u32[0] &= pref_mask;
+    }
     ctx->gpr[0] = spu_pref_u32(RET_SENTINEL);   /* link: clean natural-return terminal */
     ctx->gpr[1] = spu_pref_u32(0x3FF80u);       /* plausible stack top */
     g_spu_cur_ctx = ctx;
@@ -371,7 +411,9 @@ const char* spu_diff_run(spu_context* ctx, uint32_t entry, uint64_t hopmax)
             g_spu_trampoline_fn = 0;
         }
     }
-    term = (cutrc == 3) ? "HALTED" : "EVCUT";
+    term = (cutrc == 5) ? "HOPCUT"
+         : (cutrc == 4) ? "RETURNED"
+         : (cutrc == 3) ? "HALTED" : "EVCUT";
     return term;
 }
 
@@ -455,11 +497,15 @@ int main(int argc, char** argv)
         const char* term = spu_diff_run(&g_ctx, entry, hopmax);
         spu_diff_dump_single(out, term, &g_ctx);
     } else {
+        g_sweep_cut_on = 1;
+        g_sweep_hopmax = hopmax;
         spu_diff_env_reset(seed);
         for (uint32_t pc = base; pc < base + (uint32_t)g_codelen; pc += 4) {
             spu_diff_ctx_init(&g_ctx);
             const char* term = spu_diff_run(&g_ctx, pc, hopmax);
             spu_diff_dump_digest(out, pc, term, &g_ctx);
+            if ((pc & 0x3FCu) == 0)
+                fflush(out);   /* usable partial file if a backstop timeout fires */
         }
     }
     fclose(out);

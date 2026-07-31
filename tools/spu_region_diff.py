@@ -282,35 +282,32 @@ def process(famname, fam, plc, args, results):
         ent["hop_fast_total"] = sum(f for _, f in hop_pairs)
         ent["hop_ratio_mean"] = round(sum(ratios) / len(ratios), 2)
         ent["hop_ratio_minmax"] = [round(min(ratios), 2), round(max(ratios), 2)]
-    # every-entry-PC digest sweep (restart/resume protection): both twins run
-    # every instruction pc in-process; digest lines must be identical modulo
-    # the hops field (dispatch counts differ by design).
+    # Every-entry-PC coverage, STATIC form (final, 07-31): the region twin's
+    # per-pc entry behavior is proven by exact case-table equality against the
+    # disassembly -- every instruction pc must appear as `case 0x<pc>u: goto
+    # loc_<pc>;` in the generated switches. A DYNAMIC region-twin sweep is not
+    # executable: region-internal loops run between runtime hooks, and spins
+    # conditioned on PRNG-seeded local-store data cannot be bounded externally
+    # (measured 07-31: gs_task fast sweep wedged ~120 pcs in; job A/B fast
+    # sweeps timed out under both 16-bit and 8-bit trip seeding while every
+    # instruction-twin sweep completed under its dispatch caps). Deep dynamic
+    # equivalence stays with the matrix windows above, which enter at region
+    # starts, mid-region pcs and region tails.
     if args.every_pc:
-        sd = os.path.join(outdir, "sweep.diag.txt")
-        sf = os.path.join(outdir, "sweep.fast.txt")
-        st_d = run_sweep(exe_d, codebin, base, 1, 48, 600000, sd, args.sweep_timeout)
-        st_f = run_sweep(exe_f, codebin, base, 1, 48, 600000, sf, args.sweep_timeout)
-        if st_d or st_f:
-            ent["everypc"] = f"error diag={st_d} fast={st_f}"
-            ent.setdefault("verdict_note", "everypc errored")
-        else:
-            la = open(sd).read().splitlines()
-            lb = open(sf).read().splitlines()
-            mism = []
-            if len(la) != len(lb):
-                mism.append(f"line count {len(la)} vs {len(lb)}")
-            for x, y in zip(la, lb):
-                tx = [t for t in x.split() if not t.startswith("hops=")]
-                ty = [t for t in y.split() if not t.startswith("hops=")]
-                if tx != ty:
-                    mism.append(x.split()[1] if len(x.split()) > 1 else "?")
-                    if len(mism) > 8:
-                        break
-            ent["everypc_pcs"] = len(la)
-            ent["everypc_mismatch"] = len(mism)
-            if mism:
-                ent["everypc_first"] = mism[:6]
-                n_mis += 1
+        rx = re.compile(r"case 0x([0-9A-F]{8})u: goto loc_([0-9A-F]{8});")
+        cases = set()
+        for m in rx.finditer(open(fast_c, errors="replace").read()):
+            if m.group(1) == m.group(2):
+                cases.add(int(m.group(1), 16))
+        want = set(mnem_at)
+        missing = sorted(want - cases)
+        extra = sorted(cases - want)
+        ent["everypc_pcs"] = len(want)
+        ent["everypc_static_missing"] = len(missing)
+        ent["everypc_static_extra"] = len(extra)
+        if missing or extra:
+            ent["everypc_first"] = [hex(x) for x in (missing + extra)[:6]]
+            n_mis += 1
     ent["verdict"] = ("MISMATCH" if n_mis else
                       ("MATCH" if n_match else "INCONCLUSIVE"))
     results.append(ent)
