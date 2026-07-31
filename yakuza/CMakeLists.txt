@@ -164,7 +164,7 @@ _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/jo
 list(APPEND SPU_KERNELS "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c")
 foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
         job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
-        job_bin_orphanage_3cc00)
+        job_bin_orphanage_3c000 job_bin_orphanage_3cc00)
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_ORPHANAGE "${PS3RECOMP_DIR}/yakuza/generated/${stem}.c" "${stem}")
 endforeach()
 
