@@ -43,6 +43,13 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_
 if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(ps3recomp_runtime PRIVATE ${YZ_PERF_DEFINITIONS})
 endif()
+if(MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Ob2>)
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        $<$<CONFIG:Release>:NDEBUG>)
+endif()
 
 # The lifted PPU code is split into ppu_recomp_NNN.cpp chunks (one giant file
 # exceeds the MSVC source-line limit). The chunks go into their own object
@@ -208,6 +215,13 @@ add_executable(yakuza_recomp
 )
 if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
+endif()
+if(MSVC)
+    target_compile_options(yakuza_recomp PRIVATE
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Ob2>)
+    target_compile_definitions(yakuza_recomp PRIVATE
+        $<$<CONFIG:Release>:NDEBUG>)
 endif()
 
 target_include_directories(yakuza_recomp PRIVATE
