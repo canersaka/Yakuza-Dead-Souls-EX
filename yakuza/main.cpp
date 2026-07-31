@@ -151,6 +151,7 @@ extern "C" void spu_recomp_register_jobbin_c_17800(void);
 extern "C" void spu_recomp_register_jobbin_d_e400(void);
 extern "C" void spu_recomp_register_jobbin_d_c400(void);
 extern "C" void spu_recomp_register_jobbin_d_2b800(void);
+extern "C" void spu_recomp_register_jobbin_d_15c00(void);
 /* Sunshine orphanage geometry worker. Its descriptor identifies the distinct
  * EBOOT binary at 0x01252680; treating it as Job A ran the wrong program at the
  * same LS 0x4C00 slot and produced malformed, incomplete scene commands. */
@@ -3501,6 +3502,7 @@ int main(int argc, char** argv)
     spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
     spu_begin_image(42); spu_recomp_register_jobbin_d_c400();  /* same binary at LS 0xC400; overlaps Job D E400 and Job A C400 */
     spu_begin_image(45); spu_recomp_register_jobbin_d_2b800(); /* same binary at failed-dialogue LS 0x2B800; overlapping image 45 */
+    spu_begin_image(47); spu_recomp_register_jobbin_d_15c00(); /* exact failed-dialogue LS 0x15C00 identity */
     spu_begin_image(19); spu_recomp_register_jobbin_orphanage(); /* a010 geometry job (EBOOT 0x01252680, LS 0x4C00) */
     spu_recomp_register_jobbin_orphanage_e400();                  /*   ...same binary at the shared alternate slot 0xE400 */
     spu_recomp_register_jobbin_orphanage_2d800();                 /*   ...same binary at the live Kamurocho slot 0x2D800 */

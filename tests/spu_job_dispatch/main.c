@@ -67,6 +67,10 @@ int main(void)
      */
     expect_image("job D descriptor after orphanage occupant",
                  19, 0x0E400u, 0x01265180u, 18);
+    expect_image("job D failed fixed-dialogue 15C00 slot",
+                 13, 0x15C00u, 0x01265180u, 47);
+    expect_image("job D 15C00 descriptor remains authoritative",
+                 47, 0x15C00u, 0x01265180u, 47);
     expect_image("job D alternate post-A030 slot",
                  13, 0x04C00u, 0x01265180u, 21);
     expect_image("job D high non-overlapping post-A030 slot",
@@ -188,6 +192,8 @@ int main(void)
                           3, 0x05000u, 26);
     expect_resident_image("job D internal call at E400",
                           3, 0x0E400u, 18);
+    expect_resident_image("job D internal call at 15C00",
+                          3, 0x15C00u, 47);
     expect_resident_image("job D internal call at C400",
                           3, 0x0C400u, 42);
     expect_resident_image("job D internal call at 20C00",
