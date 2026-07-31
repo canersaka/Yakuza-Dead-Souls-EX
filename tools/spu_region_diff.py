@@ -173,6 +173,16 @@ def pc_check(dfast, mnem_at, span):
     return bad
 
 
+def run_sweep(exe, codebin, base, seed, evb, hopmax, outp, timeout):
+    try:
+        r = subprocess.run([exe, codebin, f"{base:X}", "sweep", str(seed),
+                            str(evb), str(hopmax), outp],
+                           capture_output=True, text=True, timeout=timeout)
+        return "CRASH" if r.returncode != 0 else None
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT"
+
+
 def run_one(exe, codebin, base, entry, seed, evb, hopmax, outp, timeout):
     try:
         r = subprocess.run([exe, codebin, f"{base:X}", f"{entry:X}", str(seed),
@@ -272,6 +282,35 @@ def process(famname, fam, plc, args, results):
         ent["hop_fast_total"] = sum(f for _, f in hop_pairs)
         ent["hop_ratio_mean"] = round(sum(ratios) / len(ratios), 2)
         ent["hop_ratio_minmax"] = [round(min(ratios), 2), round(max(ratios), 2)]
+    # every-entry-PC digest sweep (restart/resume protection): both twins run
+    # every instruction pc in-process; digest lines must be identical modulo
+    # the hops field (dispatch counts differ by design).
+    if args.every_pc:
+        sd = os.path.join(outdir, "sweep.diag.txt")
+        sf = os.path.join(outdir, "sweep.fast.txt")
+        st_d = run_sweep(exe_d, codebin, base, 1, 48, 600000, sd, args.sweep_timeout)
+        st_f = run_sweep(exe_f, codebin, base, 1, 48, 600000, sf, args.sweep_timeout)
+        if st_d or st_f:
+            ent["everypc"] = f"error diag={st_d} fast={st_f}"
+            ent.setdefault("verdict_note", "everypc errored")
+        else:
+            la = open(sd).read().splitlines()
+            lb = open(sf).read().splitlines()
+            mism = []
+            if len(la) != len(lb):
+                mism.append(f"line count {len(la)} vs {len(lb)}")
+            for x, y in zip(la, lb):
+                tx = [t for t in x.split() if not t.startswith("hops=")]
+                ty = [t for t in y.split() if not t.startswith("hops=")]
+                if tx != ty:
+                    mism.append(x.split()[1] if len(x.split()) > 1 else "?")
+                    if len(mism) > 8:
+                        break
+            ent["everypc_pcs"] = len(la)
+            ent["everypc_mismatch"] = len(mism)
+            if mism:
+                ent["everypc_first"] = mism[:6]
+                n_mis += 1
     ent["verdict"] = ("MISMATCH" if n_mis else
                       ("MATCH" if n_match else "INCONCLUSIVE"))
     results.append(ent)
@@ -293,6 +332,9 @@ def main():
     ap.add_argument("--evbudget", type=int, default=384)
     ap.add_argument("--hopmax", type=int, default=2000000)
     ap.add_argument("--timeout", type=int, default=45)
+    ap.add_argument("--every-pc", action="store_true", dest="every_pc",
+                    help="also run the every-entry-PC digest sweep per placement")
+    ap.add_argument("--sweep-timeout", type=int, default=900, dest="sweep_timeout")
     args = ap.parse_args()
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None

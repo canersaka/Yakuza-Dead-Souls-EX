@@ -148,8 +148,16 @@ def process_placement(famname, fam, plc, args, report):
         report.append(args.prior[stem])
         print(f"[{famname}] {stem:26s} cached (resume)")
         return
-    diag_c = os.path.join(ROOT, plc["diag"])
-    prefix, register, h_path = read_header_identity(diag_c)
+    if plc.get("diag"):
+        diag_c = os.path.join(ROOT, plc["diag"])
+        prefix, register, h_path = read_header_identity(diag_c)
+    else:
+        # New placement with NO shipped instruction twin (e.g. the 07-30
+        # observed orphanage 0x3BC00): identity comes from the manifest and
+        # the repro lane's freshly generated instruction lift IS the twin.
+        diag_c = None
+        prefix, register = plc["prefix"], plc["register"]
+        h_path = None
     base = int(plc["base"], 0) if "base" in plc else None
 
     # ---- input artifact -------------------------------------------------
@@ -176,16 +184,33 @@ def process_placement(famname, fam, plc, args, report):
     ent = {
         "family": famname, "stem": stem, "base": hex(elf_base),
         "entry": hex(elf_entry), "prefix": prefix, "register": register,
+        "canonical_ea": fam.get("eboot_ea"),
         "code_sha256": hashlib.sha256(code).hexdigest(),
         "code_bytes": len(code),
-        "diag": plc["diag"], "image_id": plc.get("image_id"),
+        "diag": plc.get("diag"), "image_id": plc.get("image_id"),
+        "entry_evidence": plc.get("entry_evidence",
+            "elf e_entry" if plc.get("elf")
+            else ("reference elf entry delta rebased to placement"
+                  if fam.get("ref_elf") else "base (validated by byte repro of the shipped twin)")),
+        "overlaps": [],
     }
 
     # ---- repro gate -----------------------------------------------------
     repro_dir = os.path.join(WORK, "repro")
     os.makedirs(repro_dir, exist_ok=True)
     shape = None
-    if not args.skip_repro:
+    if diag_c is None:
+        # No shipped twin: generate the instruction twin fresh (it becomes
+        # the correctness twin for the differential matrix) and record the
+        # provenance class loudly instead of a byte-diff verdict.
+        s1 = ["--auto-functions", elf_path, "--seed-all",
+              "--func-prefix", prefix, "--register-name", register,
+              "--output", repro_dir,
+              "--source-name", f"{stem}.c", "--header-name", f"{stem}.h"]
+        rc = run_lift(s1, os.path.join(WORK, "liftlogs", f"{stem}.repro1.log"))
+        shape = "S1-autofn-elf"
+        ent["repro"] = "NEW-PLACEMENT-NO-SHIPPED-TWIN" if rc == 0 else f"TWIN-GEN-FAILED rc={rc}"
+    elif not args.skip_repro:
         s1 = ["--auto-functions", elf_path, "--seed-all",
               "--func-prefix", prefix, "--register-name", register,
               "--output", repro_dir,
@@ -281,20 +306,82 @@ def main():
     os.makedirs(os.path.join(WORK, "liftlogs"), exist_ok=True)
     rep_path = os.path.join(WORK, "report.json")
     args.prior = {}
-    if args.resume and os.path.exists(rep_path):
+    if os.path.exists(rep_path):
         args.prior = {e["stem"]: e for e in json.load(open(rep_path))}
     manifest = json.load(open(MANIFEST))
+
+    # ---- placement identity validation (07-30 contract) -----------------
+    # A symbol namespace (func prefix) may be SHARED only by placements whose
+    # LS spans are pairwise disjoint (the shipped spu_func_ trio: kernel2,
+    # sysservice, gs_task); overlapping spans MUST live in distinct
+    # namespaces or their per-pc symbols would collide and a PC-keyed lookup
+    # could serve the wrong placement. Register names are plain link symbols
+    # and must be globally unique. Every overlapping span pair (across
+    # namespaces) is reported: that list is exactly the ambiguity set the
+    # runtime residency layer must disambiguate before mapping PC to code.
+    seen_reg, by_pfx, spans = {}, {}, []
+    fam_code_cache = {}
+    for famname, fam in manifest["families"].items():
+        for plc in fam.get("images", fam.get("placements", [])):
+            if plc.get("diag"):
+                try:
+                    pfx, reg, _h = read_header_identity(os.path.join(ROOT, plc["diag"]))
+                except SystemExit:
+                    continue
+            else:
+                pfx, reg = plc["prefix"], plc["register"]
+            if reg in seen_reg:
+                print(f"VALIDATION FAIL: register {reg!r} shared by "
+                      f"{seen_reg[reg]} and {plc['stem']}")
+                sys.exit(3)
+            seen_reg[reg] = plc["stem"]
+            if plc.get("elf"):
+                _c, b, _e = parse_spu_elf(os.path.join(ROOT, plc["elf"]))
+                ln = len(_c)
+            elif fam["kind"] == "job":
+                if famname not in fam_code_cache:
+                    fam_code_cache[famname] = len(family_code(fam)[0])
+                ln = fam_code_cache[famname]
+                b = int(plc["base"], 0)
+            else:
+                continue
+            spans.append((plc["stem"], pfx, b, b + ln))
+            by_pfx.setdefault(pfx, []).append((plc["stem"], b, b + ln))
+    for pfx, group in by_pfx.items():
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, c = group[i], group[j]
+                if a[1] < c[2] and c[1] < a[2]:
+                    print(f"VALIDATION FAIL: namespace {pfx!r} shared by "
+                          f"OVERLAPPING placements {a[0]} and {c[0]}")
+                    sys.exit(3)
+    overlaps = []
+    for i in range(len(spans)):
+        for j in range(i + 1, len(spans)):
+            a, c = spans[i], spans[j]
+            if a[1] != c[1] and a[2] < c[3] and c[2] < a[3]:
+                overlaps.append((a[0], c[0]))
+    print(f"placement validation: {len(by_pfx)} namespaces over {len(spans)} "
+          f"spans, shared-namespace groups disjoint, {len(overlaps)} "
+          f"overlapping span pair(s) across distinct namespaces")
+    with open(os.path.join(WORK, "overlap_pairs.json"), "w") as f:
+        json.dump(overlaps, f, indent=1)
+
     report = []
     for famname, fam in manifest["families"].items():
         if fams and famname not in fams:
             continue
         for plc in fam.get("images", fam.get("placements", [])):
             process_placement(famname, fam, plc, args, report)
-            with open(rep_path, "w") as f:      # incremental: crash-safe
-                json.dump(report, f, indent=1)
+            merged = dict(args.prior)
+            merged.update({e["stem"]: e for e in report})
+            with open(rep_path, "w") as f:      # incremental, crash-safe, merged
+                json.dump(list(merged.values()), f, indent=1)
 
+    merged = dict(args.prior)
+    merged.update({e["stem"]: e for e in report})
     with open(rep_path, "w") as f:
-        json.dump(report, f, indent=1)
+        json.dump(list(merged.values()), f, indent=1)
     n_bad = sum(1 for e in report if e["region_rc"] != 0)
     n_norepro = sum(1 for e in report if e.get("repro", "").startswith("DIFFERS")
                     and "EXPECTED" not in e.get("repro", ""))
