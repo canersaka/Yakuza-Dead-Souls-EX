@@ -48,6 +48,7 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     "${RUNTIME_SYNC_DIR}/lv2_deadline.c"
+    "${PS3RECOMP_TREE_ROOT}/runtime/diag/yz_frontier_trace.c"
 )
 
 target_include_directories(sync_stress PRIVATE
