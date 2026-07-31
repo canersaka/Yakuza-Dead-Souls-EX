@@ -18,6 +18,7 @@
 #include "edge_journal_hle.h"
 
 #include "ps3emu/error_codes.h"
+#include "ps3emu/yz_frontier_trace.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
 #include "movie_ffmpeg.h"       /* host FFmpeg movie decode (CRI Sofdec .sfd)   */
@@ -38,6 +39,7 @@ extern "C" void spu_perf_dump(void);
 
 extern "C" uint8_t* vm_base;
 extern "C" uint32_t g_yz_game_toc;
+extern "C" volatile uint32_t g_yz_jrnl_cur_ea;
 extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_w2life_dump(const char*);   /* s31 W2LIFE probe (spu_channels.c) */
 extern "C" void yz_fltrec_dump(const char*);   /* s41 flight recorder (runtime/spu/spu_fltrec.c) */
@@ -4426,6 +4428,35 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
         !g_yz_game_toc)
         return 0;
 
+    if (yz_frontier_trace_is_armed()) {
+        static uint32_t last_stopper = 0;
+        static uint32_t last_get = 0;
+        static uint32_t last_put = 0;
+        static uint32_t last_head = 0;
+        static uint32_t last_pending = 0;
+        const uint32_t trace_state =
+            vm_read32(g_yz_game_toc - 0x7410u);
+        const int trace_state_ok =
+            trace_state >= 0x10000u && trace_state < 0xE0000000u;
+        const uint32_t trace_head =
+            trace_state_ok ? vm_read32(trace_state + 0x00u) : 0u;
+        const uint32_t trace_pending =
+            trace_state_ok ? vm_read32(trace_state + 0x20u) : 0u;
+        if (stopper_ea != last_stopper || get != last_get ||
+            put != last_put || trace_head != last_head ||
+            trace_pending != last_pending) {
+            last_stopper = stopper_ea;
+            last_get = get;
+            last_put = put;
+            last_head = trace_head;
+            last_pending = trace_pending;
+            yz_frontier_trace_emit(
+                YZ_FT_FIFO_PARK, yz_thread_current_id(), 0,
+                get, put, stopper_ea, trace_pending,
+                trace_head, vm_read32(stopper_ea));
+        }
+    }
+
     const uint32_t ring = 0x800000u;
     const uint32_t ahead = (put - get + ring) % ring;
     if (ahead == 0u || ahead >= (ring >> 1))
@@ -4505,6 +4536,38 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
             put, ahead, pending, head);
     fflush(stderr);
     return 1;
+}
+
+extern "C" void yz_frontier_fifo_snapshot(uint32_t get, uint32_t put)
+{
+    const uint32_t stopper_ea = yz_rsx_io_to_ea(get);
+    const uint32_t state =
+        g_yz_game_toc ? vm_read32(g_yz_game_toc - 0x7410u) : 0u;
+    const int state_ok = state >= 0x10000u && state < 0xE0000000u;
+    const uint32_t base = state_ok ? vm_read32(state + 0x08u) : 0u;
+    const uint32_t end = state_ok ? vm_read32(state + 0x0Cu) : 0u;
+    const uint32_t head = state_ok ? vm_read32(state + 0x00u) : 0u;
+    const uint32_t latch = state_ok ? vm_read32(state + 0x1Cu) : 0u;
+    const uint32_t pending = state_ok ? vm_read32(state + 0x20u) : 0u;
+    const uint32_t saved = state_ok ? vm_read32(state + 0x24u) : 0u;
+    const uint32_t entry = stopper_ea
+        ? yz_gcm_stopper_release_entry(stopper_ea) : 0u;
+
+    yz_frontier_trace_emit(
+        YZ_FT_FIFO_STATE, yz_thread_current_id(), 0,
+        get, put, stopper_ea,
+        stopper_ea ? vm_read32(stopper_ea) : 0u,
+        entry, (put - get + 0x800000u) & 0x7FFFFFu);
+    yz_frontier_trace_emit(
+        YZ_FT_FIFO_PUBLICATION, yz_thread_current_id(), 0,
+        state, head, base, end, latch, pending);
+    yz_frontier_trace_emit(
+        YZ_FT_FIFO_PUBLICATION, yz_thread_current_id(), 1,
+        saved, g_yz_jrnl_cur_ea,
+        state_ok ? vm_read32(state + 0x10u) : 0u,
+        state_ok ? vm_read32(state + 0x14u) : 0u,
+        state_ok ? vm_read32(state + 0x18u) : 0u,
+        state_ok ? vm_read32(state + 0x28u) : 0u);
 }
 
 /* ============================================================================

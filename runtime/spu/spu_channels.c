@@ -1869,6 +1869,39 @@ typedef struct {
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 
+void yz_frontier_spu_snapshot(void)
+{
+    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
+        const spu_context* ctx = s_mfc_slots[slot].ctx;
+        const mfc_engine* m = &s_mfc_slots[slot].mfc;
+        uint32_t outstanding_mask = 0;
+        if (!ctx)
+            continue;
+
+        for (uint32_t tag = 0; tag < 32; tag++) {
+            if (m->tag_outstanding[tag])
+                outstanding_mask |= 1u << tag;
+        }
+
+        yz_frontier_trace_emit(
+            YZ_FT_SPU_STATE, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            (uint32_t)slot, (uint32_t)ctx->image_id, ctx->status,
+            ctx->host_depth,
+            atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
+            ctx->event_mask);
+        yz_frontier_trace_emit(
+            YZ_FT_SPU_JOB_STATE, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            ctx->job_bin_base[0], ctx->job_bin_base[1],
+            ctx->job_bin_base[2], ctx->job_bin_base[3],
+            ctx->job_bin_base[4], ctx->a010_job_record);
+        yz_frontier_trace_emit(
+            YZ_FT_SPU_MFC_STATE, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            ctx->mfc_eal, ctx->mfc_lsa,
+            ctx->mfc_size, (ctx->mfc_tag << 24) | m->queue_count,
+            outstanding_mask, m->stall_mask);
+    }
+}
+
 /*
  * Frontier-only, read-only snapshot for the post-a030 RSX segment-finalisation
  * stall. The FIFO consumer calls this after it has remained on an
@@ -2240,6 +2273,29 @@ static int yz_frontier_dma_is_relevant(const spu_context* ctx)
            (begin < 0x4019C700ull && end > 0x4019C680ull) ||
            (begin < 0x4019CB40ull && end > 0x4019CA80ull) ||
            (begin < 0x10200FF0ull && end > 0x10200FE0ull);
+}
+
+static int yz_frontier_job_select_relevant(
+    const spu_context* ctx, int selected_image, uint32_t source_ea)
+{
+    /*
+     * Completion-worker and Job B transitions are rare and always retained.
+     * Ordinary Job A geometry launches can number in the millions, so keep a
+     * periodic breadcrumb while the one-shot stall snapshot records every
+     * context's final resident state.
+     */
+    if (source_ea == 0x01252680u ||
+        source_ea == 0x01265180u ||
+        selected_image == 15 || ctx->image_id == 15)
+        return 1;
+    if (selected_image == 14 || ctx->image_id == 14) {
+        static volatile long sample_count[SPU_MAX_CONTEXTS];
+        const unsigned slot = ctx->spu_id & (SPU_MAX_CONTEXTS - 1u);
+        const unsigned long n =
+            (unsigned long)_InterlockedIncrement(&sample_count[slot]);
+        return (n & 0xFFu) == 1u;
+    }
+    return 0;
 }
 
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
@@ -4719,7 +4775,7 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
             || image_id == 32 || image_id == 33 || image_id == 34
             || image_id == 35 || image_id == 36 || image_id == 37
             || image_id == 38 || image_id == 39 || image_id == 40
-            || image_id == 41)
+            || image_id == 41 || image_id == 44)
             && addr >= 0x4880u && wildcard) {
         const int ok = g_yz_runtime_config.job_wildcard_ok;
         static int wl = 0; if (wl < 32) { wl++;
@@ -5435,7 +5491,8 @@ void spu_indirect_branch(spu_context* ctx)
                   || ctx->image_id == 34 || ctx->image_id == 35
                   || ctx->image_id == 36 || ctx->image_id == 37
                   || ctx->image_id == 38 || ctx->image_id == 39
-                  || ctx->image_id == 40 || ctx->image_id == 41;
+                  || ctx->image_id == 40 || ctx->image_id == 41
+                  || ctx->image_id == 44;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
@@ -5845,13 +5902,16 @@ void spu_indirect_branch(spu_context* ctx)
                 ((uint32_t)ctx->ls[(frontier_record + 5u) & SPU_LS_MASK] << 16) |
                 ((uint32_t)ctx->ls[(frontier_record + 6u) & SPU_LS_MASK] << 8) |
                 (uint32_t)ctx->ls[(frontier_record + 7u) & SPU_LS_MASK];
-            if (jimg == 15 && jpc == 0x1EC00u) {
+            if (jimg == 15 &&
+                (jpc == 0x1EC00u || jpc == 0x3BC00u)) {
                 yz_frontier_trace_arm(
                     ctx->spu_id, ctx->pc & SPU_LS_MASK,
                     frontier_binary, jpc, (uint32_t)jimg,
                     frontier_record);
             }
-            if (yz_frontier_trace_is_armed()) {
+            if (yz_frontier_trace_is_armed() &&
+                yz_frontier_job_select_relevant(
+                    ctx, jimg, frontier_binary)) {
                 yz_frontier_trace_emit(
                     YZ_FT_SPU_JOB_SELECT, ctx->spu_id,
                     ctx->pc & SPU_LS_MASK,
@@ -6722,7 +6782,8 @@ void spu_indirect_branch(spu_context* ctx)
                          || ctx->image_id == 34 || ctx->image_id == 35
                          || ctx->image_id == 36 || ctx->image_id == 37
                          || ctx->image_id == 38 || ctx->image_id == 39
-                         || ctx->image_id == 40 || ctx->image_id == 41;
+                         || ctx->image_id == 40 || ctx->image_id == 41
+                         || ctx->image_id == 44;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
@@ -6752,7 +6813,8 @@ void spu_indirect_branch(spu_context* ctx)
                             || s_registry[i].image_id == 38
                             || s_registry[i].image_id == 39
                             || s_registry[i].image_id == 40
-                            || s_registry[i].image_id == 41))
+                            || s_registry[i].image_id == 41
+                            || s_registry[i].image_id == 44))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }
