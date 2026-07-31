@@ -115,6 +115,19 @@ option(YZ_SPU_FAST_JOB_C "every Job C placement from region-lifted FAST sources.
 option(YZ_SPU_FAST_JOB_D "every Job D placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_ORPHANAGE "every orphanage-worker placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_SPURS_EXPERIMENTAL "EXPERIMENTAL: the five libsre SPURS payloads (kernel2/sysservice/policy/job_module/ts_exit) from region-lifted FAST sources -- an LLE oracle/fallback lane for the native-HLE track, not its destination." OFF)
+option(YZ_SPU_FAST_SPURS_KERNEL2 "Bisect override: region-lift only spurs_kernel2." OFF)
+option(YZ_SPU_FAST_SPURS_SYSSERVICE "Bisect override: region-lift only spurs_sysservice." OFF)
+option(YZ_SPU_FAST_SPURS_POLICY "Bisect override: region-lift only policy_module." OFF)
+option(YZ_SPU_FAST_SPURS_JOB_MODULE "Bisect override: region-lift only job_module." OFF)
+option(YZ_SPU_FAST_SPURS_TS_EXIT "Bisect override: region-lift only ts_exit." OFF)
+
+if(YZ_SPU_FAST_SPURS_EXPERIMENTAL)
+    set(YZ_SPU_FAST_SPURS_KERNEL2 ON)
+    set(YZ_SPU_FAST_SPURS_SYSSERVICE ON)
+    set(YZ_SPU_FAST_SPURS_POLICY ON)
+    set(YZ_SPU_FAST_SPURS_JOB_MODULE ON)
+    set(YZ_SPU_FAST_SPURS_TS_EXIT ON)
+endif()
 
 # _yz_spu_pick(<listvar> <fast_flag> <diag_path> <stem>): append either the
 # instruction-lifted DIAG source or its tracked region-lifted twin.
@@ -132,9 +145,11 @@ endfunction()
 # placement set below is the FULL active inventory (matches the
 # a010-performance build; image ids in tools/spu_region_manifest.json).
 set(SPU_KERNELS "")
-foreach(stem spurs_kernel2 spurs_sysservice policy_module job_module ts_exit)
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_EXPERIMENTAL "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_KERNEL2 "${PS3RECOMP_DIR}/yakuza/generated/diag/spurs_kernel2.c" spurs_kernel2)
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_SYSSERVICE "${PS3RECOMP_DIR}/yakuza/generated/diag/spurs_sysservice.c" spurs_sysservice)
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_POLICY "${PS3RECOMP_DIR}/yakuza/generated/diag/policy_module.c" policy_module)
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_JOB_MODULE "${PS3RECOMP_DIR}/yakuza/generated/diag/job_module.c" job_module)
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_TS_EXIT "${PS3RECOMP_DIR}/yakuza/generated/diag/ts_exit.c" ts_exit)
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST "${PS3RECOMP_DIR}/yakuza/generated/diag/gs_task.c" gs_task)          # game render task, EBOOT img #3 @0x0127A580, image 0
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_CRI "${PS3RECOMP_DIR}/yakuza/generated/diag/cri_audio.c" cri_audio)  # SOFDEC/ADX codec task, image 3
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_WKL4 "${PS3RECOMP_DIR}/yakuza/generated/diag/wkl4_task.c" wkl4_task) # 4-task worker pool, image 4
