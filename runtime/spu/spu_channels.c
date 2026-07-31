@@ -2890,8 +2890,10 @@ typedef struct {
  * job relocations now exceed 262144 lifted functions.  Hitting the old cap
  * dropped the later gs_task registration and parked the renderer at its first
  * PRESENT.  Keep one power-of-two tier of headroom for additional measured
- * relocations; this table is static process memory and remains cheap. */
-#define SPU_FN_REGISTRY_MAX 524288
+ * relocations. The exact Job D 0x2B800 lift raised the measured working set
+ * past 524288, which dropped every later image before boot. Keep the next
+ * power-of-two tier; this table is static process memory and remains cheap. */
+#define SPU_FN_REGISTRY_MAX 1048576
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
 
@@ -4775,7 +4777,7 @@ static spu_fn spu_lookup_apply_job_guard(uint32_t addr, int image_id,
             || image_id == 32 || image_id == 33 || image_id == 34
             || image_id == 35 || image_id == 36 || image_id == 37
             || image_id == 38 || image_id == 39 || image_id == 40
-            || image_id == 41 || image_id == 44)
+            || image_id == 41 || image_id == 44 || image_id == 45)
             && addr >= 0x4880u && wildcard) {
         const int ok = g_yz_runtime_config.job_wildcard_ok;
         static int wl = 0; if (wl < 32) { wl++;
@@ -5492,7 +5494,7 @@ void spu_indirect_branch(spu_context* ctx)
                   || ctx->image_id == 36 || ctx->image_id == 37
                   || ctx->image_id == 38 || ctx->image_id == 39
                   || ctx->image_id == 40 || ctx->image_id == 41
-                  || ctx->image_id == 44;
+                  || ctx->image_id == 44 || ctx->image_id == 45;
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
@@ -6783,7 +6785,7 @@ void spu_indirect_branch(spu_context* ctx)
                          || ctx->image_id == 36 || ctx->image_id == 37
                          || ctx->image_id == 38 || ctx->image_id == 39
                          || ctx->image_id == 40 || ctx->image_id == 41
-                         || ctx->image_id == 44;
+                         || ctx->image_id == 44 || ctx->image_id == 45;
         for (uint32_t i = 0; i < s_registry_count; i++)
             if (s_registry[i].addr == la && s_registry[i].image_id != ctx->image_id) {
                 if (!from_jobworld
@@ -6814,7 +6816,8 @@ void spu_indirect_branch(spu_context* ctx)
                             || s_registry[i].image_id == 39
                             || s_registry[i].image_id == 40
                             || s_registry[i].image_id == 41
-                            || s_registry[i].image_id == 44))
+                            || s_registry[i].image_id == 44
+                            || s_registry[i].image_id == 45))
                     continue;
                 foreign++; foreign_img = s_registry[i].image_id; ffn = s_registry[i].fn;
                 if (s_registry[i].image_id == 2) { pol_seen = 1; pol_fn = s_registry[i].fn; }

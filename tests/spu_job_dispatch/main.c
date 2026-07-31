@@ -85,6 +85,8 @@ int main(void)
                  18, 0x2C400u, 0x01265180u, 36);
     expect_image("job D live 2B400 frontier slot",
                  18, 0x2B400u, 0x01265180u, 29);
+    expect_image("job D failed-dialogue 2B800 slot",
+                 18, 0x2B800u, 0x01265180u, 45);
     expect_image("job D live 2D400 frontier slot",
                  18, 0x2D400u, 0x01265180u, 31);
     expect_image("job D live 2E800 frontier slot",
@@ -200,6 +202,8 @@ int main(void)
                           3, 0x2C400u, 36);
     expect_resident_image("job D internal call at 2B400",
                           3, 0x2B400u, 29);
+    expect_resident_image("job D internal call at 2B800",
+                          3, 0x2B800u, 45);
     expect_resident_image("job D internal call at 2D400",
                           3, 0x2D400u, 31);
     expect_resident_image("job D internal call at 2E800",

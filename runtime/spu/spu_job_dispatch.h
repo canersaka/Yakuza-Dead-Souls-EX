@@ -28,7 +28,7 @@ static inline int spu_job_descriptor_image(
         current_image == 38 || current_image == 39 ||
         current_image == 40 || current_image == 41 ||
         current_image == 42 || current_image == 43 ||
-        current_image == 44;
+        current_image == 44 || current_image == 45;
 
     if (!job_family)
         return -1;
@@ -91,6 +91,8 @@ static inline int spu_job_descriptor_image(
                 return 25;
             if (entry_pc == 0x2B400u)
                 return 29;
+            if (entry_pc == 0x2B800u)
+                return 45;
             if (entry_pc == 0x27400u)
                 return 32;
             if (entry_pc == 0x2A800u)
@@ -150,6 +152,7 @@ static inline int spu_job_descriptor_slot(int image)
         case 41: return 0;
         case 43: return 1;
         case 44: return 4;
+        case 45: return 3;
         case 19: return 4;
         default: return -1;
     }
@@ -187,6 +190,7 @@ static inline uint32_t spu_job_descriptor_span(int image)
         case 42: return 0x10610u;
         case 43: return 0x14C0u;
         case 44: return 0x1E80u;
+        case 45: return 0x10610u;
         case 19: return 0x1E80u;
         default: return 0;
     }
@@ -226,6 +230,7 @@ static inline int spu_job_resident_image(int slot, uint32_t base)
             if (base == 0x15800u) return 25;
             if (base == 0x05000u) return 26;
             if (base == 0x2B400u) return 29;
+            if (base == 0x2B800u) return 45;
             if (base == 0x27400u) return 32;
             if (base == 0x2A800u) return 33;
             if (base == 0x2D400u) return 31;
