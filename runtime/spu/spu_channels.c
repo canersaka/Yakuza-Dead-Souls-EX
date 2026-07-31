@@ -4123,46 +4123,9 @@ void yz_slotstore_log(uint32_t addr, unsigned long long val, int width, void* ra
 unsigned long g_yz_dlist_w = 0;  /* cap for the [dlist-w] log */
 uint32_t g_yz_taskset_ea = 0;    /* EA of the gs_task CellSpursTaskset (bitset line); captured from the task_info DMA */
 
-/* fn-pointer hash slots. MUST exceed the total number of lifted SPU functions
- * across ALL images, else spu_prof_insert()'s open-addressing probe never finds
- * an empty slot and spins forever. With --seed-all on the policy + task modules
- * the total reaches ~45k (gs_task ~9k, cri_audio ~32k), so size generously. */
-#define SPU_PROF_HSZ   (1u << 17)      /* 131072 slots */
-static void*    s_p_fn[SPU_PROF_HSZ];
-static uint32_t s_p_addr[SPU_PROF_HSZ];
-
 #define SPU_PROF_SLOTS 0x10000UL       /* one per (LS addr >> 2), 256 KB LS */
 static unsigned long s_prof_hist[SPU_PROF_SLOTS];
 static unsigned long s_prof_hops = 0;
-
-static unsigned p_hash(void* fn)
-{
-    uintptr_t p = (uintptr_t)fn;
-    p ^= p >> 17; p *= 0x9E3779B1u; p ^= p >> 13;
-    return (unsigned)p & (SPU_PROF_HSZ - 1);
-}
-
-static void spu_prof_insert(uint32_t addr, spu_fn fn)
-{
-    unsigned h = p_hash((void*)fn);
-    /* Guard against a full table: bounded probe so a future overflow degrades
-     * spu_prof_addr_of() (a diagnostic) instead of hanging registration. */
-    for (unsigned probes = 0; probes < SPU_PROF_HSZ; probes++) {
-        if (!s_p_fn[h]) { s_p_fn[h] = (void*)fn; s_p_addr[h] = addr; return; }
-        if (s_p_fn[h] == (void*)fn) { s_p_addr[h] = addr; return; }
-        h = (h + 1) & (SPU_PROF_HSZ - 1);
-    }
-}
-
-static uint32_t spu_prof_addr_of(void* fn)
-{
-    unsigned h = p_hash(fn);
-    for (unsigned probes = 0; probes < SPU_PROF_HSZ && s_p_fn[h]; probes++) {
-        if (s_p_fn[h] == fn) return s_p_addr[h];
-        h = (h + 1) & (SPU_PROF_HSZ - 1);
-    }
-    return 0xFFFFFFFFu;
-}
 
 static void spu_prof_dump(void)
 {
@@ -4633,9 +4596,14 @@ void spu_task_launch_check(spu_context* ctx, uint32_t pc)
      * spu_indirect_branch (bi savedContextLr, pc>=0x3000 under image 2). */
 }
 
-void spu_prof_hop(void* fn)
+void spu_prof_hop(void* host_fn)
 {
-    uint32_t a = spu_prof_addr_of(fn);
+    /* Region functions represent many entry PCs with one host pointer.  The
+     * architectural PC already materialized by every trampoline setter is the
+     * only identity that remains exact in both instruction and region modes. */
+    spu_context* ctx = g_spu_cur_ctx;
+    uint32_t a = ctx ? (ctx->pc & SPU_LS_MASK) : 0xFFFFFFFFu;
+    (void)host_fn;
     if (a < SPU_PROF_SLOTS * 4u) s_prof_hist[a >> 2]++;
     /* DIAG: gs_task executes via the trampoline (not spu_indirect_branch), so
      * log its trampoline-target sequence here -- the entry (should be 0x3050)
@@ -4748,7 +4716,6 @@ void spu_register_function(uint32_t addr, spu_fn fn)
             fflush(stderr); }
         abort();
     }
-    spu_prof_insert(addr, fn);
 }
 
 /* Shared exact/wildcard decision, applied identically after either the sorted
