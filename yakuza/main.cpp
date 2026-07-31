@@ -160,6 +160,7 @@ extern "C" void spu_recomp_register_jobbin_orphanage_e400(void);
 extern "C" void spu_recomp_register_jobbin_orphanage_2d800(void);
 extern "C" void spu_recomp_register_jobbin_orphanage_3b000(void);
 extern "C" void spu_recomp_register_jobbin_orphanage_3bc00(void);
+extern "C" void spu_recomp_register_jobbin_orphanage_3c000(void);
 extern "C" void spu_recomp_register_jobbin_orphanage_3cc00(void);
 extern "C" void spu_recomp_register_jobbin_orphanage_37c00(void);
 /* recomp_prx/cri_audio.c (generated) — the CRI SOFDEC/ADX audio codec task
@@ -3508,6 +3509,7 @@ int main(int argc, char** argv)
     spu_recomp_register_jobbin_orphanage_2d800();                 /*   ...same binary at the live Kamurocho slot 0x2D800 */
     spu_recomp_register_jobbin_orphanage_3b000();                 /*   ...same binary at the live post-a030 slot 0x3B000 */
     spu_begin_image(44); spu_recomp_register_jobbin_orphanage_3bc00(); /* ...same binary at LS 0x3BC00; distinct id because it overlaps the 0x3B000 lift */
+    spu_begin_image(48); spu_recomp_register_jobbin_orphanage_3c000(); /* exact failed-dialogue LS 0x3C000 identity */
     spu_begin_image(46); spu_recomp_register_jobbin_orphanage_3cc00(); /* exact failed-dialogue LS 0x3CC00 identity */
     spu_begin_image(19);
     spu_recomp_register_jobbin_orphanage_37c00();                 /*   ...same binary at the live Kamurocho slot 0x37C00 */
