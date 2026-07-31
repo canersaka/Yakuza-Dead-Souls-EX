@@ -34,6 +34,35 @@ sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 
+static uint64_t bswap64(uint64_t v);
+
+void yz_frontier_event_snapshot(void)
+{
+    const sys_event_queue_info* q = &g_sys_event_queues[1];
+    const uint64_t bits = bswap64(
+        *(const uint64_t*)vm_to_host(0x4019C680u));
+    const uint32_t bits_hi = (uint32_t)(bits >> 32);
+    const uint32_t bits_lo = (uint32_t)bits;
+
+    yz_frontier_trace_emit(
+        YZ_FT_EVENT_STATE, 0, 2,
+        (uint32_t)q->active,
+        ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
+        ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
+        bits_hi, bits_lo, (uint32_t)q->capacity);
+
+    for (uint32_t i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
+        const sys_event_flag_info* f = &g_sys_event_flags[i];
+        if (!f->active)
+            continue;
+        yz_frontier_trace_emit(
+            YZ_FT_EVENT_STATE, i + 1u, 0,
+            (uint32_t)(f->pattern >> 32),
+            (uint32_t)f->pattern, (uint32_t)f->waiters,
+            f->protocol, f->type, (uint32_t)f->force_cancelled);
+    }
+}
+
 static void yz_frontier_queue_record(uint32_t phase, uint32_t queue_id,
                                      const sys_event_queue_info* q,
                                      const sys_event_t* evt)

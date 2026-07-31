@@ -3222,6 +3222,9 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
         }
 
         if (now - unchanged_since >= 5000u) {
+            yz_frontier_fifo_snapshot(get, put);
+            yz_frontier_spu_snapshot();
+            yz_frontier_event_snapshot();
             yz_frontier_trace_emit(
                 YZ_FT_STALL, 0, 0,
                 get, put, fence, frame,

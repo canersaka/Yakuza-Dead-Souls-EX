@@ -26,7 +26,14 @@ enum yz_frontier_event_type {
     YZ_FT_EVENT_QUEUE,
     YZ_FT_SPU_HALT,
     YZ_FT_RSX_STATE,
-    YZ_FT_STALL
+    YZ_FT_STALL,
+    YZ_FT_FIFO_PARK,
+    YZ_FT_FIFO_STATE,
+    YZ_FT_FIFO_PUBLICATION,
+    YZ_FT_SPU_STATE,
+    YZ_FT_SPU_JOB_STATE,
+    YZ_FT_SPU_MFC_STATE,
+    YZ_FT_EVENT_STATE
 };
 
 enum yz_frontier_queue_phase {
@@ -50,6 +57,15 @@ void yz_frontier_trace_emit(uint32_t type, uint32_t actor, uint32_t pc,
 
 /* One-shot dump. Returns 1 only for the caller that performed the dump. */
 int yz_frontier_trace_dump(uint32_t reason);
+
+/*
+ * One-shot, read-only snapshots taken by the watchdog immediately before a
+ * stall dump. They append compact records to the same ring; they never
+ * format, allocate, or write files themselves.
+ */
+void yz_frontier_fifo_snapshot(uint32_t get, uint32_t put);
+void yz_frontier_spu_snapshot(void);
+void yz_frontier_event_snapshot(void);
 
 #ifdef __cplusplus
 }
