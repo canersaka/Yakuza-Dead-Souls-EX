@@ -2385,6 +2385,19 @@ static void yz_movie_complete(LONG serial)
     ReleaseSRWLockExclusive(&g_movie_open_lock);
 }
 
+/* The FIFO consumer is the sole guest caller of rsx_live_draw_method(), and
+ * it holds g_rsx_fifo_lock across each complete method dispatch.  Take that
+ * same lock while transferring command-list ownership to or from the host
+ * movie thread.  This drains any in-flight guest Close/reset and prevents a
+ * new one from starting during the handoff, without adding synchronization
+ * to the per-method render hot path. */
+static void yz_movie_set_live_draw_mode(int on)
+{
+    yz_rsx_fifo_acquire();
+    rsx_live_draw_set_movie_mode(on);
+    yz_rsx_fifo_release();
+}
+
 static void yz_play_queued_movie(const char* path, LONG serial)
 {
     if (!rsx_live_draw_enabled() || !movie_ffmpeg_available())
@@ -2443,7 +2456,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
             mwply_hle ? "mwPly HLE" : "fd bridge",
             accept_fast ? ", acceptance=single-frame" : "");
     fflush(stderr);
-    rsx_live_draw_set_movie_mode(1);
+    yz_movie_set_live_draw_mode(1);
     cellPad_host_movie_skip_begin();
     for (;;) {
         if (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) != serial) {
@@ -2602,7 +2615,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     if (host_audio)
         cellAudioHostStreamStop();
     InterlockedCompareExchange(&g_movie_presenting_serial, 0, serial);
-    rsx_live_draw_set_movie_mode(0);
+    yz_movie_set_live_draw_mode(0);
     movie_close(mv);
     /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
      * source EOS before Stop completion, but it does not manufacture a GPU
@@ -2674,7 +2687,7 @@ static DWORD WINAPI yz_window_thread(LPVOID)
             int fps = (int)(movie_framerate(mv) + 0.5); if (fps <= 0) fps = 30;
             const DWORD frame_ms = (DWORD)(1000 / fps);
             fprintf(stderr, "[movie] YZ_MOVIE_TEST playing %s (%ux%u @ %dfps)\n", mvpath, w, h, fps);
-            rsx_live_draw_set_movie_mode(1);
+            yz_movie_set_live_draw_mode(1);
             int n = 0;
             for (;;) {
                 const uint8_t* rgba = movie_next_rgba(mv, nullptr);
@@ -2692,7 +2705,7 @@ static DWORD WINAPI yz_window_thread(LPVOID)
             }
             fprintf(stderr, "[movie] done (%d frames presented)\n", n);
             movie_close(mv);
-            rsx_live_draw_set_movie_mode(0);
+            yz_movie_set_live_draw_mode(0);
         } else {
             fprintf(stderr, "[movie] movie_open('%s') failed (ffmpeg_available=%d)\n",
                     mvpath, movie_ffmpeg_available());

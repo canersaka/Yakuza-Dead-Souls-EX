@@ -211,6 +211,10 @@ if(PS3RECOMP_BUILD_TESTS)
             NAME stage_transform_producer_replay
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_stage_transform_producer.py"
         )
+        add_test(
+            NAME movie_fifo_handoff
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_movie_handoff.py"
+        )
         set_tests_properties(
             ppu_lifter_conformance
             spu_lifter_conformance
@@ -225,6 +229,13 @@ if(PS3RECOMP_BUILD_TESTS)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 30
                 LABELS "regression;renderer"
+        )
+        set_tests_properties(
+            movie_fifo_handoff
+            PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 30
+                LABELS "regression;renderer;movie"
         )
     endif()
 endif()
