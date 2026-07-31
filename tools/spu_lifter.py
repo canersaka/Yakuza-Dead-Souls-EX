@@ -277,6 +277,22 @@ def compute_bi_r0_jumps(insns, logical_bounds) -> set:
     return jumps
 
 
+def derive_region_prefix(func_prefix: str) -> str:
+    """s50: the region-mode symbol namespace derived from an image's
+    --func-prefix. 'spu_func_' maps to the historical bare 'spu_region_'
+    (byte-compatible with the original gs_task fast lift); any other
+    'spu_X_' maps to 'spu_region_X_'; prefixes without the 'spu_' spelling
+    (cri_audio_, spuimg6_, wkl4_) are appended whole. Every distinct
+    func-prefix yields a distinct region prefix, so images that link
+    together stay collision-free in region mode exactly as they are in
+    per-instruction mode."""
+    if func_prefix == "spu_func_":
+        return "spu_region_"
+    if func_prefix.startswith("spu_"):
+        return "spu_region_" + func_prefix[len("spu_"):]
+    return "spu_region_" + func_prefix
+
+
 def form_regions(insns: list[SPUInstruction], region_starts: set, cap: int) -> list[tuple[int, int]]:
     """s41 SPU REGION LIFT (--regions): split the (dense, 4-aligned) image
     instruction stream into regions per the reviewed design -- split at (a)
@@ -332,6 +348,25 @@ class SPULifter:
         # ~0 for a fully-covered single-image lift like gs_task -- surfaced in
         # the CLI summary so a nonzero count is visible, not silent).
         self.region_fallback_hits = 0
+        # s50 MASS REGION LIFT: per-image region symbol prefix. gs_task (the
+        # first region image) shipped in the bare "spu_region_" namespace;
+        # every LATER region-lifted image derives a distinct prefix from its
+        # --func-prefix (see main()) so images sharing LS bases (three libsre
+        # modules at 0xA00; the job binaries' overlapping slot bases) cannot
+        # collide at link time -- the same collision --func-prefix already
+        # solves for the per-instruction lift.
+        self.region_prefix = "spu_region_"
+        # s50 split fallback accounting: a cross-region target OUTSIDE the
+        # lifted image span is the architecture's legitimate cross-image path
+        # (the global indirect dispatcher resolves it at runtime, exactly like
+        # the DIAG extern stubs); a target INSIDE the span that misses the
+        # region map would be a lifter hole. --regions-strict fails on the
+        # internal class and reports the external one.
+        self.image_span = None                    # (lo, hi) or None
+        self.region_fallback_internal = []        # [(site_pc, tgt), ...]
+        self.region_fallback_external = []        # [(site_pc, tgt), ...]
+        self.cross_region_branch_sites = 0        # trampoline sets to a region symbol
+        self.cross_region_call_sites = 0          # direct region calls (brsl/brasl)
         self.header_name = "spu_recomp.h"   # what emit_source #includes
         self.register_name = "spu_recomp_register"  # global init fn name
         # Per-image C symbol prefix for the emitted functions. Images that load
@@ -399,6 +434,17 @@ class SPULifter:
         return func
 
     # ------------------------------------------------------------------ #
+    def _region_fallback(self, site, tgt):
+        """s50: record a cross-region target missing from the region owner
+        map, split by whether it lies inside the lifted image span (a lifter
+        hole -- --regions-strict fails on these) or outside it (the normal
+        cross-image indirect-dispatch path, reported but legal)."""
+        self.region_fallback_hits += 1
+        if self.image_span is not None and self.image_span[0] <= tgt < self.image_span[1]:
+            self.region_fallback_internal.append((site, tgt))
+        else:
+            self.region_fallback_external.append((site, tgt))
+
     def lift_region(self, insns: list[SPUInstruction], start: int, end: int,
                      pc_to_region: dict) -> LiftedFunction:
         """s41 SPU REGION LIFT (--regions): emit ONE region-spanning function
@@ -418,7 +464,7 @@ class SPULifter:
             [REV] 1 emitter invariant) -- see the pc_to_region-guarded
             branches inside _translate()/_uncond_branch().
         """
-        func = LiftedFunction(name=f"spu_region_{start:08X}", start_addr=start, end_addr=end)
+        func = LiftedFunction(name=f"{self.region_prefix}{start:08X}", start_addr=start, end_addr=end)
         region_insns = sorted((i for i in insns if start <= i.addr < end), key=lambda x: x.addr)
 
         # Entry switch: case every registered pc in the region (dense ->
@@ -431,7 +477,7 @@ class SPULifter:
         func.body_lines.append("default:")
         func.body_lines.append(
             f'    fprintf(stderr, "[spu-region] pc=0x%05X not a case in '
-            f'spu_region_{start:08X} (image=%d)\\n", ctx->pc, ctx->image_id); '
+            f'{self.region_prefix}{start:08X} (image=%d)\\n", ctx->pc, ctx->image_id); '
             f'fflush(stderr);')
         func.body_lines.append("    spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);")
         func.body_lines.append("    return;")
@@ -453,9 +499,10 @@ class SPULifter:
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in pc_to_region):
+            self.cross_region_branch_sites += 1
             func.body_lines.append(
                 f"    {{ ctx->pc = 0x{end:X}u; g_spu_trampoline_fn = "
-                f"spu_region_{end:08X}; return; }}")
+                f"{self.region_prefix}{end:08X}; return; }}")
 
         self.functions.append(func)
         return func
@@ -756,7 +803,7 @@ class SPULifter:
             if tgt == addr:
                 pc_set = f"ctx->pc = 0x{addr:X}u; " if pc_to_region is not None else ""
                 return f"{pc_set}ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
-            return self._uncond_branch(tgt, func, pc_to_region)
+            return self._uncond_branch(tgt, func, pc_to_region, site=addr)
         if mn in ("brsl", "brasl"):
             # The disassembler drops the link register from brsl operands, so
             # recover it from the raw encoding (rt = bits 25-31 = raw & 0x7F).
@@ -783,7 +830,7 @@ class SPULifter:
             # landed back inside its own clear loop, running it with a stale count).
             # Treat it as: set the link, then fall through to addr+4.
             if tgt == addr + 4:
-                return f"{link} {self._uncond_branch(addr + 4, func, pc_to_region)}"
+                return f"{link} {self._uncond_branch(addr + 4, func, pc_to_region, site=addr)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 # Call, then drain any tail-call the callee left pending so
@@ -807,13 +854,14 @@ class SPULifter:
                     owner = pc_to_region.get(tgt)
                     pc_set = f"ctx->pc = 0x{tgt:X}u; "
                     if owner is not None:
-                        callee = f"spu_region_{owner:08X}(ctx);"
+                        self.cross_region_call_sites += 1
+                        callee = f"{self.region_prefix}{owner:08X}(ctx);"
                     else:
                         # Not found in this image's region map (should not
                         # happen for a fully-covered single-image lift) --
                         # fall back to the global indirect dispatcher instead
                         # of guessing an unlinkable symbol name.
-                        self.region_fallback_hits += 1
+                        self._region_fallback(addr, tgt)
                         callee = "spu_indirect_branch(ctx);"
                 else:
                     pc_set = ""
@@ -843,9 +891,10 @@ class SPULifter:
                 owner = pc_to_region.get(tgt)
                 pc_set = f"ctx->pc = 0x{tgt:X}u; "
                 if owner is not None:
-                    tgt_sym = f"spu_region_{owner:08X}"
+                    self.cross_region_branch_sites += 1
+                    tgt_sym = f"{self.region_prefix}{owner:08X}"
                 else:
-                    self.region_fallback_hits += 1
+                    self._region_fallback(addr, tgt)
                     tgt_sym = "spu_indirect_branch"
             else:
                 pc_set = ""
@@ -946,7 +995,8 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
-    def _uncond_branch(self, tgt, func: LiftedFunction, pc_to_region: dict = None) -> str:
+    def _uncond_branch(self, tgt, func: LiftedFunction, pc_to_region: dict = None,
+                       site: int = None) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
         if func.start_addr <= tgt < func.end_addr:
@@ -960,9 +1010,10 @@ class SPULifter:
             owner = pc_to_region.get(tgt)
             pc_set = f"ctx->pc = 0x{tgt:X}u; "
             if owner is not None:
-                tgt_sym = f"spu_region_{owner:08X}"
+                self.cross_region_branch_sites += 1
+                tgt_sym = f"{self.region_prefix}{owner:08X}"
             else:
-                self.region_fallback_hits += 1
+                self._region_fallback(site, tgt)
                 tgt_sym = "spu_indirect_branch"
         else:
             pc_set = ""
@@ -1066,7 +1117,7 @@ class SPULifter:
         lines.append("static const spu_func_entry spu_function_table[] = {")
         for addr in sorted(pc_to_region.keys()):
             owner = pc_to_region[addr]
-            lines.append(f'    {{ 0x{addr:08X}u, spu_region_{owner:08X}, "spu_region_{owner:08X}" }},')
+            lines.append(f'    {{ 0x{addr:08X}u, {self.region_prefix}{owner:08X}, "{self.region_prefix}{owner:08X}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
@@ -1140,6 +1191,24 @@ def main() -> None:
                         "(design [REV] 7 / review R4: start at 256-512, raise "
                         "only after measuring /O2 compile time). Only used "
                         "with --regions.")
+    p.add_argument("--region-prefix", default=None,
+                   help="C symbol prefix for emitted REGION functions. Default: "
+                        "derived from --func-prefix ('spu_func_' -> 'spu_region_', "
+                        "byte-compatible with the original gs_task fast lift; "
+                        "'spu_jobAE4_' -> 'spu_region_jobAE4_'; 'cri_audio_' -> "
+                        "'spu_region_cri_audio_') so images sharing LS bases get "
+                        "distinct region namespaces automatically.")
+    p.add_argument("--regions-strict", action="store_true",
+                   help="With --regions: fail (exit 1) unless the lift is "
+                        "airtight -- no IN-IMAGE cross-region target missing "
+                        "from the region map, no brsl/brasl dropped as a no-op, "
+                        "no TODO-emitted instruction. Targets OUTSIDE the lifted "
+                        "image span stay legal (the runtime's cross-image "
+                        "indirect-dispatch path) and are reported, not fatal.")
+    p.add_argument("--metrics-json", metavar="FILE", default=None,
+                   help="With --regions: write machine-readable lift metrics "
+                        "(regions, sizes, transfer-site counts, fallback split, "
+                        "unsupported census) to FILE.")
     args = p.parse_args()
 
     if args.regions and args.trace:
@@ -1220,6 +1289,10 @@ def main() -> None:
     lifter.header_name = args.header_name
     lifter.register_name = args.register_name
     lifter.func_prefix = args.func_prefix
+    if args.regions:
+        # s50: region symbol namespace, derived from --func-prefix unless
+        # overridden, so overlapping-LS images cannot collide (see SPULifter).
+        lifter.region_prefix = args.region_prefix or derive_region_prefix(args.func_prefix)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, logical_bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1233,6 +1306,8 @@ def main() -> None:
         # s41 SPU REGION LIFT: split the WHOLE image into regions from the
         # real (pre-seed-all) function boundaries + a size cap, register
         # every pc -> containing region (design mechanic 1/3; review (g)).
+        addrs_all = sorted(i.addr for i in insns)
+        lifter.image_span = (addrs_all[0], addrs_all[-1] + 4) if addrs_all else None
         regions = form_regions(insns, region_starts, args.region_cap)
         pc_to_region: dict = {}
         for (rs, re_) in regions:
@@ -1255,7 +1330,7 @@ def main() -> None:
               f"{len(insns)} insn(s) total")
         for (rs, re_) in regions:
             n = sum(1 for a in range(rs, re_, 4) if a in pc_to_region)
-            print(f"      spu_region_{rs:08X} [0x{rs:X}, 0x{re_:X}): {n} insn(s)")
+            print(f"      {lifter.region_prefix}{rs:08X} [0x{rs:X}, 0x{re_:X}): {n} insn(s)")
         if lifter.region_fallback_hits:
             print(f"  WARNING: {lifter.region_fallback_hits} cross-region call/branch "
                   f"target(s) fell back to the global indirect dispatcher (not found "
@@ -1295,6 +1370,78 @@ def main() -> None:
             sys.exit(1)
         print(f"  PASS: emitter invariant holds -- {total_hops}/{total_hops} "
               f"g_spu_trampoline_fn site(s) have ctx->pc materialized first")
+
+        # s50: fallback split report. External (outside the lifted image span)
+        # is the legitimate cross-image indirect path -- reported, legal.
+        # Internal would be a lifter hole -- --regions-strict fails on it.
+        if lifter.region_fallback_external:
+            uniq = sorted({t for _s, t in lifter.region_fallback_external})
+            print(f"  note: {len(lifter.region_fallback_external)} cross-IMAGE target "
+                  f"site(s) (outside [0x{lifter.image_span[0]:X},0x{lifter.image_span[1]:X})) "
+                  f"route via spu_indirect_branch: "
+                  + ", ".join(f"0x{t:X}" for t in uniq[:8])
+                  + (" ..." if len(uniq) > 8 else ""))
+        if lifter.region_fallback_internal:
+            print(f"  ERROR-CLASS: {len(lifter.region_fallback_internal)} IN-IMAGE "
+                  f"cross-region target(s) missing from the region map: "
+                  + ", ".join(f"pc 0x{(s if s is not None else 0):X}->0x{t:X}"
+                              for s, t in lifter.region_fallback_internal[:8]))
+        if args.metrics_json:
+            src_lines = source_text.splitlines()
+            metrics = {
+                "source": args.source_name,
+                "register_name": args.register_name,
+                "func_prefix": args.func_prefix,
+                "region_prefix": lifter.region_prefix,
+                "base": base,
+                "image_span": list(lifter.image_span or ()),
+                "n_insns": len(insns),
+                "n_regions": len(regions),
+                "region_cap": args.region_cap,
+                "regions": [[rs, re_, sum(1 for a in range(rs, re_, 4) if a in pc_to_region)]
+                            for rs, re_ in regions],
+                "trampoline_sites": total_hops,
+                "cross_region_branch_sites": lifter.cross_region_branch_sites,
+                "cross_region_call_sites": lifter.cross_region_call_sites,
+                "indirect_tail_sites": sum(l.count("g_spu_trampoline_fn = spu_indirect_branch") for l in src_lines),
+                "indirect_call_or_fallback_sites": sum(l.count("spu_indirect_branch(ctx);") for l in src_lines),
+                "spu_ret_sites": source_text.count("SPU_RET(ctx);"),
+                "stop_sites": source_text.count("ctx->stop_code"),
+                "fallback_external": [[(s if s is not None else -1), t] for s, t in lifter.region_fallback_external],
+                "fallback_internal": [[(s if s is not None else -1), t] for s, t in lifter.region_fallback_internal],
+                "unresolved_calls": lifter.unresolved_calls,
+                "unsupported": lifter.unsupported,
+                "data_words": lifter.unsupported.get(".word", 0),
+                "bi_r0_jumps": sorted(lifter.bi_r0_jump),
+                "source_bytes": len(source_text),
+                "header_bytes": len(header_text),
+            }
+            with open(args.metrics_json, "w") as mf:
+                json.dump(metrics, mf, indent=1)
+            print(f"  metrics -> {args.metrics_json}")
+        if args.regions_strict:
+            strict_bad = []
+            if lifter.region_fallback_internal:
+                strict_bad.append(f"{len(lifter.region_fallback_internal)} in-image unresolved cross-region target(s)")
+            if lifter.unresolved_calls:
+                strict_bad.append(f"{len(lifter.unresolved_calls)} dropped brsl/brasl call(s)")
+            # `.word` entries are DATA embedded in .text (the boundary
+            # detector's documented coverage gap, e.g. gs_task's 25 words at
+            # 96.3% coverage), not instructions: they lift to the same TODO
+            # comment in the DIAG twin, so both modes behave identically if a
+            # wild jump ever reached one. Real unsupported MNEMONICS stay
+            # fatal under strict.
+            unsupported_real = {k: v for k, v in lifter.unsupported.items() if k != ".word"}
+            if unsupported_real:
+                strict_bad.append(f"{sum(unsupported_real.values())} TODO-lifted instruction(s): "
+                                  + ", ".join(sorted(unsupported_real)))
+            if strict_bad:
+                print("  STRICT FAIL: " + "; ".join(strict_bad))
+                sys.exit(1)
+            dw = lifter.unsupported.get(".word", 0)
+            print("  STRICT PASS: no in-image unresolved targets, no dropped calls, "
+                  "no TODO instructions"
+                  + (f" ({dw} data .word entries, twin-identical, exempt)" if dw else ""))
         return
 
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
