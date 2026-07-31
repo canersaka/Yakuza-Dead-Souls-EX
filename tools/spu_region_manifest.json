@@ -123,13 +123,18 @@
       "eboot_ea": "0x01252680",
       "eboot_size": "0x1E80",
       "eboot": "game/EBOOT.elf",
-      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated",
+      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated. Placement identity contract (07-30): a numeric PC alone does NOT identify a loaded job; the runtime must resolve (source identity, exact LS base) to a placement BEFORE mapping PC to a region. 0x3BC00 is both offset 0xC00 inside the 0x3B000 placement and offset 0 of the 0x3BC00 placement; range-based fallback to the older image is the diagnosed 07-30 live failure.",
       "placements": [
         { "stem": "job_bin_orphanage",       "base": "0x4C00",  "diag": "yakuza/generated/job_bin_orphanage.c",       "image_id": 19 },
         { "stem": "job_bin_orphanage_e400",  "base": "0xE400",  "diag": "yakuza/generated/job_bin_orphanage_e400.c",  "image_id": 19 },
         { "stem": "job_bin_orphanage_2d800", "base": "0x2D800", "diag": "yakuza/generated/job_bin_orphanage_2d800.c", "image_id": 19 },
         { "stem": "job_bin_orphanage_37c00", "base": "0x37C00", "diag": "yakuza/generated/job_bin_orphanage_37c00.c", "image_id": 19 },
-        { "stem": "job_bin_orphanage_3b000", "base": "0x3B000", "diag": "yakuza/generated/job_bin_orphanage_3b000.c", "image_id": 19 }
+        { "stem": "job_bin_orphanage_3b000", "base": "0x3B000", "diag": "yakuza/generated/job_bin_orphanage_3b000.c", "image_id": 19 },
+        { "stem": "job_bin_orphanage_3bc00", "base": "0x3BC00", "diag": null,
+          "prefix": "spu_jobO3BC_", "register": "spu_recomp_register_jobbin_orphanage_3bc00",
+          "image_id": "44 (PROVISIONAL, main-thread runtime fix in flight; bind at reconciliation, do not treat as authoritative)",
+          "entry_evidence": "runtime handoff observed 07-30: launch branch target equals the new placement base (live_spu_state_at_freeze capture); entry delta 0",
+          "note": "placement observed live 07-30; NO shipped instruction twin exists, so the repro lane generates the instruction twin fresh and it becomes the correctness twin for this placement. Overlaps the 0x3B000 placement span; subject of the mandatory collision regression." }
       ]
     }
   }
