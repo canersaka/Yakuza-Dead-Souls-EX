@@ -132,26 +132,57 @@ extern "C" void spu_recomp_register_jobbin_b(void);
  * descriptor-assigned LS slots — MEASURED round-1 loads jobB (0x01275A00) at
  * LS 0x4C00 (scratch/idboot.err: jobbase B=0x04C00, resident head bytes
  * 43 49 4E = jobB's), while the original lifts are fixed-base (A@0x4C00,
- * B@0xE400). Each binary is therefore lifted at BOTH slot bases and both
- * registrations share the binary's image id (spans don't collide within an
- * image). Without these, spu_lookup's image-0 wildcard silently substituted
+ * B@0xE400). Each binary is therefore lifted at every observed slot base.
+ * Overlapping placements use distinct image ids while non-overlapping
+ * placements can share the binary's original image. Without these,
+ * spu_lookup's image-0 wildcard silently substituted
  * gs_task's code at the job site and the notify job never ran (the spup17/
  * event-flag wall, DONT_RECHASE #23). */
 extern "C" void spu_recomp_register_jobbin_a_e400(void);
+extern "C" void spu_recomp_register_jobbin_a_c400(void);
+extern "C" void spu_recomp_register_jobbin_a_24400(void);
+extern "C" void spu_recomp_register_jobbin_a_2a400(void);
 extern "C" void spu_recomp_register_jobbin_b_4c00(void);
 extern "C" void spu_recomp_register_jobbin_b_6c00(void);
+extern "C" void spu_recomp_register_jobbin_b_15400(void);
 extern "C" void spu_recomp_register_jobbin_b_15800(void);
+extern "C" void spu_recomp_register_jobbin_b_1ec00(void);
+extern "C" void spu_recomp_register_jobbin_b_37c00(void);
+extern "C" void spu_recomp_register_jobbin_b_39c00(void);
+extern "C" void spu_recomp_register_jobbin_b_3b000(void);
+extern "C" void spu_recomp_register_jobbin_b_3bc00(void);
 extern "C" void spu_recomp_register_jobbin_b_3d000(void);
+extern "C" void spu_recomp_register_jobbin_b_3dc00(void);
 /* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
- * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes);
- * the observed job-manager launch loads it at LS 0x17800. */
+ * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes).
+ * Every overlapping fixed-base lift has a distinct image id. */
+extern "C" void spu_recomp_register_jobbin_c_4c00(void);
+extern "C" void spu_recomp_register_jobbin_c_e400(void);
+extern "C" void spu_recomp_register_jobbin_c_15800(void);
 extern "C" void spu_recomp_register_jobbin_c_17800(void);
+extern "C" void spu_recomp_register_jobbin_c_1a800(void);
+extern "C" void spu_recomp_register_jobbin_c_1ac00(void);
+extern "C" void spu_recomp_register_jobbin_c_1b800(void);
+extern "C" void spu_recomp_register_jobbin_c_1d800(void);
+extern "C" void spu_recomp_register_jobbin_c_1e800(void);
 /* Sibling post-a030 job: its JOBCRT header declares a 0x10610-byte binary at
- * EBOOT EA 0x01265180; the live branch entered its head at LS 0xE400. */
-extern "C" void spu_recomp_register_jobbin_d_e400(void);
+ * EBOOT EA 0x01265180 and SPURS dispatches it at multiple overlapping slots. */
+extern "C" void spu_recomp_register_jobbin_d_4c00(void);
+extern "C" void spu_recomp_register_jobbin_d_5000(void);
 extern "C" void spu_recomp_register_jobbin_d_c400(void);
-extern "C" void spu_recomp_register_jobbin_d_2b800(void);
+extern "C" void spu_recomp_register_jobbin_d_e400(void);
+extern "C" void spu_recomp_register_jobbin_d_15800(void);
 extern "C" void spu_recomp_register_jobbin_d_15c00(void);
+extern "C" void spu_recomp_register_jobbin_d_20c00(void);
+extern "C" void spu_recomp_register_jobbin_d_23000(void);
+extern "C" void spu_recomp_register_jobbin_d_27400(void);
+extern "C" void spu_recomp_register_jobbin_d_2a800(void);
+extern "C" void spu_recomp_register_jobbin_d_2b400(void);
+extern "C" void spu_recomp_register_jobbin_d_2b800(void);
+extern "C" void spu_recomp_register_jobbin_d_2c400(void);
+extern "C" void spu_recomp_register_jobbin_d_2d400(void);
+extern "C" void spu_recomp_register_jobbin_d_2e400(void);
+extern "C" void spu_recomp_register_jobbin_d_2e800(void);
 /* Sunshine orphanage geometry worker. Its descriptor identifies the distinct
  * EBOOT binary at 0x01252680; treating it as Job A ran the wrong program at the
  * same LS 0x4C00 slot and produced malformed, incomplete scene commands. */
@@ -170,7 +201,7 @@ extern "C" void spu_recomp_register_jobbin_orphanage_37c00(void);
  * TaskInfo ELF EA when the SPURS kernel dispatches the codec taskset (wid 3). */
 extern "C" void cri_audio_register_functions(void);
 extern "C" void wkl4_register_functions(void);
-#include "../recomp_prx/spu_image_table.h"   /* generated: remaining EBOOT images + registry */
+#include "generated/spu_image_table.h"   /* generated: remaining EBOOT images + registry */
 extern "C" void spu_begin_image(int image_id);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
@@ -3494,16 +3525,47 @@ int main(int argc, char** argv)
     spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
     spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, slot base 0x4C00) */
     spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
+    spu_recomp_register_jobbin_a_24400();                 /*   ...same binary at non-overlapping LS 0x24400 */
+    spu_begin_image(41); spu_recomp_register_jobbin_a_2a400(); /* ...same binary at overlapping LS 0x2A400 */
+    spu_begin_image(39); spu_recomp_register_jobbin_a_c400(); /* ...same binary at overlapping LS 0xC400 */
     spu_begin_image(15); spu_recomp_register_jobbin_b();  /* jobchain notify job binary (EBOOT 0x01275A00, slot base 0xE400) */
     spu_recomp_register_jobbin_b_4c00();                  /*   ...same binary lifted at the other slot base 0x4C00 (same image) */
     spu_recomp_register_jobbin_b_6c00();                  /*   ...same binary relocated during a010 at slot base 0x6C00 */
+    spu_begin_image(24); spu_recomp_register_jobbin_b_15400(); /* ...overlapping LS 0x15400 */
+    spu_begin_image(15);
     spu_recomp_register_jobbin_b_15800();                 /*   ...same binary relocated post-a030 at slot base 0x15800 */
+    spu_recomp_register_jobbin_b_1ec00();                 /*   ...same binary at LS 0x1EC00 */
+    spu_recomp_register_jobbin_b_3bc00();                 /*   ...same binary at LS 0x3BC00 */
+    spu_recomp_register_jobbin_b_3dc00();                 /*   ...same binary at LS 0x3DC00 */
     spu_begin_image(43); spu_recomp_register_jobbin_b_3d000(); /* exact dialogue-completion placement; overlaps other Job B lifts */
-    spu_begin_image(17); spu_recomp_register_jobbin_c_17800(); /* post-a030 transition job (EBOOT 0x0125DA80, LS 0x17800) */
+    spu_begin_image(15); spu_recomp_register_jobbin_b_39c00(); /* ...same binary at LS 0x39C00 */
+    spu_begin_image(35); spu_recomp_register_jobbin_b_37c00(); /* ...overlapping LS 0x37C00 */
+    spu_begin_image(37); spu_recomp_register_jobbin_b_3b000(); /* ...overlapping LS 0x3B000 */
+    spu_begin_image(40); spu_recomp_register_jobbin_c_15800(); /* post-Kamurocho job at LS 0x15800 */
+    spu_begin_image(17); spu_recomp_register_jobbin_c_e400();  /* same binary at non-overlapping LS 0xE400 */
+    spu_recomp_register_jobbin_c_17800();                       /* same binary at LS 0x17800 */
+    spu_begin_image(20); spu_recomp_register_jobbin_c_1a800();
+    spu_begin_image(27); spu_recomp_register_jobbin_c_1ac00();
+    spu_begin_image(23); spu_recomp_register_jobbin_c_1b800();
+    spu_begin_image(22); spu_recomp_register_jobbin_c_1d800();
+    spu_begin_image(28); spu_recomp_register_jobbin_c_1e800();
+    spu_begin_image(38); spu_recomp_register_jobbin_c_4c00();
     spu_begin_image(18); spu_recomp_register_jobbin_d_e400();  /* sibling post-a030 job (EBOOT 0x01265180, LS 0xE400) */
-    spu_begin_image(42); spu_recomp_register_jobbin_d_c400();  /* same binary at LS 0xC400; overlaps Job D E400 and Job A C400 */
-    spu_begin_image(45); spu_recomp_register_jobbin_d_2b800(); /* same binary at failed-dialogue LS 0x2B800; overlapping image 45 */
-    spu_begin_image(47); spu_recomp_register_jobbin_d_15c00(); /* exact failed-dialogue LS 0x15C00 identity */
+    spu_recomp_register_jobbin_d_20c00();
+    spu_begin_image(42); spu_recomp_register_jobbin_d_c400();
+    spu_begin_image(26); spu_recomp_register_jobbin_d_5000();
+    spu_begin_image(21); spu_recomp_register_jobbin_d_4c00();
+    spu_begin_image(47); spu_recomp_register_jobbin_d_15c00(); /* exact later A010 instruction placement */
+    spu_recomp_register_jobbin_d_23000();
+    spu_begin_image(25); spu_recomp_register_jobbin_d_15800();
+    spu_begin_image(32); spu_recomp_register_jobbin_d_27400();
+    spu_begin_image(33); spu_recomp_register_jobbin_d_2a800();
+    spu_begin_image(34); spu_recomp_register_jobbin_d_2e400();
+    spu_begin_image(36); spu_recomp_register_jobbin_d_2c400();
+    spu_begin_image(29); spu_recomp_register_jobbin_d_2b400();
+    spu_begin_image(45); spu_recomp_register_jobbin_d_2b800(); /* exact later A010 instruction placement */
+    spu_begin_image(31); spu_recomp_register_jobbin_d_2d400();
+    spu_begin_image(30); spu_recomp_register_jobbin_d_2e800();
     spu_begin_image(19); spu_recomp_register_jobbin_orphanage(); /* a010 geometry job (EBOOT 0x01252680, LS 0x4C00) */
     spu_recomp_register_jobbin_orphanage_e400();                  /*   ...same binary at the shared alternate slot 0xE400 */
     spu_recomp_register_jobbin_orphanage_2d800();                 /*   ...same binary at the live Kamurocho slot 0x2D800 */
