@@ -1,0 +1,136 @@
+{
+  "_comment": [
+    "s50 mass-region-lift manifest: every ACTIVE compiled SPU image grouped by",
+    "unique underlying binary, with every supported local-store placement.",
+    "Placement inventory source: the a010-performance yakuza/CMakeLists.txt",
+    "SPU_KERNELS list (the running build) plus the master list; image_id values",
+    "are informational, transcribed from those CMake comments.",
+    "Symbol prefixes and register names are NOT listed here: gen_spu_regions.py",
+    "extracts them from each shipped instruction-lifted header, which is the",
+    "ground truth. 'diag' paths are the retained correctness twins (never",
+    "modified). Job placement inputs are re-derived from the family's raw",
+    "bytes (raw bin, a reference wrapped elf, or an EBOOT slice) and re-wrapped",
+    "per base; shipped per-placement elfs are used directly when present."
+  ],
+  "families": {
+    "task_images": {
+      "kind": "elf",
+      "description": "EBOOT-embedded SPURS task images, batch-lifted from scratch/spu_imgs (gen_spu_images.py command shape: --auto-functions <elf> --seed-all)",
+      "images": [
+        { "stem": "gs_task",   "elf": "scratch/spu_imgs/spu_0003_at_0126A580.elf", "diag": "recomp_prx/gs_task.c",   "image_id": 0,  "expect_handedit": true,
+          "note": "reference model; shipped recomp_prx/gs_task_fast.c is the validated s41 region lift (carries s42 hand-edit probes) and is left untouched" },
+        { "stem": "cri_audio", "elf": "scratch/spu_imgs/spu_0007_at_012A4980.elf", "diag": "recomp_prx/cri_audio.c", "image_id": 3 },
+        { "stem": "wkl4_task", "elf": "scratch/spu_imgs/spu_0005_at_01274200.elf", "diag": "recomp_prx/wkl4_task.c", "image_id": 4 },
+        { "stem": "spuimg_00", "elf": "scratch/spu_imgs/spu_0000_at_01266F00.elf", "diag": "recomp_prx/spuimg_00.c", "image_id": 5 },
+        { "stem": "spuimg_01", "elf": "scratch/spu_imgs/spu_0001_at_01268700.elf", "diag": "recomp_prx/spuimg_01.c", "image_id": 6 },
+        { "stem": "spuimg_02", "elf": "scratch/spu_imgs/spu_0002_at_01268E80.elf", "diag": "recomp_prx/spuimg_02.c", "image_id": 7 },
+        { "stem": "spuimg_04", "elf": "scratch/spu_imgs/spu_0004_at_01273300.elf", "diag": "recomp_prx/spuimg_04.c", "image_id": 8 },
+        { "stem": "spuimg_06", "elf": "scratch/spu_imgs/spu_0006_at_0127C780.elf", "diag": "recomp_prx/spuimg_06.c", "image_id": 9 },
+        { "stem": "spuimg_08", "elf": "scratch/spu_imgs/spu_0008_at_012CED00.elf", "diag": "recomp_prx/spuimg_08.c", "image_id": 10 },
+        { "stem": "spuimg_09", "elf": "scratch/spu_imgs/spu_0009_at_012D9780.elf", "diag": "recomp_prx/spuimg_09.c", "image_id": 11 }
+      ]
+    },
+    "sony": {
+      "kind": "elf",
+      "experimental": true,
+      "description": "libsre-embedded SPURS payloads. Region outputs are EXPERIMENTAL LLE oracles/fallbacks for the native-HLE track, not a permanent destination. spurs_kernel1 is deliberately absent (unused; excluded from the build).",
+      "images": [
+        { "stem": "spurs_kernel2",    "elf": "recomp_prx/spurs_kernel2.elf",    "diag": "recomp_prx/spurs_kernel2.c" },
+        { "stem": "spurs_sysservice", "elf": "recomp_prx/spurs_sysservice.elf", "diag": "recomp_prx/spurs_sysservice.c" },
+        { "stem": "policy_module",    "elf": "recomp_prx/policy_module.elf",    "diag": "recomp_prx/policy_module.c" },
+        { "stem": "job_module",       "elf": "recomp_prx/job_module.elf",       "diag": "recomp_prx/job_module.c" },
+        { "stem": "ts_exit",          "elf": "recomp_prx/ts_exit.elf",          "diag": "recomp_prx/ts_exit.c" }
+      ]
+    },
+    "job_a": {
+      "kind": "job",
+      "eboot_ea": "0x01254500",
+      "raw": "recomp_prx/jobA_raw.bin",
+      "ref_elf": "recomp_prx/job_bin_a.elf",
+      "description": "jobchain bulk-worker JOB binary (measured hop leader: ~72,988,243 instruction hops in the 07-30 clean aggregate window, user-reported)",
+      "placements": [
+        { "stem": "job_bin_a",       "base": "0x4C00",  "elf": "recomp_prx/job_bin_a.elf",      "diag": "recomp_prx/job_bin_a.c",       "image_id": 14 },
+        { "stem": "job_bin_a_e400",  "base": "0xE400",  "elf": "recomp_prx/job_bin_a_e400.elf", "diag": "recomp_prx/job_bin_a_e400.c",  "image_id": 14 },
+        { "stem": "job_bin_a_c400",  "base": "0xC400",  "diag": "recomp_prx/job_bin_a_c400.c",  "image_id": 39 },
+        { "stem": "job_bin_a_24400", "base": "0x24400", "diag": "recomp_prx/job_bin_a_24400.c", "image_id": 14 },
+        { "stem": "job_bin_a_2a400", "base": "0x2A400", "diag": "recomp_prx/job_bin_a_2a400.c", "image_id": 41 }
+      ]
+    },
+    "job_b": {
+      "kind": "job",
+      "eboot_ea": "0x01275A00",
+      "raw": "recomp_prx/jobB_raw.bin",
+      "ref_elf": "recomp_prx/job_bin_b.elf",
+      "description": "jobchain notify JOB binary; the high-LS placements are the post-movie / orphanage-era frontier slots",
+      "placements": [
+        { "stem": "job_bin_b",       "base": "0xE400",  "elf": "recomp_prx/job_bin_b.elf",       "diag": "recomp_prx/job_bin_b.c",       "image_id": 15 },
+        { "stem": "job_bin_b_4c00",  "base": "0x4C00",  "elf": "recomp_prx/job_bin_b_4c00.elf",  "diag": "recomp_prx/job_bin_b_4c00.c",  "image_id": 15 },
+        { "stem": "job_bin_b_6c00",  "base": "0x6C00",  "elf": "recomp_prx/job_bin_b_6c00.elf",  "diag": "recomp_prx/job_bin_b_6c00.c",  "image_id": 15 },
+        { "stem": "job_bin_b_15400", "base": "0x15400", "diag": "recomp_prx/job_bin_b_15400.c", "image_id": 24 },
+        { "stem": "job_bin_b_15800", "base": "0x15800", "elf": "recomp_prx/job_bin_b_15800.elf", "diag": "recomp_prx/job_bin_b_15800.c", "image_id": 15 },
+        { "stem": "job_bin_b_1ec00", "base": "0x1EC00", "diag": "recomp_prx/job_bin_b_1ec00.c", "image_id": 15 },
+        { "stem": "job_bin_b_37c00", "base": "0x37C00", "diag": "recomp_prx/job_bin_b_37c00.c", "image_id": 35 },
+        { "stem": "job_bin_b_39c00", "base": "0x39C00", "diag": "recomp_prx/job_bin_b_39c00.c", "image_id": 15 },
+        { "stem": "job_bin_b_3b000", "base": "0x3B000", "diag": "recomp_prx/job_bin_b_3b000.c", "image_id": 37 },
+        { "stem": "job_bin_b_3bc00", "base": "0x3BC00", "diag": "recomp_prx/job_bin_b_3bc00.c", "image_id": 15 },
+        { "stem": "job_bin_b_3d000", "base": "0x3D000", "diag": "recomp_prx/job_bin_b_3d000.c", "image_id": 43 },
+        { "stem": "job_bin_b_3dc00", "base": "0x3DC00", "diag": "recomp_prx/job_bin_b_3dc00.c", "image_id": 15 }
+      ]
+    },
+    "job_c": {
+      "kind": "job",
+      "eboot_ea": "0x0125DA80",
+      "ref_elf": "recomp_prx/job_bin_c_17800.elf",
+      "ref_base": "0x17800",
+      "description": "post-a030 transition job",
+      "placements": [
+        { "stem": "job_bin_c_4c00",  "base": "0x4C00",  "diag": "recomp_prx/job_bin_c_4c00.c",  "image_id": 38 },
+        { "stem": "job_bin_c_e400",  "base": "0xE400",  "diag": "recomp_prx/job_bin_c_e400.c",  "image_id": 17 },
+        { "stem": "job_bin_c_15800", "base": "0x15800", "diag": "recomp_prx/job_bin_c_15800.c", "image_id": 40 },
+        { "stem": "job_bin_c_17800", "base": "0x17800", "elf": "recomp_prx/job_bin_c_17800.elf", "diag": "recomp_prx/job_bin_c_17800.c", "image_id": 17 },
+        { "stem": "job_bin_c_1a800", "base": "0x1A800", "diag": "recomp_prx/job_bin_c_1a800.c", "image_id": 20 },
+        { "stem": "job_bin_c_1ac00", "base": "0x1AC00", "diag": "recomp_prx/job_bin_c_1ac00.c", "image_id": 27 },
+        { "stem": "job_bin_c_1b800", "base": "0x1B800", "diag": "recomp_prx/job_bin_c_1b800.c", "image_id": 23 },
+        { "stem": "job_bin_c_1d800", "base": "0x1D800", "diag": "recomp_prx/job_bin_c_1d800.c", "image_id": 22 },
+        { "stem": "job_bin_c_1e800", "base": "0x1E800", "diag": "recomp_prx/job_bin_c_1e800.c", "image_id": 28 }
+      ]
+    },
+    "job_d": {
+      "kind": "job",
+      "eboot_ea": "0x01265180",
+      "ref_elf": "recomp_prx/job_bin_d_e400.elf",
+      "ref_base": "0xE400",
+      "description": "sibling post-a030 job (declared 0x10610 bytes)",
+      "placements": [
+        { "stem": "job_bin_d_4c00",  "base": "0x4C00",  "diag": "recomp_prx/job_bin_d_4c00.c",  "image_id": 21 },
+        { "stem": "job_bin_d_5000",  "base": "0x5000",  "diag": "recomp_prx/job_bin_d_5000.c",  "image_id": 26 },
+        { "stem": "job_bin_d_c400",  "base": "0xC400",  "diag": "recomp_prx/job_bin_d_c400.c",  "image_id": 42 },
+        { "stem": "job_bin_d_e400",  "base": "0xE400",  "elf": "recomp_prx/job_bin_d_e400.elf", "diag": "recomp_prx/job_bin_d_e400.c",  "image_id": 18 },
+        { "stem": "job_bin_d_15800", "base": "0x15800", "diag": "recomp_prx/job_bin_d_15800.c", "image_id": 25 },
+        { "stem": "job_bin_d_20c00", "base": "0x20C00", "diag": "recomp_prx/job_bin_d_20c00.c", "image_id": 18 },
+        { "stem": "job_bin_d_23000", "base": "0x23000", "diag": "recomp_prx/job_bin_d_23000.c", "image_id": 21 },
+        { "stem": "job_bin_d_27400", "base": "0x27400", "diag": "recomp_prx/job_bin_d_27400.c", "image_id": 32 },
+        { "stem": "job_bin_d_2a800", "base": "0x2A800", "diag": "recomp_prx/job_bin_d_2a800.c", "image_id": 33 },
+        { "stem": "job_bin_d_2b400", "base": "0x2B400", "diag": "recomp_prx/job_bin_d_2b400.c", "image_id": 29 },
+        { "stem": "job_bin_d_2c400", "base": "0x2C400", "diag": "recomp_prx/job_bin_d_2c400.c", "image_id": 36 },
+        { "stem": "job_bin_d_2d400", "base": "0x2D400", "diag": "recomp_prx/job_bin_d_2d400.c", "image_id": 31 },
+        { "stem": "job_bin_d_2e400", "base": "0x2E400", "diag": "recomp_prx/job_bin_d_2e400.c", "image_id": 34 },
+        { "stem": "job_bin_d_2e800", "base": "0x2E800", "diag": "recomp_prx/job_bin_d_2e800.c", "image_id": 30 }
+      ]
+    },
+    "orphanage": {
+      "kind": "job",
+      "eboot_ea": "0x01252680",
+      "eboot_size": "0x1E80",
+      "eboot": "game/EBOOT.elf",
+      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated",
+      "placements": [
+        { "stem": "job_bin_orphanage",       "base": "0x4C00",  "diag": "yakuza/generated/job_bin_orphanage.c",       "image_id": 19 },
+        { "stem": "job_bin_orphanage_e400",  "base": "0xE400",  "diag": "yakuza/generated/job_bin_orphanage_e400.c",  "image_id": 19 },
+        { "stem": "job_bin_orphanage_2d800", "base": "0x2D800", "diag": "yakuza/generated/job_bin_orphanage_2d800.c", "image_id": 19 },
+        { "stem": "job_bin_orphanage_37c00", "base": "0x37C00", "diag": "yakuza/generated/job_bin_orphanage_37c00.c", "image_id": 19 },
+        { "stem": "job_bin_orphanage_3b000", "base": "0x3B000", "diag": "yakuza/generated/job_bin_orphanage_3b000.c", "image_id": 19 }
+      ]
+    }
+  }
+}
