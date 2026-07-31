@@ -215,6 +215,10 @@ if(PS3RECOMP_BUILD_TESTS)
             NAME movie_fifo_handoff
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_movie_handoff.py"
         )
+        add_test(
+            NAME spu_profile_guest_pc
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_profile_pc.py"
+        )
         set_tests_properties(
             ppu_lifter_conformance
             spu_lifter_conformance
@@ -236,6 +240,13 @@ if(PS3RECOMP_BUILD_TESTS)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 30
                 LABELS "regression;renderer;movie"
+        )
+        set_tests_properties(
+            spu_profile_guest_pc
+            PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 30
+                LABELS "regression;spu;profiling"
         )
     endif()
 endif()
