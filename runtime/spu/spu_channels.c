@@ -5231,7 +5231,15 @@ void spu_indirect_branch(spu_context* ctx)
             ctx, ctx->native_spurs_opaque);
         if (native_result > 0) {
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-            g_spu_trampoline_fn = spu_indirect_branch;
+            /* Match an SPU `bi $lr` return.  When the lifted caller's host
+             * frame is still live, its call bracket owns the continuation
+             * and will publish it after the nested drain unwinds.  Dispatching
+             * r0 here as well executes the callee epilogue twice (and, for a
+             * blocking task syscall, leaks one guest stack frame per wake).
+             * A top-level/restacked resume has no such host caller, so only
+             * that case must re-enter through the indirect dispatcher. */
+            g_spu_trampoline_fn =
+                spu_return_needs_dispatch(ctx) ? spu_indirect_branch : 0;
         } else if (native_result < 0) {
             spu_halt(ctx, SPU_STATUS_STOPPED_BY_STOP);
         } else {

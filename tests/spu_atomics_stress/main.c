@@ -36,6 +36,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* This harness exercises the standalone MFC engine without the SPURS runtime. */
+void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size)
+{
+    (void)ea;
+    (void)size;
+}
 #include <stdarg.h>
 
 #include "spu_dma.h"
