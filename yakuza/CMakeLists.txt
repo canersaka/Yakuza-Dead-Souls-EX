@@ -263,7 +263,6 @@ add_executable(yakuza_recomp
     "${YZ_FUNC_TABLE}"
     "${YZ_IMPORT_BRIDGES}"
     import_overrides.cpp
-    external_input_compat.cpp
     edge_journal_hle.cpp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
@@ -300,9 +299,9 @@ endif()
 # Copy the runtime DLLs next to it from an in-repo RPCS3 install, if present.
 # Harmless no-op when FFmpeg wasn't linked (movie support stubbed).
 file(GLOB _yz_ff_dlls
-    "${PS3RECOMP_DIR}/rpcs3-v*/avcodec-*.dll"  "${PS3RECOMP_DIR}/rpcs3-v*/avformat-*.dll"
-    "${PS3RECOMP_DIR}/rpcs3-v*/avutil-*.dll"   "${PS3RECOMP_DIR}/rpcs3-v*/swscale-*.dll"
-    "${PS3RECOMP_DIR}/rpcs3-v*/swresample-*.dll")
+    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avcodec-*.dll"  "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avformat-*.dll"
+    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avutil-*.dll"   "${YZ_GAME_INPUT_DIR}/rpcs3-v*/swscale-*.dll"
+    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/swresample-*.dll")
 if(_yz_ff_dlls)
     add_custom_command(TARGET yakuza_recomp POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_yz_ff_dlls} $<TARGET_FILE_DIR:yakuza_recomp>
