@@ -1526,7 +1526,9 @@ void spu_lockline_unlock(void)
  * idle -- SwitchToThread returns immediately with no waiter); level 2 = a
  * real 1 ms sleep, the only rung that actually idles the core (laptop
  * heat/throttling; up to ~15 ms wall with the default timer resolution --
- * acceptable reaction latency for an SPU that has been idle this long).
+ * acceptable reaction latency for an SPU that has been idle this long);
+ * level 3 = Sleep(0), which gives any ready host thread a chance without
+ * incurring the timer-resolution delay of level 2.
  * Measured before the backoff: five SPURS kernel SPUs each burned ~97% of a
  * host core in their GETLLAR poll loops, and boot pacing collapsed under the
  * lock-line contention (see STATUS 2026-07-03); pacing recovered with the
@@ -1577,7 +1579,8 @@ void spu_idle_yield(int level)
         return;
     }
 #if defined(_WIN32)
-    if (level >= 2) Sleep(1);
+    if (level == 3) Sleep(0);
+    else if (level >= 2) Sleep(1);
     else SwitchToThread();
 #else
     if (level >= 2) usleep(1000);

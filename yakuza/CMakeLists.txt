@@ -177,23 +177,17 @@ foreach(stem job_bin_c_4c00 job_bin_c_e400 job_bin_c_15800 job_bin_c_17800 job_b
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_C "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_d_4c00 job_bin_d_5000 job_bin_d_e400 job_bin_d_15800
-        job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400 job_bin_d_2a800 job_bin_d_2b400
+        job_bin_d_15c00 job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400
+        job_bin_d_2a800 job_bin_d_2b400 job_bin_d_2b800
         job_bin_d_2c400 job_bin_d_2d400 job_bin_d_2e400 job_bin_d_2e800)
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
 foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
-        job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00)
+        job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
+        job_bin_orphanage_3c000 job_bin_orphanage_3cc00)
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_ORPHANAGE "${PS3RECOMP_DIR}/yakuza/generated/${stem}.c" "${stem}")
 endforeach()
-
-# Exact placements added after the systematic 61-source handoff. They retain
-# their instruction lifts until separately validated region twins exist.
-list(APPEND SPU_KERNELS
-    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c"
-    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c"
-    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_3c000.c"
-    "${PS3RECOMP_DIR}/yakuza/generated/job_bin_orphanage_3cc00.c")
 
 add_executable(yakuza_recomp
     main.cpp

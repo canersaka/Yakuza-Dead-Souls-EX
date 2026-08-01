@@ -126,6 +126,8 @@ typedef struct mfc_engine {
     uint32_t    resv_poll_n;      /* consecutive same-line GETLLARs with an unchanged
                                    * write-generation = an idle reservation poll loop;
                                    * drives the host-yield backoff (see MFC_GETLLAR_CMD) */
+    uint32_t    resv_cas_idle_ea; /* last PUTLLC line used by contention backoff */
+    uint32_t    resv_cas_idle_n;  /* consecutive failed/no-change PUTLLCs on that line */
     uint32_t    atomic_stat;      /* value waiting in MFC_RdAtomicStat */
     uint32_t    atomic_stat_ready;/* 1 while that single channel entry is readable */
 
@@ -163,12 +165,37 @@ typedef struct mfc_engine {
     uint32_t    stall_base_cmd[32];              /* base GET/PUT command (list bit already stripped) */
 } mfc_engine;
 
+/* Host scheduling backoff for a guest CAS retry loop. A PUTLLC that changes
+ * bytes is productive and resets the ladder. Repeated failures or successful
+ * same-value commits on one line are contention/idle churn: preserve every
+ * architectural attempt, but yield only after the lock has been released so
+ * the thread owning useful work can run. Unlike lock parking, this never
+ * sleeps a lock hand-off or penalizes the first retry. */
+static inline int mfc_putllc_backoff(
+    mfc_engine* mfc, uint32_t line_ea, int made_progress)
+{
+    if (mfc->resv_cas_idle_ea != line_ea) {
+        mfc->resv_cas_idle_ea = line_ea;
+        mfc->resv_cas_idle_n = 0;
+    }
+    if (made_progress) {
+        mfc->resv_cas_idle_n = 0;
+        return -1;
+    }
+    if (mfc->resv_cas_idle_n != UINT32_MAX)
+        mfc->resv_cas_idle_n++;
+    if (g_yz_runtime_config.no_spubackoff || mfc->resv_cas_idle_n <= 16u)
+        return -1;
+    return mfc->resv_cas_idle_n > 256u ? 3 : 0;
+}
+
 /* Single process-wide lock serializing lock-line transactions across all
  * SPU host threads (defined in spu_channels.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
 /* Host-core yield for SPU idle-poll loops (defined in spu_channels.c):
- * level 0 = cpu pause, level 1 = scheduler yield. */
+ * level 0 = cpu pause, level 1 = same-core scheduler yield, level 2 =
+ * 1 ms sleep, level 3 = process-wide zero-duration scheduler yield. */
 void spu_idle_yield(int level);
 
 /* External: pointer to host mapping of PS3 main memory.
@@ -3641,6 +3668,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 #endif
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                 memcmp(line, mfc->resv_data, 128) == 0) {
+                const int made_progress =
+                    memcmp(mfc->resv_data, ls_ptr, 128) != 0;
 #if !defined(YZ_PERF_CLEAN)
                 yz_a010_reltrace_spu_atomic(
                     spu->spu_id, (uint32_t)spu->image_id,
@@ -3724,8 +3753,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 { extern void spu_coh_notify_write(uint32_t);
                   spu_coh_notify_write((uint32_t)(ea & ~127ull)); }
                 mfc_publish_atomic_status(mfc, MFC_PUTLLC_SUCCESS);
+                post_unlock_idle_level = mfc_putllc_backoff(
+                    mfc, (uint32_t)(ea & ~127ull), made_progress);
             } else {
                 mfc_publish_atomic_status(mfc, MFC_PUTLLC_FAILURE);
+                post_unlock_idle_level = mfc_putllc_backoff(
+                    mfc, (uint32_t)(ea & ~127ull), 0);
             }
             mfc->resv_active = 0;
             break;
@@ -3740,6 +3773,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 (uint32_t)(ea & ~127ull), ls_ptr, cmd);
 #endif
             memcpy(line, ls_ptr, 128);
+            mfc->resv_cas_idle_n = 0;
             { extern void spu_coh_notify_write(uint32_t);
               spu_coh_notify_write((uint32_t)(ea & ~127ull)); }  /* clears resv_active + raises LR for all matching ctxs */
             mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);

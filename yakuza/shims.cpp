@@ -67,6 +67,7 @@ static int yz_vmguard_check(uint32_t a, unsigned w, int is_write);
 extern "C" void yz_a010_cmt_capture(uint32_t address, uint32_t size);
 extern "C" void yz_stage_render_checkpoint(void* context, uint32_t phase);
 
+#if !defined(YZ_PERF_CLEAN)
 static inline void yz_stage_checkpoint_before_b0(uint32_t address)
 {
     static int enabled = -1;
@@ -90,11 +91,47 @@ static inline void yz_stage_checkpoint_after_object(uint32_t address)
         (uint32_t)ctx->lr == 0x00113508u)
         yz_stage_render_checkpoint(ctx, 1u);
 }
+#endif
 
+#if defined(YZ_PERF_CLEAN)
+extern "C" uint8_t vm_read8(uint64_t addr)
+{
+    return *ea(addr);
+}
+
+extern "C" uint16_t vm_read16(uint64_t addr)
+{
+    uint16_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    return ps3_bswap16(value);
+}
+
+extern "C" uint32_t vm_read32(uint64_t addr)
+{
+    uint32_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    value = ps3_bswap32(value);
+    /* CMT discovery is behavior state used by the optional camera repair,
+     * not an observation-only memory watcher.  Its magic comparison is cold
+     * and remains available in clean builds. */
+    if (value == 0x434D5450u)
+        yz_a010_cmt_capture((uint32_t)addr,
+                            vm_read32((uint32_t)addr + 0xCu));
+    return value;
+}
+
+extern "C" uint64_t vm_read64(uint64_t addr)
+{
+    uint64_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    return ps3_bswap64(value);
+}
+#else
 extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
 extern "C" uint16_t vm_read16(uint64_t addr) { yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
 extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
 extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
+#endif
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
  * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
@@ -118,12 +155,20 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
 /* Raise SPU_EVENT_LR on any SPU whose GETLLAR reservation covers this line --
  * the SPURS idle-service wakeup (spu_channels.c). */
 extern "C" void spu_coh_notify_write(uint32_t addr);
+#if defined(YZ_PERF_CLEAN)
+#define VM_WRITE_COH(addr, src, n) do { \
+        if (spu_coh_is_reserved((uint32_t)(addr))) { \
+            spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
+            spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
+        } else memcpy(ea(addr), (src), (n)); } while (0)
+#else
 #define VM_WRITE_COH(addr, src, n) do { \
         yz_watch_bd((uint32_t)(addr), (src), (n)); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
         } else memcpy(ea(addr), (src), (n)); } while (0)
+#endif
 extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_watch_arm(uint32_t guest_addr);
 extern "C" void yz_a010_reltrace_ppu_store(
@@ -591,11 +636,13 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           (uint32_t)ctx->lr, _ReturnAddress());
                   fflush(stderr); } } }
     }
+#if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr >= 0x40400000u &&
         (uint32_t)addr < 0x40C00000u)
         yz_a010_reltrace_ppu_store(
             (uint32_t)addr, val,
             yz_guest_addr_from_host(_ReturnAddress()));
+#endif
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -669,6 +716,7 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                   fflush(stderr);
               } } }
     }
+#if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr < 0x40C00000u &&
         (uint32_t)addr + 8u > 0x40400000u) {
         if ((uint32_t)addr >= 0x40400000u)
@@ -680,6 +728,7 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                 (uint32_t)addr + 4u, (uint32_t)val,
                 yz_guest_addr_from_host(_ReturnAddress()));
     }
+#endif
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -688,8 +737,6 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
               | ((((ok ? 2u : 0u) | ((ctx->xer >> 31) & 1u))) << 28);
 }
 
-extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
-extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */
 /* YZ_JOBSTREAM_WATCH (s21): confirm the func_00E5F248 clobber hypothesis
  * (scratch/jobchain_pointer_re.md) -- log every store to the jobchain command
@@ -984,8 +1031,37 @@ static inline void yz_stage_transform_write(
     fflush(stderr);
 }
 
+#if defined(YZ_PERF_CLEAN)
+extern "C" void vm_write8(uint64_t addr, uint8_t val)
+{
+    VM_WRITE_COH(addr, &val, sizeof(val));
+}
+
+extern "C" void vm_write16(uint64_t addr, uint16_t val)
+{
+    const uint16_t value = ps3_bswap16(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+}
+
+extern "C" void vm_write32(uint64_t addr, uint32_t val)
+{
+    const uint32_t value = ps3_bswap32(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+    if ((uint32_t)addr == 0x10000040u)
+        yz_rsx_inline_on_put();
+}
+
+extern "C" void vm_write64(uint64_t addr, uint64_t val)
+{
+    const uint64_t value = ps3_bswap64(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+}
+#else
+extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
+extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 4, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr >= 0x40400000u && (uint32_t)addr < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr, val, yz_guest_addr_from_host(_ReturnAddress())); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
 extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 8, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr < 0x40C00000u && (uint64_t)(uint32_t)addr + 8u > 0x40400000ull) { const uint32_t pc = yz_guest_addr_from_host(_ReturnAddress()); if ((uint32_t)addr >= 0x40400000u) yz_a010_reltrace_ppu_store((uint32_t)addr, (uint32_t)(val >> 32), pc); if ((uint32_t)addr + 4u >= 0x40400000u && (uint32_t)addr + 4u < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr + 4u, (uint32_t)val, pc); } uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+#endif
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED

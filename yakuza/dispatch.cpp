@@ -58,6 +58,10 @@ extern "C" volatile long g_yz_ucmd_handler_completed;
 extern "C" volatile long g_yz_ucmd_handler_epoch;
 extern "C" volatile long g_yz_ucmd_handler_completed_epoch;
 extern "C" uint8_t* vm_base;
+#if defined(YZ_PERF_PROFILE)
+extern "C" void spu_perf_window_begin(uint32_t guest_frame);
+extern "C" void spu_perf_window_dump(uint32_t guest_frame);
+#endif
 extern "C" void yz_a010_reltrace_ppu(uint32_t pc,
                                       const ppu_context* ctx);
 extern "C" void yz_watch_arm_read(uint32_t guest_addr);
@@ -4876,6 +4880,82 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         g_trampoline_fn = saved_trampoline;
         return;
     }
+
+#if defined(YZ_PERF_PROFILE)
+    /*
+     * The orphanage transition watchdog caught the main PPU thread inside
+     * func_00C96170's selector-13 scene walker, specifically its indirect
+     * func_000195C0 node callback.  Execute only that callback synchronously
+     * in the symbolized profile lane so its complete tail-call chain can be
+     * timed without touching generated recompilation output.  Release/fast
+     * builds retain the ordinary trampoline hand-off below.
+     */
+    if (resolved_code == 0x000195C0u &&
+        ((uint32_t)ctx->lr == 0x00C961C0u ||
+         (uint32_t)ctx->lr == 0x00C96204u)) {
+        struct yz_scene_callback_frame_profile {
+            uint32_t frame;
+            uint64_t calls;
+            uint64_t elapsed_us;
+            uint64_t max_us;
+            uint32_t max_node;
+            uint32_t max_selector;
+        };
+        static yz_scene_callback_frame_profile aggregate = {};
+        static uint32_t spu_window_start = 0u;
+        static int spu_window_done = 0;
+        const uint32_t frame = rsx_live_draw_get_frames();
+        if (spu_window_start == 0u) {
+            spu_window_start = frame;
+            spu_perf_window_begin(frame);
+        } else if (!spu_window_done && frame >= spu_window_start + 70u) {
+            spu_perf_window_dump(frame);
+            spu_window_done = 1;
+        }
+        if (aggregate.calls != 0u && aggregate.frame != frame) {
+            fprintf(stderr,
+                    "[scene-callback-perf] frame=%u calls=%llu "
+                    "total=%.3fms max=%.3fms node=%08X selector=%u\n",
+                    aggregate.frame,
+                    (unsigned long long)aggregate.calls,
+                    (double)aggregate.elapsed_us / 1000.0,
+                    (double)aggregate.max_us / 1000.0,
+                    aggregate.max_node, aggregate.max_selector);
+            aggregate = {};
+        }
+        if (aggregate.calls == 0u)
+            aggregate.frame = frame;
+
+        const uint32_t node = (uint32_t)ctx->gpr[3];
+        const uint32_t selector = (uint32_t)ctx->gpr[4];
+        const auto started = std::chrono::steady_clock::now();
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+        g_trampoline_fn = saved_trampoline;
+        const uint64_t elapsed_us = (uint64_t)
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+
+        ++aggregate.calls;
+        aggregate.elapsed_us += elapsed_us;
+        if (elapsed_us > aggregate.max_us) {
+            aggregate.max_us = elapsed_us;
+            aggregate.max_node = node;
+            aggregate.max_selector = selector;
+        }
+        if (elapsed_us >= 20000u) {
+            fprintf(stderr,
+                    "[scene-callback-slow] frame=%u elapsed=%.3fms "
+                    "node=%08X selector=%u lr=%08X\n",
+                    frame, (double)elapsed_us / 1000.0,
+                    node, selector, (uint32_t)ctx->lr);
+            fflush(stderr);
+        }
+        return;
+    }
+#endif
 
     g_trampoline_fn = (void (*)(void*))fn;
 }
