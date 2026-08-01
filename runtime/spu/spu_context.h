@@ -1086,6 +1086,14 @@ void spu_halt(spu_context* ctx, int status);
  * function in the context's active image and runs it. Referenced by SPU_RET. */
 void spu_indirect_branch(spu_context* ctx);
 
+/* A lifted nested call still has a host frame that will publish its own
+ * return continuation.  Only a top-level/restacked return needs an explicit
+ * dispatcher hop. */
+static inline int spu_return_needs_dispatch(const spu_context* ctx)
+{
+    return ctx->host_depth == 0;
+}
+
 /* s39 channel-stall wake (spu_channels.c): signal the per-SPU wait CV so a
  * host thread blocked in spu_rdch (RdInMbox / RdSigNotify1/2 / RdEventStat)
  * re-checks its predicate immediately. MUST be called by every PPU/SPU-side
@@ -1174,7 +1182,7 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img);
  * the dispatch machinery. */
 #define SPU_RET(ctx) do {                                      \
         (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
-        if ((ctx)->host_depth == 0)                            \
+        if (spu_return_needs_dispatch(ctx))                    \
             g_spu_trampoline_fn = spu_indirect_branch;         \
         return;                                                \
     } while (0)

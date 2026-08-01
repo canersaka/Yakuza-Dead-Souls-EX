@@ -459,12 +459,18 @@ static int task_syscall(spu_context* ctx, void* opaque)
         mx_lock(&ts->sync.mutex);
         if (op == 2) {
             t->waiting = 1;
+            task_bit(ts->sync.key, 0x00, t->id, 0);
+            task_bit(ts->sync.key, 0x10, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 1);
             while (!t->signalled && !ts->shutdown)
                 cv_wait(&ts->sync.cond, &ts->sync.mutex);
             t->signalled = 0;
             task_bit(ts->sync.key, 0x40, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 0);
+            if (!ts->shutdown) {
+                task_bit(ts->sync.key, 0x00, t->id, 1);
+                task_bit(ts->sync.key, 0x10, t->id, 1);
+            }
             t->waiting = 0;
         }
         mx_unlock(&ts->sync.mutex);
@@ -963,6 +969,25 @@ void cellSpursNotifyGuestWrite(u32 ea, u32 size)
     if (g_registry_ready != 2 || !vm_base || !size) return;
     const u64 first = ea;
     const u64 last = first + size;
+    for (u32 i = 0; i < MAX_TASKSETS; ++i) {
+        TasksetState* ts = &g_tasksets[i];
+        if (!ts->sync.live || !ts->sync.key) continue;
+        const u64 object_ea = guest_ea(ts->sync.key);
+        if (first >= object_ea + 128 || last <= object_ea) continue;
+        int wake = 0;
+        mx_lock(&ts->sync.mutex);
+        const u8* object = (const u8*)ts->sync.key;
+        for (u32 id = 0; id < CELL_SPURS_MAX_TASK; ++id) {
+            const u8 mask = (u8)(0x80u >> (id & 7));
+            if (!(object[0x40 + id / 8] & mask)) continue;
+            TaskState* task = &ts->tasks[id];
+            if (!task->thread_valid || task->complete) continue;
+            task->signalled = 1;
+            wake = 1;
+        }
+        if (wake) cv_wake_all(&ts->sync.cond);
+        mx_unlock(&ts->sync.mutex);
+    }
     for (u32 i = 0; i < MAX_EVENT_FLAGS; ++i) {
         SyncKey* sync = &g_event_flags[i];
         if (!sync->live || !sync->key) continue;

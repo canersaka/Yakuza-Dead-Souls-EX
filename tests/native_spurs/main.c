@@ -159,6 +159,19 @@ static int wait_value(volatile int* value, int expected)
     return 0;
 }
 static int wait_phase(int phase) { return wait_value(&task_phase, phase); }
+static int wait_byte_mask(const volatile uint8_t* value, uint8_t mask,
+                          uint8_t expected)
+{
+    for (unsigned i = 0; i < 1000000; ++i) {
+        if ((*value & mask) == expected) return 1;
+#if defined(_WIN32)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+    return 0;
+}
 static int wait_be32_value(const void* value, uint32_t expected)
 {
     for (unsigned i = 0; i < 1000000; ++i) {
@@ -180,6 +193,17 @@ static int test_layouts(void)
     CHECK(sizeof(CellSpursTaskset2) == 0x2900);
     CHECK(sizeof(CellSpursEventFlag) == 128);
     CHECK(sizeof(CellSpursJobChain) == 272);
+    return 0;
+}
+
+static int test_native_syscall_return_depth(void)
+{
+    static spu_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.host_depth = 1;
+    CHECK(!spu_return_needs_dispatch(&ctx));
+    ctx.host_depth = 0;
+    CHECK(spu_return_needs_dispatch(&ctx));
     return 0;
 }
 
@@ -250,12 +274,49 @@ static int test_task_event_queue(void)
     }
     CHECK(wait_phase(1));
     CHECK(task_abi_ok);
+    CHECK(wait_byte_mask(ts->bytes + 0x50, 0x80, 0x80));
+    CHECK((ts->bytes[0x00] & 0x80) == 0);
+    CHECK((ts->bytes[0x10] & 0x80) == 0);
     CHECK(cellSpursTryJoinTask2(ts, be32(id), exit_code) == CELL_SPURS_TASK_ERROR_BUSY);
     CHECK(_cellSpursSendSignal((CellSpursTaskset*)ts, be32(id)) == 0);
     CHECK(cellSpursJoinTask2(ts, be32(id), exit_code) == 0);
     CHECK(task_phase == 2);
     CHECK(be32(exit_code) == 0x2468);
     CHECK(be32(task_context + 0x20) == 0xdeadbeef);
+
+    /* SPU-side synchronization primitives publish task signals by updating
+     * the taskset state line rather than entering through the PPU API. */
+    task_phase = 0;
+    task_abi_ok = 0;
+    {
+        CellSpursTaskBinInfo bin;
+        CellSpursTaskArgument arg;
+        memset(&bin, 0, sizeof(bin)); memset(&arg, 0, sizeof(arg));
+        put64((uint8_t*)&bin + 0x00, 0x8000);
+        put32((uint8_t*)&bin + 0x08, 1024);
+        put32(arg.bytes + 0x00, 0x01020304);
+        put32(arg.bytes + 0x04, 0x11121314);
+        put32(arg.bytes + 0x08, 0x21222324);
+        put32(arg.bytes + 0x0c, 0x31323334);
+        CHECK(cellSpursCreateTask2WithBinInfo(ts, id, &bin, &arg,
+                                             task_context + 0x400,
+                                             "guest-signal-task", NULL) == 0);
+    }
+    CHECK(wait_phase(1));
+    CHECK(task_abi_ok);
+    {
+        const uint32_t task_id = be32(id);
+        const uint8_t mask = (uint8_t)(0x80u >> (task_id & 7));
+        CHECK(wait_byte_mask(ts->bytes + 0x50 + task_id / 8, mask, mask));
+        CHECK((ts->bytes[0x00 + task_id / 8] & mask) == 0);
+        CHECK((ts->bytes[0x10 + task_id / 8] & mask) == 0);
+        ts->bytes[0x40 + task_id / 8] |= mask;
+        cellSpursNotifyGuestWrite(0x3000, 128);
+        CHECK(cellSpursJoinTask2(ts, task_id, exit_code) == 0);
+        CHECK((ts->bytes[0x40 + task_id / 8] & mask) == 0);
+    }
+    CHECK(task_phase == 2);
+    CHECK(be32(exit_code) == 0x2468);
 
     CHECK(_cellSpursEventFlagInitialize(NULL, (CellSpursTaskset*)ts, ef,
                                         CELL_SPURS_EVENT_FLAG_CLEAR_AUTO,
@@ -446,7 +507,8 @@ static int test_ticket_mutex(void)
 
 int main(void)
 {
-    if (test_layouts() || test_multiple_instances() ||
+    if (test_layouts() || test_native_syscall_return_depth() ||
+        test_multiple_instances() ||
         test_task_event_queue() ||
         test_job_chain() || test_ticket_mutex()) return 1;
     puts("native_spurs_tests: PASS");
