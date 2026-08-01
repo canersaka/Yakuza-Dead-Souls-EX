@@ -249,6 +249,9 @@ static int yz_register_native_spurs_images(void)
     static const RawJob jobs[] = {
         {0x01254500u, 0x9540u, 14, "job_bin_a"},
         {0x01275A00u, 0x14C0u, 15, "job_bin_b"},
+        {0x0125DA80u, 0x7640u, 17, "job_bin_c"},
+        {0x01265180u, 0x10610u, 18, "job_bin_d"},
+        {0x01252680u, 0x1E80u, 19, "job_bin_orphanage"},
     };
     for (const RawJob& d : jobs) {
         const uint8_t* image = vm_base + d.ea;
@@ -3675,7 +3678,7 @@ int main(int argc, char** argv)
     if (!yz_register_native_spurs_images())
         return 1;
     printf("[boot] native SPURS images registered "
-           "(%d exact EBOOT tasks + 2 exact game jobs; no firmware)\n",
+           "(%d exact EBOOT tasks + 5 exact game jobs; no firmware)\n",
            SPU_IMAGE_COUNT);
 #else
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",

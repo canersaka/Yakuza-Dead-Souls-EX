@@ -181,6 +181,7 @@ s32 cellSpursJoinJobChain(CellSpursJobChain*);
 s32 cellSpursJobGuardInitialize(const CellSpursJobChain*, CellSpursJobGuard*,
                                 u32, u8, u8);
 s32 cellSpursJobGuardNotify(CellSpursJobGuard*);
+s32 cellSpursJobGuardReset(CellSpursJobGuard*);
 
 /* Runtime coherence bridge: wake native waiters after an SPU writes guest
  * memory. The write itself remains authoritative; this function only notifies

@@ -7,6 +7,7 @@
  */
 #include "cellSpurs.h"
 #include "../../runtime/spu/spu_workload.h"
+#include "../../runtime/spu/spu_job_dispatch.h"
 #include "../../runtime/memory/vm.h"
 
 #include <stdio.h>
@@ -101,6 +102,15 @@ static void diag(const char* kind, const void* object, u64 value)
     fprintf(stderr, "[native-spurs] divergence=%s object=0x%08X value=0x%llX\n",
             kind, guest_ea(object), (unsigned long long)value);
 }
+static int native_trace_enabled(void)
+{
+    static int initialized, enabled;
+    if (!initialized) {
+        enabled = getenv("YZ_NATIVE_SPURS_TRACE") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Side-table synchronization registry                                       */
@@ -161,6 +171,9 @@ static void sync_init(SyncKey* s, void* key)
 typedef struct {
     SyncKey sync;
     u32 nspus;
+    u32 next_wid;
+    u32 active_wkl_mask;
+    u32 next_spu_num;
     int shutdown;
 } SpursState;
 static SpursState g_spurs[MAX_SPURS_INSTANCES];
@@ -237,6 +250,9 @@ static s32 spurs_initialize(void* object, size_t size, const CellSpursAttribute*
     if (!state) return CELL_SPURS_CORE_ERROR_NOMEM;
     memset(object, 0, size);
     state->nspus = rd32(a->bytes + 0x08);
+    state->next_wid = 1; /* Workload 0 is the SPURS system service. */
+    state->active_wkl_mask = 0x80000000u;
+    state->next_spu_num = 0;
     state->shutdown = 0;
     spu_workload_set_image_executor(spu_native_image_executor);
     ((u8*)object)[0x76] = (u8)state->nspus;
@@ -277,6 +293,7 @@ typedef struct TasksetState TasksetState;
 typedef struct {
     TasksetState* owner;
     u32 id;
+    u32 spu_num;
     const u8* elf;
     u32 elf_size;
     u32 context_ea;
@@ -291,6 +308,7 @@ typedef struct {
     int waiting;
     int signalled;
     int exit_code;
+    unsigned trace_syscalls;
 } TaskState;
 
 struct TasksetState {
@@ -298,6 +316,9 @@ struct TasksetState {
     void* spurs;
     u64 args;
     u32 size;
+    u32 wid;
+    u32 max_contention;
+    u8 priority[8];
     int shutdown;
     TaskState tasks[128];
 };
@@ -407,8 +428,30 @@ static int task_syscall(spu_context* ctx, void* opaque)
     TaskState* t = (TaskState*)opaque;
     TasksetState* ts = t->owner;
     const u32 op = ctx->gpr[3]._u32[0] & 0x0f;
+    if (native_trace_enabled()) {
+        const unsigned n = ++t->trace_syscalls;
+        if (n <= 64 || (n & 0xfffffu) == 0)
+            fprintf(stderr,
+                    "[native-spurs-trace] task-syscall n=%u task=%u "
+                    "op=%u pc=0x%05X lr=0x%05X sp=0x%05X "
+                    "r4=%08X_%08X_%08X_%08X r5=%08X "
+                    "ts{run=%08X ready=%08X pend=%08X en=%08X sig=%08X wait=%08X}\n",
+                    n, t->id, op, ctx->pc,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                    ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1],
+                    ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3],
+                    ctx->gpr[5]._u32[0],
+                    rd32(ctx->ls + 0x2700), rd32(ctx->ls + 0x2710),
+                    rd32(ctx->ls + 0x2720), rd32(ctx->ls + 0x2730),
+                    rd32(ctx->ls + 0x2740), rd32(ctx->ls + 0x2750));
+    }
     if (op == 0) {
-        t->exit_code = (s32)ctx->gpr[4]._u32[0];
+        /* The task exit wrapper saves its exit code in the taskset context
+         * before it reuses r4 to locate the syscall entry.  Reading r4 here
+         * reports that internal LS address (usually 0x27c4), not the value
+         * supplied to cellSpursExit. */
+        t->exit_code = (s32)rd32(ctx->ls + 0x2fd0);
         return -1;
     }
     if (op == 1 || op == 2) {
@@ -474,17 +517,56 @@ static void task_run(TaskState* task)
         free(ctx);
         goto finished;
     }
+
+    /* Task-side SPURS libraries inspect the resident kernel context even when
+     * the scheduler itself is host-native.  Populate the public ABI fields the
+     * taskset policy would have left at LS 0x100; no firmware image is loaded
+     * or executed. */
+    SpursState* spurs = spurs_find(task->owner->spurs);
+    u32 active_wkl_mask = 0;
+    if (spurs) {
+        mx_lock(&spurs->sync.mutex);
+        active_wkl_mask = spurs->active_wkl_mask;
+        mx_unlock(&spurs->sync.mutex);
+    }
+    if (task->owner->wid < 16)
+        ctx->ls[0x1a0 + task->owner->wid] =
+            task->owner->priority[task->spu_num & 7u];
+    wr64(ctx->ls + 0x1c0, guest_ea(task->owner->spurs));
+    wr32(ctx->ls + 0x1c8, task->spu_num);
+    wr32(ctx->ls + 0x1cc, 31); /* CELL_SPURS_KERNEL_DMA_TAG_ID */
+    wr32(ctx->ls + 0x1dc, task->owner->wid);
+    wr32(ctx->ls + 0x1e0, 0x0838); /* task exit-to-scheduler ABI target */
+    wr32(ctx->ls + 0x1e4, 0x0290); /* workload-selection ABI target */
+    wr16(ctx->ls + 0x1e8, 0x544b); /* SPURS task module id: "TK" */
+    ctx->ls[0x1ea] = 1;
+    wr16(ctx->ls + 0x1ec, (u16)(active_wkl_mask >> 16));
+    wr16(ctx->ls + 0x1ee, (u16)active_wkl_mask);
+
+    /* The taskset policy adds running before it snapshots the 128-byte header.
+     * Ready remains set while a task is runnable; it is cleared by WAIT_SIGNAL,
+     * not by selection. */
+    mx_lock(&task->owner->sync.mutex);
+    task_bit(task->owner->sync.key, 0x00, task->id, 1);
+    mx_unlock(&task->owner->sync.mutex);
+
     u8* stc = ctx->ls + 0x2700;
     memcpy(stc, task->owner->sync.key, 128);
     memcpy(ctx->ls + 0x2780, task->argument, 16);
     wr64(ctx->ls + 0x2790, guest_ea(task->elf));
-    wr64(ctx->ls + 0x2798, task->context_ea);
+    wr64(ctx->ls + 0x2798,
+         ((u64)task->context_ea & ~0x7full) |
+             ls_pattern_blocks(task->ls_pattern));
     memcpy(ctx->ls + 0x27a0, task->ls_pattern, 16);
-    wr32(ctx->ls + 0x27b8, guest_ea(task->owner->sync.key));
-    wr32(ctx->ls + 0x27bc, guest_ea(task->owner->sync.key));
+    wr64(ctx->ls + 0x27b8, guest_ea(task->owner->sync.key));
+    wr32(ctx->ls + 0x27c0, 0x0100); /* SpursKernelContext LS address */
     wr32(ctx->ls + 0x27c4, 0x0a70);
+    wr32(ctx->ls + 0x27cc, task->spu_num);
+    wr32(ctx->ls + 0x27d0, 31);     /* CELL_SPURS_KERNEL_DMA_TAG_ID */
     wr32(ctx->ls + 0x27d4, task->id);
+    memcpy(ctx->ls + 0x2840, "SPURSTASK MODULE", 16);
     wr32(ctx->ls + 0x2fb8, 0x2700);
+    wr32(ctx->ls + 0x2fbc, 0x3000);
     ctx->gpr[3] = task_load_qword(ctx->ls + 0x2780);
     {
         const u128 taskset_data = task_load_qword(ctx->ls + 0x2760);
@@ -497,15 +579,26 @@ static void task_run(TaskState* task)
     ctx->native_spurs_syscall = task_syscall;
     ctx->native_spurs_opaque = task;
     ctx->pc = task->image.entry_pc ? task->image.entry_pc : entry;
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] task-start task=%u image=%d "
+                "entry=0x%05X elf=0x%08X size=0x%X "
+                "r3=%08X_%08X_%08X_%08X r4=%08X_%08X_%08X_%08X\n",
+                task->id, task->image.image_id, ctx->pc,
+                guest_ea(task->elf), task->elf_size,
+                ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
+                ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1],
+                ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3]);
 
-    mx_lock(&task->owner->sync.mutex);
-    task_bit(task->owner->sync.key, 0x10, task->id, 0);
-    task_bit(task->owner->sync.key, 0x00, task->id, 1);
-    mx_unlock(&task->owner->sync.mutex);
     if (!spu_workload_execute(&task->image, ctx))
         task->exit_code = CELL_SPURS_TASK_ERROR_NOEXEC;
     free(ctx);
 finished:
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] task-finish task=%u rc=0x%08X\n",
+                task->id, (u32)task->exit_code);
     mx_lock(&task->owner->sync.mutex);
     task_bit(task->owner->sync.key, 0x00, task->id, 0);
     task_bit(task->owner->sync.key, 0x30, task->id, 0);
@@ -575,41 +668,68 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* a, size_t
     return CELL_OK;
 }
 static s32 create_taskset_common(CellSpurs* spurs, void* taskset, u32 size,
-                                 u64 args)
+                                  u64 args, const u8* priority,
+                                  u32 max_contention, u8 enable_clear_ls)
 {
     if (!spurs || !taskset) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (!aligned(taskset, 128)) return CELL_SPURS_TASK_ERROR_ALIGN;
-    if (!spurs_find(spurs)) return CELL_SPURS_TASK_ERROR_STAT;
+    SpursState* spurs_state = spurs_find(spurs);
+    if (!spurs_state) return CELL_SPURS_TASK_ERROR_STAT;
     TasksetState* ts = taskset_make(taskset);
     if (!ts) return CELL_SPURS_TASK_ERROR_NOMEM;
+    mx_lock(&spurs_state->sync.mutex);
+    if (spurs_state->next_wid >= 32) {
+        mx_unlock(&spurs_state->sync.mutex);
+        return CELL_SPURS_TASK_ERROR_NOMEM;
+    }
+    const u32 wid = spurs_state->next_wid++;
+    spurs_state->active_wkl_mask |= 0x80000000u >> wid;
+    mx_unlock(&spurs_state->sync.mutex);
     memset(taskset, 0, size);
     ts->spurs = spurs;
     ts->args = args;
     ts->size = size;
+    ts->wid = wid;
+    ts->max_contention = max_contention;
+    if (priority) memcpy(ts->priority, priority, sizeof(ts->priority));
+    else memset(ts->priority, 1, sizeof(ts->priority));
     ts->shutdown = 0;
     memset(ts->tasks, 0, sizeof(ts->tasks));
     wr64((u8*)taskset + 0x60, guest_ea(spurs));
     wr64((u8*)taskset + 0x68, args);
+    ((u8*)taskset)[0x70] = enable_clear_ls;
+    ((u8*)taskset)[0x72] = 0x80; /* no task waits on the workload flag */
+    wr32((u8*)taskset + 0x74, wid);
+    if (size >= 0x1894) wr32((u8*)taskset + 0x1890, size);
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] taskset-create object=0x%08X "
+                "wid=%u size=0x%X max=%u\n",
+                guest_ea(taskset), wid, size, max_contention);
     return CELL_OK;
 }
 s32 cellSpursCreateTaskset(CellSpurs* s, CellSpursTaskset* ts, u64 args,
                            const u8* priority, u32 max)
 {
-    (void)priority; (void)max;
-    return create_taskset_common(s, ts, sizeof(*ts), args);
+    return create_taskset_common(s, ts, sizeof(*ts), args, priority, max, 0);
 }
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* s, CellSpursTaskset* ts,
                                         const CellSpursTasksetAttribute* a)
 {
     if (!a) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     return create_taskset_common(s, ts, rd32(a->bytes + 0x20),
-                                 rd64(a->bytes + 0x08));
+                                  rd64(a->bytes + 0x08), a->bytes + 0x10,
+                                  rd32(a->bytes + 0x18),
+                                  a->bytes[0x24] ? 1 : 0);
 }
 s32 cellSpursCreateTaskset2(CellSpurs* s, CellSpursTaskset2* ts,
                             const CellSpursTasksetAttribute2* a)
 {
     u64 args = a ? rd64(a->bytes + 0x08) : 0;
-    return create_taskset_common(s, ts, sizeof(*ts), args);
+    return create_taskset_common(s, ts, sizeof(*ts), args,
+                                  a ? a->bytes + 0x10 : NULL,
+                                  a ? rd32(a->bytes + 0x18) : 8,
+                                  a && a->bytes[0x24] ? 1 : 0);
 }
 s32 cellSpursShutdownTaskset(CellSpursTaskset* object)
 {
@@ -713,6 +833,13 @@ static s32 create_task_common(void* object, CellSpursTaskId* out, const u8* elf,
         return CELL_SPURS_TASK_ERROR_BUSY;
     }
     task->owner = ts;
+    SpursState* spurs = spurs_find(ts->spurs);
+    if (spurs) {
+        mx_lock(&spurs->sync.mutex);
+        task->spu_num = spurs->nspus ?
+            spurs->next_spu_num++ % spurs->nspus : 0;
+        mx_unlock(&spurs->sync.mutex);
+    }
     task->elf = elf;
     task->elf_size = (u32)elf_size;
     task->context_ea = context_ea;
@@ -877,6 +1004,7 @@ s32 _cellSpursEventFlagInitialize(CellSpurs* spurs, CellSpursTaskset* ts,
     ef->bytes[0x0d] = spurs ? 1 : 0;
     ef->bytes[0x0e] = (u8)direction;
     ef->bytes[0x0f] = (u8)clear;
+    ef->bytes[0x0c] = 0xff;
     wr64(ef->bytes + 0x70, guest_ea(spurs ? (void*)spurs : (void*)ts));
     return sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 1) ?
            CELL_OK : CELL_SPURS_TASK_ERROR_NOMEM;
@@ -889,19 +1017,60 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* ts, CellSpursEventFlag* ef,
 s32 cellSpursEventFlagAttachLv2EventQueue(CellSpursEventFlag* ef)
 {
     if (!ef) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!aligned(ef, 128)) return CELL_SPURS_TASK_ERROR_ALIGN;
     SyncKey* sync = sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 0);
     if (!sync) return CELL_SPURS_TASK_ERROR_STAT;
-    ef->bytes[0x0c] = 0x10;
-    wr32(ef->bytes + 0x78, 1);
-    wr32(ef->bytes + 0x7c, 1);
+    if (ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_SPU2PPU &&
+        ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_ANY2ANY)
+        return CELL_SPURS_TASK_ERROR_PERM;
+    mx_lock(&g_registry_mutex);
+    if (ef->bytes[0x0c] != 0xff) {
+        mx_unlock(&g_registry_mutex);
+        return CELL_SPURS_TASK_ERROR_STAT;
+    }
+    u32 port = 16;
+    for (; port < 64; ++port) {
+        int used = 0;
+        for (u32 i = 0; i < MAX_EVENT_FLAGS; ++i) {
+            const SyncKey* candidate = &g_event_flags[i];
+            if (candidate->live && candidate->key && candidate->key != ef &&
+                ((const CellSpursEventFlag*)candidate->key)->bytes[0x0c] == port) {
+                used = 1;
+                break;
+            }
+        }
+        if (!used) break;
+    }
+    if (port == 64) {
+        mx_unlock(&g_registry_mutex);
+        return CELL_SPURS_TASK_ERROR_BUSY;
+    }
+    const u32 object_id = (u32)(sync - g_event_flags) + 1;
+    ef->bytes[0x0c] = (u8)port;
+    wr32(ef->bytes + 0x78, object_id);
+    wr32(ef->bytes + 0x7c, object_id);
+    mx_unlock(&g_registry_mutex);
     return CELL_OK;
 }
 s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* ef)
 {
     if (!ef) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!aligned(ef, 128)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    SyncKey* sync = sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 0);
+    if (!sync) return CELL_SPURS_TASK_ERROR_STAT;
+    if (ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_SPU2PPU &&
+        ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_ANY2ANY)
+        return CELL_SPURS_TASK_ERROR_PERM;
+    if (ef->bytes[0x0c] == 0xff) return CELL_SPURS_TASK_ERROR_STAT;
+    mx_lock(&sync->mutex);
+    if (rd16(ef->bytes + 0x04) || ef->bytes[0x07]) {
+        mx_unlock(&sync->mutex);
+        return CELL_SPURS_TASK_ERROR_BUSY;
+    }
     ef->bytes[0x0c] = 0xff;
     wr32(ef->bytes + 0x78, 0);
     wr32(ef->bytes + 0x7c, 0);
+    mx_unlock(&sync->mutex);
     return CELL_OK;
 }
 s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
@@ -940,23 +1109,65 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
 static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
 {
     if (!ef || !bits) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!aligned(ef, 128)) return CELL_SPURS_TASK_ERROR_ALIGN;
     if (mode > 1) return CELL_SPURS_TASK_ERROR_INVAL;
     SyncKey* sync = sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 0);
     if (!sync) return CELL_SPURS_TASK_ERROR_STAT;
+    if (ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_SPU2PPU &&
+        ef->bytes[0x0e] != CELL_SPURS_EVENT_FLAG_ANY2ANY)
+        return CELL_SPURS_TASK_ERROR_PERM;
+    if (!try_only && ef->bytes[0x0c] == 0xff)
+        return CELL_SPURS_TASK_ERROR_STAT;
     const u16 mask = rd16(bits);
     mx_lock(&sync->mutex);
-    while (!event_ready(rd16(ef->bytes), mask, mode)) {
-        if (try_only) { mx_unlock(&sync->mutex); return CELL_SPURS_TASK_ERROR_BUSY; }
-        wr16(ef->bytes + 0x04, mask);
-        ef->bytes[0x0a] = (u8)mode;
-        ef->bytes[0x07] = 1;
-        cv_wait(&sync->cond, &sync->mutex);
+    if (rd16(ef->bytes + 0x04) || ef->bytes[0x07]) {
+        mx_unlock(&sync->mutex);
+        return CELL_SPURS_TASK_ERROR_BUSY;
     }
-    u16 got = (u16)(rd16(ef->bytes) & mask);
-    wr16(bits, got);
-    if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        wr16(ef->bytes, (u16)(rd16(ef->bytes) & ~got));
+    if (event_ready(rd16(ef->bytes), mask, mode)) {
+        const u16 got = (u16)(rd16(ef->bytes) & mask);
+        wr16(bits, got);
+        if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
+            wr16(ef->bytes, (u16)(rd16(ef->bytes) & ~got));
+        mx_unlock(&sync->mutex);
+        return CELL_OK;
+    }
+    if (try_only) {
+        mx_unlock(&sync->mutex);
+        return CELL_SPURS_TASK_ERROR_BUSY;
+    }
+
+    u32 slot = 0;
+    if (ef->bytes[0x0e] == CELL_SPURS_EVENT_FLAG_ANY2ANY) {
+        const u16 used = rd16(ef->bytes + 0x08);
+        u32 low_slot = 0;
+        while (low_slot < 16 && (used & (1u << low_slot))) ++low_slot;
+        if (low_slot == 16) {
+            mx_unlock(&sync->mutex);
+            return CELL_SPURS_TASK_ERROR_BUSY;
+        }
+        slot = 15 - low_slot;
+    }
+    ef->bytes[0x06] = (u8)((slot << 4) | mode);
     ef->bytes[0x07] = 0;
+    wr16(ef->bytes + 0x04, mask);
+    atomic_thread_fence(memory_order_release);
+
+    while (!ef->bytes[0x07] && !event_ready(rd16(ef->bytes), mask, mode))
+        cv_wait(&sync->cond, &sync->mutex);
+
+    u16 got;
+    if (ef->bytes[0x07]) {
+        slot = ef->bytes[0x06] >> 4;
+        got = rd16(ef->bytes + 0x30 + slot * 2);
+        ef->bytes[0x07] = 0;
+    } else {
+        got = (u16)(rd16(ef->bytes) & mask);
+        if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
+            wr16(ef->bytes, (u16)(rd16(ef->bytes) & ~got));
+    }
+    wr16(bits, got);
+    wr16(ef->bytes + 0x04, 0);
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
@@ -1314,7 +1525,9 @@ s32 cellSpursBarrierInitialize(CellSpursTaskset* ts, CellSpursBarrier* b, u32 to
 
 typedef struct JobChainState {
     SyncKey sync;
+    void* spurs;
     u32 entry_ea, current_ea;
+    u32 wid;
     u16 descriptor_size;
     u16 max_grab;
     int running, complete, error;
@@ -1383,7 +1596,7 @@ static JobGuardState* jobguard_make(void* key)
 }
 
 s32 _cellSpursJobChainAttributeInitialize(u32 revision, u32 sdk,
-                                          CellSpursJobChainAttribute* a,
+                                           CellSpursJobChainAttribute* a,
                                           const u64* entry, u16 size_desc,
                                           u16 max_grab, const u8* priority,
                                           u32 max_cont, u32 auto_request,
@@ -1392,7 +1605,14 @@ s32 _cellSpursJobChainAttributeInitialize(u32 revision, u32 sdk,
 {
     if (!a || !entry || !priority) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
     if (!aligned(a, 8) || !aligned(entry, 8)) return CELL_SPURS_JOB_ERROR_ALIGN;
-    if (size_desc < 0x30 || (size_desc & 0x0f)) return CELL_SPURS_JOB_ERROR_DESCRIPTOR;
+    if ((size_desc != 64 && (size_desc < 128 || (size_desc & 127))) ||
+        !max_grab || max_grab > 16 || max_cont > CELL_SPURS_MAX_SPU ||
+        tag1 > 30 || tag2 > 30 || max_desc < 256 || max_desc > 1024 ||
+        (max_desc & 127) || size_desc > max_desc ||
+        (!auto_request && (!initial_request || initial_request > 255)))
+        return CELL_SPURS_JOB_ERROR_INVAL;
+    for (u32 i = 0; i < CELL_SPURS_MAX_SPU; ++i)
+        if (priority[i] > 15) return CELL_SPURS_JOB_ERROR_INVAL;
     memset(a->bytes, 0, sizeof(a->bytes));
     wr32(a->bytes + 0x00, revision);
     wr32(a->bytes + 0x04, sdk);
@@ -1416,26 +1636,82 @@ s32 cellSpursJobChainAttributeSetName(CellSpursJobChainAttribute* a, const char*
     return CELL_OK;
 }
 s32 cellSpursCreateJobChainWithAttribute(CellSpurs* s, CellSpursJobChain* object,
-                                         const CellSpursJobChainAttribute* a)
+                                           const CellSpursJobChainAttribute* a)
 {
     if (!s || !object || !a) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
-    if (!spurs_find(s)) return CELL_SPURS_JOB_ERROR_STAT;
+    if (!aligned(s, 128) || !aligned(object, 128) || !aligned(a, 8))
+        return CELL_SPURS_JOB_ERROR_ALIGN;
+    {
+        const u32 entry_ea = rd32(a->bytes + 0x08);
+        const u16 size_desc = rd16(a->bytes + 0x0c);
+        const u16 max_grab = rd16(a->bytes + 0x0e);
+        const u32 max_cont = rd32(a->bytes + 0x18);
+        const u32 tag1 = rd32(a->bytes + 0x20);
+        const u32 tag2 = rd32(a->bytes + 0x24);
+        const u32 max_desc = rd32(a->bytes + 0x2c);
+        const u32 initial_request = rd32(a->bytes + 0x30);
+        if (!entry_ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
+        if (entry_ea & 7) return CELL_SPURS_JOB_ERROR_ALIGN;
+        if ((size_desc != 64 && (size_desc < 128 || (size_desc & 127))) ||
+            !max_grab || max_grab > 16 || max_cont > CELL_SPURS_MAX_SPU ||
+            tag1 > 30 || tag2 > 30 || max_desc < 256 || max_desc > 1024 ||
+            (max_desc & 127) || size_desc > max_desc ||
+            (!a->bytes[0x1c] && (!initial_request || initial_request > 255)))
+            return CELL_SPURS_JOB_ERROR_INVAL;
+        for (u32 i = 0; i < CELL_SPURS_MAX_SPU; ++i)
+            if (a->bytes[0x10 + i] > 15) return CELL_SPURS_JOB_ERROR_INVAL;
+    }
+    SpursState* spurs_state = spurs_find(s);
+    if (!spurs_state) return CELL_SPURS_JOB_ERROR_STAT;
     JobChainState* jc = jobchain_make(object);
     if (!jc) return CELL_SPURS_JOB_ERROR_NOMEM;
+    mx_lock(&spurs_state->sync.mutex);
+    if (spurs_state->next_wid >= 32) {
+        mx_unlock(&spurs_state->sync.mutex);
+        return CELL_SPURS_JOB_ERROR_NOMEM;
+    }
+    const u32 wid = spurs_state->next_wid++;
+    spurs_state->active_wkl_mask |= 0x80000000u >> wid;
+    mx_unlock(&spurs_state->sync.mutex);
     memset(object->bytes, 0, sizeof(object->bytes));
+    jc->spurs = s;
     jc->entry_ea = rd32(a->bytes + 0x08);
     jc->descriptor_size = rd16(a->bytes + 0x0c);
     jc->max_grab = rd16(a->bytes + 0x0e);
+    jc->wid = wid;
     jc->current_ea = jc->entry_ea;
     jc->complete = jc->running = jc->error = 0;
     atomic_store(&jc->shutdown, 0);
     jc->alternate_slot = 0x4c00;
-    wr64(object->bytes + 0x00, guest_ea(s));
-    wr64(object->bytes + 0x20, jc->entry_ea);
+    wr64(object->bytes + 0x00, jc->entry_ea);
+    object->bytes[0x23] = 0;
+    object->bytes[0x24] = a->bytes[0x1c] ? 1 : 0;
+    object->bytes[0x28] = (u8)rd32(a->bytes + 0x30);
+    object->bytes[0x2a] = (u8)rd32(a->bytes + 0x20);
+    object->bytes[0x2b] = (u8)rd32(a->bytes + 0x24);
+    {
+        const u32 max_desc = rd32(a->bytes + 0x2c);
+        object->bytes[0x2c] = (a->bytes[0x28] ? 0x80u : 0u) |
+            (u8)((max_desc >= 0x100 ? (max_desc - 0x100) / 128 : 0) << 4);
+    }
+    object->bytes[0x2d] = (u8)rd32(a->bytes + 0x00);
+    wr16(object->bytes + 0x70, jc->max_grab);
+    wr16(object->bytes + 0x72, jc->descriptor_size);
+    wr32(object->bytes + 0x74, wid);
+    wr64(object->bytes + 0x78, guest_ea(s));
+    wr32(object->bytes + 0x90, rd32(a->bytes + 0x04));
+    object->bytes[0x94] = a->bytes[0x3c] ? 2 : 0;
     if (jc->entry_ea < g_native_spurs_ppu_watch_lo)
         g_native_spurs_ppu_watch_lo = jc->entry_ea;
     if (jc->entry_ea + 4096 > g_native_spurs_ppu_watch_hi)
         g_native_spurs_ppu_watch_hi = jc->entry_ea + 4096;
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] jobchain-create object=0x%08X "
+                "entry=0x%08X wid=%u desc=0x%X commands=%016llX/%016llX\n",
+                guest_ea(object), jc->entry_ea, jc->wid, jc->descriptor_size,
+                (unsigned long long)rd64(vm_base + jc->entry_ea),
+                (unsigned long long)rd64(vm_base + jc->entry_ea + 8));
     return CELL_OK;
 }
 
@@ -1480,6 +1756,11 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size)
     const u8* d = vm_base + descriptor_ea;
     u32 bin_ea = (u32)(rd64(d + 0x00) & ~7ull);
     u32 bin_size = (u32)rd16(d + 0x08) * 16;
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] job-start descriptor=0x%08X "
+                "bin=0x%08X size=0x%X slot=0x%05X\n",
+                descriptor_ea, bin_ea, bin_size, jc->alternate_slot);
     if (!bin_ea || !bin_size) return CELL_SPURS_JOB_ERROR_INVALID_BIN;
     if (descriptor_size < 0x30 || descriptor_size > 0x400 ||
         (descriptor_size & 0x0f)) return CELL_SPURS_JOB_ERROR_DESCRIPTOR;
@@ -1497,6 +1778,12 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size)
     spu_context_init(ctx, 0);
     u32 slot = jc->alternate_slot;
     jc->alternate_slot = slot == 0x4c00 ? 0xe400 : 0x4c00;
+    /* Current title lifts give overlapping placements distinct image ids.
+     * Select from the exact descriptor identity and the native scheduler's
+     * chosen LS slot before entering the lifted job. */
+    const int slot_image =
+        spu_job_descriptor_image(image.image_id, slot, bin_ea);
+    if (slot_image >= 0) image.image_id = slot_image;
     if (bin_size > SPU_LS_SIZE - slot) { free(ctx); return CELL_SPURS_JOB_ERROR_INVALID_BIN; }
     memcpy(ctx->ls + slot, vm_base + bin_ea, bin_size);
 
@@ -1591,18 +1878,27 @@ static int wait_guard(JobChainState* jc, u32 guard_ea)
         wr32(g->sync.key, g->count);
     }
     mx_unlock(&g->sync.mutex);
-    return atomic_load(&jc->shutdown) ? CELL_SPURS_JOB_ERROR_ABORT : CELL_OK;
+    return CELL_OK;
 }
 static int wait_job_slot(JobChainState* jc, u32 pc, u64 empty_command)
 {
     jc->current_ea = pc;
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] jobchain-park pc=0x%08X "
+                "command=%016llX\n", pc,
+                (unsigned long long)empty_command);
     mx_lock(&jc->sync.mutex);
     while (rd64(vm_base + pc) == empty_command &&
            !atomic_load(&jc->shutdown))
         cv_wait(&jc->sync.cond, &jc->sync.mutex);
     mx_unlock(&jc->sync.mutex);
-    return atomic_load(&jc->shutdown) ?
-           CELL_SPURS_JOB_ERROR_ABORT : CELL_OK;
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] jobchain-wake pc=0x%08X "
+                "command=%016llX\n", pc,
+                (unsigned long long)rd64(vm_base + pc));
+    return CELL_OK;
 }
 static int execute_chain(JobChainState* jc)
 {
@@ -1680,11 +1976,19 @@ static int execute_chain(JobChainState* jc)
         return CELL_SPURS_JOB_ERROR_UNKNOWN_CMD;
     }
     return atomic_load(&jc->shutdown) ?
-           CELL_SPURS_JOB_ERROR_ABORT : CELL_SPURS_JOB_ERROR_UNKNOWN_CMD;
+           CELL_OK : CELL_SPURS_JOB_ERROR_UNKNOWN_CMD;
 }
 static void jobchain_run(JobChainState* jc)
 {
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] jobchain-start entry=0x%08X\n",
+                jc->current_ea);
     int rc = execute_chain(jc);
+    if (native_trace_enabled())
+        fprintf(stderr,
+                "[native-spurs-trace] jobchain-finish pc=0x%08X rc=0x%08X\n",
+                jc->current_ea, (u32)rc);
     mx_lock(&jc->sync.mutex);
     jc->error = rc;
     jc->running = 0;
@@ -1760,13 +2064,13 @@ s32 cellSpursJoinJobChain(CellSpursJobChain* object)
     return rc;
 }
 s32 cellSpursJobGuardInitialize(const CellSpursJobChain* chain,
-                                CellSpursJobGuard* object, u32 count,
-                                u8 request, u8 auto_reset)
+                                 CellSpursJobGuard* object, u32 count,
+                                 u8 request, u8 auto_reset)
 {
-    JobChainState* jc = jobchain_find(chain);
-    if (!jc || !object) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
+    if (!chain || !object) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
     if (!aligned(object, 128)) return CELL_SPURS_JOB_ERROR_ALIGN;
-    if (!count) return CELL_SPURS_JOB_ERROR_INVAL;
+    JobChainState* jc = jobchain_find(chain);
+    if (!jc) return CELL_SPURS_JOB_ERROR_INVAL;
     JobGuardState* g = jobguard_make(object);
     if (!g) return CELL_SPURS_JOB_ERROR_NOMEM;
     g->chain = jc; g->count = g->original = count;
@@ -1781,15 +2085,28 @@ s32 cellSpursJobGuardInitialize(const CellSpursJobChain* chain,
 }
 s32 cellSpursJobGuardNotify(CellSpursJobGuard* object)
 {
+    if (!object) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
+    if (!aligned(object, 128)) return CELL_SPURS_JOB_ERROR_ALIGN;
     JobGuardState* g = jobguard_find(object);
-    if (!g) return object ? CELL_SPURS_JOB_ERROR_STAT : CELL_SPURS_JOB_ERROR_NULL_POINTER;
+    if (!g) return CELL_SPURS_JOB_ERROR_STAT;
     mx_lock(&g->sync.mutex);
     if (!g->count) { mx_unlock(&g->sync.mutex); return CELL_SPURS_JOB_ERROR_STAT; }
     --g->count; wr32(object->bytes, g->count);
     int released = !g->count;
     if (released) cv_wake_all(&g->sync.cond);
     mx_unlock(&g->sync.mutex);
-    if (released)
-        (void)cellSpursRunJobChain((const CellSpursJobChain*)g->chain->sync.key);
+    return CELL_OK;
+}
+
+s32 cellSpursJobGuardReset(CellSpursJobGuard* object)
+{
+    if (!object) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
+    if (!aligned(object, 128)) return CELL_SPURS_JOB_ERROR_ALIGN;
+    JobGuardState* g = jobguard_find(object);
+    if (!g) return CELL_SPURS_JOB_ERROR_STAT;
+    mx_lock(&g->sync.mutex);
+    g->count = g->original;
+    wr32(object->bytes, g->count);
+    mx_unlock(&g->sync.mutex);
     return CELL_OK;
 }

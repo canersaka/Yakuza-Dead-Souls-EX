@@ -117,8 +117,15 @@ static void synthetic_task(spu_context* ctx)
     task_abi_ok = task_abi_ok && ctx->gpr[80]._u32[0] == 0xdeadbeef;
     task_phase = 2;
     ctx->gpr[3]._u32[0] = 0; /* EXIT */
-    ctx->gpr[4]._u32[0] = 0x2468;
+    /* The SDK task exit wrapper saves the public exit code here before it
+     * repurposes r4 for the native syscall entry. */
+    put32(ctx->ls + 0x2fd0, 0x2468);
     (void)ctx->native_spurs_syscall(ctx, ctx->native_spurs_opaque);
+}
+static uint16_t be16(const void* v)
+{
+    const uint8_t* p = (const uint8_t*)v;
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 static void synthetic_job(spu_context* ctx)
 {
@@ -152,6 +159,18 @@ static int wait_value(volatile int* value, int expected)
     return 0;
 }
 static int wait_phase(int phase) { return wait_value(&task_phase, phase); }
+static int wait_be32_value(const void* value, uint32_t expected)
+{
+    for (unsigned i = 0; i < 1000000; ++i) {
+        if (be32(value) == expected) return 1;
+#if defined(_WIN32)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+    return 0;
+}
 
 static int test_layouts(void)
 {
@@ -241,6 +260,10 @@ static int test_task_event_queue(void)
     CHECK(_cellSpursEventFlagInitialize(NULL, (CellSpursTaskset*)ts, ef,
                                         CELL_SPURS_EVENT_FLAG_CLEAR_AUTO,
                                         CELL_SPURS_EVENT_FLAG_ANY2ANY) == 0);
+    put16(bits, 0x0001);
+    CHECK(cellSpursEventFlagWait(ef, bits, CELL_SPURS_EVENT_FLAG_OR) ==
+          CELL_SPURS_TASK_ERROR_STAT);
+    CHECK(cellSpursEventFlagAttachLv2EventQueue(ef) == 0);
     CHECK(cellSpursEventFlagSet(ef, 0x00a0) == 0);
     put16(bits, 0x0020);
     CHECK(cellSpursEventFlagWait(ef, bits, CELL_SPURS_EVENT_FLAG_OR) == 0);
@@ -264,6 +287,40 @@ static int test_task_event_queue(void)
         CHECK(args.rc == 0);
         CHECK(guest[0x9010] == 0 && guest[0x9011] == 0x40);
     }
+    {
+        EventWaitArgs args = {ef, bits, -1};
+        put16(bits, 0x0001);
+#if defined(_WIN32)
+        HANDLE thread = CreateThread(NULL, 0, event_wait_thread, &args, 0, NULL);
+        CHECK(thread != NULL);
+#else
+        pthread_t thread;
+        CHECK(pthread_create(&thread, NULL, event_wait_thread, &args) == 0);
+#endif
+        for (unsigned spin = 0; spin < 1000 && be16(ef->bytes + 0x04) != 0x0001; ++spin) {
+#if defined(_WIN32)
+            Sleep(1);
+#else
+            sched_yield();
+#endif
+        }
+        CHECK(be16(ef->bytes + 0x04) == 0x0001);
+        const uint32_t slot = ef->bytes[0x06] >> 4;
+        put16(ef->bytes + 0x30 + slot * 2, 0x0001);
+        put16(ef->bytes + 0x04, 0);
+        ef->bytes[0x07] = 1;
+        cellSpursNotifyGuestWrite(0x6800, 128);
+#if defined(_WIN32)
+        CHECK(WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+#else
+        CHECK(pthread_join(thread, NULL) == 0);
+#endif
+        CHECK(args.rc == 0);
+        CHECK(be16(bits) == 0x0001);
+        CHECK(ef->bytes[0x07] == 0);
+    }
+    CHECK(cellSpursEventFlagDetachLv2EventQueue(ef) == 0);
 
     CHECK(_cellSpursQueueInitialize(NULL, (CellSpursTaskset*)ts, push_queue,
                                     push_data, 16, 2, 2) == 0);
@@ -308,6 +365,7 @@ static int test_job_chain(void)
     CellSpursJobChainAttribute* ja = (CellSpursJobChainAttribute*)(guest + 0xb800);
     CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0xc000);
     uint64_t* commands = (uint64_t*)(guest + 0xd000);
+    CellSpursJobGuard* guard = (CellSpursJobGuard*)(guest + 0xd080);
     uint8_t* descriptor = guest + 0xe000;
     uint8_t* binary = guest + 0xf000;
     uint8_t* inout = guest + 0x10000;
@@ -321,9 +379,9 @@ static int test_job_chain(void)
     put32(descriptor + 0x10, 1);  /* write back input/output DMA list */
     put32(descriptor + 0x14, 16);
     put64(descriptor + 0x30, ((uint64_t)16 << 32) | 0x10000);
-    put64(commands + 0, 0x000000000000d003ull); /* empty circular NEXT */
-    put64(commands + 1, 0x0000000800000012ull); /* empty JTS slot */
-    put64(commands + 2, 127);
+    put64(commands + 0, 0x000000000000d003ull); /* circular empty NEXT */
+    put64(commands + 1, 0x000000000000d08full); /* GUARD */
+    put64(commands + 2, 0x000000000000d003ull); /* wrap to the head */
     spu_workload_reset();
     CHECK(spu_workload_register_direct(
               spu_workload_fingerprint(binary, 16), 16,
@@ -337,17 +395,32 @@ static int test_job_chain(void)
     CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
     CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
     CHECK(_cellSpursJobChainAttributeInitialize(3, 0x475001, ja, commands,
+                                                0x30, 1, priority, 1, 0,
+                                                0, 0, 0, 0x100, 1) ==
+          CELL_SPURS_JOB_ERROR_INVAL);
+    CHECK(_cellSpursJobChainAttributeInitialize(3, 0x475001, ja, commands,
                                                 0x40, 1, priority, 1, 0,
-                                                0, 0, 0, 0x40, 1) == 0);
+                                                0, 0, 0, 0x100, 1) == 0);
     CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    CHECK(cellSpursJobGuardInitialize(jc, guard, 1, 1, 1) == 0);
+    CHECK(cellSpursJobGuardNotify(guard) == 0);
+    CHECK(be32(guard->bytes) == 0);
+    CHECK(cellSpursJobGuardNotify(guard) == CELL_SPURS_JOB_ERROR_STAT);
+    CHECK(cellSpursJobGuardReset(guard) == 0);
+    CHECK(be32(guard->bytes) == 1);
     job_runs = 0;
     job_abi_ok = 0;
     CHECK(cellSpursRunJobChain(jc) == 0);
     put64(commands + 0, 0xe000);
     cellSpursNotifyPpuGuestWrite(0xd000, 8);
     CHECK(wait_value(&job_runs, 1));
-    put64(commands + 1, 127);
-    cellSpursNotifyPpuGuestWrite(0xd008, 8);
+    put64(commands + 0, 0x000000000000d003ull);
+    cellSpursNotifyPpuGuestWrite(0xd000, 8);
+    CHECK(cellSpursJobGuardNotify(guard) == 0);
+    CHECK(wait_be32_value(guard->bytes, 1));
+    put64(commands + 0, 0x0000000800000012ull);
+    cellSpursNotifyPpuGuestWrite(0xd000, 8);
+    CHECK(cellSpursShutdownJobChain(jc) == 0);
     CHECK(cellSpursJoinJobChain(jc) == 0);
     CHECK(job_runs == 1);
     CHECK(job_abi_ok);
