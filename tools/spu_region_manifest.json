@@ -106,12 +106,14 @@
         { "stem": "job_bin_d_5000",  "base": "0x5000",  "diag": "recomp_prx/job_bin_d_5000.c",  "image_id": 26 },
         { "stem": "job_bin_d_c400",  "base": "0xC400",  "diag": "yakuza/generated/job_bin_d_c400.c",  "image_id": 42 },
         { "stem": "job_bin_d_e400",  "base": "0xE400",  "elf": "recomp_prx/job_bin_d_e400.elf", "diag": "recomp_prx/job_bin_d_e400.c",  "image_id": 18 },
+        { "stem": "job_bin_d_15c00", "base": "0x15C00", "diag": "yakuza/generated/job_bin_d_15c00.c", "image_id": 47 },
         { "stem": "job_bin_d_15800", "base": "0x15800", "diag": "recomp_prx/job_bin_d_15800.c", "image_id": 25 },
         { "stem": "job_bin_d_20c00", "base": "0x20C00", "diag": "recomp_prx/job_bin_d_20c00.c", "image_id": 18 },
         { "stem": "job_bin_d_23000", "base": "0x23000", "diag": "recomp_prx/job_bin_d_23000.c", "image_id": 21 },
         { "stem": "job_bin_d_27400", "base": "0x27400", "diag": "recomp_prx/job_bin_d_27400.c", "image_id": 32 },
         { "stem": "job_bin_d_2a800", "base": "0x2A800", "diag": "recomp_prx/job_bin_d_2a800.c", "image_id": 33 },
         { "stem": "job_bin_d_2b400", "base": "0x2B400", "diag": "recomp_prx/job_bin_d_2b400.c", "image_id": 29 },
+        { "stem": "job_bin_d_2b800", "base": "0x2B800", "diag": "yakuza/generated/job_bin_d_2b800.c", "image_id": 45 },
         { "stem": "job_bin_d_2c400", "base": "0x2C400", "diag": "recomp_prx/job_bin_d_2c400.c", "image_id": 36 },
         { "stem": "job_bin_d_2d400", "base": "0x2D400", "diag": "recomp_prx/job_bin_d_2d400.c", "image_id": 31 },
         { "stem": "job_bin_d_2e400", "base": "0x2E400", "diag": "recomp_prx/job_bin_d_2e400.c", "image_id": 34 },
@@ -134,7 +136,9 @@
           "prefix": "spu_jobO3BC_", "register": "spu_recomp_register_jobbin_orphanage_3bc00",
           "image_id": 44,
           "entry_evidence": "runtime handoff observed 07-30: launch branch target equals the placement base; A010 full-tuple dispatch assigns image 44",
-          "note": "exact tracked instruction twin; overlaps the 0x3B000 placement span and is covered by the collision regression" }
+          "note": "exact tracked instruction twin; overlaps the 0x3B000 placement span and is covered by the collision regression" },
+        { "stem": "job_bin_orphanage_3c000", "base": "0x3C000", "diag": "yakuza/generated/job_bin_orphanage_3c000.c", "image_id": 48 },
+        { "stem": "job_bin_orphanage_3cc00", "base": "0x3CC00", "diag": "yakuza/generated/job_bin_orphanage_3cc00.c", "image_id": 46 }
       ]
     }
   }

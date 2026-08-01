@@ -60,6 +60,29 @@ CLFLAGS = ["/nologo", "/O2", "/Ob2", "/DNDEBUG", "/MT", "/W3",
            "/std:c17", "/experimental:c11atomics", "/bigobj"]
 
 
+def resolve_cl():
+    """Find cl even when a Python launcher restores its original PATH.
+
+    vcvars still exports VCToolsInstallDir and the selected host/target
+    architecture in that environment, so use those as the authoritative
+    fallback instead of rejecting a correctly initialized developer shell.
+    """
+    found = shutil.which("cl")
+    if found:
+        return found
+    root = os.environ.get("VCToolsInstallDir")
+    host = os.environ.get("VSCMD_ARG_HOST_ARCH", "x64")
+    target = os.environ.get("VSCMD_ARG_TGT_ARCH", "x64")
+    if root:
+        candidate = os.path.join(root, "bin", f"Host{host}", target, "cl.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+CL_EXE = resolve_cl()
+
+
 def compile_twin(stem, twin_c, twin_h_dir, twin_h_name, register, outdir, tag):
     exe = os.path.join(outdir, f"{stem}.{tag}.exe")
     if (os.path.exists(exe)
@@ -68,7 +91,7 @@ def compile_twin(stem, twin_c, twin_h_dir, twin_h_name, register, outdir, tag):
         return exe, 0.0, None
     objdir = os.path.join(outdir, f"obj_{tag}")
     os.makedirs(objdir, exist_ok=True)
-    cmd = (["cl"] + CLFLAGS +
+    cmd = ([CL_EXE] + CLFLAGS +
            ["/I", os.path.join(ROOT, "include"),
             "/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_h_dir,
             f"/DTWIN_HEADER={twin_h_name}", f"/DREGISTER_FN={register}",
@@ -337,7 +360,7 @@ def main():
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None
 
-    if shutil.which("cl") is None:
+    if CL_EXE is None:
         print("ERROR: cl not on PATH -- run from a vcvars64-imported shell")
         sys.exit(2)
 

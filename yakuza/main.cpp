@@ -2510,12 +2510,20 @@ static void yz_sample_t1_spin(const char* tag)
 {
     if (!g_yz_main_hthread) return;
     uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
-    struct { uint32_t addr; uint64_t off; int n; } hist[48]; int hn = 0, taken = 0;
+    struct {
+        uintptr_t rip;
+        uint32_t addr;
+        uint64_t off;
+        int n;
+    } hist[48];
+    int hn = 0, taken = 0;
     for (int s = 0; s < 24; s++) {
         if (SuspendThread(g_yz_main_hthread) == (DWORD)-1) { Sleep(60); continue; }
         CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_CONTROL;
+        uintptr_t rip = 0;
         uint32_t fa = 0xFFFFFFFFu; uint64_t fo = 0;
         if (GetThreadContext(g_yz_main_hthread, &cx)) {
+            rip = (uintptr_t)cx.Rip;
             if (const yz_func_entry* fe = yz_func_from_host((void*)cx.Rip)) {
                 fa = fe->addr; fo = (uintptr_t)cx.Rip - (uintptr_t)fe->fn;
             } else { fo = (uintptr_t)cx.Rip - mod; }
@@ -2523,18 +2531,40 @@ static void yz_sample_t1_spin(const char* tag)
         ResumeThread(g_yz_main_hthread);
         taken++;
         int idx = -1;
-        for (int i = 0; i < hn; i++) if (hist[i].addr == fa && hist[i].off == fo) { idx = i; break; }
-        if (idx < 0 && hn < 48) { idx = hn++; hist[idx].addr = fa; hist[idx].off = fo; hist[idx].n = 0; }
+        for (int i = 0; i < hn; i++) {
+            if (hist[i].rip == rip) { idx = i; break; }
+        }
+        if (idx < 0 && hn < 48) {
+            idx = hn++;
+            hist[idx].rip = rip;
+            hist[idx].addr = fa;
+            hist[idx].off = fo;
+            hist[idx].n = 0;
+        }
         if (idx >= 0) hist[idx].n++;
         Sleep(60);
     }
     fprintf(stderr, "[%s] t1 host-RIP profile (%d samples, host-RIP is RELIABLE):\n", tag, taken);
     for (int i = 0; i < hn; i++) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized =
+            hist[i].rip != 0 &&
+            SymFromAddr(GetCurrentProcess(), (DWORD64)hist[i].rip,
+                        &displacement, symbol) != FALSE;
         if (hist[i].addr == 0xFFFFFFFFu)
-            fprintf(stderr, "    [%2d] rva-only +0x%llX\n", hist[i].n, (unsigned long long)hist[i].off);
-        else
-            fprintf(stderr, "    [%2d] func_%08X +0x%llX\n", hist[i].n, hist[i].addr,
+            fprintf(stderr, "    [%2d] rva-only +0x%llX", hist[i].n,
                     (unsigned long long)hist[i].off);
+        else
+            fprintf(stderr, "    [%2d] func_%08X +0x%llX", hist[i].n,
+                    hist[i].addr, (unsigned long long)hist[i].off);
+        if (symbolized)
+            fprintf(stderr, " [sym %s+0x%llX]", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
     }
     fflush(stderr);
 }

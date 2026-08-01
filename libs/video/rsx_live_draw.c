@@ -95,7 +95,8 @@ extern volatile LONG g_yz_a010_root_active;
 
 #define LD_SWAP_BUFFERS  2
 #define MAX_SURFACES     64
-#define MAX_TEXTURES     128
+#define MAX_TEXTURES     1024
+#define MAX_RETIRED_TEXTURES 4096
 #define MAX_VTEX         64
 #define MAX_SAMPLERS     128
 /*
@@ -111,6 +112,9 @@ extern volatile LONG g_yz_a010_root_active;
 #define MAX_SHADER_BLOBS 8192
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
+#define SHADER_DISK_CACHE_MAGIC   0x43535A59u /* "YZSC" */
+#define SHADER_DISK_CACHE_VERSION 1u
+#define SHADER_DISK_CACHE_MAX_BLOB (4u * 1024u * 1024u)
 
 #define SRV_WHITE        0
 #define SRV_SURFACE_BASE 1
@@ -137,7 +141,7 @@ extern volatile LONG g_yz_a010_root_active;
 #define LD_VARIANT_SET_CAPACITY (MAX_SHADER_BLOBS * 2u)
 
 #define VERT_STRIDE      (16 * 4 * 4)   /* 16 attrs * float4                  */
-#define MAX_VERTS        (256 * 1024)
+#define VERT_BUFFER_SIZE (256u * 1024u * 1024u)
 #define LD_INVALID_SURFACE 0xFFFFFFFFu
 
 /* gcm texture format bytes (mirror rsx_dispatch.h) */
@@ -207,6 +211,15 @@ typedef struct {
     u64 retained_source_bytes;
     u64 retained_blob_bytes;
 } shader_blob_cache_t;
+typedef struct {
+    u32 magic;
+    u32 version;
+    u32 stage;
+    u32 source_length;
+    u32 blob_length;
+    u32 reserved;
+    u64 source_hash;
+} shader_disk_cache_header;
 
 typedef struct {
     int              enabled;    /* YZ_RSX_DRAW resolved                     */
@@ -244,7 +257,7 @@ typedef struct {
     u32                        n_textures;
     vtexcache_t                vtex[MAX_VTEX];
     u32                        n_vtex;
-    ID3D12Resource*            retired_textures[MAX_TEXTURES];
+    ID3D12Resource*            retired_textures[MAX_RETIRED_TEXTURES];
     u32                        n_retired_textures;
     ID3D12Resource*            upload;
     u8*                        upload_mapped;
@@ -772,6 +785,12 @@ static u64 g_ld_vtex_unsupported = 0;
 static u64 g_ld_vtex_enabled = 0;
 static u64 g_ld_vtex_missing_for_txl = 0;
 static u64 g_ld_divider_fetches = 0;
+static char g_ld_shader_disk_dir[MAX_PATH];
+static int g_ld_shader_disk_ready = -1;
+static u64 g_ld_shader_disk_hits[2] = {0, 0};
+static u64 g_ld_shader_disk_misses[2] = {0, 0};
+static u64 g_ld_shader_disk_writes[2] = {0, 0};
+static u64 g_ld_shader_disk_rejects = 0;
 
 /*
  * Profile-lane-only renderer accounting.  These counters deliberately live
@@ -846,6 +865,8 @@ typedef struct {
     u64 vertex_upload_bytes;
     u64 vertex_fetch_pack_qpc;
     u64 texture_upload_bytes;
+    u64 texture_decode_calls;
+    u64 texture_decode_qpc;
     u64 ps_constant_allocations;
     u64 ps_constant_upload_bytes;
     u64 ps_constant_upload_qpc;
@@ -1337,7 +1358,7 @@ void rsx_live_draw_flush(void)
 static void retire_texture(ID3D12Resource* tex)
 {
     if (!tex) return;
-    if (g.n_retired_textures >= MAX_TEXTURES)
+    if (g.n_retired_textures >= MAX_RETIRED_TEXTURES)
         ld_flush(LD_FLUSH_RETIRE_QUEUE);
     g.retired_textures[g.n_retired_textures++] = tex;
     ld_profile_note_ring_highwater();
@@ -1767,6 +1788,21 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
     return resource;
 }
 
+static ID3D12Resource* decode_guest_texture_profiled(
+    const rsx_dsp_texture* texture, u32 remap)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    g_ld_profile.total.texture_decode_calls++;
+#endif
+    ID3D12Resource* result = decode_guest_texture(texture, remap);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.texture_decode_qpc +=
+        (u64)(ld_profile_qpc() - begin);
+#endif
+    return result;
+}
+
 static void write_texture_srv(u32 index, const texcache_t* entry)
 {
     const u32 base_fmt = entry->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
@@ -1846,7 +1882,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             const u64 hash = texture_content_hash(t, &readable);
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
-                ID3D12Resource* replacement = decode_guest_texture(t, remap);
+                ID3D12Resource* replacement =
+                    decode_guest_texture_profiled(t, remap);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -1915,7 +1952,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         int readable = 0;
         replacement.content_hash = texture_content_hash(t, &readable);
     }
-    replacement.tex = decode_guest_texture(t, remap);
+    replacement.tex = decode_guest_texture_profiled(t, remap);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)
@@ -2404,6 +2441,185 @@ static u64 fnv1a(const void* data, u32 n, u64 h)
     return h;
 }
 
+static u32 shader_disk_cache_stage_index(u32 stage)
+{
+    return stage == 'V' ? 0u : 1u;
+}
+
+static void shader_disk_cache_progress(u64 value)
+{
+    if (value > 4u && (value & (value - 1u)) != 0u)
+        return;
+    fprintf(stderr,
+            "[shader-disk-cache] hits{vs=%llu ps=%llu} "
+            "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
+            "rejects=%llu\n",
+            (unsigned long long)g_ld_shader_disk_hits[0],
+            (unsigned long long)g_ld_shader_disk_hits[1],
+            (unsigned long long)g_ld_shader_disk_misses[0],
+            (unsigned long long)g_ld_shader_disk_misses[1],
+            (unsigned long long)g_ld_shader_disk_writes[0],
+            (unsigned long long)g_ld_shader_disk_writes[1],
+            (unsigned long long)g_ld_shader_disk_rejects);
+}
+
+static int shader_disk_cache_prepare(void)
+{
+    if (g_ld_shader_disk_ready >= 0)
+        return g_ld_shader_disk_ready;
+    g_ld_shader_disk_ready = 0;
+    if (getenv("YZ_RSX_NO_SHADER_DISK_CACHE")) {
+        fprintf(stderr, "[shader-disk-cache] disabled\n");
+        return 0;
+    }
+
+    const char* override_dir = getenv("YZ_RSX_SHADER_CACHE_DIR");
+    if (override_dir && override_dir[0]) {
+        if (snprintf(g_ld_shader_disk_dir, sizeof(g_ld_shader_disk_dir),
+                     "%s", override_dir) < 0 ||
+            strlen(g_ld_shader_disk_dir) >= sizeof(g_ld_shader_disk_dir) - 1u)
+            return 0;
+    } else {
+        CreateDirectoryA("scratch", NULL);
+        snprintf(g_ld_shader_disk_dir, sizeof(g_ld_shader_disk_dir),
+                 "scratch\\rsx_shader_cache_v%u",
+                 SHADER_DISK_CACHE_VERSION);
+    }
+
+    if (!CreateDirectoryA(g_ld_shader_disk_dir, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        fprintf(stderr,
+                "[shader-disk-cache] cannot create '%s' error=%lu\n",
+                g_ld_shader_disk_dir, (unsigned long)GetLastError());
+        return 0;
+    }
+    const DWORD attributes = GetFileAttributesA(g_ld_shader_disk_dir);
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return 0;
+
+    g_ld_shader_disk_ready = 1;
+    fprintf(stderr, "[shader-disk-cache] enabled dir='%s' version=%u\n",
+            g_ld_shader_disk_dir, SHADER_DISK_CACHE_VERSION);
+    return 1;
+}
+
+static int shader_disk_cache_path(
+    char path[MAX_PATH], u32 stage, u64 hash, u32 source_length)
+{
+    if (!shader_disk_cache_prepare())
+        return 0;
+    const int length = snprintf(
+        path, MAX_PATH, "%s\\%c_%016llX_%08X.bin",
+        g_ld_shader_disk_dir, (char)stage,
+        (unsigned long long)hash, source_length);
+    return length > 0 && length < MAX_PATH;
+}
+
+static ID3DBlob* shader_disk_cache_load(
+    u32 stage, const char* source, u32 source_length, u64 hash)
+{
+    char path[MAX_PATH];
+    const u32 stage_index = shader_disk_cache_stage_index(stage);
+    if (!shader_disk_cache_path(path, stage, hash, source_length))
+        return NULL;
+
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        const u64 value = ++g_ld_shader_disk_misses[stage_index];
+        shader_disk_cache_progress(value);
+        return NULL;
+    }
+
+    shader_disk_cache_header header;
+    memset(&header, 0, sizeof(header));
+    int valid = fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == SHADER_DISK_CACHE_MAGIC &&
+        header.version == SHADER_DISK_CACHE_VERSION &&
+        header.stage == stage && header.source_hash == hash &&
+        header.source_length == source_length && source_length <= 256u * 1024u &&
+        header.blob_length > 0 &&
+        header.blob_length <= SHADER_DISK_CACHE_MAX_BLOB;
+    char* stored_source = NULL;
+    ID3DBlob* blob = NULL;
+    if (valid) {
+        stored_source = (char*)malloc(source_length ? source_length : 1u);
+        valid = stored_source != NULL &&
+            fread(stored_source, 1, source_length, file) == source_length &&
+            memcmp(stored_source, source, source_length) == 0;
+    }
+    if (valid) {
+        valid = SUCCEEDED(D3DCreateBlob(header.blob_length, &blob)) && blob &&
+            fread(blob->lpVtbl->GetBufferPointer(blob), 1,
+                  header.blob_length, file) == header.blob_length;
+    }
+    free(stored_source);
+    fclose(file);
+
+    if (!valid) {
+        if (blob)
+            blob->lpVtbl->Release(blob);
+        DeleteFileA(path);
+        g_ld_shader_disk_rejects++;
+        const u64 value = ++g_ld_shader_disk_misses[stage_index];
+        shader_disk_cache_progress(value);
+        return NULL;
+    }
+
+    const u64 value = ++g_ld_shader_disk_hits[stage_index];
+    shader_disk_cache_progress(value);
+    return blob;
+}
+
+static void shader_disk_cache_store(
+    u32 stage, const char* source, u32 source_length, u64 hash,
+    ID3DBlob* blob)
+{
+    if (!blob || source_length > 256u * 1024u)
+        return;
+    const size_t blob_length = blob->lpVtbl->GetBufferSize(blob);
+    if (!blob_length || blob_length > SHADER_DISK_CACHE_MAX_BLOB)
+        return;
+
+    char path[MAX_PATH], temporary[MAX_PATH];
+    if (!shader_disk_cache_path(path, stage, hash, source_length))
+        return;
+    const int temporary_length = snprintf(
+        temporary, sizeof(temporary), "%s.tmp.%lu", path,
+        (unsigned long)GetCurrentProcessId());
+    if (temporary_length <= 0 || temporary_length >= sizeof(temporary))
+        return;
+
+    shader_disk_cache_header header;
+    memset(&header, 0, sizeof(header));
+    header.magic = SHADER_DISK_CACHE_MAGIC;
+    header.version = SHADER_DISK_CACHE_VERSION;
+    header.stage = stage;
+    header.source_length = source_length;
+    header.blob_length = (u32)blob_length;
+    header.source_hash = hash;
+
+    FILE* file = fopen(temporary, "wb");
+    if (!file)
+        return;
+    const int wrote = fwrite(&header, sizeof(header), 1, file) == 1 &&
+        fwrite(source, 1, source_length, file) == source_length &&
+        fwrite(blob->lpVtbl->GetBufferPointer(blob), 1,
+               blob_length, file) == blob_length &&
+        fflush(file) == 0;
+    fclose(file);
+    if (!wrote || !MoveFileExA(
+            temporary, path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary);
+        return;
+    }
+
+    const u32 stage_index = shader_disk_cache_stage_index(stage);
+    const u64 value = ++g_ld_shader_disk_writes[stage_index];
+    shader_disk_cache_progress(value);
+}
+
 static u64 ld_hash_structural_render_state(
     const render_state_t* state, u64 hash)
 {
@@ -2493,6 +2709,39 @@ static shader_blob_insert_result shader_blob_cache_insert(
     cache->retained_source_bytes += source_length;
     cache->retained_blob_bytes += blob->lpVtbl->GetBufferSize(blob);
     return SHADER_BLOB_INSERTED;
+}
+
+static void shader_blob_cache_insert_accounted(
+    shader_blob_cache_t* cache, const char* source, u32 source_length,
+    u64 hash, ID3DBlob* blob, u32 stage, int hash_seen)
+{
+    const u32 count_before = cache->count;
+    const shader_blob_insert_result result = shader_blob_cache_insert(
+        cache, source, source_length, hash, blob);
+#if defined(YZ_PERF_PROFILE)
+    if (stage == 'V') {
+        if (result == SHADER_BLOB_INSERTED) {
+            g_ld_profile.total.vs_blob_inserts++;
+            if (count_before >= FORMER_MAX_SHADER_BLOBS && !hash_seen)
+                g_ld_profile.total.vs_post_boundary_distinct++;
+        } else if (result == SHADER_BLOB_INSERT_FULL) {
+            g_ld_profile.total.vs_blob_full_rejects++;
+        }
+    } else {
+        if (result == SHADER_BLOB_INSERTED) {
+            g_ld_profile.total.ps_blob_inserts++;
+            if (count_before >= FORMER_MAX_SHADER_BLOBS && !hash_seen)
+                g_ld_profile.total.ps_post_boundary_distinct++;
+        } else if (result == SHADER_BLOB_INSERT_FULL) {
+            g_ld_profile.total.ps_blob_full_rejects++;
+        }
+    }
+#else
+    (void)count_before;
+    (void)result;
+    (void)stage;
+    (void)hash_seen;
+#endif
 }
 
 static void shader_blob_cache_release(shader_blob_cache_t* cache)
@@ -2677,34 +2926,31 @@ static ID3D12PipelineState* build_pso(
     } else {
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.vs_blob_misses++;
-        g_ld_profile.total.vs_compile_calls++;
-        const LONGLONG compile_begin = ld_profile_qpc();
 #endif
-        vs_hr = D3DCompile(
-            vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
-            "vs_5_0", 0, 0, &vs, &err);
+        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash);
+        if (vs) {
+            shader_blob_cache_insert_accounted(
+                &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
+                'V', vs_hash_seen);
+        } else {
 #if defined(YZ_PERF_PROFILE)
-        g_ld_profile.total.vs_compile_qpc +=
-            (u64)(ld_profile_qpc() - compile_begin);
+            g_ld_profile.total.vs_compile_calls++;
+            const LONGLONG compile_begin = ld_profile_qpc();
 #endif
-        if (SUCCEEDED(vs_hr)) {
-            const u32 count_before = g.vs_blobs.count;
-            const shader_blob_insert_result insert_result =
-                shader_blob_cache_insert(
-                &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs);
+            vs_hr = D3DCompile(
+                vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
+                "vs_5_0", 0, 0, &vs, &err);
 #if defined(YZ_PERF_PROFILE)
-            if (insert_result == SHADER_BLOB_INSERTED) {
-                g_ld_profile.total.vs_blob_inserts++;
-                if (count_before >= FORMER_MAX_SHADER_BLOBS &&
-                    !vs_hash_seen)
-                    g_ld_profile.total.vs_post_boundary_distinct++;
-            } else if (insert_result == SHADER_BLOB_INSERT_FULL) {
-                g_ld_profile.total.vs_blob_full_rejects++;
+            g_ld_profile.total.vs_compile_qpc +=
+                (u64)(ld_profile_qpc() - compile_begin);
+#endif
+            if (SUCCEEDED(vs_hr)) {
+                shader_disk_cache_store(
+                    'V', vs_hlsl, vs_length, vs_hash, vs);
+                shader_blob_cache_insert_accounted(
+                    &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
+                    'V', vs_hash_seen);
             }
-#else
-            (void)count_before;
-            (void)insert_result;
-#endif
         }
     }
     if (FAILED(vs_hr)) {
@@ -2742,34 +2988,31 @@ static ID3D12PipelineState* build_pso(
     } else {
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.ps_blob_misses++;
-        g_ld_profile.total.ps_compile_calls++;
-        const LONGLONG compile_begin = ld_profile_qpc();
 #endif
-        ps_hr = D3DCompile(
-            ps_hlsl, ps_length, "xps", NULL, NULL, "main",
-            "ps_5_0", 0, 0, &ps, &err);
+        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash);
+        if (ps) {
+            shader_blob_cache_insert_accounted(
+                &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
+                'P', ps_hash_seen);
+        } else {
 #if defined(YZ_PERF_PROFILE)
-        g_ld_profile.total.ps_compile_qpc +=
-            (u64)(ld_profile_qpc() - compile_begin);
+            g_ld_profile.total.ps_compile_calls++;
+            const LONGLONG compile_begin = ld_profile_qpc();
 #endif
-        if (SUCCEEDED(ps_hr)) {
-            const u32 count_before = g.ps_blobs.count;
-            const shader_blob_insert_result insert_result =
-                shader_blob_cache_insert(
-                &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps);
+            ps_hr = D3DCompile(
+                ps_hlsl, ps_length, "xps", NULL, NULL, "main",
+                "ps_5_0", 0, 0, &ps, &err);
 #if defined(YZ_PERF_PROFILE)
-            if (insert_result == SHADER_BLOB_INSERTED) {
-                g_ld_profile.total.ps_blob_inserts++;
-                if (count_before >= FORMER_MAX_SHADER_BLOBS &&
-                    !ps_hash_seen)
-                    g_ld_profile.total.ps_post_boundary_distinct++;
-            } else if (insert_result == SHADER_BLOB_INSERT_FULL) {
-                g_ld_profile.total.ps_blob_full_rejects++;
+            g_ld_profile.total.ps_compile_qpc +=
+                (u64)(ld_profile_qpc() - compile_begin);
+#endif
+            if (SUCCEEDED(ps_hr)) {
+                shader_disk_cache_store(
+                    'P', ps_hlsl, ps_length, ps_hash, ps);
+                shader_blob_cache_insert_accounted(
+                    &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
+                    'P', ps_hash_seen);
             }
-#else
-            (void)count_before;
-            (void)insert_result;
-#endif
         }
     }
     if (FAILED(ps_hr)) {
@@ -3700,7 +3943,8 @@ static void ld_profile_present(u32 frame)
                 "flush{present=%llu ref=%llu vb=%llu retire=%llu "
                 "movie=%llu movie_present=%llu readback=%llu} "
                 "tex{cached=%u evict=%llu refresh=%llu upload_mb=%.3f "
-                "upload_hi_mb=%.3f retired_hi=%u} "
+                "decode=%llu decode_ms=%.3f upload_hi_mb=%.3f "
+                "retired_hi=%u} "
                 "rings{vb_hi_mb=%.3f upload_total_hi_mb=%.3f "
                 "vb_total_hi_mb=%.3f retired_total_hi=%u} "
                 "vram{usage_mb=%.1f budget_mb=%.1f reservation_mb=%.1f}\n",
@@ -3790,6 +4034,10 @@ static void ld_profile_present(u32 frame)
                 (unsigned long long)refreshes,
                 (double)LD_PROFILE_DELTA(texture_upload_bytes) /
                     (1024.0 * 1024.0),
+                (unsigned long long)
+                    LD_PROFILE_DELTA(texture_decode_calls),
+                ld_profile_ticks_ms(
+                    LD_PROFILE_DELTA(texture_decode_qpc)),
                 (double)g_ld_profile.frame_upload_high /
                     (1024.0 * 1024.0),
                 g_ld_profile.frame_retired_high,
@@ -4980,7 +5228,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 vertex_stride =
         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
     const u64 draw_vb_bytes = (u64)n_tri * vertex_stride;
-    const u64 vb_capacity = (u64)MAX_VERTS * VERT_STRIDE;
+    const u64 vb_capacity = VERT_BUFFER_SIZE;
     if (draw_vb_bytes > vb_capacity) {
         live_draw_csv_emit(prim, n_tri, "drop_vbring_oversize");
         g_ld_stats.group_drop_ring++;
@@ -5641,7 +5889,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     D3D12_RANGE rr = {0, 0};
     g.upload->lpVtbl->Map(g.upload, 0, &rr, (void**)&g.upload_mapped);
 
-    bd.Width = MAX_VERTS * VERT_STRIDE;
+    bd.Width = VERT_BUFFER_SIZE;
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.vb);
     g.vb->lpVtbl->Map(g.vb, 0, &rr, (void**)&g.vb_mapped);
@@ -6560,7 +6808,8 @@ void rsx_live_draw_shutdown(void)
             "frame{count=%llu avg_ms=%.3f compile_free=%llu "
             "compile_free_avg_ms=%.3f} "
             "draw{input_v=%llu expanded_v=%llu vb_mb=%.3f} "
-            "tex{cached=%u evictions=%llu upload_mb=%.3f} "
+            "tex{cached=%u evictions=%llu upload_mb=%.3f "
+            "decode=%llu decode_ms=%.3f} "
             "high{upload_mb=%.3f vb_mb=%.3f retired=%u}\n",
             g_ld_frames,
             (unsigned long long)g_ld_profile.total.pso_lookups,
@@ -6637,6 +6886,10 @@ void rsx_live_draw_shutdown(void)
             (unsigned long long)g_ld_texture_cache_evictions,
             (double)g_ld_profile.total.texture_upload_bytes /
                 (1024.0 * 1024.0),
+            (unsigned long long)
+                g_ld_profile.total.texture_decode_calls,
+            ld_profile_ticks_ms(
+                g_ld_profile.total.texture_decode_qpc),
             (double)g_ld_profile.total_upload_high / (1024.0 * 1024.0),
             (double)g_ld_profile.total_vb_high / (1024.0 * 1024.0),
             g_ld_profile.total_retired_high);
@@ -6724,6 +6977,19 @@ void rsx_live_draw_shutdown(void)
             LD_FLUSH_PIXEL_CONSTANT_RING]));
     fflush(stderr);
 #endif
+    if (g_ld_shader_disk_ready > 0) {
+        fprintf(stderr,
+                "[shader-disk-cache-summary] hits{vs=%llu ps=%llu} "
+                "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
+                "rejects=%llu\n",
+                (unsigned long long)g_ld_shader_disk_hits[0],
+                (unsigned long long)g_ld_shader_disk_hits[1],
+                (unsigned long long)g_ld_shader_disk_misses[0],
+                (unsigned long long)g_ld_shader_disk_misses[1],
+                (unsigned long long)g_ld_shader_disk_writes[0],
+                (unsigned long long)g_ld_shader_disk_writes[1],
+                (unsigned long long)g_ld_shader_disk_rejects);
+    }
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
     shader_blob_cache_release(&g.vs_blobs);
     shader_blob_cache_release(&g.ps_blobs);

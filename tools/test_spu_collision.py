@@ -121,7 +121,9 @@ def build(tag, twin_dir, hdr_a, hdr_b, src_a, src_b):
     exe = os.path.join(WORK, f"collision_{tag}.exe")
     objd = os.path.join(WORK, f"obj_{tag}")
     os.makedirs(objd, exist_ok=True)
-    cmd = (["cl"] + D.CLFLAGS +
+    if D.CL_EXE is None:
+        raise SystemExit("cl not found; run from a vcvars64-initialized shell")
+    cmd = ([D.CL_EXE] + D.CLFLAGS +
            ["/I", os.path.join(ROOT, "include"),
             "/I", os.path.join(ROOT, "runtime", "spu"), "/I", twin_dir,
             "/I", TOOLS,
