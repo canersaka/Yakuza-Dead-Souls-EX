@@ -155,19 +155,36 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
 /* Raise SPU_EVENT_LR on any SPU whose GETLLAR reservation covers this line --
  * the SPURS idle-service wakeup (spu_channels.c). */
 extern "C" void spu_coh_notify_write(uint32_t addr);
+#if defined(YZ_NATIVE_SPURS)
+extern "C" void cellSpursNotifyPpuGuestWrite(uint32_t addr, uint32_t size);
+extern "C" volatile uint32_t g_native_spurs_ppu_watch_lo;
+extern "C" volatile uint32_t g_native_spurs_ppu_watch_hi;
+static inline void yz_native_spurs_notify_write(uint32_t addr, uint32_t size)
+{
+    const uint64_t first = addr;
+    const uint64_t last = first + size;
+    if (first < g_native_spurs_ppu_watch_hi &&
+        last > g_native_spurs_ppu_watch_lo)
+        cellSpursNotifyPpuGuestWrite(addr, size);
+}
+#else
+static inline void yz_native_spurs_notify_write(uint32_t, uint32_t) {}
+#endif
 #if defined(YZ_PERF_CLEAN)
 #define VM_WRITE_COH(addr, src, n) do { \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
-        } else memcpy(ea(addr), (src), (n)); } while (0)
+        } else memcpy(ea(addr), (src), (n)); \
+        yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
 #else
 #define VM_WRITE_COH(addr, src, n) do { \
         yz_watch_bd((uint32_t)(addr), (src), (n)); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
-        } else memcpy(ea(addr), (src), (n)); } while (0)
+        } else memcpy(ea(addr), (src), (n)); \
+        yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
 #endif
 extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
 extern "C" void yz_watch_arm(uint32_t guest_addr);
@@ -636,6 +653,8 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           (uint32_t)ctx->lr, _ReturnAddress());
                   fflush(stderr); } } }
     }
+    if (ok)
+        yz_native_spurs_notify_write((uint32_t)addr, 4);
 #if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr >= 0x40400000u &&
         (uint32_t)addr < 0x40C00000u)
@@ -716,6 +735,8 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                   fflush(stderr);
               } } }
     }
+    if (ok)
+        yz_native_spurs_notify_write((uint32_t)addr, 8);
 #if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr < 0x40C00000u &&
         (uint32_t)addr + 8u > 0x40400000u) {

@@ -359,6 +359,8 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
         }
     }
     memcpy(vm_ptr8(guest_dst), host_src, len);
+    if (len <= UINT32_MAX)
+        vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
 }
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
@@ -381,6 +383,8 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
         }
     }
     memset(vm_ptr8(guest_dst), val, len);
+    if (len <= UINT32_MAX)
+        vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
 }
 
 /* ---------------------------------------------------------------------------
@@ -427,9 +431,10 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
 
     ctx->reserve_valid = 0;
 
-    if (ok)
+    if (ok) {
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
+        vm_native_spurs_notify_write(addr, 4);
+    } else
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
 
     return ok;
@@ -466,9 +471,10 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
 
     ctx->reserve_valid = 0;
 
-    if (ok)
+    if (ok) {
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
+        vm_native_spurs_notify_write(addr, 8);
+    } else
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
 
     return ok;
