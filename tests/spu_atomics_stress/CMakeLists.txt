@@ -45,6 +45,7 @@ add_executable(spu_atomics_stress
     "${RUNTIME_SPU_DIR}/spu_channels.c"
     "${RUNTIME_SPU_DIR}/spu_fltrec.c"
     "${RUNTIME_SPU_DIR}/spu_lockstep.c"
+    "${RUNTIME_SPU_DIR}/spu_lock_order.c"
     "${PS3RECOMP_TREE_ROOT}/runtime/diag/yz_frontier_trace.c"
 )
 

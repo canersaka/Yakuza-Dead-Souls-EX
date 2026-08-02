@@ -107,7 +107,9 @@ void yz_ms_write(spu_context* c, uint32_t lsa, const uint32_t* w)
 { (void)c; (void)lsa; (void)w; }
 int yz_sguard_check(spu_context* c, void* t) { (void)c; (void)t; return 0; }
 void yz_lockstep_tick(struct spu_context* c) { (void)c; }
-void spu_task_launch_check(spu_context* c, void* f) { (void)c; (void)f; }
+void spu_task_launch_check(spu_context* c, uint32_t pc) { (void)c; (void)pc; }
+void spu_task_launch_behavior_check(spu_context* c, uint32_t pc)
+{ (void)c; (void)pc; }
 /* Dispatch counter: g_spu_prof_on=1 makes EVERY SPU_DRAIN re-entry (nested
  * drains included) call this -- the exact event the runtime's s_prof_hops
  * counts. The driver loop adds its own top-level dispatches. */
@@ -280,7 +282,42 @@ void spu_wrch(spu_context* ctx, uint32_t ch, u128 value)
     case SPU_WrDec:  g_dec = v; break;
     default: break;
     }
-    ev_push(K_WRCH, ch, v, value._u32[1], value._u32[2], value._u32[3], ctx->pc);
+    /* SPU channel writes consume only the preferred word.  Recording the
+     * three ignored lanes would make a scalar compact helper look different
+     * from an instruction write even though the channel observes the same
+     * value. */
+    ev_push(K_WRCH, ch, v, 0, 0, 0, ctx->pc);
+}
+
+/* Keep hand-written compact MFC sequences observable to this differential
+ * harness exactly like the six architectural channel writes they replace in
+ * the production runtime.  Generated fast twins may use this helper, while
+ * their instruction twins still issue the channels one at a time. */
+void spu_mfc_issue_compact(spu_context* ctx,
+                           uint32_t lsa, uint32_t eah, uint32_t eal,
+                           uint32_t size, uint32_t tag, uint32_t cmd,
+                           const uint32_t channel_pcs[6])
+{
+    static const uint32_t channels[6] = {
+        MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd
+    };
+    const uint32_t values[6] = { lsa, eah, eal, size, tag, cmd };
+    const uint32_t saved_pc = ctx->pc;
+
+    for (unsigned i = 0; i < 6; ++i) {
+        if (channel_pcs)
+            ctx->pc = channel_pcs[i];
+        spu_wrch(ctx, channels[i], spu_pref_u32(values[i]));
+    }
+    ctx->pc = saved_pc;
+}
+
+uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx)
+{
+    if (!spu_rchcnt(ctx, MFC_RdAtomicStat))
+        return 0;
+    return (1ull << 32) |
+           (uint64_t)spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
 }
 
 /* ---------------- dispatch table --------------------------------------- */

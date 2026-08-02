@@ -25,6 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(YZ_PPU_SAMPLE)
+#include <algorithm>
+#include <vector>
+#endif
 
 /* Live guest context for the current host thread, set at each guest-thread
  * entry / callback. The crash handler walks its PPC64 back-chain to print a
@@ -132,6 +136,9 @@ extern "C" void spu_recomp_register_tsexit(void);
 #ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_jobmod(void);
 #endif
+#ifdef YZ_NATIVE_SPURS
+extern "C" void cellSpursDumpNativeJobChains(const char* tag);
+#endif
 /* recomp_prx/job_bin_{a,b}.c (generated) — the game's two jobchain JOB BINARIES
  * (runtime-loaded per-descriptor SPU code; both EBOOT-static, extracted by
  * eaBinary). A = the 14-way bulk worker (EBOOT 0x01254500, 0x9540 B, loads at
@@ -167,7 +174,7 @@ extern "C" void spu_recomp_register_jobbin_b_3bc00(void);
 extern "C" void spu_recomp_register_jobbin_b_3d000(void);
 extern "C" void spu_recomp_register_jobbin_b_3dc00(void);
 /* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
- * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes).
+ * Live descriptors publish a 0x76C0-byte binary at EBOOT EA 0x0125DA80.
  * Every overlapping fixed-base lift has a distinct image id. */
 extern "C" void spu_recomp_register_jobbin_c_4c00(void);
 extern "C" void spu_recomp_register_jobbin_c_e400(void);
@@ -249,9 +256,12 @@ static int yz_register_native_spurs_images(void)
     static const RawJob jobs[] = {
         {0x01254500u, 0x9540u, 14, "job_bin_a"},
         {0x01275A00u, 0x14C0u, 15, "job_bin_b"},
-        {0x0125DA80u, 0x7640u, 17, "job_bin_c"},
+        {0x0125DA80u, 0x76C0u, 17, "job_bin_c"},
         {0x01265180u, 0x10610u, 18, "job_bin_d"},
-        {0x01252680u, 0x1E80u, 19, "job_bin_orphanage"},
+        /* The job descriptor publishes the logical binary length.  The lift's
+         * final 0x40 bytes are DMA/extraction padding and are not part of the
+         * exact native workload identity. */
+        {0x01252680u, 0x1E40u, 19, "job_bin_orphanage"},
     };
     for (const RawJob& d : jobs) {
         const uint8_t* image = vm_base + d.ea;
@@ -2682,6 +2692,9 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
      * measures; the read-only guest-state dump below is the only default. */
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-30s"); }
+#ifdef YZ_NATIVE_SPURS
+    cellSpursDumpNativeJobChains("watchdog-30s");
+#endif
     /* s31 W2LIFE (ledger #71): one early (usually pre-CRI-transition) sample of
      * the SPURS wid accounting + per-SPU liveness, then one per watchdog minute
      * below -- the healthy-vs-dead comparison for the wid2 journal consumer. */
@@ -2703,6 +2716,10 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
         char tag[32];
         snprintf(tag, sizeof tag, "watchdog-%dm", mins);
         if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, tag);
+#ifdef YZ_NATIVE_SPURS
+        if (getenv("YZ_NATIVE_SPURS_LEDGER"))
+            cellSpursDumpNativeJobChains(tag);
+#endif
         yz_chain_census_dump(tag);
         yz_w2life_dump(tag);   /* s31 W2LIFE */
     }
@@ -3198,6 +3215,766 @@ static DWORD WINAPI yz_t1_sample_thread(LPVOID)
     return 0;
 }
 
+#if defined(YZ_PPU_SAMPLE)
+/* Time-weighted main-PPU sampler for the fixed performance windows.  Read the
+ * actual host RIP: the trampoline's last-target field stays stale across
+ * direct lifted calls and host waits, which makes epilogues look artificially
+ * hot.  This is profile-build-only and resumes t1 immediately after each
+ * control-context sample. */
+static volatile LONG g_yz_ppu_perf_active;
+static volatile LONG g_yz_ppu_perf_sample_count;
+static void* g_yz_ppu_perf_samples[131072];
+static void* g_yz_ppu_perf_host_callers[131072];
+static void* g_yz_ppu_perf_host_unwinds[131072];
+static uint32_t g_yz_ppu_perf_frames[131072];
+static uint32_t g_yz_ppu_perf_syscalls[131072];
+static uint32_t g_yz_ppu_perf_syscall_lrs[131072];
+static uint64_t g_yz_ppu_perf_syscall_args[131072];
+static volatile LONG g_yz_ppu_perf_present_target;
+static volatile LONG g_yz_ppu_perf_target_tid = 1;
+
+static bool yz_ppu_perf_is_executable_image_address(uintptr_t candidate)
+{
+    const uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)module;
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const IMAGE_NT_HEADERS64* nt =
+        (const IMAGE_NT_HEADERS64*)(module + (uintptr_t)dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+        if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        const uintptr_t begin = module + sections[s].VirtualAddress;
+        const uintptr_t span = sections[s].Misc.VirtualSize >
+                                       sections[s].SizeOfRawData
+            ? sections[s].Misc.VirtualSize : sections[s].SizeOfRawData;
+        if (candidate >= begin && candidate < begin + span)
+            return true;
+    }
+    return false;
+}
+
+/* For a sample parked in ntdll/kernelbase, retain the first executable return
+ * address from our image.  This is deliberately profile-only: it attributes
+ * an otherwise opaque host wait to the bridge/runtime call site without
+ * instrumenting every possible lock and wait in the production binary. */
+static void* yz_ppu_perf_find_host_caller(const CONTEXT& context)
+{
+    MEMORY_BASIC_INFORMATION mbi = {};
+    const uintptr_t stack = (uintptr_t)context.Rsp;
+    if (!VirtualQuery((const void*)stack, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT)
+        return nullptr;
+    const uintptr_t region_end =
+        (uintptr_t)mbi.BaseAddress + (uintptr_t)mbi.RegionSize;
+    size_t words = region_end > stack
+        ? (size_t)((region_end - stack) / sizeof(uintptr_t)) : 0;
+    if (words > 192) words = 192;
+
+    const uintptr_t* sp = (const uintptr_t*)stack;
+    for (size_t i = 0; i < words; ++i) {
+        const uintptr_t candidate = sp[i];
+        if (yz_ppu_perf_is_executable_image_address(candidate))
+            return (void*)candidate;
+    }
+    return nullptr;
+}
+
+static bool yz_ppu_perf_is_leaf_helper_symbol(const char* name)
+{
+    return name &&
+        (!strcmp(name, "vrf") || !strcmp(name, "vstf") ||
+         !strcmp(name, "vstw") || !strcmp(name, "memcpy"));
+}
+
+/* Raw stack words above are a useful cheap witness, but only an x64 unwind can
+ * distinguish an active caller from a stale executable address in the stack
+ * allocation.  Keep both results so the next A/B is self-validating. */
+static void* yz_ppu_perf_unwind_host_caller(
+    HANDLE thread, const CONTEXT& sampled_context)
+{
+    CONTEXT context = sampled_context;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    const uintptr_t sampled_pc = (uintptr_t)sampled_context.Rip;
+    DWORD64 sampled_symbol_base = 0;
+    {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)sampled_pc,
+                        &displacement, symbol))
+            sampled_symbol_base = symbol->Address;
+    }
+    for (unsigned depth = 0; depth < 24; ++depth) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), thread,
+                         &frame, &context, NULL, SymFunctionTableAccess64,
+                         SymGetModuleBase64, NULL))
+            break;
+        const uintptr_t pc = (uintptr_t)frame.AddrPC.Offset;
+        if (!pc) break;
+        if (pc == sampled_pc)
+            continue;
+        if (yz_ppu_perf_is_executable_image_address(pc)) {
+            char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+            SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = 255;
+            DWORD64 displacement = 0;
+            if (SymFromAddr(GetCurrentProcess(), (DWORD64)pc,
+                            &displacement, symbol)) {
+                if ((sampled_symbol_base &&
+                     symbol->Address == sampled_symbol_base) ||
+                    yz_ppu_perf_is_leaf_helper_symbol(symbol->Name))
+                    continue;
+            }
+            return (void*)pc;
+        }
+    }
+    return nullptr;
+}
+
+static DWORD WINAPI yz_ppu_perf_sample_thread(LPVOID)
+{
+    for (;;) {
+        Sleep(2);
+        if (!g_yz_ppu_perf_active)
+            continue;
+        const bool present_target = g_yz_ppu_perf_present_target != 0;
+        const uint32_t target_tid =
+            (uint32_t)g_yz_ppu_perf_target_tid;
+        HANDLE thread = present_target
+            ? (HANDLE)rsx_live_draw_get_present_thread_handle()
+            : target_tid == 1u
+                ? g_yz_main_hthread
+                : (HANDLE)yz_thread_handle(target_tid);
+        ppu_context* guest = present_target
+            ? nullptr : (ppu_context*)yz_thread_context(target_tid);
+        const uint32_t frame = present_target
+            ? rsx_live_draw_get_frames() + 1u
+            : rsx_live_draw_get_frames();
+        if (!thread || SuspendThread(thread) == (DWORD)-1)
+            continue;
+        CONTEXT context = {};
+        context.ContextFlags = CONTEXT_CONTROL;
+        void* rip = nullptr;
+        void* host_caller = nullptr;
+        void* host_unwind = nullptr;
+        if (GetThreadContext(thread, &context)) {
+            rip = (void*)context.Rip;
+            HMODULE rip_module = NULL;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)rip, &rip_module);
+            if (rip_module != GetModuleHandleW(NULL))
+                host_caller = yz_ppu_perf_find_host_caller(context);
+            /* Always unwind one host frame. When RIP is a TU-local helper
+             * such as vrf/vstf or memcpy, the caller is the real lifted guest
+             * function; reverse-mapping RIP itself falsely assigns helpers to
+             * the nearest function-table entry in the object file. */
+            host_unwind = yz_ppu_perf_unwind_host_caller(thread, context);
+        }
+        uint32_t syscall = 0;
+        uint32_t syscall_lr = 0;
+        uint64_t syscall_arg = 0;
+        uint64_t unused4 = 0, unused5 = 0;
+        uint32_t unused_held = 0;
+        if (!present_target &&
+            yz_wait_get(target_tid, &syscall, &syscall_arg, &unused4,
+                        &unused5, &unused_held)) {
+            /* The live guest context supplies the exact syscall caller. Raw
+             * native stack words are not an unwind and routinely name stale
+             * lifted return addresses. */
+            if (guest) syscall_lr = (uint32_t)guest->lr;
+        }
+        const LONG slot = InterlockedIncrement(&g_yz_ppu_perf_sample_count) - 1;
+        if ((unsigned long)slot <
+            sizeof(g_yz_ppu_perf_samples) / sizeof(g_yz_ppu_perf_samples[0])) {
+            g_yz_ppu_perf_samples[slot] = rip;
+            g_yz_ppu_perf_host_callers[slot] = host_caller;
+            g_yz_ppu_perf_host_unwinds[slot] = host_unwind;
+            g_yz_ppu_perf_frames[slot] = frame;
+            g_yz_ppu_perf_syscalls[slot] = syscall;
+            g_yz_ppu_perf_syscall_lrs[slot] = syscall_lr;
+            g_yz_ppu_perf_syscall_args[slot] = syscall_arg;
+        }
+        ResumeThread(thread);
+    }
+    return 0;
+}
+
+extern "C" void yz_ppu_perf_window_begin(uint32_t guest_frame)
+{
+    g_yz_ppu_perf_active = 0;
+    InterlockedExchange(&g_yz_ppu_perf_sample_count, 0);
+    g_yz_ppu_perf_present_target =
+        getenv("YZ_PPU_SAMPLE_PRESENT") ? 1 : 0;
+    g_yz_ppu_perf_target_tid = 1;
+    if (const char* value = getenv("YZ_PPU_SAMPLE_TID")) {
+        const unsigned long parsed = strtoul(value, nullptr, 0);
+        if (parsed >= 1u && parsed <= 255u)
+            g_yz_ppu_perf_target_tid = (LONG)parsed;
+    }
+    g_yz_ppu_perf_active = 1;
+    fprintf(stderr,
+            "[ppu-perf-window-begin] guest_frame=%u target=%s%ld\n",
+            guest_frame,
+            g_yz_ppu_perf_present_target ? "present" : "guest-tid-",
+            g_yz_ppu_perf_present_target ? 0L :
+                g_yz_ppu_perf_target_tid);
+}
+
+extern "C" void yz_ppu_perf_window_dump(uint32_t guest_frame)
+{
+    g_yz_ppu_perf_active = 0;
+    Sleep(2);
+    LONG count = g_yz_ppu_perf_sample_count;
+    const LONG capacity =
+        (LONG)(sizeof(g_yz_ppu_perf_samples) /
+               sizeof(g_yz_ppu_perf_samples[0]));
+    if (count > capacity) count = capacity;
+    if (count < 0) count = 0;
+
+    std::vector<uint32_t> samples;
+    samples.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        const yz_func_entry* function =
+            yz_func_from_host(g_yz_ppu_perf_samples[i]);
+        if (function) samples.push_back(function->addr);
+    }
+    std::sort(samples.begin(), samples.end());
+    struct bucket { uint32_t address; uint32_t count; };
+    std::vector<bucket> buckets;
+    for (size_t i = 0; i < samples.size();) {
+        size_t end = i + 1;
+        while (end < samples.size() && samples[end] == samples[i]) ++end;
+        buckets.push_back({samples[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(buckets.begin(), buckets.end(),
+              [](const bucket& a, const bucket& b) {
+                  return a.count > b.count;
+              });
+    fprintf(stderr,
+            "[ppu-perf-window-range] guest_end=%u samples=%zu raw=%ld\n",
+            guest_frame, samples.size(), count);
+    const size_t top = buckets.size() < 20 ? buckets.size() : 20;
+    for (size_t i = 0; i < top; ++i) {
+        fprintf(stderr,
+                "[ppu-perf-hot] rank=%zu func=0x%08X samples=%u pct=%.2f\n",
+                i + 1, buckets[i].address, buckets[i].count,
+                samples.empty() ? 0.0 :
+                    100.0 * (double)buckets[i].count / (double)samples.size());
+    }
+    std::vector<uintptr_t> raw_samples;
+    raw_samples.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i)
+        raw_samples.push_back((uintptr_t)g_yz_ppu_perf_samples[i]);
+    std::sort(raw_samples.begin(), raw_samples.end());
+    struct raw_bucket { uintptr_t rip; uint32_t count; };
+    std::vector<raw_bucket> raw_buckets;
+    for (size_t i = 0; i < raw_samples.size();) {
+        size_t end = i + 1;
+        while (end < raw_samples.size() && raw_samples[end] == raw_samples[i])
+            ++end;
+        raw_buckets.push_back({raw_samples[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(raw_buckets.begin(), raw_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t raw_top = raw_buckets.size() < 20 ? raw_buckets.size() : 20;
+    const uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    for (size_t i = 0; i < raw_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)raw_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)raw_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-rip] rank=%zu rva=0x%llX samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(raw_buckets[i].rip - module),
+                raw_buckets[i].count,
+                count ? 100.0 * (double)raw_buckets[i].count / (double)count
+                      : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(raw_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uintptr_t> host_callers;
+    host_callers.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_host_callers[i])
+            host_callers.push_back(
+                (uintptr_t)g_yz_ppu_perf_host_callers[i]);
+    }
+    std::sort(host_callers.begin(), host_callers.end());
+    std::vector<raw_bucket> host_caller_buckets;
+    for (size_t i = 0; i < host_callers.size();) {
+        size_t end = i + 1;
+        while (end < host_callers.size() &&
+               host_callers[end] == host_callers[i])
+            ++end;
+        host_caller_buckets.push_back(
+            {host_callers[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_caller_buckets.begin(), host_caller_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_caller_top = host_caller_buckets.size() < 20
+        ? host_caller_buckets.size() : 20;
+    for (size_t i = 0; i < host_caller_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)host_caller_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)host_caller_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-host-caller] rank=%zu rva=0x%llX "
+                "samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(host_caller_buckets[i].rip - module),
+                host_caller_buckets[i].count,
+                count ? 100.0 * (double)host_caller_buckets[i].count /
+                            (double)count : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(host_caller_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uintptr_t> host_unwinds;
+    host_unwinds.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_host_unwinds[i])
+            host_unwinds.push_back(
+                (uintptr_t)g_yz_ppu_perf_host_unwinds[i]);
+    }
+    std::sort(host_unwinds.begin(), host_unwinds.end());
+    std::vector<raw_bucket> host_unwind_buckets;
+    for (size_t i = 0; i < host_unwinds.size();) {
+        size_t end = i + 1;
+        while (end < host_unwinds.size() &&
+               host_unwinds[end] == host_unwinds[i])
+            ++end;
+        host_unwind_buckets.push_back(
+            {host_unwinds[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_unwind_buckets.begin(), host_unwind_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_unwind_top = host_unwind_buckets.size() < 20
+        ? host_unwind_buckets.size() : 20;
+    for (size_t i = 0; i < host_unwind_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)host_unwind_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)host_unwind_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-host-unwind] rank=%zu rva=0x%llX "
+                "samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(host_unwind_buckets[i].rip - module),
+                host_unwind_buckets[i].count,
+                count ? 100.0 * (double)host_unwind_buckets[i].count /
+                            (double)count : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(host_unwind_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uint32_t> host_unwind_functions;
+    host_unwind_functions.reserve(host_unwinds.size());
+    for (uintptr_t pc : host_unwinds) {
+        if (const yz_func_entry* function = yz_func_from_host((void*)pc))
+            host_unwind_functions.push_back(function->addr);
+    }
+    std::sort(host_unwind_functions.begin(), host_unwind_functions.end());
+    std::vector<bucket> host_unwind_function_buckets;
+    for (size_t i = 0; i < host_unwind_functions.size();) {
+        size_t end = i + 1;
+        while (end < host_unwind_functions.size() &&
+               host_unwind_functions[end] == host_unwind_functions[i])
+            ++end;
+        host_unwind_function_buckets.push_back(
+            {host_unwind_functions[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_unwind_function_buckets.begin(),
+              host_unwind_function_buckets.end(),
+              [](const bucket& a, const bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_unwind_function_top =
+        host_unwind_function_buckets.size() < 20
+            ? host_unwind_function_buckets.size() : 20;
+    for (size_t i = 0; i < host_unwind_function_top; ++i) {
+        const bucket& current = host_unwind_function_buckets[i];
+        fprintf(stderr,
+                "[ppu-perf-host-unwind-func] rank=%zu func=0x%08X "
+                "samples=%u raw_pct=%.2f mapped_pct=%.2f\n",
+                i + 1, current.address, current.count,
+                count ? 100.0 * (double)current.count / (double)count : 0.0,
+                host_unwind_functions.empty() ? 0.0 :
+                    100.0 * (double)current.count /
+                        (double)host_unwind_functions.size());
+    }
+    {
+        struct frame_bucket { uint32_t frame, count; };
+        std::vector<uint32_t> frame_samples;
+        frame_samples.reserve((size_t)count);
+        for (LONG i = 0; i < count; ++i)
+            frame_samples.push_back(g_yz_ppu_perf_frames[i]);
+        std::sort(frame_samples.begin(), frame_samples.end());
+        std::vector<frame_bucket> frame_buckets;
+        for (size_t i = 0; i < frame_samples.size();) {
+            size_t end = i + 1;
+            while (end < frame_samples.size() &&
+                   frame_samples[end] == frame_samples[i])
+                ++end;
+            frame_buckets.push_back(
+                {frame_samples[i], (uint32_t)(end - i)});
+            i = end;
+        }
+        std::sort(frame_buckets.begin(), frame_buckets.end(),
+                  [](const frame_bucket& a, const frame_bucket& b) {
+                      return a.count > b.count;
+                  });
+        const size_t frame_top =
+            frame_buckets.size() < 12 ? frame_buckets.size() : 12;
+        for (size_t frame_rank = 0; frame_rank < frame_top; ++frame_rank) {
+            const frame_bucket hot_frame = frame_buckets[frame_rank];
+            fprintf(stderr,
+                    "[ppu-perf-frame] rank=%zu frame=%u samples=%u\n",
+                    frame_rank + 1, hot_frame.frame, hot_frame.count);
+            std::vector<uintptr_t> frame_rips;
+            frame_rips.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame)
+                    frame_rips.push_back(
+                        (uintptr_t)g_yz_ppu_perf_samples[i]);
+            }
+            std::sort(frame_rips.begin(), frame_rips.end());
+            std::vector<raw_bucket> frame_rip_buckets;
+            for (size_t i = 0; i < frame_rips.size();) {
+                size_t end = i + 1;
+                while (end < frame_rips.size() &&
+                       frame_rips[end] == frame_rips[i])
+                    ++end;
+                frame_rip_buckets.push_back(
+                    {frame_rips[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_rip_buckets.begin(), frame_rip_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t rip_top = frame_rip_buckets.size() < 6
+                ? frame_rip_buckets.size() : 6;
+            for (size_t rip_rank = 0; rip_rank < rip_top; ++rip_rank) {
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const raw_bucket hot_rip = frame_rip_buckets[rip_rank];
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)hot_rip.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)hot_rip.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-rip] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, rip_rank + 1,
+                        (unsigned long long)(hot_rip.rip - module),
+                        hot_rip.count,
+                        hot_frame.count
+                            ? 100.0 * (double)hot_rip.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX",
+                            function->addr,
+                            (unsigned long long)(
+                                hot_rip.rip - (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            std::vector<uintptr_t> frame_host_callers;
+            frame_host_callers.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_host_callers[i])
+                    frame_host_callers.push_back(
+                        (uintptr_t)g_yz_ppu_perf_host_callers[i]);
+            }
+            std::sort(frame_host_callers.begin(), frame_host_callers.end());
+            std::vector<raw_bucket> frame_host_caller_buckets;
+            for (size_t i = 0; i < frame_host_callers.size();) {
+                size_t end = i + 1;
+                while (end < frame_host_callers.size() &&
+                       frame_host_callers[end] == frame_host_callers[i])
+                    ++end;
+                frame_host_caller_buckets.push_back(
+                    {frame_host_callers[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_host_caller_buckets.begin(),
+                      frame_host_caller_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_host_caller_top =
+                frame_host_caller_buckets.size() < 4
+                    ? frame_host_caller_buckets.size() : 4;
+            for (size_t caller_rank = 0;
+                 caller_rank < frame_host_caller_top; ++caller_rank) {
+                const raw_bucket caller =
+                    frame_host_caller_buckets[caller_rank];
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)caller.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)caller.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-host-caller] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, caller_rank + 1,
+                        (unsigned long long)(caller.rip - module),
+                        caller.count,
+                        hot_frame.count
+                            ? 100.0 * (double)caller.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                            (unsigned long long)(caller.rip -
+                                                 (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            std::vector<uintptr_t> frame_host_unwinds;
+            frame_host_unwinds.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_host_unwinds[i])
+                    frame_host_unwinds.push_back(
+                        (uintptr_t)g_yz_ppu_perf_host_unwinds[i]);
+            }
+            std::sort(frame_host_unwinds.begin(), frame_host_unwinds.end());
+            std::vector<raw_bucket> frame_host_unwind_buckets;
+            for (size_t i = 0; i < frame_host_unwinds.size();) {
+                size_t end = i + 1;
+                while (end < frame_host_unwinds.size() &&
+                       frame_host_unwinds[end] == frame_host_unwinds[i])
+                    ++end;
+                frame_host_unwind_buckets.push_back(
+                    {frame_host_unwinds[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_host_unwind_buckets.begin(),
+                      frame_host_unwind_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_host_unwind_top =
+                frame_host_unwind_buckets.size() < 4
+                    ? frame_host_unwind_buckets.size() : 4;
+            for (size_t unwind_rank = 0;
+                 unwind_rank < frame_host_unwind_top; ++unwind_rank) {
+                const raw_bucket unwind =
+                    frame_host_unwind_buckets[unwind_rank];
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)unwind.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)unwind.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-host-unwind] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, unwind_rank + 1,
+                        (unsigned long long)(unwind.rip - module),
+                        unwind.count,
+                        hot_frame.count
+                            ? 100.0 * (double)unwind.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                            (unsigned long long)(unwind.rip -
+                                                 (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            struct frame_wait_sample {
+                uint32_t syscall, lr;
+                uint64_t arg;
+            };
+            std::vector<frame_wait_sample> frame_waits;
+            frame_waits.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_syscalls[i]) {
+                    frame_waits.push_back({g_yz_ppu_perf_syscalls[i],
+                                           g_yz_ppu_perf_syscall_lrs[i],
+                                           g_yz_ppu_perf_syscall_args[i]});
+                }
+            }
+            std::sort(frame_waits.begin(), frame_waits.end(),
+                      [](const frame_wait_sample& a,
+                         const frame_wait_sample& b) {
+                          if (a.syscall != b.syscall)
+                              return a.syscall < b.syscall;
+                          if (a.lr != b.lr) return a.lr < b.lr;
+                          return a.arg < b.arg;
+                      });
+            struct frame_wait_bucket {
+                frame_wait_sample sample;
+                uint32_t count;
+            };
+            std::vector<frame_wait_bucket> frame_wait_buckets;
+            for (size_t i = 0; i < frame_waits.size();) {
+                size_t end = i + 1;
+                while (end < frame_waits.size() &&
+                       frame_waits[end].syscall == frame_waits[i].syscall &&
+                       frame_waits[end].lr == frame_waits[i].lr &&
+                       frame_waits[end].arg == frame_waits[i].arg)
+                    ++end;
+                frame_wait_buckets.push_back(
+                    {frame_waits[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_wait_buckets.begin(), frame_wait_buckets.end(),
+                      [](const frame_wait_bucket& a,
+                         const frame_wait_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_wait_top = frame_wait_buckets.size() < 4
+                ? frame_wait_buckets.size() : 4;
+            for (size_t wait_rank = 0; wait_rank < frame_wait_top;
+                 ++wait_rank) {
+                const frame_wait_bucket& wait =
+                    frame_wait_buckets[wait_rank];
+                fprintf(stderr,
+                        "[ppu-perf-frame-wait] frame=%u rank=%zu sc=%u "
+                        "lr=0x%08X arg=0x%llX samples=%u pct=%.2f\n",
+                        hot_frame.frame, wait_rank + 1,
+                        wait.sample.syscall, wait.sample.lr,
+                        (unsigned long long)wait.sample.arg, wait.count,
+                        hot_frame.count
+                            ? 100.0 * (double)wait.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+            }
+        }
+    }
+    struct wait_sample { uint32_t syscall, lr; uint64_t arg; };
+    std::vector<wait_sample> waits;
+    waits.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_syscalls[i])
+            waits.push_back({g_yz_ppu_perf_syscalls[i],
+                             g_yz_ppu_perf_syscall_lrs[i],
+                             g_yz_ppu_perf_syscall_args[i]});
+    }
+    std::sort(waits.begin(), waits.end(),
+              [](const wait_sample& a, const wait_sample& b) {
+                  if (a.syscall != b.syscall) return a.syscall < b.syscall;
+                  if (a.lr != b.lr) return a.lr < b.lr;
+                  return a.arg < b.arg;
+              });
+    struct wait_bucket { wait_sample sample; uint32_t count; };
+    std::vector<wait_bucket> wait_buckets;
+    for (size_t i = 0; i < waits.size();) {
+        size_t end = i + 1;
+        while (end < waits.size() &&
+               waits[end].syscall == waits[i].syscall &&
+               waits[end].lr == waits[i].lr &&
+               waits[end].arg == waits[i].arg)
+            ++end;
+        wait_buckets.push_back({waits[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(wait_buckets.begin(), wait_buckets.end(),
+              [](const wait_bucket& a, const wait_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t wait_top = wait_buckets.size() < 20 ? wait_buckets.size() : 20;
+    for (size_t i = 0; i < wait_top; ++i)
+        fprintf(stderr,
+                "[ppu-perf-wait] rank=%zu sc=%u lr=0x%08X arg=0x%llX "
+                "samples=%u pct=%.2f\n",
+                i + 1, wait_buckets[i].sample.syscall,
+                wait_buckets[i].sample.lr,
+                (unsigned long long)wait_buckets[i].sample.arg,
+                wait_buckets[i].count,
+                count ? 100.0 * (double)wait_buckets[i].count / (double)count
+                      : 0.0);
+    fflush(stderr);
+}
+#endif
+
 /* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
  * Samples the FIFO GET/PUT, the command word at GET, the flip fence, and t1's
  * ctr every ~120ms WITHOUT suspending any thread, and logs ONLY on change -- so
@@ -3570,12 +4347,15 @@ int main(int argc, char** argv)
            "(libsre image/PPU lift/kernel modules requested=0)\n");
 #endif
 
-    /* LLE firmware: Sony's libgcm_sys (RSX driver). Same contract as libsre --
-     * the flat image includes its TOC (0x02114000) referenced by the export
-     * OPDs the game's cellGcmSys imports bind to. Must be loaded before
-     * yz_install_imports. The driver issues sys_rsx syscalls (668-677). */
+#ifndef YZ_NATIVE_SPURS
+    /* The oracle lane binds cellGcmSys imports to its relocated driver image.
+     * The native lane resolves every one of those imports to independent host
+     * implementations and must leave the firmware address range unmapped. */
     if (load_prx_image("recomp_prx/libgcm_sys_image.bin", YZ_LIBGCM_BASE) != 0)
         return 1;
+#else
+    printf("[boot] GCM backend=NATIVE firmware image requested=0\n");
+#endif
 
     /* LLE the GAME's own runtime-loaded engine PRX: pxd_shader (OgreZ shader
      * module). The game sys_prx_load_module's it from data/module/ps3/; we
@@ -3819,6 +4599,9 @@ int main(int argc, char** argv)
      * silent (no-syscall) t1 stall without perturbing the thread. */
     if (getenv("YZ_T1SAMPLE"))
         CreateThread(NULL, 0, yz_t1_sample_thread, NULL, 0, NULL);
+#if defined(YZ_PPU_SAMPLE)
+    CreateThread(NULL, 0, yz_ppu_perf_sample_thread, NULL, 0, NULL);
+#endif
     /* RSX FIFO flow-control band-aid -- RETIRED AGAIN (default OFF,
      * 2026-07-02 layer-1 root-cause session; opt back in with YZ_FLOWCTL=1).
      * The race it covered is root-caused: OUR deferred-release applier

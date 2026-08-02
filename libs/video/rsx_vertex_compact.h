@@ -32,6 +32,20 @@ typedef struct rsx_vertex_ref {
     u32 base_index;
 } rsx_vertex_ref;
 
+typedef struct rsx_vertex_remap_slot {
+    u64 key;
+    u32 value;
+    u32 generation;
+} rsx_vertex_remap_slot;
+
+typedef struct rsx_vertex_remap {
+    u32* occurrence_to_unique;
+    u32 occurrence_capacity;
+    rsx_vertex_remap_slot* slots;
+    u32 slot_capacity;
+    u32 generation;
+} rsx_vertex_remap;
+
 typedef struct rsx_vertex_fetch_attr {
     rsx_dsp_vertex_attr desc;
     u32 elem_size;
@@ -74,6 +88,25 @@ void rsx_vertex_fetch_plan_prepare(
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+
+/* Collapse repeated (vertex_id, base_index) references in first-use order.
+ * refs is rewritten in place with the unique prefix.  The occurrence map
+ * remains valid until the next call using the same remap object. */
+int rsx_vertex_remap_build(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count);
+
+u32 rsx_vertex_remap_index(
+    const rsx_vertex_remap* remap, u32 occurrence);
+
+void rsx_vertex_remap_destroy(rsx_vertex_remap* remap);
+
+/* Select the live renderer's triangle topology path.  A remapped triangle
+ * list must use an index buffer to reconstruct duplicate occurrences, just
+ * like converted strips, fans, and quads.  Returns zero for unsupported
+ * primitive classes. */
+int rsx_vertex_topology_plan(
+    u32 primitive, int refs_remapped, int* indexed);
 
 /* Public for focused format/endian tests. */
 int rsx_vertex_decode_element(

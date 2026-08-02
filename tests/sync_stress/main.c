@@ -775,6 +775,112 @@ static int test3_semaphore_counting(void)
     return ok ? 0 : 1;
 }
 
+/* Destroy must not close/recycle the host primitive while a waiter still
+ * owns the current semaphore lifetime.  This also covers the numeric-id ABA:
+ * after the old waiter exits and destroy succeeds, a new semaphore may reuse
+ * the same id without inheriting a token or a stale operation. */
+typedef struct {
+    uint32_t sem_id;
+    LONG volatile entered;
+    LONG volatile result;
+} t3b_wait_arg;
+
+static unsigned __stdcall t3b_waiter(void* p)
+{
+    t3b_wait_arg* arg = (t3b_wait_arg*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+    InterlockedExchange(&arg->entered, 1);
+    const int32_t rc = call2((int64_t(*)(ppu_context*))sys_semaphore_wait,
+                             &ctx, arg->sem_id, 5000000);
+    InterlockedExchange(&arg->result, rc);
+    return 0;
+}
+
+static int test3b_semaphore_destroy_lifetime(void)
+{
+    const char* name = "test3b_semaphore_destroy_lifetime";
+    LONG before = g_fail_count;
+    ppu_context ctx; ctx_init_for_thread(&ctx, alloc_tid());
+    uint32_t sattr = make_sema_attr(SYS_SYNC_FIFO);
+    uint32_t sid_addr = guest_alloc(4);
+    int32_t rc = call4((int64_t(*)(ppu_context*))sys_semaphore_create,
+                       &ctx, sid_addr, sattr, 0, 1);
+    if (rc != CELL_OK) {
+        fail(name, "sema_create rc=0x%08X", (unsigned)rc);
+        return 1;
+    }
+    const uint32_t sid = read_be32(sid_addr);
+    t3b_wait_arg arg = { sid, 0, (LONG)0x7fffffff };
+    HANDLE waiter = (HANDLE)_beginthreadex(NULL, 0, t3b_waiter, &arg, 0, NULL);
+    if (!waiter) {
+        fail(name, "could not create waiter thread");
+        call1((int64_t(*)(ppu_context*))sys_semaphore_destroy, &ctx, sid);
+        return 1;
+    }
+
+    ULONGLONG deadline = now_ms() + 3000;
+    int parked = 0;
+    while (now_ms() < deadline) {
+        sys_semaphore_info* s = &g_sys_semaphores[sid - 1];
+        const LONG refs = InterlockedCompareExchange(
+            (volatile LONG*)&s->references, 0, 0);
+        const LONG waits = InterlockedCompareExchange(
+            (volatile LONG*)&s->waiters, 0, 0);
+        if (arg.entered && refs > 0 && waits > 0) {
+            parked = 1;
+            break;
+        }
+        Sleep(1);
+    }
+    if (!parked)
+        fail(name, "waiter did not reach the parked, referenced state");
+
+    if (parked) {
+        rc = call1((int64_t(*)(ppu_context*))sys_semaphore_destroy, &ctx, sid);
+        if (rc != (int32_t)CELL_EBUSY)
+            fail(name, "destroy while parked rc=0x%08X expected EBUSY",
+                 (unsigned)rc);
+    }
+
+    rc = call2((int64_t(*)(ppu_context*))sys_semaphore_post, &ctx, sid, 1);
+    if (rc != CELL_OK)
+        fail(name, "post to release waiter rc=0x%08X", (unsigned)rc);
+    DWORD wr = WaitForSingleObject(waiter, 5000);
+    if (wr != WAIT_OBJECT_0)
+        fail(name, "old waiter did not exit after post");
+    else if ((int32_t)arg.result != CELL_OK)
+        fail(name, "old waiter rc=0x%08X", (unsigned)arg.result);
+    CloseHandle(waiter);
+
+    rc = call1((int64_t(*)(ppu_context*))sys_semaphore_destroy, &ctx, sid);
+    if (rc != CELL_OK)
+        fail(name, "destroy after waiter exit rc=0x%08X", (unsigned)rc);
+
+    uint32_t sid2_addr = guest_alloc(4);
+    rc = call4((int64_t(*)(ppu_context*))sys_semaphore_create,
+               &ctx, sid2_addr, sattr, 0, 1);
+    const uint32_t sid2 = read_be32(sid2_addr);
+    if (rc != CELL_OK)
+        fail(name, "replacement create rc=0x%08X", (unsigned)rc);
+    else {
+        if (sid2 != sid)
+            fail(name, "replacement id=%u expected recycled id=%u", sid2, sid);
+        rc = call1((int64_t(*)(ppu_context*))sys_semaphore_trywait, &ctx, sid2);
+        if (rc != (int32_t)CELL_EBUSY)
+            fail(name, "replacement inherited stale token rc=0x%08X",
+                 (unsigned)rc);
+        rc = call1((int64_t(*)(ppu_context*))sys_semaphore_destroy, &ctx, sid2);
+        if (rc != CELL_OK)
+            fail(name, "replacement destroy rc=0x%08X", (unsigned)rc);
+    }
+
+    const int ok = (g_fail_count == before);
+    printf("[%s] parked=%d old_wait_rc=0x%08X recycled_id=%u -> %s\n",
+           name, parked, (unsigned)arg.result, sid2, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* =========================================================================
  * TEST 4 -- Event queue: FIFO-per-source + exactly-one-receiver-per-event
  *
@@ -1075,12 +1181,14 @@ int main(int argc, char** argv)
     int rc1 = test1_no_lost_wakeup();
     int rc2 = test2_timed_wait_semantics();
     int rc3 = test3_semaphore_counting();
+    int rc3b = test3b_semaphore_destroy_lifetime();
     int rc4 = test4_event_queue();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
-    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || (g_fail_count != 0);
+    int failed = rc1a || rc1 || rc2 || rc3 || rc3b || rc4 ||
+                 (g_fail_count != 0);
     printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
 }

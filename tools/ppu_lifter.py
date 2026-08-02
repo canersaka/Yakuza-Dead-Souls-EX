@@ -263,6 +263,11 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
+/* Raw guest-byte stores still participate in PPU/SPU coherence.  Scalar
+ * big-endian stores already flow through vm_write8/16/32/64, but VMX stores,
+ * byte-reversed stores, and dcbz carry an already-encoded byte sequence. */
+extern "C" void vm_write_bytes(uint64_t addr, const void* src, size_t size);
+
 /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
@@ -434,6 +439,21 @@ class PPULifter:
                         except ValueError:
                             pass
 
+        # The main title's scene manager waits for a parallel worker record to
+        # clear by rereading the same word up to 0x02000000 times before a
+        # 40-us backoff. The poll counter is local and dead once the word
+        # clears, so preserve the observed flag transition while yielding the
+        # host execution resource between reads. Keep this address- and
+        # image-exact: similarly shaped loops elsewhere may expose their poll
+        # counts or require different ordering.
+        cooperative_worker_poll = (
+            self.header_name == "ppu_recomp.h" and
+            start == 0x000C5FAC and
+            any(insn.addr == 0x000C647C for insn in window)
+        )
+        if cooperative_worker_poll:
+            internal_targets.add(0x000C6488)
+
         for insn in window:
             # Label
             if insn.addr in internal_targets:
@@ -445,6 +465,16 @@ class PPULifter:
             # trace = ppu_trace_rt is a later phase).
             if self.trace:
                 func.body_lines.append(f"    ppu_trace_pc(ctx, 0x{insn.addr:X});")
+
+            if cooperative_worker_poll and insn.addr == 0x000C647C:
+                func.body_lines.extend([
+                    "    while (vm_read32((uint32_t)ctx->gpr[29]) != 0)",
+                    "        yz_ppu_cooperative_yield();",
+                    "    ctx->gpr[4] = 0;",
+                    "    { uint32_t cr_val = 2u | ((ctx->xer >> 31) & 1u);",
+                    "      ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }",
+                    "    goto loc_000C6488;",
+                ])
 
             c_line = self._translate(insn, func)
             if c_line:
@@ -1663,7 +1693,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &raw, 4); }}")
+                    f"vm_write_bytes(ea, &raw, 4); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1684,7 +1714,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &raw, 2); }}")
+                    f"vm_write_bytes(ea, &raw, 2); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
@@ -1722,7 +1752,7 @@ class PPULifter:
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
             return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0x7FULL; "
-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+                    f"static const uint8_t zero[128] = {{0}}; vm_write_bytes(ea, zero, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
             return f"/* {mn}: cache hint — no-op */;"
@@ -1791,7 +1821,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~0xFULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
+                    f"vm_write_bytes(ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -1830,9 +1860,8 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
-                    f"for (uint32_t i = sh; i < 16; i++) m[i] = s[i - sh]; }}")
+                    f"vm_write_bytes(ea, s, 16u - sh); }}")
 
         if mn in ("stvrx", "stvrxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -1840,9 +1869,8 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = (({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
-                    f"for (uint32_t i = 0; i < sh; i++) m[i] = s[16u - sh + i]; }}")
+                    f"vm_write_bytes(ea & ~0xFULL, s + 16u - sh, sh); }}")
 
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -1866,7 +1894,7 @@ class PPULifter:
             # VR byte lane EA & 0xF, to the alignment-masked EA.
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = ((({ra}) ? ctx->gpr[{ra}] : 0) + ctx->gpr[{rb}]) & ~{size - 1:#x}ULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, (uint8_t*)&ctx->vr[{vs}] + (ea & 0xF), {size}); }}")
+                    f"vm_write_bytes(ea, (uint8_t*)&ctx->vr[{vs}] + (ea & 0xF), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2739,6 +2767,10 @@ class PPULifter:
         them across translation units is harmless and keeps each chunk
         self-contained)."""
         lines = [SOURCE_PREAMBLE.replace("{header_name}", self.header_name)]
+
+        if self.header_name == "ppu_recomp.h":
+            lines.append(
+                'extern "C" void yz_ppu_cooperative_yield(void);')
 
         # --trace: the runtime provides ppu_trace_pc (defined in the game project,
         # extern "C"). ctx is passed but ignored (PC-only trace uses the PC arg +

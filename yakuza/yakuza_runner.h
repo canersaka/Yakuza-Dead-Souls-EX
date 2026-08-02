@@ -48,6 +48,7 @@ extern "C" void     yz_threads_init(uint32_t main_stack_base,
                                     uint32_t main_stack_size);
 extern "C" uint32_t yz_thread_current_id(void);
 extern "C" void*    yz_thread_context(uint32_t tid);   /* live ppu_context*, NULL if none */
+extern "C" void*    yz_thread_handle(uint32_t tid);    /* live host HANDLE, NULL if none */
 /* lv2 wait recorder (diagnostic): shims.cpp records the in-flight syscall per
  * thread; the stall dump (main.cpp) reads it to name what each thread blocks on. */
 extern "C" void yz_wait_enter(uint32_t num, uint64_t a3, uint64_t a4, uint64_t a5);

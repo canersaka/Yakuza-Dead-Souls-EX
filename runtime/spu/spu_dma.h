@@ -55,7 +55,10 @@ extern volatile long g_yz_a010_spucmd_headers;
 extern volatile long g_yz_ucmd_handler_arg;
 extern volatile long g_yz_ucmd_handler_completed;
 extern int g_yz_a010_ppucmd;
-void yz_ucmd_wait_for_handler_completion(void);
+long yz_ucmd_wait_for_handler_completion(void);
+int yz_ucmd_handler_snapshot_is_stable(long epoch);
+long yz_ucmd_handler_begin(long cause);
+void yz_ucmd_handler_end(long cause, long epoch);
 void yz_a010_record_output_put(spu_context* ctx, uint32_t producer_pc,
                                uint32_t ea, const uint8_t* payload,
                                uint32_t size);
@@ -193,6 +196,8 @@ static inline int mfc_putllc_backoff(
  * SPU host threads (defined in spu_channels.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+void spu_lockline_unlock_then_notify_guest_write(
+    int notify, uint32_t ea, uint32_t size);
 /* Host-core yield for SPU idle-poll loops (defined in spu_channels.c):
  * level 0 = cpu pause, level 1 = same-core scheduler yield, level 2 =
  * 1 ms sleep, level 3 = process-wide zero-duration scheduler yield. */
@@ -1285,9 +1290,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         memcpy(&before_value, ls_ptr, sizeof(before_value));
 #endif
 #ifdef _WIN32
-                        yz_ucmd_wait_for_handler_completion();
-#endif
+                        /* Treat the callback epochs as a sequence lock.  A
+                         * callback can begin after the first completion check,
+                         * so a single wait followed by memcpy still admits a
+                         * half-old/half-new record.  Retry until the copy was
+                         * entirely outside a callback update. */
+                        long stable_epoch;
+                        do {
+                            stable_epoch =
+                                yz_ucmd_wait_for_handler_completion();
+                            memcpy(ls_ptr, ea_ptr, size);
+                        } while (!yz_ucmd_handler_snapshot_is_stable(
+                            stable_epoch));
+#else
                         memcpy(ls_ptr, ea_ptr, size);
+#endif
 #if !defined(YZ_PERF_CLEAN)
                         uint32_t after_value;
                         memcpy(&after_value, ls_ptr, sizeof(after_value));
@@ -2008,14 +2025,51 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     int tagged = mfc_uses_tag(cmd);
     int rc = 0;
 
+    /* Temporary first-transition oracle.  The task-state checkpoint in
+     * spu_channels.c opens this window after the first Poll and closes it at
+     * the first Poll following Yield.  It deliberately remains available in
+     * the clean build so native and LLE can be compared without rebuilding a
+     * different execution configuration. */
+    {
+        extern volatile int g_yz_task_dma_trace_phase;
+        static int trace_enabled = -1;
+        static unsigned trace_count = 0;
+        if (trace_enabled < 0)
+            trace_enabled = getenv("YZ_TASK_DMA_TRACE") ? 1 : 0;
+        if (trace_enabled && g_yz_task_dma_trace_phase == 1 &&
+            spu->image_id == 0 && trace_count < 2048u) {
+            uint32_t hash = 0;
+            if (ea >= 0x41F00000ull && ea + size <= 0x42200000ull) {
+                const uint8_t* src = vm_base + (uint32_t)ea;
+                hash = 2166136261u;
+                for (uint32_t i = 0; i < size; ++i) {
+                    hash ^= src[i];
+                    hash *= 16777619u;
+                }
+            }
+            fprintf(stderr,
+                    "[task-dma] n=%u spu=%X pc=%05X cmd=%02X lsa=%05X "
+                    "ea=%08X size=%X tag=%u hash=%08X\n",
+                    trace_count++, spu->spu_id, spu->pc & SPU_LS_MASK,
+                    cmd & 0xffu, lsa & SPU_LS_MASK, (uint32_t)ea, size,
+                    tag, hash);
+        }
+    }
+
 #if defined(YZ_PERF_PROFILE)
     {
         const int image = spu->image_id;
         if ((unsigned)image < 32u) {
             if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
-                cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)
+                cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
                 spu->perf_dma_atomic[image]++;
-            else if (mfc_is_get(cmd))
+                if (image == 0) {
+                    extern volatile uint32_t
+                        g_spu_perf_gs_atomic_pc[0x10000];
+                    g_spu_perf_gs_atomic_pc[
+                        (spu->pc & SPU_LS_MASK) >> 2]++;
+                }
+            } else if (mfc_is_get(cmd))
                 spu->perf_dma_get[image]++;
             else if (mfc_is_put(cmd))
                 spu->perf_dma_put[image]++;
@@ -2786,6 +2840,44 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     }
 #endif
 
+    /* Narrow ABI oracle for a single guest dword written by an SPU DMA.
+     * Keep this outside the broad diagnostic compile gate: the clean oracle
+     * needs it too, while an unset environment variable remains inert. */
+    { static int initialized = 0; static uint32_t target = 0;
+      if (!initialized) {
+          const char* text = getenv("YZ_SPU_PUT_WATCH");
+          target = text ? (uint32_t)strtoul(text, NULL, 16) : 0;
+          initialized = 1;
+          if (target) {
+              fprintf(stderr,
+                      "[spu-put-watch] armed ea=0x%08X\n", target);
+              fflush(stderr);
+          }
+      }
+      if (target && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                     cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
+          const int atomic = cmd == MFC_PUTLLC_CMD ||
+                             cmd == MFC_PUTLLUC_CMD ||
+                             cmd == MFC_PUTQLLUC_CMD;
+          const uint32_t transfer_ea =
+              atomic ? ((uint32_t)(ea & ~0x80000000ull) & ~127u)
+                     : (uint32_t)(ea & ~0x80000000ull);
+          const uint32_t transfer_size = atomic ? 128u : size;
+          if (transfer_size >= 4u && transfer_ea <= target &&
+              target - transfer_ea <= transfer_size - 4u) {
+              const uint32_t offset = target - transfer_ea;
+              const uint8_t* payload =
+                  spu->ls + (((lsa & SPU_LS_MASK) + offset) & SPU_LS_MASK);
+              fprintf(stderr,
+                      "[spu-put-watch] spu=%X img=%d pc=0x%05X "
+                      "cmd=0x%02X ea=0x%08X size=0x%X val=%02X%02X%02X%02X\n",
+                      spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                      cmd, transfer_ea, transfer_size,
+                      payload[0], payload[1], payload[2], payload[3]);
+              fflush(stderr);
+          }
+      } }
+
     /* Lock-line atomics: a 128-byte line, EA implicitly 128-aligned, the
      * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
@@ -2982,14 +3074,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * _sys_memset/_sys_memcpy, file reads) write guest memory WITHOUT
              * bumping the generation, so a general cached-serve can go stale
              * (boot 14: zero audio rounds -- t1's flywheel start lost). Until
-             * those paths sweep the coherence bitmap, serve cache-fast ONLY for
-             * the SPURS management line 0x40197C80 -- the measured hot poll
-             * (5 kernels spinning; scratch/asset_window_profile.md) whose
-             * writers are all CAS/VM_WRITE_COH paths (the one _sys_memset of a
-             * control line, guard 0x4019C700 at init, predates any kernel
-             * reservation). */
-            if (llfast && le == 0x40197C80ull && mfc->resv_active && mfc->resv_ea == le
+             * those paths sweep the coherence bitmap, serve cache-fast only for
+             * ranges whose writers have been audited.  The SPURS management
+             * poll line is written through CAS/VM_WRITE_COH.  The EDGE command
+             * journal is produced by lifted VM stores and SPU PUTs, both of
+             * which notify the same generation map.  Keeping this as an exact
+             * range avoids making unrelated file/bulk-write memory cacheable. */
+            const int coherent_poll_line =
+                le == 0x40197C80ull ||
+                (le >= 0x41F00000ull && le < 0x42110000ull);
+            if (llfast && coherent_poll_line && mfc->resv_active && mfc->resv_ea == le
                 && spu_coh_gen((uint32_t)le) == mfc->resv_gen) {
+#if defined(YZ_PERF_PROFILE)
+                {
+                    const int image = spu->image_id;
+                    if ((unsigned)image < 32u)
+                        spu->perf_getllar_fast[image]++;
+                }
+#endif
 #if !defined(YZ_PERF_CLEAN)
                 extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
                 g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
@@ -3042,10 +3144,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         if (cmd == MFC_GETLLAR_CMD &&
             g_yz_runtime_config.spu_lockstep)
             yz_lockstep_tick(spu);
+        int notify_spurs_after_unlock = 0;
         spu_lockline_lock();
         switch (cmd) {
         case MFC_GETLLAR_CMD: {
             extern void spu_coh_reserve(uint32_t);   /* mark this line for PPU-write coherence */
+#if defined(YZ_PERF_PROFILE)
+            {
+                const int image = spu->image_id;
+                if ((unsigned)image < 32u)
+                    spu->perf_getllar_locked[image]++;
+            }
+#endif
 #if !defined(YZ_PERF_CLEAN)
             extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
             g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)(ea & ~127ull);
@@ -3783,12 +3893,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
             break;
         }
-        if ((cmd == MFC_PUTLLC_CMD &&
+        notify_spurs_after_unlock =
+            (cmd == MFC_PUTLLC_CMD &&
              mfc->atomic_stat == MFC_PUTLLC_SUCCESS) ||
-            (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD)) {
-            extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
-            cellSpursNotifyGuestWrite((uint32_t)(ea & ~127ull), 128);
-        }
+            (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD);
 #if !defined(YZ_PERF_CLEAN)
         /* TS-WATCH (env YZ_TS_WATCH, 2026-06-20 pt27): log every SPU atomic touch of
          * the CRI taskset bitset line -> who clears the created task's enabled/ready
@@ -3821,7 +3929,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               #undef TW_W
           } }
 #endif
-        spu_lockline_unlock();
+        /* Never enter SPURS while the global reservation-line lock is held.
+         * This helper is shared with the deterministic lock-order regression,
+         * which forces a queue-mutex/lockline collision. */
+        spu_lockline_unlock_then_notify_guest_write(
+            notify_spurs_after_unlock, (uint32_t)(ea & ~127ull), 128);
         if (post_unlock_idle_level >= 0)
             spu_idle_yield(post_unlock_idle_level);
         if (tagged) mfc_tag_finish(mfc, spu, tag);

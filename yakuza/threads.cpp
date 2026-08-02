@@ -105,6 +105,18 @@ extern "C" void* yz_thread_context(uint32_t tid)
     return c;
 }
 
+/* Profile/watchdog access to the host thread that owns a guest PPU thread.
+ * Thread records retain their handles for their lifetime; callers use this
+ * only for a short suspend/context/resume sample. */
+extern "C" void* yz_thread_handle(uint32_t tid)
+{
+    thr_lock();
+    thr_rec* t = thr_find(tid);
+    void* handle = t && t->started ? (void*)t->handle : NULL;
+    thr_unlock();
+    return handle;
+}
+
 /* ---- lv2 wait recorder (blocker #21 diagnostic) ---------------------------
  * shims.cpp's central lv2_syscall records the in-flight syscall per guest
  * thread here (before it dispatches, which may block), and clears it on
@@ -480,8 +492,11 @@ static DWORD WINAPI thr_proc(LPVOID pv)
     if (thr_rec* ts = thr_find(p.tid)) ts->ctx = &ctx;
     thr_unlock();
 
-    fprintf(stderr, "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X\n",
-            p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp);
+    fprintf(stderr,
+            "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X "
+            "host_tid=%lu\n",
+            p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp,
+            GetCurrentThreadId());
 
     /* resolves code+TOC from the descriptor, dispatches, drains trampolines */
     yz_call_guest_opd(p.opd_addr, &ctx);

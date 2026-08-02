@@ -244,6 +244,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+void cellGcmDispatchUserCommand(u32 cause);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
@@ -321,7 +322,7 @@ s32 cellGcmUnbindZcull(u8 index);
 /* Misc */
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch);
+u32 cellGcmGetTiledPitchSize(u32 size);
 
 /* NID: 0xBC982946 */
 void cellGcmSetDebugOutputLevel(u32 level);
@@ -340,7 +341,7 @@ void* cellGcmGetNotifyDataAddress(u32 index);
 u64 cellGcmGetTimeStampLocation(u32 index, u32 location);
 
 /* Default FIFO size configuration */
-s32 cellGcmSetDefaultFifoSize(u32 size);
+s32 cellGcmSetDefaultFifoSize(u32 bufferSize, u32 segmentSize);
 
 /* Internal flip commands (called by game code directly) */
 s32 _cellGcmSetFlipCommand(u32 bufferId);
@@ -373,7 +374,7 @@ CellGcmZcullInfo* cellGcmGetZcullInfo(u8 index);
 CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index);
 
 /* Default FIFO mode / command buffer */
-void cellGcmInitDefaultFifoMode(s32 mode);
+s32 cellGcmInitDefaultFifoMode(s32 mode);
 void cellGcmSetDefaultCommandBuffer(void);
 
 /* Debug dump (no-op) */

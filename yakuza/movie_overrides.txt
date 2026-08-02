@@ -1,4 +1,5 @@
-# mwPly video-HLE override set (Route 1 vertical slice, 2026-07-23).
+# Game-owned PPU override set. The mwPly entries form the Route 1 video-HLE
+# vertical slice.
 # Passed to tools/ppu_lifter.py via --override-funcs: these guest functions are
 # emitted as func_XXXXXXXX_lifted bodies + extern func_XXXXXXXX declarations;
 # yakuza/mwply_hle.cpp owns the plain symbols (pass-through until armed).

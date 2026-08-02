@@ -22,3 +22,26 @@ if(MSVC)
 endif()
 
 add_test(NAME cell_savedata COMMAND cell_savedata_test)
+
+add_executable(process_exitspawn_test
+    test_process_exitspawn.c
+    ../process_exitspawn.c
+)
+target_include_directories(process_exitspawn_test PRIVATE
+    "${PS3RECOMP_ROOT}/include"
+    "${PS3RECOMP_ROOT}/libs/system"
+)
+if(MSVC)
+    target_compile_definitions(process_exitspawn_test PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+    )
+    target_compile_options(process_exitspawn_test PRIVATE
+        /experimental:c11atomics
+        /W3
+        /wd4100
+        /wd4244
+        /wd4267
+        /wd4996
+    )
+endif()
+add_test(NAME process_exitspawn COMMAND process_exitspawn_test)

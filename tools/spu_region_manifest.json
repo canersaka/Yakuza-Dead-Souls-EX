@@ -18,6 +18,7 @@
       "description": "EBOOT-embedded SPURS task images, batch-lifted from scratch/spu_imgs (gen_spu_images.py command shape: --auto-functions <elf> --seed-all)",
       "images": [
         { "stem": "gs_task",   "elf": "scratch/spu_imgs/spu_0003_at_0126A580.elf", "diag": "recomp_prx/gs_task.c",   "image_id": 0,  "expect_handedit": true,
+          "conformance_entries": ["0x62F0", "0x6350", "0x6550", "0x69D8", "0x7B00"],
           "note": "reference model; yakuza/generated/fast/gs_task_fast.c is the validated region lift and is retained instead of the regenerated oracle" },
         { "stem": "cri_audio", "elf": "scratch/spu_imgs/spu_0007_at_012A4980.elf", "diag": "recomp_prx/cri_audio.c", "image_id": 3 },
         { "stem": "wkl4_task", "elf": "scratch/spu_imgs/spu_0005_at_01274200.elf", "diag": "recomp_prx/wkl4_task.c", "image_id": 4 },
@@ -82,7 +83,7 @@
       "eboot_ea": "0x0125DA80",
       "ref_elf": "recomp_prx/job_bin_c_17800.elf",
       "ref_base": "0x17800",
-      "description": "post-a030 transition job",
+      "description": "post-a030 transition job; live sizeBinary contract is 0x76C0 bytes",
       "placements": [
         { "stem": "job_bin_c_4c00",  "base": "0x4C00",  "diag": "recomp_prx/job_bin_c_4c00.c",  "image_id": 38 },
         { "stem": "job_bin_c_e400",  "base": "0xE400",  "diag": "recomp_prx/job_bin_c_e400.c",  "image_id": 17 },
@@ -124,8 +125,9 @@
       "kind": "job",
       "eboot_ea": "0x01252680",
       "eboot_size": "0x1E80",
+      "logical_size": "0x1E40",
       "eboot": "game/EBOOT.elf",
-      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated. Placement identity contract (07-30): a numeric PC alone does NOT identify a loaded job; the runtime must resolve (source identity, exact LS base) to a placement BEFORE mapping PC to a region. 0x3BC00 is both offset 0xC00 inside the 0x3B000 placement and offset 0 of the 0x3BC00 placement; range-based fallback to the older image is the diagnosed 07-30 live failure.",
+      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated. The native workload identity covers the documented logical 0x1E40-byte binary, while lift generation includes the final 0x40 bytes of DMA/extraction padding so fall-through observes the zero/STOP tail. Placement identity contract (07-30): a numeric PC alone does NOT identify a loaded job; the runtime must resolve (source identity, exact LS base) to a placement BEFORE mapping PC to a region. 0x3BC00 is both offset 0xC00 inside the 0x3B000 placement and offset 0 of the 0x3BC00 placement; range-based fallback to the older image is the diagnosed 07-30 live failure.",
       "placements": [
         { "stem": "job_bin_orphanage",       "base": "0x4C00",  "diag": "yakuza/generated/job_bin_orphanage.c",       "image_id": 19 },
         { "stem": "job_bin_orphanage_e400",  "base": "0xE400",  "diag": "yakuza/generated/job_bin_orphanage_e400.c",  "image_id": 19 },

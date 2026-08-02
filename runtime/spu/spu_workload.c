@@ -302,6 +302,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
     ctx->gpr[3]._u32[0] = args_ea;
     int ok = spu_workload_execute(&registered, ctx);
     memcpy(ls, ctx->ls, SPU_LS_SIZE);
+    spu_mfc_unregister(ctx);
     free(ctx);
 
     free(ls);

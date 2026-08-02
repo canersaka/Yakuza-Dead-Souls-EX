@@ -100,6 +100,11 @@ extern void     spu_coh_notify_write(uint32_t ea);
 extern void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 extern u128 spu_rdch(spu_context* ctx, uint32_t channel);
 extern uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
+extern void spu_mfc_issue_compact(spu_context* ctx,
+                                  uint32_t lsa, uint32_t eah, uint32_t eal,
+                                  uint32_t size, uint32_t tag, uint32_t cmd,
+                                  const uint32_t channel_pcs[6]);
+extern uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
  * Link-only stubs: spu_channels.c's SPU_WrOutIntrMbox handler (doorbell/
@@ -210,13 +215,9 @@ static uint32_t mfc_go(spu_context* ctx, uint32_t cmd)
     return 0;
 }
 
-/* Global reusable SPU-context pool. mfc_for()'s registry (spu_channels.c) is
- * capped at SPU_MAX_CONTEXTS=8 and keys on ctx POINTER IDENTITY, never
- * releasing a slot -- so every test in this binary must reuse the SAME <=8
- * persistent contexts (re-initialized per test) rather than allocating fresh
- * ones, or extra contexts beyond 8 silently fall back to ONE SHARED engine
- * (a harness artifact, not a runtime bug). No single test below uses more
- * than 6 of the 8 slots. */
+/* Global reusable contexts for the contention tests. The runtime registry is
+ * dynamically sized and contexts can be explicitly retired; test 6 exercises
+ * both properties with a separate, larger allocation. */
 #define SPU_POOL_N 8
 static spu_context g_spu_pool[SPU_POOL_N];
 
@@ -1206,6 +1207,147 @@ static int test5_cas_retry_liveness(void)
     return ok ? 0 : 1;
 }
 
+static int test0a_compact_getllar_issue(void)
+{
+    const char* name = "test0a_compact_getllar_issue";
+    LONG before = g_fail_count;
+    spu_context* ctx = &g_spu_pool[SPU_POOL_N - 2];
+    uint8_t expected[128];
+    static const uint32_t pcs[6] = {
+        0x6364u, 0x636Cu, 0x6380u, 0x6384u, 0x6388u, 0x638Cu
+    };
+
+    printf("[%s] six channel writes through one runtime issue...\n", name);
+    vm_commit_page(EA_CHSTAT);
+    for (unsigned i = 0; i < sizeof(expected); ++i)
+        expected[i] = (uint8_t)(i ^ 0xA5u);
+    memcpy(vm_base + EA_CHSTAT, expected, sizeof(expected));
+    spu_context_init(ctx, 0xE000u);
+    memset(ctx->ls + 0x1800, 0, sizeof(expected));
+    ctx->pc = 0x638Cu;
+
+    spu_mfc_issue_compact(ctx, 0x1800u, 0u, EA_CHSTAT, 128u, 0u,
+                          MFC_GETLLAR_CMD, pcs);
+    if (ctx->mfc_lsa != 0x1800u || ctx->mfc_eah != 0u ||
+        ctx->mfc_eal != EA_CHSTAT || ctx->mfc_size != 128u ||
+        ctx->mfc_tag != 0u)
+        fail(name, "compact issue did not preserve the staged MFC fields");
+    {
+        const uint64_t status =
+            spu_mfc_read_atomic_status_compact(ctx);
+        if ((status >> 32) != 1u)
+            fail(name, "compact GETLLAR did not publish atomic completion");
+        else if ((uint32_t)status != MFC_GETLLAR_SUCCESS)
+            fail(name, "compact GETLLAR completion was not success");
+        if (spu_mfc_read_atomic_status_compact(ctx) != 0u)
+            fail(name, "compact atomic status did not consume readiness");
+    }
+    if (memcmp(ctx->ls + 0x1800, expected, sizeof(expected)) != 0)
+        fail(name, "compact GETLLAR copied different data than channel issue");
+
+    printf("[%s] -> %s\n", name, g_fail_count == before ? "PASS" : "FAIL");
+    return g_fail_count == before ? 0 : 1;
+}
+
+/* =========================================================================
+ * TEST 6 -- MORE THAN EIGHT LIVE CONTEXTS KEEP ISOLATED MFC STATE
+ *
+ * Native SPURS can keep more saved task contexts alive than the machine has
+ * physical SPUs. Every context still needs its own reservation and tag state.
+ * Reserve distinct lines in 24 contexts before committing any of them; a
+ * shared fallback engine makes all but its last reservation fail.
+ * ========================================================================= */
+#define T6_CONTEXTS 24
+#define EA_MANY_CTX 0x40106000u
+
+static int test6_many_context_isolation(void)
+{
+    const char* name = "test6_many_context_isolation";
+    LONG before = g_fail_count;
+    printf("[%s] %d simultaneous reservations...\n", name, T6_CONTEXTS);
+
+    spu_context* contexts =
+        (spu_context*)calloc(T6_CONTEXTS, sizeof(*contexts));
+    if (!contexts) {
+        fail(name, "context allocation failed");
+        return 1;
+    }
+    vm_commit_page(EA_MANY_CTX);
+    memset(vm_base + EA_MANY_CTX, 0, 0x1000);
+
+    for (unsigned i = 0; i < T6_CONTEXTS; ++i) {
+        const uint32_t ea = EA_MANY_CTX + i * 128u;
+        spu_context_init(&contexts[i], 0xD000u + i);
+        mfc_stage(&contexts[i], 0x1000, ea, 128, i & 31u);
+        if (mfc_go(&contexts[i], MFC_GETLLAR_CMD) != MFC_GETLLAR_SUCCESS)
+            fail(name, "context %u GETLLAR failed", i);
+    }
+
+    for (unsigned i = 0; i < T6_CONTEXTS; ++i) {
+        const uint32_t ea = EA_MANY_CTX + i * 128u;
+        const uint32_t value = 0xC0010000u | i;
+        memcpy(contexts[i].ls + 0x1000, &value, sizeof(value));
+        mfc_stage(&contexts[i], 0x1000, ea, 128, i & 31u);
+        if (mfc_go(&contexts[i], MFC_PUTLLC_CMD) != MFC_PUTLLC_SUCCESS) {
+            fail(name, "context %u lost its private reservation", i);
+        } else {
+            uint32_t observed;
+            memcpy(&observed, vm_base + ea, sizeof(observed));
+            if (observed != value)
+                fail(name, "context %u committed %08X, expected %08X",
+                     i, observed, value);
+        }
+    }
+
+    for (unsigned i = 0; i < T6_CONTEXTS; ++i)
+        spu_mfc_unregister(&contexts[i]);
+    free(contexts);
+
+    int ok = (g_fail_count == before);
+    printf("[%s] -> %s\n", name, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+extern volatile long g_yz_ucmd_handler_arg;
+extern volatile long g_yz_ucmd_handler_completed;
+extern volatile long g_yz_ucmd_handler_epoch;
+extern volatile long g_yz_ucmd_handler_completed_epoch;
+extern volatile long g_yz_ucmd_handler_active;
+long yz_ucmd_handler_begin(long cause);
+void yz_ucmd_handler_end(long cause, long epoch);
+long yz_ucmd_wait_for_handler_completion(void);
+int yz_ucmd_handler_snapshot_is_stable(long epoch);
+
+static int test7_nested_callback_epoch(void)
+{
+    const char* name = "test7_nested_callback_epoch";
+    LONG before = g_fail_count;
+    g_yz_ucmd_handler_arg = -1;
+    g_yz_ucmd_handler_completed = -1;
+    g_yz_ucmd_handler_epoch = 0;
+    g_yz_ucmd_handler_completed_epoch = 0;
+    g_yz_ucmd_handler_active = 0;
+
+    const long outer = yz_ucmd_handler_begin(0x10);
+    const long inner = yz_ucmd_handler_begin(0x20);
+    if (outer != 1 || inner != 2 || g_yz_ucmd_handler_active != 2)
+        fail(name, "bad nested entry state outer=%ld inner=%ld active=%ld",
+             outer, inner, g_yz_ucmd_handler_active);
+    yz_ucmd_handler_end(0x20, inner);
+    if (yz_ucmd_handler_snapshot_is_stable(inner) ||
+        g_yz_ucmd_handler_active != 1)
+        fail(name, "inner completion falsely stabilized outer callback");
+    yz_ucmd_handler_end(0x10, outer);
+    if (yz_ucmd_wait_for_handler_completion() != inner ||
+        !yz_ucmd_handler_snapshot_is_stable(inner) ||
+        g_yz_ucmd_handler_completed_epoch != inner)
+        fail(name, "nested completion regressed or failed to stabilize");
+
+    const int ok = g_fail_count == before;
+    printf("[%s] -> %s\n", name, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* =========================================================================
  * main
  * ========================================================================= */
@@ -1221,6 +1363,7 @@ int main(int argc, char** argv)
     ULONGLONG t_start = now_ms();
 
     int rc0  = test0_atomic_status_channel();
+    int rc0a = test0a_compact_getllar_issue();
     int rc0b = test0b_tag_status_and_fence();
     int rc1  = test1_reservation_kill();
     int rc1b = test1b_bulk_writer_gap();   /* NOT folded into the pass/fail spec set below */
@@ -1228,12 +1371,15 @@ int main(int argc, char** argv)
     int rc3  = test3_fastpath_coherence();
     int rc4  = test4_lost_wakeup_edge();
     int rc5  = test5_cas_retry_liveness();
+    int rc6  = test6_many_context_isolation();
+    int rc7  = test7_nested_callback_epoch();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
     printf("=== invariant verdicts ===\n");
     printf("  0 atomic-status lifecycle      : %s\n", rc0  ? "FAIL" : "PASS");
+    printf("  0a compact GETLLAR issue       : %s\n", rc0a ? "FAIL" : "PASS");
     printf("  0b tag status/fence ordering   : %s\n", rc0b ? "FAIL" : "PASS");
     printf("  1 reservation-kill (ABA)      : %s\n", rc1  ? "FAIL" : "PASS");
     printf("  1b bulk-writer gap (bonus)    : %s\n", rc1b ? "REPRODUCED (pre-existing, documented)" : "not reproduced");
@@ -1241,8 +1387,10 @@ int main(int argc, char** argv)
     printf("  3 fast-path coherence         : %s\n", rc3  ? "FAIL" : "PASS");
     printf("  4 lost-wakeup edge            : %s\n", rc4  ? "FAIL" : "PASS");
     printf("  5 CAS retry liveness          : %s\n", rc5  ? "FAIL" : "PASS");
+    printf("  6 many-context MFC isolation  : %s\n", rc6  ? "FAIL" : "PASS");
+    printf("  7 nested callback epoch       : %s\n", rc7  ? "FAIL" : "PASS");
 
-    int failed = rc0 || rc0b || rc1 || rc2 || rc3 || rc4 || rc5;
+    int failed = rc0 || rc0a || rc0b || rc1 || rc2 || rc3 || rc4 || rc5 || rc6 || rc7;
     printf("=== RESULT: %s (fail_count=%ld; test1b is informational, excluded) ===\n",
            failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
