@@ -58,11 +58,12 @@ dist/
 venv/
 env/
 
-# Generated lifter output
-recompiled/
-recomp/ppu_recomp.c
-recomp/ppu_recomp_*.cpp
-recomp/ppu_recomp.h
+# Generated lifter output (title/firmware-derived; local-only, never commit)
+/recompiled/
+/recomp/
+/recomp_prx/
+/yakuza/generated/
+/functions.json
 
 # Local reference source (GPL)
 emu/
@@ -74,9 +75,9 @@ lift_err.txt
 analysis.txt
 
 # Generated runner sources
-yakuza/func_table_gen.cpp
-yakuza/import_bridges_gen.cpp
-yakuza/imports.json
+/yakuza/func_table_gen.cpp
+/yakuza/import_bridges_gen.cpp
+/yakuza/imports.json
 
 # Generated replay snapshots
 /libs/video/tests/build_replay_chr.cmd
@@ -114,6 +115,7 @@ AGENTS.md
 .aider*
 
 # Game files
+/game/
 *.elf
 *.ELF
 *.self
@@ -126,6 +128,14 @@ AGENTS.md
 *.SFO
 *.sprx
 *.SPRX
+*.prx
+*.PRX
+*.iso
+*.ISO
+*.edat
+*.EDAT
+*.pup
+*.PUP
 *.keys
 *.rap
 
@@ -136,23 +146,20 @@ ehthumbs.db
 # Logs
 *.log
 
-# firmware-LLE outputs (derived from decrypted Sony modules - never commit)
-recomp_prx/
-
 # boot logs
 boot_out.txt
 boot_err.txt
 
 # guest filesystem root (disc dump / hdd / save data - junctions to local files)
-gamedata/
+/gamedata/
 
 # RPCS3 full install (binaries + firmware PRX + game data + RSX captures) — oracle resource only; never commit (GPL binaries, firmware, multi-GB)
 rpcs3-v0.0.41-19452-e379fba9_win64_msvc/
 rpcs3-*/
 
 # In-repo oracle / reference resources (local only, never commit; rpcs3/ is GPL source)
-rpcs3/
-refs/
+/rpcs3/
+/refs/
 *.rrc
 *.rrc.gz
 *.tty
@@ -161,9 +168,9 @@ NV_vertex_program*.txt
 altivec.txt
 
 # Local working data, evidence, and goldens
-scratch/
-scratchpad/
-goldens/
+/scratch/
+/scratchpad/
+/goldens/
 /wt/
 /*scratch_*.txt
 /rpcs3_guest_memory_dumper.zip
