@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
@@ -75,26 +76,57 @@ def tracked_paths() -> list[str]:
     ]
 
 
+def historical_paths(history_ref: str) -> set[str]:
+    output = subprocess.check_output(
+        ["git", "log", "--format=", "--name-only", history_ref],
+        cwd=REPOSITORY_ROOT,
+    )
+    return {
+        line.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        for line in output.splitlines()
+        if line
+    }
+
+
+def forbidden_reason(relative_path: str) -> str | None:
+    folded = relative_path.casefold()
+
+    if folded in FORBIDDEN_EXACT_PATHS or folded.startswith(FORBIDDEN_PREFIXES):
+        return "forbidden path"
+
+    if (
+        Path(folded).suffix in FORBIDDEN_EXTENSIONS
+        or folded.endswith(FORBIDDEN_COMPOUND_EXTENSIONS)
+    ):
+        return "forbidden payload type"
+
+    if FORBIDDEN_GENERATED_NAMES.search(relative_path):
+        return "generated lift filename"
+
+    return None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--history-ref",
+        default="HEAD",
+        help="reachable commit history to scan (default: HEAD)",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
     violations: list[str] = []
+    current_paths = set(tracked_paths())
 
-    for relative_path in tracked_paths():
-        folded = relative_path.casefold()
+    for relative_path in sorted(current_paths):
         path = REPOSITORY_ROOT / relative_path
+        reason = forbidden_reason(relative_path)
 
-        if folded in FORBIDDEN_EXACT_PATHS or folded.startswith(FORBIDDEN_PREFIXES):
-            violations.append(f"forbidden path: {relative_path}")
-            continue
-
-        if (
-            Path(folded).suffix in FORBIDDEN_EXTENSIONS
-            or folded.endswith(FORBIDDEN_COMPOUND_EXTENSIONS)
-        ):
-            violations.append(f"forbidden payload type: {relative_path}")
-            continue
-
-        if FORBIDDEN_GENERATED_NAMES.search(relative_path):
-            violations.append(f"generated lift filename: {relative_path}")
+        if reason:
+            violations.append(f"{reason}: {relative_path}")
             continue
 
         if path.is_file() and path.stat().st_size > MAX_TRACKED_FILE_SIZE:
@@ -102,6 +134,11 @@ def main() -> int:
                 f"tracked file exceeds 5 MiB review limit: {relative_path} "
                 f"({path.stat().st_size} bytes)"
             )
+
+    for relative_path in sorted(historical_paths(args.history_ref) - current_paths):
+        reason = forbidden_reason(relative_path)
+        if reason:
+            violations.append(f"{reason} in reachable history: {relative_path}")
 
     if violations:
         print("Repository hygiene check failed:", file=sys.stderr)
