@@ -982,6 +982,7 @@ extern "C" void yz_rsx_fifo_acquire(void);
 extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
+extern "C" void cellGcmDispatchUserCommand(uint32_t cause);
 extern "C" void yz_a010_auth_probe_poll(void);
 
 /* The PPU ABI passes only arguments 1-8 in r3-r10. Arguments 9+ are in the
@@ -1313,6 +1314,7 @@ static int      g_rsx_iomap_init = 0;
  * so ea->io for the ring is `ea - yz_gcm_io_addr`. Set by yz_ovr__cellGcmInitBody. */
 static uint32_t yz_gcm_io_addr = 0;
 static uint32_t yz_gcm_io_size = 0;
+static uint32_t g_yz_gcm_segment_bytes = 0;
 
 static void yz_rsx_iomap_ensure_init(void)
 {
@@ -3130,6 +3132,15 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             }
         }
         vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
+#ifdef YZ_NATIVE_SPURS
+        cellGcmDispatchUserCommand(arg);
+        { static unsigned long un = 0; un++;
+          if (un <= 40 || (un & 0xFFu) == 0) {
+              fprintf(stderr, "[ucmd-hle] n=%lu cause=0x%08X dispatched\n",
+                      un, arg);
+              fflush(stderr);
+          } }
+#else
         if (g_rsx_event_port) {
             /* A newer cause supersedes any latched one (lv1 coalescing: ONE
              * pending cause register, latest wins; userCmdParam above already
@@ -3146,6 +3157,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                 fprintf(stderr, "[ucmd] DROPPED cause=0x%08X (no event port yet)\n", arg);
                 fflush(stderr); }
         }
+#endif
         break; }
     case 0x050:                                   /* NV406E SET_REFERENCE */
         /* FAITHFUL FENCE TIMING (env YZ_RSX_FENCE_SYNC, opt-in A/B). RPCS3's
@@ -3227,27 +3239,57 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                 yz_a010_fifo_publication_repair_enabled()) {
                 const uint32_t have = vm_read32(addr);
                 const uint32_t ahead = have - arg;
+                const uint32_t lag = arg - have;
+                const uint32_t task_running =
+                    vm_read32(0x42450E00u + 0x00u);
+                const uint32_t task_ready =
+                    vm_read32(0x42450E00u + 0x10u);
+                const uint32_t task_signalled =
+                    vm_read32(0x42450E00u + 0x40u);
+                const uint32_t task_waiting =
+                    vm_read32(0x42450E00u + 0x50u);
+                const int known_pool_parked =
+                    task_running == 0u && task_ready == 0u &&
+                    task_signalled == 0u && task_waiting != 0u;
+                static uint32_t stalled_arg = 0xFFFFFFFFu;
+                static uint32_t stalled_have = 0xFFFFFFFFu;
+                static ULONGLONG stalled_since = 0;
+                static ULONGLONG last_fallback_retry = 0;
+                const ULONGLONG stall_now = GetTickCount64();
+                if (stalled_arg != arg || stalled_have != have) {
+                    stalled_arg = arg;
+                    stalled_have = have;
+                    stalled_since = stall_now;
+                }
+                const int overdue_exact_stall =
+                    stall_now - stalled_since >= 2000u &&
+                    stall_now - last_fallback_retry >= 2000u;
                 /*
                  * Reduced-overhead runs exposed a lost wid4 wake after the
                  * user callback had fully staged the requested round.  This
                  * protocol is active during boot as well as a010, so its exact
                  * lost-wake repair must not be scene-gated. Retry exactly once
-                 * only when the acquire is one round ahead, the callback
-                 * completed that exact cause, and the taskset has no running,
-                 * ready, or signalled task (all workers are parked). Replaying
-                 * the cause is then idempotent: no wake remains to duplicate
-                 * and the staged record is already authoritative.
+                 * only when the acquire is a small number of rounds ahead,
+                 * the callback completed that exact cause, and either the
+                 * known pool has every worker parked or the exact (want,have)
+                 * pair has made no progress for two seconds.  The latter is a
+                 * fallback for boot phases whose wid4 taskset is not yet at
+                 * the later a010 address.  The callback's task signal is a
+                 * level bit, so replaying the same cause is idempotent; the
+                 * two-second spacing also prevents a slow live worker from
+                 * receiving a burst of duplicate callbacks.
                  */
-                if (arg - have == 1u &&
+                if (lag != 0u && lag <= 8u &&
                     vm_read32(RSX_DRIVER_INFO + 0x12CCu) == arg &&
                     (uint32_t)_InterlockedCompareExchange(
                         &g_yz_ucmd_handler_completed, 0, 0) == arg &&
-                    vm_read32(0x42450E00u + 0x00u) == 0u &&
-                    vm_read32(0x42450E00u + 0x10u) == 0u &&
-                    vm_read32(0x42450E00u + 0x40u) == 0u &&
-                    vm_read32(0x42450E00u + 0x50u) != 0u &&
+                    (known_pool_parked || overdue_exact_stall) &&
+#if defined(YZ_NATIVE_SPURS)
+                    1) {
+#else
                     (vm_read32(RSX_DRIVER_INFO + 0x12C0u) & 0x80u) != 0u &&
                     g_rsx_event_port != 0u) {
+#endif
                     static uint32_t last_reissued_cause = 0xFFFFFFFFu;
                     static uint32_t last_reissued_epoch = 0xFFFFFFFFu;
                     static unsigned reissue_attempt = 0;
@@ -3261,7 +3303,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                     }
                     /*
                      * A completed replay is a negative acknowledgement when
-                     * the label is still one behind and every task is parked
+                     * the label is still behind and every task is parked
                      * again. Allow the next replay only after that completion
                      * epoch changes; FIFO polling alone cannot generate
                      * duplicates. The small cap keeps a genuinely broken
@@ -3271,15 +3313,26 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                         reissue_attempt < 8u) {
                         last_reissued_epoch = completed_epoch;
                         reissue_attempt++;
+                        if (!known_pool_parked)
+                            last_fallback_retry = stall_now;
+#if defined(YZ_NATIVE_SPURS)
+                        cellGcmDispatchUserCommand(arg);
+                        const int64_t retry = 0;
+#else
                         const int64_t retry = yz_rsx_ev_send(0x80ull);
+#endif
 #if !defined(YZ_PERF_CLEAN)
                         fprintf(stderr,
                                 "[fifo-sync] redelivered staged cause="
-                                "0x%08X have=0x%08X epoch=%u attempt=%u "
-                                "waiting=0x%08X send=%lld\n",
-                                arg, have,
+                                "0x%08X have=0x%08X lag=%u epoch=%u "
+                                "attempt=%u parked=%d "
+                                "task{run=%08X ready=%08X sig=%08X "
+                                "wait=%08X} send=%lld\n",
+                                arg, have, lag,
                                 completed_epoch, reissue_attempt,
-                                vm_read32(0x42450E00u + 0x50u),
+                                known_pool_parked,
+                                task_running, task_ready,
+                                task_signalled, task_waiting,
                                 (long long)retry);
                         fflush(stderr);
 #else
@@ -5259,6 +5312,10 @@ static int yz_flip_on_consumer(void)
  * inline pump (only ONE drains at a time -- YZ_RSX_INLINE disables the async
  * thread). Guarded by g_rsx_fifo_lock. */
 static uint32_t g_fifo_ret = ~0u;
+static uint32_t g_fifo_last_flow_source = ~0u;
+static uint32_t g_fifo_last_flow_word = 0u;
+static uint32_t g_fifo_last_flow_target = ~0u;
+static uint32_t g_fifo_last_flow_kind = 0u; /* 1=jump, 2=call, 3=return */
 
 /* s29 (scratch/s29_terminal_park_re.md, Q4): RPCS3 (RSXFIFO.cpp) treats BOTH a
  * nested CALL (a second CALL before the pending one RETURNs) and a RETURN with
@@ -5460,6 +5517,38 @@ static int yz_rsx_fifo_step(void)
         uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
                                        : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
+            /* The reserved default-buffer head is initially guarded by a
+             * self-jump.  Release only that startup guard from the consumer
+             * side, after PUT proves a later command boundary was published.
+             * Recycled and in-stream stoppers keep their journal lifecycle. */
+            if (g_yz_gcm_segment_bytes) {
+                const uint32_t ring = 0x800000u;
+                const uint32_t segment = get / g_yz_gcm_segment_bytes;
+                const uint32_t segment_head =
+                    segment * g_yz_gcm_segment_bytes +
+                    (segment == 0u ? 0x1000u : 0u);
+                const uint32_t ahead = (put - get + ring) & (ring - 1u);
+                if (segment == 0u && get == segment_head && ahead > 4u &&
+                    ahead < (ring >> 1)) {
+                    MemoryBarrier();
+                    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+                        vm_read32(ea) == cmd) {
+                        const uint32_t resume = (get + 4u) & (ring - 1u);
+                        vm_write32(ea, 0x20000000u | resume);
+                        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, resume);
+                        static unsigned released_heads = 0;
+                        if (++released_heads <= 16u) {
+                            fprintf(stderr,
+                                    "[gcm] released published segment head "
+                                    "io=0x%06X PUT=0x%06X\n",
+                                    get, put);
+                            fflush(stderr);
+                        }
+                        LeaveCriticalSection(&g_rsx_fifo_lock);
+                        return 1;
+                    }
+                }
+            }
             /* Jump-to-self stopper. DEFERRED-RELEASE APPLY -- RETIRED (default
              * OFF 2026-07-02, layer-1 root-cause session; opt back in with
              * YZ_APPLY_REL=1 for A/B). This stand-in was built (2026-06-28)
@@ -5854,6 +5943,10 @@ static int yz_rsx_fifo_step(void)
                     te ? vm_read32(te + 12u) : 0u);
             fflush(stderr);
         }
+        g_fifo_last_flow_source = get;
+        g_fifo_last_flow_word = cmd;
+        g_fifo_last_flow_target = tgt;
+        g_fifo_last_flow_kind = 1u;
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 1;
@@ -5904,6 +5997,10 @@ static int yz_rsx_fifo_step(void)
                     ce ? vm_read32(ce + 12u) : 0u);
             fflush(stderr);
         }
+        g_fifo_last_flow_source = get;
+        g_fifo_last_flow_word = cmd;
+        g_fifo_last_flow_target = ctgt;
+        g_fifo_last_flow_kind = 2u;
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -5923,6 +6020,10 @@ static int yz_rsx_fifo_step(void)
                         get, ea, g_fifo_ret, yz_rsx_io_to_ea(g_fifo_ret));
                 fflush(stderr);
             }
+            g_fifo_last_flow_source = get;
+            g_fifo_last_flow_word = cmd;
+            g_fifo_last_flow_target = g_fifo_ret;
+            g_fifo_last_flow_kind = 3u;
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
             g_fifo_ret = ~0u;
             LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -5976,6 +6077,12 @@ static int yz_rsx_fifo_step(void)
             stuck_get = get; stuck_t0 = now; said_t = now; nnc++;
             fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
                     "finalised; waiting for producer (n=%lu)\n", cmd, get, put, nnc);
+            fprintf(stderr,
+                    "[fifo-arrival] kind=%u source=0x%08X word=0x%08X "
+                    "target=0x%08X live-ret=0x%08X\n",
+                    g_fifo_last_flow_kind, g_fifo_last_flow_source,
+                    g_fifo_last_flow_word, g_fifo_last_flow_target,
+                    g_fifo_ret);
             fflush(stderr);
             /* s35 hole-structure dump (env YZ_FIFO_HOLE_DUMP): on first hit of a
              * given non-command park, hexdump [get, get+0x120) so the
@@ -6392,7 +6499,10 @@ extern "C" { void (*g_yz_usleep_pump)(void) = 0; }
 static DWORD WINAPI yz_rsx_consumer(LPVOID)
 {
     yz_rsx_fifo_lock_ensure();
-    fprintf(stderr, "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model)\n");
+    fprintf(stderr,
+            "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model) "
+            "host_tid=%lu\n",
+            GetCurrentThreadId());
     /* s24 idle heartbeat: wall shape #2 is the consumer idling for minutes with
      * PUT far ahead and NO stopper park (the lever legitimately silent) — and
      * every return-0 path in yz_rsx_fifo_step is print-silent, so the parked
@@ -6446,51 +6556,113 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
 }
 
 extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context*);   /* defined below */
+extern "C" int32_t cellGcmInit(uint32_t cmd_size, uint32_t io_size,
+                                uint32_t io_address);
+extern "C" uint32_t cellGcmGetDefaultSegmentWordSize(void);
+extern "C" void cellGcmTickVBlank(void);
 
-/* HLE gcm out-of-space callback (root-cause fix, 2026-06-14f). The game's gcm
- * wrapper calls ctx->callback(ctx, count) when current+4 > end. We treat the whole
- * io command buffer as ONE segment and WRAP to begin when full -- CO-DESIGNED with
- * the faithful consumer:
- *   1. flush PUT = current (let the consumer drain what's pending);
- *   2. SYNCHRONOUSLY DRAIN -- wait until GET == PUT, so rewinding can't overwrite
- *      commands the consumer hasn't passed (this is the synchronization the old
- *      hand-rolled consumer lacked = the race that drove the LLE detour);
- *   3. write a jump-to-begin at the old current, rewind current=begin, PUT=begin.
- * One segment => ctx->end never changes => the game's cross-fragment release-defer
- * (the @0x300000 op-list deadlock) never triggers and nothing fragment-recycles, so
- * the game's threads never wedge. Routed here via YZ_GCM_CB_FAKE_KEY (dispatch.cpp). */
+/* SDK-internal cellGcmSys context helper. */
+static constexpr uint64_t g_yz_gcm_system_mode = 0x820u;
+static uint32_t g_yz_gcm_cmd_size;
+static SRWLOCK g_yz_gcm_callback_lock = SRWLOCK_INIT;
+extern "C" void yz_ovr__cellGcmFunc15(ppu_context* ctx)
+{
+    if (getenv("YZ_GCM15_TRACE")) {
+        static unsigned calls = 0;
+        const unsigned n = ++calls;
+        if (n <= 64 || (n & 0x3FFu) == 0u) {
+            fprintf(stderr,
+                    "[gcm15] n=%u cia=0x%08llX lr=0x%08llX "
+                    "r3=0x%08llX r4=0x%08llX r5=0x%08llX r6=0x%08llX\n",
+                    n, (unsigned long long)ctx->cia,
+                    (unsigned long long)ctx->lr,
+                    (unsigned long long)ctx->gpr[3],
+                    (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5],
+                    (unsigned long long)ctx->gpr[6]);
+        }
+    }
+    ctx->gpr[3] = 0;
+}
+
+/* Default FIFO callback. Each segment reserves its final word for a jump to the
+ * next segment. Publish the jump before advancing PUT, and do not reuse a
+ * segment while GET still points into it. */
 extern "C" void yz_gcm_fifo_callback(ppu_context* ctx)
 {
+    AcquireSRWLockExclusive(&g_yz_gcm_callback_lock);
     uint32_t gctx = (uint32_t)ctx->gpr[3];          /* CellGcmContextData* */
     { static int e = 0; if (e < 16) { e++;
         fprintf(stderr, "[gcm] callback(ctx=0x%08X count=0x%llX) begin=0x%08X end=0x%08X cur=0x%08X\n",
                 gctx, (unsigned long long)ctx->gpr[4],
                 gctx ? vm_read32(gctx + 0x0) : 0, gctx ? vm_read32(gctx + 0x4) : 0,
                 gctx ? vm_read32(gctx + 0x8) : 0); } }
-    if (gctx && yz_gcm_io_addr) {
-        uint32_t begin = vm_read32(gctx + 0x0);     /* EA: segment start */
-        uint32_t cur   = vm_read32(gctx + 0x8);     /* EA: current write head */
-        uint32_t begin_off = begin - yz_gcm_io_addr;   /* io offset (linear ring) */
-        uint32_t cur_off   = cur   - yz_gcm_io_addr;
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);     /* flush pending */
-        for (int spin = 0; spin < 4000; spin++) {                 /* drain (<=4 s) */
-            if ((vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u) == cur_off) break;
-            Sleep(1);
+    if (gctx && yz_gcm_io_addr && g_yz_gcm_cmd_size &&
+        g_yz_gcm_segment_bytes) {
+        const uint32_t begin = vm_read32(gctx + 0x0);
+        const uint32_t begin_off = begin - yz_gcm_io_addr;
+        const uint32_t cur = vm_read32(gctx + 0x8);
+        const uint32_t cur_off = cur - yz_gcm_io_addr;
+        const uint32_t segment = cur_off / g_yz_gcm_segment_bytes;
+        const uint32_t segment_count =
+            g_yz_gcm_cmd_size / g_yz_gcm_segment_bytes;
+        const uint32_t next_segment =
+            segment_count ? (segment + 1u) % segment_count : 0u;
+        uint32_t next_off = next_segment * g_yz_gcm_segment_bytes;
+        if (next_segment == 0u)
+            next_off += 0x1000u;
+        const uint32_t next_begin = yz_gcm_io_addr + next_off;
+        const uint32_t next_end = yz_gcm_io_addr +
+            (next_segment + 1u) * g_yz_gcm_segment_bytes - 4u;
+
+        vm_write32(cur, 0x20000000u | (next_off & 0x1FFFFFFCu));
+        MemoryBarrier();
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);
+        vm_write32(gctx + 0x0, next_begin);
+        vm_write32(gctx + 0x4, next_end);
+        vm_write32(gctx + 0x8, next_begin);
+
+        for (;;) {
+            uint32_t get;
+            uint32_t pending_return;
+            /* GET can be in an external display list while the FIFO's pending
+             * CALL return still owns a ring segment.  Snapshot both under the
+             * consumer lock; recycling either address would overwrite work
+             * the consumer has not retired yet. */
+            yz_rsx_fifo_acquire();
+            get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
+            pending_return = g_fifo_ret;
+            yz_rsx_fifo_release();
+            const uint32_t next_end_off = next_end - yz_gcm_io_addr;
+            const int get_in_next = get >= next_off && get <= next_end_off;
+            const int return_in_next = pending_return != ~0u &&
+                pending_return >= next_off && pending_return <= next_end_off;
+            const int get_in_initial_window = get < 0x1000u;
+            if (!get_in_next && !return_in_next && !get_in_initial_window)
+                break;
+            if (return_in_next) {
+                static unsigned protected_returns = 0;
+                if (++protected_returns <= 16u) {
+                    fprintf(stderr,
+                            "[gcm] segment recycle waiting for pending FIFO "
+                            "return=0x%X next=[0x%X,0x%X] GET=0x%X\n",
+                            pending_return, next_off, next_end_off, get);
+                    fflush(stderr);
+                }
+            }
+            SwitchToThread();
         }
-        vm_write32(cur, 0x20000000u | (begin_off & 0x1FFFFFFCu));  /* jump-to-begin */
-        vm_write32(gctx + 0x8, begin);                            /* current = begin */
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, begin_off);  /* PUT = begin */
         { static int n = 0; if (n < 8) { n++;
-            fprintf(stderr, "[gcm] fifo wrap: drained to io 0x%X, rewound to io 0x%X\n",
-                    cur_off, begin_off); } }
+            fprintf(stderr,
+                    "[gcm] fifo segment: put=0x%X next=[0x%X,0x%X]\n",
+                    cur_off, next_off, next_end - yz_gcm_io_addr); } }
     }
     ctx->gpr[3] = 0;
+    ReleaseSRWLockExclusive(&g_yz_gcm_callback_lock);
 }
 
-/* HLE _cellGcmInitBody (root-cause fix, 2026-06-14f): replaces Sony's LLE libgcm
- * init. Sets up the guest-memory contract (reusing the sys_rsx setup, like RPCS3's
- * _cellGcmInitBody calls sys_rsx_context_allocate), maps the io command buffer, and
- * builds the gcm CONTEXT (single segment + our wrap callback). Args (RPCS3 ABI):
+/* HLE _cellGcmInitBody sets up the guest-memory contract, maps the io command
+ * buffer, and builds the segmented default command context. Args:
  * gpr[3]=CellGcmContextData**, gpr[4]=cmdSize, gpr[5]=ioSize, gpr[6]=ioAddress. */
 extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
 {
@@ -6501,8 +6673,22 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     fprintf(stderr, "[gcm-hle] _cellGcmInitBody(ctx**=0x%08X cmdSize=0x%X ioSize=0x%X "
             "ioAddr=0x%08X)\n", ctx_slot, cmd_size, io_size, io_addr);
 
+    const int32_t init_rc = cellGcmInit(cmd_size, io_size, io_addr);
+    if (init_rc != 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)init_rc;
+        return;
+    }
+
     yz_gcm_io_addr = io_addr;
     yz_gcm_io_size = io_size;
+    g_yz_gcm_cmd_size = cmd_size;
+    g_yz_gcm_segment_bytes = cellGcmGetDefaultSegmentWordSize() * 4u;
+    if (!g_yz_gcm_segment_bytes)
+        g_yz_gcm_segment_bytes = 0x100000u;
+    if (!g_yz_gcm_cmd_size)
+        g_yz_gcm_cmd_size = g_yz_gcm_segment_bytes;
+    if (g_yz_gcm_segment_bytes > g_yz_gcm_cmd_size)
+        g_yz_gcm_segment_bytes = g_yz_gcm_cmd_size;
 
     /* RSX local memory (0xC0000000): reserved by vm_init, commit it now -- under LLE
      * sys_rsx_memory_allocate did this; under HLE the game addresses local VRAM
@@ -6514,6 +6700,7 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     {
         static ppu_context sc;
         memset(&sc, 0, sizeof(sc));
+        sc.gpr[8] = g_yz_gcm_system_mode;
         yz_sys_rsx_context_allocate(&sc);
     }
 
@@ -6532,10 +6719,11 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     vm_write32(YZ_GCM_CB_OPD_ADDR + 0, YZ_GCM_CB_FAKE_KEY);
     vm_write32(YZ_GCM_CB_OPD_ADDR + 4, 0);
 
-    /* CellGcmContextData: ONE segment over the whole io buffer (4 KB reserved at
-     * the front), callback @+0xC = our wrap callback. begin/end/current are EAs. */
+    /* The first segment reserves 4 KB at the front.  `end` is the address of
+     * the segment's final word; the callback writes its linking jump at the
+     * last current position before switching. */
     uint32_t begin = io_addr + 0x1000;
-    uint32_t end   = io_addr + (cmd_size ? cmd_size : 0x10000) - 4;
+    uint32_t end   = io_addr + g_yz_gcm_segment_bytes - 4u;
     vm_write32(YZ_GCM_CTX_ADDR + 0x0, begin);
     vm_write32(YZ_GCM_CTX_ADDR + 0x4, end);
     vm_write32(YZ_GCM_CTX_ADDR + 0x8, begin);
@@ -6553,8 +6741,13 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
  * All io/control/label addresses point at the structures the faithful consumer
  * reads (RSX_DMA_CONTROL, RSX_REPORTS, g_rsx_iomap_ea) so the game and the RSX
  * agree by construction. Recovered from git 79869ac + reconciled. */
-extern "C" int32_t  cellGcmGetTiledPitchSize(uint32_t size, uint32_t* pitch);
+extern "C" uint32_t cellGcmGetTiledPitchSize(uint32_t size);
 extern "C" uint64_t cellGcmGetTimeStampLocation(uint32_t index, uint32_t location);
+extern "C" int32_t cellGcmSetDisplayBuffer(uint32_t buffer_id,
+                                            uint32_t offset,
+                                            uint32_t pitch,
+                                            uint32_t width,
+                                            uint32_t height);
 
 /* put/get/ref poll pointer -> the GUEST dma_control (put@+0 get@+4 ref@+8). */
 extern "C" void yz_ovr_cellGcmGetControlRegister(ppu_context* ctx)
@@ -6583,11 +6776,38 @@ extern "C" void yz_ovr_cellGcmGetConfiguration(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+extern "C" void yz_ovr_cellGcmSetDisplayBuffer(ppu_context* ctx)
+{
+    const uint32_t id = (uint32_t)ctx->gpr[3];
+    const uint32_t offset = (uint32_t)ctx->gpr[4];
+    const uint32_t pitch = (uint32_t)ctx->gpr[5];
+    const uint32_t width = (uint32_t)ctx->gpr[6];
+    const uint32_t height = (uint32_t)ctx->gpr[7];
+    const int32_t rc = cellGcmSetDisplayBuffer(
+        id, offset, pitch, width, height);
+    if (rc == 0 && id < 8u) {
+        g_rsx_dispbuf[id].width = width;
+        g_rsx_dispbuf[id].height = height;
+        g_rsx_dispbuf[id].pitch = pitch;
+        g_rsx_dispbuf[id].offset = offset;
+        if (id + 1u > g_rsx_dispbuf_count)
+            g_rsx_dispbuf_count = id + 1u;
+        rsx_live_draw_set_display_buffer(
+            id, 0, offset, pitch, width, height);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
 /* ea -> io offset via the consumer's iomap (the game computes put=AddressToOffset
  * (current)). Linear fast path for the command-buffer ring. */
 extern "C" void yz_ovr_cellGcmAddressToOffset(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];
+    if (ea >= YZ_GCM_LOCAL_BASE &&
+        ea < YZ_GCM_LOCAL_BASE + YZ_GCM_LOCAL_SIZE) {
+        if (out) vm_write32(out, ea - YZ_GCM_LOCAL_BASE);
+        ctx->gpr[3] = 0; return;
+    }
     if (yz_gcm_io_addr && ea >= yz_gcm_io_addr && ea < yz_gcm_io_addr + yz_gcm_io_size) {
         if (out) vm_write32(out, ea - yz_gcm_io_addr);
         ctx->gpr[3] = 0; return;
@@ -6618,10 +6838,7 @@ extern "C" void yz_ovr_cellGcmUnmapEaIoAddress(ppu_context* ctx) { ctx->gpr[3] =
 
 extern "C" void yz_ovr_cellGcmGetTiledPitchSize(ppu_context* ctx)
 {
-    uint32_t pitch = 0;
-    int32_t rc = cellGcmGetTiledPitchSize((uint32_t)ctx->gpr[3], &pitch);
-    if (ctx->gpr[4]) vm_write32((uint32_t)ctx->gpr[4], pitch);
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+    ctx->gpr[3] = cellGcmGetTiledPitchSize((uint32_t)ctx->gpr[3]);
 }
 
 extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
@@ -6629,25 +6846,73 @@ extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
     ctx->gpr[3] = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
 }
 
-/* HLE flip: present the buffer + signal the flip label the game polls. These
- * entry points take the gcm CONTEXT as arg0 (r3), the buffer id in r4. */
+/* Publish a flip through the guest FIFO so draw submission, display queueing,
+ * and presentation stay ordered on the one RSX consumer thread.  The public
+ * GCM command ABI defines the head-1 queue/flip methods as 0xE944/0xE924; the
+ * flip argument's high bit selects the buffer already queued for that head. */
+static int32_t yz_gcm_append_flip_commands(uint32_t context,
+                                           uint32_t buffer_id,
+                                           int wait_for_label,
+                                           uint32_t label_index,
+                                           uint32_t label_value)
+{
+    if (!context || buffer_id >= 8u)
+        return (int32_t)CELL_GCM_ERROR_INVALID_VALUE;
+
+    const uint32_t current = vm_read32(context + 0x08u);
+    const uint32_t end = vm_read32(context + 0x04u);
+    const uint32_t words = wait_for_label ? 10u : 4u;
+    const uint32_t bytes = words * 4u;
+    if (!current || current > UINT32_MAX - bytes || current + bytes > end)
+        return (int32_t)CELL_GCM_ERROR_FAILURE;
+
+    uint32_t out = current;
+    if (wait_for_label) {
+        vm_write32(out + 0x00u, 0x00040060u); /* semaphore DMA selector */
+        vm_write32(out + 0x04u, 0x66616661u); /* report/label memory */
+        vm_write32(out + 0x08u, 0x00040064u); /* semaphore offset */
+        vm_write32(out + 0x0Cu, (label_index & 0xFFu) * 0x10u);
+        vm_write32(out + 0x10u, 0x00040068u); /* semaphore acquire */
+        vm_write32(out + 0x14u, label_value);
+        out += 0x18u;
+    }
+
+    vm_write32(out + 0x00u, 0x0004E944u); /* queue buffer on head 1 */
+    vm_write32(out + 0x04u, buffer_id);
+    vm_write32(out + 0x08u, 0x0004E924u); /* flip head 1 */
+    vm_write32(out + 0x0Cu, 0x8000010Fu); /* use queued buffer */
+
+    MemoryBarrier();
+    vm_write32(context + 0x08u, current + bytes);
+    return 0;
+}
+
+/* These entry points take the GCM context as arg0 (r3) and buffer id in r4. */
 extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 {
-    if (yz_ft_on()) yz_ft("HLE-SetFlipCommand buf=%u (label clear!)",
-                          (uint32_t)ctx->gpr[4]);
-    yz_rsx_present((uint32_t)ctx->gpr[4]);
-    vm_write32(RSX_REPORTS + 0x10, 0);             /* flip label -> done */
-    ctx->gpr[3] = 0;
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
+    const int32_t result = yz_gcm_append_flip_commands(
+        context, buffer_id, 0, 0, 0);
+    if (yz_ft_on())
+        yz_ft("HLE-SetFlipCommand ctx=0x%08X buf=%u queued result=0x%08X",
+              context, buffer_id, (uint32_t)result);
+    ctx->gpr[3] = (uint64_t)(int64_t)result;
 }
 
 extern "C" void yz_ovr__cellGcmSetFlipCommandWithWaitLabel(ppu_context* ctx)
 {
-    if (yz_ft_on()) yz_ft("HLE-SetFlipCommandWithWaitLabel buf=%u (label clear!)",
-                          (uint32_t)ctx->gpr[4]);
-    yz_rsx_present((uint32_t)ctx->gpr[4]);
-    vm_write32(RSX_REPORTS + ((uint32_t)ctx->gpr[5] & 0xFFu) * 0x10u, (uint32_t)ctx->gpr[6]);
-    vm_write32(RSX_REPORTS + 0x10, 0);
-    ctx->gpr[3] = 0;
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
+    const uint32_t label_index = (uint32_t)ctx->gpr[5];
+    const uint32_t label_value = (uint32_t)ctx->gpr[6];
+    const int32_t result = yz_gcm_append_flip_commands(
+        context, buffer_id, 1, label_index, label_value);
+    if (yz_ft_on())
+        yz_ft("HLE-SetFlipCommandWithWaitLabel ctx=0x%08X buf=%u "
+              "label=%u value=0x%08X queued result=0x%08X",
+              context, buffer_id, label_index, label_value, (uint32_t)result);
+    ctx->gpr[3] = (uint64_t)(int64_t)result;
 }
 
 /* ===========================================================================
@@ -7037,6 +7302,9 @@ extern "C" int64_t yz_sys_rsx_attribute(ppu_context* ctx) { return 0; }
 extern "C" void yz_rsx_vblank_tick(void)
 {
     if (!g_rsx_ctx_ready) return;
+#ifdef YZ_NATIVE_SPURS
+    cellGcmTickVBlank();
+#endif
     yz_ft_start();   /* YZ_FLIPTRACE arm banner + label watcher (no-op if off) */
 
     /* s25: redeliver any latched SPU throw_events (spu_channels.c loss latch,

@@ -44,6 +44,27 @@ static int sem_trace_on(void)
 static long s_sem_trace_n = 0;
 #define SEM_TRACE_CAP 4000
 
+/* Low-volume performance attribution used by the fixed orphanage sample.
+ * Unlike YZ_SEM_TRACE this records only the main-thread wait on semaphore 4
+ * and the threads that satisfy it, so logging does not become the workload. */
+static int sem_profile_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("YZ_SEM_PROFILE") ? 1 : 0;
+    return on;
+}
+#ifdef _WIN32
+static volatile LONG s_sem_profile_armed;
+static volatile LONG s_sem_profile_wait_logs;
+static volatile LONG s_sem_profile_post_logs;
+static volatile LONG s_sem_profile_wait_active;
+static volatile LONG s_sem_profile_wait_seq;
+static volatile LONG64 s_sem_profile_wait_started_ms;
+static volatile LONG s_sem_profile_last_post_seq;
+static volatile LONG s_sem_profile_last_post_after_ms;
+static volatile LONG s_sem_profile_last_post_tid;
+#endif
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
@@ -76,6 +97,34 @@ static void sem_table_unlock(void)
 #else
     pthread_mutex_unlock(&s_sem_table_lock);
 #endif
+}
+
+/*
+ * A semaphore slot can be recycled immediately after destroy.  Keep every
+ * operation pinned to the current slot lifetime so destroy cannot close the
+ * host primitive under a waiter/poster and a stale operation cannot cross
+ * into a newly-created semaphore that reused the same numeric id.
+ */
+static sys_semaphore_info* sem_ref_acquire(uint32_t sem_id)
+{
+    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) return NULL;
+    sem_table_lock();
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active) {
+        sem_table_unlock();
+        return NULL;
+    }
+    s->references++;
+    sem_table_unlock();
+    return s;
+}
+
+static void sem_ref_release(sys_semaphore_info* s)
+{
+    if (!s) return;
+    sem_table_lock();
+    if (s->references) s->references--;
+    sem_table_unlock();
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -158,6 +207,13 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, sem_id);
     }
+    if (sem_profile_on()) {
+        fprintf(stderr,
+                "[sem-profile-create] id=%u name='%.*s' initial=%d max=%d "
+                "protocol=0x%08X\n",
+                sem_id, 8, s->name, initial, max_val, s->protocol);
+        fflush(stderr);
+    }
 
     sem_table_unlock();
     return CELL_OK;
@@ -183,6 +239,18 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* The LV2 contract rejects destruction while the object is in use.  A
+     * parked waiter holds a reference for its entire wait, as do concurrent
+     * post/trywait/get-value calls. */
+    if (s->references != 0 || s->waiters != 0) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
+    /* Make the slot unreachable before releasing host resources.  With the
+     * table lock held and no references, no operation can still touch them. */
+    s->active = 0;
+
 #ifdef _WIN32
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
@@ -191,7 +259,6 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
     pthread_mutex_destroy(&s->mtx);
 #endif
 
-    s->active = 0;
     sem_table_unlock();
     return CELL_OK;
 }
@@ -206,17 +273,38 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+#ifdef _WIN32
+    ULONGLONG profile_start = 0;
+#endif
 
     /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
      * deadline multiply / ms-DWORD conversion below can't overflow. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
+    sys_semaphore_info* s = sem_ref_acquire(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+#ifdef _WIN32
+    if (sem_profile_on() && sem_id == 4 && yz_thread_current_id() == 1) {
+        profile_start = GetTickCount64();
+        InterlockedExchange64(&s_sem_profile_wait_started_ms,
+                              (LONG64)profile_start);
+        InterlockedIncrement(&s_sem_profile_wait_seq);
+        InterlockedExchange(&s_sem_profile_last_post_seq, -1);
+        InterlockedExchange(&s_sem_profile_last_post_after_ms, -1);
+        InterlockedExchange(&s_sem_profile_last_post_tid, -1);
+        InterlockedExchange(&s_sem_profile_wait_active, 1);
+        if (InterlockedCompareExchange(&s_sem_profile_armed, 1, 0) == 0) {
+            fprintf(stderr,
+                    "[sem-profile-arm] t1 waiting id=4 name='%.*s' "
+                    "timeout_us=%llu value=%d max=%d\n",
+                    8, s->name, (unsigned long long)timeout_us,
+                    s->value, s->max_value);
+            fflush(stderr);
+        }
+    }
+#endif
 
     if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
         s_sem_trace_n++;
@@ -246,6 +334,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
                 fprintf(stderr, "[t1-unblock] sem_wait id=%u forced\n", sem_id);
                 fflush(stderr);
             }
+            sem_ref_release(s);
             return CELL_OK;
         }
     }
@@ -270,21 +359,50 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         if (s->value > 0) {
             s->value--;
             LeaveCriticalSection(&s->value_lock);
+            const ULONGLONG profile_elapsed = profile_start
+                ? GetTickCount64() - profile_start : 0;
+            if (profile_start)
+                InterlockedExchange(&s_sem_profile_wait_active, 0);
+            if (profile_start && profile_elapsed >= 5 &&
+                InterlockedIncrement(&s_sem_profile_wait_logs) <= 256) {
+                const LONG wait_seq = InterlockedCompareExchange(
+                    &s_sem_profile_wait_seq, 0, 0);
+                const LONG post_seq = InterlockedCompareExchange(
+                    &s_sem_profile_last_post_seq, 0, 0);
+                const LONG post_after = InterlockedCompareExchange(
+                    &s_sem_profile_last_post_after_ms, 0, 0);
+                const LONG post_tid = InterlockedCompareExchange(
+                    &s_sem_profile_last_post_tid, 0, 0);
+                fprintf(stderr,
+                        "[sem-profile-wait] seq=%ld t1 id=4 "
+                        "elapsed_ms=%llu post_after_ms=%ld post_tid=%ld "
+                        "value=%d waiters=%d\n",
+                        wait_seq,
+                        (unsigned long long)profile_elapsed,
+                        post_seq == wait_seq ? post_after : -1,
+                        post_seq == wait_seq ? post_tid : -1,
+                        s->value, s->waiters);
+                fflush(stderr);
+            }
             if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
                 s_sem_trace_n++;
                 fprintf(stderr, "[sem] t%u WAIT-exit id=%u val=%d\n",
                         yz_thread_current_id(), sem_id, s->value);
                 fflush(stderr);
             }
+            sem_ref_release(s);
             return CELL_OK;
         }
         if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
             LeaveCriticalSection(&s->value_lock);
+            if (profile_start)
+                InterlockedExchange(&s_sem_profile_wait_active, 0);
             if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
                 s_sem_trace_n++;
                 fprintf(stderr, "[sem] t%u WAIT-timeout id=%u\n", yz_thread_current_id(), sem_id);
                 fflush(stderr);
             }
+            sem_ref_release(s);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
         s->waiters++;
@@ -325,6 +443,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
             s->waiters--;
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&s->mtx);
+                sem_ref_release(s);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
@@ -334,6 +453,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     pthread_mutex_unlock(&s->mtx);
 #endif
 
+    sem_ref_release(s);
     return CELL_OK;
 }
 
@@ -346,11 +466,8 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
 {
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
 
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_ref_acquire(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -365,6 +482,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
                     yz_thread_current_id(), sem_id);
             fflush(stderr);
         }
+        sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value--;
@@ -379,12 +497,14 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
     pthread_mutex_lock(&s->mtx);
     if (s->value <= 0) {
         pthread_mutex_unlock(&s->mtx);
+        sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value--;
     pthread_mutex_unlock(&s->mtx);
 #endif
 
+    sem_ref_release(s);
     return CELL_OK;
 }
 
@@ -400,9 +520,8 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * preload blocker; capped at max_value so it can't over-count. */
 void yz_force_sem_post(uint32_t sem_id)
 {
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) return;
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active) return;
+    sys_semaphore_info* s = sem_ref_acquire(sem_id);
+    if (!s) return;
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     int ok = (s->value < s->max_value);
@@ -418,6 +537,7 @@ void yz_force_sem_post(uint32_t sem_id)
     }
     pthread_mutex_unlock(&s->mtx);
 #endif
+    sem_ref_release(s);
 }
 
 int64_t sys_semaphore_post(ppu_context* ctx)
@@ -425,15 +545,38 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
     if (count <= 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_ref_acquire(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+#ifdef _WIN32
+    if (sem_profile_on() && sem_id == 4 && s_sem_profile_armed &&
+        s_sem_profile_wait_active) {
+        const LONG64 wait_started = InterlockedCompareExchange64(
+            &s_sem_profile_wait_started_ms, 0, 0);
+        const ULONGLONG elapsed = wait_started > 0
+            ? GetTickCount64() - (ULONGLONG)wait_started : 0;
+        const LONG wait_seq = InterlockedCompareExchange(
+            &s_sem_profile_wait_seq, 0, 0);
+        InterlockedExchange(&s_sem_profile_last_post_after_ms,
+                            (LONG)elapsed);
+        InterlockedExchange(&s_sem_profile_last_post_tid,
+                            (LONG)yz_thread_current_id());
+        InterlockedExchange(&s_sem_profile_last_post_seq, wait_seq);
+        if (InterlockedIncrement(&s_sem_profile_post_logs) <= 256) {
+            fprintf(stderr,
+                    "[sem-profile-post] seq=%ld after_ms=%llu tid=%u id=4 "
+                    "count=%d value=%d waiters=%d lr=0x%08llX\n",
+                    wait_seq, (unsigned long long)elapsed,
+                    yz_thread_current_id(), count, s->value, s->waiters,
+                    (unsigned long long)ctx->lr);
+            fflush(stderr);
+        }
+    }
+#endif
 
     /* Audit sec.6 error-code fidelity (2026-07-03, user-confirmed): RPCS3
      * sys_semaphore.cpp post() returns CELL_EBUSY (not_an_error) when the
@@ -453,6 +596,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
             fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d max=%d (n=%ld)\n",
                     yz_thread_current_id(), sem_id, count, s->value, s->max_value, ebusy_n);
             fflush(stderr); }
+        sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
@@ -482,6 +626,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
+        sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
@@ -492,6 +637,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     pthread_mutex_unlock(&s->mtx);
 #endif
 
+    sem_ref_release(s);
     return CELL_OK;
 }
 
@@ -506,11 +652,8 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
     uint32_t sem_id   = LV2_ARG_U32(ctx, 0);
     uint32_t out_addr = LV2_ARG_PTR(ctx, 1);
 
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_ref_acquire(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     int32_t val;
@@ -528,6 +671,7 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
         write_be32(out_addr, (uint32_t)val);
     }
 
+    sem_ref_release(s);
     return CELL_OK;
 }
 

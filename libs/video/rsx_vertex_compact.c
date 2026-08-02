@@ -1,7 +1,9 @@
 #include "rsx_vertex_compact.h"
+#include "rsx_commands.h"
 #include "rsx_vertex_formats.h"
 
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 static float rsx_compact_be_f32(const u8* p)
@@ -225,4 +227,125 @@ int rsx_vertex_fetch_one(
         memcpy(value, fetch->default_value, 16);
     }
     return 1;
+}
+
+static u64 rsx_vertex_remap_hash(u64 value)
+{
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdull;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ull;
+    value ^= value >> 33;
+    return value;
+}
+
+int rsx_vertex_remap_build(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count)
+{
+    if (!remap || (!refs && count) || !unique_count)
+        return 0;
+    *unique_count = count;
+    if (!count)
+        return 1;
+
+    if (count > remap->occurrence_capacity) {
+        u32* occurrences = (u32*)realloc(
+            remap->occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!occurrences)
+            return 0;
+        remap->occurrence_to_unique = occurrences;
+        remap->occurrence_capacity = count;
+    }
+
+    if (count > UINT_MAX / 2u)
+        return 0;
+    u32 slot_capacity = 16u;
+    const u32 required_slots = count * 2u;
+    while (slot_capacity < required_slots) {
+        if (slot_capacity > UINT_MAX / 2u)
+            return 0;
+        slot_capacity *= 2u;
+    }
+    if (slot_capacity > remap->slot_capacity) {
+        rsx_vertex_remap_slot* slots = (rsx_vertex_remap_slot*)realloc(
+            remap->slots, (size_t)slot_capacity * sizeof(*slots));
+        if (!slots)
+            return 0;
+        remap->slots = slots;
+        remap->slot_capacity = slot_capacity;
+        memset(remap->slots, 0,
+               (size_t)remap->slot_capacity * sizeof(*remap->slots));
+        remap->generation = 1u;
+    } else {
+        remap->generation++;
+        if (!remap->generation) {
+            memset(remap->slots, 0,
+                   (size_t)remap->slot_capacity * sizeof(*remap->slots));
+            remap->generation = 1u;
+        }
+    }
+
+    u32 unique = 0;
+    const u32 mask = remap->slot_capacity - 1u;
+    for (u32 occurrence = 0; occurrence < count; occurrence++) {
+        const rsx_vertex_ref ref = refs[occurrence];
+        const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
+        u32 slot_index = (u32)rsx_vertex_remap_hash(key) & mask;
+        for (;;) {
+            rsx_vertex_remap_slot* slot = &remap->slots[slot_index];
+            if (slot->generation != remap->generation) {
+                slot->key = key;
+                slot->value = unique;
+                slot->generation = remap->generation;
+                refs[unique] = ref;
+                remap->occurrence_to_unique[occurrence] = unique;
+                unique++;
+                break;
+            }
+            if (slot->key == key) {
+                remap->occurrence_to_unique[occurrence] = slot->value;
+                break;
+            }
+            slot_index = (slot_index + 1u) & mask;
+        }
+    }
+    *unique_count = unique;
+    return 1;
+}
+
+u32 rsx_vertex_remap_index(
+    const rsx_vertex_remap* remap, u32 occurrence)
+{
+    return remap && occurrence < remap->occurrence_capacity
+        ? remap->occurrence_to_unique[occurrence] : occurrence;
+}
+
+void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
+{
+    if (!remap)
+        return;
+    free(remap->occurrence_to_unique);
+    free(remap->slots);
+    memset(remap, 0, sizeof(*remap));
+}
+
+int rsx_vertex_topology_plan(
+    u32 primitive, int refs_remapped, int* indexed)
+{
+    if (!indexed)
+        return 0;
+    switch (primitive) {
+    case RSX_PRIMITIVE_TRIANGLES:
+        *indexed = refs_remapped != 0;
+        return 1;
+    case RSX_PRIMITIVE_TRIANGLE_STRIP:
+    case RSX_PRIMITIVE_TRIANGLE_FAN:
+    case RSX_PRIMITIVE_QUADS:
+        *indexed = 1;
+        return 1;
+    default:
+        *indexed = 0;
+        return 0;
+    }
 }

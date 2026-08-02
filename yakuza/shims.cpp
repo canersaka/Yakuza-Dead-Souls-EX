@@ -39,6 +39,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+extern "C" void yz_ppu_cooperative_yield(void)
+{
+    /* Keep very short worker completions cheap, then yield this logical CPU.
+     * The lifted guest loop otherwise performs up to 0x02000000 full VM reads
+     * before reaching its own 40-us backoff. */
+    for (unsigned i = 0; i < 64; ++i)
+        YieldProcessor();
+    SwitchToThread();
+}
+
 /* Guest back-chain walker (defined in main.cpp, C++ linkage). Declared at file
  * scope: a block-scope declaration inside an extern "C" function would inherit
  * C linkage and fail to link against the mangled definition. */
@@ -1083,6 +1093,41 @@ extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t
 extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 4, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr >= 0x40400000u && (uint32_t)addr < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr, val, yz_guest_addr_from_host(_ReturnAddress())); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
 extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 8, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr < 0x40C00000u && (uint64_t)(uint32_t)addr + 8u > 0x40400000ull) { const uint32_t pc = yz_guest_addr_from_host(_ReturnAddress()); if ((uint32_t)addr >= 0x40400000u) yz_a010_reltrace_ppu_store((uint32_t)addr, (uint32_t)(val >> 32), pc); if ((uint32_t)addr + 4u >= 0x40400000u && (uint32_t)addr + 4u < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr + 4u, (uint32_t)val, pc); } uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
 #endif
+
+/* Raw-byte counterpart to vm_write8/16/32/64 for lifted VMX, byte-reversed,
+ * and cache-block-zero stores.  The byte sequence is already in guest memory
+ * order, but it must still serialize with every overlapped GETLLAR line and
+ * notify native SPURS publication watchers. */
+extern "C" void vm_write_bytes(uint64_t addr, const void* src, size_t size)
+{
+    if (!size) return;
+    const uint32_t first = (uint32_t)addr;
+    const uint64_t end64 = (uint64_t)first + size;
+    if (end64 > 0x100000000ull) return;
+#if !defined(YZ_PERF_CLEAN)
+    yz_mem_guard(first, (unsigned)size, 1);
+    if (yz_vmguard_check(first, (unsigned)size, 1)) return;
+#endif
+
+    const uint32_t first_line = first & ~127u;
+    const uint32_t last_line = (uint32_t)(end64 - 1u) & ~127u;
+    bool reserved = false;
+    for (uint32_t line = first_line;; line += 128u) {
+        if (spu_coh_is_reserved(line)) reserved = true;
+        if (line == last_line) break;
+    }
+
+    if (reserved) spu_lockline_lock();
+    memcpy(ea(first), src, size);
+    if (reserved) {
+        for (uint32_t line = first_line;; line += 128u) {
+            if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+            if (line == last_line) break;
+        }
+        spu_lockline_unlock();
+    }
+    yz_native_spurs_notify_write(first, (uint32_t)size);
+}
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED

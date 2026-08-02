@@ -29,6 +29,7 @@ extern "C" {
 
 typedef struct sys_semaphore_info {
     int      active;
+    uint32_t references; /* table-locked lifetime references held by syscalls */
     char     name[8];
     uint32_t protocol;
     int32_t  value;      /* current count — THE single source of truth (s47) */

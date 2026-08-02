@@ -156,6 +156,10 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
+s32 _sys_process_atexitspawn(u32 callback);
+s32 _sys_process_at_Exitspawn(u32 callback);
+u32 sys_process_atexitspawn_callback(void);
+u32 sys_process_at_Exitspawn_callback(void);
 s32 sys_prx_exitspawn_with_level(void);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 

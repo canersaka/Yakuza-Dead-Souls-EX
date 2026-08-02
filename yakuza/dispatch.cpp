@@ -43,6 +43,19 @@ extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(
 extern "C" unsigned long long __stdcall GetTickCount64(void);
 extern "C" __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
 extern "C" __declspec(dllimport) void __stdcall WakeByAddressAll(void*);
+struct yz_filetime {
+    unsigned long low;
+    unsigned long high;
+};
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread(void);
+extern "C" __declspec(dllimport) int __stdcall GetThreadTimes(
+    void* thread, yz_filetime* creation, yz_filetime* exit,
+    yz_filetime* kernel, yz_filetime* user);
+
+static uint64_t yz_filetime_ticks(const yz_filetime& value)
+{
+    return ((uint64_t)value.high << 32) | value.low;
+}
 
 /* TLS trampoline slot -- the generated code declares this extern and both
  * sets it (direct tail branches) and drains it. */
@@ -57,7 +70,13 @@ extern "C" volatile long g_yz_ucmd_handler_arg;
 extern "C" volatile long g_yz_ucmd_handler_completed;
 extern "C" volatile long g_yz_ucmd_handler_epoch;
 extern "C" volatile long g_yz_ucmd_handler_completed_epoch;
+extern "C" long yz_ucmd_handler_begin(long cause);
+extern "C" void yz_ucmd_handler_end(long cause, long epoch);
 extern "C" uint8_t* vm_base;
+#if defined(YZ_PPU_SAMPLE)
+extern "C" void yz_ppu_perf_window_begin(uint32_t guest_frame);
+extern "C" void yz_ppu_perf_window_dump(uint32_t guest_frame);
+#endif
 #if defined(YZ_PERF_PROFILE)
 extern "C" void spu_perf_window_begin(uint32_t guest_frame);
 extern "C" void spu_perf_window_dump(uint32_t guest_frame);
@@ -597,6 +616,8 @@ extern "C" void yz_stage_direct_probe_snapshot(const char* reason)
  * follows the game's own status path without a boot-specific heap address. */
 extern "C" void yz_a010_auth_probe_poll(void)
 {
+    if (!YZ_DIAG_ENABLED("YZ_A010_TRACE"))
+        return;
     constexpr uint32_t manager_global = 0x014EC864u;
     constexpr uint32_t controller_auth_off = 0x220u + 0x090u;
     constexpr uint32_t controller_aux0_off = 0x220u + 0x290u;
@@ -2195,6 +2216,19 @@ static bool yz_stage_render_instance(uint32_t object)
            vm_read32(object) == 0x011D6948u;
 }
 
+#if defined(YZ_PPU_SAMPLE)
+struct yz_mt_entry_aggregate {
+    uint32_t target;
+    uint32_t calls;
+    uint64_t elapsed_us;
+};
+static thread_local bool g_yz_mt_outer_active;
+static thread_local uint32_t g_yz_mt_entry_calls;
+static thread_local uint64_t g_yz_mt_entry_elapsed_us;
+static thread_local yz_mt_entry_aggregate g_yz_mt_entries[64];
+static thread_local unsigned g_yz_mt_entry_count;
+#endif
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     g_yz_hops_indirect++;                     /* s21 hop census (see yz_tramp_guard) */
@@ -2485,26 +2519,30 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         static unsigned initial_object_count = 0;
         const float time = (float)ctx->fpr[1];
         const uint32_t object = (uint32_t)ctx->gpr[3];
+        const bool a010_trace = YZ_DIAG_ENABLED("YZ_A010_TRACE");
         if (g_yz_a010_animation_ready == 0 &&
             yz_a010_character_animation_ready(object) &&
             _InterlockedCompareExchange(
                 &g_yz_a010_animation_ready, 1, 0) == 0) {
-            const uint32_t model = vm_read32(object + 0x2Cu);
-            const uint32_t matrices = vm_read32(model + 0x214u);
-            const uint32_t palette = vm_read32(model + 0x218u);
-            uint32_t matrix_y_bits = vm_read32(matrices + 0x34u);
-            uint32_t palette_y_bits = vm_read32(palette + 0x1Cu);
-            float matrix_y = 0.0f;
-            float palette_y = 0.0f;
-            memcpy(&matrix_y, &matrix_y_bits, sizeof(matrix_y));
-            memcpy(&palette_y, &palette_y_bits, sizeof(palette_y));
-            fprintf(stderr,
-                    "[a010-animation-ready] object=%08X model=%08X "
-                    "matrices=%08X palette=%08X y=%.3f/%.3f time=%.3f\n",
-                    object, model, matrices, palette,
-                    (double)matrix_y, (double)palette_y, (double)time);
-            fflush(stderr);
+            if (a010_trace) {
+                const uint32_t model = vm_read32(object + 0x2Cu);
+                const uint32_t matrices = vm_read32(model + 0x214u);
+                const uint32_t palette = vm_read32(model + 0x218u);
+                uint32_t matrix_y_bits = vm_read32(matrices + 0x34u);
+                uint32_t palette_y_bits = vm_read32(palette + 0x1Cu);
+                float matrix_y = 0.0f;
+                float palette_y = 0.0f;
+                memcpy(&matrix_y, &matrix_y_bits, sizeof(matrix_y));
+                memcpy(&palette_y, &palette_y_bits, sizeof(palette_y));
+                fprintf(stderr,
+                        "[a010-animation-ready] object=%08X model=%08X "
+                        "matrices=%08X palette=%08X y=%.3f/%.3f time=%.3f\n",
+                        object, model, matrices, palette,
+                        (double)matrix_y, (double)palette_y, (double)time);
+                fflush(stderr);
+            }
         }
+        if (a010_trace) {
         bool first_for_object = false;
         unsigned object_slot = 0;
         for (; object_slot < initial_object_count; object_slot++) {
@@ -2581,6 +2619,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             }
             fflush(stderr);
         }
+        }
     }
     /*
      * AUTH character rendering is a separate virtual phase from its timeline
@@ -2590,7 +2629,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * This identifies whether the scene is absent from the render registry or
      * whether an individual character rejects submission.
      */
-    if (g_yz_a010_root_active != 0) {
+    if (g_yz_a010_root_active != 0 &&
+        YZ_DIAG_ENABLED("YZ_A010_TRACE")) {
         const uint32_t lr = (uint32_t)ctx->lr;
         const bool render_wrapper =
             target == 0x00066FE0u || target == 0x0006714Cu ||
@@ -2788,7 +2828,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * camera blobs are the narrowest way to identify the parser responsible
      * for turning a valid archive member into the live camera track.
      */
-    if (g_yz_a010_root_active != 0 &&
+    if (YZ_DIAG_ENABLED("YZ_A010_TRACE") &&
+        g_yz_a010_root_active != 0 &&
         (uint32_t)ctx->lr == 0x0033DE9Cu) {
         const uint32_t object = (uint32_t)ctx->gpr[3];
         const uint32_t size =
@@ -3194,7 +3235,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             }
         }
     }
-    if (g_yz_a010_root_active != 0 &&
+    if (YZ_DIAG_ENABLED("YZ_A010_TRACE") &&
+        g_yz_a010_root_active != 0 &&
         (uint32_t)ctx->lr == 0x00F0025Cu) {
         const uint32_t request = (uint32_t)ctx->gpr[31];
         const uint32_t tracked =
@@ -3844,7 +3886,8 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             const uint32_t path_ea = (uint32_t)ctx->gpr[3];
             const char* path = addr_readable(path_ea)
                              ? (const char*)(vm_base + path_ea) : nullptr;
-            if (path && strstr(path, "/auth/a010/")) {
+            if (YZ_DIAG_ENABLED("YZ_A010_TRACE") && path &&
+                strstr(path, "/auth/a010/")) {
                 const uint32_t request = (uint32_t)ctx->gpr[5] - 8u;
                 _InterlockedExchange(
                     (volatile long*)&g_yz_a010_open_request, request);
@@ -3931,16 +3974,12 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * than an arbitrary spin count.
         */
         const long cause = (long)(uint32_t)ctx->gpr[3];
-        const long epoch = _InterlockedIncrement(&g_yz_ucmd_handler_epoch);
-        _InterlockedExchange(&g_yz_ucmd_handler_arg, cause);
+        const long epoch = yz_ucmd_handler_begin(cause);
         void (*saved_trampoline)(void*) = g_trampoline_fn;
         g_trampoline_fn = nullptr;
         fn(ctx);
         yz_drain_trampolines(ctx);
-        _InterlockedExchange(&g_yz_ucmd_handler_completed, cause);
-        _InterlockedExchange(&g_yz_ucmd_handler_completed_epoch, epoch);
-        WakeByAddressAll(
-            const_cast<long*>(&g_yz_ucmd_handler_completed_epoch));
+        yz_ucmd_handler_end(cause, epoch);
         g_trampoline_fn = saved_trampoline;
         return;
     }
@@ -4881,6 +4920,39 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         return;
     }
 
+#if defined(YZ_PPU_SAMPLE)
+    static const int sample_capture_enabled =
+        std::getenv("YZ_PPU_SAMPLE_RUN") != nullptr;
+    static const int sample_present_target =
+        std::getenv("YZ_PPU_SAMPLE_PRESENT") != nullptr;
+    static const uint32_t sample_window_frames = []() {
+        const char* value = std::getenv("YZ_PPU_SAMPLE_FRAMES");
+        if (!value) return 4u;
+        const unsigned long parsed = std::strtoul(value, nullptr, 0);
+        return (uint32_t)(parsed < 4u ? 4u :
+                          parsed > 600u ? 600u : parsed);
+    }();
+    if (sample_capture_enabled && !sample_present_target &&
+        resolved_code == 0x000195C0u &&
+        ((uint32_t)ctx->lr == 0x00C961C0u ||
+         (uint32_t)ctx->lr == 0x00C96204u)) {
+        static int sample_window_started = 0;
+        static int sample_window_done = 0;
+        static uint32_t sample_window_start_frame = 0;
+        const uint32_t frame = rsx_live_draw_get_frames();
+        if (!sample_window_started && frame >= 1578u) {
+            sample_window_started = 1;
+            sample_window_start_frame = frame;
+            yz_ppu_perf_window_begin(frame);
+        } else if (sample_window_started && !sample_window_done &&
+                   frame >= sample_window_start_frame +
+                                sample_window_frames) {
+            yz_ppu_perf_window_dump(frame);
+            sample_window_done = 1;
+        }
+    }
+#endif
+
 #if defined(YZ_PERF_PROFILE)
     /*
      * The orphanage transition watchdog caught the main PPU thread inside
@@ -4957,6 +5029,138 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     }
 #endif
 
+#if defined(YZ_PPU_SAMPLE)
+    /* func_00C70D90 is the mt_task_thread callback that owns the long
+     * orphanage frames.  It is only a pair of guest work-list walkers: these
+     * two indirect call sites execute the individual entries.  Time each
+     * entry in the profile build so a genuinely slow guest callback can be
+     * distinguished from host scheduling delay around the outer walker. */
+    if (sample_capture_enabled && yz_thread_current_id() == 4u &&
+        ((uint32_t)ctx->lr == 0x00C70E38u ||
+         (uint32_t)ctx->lr == 0x00C70EB8u)) {
+        const uint32_t entry_lr = (uint32_t)ctx->lr;
+        const uint32_t entry_r3 = (uint32_t)ctx->gpr[3];
+        const uint32_t entry_r4 = (uint32_t)ctx->gpr[4];
+        const auto started = std::chrono::steady_clock::now();
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+        g_trampoline_fn = saved_trampoline;
+        const uint64_t elapsed_us = (uint64_t)
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        if (g_yz_mt_outer_active) {
+            ++g_yz_mt_entry_calls;
+            g_yz_mt_entry_elapsed_us += elapsed_us;
+            unsigned slot = g_yz_mt_entry_count;
+            for (unsigned i = 0; i < g_yz_mt_entry_count; ++i) {
+                if (g_yz_mt_entries[i].target == resolved_code) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == g_yz_mt_entry_count &&
+                g_yz_mt_entry_count < 64u) {
+                g_yz_mt_entries[g_yz_mt_entry_count++] =
+                    {resolved_code, 0u, 0u};
+            }
+            if (slot < 64u) {
+                ++g_yz_mt_entries[slot].calls;
+                g_yz_mt_entries[slot].elapsed_us += elapsed_us;
+            }
+        }
+        if (elapsed_us >= 5000u) {
+            fprintf(stderr,
+                    "[mt-task-entry] frame=%u target=%08X lr=%08X "
+                    "elapsed=%.3fms r3=%08X r4=%08X\n",
+                    rsx_live_draw_get_frames(), resolved_code, entry_lr,
+                    (double)elapsed_us / 1000.0, entry_r3, entry_r4);
+            fflush(stderr);
+        }
+        return;
+    }
+
+    /* mt_task_thread (guest tid 4) executes queued callbacks at these two
+     * dispatcher call sites and posts semaphore 4 only after a callback
+     * returns.  The main-thread profile proved every 300-400 ms orphanage
+     * stall ends exactly when tid 4 posts.  Execute the callback synchronously
+     * in this profile-only lane so its complete trampoline tail can be timed
+     * and the responsible guest target can be named. */
+    if (sample_capture_enabled && yz_thread_current_id() == 4u &&
+        resolved_code == 0x00C70D90u &&
+        ((uint32_t)ctx->lr == 0x00E5D444u ||
+         (uint32_t)ctx->lr == 0x00E5D470u)) {
+        const uint32_t callback_lr = (uint32_t)ctx->lr;
+        const uint32_t callback_r3 = (uint32_t)ctx->gpr[3];
+        const uint32_t callback_r4 = (uint32_t)ctx->gpr[4];
+        const uint32_t first_count = addr_readable(callback_r3 + 0x90Cu)
+            ? vm_read32(callback_r3 + 0x908u) : 0u;
+        const uint32_t second_count = addr_readable(callback_r3 + 0x104u)
+            ? vm_read32(callback_r3 + 0x100u) : 0u;
+        const uint32_t callback_start_frame = rsx_live_draw_get_frames();
+        yz_filetime creation = {}, exit = {};
+        yz_filetime kernel_before = {}, user_before = {};
+        yz_filetime kernel_after = {}, user_after = {};
+        const int have_cpu_before = GetThreadTimes(
+            GetCurrentThread(), &creation, &exit,
+            &kernel_before, &user_before);
+        g_yz_mt_entry_calls = 0u;
+        g_yz_mt_entry_elapsed_us = 0u;
+        g_yz_mt_entry_count = 0u;
+        memset(g_yz_mt_entries, 0, sizeof(g_yz_mt_entries));
+        g_yz_mt_outer_active = true;
+        const auto started = std::chrono::steady_clock::now();
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+        g_yz_mt_outer_active = false;
+        g_trampoline_fn = saved_trampoline;
+        const uint64_t elapsed_us = (uint64_t)
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        const int have_cpu_after = GetThreadTimes(
+            GetCurrentThread(), &creation, &exit,
+            &kernel_after, &user_after);
+        uint64_t cpu_us = 0u;
+        if (have_cpu_before && have_cpu_after) {
+            const uint64_t before = yz_filetime_ticks(kernel_before) +
+                                    yz_filetime_ticks(user_before);
+            const uint64_t after = yz_filetime_ticks(kernel_after) +
+                                   yz_filetime_ticks(user_after);
+            if (after >= before) cpu_us = (after - before) / 10u;
+        }
+        if (elapsed_us >= 5000u) {
+            const yz_mt_entry_aggregate* hot_entry = nullptr;
+            for (unsigned i = 0; i < g_yz_mt_entry_count; ++i) {
+                if (!hot_entry || g_yz_mt_entries[i].elapsed_us >
+                                      hot_entry->elapsed_us)
+                    hot_entry = &g_yz_mt_entries[i];
+            }
+            fprintf(stderr,
+                    "[mt-task-callback] frame=%u->%u target=%08X lr=%08X "
+                    "wall=%.3fms cpu=%.3fms cpu_pct=%.1f "
+                    "list=%u/%u entries=%u/%.3fms "
+                    "hot=%08X/%u/%.3fms r3=%08X r4=%08X\n",
+                    callback_start_frame, rsx_live_draw_get_frames(),
+                    resolved_code, callback_lr,
+                    (double)elapsed_us / 1000.0,
+                    (double)cpu_us / 1000.0,
+                    elapsed_us ? 100.0 * (double)cpu_us /
+                                     (double)elapsed_us : 0.0,
+                    first_count, second_count, g_yz_mt_entry_calls,
+                    (double)g_yz_mt_entry_elapsed_us / 1000.0,
+                    hot_entry ? hot_entry->target : 0u,
+                    hot_entry ? hot_entry->calls : 0u,
+                    hot_entry ? (double)hot_entry->elapsed_us / 1000.0 : 0.0,
+                    callback_r3, callback_r4);
+            fflush(stderr);
+        }
+        return;
+    }
+#endif
+
     g_trampoline_fn = (void (*)(void*))fn;
 }
 
@@ -4976,7 +5180,18 @@ extern "C" void yz_call_guest_opd(uint32_t opd_addr, ppu_context* ctx)
     }
     uint64_t saved_toc = ctx->gpr[2];
     ctx->gpr[2] = toc;
-    fn(ctx);
-    yz_drain_trampolines(ctx);
+    if (code == 0x00E7DB10u) {
+        const long cause = (long)(uint32_t)ctx->gpr[3];
+        const long epoch = yz_ucmd_handler_begin(cause);
+        void (*saved_trampoline)(void*) = g_trampoline_fn;
+        g_trampoline_fn = nullptr;
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+        yz_ucmd_handler_end(cause, epoch);
+        g_trampoline_fn = saved_trampoline;
+    } else {
+        fn(ctx);
+        yz_drain_trampolines(ctx);
+    }
     ctx->gpr[2] = saved_toc;
 }

@@ -54,8 +54,9 @@ DIFFD = os.path.join(WORK, "diff")
 REPRO = os.path.join(WORK, "repro")
 FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 HARNESS = os.path.join(TOOLS, "spu_diff_harness.c")
+INPUT_ROOT = ROOT
 
-CLFLAGS = ["/nologo", "/O2", "/Ob2", "/DNDEBUG", "/MT", "/W3",
+CLFLAGS = ["/nologo", "/O2", "/Ob2", "/DNDEBUG", "/DYZ_PERF_CLEAN=1", "/MT", "/W3",
            "/wd4100", "/wd4244", "/wd4267", "/wd4996",
            "/std:c17", "/experimental:c11atomics", "/bigobj"]
 
@@ -81,6 +82,48 @@ def resolve_cl():
 
 
 CL_EXE = resolve_cl()
+
+
+def input_path(relative):
+    return os.path.join(INPUT_ROOT, relative)
+
+
+def family_code_from_input(fam):
+    """Use a read-only external input tree without relocating test output."""
+    old_root = G.ROOT
+    try:
+        G.ROOT = INPUT_ROOT
+        return G.family_code(fam)
+    finally:
+        G.ROOT = old_root
+
+
+def derive_metrics(fast_c, base, code_size, register):
+    """Recover the small metric subset needed by the differential matrix.
+
+    Shipped region twins contain one named function per region and a dense
+    entry switch.  This lets an integration worktree validate tracked twins
+    even when the generator's disposable metrics directory is absent.
+    """
+    text = open(fast_c, errors="replace").read()
+    starts = sorted({
+        int(m.group(1), 16)
+        for m in re.finditer(
+            r"^void [A-Za-z_]\w*?([0-9A-F]{8})\(spu_context", text, re.M)
+        if base <= int(m.group(1), 16) < base + code_size
+    })
+    if not starts:
+        raise RuntimeError(f"{fast_c}: no region functions found")
+    end = base + code_size
+    regions = []
+    for i, start in enumerate(starts):
+        region_end = starts[i + 1] if i + 1 < len(starts) else end
+        regions.append([start, region_end, (region_end - start) // 4])
+    return {
+        "register_name": register,
+        "image_span": [base, end],
+        "regions": regions,
+    }
 
 
 def compile_twin(stem, twin_c, twin_h_dir, twin_h_name, register, outdir, tag):
@@ -131,10 +174,14 @@ def parse_out(path):
     return d
 
 
-def pick_entries(entry, base, metrics, max_entries):
+def pick_entries(entry, base, metrics, max_entries, conformance_entries=()):
     regions = metrics["regions"]          # [start, end, ninsns]
     starts = [r[0] for r in regions]
-    picks = [entry, base]
+    # Manifest-required entries come first so a bounded run always exercises
+    # image-specific hot paths and hand-edited continuations before the broad
+    # region sample.  Values remain ordinary synthetic entry-PC tests; they do
+    # not weaken the full-state/event comparison below.
+    picks = [entry, base] + list(conformance_entries)
     if len(starts) > 2:
         step = max(1, len(starts) // 8)
         picks += starts[::step][:8]
@@ -184,7 +231,7 @@ def pc_check(dfast, mnem_at, span):
     """Region-twin pc validity: event pc must decode to the matching op."""
     want = {1: "rdch", 2: "wrch", 3: "rchcnt", 4: "wrch"}
     bad = []
-    for ev in dfast["ev"]:
+    for index, ev in enumerate(dfast["ev"]):
         kind, pc = ev[0], ev[6]
         if kind not in want:
             continue
@@ -192,6 +239,16 @@ def pc_check(dfast, mnem_at, span):
             bad.append((pc, "outside-span", kind))
             continue
         mn = mnem_at.get(pc)
+        # The clean-performance atomic-status helper fuses the architectural
+        # rchcnt + conditional rdch pair into one runtime lookup.  Its two
+        # harness events therefore share the rchcnt site's materialized PC;
+        # accept the read half only when it immediately follows that exact
+        # count event on the same channel.
+        if (kind == 1 and mn == "rchcnt" and index > 0
+                and dfast["ev"][index - 1][0] == 3
+                and dfast["ev"][index - 1][1] == ev[1]
+                and dfast["ev"][index - 1][6] == pc):
+            continue
         if mn != want[kind]:
             bad.append((pc, mn, kind))
     return bad
@@ -223,34 +280,52 @@ def process(famname, fam, plc, args, results):
     stem = plc["stem"]
     if args.only and stem not in args.only:
         return
-    repro_c = os.path.join(REPRO, f"{stem}.c")
     fast_c = os.path.join(FAST, f"{stem}_fast.c")
     metrics_p = os.path.join(WORK, "metrics", f"{stem}.json")
-    if not (os.path.exists(repro_c) and os.path.exists(fast_c) and os.path.exists(metrics_p)):
+    if args.tracked_twins:
+        diag_c = G.resolve_diag_path(stem, plc["diag"])
+        _prefix, register, diag_h = G.read_header_identity(diag_c)
+        diag_h_dir = os.path.dirname(diag_h)
+        diag_h_name = os.path.basename(diag_h)
+    else:
+        diag_c = os.path.join(REPRO, f"{stem}.c")
+        register = None
+        diag_h_dir = REPRO
+        diag_h_name = f"{stem}.h"
+    if not (os.path.exists(diag_c) and os.path.exists(fast_c)):
         print(f"[{famname}] {stem}: sweep outputs missing, skipped")
         return
-    metrics = json.load(open(metrics_p))
-    register = metrics["register_name"]
+
+    # code bytes + base + entry, exactly as the sweep derived them
+    if plc.get("elf"):
+        code, base, entry = G.parse_spu_elf(input_path(plc["elf"]))
+    elif fam["kind"] == "elf":
+        code, base, entry = G.parse_spu_elf(input_path(fam_elf(plc)))
+    else:
+        code, ref_base, ref_entry = family_code_from_input(fam)
+        delta = (ref_entry - ref_base) if (fam.get("ref_elf") and ref_entry is not None) else 0
+        base = int(plc["base"], 0)
+        entry = base + delta
+
+    if os.path.exists(metrics_p):
+        metrics = json.load(open(metrics_p))
+        if register is None:
+            register = metrics["register_name"]
+    elif args.tracked_twins:
+        metrics = derive_metrics(fast_c, base, len(code), register)
+    else:
+        print(f"[{famname}] {stem}: metrics missing, skipped")
+        return
     span = metrics["image_span"]
 
     outdir = os.path.join(DIFFD, stem)
     os.makedirs(outdir, exist_ok=True)
-
-    # code bytes + base + entry, exactly as the sweep derived them
-    if plc.get("elf"):
-        code, base, entry = G.parse_spu_elf(os.path.join(ROOT, plc["elf"]))
-    elif fam["kind"] == "elf":
-        code, base, entry = G.parse_spu_elf(os.path.join(ROOT, fam_elf(plc)))
-    else:
-        code, ref_base, ref_entry = G.family_code(fam)
-        delta = (ref_entry - ref_base) if (fam.get("ref_elf") and ref_entry is not None) else 0
-        base = int(plc["base"], 0)
-        entry = base + delta
     codebin = os.path.join(outdir, "code.bin")
     with open(codebin, "wb") as f:
         f.write(code)
 
-    exe_d, t_d, o_d = compile_twin(stem, repro_c, REPRO, f"{stem}.h", register, outdir, "diag")
+    exe_d, t_d, o_d = compile_twin(stem, diag_c, diag_h_dir, diag_h_name,
+                                   register, outdir, "diag")
     exe_f, t_f, o_f = compile_twin(stem, fast_c, FAST, f"{stem}_fast.h", register, outdir, "fast")
     ent = {"family": famname, "stem": stem,
            "compile_diag_s": round(t_d, 1), "compile_fast_s": round(t_f, 1),
@@ -265,7 +340,12 @@ def process(famname, fam, plc, args, results):
     insns = spu_disasm.disassemble_spu(code, base)
     mnem_at = {i.addr: i.mnemonic for i in insns}
 
-    entries = pick_entries(entry, base, metrics, args.max_entries)
+    required_entries = [
+        int(value, 0) if isinstance(value, str) else int(value)
+        for value in plc.get("conformance_entries", [])
+    ]
+    entries = pick_entries(
+        entry, base, metrics, args.max_entries, required_entries)
     n_match = n_mis = n_inc = n_skip = 0
     mismatches = []
     hop_pairs = []
@@ -344,7 +424,18 @@ def fam_elf(plc):
     return plc["elf"]
 
 
+def write_report(path, entries):
+    """Publish a complete JSON snapshot even if the run is interrupted."""
+    pending = path + ".tmp"
+    with open(pending, "w") as f:
+        json.dump(entries, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(pending, path)
+
+
 def main():
+    global INPUT_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--families", default=None)
     ap.add_argument("--only", default=None)
@@ -356,7 +447,14 @@ def main():
     ap.add_argument("--every-pc", action="store_true", dest="every_pc",
                     help="also run the every-entry-PC digest sweep per placement")
     ap.add_argument("--sweep-timeout", type=int, default=900, dest="sweep_timeout")
+    ap.add_argument("--input-root", default=ROOT,
+                    help="read-only project tree containing game/raw/ELF inputs")
+    ap.add_argument("--tracked-twins", action="store_true",
+                    help="compare shipped DIAG/FAST twins and derive missing metrics")
+    ap.add_argument("--fresh-report", action="store_true",
+                    help="replace prior report entries with only this invocation")
     args = ap.parse_args()
+    INPUT_ROOT = os.path.abspath(args.input_root)
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None
 
@@ -368,7 +466,7 @@ def main():
     os.makedirs(DIFFD, exist_ok=True)
     rep = os.path.join(DIFFD, "diff_report.json")
     prior = {}
-    if os.path.exists(rep):
+    if os.path.exists(rep) and not args.fresh_report:
         prior = {e["stem"]: e for e in json.load(open(rep))}
     results = []
     for famname, fam in manifest["families"].items():
@@ -378,13 +476,11 @@ def main():
             process(famname, fam, plc, args, results)
             merged = dict(prior)
             merged.update({e["stem"]: e for e in results})
-            with open(rep, "w") as f:          # incremental + merged across runs
-                json.dump(list(merged.values()), f, indent=1)
+            write_report(rep, list(merged.values()))  # incremental + merged across runs
 
     merged = dict(prior)
     merged.update({e["stem"]: e for e in results})
-    with open(rep, "w") as f:
-        json.dump(list(merged.values()), f, indent=1)
+    write_report(rep, list(merged.values()))
     n_bad = sum(1 for r in results if r["verdict"] in ("MISMATCH", "COMPILE-FAIL"))
     n_all = len(results)
     print(f"\n{n_all} placement(s): "

@@ -91,6 +91,11 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
  * and stopped producing. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);
 
+/* Profile-only access to the host thread that consumes the live FIFO and
+ * presents game frames. Returns NULL outside the instrumented sampler build.
+ * The opaque handle keeps windows.h out of this public header. */
+void* rsx_live_draw_get_present_thread_handle(void);
+
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
 

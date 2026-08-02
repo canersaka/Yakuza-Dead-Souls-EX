@@ -84,8 +84,10 @@ def main():
     parser.add_argument("--audit", action="store_true")
     opts = parser.parse_args()
     data = open(opts.elf, "rb").read()
-    lle_modules = [m for m in LLE_MODULES
-                   if opts.spurs_backend == "lle" or not m[0].startswith("libsre_")]
+    # The native lane is firmware-free: no export table or import list from a
+    # firmware image participates in bridge generation. The LLE lane remains
+    # the untouched behavioral oracle.
+    lle_modules = LLE_MODULES if opts.spurs_backend == "lle" else []
 
     e_phoff = be64(data, 32)
     e_phentsize = be16(data, 54)
@@ -150,6 +152,10 @@ def main():
     nid2name = {}
     for n in candidates:
         nid2name[compute_nid(n)] = n
+    # SDK 4.75's cellGcmSys stub archive names this internal entry, while the
+    # public headers omit it. Keep the factual NID/name mapping here so the
+    # firmware-free bridge can bind its independent context-aware contract.
+    nid2name[0x3A33C1FD] = "_cellGcmFunc15"
 
     imports = []   # (module, nid, name_or_None, slot_vaddr)
     nvar_total = 0
@@ -279,6 +285,7 @@ def main():
         "_cellGcmInitBody",
         "cellGcmGetControlRegister",
         "cellGcmGetConfiguration",
+        "cellGcmSetDisplayBuffer",
         # gcm BE out-params / guest-address returns (fifo path depends on
         # AddressToOffset: the inline flush stores its result to ctrl->put).
         "cellGcmAddressToOffset",
@@ -307,6 +314,7 @@ def main():
         # Fourteen-argument SDK ABI: args 9-14 live in the guest parameter
         # save area and cannot pass through the generic r3-r10 bridge.
         OVERRIDES.add("_cellSpursJobChainAttributeInitialize")
+        OVERRIDES.add("_cellGcmFunc15")
 
     # Several context-aware overrides live in yakuza/*.cpp rather than the
     # libs/ and runtime/ trees scanned above.  Resolve their NIDs explicitly

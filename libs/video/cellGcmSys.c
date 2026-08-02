@@ -369,14 +369,21 @@ void cellGcmTickVBlank(void)
     s_vblank_count++;
     if (s_vblank_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_vblank_handler_opd,
-                           (uint64_t)s_vblank_count, 0, 0, 0, 0, 0, 0, 0);
+                           0, 0, 0, 0, 0, 0, 0, 0);
     }
 }
 
 void cellGcmTickFlip(void)
 {
     if (s_flip_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+void cellGcmDispatchUserCommand(u32 cause)
+{
+    if (s_user_handler_opd && g_ps3_guest_caller) {
+        g_ps3_guest_caller(s_user_handler_opd, cause, 0, 0, 0, 0, 0, 0, 0);
     }
 }
 
@@ -834,25 +841,18 @@ s32 cellGcmUnbindZcull(u8 index)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch)
+u32 cellGcmGetTiledPitchSize(u32 size)
 {
-    if (!pitch)
-        return CELL_GCM_ERROR_INVALID_VALUE;
-
     /*
      * Find the smallest valid tiled pitch that is >= size.
      * RSX only supports specific pitch values for tiled regions.
      */
     for (int i = 0; i < s_valid_pitch_count; i++) {
-        if (s_valid_pitches[i] >= size) {
-            *pitch = s_valid_pitches[i];
-            return CELL_OK;
-        }
+        if (s_valid_pitches[i] >= size)
+            return s_valid_pitches[i];
     }
 
-    /* If size exceeds all valid pitches, return the largest */
-    *pitch = s_valid_pitches[s_valid_pitch_count - 1];
-    return CELL_OK;
+    return 0;
 }
 
 /* NID: 0xBC982946 */
@@ -897,12 +897,17 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
 }
 
 /* Default FIFO size — configures command buffer size before init */
-static u32 s_default_fifo_size = 0x40000; /* 256KB default */
+static u32 s_default_fifo_size = 0x400;
+static u32 s_default_segment_size = 0x40000;
 
-s32 cellGcmSetDefaultFifoSize(u32 size)
+s32 cellGcmSetDefaultFifoSize(u32 bufferSize, u32 segmentSize)
 {
-    printf("[cellGcmSys] SetDefaultFifoSize(0x%X)\n", size);
-    s_default_fifo_size = size;
+    printf("[cellGcmSys] SetDefaultFifoSize(buffer=0x%X segment=0x%X)\n",
+           bufferSize, segmentSize);
+    if (bufferSize)
+        s_default_fifo_size = bufferSize;
+    if (segmentSize)
+        s_default_segment_size = segmentSize;
     return CELL_OK;
 }
 
@@ -1056,10 +1061,11 @@ CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index)
 }
 
 /* Set default FIFO mode (before init) */
-void cellGcmInitDefaultFifoMode(s32 mode)
+s32 cellGcmInitDefaultFifoMode(s32 mode)
 {
     printf("[cellGcmSys] InitDefaultFifoMode(mode=%d)\n", mode);
     s_default_fifo_mode = mode;
+    return CELL_OK;
 }
 
 /* Set command buffer to defaults (reset put/get pointers) */
@@ -1080,13 +1086,13 @@ void cellGcmDumpGraphicsError(void)
 /* Default command word size: 0x400 (1024) words */
 u32 cellGcmGetDefaultCommandWordSize(void)
 {
-    return 0x400;
+    return s_default_fifo_size;
 }
 
-/* Default segment word size: 0x100 (256) words */
+/* Default segment word size: 0x40000 words (one megabyte). */
 u32 cellGcmGetDefaultSegmentWordSize(void)
 {
-    return 0x100;
+    return s_default_segment_size;
 }
 
 /* Immediate flip — perform flip right now */

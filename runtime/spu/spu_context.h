@@ -383,6 +383,11 @@ typedef struct spu_context {
     int (*native_spurs_syscall)(struct spu_context*, void*);
     void* native_spurs_opaque;
 
+    /* Set before the per-context MFC registry entry is retired.  Acquirers
+     * re-check it while holding the registry lock so teardown cannot unlink a
+     * slot and let a racing channel operation create a second one. */
+    _Atomic uint32_t mfc_retiring;
+
 #if defined(YZ_PERF_PROFILE)
     /*
      * Aggregate-only profile lane counters. Each context is driven by one SPU
@@ -394,12 +399,18 @@ typedef struct spu_context {
     volatile uint64_t perf_dma_get[32];
     volatile uint64_t perf_dma_put[32];
     volatile uint64_t perf_dma_atomic[32];
+    volatile uint64_t perf_getllar_fast[32];
+    volatile uint64_t perf_getllar_locked[32];
     volatile uint64_t perf_ch_read[32];
     volatile uint64_t perf_ch_write[32];
     volatile uint64_t perf_ch_count[32];
     volatile uint64_t perf_wait_count[32];
     volatile uint64_t perf_wait_qpc[32];
     volatile uint64_t perf_reservation_invalidations;
+    volatile uint64_t perf_compact_lookup_qpc;
+    volatile uint64_t perf_compact_submit_qpc;
+    volatile uint64_t perf_compact_samples;
+    uint32_t perf_compact_sample_counter;
 #endif
 
 } spu_context;
@@ -1101,6 +1112,33 @@ static inline int spu_return_needs_dispatch(const spu_context* ctx)
  * status raises). The blocking waiter also re-polls every 10 ms, so a missed
  * wake only costs latency, never a permanent hang. No-op on non-Windows. */
 void spu_ch_wake(spu_context* ctx);
+
+/* Release the lazily-created per-context MFC engine before its spu_context is
+ * destroyed. Native SPURS tasks/jobs use heap contexts, while LV2 owns
+ * longer-lived thread contexts; both lifecycles must retire the registry
+ * entry before freeing the context storage. */
+void spu_mfc_unregister(spu_context* ctx);
+void spu_mfc_context_switch(spu_context* ctx);
+
+/* Issue one fully specified MFC command without five separate host calls for
+ * its parameter-channel writes.  This is architecturally equivalent to
+ * MFC_LSA/EAH/EAL/Size/TagID followed by MFC_Cmd; the runtime keeps channel
+ * profiling and optional recorder PCs intact.  `channel_pcs` may be NULL. */
+void spu_mfc_issue_compact(spu_context* ctx,
+                           uint32_t lsa, uint32_t eah, uint32_t eal,
+                           uint32_t size, uint32_t tag, uint32_t cmd,
+                           const uint32_t channel_pcs[6]);
+
+/* Combine the standard nonblocking atomic-status sequence
+ * rchcnt(MFC_RdAtomicStat) + conditional rdch(MFC_RdAtomicStat) into one
+ * MFC-engine lookup. Bit 32 is the channel-ready result; bits 31:0 are the
+ * consumed status when ready. */
+uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx);
+
+/* SPURS task-system calls that promise DMA completion use this runtime
+ * boundary instead of reaching into the per-context MFC registry.  It waits
+ * for every tag group through the same channel path used by lifted SPU code. */
+void spu_task_wait_all_dma(spu_context* ctx);
 
 /* Restore-on-host-return (s24 adopt-on-serve image model, ledger #51): the
  * lifted brsl/bisl call brackets save image_id in a call-site local and hand

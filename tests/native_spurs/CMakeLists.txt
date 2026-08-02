@@ -11,7 +11,12 @@ add_executable(native_spurs_tests
     main.c
     "${PS3RECOMP_ROOT}/libs/spurs/cellSpurs.c"
     "${PS3RECOMP_ROOT}/libs/sync/cellSync.c"
+    "${PS3RECOMP_ROOT}/runtime/spu/spu_lock_order.c"
     "${PS3RECOMP_ROOT}/runtime/spu/spu_workload.c")
+target_compile_definitions(native_spurs_tests PRIVATE
+    YZ_SPURS_LOCK_ORDER_TEST=1
+    YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST=1
+    YZ_SPURS_TEST_GUEST_SIZE=2097152)
 target_include_directories(native_spurs_tests PRIVATE
     "${PS3RECOMP_ROOT}/include"
     "${PS3RECOMP_ROOT}/libs/spurs"

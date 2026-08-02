@@ -39,6 +39,9 @@ option(YZ_PERF_FAST
 option(YZ_PERF_PROFILE
     "Build the symbolized aggregate-profile lane with the same diagnostic cleanup as the fast lane."
     OFF)
+option(YZ_PPU_SAMPLE
+    "Add the low-noise, fixed-window main-PPU instruction sampler."
+    OFF)
 if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
     message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
 endif()
@@ -54,7 +57,6 @@ if(YZ_PERF_PROFILE)
         add_link_options(/DEBUG:FULL /OPT:REF /OPT:NOICF /INCREMENTAL:NO)
     endif()
 endif()
-
 # Build the runtime library in this tree (with the CRT setting above).
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_FROM_ALL)
 if(YZ_PERF_DEFINITIONS)
@@ -86,16 +88,16 @@ if(NOT RECOMP_CHUNKS)
     message(FATAL_ERROR "No recomp/ppu_recomp_*.cpp chunks found -- run the lifter first.")
 endif()
 
-# LLE-lifted firmware PRX modules (currently libsre = Sony's SPURS library),
-# produced by tools/lift_prx.py + the lifter into recomp_prx/. Optional: the
-# runner builds without them until the libsre lift has been run.
+# The game-owned shader PRX is common to both lanes. Firmware PRX lifts are
+# confined to the LLE oracle lane; the native lane resolves those imports to
+# independent host implementations and never compiles their lifted images.
 file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS
-    "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp_*.cpp"
     "${YZ_RECOMP_PRX_DIR}/pxd_shader_recomp_*.cpp")
 if(YZ_SPURS_BACKEND STREQUAL "LLE")
-    file(GLOB _YZ_LIBSRE_CHUNKS CONFIGURE_DEPENDS
+    file(GLOB _YZ_FIRMWARE_CHUNKS CONFIGURE_DEPENDS
+        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp_*.cpp"
         "${YZ_RECOMP_PRX_DIR}/libsre_recomp_*.cpp")
-    list(APPEND PRX_CHUNKS ${_YZ_LIBSRE_CHUNKS})
+    list(APPEND PRX_CHUNKS ${_YZ_FIRMWARE_CHUNKS})
 endif()
 
 add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
@@ -223,6 +225,16 @@ endforeach()
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 set(YZ_IMPORT_BRIDGES "${CMAKE_CURRENT_BINARY_DIR}/import_bridges_gen.cpp")
+# Import binding is derived from function definitions across the independent
+# HLE/runtime sources.  Keep those files in the generator dependency graph so
+# adding an implementation cannot leave a stale ENOSYS bridge in an otherwise
+# successful incremental build.
+file(GLOB_RECURSE _YZ_IMPORT_IMPL_SOURCES CONFIGURE_DEPENDS
+    "${PS3RECOMP_DIR}/libs/*.c"
+    "${PS3RECOMP_DIR}/libs/*.cpp"
+    "${PS3RECOMP_DIR}/runtime/*.c"
+    "${PS3RECOMP_DIR}/runtime/*.cpp")
+list(FILTER _YZ_IMPORT_IMPL_SOURCES EXCLUDE REGEX "/tests/")
 add_custom_command(
     OUTPUT "${YZ_IMPORT_BRIDGES}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/gen_imports.py"
@@ -232,14 +244,16 @@ add_custom_command(
             --output "${YZ_IMPORT_BRIDGES}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_imports.py"
             "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
+            ${_YZ_IMPORT_IMPL_SOURCES}
     VERBATIM)
 
 set(_YZ_FUNC_HEADERS "${YZ_RECOMP_DIR}/ppu_recomp.h")
 if(YZ_SPURS_BACKEND STREQUAL "LLE")
-    list(APPEND _YZ_FUNC_HEADERS "${YZ_RECOMP_PRX_DIR}/libsre_recomp.h")
+    list(APPEND _YZ_FUNC_HEADERS
+        "${YZ_RECOMP_PRX_DIR}/libsre_recomp.h"
+        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp.h")
 endif()
 list(APPEND _YZ_FUNC_HEADERS
-    "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp.h"
     "${YZ_RECOMP_PRX_DIR}/pxd_shader_recomp.h")
 set(YZ_FUNC_TABLE "${CMAKE_CURRENT_BINARY_DIR}/func_table_gen.cpp")
 add_custom_command(
@@ -267,6 +281,15 @@ add_executable(yakuza_recomp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )
+if(YZ_PPU_SAMPLE)
+    target_compile_definitions(yakuza_recomp PRIVATE YZ_PPU_SAMPLE=1)
+    target_compile_definitions(ps3recomp_runtime PRIVATE YZ_PPU_SAMPLE=1)
+    if(MSVC)
+        target_compile_options(yakuza_recomp PRIVATE /Zi)
+        target_link_options(yakuza_recomp PRIVATE
+            /DEBUG:FULL /OPT:REF /OPT:NOICF /INCREMENTAL:NO)
+    endif()
+endif()
 if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
 endif()
@@ -328,5 +351,5 @@ endif()
 
 message(STATUS "Yakuza SPURS backend: ${YZ_SPURS_BACKEND}")
 if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
-    message(STATUS "  firmware-free: libsre PPU lift/image and firmware SPU modules excluded")
+    message(STATUS "  firmware-free: SPURS and GCM firmware PPU/SPU payloads excluded")
 endif()
