@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+zero_sha=0000000000000000000000000000000000000000
+
+tracked_ignored=$(git -C "$repo_root" ls-files -ci --exclude-standard)
+if [ -n "$tracked_ignored" ]; then
+    tracked_ignored_count=$(printf '%s\n' "$tracked_ignored" | awk 'NF { count++ } END { print count + 0 }')
+    echo "Push blocked: tracked files match local-only/derived ignore rules:" >&2
+    printf '%s\n' "$tracked_ignored" | sed -n '1,20p' >&2
+    if [ "$tracked_ignored_count" -gt 20 ]; then
+        echo "...and $((tracked_ignored_count - 20)) more." >&2
+    fi
+    echo "Move current work onto the scrubbed clean lineage; never force-push the old history." >&2
+    exit 1
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$local_sha" = "$zero_sha" ]; then
+        continue
+    fi
+
+    python "$repo_root/tools/check_repository_hygiene.py" --history-ref "$local_sha"
+done
