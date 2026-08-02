@@ -8,21 +8,35 @@ The project translates the game’s PowerPC PPU code, Cell SPU programs, and NVI
 
 ## Current Status
 
-Development began on June 9, 2026, the fifteenth anniversary of the original North American release of Yakuza: Dead Souls
+Development began on June 9, 2026, the fifteenth anniversary of the original 
+Japanese release of *Ryū ga Gotoku: Of the End*.
 
-As of July 2026, the port:
+As of August 2026, the port:
 
-- Compiles the game’s lifted PPU and SPU programs into a native Windows executable.
-- Executes SPURS components lifted from user-supplied, legally obtained PS3 firmware, including the kernel, system service, taskset policies, and job workloads.
-- Boots through the game’s CRT, constructors, memory setup, threading, filesystem, SPURS, audio, and graphics initialization.
-- Opens a native 1280×720 Windows window.
-- Runs the game’s RSX command stream, frame loop, display flips, and GPU synchronization paths.
-- Has progressed through early loading and demonstrated a real screen transition.
-- Can translate real NV40 vertex and fragment shaders into HLSL.
-- Includes PPU, SPU, synchronization, atomics, and Edge-journal tests
+- Compiles the game’s lifted PPU programs and game-owned SPU programs into a
+  native Windows executable.
+- Provides a firmware free native SPURS implementation. The
+  production native build links no Sony SPURS or GCM firmware payloads.
+- Boots through initialization, title flow, New Game, movies, and into the
+  orphanage sequence, and then Kamurocho scene
+- Reaches first controllable gameplay: the player character Akiyama can be controlled
+  using keyboard or XInput input while NPCs, cameras, animation, dialogue, and
+  scene progression continue.
+- Runs the game’s RSX command stream through a live NV4097-to-D3D12 renderer in
+  a native 1280×720 Windows window.
+- Translates real NV40 vertex and fragment programs into HLSL and presents
+  complex gameplay scenes.
+- Executes game-owned SPU tasks and job chains through the native scheduler,
+  including CRI, graphics, and orphanage workloads.
+- Plays SFD video through an FFmpeg host path and synchronizes movie
+  completion with the game.
+- Includes extensive PPU, SPU, SPURS, synchronization, atomics, job-chain,
+  renderer, movie-handoff, savedata, and differential-conformance tests.
 
-The port is **not yet playable**. The current investigation concerns a later SPU/Edge task-state divergence during scene progression. Live rendering also still needs additional integration and correctness work before the translated gameplay scene is presented reliably during a normal boot.
-
+The port has achieved first controllable gameplay, but it is not yet a finished
+or fully playable release. The immediate work concerns some live rendering
+correctness in the orphanage, severe scene dependent frame-time spikes, heavy CPU usage, and progression beyond
+the currently tested sequence.
 ## Major Engineering Accomplishments
 
 ### Recovered the Game’s PPU Code
@@ -68,23 +82,30 @@ Major work includes:
 
 The SPU audit has parsed **567,787 instructions across 20 images with zero decode disagreements**. The current executable SPU conformance suite contains 329 passing cases, with additional fuzz/reference modules covering the major instruction families.
 
-### Executes Sony’s Real SPURS Code
+### Implements a Firmware-Free Native SPURS Runtime
 
-Rather than replacing SPURS with a large collection of approximating stubs, the port can lift and execute Sony’s actual firmware modules and SPU workloads.
+The production configuration no longer requires Sony SPURS firmware.
+Instead, it provides an independently implemented native scheduler.
 
-That work includes:
+The native implementation includes:
 
-- Lifting `libsre` and its PPU exports.
-- Running the real SPURS kernel and system-service SPU images.
-- Running taskset policies, game SPU tasks, CRI audio workloads, and jobchain modules.
-- Supporting multiple SPU images whose code occupies overlapping local-store addresses.
-- Image-aware function dispatch and residency tracking.
-- Restoring task code and read-only segments after overlay rotation.
-- Preserving image identity across nested calls, task adoption, suspension, and resume.
-- Correcting job binaries that load at multiple descriptor-selected local-store bases.
-- Implementing SPURS workload signals, event queues, task scheduling state, and job completion paths.
+- SPURS instance and attribute lifecycle.
+- Tasksets, tasks, signaling, polling, yielding, context restoration, shutdown,
+  and joining.
+- Event flags, queues, LFQueues, barriers, and `cellSync` mutexes.
+- Asynchronous job-chain execution with JOB, GUARD, NEXT/JTS, synchronization,
+  circular-list wrap, shutdown, and join behavior.
+- Exact game-image registration without wildcard task selection.
+- Descriptor-selected SPU job placement and input/output DMA publication.
+- Correct handling when the game recycles a job descriptor while its grabbed
+  job is still executing.
+- Native bindings for all SPURS imports used by Yakuza: Dead Souls.
+- Standalone conformance tests and live evidence from the title and orphanage
+  sequences.
 
-This moved the project beyond “SPURS API compatibility” into execution of the console’s real scheduling and workload machinery.
+A separate LLE build remains available as a historical and behavioral oracle.
+It can execute user-supplied Sony modules, but those modules are not part of the
+native production dependency graph.
 
 ### Translates NV40 Shaders to HLSL
 
@@ -221,20 +242,19 @@ The normal test-enabled MSVC build now registers five suites through CTest, cove
 
 ## What Is Still Missing?
 
-This is not yet a finished port.
+This is not yet a finished port, despite reaching first controllable gameplay.
 
 The main remaining work includes:
 
-- Resolving the current SPU/Edge item-state divergence during scene progression. It causes a lockup after the initial loading screen.
-- Reaching the next scene naturally without diagnostic bridges or forced progress.
-- Completing coordination between the game, lifted SPU journal consumer, and RSX FIFO.
-- Making the translated live renderer the normal presentation path.
-- Completing remaining NV40 shader edge cases and render-state behavior.
-- Completing or replacing lifecycle-only HLE modules where the game requires real behavior.
-- Performance work, packaging, configuration, and end-user usability.
-
-A feature being present in the runtime does not necessarily mean it is fully compatible with every PS3 title. Some library modules intentionally provide offline, lifecycle-only, or game-specific behavior.
-
+- Correcting black or incorrectly shaded characters, ground surfaces, and other
+  live-renderer output in the orphanage, specifically in the native SPURS version
+- Completing vertex-texture, topology, shader, and remaining RSX render-state
+  behavior.
+- Eliminating the severe scene dependent stutter and long PPU callback times.
+- Completing embedded ADX movie audio and validating normal game audio.
+- Validating saves, normal user-driven input, longer gameplay progression, and
+  long-session stability.
+- Packaging, configuration, performance tuning, and end-user usability.
 ## Why Static Recompilation?
 
 An emulator translates or interprets guest code while the game runs. Static recompilation performs most of that translation ahead of time:
