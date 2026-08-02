@@ -19,7 +19,7 @@ As of August 2026, the port:
   production native build links no Sony SPURS or GCM firmware payloads.
 - Boots through initialization, title flow, New Game, movies, and into the
   orphanage sequence, and then Kamurocho scene
-- Reaches first controllable gameplay: the player character Akiyama can be controlled
+- **Reaches first controllable gameplay**: the player character Akiyama can be controlled
   using keyboard or XInput input while NPCs, cameras, animation, dialogue, and
   scene progression continue.
 - Runs the game’s RSX command stream through a live NV4097-to-D3D12 renderer in
