@@ -37,12 +37,18 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
+git config core.hooksPath .githooks
 pip install -r requirements.txt
 
 # Build the runtime library
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+The versioned pre-push hook and CI hygiene check reject generated lifts,
+game/firmware payloads, captures, local oracle data, and any forbidden path
+that remains in reachable Git history. Keep all such inputs and outputs local,
+including files produced from user-supplied game or firmware binaries.
 
 On Windows with Visual Studio:
 ```bash
