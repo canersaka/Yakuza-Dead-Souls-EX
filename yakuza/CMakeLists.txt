@@ -123,12 +123,12 @@ if(MSVC)
         target_compile_options(ppu_recomp_objs PRIVATE /O1 /bigobj /W0)
 
         # Chunk 000 owns the orphanage worker's periodic cleanup/update path.
-        # /O1 leaves its fixed-size memcpy and byte-swap operations as function
-        # calls; /Oi lowers those same operations to native instructions without
-        # changing the lifted arithmetic or guest-memory contract.
+        # Optimize that generated unit for speed and lower its fixed-size memcpy
+        # and byte-swap operations to native instructions.  This does not change
+        # the lifted arithmetic or guest-memory contract.
         set_source_files_properties(
             "${YZ_RECOMP_DIR}/ppu_recomp_000.cpp"
-            PROPERTIES COMPILE_OPTIONS "/Oi")
+            PROPERTIES COMPILE_OPTIONS "/O2;/Oi")
     else()
         # /Od: fast iteration; optimizing costs minutes and gigabytes per chunk.
         target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
