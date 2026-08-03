@@ -92,6 +92,27 @@ static thr_rec* thr_find(uint32_t tid)
 
 extern "C" uint32_t yz_thread_current_id(void) { return s_cur_tid; }
 
+/* Host service threads (vblank, window pump, RSX consumer, flip pacer) enter
+ * the lv2 layer through the same paths as guest threads. With the thread-local
+ * default they all present as tid 1 -- the main guest thread -- so anything
+ * keyed on the guest tid (the wait recorder's per-tid slot, syscall traces,
+ * guest-visible thread ids) attributes their activity to t1. Adopted ids come
+ * from a reserved band above the guest allocator (which grows upward from 2)
+ * and below the 256-entry wait-slot table so host waits are recorded, not
+ * dropped or collided into t1's slot. */
+#define YZ_HOST_TID_BASE 0xE0u
+extern "C" uint32_t yz_thread_adopt_host(const char* name)
+{
+    static volatile long s_host_seq = 0;
+    long seq = _InterlockedIncrement(&s_host_seq) - 1;
+    uint32_t tid = YZ_HOST_TID_BASE + (uint32_t)seq;
+    if (tid > 0xFFu) tid = 0xFFu;   /* band full: collide at the sentinel, never into guest ids */
+    s_cur_tid = tid;
+    fprintf(stderr, "[threads] host service thread '%s' -> tid %u\n",
+            name ? name : "?", tid);
+    return tid;
+}
+
 /* Authoritative live guest context for a thread (NULL if not a running guest
  * thread). The stall dump reads guest PC/GPRs from this instead of walking the
  * host stack -- a blocked thread parked in an lv2 wait still holds the syscall

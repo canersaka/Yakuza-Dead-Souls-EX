@@ -36,6 +36,9 @@ extern const unsigned      g_yz_func_count;
 
 /* dispatch.cpp */
 extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr);   /* NULL if unknown */
+/* threads.cpp: give a host service thread a distinct guest-visible tid (band
+ * 0xE0+) instead of the thread-local default 1 (= the main guest thread). */
+extern "C" uint32_t yz_thread_adopt_host(const char* name);
 extern "C" void      yz_drain_trampolines(ppu_context* ctx);
 /* Call a guest function through an OPD descriptor (sets r2, drains). */
 extern "C" void      yz_call_guest_opd(uint32_t opd_addr, ppu_context* ctx);
