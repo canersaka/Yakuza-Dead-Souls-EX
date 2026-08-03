@@ -17,17 +17,24 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <process.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef SOCKET http_socket_t;
 #define HTTP_INVALID_SOCKET INVALID_SOCKET
 #define http_closesocket closesocket
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 typedef int http_socket_t;
 #define HTTP_INVALID_SOCKET (-1)
 #define http_closesocket close
@@ -152,6 +159,210 @@ static int http_send_all(http_socket_t sock, const char* data, u32 len)
         total += (u32)n;
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Bounded resolve / connect
+ *
+ * cellHttpSetResolveTimeOut()/cellHttpSetConnectTimeOut() only stored a
+ * value on the client (resolve_timeout/connect_timeout above); the actual
+ * getaddrinfo()/connect() calls in cellHttpSendRequest() ran unbounded, so a
+ * stalled DNS server or an unreachable host hung the transaction forever
+ * regardless of what the game configured. The helpers below make both
+ * operations honor the configured timeout.
+ * -----------------------------------------------------------------------*/
+
+/* getaddrinfo() has no portable cancel, so a bounded wait needs a helper
+ * thread. state coordinates ownership of the heap-allocated context between
+ * the worker and the (possibly timed-out) caller via a single CAS: whichever
+ * side observes state==0 first wins and either takes the result (caller) or
+ * takes over cleanup (worker). */
+typedef struct {
+    char                hostname[256];
+    char                port_str[8];
+    struct addrinfo     hints;
+    struct addrinfo*    result;
+    int                 gai_ret;
+    volatile long       state; /* 0=running, 1=done (caller may claim), 2=abandoned (worker frees) */
+} HttpResolveCtx;
+
+#ifdef _WIN32
+static unsigned __stdcall http_resolve_worker(void* arg)
+#else
+static void* http_resolve_worker(void* arg)
+#endif
+{
+    HttpResolveCtx* ctx = (HttpResolveCtx*)arg;
+    ctx->gai_ret = getaddrinfo(ctx->hostname, ctx->port_str, &ctx->hints, &ctx->result);
+
+#ifdef _WIN32
+    long prev = InterlockedCompareExchange(&ctx->state, 1, 0);
+#else
+    long prev = __sync_val_compare_and_swap(&ctx->state, 0, 1);
+#endif
+    if (prev == 2) {
+        /* The caller already gave up and marked us abandoned; it can't see
+         * ctx->result anymore, so we own the cleanup. */
+        if (ctx->result)
+            freeaddrinfo(ctx->result);
+        free(ctx);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+/* Resolve hostname/port_str with a bound of timeout_usec microseconds.
+ * Returns the getaddrinfo() return code (0 on success) with out_result set;
+ * a timeout reports -1 with out_result == NULL, without leaking the
+ * in-flight resolution (the worker cleans itself up once it eventually
+ * completes). timeout_usec == 0 means "no bound configured" -> resolve
+ * inline as before. */
+static int http_resolve_with_timeout(const char* hostname, const char* port_str,
+                                     const struct addrinfo* hints, u32 timeout_usec,
+                                     struct addrinfo** out_result)
+{
+    *out_result = NULL;
+    if (timeout_usec == 0)
+        return getaddrinfo(hostname, port_str, hints, out_result);
+
+    HttpResolveCtx* ctx = (HttpResolveCtx*)calloc(1, sizeof(HttpResolveCtx));
+    if (!ctx)
+        return getaddrinfo(hostname, port_str, hints, out_result);
+
+    strncpy(ctx->hostname, hostname, sizeof(ctx->hostname) - 1);
+    strncpy(ctx->port_str, port_str, sizeof(ctx->port_str) - 1);
+    ctx->hints = *hints;
+    ctx->state = 0;
+
+#ifdef _WIN32
+    HANDLE th = (HANDLE)_beginthreadex(NULL, 0, http_resolve_worker, ctx, 0, NULL);
+    if (!th) {
+        free(ctx);
+        return getaddrinfo(hostname, port_str, hints, out_result);
+    }
+    DWORD ms = timeout_usec / 1000;
+    if (ms == 0)
+        ms = 1;
+    DWORD wr = WaitForSingleObject(th, ms);
+    CloseHandle(th);
+
+    if (wr == WAIT_OBJECT_0) {
+        /* Worker's CAS already ran before its thread function returned. */
+        *out_result = ctx->result;
+        int ret = ctx->gai_ret;
+        free(ctx);
+        return ret;
+    }
+
+    long prev = InterlockedCompareExchange(&ctx->state, 2, 0);
+    if (prev == 0)
+        return -1; /* abandoned; worker frees ctx when it finishes */
+    *out_result = ctx->result;
+    int ret = ctx->gai_ret;
+    free(ctx);
+    return ret;
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, http_resolve_worker, ctx) != 0) {
+        free(ctx);
+        return getaddrinfo(hostname, port_str, hints, out_result);
+    }
+    pthread_detach(th);
+
+    uint64_t waited = 0;
+    while (waited < timeout_usec && ctx->state == 0) {
+        useconds_t step = 5000;
+        uint64_t remain = timeout_usec - waited;
+        if ((uint64_t)step > remain)
+            step = (useconds_t)remain;
+        usleep(step);
+        waited += step;
+    }
+
+    if (ctx->state != 0) {
+        *out_result = ctx->result;
+        int ret = ctx->gai_ret;
+        free(ctx);
+        return ret;
+    }
+
+    long prev = __sync_val_compare_and_swap(&ctx->state, 0, 2);
+    if (prev == 0)
+        return -1; /* abandoned; worker frees ctx when it finishes */
+    *out_result = ctx->result;
+    int ret = ctx->gai_ret;
+    free(ctx);
+    return ret;
+#endif
+}
+
+/* Connect with a bound of *timeout_usec* microseconds: switch the socket to
+ * non-blocking, kick off the connect, and wait for writability via select().
+ * Restores blocking mode before returning either way -- the rest of the
+ * transaction path assumes a blocking socket bounded by SO_SNDTIMEO/
+ * SO_RCVTIMEO instead (see http_apply_timeout()).
+ * timeout_usec == 0 means "no bound configured" -> connect inline as before. */
+static int http_connect_with_timeout(http_socket_t sock, const struct sockaddr* addr,
+                                     int addrlen, u32 timeout_usec)
+{
+    if (timeout_usec == 0)
+        return connect(sock, addr, addrlen);
+
+#ifdef _WIN32
+    u_long nb = 1;
+    ioctlsocket(sock, FIONBIO, &nb);
+#else
+    int orig_flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, orig_flags | O_NONBLOCK);
+#endif
+
+    int failed = 0;
+    int ret = connect(sock, addr, addrlen);
+    if (ret != 0) {
+#ifdef _WIN32
+        int in_progress = (WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        int in_progress = (errno == EINPROGRESS);
+#endif
+        if (!in_progress) {
+            failed = 1;
+        } else {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds);
+            FD_ZERO(&efds);
+            FD_SET(sock, &wfds);
+            FD_SET(sock, &efds);
+            struct timeval tv;
+            tv.tv_sec  = (long)(timeout_usec / 1000000);
+            tv.tv_usec = (long)(timeout_usec % 1000000);
+
+            int sel = select((int)(sock + 1), NULL, &wfds, &efds, &tv);
+            if (sel <= 0) {
+                failed = 1; /* timeout or select() error */
+            } else {
+                int soerr = 0;
+#ifdef _WIN32
+                int soerr_len = sizeof(soerr);
+#else
+                socklen_t soerr_len = sizeof(soerr);
+#endif
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soerr, &soerr_len);
+                if (soerr != 0)
+                    failed = 1;
+            }
+        }
+    }
+
+#ifdef _WIN32
+    nb = 0;
+    ioctlsocket(sock, FIONBIO, &nb);
+#else
+    fcntl(sock, F_SETFL, orig_flags);
+#endif
+    return failed ? -1 : 0;
 }
 
 /* Find "\r\n\r\n" in a buffer, return pointer to start of body or NULL. */
@@ -469,8 +680,11 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
+    HttpClientSlot* c = &s_clients[t->client];
+
     struct addrinfo* result = NULL;
-    int gai = getaddrinfo(t->hostname, port_str, &hints, &result);
+    int gai = http_resolve_with_timeout(t->hostname, port_str, &hints,
+                                        c->resolve_timeout, &result);
     if (gai != 0 || !result) {
         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
@@ -489,11 +703,11 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     }
 
     /* Apply timeouts from the owning client */
-    HttpClientSlot* c = &s_clients[t->client];
     http_apply_timeout(sock, 1, c->send_timeout);
     http_apply_timeout(sock, 0, c->recv_timeout);
 
-    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
+    if (http_connect_with_timeout(sock, result->ai_addr, (int)result->ai_addrlen,
+                                  c->connect_timeout) != 0) {
         printf("[cellHttp]   connect() failed to %s:%u\n", t->hostname, t->port);
         http_closesocket(sock);
         freeaddrinfo(result);
