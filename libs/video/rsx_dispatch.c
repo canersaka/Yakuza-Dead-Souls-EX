@@ -159,6 +159,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * because its seeded register image already contained 0x901. */
     rsx->regs[M_FRONT_FACE >> 2] = 0x0901u;
 
+    /* NV40 reset ZSTENCIL_CLEAR_VALUE (Z24S8: depth24<<8 | stencil8) is
+     * 0xFFFFFF00 = depth 1.0, stencil 0 (RPCS3 rsx_methods.cpp reset image
+     * as numbering oracle). Seeded so a raw register read is trustworthy for
+     * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
+    rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);

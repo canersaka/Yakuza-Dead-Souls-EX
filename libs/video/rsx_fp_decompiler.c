@@ -605,8 +605,24 @@ static int rsx_fp_decompile_internal(
                          tex_unit, tex_unit, a, a);
             break;
         case OP_KIL:
-            out_puts(&o, "    /* TODO: KIL (condition not modeled) */\n");
-            handled = 0;
+            /* Fragment kill. Predicated by the same exec_if condition as any
+             * other instruction (RPCS3 FragmentProgramDecompiler case
+             * RSX_FP_OPCODE_KIL: AddFlowOp("discard") under GetCond());
+             * unconditional encodings discard outright. Dropping this (the
+             * old TODO) rendered every alpha-cutout material as a solid
+             * quad. */
+            if (is_never) {
+                rhs[0] = '\0';
+            } else if (is_uncond) {
+                out_puts(&o, "    discard;\n");
+            } else {
+                char kil[128];
+                snprintf(kil, sizeof(kil),
+                         "    if (any(cc%u.%s %s (float4)0)) discard;\n",
+                         cc_read, cswz, cmp_op);
+                out_puts(&o, kil);
+            }
+            handled = 0;   /* no destination write */
             break;
         default:
             out_puts(&o, "    /* TODO: unhandled FP opcode ");
