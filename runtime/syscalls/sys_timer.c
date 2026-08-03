@@ -187,10 +187,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * -- collapsing that 30us to a single yield lets the producer outrun and
          * LAP the FIFO consumer -> deadlock). Busy-wait to the precise QPC
          * deadline, mirroring RPCS3's TSC busy-tail (lv2.cpp wait_timeout,
-         * "Usleep Only"). Critically we SwitchToThread() inside the spin so a
-         * sibling host thread the guest is waiting on (the RSX FIFO consumer
-         * advancing GET) gets the core during the wait -- a pure pause-spin would
-         * pace THIS thread in wall-time but still starve the consumer. */
+         * "Usleep Only"). Give a sibling host thread one scheduling opportunity
+         * before the precision tail, then use processor pauses while checking the
+         * deadline. Repeating SwitchToThread on every QPC check can reschedule the
+         * caller for milliseconds under SPURS contention, multiplying a 30/250 us
+         * guest poll far beyond its requested duration. */
         /* Inline RSX drain ONCE per usleep call (YZ_RSX_INLINE) -- the reserve
          * loops usleep(30), so this advances GET once per reserve iteration.
          * Pumping inside the busy-wait spin (thousands of iters/30us) was
@@ -201,8 +202,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        SwitchToThread();              /* one handoff to the awaited producer */
         do {
-            SwitchToThread();          /* hand the core to the consumer/other guest threads */
+            YieldProcessor();          /* precise tail without repeated reschedules */
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
     }
