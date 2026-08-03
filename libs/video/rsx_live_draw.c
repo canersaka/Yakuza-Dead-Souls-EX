@@ -30,6 +30,7 @@ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void*
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
 void rsx_live_draw_seed_transform_program(const u32* w, u32 n) { (void)w; (void)n; }
+void rsx_live_draw_seed_transform_constants(const u32* w, u32 n) { (void)w; (void)n; }
 void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -46,6 +47,8 @@ void rsx_live_draw_dump_present_samples(void) {}
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
 int  rsx_live_draw_a010_world_ready(void) { return 1; }
+int  rsx_live_draw_debug_dump_surface(u32 l, u32 o, const char* p)
+{ (void)l; (void)o; (void)p; return -1; }
 void rsx_live_draw_set_a010_camera_matrix(const float* m) { (void)m; }
 void rsx_live_draw_shutdown(void) {}
 
@@ -123,6 +126,9 @@ extern volatile LONG g_yz_a010_root_active;
 #define SRV_TEXTURE_BASE (SRV_ZDEPTH_BASE + MAX_SURFACES)
 #define SRV_VTEX_BASE    (SRV_TEXTURE_BASE + MAX_TEXTURES)
 #define SRV_HEAP_SLOTS   (SRV_VTEX_BASE + MAX_VTEX)
+#define SRV_DEPTH_SOURCE_BASE SRV_HEAP_SLOTS
+#define UAV_ZDEPTH_BASE   (SRV_DEPTH_SOURCE_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (UAV_ZDEPTH_BASE + MAX_SURFACES)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -285,6 +291,8 @@ typedef struct {
     u32                        n_samplers;
 
     ID3D12RootSignature*       rootsig_x;
+    ID3D12RootSignature*       depth_snapshot_rootsig;
+    ID3D12PipelineState*       depth_snapshot_pso;
     psocache_t                 psos[MAX_PSOS];
     u32                        n_psos;
     shader_blob_cache_t        vs_blobs;
@@ -1318,7 +1326,7 @@ static void srv_write(u32 slot, ID3D12Resource* tex)
 static void srv_write_zdepth(u32 slot, ID3D12Resource* tex)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
-    sd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     /* The replay-proven depth snapshot broadcasts depth to RGB. Mirror that
      * mapping directly in the native SRV and force alpha to one. */
@@ -1330,6 +1338,24 @@ static void srv_write_zdepth(u32 slot, ID3D12Resource* tex)
     sd.Texture2D.MipLevels = 1;
     g.dev->lpVtbl->CreateShaderResourceView(
         g.dev, tex, &sd, srv_cpu(slot));
+}
+static void srv_write_depth_source(u32 slot, ID3D12Resource* tex)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    sd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    g.dev->lpVtbl->CreateShaderResourceView(
+        g.dev, tex, &sd, srv_cpu(slot));
+}
+static void uav_write_zdepth(u32 slot, ID3D12Resource* tex)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+    ud.Format = DXGI_FORMAT_R32_FLOAT;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.dev->lpVtbl->CreateUnorderedAccessView(
+        g.dev, tex, NULL, &ud, srv_cpu(slot));
 }
 static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
 {
@@ -1352,6 +1378,34 @@ static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
     g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &h);
     h.ptr += (u64)base * g.srv_step;
     return h;
+}
+static int depth_snapshot_descriptors(
+    u32 zindex, D3D12_GPU_DESCRIPTOR_HANDLE* out_source,
+    D3D12_GPU_DESCRIPTOR_HANDLE* out_destination)
+{
+    if (zindex >= MAX_SURFACES || g.srv_ring_used >= SRV_RING_TABLES)
+        return 0;
+    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+        g.srv_heap, &cpu);
+    cpu.ptr += (size_t)base * g.srv_step;
+    g.dev->lpVtbl->CopyDescriptorsSimple(
+        g.dev, 1, cpu, srv_cpu(SRV_DEPTH_SOURCE_BASE + zindex),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cpu.ptr += g.srv_step;
+    g.dev->lpVtbl->CopyDescriptorsSimple(
+        g.dev, 1, cpu, srv_cpu(UAV_ZDEPTH_BASE + zindex),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
+        g.srv_heap, &gpu);
+    gpu.ptr += (u64)base * g.srv_step;
+    *out_source = gpu;
+    gpu.ptr += g.srv_step;
+    *out_destination = gpu;
+    return 1;
 }
 static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
 {
@@ -2532,18 +2586,22 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     g.dev->lpVtbl->CreateDepthStencilView(
         g.dev, z->tex, &dsvd, dsv_handle(1 + slot));
 
-    /* Keep the live DSV padded to the active canvas, but expose an
-     * exact-declared-size snapshot to shaders.  Binding the padded resource
-     * directly skews 1024-wide zeta coordinates against a 1280-wide backing,
-     * while allocating the live DSV at 1024 causes D3D12 to reject later
-     * render-target/PSO combinations. */
-    D3D12_RESOURCE_DESC snapshot_rd = rd;
+    /* D3D12 forbids a partial CopyTextureRegion from a depth/stencil
+     * resource.  Keep the replay-proven logical dimensions and resolve the
+     * depth plane with a compute shader instead; that is a normal SRV read,
+     * not a depth-resource copy operation. */
+    D3D12_RESOURCE_DESC snapshot_rd = {0};
+    snapshot_rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     snapshot_rd.Width = z->snapshot_w;
     snapshot_rd.Height = z->snapshot_h;
-    snapshot_rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    snapshot_rd.DepthOrArraySize = 1;
+    snapshot_rd.MipLevels = 1;
+    snapshot_rd.Format = DXGI_FORMAT_R32_FLOAT;
+    snapshot_rd.SampleDesc.Count = 1;
+    snapshot_rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     HRESULT snapshot_hr = g.dev->lpVtbl->CreateCommittedResource(
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &snapshot_rd,
-            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
             &IID_ID3D12Resource, (void**)&z->snapshot);
     if (FAILED(snapshot_hr)) {
         fprintf(stderr,
@@ -2553,8 +2611,10 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
                 (unsigned long)snapshot_hr);
         z->snapshot = NULL;
     } else {
-        z->snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        z->snapshot_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        srv_write_depth_source(SRV_DEPTH_SOURCE_BASE + slot, z->tex);
         srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->snapshot);
+        uav_write_zdepth(UAV_ZDEPTH_BASE + slot, z->snapshot);
     }
     g.list->lpVtbl->ClearDepthStencilView(
         g.list, dsv_handle(1 + slot),
@@ -2579,8 +2639,20 @@ static int zdepth_snapshot(u32 slot)
 {
     if (!slot) return 0;
     zdepth_t* z = &g.zdepths[slot - 1];
-    if (!z->snapshot) return 0;
+    if (!z->snapshot || !g.depth_snapshot_rootsig ||
+        !g.depth_snapshot_pso)
+        return 0;
     if (!z->had_write) return z->snapshot_valid;
+
+    D3D12_GPU_DESCRIPTOR_HANDLE source_table, destination_table;
+    if (!depth_snapshot_descriptors(
+            slot - 1u, &source_table, &destination_table)) {
+        fprintf(stderr,
+                "[zetatrack] depth snapshot descriptor ring exhausted "
+                "at frame %u\n",
+                g_ld_frames);
+        return z->snapshot_valid;
+    }
 
     D3D12_RESOURCE_BARRIER bars[2] = {0};
     u32 nbar = 0;
@@ -2588,45 +2660,53 @@ static int zdepth_snapshot(u32 slot)
     bars[nbar].Transition.pResource = z->tex;
     bars[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     bars[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bars[nbar].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     nbar++;
-    if (z->snapshot_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+    if (z->snapshot_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
         bars[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         bars[nbar].Transition.pResource = z->snapshot;
         bars[nbar].Transition.Subresource =
             D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         bars[nbar].Transition.StateBefore = z->snapshot_state;
-        bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        bars[nbar].Transition.StateAfter =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         nbar++;
     }
     g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
 
-    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-    dst.pResource = z->snapshot;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    src.pResource = z->tex;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    D3D12_BOX box = {
-        0, 0, 0,
-        z->snapshot_w, z->snapshot_h, 1
-    };
-    g.list->lpVtbl->CopyTextureRegion(
-        g.list, &dst, 0, 0, 0, &src, &box);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, g.depth_snapshot_pso);
+    g.list->lpVtbl->SetComputeRootSignature(
+        g.list, g.depth_snapshot_rootsig);
+    g.list->lpVtbl->SetComputeRootDescriptorTable(
+        g.list, 0, source_table);
+    g.list->lpVtbl->SetComputeRootDescriptorTable(
+        g.list, 1, destination_table);
+    g.list->lpVtbl->Dispatch(
+        g.list, (z->snapshot_w + 7u) / 8u,
+        (z->snapshot_h + 7u) / 8u, 1);
+
+    D3D12_RESOURCE_BARRIER uav_done = {0};
+    uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_done.UAV.pResource = z->snapshot;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
 
     D3D12_RESOURCE_BARRIER done[2] = {0};
     done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     done[0].Transition.pResource = z->tex;
     done[0].Transition.Subresource =
         D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    done[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    done[0].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     done[1].Transition.pResource = z->snapshot;
     done[1].Transition.Subresource =
         D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    done[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    done[1].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     done[1].Transition.StateAfter =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
@@ -3973,6 +4053,45 @@ static const float* dc_vertex_attr(
     return fallback;
 }
 
+/* Diagnostic-only counterpart to dc_vertex_attr().  Compact rendering omits
+ * attributes the active vertex program does not read, but the legacy replay
+ * fingerprint contains all sixteen RSX attributes.  Re-fetch an omitted,
+ * enabled attribute from the original guest reference so a CSV hash compares
+ * the producer bytes rather than the two renderers' different upload layouts. */
+static const float* dc_vertex_attr_canonical(
+    u32 vertex, u32 attr, float fallback[4])
+{
+    if (!ld_vertex_compact_payload())
+        return dc.verts[vertex].a[attr];
+    const s8 slot = dc.layout.slot_by_attr[attr];
+    if (slot >= 0 && vertex < dc.n_verts)
+        return (const float*)(
+            dc.compact_verts + (u64)vertex * dc.layout.stride +
+            (u32)slot * 16u);
+
+    const rsx_vertex_fetch_attr* fetch = &dc.fetch_plan.attr[attr];
+    if (vertex < dc.n_verts && fetch->desc.type && fetch->desc.size &&
+        fetch->elem_size) {
+        const rsx_vertex_ref* ref = &dc.refs[vertex];
+        const u32 element = rsx_vertex_element_index(
+            ref->vertex_id, ref->base_index, fetch->desc.frequency,
+            (dc.fetch_plan.divider_mask >> attr) & 1u);
+        const u64 offset =
+            (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
+            (u64)element * fetch->stride;
+        if (offset <= UINT32_MAX) {
+            const u8* source = guest_ptr(
+                fetch->desc.location, (u32)offset, fetch->elem_size);
+            if (source && rsx_vertex_decode_element(
+                    fetch->desc.type, fetch->desc.size,
+                    source, fallback))
+                return fallback;
+        }
+    }
+    memcpy(fallback, fetch->default_value, 16);
+    return fallback;
+}
+
 /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
  * matches the replay harness). These were off by one (4/5/6/7), which dropped
  * EVERY quad/triangle draw through the switch's default: return -> black. */
@@ -4833,11 +4952,38 @@ static u64 live_legacy_pso_key(void)
     return fnv1a(&rs, sizeof(rs), key);
 }
 
+/* Hash the canonical sixteen-attribute vertex stream in source occurrence
+ * order.  Compact mode may deduplicate the uploaded payload, so hashing its
+ * packed bytes directly is not comparable with the legacy replay renderer.
+ * Re-expanding through the remap and applying the RSX defaults produces the
+ * same vtx_t byte stream on both paths and places the producer/consumer
+ * boundary immediately after guest-memory vertex decoding. */
+static u64 live_decoded_vertex_hash(u64 attr_hash[16])
+{
+    u64 hash = 1469598103934665603ull;
+    for (u32 attr = 0; attr < 16; attr++)
+        attr_hash[attr] = 1469598103934665603ull;
+    const u32 count = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
+    for (u32 occurrence = 0; occurrence < count; occurrence++) {
+        const u32 vertex = dc.refs_remapped
+            ? rsx_vertex_remap_index(&dc.ref_remap, occurrence)
+            : occurrence;
+        for (u32 attr = 0; attr < 16; attr++) {
+            float fallback[4];
+            const float* value =
+                dc_vertex_attr_canonical(vertex, attr, fallback);
+            hash = fnv1a(value, 16u, hash);
+            attr_hash[attr] = fnv1a(value, 16u, attr_hash[attr]);
+        }
+    }
+    return hash;
+}
+
 /* YZ_RSX_DRAW_CSV=path: uncapped per-draw fingerprints for direct comparison
  * with the working RPCS3 .rxs replay.  Default-off and renderer-neutral. */
 static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
 {
-#if defined(YZ_PERF_CLEAN)
+#if defined(YZ_PERF_CLEAN) && !defined(YZ_PERF_PROFILE)
     (void)prim;
     (void)n_tri;
     (void)outcome;
@@ -4848,7 +4994,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     const int a010_only = getenv("YZ_RSX_DRAW_CSV_A010_ONLY") != NULL;
     if (a010_only) {
         if (InterlockedCompareExchange(
-                &g_ld_a010_world_ready, 0, 0) == 0)
+                &g_yz_a010_root_active, 0, 0) == 0)
             return;
     }
     if (!inited) {
@@ -4858,11 +5004,17 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
             file = fopen(path, "w");
             if (file) {
                 fprintf(file,
-                    "draw,frame,outcome,surf,prim,verts,pso_key,regs_hash,vp_hash,"
+                    "draw,frame,outcome,surf,prim,verts,source_verts,decoded_hash,"
+                    "pso_key,regs_hash,vp_hash,"
                     "const_hash,blend,dtest,dwrite,dfunc,cull,cullface,"
                     "frontface,cmask,vpx,vpy,vpw,vph,sclx,scly,sclz,"
                     "trnx,trny,trnz,clipw,cliph,zeta_off,zeta_pitch,zeta_loc,"
-                    "seen_vtex,seen_vtxfmt,seen_freqdiv\n");
+                    "seen_vtex,seen_vtxfmt,seen_freqdiv,"
+                    "attr0_hash,attr1_hash,attr2_hash,attr3_hash,"
+                    "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
+                    "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
+                    "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
+                    "active_attr_mask,used_attr_mask\n");
                 fprintf(stderr, "[live-diff] YZ_RSX_DRAW_CSV armed: %s\n", path);
             } else {
                 fprintf(stderr, "[live-diff] cannot open YZ_RSX_DRAW_CSV: %s\n",
@@ -4896,13 +5048,23 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     for (u32 i = 0; i < 16; i++)
         seen_vtxfmt += g.rsx.seen[(0x1740u >> 2) + i];
     const u32 seen_freqdiv = g.rsx.seen[0x1FC0u >> 2];
+    u64 attr_hash[16];
+    const u64 decoded_hash = live_decoded_vertex_hash(attr_hash);
+    u32 active_attr_mask = 0;
+    for (u32 attr = 0; attr < 16; attr++)
+        if (dc.fetch_plan.attr[attr].desc.type &&
+            dc.fetch_plan.attr[attr].desc.size)
+            active_attr_mask |= 1u << attr;
 
     fprintf(file,
-        "%llu,%u,%s,0x%X,%u,%u,%016llx,%016llx,%016llx,%016llx,"
+        "%llu,%u,%s,0x%X,%u,%u,%u,%016llx,"
+        "%016llx,%016llx,%016llx,%016llx,"
         "%u,%u,%u,0x%X,%u,0x%X,0x%X,0x%08X,"
         "%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-        "%u,%u,0x%X,%u,%u,%u,%u,%u\n",
+        "%u,%u,0x%X,%u,%u,%u,%u,%u",
         (unsigned long long)draw++, g_ld_frames, outcome, surf, prim, n_tri,
+        dc.n_source_refs ? dc.n_source_refs : dc.n_verts,
+        (unsigned long long)decoded_hash,
         (unsigned long long)live_legacy_pso_key(),
         (unsigned long long)regs_hash, (unsigned long long)vp_hash,
         (unsigned long long)const_hash,
@@ -4913,6 +5075,10 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         vp.translate[0], vp.translate[1], vp.translate[2],
         sf.clip_w, sf.clip_h, sf.zeta_offset, sf.zeta_pitch, sf.zeta_location,
         seen_vtex, seen_vtxfmt, seen_freqdiv);
+    for (u32 attr = 0; attr < 16; attr++)
+        fprintf(file, ",%016llx", (unsigned long long)attr_hash[attr]);
+    fprintf(file, ",0x%04X,0x%04X\n",
+            active_attr_mask, dc.layout.mask & 0xFFFFu);
     fflush(file);
 #endif
 }
@@ -5607,6 +5773,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
     const u32 vtex_mask = vertex_texture_mask();
+    u32 vtex_slots[SRV_TABLE_SIZE];
+    for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
+        vtex_slots[u] = SRV_WHITE;
+    /* Resolve and upload every vertex texture before recording this draw's
+     * graphics state.  Cache refresh can retire a texture and flush the open
+     * command list; doing that after SetPipelineState/root bindings silently
+     * loses those bindings on the replacement list. */
+    for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
+        if (!((vtex_mask >> u) & 1u)) continue;
+        rsx_dsp_vertex_texture vt;
+        rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
+        vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        if (vtex_slots[u] != SRV_WHITE)
+            g_ld_vtex_binds++;
+        else
+            g_ld_vtex_unsupported++;
+    }
     const u32 required_srv_tables = 1u + (vtex_mask != 0);
     if (g.srv_ring_used + required_srv_tables > SRV_RING_TABLES ||
         sampler_table_needs_flush(smp_slots)) {
@@ -5657,10 +5840,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
     const D3D12_GPU_DESCRIPTOR_HANDLE stbl = sampler_table(smp_slots);
+    D3D12_GPU_DESCRIPTOR_HANDLE vtex_table = {0};
+    if (vtex_mask)
+        vtex_table = srv_table(vtex_slots);
     u64 descriptor_signature =
         fnv1a(slots, sizeof(slots), 1469598103934665603ull);
     descriptor_signature =
         fnv1a(smp_slots, sizeof(smp_slots), descriptor_signature);
+    if (vtex_mask)
+        descriptor_signature =
+            fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
 
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
@@ -5688,27 +5877,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 ps_cb_offset);
     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, stbl);
-    if (vtex_mask) {
-        u32 vtex_slots[SRV_TABLE_SIZE];
-        for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
-            vtex_slots[u] = SRV_WHITE;
-        for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
-            if (!((vtex_mask >> u) & 1u)) continue;
-            rsx_dsp_vertex_texture vt;
-            rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-            vtex_slots[u] = vertex_texture_srv_slot(&vt);
-            if (vtex_slots[u] != SRV_WHITE)
-                g_ld_vtex_binds++;
-            else
-                g_ld_vtex_unsupported++;
-        }
-        descriptor_signature =
-            fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
-        const D3D12_GPU_DESCRIPTOR_HANDLE vtex_table =
-            srv_table(vtex_slots);
+    if (vtex_mask)
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(
             g.list, 3, vtex_table);
-    }
     g.cb_used += CB_BLOCK_ALIGNED;
 
     D3D12_VIEWPORT dvp = {0, 0, W, H, 0.0f, 1.0f};
@@ -5903,14 +6074,18 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        if (zslot && (mask & RSX_CLEAR_DEPTH))
-            zdepth_snapshot(zslot);
         g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
             clear_flags, 1.0f, 0, 0, NULL);
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
-            if (mask & RSX_CLEAR_DEPTH)
+            if (mask & RSX_CLEAR_DEPTH) {
                 g.zdepths[zslot - 1].had_write = 0;
+                /* Each guest zeta owns a distinct live resource.  A clear
+                 * invalidates its older published image; do not resolve it
+                 * speculatively.  The first later texture consumer resolves
+                 * the newly written pass exactly once. */
+                g.zdepths[zslot - 1].snapshot_valid = 0;
+            }
         } else {
             if (mask & RSX_CLEAR_DEPTH)
                 g.depth_cleared = 1;
@@ -5992,6 +6167,97 @@ static int make_root_signature(void)
                                                     sig->lpVtbl->GetBufferSize(sig),
                                                     &IID_ID3D12RootSignature, (void**)&g.rootsig_x);
     sig->lpVtbl->Release(sig);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+static int make_depth_snapshot_pipeline(void)
+{
+    static const char source[] =
+        "Texture2D<float> depth_source : register(t0);\n"
+        "RWTexture2D<float> depth_destination : register(u0);\n"
+        "[numthreads(8, 8, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "    uint width, height;\n"
+        "    depth_destination.GetDimensions(width, height);\n"
+        "    if (id.x < width && id.y < height)\n"
+        "        depth_destination[id.xy] = "
+        "depth_source.Load(int3(id.xy, 0));\n"
+        "}\n";
+    ID3DBlob* shader = NULL;
+    ID3DBlob* errors = NULL;
+    HRESULT hr = D3DCompile(
+        source, sizeof(source) - 1u, "depth_snapshot_compute", NULL, NULL,
+        "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+        &shader, &errors);
+    if (FAILED(hr)) {
+        fprintf(stderr,
+                "[zetatrack] depth snapshot shader compile failed "
+                "hr=0x%08lX: %s\n",
+                (unsigned long)hr,
+                errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors)
+                       : "<no diagnostics>");
+        if (errors) errors->lpVtbl->Release(errors);
+        return -1;
+    }
+    if (errors) errors->lpVtbl->Release(errors);
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    for (u32 i = 0; i < 2; ++i) {
+        parameters[i].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[i].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC description = {0};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    ID3DBlob* serialized = NULL;
+    ID3DBlob* signature_errors = NULL;
+    hr = D3D12SerializeRootSignature(
+        &description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &serialized, &signature_errors);
+    if (FAILED(hr)) {
+        fprintf(stderr,
+                "[zetatrack] depth snapshot root signature failed "
+                "hr=0x%08lX: %s\n",
+                (unsigned long)hr,
+                signature_errors
+                    ? (const char*)signature_errors->lpVtbl->GetBufferPointer(
+                          signature_errors)
+                    : "<no diagnostics>");
+        if (signature_errors)
+            signature_errors->lpVtbl->Release(signature_errors);
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+    if (signature_errors)
+        signature_errors->lpVtbl->Release(signature_errors);
+    hr = g.dev->lpVtbl->CreateRootSignature(
+        g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
+        serialized->lpVtbl->GetBufferSize(serialized),
+        &IID_ID3D12RootSignature, (void**)&g.depth_snapshot_rootsig);
+    serialized->lpVtbl->Release(serialized);
+    if (FAILED(hr)) {
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
+    pipeline.pRootSignature = g.depth_snapshot_rootsig;
+    pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
+    pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
+    hr = g.dev->lpVtbl->CreateComputePipelineState(
+        g.dev, &pipeline, &IID_ID3D12PipelineState,
+        (void**)&g.depth_snapshot_pso);
+    shader->lpVtbl->Release(shader);
     return SUCCEEDED(hr) ? 0 : -1;
 }
 
@@ -6188,7 +6454,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     /* SRV heaps */
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = SRV_HEAP_SLOTS; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    hd.NumDescriptors = SRV_CPU_HEAP_SLOTS; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.srv_cpu_heap);
     hd.NumDescriptors = SRV_RING_TABLES * SRV_TABLE_SIZE;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -6247,7 +6513,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
         }
     }
 
-    if (make_root_signature() != 0) return -1;
+    if (make_root_signature() != 0 ||
+        make_depth_snapshot_pipeline() != 0)
+        return -1;
 
     static const u8 white[4] = {255, 255, 255, 255};
     g.white_tex = create_texture_rgba(white, 1, 1);
@@ -6276,6 +6544,10 @@ void rsx_live_draw_seed_registers(const u32* regs, u32 count)
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_transform_program(&g.rsx, words, count);
+}
+void rsx_live_draw_seed_transform_constants(const u32* words, u32 count)
+{
+    if (g.ready) rsx_dispatch_seed_transform_constants(&g.rsx, words, count);
 }
 
 void rsx_live_draw_set_display_buffer(
@@ -6693,6 +6965,30 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     return nonblack;
 }
 
+int rsx_live_draw_debug_dump_surface(
+    u32 location, u32 offset, const char* path)
+{
+    if (!g.ready || !path || !path[0]) return -1;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* surface = &g.surfaces[i];
+        if (surface->location != location || surface->offset != offset)
+            continue;
+        const u64 nonblack = ld_dump_surface_ppm(path, surface);
+        if (nonblack == UINT64_MAX) return -1;
+        fprintf(stderr,
+                "[live-replay-boundary] surface=%u:%08X index=%u "
+                "size=%ux%u nonblack=%llu path=%s\n",
+                location, offset, i, surface->w, surface->h,
+                (unsigned long long)nonblack, path);
+        fflush(stderr);
+        return 0;
+    }
+    fprintf(stderr,
+            "[live-replay-boundary] missing surface=%u:%08X path=%s\n",
+            location, offset, path);
+    return 1;
+}
+
 static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 {
     if (!g.ready || !g.vertex_diag_dir[0])
@@ -6909,6 +7205,74 @@ void rsx_live_draw_present(u32 buffer_id)
 #if defined(YZ_PERF_PROFILE)
     ld_profile_present(g_ld_frames);
 #endif
+    /* Narrow validation readback for the four user-visible orphanage shots.
+     * This captures the renderer's actual presented surface and therefore is
+     * independent of desktop focus, window visibility, and screenshot APIs.
+     * It is inert unless the validation controller supplies both variables. */
+    {
+        static int validation_capture = -1;
+        static u32 validation_dumped = 0;
+        static u64 validation_origin = UINT64_MAX;
+        static char validation_dir[MAX_PATH * 2];
+        if (validation_capture < 0) {
+            const char* enabled = getenv("YZ_RSX_VALIDATION_CAPTURE");
+            const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
+            validation_capture = enabled && directory && *directory;
+            if (validation_capture) {
+                strncpy(validation_dir, directory,
+                        sizeof(validation_dir) - 1u);
+                validation_dir[sizeof(validation_dir) - 1u] = '\0';
+            }
+        }
+        /* The a010 file-lifetime gate is the authoritative scene boundary in
+         * clean production builds.  The older exact-mesh gate was useful for
+         * a geometry experiment but is not guaranteed to occur in every
+         * authored camera block, so using it for validation can miss the
+         * entire scene even while valid draws are being presented. */
+        if (validation_capture && validation_origin == UINT64_MAX &&
+            InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0) {
+            validation_origin = g_ld_flip_requested;
+            fprintf(stderr,
+                    "[validation-capture] a010 origin flip=%llu frame=%u\n",
+                    (unsigned long long)validation_origin, g_ld_frames);
+        }
+        if (validation_capture && validation_origin != UINT64_MAX) {
+            /* Scene-open itself is a 43-flip black/fade interval.  Preserve
+             * the original four-shot spacing after that measured lead-in so
+             * the promotion run lands on the outdoor ground, children,
+             * over-shoulder hair, and face close-up rather than the fade,
+             * sink, and pre-pickup phone shots. */
+            static const u64 offsets[] = {43, 128, 302, 316};
+            static const char* labels[] = {
+                "background-ground", "children-eyes", "hair", "face-eyes"
+            };
+            for (u32 i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+                const u64 requested = validation_origin + offsets[i];
+                if (!(validation_dumped & (1u << i)) &&
+                    g_ld_flip_requested >= requested) {
+                    char path[MAX_PATH * 2];
+                    snprintf(path, sizeof(path),
+                             "%s\\orphanage_gpu_%s_flip_%llu.ppm",
+                             validation_dir, labels[i],
+                             (unsigned long long)requested);
+                    const u64 nonblack =
+                        ld_dump_surface_ppm(path, &g.surfaces[target]);
+                    fprintf(stderr,
+                            "[validation-capture] label=%s requested_flip=%llu "
+                            "actual_flip=%llu frame=%u target=%u "
+                            "nonblack=%s%llu path=%s\n",
+                            labels[i], (unsigned long long)requested,
+                            (unsigned long long)g_ld_flip_requested,
+                            g_ld_frames, target,
+                            nonblack == UINT64_MAX ? "unknown:" : "",
+                            (unsigned long long)(
+                                nonblack == UINT64_MAX ? 0 : nonblack),
+                            path);
+                    validation_dumped |= 1u << i;
+                }
+            }
+        }
+    }
     /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
      * making the TRUE frame count measurable from the log. (The old hard cap
      * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
@@ -7310,6 +7674,11 @@ void rsx_live_draw_shutdown(void)
     if (g.white_tex) g.white_tex->lpVtbl->Release(g.white_tex);
     if (g.depth) g.depth->lpVtbl->Release(g.depth);
     if (g.ps_cb) g.ps_cb->lpVtbl->Release(g.ps_cb);
+    if (g.depth_snapshot_pso)
+        g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso);
+    if (g.depth_snapshot_rootsig)
+        g.depth_snapshot_rootsig->lpVtbl->Release(
+            g.depth_snapshot_rootsig);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
     if (g.swap) g.swap->lpVtbl->Release(g.swap);
     if (g_ld_info_queue) {

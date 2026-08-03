@@ -3770,10 +3770,16 @@ static void draw_csv_emit(sink_ctx* c, const rsx_dispatch* rsx, u32 target,
             file = fopen(path, "w");
             if (file) {
                 fprintf(file,
-                    "draw,surf,prim,verts,pso_key,blend,dtest,dwrite,dfunc,"
+                    "draw,surf,prim,verts,source_verts,decoded_hash,pso_key,"
+                    "blend,dtest,dwrite,dfunc,"
                     "cull,cullface,frontface,cmask,vpx,vpy,vpw,vph,"
                     "sclx,scly,sclz,trnx,trny,trnz,clipw,cliph,"
-                    "zeta_off,zeta_pitch,zeta_loc\n");
+                    "zeta_off,zeta_pitch,zeta_loc,"
+                    "attr0_hash,attr1_hash,attr2_hash,attr3_hash,"
+                    "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
+                    "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
+                    "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
+                    "active_attr_mask\n");
                 printf("[replay] RSX_DRAW_CSV ARMED: %s\n", path);
             } else {
                 printf("[replay] RSX_DRAW_CSV: cannot open %s\n", path);
@@ -3791,13 +3797,28 @@ static void draw_csv_emit(sink_ctx* c, const rsx_dispatch* rsx, u32 target,
     rsx_dsp_get_surface(rsx, &sf);
     const u32 surf =
         target < g.n_surfaces ? g.surfaces[target].offset : 0;
+    u64 attr_hash[16];
+    u32 active_attr_mask = 0;
+    for (u32 attr = 0; attr < 16; attr++) {
+        attr_hash[attr] = 1469598103934665603ull;
+        rsx_dsp_vertex_attr desc;
+        rsx_dsp_get_vertex_attr(rsx, attr, &desc);
+        if (desc.type && desc.size)
+            active_attr_mask |= 1u << attr;
+        for (u32 vertex = 0; vertex < c->n_verts; vertex++)
+            attr_hash[attr] = fnv1a(
+                c->verts[vertex].a[attr], 16u, attr_hash[attr]);
+    }
 
     fprintf(file,
-        "%u,0x%X,%u,%u,%016llx,"
+        "%u,0x%X,%u,%u,%u,%016llx,%016llx,"
         "%u,%u,%u,0x%X,%u,0x%X,0x%X,0x%08X,"
         "%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-        "%u,%u,0x%X,%u,%u\n",
-        c->draw_count, surf, prim, n_tri,
+        "%u,%u,0x%X,%u,%u",
+        c->draw_count, surf, prim, n_tri, c->n_verts,
+        (unsigned long long)fnv1a(
+            c->verts, c->n_verts * (u32)sizeof(*c->verts),
+            1469598103934665603ull),
         (unsigned long long)pso_key,
         rs.blend_enable, rs.depth_test, rs.depth_write, rs.depth_func,
         rs.cull_enable, rs.cull_face, rs.front_face, rs.color_mask,
@@ -3806,6 +3827,9 @@ static void draw_csv_emit(sink_ctx* c, const rsx_dispatch* rsx, u32 target,
         vp.translate[0], vp.translate[1], vp.translate[2],
         sf.clip_w, sf.clip_h, sf.zeta_offset, sf.zeta_pitch,
         sf.zeta_location);
+    for (u32 attr = 0; attr < 16; attr++)
+        fprintf(file, ",%016llx", (unsigned long long)attr_hash[attr]);
+    fprintf(file, ",0x%04X\n", active_attr_mask);
     fflush(file);
 }
 

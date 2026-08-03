@@ -1772,18 +1772,25 @@ extern "C" void vm_write_bytes(uint64_t a, const void* src, size_t n) { memcpy(g
           f"({n_encoding_skipped} skipped at generation)")
 
 
-def test_cooperative_worker_poll():
-    """The exact title loop gets the cooperative wait; neighboring code does not."""
+def test_cooperative_title_worker_wait():
+    """Only the exact title worker wait gets the equivalent cooperative form."""
     insns = [
         ppu_disasm.Instruction(
             addr=0x000C647C, mnemonic="lwz", operands="r4, 0(r29)"),
         ppu_disasm.Instruction(
+            addr=0x000C6480, mnemonic="cmpwi", operands="cr0, r4, 0"),
+        ppu_disasm.Instruction(
+            addr=0x000C6484, mnemonic="bne", operands="0x000C64A0"),
+        ppu_disasm.Instruction(
             addr=0x000C6488, mnemonic="dcbf", operands="r0, r29"),
+        ppu_disasm.Instruction(
+            addr=0x000C648C, mnemonic="addi", operands="r26, r26, -1"),
     ]
     lifter = PPULifter()
-    func = lifter.lift_function(insns, 0x000C5FAC, 0x000C648C)
+    func = lifter.lift_function(insns, 0x000C5FAC, 0x000C6490)
     body = "\n".join(func.body_lines)
     required = (
+        "while (vm_read32((uint32_t)ctx->gpr[29]) != 0)",
         "yz_ppu_cooperative_yield();",
         "goto loc_000C6488;",
         "loc_000C6488:",
@@ -1793,10 +1800,13 @@ def test_cooperative_worker_poll():
     control = PPULifter()
     control.header_name = "prx_recomp.h"
     control_func = control.lift_function(
-        insns, 0x000C5FAC, 0x000C648C)
-    if "yz_ppu_cooperative_yield" in "\n".join(control_func.body_lines):
+        insns, 0x000C5FAC, 0x000C6490)
+    control_body = "\n".join(control_func.body_lines)
+    if "yz_ppu_cooperative_yield" in control_body:
         failures += 1
-    print(f"[ppu-cooperative-poll] {'PASS' if failures == 0 else 'FAIL'}")
+    if "ctx->gpr[4] = vm_read32" not in control_body:
+        failures += 1
+    print(f"[ppu-cooperative-worker-wait] {'PASS' if failures == 0 else 'FAIL'}")
     return failures
 
 # ---------------------------------------------------------------------------
@@ -1853,7 +1863,7 @@ def main():
         sys.exit(0 if rc == 0 else 1)
 
     jt_fails = test_jump_table_sizing()
-    jt_fails += test_cooperative_worker_poll()
+    jt_fails += test_cooperative_title_worker_wait()
 
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
     epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")

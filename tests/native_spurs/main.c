@@ -25,6 +25,8 @@ static volatile int job_abi_ok;
 static volatile int job_hold;
 static volatile int job_entered;
 static volatile uint32_t job_dma_tag_seen_mask;
+static volatile int sub_qword_job_runs;
+static volatile int sub_qword_layout_ok;
 static volatile int poll_hold_entered;
 static volatile int poll_hold_release;
 static volatile int poll_workload_result;
@@ -45,6 +47,7 @@ static _Atomic int descriptor_snapshot_hook_count;
 static uint32_t descriptor_snapshot_hook_ea;
 static uint32_t descriptor_snapshot_replacement_ea;
 extern volatile uint32_t g_native_spurs_ppu_watch_hi;
+extern int cellSpursTestProductionMainStorageRange(uint32_t ea, uint64_t size);
 
 typedef struct EventWaitArgs {
     CellSpursEventFlag* flag;
@@ -305,6 +308,28 @@ static void synthetic_job(spu_context* ctx)
 #endif
         }
     }
+}
+
+static void synthetic_sub_qword_job(spu_context* ctx)
+{
+    static const uint32_t ls_offset[4] = {4u, 24u, 44u, 48u};
+    static const uint32_t input[4] = {
+        0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f000u
+    };
+    const uint32_t context_ls = ctx->gpr[3]._u32[0];
+    const uint32_t io_ls = be32(ctx->ls + context_ls);
+
+    sub_qword_layout_ok =
+        ctx->gpr[0]._u32[0] == 0x0a70 &&
+        context_ls == 0x4940 &&
+        ctx->ls[context_ls + 0x18] == 0 &&
+        ctx->ls[context_ls + 0x19] == 4;
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (be32(ctx->ls + io_ls + ls_offset[i]) != input[i])
+            sub_qword_layout_ok = 0;
+        put32(ctx->ls + io_ls + ls_offset[i], input[i] ^ 0xffffffffu);
+    }
+    ++sub_qword_job_runs;
 }
 
 static int wait_value(volatile int* value, int expected)
@@ -1056,6 +1081,67 @@ static int test_job_logical_binary_size(void)
     return 0;
 }
 
+static int test_job_sub_qword_dma_layout(void)
+{
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x68000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x69000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x69800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x6a000);
+    uint64_t* commands = (uint64_t*)(guest + 0x6d000);
+    uint8_t* descriptor = guest + 0x6e000;
+    uint8_t* binary = guest + 0x6f000;
+    uint8_t* data = guest + 0x70000;
+    uint8_t expected[0x80];
+    static const uint32_t data_offset[4] = {4u, 0x28u, 0x4cu, 0x70u};
+    static const uint32_t input[4] = {
+        0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f000u
+    };
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(descriptor, 0, 0x80);
+    memset(binary, 0x6b, 16);
+    memset(data, 0xa5, 0x80);
+    for (uint32_t i = 0; i < 4; ++i)
+        put32(data + data_offset[i], input[i]);
+    memcpy(expected, data, sizeof(expected));
+    for (uint32_t i = 0; i < 4; ++i)
+        put32(expected + data_offset[i], input[i] ^ 0xffffffffu);
+
+    put64(descriptor, 0x6f000);
+    put16(descriptor + 8, 1);
+    put16(descriptor + 0x0a, 32);
+    put32(descriptor + 0x10, 1);  /* publish the four in/out elements */
+    put32(descriptor + 0x14, 64); /* one 16-byte LS slot per element */
+    for (uint32_t i = 0; i < 4; ++i)
+        put64(descriptor + 0x30 + i * 8,
+              ((uint64_t)4 << 32) | (0x70000u + data_offset[i]));
+    put64(commands + 0, 0x6e000);
+    put64(commands + 1, 0x7f);
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(binary, 16), 16,
+              synthetic_sub_qword_job, "synthetic-job-sub-qword-dma"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x80, 1, priority, 1, 0,
+              1, 0, 0, 0x100, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    sub_qword_job_runs = 0;
+    sub_qword_layout_ok = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    CHECK(cellSpursJoinJobChain(jc) == 0);
+    CHECK(sub_qword_job_runs == 1);
+    CHECK(sub_qword_layout_ok);
+    CHECK(!memcmp(data, expected, sizeof(expected)));
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
 static int test_job_descriptor_snapshot(void)
 {
     CellSpurs* spurs = (CellSpurs*)(guest + 0x42000);
@@ -1547,6 +1633,14 @@ static int test_job_guest_range_validation(void)
     memset(spurs, 0, sizeof(*spurs));
     memset(list_jc, 0, sizeof(*list_jc));
     memset(desc_jc, 0, sizeof(*desc_jc));
+    /* The title places its chain and command list in sys_memory storage.
+     * This production-range classifier caught the regression where the
+     * safety check accepted only low ELF memory and PPU stacks. */
+    CHECK(cellSpursTestProductionMainStorageRange(0x4019ca80u, 8));
+    CHECK(cellSpursTestProductionMainStorageRange(0x4ffffff8u, 8));
+    CHECK(!cellSpursTestProductionMainStorageRange(0x4ffffffcu, 8));
+    CHECK(!cellSpursTestProductionMainStorageRange(0x20000000u, 8));
+    CHECK(!cellSpursTestProductionMainStorageRange(0xfffffffcu, 8));
     CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
     CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
 
@@ -1607,6 +1701,7 @@ int main(void)
         test_task_poll_workload_yield() ||
         test_task_event_queue() || test_spurs_queue_lock_order() ||
         test_job_logical_binary_size() ||
+        test_job_sub_qword_dma_layout() ||
         test_job_chain() || test_job_descriptor_snapshot() ||
         test_job_descriptor_stable_acquisition() ||
         test_job_barrier_snapshot() ||

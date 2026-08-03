@@ -59,6 +59,7 @@ int  rsx_live_draw_init(void* hwnd, u32 width, u32 height,
  * live initial context (optional; the live path can also just stream). */
 void rsx_live_draw_seed_registers(const u32* regs, u32 count);
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
+void rsx_live_draw_seed_transform_constants(const u32* words, u32 count);
 
 /* Register a scanout buffer from sys_rsx_context_attribute(0x104). A flip's
  * argument indexes this table; it is not necessarily the current render
@@ -121,6 +122,13 @@ int  rsx_live_draw_a010_probe_active(void);
  * live draw sink. AUTH playback uses this to avoid outrunning asynchronous
  * model submission while the scene is still visually empty. */
 int  rsx_live_draw_a010_world_ready(void);
+
+/* Offline differential-test hook.  Dumps one tracked render surface without
+ * changing its state/lifetime contract.  The production title never calls
+ * this; capture replay uses it to compare the live backend against the
+ * independent replay renderer at the same guest surface boundary. */
+int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
+                                      const char* path);
 
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);

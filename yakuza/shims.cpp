@@ -41,9 +41,9 @@
 
 extern "C" void yz_ppu_cooperative_yield(void)
 {
-    /* Keep very short worker completions cheap, then yield this logical CPU.
-     * The lifted guest loop otherwise performs up to 0x02000000 full VM reads
-     * before reaching its own 40-us backoff. */
+    /* The guest's worker wait is unbounded and its poll count is dead on
+     * completion.  Yield after a short processor-spin so the producer that
+     * clears the completion word can run without changing the wait condition. */
     for (unsigned i = 0; i < 64; ++i)
         YieldProcessor();
     SwitchToThread();
