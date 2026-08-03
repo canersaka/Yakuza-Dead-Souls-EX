@@ -9,6 +9,9 @@
 #include "../../runtime/spu/spu_workload.h"
 #include "../../runtime/spu/spu_job_dispatch.h"
 #include "../../runtime/memory/vm.h"
+#if !defined(YZ_SPURS_TEST_GUEST_SIZE)
+#include "../../runtime/syscalls/sys_vm.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +116,37 @@ static u32 guest_ea(const void* p)
         return (u32)((const u8*)p - vm_base);
     return (u32)(uintptr_t)p;
 }
+static int job_guest_range_in_window(u32 ea, u64 size, u32 base, u64 bytes)
+{
+    const u64 end = (u64)ea + size;
+    const u64 limit = (u64)base + bytes;
+    if (end > 0x100000000ull || limit > 0x100000000ull)
+        return 0;
+    if (size == 0)
+        return (u64)ea >= base && (u64)ea <= limit;
+    return (u64)ea >= base && end <= limit;
+}
+static int job_guest_range_in_fixed_main_storage(u32 ea, u64 size)
+{
+    /* These are PPU-addressable storage windows, not SPU local store or RSX
+     * local memory.  sys_memory commits its complete window during runtime
+     * initialization, so an EA there is safe to inspect even before the
+     * title's bump allocator has formally handed out the containing block. */
+    return job_guest_range_in_window(
+               ea, size, VM_MAIN_MEM_BASE, VM_MAIN_MEM_SIZE) ||
+           job_guest_range_in_window(
+               ea, size, VM_STACK_BASE, VM_STACK_REGION) ||
+           job_guest_range_in_window(
+               ea, size, 0x40000000u, 0x10000000ull) ||
+           job_guest_range_in_window(
+               ea, size, 0x50000000u, 0x00400000ull);
+}
+#if defined(YZ_SPURS_TEST_GUEST_SIZE)
+int cellSpursTestProductionMainStorageRange(u32 ea, u64 size)
+{
+    return job_guest_range_in_fixed_main_storage(ea, size);
+}
+#endif
 static int job_guest_range_valid(u32 ea, u64 size)
 {
     if (!vm_base) return 0;
@@ -121,18 +155,18 @@ static int job_guest_range_valid(u32 ea, u64 size)
 #if defined(YZ_SPURS_TEST_GUEST_SIZE)
     return end <= (u64)YZ_SPURS_TEST_GUEST_SIZE;
 #else
-    /* Job-chain commands, descriptors and DMA lists live in PPU main
-     * storage.  This runtime maps ordinary main memory and PPU stacks into
-     * separate guest-EA windows; both are valid MFC sources/targets. */
-    const u64 main_lo = VM_MAIN_MEM_BASE;
-    const u64 main_hi = main_lo + VM_MAIN_MEM_SIZE;
-    const u64 stack_lo = VM_STACK_BASE;
-    const u64 stack_hi = stack_lo + VM_STACK_REGION;
-    if (size == 0)
-        return (ea >= main_lo && ea <= main_hi) ||
-               (ea >= stack_lo && ea <= stack_hi);
-    return (ea >= main_lo && end <= main_hi) ||
-           (ea >= stack_lo && end <= stack_hi);
+    if (job_guest_range_in_fixed_main_storage(ea, size))
+        return 1;
+
+    /* sys_vm commits only each live mapping, so use its allocation records
+     * instead of accepting the complete reserved address window. */
+    for (int i = 0; i < SYS_VM_MAX; ++i) {
+        const sys_vm_map_info* mapping = &g_sys_vm_maps[i];
+        if (mapping->active && job_guest_range_in_window(
+                ea, size, mapping->addr, mapping->vsize))
+            return 1;
+    }
+    return 0;
 #endif
 }
 static int aligned(const void* p, uintptr_t n) { return ((uintptr_t)p & (n - 1)) == 0; }
@@ -2808,6 +2842,10 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
         u64 item = rd64(d + 0x30 + i * 8);
         u32 item_size = (u32)(item >> 32) & 0x7fffu;
         u32 item_ea = (u32)item;
+        const u32 item_flags = (u32)(item >> 32);
+        const u32 item_alignment = item_size < 16u ? item_size : 16u;
+        const u32 item_slot_size = (item_size + 15u) & ~15u;
+        const u32 item_ls_offset = io_offset + (item_ea & 15u);
         if (job_io_trace_index < 32u) {
             fprintf(stderr,
                     "[native-job-io] #%u get[%u] ea=%08X size=%X "
@@ -2815,10 +2853,16 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                     job_io_trace_index, i, item_ea, item_size,
                     item_size >= 4 ? rd32(vm_base + item_ea) : 0,
                     item_size >= 8 ? rd32(vm_base + item_ea + 4) : 0,
-                    io_ls + io_offset);
+                    io_ls + item_ls_offset);
         }
-        if (item_size > 0x4000 || io_offset + item_size > size_io ||
-            (item_size && !item_ea)) {
+        if (item_size > 0x4000u || (item_flags & 0x80000000u) ||
+            (item_size && !item_ea) ||
+            (item_size < 16u && item_size != 0u && item_size != 1u &&
+             item_size != 2u && item_size != 4u && item_size != 8u) ||
+            (item_alignment && (item_ea & (item_alignment - 1u))) ||
+            io_offset > size_io || item_slot_size > size_io - io_offset ||
+            (item_size && item_ls_offset + item_size >
+                              io_offset + item_slot_size)) {
             native_spu_context_free(ctx);
             return CELL_SPURS_JOB_ERROR_DESCRIPTOR;
         }
@@ -2826,9 +2870,24 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
             native_spu_context_free(ctx);
             return CELL_SPURS_JOB_ERROR_FAULT;
         }
-        if (item_size) memcpy(ctx->ls + io_ls + io_offset,
+        if (job_io_trace_enabled() && item_size && item_size < 16u) {
+            static atomic_uint sub_qword_trace_count;
+            const unsigned trace = atomic_fetch_add(
+                &sub_qword_trace_count, 1u);
+            if (trace < 64u) {
+                fprintf(stderr,
+                        "[native-job-subq] #%u desc=%08X bin=%08X "
+                        "item=%u ea=%08X size=%u slot=%05X payload=%05X\n",
+                        trace, descriptor_ea, bin_ea, i, item_ea, item_size,
+                        io_ls + io_offset, io_ls + item_ls_offset);
+            }
+        }
+        /* For sub-qword list elements, libspurs preserves the effective
+         * address low nibble in the element's 16-byte LS slot.  Jobs use
+         * that placement when resolving list pointers. */
+        if (item_size) memcpy(ctx->ls + io_ls + item_ls_offset,
                               vm_base + item_ea, item_size);
-        io_offset = (io_offset + item_size + 15u) & ~15u;
+        io_offset += item_slot_size;
     }
 
     memcpy(ctx->ls + descriptor_ls, d, descriptor_size);
@@ -2872,15 +2931,17 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
         for (u32 i = 0; i < io_count; ++i) {
             const u64 item = rd64(d + 0x30 + i * 8);
             const u32 item_size = (u32)(item >> 32) & 0x7fffu;
+            const u32 item_ea = (u32)item;
+            const u32 item_ls_offset = io_offset + (item_ea & 15u);
             fprintf(stderr,
                     "[native-job-io] #%u done[%u] ok=%d pc=%05X "
                     "ls0=%08X ls4=%08X desc10=%08X guest10=%08X\n",
                     job_io_trace_index, i, ok, ctx->pc,
-                    item_size >= 4 ? rd32(ctx->ls + io_ls + io_offset) : 0,
-                    item_size >= 8 ? rd32(ctx->ls + io_ls + io_offset + 4) : 0,
+                    item_size >= 4 ? rd32(ctx->ls + io_ls + item_ls_offset) : 0,
+                    item_size >= 8 ? rd32(ctx->ls + io_ls + item_ls_offset + 4) : 0,
                     rd32(ctx->ls + descriptor_ls + 0x10),
                     rd32(guest_descriptor + 0x10));
-            io_offset = (io_offset + item_size + 15u) & ~15u;
+            io_offset += (item_size + 15u) & ~15u;
         }
     }
 
@@ -2889,20 +2950,24 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
         for (u32 i = 0; i < io_count; ++i) {
             u64 item = rd64(d + 0x30 + i * 8);
             u32 item_size = (u32)(item >> 32) & 0x7fffu;
+            const u32 item_ea = (u32)item;
+            const u32 item_ls_offset = io_offset + (item_ea & 15u);
             if (item_size)
-                job_publish_copy((u32)item, ctx->ls + io_ls + io_offset, item_size);
+                job_publish_copy(item_ea,
+                                 ctx->ls + io_ls + item_ls_offset,
+                                 item_size);
             if (job_io_trace_index < 32u && item_size) {
                 const u32 guest_hash =
-                    job_io_trace_hash(vm_base + (u32)item, item_size);
+                    job_io_trace_hash(vm_base + item_ea, item_size);
                 const u32 ls_hash = job_io_trace_hash(
-                    ctx->ls + io_ls + io_offset, item_size);
+                    ctx->ls + io_ls + item_ls_offset, item_size);
                 fprintf(stderr,
                         "[native-job-io] #%u publish[%u] match=%u "
                         "guest=%08X ls=%08X\n",
                         job_io_trace_index, i, guest_hash == ls_hash,
                         guest_hash, ls_hash);
             }
-            io_offset = (io_offset + item_size + 15u) & ~15u;
+            io_offset += (item_size + 15u) & ~15u;
         }
     }
     native_spu_context_free(ctx);

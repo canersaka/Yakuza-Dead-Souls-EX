@@ -199,6 +199,24 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND rsx_fp_despecialization_tests
         )
 
+        # Manual capture differential: feeds one RXS frame through the exact
+        # production live renderer.  It is intentionally not a CTest because
+        # the title capture is a large, local, untracked oracle.
+        add_executable(rsx_live_replay
+            libs/video/tests/live_replay_main.c
+        )
+        target_include_directories(rsx_live_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_live_replay PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_link_libraries(rsx_live_replay PRIVATE
+            ps3recomp_runtime
+            d3d12 dxgi d3dcompiler user32 gdi32
+        )
+
         find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
         add_test(
             NAME ppu_lifter_conformance

@@ -439,19 +439,20 @@ class PPULifter:
                         except ValueError:
                             pass
 
-        # The main title's scene manager waits for a parallel worker record to
-        # clear by rereading the same word up to 0x02000000 times before a
-        # 40-us backoff. The poll counter is local and dead once the word
-        # clears, so preserve the observed flag transition while yielding the
-        # host execution resource between reads. Keep this address- and
-        # image-exact: similarly shaped loops elsewhere may expose their poll
-        # counts or require different ordering.
-        cooperative_worker_poll = (
+        # This title worker wait is logically unbounded: it rereads the same
+        # completion word, and every 0x02000000 unsuccessful reads performs a
+        # 40-us backoff before restarting the counter.  The counter is dead
+        # when the word clears.  Emitting those guest reads literally can
+        # monopolize a host core long enough to starve the producer that must
+        # clear the word.  Preserve the only observable exit condition and
+        # make each unsuccessful read cooperative.  Keep this image-, function-
+        # and instruction-exact; no other poll loop inherits the substitution.
+        cooperative_worker_wait = (
             self.header_name == "ppu_recomp.h" and
             start == 0x000C5FAC and
             any(insn.addr == 0x000C647C for insn in window)
         )
-        if cooperative_worker_poll:
+        if cooperative_worker_wait:
             internal_targets.add(0x000C6488)
 
         for insn in window:
@@ -466,7 +467,7 @@ class PPULifter:
             if self.trace:
                 func.body_lines.append(f"    ppu_trace_pc(ctx, 0x{insn.addr:X});")
 
-            if cooperative_worker_poll and insn.addr == 0x000C647C:
+            if cooperative_worker_wait and insn.addr == 0x000C647C:
                 func.body_lines.extend([
                     "    while (vm_read32((uint32_t)ctx->gpr[29]) != 0)",
                     "        yz_ppu_cooperative_yield();",
