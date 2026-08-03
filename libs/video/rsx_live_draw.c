@@ -117,7 +117,9 @@ extern volatile LONG g_yz_a010_root_active;
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
 #define SHADER_DISK_CACHE_MAGIC   0x43535A59u /* "YZSC" */
-#define SHADER_DISK_CACHE_VERSION 1u
+/* v2: OP_KIL now emits discard (was a dropped TODO) — cached v1 pixel
+ * shaders would silently keep the old no-discard codegen. */
+#define SHADER_DISK_CACHE_VERSION 2u
 #define SHADER_DISK_CACHE_MAX_BLOB (4u * 1024u * 1024u)
 
 #define SRV_WHITE        0
@@ -1128,6 +1130,24 @@ int rsx_live_draw_enabled(void)
 #define M_FRONT_FACE         0x1834
 #define M_CULL_FACE_ENABLE   0x183C
 #define M_COLOR_MASK         0x0324
+/* Stencil + scissor (raw NV4097 offsets, same convention as above; RPCS3
+ * gcm_enums.h consulted as a read-only numbering oracle). */
+#define M_STENCIL_TEST_ENABLE 0x0328
+#define M_STENCIL_MASK        0x032C
+#define M_STENCIL_FUNC        0x0330
+#define M_STENCIL_FUNC_REF    0x0334
+#define M_STENCIL_FUNC_MASK   0x0338
+#define M_STENCIL_OP_FAIL     0x033C
+#define M_STENCIL_OP_ZFAIL    0x0340
+#define M_STENCIL_OP_ZPASS    0x0344
+#define M_TWO_SIDED_STENCIL   0x0348
+#define M_BACK_STENCIL_FUNC   0x0350
+#define M_BACK_STENCIL_OP_FAIL  0x035C
+#define M_BACK_STENCIL_OP_ZFAIL 0x0360
+#define M_BACK_STENCIL_OP_ZPASS 0x0364
+#define M_SCISSOR_HORIZONTAL  0x08C0
+#define M_SCISSOR_VERTICAL    0x08C4
+#define M_ZSTENCIL_CLEAR      0x1D8C
 
 static D3D12_COMPARISON_FUNC gcm_cmp(u32 f)
 {
@@ -1180,6 +1200,12 @@ typedef struct {
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
+    /* Stencil is PSO state in D3D12, so it lives here and feeds the PSO key
+     * like every other field. The reference value is dynamic
+     * (OMSetStencilRef) and deliberately NOT part of this struct. */
+    u32 stencil_enable, stencil_two_sided;
+    u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
+    u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } render_state_t;
 
 static void decode_render_state(render_state_t* rs)
@@ -1209,6 +1235,34 @@ static void decode_render_state(render_state_t* rs)
      * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
      * reset default (0x01010101), so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(&g.rsx, M_COLOR_MASK);
+    rs->stencil_enable    = rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1;
+    rs->stencil_two_sided = rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1;
+    rs->s_func       = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC);
+    rs->s_func_mask  = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_MASK) & 0xFF;
+    rs->s_write_mask = rsx_dsp_reg(&g.rsx, M_STENCIL_MASK) & 0xFF;
+    rs->s_fail       = rsx_dsp_reg(&g.rsx, M_STENCIL_OP_FAIL);
+    rs->s_zfail      = rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZFAIL);
+    rs->s_zpass      = rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZPASS);
+    rs->bs_func      = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_FUNC);
+    rs->bs_fail      = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_FAIL);
+    rs->bs_zfail     = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_ZFAIL);
+    rs->bs_zpass     = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_ZPASS);
+}
+
+/* GL stencil-op enums (the NV4097 payload) -> D3D12. Zero (never seeded by
+ * the game before first use) and GL_KEEP both map to KEEP. */
+static D3D12_STENCIL_OP gcm_stencil_op(u32 op)
+{
+    switch (op) {
+    case 0x0000: return D3D12_STENCIL_OP_ZERO;      /* GL_ZERO */
+    case 0x1E01: return D3D12_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D12_STENCIL_OP_INCR_SAT;  /* GL_INCR (clamped) */
+    case 0x1E03: return D3D12_STENCIL_OP_DECR_SAT;  /* GL_DECR (clamped) */
+    case 0x150A: return D3D12_STENCIL_OP_INVERT;
+    case 0x8507: return D3D12_STENCIL_OP_INCR;      /* GL_INCR_WRAP */
+    case 0x8508: return D3D12_STENCIL_OP_DECR;      /* GL_DECR_WRAP */
+    case 0x1E00: default: return D3D12_STENCIL_OP_KEEP;
+    }
 }
 
 static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
@@ -1250,7 +1304,26 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
         pd->DepthStencilState.DepthWriteMask =
             rs->depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         pd->DepthStencilState.DepthFunc = gcm_cmp(rs->depth_func);
-        pd->DepthStencilState.StencilEnable = FALSE;
+        if (rs->stencil_enable) {
+            pd->DepthStencilState.StencilEnable    = TRUE;
+            pd->DepthStencilState.StencilReadMask  = (UINT8)rs->s_func_mask;
+            pd->DepthStencilState.StencilWriteMask = (UINT8)rs->s_write_mask;
+            pd->DepthStencilState.FrontFace.StencilFunc = gcm_cmp(rs->s_func);
+            pd->DepthStencilState.FrontFace.StencilFailOp = gcm_stencil_op(rs->s_fail);
+            pd->DepthStencilState.FrontFace.StencilDepthFailOp = gcm_stencil_op(rs->s_zfail);
+            pd->DepthStencilState.FrontFace.StencilPassOp = gcm_stencil_op(rs->s_zpass);
+            /* Two-sided off: nv40 applies the front state to both faces. */
+            if (rs->stencil_two_sided) {
+                pd->DepthStencilState.BackFace.StencilFunc = gcm_cmp(rs->bs_func);
+                pd->DepthStencilState.BackFace.StencilFailOp = gcm_stencil_op(rs->bs_fail);
+                pd->DepthStencilState.BackFace.StencilDepthFailOp = gcm_stencil_op(rs->bs_zfail);
+                pd->DepthStencilState.BackFace.StencilPassOp = gcm_stencil_op(rs->bs_zpass);
+            } else {
+                pd->DepthStencilState.BackFace = pd->DepthStencilState.FrontFace;
+            }
+        } else {
+            pd->DepthStencilState.StencilEnable = FALSE;
+        }
     }
 }
 
@@ -2939,6 +3012,18 @@ static u64 ld_hash_structural_render_state(
     LD_HASH_RENDER_FIELD(cull_face);
     LD_HASH_RENDER_FIELD(front_face);
     LD_HASH_RENDER_FIELD(color_mask);
+    LD_HASH_RENDER_FIELD(stencil_enable);
+    LD_HASH_RENDER_FIELD(stencil_two_sided);
+    LD_HASH_RENDER_FIELD(s_func);
+    LD_HASH_RENDER_FIELD(s_func_mask);
+    LD_HASH_RENDER_FIELD(s_write_mask);
+    LD_HASH_RENDER_FIELD(s_fail);
+    LD_HASH_RENDER_FIELD(s_zfail);
+    LD_HASH_RENDER_FIELD(s_zpass);
+    LD_HASH_RENDER_FIELD(bs_func);
+    LD_HASH_RENDER_FIELD(bs_fail);
+    LD_HASH_RENDER_FIELD(bs_zfail);
+    LD_HASH_RENDER_FIELD(bs_zpass);
 #undef LD_HASH_RENDER_FIELD
     return hash;
 }
@@ -5888,8 +5973,29 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         (LONG)(g.surfaces[target].w ? g.surfaces[target].w : g.width),
         (LONG)(g.surfaces[target].h ? g.surfaces[target].h : g.height)
     };
+    /* Guest scissor, intersected with the surface rect. The nv40 reset value
+     * is a full-window 4096x4096 (never-written regs read 0 here, which the
+     * w==0 test treats as "no scissor"), so ordinary streams keep the old
+     * full-surface rect and only genuine game scissors narrow it. */
+    {
+        const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+        const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+        const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
+        const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
+        if (sw > 0 && svh > 0) {
+            if (sx > sc.left)            sc.left   = sx;
+            if (sy > sc.top)             sc.top    = sy;
+            if (sx + sw  < sc.right)     sc.right  = sx + sw;
+            if (sy + svh < sc.bottom)    sc.bottom = sy + svh;
+            if (sc.right  < sc.left)     sc.right  = sc.left;
+            if (sc.bottom < sc.top)      sc.bottom = sc.top;
+        }
+    }
     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    /* Dynamic stencil reference (kept out of the PSO key on purpose). */
+    g.list->lpVtbl->OMSetStencilRef(
+        g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
@@ -6074,8 +6180,16 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
-            clear_flags, 1.0f, 0, 0, NULL);
+        /* ZSTENCIL_CLEAR_VALUE (Z24S8 layout: depth24 << 8 | stencil8; nv40
+         * reset 0xFFFFFF00 = depth 1.0, stencil 0 — so never-written streams
+         * keep the old hardcoded behaviour). Previously decoded upstream but
+         * discarded here: every guest depth clear forced 1.0/0. */
+        {
+            const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
+            const float cd = (float)(zs >> 8) / 16777215.0f;
+            g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+                clear_flags, zs ? cd : 1.0f, (UINT8)(zs & 0xFFu), 0, NULL);
+        }
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
             if (mask & RSX_CLEAR_DEPTH) {
