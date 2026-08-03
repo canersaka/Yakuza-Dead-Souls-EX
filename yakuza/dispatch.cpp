@@ -1302,6 +1302,25 @@ static void yz_mwply_probe_dispatch(uint32_t target, yz_ppu_fn fn, ppu_context* 
 
 extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
 {
+    /* The generated table contains lifter artifacts outside any mappable code
+     * window (entries at 0x0/0x7C/... and at 0xFExxxxxx-0xFFFFFFxx, the latter
+     * shadowing the import fake-key range). A corrupted or null bctr target
+     * that matches one would execute unrelated lifted code and every downstream
+     * crash would be attributed to the wrong function. Valid guest code is
+     * 4-aligned inside the game module (< 0x02000000) or the lifted PRX window
+     * (0x02200000-0x03000000); everything else resolves to "unknown" so it
+     * reaches the no-host-function net with the true target in the report. */
+    if ((guest_addr & 3u) || guest_addr < 0x10000u ||
+        (guest_addr >= 0x02000000u &&
+         (guest_addr < 0x02200000u || guest_addr >= 0x03000000u))) {
+        static long rejected = 0;
+        long n = _InterlockedIncrement(&rejected);
+        if (n <= 8)
+            fprintf(stderr,
+                    "[dispatch] rejected out-of-range guest target 0x%08X "
+                    "(#%ld; not game/PRX code)\n", guest_addr, n);
+        return nullptr;
+    }
     unsigned lo = 0, hi = g_yz_func_count;
     while (lo < hi) {
         unsigned mid = lo + (hi - lo) / 2;

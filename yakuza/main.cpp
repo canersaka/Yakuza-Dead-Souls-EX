@@ -703,6 +703,7 @@ static void guest_caller(uint32_t opd_addr,
 extern "C" volatile LONG g_yz_a010_root_active;
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
+    yz_thread_adopt_host("vblank");
     /* YZ_VBL_DIV=N (s21, H4 discriminator): divide the vblank rate by N so a
      * ~5-7 FPS boot sees ~2 vblanks/frame (what a 30fps title expects) instead
      * of 8-12. A/B lever for the flip-label stall: if the stall vanishes or
@@ -2758,6 +2759,7 @@ extern "C" void yz_rsx_fifo_release(void);
 extern "C" int  yz_rsx_flip_pending_any(void);
 static DWORD WINAPI yz_flip_advance(LPVOID)
 {
+    yz_thread_adopt_host("flip-advance");
     const uint32_t FIFO_BASE = 0x40400000u;   /* bufdesc+0x14 io base */
     const uint32_t RING_LO = 0x1000u, RING_HI = 0x800000u;
     const uint32_t FLIP_CMD = 0x0004E944u;    /* NV DRIVER_QUEUE flip method, count 1 */

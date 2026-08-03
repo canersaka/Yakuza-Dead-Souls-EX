@@ -1370,6 +1370,11 @@ static uint32_t       g_rsx_dispbuf_count;
  * the label before the stream writes 0xFFFFFFFF (avoids a clear/redirty race).
  * The vblank tick then presents the head's buffer + clears the label. */
 static volatile long g_rsx_flip_pending[8];
+/* Running count of flips manufactured by the SEMARM release-arm heuristic
+ * (see NV406E SEMAPHORE_RELEASE below). Nonzero means frame-timing numbers
+ * from this run include uncommanded presents. */
+extern "C" volatile long g_yz_semarm_count;
+volatile long g_yz_semarm_count = 0;
 static uint32_t      g_rsx_queued_head = 1;   /* head of the last GCM_DRIVER_QUEUE */
 
 /* Real RSX command translator (libs/video/rsx_commands.c): the consumer
@@ -2684,6 +2689,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
  * HWND and takes over presentation (the null GDI present is suppressed). */
 static DWORD WINAPI yz_window_thread(LPVOID)
 {
+    yz_thread_adopt_host("window");
     if (rsx_null_backend_init(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {
         fprintf(stderr, "[rsx] window init failed\n");
         return 1;
@@ -3400,12 +3406,32 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
          * bump + FLIP event). Kill-switch YZ_NO_SEMARM for the retirement A/B;
          * flip the default to OFF once measured redundant. */
         if (addr == RSX_REPORTS + 0x10 && arg != 0) {
-            static int nsa = -1; if (nsa < 0) { nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
+            /* Measurement integrity: while this heuristic is on, every arm it
+             * performs is a present the guest did not command, so frame-timing
+             * numbers include manufactured flips. Perf lanes therefore default
+             * it OFF (YZ_SEMARM=1 forces it back for an A/B); normal boots
+             * keep the historical default ON until a visible boot validates
+             * retirement. Every effective arm (prev==0) is counted and kept
+             * visible so any timing run can state its phantom-flip footprint. */
+            static int nsa = -1; if (nsa < 0) {
+#if defined(YZ_PERF_CLEAN)
+                nsa = getenv("YZ_SEMARM") ? 0 : 1;
+#else
+                nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
+#endif
                 fprintf(stderr, "[semarm] armed (release-arm heuristic %s)\n",
-                        nsa ? "DISABLED by YZ_NO_SEMARM" : "on"); fflush(stderr); }
+                        nsa ? "DISABLED" : "on"); fflush(stderr); }
             if (!nsa) {
                 LONG prev = InterlockedExchange(
                     &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+                if (prev == 0) {
+                    long n = _InterlockedIncrement(&g_yz_semarm_count);
+                    if (n <= 4 || (n & 0xFF) == 0) {
+                        fprintf(stderr, "[semarm] manufactured flip arm "
+                                "total=%ld\n", n);
+                        fflush(stderr);
+                    }
+                }
                 if (yz_ft_on())
                     yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
             }
@@ -6498,6 +6524,7 @@ extern "C" { void (*g_yz_usleep_pump)(void) = 0; }
 
 static DWORD WINAPI yz_rsx_consumer(LPVOID)
 {
+    yz_thread_adopt_host("rsx-consumer");
     yz_rsx_fifo_lock_ensure();
     fprintf(stderr,
             "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model) "
