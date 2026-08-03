@@ -157,6 +157,38 @@ def main():
     # firmware-free bridge can bind its independent context-aware contract.
     nid2name[0x3A33C1FD] = "_cellGcmFunc15"
 
+    # sys_net exports its BSD socket entry points under the classic bare
+    # names (REG_FNID(sys_net, "socket", ...), "bind", "connect", ... -- see
+    # RPCS3 Emu/Cell/Modules/sys_net_.cpp), so the game's import NIDs hash
+    # those literal strings. Our host implementation in
+    # libs/network/sysNet.c instead uses a sys_net_bnet_* prefix (matching
+    # LV2's internal syscall names) to avoid colliding with the platform
+    # socket()/bind()/connect()/... functions it wraps. Without this alias
+    # every one of these NIDs falls through as an unresolved 0x-named stub
+    # (CELL_ENOSYS) even though the real implementation exists right below.
+    SYS_NET_NAME_ALIASES = {
+        "socket":       "sys_net_bnet_socket",
+        "bind":         "sys_net_bnet_bind",
+        "listen":       "sys_net_bnet_listen",
+        "accept":       "sys_net_bnet_accept",
+        "connect":      "sys_net_bnet_connect",
+        "send":         "sys_net_bnet_send",
+        "sendto":       "sys_net_bnet_sendto",
+        "recv":         "sys_net_bnet_recv",
+        "recvfrom":     "sys_net_bnet_recvfrom",
+        "shutdown":     "sys_net_bnet_shutdown",
+        "socketclose":  "sys_net_bnet_close",
+        "setsockopt":   "sys_net_bnet_setsockopt",
+        "getsockopt":   "sys_net_bnet_getsockopt",
+        "getsockname":  "sys_net_bnet_getsockname",
+        "socketpoll":   "sys_net_bnet_poll",
+        "socketselect": "sys_net_bnet_select",
+        "inet_aton":    "sys_net_bnet_inet_aton",
+        "gethostbyname":"sys_net_bnet_gethostbyname",
+    }
+    for exported_name, impl_name in SYS_NET_NAME_ALIASES.items():
+        nid2name[compute_nid(exported_name)] = impl_name
+
     imports = []   # (module, nid, name_or_None, slot_vaddr)
     nvar_total = 0
     off = v2o(libstubstart)
