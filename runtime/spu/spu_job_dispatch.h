@@ -158,6 +158,7 @@ static inline int spu_job_descriptor_slot(int image)
         case 39: return 0;
         case 40: return 2;
         case 41: return 0;
+        case 42: return 3;
         case 43: return 1;
         case 44: return 4;
         case 45: return 3;
