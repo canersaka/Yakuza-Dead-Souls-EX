@@ -153,6 +153,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * depth-only pass's garbage FP output (the blue-character class). */
     rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
 
+    /* NV40 reset state is counter-clockwise front winding.  Leaving this
+     * register zero made a live stream that relied on the hardware default
+     * cull the exterior of orphanage meshes, while captured replay was correct
+     * because its seeded register image already contained 0x901. */
+    rsx->regs[M_FRONT_FACE >> 2] = 0x0901u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);

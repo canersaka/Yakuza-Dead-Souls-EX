@@ -12,6 +12,7 @@
 #define M_VTXFMT           0x1740u
 #define M_VTX_ATTR_4F      0x1C00u
 #define M_FREQUENCY_DIV    0x1FC0u
+#define M_FRONT_FACE       0x1834u
 
 typedef struct test_memory {
     u8 bytes[4096];
@@ -76,6 +77,14 @@ static int float4_bits_equal(const float left[4], const float right[4])
         if (float_bits(left[component]) != float_bits(right[component]))
             return 0;
     return 1;
+}
+
+static void test_dispatch_reset_defaults(void)
+{
+    rsx_dispatch rsx;
+    rsx_dispatch_init(&rsx, NULL);
+    CHECK(rsx_dsp_reg(&rsx, M_FRONT_FACE) == 0x0901u,
+          "NV40 reset front-face winding is counter-clockwise");
 }
 
 static void set_attr(
@@ -635,6 +644,7 @@ static void test_vertex_reference_remap(void)
 
 int main(void)
 {
+    test_dispatch_reset_defaults();
     test_layout();
     test_formats();
     test_compact_matches_full_legacy_layout();
