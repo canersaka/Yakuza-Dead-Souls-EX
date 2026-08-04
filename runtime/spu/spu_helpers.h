@@ -869,21 +869,21 @@ static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
 /* xswd (ISA v1.2 p96): per doubleword, sign-extend the word in the RIGHT
  * slot -- the value stays in the right word, the sign fill goes in the left.
- * Per the LE-host sub-lane convention at lines 866-867 (same as xsbh/xshw
- * above), the right/low-order word of pair (2*i, 2*i+1) lives at _u32[2*i];
- * the left word (sign fill) lives at _u32[2*i+1].
- * The old `_s64[i] = (int32_t)_s32[2*i]` was wrong (sourced the left word
- * AND placed value/sign swapped); caught RED by tools/test_spu_lift.py
- * 2026-07-03 (61 live sites incl. the codec). A later revision fixed the
- * source word but re-swapped which slot got the value vs. the sign fill
- * (_s32[2*i+1] as source, fill into 2*i) -- still backwards against the
- * xsbh/xshw convention; corrected here 2026-08-03 per
- * test_spu_helpers.c's xswd case. */
+ * LANE CAVEAT, and why this helper keeps regressing: the sub-lane rule at
+ * lines 866-867 applies to sub-lanes WITHIN one host-endian value (bytes in
+ * a halfword, halfwords in a word). WORDS are not sub-lanes: u128 stores
+ * _u32[i] = SPU word i in SPU order, so the RIGHT word of doubleword i is
+ * _u32[2*i+1] (the HIGHER index), and the left/sign-fill word is _u32[2*i].
+ * The lifter conformance suite (extend family, cases derived from the ISA
+ * vectors) is the authority here; test_spu_helpers.c's earlier expectation
+ * was built with make128()'s host-endian u64 packing, which scrambles word
+ * lanes for asymmetric vectors and briefly "justified" the swapped form on
+ * 2026-08-03. */
 static inline u128 spu_xswd(u128 a) {
     u128 r;
     for (int i = 0; i < 2; i++) {
-        r._u32[2*i]   = a._u32[2*i];
-        r._u32[2*i+1] = (a._s32[2*i] < 0) ? 0xFFFFFFFFu : 0u;
+        r._u32[2*i]   = (a._s32[2*i+1] < 0) ? 0xFFFFFFFFu : 0u;
+        r._u32[2*i+1] = a._u32[2*i+1];
     }
     return r;
 }

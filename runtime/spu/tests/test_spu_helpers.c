@@ -374,9 +374,17 @@ static void test_sign_extend(void) {
     TEST("xshw: sign-extend low halfword of each word");
     EXPECT_EQ(spu_xshw(spu_il(0x0000FFFE)), spu_il((int32_t)0xFFFFFFFE));
 
-    TEST("xswd: sign-extend low word of each dword to 64-bit");
-    u128 in_xswd = make128(0x00000000FFFFFFFFULL, 0x000000007FFFFFFFULL);
-    u128 expected_xswd = make128(0xFFFFFFFFFFFFFFFFULL, 0x000000007FFFFFFFULL);
+    TEST("xswd: sign-extend right word of each dword (explicit SPU lanes)");
+    /* make128() packs host-endian u64s and scrambles word lanes for
+     * asymmetric vectors (its own comment warns about this) -- build the
+     * vector by explicit SPU word index instead. ISA p96: value = right
+     * word (_u32[2i+1]), sign fill = left word (_u32[2i]); matches the
+     * lifter conformance extend-family vectors. */
+    u128 in_xswd, expected_xswd;
+    in_xswd._u32[0] = 0x00000000u; in_xswd._u32[1] = 0xFFFFFFFFu;
+    in_xswd._u32[2] = 0x12345678u; in_xswd._u32[3] = 0x7FFFFFFFu;
+    expected_xswd._u32[0] = 0xFFFFFFFFu; expected_xswd._u32[1] = 0xFFFFFFFFu;
+    expected_xswd._u32[2] = 0x00000000u; expected_xswd._u32[3] = 0x7FFFFFFFu;
     EXPECT_EQ(spu_xswd(in_xswd), expected_xswd);
 }
 
