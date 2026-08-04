@@ -1273,8 +1273,60 @@ static int64_t yz_sc_abort_report(ppu_context* ctx)
     return 0;
 }
 
+/* Effect-pool slot watch symbols live in libs/spurs/cellSpurs.c so every
+ * binary that links the runtime (standalone tests included) resolves the
+ * ppu_memory.h hook; only the env arming and the poll thread are runner-side. */
+extern "C" int g_yz_effslot_watch;
+
+/* Poll-based slot watch: the store-hook variant caught nothing because the
+ * slot writers bypass vm_write* (altivec guest memcpy and SPU DMA both land
+ * as raw host memcpy). Polling the window at ~1 ms catches every channel and
+ * timestamps creation order plus any transient value in slot 2. */
+static DWORD WINAPI yz_effslot_poll_thread(LPVOID)
+{
+    extern uint8_t* vm_base;
+    yz_thread_adopt_host("effslot-poll");
+    auto rd = [](const uint8_t* p) -> uint32_t {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | p[3];
+    };
+    uint32_t mgr_last = 0, last[12] = {0};
+    fprintf(stderr, "[effslot-poll] ARMED mgr-global=0x14EC864 @1ms "
+            "(slot window follows mgr+0x230)\n");
+    fflush(stderr);
+    for (;;) {
+        uint32_t mgr = rd(vm_base + 0x14EC864u);
+        if (mgr != mgr_last) {
+            fprintf(stderr, "[effslot-poll] t=%lu MGR 0x%08X -> 0x%08X\n",
+                    (unsigned long)GetTickCount(), mgr_last, mgr);
+            fflush(stderr);
+            mgr_last = mgr;
+            memset(last, 0, sizeof(last));
+        }
+        if (mgr >= 0x10000u && mgr < 0xE0000000u) {
+            for (int i = 0; i < 12; i++) {
+                uint32_t v = rd(vm_base + mgr + 0x230u + i * 4u);
+                if (v != last[i]) {
+                    fprintf(stderr,
+                            "[effslot-poll] t=%lu slot[%d] 0x%08X -> 0x%08X\n",
+                            (unsigned long)GetTickCount(), i, last[i], v);
+                    fflush(stderr);
+                    last[i] = v;
+                }
+            }
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+
 extern "C" void yz_init_syscalls(void)
 {
+    g_yz_effslot_watch = getenv("YZ_EFFSLOT_WATCH") ? 1 : 0;
+    if (g_yz_effslot_watch)
+        fprintf(stderr, "[effslot] ARMED (slot array 0x604EC1B0+0x30)\n");
+    if (getenv("YZ_EFFSLOT_POLL"))
+        CreateThread(NULL, 0, yz_effslot_poll_thread, NULL, 0, NULL);
     lv2_register_all_syscalls(&g_lv2_syscalls);
     lv2_syscall_register(&g_lv2_syscalls, 988, yz_sc_abort_report);
 

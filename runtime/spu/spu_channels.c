@@ -6230,6 +6230,28 @@ void spu_indirect_branch(spu_context* ctx)
                             fflush(stderr);
                         }
                     }
+                } else {
+                    /* Unrecognized job launch: no catalog entry for this
+                     * (image, entry, eaBinary) triple. Execution continues on
+                     * whatever residency is already mapped -- historically
+                     * silent, which turned every uncatalogued binary a new
+                     * scene streams into a downstream mystery (stale code
+                     * runs, outputs corrupt or never publish). Loud so a
+                     * single boot enumerates every gap. */
+                    static volatile long unknown_n = 0;
+                    const unsigned long n = (unsigned long)
+                        _InterlockedIncrement(&unknown_n);
+                    if (n <= 64u || (n & (n - 1u)) == 0u) {
+                        fprintf(stderr,
+                                "[job-descriptor-UNKNOWN] n=%lu spu=%X "
+                                "image=%d entry=%05X eaBinary=%08X "
+                                "(slot=%d span=%05X) -- uncatalogued job "
+                                "binary, running stale residency\n",
+                                n, ctx->spu_id, ctx->image_id, jpc,
+                                binary_ea, descriptor_slot,
+                                descriptor_span);
+                        fflush(stderr);
+                    }
                 }
             }
             /* a010's orphanage job can take SPURS' shared-residency fast path
