@@ -1196,8 +1196,13 @@ s32 _cellSpursSendSignal(CellSpursTaskset* object, CellSpursTaskId id)
 {
     TasksetState* ts = taskset_find(object);
     if (!ts) return CELL_SPURS_TASK_ERROR_STAT;
-    if (id >= 128 || !ts->tasks[id].thread_valid) return CELL_SPURS_TASK_ERROR_NOENT;
+    if (id >= 128) return CELL_SPURS_TASK_ERROR_NOENT;
     mx_lock(&ts->sync.mutex);
+    /* S10: the architected gate is the GUEST enabled bitset, and the signal
+     * latches into the guest signalled bitset regardless of host thread
+     * bookkeeping — a task id snapshotted by a producer must not lose its
+     * wake because the host TaskState was recycled in between. Host condvar
+     * wake stays best-effort. */
     ts->tasks[id].signalled = 1;
     task_bit(object, 0x40, id, 1);
     cv_wake_all(&ts->sync.cond);
@@ -1571,6 +1576,12 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
     wr16(bits, got);
     wr16(ef->bytes + 0x04, 0);
     /* Q2-B: no [0x08] bit was set on entry, so none is cleared here. */
+    /* S4: a Set racing our raw-bits exit may have read ppuWaitMask before
+     * we zeroed it and completed delivery after — leaving ppuPendingRecv=1
+     * with nobody waiting, which would turn EVERY later Wait into BUSY at
+     * the entry gate (permanent). We are the only PPU waiter; any pending
+     * delivery was ours, so consume the marker on the way out. */
+    ef->bytes[0x07] = 0;
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
@@ -1685,7 +1696,11 @@ static void lfqueue_signal_one_waiter(const QueueState* q, const void* object,
         if (!ts || task_id >= CELL_SPURS_MAX_TASK) continue;
         mx_lock(&ts->sync.mutex);
         TaskState* task = &ts->tasks[task_id];
-        if (task->thread_valid && !task->complete && task->waiting) {
+        /* S2(i): the signal is LATCHED — never gate on task->waiting. The
+         * SPU consumer publishes its wait token BEFORE entering SPURS
+         * WAITING; a push in that window used to find waiting==0, skip the
+         * slot, and drop the wake permanently (textbook lost wakeup). */
+        if (task->thread_valid && !task->complete) {
             task->signalled = 1;
             task_bit(ts->sync.key, 0x40, task_id, 1);
             cv_wake_all(&ts->sync.cond);
@@ -1817,10 +1832,16 @@ s32 _cellSpursLFQueueInitialize(void* owner, CellSpursLFQueue* q, const void* b,
 static int spurs_queue_snapshot(const QueueState* q, const void* object,
                                 u32* head, u32* tail, u32* count)
 {
-    const s32 raw_head = (s32)rd32((const u8*)object + 0x00);
-    const s32 raw_tail = (s32)rd32((const u8*)object + 0x04);
+    s32 raw_head = (s32)rd32((const u8*)object + 0x00);
+    s32 raw_tail = (s32)rd32((const u8*)object + 0x04);
     const u32 period = q->depth * 2;
-    if (raw_head < 0 || raw_tail < 0) return 0; /* peer has a reservation */
+    /* Q1-C (firmware oracle, libsre @0x02016A8C/0x02016B78): a NEGATIVE
+     * pointer word is the one's-complement "peer parked here" encoding, not
+     * a transient reservation — the real value is ~v. Treating it as
+     * retry-later made every push/pop spin forever once an SPU-side peer
+     * parked (the GET==PUT presents-frozen wedge shape). */
+    if (raw_head < 0) raw_head = (s32)~(u32)raw_head;
+    if (raw_tail < 0) raw_tail = (s32)~(u32)raw_tail;
     if ((u32)raw_head >= period || (u32)raw_tail >= period) return -1;
     *head = (u32)raw_head;
     *tail = (u32)raw_tail;
@@ -1919,24 +1940,25 @@ static s32 spurs_queue_pop(QueueState* q, void* object, void* data,
                 queue_notify_range_locked(object, 128);
             }
             spu_lockline_unlock();
-            /* Mirror of the push-side wake (see spurs_queue_push): a
-             * producer task parked on a FULL queue registered itself in the
-             * object's waiter record; the full->not-full transition must
-             * signal it. Spurious signals are safe — SPURS task signals are
-             * latched and wait loops re-check their predicates. */
+            /* Producer wake on the full->not-full edge. S1 (firmware oracle
+             * cellSpursQueuePopBody @0x02016F40/0x02016F58/0x02016F5C): the
+             * PRODUCER waiter record lives at bytes 0x30/0x31/0x51 — a
+             * separate record from the consumer's 0x20/0x21/0x41 the push
+             * side reads. Spurious signals are safe (latched; predicates
+             * re-checked). */
             if (!peek) {
                 const u8* obj = (const u8*)object;
-                if (count == q->depth && obj[0x20]) {
+                if (count == q->depth && obj[0x30]) {
                     const u64 ts_ea = rd64(obj + 0x60);
                     if (ts_ea && vm_base) {
                         _cellSpursSendSignal(
                             (CellSpursTaskset*)(vm_base + (u32)ts_ea),
-                            obj[0x21]);
+                            obj[0x31]);
                         static _Atomic long pwake_n = 0;
                         long pn = atomic_fetch_add(&pwake_n, 1) + 1;
                         if (pn <= 8 || (pn & (pn - 1)) == 0)
                             diag("queue-pop-wake-producer", object,
-                                 ((u64)(u32)pn << 32) | obj[0x21]);
+                                 ((u64)(u32)pn << 32) | obj[0x31]);
                     }
                 }
             }
@@ -2815,8 +2837,12 @@ static void job_publish_u32(u32 ea, u32 value)
 
 static int job_return_syscall(spu_context* ctx, void* opaque)
 {
-    (void)ctx;
     (void)opaque;
+    /* S9: drain the job's outstanding MFC transfers before run_job publishes
+     * the output areas and frees the context — the task-side scheduler
+     * handoffs do exactly this so a wait cannot expose a partial context;
+     * job exit needs the same barrier or a late PUT races publication. */
+    spu_task_wait_all_dma(ctx);
     return -1;
 }
 
@@ -3088,8 +3114,16 @@ static int wait_guard(JobChainState* jc, u32 guard_ea)
     const int parked = g->count && !atomic_load(&jc->shutdown);
     if (parked)
         spurs_set_workload_runnable(jc->spurs, jc->wid, 0);
-    while (g->count && !atomic_load(&jc->shutdown))
-        cv_wait(&g->sync.cond, &g->sync.mutex);
+    while (g->count && !atomic_load(&jc->shutdown)) {
+        /* S5: re-sync the mirror from guest each wake and wait BOUNDED — a
+         * lifted-SPU putllc decrement doesn't signal this condvar, and this
+         * was the only untimed guest-dependent wait left (a lost decrement
+         * became a permanent jobchain stall instead of 2 ms latency). */
+        const u32 live = rd32((const u8*)g->sync.key + 0x00);
+        if (live != g->count) { g->count = live; continue; }
+        cv_wait_ms(&g->sync.cond, &g->sync.mutex, 2u);
+        g->count = rd32((const u8*)g->sync.key + 0x00);
+    }
     if (!g->count && g->auto_reset) {
         g->count = g->original;
         job_publish_u32(guest_ea(g->sync.key), g->count);
@@ -3416,7 +3450,15 @@ static int execute_chain(JobChainState* jc)
             pc += 8; jobchain_set_current(jc, pc); continue;
         }
         if (op == 7) {
-            if (ext == 127) return CELL_OK;                    /* END */
+            if (ext == 127) {                                  /* END */
+                /* Q4-A (Job-Reference p.55): the command pointer STOPS at the
+                 * END word; a later cellSpursRunJobChain resumes scanning
+                 * from it, not from jobChainEntry. Rewinding re-executed
+                 * stale commands on circular streams the PPU patches and
+                 * re-kicks, so the freshly published head was never run. */
+                jobchain_set_current(jc, pc);
+                return CELL_OK;
+            }
             if (ext == 119) { if (!jobchain_pop_call(jc, &pc)) return CELL_SPURS_JOB_ERROR_UNKNOWN_CMD;
                               jobchain_set_current(jc, pc);
                               continue; } /* RET */
@@ -3440,6 +3482,11 @@ static void jobchain_reset_run_locked(JobChainState* jc)
 {
     jobchain_clear_queued_snapshots(jc);
     jc->pending_snapshot_sequence = 0;
+    /* Q4-A REVERTED (measured): resuming a re-run from the parked END PC
+     * resurrected the original missing-output crash — this game re-runs its
+     * chain after appending commands and expects a fresh scan from the
+     * entry. The END command still records its PC (observability), but a
+     * re-run restarts here. */
     jc->current_ea = jc->entry_ea;
     jc->call_depth = 0;
     jc->command_snapshot_count = 0;
@@ -3588,10 +3635,24 @@ s32 cellSpursJobGuardNotify(CellSpursJobGuard* object)
     JobGuardState* g = jobguard_find(object);
     if (!g) return CELL_SPURS_JOB_ERROR_STAT;
     mx_lock(&g->sync.mutex);
-    if (!g->count) { mx_unlock(&g->sync.mutex); return CELL_SPURS_JOB_ERROR_STAT; }
-    --g->count;
-    job_publish_u32(guest_ea(object), g->count);
-    int released = !g->count;
+    /* S5 (firmware oracle cellSpursJobGuardNotify @0x02018104: lwarx/stwcx
+     * on guard[0x00]): the decrement must be an atomic on GUEST memory, not
+     * a blind write-back of a host mirror — an SPU-side putllc decrement
+     * landing between our read and store was silently overwritten and the
+     * guard never released. Decrement under the lockline, re-derive the
+     * host mirror from the result. */
+    spu_lockline_lock();
+    u32 live = rd32(object->bytes + 0x00);
+    if (!live) {
+        spu_lockline_unlock();
+        mx_unlock(&g->sync.mutex);
+        return CELL_SPURS_JOB_ERROR_STAT;
+    }
+    live--;
+    job_publish_u32(guest_ea(object), live);
+    spu_lockline_unlock();
+    g->count = live;
+    int released = !live;
     if (released) cv_wake_all(&g->sync.cond);
     mx_unlock(&g->sync.mutex);
     return CELL_OK;
