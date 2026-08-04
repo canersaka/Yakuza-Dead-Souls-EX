@@ -160,6 +160,21 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
             uint32_t addr, uint32_t val, uint32_t guest_pc);
         yz_a010_reltrace_ppu_store(addr, val, 0u);
     }
+    /* Effect-pool slot watch (env YZ_EFFSLOT_WATCH; Akiyama/Hana null-slot
+     * hunt). The manager at [0x14EC864] = 0x604EBF80 is deterministic for
+     * the autostart boot; its object-slot array lives at +0x230. Log every
+     * scalar store into it with the host return address so the creation
+     * (or deliberate null store) site can be named. */
+#ifdef PS3RECOMP_NATIVE_SPURS_PPU_WATCH
+    {
+        extern int g_yz_effslot_watch;
+        if (g_yz_effslot_watch && (addr - 0x604EC1B0u) < 0x30u) {
+            extern void yz_effslot_log(uint32_t addr, unsigned long long val,
+                                       void* ra, int width);
+            yz_effslot_log(addr, val, _ReturnAddress(), 32);
+        }
+    }
+#endif
     /* a010 object-batch source probe. Restrict it to mapped RSX command
      * arenas and headers whose method span contains a draw command. */
     if (addr >= 0x40400000u && addr < 0x43000000u &&
@@ -261,6 +276,16 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
             yz_slotstore_log(addr, val, 64, _ReturnAddress());
         }
     }
+#ifdef PS3RECOMP_NATIVE_SPURS_PPU_WATCH
+    {
+        extern int g_yz_effslot_watch;
+        if (g_yz_effslot_watch && addr < 0x604EC1E0u && addr + 8u > 0x604EC1B0u) {
+            extern void yz_effslot_log(uint32_t addr, unsigned long long val,
+                                       void* ra, int width);
+            yz_effslot_log(addr, val, _ReturnAddress(), 64);
+        }
+    }
+#endif
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 8);

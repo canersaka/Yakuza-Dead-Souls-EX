@@ -33,6 +33,15 @@ static void mx_lock(nmutex* m) { EnterCriticalSection(m); }
 static void mx_unlock(nmutex* m) { LeaveCriticalSection(m); }
 static void cv_init(ncond* c) { InitializeConditionVariable(c); }
 static void cv_wait(ncond* c, nmutex* m) { SleepConditionVariableCS(c, m, INFINITE); }
+/* Bounded wait for parks whose wake depends on OBSERVING a guest-memory
+ * store. Lifted vector (stvx) stores and raw lifted-PRX memcpys bypass the
+ * vm_write* notify hook, so a producer can append a jobchain command without
+ * ever signalling the watcher. A timed re-check converts that missed notify
+ * from a permanent park (the Akiyama/Hana effect-stream hang) into bounded
+ * latency; predicates are re-read on every wake, so spurious wakeups are
+ * harmless. Remove when the relift emits notifying stores for all widths. */
+static void cv_wait_ms(ncond* c, nmutex* m, unsigned ms)
+{ SleepConditionVariableCS(c, m, ms); }
 static void cv_wake_all(ncond* c) { WakeAllConditionVariable(c); }
 static void cv_wake_one(ncond* c) { WakeConditionVariable(c); }
 static void nthread_yield(void) { SwitchToThread(); }
@@ -62,6 +71,15 @@ static void mx_lock(nmutex* m) { pthread_mutex_lock(m); }
 static void mx_unlock(nmutex* m) { pthread_mutex_unlock(m); }
 static void cv_init(ncond* c) { pthread_cond_init(c, NULL); }
 static void cv_wait(ncond* c, nmutex* m) { pthread_cond_wait(c, m); }
+static void cv_wait_ms(ncond* c, nmutex* m, unsigned ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    ts.tv_sec += ms / 1000u + ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    pthread_cond_timedwait(c, m, &ts);
+}
 static void cv_wake_all(ncond* c) { pthread_cond_broadcast(c); }
 static void cv_wake_one(ncond* c) { pthread_cond_signal(c); }
 static void nthread_yield(void) { sched_yield(); }
@@ -646,7 +664,8 @@ static int task_syscall(spu_context* ctx, void* opaque)
             task_bit(ts->sync.key, 0x50, t->id, 1);
             taskset_refresh_runnable_locked(ts);
             while (!t->signalled && !ts->shutdown)
-                cv_wait(&ts->sync.cond, &ts->sync.mutex);
+                /* Timed: lifted-SPU signalers bypass the HLE wake (cv_wait_ms). */
+                cv_wait_ms(&ts->sync.cond, &ts->sync.mutex, 2u);
             t->signalled = 0;
             task_bit(ts->sync.key, 0x40, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 0);
@@ -1509,7 +1528,9 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
     atomic_thread_fence(memory_order_release);
 
     while (!ef->bytes[0x07] && !event_ready(rd16(ef->bytes), mask, mode))
-        cv_wait(&sync->cond, &sync->mutex);
+        /* Timed: lifted-SPU tasks set flag bytes via guest memory/MFC
+         * atomics without waking this HLE condvar (cv_wait_ms). */
+        cv_wait_ms(&sync->cond, &sync->mutex, 2u);
 
     u16 got;
     if (ef->bytes[0x07]) {
@@ -1815,7 +1836,9 @@ static s32 spurs_queue_push(QueueState* q, void* object, const void* data,
             mx_unlock(&q->sync.mutex);
             return CELL_SPURS_TASK_ERROR_AGAIN;
         }
-        cv_wait(&q->sync.cond, &q->sync.mutex);
+        /* Timed: the peer side may be lifted SPU code mutating the guest
+         * object without an HLE wake (cv_wait_ms). */
+        cv_wait_ms(&q->sync.cond, &q->sync.mutex, 2u);
     }
 }
 
@@ -1851,7 +1874,9 @@ static s32 spurs_queue_pop(QueueState* q, void* object, void* data,
             mx_unlock(&q->sync.mutex);
             return CELL_SPURS_TASK_ERROR_AGAIN;
         }
-        cv_wait(&q->sync.cond, &q->sync.mutex);
+        /* Timed: the peer side may be lifted SPU code mutating the guest
+         * object without an HLE wake (cv_wait_ms). */
+        cv_wait_ms(&q->sync.cond, &q->sync.mutex, 2u);
     }
 }
 
@@ -1935,7 +1960,9 @@ static s32 lf_queue_push(QueueState* q, void* object, const void* data,
             mx_unlock(&q->sync.mutex);
             return CELL_SPURS_TASK_ERROR_AGAIN;
         }
-        cv_wait(&q->sync.cond, &q->sync.mutex);
+        /* Timed: the peer side may be lifted SPU code mutating the guest
+         * object without an HLE wake (cv_wait_ms). */
+        cv_wait_ms(&q->sync.cond, &q->sync.mutex, 2u);
     }
 }
 
@@ -3037,7 +3064,9 @@ static int wait_job_slot(JobChainState* jc, u32 pc, u64 empty_command)
         spurs_set_workload_runnable(jc->spurs, jc->wid, 0);
     while (jc->waiting_command && rd64(vm_base + pc) == empty_command &&
            !atomic_load(&jc->shutdown))
-        cv_wait(&jc->sync.cond, &jc->sync.mutex);
+        /* Timed: the producer's append may be an un-notified lifted vector
+         * store (see cv_wait_ms). Every wake re-reads the slot. */
+        cv_wait_ms(&jc->sync.cond, &jc->sync.mutex, 4u);
     if (parked && !atomic_load(&jc->shutdown))
         spurs_set_workload_runnable(jc->spurs, jc->wid, 1);
     if (jc->waiting_command && !atomic_load(&jc->shutdown)) {
@@ -3104,6 +3133,20 @@ static int jobchain_pop_call(JobChainState* jc, u32* return_ea)
     }
     mx_unlock(&jc->sync.mutex);
     return ok;
+}
+
+/* Effect-pool slot watch (runtime/ppu/ppu_memory.h hook; Akiyama/Hana
+ * null-object hunt). Defined here so every runtime-linking binary resolves
+ * the symbols; armed by the game runner via YZ_EFFSLOT_WATCH. */
+int g_yz_effslot_watch = 0;
+void yz_effslot_log(u32 addr, unsigned long long val, void* ra, int width)
+{
+    static _Atomic long effslot_n = 0;
+    long i = atomic_fetch_add(&effslot_n, 1) + 1;
+    if (i > 64 && (i & 0x3F)) return;
+    fprintf(stderr, "[effslot] #%ld ea=0x%08X w%d val=0x%llX host=%p\n",
+            i, addr, width, val, ra);
+    fflush(stderr);
 }
 
 void cellSpursDumpNativeJobChains(const char* tag)

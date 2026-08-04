@@ -1310,9 +1310,10 @@ extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
      * 4-aligned inside the game module (< 0x02000000) or the lifted PRX window
      * (0x02200000-0x03000000); everything else resolves to "unknown" so it
      * reaches the no-host-function net with the true target in the report. */
+    /* PRX window: the native gate lifts firmware PRX at 0x0220xxxx+, the LLE
+     * oracle at 0x0200xxxx+ — accept the union [0x02000000, 0x03000000). */
     if ((guest_addr & 3u) || guest_addr < 0x10000u ||
-        (guest_addr >= 0x02000000u &&
-         (guest_addr < 0x02200000u || guest_addr >= 0x03000000u))) {
+        guest_addr >= 0x03000000u) {
         static long rejected = 0;
         long n = _InterlockedIncrement(&rejected);
         if (n <= 8)

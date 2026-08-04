@@ -4209,6 +4209,50 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
         }
     }
 
+    /* Effect-manager chain at fault time (the Akiyama/Hana null-getter
+     * crash): the global at 0x14EC864, the object slot the crashing walk
+     * reads ([mgr+0x230..0x25F]), and — if the +0x23C object is live — its
+     * vtable slot 0x28 OPD. Names which link is null/garbage without a
+     * debugger attach. */
+    {
+        extern uint8_t* vm_base;
+        auto rd_ok = [](uint32_t a) { return a >= 0x00010000u && a < 0xE0000000u; };
+        #define addr_readable rd_ok
+        uint32_t mgr = vm_read32(0x14EC864u);
+        fprintf(stderr, "\n[crash] effect-mgr @0x14EC864 = 0x%08X", mgr);
+        if (mgr && addr_readable(mgr + 0x260u)) {
+            fprintf(stderr, "\n[crash] effect-mgr +0x230:");
+            for (uint32_t off = 0x230; off < 0x260; off += 4)
+                fprintf(stderr, " %08X", vm_read32(mgr + off));
+            uint32_t obj = vm_read32(mgr + 0x23Cu);
+            if (obj && addr_readable(obj + 0x30u)) {
+                uint32_t vt = vm_read32(obj);
+                fprintf(stderr, "\n[crash] effect-obj 0x%08X vt=0x%08X", obj, vt);
+                if (vt && addr_readable(vt + 0x2Cu)) {
+                    uint32_t opd = vm_read32(vt + 0x28u);
+                    fprintf(stderr, " opd@0x28=0x%08X", opd);
+                    if (opd && addr_readable(opd + 8u))
+                        fprintf(stderr, " code=0x%08X toc=0x%08X",
+                                vm_read32(opd), vm_read32(opd + 4u));
+                }
+            }
+        }
+        #undef addr_readable
+    }
+
+    /* Every thread parked in a syscall at fault time, with age. A creation
+     * pipeline stalled for minutes shows up here as one ancient wait. */
+    {
+        fprintf(stderr, "\n[crash] parked syscalls (tid num a3 a4 a5 age_ms):");
+        for (uint32_t tid = 1; tid < 256; tid++) {
+            uint32_t num, age; uint64_t a3, a4, a5;
+            if (yz_wait_get(tid, &num, &a3, &a4, &a5, &age))
+                fprintf(stderr, "\n    t%u sc%u 0x%llX 0x%llX 0x%llX %ums",
+                        tid, num, (unsigned long long)a3,
+                        (unsigned long long)a4, (unsigned long long)a5, age);
+        }
+    }
+
     fprintf(stderr, "\n[crash] recent indirect targets:");
     extern uint32_t g_yz_last_targets[16];
     extern unsigned g_yz_last_idx;
