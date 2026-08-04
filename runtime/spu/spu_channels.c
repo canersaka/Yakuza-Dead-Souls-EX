@@ -6176,7 +6176,15 @@ void spu_indirect_branch(spu_context* ctx)
              * below.  Clearing overlapping records is required: Job A, Job B,
              * Job D, and the orphanage worker reuse shared slots.
              */
-            if (family && jpc >= 0x04880u) {
+            /* image_id == 13 gate (matches the sibling blocks above/below): a
+             * real job launch is a bisl FROM the job module. Without the gate
+             * every computed branch job code takes past 0x4880 (e.g. the
+             * shared Duff's-device qword-memset tail at base+0x90C, ~half a
+             * million times per scene) is misparsed as a launch record — r4
+             * there is a destination pointer, not a descriptor — and a stale
+             * r4 whose +4 word matched a catalogued EA could memcpy over live
+             * LS code. */
+            if (family && ctx->image_id == 13 && jpc >= 0x04880u) {
                 const uint32_t record =
                     ctx->gpr[4]._u32[0] & SPU_LS_MASK;
                 const uint32_t binary_ea =

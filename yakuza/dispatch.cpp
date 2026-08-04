@@ -1300,8 +1300,36 @@ static void yz_mwply_probe_dispatch(uint32_t target, yz_ppu_fn fn, ppu_context* 
     }
 }
 
+/* Frontier probe (Akiyama/Hana): every resolution of the crashing getter
+ * returns this wrapper instead, so ANY invocation path (indirect dispatch,
+ * OPD fallback, yz_call_guest_opd, probes) is covered. Logs the first
+ * null-this calls with the host caller and walk registers, then proceeds
+ * (and faults) so the crash dump stays comparable. */
+static void yz_fcfa20_trap(ppu_context* ctx)
+{
+    if ((uint32_t)ctx->gpr[3] == 0u) {
+        static long hits = 0;
+        if (_InterlockedIncrement(&hits) <= 3) {
+            fprintf(stderr,
+                    "[nullthis] getter this=0 host-ra=%p lr=0x%08llX "
+                    "r4=0x%08llX r5=0x%08llX r27=0x%08llX r29=0x%08llX "
+                    "r30=0x%08llX r31=0x%08llX\n",
+                    _ReturnAddress(), (unsigned long long)ctx->lr,
+                    (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5],
+                    (unsigned long long)ctx->gpr[27],
+                    (unsigned long long)ctx->gpr[29],
+                    (unsigned long long)ctx->gpr[30],
+                    (unsigned long long)ctx->gpr[31]);
+            fflush(stderr);
+        }
+    }
+    func_00FCFA20(ctx);
+}
+
 extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
 {
+    if (guest_addr == 0x00FCFA20u) return yz_fcfa20_trap;
     /* The generated table contains lifter artifacts outside any mappable code
      * window (entries at 0x0/0x7C/... and at 0xFExxxxxx-0xFFFFFFxx, the latter
      * shadowing the import fake-key range). A corrupted or null bctr target
@@ -3946,6 +3974,47 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         return;
     }
 
+    /* Frontier probe: the Akiyama/Hana crash is the getter func_00FCFA20
+     * invoked with this==0 (lr keeps 0x001A9B68 across the tail-jump, so the
+     * true call site is unknown). Trap it pre-fault and dump the walker's
+     * register file plus the static-list neighborhoods the crash regs point
+     * into (r23-r27 cluster around 0x015BCxxx) so the null's SOURCE address
+     * can be identified and then watched under both backends. */
+    if (target == 0x00FCFA20u && (uint32_t)ctx->gpr[3] == 0u) {
+        static long hits = 0;
+        if (_InterlockedIncrement(&hits) <= 3) {
+            fprintf(stderr, "[nullthis] getter 0x00FCFA20 this=0 lr=0x%08llX\n",
+                    (unsigned long long)ctx->lr);
+            for (int r = 0; r < 32; r += 4)
+                fprintf(stderr, "[nullthis] r%-2d %016llX %016llX %016llX %016llX\n",
+                        r,
+                        (unsigned long long)ctx->gpr[r],
+                        (unsigned long long)ctx->gpr[r+1],
+                        (unsigned long long)ctx->gpr[r+2],
+                        (unsigned long long)ctx->gpr[r+3]);
+            for (int r = 20; r < 32; r++) {
+                uint32_t base = (uint32_t)ctx->gpr[r];
+                if (base >= 0x10000u && base < 0xD0000000u && !(base & 3u)) {
+                    fprintf(stderr, "[nullthis] mem[r%d=0x%08X]:", r, base);
+                    for (uint32_t off = 0; off < 0x40u; off += 4)
+                        fprintf(stderr, " %08X", vm_read32(base + off));
+                    fprintf(stderr, "\n");
+                }
+            }
+            /* Guest back-chain: name the real caller past the stale lr. */
+            uint32_t sp = (uint32_t)ctx->gpr[1];
+            for (int f = 0; f < 8 && sp >= 0xD0000000u && sp < 0xE0000000u; f++) {
+                uint32_t next = vm_read32(sp);
+                uint32_t ret  = vm_read32(sp + 0x14u) ? vm_read32(sp + 0x14u)
+                                                      : vm_read32(sp + 0x10u);
+                fprintf(stderr, "[nullthis] frame%d sp=0x%08X ret~0x%08X\n",
+                        f, sp, ret);
+                if (next <= sp) break;
+                sp = next;
+            }
+            fflush(stderr);
+        }
+    }
     uint32_t resolved_code = target;
     yz_ppu_fn fn = yz_lookup_func(target);
     /* TOC repair: a gcm callback invoked by its bare code address (target is a

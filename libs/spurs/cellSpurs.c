@@ -1458,6 +1458,26 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
         }
     }
     wr16(ef->bytes + 0x02, (u16)(rd16(ef->bytes + 0x02) | pending));
+    /* Q2-A (contract audit; rpcs3 cellSpurs.cpp:3354-3370): a PPU waiter
+     * registers via ppuWaitMask[0x04] + ppuWaitSlotAndMode[0x06], NOT the
+     * task slot table walked above. Deliver to it explicitly: latch the got
+     * bits into its receive slot, raise ppuPendingRecv[0x07], clear the
+     * mask, and count the bits consumed so CLEAR_AUTO cannot lose the
+     * delivery to a racing task-slot consumer inside the waiter's poll gap. */
+    {
+        const u16 ppu_mask = rd16(ef->bytes + 0x04);
+        if (ppu_mask && !ef->bytes[0x07]) {
+            const u32 ppu_slot = ef->bytes[0x06] >> 4;
+            const int ppu_mode = ef->bytes[0x06] & 0x0F;
+            if (event_ready(events, ppu_mask, ppu_mode)) {
+                const u16 got = (u16)(events & ppu_mask);
+                wr16(ef->bytes + 0x30 + ppu_slot * 2, got);
+                ef->bytes[0x07] = 1;
+                wr16(ef->bytes + 0x04, 0);
+                consumed |= got;
+            }
+        }
+    }
     if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) events &= (u16)~consumed;
     wr16(ef->bytes, events);
     for (u32 slot = 0; slot < 16; ++slot) {
@@ -1519,8 +1539,14 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
             return CELL_SPURS_TASK_ERROR_BUSY;
         }
         slot = 15 - low_slot;
-        used |= (u16)(1u << low_slot);
-        wr16(ef->bytes + 0x08, used);
+        /* Q2-B (contract audit vs rpcs3 cellSpurs.cpp:3552-3567): the PPU
+         * waiter records its slot ONLY in ppuWaitSlotAndMode[0x06]; it must
+         * NOT set a bit in spuTaskUsedWaitSlots[0x08]. A phantom used bit
+         * with a zero spuTaskWaitMask[0x10+slot*2] makes the SPU-side
+         * firmware Set treat the slot as an always-satisfied task waiter
+         * and _cellSpursSendSignal task id 0 on every Set — spurious wakes
+         * for an unrelated task, and our own Set's used&~pending scan
+         * misroutes deliveries. */
     }
     ef->bytes[0x06] = (u8)((slot << 4) | mode);
     ef->bytes[0x07] = 0;
@@ -1544,9 +1570,7 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
     }
     wr16(bits, got);
     wr16(ef->bytes + 0x04, 0);
-    if (ef->bytes[0x0e] == CELL_SPURS_EVENT_FLAG_ANY2ANY)
-        wr16(ef->bytes + 0x08,
-             (u16)(rd16(ef->bytes + 0x08) & ~(0x8000u >> slot)));
+    /* Q2-B: no [0x08] bit was set on entry, so none is cleared here. */
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
@@ -1827,6 +1851,36 @@ static s32 spurs_queue_push(QueueState* q, void* object, const void* data,
                                       q->element_size);
             queue_notify_range_locked(object, 128);
             spu_lockline_unlock();
+            /* Firmware contract (libsre cellSpursQueuePushBody @0x02016BF8-
+             * 0x02016C90): on the empty->non-empty transition, a consumer
+             * task that parked itself in the queue object (has-waiter flag
+             * at +0x20, task id at +0x21, workload id at +0x41, taskset EA
+             * at +0x60) receives _cellSpursSendSignal. The lifted SPU-side
+             * queue routine writes that record before entering WAIT_SIGNAL;
+             * without the signal the consumer sleeps forever while the
+             * producer's memory looks perfectly intact (the Akiyama/Hana
+             * effect-stream null-object crash). */
+            {
+                const u8* obj = (const u8*)object;
+                if (count == 0 && obj[0x20]) {
+                    const u64 ts_ea = rd64(obj + 0x60);
+                    if (ts_ea && vm_base) {
+                        _cellSpursSendSignal(
+                            (CellSpursTaskset*)(vm_base + (u32)ts_ea),
+                            obj[0x21]);
+                        static _Atomic long wake_n = 0;
+                        long wn = atomic_fetch_add(&wake_n, 1) + 1;
+                        if (wn <= 8 || (wn & (wn - 1)) == 0)
+                            diag("queue-push-wake-consumer", object,
+                                 ((u64)(u32)wn << 32) | obj[0x21]);
+                    } else {
+                        static _Atomic long nots_n = 0;
+                        if (atomic_fetch_add(&nots_n, 1) < 8)
+                            diag("queue-push-waiter-no-taskset", object,
+                                 obj[0x41]);
+                    }
+                }
+            }
             cv_wake_all(&q->sync.cond);
             mx_unlock(&q->sync.mutex);
             return CELL_OK;
@@ -1865,6 +1919,27 @@ static s32 spurs_queue_pop(QueueState* q, void* object, void* data,
                 queue_notify_range_locked(object, 128);
             }
             spu_lockline_unlock();
+            /* Mirror of the push-side wake (see spurs_queue_push): a
+             * producer task parked on a FULL queue registered itself in the
+             * object's waiter record; the full->not-full transition must
+             * signal it. Spurious signals are safe — SPURS task signals are
+             * latched and wait loops re-check their predicates. */
+            if (!peek) {
+                const u8* obj = (const u8*)object;
+                if (count == q->depth && obj[0x20]) {
+                    const u64 ts_ea = rd64(obj + 0x60);
+                    if (ts_ea && vm_base) {
+                        _cellSpursSendSignal(
+                            (CellSpursTaskset*)(vm_base + (u32)ts_ea),
+                            obj[0x21]);
+                        static _Atomic long pwake_n = 0;
+                        long pn = atomic_fetch_add(&pwake_n, 1) + 1;
+                        if (pn <= 8 || (pn & (pn - 1)) == 0)
+                            diag("queue-pop-wake-producer", object,
+                                 ((u64)(u32)pn << 32) | obj[0x21]);
+                    }
+                }
+            }
             cv_wake_all(&q->sync.cond);
             mx_unlock(&q->sync.mutex);
             return CELL_OK;
