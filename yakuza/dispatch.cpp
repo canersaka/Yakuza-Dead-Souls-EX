@@ -1327,9 +1327,52 @@ static void yz_fcfa20_trap(ppu_context* ctx)
     func_00FCFA20(ctx);
 }
 
+/* Frontier probe: mesh-build entry (vtable slot +0xC of the loader class).
+ * Logs the GSGM source blob state on entry so the mesh-id=-1 failure can be
+ * attributed: blob magic != 'GSGM' => the decompress/extract stage upstream
+ * delivered garbage; magic OK on every call => suspect the 4096-entry
+ * resource handle table (leak/exhaustion) instead. */
+static void yz_meshbuild_trap(ppu_context* ctx)
+{
+    static long calls = 0;
+    long n = _InterlockedIncrement(&calls);
+    const uint32_t self = (uint32_t)ctx->gpr[3];
+    uint32_t blob = 0, magic = 0, raw120 = 0;
+    if (addr_readable(self + 0x140u)) {
+        blob   = vm_read32(self + 0x11Cu);
+        raw120 = vm_read32(self + 0x120u);
+        if (blob && addr_readable(blob + 4u)) magic = vm_read32(blob);
+    }
+    const int bad = (blob != 0 && magic != 0x4753474Du);   /* 'GSGM' */
+    /* Occupancy of the 4096-entry resource handle table (g_slots at
+     * [TOC-0x7680] = [0x0135A238]): the registrar returns -1 when the
+     * down-scan finds no free slot, which is the surviving branch for the
+     * null-mesh crash now that blob magic is measured clean. */
+    uint32_t occupied = 0, slots_ea = vm_read32(0x0135A238u);
+    if (slots_ea && addr_readable(slots_ea + 4096u * 4u))
+        for (uint32_t i = 0; i < 4096u; i++)
+            if (vm_read32(slots_ea + i * 4u)) occupied++;
+    if (n <= 12 || bad || (n & 0x3F) == 0) {
+        char name[17] = {0};
+        for (int i = 0; i < 16 && addr_readable(self + 0x134u + i); i++) {
+            char c = (char)vm_read8(self + 0x134u + (uint32_t)i);
+            if (!c) break;
+            name[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+        }
+        fprintf(stderr,
+                "[meshbuild] n=%ld this=%08X blob=%08X magic=%08X%s "
+                "raw120=%08X slots=%u/4096 name='%s'\n",
+                n, self, blob, magic, bad ? " BAD-MAGIC" : "",
+                raw120, occupied, name);
+        fflush(stderr);
+    }
+    func_0036B478(ctx);
+}
+
 extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
 {
     if (guest_addr == 0x00FCFA20u) return yz_fcfa20_trap;
+    if (guest_addr == 0x0036B478u) return yz_meshbuild_trap;
     /* The generated table contains lifter artifacts outside any mappable code
      * window (entries at 0x0/0x7C/... and at 0xFExxxxxx-0xFFFFFFxx, the latter
      * shadowing the import fake-key range). A corrupted or null bctr target

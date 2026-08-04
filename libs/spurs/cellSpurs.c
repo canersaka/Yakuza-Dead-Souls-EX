@@ -3641,19 +3641,28 @@ s32 cellSpursJobGuardNotify(CellSpursJobGuard* object)
      * landing between our read and store was silently overwritten and the
      * guard never released. Decrement under the lockline, re-derive the
      * host mirror from the result. */
-    spu_lockline_lock();
-    u32 live = rd32(object->bytes + 0x00);
-    if (!live) {
+    /* NOTE: job_publish_u32 takes the (non-reentrant) lockline itself, so
+     * the store is done inline within one critical section. */
+    {
+        extern int spu_coh_is_reserved(u32);
+        extern void spu_coh_notify_write(u32);
+        spu_lockline_lock();
+        u32 live = rd32(object->bytes + 0x00);
+        if (!live) {
+            spu_lockline_unlock();
+            mx_unlock(&g->sync.mutex);
+            return CELL_SPURS_JOB_ERROR_STAT;
+        }
+        live--;
+        wr32(object->bytes + 0x00, live);
+        {
+            const u32 line = guest_ea(object) & ~127u;
+            if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+        }
         spu_lockline_unlock();
-        mx_unlock(&g->sync.mutex);
-        return CELL_SPURS_JOB_ERROR_STAT;
+        g->count = live;
     }
-    live--;
-    job_publish_u32(guest_ea(object), live);
-    spu_lockline_unlock();
-    g->count = live;
-    int released = !live;
-    if (released) cv_wake_all(&g->sync.cond);
+    if (!g->count) cv_wake_all(&g->sync.cond);
     mx_unlock(&g->sync.mutex);
     return CELL_OK;
 }
