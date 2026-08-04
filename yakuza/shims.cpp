@@ -269,17 +269,31 @@ static void yz_a010_camera_read32(
 static void yz_a010_camera_write(
     uint32_t addr, uint64_t val, unsigned width, const void* retaddr)
 {
+    /* Scene-independent arming (YZ_CAM_WATCH): the a010 gate hid the same
+     * NaN producer in every later scene — the Akiyama/Hana effect walk
+     * consumes this matrix too (frontier hunt 2026-08-03). NaN-payload
+     * writes are always logged first-class while armed. */
+    static int cam_watch = -1;
+    if (cam_watch < 0) cam_watch = getenv("YZ_CAM_WATCH") ? 1 : 0;
     static unsigned writes = 0;
-    if (!g_yz_a010_root_active || writes >= 128u) return;
+    if (!(g_yz_a010_root_active || cam_watch) || writes >= 512u) return;
     const uint64_t end = (uint64_t)addr + width;
     if (end <= 0x01622650ull || addr >= 0x01622690u) return;
+    const uint32_t hi = (uint32_t)(width == 8 ? (val >> 32) : val);
+    const uint32_t lo = (uint32_t)val;
+    const int is_nan =
+        ((hi & 0x7F800000u) == 0x7F800000u && (hi & 0x007FFFFFu)) ||
+        (width == 8 && (lo & 0x7F800000u) == 0x7F800000u && (lo & 0x007FFFFFu));
     writes++;
-    fprintf(stderr,
-            "[a010-camera-write] n=%u addr=%08X width=%u value=%016llX "
-            "caller=%08X tid=%u\n",
-            writes, addr, width, (unsigned long long)val,
-            yz_guest_addr_from_host(retaddr), yz_thread_current_id());
-    fflush(stderr);
+    if (writes <= 128u || is_nan) {
+        fprintf(stderr,
+                "[a010-camera-write] n=%u addr=%08X width=%u value=%016llX "
+                "caller=%08X tid=%u%s\n",
+                writes, addr, width, (unsigned long long)val,
+                yz_guest_addr_from_host(retaddr), yz_thread_current_id(),
+                is_nan ? " NAN" : "");
+        fflush(stderr);
+    }
 }
 
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
