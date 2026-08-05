@@ -44,6 +44,14 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 {
     printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",
            type, msgString ? msgString : "<null>");
+    /* Also on STDERR (2026-08-05): a modal dialog can silently park the whole
+     * title -- boot 9 sat on the title screen for 11k frames behind an
+     * invisible "Sign in to PlayStation(R)Network?" prompt while every soak
+     * log line looked healthy, because this banner was stdout-only. Any
+     * dialog is load-bearing state; it belongs in the diagnostic stream. */
+    fprintf(stderr, "[msgdialog] OPEN type=0x%08X msg='%s'\n",
+            type, msgString ? msgString : "<null>");
+    fflush(stderr);
 
     if (s_dialog_open) {
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
@@ -62,8 +70,12 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         printf("========================================\n");
     }
 
-    /* Determine button type and auto-respond */
-    u32 button_type = type & 0x000000F0;
+    /* Determine button type and auto-respond. 2026-08-04 doc-conformance
+     * audit: the button-type field is bits 6-4 (mask 0x70; Reference p.5,
+     * sysutil_msgdialog.h:54-57) -- bit 7 is Disable-Cancel, and folding it
+     * in (the old 0xF0 mask) misclassified the canonical
+     * YESNO|DISABLE_CANCEL_ON dialog (0x90) as "no buttons". */
+    u32 button_type = type & 0x00000070;
     int has_progress = (type & 0x0000F000) != 0;
 
     if (!has_progress) {
@@ -84,6 +96,9 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         /* Close and dispatch the guest callback (OPD) via the guest caller.
          * Guest signature: void cb(s32 buttonType, void* userdata) -> r3/r4. */
         s_dialog_open = 0;
+        fprintf(stderr, "[msgdialog] AUTO-ANSWER %d (cb=%s)\n", (int)result,
+                s_callback_opd ? "yes" : "none");
+        fflush(stderr);
         if (s_callback_opd) {
             ps3_invoke_guest(s_callback_opd, (uint64_t)(uint32_t)result,
                              (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
@@ -125,12 +140,11 @@ s32 cellMsgDialogAbort(void)
 
     s_dialog_open = 0;
 
-    if (s_callback_opd) {
-        ps3_invoke_guest(s_callback_opd,
-                         (uint64_t)(uint32_t)CELL_MSGDIALOG_BUTTON_ESCAPE,
-                         (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
-        s_callback_opd = 0;
-    }
+    /* Reference p.14/p.18: when Abort closes the dialog the callback
+     * registered at open time is unregistered WITHOUT being called -- the
+     * old ESCAPE invocation double-advanced any caller state machine that
+     * aborts its own dialog (2026-08-04 doc-conformance audit). */
+    s_callback_opd = 0;
 
     return CELL_OK;
 }
