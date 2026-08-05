@@ -76,36 +76,30 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
     if (!state)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
-    if (videoOut != CELL_VIDEO_OUT_PRIMARY && videoOut != CELL_VIDEO_OUT_SECONDARY)
+    /* Reference p.14/p.28: only the primary output is supported; SECONDARY
+     * is rejected like every sibling entry point (the old code accepted it
+     * and advertised it ENABLED). */
+    if (videoOut != CELL_VIDEO_OUT_PRIMARY)
         return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
 
     memset(state, 0, sizeof(CellVideoOutState));
 
-    if (videoOut == CELL_VIDEO_OUT_PRIMARY) {
-        u32 mode;
-        state->state      = 2; /* enabled */
-        state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
-
-        /* Set display mode based on current resolution */
-        switch (s_resolution_id) {
-        case CELL_VIDEO_OUT_RESOLUTION_1080:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_1920_1080_59_94HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_480:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_720_480_59_94HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_576:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_720_576_50HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_720:
-        default:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_1280_720_59_94HZ;
-            break;
-        }
-        state->displayMode = ps3_bswap32(mode);  /* guest BE struct */
-    } else {
-        state->state = 0; /* disabled */
-    }
+    /* 2026-08-04 doc-conformance audit: state values were inverted (we
+     * reported 2, which is PREPARING, as "enabled" -- Reference p.35 says
+     * in PREPARING no other member is even valid, and a spec-following
+     * boot polls for ENABLED=0). displayMode is the 8-byte struct, not a
+     * packed u32, and Reference p.4 guarantees at least one refreshRates
+     * bit in the mode returned here. */
+    state->state      = CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED;
+    state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
+    state->displayMode.resolutionId = (u8)s_resolution_id;
+    state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+    state->displayMode.conversion   = 0;   /* CONVERSION_NONE */
+    state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    state->displayMode.refreshRates =
+        ps3_bswap16((s_resolution_id == CELL_VIDEO_OUT_RESOLUTION_576)
+                        ? CELL_VIDEO_OUT_REFRESH_RATE_50HZ
+                        : CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ);
 
     return CELL_OK;
 }
@@ -196,7 +190,9 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
     info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
     info->latency        = 0;
-    info->state          = 2; /* connected */
+    /* Reference p.38: CellVideoOutDeviceState is UNAVAILABLE=0/AVAILABLE=1;
+     * the old value 2 is out of range and could read as "no display". */
+    info->state          = 1; /* CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE */
     info->rgbOutputRange = 1;
 
     /* Report supported modes */
@@ -206,24 +202,28 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ);
     idx++;
 
     /* 576p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_50HZ);
     idx++;
 
     /* 720p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ);
     idx++;
 
     /* 1080p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ);
     idx++;
 
     info->availableModeCount = (u8)idx;

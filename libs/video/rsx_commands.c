@@ -341,8 +341,14 @@ static int rsx_report_is_zcull_type(u32 type)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    /* Surface configuration */
-    if (method >= 0x200 && method <= 0x23C)
+    /* Surface configuration. 2026-08-04 doc-conformance audit: the method
+     * table in rsx_commands.h was regenerated from the SDK's own offsets
+     * (~40 entries were shifted/wrong; rsx_dispatch.c, rsx_live_draw.c and
+     * tools/nv40_methods.py already agreed on these values). The real
+     * surface block spans 0x200-0x22C plus the C/D pitch+offset quartet at
+     * 0x280-0x28C, which the old 0x200..0x23C gate never routed. */
+    if ((method >= 0x200 && method <= 0x22C) ||
+        (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
