@@ -40,6 +40,21 @@ extern "C" {
 #define CELL_NET_CTL_STATE_IPObtained        3
 
 /* ---------------------------------------------------------------------------
+ * Handler event codes (the `event` argument of cellNetCtlHandler).
+ * Values ORACLE(SDK netex/libnetctl.h:106-112). Added 2026-08-05 (item-K
+ * fix 9; the 2026-08-04 audit flagged them missing). No handler is ever
+ * fired by this offline runtime today; the constants exist so guest-facing
+ * code and future dispatch use the documented values.
+ * -----------------------------------------------------------------------*/
+#define CELL_NET_CTL_EVENT_CONNECT_REQ          0
+#define CELL_NET_CTL_EVENT_ESTABLISH            1
+#define CELL_NET_CTL_EVENT_GET_IP               2
+#define CELL_NET_CTL_EVENT_DISCONNECT_REQ       3
+#define CELL_NET_CTL_EVENT_ERROR                4
+#define CELL_NET_CTL_EVENT_LINK_DISCONNECTED    5
+#define CELL_NET_CTL_EVENT_AUTO_RETRY           6
+
+/* ---------------------------------------------------------------------------
  * NAT types
  * -----------------------------------------------------------------------*/
 #define CELL_NET_CTL_NATINFO_NAT_TYPE_1     1   /* Open */
