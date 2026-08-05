@@ -16,14 +16,19 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_DAISY_ERROR_NOT_INITIALIZED     0x80410B01
-#define CELL_DAISY_ERROR_ALREADY_INITIALIZED 0x80410B02
-#define CELL_DAISY_ERROR_INVALID_ARGUMENT    0x80410B03
-#define CELL_DAISY_ERROR_OUT_OF_MEMORY       0x80410B04
-#define CELL_DAISY_ERROR_QUEUE_FULL          0x80410B05
-#define CELL_DAISY_ERROR_QUEUE_EMPTY         0x80410B06
-#define CELL_DAISY_ERROR_BUSY                0x80410B07
+/* Error codes. Real SDK values from cell/daisy/error.h (2026-08-05):
+ * the old invented 0x80410Bxx block collided byte-for-byte with the LIVE
+ * swcache namespace (cell/swcache/error.h) -- diagnostic poison. Our
+ * invented lifecycle/queue names map onto the closest documented codes in
+ * daisy's real 0x804105xx namespace (STAT = wrong object state,
+ * INVAL = bad argument, AGAIN = not available yet, BUSY = in use). */
+#define CELL_DAISY_ERROR_NOT_INITIALIZED     0x8041050F /* = real STAT */
+#define CELL_DAISY_ERROR_ALREADY_INITIALIZED 0x8041050F /* = real STAT */
+#define CELL_DAISY_ERROR_INVALID_ARGUMENT    0x80410512 /* = real INVAL */
+#define CELL_DAISY_ERROR_OUT_OF_MEMORY       0x80410511 /* = real AGAIN */
+#define CELL_DAISY_ERROR_QUEUE_FULL          0x8041051A /* = real BUSY */
+#define CELL_DAISY_ERROR_QUEUE_EMPTY         0x80410511 /* = real AGAIN */
+#define CELL_DAISY_ERROR_BUSY                0x8041051A /* = real BUSY */
 
 /* Pipe depth limits */
 #define CELL_DAISY_MAX_PIPES     32

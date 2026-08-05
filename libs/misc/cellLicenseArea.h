@@ -16,8 +16,14 @@ extern "C" {
 #endif
 
 /* Error codes */
-#define CELL_LICENSE_AREA_ERROR_INVALID_ARGUMENT  0x80410B01
-#define CELL_LICENSE_AREA_ERROR_NOT_FOUND         0x80410B02
+/* The real cellSysutilGetLicenseArea API has NO error facility
+ * (sysutil_licensearea.h defines zero error constants). These stub-local
+ * guard values previously sat on 0x80410B01/02 == the LIVE swcache
+ * namespace (cell/swcache/error.h) -- diagnostic poison. Map them to the
+ * real generic sysutil-common codes instead (sysutil_common.h 0x8002b1xx):
+ * bad pointer arg -> ERROR_VALUE, lookup failure -> ERROR_STATUS. */
+#define CELL_LICENSE_AREA_ERROR_INVALID_ARGUMENT  0x8002b102 /* SYSUTIL VALUE */
+#define CELL_LICENSE_AREA_ERROR_NOT_FOUND         0x8002b106 /* SYSUTIL STATUS */
 
 /* License area IDs */
 #define CELL_LICENSE_AREA_J    1   /* Japan */
