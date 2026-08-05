@@ -76,14 +76,21 @@
 #define CELL_ERROR_BASE_FS              0x80010700
 #define CELL_ERROR_BASE_AUDIO           0x80310700
 #define CELL_ERROR_BASE_VIDEO           0x8002B100
-#define CELL_ERROR_BASE_GCM             0x80210700
+/* Real libgcm base is 0x80210000 (SDK cell/gcm/gcm_error.h: facility GFX
+ * 0x021, range 0x8021_0001 - 0x8021_00ff). The old 0x80210700 was fabricated
+ * (2026-08-04 audit: every GCM error off by 0x700). */
+#define CELL_ERROR_BASE_GCM             0x80210000
 #define CELL_ERROR_BASE_NET             0x80130100
 #define CELL_ERROR_BASE_PAD             0x80121100
 #define CELL_ERROR_BASE_KB              0x80121200
 #define CELL_ERROR_BASE_MOUSE           0x80121300
 #define CELL_ERROR_BASE_SYSUTIL         0x8002B000
 #define CELL_ERROR_BASE_SYSUTIL_SAVE    0x8002B400
-#define CELL_ERROR_BASE_SYSUTIL_GAME    0x8002B600
+/* Real cellGame base is 0x8002cb00 (SDK sysutil_game_common.h), not the
+ * fabricated 0x8002B600. Offsets are sparse (04-09, 20-28, 50), so
+ * cellGame.h defines each CELL_GAME_ERROR_* value verbatim instead of
+ * OR-ing this base. Kept only as documentation of the range. */
+#define CELL_ERROR_BASE_SYSUTIL_GAME    0x8002CB00
 #define CELL_ERROR_BASE_PNG             0x80611200
 #define CELL_ERROR_BASE_JPG             0x80611300
 #define CELL_ERROR_BASE_FONT            0x80540000
@@ -102,18 +109,26 @@
 #define CELL_SYSMODULE_ERROR_UNLOADED       (CELL_ERROR_BASE_SYSMODULE | 0x03)
 #define CELL_SYSMODULE_ERROR_FATAL          (CELL_ERROR_BASE_SYSMODULE | 0xFF)
 
-/* sysutil errors */
-#define CELL_SYSUTIL_ERROR_TYPE             (CELL_ERROR_BASE_SYSUTIL | 0x01)
-#define CELL_SYSUTIL_ERROR_VALUE            (CELL_ERROR_BASE_SYSUTIL | 0x02)
-#define CELL_SYSUTIL_ERROR_SIZE             (CELL_ERROR_BASE_SYSUTIL | 0x03)
-#define CELL_SYSUTIL_ERROR_NUM              (CELL_ERROR_BASE_SYSUTIL | 0x04)
+/* sysutil errors. Real SDK values (sysutil_common.h: common block at
+ * 0x8002b1xx, not the 0x8002b0xx internal block our old |0x0n numbering
+ * landed on -- same fabricated-namespace class as the 2026-08-04 sweep's
+ * videoout/msgdialog findings; corrected 2026-08-05). */
+#define CELL_SYSUTIL_ERROR_TYPE             0x8002b101
+#define CELL_SYSUTIL_ERROR_VALUE            0x8002b102
+#define CELL_SYSUTIL_ERROR_SIZE             0x8002b103
+#define CELL_SYSUTIL_ERROR_NUM              0x8002b104
+#define CELL_SYSUTIL_ERROR_BUSY             0x8002b105
+#define CELL_SYSUTIL_ERROR_STATUS           0x8002b106
+#define CELL_SYSUTIL_ERROR_MEMORY           0x8002b107
 
 /* pad errors */
 #define CELL_PAD_ERROR_FATAL                (CELL_ERROR_BASE_PAD | 0x01)
 #define CELL_PAD_ERROR_INVALID_PARAMETER    (CELL_ERROR_BASE_PAD | 0x02)
 #define CELL_PAD_ERROR_ALREADY_OPENED       (CELL_ERROR_BASE_PAD | 0x03)
 #define CELL_PAD_ERROR_NOT_OPENED           (CELL_ERROR_BASE_PAD | 0x04)
-#define CELL_PAD_ERROR_NO_DEVICE            (CELL_ERROR_BASE_PAD | 0x05)
+/* Real SDK value (cell/pad/error.h): NO_DEVICE is 0x80121107; |0x05 is
+ * RESOURCE_ALLOCATION_FAILED's slot (2026-08-05, audit item K). */
+#define CELL_PAD_ERROR_NO_DEVICE            (CELL_ERROR_BASE_PAD | 0x07)
 
 /* audio errors */
 #define CELL_AUDIO_ERROR_ALREADY_INIT       (CELL_ERROR_BASE_AUDIO | 0x01)
@@ -133,7 +148,13 @@
 #define CELL_AUDIO_ERROR_AUDIOSYSTEM_NOT_FOUND   (CELL_ERROR_BASE_AUDIO | 0x0E)
 #define CELL_AUDIO_ERROR_TAG_NOT_FOUND           (CELL_ERROR_BASE_AUDIO | 0x0F)
 
-/* GCM errors */
+/* GCM errors -- values verbatim from SDK cell/gcm/gcm_error.h:
+ *   FAILURE          0x802100ff
+ *   NO_IO_PAGE_TABLE 0x80210001
+ *   INVALID_ENUM     0x80210002
+ *   INVALID_VALUE    0x80210003
+ *   INVALID_ALIGNMENT 0x80210004
+ *   ADDRESS_OVERWRAP 0x80210005 */
 #define CELL_GCM_ERROR_FAILURE              (CELL_ERROR_BASE_GCM | 0xFF)
 #define CELL_GCM_ERROR_NO_IO_PAGE_TABLE     (CELL_ERROR_BASE_GCM | 0x01)
 #define CELL_GCM_ERROR_INVALID_ENUM         (CELL_ERROR_BASE_GCM | 0x02)
