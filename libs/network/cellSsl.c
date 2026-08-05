@@ -1,8 +1,12 @@
 /*
  * ps3recomp - cellSsl HLE implementation
  *
- * Stub SSL module. Init/End lifecycle works, certificate functions
- * return empty data, and RNG uses host OS entropy.
+ * Init/End lifecycle works; the certificate loader and cert accessors
+ * fail with their DOCUMENTED error values because this firmware-free
+ * build ships no CA certificate store and no TLS engine (see the TLS
+ * policy note in cellHttps.h).  RNG uses host OS entropy.
+ *
+ * Error values: ORACLE(cell/ssl/error.h), 0x8074xxxx namespace.
  */
 
 #include "cellSsl.h"
@@ -58,62 +62,63 @@ s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required)
 {
     (void)buffer; (void)size;
     printf("[cellSsl] CertificateLoader(flags=0x%llX)\n", (unsigned long long)flags);
+
+    if (!s_ssl_initialized)
+        return (s32)CELL_SSL_ERROR_NOT_INITIALIZED;
+
+    /* Flag validation per ORACLE(cell/ssl/cert.h:80-146): the defined
+     * CELL_SSL_LOAD_CERT_* selectors occupy bits 0..57.
+     * ORACLE(cell/ssl/error.h:80-82): "unknown certificate load flag". */
+    if (flags == 0 || (flags & ~CELL_SSL_LOAD_CERT_VALID_MASK))
+        return (s32)CELL_SSL_ERROR_UNKNOWN_LOAD_CERT;
+
+    /* No CA bundle exists in this firmware-free build.  Report the
+     * documented read failure (ORACLE(cell/ssl/error.h:53-54)) instead of
+     * fabricating an empty success -- the old required=0 + CELL_OK made
+     * the game hand an empty CA list to cellHttpsInit (audit 2026-08-04
+     * MEDIUM).  The https path fail-softs on this error. */
     if (required)
-        *required = ps3_bswap32(0u);  /* out-param is guest memory, write big-endian */
-    return CELL_OK;
+        *required = ps3_bswap32(0u);  /* out-param is guest memory, big-endian */
+    return (s32)CELL_SSL_ERROR_READ_FAILED;
 }
+
+/* With the loader unable to produce certificates, no valid certificate
+ * object can exist; every accessor rejects its input with the documented
+ * "invalid certificate pointer" error (ORACLE(cell/ssl/error.h:39-41))
+ * instead of fabricating data. */
 
 s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize)
 {
-    (void)certId;
+    (void)certId; (void)serial; (void)serialSize;
     printf("[cellSsl] CertGetSerialNumber()\n");
-
-    if (!serial || !serialSize)
-        return (s32)CELL_SSL_ERROR_INVALID_ARG;
-
-    /* Fake serial number */
-    if (*serialSize >= 4) {
-        serial[0] = 0x01;
-        serial[1] = 0x00;
-        serial[2] = 0x00;
-        serial[3] = 0x01;
-        *serialSize = ps3_bswap32(4u);  /* out-param is guest memory, write big-endian */
-    }
-    return CELL_OK;
+    return (s32)CELL_SSL_ERROR_INVALID_CERTIFICATE;
 }
 
 s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize)
 {
-    (void)certId;
-    (void)key;
+    (void)certId; (void)key; (void)keySize;
     printf("[cellSsl] CertGetPublicKey()\n");
-
-    if (keySize)
-        *keySize = ps3_bswap32(0u);  /* out-param is guest memory, write big-endian */
-
-    return CELL_OK;
+    return (s32)CELL_SSL_ERROR_INVALID_CERTIFICATE;
 }
 
 s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time)
 {
-    (void)certId;
-    if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = ps3_bswap64(0ull);  /* out-param is guest memory, write big-endian */
-    return CELL_OK;
+    (void)certId; (void)time;
+    printf("[cellSsl] CertGetNotBefore()\n");
+    return (s32)CELL_SSL_ERROR_INVALID_CERTIFICATE;
 }
 
 s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time)
 {
-    (void)certId;
-    if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = ps3_bswap64(0xFFFFFFFFFFFFFFFFULL);  /* out-param is guest memory, write big-endian */
-    return CELL_OK;
+    (void)certId; (void)time;
+    printf("[cellSsl] CertGetNotAfter()\n");
+    return (s32)CELL_SSL_ERROR_INVALID_CERTIFICATE;
 }
 
 s32 cellSslGetRandomNumber(u8* buf, u32 size)
 {
     if (!buf || size == 0)
-        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+        return (s32)CELL_SSL_ERROR_NO_BUFFER;
 
 #ifdef _WIN32
     NTSTATUS status = BCryptGenRandom(NULL, buf, size,
