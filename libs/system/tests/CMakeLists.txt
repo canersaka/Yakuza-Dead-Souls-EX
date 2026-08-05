@@ -9,6 +9,10 @@ target_include_directories(cell_savedata_test PRIVATE
     "${PS3RECOMP_ROOT}/runtime"
 )
 
+# Standalone build (no SPU runtime linked): stub out the PPU->SPU lock-line
+# coherence externs that runtime/ppu/ppu_memory.h's stores now use.
+target_compile_definitions(cell_savedata_test PRIVATE PS3RECOMP_NO_SPU_COH=1)
+
 if(MSVC)
     target_compile_definitions(cell_savedata_test PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(cell_savedata_test PRIVATE
