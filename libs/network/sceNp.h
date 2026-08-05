@@ -17,16 +17,22 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define SCE_NP_ERROR_NOT_INITIALIZED            0x80550001
-#define SCE_NP_ERROR_ALREADY_INITIALIZED        0x80550002
-#define SCE_NP_ERROR_INVALID_ARGUMENT           0x80550003
-#define SCE_NP_ERROR_OUT_OF_MEMORY              0x80550004
-#define SCE_NP_ERROR_ID_NOT_FOUND               0x80550005
-#define SCE_NP_ERROR_SIGNED_OUT                 0x80550006
-#define SCE_NP_ERROR_ABORTED                    0x80550007
-#define SCE_NP_ERROR_OFFLINE                    0x80550008
-#define SCE_NP_ERROR_VARIANT                    0x80550009
-#define SCE_NP_ERROR_UNKNOWN                    0x805500FF
+/* 2026-08-04 doc-conformance audit: values corrected to the SDK's real NP
+ * Manager error namespace (np/error.h, 0x8002aaxx). The previous 0x80550xxx
+ * block was fabricated -- the offline-status probes this game imports
+ * (sceNpManagerGetNpId etc.) returned values the game could not recognize
+ * as "cleanly offline". Names without an exact SDK spelling map to the
+ * closest documented code. */
+#define SCE_NP_ERROR_NOT_INITIALIZED            0x8002aa01
+#define SCE_NP_ERROR_ALREADY_INITIALIZED        0x8002aa02
+#define SCE_NP_ERROR_INVALID_ARGUMENT           0x8002aa03
+#define SCE_NP_ERROR_OUT_OF_MEMORY              0x8002aa04
+#define SCE_NP_ERROR_ID_NOT_FOUND               0x8002aa06
+#define SCE_NP_ERROR_SIGNED_OUT                 0x8002aa0c  /* = OFFLINE */
+#define SCE_NP_ERROR_ABORTED                    0x8002aa0b
+#define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
+#define SCE_NP_ERROR_VARIANT                    0x8002aa0d  /* = VARIANT_ACCOUNT_ID */
+#define SCE_NP_ERROR_UNKNOWN                    0x8002aa0a  /* = INVALID_STATE */
 
 /* NP Community/Score errors (the Score API has its own error namespace). */
 #define SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED 0x8002A101
@@ -104,9 +110,8 @@ typedef struct SceNpMyLanguages {
  * RPCS3's offline branch (Emu/Cell/Modules/sceNp.cpp), which early-returns
  * SCE_NP_ERROR_OFFLINE without touching its output params whenever
  * np_handler::get_psn_status() == OFFLINE. The status enum value below (-1)
- * matches RPCS3 exactly; the SCE_NP_ERROR_* codes above are this repo's own
- * existing numbering (kept for consistency with the rest of this file's
- * error paths, not Sony's real 0x8002aaXX values). --- */
+ * matches RPCS3 exactly; the SCE_NP_ERROR_* codes above carry Sony's real
+ * 0x8002aaXX NP-manager values (corrected 2026-08-04). --- */
 #define SCE_NP_MANAGER_STATUS_OFFLINE          (-1)
 #define SCE_NP_MANAGER_STATUS_GETTING_TICKET    0
 #define SCE_NP_MANAGER_STATUS_GETTING_PROFILE   1

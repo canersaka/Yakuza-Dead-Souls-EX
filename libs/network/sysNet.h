@@ -22,20 +22,44 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * PS3 network error codes
+ * PS3 network error codes (2026-08-05, doc-conformance item D).
+ *
+ * Two REAL namespaces, per ORACLE(netex/errno.h) + libnet-Reference p.117:
+ * - bnet_* BSD-style calls return -1 and publish a plain BSD-numbered int
+ *   errno (per thread, via _sys_net_errno_loc). These are the SYS_NET_E*
+ *   values below. Conveniently Winsock's WSAE* codes are WSABASEERR(10000)
+ *   + the SAME numbering, so translation is mechanical.
+ * - the non-BSD "sys_net_*" module API returns CELL codes 0x80010200+n
+ *   (SYS_NET_ERROR_E*). The previous 0x80410100-based values were a
+ *   fabricated third namespace matching neither.
  * -----------------------------------------------------------------------*/
-#define SYS_NET_ERROR_BASE          0x80410100
-#define SYS_NET_EWOULDBLOCK         (SYS_NET_ERROR_BASE | 0x03)
-#define SYS_NET_EINPROGRESS         (SYS_NET_ERROR_BASE | 0x06)
-#define SYS_NET_EALREADY            (SYS_NET_ERROR_BASE | 0x07)
-#define SYS_NET_ENOTCONN            (SYS_NET_ERROR_BASE | 0x0B)
-#define SYS_NET_ECONNREFUSED        (SYS_NET_ERROR_BASE | 0x13)
-#define SYS_NET_ETIMEDOUT           (SYS_NET_ERROR_BASE | 0x16)
-#define SYS_NET_ECONNRESET          (SYS_NET_ERROR_BASE | 0x15)
-#define SYS_NET_ECONNABORTED        (SYS_NET_ERROR_BASE | 0x14)
-#define SYS_NET_ENOMEM              (SYS_NET_ERROR_BASE | 0x23)
-#define SYS_NET_EBADF               (SYS_NET_ERROR_BASE | 0x27)
-#define SYS_NET_EINVAL              (SYS_NET_ERROR_BASE | 0x28)
+#define SYS_NET_EPERM               1
+#define SYS_NET_EINTR               4
+#define SYS_NET_EBADF               9
+#define SYS_NET_ENOMEM              12
+#define SYS_NET_EINVAL              22
+#define SYS_NET_EMFILE              24
+#define SYS_NET_EAGAIN              35
+#define SYS_NET_EWOULDBLOCK         SYS_NET_EAGAIN
+#define SYS_NET_EINPROGRESS         36
+#define SYS_NET_EALREADY            37
+#define SYS_NET_ENOTSOCK            38
+#define SYS_NET_EMSGSIZE            40
+#define SYS_NET_ENOPROTOOPT         42
+#define SYS_NET_EADDRINUSE          48
+#define SYS_NET_ECONNABORTED        53
+#define SYS_NET_ECONNRESET          54
+#define SYS_NET_ENOBUFS             55
+#define SYS_NET_EISCONN             56
+#define SYS_NET_ENOTCONN            57
+#define SYS_NET_ETIMEDOUT           60
+#define SYS_NET_ECONNREFUSED        61
+#define SYS_NET_EHOSTUNREACH        65
+
+/* CELL-namespace forms for the non-BSD module API (0x80010200 + errno). */
+#define SYS_NET_ERROR_EINVAL        (s32)0x80010216
+#define SYS_NET_ERROR_ENOMEM        (s32)0x8001020c
+#define SYS_NET_ERROR_EBUSY         (s32)0x80010210
 
 /* PS3 address families */
 #define SYS_NET_AF_INET             2
@@ -156,8 +180,9 @@ int32_t sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
 /* gethostbyname returns a guest pointer to a static hostent */
 uint32_t sys_net_bnet_gethostbyname(const char* name);
 
-/* Thread-local errno */
-int32_t* sys_net_errno_loc(void);
+/* Thread-local errno. Real export name has the leading underscore
+ * (libnet-Reference p.117); the NID hashes "_sys_net_errno_loc". */
+int32_t* _sys_net_errno_loc(void);
 
 #ifdef __cplusplus
 }
