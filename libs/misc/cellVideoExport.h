@@ -15,13 +15,26 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_VIDEO_EXPORT_ERROR_NOT_INITIALIZED     0x80610501
-#define CELL_VIDEO_EXPORT_ERROR_ALREADY_INITIALIZED 0x80610502
-#define CELL_VIDEO_EXPORT_ERROR_INVALID_ARGUMENT    0x80610503
-#define CELL_VIDEO_EXPORT_ERROR_OUT_OF_MEMORY       0x80610504
-#define CELL_VIDEO_EXPORT_ERROR_NOT_SUPPORTED       0x80610505
-#define CELL_VIDEO_EXPORT_ERROR_BUSY                0x80610506
+/* Error codes
+ * Previous values (0x80610501-06) were invented and collided byte-for-byte
+ * with CELL_PAMF_ERROR_STREAM_NOT_FOUND's range (movie path is live).
+ * Re-pointed at real cellVideoExport values, base
+ * CELL_SYSUTIL_ERROR_BASE_VIDEO_EXPORT_UTIL (sysutil_common.h:43). Real
+ * module has no OOM or not-supported concept — closest documented real
+ * codes used instead.
+ */
+#define CELL_VIDEO_EXPORT_UTIL_ERROR_BUSY      0x8002ca01  /* real SDK value (sysutil_video_export.h:22) */
+#define CELL_VIDEO_EXPORT_UTIL_ERROR_INTERNAL  0x8002ca02  /* real SDK value (sysutil_video_export.h:23) */
+#define CELL_VIDEO_EXPORT_UTIL_ERROR_PARAM     0x8002ca03  /* real SDK value (sysutil_video_export.h:24) */
+#define CELL_VIDEO_EXPORT_UTIL_ERROR_ACCESS_ERROR 0x8002ca04  /* real SDK value (sysutil_video_export.h:25) */
+#define CELL_VIDEO_EXPORT_UTIL_ERROR_INITIALIZE   0x8002ca0a  /* real SDK value (sysutil_video_export.h:31) */
+
+#define CELL_VIDEO_EXPORT_ERROR_NOT_INITIALIZED     CELL_VIDEO_EXPORT_UTIL_ERROR_INITIALIZE   /* alias: init-domain real code */
+#define CELL_VIDEO_EXPORT_ERROR_ALREADY_INITIALIZED CELL_VIDEO_EXPORT_UTIL_ERROR_INTERNAL      /* alias: no real "already initialized" concept; generic fallback */
+#define CELL_VIDEO_EXPORT_ERROR_INVALID_ARGUMENT    CELL_VIDEO_EXPORT_UTIL_ERROR_PARAM          /* alias: exact real semantic */
+#define CELL_VIDEO_EXPORT_ERROR_OUT_OF_MEMORY       CELL_VIDEO_EXPORT_UTIL_ERROR_ACCESS_ERROR   /* alias: no real OOM code; closest storage-resource-exhaustion analog */
+#define CELL_VIDEO_EXPORT_ERROR_NOT_SUPPORTED       CELL_VIDEO_EXPORT_UTIL_ERROR_INTERNAL       /* alias: no real not-supported concept; generic fallback */
+#define CELL_VIDEO_EXPORT_ERROR_BUSY                CELL_VIDEO_EXPORT_UTIL_ERROR_BUSY           /* alias: exact real semantic */
 
 /* Export format */
 #define CELL_VIDEO_EXPORT_FORMAT_AVI    0

@@ -15,13 +15,25 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_GAME_REC_ERROR_NOT_INITIALIZED     0x80610701
-#define CELL_GAME_REC_ERROR_ALREADY_INITIALIZED 0x80610702
-#define CELL_GAME_REC_ERROR_INVALID_ARGUMENT    0x80610703
-#define CELL_GAME_REC_ERROR_OUT_OF_MEMORY       0x80610704
-#define CELL_GAME_REC_ERROR_NOT_SUPPORTED       0x80610705
-#define CELL_GAME_REC_ERROR_BUSY                0x80610706
+/* Error codes
+ * Previous values (0x80610701-06) were invented and collided byte-for-byte
+ * with CELL_SAIL_ERROR_INVALID_ARG (sail is imported/live). Re-pointed at
+ * real cellRec values, base CELL_SYSUTIL_ERROR_BASE_REC (real SDK value;
+ * sysutil_common.h:38, matches "cellGameRecording" == real "cellRec").
+ * Real module has no "not supported" concept — closest generic real code
+ * (FATAL) used instead.
+ */
+#define CELL_REC_ERROR_OUT_OF_MEMORY  0x8002c501  /* real SDK value (sysutil_rec.h:28) */
+#define CELL_REC_ERROR_FATAL          0x8002c502  /* real SDK value (sysutil_rec.h:29) */
+#define CELL_REC_ERROR_INVALID_VALUE  0x8002c503  /* real SDK value (sysutil_rec.h:30) */
+#define CELL_REC_ERROR_INVALID_STATE  0x8002c506  /* real SDK value (sysutil_rec.h:33) */
+
+#define CELL_GAME_REC_ERROR_NOT_INITIALIZED     CELL_REC_ERROR_INVALID_STATE  /* alias: init-check is a state-validity check */
+#define CELL_GAME_REC_ERROR_ALREADY_INITIALIZED CELL_REC_ERROR_INVALID_STATE  /* alias: same state-domain code */
+#define CELL_GAME_REC_ERROR_INVALID_ARGUMENT    CELL_REC_ERROR_INVALID_VALUE  /* alias: closest real semantic (invalid value) */
+#define CELL_GAME_REC_ERROR_OUT_OF_MEMORY       CELL_REC_ERROR_OUT_OF_MEMORY  /* alias: exact real semantic */
+#define CELL_GAME_REC_ERROR_NOT_SUPPORTED       CELL_REC_ERROR_FATAL          /* alias: no real not-supported concept; generic fallback */
+#define CELL_GAME_REC_ERROR_BUSY                CELL_REC_ERROR_INVALID_STATE  /* alias: recording-already-active is a state conflict */
 
 /* Recording quality */
 #define CELL_GAME_REC_QUALITY_LOW     0
