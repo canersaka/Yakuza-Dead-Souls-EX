@@ -126,6 +126,19 @@ typedef struct {
 
 static int            s_audio_initialized = 0;
 static u64            s_audio_start_us = 0;      /* us anchor for GetPortTimestamp */
+/* 2026-08-04 doc-conformance audit: block tags must come from ONE global
+ * counter shared by all ports (RPCS3 cellAudio.cpp:1329 seeds each port from
+ * the global m_counter), not from the per-port read_index that restarts at 0
+ * on every PortOpen -- otherwise a port opened T us after init reports every
+ * block T us in the past and two ports contradict each other. Ticks once per
+ * mixed block (5.33 ms). */
+static u64            s_audio_block_counter = 0;
+/* Guest "system time" clock hook (runtime/syscalls/sys_timer.h); registered
+ * by the runner before main(). GetPortTimestamp must answer in the same
+ * domain the guest reads via sys_time_get_system_time -- the old raw-QPC
+ * anchor was on the HOST-uptime epoch, putting every stamp-vs-now delta the
+ * surmixer computes off by hours to days. */
+extern u64 (*g_lv2_system_time_us)(void);
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
 
 /* Event queue notification */
@@ -155,6 +168,18 @@ static mutex_t       s_audio_mutex;
 static u32 s_audio_vm_bump = AUDIO_VM_BASE;
 static int s_audio_vm_ready = 0;
 
+/* 2026-08-05 item-K fix 8d (2026-08-04 audit): PortClose never returned the
+ * port's ring/read-index blocks to this region, so ~15 open/close cycles
+ * exhausted the 4 MB window and every later PortOpen failed forever (a title
+ * cycling ports per-movie dies). Freed blocks are recorded here and reused
+ * EXACT-SIZE-first by audio_vm_alloc (ports come in a handful of fixed sizes
+ * -- 2ch/8ch x 2/4/8/16/32 blocks + the 128-byte read-index -- so exact-fit
+ * reclaims the recycled shapes without fragmentation bookkeeping). Callers
+ * hold s_audio_mutex on the open/close paths, which serializes access. */
+#define AUDIO_VM_FREE_MAX 32
+typedef struct { u32 addr; u32 size; } AudioVmFreeBlock;
+static AudioVmFreeBlock s_audio_vm_free[AUDIO_VM_FREE_MAX];
+
 static u32 audio_vm_alloc(u32 size)
 {
     size = (size + 0x7Fu) & ~0x7Fu;   /* 128-byte align */
@@ -163,11 +188,35 @@ static u32 audio_vm_alloc(u32 size)
             return 0;
         s_audio_vm_ready = 1;
     }
+    /* Reuse an exact-size freed block before bumping. */
+    for (int i = 0; i < AUDIO_VM_FREE_MAX; i++) {
+        if (s_audio_vm_free[i].size == size) {
+            u32 a = s_audio_vm_free[i].addr;
+            s_audio_vm_free[i].addr = 0;
+            s_audio_vm_free[i].size = 0;
+            return a;
+        }
+    }
     if ((u64)s_audio_vm_bump + size > (u64)AUDIO_VM_BASE + AUDIO_VM_SIZE)
         return 0;
     u32 a = s_audio_vm_bump;
     s_audio_vm_bump += size;
     return a;
+}
+
+static void audio_vm_free(u32 addr, u32 size)
+{
+    if (!addr) return;
+    size = (size + 0x7Fu) & ~0x7Fu;   /* mirror audio_vm_alloc rounding */
+    for (int i = 0; i < AUDIO_VM_FREE_MAX; i++) {
+        if (s_audio_vm_free[i].size == 0) {
+            s_audio_vm_free[i].addr = addr;
+            s_audio_vm_free[i].size = size;
+            return;
+        }
+    }
+    /* Free table full: drop the block (bounded leak, strictly better than
+     * the old always-leak). */
 }
 
 /* Write host->guest in big-endian (the guest is PPC BE). */
@@ -488,6 +537,11 @@ static void audio_mix_one_block(void)
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
+
+    /* One global block tick per mixed period (all ports advance together;
+     * libaudio Reference p.23: update notifications are issued at the same
+     * time for all ports). Tag/timestamp queries key off this counter. */
+    s_audio_block_counter++;
 
     const int mix_guest_ports =
         !(s_host_audio.present && s_host_audio.mute_guest_ports);
@@ -890,11 +944,17 @@ s32 cellAudioInit(void)
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
 
+    if (g_lv2_system_time_us) {
+        /* Guest boot-anchored domain (see the hook comment above). */
+        s_audio_start_us = g_lv2_system_time_us();
+    } else {
 #ifdef _WIN32
-    { LARGE_INTEGER f, c;
-      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-      s_audio_start_us = (u64)((c.QuadPart * 1000000LL) / f.QuadPart); }
+        LARGE_INTEGER f, c;
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+        s_audio_start_us = (u64)((c.QuadPart * 1000000LL) / f.QuadPart);
 #endif
+    }
+    s_audio_block_counter = 0;
     s_audio_initialized = 1;
     return CELL_OK;
 }
@@ -1006,18 +1066,32 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u64 nblk = hp.nBlock;
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
-    if (nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 && nblk != CELL_AUDIO_BLOCK_32)
+    /* 2026-08-05 item-K fix 8b: firmware also accepts nBlock 2 and 4 (used
+     * by CRI/libmixer ports; rejecting them killed audio at init --
+     * 2026-08-04 audit). The libaudio Reference (p.4) documents only
+     * BLOCK_8/16, but ORACLE(SDK cell/audio.h:40-42) defines BLOCK_8/16/32
+     * and ORACLE(RPCS3 cellAudio.cpp:1267-1271) accepts exactly
+     * {2,4,8,16,32}; anything else is CELL_AUDIO_ERROR_PARAM. */
+    if (nblk != 2 && nblk != 4 &&
+        nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 &&
+        nblk != CELL_AUDIO_BLOCK_32)
         return CELL_AUDIO_ERROR_PARAM;
 
     /* U6 fix (2026-07-09): only honor the game's requested level when
      * CELL_AUDIO_PORTATTR_INITLEVEL is set (RPCS3 cellAudio.cpp:1340-1346);
-     * otherwise default to 1.0f, same as before this fix. Clamped to [0,1]
-     * as our own safety margin (RPCS3 itself only rejects level <= -1.0f). */
+     * otherwise default to 1.0f, same as before this fix.
+     * 2026-08-05 item-K fix 8c -- ORACLE(libaudio Reference p.18, level
+     * semantics): "When a negative value is specified to level, a positive
+     * inverse of the specified value will be applied as the scaling factor"
+     * -- i.e. the ABSOLUTE value, not silence (the old floor-at-0 turned a
+     * negative INITLEVEL into a muted port where hardware plays at |level|).
+     * The >1.0 clamp stays as our own safety margin (spec allows >1.0 but
+     * warns it deteriorates quality; RPCS3 only rejects level <= -1.0f). */
     {
         float resolved_level = 1.0f;
         if (hp.attr & CELL_AUDIO_PORTATTR_INITLEVEL) {
             resolved_level = hp.level;
-            if (resolved_level < 0.0f) resolved_level = 0.0f;
+            if (resolved_level < 0.0f) resolved_level = -resolved_level;
             if (resolved_level > 1.0f) resolved_level = 1.0f;
         }
         hp.level = resolved_level;
@@ -1105,7 +1179,14 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    /* Buffer lives in the guest-VM bump region (not malloc'd) -- don't free it. */
+    /* item-K fix 8d: return the port's guest-VM blocks (ring buffer +
+     * read-index) to the audio VM free list so reopened ports reuse them
+     * instead of exhausting the 4 MB window (see audio_vm_free above).
+     * Matches real firmware, which releases port memory on close. */
+    audio_vm_free((u32)s_ports[portNum].port_addr, s_ports[portNum].buf_size);
+    audio_vm_free((u32)s_ports[portNum].read_idx_addr, 16);
+    s_ports[portNum].port_addr     = 0;
+    s_ports[portNum].read_idx_addr = 0;
     s_ports[portNum].buffer  = NULL;
     s_ports[portNum].in_use  = 0;
     s_ports[portNum].running = 0;
@@ -1192,7 +1273,23 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
                  found ? "found" : "TIMEOUT");
       } }
 
+    /* 2026-08-04 doc-conformance audit (RPCS3 cellAudio.cpp:1722-1742):
+     * the key must resolve to an EXISTING event queue and must not already
+     * be registered; both cases are CELL_AUDIO_ERROR_TRANS_EVENT. Titles
+     * poll SetNotifyEventQueue until the surmixer queue appears -- answering
+     * CELL_OK for a nonexistent queue broke that retry loop, and a duplicate
+     * registration doubled the 5.3 ms event rate into one queue (overrun). */
+    if (!sys_event_find_queue_by_key(key))
+        return CELL_AUDIO_ERROR_TRANS_EVENT;
+
     mutex_lock(&s_audio_mutex);
+
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (s_notify_queues[i].in_use && s_notify_queues[i].key == key) {
+            mutex_unlock(&s_audio_mutex);
+            return CELL_AUDIO_ERROR_TRANS_EVENT; /* already registered */
+        }
+    }
 
     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
         if (!s_notify_queues[i].in_use) {
@@ -1204,7 +1301,7 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
     }
 
     mutex_unlock(&s_audio_mutex);
-    return CELL_AUDIO_ERROR_PARAM; /* no free slots */
+    return CELL_AUDIO_ERROR_TRANS_EVENT; /* table full (oracle convention) */
 }
 
 s32 cellAudioRemoveNotifyEventQueue(u64 key)
@@ -1226,7 +1323,9 @@ s32 cellAudioRemoveNotifyEventQueue(u64 key)
     }
 
     mutex_unlock(&s_audio_mutex);
-    return CELL_AUDIO_ERROR_PARAM;
+    /* Unknown key: TRANS_EVENT per the oracle (RPCS3 cellAudio.cpp:1811),
+     * not PARAM (2026-08-04 audit). */
+    return CELL_AUDIO_ERROR_TRANS_EVENT;
 }
 
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
@@ -1234,11 +1333,26 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
-        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-
-    if (!config)
+    /* 2026-08-05 item-K fix 8a -- validation order + closed-port contract.
+     * ORACLE(RPCS3 cellAudio.cpp cellAudioGetPortConfig): NULL config or
+     * out-of-range portNum -> CELL_AUDIO_ERROR_PARAM (checked FIRST); a
+     * valid but never-opened/closed port is NOT an error -- it reports
+     * CELL_OK with status = CELL_AUDIO_STATUS_CLOSE
+     * (ORACLE(SDK cell/audio.h:33) = 0x1010; libaudio Reference p.6:
+     * "CELL_AUDIO_STATUS_CLOSE: Closed (cannot start reading)"). The old
+     * code returned PORT_NOT_OPEN, so a spec-following status poll could
+     * never observe the documented CLOSE state (2026-08-04 audit). */
+    if (!config || portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PARAM;
+
+    if (!s_ports[portNum].in_use) {
+        unsigned char* cc = (unsigned char*)config;
+        memset(cc, 0, 32);
+        u32 v = (u32)CELL_AUDIO_STATUS_CLOSE;
+        cc[4] = (unsigned char)(v >> 24); cc[5] = (unsigned char)(v >> 16);
+        cc[6] = (unsigned char)(v >> 8);  cc[7] = (unsigned char)v;
+        return CELL_OK;
+    }
 
     mutex_lock(&s_audio_mutex);
 
@@ -1316,7 +1430,11 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_PARAM;
     }
-    u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    /* Global-counter form (RPCS3 cellAudio.cpp:1557: tag = global_counter +
+     * blockNo - cur_pos); while running, read_index and the global counter
+     * advance in lockstep, so this stays consistent per-port while giving
+     * all ports one shared tag timeline. */
+    u64 t = s_audio_block_counter + blockNo - (port->read_index % nblk);
     mutex_unlock(&s_audio_mutex);
 
     unsigned char* c = (unsigned char*)tag;
@@ -1345,10 +1463,11 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
     /* U6c fix (2026-07-09): RPCS3 cellAudio.cpp:1519-1521 --
      * `if (port.global_counter < tag) return CELL_AUDIO_ERROR_TAG_NOT_FOUND;`
      * before this fix we always answered with a timestamp, even for a tag
-     * the port hasn't advanced to yet. Our read_index is the same monotonic
-     * global counter used by cellAudioGetPortBlockTag above. */
+     * the port hasn't advanced to yet. 2026-08-04: tags now come from the
+     * shared s_audio_block_counter (see GetPortBlockTag), so compare against
+     * that, and the stamp below is anchored on the guest system-time clock. */
     mutex_lock(&s_audio_mutex);
-    u64 global_counter = s_ports[portNum].read_index;
+    u64 global_counter = s_audio_block_counter;
     mutex_unlock(&s_audio_mutex);
     if (tag > global_counter)
         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
