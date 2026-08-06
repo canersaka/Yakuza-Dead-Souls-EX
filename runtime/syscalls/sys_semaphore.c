@@ -578,23 +578,26 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     }
 #endif
 
-    /* Audit sec.6 error-code fidelity (2026-07-03, user-confirmed): RPCS3
-     * sys_semaphore.cpp post() returns CELL_EBUSY (not_an_error) when the
-     * post would exceed max_val (a fetch_op failure on the atomic), not
-     * CELL_EINVAL. */
+    /* 2026-08-05 item-K fix 5 -- ORACLE(Lv2 Reference p.220): waiters absorb
+     * the post FIRST. "If the value specified ... is equal to or larger than
+     * the number of threads that is waiting, all the waiting threads are
+     * woken up, and the semaphore value is incremented by the number of
+     * difference. At this point, if the semaphore value after the
+     * incrementation is larger than the maximum number, the threads are not
+     * woken up, and an error [EBUSY] is returned." The old check compared
+     * value+count against max WITHOUT crediting waiters, refusing legal
+     * posts (and dropping every owed wake) whenever count > max while
+     * waiters were parked (2026-08-04 audit). Error value stays CELL_EBUSY
+     * (Reference p.220 "The semaphore value is above the upper limit"). */
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
-    if (s->value + count > s->max_value) {
+    int wake = (count < s->waiters) ? count : s->waiters;
+    if ((int64_t)s->value + count - wake > (int64_t)s->max_value) {
         LeaveCriticalSection(&s->value_lock);
-        /* Faithful: RPCS3 sys_semaphore.cpp post() returns EBUSY (not_an_error)
-         * when the post would exceed max_val. s47: with single-truth `value`
-         * this is now a TRUE refusal (no shadow lag) — the guest's own retry
-         * contract governs, and no wake is dropped because none was owed (a
-         * waiter can only exist when value<=0, i.e. far below max). */
         static long ebusy_n = 0;
         if (ebusy_n < 64) { ebusy_n++;
-            fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d max=%d (n=%ld)\n",
-                    yz_thread_current_id(), sem_id, count, s->value, s->max_value, ebusy_n);
+            fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d waiters=%d max=%d (n=%ld)\n",
+                    yz_thread_current_id(), sem_id, count, s->value, s->waiters, s->max_value, ebusy_n);
             fflush(stderr); }
         sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
@@ -604,7 +607,6 @@ int64_t sys_semaphore_post(ppu_context* ctx)
      * this post can satisfy (min(count, waiters)). Woken waiters re-check
      * value under the lock; an orphaned token (waiter already left) is benign.
      * This is the lost-wake fix — a post can NEVER skip the release now. */
-    int wake = (count < s->waiters) ? count : s->waiters;
     LeaveCriticalSection(&s->value_lock);
 
     if (wake > 0 && !ReleaseSemaphore(s->sem_handle, wake, NULL)) {
@@ -624,15 +626,17 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     }
 #else
     pthread_mutex_lock(&s->mtx);
-    if (s->value + count > s->max_value) {
-        pthread_mutex_unlock(&s->mtx);
-        sem_ref_release(s);
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-    s->value += count;
-    /* Wake the waiters this post can satisfy (broadcast is also correct — they
-     * re-check value — but min(count,waiters) signals is precise). */
+    /* item-K fix 5 (see Win32 branch): waiters absorb the post before the
+     * max_value ceiling applies (Lv2 Reference p.220). */
     { int wake = (count < s->waiters) ? count : s->waiters;
+      if ((int64_t)s->value + count - wake > (int64_t)s->max_value) {
+          pthread_mutex_unlock(&s->mtx);
+          sem_ref_release(s);
+          return (int64_t)(int32_t)CELL_EBUSY;
+      }
+      s->value += count;
+      /* Wake the waiters this post can satisfy (broadcast is also correct — they
+       * re-check value — but min(count,waiters) signals is precise). */
       for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
 #endif

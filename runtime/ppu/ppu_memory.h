@@ -63,6 +63,41 @@ static inline uint16_t* vm_ptr16(uint32_t addr) { return (uint16_t*)vm_translate
 static inline uint32_t* vm_ptr32(uint32_t addr) { return (uint32_t*)vm_translate(addr); }
 static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate(addr); }
 
+/* PPU->SPU lock-line coherence for the runtime-side inline stores (2026-08-04
+ * doc-conformance audit): mirror yakuza/shims.cpp's VM_WRITE_COH. An HLE
+ * store to a 128-byte line an SPU holds under GETLLAR must serialize through
+ * the SPU lock-line and raise SPU_EVENT_LR, else the SPU's PUTLLC clobbers
+ * the store or a parked idle-service never wakes. Previously only lifted
+ * code (via the exported shims accessors) had this; cellFs/cellSaveData/
+ * lv2_register/sys_cond stores bypassed it. Fast path: spu_coh_is_reserved()
+ * is a range check + O(1) bitmap probe (spu_channels.c), so ordinary writes
+ * skip the lock entirely. Bulk forms check the first line only, matching the
+ * shims macro. */
+#ifdef PS3RECOMP_NO_SPU_COH
+/* Standalone unit-test builds that compile an HLE module WITHOUT the SPU
+ * runtime (e.g. libs/system/tests) define this to get no-op coherence. */
+static inline int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+static inline void spu_lockline_lock(void) {}
+static inline void spu_lockline_unlock(void) {}
+static inline void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+#else
+int  spu_coh_is_reserved(uint32_t addr);
+void spu_lockline_lock(void);
+void spu_lockline_unlock(void);
+void spu_coh_notify_write(uint32_t ea);
+#endif
+static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
+{
+    if (spu_coh_is_reserved(addr)) {
+        spu_lockline_lock();
+        memcpy(vm_ptr8(addr), src, n);
+        spu_coh_notify_write(addr);
+        spu_lockline_unlock();
+    } else {
+        memcpy(vm_ptr8(addr), src, n);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Loads -- read from big-endian guest memory, return host-endian value.
  * -----------------------------------------------------------------------*/
@@ -126,7 +161,7 @@ static inline void vm_write8(uint32_t addr, uint8_t val)
             yz_slotstore_log(addr, val, 8, _ReturnAddress());
         }
     }
-    *vm_ptr8(addr) = val;
+    vm_store_coh(addr, &val, 1);
     vm_native_spurs_notify_write(addr, 1);
 }
 
@@ -141,7 +176,7 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
         }
     }
     uint16_t raw = ps3_bswap16(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 2);
 }
 
@@ -248,7 +283,7 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
         }
     }
     uint32_t raw = ps3_bswap32(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 4);
 }
 
@@ -287,7 +322,7 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     }
 #endif
     uint64_t raw = ps3_bswap64(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 8);
 }
 
@@ -383,7 +418,16 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
             yz_slotstore_log(guest_dst, head, 99, _ReturnAddress());
         }
     }
-    memcpy(vm_ptr8(guest_dst), host_src, len);
+    /* frontier writer attribution (YZ_EA_TRAP, shims.cpp): bulk HLE copies are
+     * a write path lifted-code traps do not see. */
+    {
+        extern void yz_ea_trap_c(uint32_t, unsigned, unsigned long long, void*);
+        if (len && len <= UINT32_MAX)
+            yz_ea_trap_c(guest_dst, (unsigned)len,
+                         len >= 4 ? *(const uint32_t*)host_src : 0,
+                         _ReturnAddress());
+    }
+    vm_store_coh(guest_dst, host_src, len);
     if (len <= UINT32_MAX)
         vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
 }
@@ -407,13 +451,29 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
             yz_slotstore_log(guest_dst, (unsigned long long)(unsigned)val, 98, _ReturnAddress());
         }
     }
-    memset(vm_ptr8(guest_dst), val, len);
+    if (spu_coh_is_reserved(guest_dst)) {
+        spu_lockline_lock();
+        memset(vm_ptr8(guest_dst), val, len);
+        spu_coh_notify_write(guest_dst);
+        spu_lockline_unlock();
+    } else {
+        memset(vm_ptr8(guest_dst), val, len);
+    }
     if (len <= UINT32_MAX)
         vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
 }
 
 /* ---------------------------------------------------------------------------
  * Atomic operations -- lwarx / stwcx emulation
+ *
+ * !! DEAD CODE ON THE LIFTED PATH -- DO NOT AUDIT OR FIX THESE AS IF LIVE !!
+ * The recompiler emits ppu_res_lwarx/ppu_res_stwcx/ppu_res_ldarx/ppu_res_stdcx
+ * (yakuza/shims.cpp), which carry the REAL semantics incl. the SPU lock-line
+ * coherence discipline (spu_coh_is_reserved -> lockline lock + notify; the
+ * 2026-07-03 lost-update fix). These inline helpers have ZERO callers today
+ * and lack that discipline; they mislead audits (three separate reviews have
+ * flagged them as a live divergence -- see scratch/audit_spurs_ordering_
+ * 20260805.md, refuted). Kept only as a reference of the naive model.
  *
  * PowerPC reservation-based atomics:
  *   lwarx  rD, rA, rB   -- Load word and reserve (sets reservation)

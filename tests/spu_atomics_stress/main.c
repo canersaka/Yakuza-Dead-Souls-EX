@@ -120,6 +120,13 @@ extern uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx);
 uint32_t g_yz_spurs_taskset = 0;
 uint32_t g_yz_codec_taskset = 0;
 uint32_t g_yz_parked_pub_ea = 0;
+/* YZ_EA_TRAP store-attribution range check (yakuza/shims.cpp). Called on
+ * every DMA PUT / atomic commit, so it must quietly report "unarmed". */
+int yz_ea_trap_range(uint32_t ea, unsigned size, uint32_t* lo, uint32_t* hi)
+{
+    (void)ea; (void)size; (void)lo; (void)hi;
+    return 0;
+}
 volatile long g_yz_a010_root_active = 0;
 volatile long g_yz_a010_stage_generation = 0;
 uint32_t yz_guest_addr_from_host(const void* rip) { (void)rip; return 0; }

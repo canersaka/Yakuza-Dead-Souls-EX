@@ -68,6 +68,31 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
+/* Committed-waiter tid registry (item-K fix 1, see sys_cond.h). All three
+ * helpers require the cond's sig lock to be held by the caller. */
+static void cond_waiter_add(sys_cond_info* c, uint64_t tid)
+{
+    for (int i = 0; i < SYS_COND_WAITER_TIDS_MAX; i++) {
+        if (c->waiter_tids[i] == 0) { c->waiter_tids[i] = tid; return; }
+    }
+    /* Table full: waiter stays untracked (bounded, documented in sys_cond.h). */
+}
+
+static void cond_waiter_remove(sys_cond_info* c, uint64_t tid)
+{
+    for (int i = 0; i < SYS_COND_WAITER_TIDS_MAX; i++) {
+        if (c->waiter_tids[i] == tid) { c->waiter_tids[i] = 0; return; }
+    }
+}
+
+static int cond_waiter_present(const sys_cond_info* c, uint64_t tid)
+{
+    for (int i = 0; i < SYS_COND_WAITER_TIDS_MAX; i++) {
+        if (c->waiter_tids[i] == tid) return 1;
+    }
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_cond_create
  *
@@ -120,6 +145,12 @@ int64_t sys_cond_create(ppu_context* ctx)
     c->active   = 1;
     c->mutex_id = mutex_id;
 
+    /* item-K fix 6 support: count this cond against its mutex so
+     * sys_mutex_destroy can return the documented EPERM while associated
+     * conds exist (Lv2 Reference p.173). Serialized against other cond
+     * create/destroy by the cond table lock held here. */
+    g_sys_mutexes[mutex_id - 1].cond_count++;
+
     /* Read name from attribute if provided */
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -162,10 +193,29 @@ int64_t sys_cond_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* Lv2 Reference p.181: EBUSY when a PPU thread is waiting on this cond.
+     * Destroying anyway strands the parked waiter forever, and the slot's
+     * later recycling lets the stale waiter drive the new cond's
+     * committed/pending counters negative (2026-08-04 doc-conformance
+     * audit) -- after which every signal on the recycled cond is dropped. */
+    if (c->committed > 0) {
+        cond_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
 #ifndef _WIN32
     pthread_cond_destroy(&c->cv);
 #endif
     /* Windows CONDITION_VARIABLE doesn't need destruction */
+
+    /* item-K fix 6 support: release this cond's claim on its mutex (see
+     * sys_cond_create). Guarded against a mutex slot that was itself already
+     * destroyed/recycled out from under us. */
+    if (c->mutex_id >= 1 && c->mutex_id <= SYS_MUTEX_MAX) {
+        sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+        if (m->active && m->cond_count > 0)
+            m->cond_count--;
+    }
 
     c->active = 0;
     cond_table_unlock();
@@ -271,6 +321,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
      * re-acquire the guest mutex. */
     EnterCriticalSection(&c->sig_cs);
     c->committed++;
+    cond_waiter_add(c, caller_tid);   /* item-K fix 1: visible to signal_to */
 
     for (int i = 0; i < saved_count; i++) {
         LeaveCriticalSection(&m->cs);
@@ -306,6 +357,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (ok)
         c->pending--;
     c->committed--;
+    cond_waiter_remove(c, caller_tid);
     LeaveCriticalSection(&c->sig_cs);
 
     /* Re-acquire ALL N recursion levels of the guest mutex. */
@@ -340,6 +392,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
      * guest-mutex release; park against the sig lock; consume one pending. */
     pthread_mutex_lock(&c->sig_mtx);
     c->committed++;
+    cond_waiter_add(c, caller_tid);   /* item-K fix 1: visible to signal_to */
 
     for (int i = 0; i < saved_count; i++) {
         pthread_mutex_unlock(&m->mtx);
@@ -366,6 +419,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (!timed_out)
         c->pending--;
     c->committed--;
+    cond_waiter_remove(c, caller_tid);
     pthread_mutex_unlock(&c->sig_mtx);
 
     for (int i = 0; i < saved_count; i++) {
@@ -509,6 +563,77 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_cond_signal_to (syscall 110)
+ *
+ * r3 = cond_id
+ * r4 = ppu_thread_id (target)
+ *
+ * 2026-08-05 item-K fix 1 -- ORACLE(Lv2 Reference p.184): CELL_OK when the
+ * signal is delivered; ESRCH for an un-issued cond ID; EPERM when "the
+ * specified PPU thread is not waiting on the condition variable". Membership
+ * comes from the waiter-tid registry the wait path maintains under the sig
+ * lock, so the check is race-free against wait entry/exit.
+ *
+ * Delivery approximation (documented deviation): the rendezvous core wakes
+ * committed waiters through a shared pending counter, so with MULTIPLE
+ * simultaneous waiters an arbitrary committed waiter may consume the signal
+ * instead of the targeted one (real lv2 wakes exactly the target). The
+ * validation/error contract and the delivery COUNT are exact; single-waiter
+ * behavior (the common signal_to idiom) is exact. A per-thread directed-wake
+ * channel is the follow-up if a title measurably depends on targeting.
+ * -----------------------------------------------------------------------*/
+int64_t sys_cond_signal_to(ppu_context* ctx)
+{
+    uint32_t cond_id   = LV2_ARG_U32(ctx, 0);
+    uint64_t target_tid = LV2_ARG_U64(ctx, 1);
+
+    if (cond_id == 0 || cond_id > SYS_COND_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_cond_info* c = &g_sys_conds[cond_id - 1];
+    if (!c->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    if (cond_trace_on() && cond_id <= 16) {
+        static long sn = 0;
+        if (sn < 4000) { sn++;
+            fprintf(stderr, "[cond] t%u SIGNAL-TO cond=%u target=t%u committed=%d pending=%d\n",
+                    yz_thread_current_id(), cond_id, (uint32_t)target_tid,
+                    c->committed, c->pending); }
+    }
+
+#ifdef _WIN32
+    EnterCriticalSection(&c->sig_cs);
+    if (!cond_waiter_present(c, target_tid)) {
+        LeaveCriticalSection(&c->sig_cs);
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+    if (c->committed > c->pending) {
+        c->pending++;
+        /* Broadcast so the TARGET is guaranteed to wake and re-check; extra
+         * wakes are benign (waiters loop on pending and re-sleep). */
+        WakeAllConditionVariable(&c->cv);
+    }
+    /* committed == pending: every committed waiter (incl. the target) already
+     * has a wake owed -- the signal is already satisfied; CELL_OK. */
+    LeaveCriticalSection(&c->sig_cs);
+#else
+    pthread_mutex_lock(&c->sig_mtx);
+    if (!cond_waiter_present(c, target_tid)) {
+        pthread_mutex_unlock(&c->sig_mtx);
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+    if (c->committed > c->pending) {
+        c->pending++;
+        pthread_cond_broadcast(&c->cv);
+    }
+    pthread_mutex_unlock(&c->sig_mtx);
+#endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
 void sys_cond_init(lv2_syscall_table* tbl)
@@ -527,4 +652,5 @@ void sys_cond_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_COND_WAIT,        sys_cond_wait);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL,      sys_cond_signal);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL,  sys_cond_signal_all);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL_TO,   sys_cond_signal_to);
 }
