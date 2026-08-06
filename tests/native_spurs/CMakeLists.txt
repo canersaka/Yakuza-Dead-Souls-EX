@@ -12,7 +12,9 @@ add_executable(native_spurs_tests
     "${PS3RECOMP_ROOT}/libs/spurs/cellSpurs.c"
     "${PS3RECOMP_ROOT}/libs/sync/cellSync.c"
     "${PS3RECOMP_ROOT}/runtime/spu/spu_lock_order.c"
-    "${PS3RECOMP_ROOT}/runtime/spu/spu_workload.c")
+    "${PS3RECOMP_ROOT}/runtime/spu/spu_workload.c"
+    # cellSpurs.c's handoff-ordering ring emits (2026-08-06) resolve here.
+    "${PS3RECOMP_ROOT}/runtime/diag/yz_frontier_trace.c")
 target_compile_definitions(native_spurs_tests PRIVATE
     YZ_SPURS_LOCK_ORDER_TEST=1
     YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST=1
