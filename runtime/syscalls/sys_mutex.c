@@ -187,6 +187,17 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
+    /* 2026-08-05 item-K fix 6 -- ORACLE(Lv2 Reference p.173): "Prior to this
+     * system call, all condition variables that are associated with the mutex
+     * must be destroyed. Otherwise, EPERM will be returned." Tearing the
+     * mutex down under a live cond also left that cond's later waits touching
+     * a deleted CRITICAL_SECTION (host UB). cond_count is maintained by
+     * sys_cond_create/sys_cond_destroy. */
+    if (m->cond_count > 0) {
+        mtx_table_unlock();
+        return (int64_t)(int32_t)CELL_EPERM;
+    }
+
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
     if (m->wait_handle) CloseHandle(m->wait_handle);
