@@ -24,9 +24,13 @@ the scelibstub records, resolves NIDs to names, and emits:
     to the bridges.
 
 Implemented-name detection scans libs/ + runtime/ sources for a function
-definition `name(`. Bridges call through a generic 8 x u64 prototype; the
-x64 ABI tolerates extra args, and returns are narrowed via (int32_t).
-Float-arg HLE functions would need a hand-written bridge (none needed yet).
+definition `name(`. Bridges are signature-aware (2026-08-05): float/double
+params read ctx->fpr[1..13] (PPU ABI: fp args travel in FPRs; every param
+still consumes a GPR slot) and are declared in-position so x64 passes them
+in xmmN; float/double returns write ctx->fpr[1]; u32 returns zero-extend,
+s32 returns sign-extend, 64-bit returns pass through. Signature-less names
+fall back to the legacy 8 x u64 prototype with (int32_t) narrowing. No HLE
+import returns a vector today; a vr[2] return lane is unimplemented.
 
 Usage:  py -3 gen_imports.py
 """
@@ -56,8 +60,10 @@ OUT = os.path.join(HERE, "import_bridges_gen.cpp")
 # Each pair is (exports.json, imports.json) under recomp_prx/. Exports from all
 # modules merge into one (lib, nid) -> OPD map; imports from all modules are
 # appended after the game's own imports (LLE binding still wins over OVERRIDES).
-LLE_MODULES = [
+LLE_SPURS_MODULES = [
     ("libsre_exports.json",     "libsre_imports.json"),
+]
+LLE_GCM_MODULES = [
     # libgcm_sys: RE-ADDED 2026-06-14g -- RPCS3.log PROVES RPCS3 renders this game
     # with LLE cellGcmSys (Sony's real code in liblv2 @0x019xxxx), so HLE was
     # BACKWARDS. The gcm layer is not the problem; our RSX consumer's control plane
@@ -78,6 +84,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spurs-backend", choices=("lle", "native"),
                         default=os.environ.get("YZ_SPURS_BACKEND", "lle").lower())
+    parser.add_argument("--gcm-backend", choices=("lle", "native"), default=None)
     parser.add_argument("--elf", default=ELF)
     parser.add_argument("--firmware-dir", default=os.path.join(ROOT, "recomp_prx"))
     parser.add_argument("--output", default=OUT)
@@ -87,7 +94,13 @@ def main():
     # The native lane is firmware-free: no export table or import list from a
     # firmware image participates in bridge generation. The LLE lane remains
     # the untouched behavioral oracle.
-    lle_modules = LLE_MODULES if opts.spurs_backend == "lle" else []
+    gcm_backend = opts.gcm_backend or os.environ.get(
+        "YZ_GCM_BACKEND", opts.spurs_backend).lower()
+    lle_modules = []
+    if opts.spurs_backend == "lle":
+        lle_modules.extend(LLE_SPURS_MODULES)
+    if gcm_backend == "lle":
+        lle_modules.extend(LLE_GCM_MODULES)
 
     e_phoff = be64(data, 32)
     e_phentsize = be16(data, 54)
@@ -261,17 +274,109 @@ def main():
             params = [p.strip() for p in ptxt.split(",")]
         return ret, params
 
-    def param_marshal(p):
-        """Return C expression template for one param ('{}' = gpr value)."""
+    def param_kind(p, prev_kind=None):
+        """Classify one parameter: 'float' | 'double' | 'ptr' | 'raw' | 'cb'.
+
+        Order matters (2026-08-05, doc-conformance audit systemic finding):
+        the old classifier tested "Callback" in the TYPE NAME before "*", so
+        a pointer TO a callback-named struct (CellOskDialogCallbackReturnParam*)
+        was passed as a raw guest EA to an HLE function that dereferences it
+        as a host pointer -- the wild-write class. A '*' now means
+        guest->host translation EXCEPT for the opaque user-token idiom: a
+        void* named like a user token, or a void* immediately following a
+        callback-typedef param (the SDK's (cb, cbArg) pair convention),
+        travels back to a guest callback verbatim and must stay raw.
+        'cb' is a raw starless callback typedef (returned so the NEXT
+        param's classification can see it).
+        """
         if p == "...":
-            return "{}"
+            return "raw"
         name_tok = p.replace("*", " ").split()[-1] if p.split() else ""
-        if "(" in p or "Callback" in p or "callback" in p.lower() \
-           or name_tok.lower().startswith("userdata"):
-            return "{}"            # raw guest value
+        if "(" in p:
+            return "cb"            # explicit function-pointer syntax
+        if name_tok.lower().startswith(("userdata", "userarg", "callbackarg",
+                                        "cbarg")):
+            return "raw"           # opaque guest token (cellSysutil.c:82)
         if "*" in p:
-            return "yz_hp({})"     # guest addr -> host pointer
-        return "{}"
+            if prev_kind == "cb" and re.match(r"^\s*(const\s+)?void\s*\*", p):
+                return "raw"       # the (callback, void* arg) pair idiom
+            return "ptr"           # guest addr -> host pointer
+        if "Callback" in p or "callback" in p.lower():
+            return "cb"            # typedef'd function pointer, no '*'
+        if re.search(r"\bfloat\b", p):
+            return "float"         # PPU ABI: f1..f13, gpr slot skipped
+        if re.search(r"\bdouble\b", p):
+            return "double"
+        return "raw"
+
+    def ret_kind(ret):
+        """Classify a return type for bridge marshalling (audit finding:
+        unconditional (int32_t) narrowing corrupted u32 returns >= 0x80000000
+        and truncated 64-bit returns; float returns never reached fpr[1])."""
+        if "*" in ret:
+            return "ptr"
+        if re.match(r"^void\b", ret):
+            return "void"
+        if re.search(r"\bfloat\b", ret):
+            return "float"
+        if re.search(r"\bdouble\b", ret):
+            return "double"
+        if re.search(r"\b(u64|uint64_t|s64|int64_t|long long)\b", ret):
+            return "i64"
+        if re.search(r"\b(u32|uint32_t|unsigned)\b", ret):
+            return "u32"
+        return "s32"
+
+    def bridge_plan(name):
+        """Compute (decl_ret, decl_params[8], args[8], rkind) for an
+        implemented HLE import, or None when no signature was found (the
+        caller falls back to the legacy generic bridge). PPU ELF ABI: every
+        parameter consumes one 64-bit GPR slot (r3..r10) whether or not it
+        is floating point; float/double values travel in f1..f13 in order
+        of appearance. On the host side the extern declaration must carry
+        float/double in the right POSITIONS (x64 passes by position into
+        xmmN) while everything else stays u64."""
+        sig = signature_of(name)
+        if not sig:
+            return None
+        ret, params = sig
+        gprs = [f"ctx->gpr[{3+i}]" for i in range(8)]
+        args = []
+        decl_params = []
+        nf = 0
+        variadic = bool(params) and params[-1] == "..."
+        fixed = params[:-1] if variadic else params
+        prev_kind = None
+        for i, p in enumerate(fixed[:8]):
+            kind = param_kind(p, prev_kind)
+            prev_kind = kind
+            if kind == "float":
+                nf += 1
+                args.append(f"(float)ctx->fpr[{nf}]")
+                decl_params.append("float")
+            elif kind == "double":
+                nf += 1
+                args.append(f"ctx->fpr[{nf}]")
+                decl_params.append("double")
+            elif kind == "ptr":
+                args.append(f"yz_hp({gprs[i]})")
+                decl_params.append("u64")
+            else:
+                args.append(gprs[i])
+                decl_params.append("u64")
+        if variadic and nf:
+            # PPU varargs copy fp args into GPRs, so the fixed-float read
+            # above still holds; no HLE vararg import has float fixed params
+            # today -- warn if one appears so the bridge gets hand-checked.
+            print(f"WARNING: variadic import {name} has float fixed params; "
+                  f"verify its bridge by hand")
+        # pad to 8: raw gprs (x64 ABI ignores extras beyond what callee reads)
+        for i in range(len(args), 8):
+            args.append(gprs[i])
+            decl_params.append("u64")
+        rk = ret_kind(ret)
+        decl_ret = {"float": "float", "double": "double"}.get(rk, "int64_t")
+        return decl_ret, decl_params, args, rk
 
     # Imports that need ppu_context access -> hand-written bridges in
     # import_overrides.cpp. These take precedence over libs/ implementations.
@@ -449,7 +554,12 @@ def main():
                     lines.append(f"void yz_ovr_{name}(ppu_context*);")
             elif implemented(name) and name not in seen_decl:
                 seen_decl.add(name)
-                lines.append(f"int64_t {name}(u64,u64,u64,u64,u64,u64,u64,u64);")
+                plan = bridge_plan(name)
+                if plan:
+                    decl_ret, decl_params, _args, _rk = plan
+                    lines.append(f"{decl_ret} {name}({','.join(decl_params)});")
+                else:
+                    lines.append(f"int64_t {name}(u64,u64,u64,u64,u64,u64,u64,u64);")
     lines.append("}")
     lines.append("")
 
@@ -487,52 +597,35 @@ def main():
             ident = f"yz_imp_{name}"
             if ident not in emitted:
                 emitted.add(ident)
-                sig = signature_of(name)
+                plan = bridge_plan(name)
                 gprs = [f"ctx->gpr[{3+i}]" for i in range(8)]
-                if sig:
-                    ret, params = sig
-                    if params and params[-1] == "...":
-                        # fixed params marshalled, varargs passed raw
-                        fixed = params[:-1]
-                        args = [param_marshal(p).format(g)
-                                for p, g in zip(fixed, gprs)]
-                        args += gprs[len(fixed):8]
-                    else:
-                        args = [param_marshal(p).format(g)
-                                for p, g in zip(params, gprs)]
-                    # extern decl takes 8 args; pad with raw gprs (x64 ABI
-                    # ignores extras beyond what the callee reads)
-                    args += gprs[len(args):8]
-                    is_void_ret = re.match(r"^void\b", ret) is not None
-                    if is_void_ret:
-                        retexpr = ""
-                        retclose = ""
-                    elif "*" in ret:
-                        retexpr = "yz_gp((u64)"
-                        retclose = ")"
-                    elif re.search(r"\b(u64|uint64_t|s64|int64_t)\b", ret):
-                        retexpr = "(uint64_t)"
-                        retclose = ""
-                    else:
-                        retexpr = "(uint64_t)(int64_t)(int32_t)"
-                        retclose = ""
+                if plan:
+                    _decl_ret, _decl_params, args, rk = plan
                 else:
-                    is_void_ret = False
                     args = gprs
-                    retexpr = "(uint64_t)(int64_t)(int32_t)"
-                    retclose = ""
+                    rk = "s32"
                 lines.append(f"static void {ident}(ppu_context* ctx) {{")
                 lines.append(f"    static int logged = 0;")
                 lines.append(f'    if (!logged) {{ logged = 1; fprintf(stderr, "[import] call {name}\\n"); }}')
-                if is_void_ret:
+                call = f"{name}(\n        " + ", ".join(args) + ")"
+                if rk == "void":
                     # void-returning guest function: no r3 value to marshal back;
                     # leave ctx->gpr[3] whatever it already was (CELL_OK convention
                     # doesn't apply -- callers of a void SDK function don't read r3).
-                    lines.append(f"    {name}(")
-                    lines.append("        " + ", ".join(args) + ");")
+                    lines.append(f"    {call};")
+                elif rk in ("float", "double"):
+                    # PPU ABI: fp returns travel in f1 only; r3 is not written.
+                    lines.append(f"    ctx->fpr[1] = (double){call};")
+                elif rk == "ptr":
+                    lines.append(f"    ctx->gpr[3] = yz_gp((u64){call});")
+                elif rk == "i64":
+                    lines.append(f"    ctx->gpr[3] = (uint64_t){call};")
+                elif rk == "u32":
+                    # zero-extend: the old unconditional (int32_t) narrowing
+                    # sign-poisoned u32 returns >= 0x80000000
+                    lines.append(f"    ctx->gpr[3] = (uint64_t)(uint32_t){call};")
                 else:
-                    lines.append(f"    ctx->gpr[3] = {retexpr}{name}(")
-                    lines.append("        " + ", ".join(args) + f"){retclose};")
+                    lines.append(f"    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t){call};")
                 lines.append("}")
         else:
             label = name if name else f"0x{nid:08X}"
