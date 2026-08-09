@@ -2953,7 +2953,19 @@ class PPULifter:
         label = self.name_map.get(func.start_addr)
         if label:
             lines.append(f"/* {label} */")
+        if (self.header_name == "ppu_recomp.h" and
+                func.start_addr == 0x00E7DE88):
+            lines.append('extern "C" void yz_jrnl_throttle(void);')
         lines.append(f"void {emit_name}(ppu_context* ctx) {{")
+        # The EDGE/gs_task release journal must be drained before the game
+        # zeroes and rebuilds it at this phase-boundary initializer. Real
+        # hardware reaches this entry with the release engine empty; the
+        # recompiler can let the PPU producer outrun the SPU consumer. Keep
+        # the bounded, fail-open wait as a durable lift rule rather than a
+        # generated-file hand edit that disappears on every relift.
+        if (self.header_name == "ppu_recomp.h" and
+                func.start_addr == 0x00E7DE88):
+            lines.append("    yz_jrnl_throttle();")
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -3020,7 +3032,17 @@ class PPULifter:
             nonlocal chunk_idx
             path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
             with open(path, "w") as f:
-                f.write("\n".join(preamble + body_lines + (trailer or [])))
+                # Do not concatenate a 600k-line translation unit into one
+                # second giant string. The line lists already own most of the
+                # process memory during a full-game lift; joining them here can
+                # exhaust the address space after stale chunks were removed.
+                first = True
+                for section in (preamble, body_lines, trailer or []):
+                    for line in section:
+                        if not first:
+                            f.write("\n")
+                        f.write(line)
+                        first = False
             written.append(path)
             print(f"  wrote {os.path.basename(path)} "
                   f"({len(preamble) + len(body_lines) + len(trailer or [])} lines)",
