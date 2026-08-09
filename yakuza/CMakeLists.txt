@@ -25,6 +25,19 @@ if(NOT YZ_SPURS_BACKEND STREQUAL "LLE" AND
 endif()
 string(TOLOWER "${YZ_SPURS_BACKEND}" _yz_spurs_backend_arg)
 
+# Keep the historical coupled default, but allow the oracle to vary the GCM
+# driver independently from SPURS.  Without this split an LLE-vs-native result
+# cannot attribute a rendering difference to either subsystem.
+set(YZ_GCM_BACKEND "${YZ_SPURS_BACKEND}" CACHE STRING
+    "GCM backend: LLE (Sony oracle) or NATIVE (host implementation)")
+set_property(CACHE YZ_GCM_BACKEND PROPERTY STRINGS LLE NATIVE)
+string(TOUPPER "${YZ_GCM_BACKEND}" YZ_GCM_BACKEND)
+if(NOT YZ_GCM_BACKEND STREQUAL "LLE" AND
+   NOT YZ_GCM_BACKEND STREQUAL "NATIVE")
+    message(FATAL_ERROR "YZ_GCM_BACKEND must be LLE or NATIVE")
+endif()
+string(TOLOWER "${YZ_GCM_BACKEND}" _yz_gcm_backend_arg)
+
 # A separate worktree can use the original tree's decrypted, untracked game
 # and firmware inputs while compiling the current branch's tracked lifts.
 set(YZ_GAME_INPUT_DIR "${PS3RECOMP_DIR}" CACHE PATH
@@ -95,9 +108,13 @@ file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS
     "${YZ_RECOMP_PRX_DIR}/pxd_shader_recomp_*.cpp")
 if(YZ_SPURS_BACKEND STREQUAL "LLE")
     file(GLOB _YZ_FIRMWARE_CHUNKS CONFIGURE_DEPENDS
-        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp_*.cpp"
         "${YZ_RECOMP_PRX_DIR}/libsre_recomp_*.cpp")
     list(APPEND PRX_CHUNKS ${_YZ_FIRMWARE_CHUNKS})
+endif()
+if(YZ_GCM_BACKEND STREQUAL "LLE")
+    file(GLOB _YZ_GCM_FIRMWARE_CHUNKS CONFIGURE_DEPENDS
+        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp_*.cpp")
+    list(APPEND PRX_CHUNKS ${_YZ_GCM_FIRMWARE_CHUNKS})
 endif()
 
 add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
@@ -219,11 +236,16 @@ foreach(stem job_bin_c_4c00 job_bin_c_e400 job_bin_c_15800 job_bin_c_17800 job_b
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_C "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_d_4c00 job_bin_d_5000 job_bin_d_e400 job_bin_d_15800
-        job_bin_d_15c00 job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400
-        job_bin_d_2a800 job_bin_d_2b400 job_bin_d_2b800
+        job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400
+        job_bin_d_2a800 job_bin_d_2b400
         job_bin_d_2c400 job_bin_d_2d400 job_bin_d_2e400 job_bin_d_2e800)
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
+# These later placement lifts predate the diag/fast directory split.  Their
+# instruction-mode correctness twins remain in generated/ rather than
+# generated/diag; keep both selector positions buildable.
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c" job_bin_d_15c00)
+_yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c" job_bin_d_2b800)
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
 foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
         job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
@@ -247,6 +269,7 @@ add_custom_command(
     OUTPUT "${YZ_IMPORT_BRIDGES}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/gen_imports.py"
             --spurs-backend "${_yz_spurs_backend_arg}"
+            --gcm-backend "${_yz_gcm_backend_arg}"
             --elf "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
             --firmware-dir "${YZ_FIRMWARE_DIR}"
             --output "${YZ_IMPORT_BRIDGES}"
@@ -258,7 +281,10 @@ add_custom_command(
 set(_YZ_FUNC_HEADERS "${YZ_RECOMP_DIR}/ppu_recomp.h")
 if(YZ_SPURS_BACKEND STREQUAL "LLE")
     list(APPEND _YZ_FUNC_HEADERS
-        "${YZ_RECOMP_PRX_DIR}/libsre_recomp.h"
+        "${YZ_RECOMP_PRX_DIR}/libsre_recomp.h")
+endif()
+if(YZ_GCM_BACKEND STREQUAL "LLE")
+    list(APPEND _YZ_FUNC_HEADERS
         "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp.h")
 endif()
 list(APPEND _YZ_FUNC_HEADERS
@@ -325,6 +351,9 @@ target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp user32 gdi
 if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
     target_compile_definitions(yakuza_recomp PRIVATE YZ_NATIVE_SPURS=1)
 endif()
+if(YZ_GCM_BACKEND STREQUAL "NATIVE")
+    target_compile_definitions(yakuza_recomp PRIVATE YZ_NATIVE_GCM=1)
+endif()
 
 # FFmpeg (host movie decode) creates a load-time DLL dependency on the exe.
 # Copy the runtime DLLs next to it from an in-repo RPCS3 install, if present.
@@ -358,6 +387,8 @@ if(MSVC)
 endif()
 
 message(STATUS "Yakuza SPURS backend: ${YZ_SPURS_BACKEND}")
-if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
+message(STATUS "Yakuza GCM backend: ${YZ_GCM_BACKEND}")
+if(YZ_SPURS_BACKEND STREQUAL "NATIVE" AND
+   YZ_GCM_BACKEND STREQUAL "NATIVE")
     message(STATUS "  firmware-free: SPURS and GCM firmware PPU/SPU payloads excluded")
 endif()
