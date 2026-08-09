@@ -38,18 +38,26 @@ static uint64_t bswap64(uint64_t v);
 
 void yz_frontier_event_snapshot(void)
 {
-    const sys_event_queue_info* q = &g_sys_event_queues[1];
     const uint64_t bits = bswap64(
         *(const uint64_t*)vm_to_host(0x4019C680u));
     const uint32_t bits_hi = (uint32_t)(bits >> 32);
     const uint32_t bits_lo = (uint32_t)bits;
 
-    yz_frontier_trace_emit(
-        YZ_FT_EVENT_STATE, 0, 2,
-        (uint32_t)q->active,
-        ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
-        ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
-        bits_hi, bits_lo, (uint32_t)q->capacity);
+    for (uint32_t i = 0; i < SYS_EVENT_QUEUE_MAX; ++i) {
+        const sys_event_queue_info* q = &g_sys_event_queues[i];
+        if (!q->active) continue;
+        yz_frontier_trace_emit(
+            YZ_FT_EVENT_STATE, i + 1u, 2u,
+            (uint32_t)q->active,
+            ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
+            ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
+            bits_hi, bits_lo, (uint32_t)q->capacity);
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 5u,
+            (uint32_t)q->count, (uint32_t)q->capacity,
+            (uint32_t)q->waiters, (uint32_t)q->head,
+            (uint32_t)q->tail, (uint32_t)q->force_destroyed);
+    }
 
     for (uint32_t i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
         const sys_event_flag_info* f = &g_sys_event_flags[i];
@@ -59,7 +67,12 @@ void yz_frontier_event_snapshot(void)
             YZ_FT_EVENT_STATE, i + 1u, 0,
             (uint32_t)(f->pattern >> 32),
             (uint32_t)f->pattern, (uint32_t)f->waiters,
-            f->protocol, f->type, (uint32_t)f->force_cancelled);
+            f->protocol, f->type, (uint32_t)f->cancel_gen);
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 6u,
+            (uint32_t)f->pattern, (uint32_t)(f->pattern >> 32),
+            (uint32_t)f->waiters, f->protocol, f->type,
+            (uint32_t)f->cancel_gen);
     }
 }
 
@@ -196,6 +209,23 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     evt_table_lock();
 
+    /* 2026-08-05 item-K fix 3 -- duplicate global key must be refused, not
+     * silently given a second queue (2026-08-04 audit: key-routed producers,
+     * e.g. the cellAudio notify lookup, could then hit either queue).
+     * ORACLE(Lv2 Reference p.237): return-values table lists EEXIST "The
+     * specified key is already in use" (the description prose says EINVAL --
+     * the doc contradicts itself; the table and RPCS3 sys_event.cpp agree on
+     * EEXIST, so EEXIST it is). Key 0 = SYS_EVENT_QUEUE_LOCAL is the
+     * documented process-local key exempt from duplication checks. */
+    if (key != 0) {
+        for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+            if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key) {
+                evt_table_unlock();
+                return (int64_t)(int32_t)CELL_EEXIST;
+            }
+        }
+    }
+
     int slot = -1;
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
         if (!g_sys_event_queues[i].active) { slot = i; break; }
@@ -295,6 +325,19 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
 #endif
+
+    /* 2026-08-05 item-K fix 4 -- ORACLE(Lv2 Reference p.239): "All
+     * connections with event ports are forcibly disconnected." Leaving the
+     * connection standing let a later sys_event_port_send inject into
+     * whatever queue recycled this slot (2026-08-04 audit: stale-port
+     * injection). After this sweep a send on such a port takes the
+     * documented ENOTCONN path (Reference p.248). Done under the table lock
+     * that also guards connect/disconnect. */
+    for (int i = 0; i < SYS_EVENT_PORT_MAX; i++) {
+        sys_event_port_info* p = &g_sys_event_ports[i];
+        if (p->active && p->connected_queue == (int32_t)queue_id)
+            p->connected_queue = 0;
+    }
 
     evt_table_unlock();
     return CELL_OK;
@@ -503,7 +546,13 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    if (max_count <= 0) max_count = 1;
+    /* 2026-08-05 item-K fix 2 -- ORACLE(Lv2 Reference p.241 Notes): "If 0 is
+     * specified to size and other argument values are correct, this function
+     * successfully returns CELL_OK, storing 0 in number." The old
+     * clamp-to-1 dequeued an event and wrote 32 bytes into the caller's
+     * zero-length buffer (2026-08-04 audit). size<=0 now receives nothing:
+     * the drain loop below runs zero iterations and *number gets 0. */
+    if (max_count < 0) max_count = 0;
 
     int32_t received = 0;
 
@@ -987,16 +1036,17 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             fflush(stderr); }
     }
     f->waiters++;
+    unsigned cancel_snap = f->cancel_gen;
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
     } else if (timeout_us < 1000) {
         /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
          * floored-to-1ms condvar wait (see sys_event_queue_receive above). */
         int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
             if (lv2_deadline_passed(deadline)) {
                 /* Write current pattern even on timeout */
                 if (result_addr != 0) {
@@ -1016,7 +1066,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
          * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
         uint64_t ms64 = timeout_us / 1000;
         DWORD ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
-        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     /* Write current pattern even on timeout */
@@ -1034,9 +1084,14 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 
     f->waiters--;
 
-    /* Batch fixes item 9(d): a cancel forced this wake -- report
-     * CELL_ECANCELED instead of consuming the pattern. */
-    if (f->force_cancelled) {
+    /* Batch fixes item 9(d), generation-scoped: a cancel issued while THIS
+     * thread was parked forces CELL_ECANCELED without consuming the pattern.
+     * Ref p.228 Notes: result receives the flag value at cancel timing. */
+    if (f->cancel_gen != cancel_snap) {
+        if (result_addr != 0) {
+            uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+            *out = bswap64(f->pattern);
+        }
         LeaveCriticalSection(&f->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
@@ -1066,9 +1121,10 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             fflush(stderr); }
     }
     f->waiters++;
+    unsigned cancel_snap = f->cancel_gen;
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
             pthread_cond_wait(&f->cv, &f->lock);
         }
     } else {
@@ -1080,7 +1136,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->force_cancelled) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
             int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
             if (rc == ETIMEDOUT) {
                 if (result_addr != 0) {
@@ -1096,7 +1152,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 
     f->waiters--;
 
-    if (f->force_cancelled) {
+    if (f->cancel_gen != cancel_snap) {
+        if (result_addr != 0) {
+            uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+            *out = bswap64(f->pattern);
+        }
         pthread_mutex_unlock(&f->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
@@ -1288,9 +1348,9 @@ int64_t sys_event_flag_get(ppu_context* ctx)
  * r3 = flag_id
  * r4 = pointer to receive the number of woken waiters (u32*, optional)
  *
- * Mirrors sys_event_queue_destroy's force_destroyed pattern (this file,
- * ~line 237): force every parked waiter to observe force_cancelled and
- * return CELL_ECANCELED instead of re-parking.
+ * Bumps the cancel generation so exactly the waiters parked at call time
+ * observe it and return CELL_ECANCELED (Lv2 Reference p.232); later waits
+ * are unaffected (the previous sticky flag poisoned them forever).
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_cancel(ppu_context* ctx)
 {
@@ -1307,13 +1367,13 @@ int64_t sys_event_flag_cancel(ppu_context* ctx)
     uint32_t woken;
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
-    f->force_cancelled = 1;
+    f->cancel_gen++;
     woken = (uint32_t)f->waiters;
     WakeAllConditionVariable(&f->cv);
     LeaveCriticalSection(&f->lock);
 #else
     pthread_mutex_lock(&f->lock);
-    f->force_cancelled = 1;
+    f->cancel_gen++;
     woken = (uint32_t)f->waiters;
     pthread_cond_broadcast(&f->cv);
     pthread_mutex_unlock(&f->lock);
