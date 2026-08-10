@@ -32,6 +32,7 @@ extern "C" {
 #define CELL_SPURS_TASK_ERROR_INVAL        ((s32)0x80410902u)
 #define CELL_SPURS_TASK_ERROR_NOSYS        ((s32)0x80410903u)
 #define CELL_SPURS_TASK_ERROR_NOMEM        ((s32)0x80410904u)
+#define CELL_SPURS_TASK_ERROR_SRCH         ((s32)0x80410905u)
 #define CELL_SPURS_TASK_ERROR_NOENT        ((s32)0x80410906u)
 #define CELL_SPURS_TASK_ERROR_NOEXEC       ((s32)0x80410907u)
 #define CELL_SPURS_TASK_ERROR_PERM         ((s32)0x80410909u)
@@ -147,6 +148,7 @@ s32 _cellSpursSendSignal(CellSpursTaskset*, CellSpursTaskId);
 s32 cellSpursJoinTask2(CellSpursTaskset2*, CellSpursTaskId, s32*);
 s32 cellSpursTryJoinTask2(CellSpursTaskset2*, CellSpursTaskId, s32*);
 s32 cellSpursTaskExitCodeTryGet(CellSpursTaskExitCode*, s32*);
+s32 cellSpursTaskExitCodeGet(CellSpursTaskExitCode*, s32*);
 s32 cellSpursTaskGetContextSaveAreaSize(u32*, const CellSpursTaskLsPattern*);
 
 s32 _cellSpursEventFlagInitialize(CellSpurs*, CellSpursTaskset*,
@@ -190,6 +192,14 @@ s32 cellSpursJobGuardReset(CellSpursJobGuard*);
  * predicates that re-read the guest bytes. */
 void cellSpursNotifyGuestWrite(u32 ea, u32 size);
 void cellSpursNotifyPpuGuestWrite(u32 ea, u32 size);
+/* Test support: is the jobchain's worker parked waiting at guest EA? */
+int yz_spurs_jobchain_is_parked_at(CellSpursJobChain* object, u32 ea);
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+int yz_spurs_test_watch_pending_descriptor(
+    CellSpursJobChain* object, u32 descriptor);
+int yz_spurs_test_pending_ticket_publish_candidate(
+    CellSpursJobChain* object, u32 ea, u32 size, u32* descriptor_out);
+#endif
 
 /* Compatibility surface used elsewhere in the generic runtime. */
 s32 cellSpursInitialize(CellSpurs*, s32, s32, s32, u8);
