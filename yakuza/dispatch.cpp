@@ -862,6 +862,103 @@ extern "C" volatile unsigned long long g_yz_auto_start_tick = 0;
 extern "C" volatile long g_yz_a010_root_active;
 static uint32_t g_yz_auto_input_cached;
 static uint32_t g_yz_auto_input_mask;
+static uint32_t g_yz_frontier_input_cached;
+static uint32_t g_yz_frontier_input_mask;
+
+/* Four proof-boundary snapshots separate raw cellPad acceptance from the
+ * game's high-level input cache and from its final camera producer.  Keep the
+ * output bounded: the cache is copied only at a before/held boundary, and a
+ * held snapshot lists only words that differ from its immediately preceding
+ * before snapshot. */
+extern "C" uint32_t yz_pad_guest_input_serial(void);
+extern "C" void yz_movement_frontier_snapshot(const char* reason)
+{
+    constexpr uint32_t cache_bytes = 0x310u;
+    constexpr uint32_t cache_words = cache_bytes / 4u;
+    constexpr uint32_t camera = 0x01622650u;
+    static uint32_t baseline[cache_words];
+    static uint32_t baseline_addr;
+    static bool baseline_valid;
+
+    const uint32_t cached = g_yz_frontier_input_cached
+        ? g_yz_frontier_input_cached : g_yz_auto_input_cached;
+    const uint32_t mask = g_yz_frontier_input_mask
+        ? g_yz_frontier_input_mask : g_yz_auto_input_mask;
+    const bool before = reason && std::strncmp(reason, "before-", 7) == 0;
+    const bool cache_valid = cached && addr_readable(cached) &&
+        addr_readable(cached + cache_bytes - 4u);
+
+    fprintf(stderr,
+            "[movement-frontier] reason=%s serial=%u cached=%08X "
+            "mask=%08X mask_value=%08X root=%ld\n",
+            reason ? reason : "unknown", yz_pad_guest_input_serial(),
+            cached, mask,
+            mask && addr_readable(mask) ? vm_read32(mask) : 0u,
+            g_yz_a010_root_active);
+
+    if (cache_valid) {
+        fprintf(stderr,
+                "[movement-frontier-cache] reason=%s "
+                "+000=%08X +004=%08X +008=%08X +00C=%08X "
+                "+010=%08X +014=%08X +018=%08X +01C=%08X "
+                "+300=%08X +304=%08X +308=%08X\n",
+                reason ? reason : "unknown",
+                vm_read32(cached + 0x000u), vm_read32(cached + 0x004u),
+                vm_read32(cached + 0x008u), vm_read32(cached + 0x00Cu),
+                vm_read32(cached + 0x010u), vm_read32(cached + 0x014u),
+                vm_read32(cached + 0x018u), vm_read32(cached + 0x01Cu),
+                vm_read32(cached + 0x300u), vm_read32(cached + 0x304u),
+                vm_read32(cached + 0x308u));
+        if (before || !baseline_valid || baseline_addr != cached) {
+            for (uint32_t i = 0; i < cache_words; ++i)
+                baseline[i] = vm_read32(cached + i * 4u);
+            baseline_addr = cached;
+            baseline_valid = true;
+            fprintf(stderr,
+                    "[movement-frontier-cache] reason=%s baseline_words=%u\n",
+                    reason ? reason : "unknown", cache_words);
+        } else {
+            uint32_t changed = 0;
+            uint32_t reported = 0;
+            for (uint32_t i = 0; i < cache_words; ++i) {
+                const uint32_t actual = vm_read32(cached + i * 4u);
+                if (actual == baseline[i])
+                    continue;
+                ++changed;
+                if (reported < 96u) {
+                    fprintf(stderr,
+                            "[movement-frontier-cache-diff] reason=%s "
+                            "offset=%03X before=%08X actual=%08X\n",
+                            reason ? reason : "unknown", i * 4u,
+                            baseline[i], actual);
+                    ++reported;
+                }
+            }
+            fprintf(stderr,
+                    "[movement-frontier-cache] reason=%s changed=%u "
+                    "reported=%u\n",
+                    reason ? reason : "unknown", changed, reported);
+        }
+    } else {
+        fprintf(stderr,
+                "[movement-frontier-cache] reason=%s unreadable\n",
+                reason ? reason : "unknown");
+    }
+
+    if (addr_readable(camera + 0x3Cu)) {
+        for (uint32_t row = 0; row < 4u; ++row) {
+            fprintf(stderr,
+                    "[movement-frontier-camera-producer] reason=%s row=%u "
+                    "%08X/%08X/%08X/%08X\n",
+                    reason ? reason : "unknown", row,
+                    vm_read32(camera + row * 16u + 0u),
+                    vm_read32(camera + row * 16u + 4u),
+                    vm_read32(camera + row * 16u + 8u),
+                    vm_read32(camera + row * 16u + 12u));
+        }
+    }
+    fflush(stderr);
+}
 
 /* One-shot diagnostic Start press at the title callback. The game does not
  * read cellPadGetData here; it consumes two cached button bitsets owned by its
@@ -903,6 +1000,8 @@ static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
     vm_write32(cached + 0x8u, vm_read32(cached + 0x8u) | 0x100u);
     g_yz_auto_input_cached = cached;
     g_yz_auto_input_mask = mask;
+    g_yz_frontier_input_cached = cached;
+    g_yz_frontier_input_mask = mask;
     g_yz_auto_start_tick = GetTickCount64();
     state = 2;
     fprintf(stderr,
@@ -991,6 +1090,8 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
     if (!addr_readable(cached + 0x308u)) return;
     const uint32_t mask = vm_read32(cached + 0x308u);
     if (!addr_readable(mask)) return;
+    g_yz_frontier_input_cached = cached;
+    g_yz_frontier_input_mask = mask;
 
     const unsigned long long now = GetTickCount64();
     if (!first_seen) {
@@ -1343,7 +1444,24 @@ static void yz_meshbuild_trap(ppu_context* ctx)
         raw120 = vm_read32(self + 0x120u);
         if (blob && addr_readable(blob + 4u)) magic = vm_read32(blob);
     }
-    const int bad = (blob != 0 && magic != 0x4753474Du);   /* 'GSGM' */
+    int bad = (blob != 0 && magic != 0x4753474Du);   /* 'GSGM' */
+    /* Race discriminator + bridge: build n=152 measured consuming the
+     * staging buffer mid-write (magic 0x00000002). If the blob is invalid,
+     * wait it out briefly — the staging producer completing within the
+     * bound proves the ordering race live (and the scene proceeds); a blob
+     * still bad after the bound is genuinely corrupt. */
+    if (bad) {
+        for (int spin = 0; spin < 200; spin++) {   /* <= ~200 ms */
+            Sleep(1);
+            magic = vm_read32(blob);
+            if (magic == 0x4753474Du) break;
+        }
+        const int cured = (magic == 0x4753474Du);
+        fprintf(stderr, "[meshbuild] RACE %s n=%ld blob=%08X magic=%08X\n",
+                cured ? "CURED-BY-WAIT" : "STILL-BAD", n, blob, magic);
+        fflush(stderr);
+        bad = !cured;
+    }
     /* Occupancy of the 4096-entry resource handle table (g_slots at
      * [TOC-0x7680] = [0x0135A238]): the registrar returns -1 when the
      * down-scan finds no free slot, which is the surviving branch for the
