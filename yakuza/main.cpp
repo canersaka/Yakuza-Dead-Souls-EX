@@ -136,8 +136,12 @@ extern "C" void spu_recomp_register_tsexit(void);
 #ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_jobmod(void);
 #endif
+/* lv2 lwmutex HLE is compiled in every backend config; the declaration must
+ * not hide behind the native-SPURS gate (LLE oracle build, 2026-08-06). */
+extern "C" void sys_lwmutex_dump_holders(const char* tag);
 #ifdef YZ_NATIVE_SPURS
 extern "C" void cellSpursDumpNativeJobChains(const char* tag);
+extern "C" void yz_spurs_dump_tasksets(const char* tag);
 #endif
 /* recomp_prx/job_bin_{a,b}.c (generated) — the game's two jobchain JOB BINARIES
  * (runtime-loaded per-descriptor SPU code; both EBOOT-static, extracted by
@@ -258,6 +262,13 @@ static int yz_register_native_spurs_images(void)
         {0x01275A00u, 0x14C0u, 15, "job_bin_b"},
         {0x0125DA80u, 0x76C0u, 17, "job_bin_c"},
         {0x01265180u, 0x10610u, 18, "job_bin_d"},
+        /* Dialogue-load submissions publish sizeBinary 0x10800 over the SAME
+         * binary (EBOOT-verified offline: FNV over the 0x10800 window at
+         * 0x01265180 = 0x3A59127372DEA154 = the boots-36/40 miss that killed
+         * the jobchain with INVALID_BIN at claim 0x4019E030). Wider
+         * descriptor window, identical image; trailing bytes are padding
+         * per the orphanage precedent below. */
+        {0x01265180u, 0x10800u, 18, "job_bin_d"},
         /* The job descriptor publishes the logical binary length.  The lift's
          * final 0x40 bytes are DMA/extraction padding and are not part of the
          * exact native workload identity. */
@@ -645,16 +656,20 @@ static int replay_camera_from_guest_dump(
     return (uint32_t)ctx.gpr[3] == 1u ? 0 : 3;
 }
 
-static void guest_caller(uint32_t opd_addr,
-                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+/* Returning variant of the guest-callback hook: same dispatch, but hands the
+ * guest function's r3 back to the HLE caller. sceNpTrophyRegisterContext's
+ * status callback is the first user (a negative return aborts registration).
+ * guest_caller() below wraps this for the fire-and-forget dispatch sites. */
+static uint64_t guest_caller_ret(uint32_t opd_addr,
+                                 uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     /* One lazily-allocated guest stack + context per host thread. */
     static thread_local ppu_context cb_ctx;
     static thread_local uint32_t cb_stack = 0;
     if (!cb_stack) {
         cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);
-        if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return; }
+        if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return 0; }
         cb_ctx.gpr[1] = ((uint64_t)cb_stack + 256 * 1024 - 0x100) & ~0xFull;
         /* Null back-chain terminator: a platform stack-trace walker (e.g. libsre's
          * assertion handler) follows [r1] up until it reads 0. Without this the
@@ -683,6 +698,14 @@ static void guest_caller(uint32_t opd_addr,
     g_yz_cur_ctx = &cb_ctx;
     yz_call_guest_opd(opd_addr, &cb_ctx);
     g_yz_cur_ctx = prev;
+    return cb_ctx.gpr[3];
+}
+
+static void guest_caller(uint32_t opd_addr,
+                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    (void)guest_caller_ret(opd_addr, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
 /* ---------------------------------------------------------------------------
@@ -822,6 +845,51 @@ extern "C" uint32_t yz_guest_addr_from_host(const void* rip)
 {
     const yz_func_entry* fe = yz_func_from_host(rip);
     return fe ? fe->addr : 0u;
+}
+
+/* Runtime vm helpers are linked BETWEEN lifted chunks, so yz_func_from_host
+ * (lifted table only) attributes a fault inside them to the preceding lifted
+ * function with a bogus offset -- boot 12's "func_00E7E1EC +0x1333" was really
+ * vm_read32+0x13 (map-verified), which mislabeled the frontier crash as the
+ * effect walk for weeks. Check the helper table FIRST when naming a host RIP.
+ * Each helper's span is bounded by the next helper's start (they are emitted
+ * adjacently from shims.cpp), capped at 0x400 for the last / stray layouts.
+ * (All eight are declared extern "C" by ppu_recomp.h, included above.) */
+static const char* yz_vm_helper_from_host(const void* rip, unsigned* off_out)
+{
+    struct ent { uintptr_t a; const char* n; };
+    static ent tab[8];
+    static int n = 0;
+    if (!n) {
+        ent t[8] = {
+            { (uintptr_t)&vm_read8,   "vm_read8"   },
+            { (uintptr_t)&vm_read16,  "vm_read16"  },
+            { (uintptr_t)&vm_read32,  "vm_read32"  },
+            { (uintptr_t)&vm_read64,  "vm_read64"  },
+            { (uintptr_t)&vm_write8,  "vm_write8"  },
+            { (uintptr_t)&vm_write16, "vm_write16" },
+            { (uintptr_t)&vm_write32, "vm_write32" },
+            { (uintptr_t)&vm_write64, "vm_write64" },
+        };
+        for (int i = 0; i < 8; i++) {           /* insertion sort by address */
+            int j = i;
+            while (j > 0 && t[j - 1].a > t[j].a) { ent s = t[j]; t[j] = t[j - 1]; t[j - 1] = s; j--; }
+        }
+        memcpy(tab, t, sizeof(t));
+        n = 8;
+    }
+    uintptr_t r = (uintptr_t)rip;
+    for (int i = n - 1; i >= 0; i--) {
+        if (r < tab[i].a) continue;
+        uintptr_t end = (i + 1 < n) ? tab[i + 1].a : tab[i].a + 0x400;
+        if (end > tab[i].a + 0x400) end = tab[i].a + 0x400;
+        if (r < end) {
+            if (off_out) *off_out = (unsigned)(r - tab[i].a);
+            return tab[i].n;
+        }
+        break;
+    }
+    return nullptr;
 }
 
 extern "C" void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
@@ -1128,6 +1196,31 @@ static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
             }
             fprintf(stderr, "[watch-wr] tid=%u ea=0x%08X old=0x%08X new=0x%08X bt: %s\n",
                     wtid, g_wwr_ea[i], old_be, new_be, chain);
+            /* HOST frames too. A writer that is RUNTIME code (not lifted guest
+             * code) resolves to NOTHING above -- boot 22 caught the fatal
+             * motion-descriptor write with an empty guest chain AND an empty
+             * trampoline ring, i.e. a host thread that has never run lifted
+             * code. Print module-relative RVAs (resolvable against
+             * yakuza_recomp.map) plus any PDB symbol so that writer is named. */
+            {
+                const uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+                fprintf(stderr, "[watch-wr]   host frames:");
+                for (unsigned k = 0; k < got && k < 14; k++) {
+                    const uintptr_t r = (uintptr_t)bt[k];
+                    char sbuf[sizeof(SYMBOL_INFO) + 256];
+                    SYMBOL_INFO* sym = (SYMBOL_INFO*)sbuf;
+                    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                    sym->MaxNameLen = 255;
+                    DWORD64 disp = 0;
+                    if (SymFromAddr(GetCurrentProcess(), (DWORD64)r, &disp, sym))
+                        fprintf(stderr, " %s+0x%llX", sym->Name,
+                                (unsigned long long)disp);
+                    else
+                        fprintf(stderr, " rva:0x%llX",
+                                (unsigned long long)(r - mod));
+                }
+                fprintf(stderr, "\n");
+            }
             /* Trampoline-ring fallback/supplement (reliable across memcpy/data-lr
              * hops the host back-chain mis-symbolizes -- same rationale as the
              * existing yz_watch_veh). */
@@ -2234,6 +2327,85 @@ static DWORD WINAPI yz_lookahead_thread(LPVOID)
     return 0;
 }
 
+/* ---- motion-block fixup watcher (2026-08-05, env YZ_MOTBLK_WATCH) ----------
+ * Boot-12 decode (scratch/boot12_nullcall_decode_20260805.md): the frontier
+ * crash is guest 0x00AA0434 dereferencing *(block+0x14) of the motion bank
+ * header @0x62B40880 while +0x14/+0x18 still hold FILE-RELATIVE offsets
+ * (0xC520/0xC58C) -- the block was consumed mid-stream (t9 reading
+ * motion/adventure.par at that instant). This watcher answers the fork the
+ * static decode cannot: does the loader's pointer fixup ever run (race window,
+ * order vs t1's submit), or never (dropped parse step)?
+ * 1 ms poll, TRANSITIONS ONLY, of {+0x00,+0x08,+0x14,+0x18} at the (boot-
+ * stable) block plus the fast/slow gate u16 @0x42800D32 (crash gate obj+0x32).
+ * YZ_MOTBLK_WATCH=1 uses the boot-12 addresses; a hex value overrides the
+ * block EA. Read-only, uncapped (transitions are rare), kill = unset env. */
+static void yz_dump_all_threads(const char* tag);   /* defined below */
+static DWORD WINAPI yz_motblk_watch_thread(LPVOID)
+{
+    const char* env = getenv("YZ_MOTBLK_WATCH");
+    uint32_t blk = 0x62B40880u;
+    if (env && env[0] && !(env[0] == '1' && !env[1]))
+        blk = (uint32_t)strtoul(env, NULL, 16);
+    const uint32_t gate_ea = 0x42800D32u;
+    fprintf(stderr, "[motblk] ARMED: block=0x%08X fields {+0,+8,+14,+18} + gate16 @0x%08X (1ms poll)\n",
+            blk, gate_ea);
+    fflush(stderr);
+    uint32_t last[4] = { 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu };
+    uint32_t last_gate = 0xDEADBEEFu;
+    const uint32_t offs[4] = { 0x00u, 0x08u, 0x14u, 0x18u };
+    unsigned rearm_tick = 0;
+    for (;;) {
+        Sleep(1);
+        if (!vm_base) continue;
+        if (IsBadReadPtr(vm_base + blk, 0x20)) continue;
+        /* Keep any YZ_WATCH_WR page guard on this block ALIVE. The block lives
+         * in the lazily-committed sys_vm window, so the guard armed at startup
+         * is silently replaced by PAGE_READWRITE when the heap commits/recommits
+         * the page -- boot 16 printed its armed banner and then logged ZERO
+         * events for a region provably being written. Re-arm ~1/s (the existing
+         * helper is idempotent) so the watch is live for the whole scene; this
+         * is the only instrument that catches a writer on a path none of the
+         * vm_write / DMA traps cover. */
+        if ((++rearm_tick % 1000u) == 0u) {
+            extern void yz_watch_wr_rearm(void);
+            yz_watch_wr_rearm();
+        }
+        uint32_t cur[4];
+        for (int i = 0; i < 4; i++) cur[i] = vm_read32(blk + offs[i]);
+        uint32_t gate = IsBadReadPtr(vm_base + (gate_ea & ~3u), 4)
+                            ? 0xDEADBEEFu : (uint32_t)vm_read16(gate_ea);
+        int changed = (gate != last_gate);
+        for (int i = 0; i < 4; i++) changed |= (cur[i] != last[i]);
+        if (!changed) continue;
+        fprintf(stderr, "[motblk] frame=%u +00=0x%08X +08=0x%08X +14=0x%08X +18=0x%08X gate=0x%04X%s\n",
+                rsx_live_draw_get_frames(), cur[0], cur[1], cur[2], cur[3],
+                gate & 0xFFFFu,
+                (cur[2] && cur[2] < 0x01000000u) ? "  << +14 RAW-OFFSET (unfixed)" : "");
+        fflush(stderr);
+        /* Boot-14 escalation: the valid->raw flip of +0x14 IS the fatal reload
+         * write (crash follows within ~1 ms, boots 12/13/14). Snapshot every
+         * thread the instant the poller sees it — the writer thread is still
+         * inside the reload path, so its guest chain names the path the static
+         * decode is hunting (who rewrites a LIVE bank header and under which
+         * guard). Cap 2 (first flip may be a benign boot-era transition). */
+        /* "valid pointer -> raw file offset" (boot 16: 0x62B408A0 -> 0x00015D20;
+         * raw offsets are NOT always < 64 KB, which is why the boot-16 snapshot
+         * never fired -- threshold widened to the whole low 16 MB). */
+        if (last[2] >= 0x01000000u && cur[2] && cur[2] < 0x01000000u) {
+            static int flips = 0;
+            if (flips < 2) {
+                flips++;
+                fprintf(stderr, "[motblk] RAW FLIP #%d -> all-thread snapshot\n", flips);
+                fflush(stderr);
+                yz_dump_all_threads("motblk-flip");
+            }
+        }
+        memcpy(last, cur, sizeof(cur));
+        last_gate = gate;
+    }
+    return 0;
+}
+
 void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 {
     if (!gc) return;
@@ -2390,6 +2562,31 @@ void yz_dump_guest_state(const ppu_context* gc, const char* tag)
                         n, hit >= 0 ? "IS" : "is NOT");
             }
         }
+        /* FRAME-CREDIT SAMPLE (2026-08-07, boot-66 producer-stall decode):
+         * t1's frame append (func_00E5F094, called from func_00E5F248 with
+         * bits=0x8000) takes a CREDIT via lwarx/stwcx decrement of
+         * *(obj+4), obj = *( *(TOC-0x7B28) + 0x20 ); zero credits diverts
+         * to the wait path (func_00E5F240) — the boot-66 terminal park.
+         * The gradual fps decay (5.0 -> 4.7 -> 1.6 -> frozen) is the
+         * credit-LEAK signature: completions failing to return credits.
+         * Sample the counter each watchdog tick so the decay shows as a
+         * monotonic credit drop with timestamps. */
+        {
+            uint32_t fobj_p = vm_read32(g_yz_game_toc - 0x7B28);
+            if (fobj_p >= 0x10000u && fobj_p < 0xE0000000u) {
+                uint32_t fobj = vm_read32(fobj_p + 0x20);
+                if (fobj >= 0x10000u && fobj < 0xE0000000u)
+                    /* Counter is at +8 (boot-67 correction: F094's lwarx
+                     * target is arg+4 where arg was already obj+4; +4
+                     * holds a pointer, 0x4019CA00). */
+                    fprintf(stderr,
+                            "    [framecredit] obj=0x%08X credits[+8]=%d "
+                            "wC=0x%08X w4=0x%08X w10=0x%08X w18=0x%08X\n",
+                            fobj, (int32_t)vm_read32(fobj + 8),
+                            vm_read32(fobj + 0xC), vm_read32(fobj + 4),
+                            vm_read32(fobj + 0x10), vm_read32(fobj + 0x18));
+            }
+        }
     }
 }
 
@@ -2521,6 +2718,10 @@ static void yz_dump_one_thread_cb(uint32_t tid, const char* name, void* handle)
     yz_dump_host_stack_of((HANDLE)handle, tag);
 }
 /* Dump every guest thread's host stack -- finds the blocked producer. */
+/* C-callable wrapper so cross-TU forensics (cellSync's frozen-ticket dump)
+ * can capture every thread's state at the instant of a deadlock. */
+extern "C" void yz_dump_all_threads_c(const char* tag) { yz_dump_all_threads(tag); }
+
 static void yz_dump_all_threads(const char* tag)
 {
     fprintf(stderr, "[%s] === all guest threads ===\n", tag);
@@ -2695,6 +2896,8 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-30s"); }
 #ifdef YZ_NATIVE_SPURS
     cellSpursDumpNativeJobChains("watchdog-30s");
+    if (getenv("YZ_NATIVE_SPURS_TASKSETS"))
+        yz_spurs_dump_tasksets("watchdog-30s");
 #endif
     /* s31 W2LIFE (ledger #71): one early (usually pre-CRI-transition) sample of
      * the SPURS wid accounting + per-SPU liveness, then one per watchdog minute
@@ -2705,9 +2908,11 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-45s"); }
+    sys_lwmutex_dump_holders("watchdog-45s");
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-60s"); }
+    sys_lwmutex_dump_holders("watchdog-60s");
     /* s24: keep sampling forever (read-only dumps only). The fixed 30/45/60 s
      * schedule missed every late wedge — e.g. the iteration-4 wedge at ~207 s
      * had no dump. Every 60 s: t1 guest state + the chain-probe census (the
@@ -2717,9 +2922,12 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
         char tag[32];
         snprintf(tag, sizeof tag, "watchdog-%dm", mins);
         if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, tag);
+        sys_lwmutex_dump_holders(tag);
 #ifdef YZ_NATIVE_SPURS
         if (getenv("YZ_NATIVE_SPURS_LEDGER"))
             cellSpursDumpNativeJobChains(tag);
+        if (getenv("YZ_NATIVE_SPURS_TASKSETS"))
+            yz_spurs_dump_tasksets(tag);
 #endif
         yz_chain_census_dump(tag);
         yz_w2life_dump(tag);   /* s31 W2LIFE */
@@ -4080,10 +4288,106 @@ extern "C" __declspec(thread) uint64_t g_yz_tramp_r31[256];
 extern "C" __declspec(thread) uint64_t g_yz_tramp_r1[256];
 extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 
+extern "C" uint32_t yz_pad_guest_input_serial(void);
+extern "C" uint32_t yz_frontier_job_completion_serial(void);
+
+static bool yz_frontier_guest_word(uint32_t ea, uint32_t* value)
+{
+    if (!vm_base || ea < 0x10000u || ea > 0xFFFFFFFBu)
+        return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(vm_base + ea, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
+        (mbi.Protect & PAGE_GUARD))
+        return false;
+    *value = vm_read32(ea);
+    return true;
+}
+
+static void yz_frontier_snapshot_context(uint32_t tid, ppu_context* ctx)
+{
+    if (!ctx) return;
+    uint32_t syscall = 0, age = 0;
+    uint64_t a3 = 0, a4 = 0, a5 = 0;
+    (void)yz_wait_get(tid, &syscall, &a3, &a4, &a5, &age);
+    yz_frontier_trace_emit(
+        YZ_FT_PPU_THREAD, tid, (uint32_t)ctx->cia,
+        (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1], (uint32_t)ctx->ctr,
+        syscall, (uint32_t)a3, age);
+
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    for (uint32_t depth = 0; depth < 12u; ++depth) {
+        if (sp < 0x10000u || sp > 0xFFFFFFE7u) break;
+        uint32_t next = 0, ret = 0, alternate = 0;
+        if (!yz_frontier_guest_word(sp, &next) ||
+            !yz_frontier_guest_word(sp + 0x14u, &ret))
+            break;
+        if (!ret && yz_frontier_guest_word(sp + 0x10u, &alternate))
+            ret = alternate;
+        yz_frontier_trace_emit(
+            YZ_FT_PPU_STACK, tid, ret, sp, next, depth, 0u, 0u, 0u);
+        if (next <= sp || next - sp > 0x100000u) break;
+        sp = next;
+    }
+
+    /* General poll witness plus the currently symbolized completion protocol:
+     * func_00454C90 sleeps with LR=00454F90 while r30 addresses the word it
+     * requires to become zero and r31 is its descriptor base. */
+    const uint32_t wait_word = (uint32_t)ctx->gpr[30];
+    uint32_t actual = 0;
+    if ((uint32_t)ctx->lr == 0x00454F90u &&
+        yz_frontier_guest_word(wait_word, &actual))
+        yz_frontier_trace_emit(
+            YZ_FT_COMPLETION, tid, 5u,
+            (uint32_t)ctx->gpr[31], wait_word, actual, 0u,
+            (uint32_t)ctx->gpr[27], (uint32_t)ctx->gpr[26]);
+}
+
+static void yz_frontier_snapshot_thread_cb(
+    uint32_t tid, const char*, void*)
+{
+    yz_frontier_snapshot_context(
+        tid, (ppu_context*)yz_thread_context(tid));
+}
+
+static void yz_frontier_frame_credit_snapshot(void)
+{
+    if (!g_yz_game_toc || !vm_base) return;
+    const uint32_t owner = vm_read32(g_yz_game_toc - 0x7B28u);
+    if (owner < 0x10000u || owner > 0xFFFFFFDBu) return;
+    const uint32_t object = vm_read32(owner + 0x20u);
+    if (object < 0x10000u || object > 0xFFFFFFE3u) return;
+    yz_frontier_trace_emit(
+        YZ_FT_FRAME_CREDIT, 0u, 0u,
+        object, vm_read32(object + 0x08u),
+        vm_read32(object + 0x0Cu), vm_read32(object + 0x04u),
+        vm_read32(object + 0x10u), vm_read32(object + 0x18u));
+}
+
+static void yz_frontier_autopsy_snapshot(
+    uint32_t phase, uint32_t get, uint32_t put, uint32_t fence,
+    uint32_t frame, uint32_t dependency_word, uint32_t dependency_value)
+{
+    yz_frontier_trace_emit(
+        YZ_FT_AUTOPSY, 0u, phase,
+        get, put, fence, frame, dependency_word, dependency_value);
+    yz_frontier_snapshot_context(1u, g_yz_main_ctx);
+    yz_for_each_thread(yz_frontier_snapshot_thread_cb);
+    yz_frontier_sync_snapshot();
+    yz_frontier_event_snapshot();
+    yz_frontier_spurs_snapshot();
+    yz_frontier_spu_snapshot();
+    yz_frontier_fifo_snapshot(get, put);
+    yz_frontier_frame_credit_snapshot();
+}
+
 /*
- * Non-formatting frontier stall detector. It is dormant until the semantic
- * completion-job arm and records only state changes. A five-second quiet
- * interval produces one read-only worker snapshot and one ring dump.
+ * Progress-based freeze detector. A 10-second stable dependency signature is
+ * a soft snapshot only. The process keeps running; a hard snapshot/dump is
+ * taken only after that same signature survives another 10 seconds. Logical
+ * stalls are tracked independently: presented frames and jobs may advance,
+ * but accepted input with an unchanged guest-control signature for 60 seconds
+ * produces phase 3.
  */
 static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
 {
@@ -4091,10 +4395,26 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
     uint32_t last_put = ~0u;
     uint32_t last_fence = ~0u;
     uint32_t last_frame = ~0u;
+    uint32_t last_lr = ~0u;
+    uint32_t last_wait_word = ~0u;
+    uint32_t last_wait_value = ~0u;
+    uint32_t last_wait_descriptor = ~0u;
     DWORD unchanged_since = 0;
+    bool soft_captured = false;
+    bool hard_captured = false;
+    uint32_t last_input = 0;
+    uint32_t last_semantic = ~0u;
+    uint32_t semantic_input = 0;
+    uint32_t semantic_worker = 0;
+    DWORD semantic_since = 0;
+    bool logical_captured = false;
 
     for (;;) {
         Sleep(50);
+        /* Progress feed BEFORE the armed gate — mode 3 arms FROM this call
+         * (boot 56: records=0 because the old order made arming impossible:
+         * not-armed -> continue -> progress never reported). */
+        yz_frontier_trace_progress(rsx_live_draw_get_frames());
         if (!yz_frontier_trace_is_armed() || !vm_base)
             continue;
 
@@ -4103,9 +4423,63 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
         const uint32_t fence = vm_read32(0x40C00000u);
         const uint32_t frame = rsx_live_draw_get_frames();
         const DWORD now = GetTickCount();
+        const uint32_t main_lr =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u;
+        const uint32_t wait_word =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->gpr[30] : 0u;
+        const uint32_t wait_descriptor =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->gpr[31] : 0u;
+        uint32_t wait_value = 0u;
+        if (!yz_frontier_guest_word(wait_word, &wait_value))
+            wait_value = 0u;
+
+        const uint32_t input = yz_pad_guest_input_serial();
+        const uint32_t worker = yz_frontier_job_completion_serial();
+        const uint32_t semantic = g_yz_main_ctx
+            ? (uint32_t)g_yz_main_ctx->lr ^
+                  (uint32_t)g_yz_main_ctx->gpr[3] ^
+                  (uint32_t)g_yz_main_ctx->gpr[27] ^
+                  (uint32_t)g_yz_main_ctx->gpr[29] ^
+                  (uint32_t)g_yz_main_ctx->gpr[30] ^
+                  (uint32_t)g_yz_main_ctx->gpr[31]
+            : 0u;
+        if (semantic != last_semantic) {
+            last_semantic = semantic;
+            semantic_since = now;
+            semantic_input = input;
+            semantic_worker = worker;
+            logical_captured = false;
+        }
+        if (input != last_input) {
+            last_input = input;
+            yz_frontier_trace_emit(
+                YZ_FT_LOGICAL_STATE, 0u, 0u,
+                frame, input, semantic, worker,
+                main_lr, wait_descriptor);
+        }
+        if (!logical_captured && semantic_since &&
+            now - semantic_since >= 60000u && input != semantic_input &&
+            worker != semantic_worker && frame != last_frame) {
+            logical_captured = true;
+            yz_frontier_trace_emit(
+                YZ_FT_LOGICAL_STATE, 0u, 1u,
+                frame, input, semantic, worker,
+                main_lr, wait_descriptor);
+            yz_frontier_autopsy_snapshot(
+                3u, get, put, fence, frame, wait_word, wait_value);
+            yz_frontier_trace_dump(2u);
+            fprintf(stderr,
+                    "[freeze-autopsy] LOGICAL stall: frames/workers advance "
+                    "but accepted input left the guest-control signature "
+                    "unchanged for 60s\n");
+            fflush(stderr);
+        }
 
         if (get != last_get || put != last_put ||
-            fence != last_fence || frame != last_frame) {
+            fence != last_fence || frame != last_frame ||
+            main_lr != last_lr || wait_word != last_wait_word ||
+            wait_value != last_wait_value ||
+            wait_descriptor != last_wait_descriptor) {
             yz_frontier_trace_emit(
                 YZ_FT_RSX_STATE, 0, 0,
                 get, put, fence, frame,
@@ -4115,7 +4489,13 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
             last_put = put;
             last_fence = fence;
             last_frame = frame;
+            last_lr = main_lr;
+            last_wait_word = wait_word;
+            last_wait_value = wait_value;
+            last_wait_descriptor = wait_descriptor;
             unchanged_since = now;
+            soft_captured = false;
+            hard_captured = false;
             continue;
         }
 
@@ -4124,18 +4504,40 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
             continue;
         }
 
-        if (now - unchanged_since >= 5000u) {
-            yz_frontier_fifo_snapshot(get, put);
-            yz_frontier_spu_snapshot();
-            yz_frontier_event_snapshot();
+        if (now - unchanged_since >= 10000u && !soft_captured) {
+            soft_captured = true;
+            yz_frontier_autopsy_snapshot(
+                1u, get, put, fence, frame, wait_word, wait_value);
+            fprintf(stderr,
+                    "[freeze-autopsy] SOFT snapshot frame=%u flip=%u "
+                    "lr=%08X dependency=%08X:%08X; confirming\n",
+                    frame, fence, main_lr, wait_word, wait_value);
+            fflush(stderr);
+        }
+        if (now - unchanged_since >= 20000u && soft_captured &&
+            !hard_captured) {
+            hard_captured = true;
+            yz_frontier_autopsy_snapshot(
+                2u, get, put, fence, frame, wait_word, wait_value);
             yz_frontier_trace_emit(
-                YZ_FT_STALL, 0, 0,
-                get, put, fence, frame,
-                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u,
-                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u);
-            yz_frontier_edge_dump(0u, get, put);
+                YZ_FT_STALL, 0u, 2u,
+                get, put, fence, frame, wait_word, wait_value);
             yz_frontier_trace_dump(1u);
-            return 0;
+            fprintf(stderr,
+                    "[freeze-autopsy] HARD freeze confirmed: unchanged "
+                    "dependency chain for 20s frame=%u flip=%u lr=%08X "
+                    "dependency=%08X actual=%08X\n",
+                    frame, fence, main_lr, wait_word, wait_value);
+            fflush(stderr);
+            /* Expensive suspension/host-stack capture is terminal-only. The
+             * flight ring and non-invasive guest snapshots are already safe
+             * on disk before this corroborating dump begins. */
+            if (g_yz_main_ctx)
+                yz_dump_guest_state(g_yz_main_ctx, "freeze-autopsy-hard");
+            yz_dump_all_threads("freeze-autopsy-hard");
+            cellSpursDumpNativeJobChains("freeze-autopsy-hard");
+            yz_spurs_dump_tasksets("freeze-autopsy-hard");
+            yz_frontier_edge_dump(0u, get, put);
         }
     }
 }
@@ -4150,10 +4552,16 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
     fprintf(stderr, " (rva 0x%llX)",
             (unsigned long long)((uintptr_t)er->ExceptionAddress -
                                  (uintptr_t)GetModuleHandleW(NULL)));
-    if (const yz_func_entry* fe = yz_func_from_host(er->ExceptionAddress))
-        fprintf(stderr, " (in func_%08X +0x%llX)", fe->addr,
-                (unsigned long long)((uintptr_t)er->ExceptionAddress -
-                                     (uintptr_t)fe->fn));
+    {
+        unsigned hoff = 0;
+        if (const char* hn = yz_vm_helper_from_host(er->ExceptionAddress, &hoff))
+            fprintf(stderr, " (in %s +0x%X -- runtime vm helper; the guest "
+                    "faulter is the next lifted frame below)", hn, hoff);
+        else if (const yz_func_entry* fe = yz_func_from_host(er->ExceptionAddress))
+            fprintf(stderr, " (in func_%08X +0x%llX)", fe->addr,
+                    (unsigned long long)((uintptr_t)er->ExceptionAddress -
+                                         (uintptr_t)fe->fn));
+    }
     /* PDB symbol for the faulting host code — authoritative for runtime/HLE
      * code, and disambiguates when the table hit above is a tiny stub the
      * linker happened to place just before the real function. */
@@ -4200,8 +4608,12 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
         uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
         fprintf(stderr, "\n[crash] HOST call stack (%u frames, newest first):", nf);
         for (USHORT i = 0; i < nf; i++) {
-            const yz_func_entry* fe = yz_func_from_host(frames[i]);
-            if (fe)
+            unsigned hoff = 0;
+            const char* hn = yz_vm_helper_from_host(frames[i], &hoff);
+            const yz_func_entry* fe = hn ? nullptr : yz_func_from_host(frames[i]);
+            if (hn)
+                fprintf(stderr, "\n    %s +0x%X (runtime vm helper)", hn, hoff);
+            else if (fe)
                 fprintf(stderr, "\n    func_%08X +0x%llX", fe->addr,
                         (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)fe->fn));
             else
@@ -4393,7 +4805,7 @@ int main(int argc, char** argv)
            "(libsre image/PPU lift/kernel modules requested=0)\n");
 #endif
 
-#ifndef YZ_NATIVE_SPURS
+#ifndef YZ_NATIVE_GCM
     /* The oracle lane binds cellGcmSys imports to its relocated driver image.
      * The native lane resolves every one of those imports to independent host
      * implementations and must leave the firmware address range unmapped. */
@@ -4560,6 +4972,7 @@ int main(int argc, char** argv)
     yz_install_imports();
     printf("[boot] installed %u import bridges\n", g_yz_import_count);
     g_ps3_guest_caller = guest_caller;
+    g_ps3_guest_caller_ret = guest_caller_ret;
 
     /* Read the real title id (+ title/version) from the game's PARAM.SFO so every
      * title-id-based path (cellGame content/boot/data, cellDiscGame) is correct for
@@ -4628,6 +5041,8 @@ int main(int argc, char** argv)
     CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL);
     if (getenv("YZ_DEFERWATCH"))
         CreateThread(NULL, 0, yz_deferwatch_thread, NULL, 0, NULL);
+    if (getenv("YZ_MOTBLK_WATCH"))
+        CreateThread(NULL, 0, yz_motblk_watch_thread, NULL, 0, NULL);
     /* s24: lookahead REFUTED on its first boot (DONT_RECHASE #50 — reproduced
      * the June eager-applier wedge: releases without the preceding patch
      * entries hand GET torn content). Explicit opt-in only. */
