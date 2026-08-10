@@ -26,6 +26,9 @@ static volatile int job_hold;
 static volatile int job_entered;
 static volatile uint32_t job_dma_tag_seen_mask;
 static volatile int sub_qword_job_runs;
+static volatile int ticket_job_runs;
+static volatile int ticket_job_hold;
+static volatile int ticket_job_entered;
 static volatile int sub_qword_layout_ok;
 static volatile int poll_hold_entered;
 static volatile int poll_hold_release;
@@ -275,6 +278,48 @@ static uint16_t be16(const void* v)
     const uint8_t* p = (const uint8_t*)v;
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
+
+/* The SPURS job module never writes the io buffer back to main memory: a job
+ * publishes its own outputs over the context dmaTag (Job Reference dmaTag
+ * "for data output from a job"; the SDK JDL codegen PUTs its inout buffer at
+ * job end). These synthetic jobs follow the same contract, targeting the EAs
+ * in their LS descriptor SNAPSHOT — which is what keeps the descriptor-reuse
+ * tests honest. Jobs run as host functions in this harness, so the PUT is a
+ * host store + publication notify; the real MFC transport is exercised by
+ * tests/spu_atomics_stress and the title. */
+extern void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size);
+static void job_put_io_items(spu_context* ctx)
+{
+    const uint32_t context_ls = ctx->gpr[3]._u32[0];
+    const uint32_t descriptor_ls = ctx->gpr[4]._u32[0];
+    if (!be32(ctx->ls + descriptor_ls + 0x10)) return;   /* input-only job */
+    const uint32_t io_ls = be32(ctx->ls + context_ls);
+    const uint32_t count = be16(ctx->ls + context_ls + 0x18);
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t size =
+            be32(ctx->ls + descriptor_ls + 0x30 + i * 8) & 0x7fffu;
+        const uint32_t ea = be32(ctx->ls + descriptor_ls + 0x30 + i * 8 + 4);
+        if (size) {
+            memcpy(vm_base + ea, ctx->ls + io_ls + offset + (ea & 15u), size);
+            cellSpursNotifyGuestWrite(ea, size);
+        }
+        offset += (size + 15u) & ~15u;
+    }
+}
+
+/* Link stub: cellSync.c's frozen-ticket forensics dumps every runner thread
+ * (yakuza/main.cpp). This harness never freezes a ticket long enough. */
+void yz_dump_all_threads_c(const char* tag) { (void)tag; }
+
+/* Link stub: the job-stall watchdog's all-SPU-ctx pc dump (boot 44 face-B
+ * forensics; real one in runtime/spu/spu_channels.c, not linked here). */
+void yz_spu_dump_all_ctx(const char* tag) { (void)tag; }
+
+/* Link stubs: run_job's job output-DMA census (counters live in
+ * spu_channels.c in the full runtime; this harness's jobs are host fns). */
+volatile unsigned long g_yz_job_dma_put_n = 0;
+volatile unsigned long g_yz_job_dma_put_bytes = 0;
 static void synthetic_job(spu_context* ctx)
 {
     const uint32_t context_ls = ctx->gpr[3]._u32[0];
@@ -308,6 +353,27 @@ static void synthetic_job(spu_context* ctx)
 #endif
         }
     }
+    job_put_io_items(ctx);
+}
+
+static void synthetic_ticket_job(spu_context* ctx)
+{
+    const uint32_t context_ls = ctx->gpr[3]._u32[0];
+    const uint32_t descriptor_ea = be32(ctx->ls + context_ls + 0x2c);
+    ++ticket_job_runs;
+    /* Model the title's persistent dispatcher consuming pending kind 6. */
+    if (be32(vm_base + descriptor_ea + 0x10) == 6)
+        put32(vm_base + descriptor_ea + 0x10, 0);
+    if (ticket_job_hold) {
+        ticket_job_entered = 1;
+        while (ticket_job_hold) {
+#if defined(_WIN32)
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+    }
 }
 
 static void synthetic_sub_qword_job(spu_context* ctx)
@@ -330,6 +396,7 @@ static void synthetic_sub_qword_job(spu_context* ctx)
         put32(ctx->ls + io_ls + ls_offset[i], input[i] ^ 0xffffffffu);
     }
     ++sub_qword_job_runs;
+    job_put_io_items(ctx);
 }
 
 static int wait_value(volatile int* value, int expected)
@@ -607,7 +674,10 @@ static int test_task_event_queue(void)
     CHECK(wait_byte_mask(ts->bytes + 0x50, 0x80, 0x80));
     CHECK((ts->bytes[0x00] & 0x80) == 0);
     CHECK((ts->bytes[0x10] & 0x80) == 0);
-    CHECK(cellSpursTryJoinTask2(ts, be32(id), exit_code) == CELL_SPURS_TASK_ERROR_BUSY);
+    /* Task-Reference p.38: a still-running task answers AGAIN (BUSY is
+     * reserved for "another thread is already waiting"); the old BUSY
+     * expectation pinned our pre-2026-08-04 out-of-contract return. */
+    CHECK(cellSpursTryJoinTask2(ts, be32(id), exit_code) == CELL_SPURS_TASK_ERROR_AGAIN);
     CHECK(_cellSpursSendSignal((CellSpursTaskset*)ts, be32(id)) == 0);
     CHECK(cellSpursJoinTask2(ts, be32(id), exit_code) == 0);
     CHECK(task_phase == 2);
@@ -741,7 +811,11 @@ static int test_task_event_queue(void)
         CHECK(be16(ef->bytes + 0x04) == 0x0001);
         const uint32_t slot = ef->bytes[0x06] >> 4;
         const uint16_t slot_bit = (uint16_t)(0x8000u >> slot);
-        CHECK((be16(ef->bytes + 0x08) & slot_bit) != 0);
+        /* Q2-B: a PPU waiter records its slot ONLY in ppuWaitSlotAndMode
+         * [0x06]; spuTaskUsedWaitSlots[0x08] stays clear (rpcs3 oracle,
+         * cellSpurs.cpp:3552-3567). The pre-sweep assertion expected the
+         * phantom bit this fix removed. */
+        CHECK((be16(ef->bytes + 0x08) & slot_bit) == 0);
         put16(ef->bytes + 0x30 + slot * 2, 0x0001);
         put16(ef->bytes + 0x04, 0);
         ef->bytes[0x07] = 1;
@@ -945,6 +1019,139 @@ static int test_job_chain(void)
     CHECK(job_dma_tag_seen_mask == 3u);
     for (uint32_t i = 0; i < 16; ++i)
         CHECK(inout[i] == (uint8_t)i);
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
+static int test_unnotified_pending_ticket_orbit(void)
+{
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x58000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x59000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x59800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x5a000);
+    uint64_t* commands = (uint64_t*)(guest + 0x5a800);
+    uint8_t* descriptor = guest + 0x5b000;
+    uint8_t* binary = guest + 0x5c000;
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(descriptor, 0, 0x40);
+    memset(binary, 0x6b, 16);
+    put64(descriptor, 0x5c000);
+    put16(descriptor + 8, 1);
+    put16(descriptor + 0x0a, 0);
+    put32(descriptor + 0x10, 0);
+    put32(descriptor + 0x14, 0);
+    put64(commands + 0, 0x0000000800000012ull);
+    put64(commands + 1, 0x0000000800000012ull);
+    put64(commands + 2, 0x0000000800000012ull);
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(binary, 16), 16,
+              synthetic_ticket_job, "synthetic-ticket-job"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x40, 1, priority, 1, 0,
+              0, 0, 0, 0x100, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+
+    /* The real producer publishes this reusable descriptor in two stores.
+     * The counter edge alone is incomplete; the following ready-word store
+     * is the first point at which redispatch is valid. */
+    {
+        uint32_t candidate_descriptor = 0;
+        CHECK(yz_spurs_test_watch_pending_descriptor(jc, 0x5b000) == 0);
+        put32(descriptor + 0x10, 6);
+        CHECK(yz_spurs_test_pending_ticket_publish_candidate(
+                  jc, 0x5b010, 4, &candidate_descriptor) == 0);
+        put32(descriptor + 0x14, 16);
+        CHECK(yz_spurs_test_pending_ticket_publish_candidate(
+                  jc, 0x5b014, 4, &candidate_descriptor) == 1);
+        CHECK(candidate_descriptor == 0x5b000);
+        put32(descriptor + 0x10, 0);
+    }
+    ticket_job_runs = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    {
+        int parked = 0;
+        for (unsigned i = 0; i < 1000000 && !parked; ++i) {
+            parked = yz_spurs_jobchain_is_parked_at(jc, 0x5a800);
+            if (!parked)
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+        }
+        CHECK(parked);
+    }
+    put64(commands + 0, 0x5b000);
+    cellSpursNotifyGuestWrite(0x5a800, 8);
+    CHECK(wait_value(&ticket_job_runs, 1));
+
+    /* Acquire the same persistent dispatcher through a newer ring slot.  A
+     * retained descriptor map now has two historical owners; only this latest
+     * acquisition carries the continuation context for the active orbit. */
+    put64(commands + 1, 0x5b000);
+    cellSpursNotifyGuestWrite(0x5a808, 8);
+    CHECK(wait_value(&ticket_job_runs, 2));
+
+    /* Once the persistent dispatcher JOB has been acquired, the producer may
+     * recycle its command-ring slot before publishing the next descriptor
+     * ticket.  Redispatch must use the most recently acquired command, not
+     * rediscover the descriptor from mutable memory or pick its older slot. */
+    put64(commands + 0, 0x0000000800000012ull);
+    put64(commands + 1, 0x0000000800000012ull);
+    put32(descriptor + 0x10, 6);
+    put32(descriptor + 0x14, 16);
+    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
+    CHECK(wait_value(&ticket_job_runs, 3));
+    CHECK(wait_be32_value(descriptor + 0x10, 0));
+    {
+        int parked = 0;
+        for (unsigned i = 0; i < 1000000 && !parked; ++i) {
+            parked = yz_spurs_jobchain_is_parked_at(jc, 0x5a810);
+            if (!parked)
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+        }
+        CHECK(parked);
+    }
+
+    /* Deliberately omit cellSpursNotifyGuestWrite(): the native worker must
+     * still make a hardware-like pass over the persistent JOB while parked. */
+    put64(commands + 1, 0x5b000);
+    put32(descriptor + 0x10, 6);
+    CHECK(wait_value(&ticket_job_runs, 4));
+    CHECK(wait_be32_value(descriptor + 0x10, 0));
+
+    /* The live title can publish the next ticket while the persistent
+     * dispatcher is still executing the previous orbit.  The PPU-store edge
+     * must be retained as a deferred resume and consumed at the next park;
+     * a parked-only fallback cannot cover this ordering. */
+    ticket_job_hold = 1;
+    ticket_job_entered = 0;
+    put32(descriptor + 0x10, 6);
+    put32(descriptor + 0x14, 16);
+    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
+    CHECK(wait_value(&ticket_job_runs, 5));
+    CHECK(wait_value(&ticket_job_entered, 1));
+    CHECK(wait_be32_value(descriptor + 0x10, 0));
+    put32(descriptor + 0x10, 6);
+    put32(descriptor + 0x14, 16);
+    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
+    ticket_job_hold = 0;
+    CHECK(wait_value(&ticket_job_runs, 6));
+    CHECK(wait_be32_value(descriptor + 0x10, 0));
+    CHECK(cellSpursShutdownJobChain(jc) == 0);
+    CHECK(cellSpursJoinJobChain(jc) == 0);
     CHECK(cellSpursFinalize(spurs) == 0);
     return 0;
 }
@@ -1265,8 +1472,9 @@ static int test_job_descriptor_stable_acquisition(void)
         CHECK(replacement[i] == (uint8_t)((0x40u + i) ^ 0xffu));
     }
 
-    /* A completed chain can be run again.  The second run must restart from
-     * entry and discard the prior END/current/ring publication state. */
+    /* A completed chain can be run again.  The title-observed lifecycle starts
+     * the second run at jobChainEntry and discards the prior END/current/ring
+     * publication state. */
     CHECK(cellSpursRunJobChain(jc) == 0);
     CHECK(cellSpursJoinJobChain(jc) == 0);
     CHECK(job_runs == 2);
@@ -1364,7 +1572,24 @@ static int test_job_barrier_snapshot(void)
     job_abi_ok = 0;
     job_hold = 0;
     CHECK(cellSpursRunJobChain(claimed_jc) == 0);
-    brief_sleep();
+    /* Deterministic parked edge (2026-08-05): the exact-SYNC-at-parked-slot
+     * claim is only exercised when the worker is ALREADY parked at 0x24008.
+     * The brief_sleep formerly here lost that race ~2-3/12 runs -- the SYNC
+     * then arrived as a future publication and replayed on generation wrap,
+     * failing the job_runs == 1 check below (the known flake). */
+    {
+        int parked = 0;
+        for (unsigned i = 0; i < 1000000 && !parked; ++i) {
+            parked = yz_spurs_jobchain_is_parked_at(claimed_jc, 0x24008);
+            if (!parked)
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+        }
+        CHECK(parked);
+    }
     put64(claimed_commands + 1, 0x0000000000000002ull); /* SYNC */
     put64(claimed_commands + 2, 0xe000);
     cellSpursNotifyGuestWrite(0x24008, 8);
@@ -1702,7 +1927,8 @@ int main(void)
         test_task_event_queue() || test_spurs_queue_lock_order() ||
         test_job_logical_binary_size() ||
         test_job_sub_qword_dma_layout() ||
-        test_job_chain() || test_job_descriptor_snapshot() ||
+        test_job_chain() || test_unnotified_pending_ticket_orbit() ||
+        test_job_descriptor_snapshot() ||
         test_job_descriptor_stable_acquisition() ||
         test_job_barrier_snapshot() ||
         test_streamed_job_generation() ||

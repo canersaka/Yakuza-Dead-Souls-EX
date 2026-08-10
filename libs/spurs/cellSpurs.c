@@ -9,6 +9,7 @@
 #include "../../runtime/spu/spu_workload.h"
 #include "../../runtime/spu/spu_job_dispatch.h"
 #include "../../runtime/memory/vm.h"
+#include "ps3emu/yz_frontier_trace.h"
 #if !defined(YZ_SPURS_TEST_GUEST_SIZE)
 #include "../../runtime/syscalls/sys_vm.h"
 #endif
@@ -211,6 +212,14 @@ static int lfqueue_trace_enabled(void)
         initialized = 1;
     }
     return enabled;
+}
+
+static int jobchain_bridge_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0)
+        disabled = getenv("YZ_NO_JC_BRIDGE") ? 1 : 0;
+    return disabled;
 }
 
 static int jobchain_ledger_enabled(void)
@@ -453,6 +462,7 @@ typedef struct {
     int waiting;
     int signalled;
     int exit_code;
+    u32 exit_container_ea;   /* guest CellSpursTaskExitCode (0 = none) */
     unsigned idle_poll_count;
     unsigned trace_syscalls;
     unsigned profile_poll_workload_hits;
@@ -472,6 +482,53 @@ struct TasksetState {
     TaskState tasks[128];
 };
 static TasksetState g_tasksets[MAX_TASKSETS];
+
+/* Frozen-ticket forensics (2026-08-05, boots 3+10): one call dumps every
+ * live taskset's guest state bitsets + host task flags so a stuck cellSync
+ * ticket holder (SPU-side lifted code that stopped being scheduled
+ * mid-critical-section) can be NAMED instead of inferred. Called from
+ * cellSync's TryLock spin diagnostic when serving freezes. Racy reads by
+ * design (point-in-time forensics on a wedged process). */
+void yz_spurs_dump_tasksets(const char* tag)
+{
+    fprintf(stderr, "[ts-dump] %s: live tasksets:\n", tag ? tag : "");
+    for (u32 i = 0; i < MAX_TASKSETS; ++i) {
+        TasksetState* ts = &g_tasksets[i];
+        if (!ts->sync.live) continue;
+        const u8* o = (const u8*)ts->sync.key;
+        fprintf(stderr,
+                "[ts-dump]  obj=0x%08X wid=%u shut=%d run=%02X%02X ready=%02X%02X "
+                "en=%02X%02X sig=%02X%02X wait=%02X%02X tasks:",
+                guest_ea((void*)ts->sync.key), ts->wid, ts->shutdown,
+                o[0x00], o[0x01], o[0x10], o[0x11], o[0x30], o[0x31],
+                o[0x40], o[0x41], o[0x50], o[0x51]);
+        for (u32 t = 0; t < 128; ++t) {
+            const TaskState* k = &ts->tasks[t];
+            if (!k->thread_valid && !k->complete) continue;
+            fprintf(stderr, " %u%s%s%s%s", t,
+                    k->complete ? "C" : "", k->waiting ? "W" : "",
+                    k->signalled ? "S" : "", k->thread_valid ? "" : "-");
+        }
+        fprintf(stderr, "\n");
+        /* Face-B forensics (2026-08-06): a WAITING task's saved guest
+         * context holds what it parked ON (yield-time registers). Dump the
+         * head of each waiting task's context area so the wait object can
+         * be decoded offline against the SDK task-context layout. */
+        for (u32 t = 0; t < 128; ++t) {
+            const TaskState* k = &ts->tasks[t];
+            if (!k->thread_valid || !k->waiting || !k->context_ea) continue;
+            if (!vm_base || !job_guest_range_valid(k->context_ea, 0x60))
+                continue;
+            fprintf(stderr,
+                    "[ts-dump]   task %u ctx=0x%08X:", t, k->context_ea);
+            for (u32 o = 0; o < 0x60; o += 4)
+                fprintf(stderr, "%s%08X", (o & 15u) ? " " : " | ",
+                        rd32(vm_base + k->context_ea + o));
+            fprintf(stderr, "\n");
+        }
+    }
+    fflush(stderr);
+}
 
 static TasksetState* taskset_find(const void* key)
 {
@@ -663,9 +720,47 @@ static int task_syscall(spu_context* ctx, void* opaque)
             task_bit(ts->sync.key, 0x10, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 1);
             taskset_refresh_runnable_locked(ts);
-            while (!t->signalled && !ts->shutdown)
-                /* Timed: lifted-SPU signalers bypass the HLE wake (cv_wait_ms). */
-                cv_wait_ms(&ts->sync.cond, &ts->sync.mutex, 2u);
+            /* The signal buffer is a depth-1 LATCH in the GUEST bitset
+             * (+0x40): "If a signal has already been sent ... immediately
+             * clear it and return" ORACLE(libspurs_Task-Reference p.47).
+             * A signaler running as lifted SPU code writes ONLY the guest
+             * bit — it never sets the host mirror t->signalled — so the
+             * predicate must consume the guest latch too. Re-polling only
+             * the host flag slept forever on lifted-side signals (the
+             * CriSr cellSync-ticket freeze, 2026-08-04). */
+            {
+                const u8* obj = (const u8*)ts->sync.key;
+                const u8 sig_mask = (u8)(0x80u >> (t->id & 7));
+                const u32 sig_byte = 0x40 + t->id / 8;
+                /* Handoff-ordering ring (STATUS 2026-08-06): park + wake
+                 * edges, with the wake reason. No I/O on this path. */
+                yz_frontier_trace_emit(YZ_FT_TASK_WAIT, ts->wid, t->id,
+                                       guest_ea(ts->sync.key), 0u,
+                                       obj[sig_byte], t->signalled ? 1u : 0u,
+                                       0, 0);
+                while (!t->signalled && !(obj[sig_byte] & sig_mask) &&
+                       !ts->shutdown)
+                    /* Timed: lifted-SPU signalers bypass the HLE wake. */
+                    cv_wait_ms(&ts->sync.cond, &ts->sync.mutex, 2u);
+                /* Witness (2026-08-05): a guest-latch-only wake means a
+                 * lifted-SPU signaler delivered while the host flag never
+                 * set -- the path the 08-04 fix opened. First 8 only. */
+                if (!t->signalled && (obj[sig_byte] & sig_mask)) {
+                    static unsigned long nglw = 0;
+                    if (++nglw <= 8) {
+                        fprintf(stderr, "[spurs-glatch] WAIT_SIGNAL woke on "
+                                "guest latch id=%u taskset=0x%08X n=%lu\n",
+                                t->id, guest_ea(ts->sync.key), nglw);
+                        fflush(stderr);
+                    }
+                }
+                yz_frontier_trace_emit(YZ_FT_TASK_WAIT, ts->wid, t->id,
+                                       guest_ea(ts->sync.key),
+                                       ts->shutdown ? 3u :
+                                       (t->signalled ? 1u : 2u),
+                                       obj[sig_byte], t->signalled ? 1u : 0u,
+                                       0, 0);
+            }
             t->signalled = 0;
             task_bit(ts->sync.key, 0x40, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 0);
@@ -872,6 +967,15 @@ finished:
     task_bit(task->owner->sync.key, 0x40, task->id, 0);
     task_bit(task->owner->sync.key, 0x50, task->id, 0);
     task->complete = 1;
+    /* 2026-08-05 (queue item E): publish the exit code into the guest
+     * exit-code container, value first then the ready flag, so
+     * cellSpursTaskExitCode(Try)Get observes a complete record. The old
+     * code accepted the container at attr+0x40 and never wrote it
+     * (TryGet answered BUSY forever). */
+    if (task->exit_container_ea && vm_base) {
+        wr32(vm_base + task->exit_container_ea + 4, (u32)task->exit_code);
+        vm_base[task->exit_container_ea] = 1;
+    }
     taskset_refresh_runnable_locked(task->owner);
     cv_wake_all(&task->owner->sync.cond);
     mx_unlock(&task->owner->sync.mutex);
@@ -948,7 +1052,13 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* a, const char* n
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* a, size_t size)
 {
     if (!a) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    if (size < CELL_SPURS_TASKSET_SIZE) return CELL_SPURS_TASK_ERROR_INVAL;
+    /* Task-Reference p.180 / task_types.h: the only legal sizes are the
+     * class-0 (0x1900) and class-1 (0x2900) taskset sizes. Only the lower
+     * bound used to be checked, and create_taskset_common memsets the
+     * caller's object with this value -- an oversized/garbage attribute
+     * word was an unbounded guest-memory clear (2026-08-04 audit). */
+    if (size != CELL_SPURS_TASKSET_SIZE && size != CELL_SPURS_TASKSET2_SIZE)
+        return CELL_SPURS_TASK_ERROR_INVAL;
     wr32(a->bytes + 0x20, (u32)size);
     return CELL_OK;
 }
@@ -999,7 +1109,14 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* s, CellSpursTaskset* ts,
                                         const CellSpursTasksetAttribute* a)
 {
     if (!a) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    return create_taskset_common(s, ts, rd32(a->bytes + 0x20),
+    /* Validate the size word before create_taskset_common memsets the guest
+     * object with it -- an uninitialized/foreign attribute otherwise turns
+     * into an unbounded guest-memory clear (2026-08-04 audit; legal values
+     * per task_types.h are exactly the class-0/class-1 sizes). */
+    u32 tsize = rd32(a->bytes + 0x20);
+    if (tsize != CELL_SPURS_TASKSET_SIZE && tsize != CELL_SPURS_TASKSET2_SIZE)
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    return create_taskset_common(s, ts, tsize,
                                   rd64(a->bytes + 0x08), a->bytes + 0x10,
                                   rd32(a->bytes + 0x18),
                                   a->bytes[0x24] ? 1 : 0);
@@ -1008,10 +1125,15 @@ s32 cellSpursCreateTaskset2(CellSpurs* s, CellSpursTaskset2* ts,
                             const CellSpursTasksetAttribute2* a)
 {
     u64 args = a ? rd64(a->bytes + 0x08) : 0;
+    /* CellSpursTasksetAttribute2 is a TRANSPARENT struct (task_types.h:
+     * revision@0, name@4, argTaskset@8, priority[8]@0x10, maxContention@
+     * 0x18, enableClearLs int32 @0x1C, taskNameBuffer@0x20) -- the old read
+     * at 0x24 landed in __reserved__ and always saw 0 (2026-08-04 audit;
+     * 0x24 is only right for the opaque class-1 attribute). */
     return create_taskset_common(s, ts, sizeof(*ts), args,
                                   a ? a->bytes + 0x10 : NULL,
                                   a ? rd32(a->bytes + 0x18) : 8,
-                                  a && a->bytes[0x24] ? 1 : 0);
+                                  (a && rd32(a->bytes + 0x1C) != 0) ? 1 : 0);
 }
 s32 cellSpursShutdownTaskset(CellSpursTaskset* object)
 {
@@ -1039,6 +1161,25 @@ s32 cellSpursJoinTaskset(CellSpursTaskset* object)
     }
     mx_unlock(&ts->sync.mutex);
     for (u32 i = 0; i < 128; ++i) task_join_thread(ts, &ts->tasks[i]);
+    /* 2026-08-05 (queue item E): Join finishes the taskset — release its
+     * workload id and recycle the host slot. Previously neither happened,
+     * so MAX_TASKSETS and the workload table were LIFETIME totals on the
+     * v1 CreateTask+JoinTaskset path. A signal to a joined taskset now
+     * answers STAT (taskset_find misses) — the faithful dead-object reply —
+     * instead of latching into whatever recycled the slot. DestroyTaskset's
+     * own release tail turns into a no-op (its taskset_find misses too). */
+    {
+        mx_lock(&ts->sync.mutex);
+        const int release = ts->wid_registered;
+        ts->wid_registered = 0;
+        mx_unlock(&ts->sync.mutex);
+        if (release)
+            spurs_release_workload(spurs_find(ts->spurs), ts->wid);
+        registry_init();
+        mx_lock(&g_registry_mutex);
+        ts->sync.live = 0;
+        mx_unlock(&g_registry_mutex);
+    }
     return CELL_OK;
 }
 s32 cellSpursDestroyTaskset(CellSpursTaskset* ts)
@@ -1102,7 +1243,8 @@ s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* a,
 }
 static s32 create_task_common(void* object, CellSpursTaskId* out, const u8* elf,
                               u32 context_ea, u32 context_size,
-                              const u8 lsp[16], const u8 arg[16])
+                              const u8 lsp[16], const u8 arg[16],
+                              u32 exit_container_ea)
 {
     TasksetState* ts = taskset_find(object);
     if (!ts || !out || !elf) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -1143,6 +1285,7 @@ static s32 create_task_common(void* object, CellSpursTaskId* out, const u8* elf,
     task->elf_size = (u32)elf_size;
     task->context_ea = context_ea;
     task->context_size = context_size;
+    task->exit_container_ea = exit_container_ea;
     memcpy(task->ls_pattern, lsp, 16);
     memcpy(task->argument, arg, 16);
     task->image = resolved;
@@ -1167,7 +1310,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* ts, CellSpursTaskId* out,
     static const u8 zero[16];
     return create_task_common(ts, out, (const u8*)elf, guest_ea(context),
                               context_size, lsp ? lsp->bytes : zero,
-                              arg ? arg->bytes : zero);
+                              arg ? arg->bytes : zero, 0);
 }
 s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* ts, CellSpursTaskId* out,
                                      const CellSpursTaskAttribute* a)
@@ -1177,7 +1320,8 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* ts, CellSpursTaskId* out,
     return create_task_common(ts, out, vm_base + elf,
                               (u32)rd64(a->bytes + TA_CONTEXT),
                               rd32(a->bytes + TA_CONTEXT_SIZE),
-                              a->bytes + TA_LSP, a->bytes + TA_ARG);
+                              a->bytes + TA_LSP, a->bytes + TA_ARG,
+                              rd32(a->bytes + TA_EXIT));
 }
 s32 cellSpursCreateTask2WithBinInfo(CellSpursTaskset2* ts, CellSpursTaskId* out,
                                     const CellSpursTaskBinInfo* bin,
@@ -1190,19 +1334,79 @@ s32 cellSpursCreateTask2WithBinInfo(CellSpursTaskset2* ts, CellSpursTaskId* out,
     u32 elf = (u32)rd64(b + 0x00);
     return create_task_common(ts, out, vm_base + elf, guest_ea(context),
                               rd32(b + 0x08), b + 0x10,
-                              arg ? arg->bytes : (const u8[16]){0});
+                              arg ? arg->bytes : (const u8[16]){0}, 0);
 }
+/* Boot 57 (flight recorder): the wid-4 wake broadcasts are NOT
+ * EventFlagSet (zero event-set records in every window while broadcasts
+ * flowed) — they come from another SendSignal path. Tag the origin so the
+ * ring names the producer: 0=direct guest import, 1=eventflag-wake,
+ * 2=queue-push consumer wake, 3=queue-pop producer wake. */
+#if defined(_MSC_VER)
+static __declspec(thread) int g_yz_sendsig_origin;
+#else
+static _Thread_local int g_yz_sendsig_origin;
+#endif
 s32 _cellSpursSendSignal(CellSpursTaskset* object, CellSpursTaskId id)
 {
     TasksetState* ts = taskset_find(object);
     if (!ts) return CELL_SPURS_TASK_ERROR_STAT;
-    if (id >= 128) return CELL_SPURS_TASK_ERROR_NOENT;
+    if (id >= 128) return CELL_SPURS_TASK_ERROR_SRCH;
     mx_lock(&ts->sync.mutex);
-    /* S10: the architected gate is the GUEST enabled bitset, and the signal
-     * latches into the guest signalled bitset regardless of host thread
-     * bookkeeping — a task id snapshotted by a producer must not lose its
-     * wake because the host TaskState was recycled in between. Host condvar
-     * wake stays best-effort. */
+    /* S10 (amended 2026-08-04): the signal latches into the guest signalled
+     * bitset regardless of host thread bookkeeping — a task id snapshotted
+     * by a producer must not lose its wake because the host TaskState was
+     * recycled in between (depth-1 latch, ORACLE(libspurs_Task-Reference
+     * p.34)). But firmware gates delivery on the task EXISTING: libsre
+     * @0x020125D8 checks the guest state sets and returns SRCH 0x80410905
+     * for a dead id ("Specified task does not exist", p.34). Without the
+     * gate, a stale waiter record latches a phantom signal that a live
+     * task later consumes in place of its real wake — the docs warn an
+     * overwritten signal "can destroy the internal state" of primitives
+     * built on it. Guest enabled bit (0x30) is the liveness authority. */
+    {
+        const u8* obj = (const u8*)object;
+        if (!(obj[0x30 + id / 8] & (u8)(0x80u >> (id & 7)))) {
+            /* 2026-08-05 (boot-3 frozen-ticket triage): the gate shipped
+             * with NO witness -- a dropped signal to an exited-but-about-
+             * to-be-recreated id is exactly the lost-wake shape of the
+             * cellSync ticket freeze. Loud counter, plus kill-switch
+             * YZ_NO_SENDSIG_SRCH=1 -> restore the pre-gate latch-always
+             * behavior for a no-rebuild A/B. */
+            static int no_gate = -1;
+            static unsigned long nsrch = 0;
+            if (no_gate < 0) {
+                const char* e = getenv("YZ_NO_SENDSIG_SRCH");
+                no_gate = (e && *e == '1') ? 1 : 0;
+            }
+            nsrch++;
+            if (nsrch <= 8 || (nsrch & 1023u) == 0) {
+                fprintf(stderr, "[spurs-srch] SendSignal to disabled task "
+                        "id=%u taskset=0x%08X n=%lu -> %s\n",
+                        id, guest_ea(object), nsrch,
+                        no_gate ? "LATCHED (gate off)" : "SRCH (dropped)");
+                fflush(stderr);
+            }
+            if (!no_gate) {
+                yz_frontier_trace_emit(YZ_FT_TASK_SIGNAL, ts->wid, id,
+                                       guest_ea(object),
+                                       ts->tasks[id].waiting ? 1u : 0u,
+                                       1u /* dropped: SRCH */, 0, 0, 0);
+                mx_unlock(&ts->sync.mutex);
+                return CELL_SPURS_TASK_ERROR_SRCH;
+            }
+        }
+    }
+    yz_frontier_trace_emit(YZ_FT_TASK_SIGNAL, ts->wid, id,
+                           guest_ea(object),
+                           ts->tasks[id].waiting ? 1u : 0u,
+                           0u /* delivered */,
+                           (u32)g_yz_sendsig_origin,
+#if defined(_WIN32)
+                           (u32)GetCurrentThreadId(),
+#else
+                           0u,
+#endif
+                           0);
     ts->tasks[id].signalled = 1;
     task_bit(object, 0x40, id, 1);
     cv_wake_all(&ts->sync.cond);
@@ -1225,7 +1429,10 @@ static s32 join_task_common(void* object, u32 id, s32* exit, int try_only)
     TaskState* task = &ts->tasks[id];
     if (try_only && !task->complete) {
         mx_unlock(&ts->sync.mutex);
-        return CELL_SPURS_TASK_ERROR_BUSY;
+        /* Task-Reference p.38: "still running" is AGAIN; BUSY means another
+         * thread is already waiting. A caller polling TryJoinTask2 on AGAIN
+         * never terminated against our old BUSY (2026-08-04 audit). */
+        return CELL_SPURS_TASK_ERROR_AGAIN;
     }
     while (!task->complete) cv_wait(&ts->sync.cond, &ts->sync.mutex);
     s32 code = task->exit_code;
@@ -1260,7 +1467,19 @@ s32 cellSpursJoinTask(CellSpursTaskset* ts, u32 id, s32* exit)
 s32 cellSpursTaskExitCodeTryGet(CellSpursTaskExitCode* object, s32* out)
 {
     if (!object || !out) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    if (!object->bytes[0]) return CELL_SPURS_TASK_ERROR_BUSY;
+    if (!object->bytes[0]) return CELL_SPURS_TASK_ERROR_AGAIN;
+    wr32(out, rd32(object->bytes + 4));
+    return CELL_OK;
+}
+/* Blocking form (imported alongside TryGet; was missing entirely). The
+ * writer is a task-completion on another host thread (task_run) — a
+ * yield-poll cannot park permanently, matching the file's bounded-wait
+ * convention for guest-memory predicates. */
+s32 cellSpursTaskExitCodeGet(CellSpursTaskExitCode* object, s32* out)
+{
+    if (!object || !out) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    while (!object->bytes[0])
+        nthread_yield();
     wr32(out, rd32(object->bytes + 4));
     return CELL_OK;
 }
@@ -1434,6 +1653,8 @@ s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* ef)
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
 s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
 {
     if (!ef) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -1447,7 +1668,26 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
     u8 wake_task_ids[16] = {0};
     u32 wake_count = 0;
     mx_lock(&sync->mutex);
+    /* 2026-08-06 (boot 50 flight recorder): SERIALIZE this whole RMW section
+     * against SPU lock-line commits, exactly as the queue paths do (line
+     * ~2061). The waiting tasks' pending-bit clears (+0x02) and re-arms are
+     * committed SPU-side as 128-byte PUTLLC line commits; this section's
+     * rd16(+0x02) ... wr16(+0x02, old|pending) window otherwise RESURRECTS
+     * every bit cleared in between — one racy Set excludes all five wid-4
+     * waiter slots from `used` FOREVER (measured terminal state: 2,800
+     * signals to the CRI taskset, zero to wid-4, pack parked, no banner).
+     * Same defect class as the cellSync mutex RMW fix (08-05). HARDENING
+     * until the A/B: kill-switch YZ_EF_NO_LOCKLINE=1 restores the old
+     * unserialized behavior. */
+    static int ef_no_lockline = -1;
+    if (ef_no_lockline < 0) {
+        const char* e = getenv("YZ_EF_NO_LOCKLINE");
+        ef_no_lockline = (e && *e == '1') ? 1 : 0;
+    }
+    if (!ef_no_lockline) spu_lockline_lock();
     u16 events = (u16)(rd16(ef->bytes) | bits);
+    const u16 wtn_pend02_before = rd16(ef->bytes + 0x02);
+    const u16 wtn_used08 = rd16(ef->bytes + 0x08);
     u16 used = (u16)(rd16(ef->bytes + 0x08) & ~rd16(ef->bytes + 0x02));
     u16 modes = rd16(ef->bytes + 0x0a);
     u16 pending = 0, consumed = 0;
@@ -1494,13 +1734,37 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
             ++wake_count;
         }
     }
+    if (!ef_no_lockline) spu_lockline_unlock();
+    /* Set-path witness (flight recorder): before/after slot state + wake
+     * fanout. The boot-50 exclusion face reads as pend02-before holding the
+     * victim slots' bits with used==0 for them and wake_count collapsed. */
+    yz_frontier_trace_emit(YZ_FT_EVENT_SET, 0 /* tid: adjacent evq records
+                           carry the caller */,
+                           guest_ea(ef),
+                           ((u32)bits << 16) | events,
+                           ((u32)wtn_used08 << 16) | wtn_pend02_before,
+                           ((u32)used << 16) | pending,
+                           wake_count,
+                           wake_count ? guest_ea(wake_tasksets[0]->sync.key) : 0u,
+                           ((u32)ef->bytes[0x0e] << 8) | ef->bytes[0x0f]);
+    {
+        static _Atomic long efset_n = 0;
+        long en = atomic_fetch_add(&efset_n, 1) + 1;
+        if (en <= 4)
+            fprintf(stderr, "[ef-set] ea=0x%08X bits=0x%04X used08=0x%04X "
+                    "pend02=0x%04X wake=%u n=%ld\n",
+                    guest_ea(ef), bits, wtn_used08, wtn_pend02_before,
+                    wake_count, en);
+    }
     cv_wake_all(&sync->cond);
     mx_unlock(&sync->mutex);
     /* Do not nest a taskset mutex under the event-flag mutex.  Task code can
      * publish event-flag state while its scheduler owns the taskset mutex. */
+    g_yz_sendsig_origin = 1;
     for (u32 i = 0; i < wake_count; ++i)
         _cellSpursSendSignal(
             (CellSpursTaskset*)wake_tasksets[i]->sync.key, wake_task_ids[i]);
+    g_yz_sendsig_origin = 0;
     return CELL_OK;
 }
 static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
@@ -1886,9 +2150,11 @@ static s32 spurs_queue_push(QueueState* q, void* object, const void* data,
                 if (count == 0 && obj[0x20]) {
                     const u64 ts_ea = rd64(obj + 0x60);
                     if (ts_ea && vm_base) {
+                        g_yz_sendsig_origin = 2;
                         _cellSpursSendSignal(
                             (CellSpursTaskset*)(vm_base + (u32)ts_ea),
                             obj[0x21]);
+                        g_yz_sendsig_origin = 0;
                         static _Atomic long wake_n = 0;
                         long wn = atomic_fetch_add(&wake_n, 1) + 1;
                         if (wn <= 8 || (wn & (wn - 1)) == 0)
@@ -1951,9 +2217,11 @@ static s32 spurs_queue_pop(QueueState* q, void* object, void* data,
                 if (count == q->depth && obj[0x30]) {
                     const u64 ts_ea = rd64(obj + 0x60);
                     if (ts_ea && vm_base) {
+                        g_yz_sendsig_origin = 3;
                         _cellSpursSendSignal(
                             (CellSpursTaskset*)(vm_base + (u32)ts_ea),
                             obj[0x31]);
+                        g_yz_sendsig_origin = 0;
                         static _Atomic long pwake_n = 0;
                         long pn = atomic_fetch_add(&pwake_n, 1) + 1;
                         if (pn <= 8 || (pn & (pn - 1)) == 0)
@@ -2093,7 +2361,12 @@ s32 cellSpursBarrierInitialize(CellSpursTaskset* ts, CellSpursBarrier* b, u32 to
 /* Job chains and guards                                                     */
 
 #define MAX_JOB_COMMAND_SNAPSHOT 512
-#define MAX_JOB_PARKED_SLOTS 512
+/* 2026-08-05 (boots 35/36): the dialogue-era command list spans ~700 slots;
+ * at the old cap of 512 the tables saturated SILENTLY, jobchain_command_slot
+ * returned -1 for new slots, publication/consumed tracking went blind, and
+ * the scan eventually claimed an unpublished region and died on
+ * INVALID_BIN (boot 36, error 0x80410A1F, image-miss fp=0x3A591273...). */
+#define MAX_JOB_PARKED_SLOTS 4096
 #define MAX_JOB_LEDGER_ENTRIES 128
 typedef struct {
     u32 ea;
@@ -2138,7 +2411,19 @@ typedef struct JobChainState {
     PendingJobSnapshot* pending_snapshot_tail;
     u64 pending_snapshot_sequence;
     u32 watch_lo, watch_hi;
+    /* Pending-ticket bridge window: dispatched descriptors' kind words.
+     * SEPARATE from watch_lo/hi — routing ring stores through the command
+     * machinery saturated the parked/command tables (boot 35, parked=512)
+     * and degraded publication tracking. */
+    u32 bridge_lo, bridge_hi;
     u32 command_state_ea[MAX_JOB_PARKED_SLOTS];
+    /* The command ring is mutable: after a JOB has been acquired, the PPU may
+     * recycle its slot before publishing the next ticket for the persistent
+     * dispatcher.  Keep the acquired slot -> descriptor relationship instead
+     * of trying to reconstruct it from the recycled guest word. */
+    u32 command_last_descriptor[MAX_JOB_PARKED_SLOTS];
+    u64 command_last_dispatch_sequence[MAX_JOB_PARKED_SLOTS];
+    u64 command_dispatch_sequence_next;
     u32 command_state_count;
     u32 parked_slot_ea[MAX_JOB_PARKED_SLOTS];
     u64 parked_slot_empty[MAX_JOB_PARKED_SLOTS];
@@ -2180,9 +2465,33 @@ static void jobchain_watch_ea_locked(JobChainState* jc, u32 ea)
         g_native_spurs_ppu_watch_hi = jc->watch_hi;
 }
 
+static void jobchain_bridge_watch_ea_locked(JobChainState* jc, u32 ea)
+{
+    if (!ea) return;
+    if (ea < jc->bridge_lo) jc->bridge_lo = ea;
+    if (ea <= 0xfffffff7u && ea + 8u > jc->bridge_hi)
+        jc->bridge_hi = ea + 8u;
+    /* The global store-notify window must span BOTH windows. */
+    if (jc->bridge_lo < g_native_spurs_ppu_watch_lo)
+        g_native_spurs_ppu_watch_lo = jc->bridge_lo;
+    if (jc->bridge_hi > g_native_spurs_ppu_watch_hi)
+        g_native_spurs_ppu_watch_hi = jc->bridge_hi;
+}
+
 static void jobchain_ledger_record(JobChainState* jc, u32 type, u32 ea,
                                    u32 aux, u64 value)
 {
+    /* Allocation-free flight record of submission/claim/park/publication and
+     * redispatch edges.  Keep this independent of the verbose ledger flag so
+     * a diagnostic build retains the transition tail without stderr I/O. */
+    /* J/D already have the richer YZ_FT_JOB start/done pair. Avoid doubling
+     * the hottest event and retain well over the hard-confirmation window. */
+    if (type != 'J' && type != 'D')
+        yz_frontier_trace_emit(
+            YZ_FT_JOBCHAIN, jc->wid, guest_ea(jc->sync.key),
+            type, ea, aux, (u32)(value >> 32), (u32)value,
+            (jc->waiting_command ? 1u : 0u) |
+                (jc->running ? 2u : 0u) | (jc->complete ? 4u : 0u));
     if (!jobchain_ledger_enabled()) return;
     const u32 sequence = atomic_fetch_add_explicit(
         &jc->ledger_next, 1, memory_order_relaxed) + 1;
@@ -2244,8 +2553,17 @@ static int jobchain_command_slot(JobChainState* jc, u32 ea, int create)
     if (!ea || (ea & 7u)) return -1;
     for (u32 i = 0; i < jc->command_state_count; ++i)
         if (jc->command_state_ea[i] == ea) return (int)i;
-    if (!create || jc->command_state_count == MAX_JOB_PARKED_SLOTS)
+    if (!create || jc->command_state_count == MAX_JOB_PARKED_SLOTS) {
+        if (create) {
+            static atomic_uint sat_n;
+            const unsigned k = atomic_fetch_add(&sat_n, 1u);
+            if (k < 8u)
+                fprintf(stderr, "[jc-SATURATED] command_state full (%u) "
+                        "ea=%08X — publication tracking degraded\n",
+                        (unsigned)MAX_JOB_PARKED_SLOTS, ea);
+        }
         return -1;
+    }
     const u32 slot = jc->command_state_count++;
     jc->command_state_ea[slot] = ea;
     return (int)slot;
@@ -2259,7 +2577,8 @@ static int jobchain_command_slot(JobChainState* jc, u32 ea, int create)
  * would therefore observe a mixture of two publications.
  */
 static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
-                                     JobCommandSnapshot* snapshot)
+                                     JobCommandSnapshot* snapshot,
+                                     int grab_bounded)
 {
     u32 pc = start_ea;
     u32 stack[16];
@@ -2268,7 +2587,26 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
     memcpy(stack, jc->call_stack, depth * sizeof(stack[0]));
 
     u32 count = 0;
+    /* 2026-08-05 (audit H5): bound the stable-snapshot "grab window" like
+     * hardware. The SPU fetches the command list in 128-byte units and
+     * grabs at most maxGrabbedJob jobs per grab; our old capture walked up
+     * to 512 commands across the whole chain, widening the stale-view
+     * window ~100x into the producer's legally-mutating region. Sequential
+     * advancement past the current 128-byte line ends the SNAPSHOT (the
+     * executor falls back to live reads / a fresh capture there); flow
+     * control (NEXT/CALL/RET) models a new fetch and re-bases the line.
+     * The job budget spans the whole capture.
+     * grab_bounded=0 is the PUBLICATION-time snapshot (the producer's
+     * published prefix, bounded by the barrier set, not by the grab
+     * window -- a published stable view must survive producer slot reuse
+     * regardless of maxGrabbedJob; the claimed-publication regression
+     * test covers this). grab_bounded=1 is the claim-time fetch. */
+    const u32 grab_cap = jc->max_grab ? jc->max_grab : 16u;
+    u32 jobs_grabbed = 0;
+    u32 fetch_line = start_ea & ~127u;
     while (count < MAX_JOB_COMMAND_SNAPSHOT) {
+        if (grab_bounded && (pc & ~127u) != fetch_line)
+            break;                        /* 128-byte boundary stop */
         if (!job_guest_range_valid(pc, sizeof(u64)))
             break;
         int visited = 0;
@@ -2285,6 +2623,11 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
         const u32 ext = (u32)(command & 127u);
         if (job_command_is_empty(pc, command))
             break;
+        if (grab_bounded && command && op == 0u) {
+            if (jobs_grabbed == grab_cap)
+                break;                    /* maxGrabbedJob bound */
+            ++jobs_grabbed;
+        }
 
         snapshot[count].ea = pc;
         snapshot[count].command = command;
@@ -2315,18 +2658,21 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
         if (op == 1u || op == 3u) {
             if (op == 1u) depth = 0;
             pc = (u32)(command & ~7ull);
+            fetch_line = pc & ~127u;      /* new fetch */
             continue;
         }
         if (op == 4u) {
             if (depth == 16) break;
             stack[depth++] = pc + 8;
             pc = (u32)(command & ~7ull);
+            fetch_line = pc & ~127u;      /* new fetch */
             continue;
         }
         if (op == 7u) {
             if (ext == 119u) {
                 if (!depth) break;
                 pc = stack[--depth];
+                fetch_line = pc & ~127u;  /* new fetch */
                 continue;
             }
             if (ext == 15u || ext == 23u) {
@@ -2342,13 +2688,50 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
 
 static u32 jobchain_claim_current(JobChainState* jc, u32 start_ea)
 {
+    /* grab_bounded=0: this claim consumes a PUBLISHED view (parked-slot
+     * resume). Bounding it by maxGrabbedJob breaks the publication-claim
+     * protocol -- the producer legally reuses consumed slots immediately
+     * after notify, trusting the claim took the whole published prefix
+     * (MEASURED 2026-08-05: tests/native_spurs line ~940 fails 10/10 with
+     * the bound here). Audit H5's literal fix is incompatible with this
+     * architecture; a future bound must clip by PUBLISHED EXTENT instead. */
     const u32 count = jobchain_capture_commands(
-        jc, start_ea, jc->command_snapshot);
+        jc, start_ea, jc->command_snapshot, /*grab_bounded=*/0);
     jc->command_snapshot_count = count;
     jc->command_snapshot_index = 0;
     jobchain_ledger_record(jc, 'C', start_ea, count,
                            count ? jc->command_snapshot[0].command : 0);
     return count;
+}
+
+static u32 jobchain_claim_persistent_job(JobChainState* jc, u32 slot_ea,
+                                         u32 descriptor_ea)
+{
+    const u64 live_command = rd64(vm_base + slot_ea);
+    if ((live_command & 7u) == 0u && (u32)live_command == descriptor_ea)
+        return jobchain_claim_current(jc, slot_ea);
+
+    /* The SPURS kernel has already acquired this persistent JOB command.  A
+     * producer is therefore free to recycle the main-memory ring slot while
+     * the dispatcher continues to orbit it.  Recreate that one acquired
+     * command from command state, including a stable descriptor snapshot, so
+     * redispatch does not depend on the current contents of the ring slot. */
+    JobCommandSnapshot* snapshot = &jc->command_snapshot[0];
+    snapshot->ea = slot_ea;
+    snapshot->command = descriptor_ea;
+    snapshot->publication_sequence = 0;
+    snapshot->descriptor_size = 0;
+    snapshot->descriptor_status = 2;
+    if (jc->descriptor_size <= sizeof(snapshot->descriptor) &&
+        job_descriptor_copy_stable(descriptor_ea, jc->descriptor_size,
+                                   snapshot->descriptor)) {
+        snapshot->descriptor_size = jc->descriptor_size;
+        snapshot->descriptor_status = 1;
+    }
+    jc->command_snapshot_count = 1;
+    jc->command_snapshot_index = 0;
+    jobchain_ledger_record(jc, 'C', slot_ea, 1, descriptor_ea);
+    return 1;
 }
 
 static void jobchain_remember_parked_slot(JobChainState* jc, u32 ea,
@@ -2369,6 +2752,13 @@ static void jobchain_remember_parked_slot(JobChainState* jc, u32 ea,
         const u32 i = jc->parked_slot_count++;
         jc->parked_slot_ea[i] = ea;
         jc->parked_slot_empty[i] = empty_command;
+    } else {
+        static atomic_uint psat_n;
+        const unsigned k = atomic_fetch_add(&psat_n, 1u);
+        if (k < 8u)
+            fprintf(stderr, "[jc-SATURATED] parked_slot full (%u) "
+                    "ea=%08X — wrapped publications unwatched\n",
+                    (unsigned)MAX_JOB_PARKED_SLOTS, ea);
     }
 }
 
@@ -2436,7 +2826,7 @@ static u32 jobchain_queue_snapshot(JobChainState* jc, u32 start_ea)
     snapshot->next = NULL;
     snapshot->start_ea = start_ea;
     snapshot->count = jobchain_capture_commands(
-        jc, start_ea, snapshot->command);
+        jc, start_ea, snapshot->command, /*grab_bounded=*/0);
     if (!snapshot->count) {
         free(snapshot);
         jobchain_ledger_record(jc, 'Q', start_ea, 0, 0);
@@ -2479,6 +2869,164 @@ static u32 jobchain_take_queued_snapshot(JobChainState* jc, u32 start_ea)
     return count;
 }
 
+/* The title's synchronous ticket producer writes descriptor+0x10 = 6 and
+ * then waits for the persistent dispatcher JOB to clear it.  Normally the
+ * PPU-store notification below turns that edge into a re-dispatch.  The real
+ * SPURS kernel does not depend on observing that single store, though: while
+ * the command ring is parked it continues to orbit persistent JOB commands.
+ *
+ * Keep the event-driven fast path, but share it with the bounded parked-state
+ * poll in wait_job_slot().  That fallback is required for lifted stores that
+ * bypass notification and for a notification that races command tracking.
+ * A nonzero size_io is also the title-observed descriptor-ready edge: the
+ * producer writes kind 6 before finishing the rest of the descriptor. */
+static u32 jobchain_resume_pending_ticket_locked(JobChainState* jc,
+                                                 u32 descriptor_filter,
+                                                 int polled)
+{
+    int selected = 0;
+    u32 selected_slot_ea = 0;
+    u32 selected_desc = 0;
+    u64 selected_command = 0;
+    u64 selected_sequence = 0;
+    for (u32 m = 0; m < jc->command_state_count; ++m) {
+        const u32 slot_ea = jc->command_state_ea[m];
+        if (!job_guest_range_valid(slot_ea, 8)) continue;
+        const u64 command = rd64(vm_base + slot_ea);
+        const u32 live_desc = command && (command & 7u) == 0u ?
+            (u32)command : 0u;
+        const u32 desc = live_desc ? live_desc :
+            jc->command_last_descriptor[m];
+        if (!desc) continue;
+        if (descriptor_filter && desc != descriptor_filter) continue;
+        /* A retained mapping represents a command already acquired by the
+         * kernel, not a newly published ring generation.  It may restart the
+         * dispatcher only from its parked orbit.  Deferring it while another
+         * generation is running stacks stale dispatcher executions (the live
+         * title publishes adjacent tickets in a burst) and corrupts ordering.
+         * A command still present in the live slot keeps the existing busy ->
+         * deferred-publication behavior. */
+        /* A retained command is an asynchronous kernel-orbit dependency.  The
+         * PPU write callback runs inside the producer's lifted store helper;
+         * executing the retained JOB from that callback lets the consumer
+         * clear the ticket before the producer instruction/transition has
+         * returned.  Observe retained mappings only from the worker's bounded
+         * parked poll.  Live commands keep their existing event/defer path. */
+        if (!live_desc && (!polled || !jc->waiting_command))
+            continue;
+        if (desc > 0xffffffebu ||
+            !job_guest_range_valid(desc + 0x10u, 8u))
+            continue;
+        const u32 ticket = rd32(vm_base + desc + 0x10u);
+        const u32 ready = rd32(vm_base + desc + 0x14u);
+        if (descriptor_filter && desc == descriptor_filter)
+            yz_frontier_trace_emit(
+                YZ_FT_COMPLETION, jc->wid, 2u,
+                desc, desc + 0x10u, ticket, 6u, ready,
+                polled ? 2u : 1u);
+        if (ticket != 6u || ready == 0u)
+            continue;
+        /* A long-lived circular list can acquire the same persistent
+         * descriptor through several recycled command slots.  The most recent
+         * acquisition is the active kernel orbit; an older historical slot
+         * carries stale continuation context and must not be redispatched. */
+        const u64 sequence = jc->command_last_dispatch_sequence[m];
+        if (!selected || sequence > selected_sequence) {
+            selected = 1;
+            selected_slot_ea = slot_ea;
+            selected_desc = desc;
+            selected_command = command;
+            selected_sequence = sequence;
+        }
+    }
+    if (!selected)
+        return 0;
+
+    yz_frontier_trace_emit(
+        YZ_FT_COMPLETION, jc->wid, 3u,
+        selected_desc, selected_desc + 0x10u,
+        rd32(vm_base + selected_desc + 0x10u), 6u,
+        rd32(vm_base + selected_desc + 0x14u),
+        polled ? 2u : 1u);
+
+    jobchain_ledger_record(jc, 'B', selected_slot_ea, selected_desc,
+                           selected_command);
+    {
+        static atomic_uint bridge_n;
+        const unsigned k = atomic_fetch_add(&bridge_n, 1u);
+        if (k < 24u || (k & (k + 1u)) == 0u) {
+            fprintf(stderr,
+                    "[jc-bridge] pending ticket desc=%08X kind=6 "
+                    "-> redispatch slot=%08X parked=%d source=%s "
+                    "(#%u)\n",
+                    selected_desc, selected_slot_ea,
+                    jc->waiting_command,
+                    polled ? "park-poll" : "ppu-store", k + 1u);
+            fflush(stderr);
+        }
+    }
+    if (jc->waiting_command) {
+        jc->current_ea = selected_slot_ea;
+        if (jobchain_claim_persistent_job(
+                jc, selected_slot_ea, selected_desc))
+            jc->waiting_command = 0;
+    } else {
+        const int cs = jobchain_command_slot(jc, selected_slot_ea, 1);
+        jobchain_defer_resume(jc, selected_slot_ea, selected_command,
+                              cs >= 0 ?
+                              ++jc->command_publication_sequence[cs] : 0);
+    }
+    return 1;
+}
+
+static int jobchain_pending_ticket_publish_candidate(
+    JobChainState* jc, u32 ea, u32 size, u32* descriptor_out)
+{
+    const u64 first = ea;
+    const u64 last = first + size;
+    const u32 descriptor = ea & ~0x7fu;
+    const u32 descriptor_offset = ea & 0x7fu;
+    const int in_bridge_window =
+        first < jc->bridge_hi && last > jc->bridge_lo;
+    const int candidate =
+        in_bridge_window && size <= 8u &&
+        descriptor_offset < 0x18u &&
+        descriptor_offset + size > 0x10u &&
+        job_guest_range_valid(descriptor + 0x10u, 8u) &&
+        rd32(vm_base + descriptor + 0x10u) == 6u &&
+        rd32(vm_base + descriptor + 0x14u) != 0u;
+    if (candidate && descriptor_out)
+        *descriptor_out = descriptor;
+    return candidate;
+}
+
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+int yz_spurs_test_watch_pending_descriptor(
+    CellSpursJobChain* object, u32 descriptor)
+{
+    for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
+        JobChainState* jc = &g_jobchains[i];
+        if (jc->sync.live && jc->sync.key == object) {
+            jobchain_bridge_watch_ea_locked(jc, descriptor + 0x10u);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int yz_spurs_test_pending_ticket_publish_candidate(
+    CellSpursJobChain* object, u32 ea, u32 size, u32* descriptor_out)
+{
+    for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
+        JobChainState* jc = &g_jobchains[i];
+        if (jc->sync.live && jc->sync.key == object)
+            return jobchain_pending_ticket_publish_candidate(
+                jc, ea, size, descriptor_out);
+    }
+    return -1;
+}
+#endif
+
 static void jobchain_notify_guest_write(u32 ea, u32 size)
 {
     const u64 first = ea;
@@ -2488,10 +3036,44 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
         if (!jc->sync.live) continue;
         const u64 chain_first = jc->watch_lo;
         const u64 chain_last = jc->watch_hi;
-        if (first >= chain_last || last <= chain_first) continue;
+        const int in_command_window =
+            first < chain_last && last > chain_first;
+        /* Cheap LOCK-FREE pre-filter: only a small store landing on a ring
+         * descriptor's kind word with the pending value is a bridge
+         * candidate. Ordinary ring traffic (whole-slot builds, thousands
+         * per second on t1's submit path) must NOT take the chain mutex —
+         * boots 37-41 showed the early frame-drain wedge rate exploding
+         * under exactly that contention. */
+        const int in_bridge_window =
+            first < jc->bridge_hi && last > jc->bridge_lo;
+        u32 bridge_descriptor = 0;
+        const int bridge_candidate =
+            jobchain_pending_ticket_publish_candidate(
+                jc, ea, size, &bridge_descriptor);
+        /* Record both halves of a completion descriptor's two-store publish.
+         * Redispatch becomes eligible only when either write completes the
+         * tuple { ticket == 6, ready != 0 }. */
+        const u32 descriptor = ea & ~0x7fu;
+        const u32 descriptor_offset = ea & 0x7fu;
+        const int completion_field_write =
+            in_bridge_window && size <= 8u && descriptor_offset < 0x18u &&
+            descriptor_offset + size > 0x10u &&
+            job_guest_range_valid(descriptor + 0x10u, 8u);
+        /* Only retain the pending-ticket protocol under investigation.  Other
+         * descriptor families publish these same two words at very high rate
+         * and would evict the useful dependency history without adding signal. */
+        if (completion_field_write &&
+            rd32(vm_base + descriptor + 0x10u) == 6u)
+            yz_frontier_trace_emit(
+                YZ_FT_COMPLETION, 0u, 1u,
+                descriptor, ea,
+                rd32(vm_base + descriptor + 0x10u), 0u,
+                rd32(vm_base + descriptor + 0x14u),
+                bridge_candidate ? 1u : 0u);
+        if (!in_command_window && !bridge_candidate) continue;
         mx_lock(&jc->sync.mutex);
         u64 exact_publication_sequence = 0;
-        if (size == sizeof(u64) && !(ea & 7u) &&
+        if (in_command_window && size == sizeof(u64) && !(ea & 7u) &&
             job_guest_range_valid(ea, sizeof(u64))) {
             const u64 exact_command = rd64(vm_base + ea);
             jobchain_ledger_record(jc, 'N', ea, size, exact_command);
@@ -2509,8 +3091,34 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                         ++jc->command_publication_sequence[slot];
             }
         }
+        /* PENDING-TICKET BRIDGE (2026-08-05, dialogue-load wedge, boots
+         * 25-33, 7/7). The title's synchronous loads submit a ring ticket
+         * by writing kind 6 into descriptor+0x10 (MEASURED: t1 via
+         * func_00AA0D50 <- 00454C90 <- 00456BC0) and then SPIN IN PLACE
+         * until the SPU side clears it — no jobchain command is ever
+         * appended for it (t1 is the appender and it is blocked). On real
+         * HW the free-running kernel re-executes the stale JOB command
+         * still in the circular list and the self-gating dispatcher (bin
+         * 0x01254500) picks the ticket up; our parked scanner never
+         * revisits consumed commands, so the ticket starved and t1 hung.
+         * Bridge: when a write to either readiness word leaves the complete
+         * tuple { kind 6, size_io nonzero }, re-dispatch the command slot that last
+         * dispatched that descriptor — the event-driven equivalent of the
+         * real kernel's next orbit. A double dispatch is a no-op: the
+         * dispatcher reads kind 0 and returns (jobput census, boots
+         * 27-30). Kill-switch YZ_NO_JC_BRIDGE=1 for A/B. */
+        int bridge_resumed = 0;
+        if (!jobchain_bridge_disabled() && bridge_candidate) {
+            /* Ring descriptors are 128-aligned; a small store completing the
+             * +0x10/+0x14 tuple identifies a synchronous-submit ticket
+             * structurally (no map to evict).
+             * The stale JOB command for it persists in guest memory in one
+             * of the command slots this chain has already seen. */
+            bridge_resumed = jobchain_resume_pending_ticket_locked(
+                jc, bridge_descriptor, /*polled=*/0);
+        }
         int exact_barrier_handled = 0;
-        for (u32 p = 0; p < jc->parked_slot_count; ++p) {
+        for (u32 p = 0; in_command_window && p < jc->parked_slot_count; ++p) {
             const u32 slot_ea = jc->parked_slot_ea[p];
             /* A PPU producer may publish a 64-bit command with one or two
              * narrower stores.  The write callback runs after each store, so
@@ -2598,7 +3206,11 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                 }
             }
         }
-        cv_wake_all(&jc->sync.cond);
+        /* A bridge-only retained-map notification deliberately does not wake
+         * the worker reentrantly; its 4 ms parked poll observes the completed
+         * producer transition. */
+        if (in_command_window || bridge_resumed)
+            cv_wake_all(&jc->sync.cond);
         mx_unlock(&jc->sync.mutex);
     }
 }
@@ -2619,6 +3231,21 @@ static JobGuardState* jobguard_find(const void* key)
     for (u32 i = 0; i < MAX_JOB_GUARDS; ++i)
         if (g_jobguards[i].sync.live && g_jobguards[i].sync.key == key) return &g_jobguards[i];
     return NULL;
+}
+
+/* Test support (2026-08-05): report whether a jobchain's worker is parked
+ * waiting for a command at guest EA `ea`. The claimed-SYNC publication
+ * regression test needs this deterministic parked edge before writing its
+ * exact SYNC; the brief_sleep it used instead lost the race ~2-3/12 runs
+ * (the known pre-existing job_runs flake). Not part of any SDK surface. */
+int yz_spurs_jobchain_is_parked_at(CellSpursJobChain* object, u32 ea)
+{
+    JobChainState* jc = jobchain_find(object);
+    if (!jc) return 0;
+    mx_lock(&jc->sync.mutex);
+    const int parked = jc->waiting_command && jc->current_ea == ea;
+    mx_unlock(&jc->sync.mutex);
+    return parked;
 }
 static JobChainState* jobchain_make(void* key)
 {
@@ -2742,8 +3369,15 @@ s32 cellSpursCreateJobChainWithAttribute(CellSpurs* s, CellSpursJobChain* object
     jc->pending_snapshot_sequence = 0;
     jc->watch_lo = jc->entry_ea;
     jc->watch_hi = jc->entry_ea + 8u;
+    jc->bridge_lo = UINT32_MAX;
+    jc->bridge_hi = 0;
     jc->command_state_count = 0;
     memset(jc->command_state_ea, 0, sizeof(jc->command_state_ea));
+    memset(jc->command_last_descriptor, 0,
+           sizeof(jc->command_last_descriptor));
+    memset(jc->command_last_dispatch_sequence, 0,
+           sizeof(jc->command_last_dispatch_sequence));
+    jc->command_dispatch_sequence_next = 0;
     jc->command_snapshot_count = jc->command_snapshot_index = 0;
     jc->parked_slot_count = 0;
     for (u32 i = 0; i < MAX_JOB_PARKED_SLOTS; ++i)
@@ -2854,6 +3488,24 @@ static int job_io_trace_enabled(void)
     return enabled;
 }
 
+/* Kill-switch YZ_JOB_INOUT_WB=1 restores the RETIRED automatic inout
+ * write-back (the boot-24 measured descriptor corruption) for
+ * single-variable A/B. Default: no write-back, per the SPURS contract. */
+static int job_inout_wb_forced(void)
+{
+    static int forced = -1;
+    if (forced < 0) {
+        const char* e = getenv("YZ_JOB_INOUT_WB");
+        forced = (e && *e == '1') ? 1 : 0;
+        if (forced) {
+            fprintf(stderr, "[jobpub] KILL-SWITCH: legacy inout write-back "
+                    "FORCED ON (YZ_JOB_INOUT_WB=1)\n");
+            fflush(stderr);
+        }
+    }
+    return forced;
+}
+
 static u32 job_io_trace_hash(const u8* bytes, u32 size)
 {
     u32 hash = 2166136261u;
@@ -2862,6 +3514,117 @@ static u32 job_io_trace_hash(const u8* bytes, u32 size)
         hash *= 16777619u;
     }
     return hash;
+}
+
+/* In-flight job hang watcher (2026-08-05, wedge boots 25-28): at the
+ * dialogue load, jobs cease to FLOW while zero executed jobs exit STALE —
+ * so the stuck submission either never starts or never RETURNS. Track
+ * in-flight jobs; a watcher prints any older than 4 s with its live LS pc
+ * (racy read, diagnostic only) — a hung job names its spin site directly. */
+#define JOB_INFLIGHT_MAX 16
+typedef struct {
+    void* volatile ctx;              /* spu_context*; NULL = slot free */
+    u32 desc, bin, d10;
+    unsigned long long start_ms;
+} JobInflightSlot;
+static JobInflightSlot g_job_inflight[JOB_INFLIGHT_MAX];
+static atomic_int g_job_watch_started;
+static atomic_uint g_frontier_job_completion_serial;
+
+u32 yz_frontier_job_completion_serial(void)
+{
+    return atomic_load_explicit(
+        &g_frontier_job_completion_serial, memory_order_relaxed);
+}
+
+static unsigned long long job_watch_now_ms(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull +
+           (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+}
+
+/* Job-flow stall detector (boots 25-30): the wedge face is "jobs stop being
+ * consumed while a live chain waits at a slot the game has already filled".
+ * When no job has ENTERED run_job for >6 s while a chain is live+running,
+ * dump every chain's state, ledger ring (YZ_NATIVE_SPURS_LEDGER) and the
+ * LIVE GUEST command words at its current/parked slots — the direct
+ * discriminator between "publication missed" and "never published". */
+static volatile unsigned long long g_job_watch_last_job_ms;
+void cellSpursDumpNativeJobChains(const char* tag);
+static int jobchain_any_running(void);
+
+#ifdef _WIN32
+static DWORD WINAPI job_watch_proc(LPVOID opaque)
+#else
+static void* job_watch_proc(void* opaque)
+#endif
+{
+    (void)opaque;
+    static long printed;
+    static int stall_episodes, stall_armed = 1;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(2000);
+#else
+        const struct timespec two_s = {2, 0};
+        nanosleep(&two_s, NULL);
+#endif
+        const unsigned long long now = job_watch_now_ms();
+        {
+            const unsigned long long last = g_job_watch_last_job_ms;
+            if (last && now - last > 6000ull) {
+                if (stall_armed && stall_episodes < 3 &&
+                    jobchain_any_running()) {
+                    ++stall_episodes;
+                    stall_armed = 0;
+                    fprintf(stderr,
+                            "[job-stall] no job entered run_job for %llums "
+                            "with a live running chain — dumping chains "
+                            "(episode %d)\n",
+                            now - last, stall_episodes);
+                    cellSpursDumpNativeJobChains("job-stall");
+                    yz_spurs_dump_tasksets("job-stall");
+                    {
+                        extern void yz_spu_dump_all_ctx(const char*);
+                        yz_spu_dump_all_ctx("job-stall");
+                    }
+                    /* Handoff-ordering ring (STATUS 2026-08-06): the stall IS
+                     * the trigger of record — dump the pre-stall event tail.
+                     * One-shot inside; a later RSX-stall dump becomes a no-op. */
+                    yz_frontier_trace_dump(2u);
+                    fflush(stderr);
+                }
+            } else if (last) {
+                stall_armed = 1;    /* jobs flowed again: re-arm */
+            }
+        }
+        for (int i = 0; i < JOB_INFLIGHT_MAX; ++i) {
+            spu_context* c = (spu_context*)g_job_inflight[i].ctx;
+            if (!c) continue;
+            const unsigned long long age = now - g_job_inflight[i].start_ms;
+            if (age < 4000ull) continue;
+            if (printed < 96) {
+                ++printed;
+                fprintf(stderr,
+                        "[jobhang] desc=%08X bin=%08X d10=%08X age=%llums "
+                        "pc=0x%05X\n",
+                        g_job_inflight[i].desc, g_job_inflight[i].bin,
+                        g_job_inflight[i].d10, age, c->pc);
+                fflush(stderr);
+            }
+        }
+    }
+#ifndef _WIN32
+    return NULL;
+#else
+    return 0;
+#endif
 }
 
 static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
@@ -2884,6 +3647,26 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                                          descriptor_copy))
         return CELL_SPURS_JOB_ERROR_FAULT;
     const u8* const d = descriptor_copy;
+    /* 2026-08-05 (audit H1 / task-ledger #16): jobType at d[0x2C] selects
+     * the descriptor format; nonzero = the BINARY2 family, whose
+     * binaryInfo[10] layout is documented nowhere. We would MISPARSE it as
+     * legacy eaBinary+sizeBinary. One-shot probe dumps the first real
+     * BINARY2 descriptor seen so its layout can be recovered from the log;
+     * until then, refuse the parse honestly instead of loading garbage. */
+    if (descriptor_size > 0x2C && d[0x2C] != 0) {
+        static int b2_dumped = 0;
+        if (!b2_dumped) {
+            b2_dumped = 1;
+            fprintf(stderr, "[jc-binary2] jobType=%u descriptor=0x%08X — "
+                    "header+binaryInfo dump:\n", d[0x2C], descriptor_ea);
+            for (u32 o = 0; o < 0x40 && o < descriptor_size; o += 16)
+                fprintf(stderr, "[jc-binary2]   +%02X: %08X %08X %08X %08X\n",
+                        o, rd32(d + o), rd32(d + o + 4),
+                        rd32(d + o + 8), rd32(d + o + 12));
+            fflush(stderr);
+        }
+        return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+    }
     u32 bin_ea = (u32)(rd64(d + 0x00) & ~1ull);
     u32 bin_size = (u32)rd16(d + 0x08) * 16;
     jobchain_ledger_record(jc, 'J', descriptor_ea, bin_size, bin_ea);
@@ -2932,7 +3715,20 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     u32 cache_count = cache_list_size / 8;
     for (u32 i = 0; i < cache_count; ++i) {
         u64 item = rd64(d + 0x30 + dma_list_size + i * 8);
-        u32 item_size = (u32)(item >> 32) & 0x7fffu;
+        /* 2026-08-05 (audit H6): read-only cache elements carry the FULL
+         * high word as their size -- the old MFC-list-style 0x7fff mask
+         * silently truncated >=32KB caches. Validate instead: 16-multiple,
+         * fits in LS. (The io list below keeps its 0x7fff mask -- those ARE
+         * MFC list elements with a <=16KB contract enforced there.) */
+        u32 item_size = (u32)(item >> 32);
+        if (item_size & 15u) {
+            native_spu_context_free(ctx);
+            return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+        }
+        if (item_size > SPU_LS_SIZE) {
+            native_spu_context_free(ctx);
+            return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+        }
         cache_ls[i] = job_alloc(&cursor, descriptor_ls, item_size, 1024);
         if (item_size && !cache_ls[i]) { native_spu_context_free(ctx); return CELL_SPURS_JOB_ERROR_NOMEM; }
         if (item_size && !job_guest_range_valid((u32)item, item_size)) {
@@ -3044,7 +3840,179 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     ctx->native_spurs_syscall = job_return_syscall;
     ctx->pc = slot;
     image.entry_pc = slot;
+    const u32 jobdone_d10_snap = rd32(d + 0x10);
+    const int parity_motion =
+        ((u32)(descriptor_ea - 0x401ACB00u) < 0x80000u) &&
+        jobdone_d10_snap == 7u;
+    static atomic_uint parity_motion_submit_generation;
+    const u32 parity_motion_generation = parity_motion
+        ? atomic_fetch_add_explicit(
+              &parity_motion_submit_generation, 1u,
+              memory_order_relaxed) + 1u
+        : 0u;
+    if (parity_motion) {
+        const u32 ticket = (descriptor_ea - 0x401ACB00u) >> 7;
+        const u32 placement =
+            ((u32)(image.image_id & 0xff) << 20) | (slot & 0xfffffu);
+        ctx->parity_motion_generation = parity_motion_generation;
+        yz_frontier_trace_emit(
+            YZ_FT_PARITY_MOTION, jc->wid, 0u,
+            guest_ea(jc->sync.key), descriptor_ea,
+            parity_motion_generation, placement,
+            ticket, jobdone_d10_snap);
+    }
+    yz_frontier_trace_emit(
+        YZ_FT_JOB, jc->wid, 0u,
+        descriptor_ea, bin_ea, jobdone_d10_snap,
+        rd32(vm_base + descriptor_ea + 0x10u), 0u,
+        atomic_load_explicit(&jc->ledger_next, memory_order_relaxed));
+    /* Register in flight + [jobstart] for the rare submission kinds (>=6:
+     * the boots-26/27 stuck kind and the motion job) so "started but hung"
+     * is distinguishable from "never consumed". Racy slot claim is fine —
+     * diagnostic only, worst case one lost entry. */
+    g_job_watch_last_job_ms = job_watch_now_ms();
+    int inflight_idx = -1;
+    for (int ii = 0; ii < JOB_INFLIGHT_MAX; ++ii) {
+        if (!g_job_inflight[ii].ctx) {
+            g_job_inflight[ii].desc = descriptor_ea;
+            g_job_inflight[ii].bin = bin_ea;
+            g_job_inflight[ii].d10 = jobdone_d10_snap;
+            g_job_inflight[ii].start_ms = job_watch_now_ms();
+            g_job_inflight[ii].ctx = ctx;
+            inflight_idx = ii;
+            break;
+        }
+    }
+    if (inflight_idx >= 0 && !atomic_exchange(&g_job_watch_started, 1)) {
+        nthread watch_thread;
+        nthread_create_spu(&watch_thread, job_watch_proc, NULL);
+    }
+    if (((u32)(descriptor_ea - 0x401ACB00u) < 0x80000u) &&
+        jobdone_d10_snap >= 6u) {
+        static atomic_uint jobstart_n;
+        const unsigned k = atomic_fetch_add(&jobstart_n, 1u);
+        if (k < 64u) {
+            fprintf(stderr, "[jobstart] desc=%08X bin=%08X d10=%08X\n",
+                    descriptor_ea, bin_ea, jobdone_d10_snap);
+            fflush(stderr);
+        }
+    }
+    extern volatile unsigned long g_yz_job_dma_put_n;
+    extern volatile unsigned long g_yz_job_dma_put_bytes;
+    const unsigned long job_put_n0 = g_yz_job_dma_put_n;
+    const unsigned long job_put_b0 = g_yz_job_dma_put_bytes;
     int ok = spu_workload_execute(&image, ctx);
+    if (parity_motion) {
+        static atomic_uint parity_motion_completion_generation;
+        const u32 completion_generation =
+            atomic_fetch_add_explicit(
+                &parity_motion_completion_generation, 1u,
+                memory_order_relaxed) + 1u;
+        const u32 placement =
+            ((u32)(image.image_id & 0xff) << 20) | (slot & 0xfffffu);
+        yz_frontier_trace_emit(
+            YZ_FT_PARITY_MOTION, jc->wid, 1u,
+            guest_ea(jc->sync.key), descriptor_ea,
+            parity_motion_generation, completion_generation,
+            rd32(vm_base + descriptor_ea + 0x10u), placement);
+    }
+    if (inflight_idx >= 0) g_job_inflight[inflight_idx].ctx = NULL;
+    yz_frontier_trace_emit(
+        YZ_FT_JOB, jc->wid, 1u,
+        descriptor_ea, bin_ea, jobdone_d10_snap,
+        rd32(vm_base + descriptor_ea + 0x10u), ok ? 0u : 1u,
+        atomic_load_explicit(&jc->ledger_next, memory_order_relaxed));
+    atomic_fetch_add_explicit(
+        &g_frontier_job_completion_serial, 1u, memory_order_relaxed);
+    /* DECISIVE (2026-08-05 wedge): did this job publish ANYTHING itself?
+     * The SPURS contract says a job's outputs reach main memory only via
+     * its own DMA. A completed job with zero store-class DMA has produced
+     * nothing the game can observe — which is exactly what the retired
+     * write-back used to paper over. Counters are cross-thread-summed, so
+     * treat a delta as a lower bound / attributable only on quiet lanes. */
+    {
+        const unsigned long put_n = g_yz_job_dma_put_n - job_put_n0;
+        const unsigned long put_b = g_yz_job_dma_put_bytes - job_put_b0;
+        const int ring_load =
+            ((u32)(descriptor_ea - 0x401ACB00u) < 0x80000u) &&
+            jobdone_d10_snap >= 6u;
+        if (ring_load) {
+            static atomic_uint jobput_n, jobput_zero_n;
+            const unsigned k = atomic_fetch_add(
+                put_n ? &jobput_n : &jobput_zero_n, 1u);
+            if (k < 48u) {
+                fprintf(stderr,
+                        "[jobput]%s desc=%08X bin=%08X d10=%X ok=%d "
+                        "puts=%lu bytes=%lu\n",
+                        put_n ? "" : " ZERO-OUTPUT", descriptor_ea, bin_ea,
+                        jobdone_d10_snap, ok, put_n, put_b);
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* [jobdone] completion-protocol probe (2026-08-05, boots 25/26 wedge
+     * root-cause). The title's PPU polls its ticket-ring slot word
+     * (descriptor+0x10) for job completion, and both no-write-back boots
+     * froze in that poll (func_00456BC0 spin, ring 0x401ACB00) — a face NO
+     * pre-fix wedge boot shows. Measure who delivers the zero: the job's
+     * own output DMA (guest flips by job end), a later actor (guest still
+     * set at job end while the boot stays healthy), or nobody (the wedge).
+     * io0 identifies whether the slot itself is an inout item — the path
+     * by which the retired write-back used to publish the LS-side zero. */
+    {
+        static atomic_uint jobdone_any_n, jobdone_ring_n, jobdone_stale_n;
+        const u32 d10_now = rd32(vm_base + descriptor_ea + 0x10);
+        const u32 d10_ls = rd32(ctx->ls + descriptor_ls + 0x10);
+        const u64 io0 = io_count ? rd64(d + 0x30) : 0;
+        const u32 io0_ea = (u32)io0;
+        const u32 io0_size = (u32)(io0 >> 32) & 0x7fffu;
+        const int io0_covers_d10 =
+            io0_size >= 0x14 && io0_ea <= descriptor_ea &&
+            descriptor_ea + 0x14 <= io0_ea + io0_size;
+        const u32 io0_ls10 = io0_covers_d10
+            ? rd32(ctx->ls + io_ls + (io0_ea & 15u) +
+                   (descriptor_ea - io0_ea) + 0x10)
+            : 0xdeaddead;
+        /* MEASURED ring (pool @0x015F4410): base 0x401ACB00, cap 0x1000
+         * slots * 128B. d+0x10 is useInOutBuffer for every OTHER job, so
+         * "still set at exit" is only anomalous for ring descriptors.
+         * d10 snap > 1 marks the LOAD-era submissions (measured 6/7 vs the
+         * per-frame kind 1) — boots 26/27 wedged on one of those never
+         * executing, so they are sampled on their own generous cap. */
+        static atomic_uint jobdone_load_n, jobdone_total_n;
+        const int in_ring = (u32)(descriptor_ea - 0x401ACB00u) < 0x80000u;
+        const int load_kind = in_ring && jobdone_d10_snap >= 6u;
+        const int stale = ok && in_ring && jobdone_d10_snap &&
+                          d10_now == jobdone_d10_snap;
+        const unsigned k = atomic_fetch_add(
+            stale ? &jobdone_stale_n :
+            load_kind ? &jobdone_load_n :
+            in_ring ? &jobdone_ring_n : &jobdone_any_n, 1u);
+        if (k < (stale || load_kind ? 64u : 24u)) {
+            fprintf(stderr,
+                    "[jobdone]%s desc=%08X bin=%08X ok=%d d10 snap=%08X "
+                    "now=%08X lsdesc=%08X io0=%08X/%X io0ls10=%08X\n",
+                    stale ? " STALE" : load_kind ? " ringload" :
+                    in_ring ? " ring" : "",
+                    descriptor_ea, bin_ea, ok,
+                    jobdone_d10_snap, d10_now, d10_ls,
+                    io0_ea, io0_size, io0_ls10);
+            fflush(stderr);
+        }
+        {
+            const unsigned t = atomic_fetch_add(&jobdone_total_n, 1u);
+            if ((t & 2047u) == 2047u) {
+                fprintf(stderr,
+                        "[jobdone] totals jobs=%u ring=%u ringload=%u "
+                        "stale=%u\n", t + 1u,
+                        atomic_load(&jobdone_ring_n),
+                        atomic_load(&jobdone_load_n),
+                        atomic_load(&jobdone_stale_n));
+                fflush(stderr);
+            }
+        }
+    }
 
     if (job_io_trace_index < 32u) {
         fprintf(stderr,
@@ -3073,24 +4041,141 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
         }
     }
 
-    if (ok && rd32(d + 0x10)) {
+    /* NO automatic inout write-back — contract-corrected 2026-08-05.
+     * The SPURS job module does NOT copy the input-output buffer back to
+     * main memory. useInOutBuffer only selects a WRITABLE gather buffer;
+     * data output is the JOB's own responsibility over the context dmaTag,
+     * and the chain merely fences that tag group. ORACLE(Job Reference:
+     * CellSpursJobContext2.dmaTag "DMA tag IDs to be used for data output
+     * from a job"; jobchain attr tag1/tag2 "DMA tag IDs to be used for job
+     * output DMAs"; SYNC "also waits for DMA output to complete") and
+     * ORACLE(SDK JDL codegen jdl/02_basic_buffers/_jobTransformVariable_
+     * spurs_job.cpp: the useInOutBuffer=1 job PUTs its own io buffer with
+     * the context tag). Our former unconditional write-back republished the
+     * job's LS WORKING COPY over guest memory; boot 24 MEASURED it clobbering
+     * the motion descriptor's EA pointers with the job's LS-relocated working
+     * pointers (the dialogue-scene crash — every pointer field off by exactly
+     * item_ea - item_ls, and the PPU builder func_00E88B88 never runs again).
+     * Jobs' real output DMAs already execute inside spu_workload_execute and
+     * are drained by job_return_syscall before this point, so the removal
+     * loses nothing. YZ_JOB_INOUT_WB=1 forces the legacy write-back for A/B. */
+    /* [jobio-diff] (2026-08-05 wedge root-cause, boots 25-27): with the
+     * fabricated write-back retired, log what each completed inout job left
+     * CHANGED in its LS io buffer relative to guest — exactly the bytes the
+     * old write-back would have published. A diff is either (a) job-local
+     * working state never meant to be published (the boot-24 pointer
+     * clobber) or (b) protocol words the game expects a writer to deliver
+     * (chain commands / completion words / result pointers) — (b) is the
+     * wedge suspect. Diagnostic only; capped; LOAD-era ring jobs always
+     * sampled on their own cap. */
+    if (ok && rd32(d + 0x10) && !job_inout_wb_forced()) {
+        static atomic_uint jobio_diff_n, jobio_diff_load_n;
+        /* >= 6: the boot-26/27 stuck kind (6) and the motion job (7); the
+         * kind-5 load flood (9k+ in boot 28) must not exhaust the cap. */
+        const int diff_load = ((u32)(descriptor_ea - 0x401ACB00u) < 0x80000u)
+                              && rd32(d + 0x10) >= 6u;
+        io_offset = 0;
+        for (u32 i = 0; i < io_count; ++i) {
+            const u64 item = rd64(d + 0x30 + i * 8);
+            const u32 item_size = (u32)(item >> 32) & 0x7fffu;
+            const u32 item_ea = (u32)item;
+            const u32 item_ls_offset = io_offset + (item_ea & 15u);
+            if (item_size >= 4) {
+                u32 diffw = 0, first = 0xffffffffu, last = 0;
+                for (u32 o = 0; o + 4 <= item_size; o += 4) {
+                    if (rd32(vm_base + item_ea + o) !=
+                        rd32(ctx->ls + io_ls + item_ls_offset + o)) {
+                        ++diffw;
+                        if (first == 0xffffffffu) first = o;
+                        last = o;
+                    }
+                }
+                if (diffw) {
+                    const unsigned k = atomic_fetch_add(
+                        diff_load ? &jobio_diff_load_n : &jobio_diff_n, 1u);
+                    if (k < (diff_load ? 64u : 24u)) {
+                        fprintf(stderr,
+                                "[jobio-diff]%s desc=%08X bin=%08X item=%u "
+                                "ea=%08X size=%X diffw=%u first=+%X "
+                                "last=+%X g=%08X ls=%08X\n",
+                                diff_load ? " LOAD" : "", descriptor_ea,
+                                bin_ea, i, item_ea, item_size, diffw,
+                                first, last,
+                                rd32(vm_base + item_ea + first),
+                                rd32(ctx->ls + io_ls + item_ls_offset +
+                                     first));
+                        fflush(stderr);
+                    }
+                }
+            }
+            io_offset += (item_size + 15u) & ~15u;
+        }
+    }
+    if (ok && rd32(d + 0x10) && job_inout_wb_forced()) {
         io_offset = 0;
         for (u32 i = 0; i < io_count; ++i) {
             u64 item = rd64(d + 0x30 + i * 8);
             u32 item_size = (u32)(item >> 32) & 0x7fffu;
             const u32 item_ea = (u32)item;
             const u32 item_ls_offset = io_offset + (item_ea & 15u);
-            if (item_size)
+            /* YZ_JOBPUB_WATCH=hexLO[-hexHI] (2026-08-05 frontier): the
+             * inout write-back is the MEASURED writer of the fatal motion
+             * descriptor -- the page guard caught this copy turning a
+             * correctly-rebuilt pointer (0x62B408A0) into an LS-space one
+             * (0x0000C520 == io_ls + 0x100 + 0x20). Dump the job identity and
+             * the LS-vs-guest bytes so we can tell whether the JOB produced
+             * these bytes (our SPU execution left the buffer unconverted) or
+             * whether the PUBLISH itself is wrong (stale/over-broad copy).
+             * Diagnostic only; no behavior change. */
+            if (item_size) {
+                static int jpw_lo = -1; static u32 jpw_l = 0, jpw_h = 0;
+                if (jpw_lo < 0) {
+                    const char* e = getenv("YZ_JOBPUB_WATCH");
+                    if (e && *e) {
+                        char* end = NULL;
+                        jpw_l = (u32)strtoul(e, &end, 16);
+                        jpw_h = (end && *end == '-') ? (u32)strtoul(end + 1, NULL, 16)
+                                                     : jpw_l + 4u;
+                        jpw_lo = 1;
+                    } else jpw_lo = 0;
+                }
+                if (jpw_lo == 1 && item_ea < jpw_h && item_ea + item_size > jpw_l) {
+                    const u8* lsp = ctx->ls + io_ls + item_ls_offset;
+                    fprintf(stderr,
+                            "[jobpub] CLOBBER desc=0x%08X bin=0x%08X item=%u "
+                            "ea=0x%08X size=0x%X io_ls=0x%05X off=0x%05X "
+                            "useInOut=0x%X ok=%d\n",
+                            descriptor_ea, bin_ea, i, item_ea, item_size,
+                            io_ls, item_ls_offset, rd32(d + 0x10), ok);
+                    for (u32 o = 0; o + 4 <= item_size && o < 0x40; o += 4) {
+                        const u32 dst = item_ea + o;
+                        if (dst + 4 <= jpw_l || dst >= jpw_h) continue;
+                        fprintf(stderr, "[jobpub]   +%02X guest=%08X ls=%08X\n",
+                                o, rd32(vm_base + dst), rd32(lsp + o));
+                    }
+                    fflush(stderr);
+                }
                 job_publish_copy(item_ea,
                                  ctx->ls + io_ls + item_ls_offset,
                                  item_size);
-            if (job_io_trace_index < 32u && item_size) {
+            }
+            io_offset += (item_size + 15u) & ~15u;
+        }
+    }
+    if (job_io_trace_index < 32u) {
+        io_offset = 0;
+        for (u32 i = 0; i < io_count; ++i) {
+            const u64 item = rd64(d + 0x30 + i * 8);
+            const u32 item_size = (u32)(item >> 32) & 0x7fffu;
+            const u32 item_ea = (u32)item;
+            const u32 item_ls_offset = io_offset + (item_ea & 15u);
+            if (item_size) {
                 const u32 guest_hash =
                     job_io_trace_hash(vm_base + item_ea, item_size);
                 const u32 ls_hash = job_io_trace_hash(
                     ctx->ls + io_ls + item_ls_offset, item_size);
                 fprintf(stderr,
-                        "[native-job-io] #%u publish[%u] match=%u "
+                        "[native-job-io] #%u final[%u] match=%u "
                         "guest=%08X ls=%08X\n",
                         job_io_trace_index, i, guest_hash == ls_hash,
                         guest_hash, ls_hash);
@@ -3171,11 +4256,24 @@ static int wait_job_slot(JobChainState* jc, u32 pc, u64 empty_command)
                        !atomic_load(&jc->shutdown);
     if (parked)
         spurs_set_workload_runnable(jc->spurs, jc->wid, 0);
+    /* NOTE (2026-08-05, boot 32 REFUTATION — do not re-chase): treating
+     * 0x0000000800000012 as an executable LWSYNC (its low word does decode
+     * as 2|(2<<3)) and advancing after a grace DOES NOT WORK. Boot 32 died
+     * at frame 88: during disc-bound phases the producer's marker->command
+     * gap is arbitrarily LONG, the scan raced a full lap through marker
+     * runs, and the pipeline desynced before the title screen. The marker
+     * park below is behaviorally REQUIRED; whatever unsticks the dialogue
+     * stall, it is not this. */
     while (jc->waiting_command && rd64(vm_base + pc) == empty_command &&
-           !atomic_load(&jc->shutdown))
+           !atomic_load(&jc->shutdown)) {
         /* Timed: the producer's append may be an un-notified lifted vector
          * store (see cv_wait_ms). Every wake re-reads the slot. */
         cv_wait_ms(&jc->sync.cond, &jc->sync.mutex, 4u);
+        if (!jobchain_bridge_disabled() && jc->waiting_command &&
+            jobchain_resume_pending_ticket_locked(
+                jc, /*descriptor_filter=*/0, /*polled=*/1))
+            break;
+    }
     if (parked && !atomic_load(&jc->shutdown))
         spurs_set_workload_runnable(jc->spurs, jc->wid, 1);
     if (jc->waiting_command && !atomic_load(&jc->shutdown)) {
@@ -3258,6 +4356,17 @@ void yz_effslot_log(u32 addr, unsigned long long val, void* ra, int width)
     fflush(stderr);
 }
 
+static int jobchain_any_running(void)
+{
+    for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
+        JobChainState* jc = &g_jobchains[i];
+        if (jc->sync.live && jc->running && !jc->complete &&
+            !atomic_load(&jc->shutdown))
+            return 1;
+    }
+    return 0;
+}
+
 void cellSpursDumpNativeJobChains(const char* tag)
 {
     const char* label = tag ? tag : "snapshot";
@@ -3273,6 +4382,24 @@ void cellSpursDumpNativeJobChains(const char* tag)
                 jc->running, jc->complete, (u32)jc->error,
                 jc->waiting_command, jc->command_snapshot_index,
                 jc->command_snapshot_count, jc->parked_slot_count);
+        /* LIVE guest words (2026-08-05 stall decode): what the game has
+         * actually published at the slots we are waiting on, vs the
+         * remembered "empty" view we parked against. */
+        if (vm_base && jc->current_ea &&
+            job_guest_range_valid(jc->current_ea, 8))
+            fprintf(stderr,
+                    "[native-spurs-ledger]   current guest=%016llX\n",
+                    (unsigned long long)rd64(vm_base + jc->current_ea));
+        for (u32 p = 0; p < jc->parked_slot_count; ++p) {
+            const u32 slot_ea = jc->parked_slot_ea[p];
+            if (!vm_base || !job_guest_range_valid(slot_ea, 8)) continue;
+            fprintf(stderr,
+                    "[native-spurs-ledger]   parked[%u] ea=%08X "
+                    "empty=%016llX guest=%016llX\n",
+                    p, slot_ea,
+                    (unsigned long long)jc->parked_slot_empty[p],
+                    (unsigned long long)rd64(vm_base + slot_ea));
+        }
         if (jc->command_snapshot_count) {
             const JobCommandSnapshot* first = &jc->command_snapshot[0];
             const JobCommandSnapshot* last =
@@ -3314,6 +4441,90 @@ void cellSpursDumpNativeJobChains(const char* tag)
         }
         fflush(stderr);
         mx_unlock(&jc->sync.mutex);
+    }
+}
+
+/* Non-formatting, read-only freeze snapshot.  The side tables are fixed for
+ * the process lifetime; racy scalar reads are preferable here to taking a
+ * mutex that may itself be part of the wait-for chain. */
+void yz_frontier_spurs_snapshot(void)
+{
+    for (u32 i = 0; i < MAX_SPURS_INSTANCES; ++i) {
+        const SpursState* spurs = &g_spurs[i];
+        if (!spurs->sync.live) continue;
+        yz_frontier_trace_emit(
+            YZ_FT_SPURS_WORKLOAD, i, guest_ea(spurs->sync.key),
+            spurs->active_wkl_mask, spurs->runnable_wkl_mask,
+            spurs->nspus, spurs->shutdown ? 1u : 0u,
+            spurs->next_wid, spurs->next_spu_num);
+    }
+
+    for (u32 i = 0; i < MAX_TASKSETS; ++i) {
+        const TasksetState* ts = &g_tasksets[i];
+        if (!ts->sync.live || !ts->sync.key) continue;
+        const u8* object = (const u8*)ts->sync.key;
+        for (u32 word = 0; word < 4; ++word)
+            yz_frontier_trace_emit(
+                YZ_FT_SPURS_TASKSET, ts->wid, guest_ea(ts->sync.key),
+                word,
+                rd32(object + 0x00u + word * 4u),
+                rd32(object + 0x10u + word * 4u),
+                rd32(object + 0x30u + word * 4u),
+                rd32(object + 0x40u + word * 4u),
+                rd32(object + 0x50u + word * 4u));
+        for (u32 id = 0; id < CELL_SPURS_MAX_TASK; ++id) {
+            const TaskState* task = &ts->tasks[id];
+            if (!task->thread_valid && !task->complete && !task->waiting &&
+                !task->signalled)
+                continue;
+            const u32 flags =
+                (task->thread_valid ? 1u : 0u) |
+                (task->complete ? 2u : 0u) |
+                (task->joined ? 4u : 0u) |
+                (task->waiting ? 8u : 0u) |
+                (task->signalled ? 16u : 0u) |
+                (task->reaping ? 32u : 0u);
+            yz_frontier_trace_emit(
+                YZ_FT_SPURS_TASK, ts->wid, id,
+                guest_ea(ts->sync.key), flags, task->context_ea,
+                (u32)task->image.image_id, (u32)task->exit_code,
+                task->idle_poll_count);
+        }
+    }
+
+    for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
+        const JobChainState* jc = &g_jobchains[i];
+        if (!jc->sync.live) continue;
+        const u32 flags =
+            (jc->running ? 1u : 0u) |
+            (jc->complete ? 2u : 0u) |
+            (jc->waiting_command ? 4u : 0u) |
+            (atomic_load_explicit(&jc->shutdown, memory_order_relaxed) ? 8u : 0u);
+        yz_frontier_trace_emit(
+            YZ_FT_JOBCHAIN, jc->wid, guest_ea(jc->sync.key),
+            'S', jc->current_ea, jc->entry_ea,
+            ((jc->command_snapshot_index & 0xffffu) << 16) |
+                (jc->command_snapshot_count & 0xffffu),
+            (u32)jc->error, flags);
+
+        /* Map every pending completion descriptor back to the persistent JOB
+         * command slot responsible for consuming it. */
+        for (u32 slot = 0; slot < jc->command_state_count; ++slot) {
+            const u32 slot_ea = jc->command_state_ea[slot];
+            if (!job_guest_range_valid(slot_ea, 8u)) continue;
+            const u64 command = rd64(vm_base + slot_ea);
+            if (!command || (command & 7u) != 0u) continue;
+            const u32 desc = (u32)command;
+            if (desc > 0xffffffebu ||
+                !job_guest_range_valid(desc + 0x10u, 8u))
+                continue;
+            const u32 actual = rd32(vm_base + desc + 0x10u);
+            if (!actual) continue;
+            yz_frontier_trace_emit(
+                YZ_FT_COMPLETION, jc->wid, 4u,
+                desc, desc + 0x10u, actual, 0u,
+                rd32(vm_base + desc + 0x14u), slot_ea);
+        }
     }
 }
 static int execute_chain(JobChainState* jc)
@@ -3374,10 +4585,17 @@ static int execute_chain(JobChainState* jc)
         }
         jobchain_cancel_deferred_resume(jc, pc, publication_sequence);
         {
-            const int command_slot = jobchain_command_slot(jc, pc, 0);
-            if (command_slot >= 0)
+            const int is_job = cmd && (cmd & 7u) == 0u;
+            const int command_slot = jobchain_command_slot(jc, pc, is_job);
+            if (command_slot >= 0) {
                 atomic_store_explicit(&jc->command_consumed[command_slot], 1,
                                       memory_order_release);
+                if (is_job)
+                    jc->command_last_descriptor[command_slot] = (u32)cmd;
+                if (is_job)
+                    jc->command_last_dispatch_sequence[command_slot] =
+                        ++jc->command_dispatch_sequence_next;
+            }
         }
         jobchain_watch_ea_locked(jc, pc);
         if (pc <= 0xfffffff7u)
@@ -3393,6 +4611,14 @@ static int execute_chain(JobChainState* jc)
         if (cmd && op == 0) {
             if (acquired_descriptor_fault)
                 return CELL_SPURS_JOB_ERROR_FAULT;
+            /* Pending-ticket bridge: keep every dispatched descriptor's
+             * kind word (+0x10) inside the store-notify window so the
+             * bridge in jobchain_notify_guest_write sees the submit. */
+            if (!jobchain_bridge_disabled()) {
+                mx_lock(&jc->sync.mutex);
+                jobchain_bridge_watch_ea_locked(jc, (u32)cmd + 0x10);
+                mx_unlock(&jc->sync.mutex);
+            }
             int rc = run_job(jc, (u32)cmd, jc->descriptor_size,
                              acquired_descriptor);
             if (rc) return rc;
@@ -3482,12 +4708,25 @@ static void jobchain_reset_run_locked(JobChainState* jc)
 {
     jobchain_clear_queued_snapshots(jc);
     jc->pending_snapshot_sequence = 0;
-    /* Q4-A REVERTED (measured): resuming a re-run from the parked END PC
-     * resurrected the original missing-output crash — this game re-runs its
-     * chain after appending commands and expects a fresh scan from the
-     * entry. The END command still records its PC (observability), but a
-     * re-run restarts here. */
-    jc->current_ea = jc->entry_ea;
+    /* TITLE-OBSERVED RUN CONTRACT (2026-08-09): each Run starts a fresh scan
+     * from jobChainEntry.  A direct A/B at the Akiyama/Hana frontier was
+     * decisive: preserving the parked END PC left the title on a blank
+     * dialogue line through frame 4703, while entry restart crossed the text
+     * transition and reached the following animation by frame 4100.  The
+     * standalone overwrite-END interpretation was therefore not the title's
+     * live lifecycle.  Preserve END-resume only as a diagnostic lever. */
+    {
+        static int end_resume = -1;
+        if (end_resume < 0) {
+            const char* e = getenv("YZ_JC_END_RESUME");
+            end_resume = (e && *e == '1') ? 1 : 0;
+            if (end_resume)
+                fprintf(stderr, "[jc-resume] DIAGNOSTIC: re-run preserves "
+                        "the parked END pc instead of jobChainEntry\n");
+        }
+        if (!end_resume || !jc->current_ea)
+            jc->current_ea = jc->entry_ea;
+    }
     jc->call_depth = 0;
     jc->command_snapshot_count = 0;
     jc->command_snapshot_index = 0;
@@ -3495,6 +4734,11 @@ static void jobchain_reset_run_locked(JobChainState* jc)
     jc->parked_slot_count = 0;
     jc->command_state_count = 0;
     memset(jc->command_state_ea, 0, sizeof(jc->command_state_ea));
+    memset(jc->command_last_descriptor, 0,
+           sizeof(jc->command_last_descriptor));
+    memset(jc->command_last_dispatch_sequence, 0,
+           sizeof(jc->command_last_dispatch_sequence));
+    jc->command_dispatch_sequence_next = 0;
     memset(jc->parked_slot_ea, 0, sizeof(jc->parked_slot_ea));
     memset(jc->parked_slot_empty, 0, sizeof(jc->parked_slot_empty));
     for (u32 i = 0; i < MAX_JOB_PARKED_SLOTS; ++i)
@@ -3509,6 +4753,8 @@ static void jobchain_reset_run_locked(JobChainState* jc)
     jc->deferred_sequence_next = 0;
     jc->watch_lo = jc->entry_ea;
     jc->watch_hi = jc->entry_ea + 8u;
+    jc->bridge_lo = UINT32_MAX;
+    jc->bridge_hi = 0;
     jc->alternate_slot = 0x4c00;
     jc->next_dma_tag = 0;
     jobchain_watch_ea_locked(jc, jc->entry_ea);
