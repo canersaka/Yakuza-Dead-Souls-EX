@@ -1760,6 +1760,7 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
     case MFC_RdTagStat: {
         mfc_engine* m = mfc_for(ctx);
         const int ready = m->tag_status_ready != 0;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
         mfc_release(m);
         return ready;
     }
@@ -1801,6 +1802,7 @@ static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
     case MFC_RdTagStat: {
         mfc_engine* m = mfc_for(ctx);
         const u32 count = m->tag_status_ready ? 1u : 0u;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
         mfc_release(m);
         return count;
     }
@@ -1948,6 +1950,20 @@ static atomic_uchar s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 K
 static atomic_uchar s_coh2_bitmap[((SPU_COH2_HI - SPU_COH2_LO) >> 7) / 8];
 static _Atomic uint32_t s_coh2_gen[(SPU_COH2_HI - SPU_COH2_LO) >> 7];
 
+/* WINDOW 3 (2026-08-05, soak boot 2): the fail-open witness below caught a
+ * live gap — an SPU GETLLAR-reserves the camera/effect block line
+ * 0x01622280 (main-RAM game data; the standing camera-NaN lead's
+ * view-projection block is 0x01622650, same structure region) while PPU
+ * writes to it took the plain-memcpy path. Torn PPU-store-vs-PUTLLC commits
+ * on that block are the exact mixed-garbage shape of the effect-walk crash
+ * (boot 2: AV on effect-list pointer 0xFBC10074) and the camera NaNs. Same
+ * machinery, third range over the game's main-RAM structure segment.
+ * MEASURED(scratch/soak_conformance_ab_20260805_boot2/soak.stderr.log). */
+#define SPU_COH3_LO 0x01000000u
+#define SPU_COH3_HI 0x02000000u
+static atomic_uchar s_coh3_bitmap[((SPU_COH3_HI - SPU_COH3_LO) >> 7) / 8];
+static _Atomic uint32_t s_coh3_gen[(SPU_COH3_HI - SPU_COH3_LO) >> 7];
+
 /* Per-128B-line write GENERATION (mirrors RPCS3 vm::reservation_acquire). Bumped on
  * every PPU coherence write to a reserved line; GETLLAR snapshots it and LR is
  * RE-DERIVED at the next GETLLAR by comparison -- so a write that lands while no SPU
@@ -1962,9 +1978,13 @@ uint32_t spu_coh_gen(uint32_t addr)
     if (addr - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO)
         return atomic_load_explicit(
             &s_coh2_gen[(addr - SPU_COH2_LO) >> 7], memory_order_acquire);
+    if (addr - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO)
+        return atomic_load_explicit(
+            &s_coh3_gen[(addr - SPU_COH3_LO) >> 7], memory_order_acquire);
     return 0;
 }
 
+void yz_spu_dump_line_owners(unsigned ea);   /* defined below the registry */
 void spu_coh_reserve(uint32_t ea)
 {
     if (ea - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO) {
@@ -1981,12 +2001,29 @@ void spu_coh_reserve(uint32_t ea)
             (unsigned char)(1u << (line & 7)), memory_order_release);
         return;
     }
+    if (ea - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO) {
+        uint32_t line = (ea - SPU_COH3_LO) >> 7;
+        atomic_fetch_or_explicit(
+            &s_coh3_bitmap[line >> 3],
+            (unsigned char)(1u << (line & 7)), memory_order_release);
+        return;
+    }
     /* Outside every coherence window: fail open, LOUD (LESSONS #21b — a
-     * silent gap here cost the taskset region its serialization for a month). */
-    { static unsigned long n = 0; n++;
-      if (n <= 8 || (n & 4095u) == 0) {
-          fprintf(stderr, "[coh] reservation OUTSIDE coherence windows ea=0x%08X n=%lu — PPU writes to this line are UNSERIALIZED\n",
-                  ea, n);
+     * silent gap here cost the taskset region its serialization for a month).
+     * 2026-08-05: per-distinct-LINE tracking — boot 2's single-counter form
+     * proved the witness works (it caught the 0x01622280 camera-block gap
+     * that became window 3) but could hide additional distinct lines behind
+     * the sampling. Each new line prints once; the periodic sample keeps
+     * overall volume visible. Racy statics are fine for a diagnostic. */
+    { static uint32_t seen_lines[8]; static int seen_n = 0;
+      static unsigned long n = 0; n++;
+      const uint32_t ln = ea & ~127u;
+      int known = 0;
+      for (int i = 0; i < seen_n; i++) if (seen_lines[i] == ln) { known = 1; break; }
+      if (!known && seen_n < 8) seen_lines[seen_n++] = ln;
+      if (!known || (n & 4095u) == 0) {
+          fprintf(stderr, "[coh] reservation OUTSIDE coherence windows ea=0x%08X (distinct line %d%s) n=%lu — PPU writes to this line are UNSERIALIZED\n",
+                  ea, known ? -1 : seen_n, seen_n >= 8 ? "+cap" : "", n);
           fflush(stderr); } }
 }
 int spu_coh_is_reserved(uint32_t addr)
@@ -2001,6 +2038,12 @@ int spu_coh_is_reserved(uint32_t addr)
         uint32_t line = (addr - SPU_COH2_LO) >> 7;
         return (atomic_load_explicit(
                     &s_coh2_bitmap[line >> 3], memory_order_acquire)
+                >> (line & 7)) & 1u;
+    }
+    if (addr - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO) {
+        uint32_t line = (addr - SPU_COH3_LO) >> 7;
+        return (atomic_load_explicit(
+                    &s_coh3_bitmap[line >> 3], memory_order_acquire)
                 >> (line & 7)) & 1u;
     }
     return 0;
@@ -2039,6 +2082,50 @@ static void mfc_registry_unlock(void)
     atomic_flag_clear_explicit(&s_mfc_registry_lock, memory_order_release);
 }
 
+/* Frozen-ticket forensics (2026-08-05): name every SPU context touching a
+ * 128-byte line — active reservation or not — with its image id and last pc.
+ * Point-in-time racy reads on a wedged process; no locking beyond the
+ * registry walk. */
+void yz_spu_dump_line_owners(unsigned ea)
+{
+    const uint32_t line = ea & ~127u;
+    fprintf(stderr, "[line-own] line=0x%08X:\n", line);
+    mfc_registry_lock();
+    for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next) {
+        spu_context* c = s->ctx;
+        mfc_engine* m = &s->mfc;
+        const uint32_t rl = (uint32_t)(m->resv_ea & ~127ull);
+        fprintf(stderr,
+                "[line-own]  ctx serial=%u img=%d pc=0x%05X resv=%s@0x%08X\n",
+                s->serial, c ? c->image_id : -1, c ? c->pc : 0,
+                m->resv_active ? "ACTIVE" : (rl == line ? "stale" : "-"),
+                rl);
+    }
+    mfc_registry_unlock();
+    fflush(stderr);
+}
+
+
+/* Wedge forensics (2026-08-06, dialogue-load face B): every registered SPU
+ * context with image and last pc — the LS pc against the lifted sources
+ * names the wait loop each parked worker sits in. Racy point-in-time. */
+void yz_spu_dump_all_ctx(const char* tag)
+{
+    fprintf(stderr, "[ctx-dump] %s:\n", tag ? tag : "");
+    mfc_registry_lock();
+    for (spu_mfc_slot* s2 = s_mfc_slots; s2; s2 = s2->next) {
+        spu_context* c = s2->ctx;
+        mfc_engine* m = &s2->mfc;
+        fprintf(stderr,
+                "[ctx-dump]  serial=%u img=%d pc=0x%05X resv=%s@0x%08X\n",
+                s2->serial, c ? c->image_id : -1, c ? c->pc : 0,
+                m->resv_active ? "ACTIVE" : "-",
+                (uint32_t)(m->resv_ea & ~127ull));
+    }
+    mfc_registry_unlock();
+    fflush(stderr);
+}
+
 void yz_frontier_spu_snapshot(void)
 {
     mfc_registry_lock();
@@ -2068,6 +2155,12 @@ void yz_frontier_spu_snapshot(void)
             ctx->mfc_eal, ctx->mfc_lsa,
             ctx->mfc_size, (ctx->mfc_tag << 24) | m->queue_count,
             outstanding_mask, m->stall_mask);
+        yz_frontier_trace_emit(
+            YZ_FT_RESERVATION, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            (uint32_t)(m->resv_ea & ~127ull),
+            m->resv_active ? 1u : 0u, m->resv_gen,
+            ctx->mfc_tag & 31u,
+            slot->serial, m->resv_cas_idle_n);
     }
     mfc_registry_unlock();
 }
@@ -2592,6 +2685,10 @@ void spu_coh_notify_write(uint32_t ea)
         atomic_fetch_add_explicit(
             &s_coh2_gen[(line - SPU_COH2_LO) >> 7], 1,
             memory_order_release); /* s41 window 2 */
+    else if (line - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO)
+        atomic_fetch_add_explicit(
+            &s_coh3_gen[(line - SPU_COH3_LO) >> 7], 1,
+            memory_order_release); /* 2026-08-05 window 3 (camera/effect block) */
     mfc_registry_lock();
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         spu_context* c = slot->ctx;
@@ -3009,6 +3106,9 @@ unsigned long g_spu_ch_rd[128]  = {0};
 unsigned long g_spu_ch_cnt[128] = {0};
 unsigned long g_spu_getllar_n   = 0;
 uint32_t      g_spu_getllar_ea  = 0;
+/* Job output-DMA census (spu_dma.h mfc_submit; read by cellSpurs.c run_job). */
+volatile unsigned long g_yz_job_dma_put_n     = 0;
+volatile unsigned long g_yz_job_dma_put_bytes = 0;
 unsigned long g_spu_putllc_log  = 0;   /* spu_dma.h mgmt-CAS diag cap (YZ_SPU_PROF) */
 unsigned long g_spu_lsdump_n    = 0;   /* spu_dma.h mgmt-GETLLAR kernel-ctx dump cap */
 unsigned long g_spu_wrun_log    = 0;   /* spu_context.h wklRunnable-write diag cap */
@@ -3339,6 +3439,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case MFC_RdTagStat: {
         mfc_engine* m = mfc_for(ctx);
         const u32 count = m->tag_status_ready ? 1u : 0u;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
         mfc_release(m);
         return count;
     }
@@ -4598,6 +4699,48 @@ void yz_tr_record(spu_context* ctx, uint32_t lsa, const uint32_t* v)
     }
 }
 #endif
+
+/* Clean-build half of the focused stopper lifecycle recorder.  Most of the
+ * record-output census above is intentionally absent from YZ_PERF_CLEAN, but
+ * root-cause boots still need the exact self-stop creation and later DMA
+ * overwrite history when YZ_A010_RELEASE_TRACE is explicitly requested. */
+extern void yz_a010_reltrace_spu(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size,
+    const uint32_t* context);
+
+void yz_a010_release_trace_put(spu_context* ctx, uint32_t producer_pc,
+                               uint32_t ea, const uint8_t* payload,
+                               uint32_t size)
+{
+    uint32_t trace_context[16] = {0};
+    uint32_t wi, off;
+
+    if (g_yz_a010_release_scene_active != 0 &&
+        ctx->image_id == 0 &&
+        (producer_pc == 0x05F70u ||
+         (producer_pc >= 0x05EB8u && producer_pc <= 0x05F20u))) {
+        for (wi = 0; wi < 8u; ++wi)
+            trace_context[wi] = ctx->gpr[wi + 3u]._u32[0];
+        for (wi = 0; wi < 2u; ++wi) {
+            const uint32_t lsa = trace_context[wi] & SPU_LS_MASK;
+            if (lsa + 16u > SPU_LS_SIZE)
+                continue;
+            for (off = 0; off < 16u; off += 4u) {
+                const uint8_t* const p = &ctx->ls[lsa + off];
+                trace_context[8u + wi * 4u + off / 4u] =
+                    ((uint32_t)p[0] << 24) |
+                    ((uint32_t)p[1] << 16) |
+                    ((uint32_t)p[2] << 8) |
+                    (uint32_t)p[3];
+            }
+        }
+    }
+
+    yz_a010_reltrace_spu(
+        ctx->spu_id, (uint32_t)ctx->image_id, producer_pc,
+        ea, payload, size, trace_context);
+}
 
 /*
  * Exact a010 static-stage result addresses, published by Job A and consumed
