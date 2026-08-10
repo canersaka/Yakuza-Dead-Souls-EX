@@ -158,6 +158,21 @@ if(PS3RECOMP_BUILD_TESTS)
     add_subdirectory(libs/system/tests)
     add_subdirectory(tests/native_spurs)
 
+    add_executable(fifo_publication_tests
+        tests/fifo_publication/main.c
+    )
+    target_include_directories(fifo_publication_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(
+        NAME fifo_publication_island_edge
+        COMMAND fifo_publication_tests
+    )
+    set_tests_properties(
+        fifo_publication_island_edge
+        PROPERTIES LABELS "firmware-free;native;gcm;regression"
+    )
+
     # These two suites currently use the MSVC-based generated-code harness.
     # Keep them visible to CTest where that harness is supported; the native
     # stress tests above remain portable across the other toolchains.
