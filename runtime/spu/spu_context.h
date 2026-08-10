@@ -388,6 +388,13 @@ typedef struct spu_context {
      * slot and let a racing channel operation create a second one. */
     _Atomic uint32_t mfc_retiring;
 
+    /* Focused native-SPURS motion parity diagnostic.  run_job sets this only
+     * for the title's motion ticket kind (descriptor +0x10 == 7).  The DMA
+     * layer then records only that job's output transfers into the fixed
+     * parity ring; zero means completely inert.  Appended per the context
+     * layout rule above. */
+    uint32_t parity_motion_generation;
+
 #if defined(YZ_PERF_PROFILE)
     /*
      * Aggregate-only profile lane counters. Each context is driven by one SPU
@@ -528,6 +535,16 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
               fflush(stderr);
           }
       } }
+    /* Low-overhead clean-lane root catcher: only the exact gs_task journal
+     * record load and tag 0x7F cross into the host recorder. */
+    extern volatile long g_yz_a010_release_scene_active;
+    if (g_yz_a010_release_scene_active != 0 && ctx->image_id == 0 &&
+        v._u32[0] == 0x7Fu) {
+        const uint32_t tpc = ctx->pc & SPU_LS_MASK;
+        extern void yz_a010_reltrace_dispatch(
+            uint32_t, uint32_t, const uint32_t*);
+        yz_a010_reltrace_dispatch(ctx->spu_id, tpc, v._u32);
+    }
 #if !defined(YZ_PERF_CLEAN)
     /* s49 MASK-SEAL read leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_read):
      * the gs_task pending-DMA-tag mask gate. pc 0x624C is the `lqd $r2,0xB0($r3)`
