@@ -104,15 +104,9 @@ docs/SPURS_TASKSET.md
 docs/TRACEDIFF.md
 /docs/A0??_*.md
 /docs/BOOT_ORDERING_ANALYSIS.md
-/docs/CLAUDE_HANDOFF_*.md
 /docs/*_HANDOFF.md
 tools/lint_handoff.py
 CHEATSHEET.md
-CLAUDE.md
-AGENTS.md
-.claude/
-.cursor/
-.aider*
 
 # Game files
 /game/
