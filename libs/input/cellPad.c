@@ -78,6 +78,15 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+static volatile long s_accepted_input_serial;
+/* Opt-in unattended gameplay proof.  The renderer acknowledges each capture
+ * boundary by advancing this phase, so input cannot race the "before" image.
+ * Zero in ordinary builds/runs; YZ_MOVEMENT_PROOF is required to arm it. */
+volatile long g_yz_movement_proof_phase;
+/* Boundary-only diagnostic owned by the recompiled title.  It snapshots the
+ * game's cached input object and camera producer without adding per-poll log
+ * traffic to the timing-sensitive pad path. */
+void yz_movement_frontier_snapshot(const char* reason);
 #if PAD_BACKEND_XINPUT
 static volatile LONG s_window_key_state[256];
 #endif
@@ -101,6 +110,16 @@ static int pad_trace_enabled(void)
         enabled = getenv("YZ_PAD_TRACE") ? 1 : 0;
     return enabled;
 }
+
+#if PAD_BACKEND_XINPUT
+static int pad_movement_proof_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_MOVEMENT_PROOF") ? 1 : 0;
+    return enabled;
+}
+#endif
 
 static u32 pad_connected_mask(void)
 {
@@ -403,6 +422,156 @@ static void pad_merge_keyboard(void)
             }
         }
     }
+
+    /* Headless-safe acceptance controller for the promotion proof.  Desktop
+     * key injection cannot reach a deliberately hidden D3D window, so drive
+     * the same guest-visible PadHostState used by real XInput/keyboard input.
+     *
+     * Phase ownership is deliberately split:
+     *   input:    0 -> 1, 2 -> 3, 4 -> 5
+     *   renderer: 1 -> 2, 3 -> 4, 5 -> 6
+     * This handshake proves that the pre-movement surface was captured before
+     * the first stick sample, then sustains movement for a measured 60 seconds
+     * before the paired image is taken. */
+    if (pad_movement_proof_enabled()) {
+        extern volatile unsigned long long g_yz_auto_start_tick;
+        static unsigned long long movement_tick = 0;
+        static unsigned long long last_logged_pulse = ~0ull;
+        static unsigned long long next_arm_file_poll = 0;
+        static int arm_file_mode = -1;
+        static char arm_file[MAX_PATH * 2];
+        const unsigned long long now = GetTickCount64();
+        const unsigned long long elapsed = g_yz_auto_start_tick
+            ? now - g_yz_auto_start_tick : 0;
+        unsigned long long proof_delay = 780000ull;
+        const char* delay_text = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
+        if (delay_text && *delay_text) {
+            const unsigned long long requested = _strtoui64(delay_text, NULL, 10);
+            if (requested >= 60000ull)
+                proof_delay = requested;
+        }
+
+        if (arm_file_mode < 0) {
+            const char* requested = getenv("YZ_MOVEMENT_PROOF_ARM_FILE");
+            arm_file_mode = requested && *requested;
+            if (arm_file_mode) {
+                strncpy(arm_file, requested, sizeof(arm_file) - 1u);
+                arm_file[sizeof(arm_file) - 1u] = '\0';
+                fprintf(stderr,
+                        "[movement-proof] visual arm required path=%s\n",
+                        arm_file);
+                fflush(stderr);
+            }
+        }
+
+        /* Advance authored dialogue with distinct rising edges while the
+         * story continues to render.  Stop before the capture handshake so
+         * no face button contaminates the movement samples. */
+        if (g_yz_auto_start_tick && elapsed >= 180000ull &&
+            InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0) == 0 &&
+            (arm_file_mode || elapsed < proof_delay)) {
+            /* The raw pad service can be polled much faster than the title's
+             * high-level input cache.  At ~4 rendered FPS, the old 350 ms
+             * down interval was repeatedly observed by cellPadGetData yet
+             * cleared before the dialogue consumer sampled it.  Match the
+             * proven menu-input cadence: hold across several guest frames,
+             * then leave a full release interval for a distinct next edge. */
+            const unsigned long long pulse = (elapsed - 180000ull) / 3000ull;
+            const unsigned long long pulse_phase =
+                (elapsed - 180000ull) % 3000ull;
+            if (pulse_phase < 1800ull) {
+                hs->buttons |= CELL_PAD_CTRL_CROSS;
+                hs->press_cross = 255;
+                if (pulse != last_logged_pulse) {
+                    last_logged_pulse = pulse;
+                    fprintf(stderr,
+                            "[movement-proof] accepted-dialogue pulse=%llu "
+                            "elapsed_ms=%llu\n",
+                            pulse, elapsed);
+                    fflush(stderr);
+                }
+            }
+        }
+
+        if (g_yz_auto_start_tick && elapsed >= proof_delay) {
+            if (!arm_file_mode) {
+                InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, 1, 0);
+            } else if (now >= next_arm_file_poll) {
+                const DWORD attrs = GetFileAttributesA(arm_file);
+                next_arm_file_poll = now + 1000ull;
+                if (attrs != INVALID_FILE_ATTRIBUTES &&
+                    !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, 1, 0) == 0) {
+                    fprintf(stderr,
+                            "[movement-proof] visually armed elapsed_ms=%llu "
+                            "path=%s\n", elapsed, arm_file);
+                    fflush(stderr);
+                }
+            }
+        }
+
+        {
+            LONG phase = InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0);
+#if defined(YZ_PERF_CLEAN)
+            /* Clean promotion builds intentionally compile renderer readback
+             * and automatic image dumping out.  Preserve the optional input
+             * controller without reintroducing a renderer hot-path check: in
+             * this opt-in branch, acknowledge the three former capture
+             * handshakes locally and continue with the same camera/movement
+             * cadence.  Ordinary runs never enter this block. */
+            if (phase == 1 || phase == 3 || phase == 5) {
+                InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, phase + 1, phase);
+                phase = InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, 0, 0);
+            }
+#endif
+            if (phase == 2) {
+                if (!movement_tick) {
+                    movement_tick = now;
+                    yz_movement_frontier_snapshot("before-camera");
+                    fprintf(stderr,
+                            "[movement-proof] right-stick camera begin "
+                            "elapsed_ms=%llu\n", elapsed);
+                    fflush(stderr);
+                }
+                hs->analog_rx = 255;
+                if (now - movement_tick >= 5000ull) {
+                    yz_movement_frontier_snapshot("camera-held");
+                    movement_tick = 0;
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, 3, 2);
+                    fprintf(stderr,
+                            "[movement-proof] right-stick camera complete "
+                            "duration_ms=5000\n");
+                    fflush(stderr);
+                }
+            } else if (phase == 4) {
+                if (!movement_tick) {
+                    movement_tick = now;
+                    yz_movement_frontier_snapshot("before-movement");
+                    fprintf(stderr,
+                            "[movement-proof] left-stick movement begin\n");
+                    fflush(stderr);
+                }
+                hs->analog_ly = 0;
+                if (now - movement_tick >= 60000ull) {
+                    yz_movement_frontier_snapshot("movement-held");
+                    movement_tick = 0;
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, 5, 4);
+                    fprintf(stderr,
+                            "[movement-proof] left-stick movement complete "
+                            "duration_ms=60000\n");
+                    fflush(stderr);
+                }
+            }
+        }
+    }
 }
 
 static void pad_init_backend(void)
@@ -694,7 +863,12 @@ int cellPad_host_movie_skip_requested(void)
 s32 cellPadGetData(u32 port_no, CellPadData* data)
 {
     static u16 last_buttons[PAD_MAX_HOST_PORTS];
+    static u32 last_analog[PAD_MAX_HOST_PORTS];
+    static u8 analog_seen[PAD_MAX_HOST_PORTS];
     static int first_call = 1;
+    static u16 accepted_last_buttons[PAD_MAX_HOST_PORTS];
+    static u32 accepted_last_analog[PAD_MAX_HOST_PORTS];
+    static u8 accepted_analog_seen[PAD_MAX_HOST_PORTS];
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
@@ -719,6 +893,29 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     }
 
     PadHostState* hs = &s_host_state[port_no];
+    /* A guest-visible input edge is the logical-stall detector's evidence
+     * that cellPadGetData accepted it.  No per-frame increment: only actual
+     * button or analog transitions count. */
+    {
+        const u32 accepted_analog = (u32)hs->analog_lx |
+            ((u32)hs->analog_ly << 8) |
+            ((u32)hs->analog_rx << 16) |
+            ((u32)hs->analog_ry << 24);
+        const int input_changed =
+            hs->buttons != accepted_last_buttons[port_no] ||
+            (accepted_analog_seen[port_no] &&
+             accepted_analog != accepted_last_analog[port_no]);
+        accepted_last_buttons[port_no] = hs->buttons;
+        accepted_last_analog[port_no] = accepted_analog;
+        accepted_analog_seen[port_no] = 1;
+        if (input_changed) {
+#ifdef _WIN32
+            InterlockedIncrement(&s_accepted_input_serial);
+#else
+            __atomic_add_fetch(&s_accepted_input_serial, 1, __ATOMIC_RELAXED);
+#endif
+        }
+    }
     u32 setting = s_port_setting[port_no];
 #if PAD_BACKEND_XINPUT
     LONG movie_poll = 0;
@@ -744,6 +941,21 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
         fprintf(stderr, "[pad-trace] port=%u buttons=0x%04X\n", port_no, hs->buttons);
         fflush(stderr);
         last_buttons[port_no] = hs->buttons;
+    }
+    if (pad_trace_enabled()) {
+        const u32 analog = (u32)hs->analog_lx |
+            ((u32)hs->analog_ly << 8) |
+            ((u32)hs->analog_rx << 16) |
+            ((u32)hs->analog_ry << 24);
+        if (!analog_seen[port_no] || analog != last_analog[port_no]) {
+            fprintf(stderr,
+                    "[pad-trace] port=%u analog lx=%u ly=%u rx=%u ry=%u\n",
+                    port_no, hs->analog_lx, hs->analog_ly,
+                    hs->analog_rx, hs->analog_ry);
+            fflush(stderr);
+            last_analog[port_no] = analog;
+            analog_seen[port_no] = 1;
+        }
     }
 
     /* Determine data length based on port settings */
@@ -801,6 +1013,17 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     for (size_t i = 0; i < sizeof(data->button)/sizeof(data->button[0]); i++)
         data->button[i] = ps3_bswap16(data->button[i]);
     return CELL_OK;
+}
+
+u32 yz_pad_guest_input_serial(void)
+{
+#ifdef _WIN32
+    return (u32)InterlockedCompareExchange(
+        &s_accepted_input_serial, 0, 0);
+#else
+    return (u32)__atomic_load_n(
+        &s_accepted_input_serial, __ATOMIC_RELAXED);
+#endif
 }
 
 s32 cellPadGetInfo2(CellPadInfo2* info)

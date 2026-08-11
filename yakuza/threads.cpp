@@ -92,6 +92,27 @@ static thr_rec* thr_find(uint32_t tid)
 
 extern "C" uint32_t yz_thread_current_id(void) { return s_cur_tid; }
 
+/* Host service threads (vblank, window pump, RSX consumer, flip pacer) enter
+ * the lv2 layer through the same paths as guest threads. With the thread-local
+ * default they all present as tid 1 -- the main guest thread -- so anything
+ * keyed on the guest tid (the wait recorder's per-tid slot, syscall traces,
+ * guest-visible thread ids) attributes their activity to t1. Adopted ids come
+ * from a reserved band above the guest allocator (which grows upward from 2)
+ * and below the 256-entry wait-slot table so host waits are recorded, not
+ * dropped or collided into t1's slot. */
+#define YZ_HOST_TID_BASE 0xE0u
+extern "C" uint32_t yz_thread_adopt_host(const char* name)
+{
+    static volatile long s_host_seq = 0;
+    long seq = _InterlockedIncrement(&s_host_seq) - 1;
+    uint32_t tid = YZ_HOST_TID_BASE + (uint32_t)seq;
+    if (tid > 0xFFu) tid = 0xFFu;   /* band full: collide at the sentinel, never into guest ids */
+    s_cur_tid = tid;
+    fprintf(stderr, "[threads] host service thread '%s' -> tid %u\n",
+            name ? name : "?", tid);
+    return tid;
+}
+
 /* Authoritative live guest context for a thread (NULL if not a running guest
  * thread). The stall dump reads guest PC/GPRs from this instead of walking the
  * host stack -- a blocked thread parked in an lv2 wait still holds the syscall
@@ -103,6 +124,18 @@ extern "C" void* yz_thread_context(uint32_t tid)
     void* c = t ? (void*)t->ctx : NULL;
     thr_unlock();
     return c;
+}
+
+/* Profile/watchdog access to the host thread that owns a guest PPU thread.
+ * Thread records retain their handles for their lifetime; callers use this
+ * only for a short suspend/context/resume sample. */
+extern "C" void* yz_thread_handle(uint32_t tid)
+{
+    thr_lock();
+    thr_rec* t = thr_find(tid);
+    void* handle = t && t->started ? (void*)t->handle : NULL;
+    thr_unlock();
+    return handle;
 }
 
 /* ---- lv2 wait recorder (blocker #21 diagnostic) ---------------------------
@@ -480,8 +513,11 @@ static DWORD WINAPI thr_proc(LPVOID pv)
     if (thr_rec* ts = thr_find(p.tid)) ts->ctx = &ctx;
     thr_unlock();
 
-    fprintf(stderr, "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X\n",
-            p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp);
+    fprintf(stderr,
+            "[thread %u] start opd=0x%08X arg=0x%llX sp=0x%08X "
+            "host_tid=%lu\n",
+            p.tid, p.opd_addr, (unsigned long long)p.arg, p.sp,
+            GetCurrentThreadId());
 
     /* resolves code+TOC from the descriptor, dispatches, drains trampolines */
     yz_call_guest_opd(p.opd_addr, &ctx);

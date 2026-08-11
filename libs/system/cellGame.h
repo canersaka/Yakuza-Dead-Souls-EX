@@ -59,25 +59,49 @@ extern "C" {
 /* Size info mode */
 #define CELL_GAME_SIZEKB_NOTCALC    (-1)
 
+/* Error dialog types (cellGameContentErrorDialog). ORACLE(SDK
+ * sysutil_gamecontent.h enum + Game_Content-Reference p.31): the _EXIT
+ * variants additionally issue the game-termination request event after the
+ * dialog closes. */
+#define CELL_GAME_ERRDIALOG_BROKEN_GAMEDATA        0
+#define CELL_GAME_ERRDIALOG_BROKEN_HDDGAME         1
+#define CELL_GAME_ERRDIALOG_NOSPACE                2
+#define CELL_GAME_ERRDIALOG_BROKEN_EXIT_GAMEDATA   100
+#define CELL_GAME_ERRDIALOG_BROKEN_EXIT_HDDGAME    101
+#define CELL_GAME_ERRDIALOG_NOSPACE_EXIT           102
+
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Return / error codes
+ *
+ * 2026-08-05 doc-conformance fix: the old values were fabricated as
+ * (CELL_ERROR_BASE_SYSUTIL_GAME | n) with a dense 0x01.. numbering on base
+ * 0x8002B600. The real module base is 0x8002cb00 and the offsets are SPARSE
+ * (04-09, 20-28, 50). Every value below is verbatim from the SDK header
+ * ORACLE(sysutil_game_common.h:17-39); do not re-derive them from a base|n
+ * scheme. RET_* are documented non-error positive results
+ * (Game_Content-Reference p.9: DataCheck returns RET_NONE(2) for missing
+ * content "without handling this as an error").
  * -----------------------------------------------------------------------*/
-#define CELL_GAME_ERROR_NOTFOUND       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x01)
-#define CELL_GAME_ERROR_BROKEN         (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x02)
-#define CELL_GAME_ERROR_INTERNAL       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x03)
-#define CELL_GAME_ERROR_PARAM          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x04)
-#define CELL_GAME_ERROR_NOAPP          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x05)
-#define CELL_GAME_ERROR_ACCESS_ERROR   (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x06)
-#define CELL_GAME_ERROR_NOSPACE        (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x07)
-#define CELL_GAME_ERROR_NOTSUPPORTED   (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x08)
-#define CELL_GAME_ERROR_FAILURE        (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x09)
-#define CELL_GAME_ERROR_BUSY           (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0A)
-#define CELL_GAME_ERROR_IN_SHUTDOWN    (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0B)
-#define CELL_GAME_ERROR_INVALID_ID     (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0C)
-#define CELL_GAME_ERROR_EXIST          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0D)
-#define CELL_GAME_ERROR_NOTPATCH       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0E)
-#define CELL_GAME_ERROR_INVALID_THEME_FILE (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x0F)
-#define CELL_GAME_ERROR_BOOTPATH       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x10)
+#define CELL_GAME_RET_OK               (0)
+#define CELL_GAME_RET_CANCEL           (1)   /* operation canceled */
+#define CELL_GAME_RET_NONE             (2)   /* content does not exist */
+
+#define CELL_GAME_ERROR_NOTFOUND       (s32)0x8002cb04
+#define CELL_GAME_ERROR_BROKEN         (s32)0x8002cb05
+#define CELL_GAME_ERROR_INTERNAL       (s32)0x8002cb06
+#define CELL_GAME_ERROR_PARAM          (s32)0x8002cb07
+#define CELL_GAME_ERROR_NOAPP          (s32)0x8002cb08
+#define CELL_GAME_ERROR_ACCESS_ERROR   (s32)0x8002cb09
+#define CELL_GAME_ERROR_NOSPACE        (s32)0x8002cb20
+#define CELL_GAME_ERROR_NOTSUPPORTED   (s32)0x8002cb21
+#define CELL_GAME_ERROR_FAILURE        (s32)0x8002cb22
+#define CELL_GAME_ERROR_BUSY           (s32)0x8002cb23
+#define CELL_GAME_ERROR_IN_SHUTDOWN    (s32)0x8002cb24
+#define CELL_GAME_ERROR_INVALID_ID     (s32)0x8002cb25
+#define CELL_GAME_ERROR_EXIST          (s32)0x8002cb26
+#define CELL_GAME_ERROR_NOTPATCH       (s32)0x8002cb27
+#define CELL_GAME_ERROR_INVALID_THEME_FILE (s32)0x8002cb28
+#define CELL_GAME_ERROR_BOOTPATH       (s32)0x8002cb50
 
 /* ---------------------------------------------------------------------------
  * Structures
@@ -137,6 +161,11 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
                             char* tmp_usrdirPath);
 
 s32 cellGameDeleteGameData(const char* dirName);
+
+/* Fatal-content error dialog. Logs the template message, posts the
+ * game-termination request event for the _EXIT types, returns
+ * CELL_GAME_RET_OK (Game_Content-Reference pp.31-33). No UI. */
+s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName);
 
 /* cellGameSetExitParam — see cellGameExec.h for correct signature */
 

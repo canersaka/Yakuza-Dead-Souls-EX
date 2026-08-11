@@ -59,6 +59,7 @@ int  rsx_live_draw_init(void* hwnd, u32 width, u32 height,
  * live initial context (optional; the live path can also just stream). */
 void rsx_live_draw_seed_registers(const u32* regs, u32 count);
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
+void rsx_live_draw_seed_transform_constants(const u32* words, u32 count);
 
 /* Register a scanout buffer from sys_rsx_context_attribute(0x104). A flip's
  * argument indexes this table; it is not necessarily the current render
@@ -68,6 +69,16 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
+
+/* Publish the FIFO bounds associated with the next flip method.  The live
+ * consumer calls this only for driver-queue methods; ordinary method traffic
+ * pays no extra synchronization cost. */
+void rsx_live_draw_set_fifo_position(u32 get, u32 put);
+
+/* Record an NV308A inline-to-memory write that overlaps a registered color
+ * surface.  Guest memory changes are deliberately tracked separately from
+ * actual D3D render-target mutations. */
+void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
 
 /* Block until the GPU finishes all queued draws (RSX SET_REFERENCE / sync
  * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only
@@ -90,6 +101,11 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
  * per-vblank "flips" present count, which keeps ticking even when t1 has stalled
  * and stopped producing. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);
+
+/* Profile-only access to the host thread that consumes the live FIFO and
+ * presents game frames. Returns NULL outside the instrumented sampler build.
+ * The opaque handle keeps windows.h out of this public header. */
+void* rsx_live_draw_get_present_thread_handle(void);
 
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
@@ -116,6 +132,13 @@ int  rsx_live_draw_a010_probe_active(void);
  * live draw sink. AUTH playback uses this to avoid outrunning asynchronous
  * model submission while the scene is still visually empty. */
 int  rsx_live_draw_a010_world_ready(void);
+
+/* Offline differential-test hook.  Dumps one tracked render surface without
+ * changing its state/lifetime contract.  The production title never calls
+ * this; capture replay uses it to compare the live backend against the
+ * independent replay renderer at the same guest surface boundary. */
+int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
+                                      const char* path);
 
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);

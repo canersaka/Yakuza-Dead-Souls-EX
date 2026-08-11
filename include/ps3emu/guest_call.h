@@ -42,10 +42,28 @@ typedef void (*ps3_guest_caller_fn)(uint32_t opd_addr,
                                     uint64_t arg4, uint64_t arg5,
                                     uint64_t arg6, uint64_t arg7);
 
+/* Returning variant: identical dispatch, but hands back the guest function's
+ * r3 return value. Needed by the few callbacks whose return value carries
+ * protocol meaning -- e.g. SceNpTrophyStatusCallback, where a negative
+ * return instructs sceNpTrophyRegisterContext to abort registration
+ * (NP_Trophy-Reference p.23). The void variant stays for the common
+ * fire-and-forget case so existing dispatch sites are untouched. */
+typedef uint64_t (*ps3_guest_caller_ret_fn)(uint32_t opd_addr,
+                                            uint64_t arg0, uint64_t arg1,
+                                            uint64_t arg2, uint64_t arg3,
+                                            uint64_t arg4, uint64_t arg5,
+                                            uint64_t arg6, uint64_t arg7);
+
 /* Set by the game's host code (e.g. flow main.cpp) at startup. NULL until
  * installed; HLE bridges that need to call back into guest code must
  * check for NULL before invoking. */
 extern ps3_guest_caller_fn g_ps3_guest_caller;
+
+/* NULL until installed (both are defined in libs/system/cellSysutil.c and
+ * installed together by the game's host code). HLE code that needs a return
+ * value should prefer this hook and fall back to the void hook -- treating
+ * the callback as having returned 0 -- when only the void hook is set. */
+extern ps3_guest_caller_ret_fn g_ps3_guest_caller_ret;
 
 /* Convenience wrapper — checks for NULL and invokes if set. */
 static inline void ps3_invoke_guest(uint32_t opd_addr,

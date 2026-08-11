@@ -245,6 +245,30 @@ int main(void)
         return 11;
     }
 
+    /* The live vertex-CB lane has 4,096 fixed blocks.  The last block fits,
+     * the 4,097th requests a fence/reset, and retrying at zero succeeds. */
+    {
+        const u32 vertex_block = 8448u;
+        const u32 vertex_capacity = vertex_block * 4096u;
+        u32 vertex_offset = 99u;
+        if (rsx_vertex_constant_ring_plan(
+                vertex_block * 4095u, vertex_capacity,
+                vertex_block, &vertex_offset) != 1 ||
+            vertex_offset != vertex_block * 4095u ||
+            rsx_vertex_constant_ring_plan(
+                vertex_capacity, vertex_capacity,
+                vertex_block, &vertex_offset) != 0 ||
+            rsx_vertex_constant_ring_plan(
+                0, vertex_capacity, vertex_block, &vertex_offset) != 1 ||
+            vertex_offset != 0 ||
+            rsx_vertex_constant_ring_plan(
+                0, vertex_capacity, vertex_capacity + 256u,
+                &vertex_offset) != -1) {
+            printf("[FAIL] vertex constant-ring 4097th-draw recycle\n");
+            return 12;
+        }
+    }
+
 #if defined(_WIN32)
     ID3DBlob* shader = NULL;
     ID3DBlob* errors = NULL;

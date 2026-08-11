@@ -15,11 +15,17 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_SHEAP_ERROR_INVAL       0x80410401
-#define CELL_SHEAP_ERROR_NOMEM       0x80410402
-#define CELL_SHEAP_ERROR_ALIGN       0x80410403
-#define CELL_SHEAP_ERROR_NOSYS       0x80410404
+/* Error codes
+ * Previous values (0x80410401-04) were invented and collided byte-for-byte
+ * with cellOvis's real facility (0x80410402 == CELL_OVIS_ERROR_INVAL).
+ * Our macro names already match the real cellSheap names exactly
+ * (cell/sheap/error.h) — only the numeric values were wrong; repointed to
+ * the real sheap facility base (minor facility 0x3 -> 0x804103xx).
+ */
+#define CELL_SHEAP_ERROR_INVAL       0x80410302  /* real SDK value (cell/sheap/error.h:35) */
+#define CELL_SHEAP_ERROR_NOMEM       0x80410304  /* real SDK value (cell/sheap/error.h:41) */
+#define CELL_SHEAP_ERROR_ALIGN       0x80410310  /* real SDK value (cell/sheap/error.h:76) */
+#define CELL_SHEAP_ERROR_NOSYS       0x80410303  /* real SDK value (cell/sheap/error.h:38) */
 
 /* Constants */
 #define CELL_SHEAP_MAX   8

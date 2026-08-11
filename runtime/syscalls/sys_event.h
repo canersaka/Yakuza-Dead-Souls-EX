@@ -127,9 +127,13 @@ typedef struct sys_event_flag_info {
      * second concurrent waiter (RPCS3 sys_event_flag.cpp:170-173) and destroy
      * can refuse to tear down a flag with parked waiters (:103-108). */
     int      waiters;
-    /* Batch fixes item 9(d): set by sys_event_flag_cancel; every waiter
-     * checks this on wake and returns CELL_ECANCELED instead of re-parking. */
-    int      force_cancelled;
+    /* Batch fixes item 9(d), reworked per Lv2 Reference p.232: cancellation
+     * applies only to threads waiting AT THE TIME of the cancel call. A
+     * sticky flag poisoned every later wait with CELL_ECANCELED forever
+     * (2026-08-04 doc-conformance audit); a generation counter scopes it:
+     * waiters snapshot cancel_gen at park time and report ECANCELED only if
+     * it changed while they were parked. */
+    unsigned cancel_gen;
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;

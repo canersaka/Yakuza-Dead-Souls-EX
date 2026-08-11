@@ -38,7 +38,9 @@ extern "C" {
  * CellSyncMutex -- 32-bit spinlock
  * -----------------------------------------------------------------------*/
 typedef struct CellSyncMutex {
-    atomic_uint lock;
+    /* One guest-owned big-endian ticket word: current in the high half,
+     * next in the low half. */
+    _Atomic u32 tickets;
 } CellSyncMutex;
 
 s32 cellSyncMutexInitialize(CellSyncMutex* mutex);

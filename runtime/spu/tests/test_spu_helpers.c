@@ -17,6 +17,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* spu_helpers.h's yz_xf_ieee() reads g_yz_runtime_config (defined in
+ * yakuza/runtime_config.cpp, which parses env vars for the full runner).
+ * This standalone unit test links none of that; provide the test-only
+ * all-zero definition so xf_ieee defaults OFF (the SPU-accurate xfloat path,
+ * matching production default) without pulling in the runner. */
+const yz_runtime_config g_yz_runtime_config = {0};
+
 static int g_pass = 0;
 static int g_fail = 0;
 static const char* g_current = "(none)";
@@ -367,9 +374,17 @@ static void test_sign_extend(void) {
     TEST("xshw: sign-extend low halfword of each word");
     EXPECT_EQ(spu_xshw(spu_il(0x0000FFFE)), spu_il((int32_t)0xFFFFFFFE));
 
-    TEST("xswd: sign-extend low word of each dword to 64-bit");
-    u128 in_xswd = make128(0x00000000FFFFFFFFULL, 0x000000007FFFFFFFULL);
-    u128 expected_xswd = make128(0xFFFFFFFFFFFFFFFFULL, 0x000000007FFFFFFFULL);
+    TEST("xswd: sign-extend right word of each dword (explicit SPU lanes)");
+    /* make128() packs host-endian u64s and scrambles word lanes for
+     * asymmetric vectors (its own comment warns about this) -- build the
+     * vector by explicit SPU word index instead. ISA p96: value = right
+     * word (_u32[2i+1]), sign fill = left word (_u32[2i]); matches the
+     * lifter conformance extend-family vectors. */
+    u128 in_xswd, expected_xswd;
+    in_xswd._u32[0] = 0x00000000u; in_xswd._u32[1] = 0xFFFFFFFFu;
+    in_xswd._u32[2] = 0x12345678u; in_xswd._u32[3] = 0x7FFFFFFFu;
+    expected_xswd._u32[0] = 0xFFFFFFFFu; expected_xswd._u32[1] = 0xFFFFFFFFu;
+    expected_xswd._u32[2] = 0x00000000u; expected_xswd._u32[3] = 0x7FFFFFFFu;
     EXPECT_EQ(spu_xswd(in_xswd), expected_xswd);
 }
 
@@ -403,6 +418,73 @@ static void test_float_fused(void) {
 }
 
 /* ===========================================================================
+ * SPUF-1 regression: cflts/cfltu must decode through the extended-range
+ * xfloat model (spu_xf_decode), never through the host `float` member, so
+ * every input bit pattern -- including ones that look like a host QNaN/Inf
+ * (exponent field 0xFF) -- converts deterministically per the SPU ISA
+ * (no NaN/Inf on SPU; those bit patterns are large finite xfloat values that
+ * saturate like any other out-of-range magnitude). i8=173 is the identity
+ * scale (f = 2^(173-173) = 1.0), used throughout so the raw decoded value is
+ * what gets saturated/truncated.
+ * ===========================================================================*/
+static void test_float_conversions(void) {
+    const int IDENT = 173;
+
+    TEST("cflts: QNaN bit pattern 0x7FC00000 -> saturates to INT32_MAX (no UB)");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x7FC00000u), IDENT), spu_splat_u32(0x7FFFFFFFu));
+    TEST("cfltu: QNaN bit pattern 0x7FC00000 -> saturates to UINT32_MAX");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x7FC00000u), IDENT), spu_splat_u32(0xFFFFFFFFu));
+
+    TEST("cflts: negative QNaN bit pattern 0xFFC00000 -> saturates to INT32_MIN");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0xFFC00000u), IDENT), spu_splat_u32(0x80000000u));
+    TEST("cfltu: negative QNaN bit pattern 0xFFC00000 -> clamps to 0");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0xFFC00000u), IDENT), spu_splat_u32(0x00000000u));
+
+    TEST("cflts: +Inf bit pattern 0x7F800000 -> saturates to INT32_MAX");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x7F800000u), IDENT), spu_splat_u32(0x7FFFFFFFu));
+    TEST("cfltu: +Inf bit pattern 0x7F800000 -> saturates to UINT32_MAX");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x7F800000u), IDENT), spu_splat_u32(0xFFFFFFFFu));
+
+    TEST("cflts: -Inf bit pattern 0xFF800000 -> saturates to INT32_MIN");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0xFF800000u), IDENT), spu_splat_u32(0x80000000u));
+    TEST("cfltu: -Inf bit pattern 0xFF800000 -> clamps to 0");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0xFF800000u), IDENT), spu_splat_u32(0x00000000u));
+
+    TEST("cflts: exponent-0xFF finite (frac=1, 0x7F800001) still saturates to INT32_MAX");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x7F800001u), IDENT), spu_splat_u32(0x7FFFFFFFu));
+    TEST("cfltu: exponent-0xFF finite (frac=1, 0x7F800001) still saturates to UINT32_MAX");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x7F800001u), IDENT), spu_splat_u32(0xFFFFFFFFu));
+
+    TEST("cflts: denormal-shaped bits (exp field 0, 0x00400000) flush to 0, not a tiny nonzero");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x00400000u), IDENT), spu_splat_u32(0u));
+    TEST("cfltu: denormal-shaped bits (0x00400000) flush to 0");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x00400000u), IDENT), spu_splat_u32(0u));
+
+    TEST("cflts: negative-signed denormal-shaped bits (exp field 0, 0x80400000) flush to 0 (sign ignored)");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x80400000u), IDENT), spu_splat_u32(0u));
+
+    TEST("cflts: true zero (0x00000000) -> 0");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x00000000u), IDENT), spu_splat_u32(0u));
+    TEST("cflts: signed zero (0x80000000) -> 0");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x80000000u), IDENT), spu_splat_u32(0u));
+
+    TEST("cflts: ordinary finite value 1000.0f (0x447A0000) converts exactly, no saturation");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x447A0000u), IDENT), spu_splat_u32(1000u));
+    TEST("cfltu: ordinary finite value 1000.0f converts exactly");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x447A0000u), IDENT), spu_splat_u32(1000u));
+
+    TEST("cflts: 2^31 (0x4F000000) saturates signed to INT32_MAX, boundary crossed");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x4F000000u), IDENT), spu_splat_u32(0x7FFFFFFFu));
+    TEST("cfltu: 2^31 (0x4F000000) fits unsigned exactly (below UINT32_MAX), no saturation");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x4F000000u), IDENT), spu_splat_u32(0x80000000u));
+
+    TEST("cfltu: 2^32 (0x4F800000) saturates unsigned to UINT32_MAX, boundary crossed");
+    EXPECT_EQ(spu_cfltu(spu_splat_u32(0x4F800000u), IDENT), spu_splat_u32(0xFFFFFFFFu));
+    TEST("cflts: 2^32 (0x4F800000) saturates signed to INT32_MAX");
+    EXPECT_EQ(spu_cflts(spu_splat_u32(0x4F800000u), IDENT), spu_splat_u32(0x7FFFFFFFu));
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
 int main(void) {
@@ -417,6 +499,7 @@ int main(void) {
     test_fsmbi();
     test_sign_extend();
     test_float_fused();
+    test_float_conversions();
 
     printf("\nSPU helper tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

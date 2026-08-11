@@ -27,6 +27,16 @@ extern "C" {
 
 #define SYS_COND_MAX  256
 
+/* Per-cond committed-waiter thread-id registry (2026-08-05 item-K fix 1).
+ * sys_cond_signal_to must distinguish "target thread is parked on this cond"
+ * (deliver) from "target is not waiting" (EPERM, Lv2 Reference p.184). The
+ * committed/pending counters can't answer per-thread membership, so waits
+ * record their guest tid here (under the sig lock) for the wait's lifetime.
+ * 32 concurrent waiters per cond is far above anything observed; overflow
+ * entries are simply untracked (signal_to would then miss them -- capped,
+ * documented approximation). */
+#define SYS_COND_WAITER_TIDS_MAX  32
+
 typedef struct sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
@@ -44,6 +54,10 @@ typedef struct sys_cond_info {
      * faithful lv2. */
     int      committed;  /* waiters inside the wait syscall */
     int      pending;    /* signals held for committed waiters */
+
+    /* Guest tids of committed waiters (0 = free slot); guarded by the sig
+     * lock. See SYS_COND_WAITER_TIDS_MAX above. */
+    uint64_t waiter_tids[SYS_COND_WAITER_TIDS_MAX];
 
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
@@ -65,6 +79,7 @@ int64_t sys_cond_destroy(ppu_context* ctx);
 int64_t sys_cond_wait(ppu_context* ctx);
 int64_t sys_cond_signal(ppu_context* ctx);
 int64_t sys_cond_signal_all(ppu_context* ctx);
+int64_t sys_cond_signal_to(ppu_context* ctx);
 
 /* Registration */
 void sys_cond_init(lv2_syscall_table* tbl);

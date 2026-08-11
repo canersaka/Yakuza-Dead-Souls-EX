@@ -187,10 +187,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * -- collapsing that 30us to a single yield lets the producer outrun and
          * LAP the FIFO consumer -> deadlock). Busy-wait to the precise QPC
          * deadline, mirroring RPCS3's TSC busy-tail (lv2.cpp wait_timeout,
-         * "Usleep Only"). Critically we SwitchToThread() inside the spin so a
-         * sibling host thread the guest is waiting on (the RSX FIFO consumer
-         * advancing GET) gets the core during the wait -- a pure pause-spin would
-         * pace THIS thread in wall-time but still starve the consumer. */
+         * "Usleep Only"). Give a sibling host thread one scheduling opportunity
+         * before the precision tail, then use processor pauses while checking the
+         * deadline. Repeating SwitchToThread on every QPC check can reschedule the
+         * caller for milliseconds under SPURS contention, multiplying a 30/250 us
+         * guest poll far beyond its requested duration. */
         /* Inline RSX drain ONCE per usleep call (YZ_RSX_INLINE) -- the reserve
          * loops usleep(30), so this advances GET once per reserve iteration.
          * Pumping inside the busy-wait spin (thousands of iters/30us) was
@@ -201,8 +202,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        SwitchToThread();              /* one handoff to the awaited producer */
         do {
-            SwitchToThread();          /* hand the core to the consumer/other guest threads */
+            YieldProcessor();          /* precise tail without repeated reschedules */
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
     }
@@ -335,16 +337,25 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
-/* Batch fixes item 6: the same wall-clock-anchored microsecond clock as
- * sys_time_get_current_time (RPCS3 sys_time.cpp:30-52 anchor pair), so a
- * base_time obtained from sys_time_get_current_time and handed to
- * sys_timer_start compares against the same clock here. Self-contained
- * (duplicated, not shared) since this file registers its own timer thread. */
+/* 2026-08-04 doc-conformance audit (supersedes batch item 6): sys_timer
+ * base/expiry times and the event data3 stamp are defined in SYSTEM time --
+ * microseconds since boot, the clock the guest reads through
+ * sys_time_get_system_time (Lv2 Reference p.27, p.255, p.257, p.259, p.262)
+ * -- NOT Unix-epoch wall time. The previous wall-epoch clock (~1.75e15 us)
+ * made every guest-supplied absolute base compare as "already past", firing
+ * one-shots and periodic-absolute timers immediately. The runner registers
+ * its boot-anchored guest clock here at startup (yakuza/import_overrides.cpp
+ * yz_guest_system_time_us); standalone runtime builds fall back to a local
+ * first-call anchor in the same domain. */
+uint64_t (*g_lv2_system_time_us)(void) = 0;
+
 #ifdef _WIN32
 static uint64_t timer_now_usec(void)
 {
+    if (g_lv2_system_time_us)
+        return g_lv2_system_time_us();
+
     static int           anchor_init = 0;
-    static uint64_t      anchor_epoch_ns = 0;
     static LARGE_INTEGER anchor_qpc;
 
     ensure_qpc_init();
@@ -352,26 +363,27 @@ static uint64_t timer_now_usec(void)
     QueryPerformanceCounter(&now);
 
     if (!anchor_init) {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        uint64_t ft100ns = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-        anchor_epoch_ns = (ft100ns - 116444736000000000ULL) * 100ULL;
         anchor_qpc = now;
         anchor_init = 1;
     }
 
     uint64_t d = (uint64_t)(now.QuadPart - anchor_qpc.QuadPart);
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    uint64_t delta_ns = (d / q) * 1000000000ULL + (d % q) * 1000000000ULL / q;
-    uint64_t time_ns  = anchor_epoch_ns + delta_ns;
-    return time_ns / 1000ULL;
+    return (d / q) * 1000000ULL + (d % q) * 1000000ULL / q;
 }
 #else
 static uint64_t timer_now_usec(void)
 {
+    if (g_lv2_system_time_us)
+        return g_lv2_system_time_us();
+
+    static int      anchor_init = 0;
+    static uint64_t anchor_us = 0;
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    if (!anchor_init) { anchor_us = us; anchor_init = 1; }
+    return us - anchor_us;
 }
 #endif
 

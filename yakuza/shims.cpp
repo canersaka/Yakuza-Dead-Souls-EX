@@ -39,6 +39,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+extern "C" void yz_ppu_cooperative_yield(void)
+{
+    /* The guest's worker wait is unbounded and its poll count is dead on
+     * completion.  Yield after a short processor-spin so the producer that
+     * clears the completion word can run without changing the wait condition. */
+    for (unsigned i = 0; i < 64; ++i)
+        YieldProcessor();
+    SwitchToThread();
+}
+
 /* Guest back-chain walker (defined in main.cpp, C++ linkage). Declared at file
  * scope: a block-scope declaration inside an extern "C" function would inherit
  * C linkage and fail to link against the mangled definition. */
@@ -55,6 +65,9 @@ extern "C" uint8_t* vm_base = nullptr;
  * 32-bit mode. */
 static inline uint8_t* ea(uint64_t addr) { return vm_base + (uint32_t)addr; }
 
+extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
+extern "C" uint32_t yz_thread_current_id(void);
+
 static void yz_mem_guard(uint32_t a, unsigned w, int is_write);  /* DIAG (YZ_GUARD), def below */
 static void yz_a010_constsrc_read64(
     uint32_t addr, uint64_t val, const void* retaddr);
@@ -67,6 +80,7 @@ static int yz_vmguard_check(uint32_t a, unsigned w, int is_write);
 extern "C" void yz_a010_cmt_capture(uint32_t address, uint32_t size);
 extern "C" void yz_stage_render_checkpoint(void* context, uint32_t phase);
 
+#if !defined(YZ_PERF_CLEAN)
 static inline void yz_stage_checkpoint_before_b0(uint32_t address)
 {
     static int enabled = -1;
@@ -90,11 +104,47 @@ static inline void yz_stage_checkpoint_after_object(uint32_t address)
         (uint32_t)ctx->lr == 0x00113508u)
         yz_stage_render_checkpoint(ctx, 1u);
 }
+#endif
 
+#if defined(YZ_PERF_CLEAN)
+extern "C" uint8_t vm_read8(uint64_t addr)
+{
+    return *ea(addr);
+}
+
+extern "C" uint16_t vm_read16(uint64_t addr)
+{
+    uint16_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    return ps3_bswap16(value);
+}
+
+extern "C" uint32_t vm_read32(uint64_t addr)
+{
+    uint32_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    value = ps3_bswap32(value);
+    /* CMT discovery is behavior state used by the optional camera repair,
+     * not an observation-only memory watcher.  Its magic comparison is cold
+     * and remains available in clean builds. */
+    if (value == 0x434D5450u)
+        yz_a010_cmt_capture((uint32_t)addr,
+                            vm_read32((uint32_t)addr + 0xCu));
+    return value;
+}
+
+extern "C" uint64_t vm_read64(uint64_t addr)
+{
+    uint64_t value;
+    memcpy(&value, ea(addr), sizeof(value));
+    return ps3_bswap64(value);
+}
+#else
 extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
 extern "C" uint16_t vm_read16(uint64_t addr) { yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
 extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
 extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
+#endif
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
  * line the SPURS kernel has reserved (GETLLAR) must serialize through the SPU
@@ -118,16 +168,42 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
 /* Raise SPU_EVENT_LR on any SPU whose GETLLAR reservation covers this line --
  * the SPURS idle-service wakeup (spu_channels.c). */
 extern "C" void spu_coh_notify_write(uint32_t addr);
+#if defined(YZ_NATIVE_SPURS)
+extern "C" void cellSpursNotifyPpuGuestWrite(uint32_t addr, uint32_t size);
+extern "C" volatile uint32_t g_native_spurs_ppu_watch_lo;
+extern "C" volatile uint32_t g_native_spurs_ppu_watch_hi;
+static inline void yz_native_spurs_notify_write(uint32_t addr, uint32_t size)
+{
+    const uint64_t first = addr;
+    const uint64_t last = first + size;
+    if (first < g_native_spurs_ppu_watch_hi &&
+        last > g_native_spurs_ppu_watch_lo)
+        cellSpursNotifyPpuGuestWrite(addr, size);
+}
+#else
+static inline void yz_native_spurs_notify_write(uint32_t, uint32_t) {}
+#endif
+#if defined(YZ_PERF_CLEAN)
+#define VM_WRITE_COH(addr, src, n) do { \
+        if (spu_coh_is_reserved((uint32_t)(addr))) { \
+            spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
+            spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
+        } else memcpy(ea(addr), (src), (n)); \
+        yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
+#else
 #define VM_WRITE_COH(addr, src, n) do { \
         yz_watch_bd((uint32_t)(addr), (src), (n)); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
-        } else memcpy(ea(addr), (src), (n)); } while (0)
-extern "C" uint32_t yz_guest_addr_from_host(const void* rip);
+        } else memcpy(ea(addr), (src), (n)); \
+        yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
+#endif
 extern "C" void yz_watch_arm(uint32_t guest_addr);
 extern "C" void yz_a010_reltrace_ppu_store(
     uint32_t addr, uint32_t val, uint32_t guest_pc);
+extern "C" void yz_a010_data_island_register(
+    uint32_t stopper_ea, uint32_t data_end_ea);
 extern "C" volatile long g_yz_a010_release_scene_active;
 
 /* YZ_A010_HANDOFF: name the last camera handoff gate without modifying the
@@ -197,17 +273,31 @@ static void yz_a010_camera_read32(
 static void yz_a010_camera_write(
     uint32_t addr, uint64_t val, unsigned width, const void* retaddr)
 {
+    /* Scene-independent arming (YZ_CAM_WATCH): the a010 gate hid the same
+     * NaN producer in every later scene — the Akiyama/Hana effect walk
+     * consumes this matrix too (frontier hunt 2026-08-03). NaN-payload
+     * writes are always logged first-class while armed. */
+    static int cam_watch = -1;
+    if (cam_watch < 0) cam_watch = getenv("YZ_CAM_WATCH") ? 1 : 0;
     static unsigned writes = 0;
-    if (!g_yz_a010_root_active || writes >= 128u) return;
+    if (!(g_yz_a010_root_active || cam_watch) || writes >= 512u) return;
     const uint64_t end = (uint64_t)addr + width;
     if (end <= 0x01622650ull || addr >= 0x01622690u) return;
+    const uint32_t hi = (uint32_t)(width == 8 ? (val >> 32) : val);
+    const uint32_t lo = (uint32_t)val;
+    const int is_nan =
+        ((hi & 0x7F800000u) == 0x7F800000u && (hi & 0x007FFFFFu)) ||
+        (width == 8 && (lo & 0x7F800000u) == 0x7F800000u && (lo & 0x007FFFFFu));
     writes++;
-    fprintf(stderr,
-            "[a010-camera-write] n=%u addr=%08X width=%u value=%016llX "
-            "caller=%08X tid=%u\n",
-            writes, addr, width, (unsigned long long)val,
-            yz_guest_addr_from_host(retaddr), yz_thread_current_id());
-    fflush(stderr);
+    if (writes <= 128u || is_nan) {
+        fprintf(stderr,
+                "[a010-camera-write] n=%u addr=%08X width=%u value=%016llX "
+                "caller=%08X tid=%u%s\n",
+                writes, addr, width, (unsigned long long)val,
+                yz_guest_addr_from_host(retaddr), yz_thread_current_id(),
+                is_nan ? " NAN" : "");
+        fflush(stderr);
+    }
 }
 
 extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n) {
@@ -591,11 +681,15 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                           (uint32_t)ctx->lr, _ReturnAddress());
                   fflush(stderr); } } }
     }
+    if (ok)
+        yz_native_spurs_notify_write((uint32_t)addr, 4);
+#if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr >= 0x40400000u &&
         (uint32_t)addr < 0x40C00000u)
         yz_a010_reltrace_ppu_store(
             (uint32_t)addr, val,
             yz_guest_addr_from_host(_ReturnAddress()));
+#endif
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -669,6 +763,9 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                   fflush(stderr);
               } } }
     }
+    if (ok)
+        yz_native_spurs_notify_write((uint32_t)addr, 8);
+#if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr < 0x40C00000u &&
         (uint32_t)addr + 8u > 0x40400000u) {
         if ((uint32_t)addr >= 0x40400000u)
@@ -680,6 +777,7 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                 (uint32_t)addr + 4u, (uint32_t)val,
                 yz_guest_addr_from_host(_ReturnAddress()));
     }
+#endif
     ctx->reserve_addr = 0;
     /* CR0 = 0b00 || store_ok || XER[SO] (the conditional-store record form
      * folds the sticky SO like every compare/record op; SO is provably 0 in
@@ -688,8 +786,6 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
               | ((((ok ? 2u : 0u) | ((ctx->xer >> 31) & 1u))) << 28);
 }
 
-extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
-extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void yz_rsx_inline_on_put(void);   /* import_overrides.cpp: inline FIFO drain on PUT flush (YZ_RSX_INLINE) */
 /* YZ_JOBSTREAM_WATCH (s21): confirm the func_00E5F248 clobber hypothesis
  * (scratch/jobchain_pointer_re.md) -- log every store to the jobchain command
@@ -984,8 +1080,231 @@ static inline void yz_stage_transform_write(
     fflush(stderr);
 }
 
+/* ---- YZ_EA_TRAP=hexLO[-hexHI] : deterministic guest-store attribution -------
+ * The frontier crash (dialogue-scene motion bank, STATUS) needed the writer of
+ * an 8-byte store into a LIVE structure. YZ_WATCH_WR could not answer it: its
+ * page guard is armed at startup, and the target lives in the lazily-committed
+ * sys_vm window [0x60000000,0x70000000) -- the later commit resets protection
+ * and silently disarms the guard (boot 16: armed banner printed, ZERO events,
+ * including during the initial load = dead instrument, LESSONS "check the
+ * instrument"). This trap instead sits IN the guest store path, so it cannot
+ * be disarmed by page-protection changes and works in the PERF_CLEAN gate
+ * build (where the older watchers are compiled out).
+ * Logs value + width + tid + the resolved LIFTED caller chain. Uncapped by
+ * design (the watched range is a handful of bytes); zero cost when unset (one
+ * predictable branch on a cached flag). */
+/* 2026-08-06 (oracle boot): up to 4 comma-separated lo-hi ranges. The
+ * legacy single-range globals remain as range 0 so old call shapes and
+ * spu_dma.h's yz_ea_trap_range API keep working. */
+#define YZ_EA_TRAP_MAX_RANGES 4
+static uint32_t g_ea_trap_lo = 0, g_ea_trap_hi = 0;
+static uint32_t g_ea_trap_los[YZ_EA_TRAP_MAX_RANGES];
+static uint32_t g_ea_trap_his[YZ_EA_TRAP_MAX_RANGES];
+static unsigned g_ea_trap_ranges = 0;
+static int g_ea_trap_on = -1;
+static void yz_ea_trap_init(void)
+{
+    const char* e = getenv("YZ_EA_TRAP");
+    if (!e || !*e) { g_ea_trap_on = 0; return; }
+    const char* p = e;
+    while (*p && g_ea_trap_ranges < YZ_EA_TRAP_MAX_RANGES) {
+        char* end = nullptr;
+        uint32_t lo = (uint32_t)strtoul(p, &end, 16);
+        uint32_t hi = (end && *end == '-')
+                          ? (uint32_t)strtoul(end + 1, &end, 16)
+                          : lo + 4u;
+        if (hi <= lo) hi = lo + 4u;
+        g_ea_trap_los[g_ea_trap_ranges] = lo;
+        g_ea_trap_his[g_ea_trap_ranges] = hi;
+        ++g_ea_trap_ranges;
+        while (end && (*end == ',' || *end == ' ')) ++end;
+        if (!end || end == p || !*end) break;
+        p = end;
+    }
+    if (!g_ea_trap_ranges) { g_ea_trap_on = 0; return; }
+    g_ea_trap_lo = g_ea_trap_los[0];
+    g_ea_trap_hi = g_ea_trap_his[0];
+    g_ea_trap_on = 1;
+    for (unsigned i = 0; i < g_ea_trap_ranges; ++i)
+        fprintf(stderr, "[ea-trap] ARMED guest stores in [0x%08X,0x%08X)\n",
+                g_ea_trap_los[i], g_ea_trap_his[i]);
+    fflush(stderr);
+}
+static void yz_ea_trap(uint32_t a, unsigned w, uint64_t val, void* ra);
+
+/* Range query for write paths that do their own reporting (the SPU DMA PUT leg
+ * in runtime/spu/spu_dma.h needs the bounds so it can dump only the payload
+ * words that land inside the watched span). Returns 1 when [ea,ea+size)
+ * overlaps the armed range. */
+extern "C" int yz_ea_trap_range(uint32_t ea, unsigned size, uint32_t* lo, uint32_t* hi)
+{
+    if (g_ea_trap_on < 0) yz_ea_trap_init();
+    if (!g_ea_trap_on) return 0;
+    for (unsigned i = 0; i < g_ea_trap_ranges; ++i) {
+        if (ea >= g_ea_trap_his[i] ||
+            (uint64_t)ea + size <= g_ea_trap_los[i]) continue;
+        if (lo) *lo = g_ea_trap_los[i];
+        if (hi) *hi = g_ea_trap_his[i];
+        return 1;
+    }
+    return 0;
+}
+
+/* C-callable entry so HLE/runtime write paths (ppu_memory.h's vm_memcpy_to /
+ * vm_memset, libs' _sys_memcpy) can report too -- lifted-code coverage alone
+ * would miss a store made by our own HLE. */
+extern "C" void yz_ea_trap_c(uint32_t a, unsigned w, unsigned long long val, void* ra)
+{
+    yz_ea_trap(a, w, (uint64_t)val, ra);
+}
+static void yz_ea_trap(uint32_t a, unsigned w, uint64_t val, void* ra)
+{
+    if (g_ea_trap_on < 0) yz_ea_trap_init();
+    if (!g_ea_trap_on) return;
+    {
+        int hit = 0;
+        for (unsigned i = 0; i < g_ea_trap_ranges; ++i)
+            if (a < g_ea_trap_his[i] && a + w > g_ea_trap_los[i]) { hit = 1; break; }
+        if (!hit) return;
+    }
+    /* Handoff-ordering ring first (no backtrace, no I/O), then the print.
+     * YZ_EA_TRAP_QUIET=1 keeps the ranges armed for ring/record purposes but
+     * suppresses the backtrace+flush print — the measured perturbation class
+     * (boots 37-41). */
+    yz_frontier_trace_emit(YZ_FT_PPU_STORE, yz_thread_current_id(),
+                           yz_guest_addr_from_host(ra), a, w,
+                           (uint32_t)(val >> 32), (uint32_t)val, 0, 0);
+    {
+        static int ppu_quiet = -1;
+        if (ppu_quiet < 0) { const char* q = getenv("YZ_EA_TRAP_QUIET");
+            ppu_quiet = (q && *q == '1') ? 1 : 0; }
+        if (ppu_quiet) return;
+    }
+    char chain[300]; int ci = 0; chain[0] = 0;
+    void* bt[24];
+    unsigned short got = RtlCaptureStackBackTrace(1, 24, bt, 0);
+    for (unsigned k = 0; k < got && ci < 260; k++) {
+        uint32_t g = yz_guest_addr_from_host(bt[k]);
+        if (g) ci += snprintf(chain + ci, sizeof(chain) - (size_t)ci,
+                              "%s0x%08X", ci ? "<-" : "", g);
+    }
+    uint32_t rag = yz_guest_addr_from_host(ra);
+    fprintf(stderr, "[ea-trap] tid=%u STORE ea=0x%08X w=%u val=0x%llX ra=0x%08X bt:%s\n",
+            yz_thread_current_id(), a, w, (unsigned long long)val, rag,
+            chain[0] ? chain : " (no lifted frames)");
+    fflush(stderr);
+}
+
+#if defined(YZ_PERF_CLEAN)
+extern "C" void vm_write8(uint64_t addr, uint8_t val)
+{
+    yz_ea_trap((uint32_t)addr, 1, val, _ReturnAddress());
+    VM_WRITE_COH(addr, &val, sizeof(val));
+}
+
+extern "C" void vm_write16(uint64_t addr, uint16_t val)
+{
+    yz_ea_trap((uint32_t)addr, 2, val, _ReturnAddress());
+    const uint16_t value = ps3_bswap16(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+}
+
+extern "C" void vm_write32(uint64_t addr, uint32_t val)
+{
+    static thread_local uint32_t data_island_stopper = 0;
+    yz_ea_trap((uint32_t)addr, 4, val, _ReturnAddress());
+    uint32_t guest_pc = 0;
+    /* Opt-in compact FIFO lifecycle catcher.  Generated PPU code calls this
+     * exported shim directly; runtime/ppu/ppu_memory.h does not cover it. */
+    if (g_yz_a010_release_scene_active &&
+        (uint32_t)addr >= 0x40400000u &&
+        (uint32_t)addr < 0x40C00000u) {
+        guest_pc = yz_guest_addr_from_host(_ReturnAddress());
+        yz_a010_reltrace_ppu_store(
+            (uint32_t)addr, val, guest_pc);
+        const uint32_t self = 0x20000000u |
+            (((uint32_t)addr - 0x40400000u) & 0x1FFFFFFCu);
+        if (guest_pc == 0x00EAB3DCu && val == self)
+            data_island_stopper = (uint32_t)addr;
+    } else if (data_island_stopper) {
+        guest_pc = yz_guest_addr_from_host(_ReturnAddress());
+        if (guest_pc == 0x00EAB3DCu &&
+            val > data_island_stopper && val <= 0x40C00000u) {
+            /* The allocator's very next store publishes ctx->current, which
+             * is the exact forward jump after its reserved data island. */
+            yz_a010_data_island_register(data_island_stopper, val);
+        }
+        data_island_stopper = 0;
+    }
+    const uint32_t value = ps3_bswap32(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+    if ((uint32_t)addr == 0x10000040u)
+        yz_rsx_inline_on_put();
+}
+
+extern "C" void vm_write64(uint64_t addr, uint64_t val)
+{
+    yz_ea_trap((uint32_t)addr, 8, val, _ReturnAddress());
+    if (g_yz_a010_release_scene_active &&
+        (uint32_t)addr < 0x40C00000u &&
+        (uint64_t)(uint32_t)addr + 8u > 0x40400000ull) {
+        const uint32_t pc = yz_guest_addr_from_host(_ReturnAddress());
+        if ((uint32_t)addr >= 0x40400000u)
+            yz_a010_reltrace_ppu_store(
+                (uint32_t)addr, (uint32_t)(val >> 32), pc);
+        if ((uint32_t)addr + 4u >= 0x40400000u &&
+            (uint32_t)addr + 4u < 0x40C00000u)
+            yz_a010_reltrace_ppu_store(
+                (uint32_t)addr + 4u, (uint32_t)val, pc);
+    }
+    const uint64_t value = ps3_bswap64(val);
+    VM_WRITE_COH(addr, &value, sizeof(value));
+}
+#else
+extern "C" void vm_write8 (uint64_t addr, uint8_t  val) { yz_mem_guard((uint32_t)addr,1,1); if (yz_vmguard_check((uint32_t)addr,1,1)) return; VM_WRITE_COH(addr, &val, 1); }
+extern "C" void vm_write16(uint64_t addr, uint16_t val) { yz_mem_guard((uint32_t)addr,2,1); if (yz_vmguard_check((uint32_t)addr,2,1)) return; uint16_t v = ps3_bswap16(val); VM_WRITE_COH(addr, &v, 2); }
 extern "C" void vm_write32(uint64_t addr, uint32_t val) { yz_mem_guard((uint32_t)addr,4,1); if (yz_vmguard_check((uint32_t)addr,4,1)) return; yz_jobstream_watch((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 4, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 4, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr >= 0x40400000u && (uint32_t)addr < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr, val, yz_guest_addr_from_host(_ReturnAddress())); uint32_t v = ps3_bswap32(val); VM_WRITE_COH(addr, &v, 4); if ((uint32_t)addr == 0x10000040u) yz_rsx_inline_on_put(); }
 extern "C" void vm_write64(uint64_t addr, uint64_t val) { yz_mem_guard((uint32_t)addr,8,1); if (yz_vmguard_check((uint32_t)addr,8,1)) return; yz_jobstream_watch((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_constsrc_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_stage_transform_write((uint32_t)addr, val, 8, _ReturnAddress()); yz_a010_camera_write((uint32_t)addr, val, 8, _ReturnAddress()); if (g_yz_a010_release_scene_active && (uint32_t)addr < 0x40C00000u && (uint64_t)(uint32_t)addr + 8u > 0x40400000ull) { const uint32_t pc = yz_guest_addr_from_host(_ReturnAddress()); if ((uint32_t)addr >= 0x40400000u) yz_a010_reltrace_ppu_store((uint32_t)addr, (uint32_t)(val >> 32), pc); if ((uint32_t)addr + 4u >= 0x40400000u && (uint32_t)addr + 4u < 0x40C00000u) yz_a010_reltrace_ppu_store((uint32_t)addr + 4u, (uint32_t)val, pc); } uint64_t v = ps3_bswap64(val); VM_WRITE_COH(addr, &v, 8); }
+#endif
+
+/* Raw-byte counterpart to vm_write8/16/32/64 for lifted VMX, byte-reversed,
+ * and cache-block-zero stores.  The byte sequence is already in guest memory
+ * order, but it must still serialize with every overlapped GETLLAR line and
+ * notify native SPURS publication watchers. */
+extern "C" void vm_write_bytes(uint64_t addr, const void* src, size_t size)
+{
+    if (!size) return;
+    const uint32_t first = (uint32_t)addr;
+    const uint64_t end64 = (uint64_t)first + size;
+    if (end64 > 0x100000000ull) return;
+    yz_ea_trap(first, (unsigned)size,
+               size >= 8 ? *(const uint64_t*)src
+                         : (size >= 4 ? *(const uint32_t*)src : 0),
+               _ReturnAddress());
+#if !defined(YZ_PERF_CLEAN)
+    yz_mem_guard(first, (unsigned)size, 1);
+    if (yz_vmguard_check(first, (unsigned)size, 1)) return;
+#endif
+
+    const uint32_t first_line = first & ~127u;
+    const uint32_t last_line = (uint32_t)(end64 - 1u) & ~127u;
+    bool reserved = false;
+    for (uint32_t line = first_line;; line += 128u) {
+        if (spu_coh_is_reserved(line)) reserved = true;
+        if (line == last_line) break;
+    }
+
+    if (reserved) spu_lockline_lock();
+    memcpy(ea(first), src, size);
+    if (reserved) {
+        for (uint32_t line = first_line;; line += 128u) {
+            if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+            if (line == last_line) break;
+        }
+        spu_lockline_unlock();
+    }
+    yz_native_spurs_notify_write(first, (uint32_t)size);
+}
 
 /* DIAG (env YZ_GUARD): catch a wild out-of-range guest access -- the firmware
  * coin-flip crasher. On a null-page or uncommitted EA, log the faulting LIFTED
@@ -1131,8 +1450,60 @@ static int64_t yz_sc_abort_report(ppu_context* ctx)
     return 0;
 }
 
+/* Effect-pool slot watch symbols live in libs/spurs/cellSpurs.c so every
+ * binary that links the runtime (standalone tests included) resolves the
+ * ppu_memory.h hook; only the env arming and the poll thread are runner-side. */
+extern "C" int g_yz_effslot_watch;
+
+/* Poll-based slot watch: the store-hook variant caught nothing because the
+ * slot writers bypass vm_write* (altivec guest memcpy and SPU DMA both land
+ * as raw host memcpy). Polling the window at ~1 ms catches every channel and
+ * timestamps creation order plus any transient value in slot 2. */
+static DWORD WINAPI yz_effslot_poll_thread(LPVOID)
+{
+    extern uint8_t* vm_base;
+    yz_thread_adopt_host("effslot-poll");
+    auto rd = [](const uint8_t* p) -> uint32_t {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | p[3];
+    };
+    uint32_t mgr_last = 0, last[12] = {0};
+    fprintf(stderr, "[effslot-poll] ARMED mgr-global=0x14EC864 @1ms "
+            "(slot window follows mgr+0x230)\n");
+    fflush(stderr);
+    for (;;) {
+        uint32_t mgr = rd(vm_base + 0x14EC864u);
+        if (mgr != mgr_last) {
+            fprintf(stderr, "[effslot-poll] t=%lu MGR 0x%08X -> 0x%08X\n",
+                    (unsigned long)GetTickCount(), mgr_last, mgr);
+            fflush(stderr);
+            mgr_last = mgr;
+            memset(last, 0, sizeof(last));
+        }
+        if (mgr >= 0x10000u && mgr < 0xE0000000u) {
+            for (int i = 0; i < 12; i++) {
+                uint32_t v = rd(vm_base + mgr + 0x230u + i * 4u);
+                if (v != last[i]) {
+                    fprintf(stderr,
+                            "[effslot-poll] t=%lu slot[%d] 0x%08X -> 0x%08X\n",
+                            (unsigned long)GetTickCount(), i, last[i], v);
+                    fflush(stderr);
+                    last[i] = v;
+                }
+            }
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+
 extern "C" void yz_init_syscalls(void)
 {
+    g_yz_effslot_watch = getenv("YZ_EFFSLOT_WATCH") ? 1 : 0;
+    if (g_yz_effslot_watch)
+        fprintf(stderr, "[effslot] ARMED (slot array 0x604EC1B0+0x30)\n");
+    if (getenv("YZ_EFFSLOT_POLL"))
+        CreateThread(NULL, 0, yz_effslot_poll_thread, NULL, 0, NULL);
     lv2_register_all_syscalls(&g_lv2_syscalls);
     lv2_syscall_register(&g_lv2_syscalls, 988, yz_sc_abort_report);
 
@@ -1367,11 +1738,36 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * blocking) syscall dispatch so a higher-priority runnable thread can run,
      * then re-acquire on return (the priority arbitration point). No-op when the
      * gate is OFF (default). */
+    /* Freeze flight recorder: only synchronization operations enter this
+     * path.  Ordinary syscalls (and the main thread's 40 us poll sleep) do
+     * not consume ring space or take a timestamp. */
+    const bool ft_sync_syscall =
+        num == 44  || num == 85  || num == 87  ||
+        num == 92  || num == 94  || num == 97  || num == 98  ||
+        num == 102 || num == 104 || num == 107 || num == 108 ||
+        num == 109 || num == 110 || num == 113 || num == 115 ||
+        num == 116 || num == 118 || num == 122 || num == 124 ||
+        num == 125 || num == 127 || num == 130 || num == 138 ||
+        num == 178;
+    const bool ft_sync_armed =
+        ft_sync_syscall && yz_frontier_trace_is_armed();
+    const ULONGLONG ft_sync_start = ft_sync_armed ? GetTickCount64() : 0;
+    if (ft_sync_armed)
+        yz_frontier_trace_emit(
+            YZ_FT_SYSCALL, yz_thread_current_id(), num,
+            0u, (uint32_t)a3, (uint32_t)a4, (uint32_t)a5, 0u, 0u);
+
     yz_wait_enter(num, a3, a4, a5);
     yz_gate_syscall_release();
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
     yz_gate_syscall_acquire();
     yz_wait_exit();
+    if (ft_sync_armed)
+        yz_frontier_trace_emit(
+            YZ_FT_SYSCALL, yz_thread_current_id(), num,
+            1u, (uint32_t)a3, (uint32_t)a4, (uint32_t)a5,
+            (uint32_t)ctx->gpr[3],
+            (uint32_t)((GetTickCount64() - ft_sync_start) * 1000ull));
 
 #if !defined(YZ_PERF_CLEAN)
     if (first || (lv2_log_full && (spu_range || intr))) {
@@ -1387,8 +1783,10 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 #endif
 }
 
-/* Guest-callback hook g_ps3_guest_caller: defined by the runtime
- * (libs/system/cellSysutil.c), installed by main.cpp. */
+/* Guest-callback hooks g_ps3_guest_caller / g_ps3_guest_caller_ret: defined
+ * by the runtime (libs/system/cellSysutil.c), installed by main.cpp. The
+ * _ret variant returns the guest r3 (used by sceNpTrophy's status callback,
+ * whose negative return aborts registration). */
 
 /* s28: [t1-hb] rider globals (lv2_syscall_table.h externs) */
 extern "C" uint32_t g_yz_t1_sc = 0;

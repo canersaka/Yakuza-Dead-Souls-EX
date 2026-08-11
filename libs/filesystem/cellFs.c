@@ -579,6 +579,27 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
     }
+    /* Boot-14 frontier diag: name any file read whose destination overlaps the
+     * watched motion-bank HEADER (0x62B40880..+0x20) — the fatal reload writes
+     * raw offsets into +0x14/+0x18 of the LIVE block; if that write is a
+     * cellFsRead landing there this line is the writer attribution. Armed with
+     * the same env as the [motblk] watcher; guest EA = buf - vm_base. */
+    {
+        static int mw = -1;
+        if (mw < 0) mw = getenv("YZ_MOTBLK_WATCH") ? 1 : 0;
+        if (mw) {
+            extern u8* vm_base;
+            u64 dest = (u64)((u8*)buf - vm_base);
+            if (dest < 0x62B408A0ull && dest + bytes_read > 0x62B40880ull) {
+                fprintf(stderr, "[cellFs] t%u READ-OVERLAPS-MOTBLK dest=0x%08llX "
+                        "len=0x%llX off=%lld '%s'\n",
+                        yz_thread_current_id(), (unsigned long long)dest,
+                        (unsigned long long)bytes_read, off_before,
+                        p ? p : "?");
+                fflush(stderr);
+            }
+        }
+    }
     if (!s_files[fd].read_seen) {
         /* s30 first-read marker (see FsFileSlot.read_seen) — stderr on
          * purpose: stdout is the ledger-#67 treatment under test. tms =
@@ -586,10 +607,14 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * .err stream has no other timestamps). */
         s_files[fd].read_seen = 1;
 #ifdef _WIN32
-        fprintf(stderr, "[cellFs] t%u FIRST-READ tms=%llu fd=%d '%s' nbytes=0x%llX -> 0x%llX\n",
-                yz_thread_current_id(), (unsigned long long)GetTickCount64(),
-                fd, p ? p : "?",
-                (unsigned long long)nbytes, (unsigned long long)bytes_read);
+        {
+            extern u8* vm_base;
+            fprintf(stderr, "[cellFs] t%u FIRST-READ tms=%llu fd=%d '%s' nbytes=0x%llX -> 0x%llX dest=0x%08llX\n",
+                    yz_thread_current_id(), (unsigned long long)GetTickCount64(),
+                    fd, p ? p : "?",
+                    (unsigned long long)nbytes, (unsigned long long)bytes_read,
+                    (unsigned long long)(u64)((u8*)buf - vm_base));
+        }
 #else
         fprintf(stderr, "[cellFs] t%u FIRST-READ fd=%d '%s' nbytes=0x%llX -> 0x%llX\n",
                 yz_thread_current_id(), fd, p ? p : "?",

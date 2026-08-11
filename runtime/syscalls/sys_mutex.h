@@ -59,6 +59,13 @@ typedef struct sys_mutex_info {
     int      recursive;
     uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
     int      lock_count;  /* recursive lock count */
+    /* Number of live condition variables associated with this mutex.
+     * Maintained by sys_cond_create/sys_cond_destroy (under the cond table
+     * lock); read by sys_mutex_destroy, which must refuse with EPERM while
+     * any associated cond exists (Lv2 Reference p.173: "Prior to this system
+     * call, all condition variables that are associated with the mutex must
+     * be destroyed. Otherwise, EPERM will be returned."). */
+    int      cond_count;
 
 #ifdef _WIN32
     CRITICAL_SECTION cs;

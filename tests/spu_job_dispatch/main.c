@@ -33,6 +33,34 @@ static void expect_resident_image(
     failures++;
 }
 
+/*
+ * Consistency sweep: every image id that resolves a nonzero span must also
+ * resolve a slot, and vice versa.  A gap between the two maps (e.g. an image
+ * with a span but no slot) makes the descriptor-handoff guard fail silently
+ * and lets image attribution fall back to whatever job_bin_base[] last held.
+ * Walk a generous range past the highest known case value so a future image
+ * addition to one map without the other is caught automatically.
+ */
+static void check_span_slot_consistency(void)
+{
+    for (int image = 0; image < 64; image++) {
+        checks++;
+        const int slot = spu_job_descriptor_slot(image);
+        const uint32_t span = spu_job_descriptor_span(image);
+        const int has_slot = slot != -1;
+        const int has_span = span != 0;
+        if (has_slot == has_span)
+            continue;
+
+        fprintf(stderr,
+                "FAIL span/slot consistency: image %d has %s but not %s "
+                "(slot=%d span=0x%x)\n",
+                image, has_span ? "a span" : "a slot",
+                has_span ? "a slot" : "a span", slot, span);
+        failures++;
+    }
+}
+
 int main(void)
 {
     /*
@@ -246,6 +274,8 @@ int main(void)
                           4, 0x3C000u, 48);
     expect_resident_image("orphanage internal call at 3CC00",
                           4, 0x3CC00u, 46);
+
+    check_span_slot_consistency();
 
     if (failures)
         return 1;

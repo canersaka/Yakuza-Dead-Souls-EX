@@ -14,6 +14,7 @@
  * Guest callback dispatch hook (set by the game's host code at startup).
  * -----------------------------------------------------------------------*/
 ps3_guest_caller_fn g_ps3_guest_caller = NULL;
+ps3_guest_caller_ret_fn g_ps3_guest_caller_ret = NULL;
 
 /* ---------------------------------------------------------------------------
  * Internal state

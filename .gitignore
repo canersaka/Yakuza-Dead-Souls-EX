@@ -107,9 +107,6 @@ docs/TRACEDIFF.md
 /docs/*_HANDOFF.md
 tools/lint_handoff.py
 CHEATSHEET.md
-AGENTS.md
-.cursor/
-.aider*
 
 # Game files
 /game/

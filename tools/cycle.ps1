@@ -16,7 +16,8 @@ param(
     [switch]$SpuImages,
     [string]$Pattern = '',
     [int]$Timeout = 90,
-    [switch]$SkipGolden
+    [switch]$SkipGolden,
+    [string]$GameInputDir = ''
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -24,6 +25,19 @@ Set-Location $root
 $sum = Join-Path $root 'scratch\cycle_summary.txt'
 "cycle @ $(Get-Date -Format 'HH:mm:ss')  relift=$Relift spuimages=$SpuImages pattern='$Pattern'" | Set-Content $sum
 $fail = $false
+
+if ($GameInputDir -eq '') {
+    # In a linked worktree the decrypted inputs remain in the primary
+    # worktree. Derive that location from git's common directory rather than
+    # recording a machine-specific absolute path.
+    $gitCommon = (& git rev-parse --path-format=absolute --git-common-dir).Trim()
+    if ($LASTEXITCODE -ne 0 -or $gitCommon -eq '') {
+        throw 'Could not derive GameInputDir from git; pass -GameInputDir.'
+    }
+    $GameInputDir = Split-Path -Parent $gitCommon
+}
+$gameElf = Join-Path $GameInputDir 'game\EBOOT.elf'
+$firmwareInput = Join-Path $GameInputDir 'recomp_prx'
 
 function Step($name, [scriptblock]$body) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -45,12 +59,12 @@ if ($Relift) {
         Write-Host '[cycle] conformance FAILED -- aborting before the expensive relift'
         Get-Content $sum | Write-Host; exit 1
     }
-    Step 'relift game' { py -3 -u tools\ppu_lifter.py game\EBOOT.elf --output recomp\ --functions functions.json } | Out-Null
-    Step 'relift libsre' { py -3 -u tools\ppu_lifter.py recomp_prx\libsre_image.bin --raw --base 0x02000000 --functions recomp_prx\libsre_functions.json --output recomp_prx --header-name libsre_recomp.h --source-name libsre_recomp --table-name libsre_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
-    Step 'relift libgcm' { py -3 -u tools\ppu_lifter.py recomp_prx\libgcm_sys_image.bin --raw --base 0x02100000 --functions recomp_prx\libgcm_sys_functions.json --output recomp_prx --header-name libgcm_sys_recomp.h --source-name libgcm_sys_recomp --table-name libgcm_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
-    Step 'relift pxd_shader' { py -3 -u tools\ppu_lifter.py recomp_prx\ogrez_shader_ps3.ppu_image.bin --raw --base 0x02200000 --functions recomp_prx\ogrez_shader_ps3.ppu_functions.json --output recomp_prx --header-name pxd_shader_recomp.h --source-name pxd_shader_recomp --table-name pxd_shader_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
+    Step 'relift game' { py -3 -u tools\ppu_lifter.py $gameElf --output recomp\ --functions functions.json --override-funcs yakuza\movie_overrides.txt } | Out-Null
+    Step 'relift libsre oracle' { py -3 -u tools\ppu_lifter.py (Join-Path $firmwareInput 'libsre_image.bin') --raw --base 0x02000000 --toc 0x02039AB0 --functions (Join-Path $firmwareInput 'libsre_functions.json') --output recomp\prx --header-name libsre_recomp.h --source-name libsre_recomp --table-name libsre_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
+    Step 'relift libgcm oracle' { py -3 -u tools\ppu_lifter.py (Join-Path $firmwareInput 'libgcm_sys_image.bin') --raw --base 0x02100000 --toc 0x02114000 --functions (Join-Path $firmwareInput 'libgcm_sys_functions.json') --output recomp\prx --header-name libgcm_sys_recomp.h --source-name libgcm_sys_recomp --table-name libgcm_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
+    Step 'relift pxd_shader' { py -3 -u tools\ppu_lifter.py (Join-Path $firmwareInput 'ogrez_shader_ps3.ppu_image.bin') --raw --base 0x02200000 --toc 0x02673020 --functions (Join-Path $firmwareInput 'ogrez_shader_ps3.ppu_functions.json') --output recomp\prx --header-name pxd_shader_recomp.h --source-name pxd_shader_recomp --table-name pxd_shader_function_table --extern-funcs recomp\ppu_recomp.h } | Out-Null
     Step 'gen_func_table' { py -3 yakuza\gen_func_table.py } | Out-Null
-    Step 'gen_imports' { py -3 yakuza\gen_imports.py } | Out-Null
+    Step 'audit native imports' { py -3 yakuza\gen_imports.py --spurs-backend native --elf $gameElf --firmware-dir $firmwareInput --output scratch\import_bridges_native_audit.cpp --audit } | Out-Null
 }
 if ($SpuImages) {
     Step 'batch SPU image lift + table' { py -3 tools\gen_spu_images.py } | Out-Null

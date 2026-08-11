@@ -22,8 +22,9 @@ extern "C" {
 #define CELL_MSGDIALOG_TYPE_SE_TYPE_ERROR          0x00000000
 #define CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL         0x00000001
 #define CELL_MSGDIALOG_TYPE_SE_MUTE_ON             0x00000002
-#define CELL_MSGDIALOG_TYPE_BG_VISIBLE             0x00000004
-#define CELL_MSGDIALOG_TYPE_BG_INVISIBLE           0x00000000
+/* 2026-08-04 audit (sysutil_msgdialog.h:145-148): VISIBLE is bit2 CLEAR. */
+#define CELL_MSGDIALOG_TYPE_BG_VISIBLE             0x00000000
+#define CELL_MSGDIALOG_TYPE_BG_INVISIBLE           0x00000004
 #define CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE       0x00000000
 #define CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO      0x00000010
 #define CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK         0x00000020
@@ -36,16 +37,22 @@ extern "C" {
 #define CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE     0x00002000
 
 /* Button results */
-#define CELL_MSGDIALOG_BUTTON_NONE     0
-#define CELL_MSGDIALOG_BUTTON_INVALID  (-1)
+/* 2026-08-04 doc-conformance audit (sysutil_msgdialog.h:190-192): NONE is
+ * -1 and INVALID is 0 -- the old values were swapped, so every close/
+ * no-button result reached the guest as the wrong constant. */
+#define CELL_MSGDIALOG_BUTTON_NONE     (-1)
+#define CELL_MSGDIALOG_BUTTON_INVALID  0
 #define CELL_MSGDIALOG_BUTTON_OK       1
 #define CELL_MSGDIALOG_BUTTON_YES      1
 #define CELL_MSGDIALOG_BUTTON_NO       2
 #define CELL_MSGDIALOG_BUTTON_ESCAPE   3
 
 /* Error codes */
-#define CELL_MSGDIALOG_ERROR_PARAM         (s32)(CELL_ERROR_BASE_SYSUTIL | 0x01)
-#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)(CELL_ERROR_BASE_SYSUTIL | 0x10)
+/* Real SDK values (msgdialog block 0x8002b30x; the previous
+ * CELL_ERROR_BASE_SYSUTIL|0x01/0x10 numbering was fabricated --
+ * 2026-08-05 review follow-up to the doc-conformance sweep). */
+#define CELL_MSGDIALOG_ERROR_PARAM         (s32)0x8002b301
+#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)0x8002b302
 
 /* ---------------------------------------------------------------------------
  * Types

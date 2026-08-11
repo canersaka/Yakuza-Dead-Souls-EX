@@ -5,18 +5,17 @@
  * (cellSpursCreateTask, a task ELF), the runtime must actually RUN that SPU
  * program. We do not interpret SPU ELFs at runtime — we statically lift each
  * title's SPU binaries ahead of time (spu_lifter -> a native entry fn). This
- * layer maps a registered SPU image, by content FINGERPRINT, to its pre-lifted
- * native entry, loads the image into a fresh 256 KB local store, and runs it
- * with the SPURS task ABI (job/task arg EA in r3) via the lifted-job adapter.
+ * layer maps an exact registered SPU image identity (content fingerprint plus
+ * byte size) to its pre-lifted native entry, loads the image into a fresh
+ * 256 KB local store, and runs it with the SPURS task/job ABI.
  *
  * Flow:
  *   1) At init, the title's generated registration code calls
- *      spu_workload_register(fingerprint, lifted_entry, "name") once per lifted
- *      SPU binary. The fingerprint is FNV-1a-64 over the exact ELF image bytes
- *      (the same bytes the title later hands to cellSpurs), computed identically
- *      here and by the offline extractor (so a manifest can be emitted).
- *   2) cellSpursAddWorkload / cellSpursCreateTask call spu_workload_dispatch()
- *      with the guest image -> fingerprint -> lifted entry -> load LS -> run.
+ *      spu_workload_register_direct() or spu_workload_register_image() once per
+ *      lifted SPU binary. Identity is the exact pair (FNV-1a fingerprint, image
+ *      byte size), computed identically here and by the offline extractor.
+ *   2) Native SPURS resolves that exact identity, prepares local store and ABI
+ *      state, and invokes the matching lifted entry.
  *
  * This is title-agnostic ps3recomp runtime: the registry is populated by the
  * title's lifted SPU set; the dispatch mechanism is generic.
@@ -33,6 +32,16 @@ extern "C" {
 #endif
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+typedef int (*spu_workload_image_executor_fn)(spu_context*, int, uint32_t);
+
+typedef struct spu_workload_image {
+    uint64_t fingerprint;
+    uint32_t image_size;
+    int image_id;
+    uint32_t entry_pc;
+    spu_lifted_entry_fn direct_entry;
+    const char* name;
+} spu_workload_image;
 
 /* FNV-1a 64-bit over a byte range. The canonical workload fingerprint; the
  * offline extractor computes the same value so registrations and the images a
@@ -44,6 +53,22 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n);
  * fingerprint: a second register of the same fp updates the entry. */
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
                            const char* name);
+/* Native SPURS never resolves the legacy registration above: callers must
+ * supply an exact image size through one of the two APIs below. */
+int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
+                                 spu_lifted_entry_fn fn, const char* name);
+
+/* Register an exact lifted image for native SPURS.  Identity is the pair of
+ * content fingerprint and byte size; there is deliberately no wildcard.
+ * `image_id`/`entry_pc` select a title's already-registered lifted functions. */
+int spu_workload_register_image(uint64_t fingerprint, uint32_t image_size,
+                                int image_id, uint32_t entry_pc,
+                                const char* name);
+void spu_workload_set_image_executor(spu_workload_image_executor_fn executor);
+int spu_native_image_executor(spu_context* ctx, int image_id, uint32_t entry_pc);
+int spu_workload_resolve(const void* image, uint32_t image_size,
+                         spu_workload_image* out);
+int spu_workload_execute(const spu_workload_image* image, spu_context* ctx);
 
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
@@ -73,6 +98,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
+void spu_workload_reset(void);
 
 #ifdef __cplusplus
 }
