@@ -21,6 +21,7 @@
 
 #include "rsx_live_draw.h"
 #include "ps3emu/yz_runtime_config.h"
+#include "ps3emu/yz_frontier_trace.h"
 
 #if !defined(_WIN32)
 
@@ -35,6 +36,9 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
+void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+{ (void)d; (void)o; (void)v; }
 void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
@@ -92,6 +96,9 @@ void rsx_live_draw_shutdown(void) {}
 extern volatile LONG g_yz_a010_reference_camera_active;
 /* Published when the Sunshine Orphanage AUTH root becomes live. */
 extern volatile LONG g_yz_a010_root_active;
+/* Opt-in headless gameplay-proof handshake, owned jointly with cellPad.c. */
+extern volatile LONG g_yz_movement_proof_phase;
+extern volatile unsigned long long g_yz_auto_start_tick;
 
 /* ---------------------------------------------------------------------------
  * Engine state (module-static; single live RSX)
@@ -173,6 +180,20 @@ typedef struct {
     u32 location, offset;
     ID3D12Resource* tex;
     u32 w, h;
+#if !defined(YZ_PERF_CLEAN)
+    u32 resource_serial;
+    u32 last_write_generation;
+    u32 last_write_kind;
+    u32 last_create_generation;
+    u32 last_draw_generation;
+    u32 last_clear_generation;
+    u32 last_copy_generation;
+    u32 last_blit_generation;
+    u32 last_resolve_generation;
+    u32 last_other_generation;
+    u32 last_guest_blit_generation;
+    u32 last_present_copy_generation;
+#endif
 } surface_t;
 typedef struct {
     u32 location, offset, pitch, width, height;
@@ -403,8 +424,65 @@ static u64 g_ld_flip_consumed = 0;
 static u32 g_ld_last_requested_buffer = UINT32_MAX;
 static u32 g_ld_last_consumed_buffer = UINT32_MAX;
 static u32 g_ld_last_present_target = UINT32_MAX;
+static u64 g_ld_last_dump_fingerprint = 0;
+#if !defined(YZ_PERF_CLEAN)
+static u32 g_ld_surface_generation = 0;
+static u32 g_ld_surface_resource_serial = 0;
+static u32 g_ld_guest_blit_generation = 0;
+static u32 g_ld_present_copy_generation = 0;
+static u64 g_ld_vertex_constant_ring_recycles = 0;
+static u32 g_ld_frame_vertex_constant_ring_recycles = 0;
+static u32 g_ld_fifo_get = 0;
+static u32 g_ld_fifo_put = 0;
 static volatile LONG g_ld_diag_post_movie_pending = 0;
 static volatile LONG g_ld_diag_post_movie_presents = 0;
+
+enum {
+    LD_SURFACE_WRITE_NONE = 0,
+    LD_SURFACE_WRITE_CREATE = 1,
+    LD_SURFACE_WRITE_DRAW = 2,
+    LD_SURFACE_WRITE_CLEAR = 3,
+    LD_SURFACE_WRITE_COPY = 4,
+    LD_SURFACE_WRITE_BLIT = 5,
+    LD_SURFACE_WRITE_RESOLVE = 6,
+    LD_SURFACE_WRITE_OTHER = 7
+};
+
+static void ld_surface_note_write(u32 target, u32 kind)
+{
+    if (target >= MAX_SURFACES)
+        return;
+    surface_t* surface = &g.surfaces[target];
+    const u32 generation = ++g_ld_surface_generation;
+    surface->last_write_generation = generation;
+    surface->last_write_kind = kind;
+    switch (kind) {
+    case LD_SURFACE_WRITE_CREATE:
+        surface->last_create_generation = generation;
+        break;
+    case LD_SURFACE_WRITE_DRAW:
+        surface->last_draw_generation = generation;
+        break;
+    case LD_SURFACE_WRITE_CLEAR:
+        surface->last_clear_generation = generation;
+        break;
+    case LD_SURFACE_WRITE_COPY:
+        surface->last_copy_generation = generation;
+        break;
+    case LD_SURFACE_WRITE_BLIT:
+        surface->last_blit_generation = generation;
+        break;
+    case LD_SURFACE_WRITE_RESOLVE:
+        surface->last_resolve_generation = generation;
+        break;
+    default:
+        surface->last_other_generation = generation;
+        break;
+    }
+}
+#else
+#define ld_surface_note_write(target, kind) ((void)0)
+#endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
 typedef struct {
@@ -928,6 +1006,7 @@ typedef enum {
     LD_FLUSH_PRESENT = 0,
     LD_FLUSH_GUEST_REFERENCE,
     LD_FLUSH_VERTEX_RING,
+    LD_FLUSH_VERTEX_CONSTANT_RING,
     LD_FLUSH_RETIRE_QUEUE,
     LD_FLUSH_MOVIE,
     LD_FLUSH_MOVIE_PRESENT,
@@ -1081,6 +1160,34 @@ static u64 g_ld_a010_probe_touched = 0;
 static volatile LONG g_ld_a010_camera_ready = 0;
 static volatile LONG g_ld_a010_world_ready = 0;
 static u32 g_ld_a010_camera_bits[16];
+
+static void ld_movement_camera_snapshot(LONG phase)
+{
+    fprintf(stderr,
+            "[movement-frontier-rsx] phase=%ld frame=%u root=%ld "
+            "reference_active=%ld camera_ready=%ld\n",
+            phase, g_ld_frames,
+            InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0),
+            InterlockedCompareExchange(
+                &g_yz_a010_reference_camera_active, 0, 0),
+            InterlockedCompareExchange(&g_ld_a010_camera_ready, 0, 0));
+    for (u32 row = 0; row < 4u; ++row) {
+        fprintf(stderr,
+                "[movement-frontier-rsx-camera] phase=%ld row=%u "
+                "constant=%08X/%08X/%08X/%08X "
+                "fallback=%08X/%08X/%08X/%08X\n",
+                phase, row,
+                g.rsx.constants[108u + row][0],
+                g.rsx.constants[108u + row][1],
+                g.rsx.constants[108u + row][2],
+                g.rsx.constants[108u + row][3],
+                g_ld_a010_camera_bits[row * 4u + 0u],
+                g_ld_a010_camera_bits[row * 4u + 1u],
+                g_ld_a010_camera_bits[row * 4u + 2u],
+                g_ld_a010_camera_bits[row * 4u + 3u]);
+    }
+    fflush(stderr);
+}
 /* Host movie presentation and the FIFO consumer live on different threads but
  * share one D3D12 command list. Normal gameplay remains single-producer and
  * bypasses this lock; the active-reader handshake closes the movie-mode
@@ -2527,6 +2634,10 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h)
         retire_texture(s->tex);
     s->tex = replacement;
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
+#if !defined(YZ_PERF_CLEAN)
+    s->resource_serial = ++g_ld_surface_resource_serial;
+#endif
+    ld_surface_note_write(slot, LD_SURFACE_WRITE_CREATE);
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
         NULL, rtv_handle(LD_SWAP_BUFFERS + slot));
@@ -4826,9 +4937,11 @@ static void ld_movie_overlay_begin(void)
 
     ld_flush(LD_FLUSH_MOVIE);
     const float transparent[4] = {0, 0, 0, 0};
-    for (u32 i = 0; i < g.n_surfaces; i++)
+    for (u32 i = 0; i < g.n_surfaces; i++) {
         g.list->lpVtbl->ClearRenderTargetView(
             g.list, rtv_handle(LD_SWAP_BUFFERS + i), transparent, 0, NULL);
+        ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
+    }
     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
     ld_movie_reset_rings();
     fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
@@ -5756,11 +5869,33 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_pso++;
         return;   /* no fallback in live path */
     }
-    if (g.cb_used + CB_BLOCK_ALIGNED > CB_RING_BYTES) {
-        live_draw_csv_emit(prim, n_tri, "drop_cbring");
-        g_ld_stats.group_drop_ring++;
-        return;   /* no fallback in live path */
+    u32 vertex_cb_offset = 0;
+    int vertex_cb_plan = rsx_vertex_constant_ring_plan(
+        g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED, &vertex_cb_offset);
+    if (vertex_cb_plan == 0) {
+#if !defined(YZ_PERF_CLEAN)
+        g_ld_vertex_constant_ring_recycles++;
+        g_ld_frame_vertex_constant_ring_recycles++;
+        yz_frontier_trace_emit(
+            YZ_FT_PARITY_CB_RECYCLE, g_ld_frames, g_ld_last_present_target,
+            g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED,
+            (u32)g_ld_stats.groups_executed,
+            g_ld_fifo_get, g_ld_fifo_put);
+#endif
+        ld_flush(LD_FLUSH_VERTEX_CONSTANT_RING);
+        if (!g.ready)
+            return;
+        g.cb_used = 0;
+        vertex_cb_plan = rsx_vertex_constant_ring_plan(
+            g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED,
+            &vertex_cb_offset);
     }
+    if (vertex_cb_plan != 1) {
+        live_draw_csv_emit(prim, n_tri, "drop_cbring_invalid");
+        g_ld_stats.group_drop_ring++;
+        return;
+    }
+    g.cb_used = vertex_cb_offset;
     u32 ps_cb_offset = 0;
     if (!ld_upload_pixel_constants(&ps_cb_offset)) {
         live_draw_csv_emit(prim, n_tri, "drop_ps_cbring");
@@ -6048,6 +6183,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     } else {
         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
     }
+    ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
     if (current_zslot) {
         render_state_t depth_state;
         decode_render_state(&depth_state);
@@ -6168,6 +6304,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         const float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
                                (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
+        ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
     }
     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
         rsx_dsp_surface sf;
@@ -6455,6 +6592,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
             break;
         }
         g.vertex_mode = mode;
+#if !defined(YZ_PERF_CLEAN)
         const char* diag_dir = getenv("YZ_RSX_VERTEX_DIAG_DIR");
         if (diag_dir && diag_dir[0]) {
             strncpy(
@@ -6462,6 +6600,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                 sizeof(g.vertex_diag_dir) - 1u);
             g.vertex_diag_dir[sizeof(g.vertex_diag_dir) - 1u] = '\0';
         }
+#endif
         fprintf(stderr,
                 "[rsx-vertex] mode=%s features=0x%X "
                 "(startup-selected)\n",
@@ -6472,8 +6611,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g_ld_last_requested_buffer = UINT32_MAX;
     g_ld_last_consumed_buffer = UINT32_MAX;
     g_ld_last_present_target = UINT32_MAX;
+#if !defined(YZ_PERF_CLEAN)
+    g_ld_surface_generation = 0;
+    g_ld_surface_resource_serial = 0;
+    g_ld_guest_blit_generation = 0;
+    g_ld_present_copy_generation = 0;
+    g_ld_vertex_constant_ring_recycles = 0;
+    g_ld_frame_vertex_constant_ring_recycles = 0;
+    g_ld_fifo_get = 0;
+    g_ld_fifo_put = 0;
     InterlockedExchange(&g_ld_diag_post_movie_pending, 0);
     InterlockedExchange(&g_ld_diag_post_movie_presents, 0);
+#endif
+    g_ld_last_dump_fingerprint = 0;
     memset(g_ld_layout_cache, 0, sizeof(g_ld_layout_cache));
     g_ld_layout_cache_count = 0;
 
@@ -6788,9 +6938,11 @@ void rsx_live_draw_set_movie_mode(int on)
              * the last host movie frame and the next clean guest scene. */
             ld_flush(LD_FLUSH_MOVIE);
             const float black[4] = {0, 0, 0, 1};
-            for (u32 i = 0; i < g.n_surfaces; i++)
+            for (u32 i = 0; i < g.n_surfaces; i++) {
                 g.list->lpVtbl->ClearRenderTargetView(
                     g.list, rtv_handle(LD_SWAP_BUFFERS + i), black, 0, NULL);
+                ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
+            }
             if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
             ld_movie_reset_rings();
             InterlockedExchange((volatile LONG*)&g_ld_movie_mode, 0);
@@ -6806,10 +6958,12 @@ void rsx_live_draw_set_movie_mode(int on)
                     g_ld_stats.packets_movie - suppressed_at_start);
             fflush(stderr);
         }
+#if !defined(YZ_PERF_CLEAN)
         if (g.vertex_diag_dir[0]) {
             InterlockedExchange(&g_ld_diag_post_movie_presents, 0);
             InterlockedExchange(&g_ld_diag_post_movie_pending, 1);
         }
+#endif
     }
     ld_vertex_diag_emit(on ? "movie-begin" : "movie-end", 0);
     if (serialized) {
@@ -6819,6 +6973,45 @@ void rsx_live_draw_set_movie_mode(int on)
 }
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
+
+void rsx_live_draw_set_fifo_position(u32 get, u32 put)
+{
+#if defined(YZ_PERF_CLEAN)
+    (void)get;
+    (void)put;
+#else
+    g_ld_fifo_get = get;
+    g_ld_fifo_put = put;
+#endif
+}
+
+void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
+{
+#if defined(YZ_PERF_CLEAN)
+    (void)dma;
+    (void)offset;
+    (void)value;
+#else
+    if (!g.ready || !yz_frontier_trace_is_armed())
+        return;
+    const u32 location = dma == 0xFEED0000u ? 0u :
+                         dma == 0xFEED0001u ? 1u : UINT32_MAX;
+    if (location == UINT32_MAX)
+        return;
+    for (u32 i = 0; i < g.n_surfaces; ++i) {
+        surface_t* surface = &g.surfaces[i];
+        const u64 begin = surface->offset;
+        const u64 end = begin + (u64)surface->w * surface->h * 4u;
+        if (surface->location != location || offset < begin || offset >= end)
+            continue;
+        surface->last_guest_blit_generation = ++g_ld_guest_blit_generation;
+        yz_frontier_trace_emit(
+            YZ_FT_PARITY_GUEST_BLIT, i, location,
+            surface->last_guest_blit_generation, offset, value,
+            g_ld_fifo_get, g_ld_fifo_put, surface->last_write_generation);
+    }
+#endif
+}
 
 void* rsx_live_draw_get_present_thread_handle(void)
 {
@@ -7045,6 +7238,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
 
     u64 nonblack = UINT64_MAX;
+    u64 fingerprint = 1469598103934665603ull;
     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
         nonblack = 0;
@@ -7057,6 +7251,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                     const u8* pixel = row + x * 4;
                     if (pixel[0] || pixel[1] || pixel[2])
                         nonblack++;
+                    fingerprint = fnv1a(pixel, 3, fingerprint);
                     fwrite(pixel, 1, 3, f);  /* RGBA->RGB */
                 }
             }
@@ -7069,15 +7264,64 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                     const u8* pixel = row + x * 4;
                     if (pixel[0] || pixel[1] || pixel[2])
                         nonblack++;
+                    fingerprint = fnv1a(pixel, 3, fingerprint);
                 }
             }
         }
         D3D12_RANGE wr = {0, 0};
         rb->lpVtbl->Unmap(rb, 0, &wr);
+        g_ld_last_dump_fingerprint = fingerprint;
     }
     rb->lpVtbl->Release(rb);
     return nonblack;
 }
+
+#if !defined(YZ_PERF_CLEAN)
+static void ld_parity_capture_surface(
+    const char* directory, const char* phase, u32 serial,
+    u32 buffer_id, u32 target)
+{
+    if (!directory || !directory[0] || target >= g.n_surfaces)
+        return;
+    surface_t* surface = &g.surfaces[target];
+    char path[MAX_PATH * 2];
+    snprintf(
+        path, sizeof(path),
+        "%s\\%s_%03u_flip_%llu_buf_%u_surface_%u_write_%u_kind_%u.ppm",
+        directory, phase, serial,
+        (unsigned long long)g_ld_flip_requested,
+        buffer_id, target, surface->last_write_generation,
+        surface->last_write_kind);
+    const u64 nonblack = ld_dump_surface_ppm(path, surface);
+    fprintf(
+        stderr,
+        "[parity-capture] phase=%s serial=%u flip=%llu buffer=%u "
+        "surface=%u resource=%u write=%u kind=%u draw=%u clear=%u "
+        "copy=%u blit=%u resolve=%u other=%u guest_blit=%u "
+        "present_copy=%u get=%08X put=%08X cb=%u vb=%u srv=%u "
+        "groups=%llu drop_ring=%llu cb_recycles=%llu frame_cb_recycles=%u "
+        "hash=%016llX nonblack=%s%llu path=%s\n",
+        phase, serial, (unsigned long long)g_ld_flip_requested,
+        buffer_id, target, surface->resource_serial,
+        surface->last_write_generation, surface->last_write_kind,
+        surface->last_draw_generation, surface->last_clear_generation,
+        surface->last_copy_generation, surface->last_blit_generation,
+        surface->last_resolve_generation, surface->last_other_generation,
+        surface->last_guest_blit_generation,
+        surface->last_present_copy_generation,
+        g_ld_fifo_get, g_ld_fifo_put, g.cb_used, g.vb_used,
+        g.srv_ring_used,
+        (unsigned long long)g_ld_stats.groups_executed,
+        (unsigned long long)g_ld_stats.group_drop_ring,
+        (unsigned long long)g_ld_vertex_constant_ring_recycles,
+        g_ld_frame_vertex_constant_ring_recycles,
+        (unsigned long long)g_ld_last_dump_fingerprint,
+        nonblack == UINT64_MAX ? "unknown:" : "",
+        (unsigned long long)(nonblack == UINT64_MAX ? 0 : nonblack),
+        path);
+    fflush(stderr);
+}
+#endif
 
 int rsx_live_draw_debug_dump_surface(
     u32 location, u32 offset, const char* path)
@@ -7237,12 +7481,46 @@ void rsx_live_draw_present(u32 buffer_id)
         return;
     }
     g_ld_last_present_target = target;
+    const u32 current = current_surface();
+    surface_t* presented_surface = &g.surfaces[target];
+#if !defined(YZ_PERF_CLEAN)
+    presented_surface->last_present_copy_generation =
+        ++g_ld_present_copy_generation;
+    yz_frontier_trace_emit(
+        YZ_FT_PARITY_FLIP, buffer_id, target,
+        (u32)g_ld_flip_requested,
+        presented_surface->last_draw_generation,
+        presented_surface->last_clear_generation,
+        g_ld_fifo_get, g_ld_fifo_put, current);
+    yz_frontier_trace_emit(
+        YZ_FT_PARITY_SURFACE, target, presented_surface->last_write_kind,
+        presented_surface->last_write_generation,
+        presented_surface->last_draw_generation,
+        presented_surface->last_clear_generation,
+        presented_surface->last_copy_generation,
+        presented_surface->last_blit_generation,
+        presented_surface->last_resolve_generation);
+    yz_frontier_trace_emit(
+        YZ_FT_PARITY_SURFACE_AUX, target,
+        presented_surface->resource_serial,
+        presented_surface->last_create_generation,
+        presented_surface->last_other_generation,
+        presented_surface->last_guest_blit_generation,
+        presented_surface->offset, presented_surface->location,
+        presented_surface->last_present_copy_generation);
+    yz_frontier_trace_emit(
+        YZ_FT_PARITY_RENDER, target, current,
+        (u32)g_ld_stats.groups_executed,
+        (u32)g_ld_stats.group_drop_ring,
+        g.cb_used, g.vb_used, g.srv_ring_used,
+        presented_surface->last_present_copy_generation);
+#endif
     { static u32 last_present_target = LD_INVALID_SURFACE;
       if (target != last_present_target) {
           ld_trace_target("present", target, buffer_id);
           last_present_target = target;
       } }
-    ID3D12Resource* srcimg = g.surfaces[target].tex;
+    ID3D12Resource* srcimg = presented_surface->tex;
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
 
@@ -7283,6 +7561,7 @@ void rsx_live_draw_present(u32 buffer_id)
             g.ready = 0;
         }
     }
+#if !defined(YZ_PERF_CLEAN)
     if (InterlockedCompareExchange(
             &g_ld_diag_post_movie_pending, 0, 0) != 0) {
         const LONG post_movie_present =
@@ -7311,6 +7590,7 @@ void rsx_live_draw_present(u32 buffer_id)
             fflush(stderr);
         }
     }
+#endif
 
     { static unsigned long long packets_at_last_frame = 0;
       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
@@ -7319,6 +7599,251 @@ void rsx_live_draw_present(u32 buffer_id)
 #if defined(YZ_PERF_PROFILE)
     ld_profile_present(g_ld_frames);
 #endif
+#if !defined(YZ_PERF_CLEAN)
+    /* Autonomous parity capture.  Scalar records remain circular and cheap.
+     * Readback begins only after two alternating display surfaces stop
+     * receiving writes while FIFO progress continues, and again for the first
+     * 16 held-movement presentations.  The latter continues counting to 120
+     * without readback so validation does not materially alter movement. */
+    {
+        static int parity_enabled = -1;
+        static char parity_dir[MAX_PATH * 2];
+        static u32 observed_write[MAX_SURFACES];
+        static u8 observed_valid[MAX_SURFACES];
+        static u32 prior_target = LD_INVALID_SURFACE;
+        static u32 prior_get;
+        static u32 prior_put;
+        static u32 dialogue_stable;
+        static u64 dialogue_targets;
+        static int dialogue_armed;
+        static u32 dialogue_captures;
+        static u32 movement_frames;
+        static u32 movement_captures;
+        if (parity_enabled < 0) {
+            const char* enabled = getenv("YZ_PARITY_DIAG");
+            const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
+            parity_enabled = enabled && *enabled && directory && *directory;
+            if (parity_enabled) {
+                strncpy(parity_dir, directory, sizeof(parity_dir) - 1u);
+                parity_dir[sizeof(parity_dir) - 1u] = '\0';
+            }
+        }
+        if (parity_enabled) {
+            const LONG movement_phase = InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0);
+            const u64 elapsed = g_yz_auto_start_tick
+                ? GetTickCount64() - g_yz_auto_start_tick : 0;
+            surface_t* surface = &g.surfaces[target];
+            const int fifo_progress =
+                g_ld_fifo_get != prior_get || g_ld_fifo_put != prior_put;
+            const int alternating =
+                prior_target != LD_INVALID_SURFACE && prior_target != target;
+            const int unchanged = observed_valid[target] &&
+                observed_write[target] == surface->last_write_generation;
+
+            if (!dialogue_armed && !dialogue_captures &&
+                movement_phase == 0 &&
+                ((g_ld_frame_vertex_constant_ring_recycles != 0 &&
+                  elapsed >= 300000ull) || elapsed >= 420000ull)) {
+                if (g_ld_frame_vertex_constant_ring_recycles != 0) {
+                    dialogue_armed = 1;
+                    fprintf(
+                        stderr,
+                        "[parity-diag] DIALOGUE HIGH-DRAW TRIGGER "
+                        "elapsed_ms=%llu frame_recycles=%u total_recycles=%llu "
+                        "drop_ring=%llu frame=%u flip=%llu\n",
+                        (unsigned long long)elapsed,
+                        g_ld_frame_vertex_constant_ring_recycles,
+                        (unsigned long long)
+                            g_ld_vertex_constant_ring_recycles,
+                        (unsigned long long)g_ld_stats.group_drop_ring,
+                        g_ld_frames,
+                        (unsigned long long)g_ld_flip_requested);
+                    fflush(stderr);
+                } else if (fifo_progress && alternating && unchanged) {
+                    dialogue_stable++;
+                    if (target < 64u)
+                        dialogue_targets |= 1ull << target;
+                } else if (fifo_progress) {
+                    dialogue_stable = 0;
+                    dialogue_targets = target < 64u ? 1ull << target : 0;
+                }
+                if (dialogue_stable >= 12u &&
+                    dialogue_targets &&
+                    (dialogue_targets & (dialogue_targets - 1u)) != 0) {
+                    dialogue_armed = 1;
+                    fprintf(
+                        stderr,
+                        "[parity-diag] DIALOGUE TRIGGER elapsed_ms=%llu "
+                        "stable=%u targets=%016llX drop_ring=%llu "
+                        "frame=%u flip=%llu\n",
+                        (unsigned long long)elapsed, dialogue_stable,
+                        (unsigned long long)dialogue_targets,
+                        (unsigned long long)g_ld_stats.group_drop_ring,
+                        g_ld_frames,
+                        (unsigned long long)g_ld_flip_requested);
+                    fflush(stderr);
+                }
+            }
+            if (dialogue_armed && dialogue_captures < 16u) {
+                const u32 capture = ++dialogue_captures;
+                ld_parity_capture_surface(
+                    parity_dir, "dialogue", capture, buffer_id, target);
+                if (capture == 16u) {
+                    dialogue_armed = 0;
+                    yz_frontier_trace_dump(5u);
+                    fprintf(
+                        stderr,
+                        "[parity-diag] DIALOGUE COMPLETE captures=16 "
+                        "frame=%u flip=%llu\n",
+                        g_ld_frames,
+                        (unsigned long long)g_ld_flip_requested);
+                    fflush(stderr);
+                }
+            }
+
+            if (movement_phase == 4) {
+                movement_frames++;
+                if (movement_captures < 16u) {
+                    const u32 capture = ++movement_captures;
+                    ld_parity_capture_surface(
+                        parity_dir, "movement", capture, buffer_id, target);
+                    if (capture == 16u)
+                        yz_frontier_trace_dump(6u);
+                }
+                if (movement_frames == 120u) {
+                    yz_frontier_trace_dump(7u);
+                    fprintf(
+                        stderr,
+                        "[parity-diag] MOVEMENT 120 COMPLETE "
+                        "captures=16 frame=%u flip=%llu groups=%llu "
+                        "drop_ring=%llu\n",
+                        g_ld_frames,
+                        (unsigned long long)g_ld_flip_requested,
+                        (unsigned long long)g_ld_stats.groups_executed,
+                        (unsigned long long)g_ld_stats.group_drop_ring);
+                    fflush(stderr);
+                }
+            }
+
+            observed_write[target] = surface->last_write_generation;
+            observed_valid[target] = 1;
+            prior_target = target;
+            prior_get = g_ld_fifo_get;
+            prior_put = g_ld_fifo_put;
+        }
+    }
+    /* Capture the actual presented surface at acknowledged input boundaries.
+     * This is independent of desktop visibility/focus and is inert unless the
+     * promotion controller explicitly enables YZ_MOVEMENT_PROOF. */
+    {
+        static int movement_capture = -1;
+        static char movement_dir[MAX_PATH * 2];
+        if (movement_capture < 0) {
+            const char* enabled = getenv("YZ_MOVEMENT_PROOF");
+            const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
+            movement_capture = enabled && directory && *directory;
+            if (movement_capture) {
+                strncpy(movement_dir, directory,
+                        sizeof(movement_dir) - 1u);
+                movement_dir[sizeof(movement_dir) - 1u] = '\0';
+            }
+        }
+        if (movement_capture) {
+            const LONG phase = InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0);
+            static u64 next_probe_tick;
+            static u32 probe_serial;
+            static u64 probe_delay_ms;
+            static u64 probe_interval_ms;
+            static int probe_configured;
+
+            if (!probe_configured) {
+                const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
+                const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
+                probe_delay_ms = delay && *delay
+                    ? _strtoui64(delay, NULL, 10) : 780000ull;
+                probe_interval_ms = interval && *interval
+                    ? _strtoui64(interval, NULL, 10) : 0ull;
+                if (probe_interval_ms && probe_interval_ms < 30000ull)
+                    probe_interval_ms = 30000ull;
+                probe_configured = 1;
+            }
+
+            /* A time threshold alone cannot distinguish authored camera work
+             * from playable Akiyama.  In visual-arm mode, retain occasional
+             * renderer-surface probes while dialogue input continues.  The
+             * proof is armed only after one of these images visibly shows the
+             * gameplay HUD, avoiding timing-dependent false positives. */
+            if (phase == 0 && probe_interval_ms && g_yz_auto_start_tick) {
+                const u64 now = GetTickCount64();
+                const u64 elapsed = now - g_yz_auto_start_tick;
+                if (elapsed >= probe_delay_ms &&
+                    (!next_probe_tick || now >= next_probe_tick)) {
+                    char path[MAX_PATH * 2];
+                    const u32 serial = ++probe_serial;
+                    snprintf(path, sizeof(path),
+                             "%s\\frontier_probe_%03u.ppm",
+                             movement_dir, serial);
+                    {
+                        const u64 nonblack =
+                            ld_dump_surface_ppm(path, &g.surfaces[target]);
+                        fprintf(stderr,
+                                "[movement-proof] frontier-probe serial=%u "
+                                "elapsed_ms=%llu frame=%u nonblack=%s%llu "
+                                "path=%s\n",
+                                serial, (unsigned long long)elapsed,
+                                g_ld_frames,
+                                nonblack == UINT64_MAX ? "unknown:" : "",
+                                (unsigned long long)(
+                                    nonblack == UINT64_MAX ? 0 : nonblack),
+                                path);
+                        fflush(stderr);
+                    }
+                    next_probe_tick = now + probe_interval_ms;
+                }
+            }
+            const char* name = NULL;
+            LONG next_phase = phase;
+            if (phase == 1) {
+                name = "movement_before.ppm";
+                next_phase = 2;
+            } else if (phase == 3) {
+                name = "camera_after.ppm";
+                next_phase = 4;
+            } else if (phase == 5) {
+                name = "movement_after_60s.ppm";
+                next_phase = 6;
+            }
+            if (name) {
+                char path[MAX_PATH * 2];
+                snprintf(path, sizeof(path), "%s\\%s", movement_dir, name);
+                ld_movement_camera_snapshot(phase);
+                {
+                    const u64 nonblack =
+                        ld_dump_surface_ppm(path, &g.surfaces[target]);
+                    fprintf(stderr,
+                            "[movement-proof] capture phase=%ld frame=%u "
+                            "flip=%llu nonblack=%s%llu path=%s\n",
+                            phase, g_ld_frames,
+                            (unsigned long long)g_ld_flip_requested,
+                            nonblack == UINT64_MAX ? "unknown:" : "",
+                            (unsigned long long)(
+                                nonblack == UINT64_MAX ? 0 : nonblack),
+                            path);
+                    fflush(stderr);
+                }
+                InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, next_phase, phase);
+                if (next_phase == 6) {
+                    fprintf(stderr,
+                            "[movement-proof] COMPLETE sustained_ms=60000 "
+                            "camera_ms=5000 frame=%u\n", g_ld_frames);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
     /* Narrow validation readback for the four user-visible orphanage shots.
      * This captures the renderer's actual presented surface and therefore is
      * independent of desktop focus, window visibility, and screenshot APIs.
@@ -7387,6 +7912,7 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
     }
+#endif
     /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
      * making the TRUE frame count measurable from the log. (The old hard cap
      * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
@@ -7447,6 +7973,7 @@ void rsx_live_draw_present(u32 buffer_id)
             ld_dump_surface_ppm(path, &g.surfaces[cur]);
         }
     }
+#if !defined(YZ_PERF_CLEAN)
     if (rsx_live_draw_a010_probe_active()) {
         const u32 elapsed = g_ld_frames - g_ld_a010_probe_start_frame;
         const int targeted = getenv("YZ_RSX_A010_SURFACE_DUMP") != NULL;
@@ -7547,10 +8074,14 @@ void rsx_live_draw_present(u32 buffer_id)
             InterlockedExchange(&g_ld_a010_probe_active, 0);
         }
     }
+#endif
 
     /* new frame: reset per-frame ring cursors */
     g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
+#if !defined(YZ_PERF_CLEAN)
+    g_ld_frame_vertex_constant_ring_recycles = 0;
+#endif
     g.depth_cleared = 0;
     /* Per-zeta resources model persistent RSX memory.  Do not mark them
      * uncleared at a host-frame boundary: the implicit-clear branch would
