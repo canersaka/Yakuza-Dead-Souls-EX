@@ -3,6 +3,7 @@
  */
 
 #include "sys_rwlock.h"
+#include "sys_timer.h"     /* lv2_usec_deadline / lv2_deadline_passed */
 #include "../memory/vm.h"
 #include <string.h>
 
@@ -94,7 +95,7 @@ int64_t sys_rwlock_destroy(ppu_context* ctx)
 int64_t sys_rwlock_rlock(ppu_context* ctx)
 {
     uint32_t rwlock_id  = LV2_ARG_U32(ctx, 0);
-    /* uint64_t timeout = LV2_ARG_U64(ctx, 1); -- timeout not commonly used */
+    uint64_t timeout_us = LV2_ARG_U64(ctx, 1);   /* 0 = wait forever */
 
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -104,10 +105,36 @@ int64_t sys_rwlock_rlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    AcquireSRWLockShared(&r->srw);
+    if (timeout_us == 0) {
+        AcquireSRWLockShared(&r->srw);
+    } else {
+        /* Lv2 Reference p.190: a finite timeout must produce CELL_ETIMEDOUT.
+         * The argument used to be discarded, turning every timed rlock into
+         * an unbounded block (2026-08-04 doc-conformance audit). SRWLocks
+         * have no timed acquire; poll the try form against a QPC deadline
+         * (same shape as the sub-ms waits in sys_event.c). */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (!TryAcquireSRWLockShared(&r->srw)) {
+            if (!r->active)
+                return (int64_t)(int32_t)CELL_ESRCH;
+            if (lv2_deadline_passed(deadline))
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            SwitchToThread();
+        }
+    }
     InterlockedIncrement(&r->readers);
 #else
-    pthread_rwlock_rdlock(&r->rwl);
+    if (timeout_us == 0) {
+        pthread_rwlock_rdlock(&r->rwl);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += (time_t)(timeout_us / 1000000);
+        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_rwlock_timedrdlock(&r->rwl, &ts) != 0)
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
 #endif
 
     return CELL_OK;
@@ -161,7 +188,7 @@ int64_t sys_rwlock_runlock(ppu_context* ctx)
 int64_t sys_rwlock_wlock(ppu_context* ctx)
 {
     uint32_t rwlock_id  = LV2_ARG_U32(ctx, 0);
-    /* uint64_t timeout = LV2_ARG_U64(ctx, 1); */
+    uint64_t timeout_us = LV2_ARG_U64(ctx, 1);   /* 0 = wait forever */
 
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -175,11 +202,33 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
      * the (non-recursive) SRWLock. Real lv2 returns CELL_EDEADLK. */
     if (r->writer && r->writer_tid == ctx->thread_id)
         return (int64_t)(int32_t)CELL_EDEADLK;
-    AcquireSRWLockExclusive(&r->srw);
+    if (timeout_us == 0) {
+        AcquireSRWLockExclusive(&r->srw);
+    } else {
+        /* Lv2 Reference p.193: finite timeout -> CELL_ETIMEDOUT (see rlock). */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (!TryAcquireSRWLockExclusive(&r->srw)) {
+            if (!r->active)
+                return (int64_t)(int32_t)CELL_ESRCH;
+            if (lv2_deadline_passed(deadline))
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            SwitchToThread();
+        }
+    }
     InterlockedExchange(&r->writer, 1);
     r->writer_tid = ctx->thread_id;
 #else
-    pthread_rwlock_wrlock(&r->rwl);
+    if (timeout_us == 0) {
+        pthread_rwlock_wrlock(&r->rwl);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += (time_t)(timeout_us / 1000000);
+        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_rwlock_timedwrlock(&r->rwl, &ts) != 0)
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
 #endif
 
     return CELL_OK;

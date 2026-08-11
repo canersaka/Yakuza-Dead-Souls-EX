@@ -130,6 +130,12 @@ int rsx_fp_constant_ring_plan(
     u32 used, u32 capacity, u32 data_bytes,
     u32* out_offset, u32* out_allocation_bytes);
 
+/* Plan one already-aligned fixed-size vertex-constant block.  The caller must
+ * fence and retry from offset zero when this returns 0; silently dropping the
+ * draw would leave a multi-buffered display surface on an older generation. */
+int rsx_vertex_constant_ring_plan(
+    u32 used, u32 capacity, u32 block_bytes, u32* out_offset);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);

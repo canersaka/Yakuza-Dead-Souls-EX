@@ -359,13 +359,23 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * sys_memory_container_get_size
  *
- * r3 = container_id
- * r4 = pointer to output struct: { u32 total, u32 used }
- * -----------------------------------------------------------------------*/
+ * r3 = pointer to sys_memory_info_t { u32 total_user_memory,
+ *                                     u32 available_user_memory }
+ * r4 = container_id
+ *
+ * 2026-08-05 item-K fix 7 -- the old handler read r3 as the container id and
+ * r4 as the pointer (2026-08-04 audit: a conforming call always got ESRCH).
+ * ORACLE(SDK sys/memory.h:318-324): sys_memory_container_get_size(
+ * sys_memory_info_t* mem_info, sys_memory_container_t cid) with
+ * system_call_2(..., (uint32_t)mem_info, cid) -- pointer in r3, cid in r4;
+ * struct is {total_user_memory, available_user_memory} (memory.h:45-48), so
+ * the second field is AVAILABLE (total - used), not used
+ * (ORACLE(Lv2 Reference p.49): "obtains the maximum size and available
+ * size"). */
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
-    uint32_t container_id = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
+    uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
 
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -375,8 +385,10 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     if (out_addr != 0) {
+        uint32_t avail = (c->total_size >= c->used_size)
+                       ? (c->total_size - c->used_size) : 0;
         write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
+        write_be32(out_addr + 4, avail);
     }
 
     return CELL_OK;

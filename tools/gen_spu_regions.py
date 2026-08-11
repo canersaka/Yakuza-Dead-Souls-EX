@@ -82,6 +82,19 @@ def read_header_identity(diag_c_path):
     return m_pre.group(1), reg, h_path
 
 
+def resolve_diag_path(stem, declared_path):
+    """Return the active instruction twin after integration relocations.
+
+    The integration branch tracks the systematic instruction lifts under
+    yakuza/generated/diag while the manifest retains their provenance paths.
+    Exact placements added later still live at their declared paths.
+    """
+    integrated = os.path.join(TRACKED_DIAG, f"{stem}.c")
+    if os.path.exists(integrated):
+        return integrated
+    return os.path.join(ROOT, declared_path)
+
+
 def parse_spu_elf(path):
     """Minimal BE32 SPU-elf reader -> (code_bytes, base, entry)."""
     d = open(path, "rb").read()
@@ -150,10 +163,7 @@ def process_placement(famname, fam, plc, args, report):
         print(f"[{famname}] {stem:26s} cached (resume)")
         return
     if plc.get("diag"):
-        diag_c = os.path.join(ROOT, plc["diag"])
-        tracked_diag = os.path.join(TRACKED_DIAG, f"{stem}.c")
-        if os.path.exists(tracked_diag):
-            diag_c = tracked_diag
+        diag_c = resolve_diag_path(stem, plc["diag"])
         prefix, register, h_path = read_header_identity(diag_c)
     else:
         # New placement with NO shipped instruction twin (e.g. the 07-30
@@ -332,7 +342,8 @@ def main():
         for plc in fam.get("images", fam.get("placements", [])):
             if plc.get("diag"):
                 try:
-                    pfx, reg, _h = read_header_identity(os.path.join(ROOT, plc["diag"]))
+                    pfx, reg, _h = read_header_identity(
+                        resolve_diag_path(plc["stem"], plc["diag"]))
                 except SystemExit:
                     continue
             else:

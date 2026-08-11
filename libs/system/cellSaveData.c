@@ -68,6 +68,14 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 #endif
 }
 
+/* dirNamePrefix may hold multiple '|'-separated prefixes (Save_Data-Reference
+ * p.5, p.100); a directory matches if it starts with ANY of them. The old
+ * single strncmp compared the whole "A|B" string literally and enumerated
+ * nothing -- and this enumeration feeds cellSaveDataListAutoLoad, the New
+ * Game gate (2026-08-04 doc-conformance audit). Defined below the file-op
+ * helpers; declared here for the enumerators. */
+static int savedata_prefix_match(const char* name, const char* prefix);
+
 static int dir_exists(const char* path)
 {
     HOST_STAT_T st;
@@ -546,7 +554,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             if (fd.cFileName[0] == '.')
                 continue;
-            if (prefix && prefix[0] && strncmp(fd.cFileName, prefix, strlen(prefix)) != 0)
+            if (!savedata_prefix_match(fd.cFileName, prefix))
                 continue;
             {
                 char full[1024];
@@ -582,7 +590,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
             snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);
             if (!dir_exists(full))
                 continue;
-            if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
+            if (!savedata_prefix_match(de->d_name, prefix))
                 continue;
             {
                 SaveDataMetadata meta;
@@ -724,6 +732,22 @@ static u32 enumerate_save_files(const char* save_path,
 }
 
 /* Execute file callback: read/write/delete files in the save directory */
+static int savedata_prefix_match(const char* name, const char* prefix)
+{
+    if (!prefix || !prefix[0])
+        return 1;
+    const char* p = prefix;
+    while (*p) {
+        const char* bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        if (len && strncmp(name, p, len) == 0)
+            return 1;
+        if (!bar) break;
+        p = bar + 1;
+    }
+    return 0;
+}
+
 static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 {
     if (!set || !is_safe_component(set->fileName, CELL_SAVEDATA_FILENAME_SIZE - 1))
@@ -742,7 +766,13 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         FILE* fp = fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
-            return 0; /* excSize = 0 */
+            /* Save_Data-Overview p.21 / Reference p.105 (0x8002920a): a data
+             * file the game asked to READ but which does not exist terminates
+             * the utility with CELL_SAVEDATA_ERROR_FAILURE. Reporting a
+             * successful 0-byte transfer here let the game proceed on an
+             * uninitialized buffer (2026-08-04 doc-conformance audit). -2 is
+             * the caller's file-not-found sentinel. */
+            return -2;
         }
         if (set->fileOffset > 0) {
 #ifdef _MSC_VER
@@ -1114,6 +1144,8 @@ static s32 savedata_execute(const char* dirName, int is_save,
             userdata_ea = vm_read32(cb_ea + 16);
             if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
             exc_size = process_file_op_guest(save_path, file_set_ea, &metadata, is_save);
+            if (exc_size == -2)
+                return CELL_SAVEDATA_ERROR_FAILURE;   /* READ of a missing file */
             if (exc_size < 0)
                 return CELL_SAVEDATA_ERROR_PARAM;
         }

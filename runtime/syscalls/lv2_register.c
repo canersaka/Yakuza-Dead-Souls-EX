@@ -24,6 +24,7 @@
 #include "ps3emu/spu_fallback.h"
 #include "sys_event.h"
 #include "../ppu/ppu_memory.h"
+#include "ps3emu/yz_frontier_trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>  /* calloc/free: without the prototype MSVC assumed int
@@ -40,6 +41,53 @@
  * -----------------------------------------------------------------------*/
 
 extern uint8_t* vm_base;
+
+void yz_frontier_sync_snapshot(void)
+{
+    uint32_t i;
+    for (i = 0; i < SYS_SEMAPHORE_MAX; ++i) {
+        const sys_semaphore_info* s = &g_sys_semaphores[i];
+        if (!s->active) continue;
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 1u,
+            (uint32_t)s->value, (uint32_t)s->max_value,
+            (uint32_t)s->waiters, 0u, 0u, s->protocol);
+    }
+    for (i = 0; i < SYS_MUTEX_MAX; ++i) {
+        const sys_mutex_info* m = &g_sys_mutexes[i];
+        if (!m->active) continue;
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 2u,
+            (uint32_t)m->lock_count, m->recursive ? 1u : 0u,
+            0u, (uint32_t)(m->owner_tid >> 32), (uint32_t)m->owner_tid,
+            (m->protocol & 0xffffu) | ((uint32_t)m->cond_count << 16));
+    }
+    for (i = 0; i < SYS_COND_MAX; ++i) {
+        const sys_cond_info* c = &g_sys_conds[i];
+        if (!c->active) continue;
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 3u,
+            (uint32_t)c->pending, 0u, (uint32_t)c->committed,
+            c->mutex_id,
+            (uint32_t)c->waiter_tids[0],
+            (uint32_t)(c->waiter_tids[0] >> 32));
+    }
+    for (i = 0; i < SYS_RWLOCK_MAX; ++i) {
+        const sys_rwlock_info* r = &g_sys_rwlocks[i];
+        if (!r->active) continue;
+#ifdef _WIN32
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 4u,
+            (uint32_t)r->readers, (uint32_t)r->writer, 0u,
+            (uint32_t)(r->writer_tid >> 32), (uint32_t)r->writer_tid,
+            r->protocol);
+#else
+        yz_frontier_trace_emit(
+            YZ_FT_SYNC_STATE, i + 1u, 4u,
+            0u, 0u, 0u, 0u, 0u, r->protocol);
+#endif
+    }
+}
 
 static int64_t sys_tty_write(ppu_context* ctx)
 {

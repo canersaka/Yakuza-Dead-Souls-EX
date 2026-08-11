@@ -133,10 +133,29 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* Match the runtime's offline NP policy and RPCS3's Disconnected config. */
+    /* FULLY-OFFLINE POLICY (2026-08-05, REVERTS the same day's item-K fix 9).
+     *
+     * MEASURED ROOT CAUSE (soak boot 9, wt scratch/..._boot9/soak.stdout.log):
+     * reporting IPObtained made the game believe a usable network exists, so
+     * at the title->menu transition it opened
+     *   cellMsgDialogOpen2(type=0x90, "Sign in to PlayStation(R)Network?")
+     * and then waited for a sign-in that CANNOT complete here -- sceNp is an
+     * offline stub with no PSN behind it. The title screen kept rendering at
+     * 30 FPS while every input (auto-start injection AND the user's own
+     * Start presses) went nowhere: the game was parked in its sign-in flow,
+     * not in the menu. Boots 2/6 predate the IPObtained change and reached
+     * the menu normally -- that is the A/B.
+     *
+     * The 08-04 audit's complaint was module SELF-CONSISTENCY, not a demand
+     * to be online. Consistency is satisfied just as well by answering
+     * "no network" everywhere, and that is the correct story for a
+     * firmware-free offline build: no PSN prompt, no sign-in wait, no
+     * online-only code paths entered. If online behavior is ever wanted, the
+     * whole NP surface (sign-in, ticket, manager status) has to come first --
+     * then flip this together with GetInfo and the NetStart dialog. */
     *state = (s32)ps3_bswap32((u32)CELL_NET_CTL_STATE_Disconnected);
 
-    printf("[cellNetCtl] GetState() -> Disconnected\n");
+    printf("[cellNetCtl] GetState() -> Disconnected (offline policy)\n");
     return CELL_OK;
 }
 
@@ -251,7 +270,11 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
             s_handlers[i].in_use  = 1;
             s_handlers[i].handler = handler;
             s_handlers[i].arg     = arg;
-            *hid = i;
+            /* item-K fix 9: hid aliases guest BE memory -- store big-endian
+             * like every other numeric out-param in this module (the raw
+             * host-endian store handed the guest a byte-swapped id;
+             * 2026-08-04 audit). Ids 0-2 are endian-visible on PPC. */
+            *hid = (s32)ps3_bswap32((u32)i);
             printf("[cellNetCtl] AddHandler(hid=%d)\n", i);
             return CELL_OK;
         }

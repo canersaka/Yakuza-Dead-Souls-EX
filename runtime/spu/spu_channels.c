@@ -20,8 +20,9 @@
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
-#include "../../yakuza/generated/spu_image_table.h"
+#include "spu_image_table_compat.h"
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -42,6 +43,7 @@ volatile long g_yz_ucmd_handler_arg = -1;
 volatile long g_yz_ucmd_handler_completed = -1;
 volatile long g_yz_ucmd_handler_epoch = 0;
 volatile long g_yz_ucmd_handler_completed_epoch = 0;
+volatile long g_yz_ucmd_handler_active = 0;
 
 #if defined(YZ_PERF_PROFILE)
 #if defined(_MSC_VER)
@@ -974,6 +976,7 @@ static int yz_we_saved(uint32_t ea)
  * actually exist at seams (data either way). Kill switch YZ_NO_RESVSW
  * restores the legacy keep-across-switch behavior for A/B. */
 static mfc_engine* mfc_for(spu_context* ctx);
+static void mfc_release(mfc_engine* mfc);
 static void yz_resv_ctxswitch_clear(spu_context* ctx, const char* seam)
 {
     const int off = g_yz_runtime_config.no_resvsw;
@@ -992,6 +995,7 @@ static void yz_resv_ctxswitch_clear(spu_context* ctx, const char* seam)
         }
         m->resv_active = 0;
     }
+    mfc_release(m);
 }
 
 void yz_resident_save(spu_context* ctx, const char* site)
@@ -1471,6 +1475,38 @@ void spu_halt(spu_context* ctx, int status)
     /* No unwind target (e.g. unit test): fall back to returning. */
 }
 
+int spu_native_image_executor(spu_context* ctx, int image_id, uint32_t entry_pc)
+{
+    jmp_buf halt_jb, restart_jb;
+    char stack_base_marker;
+    int success;
+    if (!ctx) return 0;
+
+    ctx->image_id = image_id;
+    ctx->pc = entry_pc & SPU_LS_MASK;
+    ctx->status = SPU_STATUS_RUNNING;
+    g_spu_halt_jmp = &halt_jb;
+    g_spu_restart_jmp = &restart_jb;
+    g_spu_stack_base = &stack_base_marker;
+    g_spu_trampoline_fn = 0;
+    if (setjmp(halt_jb) == 0) {
+        (void)setjmp(restart_jb);
+        g_spu_trampoline_fn = 0;
+        ctx->host_depth = 0;
+        spu_indirect_branch(ctx);
+        SPU_DRAIN(ctx);
+        if (ctx->status == SPU_STATUS_RUNNING)
+            ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+    }
+    success = ctx->status == SPU_STATUS_STOPPED_BY_STOP ||
+              ctx->status == SPU_STATUS_STOPPED;
+    g_spu_halt_jmp = 0;
+    g_spu_restart_jmp = 0;
+    g_spu_stack_base = 0;
+    g_spu_trampoline_fn = 0;
+    return success;
+}
+
 /* ===========================================================================
  * Global lock-line lock (GETLLAR/PUTLLC transactions across all SPU host
  * threads). The critical sections are tiny (two 128-byte memcpy + memcmp),
@@ -1526,7 +1562,9 @@ void spu_lockline_unlock(void)
  * idle -- SwitchToThread returns immediately with no waiter); level 2 = a
  * real 1 ms sleep, the only rung that actually idles the core (laptop
  * heat/throttling; up to ~15 ms wall with the default timer resolution --
- * acceptable reaction latency for an SPU that has been idle this long).
+ * acceptable reaction latency for an SPU that has been idle this long);
+ * level 3 = Sleep(0), which gives any ready host thread a chance without
+ * incurring the timer-resolution delay of level 2.
  * Measured before the backoff: five SPURS kernel SPUs each burned ~97% of a
  * host core in their GETLLAR poll loops, and boot pacing collapsed under the
  * lock-line contention (see STATUS 2026-07-03); pacing recovered with the
@@ -1545,6 +1583,7 @@ __declspec(dllimport) int  __stdcall SleepConditionVariableSRW(void* cv, void* l
 __declspec(dllimport) int  __stdcall WaitOnAddress(
     volatile void* address, void* compare_address,
     size_t address_size, unsigned long milliseconds);
+__declspec(dllimport) void __stdcall WakeByAddressAll(void* address);
 __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 #else
 #include <sched.h>
@@ -1552,21 +1591,81 @@ __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 #include <time.h>
 #endif
 
-void yz_ucmd_wait_for_handler_completion(void)
+long yz_ucmd_handler_begin(long cause)
+{
+#if defined(_WIN32)
+    _InterlockedIncrement(&g_yz_ucmd_handler_active);
+    const long epoch = _InterlockedIncrement(&g_yz_ucmd_handler_epoch);
+    _InterlockedExchange(&g_yz_ucmd_handler_arg, cause);
+    return epoch;
+#else
+    ++g_yz_ucmd_handler_active;
+    g_yz_ucmd_handler_arg = cause;
+    return ++g_yz_ucmd_handler_epoch;
+#endif
+}
+
+void yz_ucmd_handler_end(long cause, long epoch)
+{
+#if defined(_WIN32)
+    _InterlockedExchange(&g_yz_ucmd_handler_completed, cause);
+    long observed = _InterlockedCompareExchange(
+        &g_yz_ucmd_handler_completed_epoch, 0, 0);
+    while (observed < epoch) {
+        const long prior = _InterlockedCompareExchange(
+            &g_yz_ucmd_handler_completed_epoch, epoch, observed);
+        if (prior == observed) break;
+        observed = prior;
+    }
+    _InterlockedDecrement(&g_yz_ucmd_handler_active);
+    WakeByAddressAll(&g_yz_ucmd_handler_active);
+#else
+    g_yz_ucmd_handler_completed = cause;
+    if (g_yz_ucmd_handler_completed_epoch < epoch)
+        g_yz_ucmd_handler_completed_epoch = epoch;
+    --g_yz_ucmd_handler_active;
+#endif
+}
+
+long yz_ucmd_wait_for_handler_completion(void)
 {
 #if defined(_WIN32)
     for (;;) {
+        const long active = _InterlockedCompareExchange(
+            &g_yz_ucmd_handler_active, 0, 0);
         const long entered = _InterlockedCompareExchange(
             &g_yz_ucmd_handler_epoch, 0, 0);
         const long completed = _InterlockedCompareExchange(
             &g_yz_ucmd_handler_completed_epoch, 0, 0);
-        if (entered == completed)
-            return;
-        long observed = completed;
-        WaitOnAddress(
-            &g_yz_ucmd_handler_completed_epoch, &observed,
-            sizeof(observed), 0xFFFFFFFFul);
+        if (!active && completed >= entered &&
+            _InterlockedCompareExchange(
+                &g_yz_ucmd_handler_active, 0, 0) == 0)
+            return entered;
+        long observed = active;
+        WaitOnAddress(&g_yz_ucmd_handler_active, &observed,
+                      sizeof(observed), 0xFFFFFFFFul);
     }
+#else
+    return g_yz_ucmd_handler_epoch;
+#endif
+}
+
+int yz_ucmd_handler_snapshot_is_stable(long epoch)
+{
+#if defined(_WIN32)
+    const long active = _InterlockedCompareExchange(
+        &g_yz_ucmd_handler_active, 0, 0);
+    const long entered = _InterlockedCompareExchange(
+        &g_yz_ucmd_handler_epoch, 0, 0);
+    const long completed = _InterlockedCompareExchange(
+        &g_yz_ucmd_handler_completed_epoch, 0, 0);
+    return !active && entered == epoch && completed >= epoch &&
+           _InterlockedCompareExchange(
+               &g_yz_ucmd_handler_active, 0, 0) == 0;
+#else
+    return g_yz_ucmd_handler_active == 0 &&
+           g_yz_ucmd_handler_epoch == epoch &&
+           g_yz_ucmd_handler_completed_epoch >= epoch;
 #endif
 }
 
@@ -1577,7 +1676,8 @@ void spu_idle_yield(int level)
         return;
     }
 #if defined(_WIN32)
-    if (level >= 2) Sleep(1);
+    if (level == 3) Sleep(0);
+    else if (level >= 2) Sleep(1);
     else SwitchToThread();
 #else
     if (level >= 2) usleep(1000);
@@ -1645,12 +1745,25 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
         return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire) != 0;
     case SPU_RdEventStat:
         return (atomic_load_explicit(&ctx->event_status, memory_order_acquire) & ctx->event_mask) != 0;
-    case MFC_RdAtomicStat:
-        return mfc_for(ctx)->atomic_stat_ready != 0;
-    case MFC_Cmd:
-        return mfc_for(ctx)->queue_count < MFC_QUEUE_DEPTH;
-    case MFC_RdTagStat:
-        return mfc_for(ctx)->tag_status_ready != 0;
+    case MFC_RdAtomicStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const int ready = m->atomic_stat_ready != 0;
+        mfc_release(m);
+        return ready;
+    }
+    case MFC_Cmd: {
+        mfc_engine* m = mfc_for(ctx);
+        const int ready = m->queue_count < MFC_QUEUE_DEPTH;
+        mfc_release(m);
+        return ready;
+    }
+    case MFC_RdTagStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const int ready = m->tag_status_ready != 0;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
+        mfc_release(m);
+        return ready;
+    }
     case MFC_WrTagUpdate:
         /* The write channel is acknowledged once the request is accepted;
          * conditional result readiness belongs to RdTagStat, not this count. */
@@ -1674,12 +1787,25 @@ static uint32_t spu_ch_count_at(spu_context* ctx, uint32_t channel)
         return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_relaxed);
     case SPU_RdEventStat:
         return (atomic_load_explicit(&ctx->event_status, memory_order_relaxed) & ctx->event_mask) ? 1u : 0u;
-    case MFC_RdAtomicStat:
-        return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
-    case MFC_Cmd:
-        return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
-    case MFC_RdTagStat:
-        return mfc_for(ctx)->tag_status_ready ? 1u : 0u;
+    case MFC_RdAtomicStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = m->atomic_stat_ready ? 1u : 0u;
+        mfc_release(m);
+        return count;
+    }
+    case MFC_Cmd: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = MFC_QUEUE_DEPTH - m->queue_count;
+        mfc_release(m);
+        return count;
+    }
+    case MFC_RdTagStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = m->tag_status_ready ? 1u : 0u;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
+        mfc_release(m);
+        return count;
+    }
     case MFC_WrTagUpdate:
         return 1u;
     default:                return 0;
@@ -1807,7 +1933,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * reserved; a stale mark only costs an extra locked write to a SPURS struct). */
 #define SPU_COH_LO 0x40000000u
 #define SPU_COH_HI 0x44000000u
-static unsigned char s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 KB, bit per 128B line */
+static atomic_uchar s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 KB, bit per 128B line */
 
 /* s41 WINDOW 2 (2026-07-16, CBEA conformance — the audit found reservation
  * coherence hard-scoped to window 1 while CBEA 9.12.10 puts NO address bound
@@ -1821,77 +1947,192 @@ static unsigned char s_coh_bitmap[((SPU_COH_HI - SPU_COH_LO) >> 7) / 8];  /* 64 
  * visible instead of silent. */
 #define SPU_COH2_LO 0x60000000u
 #define SPU_COH2_HI 0x68000000u
-static unsigned char s_coh2_bitmap[((SPU_COH2_HI - SPU_COH2_LO) >> 7) / 8];
-static uint32_t s_coh2_gen[(SPU_COH2_HI - SPU_COH2_LO) >> 7];
+static atomic_uchar s_coh2_bitmap[((SPU_COH2_HI - SPU_COH2_LO) >> 7) / 8];
+static _Atomic uint32_t s_coh2_gen[(SPU_COH2_HI - SPU_COH2_LO) >> 7];
+
+/* WINDOW 3 (2026-08-05, soak boot 2): the fail-open witness below caught a
+ * live gap — an SPU GETLLAR-reserves the camera/effect block line
+ * 0x01622280 (main-RAM game data; the standing camera-NaN lead's
+ * view-projection block is 0x01622650, same structure region) while PPU
+ * writes to it took the plain-memcpy path. Torn PPU-store-vs-PUTLLC commits
+ * on that block are the exact mixed-garbage shape of the effect-walk crash
+ * (boot 2: AV on effect-list pointer 0xFBC10074) and the camera NaNs. Same
+ * machinery, third range over the game's main-RAM structure segment.
+ * MEASURED(scratch/soak_conformance_ab_20260805_boot2/soak.stderr.log). */
+#define SPU_COH3_LO 0x01000000u
+#define SPU_COH3_HI 0x02000000u
+static atomic_uchar s_coh3_bitmap[((SPU_COH3_HI - SPU_COH3_LO) >> 7) / 8];
+static _Atomic uint32_t s_coh3_gen[(SPU_COH3_HI - SPU_COH3_LO) >> 7];
 
 /* Per-128B-line write GENERATION (mirrors RPCS3 vm::reservation_acquire). Bumped on
  * every PPU coherence write to a reserved line; GETLLAR snapshots it and LR is
  * RE-DERIVED at the next GETLLAR by comparison -- so a write that lands while no SPU
  * reservation is active (the window between PUTLLC and the next GETLLAR) is NOT lost.
  * This closes the lost-wakeup that made the SPURS codec dispatch a boot coin-flip. */
-static uint32_t s_coh_gen[(SPU_COH_HI - SPU_COH_LO) >> 7];
+static _Atomic uint32_t s_coh_gen[(SPU_COH_HI - SPU_COH_LO) >> 7];
 uint32_t spu_coh_gen(uint32_t addr)
 {
     if (addr - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO)
-        return s_coh_gen[(addr - SPU_COH_LO) >> 7];
+        return atomic_load_explicit(
+            &s_coh_gen[(addr - SPU_COH_LO) >> 7], memory_order_acquire);
     if (addr - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO)
-        return s_coh2_gen[(addr - SPU_COH2_LO) >> 7];
+        return atomic_load_explicit(
+            &s_coh2_gen[(addr - SPU_COH2_LO) >> 7], memory_order_acquire);
+    if (addr - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO)
+        return atomic_load_explicit(
+            &s_coh3_gen[(addr - SPU_COH3_LO) >> 7], memory_order_acquire);
     return 0;
 }
 
+void yz_spu_dump_line_owners(unsigned ea);   /* defined below the registry */
 void spu_coh_reserve(uint32_t ea)
 {
     if (ea - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO) {
         uint32_t line = (ea - SPU_COH_LO) >> 7;
-        s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+        atomic_fetch_or_explicit(
+            &s_coh_bitmap[line >> 3],
+            (unsigned char)(1u << (line & 7)), memory_order_release);
         return;
     }
     if (ea - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO) {
         uint32_t line = (ea - SPU_COH2_LO) >> 7;
-        s_coh2_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+        atomic_fetch_or_explicit(
+            &s_coh2_bitmap[line >> 3],
+            (unsigned char)(1u << (line & 7)), memory_order_release);
+        return;
+    }
+    if (ea - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO) {
+        uint32_t line = (ea - SPU_COH3_LO) >> 7;
+        atomic_fetch_or_explicit(
+            &s_coh3_bitmap[line >> 3],
+            (unsigned char)(1u << (line & 7)), memory_order_release);
         return;
     }
     /* Outside every coherence window: fail open, LOUD (LESSONS #21b — a
-     * silent gap here cost the taskset region its serialization for a month). */
-    { static unsigned long n = 0; n++;
-      if (n <= 8 || (n & 4095u) == 0) {
-          fprintf(stderr, "[coh] reservation OUTSIDE coherence windows ea=0x%08X n=%lu — PPU writes to this line are UNSERIALIZED\n",
-                  ea, n);
+     * silent gap here cost the taskset region its serialization for a month).
+     * 2026-08-05: per-distinct-LINE tracking — boot 2's single-counter form
+     * proved the witness works (it caught the 0x01622280 camera-block gap
+     * that became window 3) but could hide additional distinct lines behind
+     * the sampling. Each new line prints once; the periodic sample keeps
+     * overall volume visible. Racy statics are fine for a diagnostic. */
+    { static uint32_t seen_lines[8]; static int seen_n = 0;
+      static unsigned long n = 0; n++;
+      const uint32_t ln = ea & ~127u;
+      int known = 0;
+      for (int i = 0; i < seen_n; i++) if (seen_lines[i] == ln) { known = 1; break; }
+      if (!known && seen_n < 8) seen_lines[seen_n++] = ln;
+      if (!known || (n & 4095u) == 0) {
+          fprintf(stderr, "[coh] reservation OUTSIDE coherence windows ea=0x%08X (distinct line %d%s) n=%lu — PPU writes to this line are UNSERIALIZED\n",
+                  ea, known ? -1 : seen_n, seen_n >= 8 ? "+cap" : "", n);
           fflush(stderr); } }
 }
 int spu_coh_is_reserved(uint32_t addr)
 {
     if (addr - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO) {
         uint32_t line = (addr - SPU_COH_LO) >> 7;
-        return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+        return (atomic_load_explicit(
+                    &s_coh_bitmap[line >> 3], memory_order_acquire)
+                >> (line & 7)) & 1u;
     }
     if (addr - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO) {
         uint32_t line = (addr - SPU_COH2_LO) >> 7;
-        return (s_coh2_bitmap[line >> 3] >> (line & 7)) & 1u;
+        return (atomic_load_explicit(
+                    &s_coh2_bitmap[line >> 3], memory_order_acquire)
+                >> (line & 7)) & 1u;
+    }
+    if (addr - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO) {
+        uint32_t line = (addr - SPU_COH3_LO) >> 7;
+        return (atomic_load_explicit(
+                    &s_coh3_bitmap[line >> 3], memory_order_acquire)
+                >> (line & 7)) & 1u;
     }
     return 0;
 }
 
 /* ===========================================================================
  * Per-context MFC engine registry
+ *
+ * Native SPURS maps independently-saved tasks to host contexts. There can be
+ * more live task contexts than physical SPUs, so an eight-entry array is not
+ * a valid architectural limit. Keep a dynamically-sized, synchronized list:
+ * each context always owns isolated tag/reservation/list-stall state, and
+ * teardown removes the entry before the context storage is freed.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
-
-typedef struct {
+typedef struct spu_mfc_slot {
     spu_context* ctx;
     mfc_engine   mfc;
+    _Atomic uint32_t refs;
+    uint32_t     serial;
+    struct spu_mfc_slot* next;
 } spu_mfc_slot;
 
-static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
+static spu_mfc_slot* s_mfc_slots;
+static uint32_t s_mfc_slot_serial;
+static atomic_flag s_mfc_registry_lock = ATOMIC_FLAG_INIT;
+
+static void mfc_registry_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(
+               &s_mfc_registry_lock, memory_order_acquire))
+        SPU_CPU_RELAX();
+}
+
+static void mfc_registry_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_mfc_registry_lock, memory_order_release);
+}
+
+/* Frozen-ticket forensics (2026-08-05): name every SPU context touching a
+ * 128-byte line — active reservation or not — with its image id and last pc.
+ * Point-in-time racy reads on a wedged process; no locking beyond the
+ * registry walk. */
+void yz_spu_dump_line_owners(unsigned ea)
+{
+    const uint32_t line = ea & ~127u;
+    fprintf(stderr, "[line-own] line=0x%08X:\n", line);
+    mfc_registry_lock();
+    for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next) {
+        spu_context* c = s->ctx;
+        mfc_engine* m = &s->mfc;
+        const uint32_t rl = (uint32_t)(m->resv_ea & ~127ull);
+        fprintf(stderr,
+                "[line-own]  ctx serial=%u img=%d pc=0x%05X resv=%s@0x%08X\n",
+                s->serial, c ? c->image_id : -1, c ? c->pc : 0,
+                m->resv_active ? "ACTIVE" : (rl == line ? "stale" : "-"),
+                rl);
+    }
+    mfc_registry_unlock();
+    fflush(stderr);
+}
+
+
+/* Wedge forensics (2026-08-06, dialogue-load face B): every registered SPU
+ * context with image and last pc — the LS pc against the lifted sources
+ * names the wait loop each parked worker sits in. Racy point-in-time. */
+void yz_spu_dump_all_ctx(const char* tag)
+{
+    fprintf(stderr, "[ctx-dump] %s:\n", tag ? tag : "");
+    mfc_registry_lock();
+    for (spu_mfc_slot* s2 = s_mfc_slots; s2; s2 = s2->next) {
+        spu_context* c = s2->ctx;
+        mfc_engine* m = &s2->mfc;
+        fprintf(stderr,
+                "[ctx-dump]  serial=%u img=%d pc=0x%05X resv=%s@0x%08X\n",
+                s2->serial, c ? c->image_id : -1, c ? c->pc : 0,
+                m->resv_active ? "ACTIVE" : "-",
+                (uint32_t)(m->resv_ea & ~127ull));
+    }
+    mfc_registry_unlock();
+    fflush(stderr);
+}
 
 void yz_frontier_spu_snapshot(void)
 {
-    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
-        const spu_context* ctx = s_mfc_slots[slot].ctx;
-        const mfc_engine* m = &s_mfc_slots[slot].mfc;
+    mfc_registry_lock();
+    for (const spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        const spu_context* ctx = slot->ctx;
+        const mfc_engine* m = &slot->mfc;
         uint32_t outstanding_mask = 0;
-        if (!ctx)
-            continue;
 
         for (uint32_t tag = 0; tag < 32; tag++) {
             if (m->tag_outstanding[tag])
@@ -1900,7 +2141,7 @@ void yz_frontier_spu_snapshot(void)
 
         yz_frontier_trace_emit(
             YZ_FT_SPU_STATE, ctx->spu_id, ctx->pc & SPU_LS_MASK,
-            (uint32_t)slot, (uint32_t)ctx->image_id, ctx->status,
+            slot->serial, (uint32_t)ctx->image_id, ctx->status,
             ctx->host_depth,
             atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
             ctx->event_mask);
@@ -1914,7 +2155,14 @@ void yz_frontier_spu_snapshot(void)
             ctx->mfc_eal, ctx->mfc_lsa,
             ctx->mfc_size, (ctx->mfc_tag << 24) | m->queue_count,
             outstanding_mask, m->stall_mask);
+        yz_frontier_trace_emit(
+            YZ_FT_RESERVATION, ctx->spu_id, ctx->pc & SPU_LS_MASK,
+            (uint32_t)(m->resv_ea & ~127ull),
+            m->resv_active ? 1u : 0u, m->resv_gen,
+            ctx->mfc_tag & 31u,
+            slot->serial, m->resv_cas_idle_n);
     }
+    mfc_registry_unlock();
 }
 
 /*
@@ -1932,10 +2180,11 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
             parked_ea, get, put, (void*)g_yz_consumer_ctx,
             yz_consumer_cursor());
 
-    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
-        const spu_context* ctx = s_mfc_slots[slot].ctx;
-        const mfc_engine* m = &s_mfc_slots[slot].mfc;
-        if (!ctx) continue;
+    mfc_registry_lock();
+    for (const spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        const spu_context* ctx = slot->ctx;
+        const mfc_engine* m = &slot->mfc;
+        const uint32_t slot_id = slot->serial;
 
         uint32_t outstanding_mask = 0;
         for (uint32_t tag = 0; tag < 32; tag++) {
@@ -1947,7 +2196,7 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
                 "[frontier-edge] slot=%d ctx=%p spu=%04X image=%d "
                 "pc=0x%05X status=0x%X host_depth=%u module_a00=%d "
                 "module_src=0x%08X/0x%X event=0x%08X/0x%08X\n",
-                slot, (const void*)ctx, ctx->spu_id, ctx->image_id,
+                slot_id, (const void*)ctx, ctx->spu_id, ctx->image_id,
                 ctx->pc, ctx->status, ctx->host_depth, ctx->module_img_a00,
                 ctx->module_src_ea, ctx->module_src_size,
                 atomic_load_explicit(&ctx->event_status, memory_order_relaxed),
@@ -1958,7 +2207,7 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
                 "mfc{queue=%u deferred=%u completed=0x%08X "
                 "outstanding=0x%08X stall=0x%08X resv=%d@0x%08X "
                 "gen=%u polls=%u atomic=%u/%u}\n",
-                slot, ctx->mfc_lsa, ctx->mfc_eah, ctx->mfc_eal,
+                slot_id, ctx->mfc_lsa, ctx->mfc_eah, ctx->mfc_eal,
                 ctx->mfc_size, ctx->mfc_tag, ctx->mfc_tag_mask,
                 ctx->mfc_tag_status, m->queue_count, m->deferred_count,
                 m->tag_completed, outstanding_mask, m->stall_mask,
@@ -1969,7 +2218,7 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
                 "r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X "
                 "r9=%08X r10=%08X r11=%08X r12=%08X r13=%08X} "
                 "jobbase{%05X,%05X,%05X,%05X,%05X}\n",
-                slot,
+                slot_id,
                 ctx->gpr[0]._u32[0], ctx->gpr[1]._u32[0],
                 ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0],
                 ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
@@ -2004,6 +2253,7 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
             }
         }
     }
+    mfc_registry_unlock();
     fprintf(stderr, "[frontier-edge] END\n");
     fflush(stderr);
 }
@@ -2012,9 +2262,13 @@ void yz_frontier_edge_dump(uint32_t parked_ea, uint32_t get, uint32_t put)
 typedef struct spu_perf_totals {
     uint64_t hops[32];
     uint64_t dma_get[32], dma_put[32], dma_atomic[32];
+    uint64_t getllar_fast[32], getllar_locked[32];
     uint64_t ch_read[32], ch_write[32], ch_count[32];
     uint64_t waits[32], wait_qpc[32];
     uint64_t invalidations;
+    uint64_t compact_lookup_qpc;
+    uint64_t compact_submit_qpc;
+    uint64_t compact_samples;
     long long lock_contended;
     long long lock_spins;
 } spu_perf_totals;
@@ -2032,6 +2286,35 @@ static const char* const s_perf_image_names[32] = {
 static spu_perf_totals s_perf_window_start;
 static uint32_t s_perf_window_start_frame;
 static int s_perf_window_started;
+volatile uint32_t g_spu_perf_gs_atomic_pc[0x10000];
+static uint32_t s_perf_window_gs_atomic_pc[0x10000];
+
+static void spu_perf_print_gs_atomic_pc(void)
+{
+    enum { TOP = 12 };
+    uint32_t best_pc[TOP] = {0};
+    uint32_t best_count[TOP] = {0};
+    for (uint32_t slot = 0; slot < 0x10000u; ++slot) {
+        const uint32_t end = g_spu_perf_gs_atomic_pc[slot];
+        const uint32_t begin = s_perf_window_gs_atomic_pc[slot];
+        const uint32_t count = end >= begin ? end - begin : 0u;
+        if (count <= best_count[TOP - 1])
+            continue;
+        int insert = TOP - 1;
+        while (insert > 0 && best_count[insert - 1] < count) {
+            best_count[insert] = best_count[insert - 1];
+            best_pc[insert] = best_pc[insert - 1];
+            --insert;
+        }
+        best_count[insert] = count;
+        best_pc[insert] = slot << 2;
+    }
+    for (int i = 0; i < TOP && best_count[i] != 0u; ++i)
+        fprintf(stderr,
+                "[spu-perf-gs-atomic-pc] pc=0x%05X count=%u\n",
+                best_pc[i], best_count[i]);
+    fflush(stderr);
+}
 
 static void spu_perf_collect(spu_perf_totals* totals)
 {
@@ -2042,15 +2325,20 @@ static void spu_perf_collect(spu_perf_totals* totals)
         _InterlockedCompareExchange64(&s_perf_lock_spins, 0, 0);
 
     (void)yz_perf_qpc_now();
-    for (int slot = 0; slot < SPU_MAX_CONTEXTS; slot++) {
-        const spu_context* ctx = s_mfc_slots[slot].ctx;
-        if (!ctx) continue;
+    mfc_registry_lock();
+    for (const spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        const spu_context* ctx = slot->ctx;
         totals->invalidations += ctx->perf_reservation_invalidations;
+        totals->compact_lookup_qpc += ctx->perf_compact_lookup_qpc;
+        totals->compact_submit_qpc += ctx->perf_compact_submit_qpc;
+        totals->compact_samples += ctx->perf_compact_samples;
         for (int image = 0; image < 32; image++) {
             totals->hops[image] += ctx->perf_hops[image];
             totals->dma_get[image] += ctx->perf_dma_get[image];
             totals->dma_put[image] += ctx->perf_dma_put[image];
             totals->dma_atomic[image] += ctx->perf_dma_atomic[image];
+            totals->getllar_fast[image] += ctx->perf_getllar_fast[image];
+            totals->getllar_locked[image] += ctx->perf_getllar_locked[image];
             totals->ch_read[image] += ctx->perf_ch_read[image];
             totals->ch_write[image] += ctx->perf_ch_write[image];
             totals->ch_count[image] += ctx->perf_ch_count[image];
@@ -2058,6 +2346,136 @@ static void spu_perf_collect(spu_perf_totals* totals)
             totals->wait_qpc[image] += ctx->perf_wait_qpc[image];
         }
     }
+    mfc_registry_unlock();
+}
+
+typedef struct spu_perf_frame_sample {
+    uint32_t frame;
+    uint32_t top_image;
+    uint64_t gs_hops;
+    uint64_t gs_atomic;
+    uint64_t gs_ch_write;
+    uint64_t all_hops;
+    uint64_t all_atomic;
+    uint64_t top_hops;
+    uint64_t lock_contended;
+    uint64_t lock_spins;
+    uint64_t compact_lookup_qpc;
+    uint64_t compact_submit_qpc;
+    uint64_t compact_samples;
+} spu_perf_frame_sample;
+
+enum { SPU_PERF_FRAME_CAP = 256 };
+static spu_perf_frame_sample s_perf_frames[SPU_PERF_FRAME_CAP];
+static uint32_t s_perf_frame_count;
+static int s_perf_frame_started;
+static spu_perf_totals s_perf_frame_previous;
+
+void spu_perf_frame_sample_record(uint32_t guest_frame)
+{
+    spu_perf_totals current;
+    spu_perf_collect(&current);
+    if (!s_perf_frame_started) {
+        s_perf_frame_previous = current;
+        s_perf_frame_started = 1;
+        s_perf_frame_count = 0;
+        return;
+    }
+
+    spu_perf_frame_sample* sample =
+        &s_perf_frames[s_perf_frame_count % SPU_PERF_FRAME_CAP];
+    memset(sample, 0, sizeof(*sample));
+    sample->frame = guest_frame;
+    sample->lock_contended =
+        current.lock_contended >= s_perf_frame_previous.lock_contended
+            ? (uint64_t)(current.lock_contended -
+                         s_perf_frame_previous.lock_contended) : 0u;
+    sample->lock_spins =
+        current.lock_spins >= s_perf_frame_previous.lock_spins
+            ? (uint64_t)(current.lock_spins -
+                         s_perf_frame_previous.lock_spins) : 0u;
+    sample->compact_lookup_qpc =
+        current.compact_lookup_qpc >=
+                s_perf_frame_previous.compact_lookup_qpc
+            ? current.compact_lookup_qpc -
+                s_perf_frame_previous.compact_lookup_qpc : 0u;
+    sample->compact_submit_qpc =
+        current.compact_submit_qpc >=
+                s_perf_frame_previous.compact_submit_qpc
+            ? current.compact_submit_qpc -
+                s_perf_frame_previous.compact_submit_qpc : 0u;
+    sample->compact_samples =
+        current.compact_samples >= s_perf_frame_previous.compact_samples
+            ? current.compact_samples -
+                s_perf_frame_previous.compact_samples : 0u;
+    for (uint32_t image = 0; image < 32u; ++image) {
+        const uint64_t hops =
+            current.hops[image] >= s_perf_frame_previous.hops[image]
+                ? current.hops[image] - s_perf_frame_previous.hops[image] : 0;
+        const uint64_t atomics =
+            current.dma_atomic[image] >=
+                    s_perf_frame_previous.dma_atomic[image]
+                ? current.dma_atomic[image] -
+                    s_perf_frame_previous.dma_atomic[image] : 0;
+        const uint64_t ch_write =
+            current.ch_write[image] >=
+                    s_perf_frame_previous.ch_write[image]
+                ? current.ch_write[image] -
+                    s_perf_frame_previous.ch_write[image] : 0;
+        sample->all_hops += hops;
+        sample->all_atomic += atomics;
+        if (hops > sample->top_hops) {
+            sample->top_hops = hops;
+            sample->top_image = image;
+        }
+        if (image == 0u) {
+            sample->gs_hops = hops;
+            sample->gs_atomic = atomics;
+            sample->gs_ch_write = ch_write;
+        }
+    }
+    s_perf_frame_previous = current;
+    ++s_perf_frame_count;
+}
+
+void spu_perf_frame_sample_dump(uint32_t guest_start, uint32_t guest_end)
+{
+    const uint32_t count = s_perf_frame_count < SPU_PERF_FRAME_CAP
+        ? s_perf_frame_count : SPU_PERF_FRAME_CAP;
+    const uint32_t first = s_perf_frame_count > SPU_PERF_FRAME_CAP
+        ? s_perf_frame_count - SPU_PERF_FRAME_CAP : 0u;
+    fprintf(stderr,
+            "[spu-perf-frame-range] guest_frames=%u-%u samples=%u\n",
+            guest_start, guest_end, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const spu_perf_frame_sample* sample =
+            &s_perf_frames[(first + i) % SPU_PERF_FRAME_CAP];
+        fprintf(stderr,
+                "[spu-perf-frame] frame=%u gs_hops=%llu gs_atomic=%llu "
+                "gs_ch_write=%llu all_hops=%llu all_atomic=%llu "
+                "lock_contended=%llu lock_spins=%llu "
+                "compact_samples=%llu compact_lookup_qpc=%llu "
+                "compact_submit_qpc=%llu "
+                "top_image=%u top_name=%s top_hops=%llu\n",
+                sample->frame,
+                (unsigned long long)sample->gs_hops,
+                (unsigned long long)sample->gs_atomic,
+                (unsigned long long)sample->gs_ch_write,
+                (unsigned long long)sample->all_hops,
+                (unsigned long long)sample->all_atomic,
+                (unsigned long long)sample->lock_contended,
+                (unsigned long long)sample->lock_spins,
+                (unsigned long long)sample->compact_samples,
+                (unsigned long long)sample->compact_lookup_qpc,
+                (unsigned long long)sample->compact_submit_qpc,
+                sample->top_image,
+                s_perf_image_names[sample->top_image]
+                    ? s_perf_image_names[sample->top_image] : "unknown",
+                (unsigned long long)sample->top_hops);
+    }
+    fflush(stderr);
+    s_perf_frame_started = 0;
+    s_perf_frame_count = 0;
 }
 
 static void spu_perf_print(const char* header, const char* image_header,
@@ -2073,12 +2491,14 @@ static void spu_perf_print(const char* header, const char* image_header,
     for (int image = 0; image < 32; image++) {
         if (!(totals->hops[image] || totals->dma_get[image] ||
               totals->dma_put[image] || totals->dma_atomic[image] ||
+              totals->getllar_fast[image] || totals->getllar_locked[image] ||
               totals->ch_read[image] || totals->ch_write[image] ||
               totals->ch_count[image] || totals->waits[image]))
             continue;
         fprintf(stderr,
                 "[%s] id=%d name=%s hops=%llu "
                 "dma_get=%llu dma_put=%llu dma_atomic=%llu "
+                "getllar_fast=%llu getllar_locked=%llu "
                 "ch_read=%llu ch_write=%llu ch_count=%llu "
                 "waits=%llu wait_qpc=%llu wait_ms=%.3f\n",
                 image_header, image,
@@ -2088,6 +2508,8 @@ static void spu_perf_print(const char* header, const char* image_header,
                 (unsigned long long)totals->dma_get[image],
                 (unsigned long long)totals->dma_put[image],
                 (unsigned long long)totals->dma_atomic[image],
+                (unsigned long long)totals->getllar_fast[image],
+                (unsigned long long)totals->getllar_locked[image],
                 (unsigned long long)totals->ch_read[image],
                 (unsigned long long)totals->ch_write[image],
                 (unsigned long long)totals->ch_count[image],
@@ -2111,6 +2533,9 @@ void spu_perf_dump(void)
 void spu_perf_window_begin(uint32_t guest_frame)
 {
     spu_perf_collect(&s_perf_window_start);
+    for (uint32_t slot = 0; slot < 0x10000u; ++slot)
+        s_perf_window_gs_atomic_pc[slot] =
+            g_spu_perf_gs_atomic_pc[slot];
     s_perf_window_start_frame = guest_frame;
     s_perf_window_started = 1;
     fprintf(stderr, "[spu-perf-window-begin] guest_frame=%u\n", guest_frame);
@@ -2131,6 +2556,8 @@ void spu_perf_window_dump(uint32_t guest_frame)
         SPU_PERF_DELTA(dma_get);
         SPU_PERF_DELTA(dma_put);
         SPU_PERF_DELTA(dma_atomic);
+        SPU_PERF_DELTA(getllar_fast);
+        SPU_PERF_DELTA(getllar_locked);
         SPU_PERF_DELTA(ch_read);
         SPU_PERF_DELTA(ch_write);
         SPU_PERF_DELTA(ch_count);
@@ -2150,60 +2577,93 @@ void spu_perf_window_dump(uint32_t guest_frame)
     fprintf(stderr, "[spu-perf-window-range] guest_frames=%u-%u\n",
             s_perf_window_start_frame, guest_frame);
     spu_perf_print("spu-perf-window", "spu-perf-window-image", &end);
+    spu_perf_print_gs_atomic_pc();
     s_perf_window_started = 0;
 }
 #endif
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    spu_mfc_slot* free_slot = NULL;
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
-        if (!free_slot && s_mfc_slots[i].ctx == NULL)
-            free_slot = &s_mfc_slots[i];
+    mfc_registry_lock();
+    if (atomic_load_explicit(&ctx->mfc_retiring, memory_order_acquire)) {
+        mfc_registry_unlock();
+        fprintf(stderr, "[mfc] FATAL: channel access after ctx retirement %p\n",
+                (void*)ctx);
+        fflush(stderr);
+        abort();
     }
-    if (free_slot) {
-        free_slot->ctx = ctx;
-        mfc_engine_init(&free_slot->mfc);
-        return &free_slot->mfc;
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            atomic_fetch_add_explicit(&slot->refs, 1, memory_order_relaxed);
+            mfc_registry_unlock();
+            return &slot->mfc;
+        }
     }
-    /* Out of slots: fall back to a shared engine (correct for single-SPU).
-     * s40: SHARED-STATE HAZARD — a shared engine mixes reservations, tag masks
-     * and list-stall state across unrelated SPUs (2026-07-15 external review,
-     * confirmed by code read). Current boots register ~5 contexts so this path
-     * never engages (grep for this banner to verify per boot); if it EVER
-     * fires, fix the registry before trusting any SPU behavior. */
-    { static int warned = 0;
-      if (!warned) { warned = 1;
-          fprintf(stderr, "[mfc] WARNING: context registry EXHAUSTED (>%d) — SHARED fallback engine engaged, cross-SPU state mixing possible\n",
-                  SPU_MAX_CONTEXTS);
-          fflush(stderr); } }
-    static mfc_engine fallback;
-    static int fallback_init = 0;
-    if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
-    return &fallback;
+    spu_mfc_slot* slot = (spu_mfc_slot*)calloc(1, sizeof(*slot));
+    if (!slot) {
+        mfc_registry_unlock();
+        fprintf(stderr,
+                "[mfc] FATAL: cannot allocate isolated engine for ctx=%p\n",
+                (void*)ctx);
+        fflush(stderr);
+        abort();
+    }
+    slot->ctx = ctx;
+    atomic_init(&slot->refs, 1);
+    slot->serial = ++s_mfc_slot_serial;
+    mfc_engine_init(&slot->mfc);
+    slot->next = s_mfc_slots;
+    s_mfc_slots = slot;
+    mfc_registry_unlock();
+    return &slot->mfc;
 }
 
-/* Unregister a context's MFC engine slot. Called at SPU thread/group teardown
- * (sys_spu_thread_group_destroy_handler, runtime/syscalls/lv2_register.c) so
- * a destroy/create cycle does not permanently strand a slot -- previously
- * s_mfc_slots entries were never cleared, so SPU_MAX_CONTEXTS destroy/create
- * cycles exhausted the registry and pushed every later context onto the
- * shared-state-hazard fallback engine above. Matches on the same key mfc_for()
- * uses (the spu_context pointer). No-op if `ctx` never registered (e.g. a
- * thread whose entry only ever resolved to a PPU fallback, or whose group was
- * destroyed before it made its first MFC channel access) or is NULL. */
+static void mfc_release(mfc_engine* mfc)
+{
+    spu_mfc_slot* slot = (spu_mfc_slot*)((uint8_t*)mfc -
+        offsetof(spu_mfc_slot, mfc));
+    atomic_fetch_sub_explicit(&slot->refs, 1, memory_order_release);
+}
+
+/* No-op if `ctx` never issued an MFC channel operation. */
 void spu_mfc_unregister(spu_context* ctx)
 {
     if (!ctx) return;
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx == ctx) {
-            s_mfc_slots[i].ctx = NULL;
-            memset(&s_mfc_slots[i].mfc, 0, sizeof(s_mfc_slots[i].mfc));
+    atomic_store_explicit(&ctx->mfc_retiring, 1, memory_order_release);
+    mfc_registry_lock();
+    spu_mfc_slot** link = &s_mfc_slots;
+    while (*link) {
+        spu_mfc_slot* slot = *link;
+        if (slot->ctx == ctx) {
+            *link = slot->next;
+            mfc_registry_unlock();
+            while (atomic_load_explicit(&slot->refs,
+                                        memory_order_acquire) != 0)
+                SPU_CPU_RELAX();
+            memset(&slot->mfc, 0, sizeof(slot->mfc));
+            free(slot);
             return;
         }
+        link = &slot->next;
     }
+    mfc_registry_unlock();
+}
+
+/* A task switch flushes the SPU atomic cache.  Ordinary DMA has already been
+ * drained by the task API before this seam; only the lock-line reservation
+ * needs to be discarded from the persistent host MFC engine. */
+void spu_mfc_context_switch(spu_context* ctx)
+{
+    if (!ctx) return;
+    mfc_registry_lock();
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            slot->mfc.resv_active = 0;
+            slot->mfc.resv_poll_n = 0;
+            break;
+        }
+    }
+    mfc_registry_unlock();
 }
 
 /* SPU_EVENT_LR (lock-line reservation lost): a write by another processor to a
@@ -2218,13 +2678,21 @@ void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
     if (line - SPU_COH_LO < SPU_COH_HI - SPU_COH_LO)
-        s_coh_gen[(line - SPU_COH_LO) >> 7]++;   /* generation bump -- the missed-edge fix */
+        atomic_fetch_add_explicit(
+            &s_coh_gen[(line - SPU_COH_LO) >> 7], 1,
+            memory_order_release); /* generation bump -- missed-edge fix */
     else if (line - SPU_COH2_LO < SPU_COH2_HI - SPU_COH2_LO)
-        s_coh2_gen[(line - SPU_COH2_LO) >> 7]++; /* s41 window 2 */
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        spu_context* c = s_mfc_slots[i].ctx;
-        if (!c) continue;
-        mfc_engine* m = &s_mfc_slots[i].mfc;
+        atomic_fetch_add_explicit(
+            &s_coh2_gen[(line - SPU_COH2_LO) >> 7], 1,
+            memory_order_release); /* s41 window 2 */
+    else if (line - SPU_COH3_LO < SPU_COH3_HI - SPU_COH3_LO)
+        atomic_fetch_add_explicit(
+            &s_coh3_gen[(line - SPU_COH3_LO) >> 7], 1,
+            memory_order_release); /* 2026-08-05 window 3 (camera/effect block) */
+    mfc_registry_lock();
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        spu_context* c = slot->ctx;
+        mfc_engine* m = &slot->mfc;
         if (m->resv_active && (uint32_t)(m->resv_ea & ~127ull) == line) {
             /* FIX 2 (2026-07-17): atomic fetch-or, not a plain `|=`. This is a
              * genuine cross-thread write (the caller, shims.cpp VM_WRITE_COH,
@@ -2252,6 +2720,7 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+    mfc_registry_unlock();
 }
 
 static int channel_is_mfc(uint32_t ch)
@@ -2304,8 +2773,9 @@ static int yz_frontier_job_select_relevant(
         selected_image == 15 || ctx->image_id == 15)
         return 1;
     if (selected_image == 14 || ctx->image_id == 14) {
-        static volatile long sample_count[SPU_MAX_CONTEXTS];
-        const unsigned slot = ctx->spu_id & (SPU_MAX_CONTEXTS - 1u);
+        enum { SPU_JOB_SAMPLE_SLOTS = 64 };
+        static volatile long sample_count[SPU_JOB_SAMPLE_SLOTS];
+        const unsigned slot = ctx->spu_id & (SPU_JOB_SAMPLE_SLOTS - 1u);
         const unsigned long n =
             (unsigned long)_InterlockedIncrement(&sample_count[slot]);
         return (n & 0xFFu) == 1u;
@@ -2326,6 +2796,22 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
      * mfc_submit (spu_dma.h) once the whole command is assembled. */
     if (yz_fltrec_hot(ctx)) yz_fltrec_wrch(ctx, channel, v);
 
+    /* MFC parameter channels only stage values in this SPU context.  They do
+     * not inspect or mutate the context's mfc_engine, so avoid taking the
+     * process-wide MFC registry lock merely to reach mfc_channel_write's
+     * corresponding assignments.  MFC_Cmd and the status/list operations
+     * still resolve the isolated engine below, preserving command issue,
+     * ordering, queue-capacity, and reservation behavior exactly. */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;      return;
+    case MFC_EAH:       ctx->mfc_eah = v;      return;
+    case MFC_EAL:       ctx->mfc_eal = v;      return;
+    case MFC_Size:      ctx->mfc_size = v;     return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1Fu; return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v; return;
+    default: break;
+    }
+
     if (channel_is_mfc(channel)) {
         if (channel == MFC_Cmd &&
             yz_frontier_trace_is_armed() &&
@@ -2341,7 +2827,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             spu_ch_wait(ctx, MFC_Cmd, "wrch");
         if (channel == MFC_WrTagUpdate && !yz_ch_nonblock())
             spu_ch_wait(ctx, MFC_WrTagUpdate, "wrch");
-        mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        mfc_engine* mfc = mfc_for(ctx);
+        mfc_channel_write(mfc, ctx, channel, v);
+        mfc_release(mfc);
         return;
     }
 
@@ -2618,6 +3106,9 @@ unsigned long g_spu_ch_rd[128]  = {0};
 unsigned long g_spu_ch_cnt[128] = {0};
 unsigned long g_spu_getllar_n   = 0;
 uint32_t      g_spu_getllar_ea  = 0;
+/* Job output-DMA census (spu_dma.h mfc_submit; read by cellSpurs.c run_job). */
+volatile unsigned long g_yz_job_dma_put_n     = 0;
+volatile unsigned long g_yz_job_dma_put_bytes = 0;
 unsigned long g_spu_putllc_log  = 0;   /* spu_dma.h mgmt-CAS diag cap (YZ_SPU_PROF) */
 unsigned long g_spu_lsdump_n    = 0;   /* spu_dma.h mgmt-GETLLAR kernel-ctx dump cap */
 unsigned long g_spu_wrun_log    = 0;   /* spu_context.h wklRunnable-write diag cap */
@@ -2642,6 +3133,88 @@ void spu_llar_note(uint32_t ea)
         g_spu_llar_cnt[g_spu_llar_nea] = 1;
         g_spu_llar_nea++;
     }
+}
+
+void spu_mfc_issue_compact(spu_context* ctx,
+                           uint32_t lsa, uint32_t eah, uint32_t eal,
+                           uint32_t size, uint32_t tag, uint32_t cmd,
+                           const uint32_t channel_pcs[6])
+{
+    static const uint32_t channels[6] = {
+        MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd
+    };
+    const uint32_t values[6] = { lsa, eah, eal, size, tag, cmd };
+
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_write[ctx->image_id] += 6u;
+#endif
+
+    if (yz_fltrec_hot(ctx)) {
+        const uint32_t saved_pc = ctx->pc;
+        for (unsigned i = 0; i < 6u; ++i) {
+            if (channel_pcs)
+                ctx->pc = channel_pcs[i];
+            yz_fltrec_wrch(ctx, channels[i], values[i]);
+        }
+        ctx->pc = saved_pc;
+    }
+
+    ctx->mfc_lsa = lsa;
+    ctx->mfc_eah = eah;
+    ctx->mfc_eal = eal;
+    ctx->mfc_size = size;
+    ctx->mfc_tag = tag & 0x1Fu;
+
+    if (yz_frontier_trace_is_armed() && yz_frontier_dma_is_relevant(ctx)) {
+        yz_frontier_trace_emit(
+            YZ_FT_SPU_DMA_CMD, ctx->spu_id,
+            ctx->pc & SPU_LS_MASK,
+            cmd & 0xFFu, ctx->mfc_lsa & SPU_LS_MASK,
+            ctx->mfc_eal, ctx->mfc_size,
+            ctx->mfc_tag, (uint32_t)ctx->image_id);
+    }
+    if (!yz_ch_nonblock())
+        spu_ch_wait(ctx, MFC_Cmd, "wrch-compact");
+#if defined(YZ_PERF_PROFILE)
+    if (ctx->image_id == 0 && (ctx->pc & SPU_LS_MASK) == 0x638Cu &&
+        ((ctx->perf_compact_sample_counter++ & 63u) == 0u)) {
+        const uint64_t begin = yz_perf_qpc_now();
+        mfc_engine* const mfc = mfc_for(ctx);
+        const uint64_t after_lookup = yz_perf_qpc_now();
+        mfc_channel_write(mfc, ctx, MFC_Cmd, cmd);
+        const uint64_t after_submit = yz_perf_qpc_now();
+        ctx->perf_compact_lookup_qpc += after_lookup - begin;
+        ctx->perf_compact_submit_qpc += after_submit - after_lookup;
+        ctx->perf_compact_samples++;
+        mfc_release(mfc);
+        return;
+    }
+#endif
+    mfc_engine* const mfc = mfc_for(ctx);
+    mfc_channel_write(mfc, ctx, MFC_Cmd, cmd);
+    mfc_release(mfc);
+}
+
+uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx)
+{
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_count[ctx->image_id]++;
+#endif
+    mfc_engine* const mfc = mfc_for(ctx);
+    if (!mfc->atomic_stat_ready) {
+        mfc_release(mfc);
+        return 0;
+    }
+#if defined(YZ_PERF_PROFILE)
+    if ((unsigned)ctx->image_id < 32u)
+        ctx->perf_ch_read[ctx->image_id]++;
+#endif
+    const uint32_t status =
+        mfc_channel_read(mfc, ctx, MFC_RdAtomicStat);
+    mfc_release(mfc);
+    return (1ull << 32) | status;
 }
 
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
@@ -2676,7 +3249,9 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     if (channel_is_mfc(channel)) {
         if ((channel == MFC_RdAtomicStat || channel == MFC_RdTagStat) && !yz_ch_nonblock())
             spu_ch_wait(ctx, channel, "rdch");
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        mfc_engine* mfc = mfc_for(ctx);
+        v = mfc_channel_read(mfc, ctx, channel);
+        mfc_release(mfc);
         /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only). */
         if (yz_fltrec_hot(ctx)) yz_fltrec_rdch(ctx, channel, v);
         return spu_make_preferred_u32(v);
@@ -2801,6 +3376,16 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     return spu_make_preferred_u32(v);
 }
 
+void spu_task_wait_all_dma(spu_context* ctx)
+{
+    if (!ctx) return;
+    const uint32_t saved_tag_mask = ctx->mfc_tag_mask;
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(UINT32_MAX));
+    spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(2u));
+    (void)spu_rdch(ctx, MFC_RdTagStat);
+    spu_wrch(ctx, MFC_WrTagMask, spu_make_preferred_u32(saved_tag_mask));
+}
+
 /* ===========================================================================
  * Channel count (rchcnt) -- how many entries can be read/written right now
  * ===========================================================================*/
@@ -2845,10 +3430,26 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count; /* same-thread only */
     case SPU_RdSigNotify1:   return atomic_load_explicit(&ctx->ch_sig_notify[0].count, memory_order_acquire);
     case SPU_RdSigNotify2:   return atomic_load_explicit(&ctx->ch_sig_notify[1].count, memory_order_acquire);
-    case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
-    case MFC_RdTagStat:      return mfc_for(ctx)->tag_status_ready ? 1u : 0u;
+    case MFC_Cmd: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = MFC_QUEUE_DEPTH - m->queue_count;
+        mfc_release(m);
+        return count;
+    }
+    case MFC_RdTagStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = m->tag_status_ready ? 1u : 0u;
+        mfc_stucktag_check(m, ctx);   /* lost-completion witness (root hunt) */
+        mfc_release(m);
+        return count;
+    }
     case MFC_WrTagUpdate:    return 1u;
-    case MFC_RdAtomicStat:   return mfc_for(ctx)->atomic_stat_ready ? 1u : 0u;
+    case MFC_RdAtomicStat: {
+        mfc_engine* m = mfc_for(ctx);
+        const u32 count = m->atomic_stat_ready ? 1u : 0u;
+        mfc_release(m);
+        return count;
+    }
     case MFC_RdListStallStat:
         /* F11/P6: nonzero (readable) iff at least one tag is currently
          * stalled, mirroring RPCS3 SPUThread.cpp:5298
@@ -2861,7 +3462,12 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
          * path -- MFC_RdListStallStat had no rchcnt case before this change
          * and fell through to the generic `default: return 1`, which was
          * spec-wrong for the common "nothing stalled" case). */
-        return mfc_for(ctx)->stall_mask ? 1u : 0u;
+        {
+            mfc_engine* m = mfc_for(ctx);
+            const u32 count = m->stall_mask ? 1u : 0u;
+            mfc_release(m);
+            return count;
+        }
     default:
         /* s39: an UNIMPLEMENTED channel has zero capacity on the ISA -- rchcnt
          * must read 0, not 1. The old default-1 falsely told guest code the
@@ -4094,6 +4700,48 @@ void yz_tr_record(spu_context* ctx, uint32_t lsa, const uint32_t* v)
 }
 #endif
 
+/* Clean-build half of the focused stopper lifecycle recorder.  Most of the
+ * record-output census above is intentionally absent from YZ_PERF_CLEAN, but
+ * root-cause boots still need the exact self-stop creation and later DMA
+ * overwrite history when YZ_A010_RELEASE_TRACE is explicitly requested. */
+extern void yz_a010_reltrace_spu(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size,
+    const uint32_t* context);
+
+void yz_a010_release_trace_put(spu_context* ctx, uint32_t producer_pc,
+                               uint32_t ea, const uint8_t* payload,
+                               uint32_t size)
+{
+    uint32_t trace_context[16] = {0};
+    uint32_t wi, off;
+
+    if (g_yz_a010_release_scene_active != 0 &&
+        ctx->image_id == 0 &&
+        (producer_pc == 0x05F70u ||
+         (producer_pc >= 0x05EB8u && producer_pc <= 0x05F20u))) {
+        for (wi = 0; wi < 8u; ++wi)
+            trace_context[wi] = ctx->gpr[wi + 3u]._u32[0];
+        for (wi = 0; wi < 2u; ++wi) {
+            const uint32_t lsa = trace_context[wi] & SPU_LS_MASK;
+            if (lsa + 16u > SPU_LS_SIZE)
+                continue;
+            for (off = 0; off < 16u; off += 4u) {
+                const uint8_t* const p = &ctx->ls[lsa + off];
+                trace_context[8u + wi * 4u + off / 4u] =
+                    ((uint32_t)p[0] << 24) |
+                    ((uint32_t)p[1] << 16) |
+                    ((uint32_t)p[2] << 8) |
+                    (uint32_t)p[3];
+            }
+        }
+    }
+
+    yz_a010_reltrace_spu(
+        ctx->spu_id, (uint32_t)ctx->image_id, producer_pc,
+        ea, payload, size, trace_context);
+}
+
 /*
  * Exact a010 static-stage result addresses, published by Job A and consumed
  * by whichever SPU owns the next handoff.  These shared globals deliberately
@@ -5186,9 +5834,98 @@ static const char* spu_img_class(uint32_t pc)
  * the 0xA70 taskset-syscall probe below) — so the budget captures the code of
  * interest instead of boot-time dispatch-loop noise. */
 int g_spu_trace_evarm = 0;
+volatile int g_yz_task_dma_trace_phase = 0;
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    if ((ctx->pc & SPU_LS_MASK) == 0x0A70u && ctx->image_id == 0 &&
+        getenv("YZ_TASK_STATE_TRACE")) {
+        static int first_poll_traced = 0;
+        static int first_yield_seen = 0;
+        static int after_yield_traced = 0;
+        int opens_dma_window = 0;
+        const uint32_t task_op = ctx->gpr[3]._u32[0] & 0x0fu;
+        if (task_op == 1u)
+            first_yield_seen = 1;
+        if (task_op == 3u &&
+            (!first_poll_traced ||
+             (first_yield_seen && !after_yield_traced))) {
+            const char* phase;
+            if (!first_poll_traced) {
+                first_poll_traced = 1;
+                phase = "before-yield";
+                opens_dma_window = 1;
+            } else {
+                after_yield_traced = 1;
+                phase = "after-yield";
+                if (!getenv("YZ_TASK_DMA_TRACE_CONTINUE"))
+                    g_yz_task_dma_trace_phase = 2;
+            }
+            const uint32_t object = ctx->gpr[80]._u32[0] & SPU_LS_MASK;
+            fprintf(stderr,
+                    "[task-state] %s spu=%X object=0x%05X "
+                    "r3=%08X_%08X_%08X_%08X "
+                    "r4=%08X_%08X_%08X_%08X\n",
+                    phase, ctx->spu_id, object,
+                    ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
+                    ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                    ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1],
+                    ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3]);
+            if (object <= SPU_LS_SIZE - 0xD0u) {
+                for (uint32_t off = 0; off < 0xD0u; off += 0x10u) {
+                    fprintf(stderr,
+                            "[task-state] obj+%02X %08X %08X %08X %08X\n",
+                            off,
+                            yz_ls_w32(ctx->ls + object + off + 0x0u),
+                            yz_ls_w32(ctx->ls + object + off + 0x4u),
+                            yz_ls_w32(ctx->ls + object + off + 0x8u),
+                            yz_ls_w32(ctx->ls + object + off + 0xCu));
+                }
+            }
+            fprintf(stderr,
+                    "[task-state] kernel+1C0 %08X %08X %08X %08X "
+                    "%08X %08X %08X %08X\n",
+                    yz_ls_w32(ctx->ls + 0x1C0u),
+                    yz_ls_w32(ctx->ls + 0x1C4u),
+                    yz_ls_w32(ctx->ls + 0x1C8u),
+                    yz_ls_w32(ctx->ls + 0x1CCu),
+                    yz_ls_w32(ctx->ls + 0x1D0u),
+                    yz_ls_w32(ctx->ls + 0x1D4u),
+                    yz_ls_w32(ctx->ls + 0x1D8u),
+                    yz_ls_w32(ctx->ls + 0x1DCu));
+            fflush(stderr);
+            if (opens_dma_window)
+                g_yz_task_dma_trace_phase = 1;
+            if (after_yield_traced &&
+                getenv("YZ_FLTREC_DUMP_ON_TASK_STATE")) {
+                yz_fltrec_dump("task-after-first-yield");
+            }
+        }
+    }
+    /* Firmware-free SPURS task syscall entry. LLE contexts leave the callback
+     * null and proceed through the historical dispatcher unchanged. */
+    if ((ctx->pc & SPU_LS_MASK) == 0x0A70u && ctx->native_spurs_syscall) {
+        int native_result = ctx->native_spurs_syscall(
+            ctx, ctx->native_spurs_opaque);
+        if (native_result > 0) {
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            /* Match an SPU `bi $lr` return.  When the lifted caller's host
+             * frame is still live, its call bracket owns the continuation
+             * and will publish it after the nested drain unwinds.  Dispatching
+             * r0 here as well executes the callee epilogue twice (and, for a
+             * blocking task syscall, leaks one guest stack frame per wake).
+             * A top-level/restacked resume has no such host caller, so only
+             * that case must re-enter through the indirect dispatcher. */
+            g_spu_trampoline_fn =
+                spu_return_needs_dispatch(ctx) ? spu_indirect_branch : 0;
+        } else if (native_result < 0) {
+            spu_halt(ctx, SPU_STATUS_STOPPED_BY_STOP);
+        } else {
+            spu_halt(ctx, SPU_STATUS_STOPPED_BY_HALT);
+        }
+        return;
+    }
+
     /*
      * Focused a010 item-lifecycle census.  Start at the first static-stage
      * record rather than the later mature 819-record batch: the top-level
@@ -5582,7 +6319,15 @@ void spu_indirect_branch(spu_context* ctx)
              * below.  Clearing overlapping records is required: Job A, Job B,
              * Job D, and the orphanage worker reuse shared slots.
              */
-            if (family && jpc >= 0x04880u) {
+            /* image_id == 13 gate (matches the sibling blocks above/below): a
+             * real job launch is a bisl FROM the job module. Without the gate
+             * every computed branch job code takes past 0x4880 (e.g. the
+             * shared Duff's-device qword-memset tail at base+0x90C, ~half a
+             * million times per scene) is misparsed as a launch record — r4
+             * there is a destination pointer, not a descriptor — and a stale
+             * r4 whose +4 word matched a catalogued EA could memcpy over live
+             * LS code. */
+            if (family && ctx->image_id == 13 && jpc >= 0x04880u) {
                 const uint32_t record =
                     ctx->gpr[4]._u32[0] & SPU_LS_MASK;
                 const uint32_t binary_ea =
@@ -5635,6 +6380,28 @@ void spu_indirect_branch(spu_context* ctx)
                                     descriptor_span);
                             fflush(stderr);
                         }
+                    }
+                } else {
+                    /* Unrecognized job launch: no catalog entry for this
+                     * (image, entry, eaBinary) triple. Execution continues on
+                     * whatever residency is already mapped -- historically
+                     * silent, which turned every uncatalogued binary a new
+                     * scene streams into a downstream mystery (stale code
+                     * runs, outputs corrupt or never publish). Loud so a
+                     * single boot enumerates every gap. */
+                    static volatile long unknown_n = 0;
+                    const unsigned long n = (unsigned long)
+                        _InterlockedIncrement(&unknown_n);
+                    if (n <= 64u || (n & (n - 1u)) == 0u) {
+                        fprintf(stderr,
+                                "[job-descriptor-UNKNOWN] n=%lu spu=%X "
+                                "image=%d entry=%05X eaBinary=%08X "
+                                "(slot=%d span=%05X) -- uncatalogued job "
+                                "binary, running stale residency\n",
+                                n, ctx->spu_id, ctx->image_id, jpc,
+                                binary_ea, descriptor_slot,
+                                descriptor_span);
+                        fflush(stderr);
                     }
                 }
             }

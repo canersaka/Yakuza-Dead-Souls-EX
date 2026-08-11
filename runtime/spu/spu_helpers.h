@@ -396,10 +396,22 @@ static inline u128 spu_fs(u128 a, u128 b)
  *   csflt/cuflt: result = (float)int * 2^(i8-155) -- i8=155 is the identity
  * (Prior code applied a spurious -155 table offset -> off by 2^155; canonical
  * conversions collapsed to ~0. f computed in double so 2^173 doesn't overflow.) */
+/* NOTE (SPUF-1 fix): decode through spu_xf_decode(), NOT (double)a._f32[i].
+ * The SPU has no NaN/Inf; every f32 bit pattern -- including ones that look
+ * like a host QNaN/Inf (exponent field 0xFF) -- is a genuine extended-range
+ * FINITE value per the xfloat model documented above spu_xf_decode/encode.
+ * Going through the native `float` member instead would route those bit
+ * patterns through the host FPU's NaN/Inf comparison and cast rules: both
+ * saturation compares below would be false for a NaN operand and the final
+ * (int32_t)v / (uint32_t)v cast would be UB on a NaN double. Decoding via
+ * spu_xf_decode always yields a finite double, so the existing saturate-then-
+ * truncate logic (scale unchanged) is well-defined for every input bit
+ * pattern and matches CFLTS/CFLTU's documented ldexp(a,173-i8)-style scale
+ * with deterministic saturation at the int32/uint32 boundary. */
 static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=spu_xf_decode(a._u32[i])*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=spu_xf_decode(a._u32[i])*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
 static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
@@ -857,9 +869,16 @@ static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
 /* xswd (ISA v1.2 p96): per doubleword, sign-extend the word in the RIGHT
  * slot -- the value stays in the right word, the sign fill goes in the left.
- * The old `_s64[i] = (int32_t)_s32[2*i]` was wrong on BOTH counts in our lane
- * convention (sourced the left word AND placed value/sign swapped); caught
- * RED by tools/test_spu_lift.py 2026-07-03 (61 live sites incl. the codec). */
+ * LANE CAVEAT, and why this helper keeps regressing: the sub-lane rule at
+ * lines 866-867 applies to sub-lanes WITHIN one host-endian value (bytes in
+ * a halfword, halfwords in a word). WORDS are not sub-lanes: u128 stores
+ * _u32[i] = SPU word i in SPU order, so the RIGHT word of doubleword i is
+ * _u32[2*i+1] (the HIGHER index), and the left/sign-fill word is _u32[2*i].
+ * The lifter conformance suite (extend family, cases derived from the ISA
+ * vectors) is the authority here; test_spu_helpers.c's earlier expectation
+ * was built with make128()'s host-endian u64 packing, which scrambles word
+ * lanes for asymmetric vectors and briefly "justified" the swapped form on
+ * 2026-08-03. */
 static inline u128 spu_xswd(u128 a) {
     u128 r;
     for (int i = 0; i < 2; i++) {

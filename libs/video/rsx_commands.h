@@ -38,24 +38,24 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 
 /* Surface / render target configuration */
-#define NV4097_SET_SURFACE_FORMAT              0x00000200
-#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000204
-#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000208
+#define NV4097_SET_SURFACE_FORMAT              0x00000208
+#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000200
+#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
 #define NV4097_SET_SURFACE_COLOR_AOFFSET       0x00000210
-#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000214
-#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000218
-#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000021C
-#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000220
-#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000224
-#define NV4097_SET_SURFACE_PITCH_A             0x0000022C
-#define NV4097_SET_SURFACE_PITCH_B             0x00000230
-#define NV4097_SET_SURFACE_PITCH_C             0x00000234
-#define NV4097_SET_SURFACE_PITCH_D             0x00000238
-#define NV4097_SET_SURFACE_PITCH_Z             0x0000023C
+#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000218
+#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000288
+#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000028C
+#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000214
+#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000220
+#define NV4097_SET_SURFACE_PITCH_A             0x0000020C
+#define NV4097_SET_SURFACE_PITCH_B             0x0000021C
+#define NV4097_SET_SURFACE_PITCH_C             0x00000280
+#define NV4097_SET_SURFACE_PITCH_D             0x00000284
+#define NV4097_SET_SURFACE_PITCH_Z             0x0000022C
 
 /* Viewport */
-#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000300
-#define NV4097_SET_VIEWPORT_VERTICAL           0x00000304
+#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000A00
+#define NV4097_SET_VIEWPORT_VERTICAL           0x00000A04
 #define NV4097_SET_CLIP_MIN                    0x00000394
 #define NV4097_SET_CLIP_MAX                    0x00000398
 
@@ -64,8 +64,8 @@ extern "C" {
 #define NV4097_SET_SCISSOR_VERTICAL            0x000008C4
 
 /* Clear */
-#define NV4097_SET_COLOR_CLEAR_VALUE           0x000001D0
-#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x000001D8
+#define NV4097_SET_COLOR_CLEAR_VALUE           0x00001D90
+#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x00001D8C
 #define NV4097_CLEAR_SURFACE                   0x00001D94
 
 /* Reports / ZCULL — writes land in guest memory (unlike most of this file's
@@ -95,16 +95,21 @@ extern "C" {
 /* Guest-memory window this module writes local-area reports into. This
  * generic FIFO-method processor has no io-map table of its own (that lives
  * in yakuza/import_overrides.cpp, out of scope here), so it owns a small,
- * independent guest window sized to match the real report region
- * (CellGcmReportData is 16 bytes * 256 slots = 0x1000, per
- * libs/video/cellGcmSys.h's
- * CELL_GCM_MAX_REPORT_COUNT/CELL_GCM_REPORT_DATA_SIZE). Pinned to the same
- * numeric base the live Yakuza consumer already uses for this exact region
- * (yakuza/import_overrides.cpp: RSX_CTX_BASE 0x10000000 + 0x200000 ==
- * RSX_REPORTS) so a report written here lands where the rest of that
- * consumer's label/semaphore code already expects report data to live. */
+ * independent guest window sized to match the real report region.
+ * 2026-08-05 item-K fix 10: the window was 0x1000 (256 slots), silently
+ * dropping every GET_REPORT at offset >= 0x1000 -- the contract allows 2048
+ * local report slots x 16-byte CellGcmReportData = 0x8000
+ * (ORACLE(SDK cell/gcm/gcm_enum.h:554
+ * CELL_GCM_INDEX_RANGE_REPORT_LOCAL_COUNT=2048); the 2026-08-04 audit noted
+ * the title already reads at offset 0xFE0, one slot below the old cliff).
+ * Pinned to the same numeric base the live Yakuza consumer already uses for
+ * this exact region (yakuza/import_overrides.cpp: RSX_CTX_BASE 0x10000000 +
+ * 0x200000 == RSX_REPORTS; that consumer zero-initializes 0x9400 bytes
+ * there, so the widened window stays inside initialized guest memory) so a
+ * report written here lands where the rest of that consumer's
+ * label/semaphore code already expects report data to live. */
 #define RSX_REPORT_LOCAL_BASE                   0x10200000u
-#define RSX_REPORT_AREA_SIZE                    0x1000u
+#define RSX_REPORT_AREA_SIZE                    0x8000u
 
 /* NV4097_GET_REPORT's arg packs a report "type" into the top byte and a
  * 24-bit offset in the rest (nv4097.cpp:579-580). type values matching
@@ -119,7 +124,7 @@ extern "C" {
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
-#define NV4097_DRAW_INDEX_ARRAY                0x00001820
+#define NV4097_DRAW_INDEX_ARRAY                0x00001824
 
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
@@ -137,7 +142,7 @@ extern "C" {
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
-#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF0
+#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
@@ -148,36 +153,36 @@ extern "C" {
 #define RSX_MAX_VERTEX_CONSTANTS                512
 
 /* Color mask */
-#define NV4097_SET_COLOR_MASK                   0x00000028
+#define NV4097_SET_COLOR_MASK                   0x00000324
 
 /* Alpha test */
-#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000104
-#define NV4097_SET_ALPHA_FUNC                   0x00000108
-#define NV4097_SET_ALPHA_REF                    0x0000010C
+#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000304
+#define NV4097_SET_ALPHA_FUNC                   0x00000308
+#define NV4097_SET_ALPHA_REF                    0x0000030C
 
 /* Blending */
 #define NV4097_SET_BLEND_ENABLE                 0x00000310
-#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000344
-#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000348
-#define NV4097_SET_BLEND_EQUATION               0x0000034C
-#define NV4097_SET_BLEND_COLOR                  0x00000350
+#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000314
+#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000318
+#define NV4097_SET_BLEND_EQUATION               0x00000320
+#define NV4097_SET_BLEND_COLOR                  0x0000031C
 
 /* Depth / stencil */
-#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000304
-#define NV4097_SET_DEPTH_FUNC                   0x00000308
-#define NV4097_SET_DEPTH_MASK                   0x0000030C
-#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000360
-#define NV4097_SET_STENCIL_FUNC                 0x00000364
-#define NV4097_SET_STENCIL_FUNC_REF             0x00000368
-#define NV4097_SET_STENCIL_FUNC_MASK            0x0000036C
-#define NV4097_SET_STENCIL_OP_FAIL              0x00000370
-#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000374
-#define NV4097_SET_STENCIL_OP_ZPASS             0x00000378
+#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
+#define NV4097_SET_DEPTH_FUNC                   0x00000A6C
+#define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
+#define NV4097_SET_STENCIL_FUNC                 0x00000330
+#define NV4097_SET_STENCIL_FUNC_REF             0x00000334
+#define NV4097_SET_STENCIL_FUNC_MASK            0x00000338
+#define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
+#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
+#define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
 
 /* Culling */
-#define NV4097_SET_CULL_FACE_ENABLE             0x000002BC
-#define NV4097_SET_CULL_FACE                    0x000002C0
-#define NV4097_SET_FRONT_FACE                   0x000002C4
+#define NV4097_SET_CULL_FACE_ENABLE             0x0000183C
+#define NV4097_SET_CULL_FACE                    0x00001830
+#define NV4097_SET_FRONT_FACE                   0x00001834
 
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1

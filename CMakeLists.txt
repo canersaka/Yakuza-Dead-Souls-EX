@@ -156,6 +156,22 @@ if(PS3RECOMP_BUILD_TESTS)
     add_subdirectory(tests/spu_job_dispatch)
     add_subdirectory(tests/edge_journal_hle)
     add_subdirectory(libs/system/tests)
+    add_subdirectory(tests/native_spurs)
+
+    add_executable(fifo_publication_tests
+        tests/fifo_publication/main.c
+    )
+    target_include_directories(fifo_publication_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(
+        NAME fifo_publication_island_edge
+        COMMAND fifo_publication_tests
+    )
+    set_tests_properties(
+        fifo_publication_island_edge
+        PROPERTIES LABELS "firmware-free;native;gcm;regression"
+    )
 
     # These two suites currently use the MSVC-based generated-code harness.
     # Keep them visible to CTest where that harness is supported; the native
@@ -196,6 +212,24 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(
             NAME rsx_fp_despecialization
             COMMAND rsx_fp_despecialization_tests
+        )
+
+        # Manual capture differential: feeds one RXS frame through the exact
+        # production live renderer.  It is intentionally not a CTest because
+        # the title capture is a large, local, untracked oracle.
+        add_executable(rsx_live_replay
+            libs/video/tests/live_replay_main.c
+        )
+        target_include_directories(rsx_live_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_live_replay PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_link_libraries(rsx_live_replay PRIVATE
+            ps3recomp_runtime
+            d3d12 dxgi d3dcompiler user32 gdi32
         )
 
         find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)

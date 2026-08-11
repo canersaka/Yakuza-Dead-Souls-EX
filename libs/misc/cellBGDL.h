@@ -15,12 +15,25 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_BGDL_ERROR_NOT_INITIALIZED     0x80410901
-#define CELL_BGDL_ERROR_ALREADY_INITIALIZED 0x80410902
-#define CELL_BGDL_ERROR_INVALID_ARGUMENT    0x80410903
-#define CELL_BGDL_ERROR_NOT_FOUND           0x80410904
-#define CELL_BGDL_ERROR_BUSY                0x80410905
+/* Error codes
+ * Previous values (0x80410901-05) were invented and collided byte-for-byte
+ * with CELL_SPURS_TASK_ERROR_*. Re-pointed at real cellBGDL values, base
+ * CELL_SYSUTIL_ERROR_BASE_BGDL (real SDK value; sysutil_common.h:48).
+ * Real cellBGDL has no init-lifecycle codes (SDK exposes only SetMode/
+ * GetMode) — NOT_INITIALIZED/ALREADY_INITIALIZED have no exact analog and
+ * fall back to the closest documented real code.
+ */
+#define CELL_BGDL_UTIL_ERROR_BUSY          0x8002ce01  /* real SDK value (sysutil_bgdl.h:21) */
+#define CELL_BGDL_UTIL_ERROR_INTERNAL      0x8002ce02  /* real SDK value (sysutil_bgdl.h:22) */
+#define CELL_BGDL_UTIL_ERROR_PARAM         0x8002ce03  /* real SDK value (sysutil_bgdl.h:23) */
+#define CELL_BGDL_UTIL_ERROR_ACCESS_ERROR  0x8002ce04  /* real SDK value (sysutil_bgdl.h:24) */
+#define CELL_BGDL_UTIL_ERROR_INITIALIZE    0x8002ce05  /* real SDK value (sysutil_bgdl.h:25) */
+
+#define CELL_BGDL_ERROR_NOT_INITIALIZED     CELL_BGDL_UTIL_ERROR_INITIALIZE    /* alias: closest real code is init-domain (no NOT_INITIALIZED concept in real SDK) */
+#define CELL_BGDL_ERROR_ALREADY_INITIALIZED CELL_BGDL_UTIL_ERROR_INTERNAL      /* alias: no real "already initialized" concept; generic fallback */
+#define CELL_BGDL_ERROR_INVALID_ARGUMENT    CELL_BGDL_UTIL_ERROR_PARAM         /* alias: exact real semantic (invalid parameter) */
+#define CELL_BGDL_ERROR_NOT_FOUND           CELL_BGDL_UTIL_ERROR_ACCESS_ERROR  /* alias: closest real code (HDD access error) */
+#define CELL_BGDL_ERROR_BUSY                CELL_BGDL_UTIL_ERROR_BUSY          /* alias: exact real semantic */
 
 /* Download status */
 #define CELL_BGDL_STATUS_IDLE         0

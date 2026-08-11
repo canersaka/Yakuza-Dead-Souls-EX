@@ -41,7 +41,9 @@ extern "C" {
 #define CELL_VIDEO_OUT_ASPECT_16_9   2
 
 /* Output type */
-#define CELL_VIDEO_OUT_OUTPUT_HDMI   5
+/* Reference p.32: the HDMI port type is 0x01 (the old value 5 is unassigned
+ * in the CellVideoOutPortType enum). */
+#define CELL_VIDEO_OUT_OUTPUT_HDMI   0x01
 
 /* Color space */
 #define CELL_VIDEO_OUT_COLOR_SPACE_RGB   0x01
@@ -63,14 +65,19 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED  (s32)(CELL_ERROR_BASE_VIDEO | 0x01)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION (s32)(CELL_ERROR_BASE_VIDEO | 0x02)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER (s32)(CELL_ERROR_BASE_VIDEO | 0x03)
-#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE (s32)(CELL_ERROR_BASE_VIDEO | 0x04)
-#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND (s32)(CELL_ERROR_BASE_VIDEO | 0x05)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT (s32)(CELL_ERROR_BASE_VIDEO | 0x06)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)(CELL_ERROR_BASE_VIDEO | 0x07)
-#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY (s32)(CELL_ERROR_BASE_VIDEO | 0x08)
+/* Real SDK values (systemparam error block 0x8002b2xx, video at +0x20; the
+ * previous CELL_ERROR_BASE_VIDEO|0x0n numbering was fabricated -- a game
+ * matching on a specific CELL_VIDEO_OUT_ERROR_* value never recognized it;
+ * 2026-08-05 review follow-up to the doc-conformance sweep). */
+#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED  (s32)0x8002b220
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION (s32)0x8002b221
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER (s32)0x8002b222
+#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE (s32)0x8002b223
+#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND (s32)0x8002b224
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT (s32)0x8002b225
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)0x8002b226
+#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY (s32)0x8002b227
+#define CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET (s32)0x8002b228
 
 /* ---------------------------------------------------------------------------
  * Structures
@@ -81,11 +88,36 @@ typedef struct CellVideoOutResolution {
     u16 height;
 } CellVideoOutResolution;
 
+typedef struct CellVideoOutDisplayMode {
+    u8  resolutionId;
+    u8  scanMode;
+    u8  conversion;
+    u8  aspect;
+    u8  reserved[2];
+    u16 refreshRates;   /* guest BE bitmask; Reference p.31 */
+} CellVideoOutDisplayMode;
+
+/* Refresh-rate bits (Video_Configuration-Reference p.31). */
+#define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ  0x0001
+#define CELL_VIDEO_OUT_REFRESH_RATE_50HZ     0x0002
+#define CELL_VIDEO_OUT_REFRESH_RATE_60HZ     0x0004
+#define CELL_VIDEO_OUT_REFRESH_RATE_30HZ     0x0008
+
+/* Output states (Reference p.35): ENABLED=0, DISABLED=1, PREPARING=2. The
+ * old comment/values here were inverted (2 treated as "enabled"), so a
+ * spec-following boot poll for ENABLED(0) could spin forever (2026-08-04
+ * doc-conformance audit). */
+#define CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED    0
+#define CELL_VIDEO_OUT_OUTPUT_STATE_DISABLED   1
+#define CELL_VIDEO_OUT_OUTPUT_STATE_PREPARING  2
+
 typedef struct CellVideoOutState {
-    u8  state;          /* 0=disabled, 2=enabled */
+    u8  state;          /* CELL_VIDEO_OUT_OUTPUT_STATE_* */
     u8  colorSpace;
     u8  reserved[6];
-    u32 displayMode;
+    CellVideoOutDisplayMode displayMode;   /* 8-byte struct, NOT a u32
+                                            * (Reference p.9; the old u32
+                                            * left refreshRates unwritten) */
 } CellVideoOutState;
 
 typedef struct CellVideoOutConfiguration {
@@ -95,15 +127,6 @@ typedef struct CellVideoOutConfiguration {
     u8  reserved[9];
     u32 pitch;
 } CellVideoOutConfiguration;
-
-typedef struct CellVideoOutDisplayMode {
-    u8  resolutionId;
-    u8  scanMode;
-    u8  conversion;
-    u8  aspect;
-    u8  reserved[2];
-    u16 refreshRates;
-} CellVideoOutDisplayMode;
 
 typedef struct CellVideoOutDeviceInfo {
     u8  portType;

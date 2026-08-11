@@ -55,8 +55,14 @@ extern volatile long g_yz_a010_spucmd_headers;
 extern volatile long g_yz_ucmd_handler_arg;
 extern volatile long g_yz_ucmd_handler_completed;
 extern int g_yz_a010_ppucmd;
-void yz_ucmd_wait_for_handler_completion(void);
+long yz_ucmd_wait_for_handler_completion(void);
+int yz_ucmd_handler_snapshot_is_stable(long epoch);
+long yz_ucmd_handler_begin(long cause);
+void yz_ucmd_handler_end(long cause, long epoch);
 void yz_a010_record_output_put(spu_context* ctx, uint32_t producer_pc,
+                               uint32_t ea, const uint8_t* payload,
+                               uint32_t size);
+void yz_a010_release_trace_put(spu_context* ctx, uint32_t producer_pc,
                                uint32_t ea, const uint8_t* payload,
                                uint32_t size);
 void yz_a010_reltrace_spu_commit(
@@ -114,6 +120,16 @@ typedef struct mfc_engine {
     uint8_t     tag_status_ready;
     uint8_t     tag_update_type;
     uint32_t    tag_update_mask;
+    /* STUCK-TAG WITNESS (2026-08-06 root hunt): consecutive non-blocking
+     * RdTagStat polls observed while the armed update is UNSATISFIABLE —
+     * pending set, not ready, and no masked tag has anything outstanding,
+     * deferred, or stalled. By CBEA tag-group semantics that state must
+     * resolve immediately (a finished group is complete); persisting means
+     * a completion publication was LOST. gs_task's release pipeline has no
+     * timeout/retry for exactly this (static decode 2026-08-06), so one
+     * lost completion silently drops one stopper-release write — the
+     * dialogue-wedge root candidate. Reset whenever the state is legal. */
+    uint32_t    stucktag_polls;
 
     /* Lock-line reservation (GETLLAR/PUTLLC). A 128-byte snapshot of the
      * line is taken under the global lock-line lock; PUTLLC commits only
@@ -126,6 +142,8 @@ typedef struct mfc_engine {
     uint32_t    resv_poll_n;      /* consecutive same-line GETLLARs with an unchanged
                                    * write-generation = an idle reservation poll loop;
                                    * drives the host-yield backoff (see MFC_GETLLAR_CMD) */
+    uint32_t    resv_cas_idle_ea; /* last PUTLLC line used by contention backoff */
+    uint32_t    resv_cas_idle_n;  /* consecutive failed/no-change PUTLLCs on that line */
     uint32_t    atomic_stat;      /* value waiting in MFC_RdAtomicStat */
     uint32_t    atomic_stat_ready;/* 1 while that single channel entry is readable */
 
@@ -163,12 +181,39 @@ typedef struct mfc_engine {
     uint32_t    stall_base_cmd[32];              /* base GET/PUT command (list bit already stripped) */
 } mfc_engine;
 
+/* Host scheduling backoff for a guest CAS retry loop. A PUTLLC that changes
+ * bytes is productive and resets the ladder. Repeated failures or successful
+ * same-value commits on one line are contention/idle churn: preserve every
+ * architectural attempt, but yield only after the lock has been released so
+ * the thread owning useful work can run. Unlike lock parking, this never
+ * sleeps a lock hand-off or penalizes the first retry. */
+static inline int mfc_putllc_backoff(
+    mfc_engine* mfc, uint32_t line_ea, int made_progress)
+{
+    if (mfc->resv_cas_idle_ea != line_ea) {
+        mfc->resv_cas_idle_ea = line_ea;
+        mfc->resv_cas_idle_n = 0;
+    }
+    if (made_progress) {
+        mfc->resv_cas_idle_n = 0;
+        return -1;
+    }
+    if (mfc->resv_cas_idle_n != UINT32_MAX)
+        mfc->resv_cas_idle_n++;
+    if (g_yz_runtime_config.no_spubackoff || mfc->resv_cas_idle_n <= 16u)
+        return -1;
+    return mfc->resv_cas_idle_n > 256u ? 3 : 0;
+}
+
 /* Single process-wide lock serializing lock-line transactions across all
  * SPU host threads (defined in spu_channels.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+void spu_lockline_unlock_then_notify_guest_write(
+    int notify, uint32_t ea, uint32_t size);
 /* Host-core yield for SPU idle-poll loops (defined in spu_channels.c):
- * level 0 = cpu pause, level 1 = scheduler yield. */
+ * level 0 = cpu pause, level 1 = same-core scheduler yield, level 2 =
+ * 1 ms sleep, level 3 = process-wide zero-duration scheduler yield. */
 void spu_idle_yield(int level);
 
 /* External: pointer to host mapping of PS3 main memory.
@@ -245,6 +290,63 @@ static inline int mfc_has_deferred_tag(const mfc_engine* mfc, uint32_t tag)
         if (mfc->queue[i].tag == tag)
             return 1;
     return 0;
+}
+
+/* STUCK-TAG WITNESS (2026-08-06, dialogue-wedge root hunt — see
+ * scratch/handoff_20260806_repair_narrowing.md). Called from the
+ * NON-BLOCKING RdTagStat readiness polls (spu_channels.c rchcnt paths),
+ * which is exactly how gs_task's completion reaper watches its release
+ * DMAs — a lost completion there never blocks and is invisible to
+ * spu_ch_wait's stall witness. Predicate: the armed tag update is
+ * UNSATISFIABLE — pending, not ready, and every masked tag has zero
+ * outstanding commands, zero deferred commands, and no list stall. By
+ * CBEA tag-group semantics that must resolve immediately; if it persists
+ * across ~200k consecutive polls, a completion publication was lost and
+ * (per the gs_task static decode) the game will never retry — one
+ * stopper-release write silently dropped. Diagnostic only: one capped
+ * stderr line + one ring record per episode; no behavior change. */
+static inline void mfc_stucktag_check(mfc_engine* mfc, spu_context* spu)
+{
+    if (!mfc->tag_update_pending || mfc->tag_status_ready) {
+        mfc->stucktag_polls = 0;
+        return;
+    }
+    const uint32_t mask = mfc->tag_update_mask;
+    for (uint32_t t = 0; t < 32u; t++) {
+        if (!((mask >> t) & 1u))
+            continue;
+        if (mfc->tag_outstanding[t] || (mfc->stall_mask & (1u << t)) ||
+            mfc_has_deferred_tag(mfc, t)) {
+            mfc->stucktag_polls = 0;   /* legitimately in flight */
+            return;
+        }
+    }
+    if (++mfc->stucktag_polls != 200000u)
+        return;                        /* one-shot per stuck episode */
+    {
+        extern void yz_frontier_trace_emit(
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+            uint32_t, uint32_t, uint32_t, uint32_t);
+        static int stucktag_prints;    /* racy diagnostic cap, fine */
+        if (stucktag_prints < 8) {
+            stucktag_prints++;
+            fprintf(stderr,
+                    "[mfc-stucktag] img=%d spu=%u pc=0x%05X mask=0x%08X "
+                    "completed=0x%08X type=%u qcount=%u defer=%u — armed "
+                    "tag update unsatisfiable with nothing in flight "
+                    "(LOST COMPLETION)\n",
+                    spu->image_id, spu->spu_id, spu->pc, mask,
+                    mfc->tag_completed, mfc->tag_update_type,
+                    mfc->queue_count, mfc->deferred_count);
+            fflush(stderr);
+        }
+        yz_frontier_trace_emit(14u /* YZ_FT_STALL */, spu->spu_id,
+                               spu->pc, mask, mfc->tag_completed,
+                               ((uint32_t)spu->image_id << 16) |
+                                   mfc->tag_update_type,
+                               mfc->queue_count, mfc->deferred_count,
+                               0xDEADAA61u /* stucktag marker */);
+    }
 }
 
 static inline int mfc_defer_command(mfc_engine* mfc, uint32_t lsa, uint64_t ea,
@@ -350,6 +452,40 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     /* Mask LSA to local store range */
     lsa &= SPU_LS_MASK;
+
+    /* Motion-job parity recorder.  Sample at the final per-transfer boundary
+     * (including individual list elements), before the PUT reaches guest
+     * memory.  The fingerprint covers up to 32 bytes at each end plus the
+     * transfer length: enough to correlate repeated/stale publications while
+     * avoiding a full-buffer hash in the hot job path. */
+    if (spu->parity_motion_generation && mfc_is_put(cmd)) {
+        uint32_t fingerprint = 2166136261u ^ size;
+        const uint32_t head = size < 32u ? size : 32u;
+        const uint32_t tail = size > 32u
+            ? (size - 32u < 32u ? size - 32u : 32u) : 0u;
+        for (uint32_t i = 0; i < head; ++i) {
+            fingerprint ^= spu->ls[(lsa + i) & SPU_LS_MASK];
+            fingerprint *= 16777619u;
+        }
+        for (uint32_t i = 0; i < tail; ++i) {
+            fingerprint ^=
+                spu->ls[(lsa + size - tail + i) & SPU_LS_MASK];
+            fingerprint *= 16777619u;
+        }
+        {
+            extern void yz_frontier_trace_emit(
+                uint32_t, uint32_t, uint32_t,
+                uint32_t, uint32_t, uint32_t,
+                uint32_t, uint32_t, uint32_t);
+            yz_frontier_trace_emit(
+                43u /* YZ_FT_PARITY_MOTION_DMA */,
+                spu->parity_motion_generation,
+                spu->pc & SPU_LS_MASK,
+                (uint32_t)(ea & ~0x80000000ull), size, fingerprint,
+                (cmd & 0xffu) | ((spu->mfc_tag & 31u) << 8),
+                lsa, (uint32_t)spu->image_id);
+        }
+    }
 
 #if !defined(YZ_PERF_CLEAN)
     /*
@@ -1258,9 +1394,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         memcpy(&before_value, ls_ptr, sizeof(before_value));
 #endif
 #ifdef _WIN32
-                        yz_ucmd_wait_for_handler_completion();
-#endif
+                        /* Treat the callback epochs as a sequence lock.  A
+                         * callback can begin after the first completion check,
+                         * so a single wait followed by memcpy still admits a
+                         * half-old/half-new record.  Retry until the copy was
+                         * entirely outside a callback update. */
+                        long stable_epoch;
+                        do {
+                            stable_epoch =
+                                yz_ucmd_wait_for_handler_completion();
+                            memcpy(ls_ptr, ea_ptr, size);
+                        } while (!yz_ucmd_handler_snapshot_is_stable(
+                            stable_epoch));
+#else
                         memcpy(ls_ptr, ea_ptr, size);
+#endif
 #if !defined(YZ_PERF_CLEAN)
                         uint32_t after_value;
                         memcpy(&after_value, ls_ptr, sizeof(after_value));
@@ -1397,11 +1545,72 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
         } else if (mfc_is_put(cmd)) {
             /* PUT: local store -> main memory */
-#if !defined(YZ_PERF_CLEAN)
-            yz_a010_record_output_put(spu, spu->pc & SPU_LS_MASK,
+            /* YZ_EA_TRAP SPU leg (2026-08-05 frontier): the PPU-side trap
+             * proved the fatal motion-descriptor write is NOT any PPU store
+             * path (boot 19: header flipped to file-relative pointers with
+             * ZERO trapped stores), which leaves SPU DMA. Compiled
+             * unconditionally -- the gate build defines YZ_PERF_CLEAN, so the
+             * older witnesses above are absent exactly when we need this.
+             * Names the image, LS pc and payload of the writing job. */
+            {
+                extern int yz_ea_trap_range(uint32_t ea, unsigned size,
+                                            uint32_t* lo, uint32_t* hi);
+                uint32_t tlo = 0, thi = 0;
+                const uint32_t put_ea = (uint32_t)(ea & ~0x80000000ull);
+                if (yz_ea_trap_range(put_ea, size, &tlo, &thi)) {
+                    /* Ring record (boot 62, journal-writer hunt): print-cap-
+                     * independent, QUIET-safe. First two watched words of the
+                     * PUT payload; a5 cmd byte distinguishes DMA from the
+                     * PUTLLC (0xB4) records. */
+                    { extern void yz_frontier_trace_emit(
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t);
+                      uint32_t off1 = 0xFFu, w1 = 0, w2 = 0, off2 = 0xFFu;
+                      for (uint32_t off = 0; off + 4u <= size; off += 4u) {
+                          const uint32_t dst = put_ea + off;
+                          if (dst + 4u <= tlo || dst >= thi) continue;
+                          const uint8_t* p = ls_ptr + off;
+                          const uint32_t w = ((uint32_t)p[0] << 24) |
+                              ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) |
+                              p[3];
+                          if (off1 == 0xFFu) { off1 = off; w1 = w; }
+                          else { off2 = off; w2 = w; break; }
+                      }
+                      yz_frontier_trace_emit(24u /* YZ_FT_ATOMIC_COMMIT */,
+                          (uint32_t)spu->spu_id, spu->pc & SPU_LS_MASK,
+                          put_ea,
+                          ((uint32_t)spu->image_id << 16) | (off1 & 0xFFu),
+                          size, w1, w2,
+                          ((uint32_t)cmd << 8) | (off2 & 0xFFu)); }
+                    static int dma_quiet = -1;
+                    if (dma_quiet < 0) { const char* q = getenv("YZ_EA_TRAP_QUIET");
+                        dma_quiet = (q && *q == '1') ? 1 : 0; }
+                    static unsigned long dma_trap_n = 0;
+                    if (!dma_quiet && ++dma_trap_n <= 512) {
+                        fprintf(stderr,
+                                "[ea-trap] SPU-DMA PUT spu=%X img=%d pc=0x%05X "
+                                "lsa=0x%05X ea=0x%08X size=0x%X cmd=0x%02X payload:",
+                                spu->spu_id, spu->image_id,
+                                spu->pc & SPU_LS_MASK, lsa, put_ea, size, cmd);
+                        /* dump the words that land inside the watched range */
+                        for (uint32_t off = 0; off + 4u <= size; off += 4u) {
+                            const uint32_t dst = put_ea + off;
+                            if (dst + 4u <= tlo || dst >= thi) continue;
+                            const uint8_t* p = ls_ptr + off;
+                            fprintf(stderr, " [0x%08X]=%02X%02X%02X%02X",
+                                    dst, p[0], p[1], p[2], p[3]);
+                        }
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                    }
+                }
+            }
+            /* Temporary root-capture lane: keep the release lifecycle
+             * recorder callable in a clean build.  The callee is inert
+             * unless YZ_A010_RELEASE_TRACE is explicitly enabled. */
+            yz_a010_release_trace_put(spu, spu->pc & SPU_LS_MASK,
                                       (uint32_t)(ea & ~0x80000000ull),
                                       ls_ptr, size);
-#endif
 #if !defined(YZ_PERF_CLEAN)
             /* First-writer witness for Job A's main-memory descriptor tail.
              * This runs before the PUT while both the old destination bytes
@@ -1532,12 +1741,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * real PUT has completed.  It is a no-op unless
              * YZ_A010_RELEASE_TRACE is enabled.
              */
-#if !defined(YZ_PERF_CLEAN)
             yz_a010_reltrace_spu_commit(
                 spu->spu_id, (uint32_t)spu->image_id,
                 spu->pc & SPU_LS_MASK,
                 (uint32_t)(ea & ~0x80000000ull), ls_ptr, size);
-#endif
 #if !defined(YZ_PERF_CLEAN)
             /* The a010-specific 0x01252680 job was previously executed as
              * Job A.  Count its actual publications independently of the
@@ -1799,6 +2006,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+        if (mfc_is_put(cmd)) {
+            extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
+            cellSpursNotifyGuestWrite((uint32_t)ea, size);
+        }
 #ifdef _WIN32
     } __except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION */
                 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
@@ -1977,14 +2188,72 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     int tagged = mfc_uses_tag(cmd);
     int rc = 0;
 
+    /* Job output-DMA census (2026-08-05, wedge root-cause boots 25-29).
+     * The SPURS contract makes a JOB publish its own results over its
+     * context dmaTag; run_job (libs/spurs/cellSpurs.c) reads these counters
+     * around spu_workload_execute to answer whether our execution of a job
+     * issues ANY store-class DMA. Zero PUTs from a job whose outputs the
+     * game then waits on is the wedge. Plain counters: a job runs
+     * single-threaded on its own host thread with its own context. */
+    {
+        extern volatile unsigned long g_yz_job_dma_put_n;
+        extern volatile unsigned long g_yz_job_dma_put_bytes;
+        switch (cmd) {
+        case MFC_PUT_CMD:  case MFC_PUTB_CMD:  case MFC_PUTF_CMD:
+        case MFC_PUTL_CMD: case MFC_PUTLB_CMD: case MFC_PUTLF_CMD:
+        case MFC_PUTLLC_CMD: case MFC_PUTLLUC_CMD: case MFC_PUTQLLUC_CMD:
+            ++g_yz_job_dma_put_n;
+            g_yz_job_dma_put_bytes += size;
+            break;
+        default: break;
+        }
+    }
+
+    /* Temporary first-transition oracle.  The task-state checkpoint in
+     * spu_channels.c opens this window after the first Poll and closes it at
+     * the first Poll following Yield.  It deliberately remains available in
+     * the clean build so native and LLE can be compared without rebuilding a
+     * different execution configuration. */
+    {
+        extern volatile int g_yz_task_dma_trace_phase;
+        static int trace_enabled = -1;
+        static unsigned trace_count = 0;
+        if (trace_enabled < 0)
+            trace_enabled = getenv("YZ_TASK_DMA_TRACE") ? 1 : 0;
+        if (trace_enabled && g_yz_task_dma_trace_phase == 1 &&
+            spu->image_id == 0 && trace_count < 2048u) {
+            uint32_t hash = 0;
+            if (ea >= 0x41F00000ull && ea + size <= 0x42200000ull) {
+                const uint8_t* src = vm_base + (uint32_t)ea;
+                hash = 2166136261u;
+                for (uint32_t i = 0; i < size; ++i) {
+                    hash ^= src[i];
+                    hash *= 16777619u;
+                }
+            }
+            fprintf(stderr,
+                    "[task-dma] n=%u spu=%X pc=%05X cmd=%02X lsa=%05X "
+                    "ea=%08X size=%X tag=%u hash=%08X\n",
+                    trace_count++, spu->spu_id, spu->pc & SPU_LS_MASK,
+                    cmd & 0xffu, lsa & SPU_LS_MASK, (uint32_t)ea, size,
+                    tag, hash);
+        }
+    }
+
 #if defined(YZ_PERF_PROFILE)
     {
         const int image = spu->image_id;
         if ((unsigned)image < 32u) {
             if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
-                cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)
+                cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
                 spu->perf_dma_atomic[image]++;
-            else if (mfc_is_get(cmd))
+                if (image == 0) {
+                    extern volatile uint32_t
+                        g_spu_perf_gs_atomic_pc[0x10000];
+                    g_spu_perf_gs_atomic_pc[
+                        (spu->pc & SPU_LS_MASK) >> 2]++;
+                }
+            } else if (mfc_is_get(cmd))
                 spu->perf_dma_get[image]++;
             else if (mfc_is_put(cmd))
                 spu->perf_dma_put[image]++;
@@ -2015,21 +2284,25 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
-#if !defined(YZ_PERF_CLEAN)
-    /* s44: durable consumer-identity publish (replaces the gs_task.c 0x6380
+    /* Durable consumer-identity publish (replaces the gs_task.c 0x6380
      * hand-edit the s43 relift wiped -- generated-file edits die on relift).
      * The journal consumer = the image-0 (gs_task) context GETting from the
      * journal arena [0x41F00000,0x42200000) (the same constant range
      * spu_fltrec.c's arena dump uses). First such GET publishes; same
-     * diagnostic-only, fail-open-on-0 semantics as the old publish site. */
+     * fail-open-on-0 semantics as the old publish site. The identity itself
+     * is required by the bounded producer throttle, so it must also exist in
+     * YZ_PERF_CLEAN builds; only its diagnostic print remains compiled out. */
     if (!g_yz_consumer_ctx && spu->image_id == 0 && mfc_is_get(cmd)
         && ea >= 0x41F00000ull && ea < 0x42200000ull) {
         g_yz_consumer_ctx = (volatile void*)spu;
+#if !defined(YZ_PERF_CLEAN)
         fprintf(stderr, "[fltrec] consumer ctx published: spu=%X (journal GET ea=0x%08X pc=0x%05X)\n",
                 spu->spu_id, (uint32_t)ea, spu->pc & SPU_LS_MASK);
         fflush(stderr);
+#endif
     }
 
+#if !defined(YZ_PERF_CLEAN)
     /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
      * Covers every real transfer including the lock-line atomics (GETLLAR/
      * PUTLLC/PUTLLUC/PUTQLLUC all satisfy mfc_is_get/mfc_is_put). Two fixed
@@ -2755,6 +3028,44 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     }
 #endif
 
+    /* Narrow ABI oracle for a single guest dword written by an SPU DMA.
+     * Keep this outside the broad diagnostic compile gate: the clean oracle
+     * needs it too, while an unset environment variable remains inert. */
+    { static int initialized = 0; static uint32_t target = 0;
+      if (!initialized) {
+          const char* text = getenv("YZ_SPU_PUT_WATCH");
+          target = text ? (uint32_t)strtoul(text, NULL, 16) : 0;
+          initialized = 1;
+          if (target) {
+              fprintf(stderr,
+                      "[spu-put-watch] armed ea=0x%08X\n", target);
+              fflush(stderr);
+          }
+      }
+      if (target && (mfc_is_put(cmd) || cmd == MFC_PUTLLC_CMD ||
+                     cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
+          const int atomic = cmd == MFC_PUTLLC_CMD ||
+                             cmd == MFC_PUTLLUC_CMD ||
+                             cmd == MFC_PUTQLLUC_CMD;
+          const uint32_t transfer_ea =
+              atomic ? ((uint32_t)(ea & ~0x80000000ull) & ~127u)
+                     : (uint32_t)(ea & ~0x80000000ull);
+          const uint32_t transfer_size = atomic ? 128u : size;
+          if (transfer_size >= 4u && transfer_ea <= target &&
+              target - transfer_ea <= transfer_size - 4u) {
+              const uint32_t offset = target - transfer_ea;
+              const uint8_t* payload =
+                  spu->ls + (((lsa & SPU_LS_MASK) + offset) & SPU_LS_MASK);
+              fprintf(stderr,
+                      "[spu-put-watch] spu=%X img=%d pc=0x%05X "
+                      "cmd=0x%02X ea=0x%08X size=0x%X val=%02X%02X%02X%02X\n",
+                      spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK,
+                      cmd, transfer_ea, transfer_size,
+                      payload[0], payload[1], payload[2], payload[3]);
+              fflush(stderr);
+          }
+      } }
+
     /* Lock-line atomics: a 128-byte line, EA implicitly 128-aligned, the
      * MFC_Size register is ignored. Status lands in MFC_RdAtomicStat. */
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
@@ -2951,14 +3262,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * _sys_memset/_sys_memcpy, file reads) write guest memory WITHOUT
              * bumping the generation, so a general cached-serve can go stale
              * (boot 14: zero audio rounds -- t1's flywheel start lost). Until
-             * those paths sweep the coherence bitmap, serve cache-fast ONLY for
-             * the SPURS management line 0x40197C80 -- the measured hot poll
-             * (5 kernels spinning; scratch/asset_window_profile.md) whose
-             * writers are all CAS/VM_WRITE_COH paths (the one _sys_memset of a
-             * control line, guard 0x4019C700 at init, predates any kernel
-             * reservation). */
-            if (llfast && le == 0x40197C80ull && mfc->resv_active && mfc->resv_ea == le
+             * those paths sweep the coherence bitmap, serve cache-fast only for
+             * ranges whose writers have been audited.  The SPURS management
+             * poll line is written through CAS/VM_WRITE_COH.  The EDGE command
+             * journal is produced by lifted VM stores and SPU PUTs, both of
+             * which notify the same generation map.  Keeping this as an exact
+             * range avoids making unrelated file/bulk-write memory cacheable. */
+            const int coherent_poll_line =
+                le == 0x40197C80ull ||
+                (le >= 0x41F00000ull && le < 0x42110000ull);
+            if (llfast && coherent_poll_line && mfc->resv_active && mfc->resv_ea == le
                 && spu_coh_gen((uint32_t)le) == mfc->resv_gen) {
+#if defined(YZ_PERF_PROFILE)
+                {
+                    const int image = spu->image_id;
+                    if ((unsigned)image < 32u)
+                        spu->perf_getllar_fast[image]++;
+                }
+#endif
 #if !defined(YZ_PERF_CLEAN)
                 extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
                 g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)le;
@@ -3011,10 +3332,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         if (cmd == MFC_GETLLAR_CMD &&
             g_yz_runtime_config.spu_lockstep)
             yz_lockstep_tick(spu);
+        int notify_spurs_after_unlock = 0;
         spu_lockline_lock();
         switch (cmd) {
         case MFC_GETLLAR_CMD: {
             extern void spu_coh_reserve(uint32_t);   /* mark this line for PPU-write coherence */
+#if defined(YZ_PERF_PROFILE)
+            {
+                const int image = spu->image_id;
+                if ((unsigned)image < 32u)
+                    spu->perf_getllar_locked[image]++;
+            }
+#endif
 #if !defined(YZ_PERF_CLEAN)
             extern unsigned long g_spu_getllar_n; extern uint32_t g_spu_getllar_ea;
             g_spu_getllar_n++; g_spu_getllar_ea = (uint32_t)(ea & ~127ull);
@@ -3641,6 +3970,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 #endif
             if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
                 memcmp(line, mfc->resv_data, 128) == 0) {
+                const int made_progress =
+                    memcmp(mfc->resv_data, ls_ptr, 128) != 0;
 #if !defined(YZ_PERF_CLEAN)
                 yz_a010_reltrace_spu_atomic(
                     spu->spu_id, (uint32_t)spu->image_id,
@@ -3712,6 +4043,66 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       if (sb != sa) { static int n = 0; if (n < 80) { n++;
                           fprintf(stderr, "[sig-chg] PUTLLC mgmt wklSignal1 0x%04X -> 0x%04X\n", sb, sa); fflush(stderr); } } } }
 #endif
+                /* YZ_EA_TRAP atomic leg (2026-08-05 frontier): neither any PPU
+                 * store path NOR the DMA PUT path writes the fatal motion
+                 * descriptor (boots 19/20 flipped with zero hits on both), and
+                 * this line-sized commit is the remaining writer -- the
+                 * descriptor is a 128-byte, 128-byte-aligned allocation, i.e.
+                 * exactly one lock line. Names the image/LS pc and the
+                 * committed payload words. */
+                { extern int yz_ea_trap_range(uint32_t, unsigned, uint32_t*, uint32_t*);
+                  uint32_t tlo = 0, thi = 0;
+                  const uint32_t cea = (uint32_t)(ea & ~127ull);
+                  if (yz_ea_trap_range(cea, 128u, &tlo, &thi)) {
+                      /* Ring record FIRST, print-cap-independent (boot 45's
+                       * cap-32 tail loss; STATUS 2026-08-06). Old value from
+                       * `line` (guest content — the memcpy below has not run
+                       * yet), new from LS. Records the first two CHANGED
+                       * watched words; no I/O, no backtrace. */
+                      { extern void yz_frontier_trace_emit(
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t);
+                        uint32_t n_chg = 0, off1 = 0xFFu, off2 = 0xFFu;
+                        uint32_t old1 = 0, new1 = 0, new2 = 0;
+                        for (uint32_t off = 0; off + 4u <= 128u; off += 4u) {
+                            const uint32_t dst = cea + off;
+                            if (dst + 4u <= tlo || dst >= thi) continue;
+                            const uint8_t* po = line + off;
+                            const uint8_t* pn = ls_ptr + off;
+                            const uint32_t ow = ((uint32_t)po[0] << 24) | ((uint32_t)po[1] << 16) |
+                                                ((uint32_t)po[2] << 8) | po[3];
+                            const uint32_t nw = ((uint32_t)pn[0] << 24) | ((uint32_t)pn[1] << 16) |
+                                                ((uint32_t)pn[2] << 8) | pn[3];
+                            if (off1 == 0xFFu) { off1 = off; old1 = ow; new1 = nw; }
+                            if (ow == nw) continue;
+                            ++n_chg;
+                            if (n_chg == 1u) { off1 = off; old1 = ow; new1 = nw; }
+                            else if (n_chg == 2u) { off2 = off; new2 = nw; }
+                        }
+                        yz_frontier_trace_emit(24u /* YZ_FT_ATOMIC_COMMIT */,
+                            (uint32_t)spu->spu_id, spu->pc & SPU_LS_MASK, cea,
+                            ((uint32_t)spu->image_id << 16) | (n_chg << 8) | (off1 & 0xFFu),
+                            old1, new1, new2,
+                            ((uint32_t)MFC_PUTLLC_CMD << 8) | (off2 & 0xFFu)); }
+                      static unsigned long atr_n = 0;
+                      static int atr_quiet = -1;
+                      if (atr_quiet < 0) { const char* q = getenv("YZ_EA_TRAP_QUIET");
+                          atr_quiet = (q && *q == '1') ? 1 : 0; }
+                      if (!atr_quiet && ++atr_n <= 512) {
+                          fprintf(stderr, "[ea-trap] SPU-PUTLLC spu=%X img=%d pc=0x%05X "
+                                  "line=0x%08X payload:", spu->spu_id, spu->image_id,
+                                  spu->pc & SPU_LS_MASK, cea);
+                          for (uint32_t off = 0; off + 4u <= 128u; off += 4u) {
+                              const uint32_t dst = cea + off;
+                              if (dst + 4u <= tlo || dst >= thi) continue;
+                              const uint8_t* p = ls_ptr + off;
+                              fprintf(stderr, " [0x%08X]=%02X%02X%02X%02X",
+                                      dst, p[0], p[1], p[2], p[3]);
+                          }
+                          fprintf(stderr, "\n");
+                          fflush(stderr);
+                      }
+                  } }
                 memcpy(line, ls_ptr, 128);
                 /* s21: a committing PUTLLC is a line WRITE -- bump the coherence
                  * generation and kill PEER reservations (CBEA reservation-lost;
@@ -3724,8 +4115,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 { extern void spu_coh_notify_write(uint32_t);
                   spu_coh_notify_write((uint32_t)(ea & ~127ull)); }
                 mfc_publish_atomic_status(mfc, MFC_PUTLLC_SUCCESS);
+                post_unlock_idle_level = mfc_putllc_backoff(
+                    mfc, (uint32_t)(ea & ~127ull), made_progress);
             } else {
                 mfc_publish_atomic_status(mfc, MFC_PUTLLC_FAILURE);
+                post_unlock_idle_level = mfc_putllc_backoff(
+                    mfc, (uint32_t)(ea & ~127ull), 0);
             }
             mfc->resv_active = 0;
             break;
@@ -3739,12 +4134,67 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 spu->pc & SPU_LS_MASK,
                 (uint32_t)(ea & ~127ull), ls_ptr, cmd);
 #endif
+            /* YZ_EA_TRAP atomic leg -- PUTLLUC/PUTQLLUC (unconditional commit). */
+            { extern int yz_ea_trap_range(uint32_t, unsigned, uint32_t*, uint32_t*);
+              uint32_t tlo = 0, thi = 0;
+              const uint32_t cea = (uint32_t)(ea & ~127ull);
+              if (yz_ea_trap_range(cea, 128u, &tlo, &thi)) {
+                  /* Ring record first, print-cap-independent (see PUTLLC leg). */
+                  { extern void yz_frontier_trace_emit(
+                        uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                        uint32_t, uint32_t, uint32_t, uint32_t);
+                    uint32_t n_chg = 0, off1 = 0xFFu, off2 = 0xFFu;
+                    uint32_t old1 = 0, new1 = 0, new2 = 0;
+                    for (uint32_t off = 0; off + 4u <= 128u; off += 4u) {
+                        const uint32_t dst = cea + off;
+                        if (dst + 4u <= tlo || dst >= thi) continue;
+                        const uint8_t* po = line + off;
+                        const uint8_t* pn = ls_ptr + off;
+                        const uint32_t ow = ((uint32_t)po[0] << 24) | ((uint32_t)po[1] << 16) |
+                                            ((uint32_t)po[2] << 8) | po[3];
+                        const uint32_t nw = ((uint32_t)pn[0] << 24) | ((uint32_t)pn[1] << 16) |
+                                            ((uint32_t)pn[2] << 8) | pn[3];
+                        if (off1 == 0xFFu) { off1 = off; old1 = ow; new1 = nw; }
+                        if (ow == nw) continue;
+                        ++n_chg;
+                        if (n_chg == 1u) { off1 = off; old1 = ow; new1 = nw; }
+                        else if (n_chg == 2u) { off2 = off; new2 = nw; }
+                    }
+                    yz_frontier_trace_emit(24u /* YZ_FT_ATOMIC_COMMIT */,
+                        (uint32_t)spu->spu_id, spu->pc & SPU_LS_MASK, cea,
+                        ((uint32_t)spu->image_id << 16) | (n_chg << 8) | (off1 & 0xFFu),
+                        old1, new1, new2,
+                        ((uint32_t)cmd << 8) | (off2 & 0xFFu)); }
+                  static unsigned long auc_n = 0;
+                  static int auc_quiet = -1;
+                  if (auc_quiet < 0) { const char* q = getenv("YZ_EA_TRAP_QUIET");
+                      auc_quiet = (q && *q == '1') ? 1 : 0; }
+                  if (!auc_quiet && ++auc_n <= 512) {
+                      fprintf(stderr, "[ea-trap] SPU-PUTLLUC spu=%X img=%d pc=0x%05X "
+                              "line=0x%08X cmd=0x%02X payload:", spu->spu_id,
+                              spu->image_id, spu->pc & SPU_LS_MASK, cea, cmd);
+                      for (uint32_t off = 0; off + 4u <= 128u; off += 4u) {
+                          const uint32_t dst = cea + off;
+                          if (dst + 4u <= tlo || dst >= thi) continue;
+                          const uint8_t* p = ls_ptr + off;
+                          fprintf(stderr, " [0x%08X]=%02X%02X%02X%02X",
+                                  dst, p[0], p[1], p[2], p[3]);
+                      }
+                      fprintf(stderr, "\n");
+                      fflush(stderr);
+                  }
+              } }
             memcpy(line, ls_ptr, 128);
+            mfc->resv_cas_idle_n = 0;
             { extern void spu_coh_notify_write(uint32_t);
               spu_coh_notify_write((uint32_t)(ea & ~127ull)); }  /* clears resv_active + raises LR for all matching ctxs */
             mfc_publish_atomic_status(mfc, MFC_PUTLLUC_SUCCESS);
             break;
         }
+        notify_spurs_after_unlock =
+            (cmd == MFC_PUTLLC_CMD &&
+             mfc->atomic_stat == MFC_PUTLLC_SUCCESS) ||
+            (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD);
 #if !defined(YZ_PERF_CLEAN)
         /* TS-WATCH (env YZ_TS_WATCH, 2026-06-20 pt27): log every SPU atomic touch of
          * the CRI taskset bitset line -> who clears the created task's enabled/ready
@@ -3777,7 +4227,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               #undef TW_W
           } }
 #endif
-        spu_lockline_unlock();
+        /* Never enter SPURS while the global reservation-line lock is held.
+         * This helper is shared with the deterministic lock-order regression,
+         * which forces a queue-mutex/lockline collision. */
+        spu_lockline_unlock_then_notify_guest_write(
+            notify_spurs_after_unlock, (uint32_t)(ea & ~127ull), 128);
         if (post_unlock_idle_level >= 0)
             spu_idle_yield(post_unlock_idle_level);
         if (tagged) mfc_tag_finish(mfc, spu, tag);

@@ -18,6 +18,7 @@
 #include "edge_journal_hle.h"
 
 #include "ps3emu/error_codes.h"
+#include "ps3emu/yz_fifo_publication.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
@@ -26,6 +27,7 @@
 #include "../libs/filesystem/cellFs.h"
 #include "../libs/input/cellPad.h"
 #include "../libs/system/cellSaveData.h"
+#include "../libs/spurs/cellSpurs.h"
 
 #include <cstdio>
 #include <cstring>
@@ -99,6 +101,7 @@ enum : uint32_t {
     YZ_A010_RELTRACE_SPU_ATOMIC = 6u,
     YZ_A010_RELTRACE_PPU_BULK = 7u,
     YZ_A010_RELTRACE_STOP_CREATE = 8u,
+    YZ_A010_RELTRACE_DISPATCH = 9u,
 };
 
 struct yz_a010_reltrace_event {
@@ -157,6 +160,146 @@ static yz_a010_stop_generation
     g_yz_a010_stop_generation[YZ_A010_RELWATCH_CAP] = {};
 static SRWLOCK g_yz_a010_stop_generation_lock = SRWLOCK_INIT;
 
+/* Collision-resistant, low-overhead lifecycle table for the clean-lane
+ * root catcher.  The older generation table is direct-mapped and aliases
+ * FIFO addresses every 256 KiB, so a producer several MiB ahead can evict
+ * the exact stopper before GET finally parks on it. */
+/* One slot per word in the 8 MiB title FIFO.  The previous 2^18-entry
+ * open-addressed table eventually saturated during a long run, which made
+ * every later stopper look unobserved.  With an odd multiplicative hash and
+ * 2^21 slots, the 2^21 consecutive FIFO word indices map bijectively. */
+constexpr uint32_t YZ_A010_STOPLIFE_CAP = 1u << 21;
+struct yz_a010_stoplife {
+    volatile LONG ea;
+    volatile LONG generation;
+    volatile LONG creator_actor;
+    volatile LONG creator_pc;
+    volatile LONG release_generation;
+    volatile LONG release_pc;
+    volatile LONG release_word;
+    volatile LONG commit_generation;
+    volatile LONG commit_word;
+    volatile LONG64 create_ms;
+    volatile LONG64 release_ms;
+    volatile LONG64 commit_ms;
+};
+static yz_a010_stoplife g_yz_a010_stoplife[YZ_A010_STOPLIFE_CAP] = {};
+
+/* func_00EAB3DC publishes a temporary self-stop before an inline data island,
+ * then stores the exact cursor after that island.  Retain that producer-owned
+ * edge outside guest memory so a hard-freeze autopsy can prove the intended
+ * transition instead of guessing through data.  Direct FIFO-word indexing
+ * prevents a producer several MiB ahead of GET from aliasing the record. */
+static volatile LONG
+    g_yz_a010_data_island_end[0x800000u / 4u] = {};
+
+extern "C" void yz_a010_data_island_register(
+    uint32_t stopper_ea, uint32_t data_end_ea)
+{
+    if (stopper_ea < 0x40400000u || stopper_ea >= 0x40C00000u ||
+        (stopper_ea & 3u) || data_end_ea <= stopper_ea ||
+        data_end_ea > 0x40C00000u)
+        return;
+    InterlockedExchange(
+        &g_yz_a010_data_island_end[
+            (stopper_ea - 0x40400000u) >> 2],
+        (LONG)data_end_ea);
+}
+
+static uint32_t yz_a010_data_island_end(uint32_t stopper_ea)
+{
+    if (stopper_ea < 0x40400000u || stopper_ea >= 0x40C00000u ||
+        (stopper_ea & 3u))
+        return 0u;
+    return (uint32_t)InterlockedCompareExchange(
+        &g_yz_a010_data_island_end[
+            (stopper_ea - 0x40400000u) >> 2], 0, 0);
+}
+
+static yz_a010_stoplife* yz_a010_stoplife_find(uint32_t ea, int create)
+{
+    uint32_t slot = ((ea >> 2) * 2654435761u) &
+                    (YZ_A010_STOPLIFE_CAP - 1u);
+    for (unsigned probe = 0; probe < 16u; ++probe) {
+        yz_a010_stoplife* const life =
+            &g_yz_a010_stoplife[(slot + probe) &
+                                (YZ_A010_STOPLIFE_CAP - 1u)];
+        const uint32_t have = (uint32_t)InterlockedCompareExchange(
+            &life->ea, create ? (LONG)ea : 0, 0);
+        if (have == ea || (create && have == 0u))
+            return life;
+        if (!create && have == 0u)
+            return nullptr;
+    }
+    return nullptr;
+}
+
+static void yz_a010_stoplife_create(uint32_t ea, uint32_t actor,
+                                    uint32_t pc)
+{
+    yz_a010_stoplife* const life = yz_a010_stoplife_find(ea, 1);
+    if (!life)
+        return;
+    LONG generation = InterlockedIncrement(&life->generation);
+    if (generation == 0)
+        generation = InterlockedIncrement(&life->generation);
+    InterlockedExchange(&life->creator_actor, (LONG)actor);
+    InterlockedExchange(&life->creator_pc, (LONG)pc);
+    InterlockedExchange(&life->release_generation, 0);
+    InterlockedExchange(&life->release_pc, 0);
+    InterlockedExchange(&life->release_word, 0);
+    InterlockedExchange(&life->commit_generation, 0);
+    InterlockedExchange(&life->commit_word, 0);
+    InterlockedExchange64(&life->create_ms, (LONG64)GetTickCount64());
+    InterlockedExchange64(&life->release_ms, 0);
+    InterlockedExchange64(&life->commit_ms, 0);
+}
+
+static void yz_a010_stoplife_mark(uint32_t ea, uint32_t pc,
+                                  uint32_t word, int commit)
+{
+    yz_a010_stoplife* const life = yz_a010_stoplife_find(ea, 0);
+    if (!life)
+        return;
+    const LONG generation = InterlockedCompareExchange(
+        &life->generation, 0, 0);
+    if (commit) {
+        InterlockedExchange(&life->commit_word, (LONG)word);
+        InterlockedExchange(&life->commit_generation, generation);
+        InterlockedExchange64(&life->commit_ms, (LONG64)GetTickCount64());
+    } else {
+        InterlockedExchange(&life->release_pc, (LONG)pc);
+        InterlockedExchange(&life->release_word, (LONG)word);
+        InterlockedExchange(&life->release_generation, generation);
+        InterlockedExchange64(&life->release_ms, (LONG64)GetTickCount64());
+    }
+}
+
+static void yz_a010_stoplife_dump(uint32_t ea)
+{
+    yz_a010_stoplife* const life = yz_a010_stoplife_find(ea, 0);
+    if (!life) {
+        fprintf(stderr,
+                "[a010-stoplife] ea=0x%08X lifecycle=ABSENT\n", ea);
+        return;
+    }
+    fprintf(stderr,
+            "[a010-stoplife] ea=0x%08X gen=%u creator=%08X pc=%05X "
+            "release-gen=%u release-pc=%05X release-word=%08X "
+            "commit-gen=%u commit-word=%08X ms=%lld/%lld/%lld\n",
+            ea, (uint32_t)life->generation,
+            (uint32_t)life->creator_actor,
+            (uint32_t)life->creator_pc,
+            (uint32_t)life->release_generation,
+            (uint32_t)life->release_pc,
+            (uint32_t)life->release_word,
+            (uint32_t)life->commit_generation,
+            (uint32_t)life->commit_word,
+            (long long)life->create_ms,
+            (long long)life->release_ms,
+            (long long)life->commit_ms);
+}
+
 static const char* yz_a010_reltrace_kind_name(uint32_t kind)
 {
     switch (kind) {
@@ -168,6 +311,7 @@ static const char* yz_a010_reltrace_kind_name(uint32_t kind)
     case YZ_A010_RELTRACE_SPU_ATOMIC: return "spu-atomic";
     case YZ_A010_RELTRACE_PPU_BULK: return "ppu-bulk";
     case YZ_A010_RELTRACE_STOP_CREATE: return "stop-create";
+    case YZ_A010_RELTRACE_DISPATCH: return "release-dispatch";
     default: return "unknown";
     }
 }
@@ -412,7 +556,8 @@ static int yz_a010_reltrace_on()
         &g_yz_a010_reltrace_mode, -1, -1);
     if (mode < 0) {
         const LONG requested =
-            getenv("YZ_A010_RELEASE_TRACE") ? 1 : 0;
+            (getenv("YZ_A010_RELEASE_TRACE") ||
+             getenv("YZ_A010_RELEASE_RING")) ? 1 : 0;
         const LONG prior = InterlockedCompareExchange(
             &g_yz_a010_reltrace_mode, requested, -1);
         mode = prior < 0 ? requested : prior;
@@ -425,6 +570,28 @@ static int yz_a010_reltrace_on()
         fflush(stderr);
     }
     return mode != 0;
+}
+
+static int yz_a010_reltrace_targeted()
+{
+    static volatile LONG mode = -1;
+    LONG value = InterlockedCompareExchange(&mode, -1, -1);
+    if (value < 0) {
+        const LONG requested =
+            getenv("YZ_A010_RELEASE_TARGETED") ? 1 : 0;
+        const LONG prior = InterlockedCompareExchange(
+            &mode, requested, -1);
+        value = prior < 0 ? requested : prior;
+    }
+    return value != 0;
+}
+
+static int yz_a010_reltrace_eager_dump()
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_A010_RELEASE_TRACE") ? 1 : 0;
+    return enabled;
 }
 
 static yz_a010_reltrace_event* yz_a010_reltrace_reserve(
@@ -472,6 +639,7 @@ static void yz_a010_reltrace_dump(uint32_t stopper_ea)
             "[a010-reltrace] FAILURE stopper=0x%08X seq=%lld; "
             "matching producer history follows\n",
             stopper_ea, (long long)end);
+    yz_a010_stoplife_dump(stopper_ea);
     yz_a010_stop_generation_dump(stopper_ea);
     const LONG64 create_seq =
         yz_a010_stop_generation_create_seq(stopper_ea);
@@ -573,6 +741,8 @@ extern "C" void yz_a010_reltrace_ppu(uint32_t pc,
             &g_yz_a010_release_scene_active, 0, 0) == 0 ||
         !yz_a010_reltrace_on())
         return;
+    if (yz_a010_reltrace_targeted())
+        return;
 
     yz_a010_reltrace_event* const ev =
         yz_a010_reltrace_reserve(
@@ -609,6 +779,31 @@ extern "C" void yz_a010_reltrace_spu(
     if (!fifo)
         return;
 
+    const int targeted = yz_a010_reltrace_targeted();
+
+    /* In the compact lane, classify the words themselves instead of relying
+     * on a gs_task PC.  This catches alternate lifted regions and any other
+     * SPU publisher while remaining event-log free. */
+    if (targeted) {
+        const uint32_t actor =
+            (image_id << 16) | (spu_id & 0xFFFFu);
+        for (uint32_t off = 0; off + 4u <= size; off += 4u) {
+            const uint32_t word_ea = ea + off;
+            if (word_ea < 0x40400000u || word_ea >= 0x40C00000u)
+                continue;
+            const uint32_t word = yz_a010_be32(payload + off);
+            const uint32_t self =
+                0x20000000u |
+                ((word_ea - 0x40400000u) & 0x1FFFFFFCu);
+            if (word == self) {
+                yz_a010_stoplife_create(word_ea, actor, pc);
+            } else if ((word & 0xE0000003u) == 0x20000000u) {
+                yz_a010_stoplife_mark(word_ea, pc, word, 0);
+            }
+        }
+        return;
+    }
+
     /*
      * The group publisher can place one or more terminal self-jumps anywhere
      * in a bulk PUT.  Detect those words by comparing their encoded target
@@ -629,6 +824,9 @@ extern "C" void yz_a010_reltrace_spu(
                 continue;
             const uint32_t actor =
                 (image_id << 16) | (spu_id & 0xFFFFu);
+            yz_a010_stoplife_create(word_ea, actor, pc);
+            if (targeted)
+                continue;
             const uint32_t generation =
                 yz_a010_stop_generation_create(
                     actor, pc, word_ea, size, off,
@@ -674,6 +872,10 @@ extern "C" void yz_a010_reltrace_spu(
     const int arm_release =
         image_id == 0u && pc >= 0x05EB8u && pc <= 0x05F20u &&
         size == 4u && first_word == expected_release;
+    if (arm_release)
+        yz_a010_stoplife_mark(ea, pc, first_word, 0);
+    if (targeted)
+        return;
     if (!arm_release && !yz_a010_relwatch_range(ea, size))
         return;
 
@@ -718,6 +920,40 @@ extern "C" void yz_a010_reltrace_spu(
     yz_a010_reltrace_publish(ev);
 }
 
+extern "C" void yz_a010_reltrace_dispatch(
+    uint32_t spu_id, uint32_t pc, const uint32_t* words)
+{
+    if (!words || words[0] != 0x7Fu ||
+        InterlockedCompareExchange(
+            &g_yz_a010_release_scene_active, 0, 0) == 0 ||
+        !yz_a010_reltrace_on() || !yz_a010_reltrace_targeted())
+        return;
+
+    const uint32_t stopper = words[1];
+    if (stopper < 0x40400000u || stopper >= 0x40C00000u)
+        return;
+
+    yz_a010_reltrace_event* const ev = yz_a010_reltrace_reserve(
+        YZ_A010_RELTRACE_DISPATCH, spu_id & 0xFFFFu, pc);
+    ev->ea = stopper;
+    ev->size = 4u;
+    ev->aux = vm_read32(stopper);
+    for (unsigned i = 0; i < 4u; ++i)
+        ev->words[i] = words[i];
+    yz_a010_reltrace_publish(ev);
+
+    yz_a010_relwatch* const watch = yz_a010_relwatch_slot(stopper);
+    InterlockedExchange(&watch->expected, (LONG)ev->aux);
+    InterlockedExchange64(
+        &watch->source_seq,
+        InterlockedCompareExchange64(&ev->published_seq, 0, 0));
+    MemoryBarrier();
+    InterlockedExchange(&watch->ea, (LONG)stopper);
+    InterlockedExchange(
+        &g_yz_a010_relwatch_lines[
+            (stopper - 0x40400000u) >> 7], 1);
+}
+
 extern "C" void yz_a010_reltrace_spu_commit(
     uint32_t spu_id, uint32_t image_id, uint32_t pc,
     uint32_t ea, const uint8_t* payload, uint32_t size)
@@ -727,23 +963,47 @@ extern "C" void yz_a010_reltrace_spu_commit(
             &g_yz_a010_release_scene_active, 0, 0) == 0 ||
         !yz_a010_reltrace_on())
         return;
+    const int targeted = yz_a010_reltrace_targeted();
+    if (targeted) {
+        for (uint32_t off = 0; off + 4u <= size; off += 4u) {
+            const uint32_t word_ea = ea + off;
+            if (word_ea < 0x40400000u || word_ea >= 0x40C00000u)
+                continue;
+            const uint32_t word = yz_a010_be32(payload + off);
+            const uint32_t self =
+                0x20000000u |
+                ((word_ea - 0x40400000u) & 0x1FFFFFFCu);
+            if (word != self &&
+                (word & 0xE0000003u) == 0x20000000u) {
+                yz_a010_stoplife_mark(word_ea, pc, word, 1);
+            }
+        }
+        return;
+    }
     const uint32_t expected_release =
         0x20000000u |
         (((ea - 0x40400000u) + 4u) & 0x1FFFFFFCu);
     const int release =
         image_id == 0u && pc >= 0x05EB8u && pc <= 0x05F20u &&
         size == 4u && yz_a010_be32(payload) == expected_release;
-    if (ea < 0x40400000u || ea >= 0x40C00000u || !release)
+    if (release)
+        yz_a010_stoplife_mark(
+            ea, pc, yz_a010_be32(payload), 1);
+    if (targeted)
         return;
+    uint32_t target = ea;
+    if (ea < 0x40400000u || ea >= 0x40C00000u || !release) {
+        return;
+    }
 
     yz_a010_reltrace_event* const ev =
         yz_a010_reltrace_reserve(
             YZ_A010_RELTRACE_SPU_COMMIT,
             (image_id << 16) | (spu_id & 0xFFFFu), pc);
-    ev->ea = ea;
-    ev->size = size;
-    ev->aux = yz_a010_be32(payload);
-    ev->words[0] = vm_read32(ea);
+    ev->ea = target;
+    ev->size = 4u;
+    ev->aux = yz_a010_be32(payload + (target - ea));
+    ev->words[0] = vm_read32(target);
     ev->state[0] = ev->words[0] == ev->aux;
     ev->state[1] = yz_a010_stop_generation_mark(
         ea, 1, -ev->published_seq);
@@ -795,8 +1055,22 @@ extern "C" void yz_a010_reltrace_ppu_store(
     const uint32_t io =
         (addr - 0x40400000u) & 0x1FFFFFFCu;
     const uint32_t self = 0x20000000u | io;
+    if (yz_a010_reltrace_targeted()) {
+        const uint32_t actor =
+            0x80000000u |
+            ((uint32_t)yz_thread_current_id() & 0x7FFFFFFFu);
+        if (val == self) {
+            yz_a010_stoplife_create(addr, actor, guest_pc);
+        } else if ((val & 0xE0000003u) == 0x20000000u) {
+            /* vm_write32 invokes this hook immediately before the coherent
+             * store.  A validated FIFO-range store cannot fault, so record
+             * both issue and commit for the PPU-owned lifecycle. */
+            yz_a010_stoplife_mark(addr, guest_pc, val, 0);
+            yz_a010_stoplife_mark(addr, guest_pc, val, 1);
+        }
+    }
     uint32_t generation = 0;
-    if (val == self) {
+    if (val == self && !yz_a010_reltrace_targeted()) {
         uint32_t context[16] = {};
         const uint32_t state = g_yz_game_toc
             ? vm_read32(g_yz_game_toc - 0x7410u) : 0u;
@@ -884,12 +1158,40 @@ extern "C" void yz_a010_reltrace_ppu_bulk(
     uint32_t dst, const uint8_t* src, uint32_t size,
     uint32_t guest_pc, uint32_t op, uint8_t fill)
 {
+    const int targeted = yz_a010_reltrace_targeted();
     if (!size ||
         InterlockedCompareExchange(
             &g_yz_a010_release_scene_active, 0, 0) == 0 ||
         !yz_a010_reltrace_on() ||
-        !yz_a010_relwatch_range(dst, size))
+        (!targeted && !yz_a010_relwatch_range(dst, size)))
         return;
+
+    if (targeted) {
+        const uint32_t actor =
+            0x80000000u |
+            ((uint32_t)yz_thread_current_id() & 0x7FFFFFFFu);
+        const uint64_t fifo_begin = dst < 0x40400000u
+            ? 0x40400000ull : (uint64_t)dst;
+        const uint64_t raw_end = (uint64_t)dst + size;
+        const uint64_t fifo_end = raw_end > 0x40C00000ull
+            ? 0x40C00000ull : raw_end;
+        uint32_t word_ea = (uint32_t)((fifo_begin + 3u) & ~3ull);
+        for (; (uint64_t)word_ea + 4u <= fifo_end; word_ea += 4u) {
+            const uint32_t word = op == 1u
+                ? yz_a010_be32(src + (word_ea - dst))
+                : (uint32_t)fill * 0x01010101u;
+            const uint32_t self =
+                0x20000000u |
+                ((word_ea - 0x40400000u) & 0x1FFFFFFCu);
+            if (word == self) {
+                yz_a010_stoplife_create(word_ea, actor, guest_pc);
+            } else if ((word & 0xE0000003u) == 0x20000000u) {
+                yz_a010_stoplife_mark(word_ea, guest_pc, word, 0);
+                yz_a010_stoplife_mark(word_ea, guest_pc, word, 1);
+            }
+        }
+        return;
+    }
 
     const uint64_t end = (uint64_t)dst + size;
     uint32_t word = (dst + 3u) & ~3u;
@@ -981,7 +1283,33 @@ extern "C" void yz_rsx_fifo_acquire(void);
 extern "C" void yz_rsx_fifo_release(void);
 extern "C" int yz_rsx_flip_pending_any(void);
 extern "C" void yz_rsx_vblank_tick(void);
+extern "C" void cellGcmDispatchUserCommand(uint32_t cause);
 extern "C" void yz_a010_auth_probe_poll(void);
+
+/* The PPU ABI passes only arguments 1-8 in r3-r10. Arguments 9+ are in the
+ * parameter save area at r1+0x30+i*8 (i is zero-based from r3). */
+extern "C" void yz_ovr__cellSpursJobChainAttributeInitialize(ppu_context* ctx)
+{
+    auto stack_arg = [ctx](unsigned i) -> uint64_t {
+        return vm_read64((uint32_t)ctx->gpr[1] + 0x30u + i * 8u);
+    };
+    const int32_t rc = _cellSpursJobChainAttributeInitialize(
+        (uint32_t)ctx->gpr[3],
+        (uint32_t)ctx->gpr[4],
+        (CellSpursJobChainAttribute*)(vm_base + (uint32_t)ctx->gpr[5]),
+        (const uint64_t*)(vm_base + (uint32_t)ctx->gpr[6]),
+        (uint16_t)ctx->gpr[7],
+        (uint16_t)ctx->gpr[8],
+        (const uint8_t*)(vm_base + (uint32_t)ctx->gpr[9]),
+        (uint32_t)ctx->gpr[10],
+        (uint32_t)stack_arg(8),
+        (uint32_t)stack_arg(9),
+        (uint32_t)stack_arg(10),
+        (uint32_t)stack_arg(11),
+        (uint32_t)stack_arg(12),
+        (uint32_t)stack_arg(13));
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
 
 #define YZ_TLS_BASE   0x0FE00000u
 #define YZ_HEAP_BASE  0x0D000000u
@@ -1071,17 +1399,24 @@ extern "C" void yz_ovr__sys_heap_free(ppu_context* ctx)
  * sys_time_get_system_time -> microseconds (64-bit, so not bridgeable
  * through the generic int32-narrowing bridge)
  * -----------------------------------------------------------------------*/
-extern "C" void yz_ovr_sys_time_get_system_time(ppu_context* ctx)
+/* U1/U2 fix (2026-07-09): the old code returned microseconds since the
+ * QPC counter's own epoch, i.e. leaked this PC's uptime straight into
+ * the game -- RPCS3 sys_time.cpp:191-192 calls this out explicitly
+ * ("Add an offset to get_timebased_time to avoid leaking PC's uptime
+ * into the game / As if PS3 starts at value 0 (base time) when the game
+ * boots"). Cache the QPC frequency once and report elapsed time since a
+ * first-call anchor instead of raw QPC. Kill-switch YZ_NO_TIMEANCHOR
+ * (shared with sys_timer.c's sys_time_get_current_time anchor) restores
+ * the old raw-QPC (host-uptime) behaviour for A/B.
+ *
+ * 2026-08-04 doc-conformance audit: factored into a callable helper and
+ * registered as the lv2 timer subsystem's clock (g_lv2_system_time_us).
+ * Lv2 Reference p.255/p.257/p.259 define sys_timer base/expiry times and
+ * the event data3 stamp in SYSTEM time -- this clock -- while sys_timer.c
+ * compared them against Unix-epoch wall time (~1.75e15 us), so every
+ * absolute-base timer fired immediately. */
+extern "C" uint64_t yz_guest_system_time_us(void)
 {
-    /* U1/U2 fix (2026-07-09): the old code returned microseconds since the
-     * QPC counter's own epoch, i.e. leaked this PC's uptime straight into
-     * the game -- RPCS3 sys_time.cpp:191-192 calls this out explicitly
-     * ("Add an offset to get_timebased_time to avoid leaking PC's uptime
-     * into the game / As if PS3 starts at value 0 (base time) when the game
-     * boots"). Cache the QPC frequency once and report elapsed time since a
-     * first-call anchor instead of raw QPC. Kill-switch YZ_NO_TIMEANCHOR
-     * (shared with sys_timer.c's sys_time_get_current_time anchor) restores
-     * the old raw-QPC (host-uptime) behaviour for A/B. */
     static LARGE_INTEGER s_freq;
     static LARGE_INTEGER s_anchor;
     static int s_init = 0;
@@ -1103,7 +1438,26 @@ extern "C" void yz_ovr_sys_time_get_system_time(ppu_context* ctx)
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     int64_t d = s_no_anchor ? c.QuadPart : (c.QuadPart - s_anchor.QuadPart);
-    ctx->gpr[3] = (uint64_t)((d * 1000000) / s_freq.QuadPart);
+    return (uint64_t)((d * 1000000) / s_freq.QuadPart);
+}
+
+/* Register this clock with runtime/syscalls/sys_timer.c before main() runs
+ * (dynamic initializer; import_overrides.cpp is always linked into the
+ * runner). */
+extern "C" uint64_t (*g_lv2_system_time_us)(void);
+static const int s_yz_timer_clock_registered =
+    (g_lv2_system_time_us = &yz_guest_system_time_us, 0);
+
+/* Frozen-ticket forensics: hand cellSync's spin diagnostic the SPU
+ * line-owner dump (runner-only; unit tests leave the pointer NULL). */
+extern "C" void yz_spu_dump_line_owners(unsigned ea);
+extern "C" void (*g_yz_spu_line_dump)(unsigned);
+static const int s_yz_line_dump_registered =
+    (g_yz_spu_line_dump = &yz_spu_dump_line_owners, 0);
+
+extern "C" void yz_ovr_sys_time_get_system_time(ppu_context* ctx)
+{
+    ctx->gpr[3] = yz_guest_system_time_us();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1287,6 +1641,7 @@ static int      g_rsx_iomap_init = 0;
  * so ea->io for the ring is `ea - yz_gcm_io_addr`. Set by yz_ovr__cellGcmInitBody. */
 static uint32_t yz_gcm_io_addr = 0;
 static uint32_t yz_gcm_io_size = 0;
+static uint32_t g_yz_gcm_segment_bytes = 0;
 
 static void yz_rsx_iomap_ensure_init(void)
 {
@@ -1342,6 +1697,11 @@ static uint32_t       g_rsx_dispbuf_count;
  * the label before the stream writes 0xFFFFFFFF (avoids a clear/redirty race).
  * The vblank tick then presents the head's buffer + clears the label. */
 static volatile long g_rsx_flip_pending[8];
+/* Running count of flips manufactured by the SEMARM release-arm heuristic
+ * (see NV406E SEMAPHORE_RELEASE below). Nonzero means frame-timing numbers
+ * from this run include uncommanded presents. */
+extern "C" volatile long g_yz_semarm_count;
+volatile long g_yz_semarm_count = 0;
 static uint32_t      g_rsx_queued_head = 1;   /* head of the last GCM_DRIVER_QUEUE */
 
 /* Real RSX command translator (libs/video/rsx_commands.c): the consumer
@@ -2234,8 +2594,20 @@ static void yz_movie_open_hook(CellFsFd fd, const char* guest_path,
 #if defined(YZ_PERF_CLEAN)
             InterlockedExchange(&g_yz_a010_root_active, 0);
 #endif
-            if (InterlockedExchange(
-                    &g_yz_a010_release_scene_active, 0) != 0) {
+            /* The compact lifecycle catcher must remain armed after a020:
+             * the rare terminal stopper has also appeared much later in the
+             * FIFO.  This is observation-only and is opt-in. */
+            if (yz_a010_reltrace_targeted()) {
+                if (InterlockedCompareExchange(
+                        &g_yz_a010_release_scene_active, 0, 0) != 0) {
+                    fprintf(stderr,
+                            "[a010-reltrace] TARGETED lifetime retained on "
+                            "open '%s'\n",
+                            guest_path);
+                    fflush(stderr);
+                }
+            } else if (InterlockedExchange(
+                           &g_yz_a010_release_scene_active, 0) != 0) {
                 if (a010_release_trace) {
                     fprintf(stderr,
                             "[a010-reltrace] SCENE END on open '%s'\n",
@@ -2656,6 +3028,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
  * HWND and takes over presentation (the null GDI present is suppressed). */
 static DWORD WINAPI yz_window_thread(LPVOID)
 {
+    yz_thread_adopt_host("window");
     if (rsx_null_backend_init(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {
         fprintf(stderr, "[rsx] window init failed\n");
         return 1;
@@ -2739,6 +3112,10 @@ static DWORD WINAPI yz_window_thread(LPVOID)
 #endif
     fprintf(stderr, "[window] closed; terminating host process\n");
     fflush(stderr);
+    /* Exit dump (reason 3): ExitProcess skips CRT atexit, and the stall
+     * dumps are progress-gated — this is the capture of record for a
+     * pre-progress freeze (boots 49/51 frame-52 face). */
+    yz_frontier_trace_dump(3u);
     ExitProcess(0);
     return 0;
 }
@@ -2968,8 +3345,12 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         uint32_t pitch = yz_rsx_blit_pitch & 0xFFFFu;
         uint32_t addr = yz_rsx_sem_addr(yz_rsx_blit_dst_dma,
                                         yz_rsx_blit_dst_off + x * 4 + y * pitch);
-        if (addr)
+        if (addr) {
             yz_rsx_w32(addr, arg);
+            rsx_live_draw_note_inline_transfer(
+                yz_rsx_blit_dst_dma,
+                yz_rsx_blit_dst_off + x * 4 + y * pitch, arg);
+        }
         if (trace_a010_blit) {
             a010_blit_n++;
             fprintf(stderr,
@@ -3104,6 +3485,15 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
             }
         }
         vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
+#ifdef YZ_NATIVE_GCM
+        cellGcmDispatchUserCommand(arg);
+        { static unsigned long un = 0; un++;
+          if (un <= 40 || (un & 0xFFu) == 0) {
+              fprintf(stderr, "[ucmd-hle] n=%lu cause=0x%08X dispatched\n",
+                      un, arg);
+              fflush(stderr);
+          } }
+#else
         if (g_rsx_event_port) {
             /* A newer cause supersedes any latched one (lv1 coalescing: ONE
              * pending cause register, latest wins; userCmdParam above already
@@ -3120,6 +3510,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                 fprintf(stderr, "[ucmd] DROPPED cause=0x%08X (no event port yet)\n", arg);
                 fflush(stderr); }
         }
+#endif
         break; }
     case 0x050:                                   /* NV406E SET_REFERENCE */
         /* FAITHFUL FENCE TIMING (env YZ_RSX_FENCE_SYNC, opt-in A/B). RPCS3's
@@ -3201,27 +3592,57 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                 yz_a010_fifo_publication_repair_enabled()) {
                 const uint32_t have = vm_read32(addr);
                 const uint32_t ahead = have - arg;
+                const uint32_t lag = arg - have;
+                const uint32_t task_running =
+                    vm_read32(0x42450E00u + 0x00u);
+                const uint32_t task_ready =
+                    vm_read32(0x42450E00u + 0x10u);
+                const uint32_t task_signalled =
+                    vm_read32(0x42450E00u + 0x40u);
+                const uint32_t task_waiting =
+                    vm_read32(0x42450E00u + 0x50u);
+                const int known_pool_parked =
+                    task_running == 0u && task_ready == 0u &&
+                    task_signalled == 0u && task_waiting != 0u;
+                static uint32_t stalled_arg = 0xFFFFFFFFu;
+                static uint32_t stalled_have = 0xFFFFFFFFu;
+                static ULONGLONG stalled_since = 0;
+                static ULONGLONG last_fallback_retry = 0;
+                const ULONGLONG stall_now = GetTickCount64();
+                if (stalled_arg != arg || stalled_have != have) {
+                    stalled_arg = arg;
+                    stalled_have = have;
+                    stalled_since = stall_now;
+                }
+                const int overdue_exact_stall =
+                    stall_now - stalled_since >= 2000u &&
+                    stall_now - last_fallback_retry >= 2000u;
                 /*
                  * Reduced-overhead runs exposed a lost wid4 wake after the
                  * user callback had fully staged the requested round.  This
                  * protocol is active during boot as well as a010, so its exact
                  * lost-wake repair must not be scene-gated. Retry exactly once
-                 * only when the acquire is one round ahead, the callback
-                 * completed that exact cause, and the taskset has no running,
-                 * ready, or signalled task (all workers are parked). Replaying
-                 * the cause is then idempotent: no wake remains to duplicate
-                 * and the staged record is already authoritative.
+                 * only when the acquire is a small number of rounds ahead,
+                 * the callback completed that exact cause, and either the
+                 * known pool has every worker parked or the exact (want,have)
+                 * pair has made no progress for two seconds.  The latter is a
+                 * fallback for boot phases whose wid4 taskset is not yet at
+                 * the later a010 address.  The callback's task signal is a
+                 * level bit, so replaying the same cause is idempotent; the
+                 * two-second spacing also prevents a slow live worker from
+                 * receiving a burst of duplicate callbacks.
                  */
-                if (arg - have == 1u &&
+                if (lag != 0u && lag <= 8u &&
                     vm_read32(RSX_DRIVER_INFO + 0x12CCu) == arg &&
                     (uint32_t)_InterlockedCompareExchange(
                         &g_yz_ucmd_handler_completed, 0, 0) == arg &&
-                    vm_read32(0x42450E00u + 0x00u) == 0u &&
-                    vm_read32(0x42450E00u + 0x10u) == 0u &&
-                    vm_read32(0x42450E00u + 0x40u) == 0u &&
-                    vm_read32(0x42450E00u + 0x50u) != 0u &&
+                    (known_pool_parked || overdue_exact_stall) &&
+#if defined(YZ_NATIVE_GCM)
+                    1) {
+#else
                     (vm_read32(RSX_DRIVER_INFO + 0x12C0u) & 0x80u) != 0u &&
                     g_rsx_event_port != 0u) {
+#endif
                     static uint32_t last_reissued_cause = 0xFFFFFFFFu;
                     static uint32_t last_reissued_epoch = 0xFFFFFFFFu;
                     static unsigned reissue_attempt = 0;
@@ -3235,7 +3656,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                     }
                     /*
                      * A completed replay is a negative acknowledgement when
-                     * the label is still one behind and every task is parked
+                     * the label is still behind and every task is parked
                      * again. Allow the next replay only after that completion
                      * epoch changes; FIFO polling alone cannot generate
                      * duplicates. The small cap keeps a genuinely broken
@@ -3245,15 +3666,26 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                         reissue_attempt < 8u) {
                         last_reissued_epoch = completed_epoch;
                         reissue_attempt++;
+                        if (!known_pool_parked)
+                            last_fallback_retry = stall_now;
+#if defined(YZ_NATIVE_GCM)
+                        cellGcmDispatchUserCommand(arg);
+                        const int64_t retry = 0;
+#else
                         const int64_t retry = yz_rsx_ev_send(0x80ull);
+#endif
 #if !defined(YZ_PERF_CLEAN)
                         fprintf(stderr,
                                 "[fifo-sync] redelivered staged cause="
-                                "0x%08X have=0x%08X epoch=%u attempt=%u "
-                                "waiting=0x%08X send=%lld\n",
-                                arg, have,
+                                "0x%08X have=0x%08X lag=%u epoch=%u "
+                                "attempt=%u parked=%d "
+                                "task{run=%08X ready=%08X sig=%08X "
+                                "wait=%08X} send=%lld\n",
+                                arg, have, lag,
                                 completed_epoch, reissue_attempt,
-                                vm_read32(0x42450E00u + 0x50u),
+                                known_pool_parked,
+                                task_running, task_ready,
+                                task_signalled, task_waiting,
                                 (long long)retry);
                         fflush(stderr);
 #else
@@ -3321,12 +3753,32 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
          * bump + FLIP event). Kill-switch YZ_NO_SEMARM for the retirement A/B;
          * flip the default to OFF once measured redundant. */
         if (addr == RSX_REPORTS + 0x10 && arg != 0) {
-            static int nsa = -1; if (nsa < 0) { nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
+            /* Measurement integrity: while this heuristic is on, every arm it
+             * performs is a present the guest did not command, so frame-timing
+             * numbers include manufactured flips. Perf lanes therefore default
+             * it OFF (YZ_SEMARM=1 forces it back for an A/B); normal boots
+             * keep the historical default ON until a visible boot validates
+             * retirement. Every effective arm (prev==0) is counted and kept
+             * visible so any timing run can state its phantom-flip footprint. */
+            static int nsa = -1; if (nsa < 0) {
+#if defined(YZ_PERF_CLEAN)
+                nsa = getenv("YZ_SEMARM") ? 0 : 1;
+#else
+                nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
+#endif
                 fprintf(stderr, "[semarm] armed (release-arm heuristic %s)\n",
-                        nsa ? "DISABLED by YZ_NO_SEMARM" : "on"); fflush(stderr); }
+                        nsa ? "DISABLED" : "on"); fflush(stderr); }
             if (!nsa) {
                 LONG prev = InterlockedExchange(
                     &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+                if (prev == 0) {
+                    long n = _InterlockedIncrement(&g_yz_semarm_count);
+                    if (n <= 4 || (n & 0xFF) == 0) {
+                        fprintf(stderr, "[semarm] manufactured flip arm "
+                                "total=%ld\n", n);
+                        fflush(stderr);
+                    }
+                }
                 if (yz_ft_on())
                     yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
             }
@@ -3530,8 +3982,9 @@ static void yz_jrnl_retire_through(uint32_t entry_addr)
 }
 
 /* ============================================================================
- * s40b PRODUCER THROTTLE (YZ_JRNL_THROTTLE=<K lines>, default OFF; K=8 when
- * set without a number). scratch/s40b_findings.md sec.19-20.
+ * s40b PRODUCER THROTTLE (native-GCM default K=8; YZ_JRNL_THROTTLE=<K>
+ * overrides it and YZ_NO_JRNL_THROTTLE=1 is the rollback).
+ * scratch/s40b_findings.md sec.19-20.
  *
  * THE MEASURED ROOT of both terminal modes at the frame-~800 phase transition:
  * our backlog carries live release records ACROSS the game's phase-boundary
@@ -3559,13 +4012,25 @@ extern "C" void yz_jrnl_throttle(void)
     static int on = -1; static uint32_t K = 8; static uint32_t budget_ms = 200;
     if (on < 0) {
         const char* e = getenv("YZ_JRNL_THROTTLE");
-        on = (e && *e) ? 1 : 0;
+#if defined(YZ_NATIVE_GCM)
+        on = getenv("YZ_NO_JRNL_THROTTLE") ? 0 : 1;
+#else
+        on = 0;
+#endif
+        if (!getenv("YZ_NO_JRNL_THROTTLE") && e && *e)
+            on = 1;
         if (on) {
-            int k = atoi(e); if (k > 0 && k <= 4096) K = (uint32_t)k;
+            int k = e ? atoi(e) : 0;
+            if (k > 0 && k <= 4096) K = (uint32_t)k;
             const char* m = getenv("YZ_JRNL_THROTTLE_MS");
             if (m && atoi(m) > 0) budget_ms = (uint32_t)atoi(m);
-            fprintf(stderr, "[jthr] ARMED K=%u lines budget=%ums (producer throttle at append 0xE7DE88)\n",
-                    K, budget_ms);
+            fprintf(stderr, "[jthr] ARMED K=%u lines budget=%ums "
+                    "(producer throttle at append 0xE7DE88%s)\n",
+                    K, budget_ms,
+                    (e && *e) ? ", env override" : ", native-GCM default");
+            fflush(stderr);
+        } else if (getenv("YZ_NO_JRNL_THROTTLE")) {
+            fprintf(stderr, "[jthr] DISABLED (YZ_NO_JRNL_THROTTLE)\n");
             fflush(stderr);
         }
     }
@@ -3667,18 +4132,46 @@ extern "C" void yz_jrnl_throttle(void)
 /* Locate the journal entry for a deferred release (same match as
  * yz_gcm_stopper_release_deferred but returns the ENTRY ADDRESS so the
  * retirement sweep knows how far GET's consumption has proven progress). */
+/* Region of the last yz_gcm_stopper_release_entry() hit: 0 = none,
+ * 1 = ordered window [base..head), 2 = above head [head..end) — an entry
+ * written before the ring's head wrapped this lap, or a stale prior-lap
+ * entry for a recycled stopper EA. Racy diagnostic (consumer + poller
+ * threads); callers read it immediately after the call, and every caller
+ * treats region 2 in the REFUSAL direction, so a torn read cannot widen
+ * the repair. */
+static uint32_t g_yz_relentry_region = 0;
+
 static uint32_t yz_gcm_stopper_release_entry(uint32_t stopper_ea)
 {
+    g_yz_relentry_region = 0;
     if (!g_yz_game_toc) return 0;
     uint32_t S = vm_read32(g_yz_game_toc - 0x7410u);
     if (S < 0x10000u || S >= 0xE0000000u) return 0;
     uint32_t base = vm_read32(S + 0x08u);
     uint32_t head = vm_read32(S + 0x00u);
+    uint32_t end = vm_read32(S + 0x0Cu);
     if (base < 0x10000u || base >= 0xE0000000u) return 0;
     if (head < base || (head - base) > 0x1000000u) return 0;
     for (uint32_t e = base; e < head; e += 0x20u)
-        if (vm_read32(e + 0x00u) == 0x7Fu && vm_read32(e + 0x04u) == stopper_ea)
+        if (vm_read32(e + 0x00u) == 0x7Fu && vm_read32(e + 0x04u) == stopper_ea) {
+            g_yz_relentry_region = 1u;
             return e;
+        }
+    /* WRAP-AWARE LEG (2026-08-06, boot-62 ring decode): the journal is a
+     * ring [base..end) (end = S+0x0C, 0x42100080 live) and head WRAPS to
+     * base; the linear scan above is blind to entries still live in
+     * [head..end). Every pre-08-06 "journal-ABSENT" verdict carried that
+     * blindness (boot-62 repairs fired with head=0x41F00E20 just after a
+     * wrap). An above-head match may also be a stale prior-lap entry for a
+     * recycled stopper EA, so callers must treat region 2 conservatively:
+     * journal-owned, wait — never a reason to jump. */
+    if (end > head && end - base <= 0x1000000u)
+        for (uint32_t e = head; e + 0x20u <= end; e += 0x20u)
+            if (vm_read32(e + 0x00u) == 0x7Fu &&
+                vm_read32(e + 0x04u) == stopper_ea) {
+                g_yz_relentry_region = 2u;
+                return e;
+            }
     return 0;
 }
 
@@ -4470,43 +4963,138 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
         }
     }
 
+    /* Refusal witness (boot 59, face-B cycle): the reltrace at the bottom
+     * only sees candidates that PASS every gate; the terminal face-B
+     * stopper is refused silently upstream. Under the trace flag, name the
+     * FIRST refusing gate once per (stopper,gate) — capped, dedup'd, and
+     * cheap enough for the consumer thread. */
+    static int relgate_trace = -1;
+    if (relgate_trace < 0)
+        relgate_trace = getenv("YZ_A010_MISSING_REL_TRACE") ? 1 : 0;
+    /* Boot 59 lesson (the cap sin, again): routine per-frame stoppers are
+     * healthily refused (gate 4 unaligned-producer / gate 5 journal-owned)
+     * hundreds of times per minute and burned the print budget long before
+     * the terminal stopper. Scope the witness to stoppers that have been
+     * the parked candidate for >2 s — face B parks for 180 s, routine ones
+     * for milliseconds — and re-print each gate on each 2 s epoch so the
+     * terminal stopper's refusal is ALWAYS in the tail of the log. */
+    static uint32_t rg_cur_stopper, rg_last_gate;
+    static uint64_t rg_first_seen_ms, rg_last_print_ms;
+    const uint64_t rg_now = relgate_trace ? GetTickCount64() : 0;
+    if (relgate_trace && rg_cur_stopper != stopper_ea) {
+        rg_cur_stopper = stopper_ea;
+        rg_first_seen_ms = rg_now;
+        rg_last_gate = 0;
+    }
+#define YZ_RELGATE(gate_id, fmt, ...)                                        \
+    do {                                                                     \
+        if (relgate_trace && rg_now - rg_first_seen_ms > 2000u &&            \
+            (rg_last_gate != (gate_id) ||                                    \
+             rg_now - rg_last_print_ms > 2000u)) {                           \
+            rg_last_gate = (gate_id); rg_last_print_ms = rg_now;             \
+            fprintf(stderr, "[relgate] stopper=0x%08X parked=%llums gate=%u "\
+                    fmt "\n", stopper_ea,                                    \
+                    (unsigned long long)(rg_now - rg_first_seen_ms),         \
+                    (gate_id), __VA_ARGS__);                                 \
+            fflush(stderr);                                                  \
+        }                                                                    \
+    } while (0)
+
     const uint32_t ring = 0x800000u;
     const uint32_t ahead = (put - get + ring) % ring;
-    if (ahead == 0u || ahead >= (ring >> 1))
+    /* RING-FULL-THROTTLE FACE (2026-08-06, boot 63 — ring d7 rsx-state +
+     * [defer]): GET parked on a segment-entry JTS while the producer wrote
+     * an ENTIRE LAP behind it (put 0x26F4CC -> 0x4BFF90, throttle-parked
+     * 0x80 short of GET, t1lr=0xE9BACC in gcm reserve) and the game's own
+     * ledger says the stopper is fully retired (S[0x20]=0, S[0x1C]=0) —
+     * the physical release write alone went missing. ahead measures
+     * ~ring-0x80 here, so the ring/2 sanity bound (built for the
+     * "t1 lapped while parked = invalid snapshot" reading, boots 58/61)
+     * refuses the repair's own strongest face. Admit it as a DISTINCT
+     * branch with stricter proofs (game-ledger-retired at gate 4,
+     * journal-quiet gate 7, wrap-aware-ABSENT gate 5) and a SEQUENTIAL-
+     * ONLY resume — never the linked-guess resume whose mis-rejoin was
+     * boot 60/62's derail. Kill-switch YZ_NO_RINGFULL_REL=1. */
+    /* BOOT 64 GENERALIZATION (same day): the producer need not fill the
+     * ring — boot 64 parked in frame-drain mid-lap (t1lr=0xE7DCA4, PUT
+     * 6.8MB ahead, 1.2MB still free) with the LEDGER POSTURE of the
+     * repair's original face: S[0x20] == PUT exactly, S[0x1C]=0, journal
+     * quiet, wrap-aware ABSENT — and again ONLY the ring/2 bound refused,
+     * 180 s to the watchdog. Two stable, valid, fully-witnessed deep-lag
+     * parks (63/64) refute the "ahead >= ring/2 == invalid snapshot"
+     * reading (boots 58/61 inherited it); the stable-snapshot recheck and
+     * gate 7 carry the actual guarantees. The branch admits the whole
+     * deep-lag range with the stricter proofs at gate 4. */
+    static int no_deeplag = -1;
+    if (no_deeplag < 0) no_deeplag = getenv("YZ_NO_DEEPLAG_REL") ? 1 : 0;
+    const int deep_lag = !no_deeplag && ahead >= (ring >> 1);
+    if (ahead == 0u || (ahead >= (ring >> 1) && !deep_lag)) {
+        YZ_RELGATE(1u, "ahead=0x%X get=0x%06X put=0x%06X", ahead, get, put);
         return 0;
+    }
 
     MemoryBarrier();
     const uint32_t state = vm_read32(g_yz_game_toc - 0x7410u);
-    if (state < 0x10000u || state >= 0xE0000000u)
+    if (state < 0x10000u || state >= 0xE0000000u) {
+        YZ_RELGATE(2u, "state=0x%08X", state);
         return 0;
+    }
     const uint32_t base = vm_read32(state + 0x08u);
     const uint32_t end = vm_read32(state + 0x0Cu);
     const uint32_t head = vm_read32(state + 0x00u);
     const uint32_t pending = vm_read32(state + 0x20u);
     if (base < 0x10000u || end <= base || end - base > 0x1000000u ||
-        head < base || head >= end)
+        head < base || head >= end) {
+        YZ_RELGATE(3u, "base=0x%08X end=0x%08X head=0x%08X", base, end, head);
         return 0;
+    }
 
     const uint32_t put_ea = yz_rsx_io_to_ea(put);
-    if (!put_ea || pending != put_ea || pending == stopper_ea)
+    if (deep_lag) {
+        /* Deep-lag branch: the game's OWN ledger must be coherent about
+         * this stopper being someone else's problem — no deferred ops
+         * (S[0x1C]=0) and the pending cursor either fully cleared
+         * (boot 63: ring-full throttle, S[0x20]=0) or naming the CURRENT
+         * commit at PUT exactly (boot 64: drain-park, S[0x20]==put_ea —
+         * the original repair proof). A cursor still naming THIS stopper
+         * (or anything else) means the game owes protocol; wait. */
+        const uint32_t latch = vm_read32(state + 0x1Cu);
+        const int ledger_ok =
+            latch == 0u && pending != stopper_ea &&
+            (pending == 0u || (put_ea && pending == put_ea));
+        if (!ledger_ok) {
+            YZ_RELGATE(4u, "deeplag pending=0x%08X latch=0x%08X put_ea=0x%08X",
+                       pending, latch, put_ea);
+            return 0;
+        }
+    } else if (!put_ea || pending != put_ea || pending == stopper_ea) {
+        YZ_RELGATE(4u, "put_ea=0x%08X pending=0x%08X", put_ea, pending);
         return 0;
+    }
 
     /* A deferred release owns this stopper if it appears at any point before
      * the stable producer head.  In that case the ordered journal consumer,
      * not this direct-release recovery, must apply it. */
-    if (yz_gcm_stopper_release_entry(stopper_ea) != 0u)
+    if (yz_gcm_stopper_release_entry(stopper_ea) != 0u) {
+        YZ_RELGATE(5u, "journal-owned entry=0x%08X region=%s",
+                   yz_gcm_stopper_release_entry(stopper_ea),
+                   g_yz_relentry_region == 2u ? "above-head" : "ordered");
         return 0;
+    }
 
     const uint32_t expected = 0x20000000u | (get & 0x1FFFFFFCu);
-    if (vm_read32(stopper_ea) != expected)
+    if (vm_read32(stopper_ea) != expected) {
+        YZ_RELGATE(6u, "*stopper=0x%08X expected=0x%08X",
+                   vm_read32(stopper_ea), expected);
         return 0;
+    }
 
     /*
      * A release-trace-only run must be able to report the current generation
      * without enabling the recovery bridge.  Dump once per stable
      * (stopper, PUT, pending-stopper) tuple, then leave GET untouched.
      */
-    if (trace &&
+    if (trace && yz_a010_reltrace_eager_dump() &&
         (last_dump_stopper != stopper_ea ||
          last_dump_put != put ||
          last_dump_pending != pending)) {
@@ -4518,7 +5106,93 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
     if (!enabled)
         return 0;
 
-    const uint32_t resume = yz_a010_missing_release_resume(get, put);
+    /* GATE 7 — journal-flowing refusal (2026-08-06, boot-62 ring decode).
+     * A missing release while the producer's journal head is still
+     * ADVANCING is a DEFERRED-LATE release, not a lost one: boot 62's ring
+     * (rel_hunt.py over frontier_ring_d3) caught t1 writing the 0x7F
+     * entries for repaired stoppers 0x40858000/0x40880000 at seq
+     * 24966429/24968522 — tens of seconds AFTER this repair had already
+     * jumped them (repair-time head 0x41F00E20), and the n=3 jump's walk
+     * ended on the terminal non-command park at io 0x22C0 (the boot-60
+     * mis-rejoin class). The game's deferral drain is flip-coupled and
+     * slows to tens of seconds at load boundaries; jumping then trades a
+     * self-resolving park for a derailed walk. Repair only once the head
+     * has been quiet for 5 s — the genuine idle-producer face the repair
+     * was built for (a010 orphanage; post-a020 frame 3214). Kill-switch
+     * YZ_A010_EAGER=1 restores the old always-eager behavior for A/B. */
+    {
+        static uint32_t rel_head_last;
+        static uint64_t rel_head_change_ms;
+        static int rel_eager = -1;
+        if (rel_eager < 0)
+            rel_eager = getenv("YZ_A010_EAGER") ? 1 : 0;
+        const uint64_t rel_now = GetTickCount64();
+        if (rel_head_last != head) {
+            rel_head_last = head;
+            rel_head_change_ms = rel_now;
+        }
+        if (!rel_eager && rel_now - rel_head_change_ms < 5000u) {
+            YZ_RELGATE(7u, "journal-flowing head=0x%08X age=%llums",
+                       head,
+                       (unsigned long long)(rel_now - rel_head_change_ms));
+            return 0;
+        }
+    }
+
+    /* Deep-lag resume — BOOT-68 CORRECTION (first firing, n=1): blind
+     * sequential (get+4) stepped GET into an EDGE data island (words at
+     * get+4 = BF000000.. vertex floats; 178 s non-command park at io
+     * 0x304524) — the documented class "EDGE reserves data islands in
+     * the FIFO and links around them". Island stoppers release with a
+     * jump FORWARD, and the island length lived only in the lost journal
+     * entry. Order of preference now:
+     *  1. the island-aware, fail-closed pending-chain hunt, scan-bounded
+     *     one segment ahead (the real PUT is nearly a ring behind in
+     *     deep-lag geometry; the prologue hunt's own ahead<ring/2 guard
+     *     would refuse the raw PUT);
+     *  2. refuse (stay parked, witnesses live) when no chain is found.
+     * A single command-looking word at get+4 is not enough to prove that the
+     * rest of the segment is commands. Boot 73 passed that old check, then
+     * walked into a data island at io 0x69C2D8 and parked permanently.
+     * The boot-60/62 linked-resume hazard (jumping a stopper whose
+     * release was still coming) stays excluded by gate 7 + the ledger
+     * proofs above, so using the hunt here does not re-open it. */
+    uint32_t resume;
+    uint32_t island_end = 0u;
+    uint32_t island_resume = 0u;
+    uint32_t island_word = 0u;
+    if (deep_lag) {
+        resume = yz_a010_find_pending_chain((get + 4u) & (ring - 1u),
+                                            (get + 0x8000u) & (ring - 1u));
+        if (!resume) {
+            const uint32_t next_io = (get + 4u) & (ring - 1u);
+            const uint32_t nea = yz_rsx_io_to_ea(next_io);
+            island_end = yz_a010_data_island_end(stopper_ea);
+            island_resume = yz_fifo_registered_island_resume(
+                stopper_ea, island_end, get, put,
+                0x40400000u, ring);
+            island_word = island_resume ? vm_read32(island_end) : 0u;
+            if (island_resume) {
+                resume = island_resume;
+                if (relgate_trace) {
+                    fprintf(stderr,
+                            "[a010-data-island-rel] selected "
+                            "stopper=0x%08X island-end=0x%08X "
+                            "resume=0x%06X word=0x%08X span=0x%X\n",
+                            stopper_ea, island_end, island_resume,
+                            island_word, island_end - stopper_ea);
+                    fflush(stderr);
+                }
+            } else if (relgate_trace) {
+                YZ_RELGATE(8u, "deeplag no-linked-chain next=0x%08X "
+                           "island-end=0x%08X resume=0x%06X word=0x%08X",
+                           nea ? vm_read32(nea) : 0u, island_end,
+                           island_resume, island_word);
+            }
+        }
+    } else {
+        resume = yz_a010_missing_release_resume(get, put);
+    }
     if (!resume)
         return 0;
 
@@ -4533,7 +5207,12 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
         vm_read32(g_yz_game_toc - 0x7410u) != state ||
         vm_read32(state + 0x00u) != head ||
         vm_read32(state + 0x20u) != pending ||
-        vm_read32(stopper_ea) != expected)
+        vm_read32(stopper_ea) != expected ||
+        (island_resume &&
+         (yz_a010_data_island_end(stopper_ea) != island_end ||
+          yz_fifo_registered_island_resume(
+              stopper_ea, island_end, get, put,
+              0x40400000u, ring) != island_resume)))
         return 0;
 
     vm_write32(stopper_ea,
@@ -4545,8 +5224,20 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
             "GET=0x%06X -> resume=0x%06X (%s) PUT=0x%06X ahead=0x%X "
             "new-pending=0x%08X head=0x%08X snapshot=stable\n",
             repairs, stopper_ea, get, resume,
-            resume == ((get + 4u) & (ring - 1u)) ? "sequential" : "linked",
+            island_resume ? "registered-island" :
+            (resume == ((get + 4u) & (ring - 1u))
+                ? "sequential" : "linked"),
             put, ahead, pending, head);
+    if (deep_lag)
+        fprintf(stderr,
+                "[a010-deeplag-rel] lost physical release re-issued "
+                "through %s (posture=%s S1C=0, journal quiet); "
+                "words@0x%08X now %08X %08X\n",
+                island_resume ? "registered data-island edge" :
+                                "linked chain",
+                pending ? "moved-past(S20==PUT)" : "ledger-retired(S20=0)",
+                stopper_ea, vm_read32(stopper_ea),
+                vm_read32(stopper_ea + 4u));
     fflush(stderr);
     return 1;
 }
@@ -4581,6 +5272,10 @@ extern "C" void yz_frontier_fifo_snapshot(uint32_t get, uint32_t put)
         state_ok ? vm_read32(state + 0x14u) : 0u,
         state_ok ? vm_read32(state + 0x18u) : 0u,
         state_ok ? vm_read32(state + 0x28u) : 0u);
+    yz_frontier_trace_emit(
+        YZ_FT_RELEASE_JOURNAL, yz_thread_current_id(), 0u,
+        state, head, pending, g_yz_jrnl_cur_ea, entry,
+        stopper_ea ? vm_read32(stopper_ea) : 0u);
 }
 
 /* ============================================================================
@@ -5233,6 +5928,10 @@ static int yz_flip_on_consumer(void)
  * inline pump (only ONE drains at a time -- YZ_RSX_INLINE disables the async
  * thread). Guarded by g_rsx_fifo_lock. */
 static uint32_t g_fifo_ret = ~0u;
+static uint32_t g_fifo_last_flow_source = ~0u;
+static uint32_t g_fifo_last_flow_word = 0u;
+static uint32_t g_fifo_last_flow_target = ~0u;
+static uint32_t g_fifo_last_flow_kind = 0u; /* 1=jump, 2=call, 3=return */
 
 /* s29 (scratch/s29_terminal_park_re.md, Q4): RPCS3 (RSXFIFO.cpp) treats BOTH a
  * nested CALL (a second CALL before the pending one RETURNs) and a RETURN with
@@ -5434,6 +6133,38 @@ static int yz_rsx_fifo_step(void)
         uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
                                        : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
+            /* The reserved default-buffer head is initially guarded by a
+             * self-jump.  Release only that startup guard from the consumer
+             * side, after PUT proves a later command boundary was published.
+             * Recycled and in-stream stoppers keep their journal lifecycle. */
+            if (g_yz_gcm_segment_bytes) {
+                const uint32_t ring = 0x800000u;
+                const uint32_t segment = get / g_yz_gcm_segment_bytes;
+                const uint32_t segment_head =
+                    segment * g_yz_gcm_segment_bytes +
+                    (segment == 0u ? 0x1000u : 0u);
+                const uint32_t ahead = (put - get + ring) & (ring - 1u);
+                if (segment == 0u && get == segment_head && ahead > 4u &&
+                    ahead < (ring >> 1)) {
+                    MemoryBarrier();
+                    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+                        vm_read32(ea) == cmd) {
+                        const uint32_t resume = (get + 4u) & (ring - 1u);
+                        vm_write32(ea, 0x20000000u | resume);
+                        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, resume);
+                        static unsigned released_heads = 0;
+                        if (++released_heads <= 16u) {
+                            fprintf(stderr,
+                                    "[gcm] released published segment head "
+                                    "io=0x%06X PUT=0x%06X\n",
+                                    get, put);
+                            fflush(stderr);
+                        }
+                        LeaveCriticalSection(&g_rsx_fifo_lock);
+                        return 1;
+                    }
+                }
+            }
             /* Jump-to-self stopper. DEFERRED-RELEASE APPLY -- RETIRED (default
              * OFF 2026-07-02, layer-1 root-cause session; opt back in with
              * YZ_APPLY_REL=1 for A/B). This stand-in was built (2026-06-28)
@@ -5466,10 +6197,10 @@ static int yz_rsx_fifo_step(void)
              * the SAME stopper for 3 s with PUT ahead -- a state that is
              * otherwise a permanent deadlock. Opt-in for A/B validation. */
             static int prel = -1; static unsigned fast_ms = 250;
-            if (prel < 0) { prel = (!journal_hle && getenv("YZ_PARK_REL")) ? 1 : 0;
+            if (prel < 0) { prel = (!journal_hle && !getenv("YZ_NO_PARK_REL")) ? 1 : 0;
                 const char* fm = getenv("YZ_PARKREL_FAST_MS");
                 if (fm) fast_ms = (unsigned)atoi(fm);   /* 0 = fast path off (3 s tier only) */
-                if (prel) fprintf(stderr, "[park-rel] ARMED (YZ_PARK_REL): deadlock-only deferred-release apply, fast=%ums+t1-frozen witness, fallback=3000ms\n", fast_ms); }
+                if (prel) fprintf(stderr, "[park-rel] ARMED (default): deadlock-only deferred-release apply, fast=%ums+t1-frozen witness, fallback=3000ms\n", fast_ms); }
             /* s24 FAST PATH: the 3 s tier alone cost 16x3 s = ~48 s/boot at the
              * movie boundary (scratch/s24pr1.err). Fire early ONLY when the
              * deadlock is witnessed, not merely suspected: (a) parked on this
@@ -5568,20 +6299,35 @@ static int yz_rsx_fifo_step(void)
               if (parked_ms > 5000 && (sj_ea != ea || GetTickCount64() - sj_t > 10000)) {
                   sj_ea = ea; sj_t = GetTickCount64();
                   const uint32_t je = yz_gcm_stopper_release_entry(ea);
-                  fprintf(stderr, "[stop-jrnl] parked %llums @io 0x%06X ea=0x%08X journal-entry=%s (0x%08X)\n",
-                          (unsigned long long)parked_ms, get, ea, je ? "PRESENT" : "ABSENT", je);
+                  fprintf(stderr, "[stop-jrnl] parked %llums @io 0x%06X ea=0x%08X journal-entry=%s (0x%08X%s)\n",
+                          (unsigned long long)parked_ms, get, ea, je ? "PRESENT" : "ABSENT", je,
+                          je && g_yz_relentry_region == 2u ? " above-head" : "");
                   fflush(stderr);
                   /* Frontier diagnosis: one read-only snapshot of every live
                    * SPU/MFC context at an unjournaled five-second park. */
                   { static int edge_mode = -1;
-                    static int edge_dumped = 0;
+                    static uint32_t edge_dumped_ea = 0;
+                    static unsigned edge_dwell_ms = 5000u;
                     if (edge_mode < 0) {
                         const char* e = getenv("YZ_FRONTIER_EDGE");
                         edge_mode = (e && *e == '1') ? 1 : 0;
+                        const char* d = getenv("YZ_FRONTIER_EDGE_DWELL_MS");
+                        if (d) edge_dwell_ms = (unsigned)atoi(d);
                     }
-                    if (edge_mode && !edge_dumped && !je) {
-                        edge_dumped = 1;
+                    if (edge_mode && edge_dumped_ea != ea && !je &&
+                        parked_ms > edge_dwell_ms) {
+                        edge_dumped_ea = ea;
                         yz_frontier_edge_dump(ea, get, put);
+                    } }
+                  /* Deferred ring dump: retain lifecycle events silently on
+                   * normal slow frames, then print the matching producer tail
+                   * only after this exact stopper has remained invariant long
+                   * enough to be a genuine hard-stall candidate. */
+                  { static uint32_t ring_dumped_ea = 0;
+                    if (ring_dumped_ea != ea && parked_ms > 30000u &&
+                        yz_a010_reltrace_on()) {
+                        ring_dumped_ea = ea;
+                        yz_a010_reltrace_dump(ea);
                     } }
                   /* s34 CONSUME-GAP HEXDUMP — fires ONCE at the 2nd park
                    * sample (>15s), anchored on the STABLE release entry (NOT
@@ -5623,15 +6369,24 @@ static int yz_rsx_fifo_step(void)
                                   vm_read32(a+0x00u), vm_read32(a+0x04u), vm_read32(a+0x08u), vm_read32(a+0x0Cu),
                                   vm_read32(a+0x10u), vm_read32(a+0x14u), vm_read32(a+0x18u), vm_read32(a+0x1Cu));
                       }
-                      if (jbase && jhead > jbase && (jhead - jbase) < 0x1000000u) {
+                      /* Wrap-aware (2026-08-06): scan the FULL ring
+                       * [jbase..jend), not just [jbase..jhead) — after a
+                       * head wrap, still-live entries sit ABOVE head and
+                       * the old scan was blind to them (boot-62 decode). */
+                      const uint32_t jend = Sok ? vm_read32(S2 + 0x0Cu) : 0;
+                      const uint32_t jtop =
+                          (jend > jbase && (jend - jbase) < 0x1000000u)
+                              ? jend : jhead;
+                      if (jbase && jtop > jbase && (jtop - jbase) < 0x1000000u) {
                           int n7f = 0;
-                          fprintf(stderr, "[stop-jrnl] SCAN tag-0x7F entries with word1==0x%08X in [0x%08X..0x%08X):\n", ea, jbase, jhead);
-                          for (uint32_t e = jbase; e < jhead; e += 0x20u) {
+                          fprintf(stderr, "[stop-jrnl] SCAN tag-0x7F entries with word1==0x%08X in [0x%08X..0x%08X) head=0x%08X:\n", ea, jbase, jtop, jhead);
+                          for (uint32_t e = jbase; e < jtop; e += 0x20u) {
                               if (vm_read32(e) == 0x7Fu && vm_read32(e + 0x04u) == ea) {
                                   n7f++;
                                   if (n7f <= 8)
-                                      fprintf(stderr, "    #%d @0x%08X (%s cursor by %d)\n",
-                                              n7f, e, e < cur ? "behind" : "ahead of", (int)(e - cur));
+                                      fprintf(stderr, "    #%d @0x%08X (%s cursor by %d%s)\n",
+                                              n7f, e, e < cur ? "behind" : "ahead of", (int)(e - cur),
+                                              jhead && e >= jhead ? ", above-head" : "");
                               }
                           }
                           fprintf(stderr, "[stop-jrnl] SCAN total=%d\n", n7f);
@@ -5828,6 +6583,10 @@ static int yz_rsx_fifo_step(void)
                     te ? vm_read32(te + 12u) : 0u);
             fflush(stderr);
         }
+        g_fifo_last_flow_source = get;
+        g_fifo_last_flow_word = cmd;
+        g_fifo_last_flow_target = tgt;
+        g_fifo_last_flow_kind = 1u;
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
         return 1;
@@ -5878,6 +6637,10 @@ static int yz_rsx_fifo_step(void)
                     ce ? vm_read32(ce + 12u) : 0u);
             fflush(stderr);
         }
+        g_fifo_last_flow_source = get;
+        g_fifo_last_flow_word = cmd;
+        g_fifo_last_flow_target = ctgt;
+        g_fifo_last_flow_kind = 2u;
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
         LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -5897,6 +6660,10 @@ static int yz_rsx_fifo_step(void)
                         get, ea, g_fifo_ret, yz_rsx_io_to_ea(g_fifo_ret));
                 fflush(stderr);
             }
+            g_fifo_last_flow_source = get;
+            g_fifo_last_flow_word = cmd;
+            g_fifo_last_flow_target = g_fifo_ret;
+            g_fifo_last_flow_kind = 3u;
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
             g_fifo_ret = ~0u;
             LeaveCriticalSection(&g_rsx_fifo_lock);
@@ -5950,6 +6717,12 @@ static int yz_rsx_fifo_step(void)
             stuck_get = get; stuck_t0 = now; said_t = now; nnc++;
             fprintf(stderr, "[rsx] non-command 0x%08X at io=0x%X (PUT=0x%X) -- segment not "
                     "finalised; waiting for producer (n=%lu)\n", cmd, get, put, nnc);
+            fprintf(stderr,
+                    "[fifo-arrival] kind=%u source=0x%08X word=0x%08X "
+                    "target=0x%08X live-ret=0x%08X\n",
+                    g_fifo_last_flow_kind, g_fifo_last_flow_source,
+                    g_fifo_last_flow_word, g_fifo_last_flow_target,
+                    g_fifo_ret);
             fflush(stderr);
             /* s35 hole-structure dump (env YZ_FIFO_HOLE_DUMP): on first hit of a
              * given non-command park, hexdump [get, get+0x120) so the
@@ -6265,6 +7038,8 @@ static int yz_rsx_fifo_step(void)
             if (!a010_draw_source_written)
                 a010_draw_source_n = 0;
         }
+        if (eff >= 0xE940u && eff <= 0xE95Cu)
+            rsx_live_draw_set_fifo_position(get, put);
         stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
     }
     if (stalled) {
@@ -6365,8 +7140,12 @@ extern "C" { void (*g_yz_usleep_pump)(void) = 0; }
 
 static DWORD WINAPI yz_rsx_consumer(LPVOID)
 {
+    yz_thread_adopt_host("rsx-consumer");
     yz_rsx_fifo_lock_ensure();
-    fprintf(stderr, "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model)\n");
+    fprintf(stderr,
+            "[rsx] FIFO consumer up: faithful (RPCS3 run_FIFO model) "
+            "host_tid=%lu\n",
+            GetCurrentThreadId());
     /* s24 idle heartbeat: wall shape #2 is the consumer idling for minutes with
      * PUT far ahead and NO stopper park (the lever legitimately silent) — and
      * every return-0 path in yz_rsx_fifo_step is print-silent, so the parked
@@ -6420,51 +7199,175 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
 }
 
 extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context*);   /* defined below */
+extern "C" int32_t cellGcmInit(uint32_t cmd_size, uint32_t io_size,
+                                uint32_t io_address);
+extern "C" uint32_t cellGcmGetDefaultSegmentWordSize(void);
+extern "C" void cellGcmTickVBlank(void);
 
-/* HLE gcm out-of-space callback (root-cause fix, 2026-06-14f). The game's gcm
- * wrapper calls ctx->callback(ctx, count) when current+4 > end. We treat the whole
- * io command buffer as ONE segment and WRAP to begin when full -- CO-DESIGNED with
- * the faithful consumer:
- *   1. flush PUT = current (let the consumer drain what's pending);
- *   2. SYNCHRONOUSLY DRAIN -- wait until GET == PUT, so rewinding can't overwrite
- *      commands the consumer hasn't passed (this is the synchronization the old
- *      hand-rolled consumer lacked = the race that drove the LLE detour);
- *   3. write a jump-to-begin at the old current, rewind current=begin, PUT=begin.
- * One segment => ctx->end never changes => the game's cross-fragment release-defer
- * (the @0x300000 op-list deadlock) never triggers and nothing fragment-recycles, so
- * the game's threads never wedge. Routed here via YZ_GCM_CB_FAKE_KEY (dispatch.cpp). */
+/* SDK-internal cellGcmSys context helper. */
+static constexpr uint64_t g_yz_gcm_system_mode = 0x820u;
+static uint32_t g_yz_gcm_cmd_size;
+static SRWLOCK g_yz_gcm_callback_lock = SRWLOCK_INIT;
+static volatile LONG g_yz_gcm_callback_active;
+
+static int yz_gcm_callback_lock_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        /* Sony's default FIFO callback is not protected by a process-wide
+         * host lock.  The old lock was held across the callback's unbounded
+         * GET wait, imposing host-only cross-callback serialization on a
+         * guest path that has no such primitive.  Follow Sony by default;
+         * YZ_GCM_CB_TRACE is the overlap witness and YZ_GCM_CB_LOCK retains
+         * the legacy posture for timing/regression A/B. */
+        enabled = getenv("YZ_GCM_CB_LOCK") ? 1 : 0;
+        fprintf(stderr, "[gcm] callback host serialization: %s\n",
+                enabled ? "ON (legacy YZ_GCM_CB_LOCK)" : "OFF (Sony behavior)");
+        fflush(stderr);
+    }
+    return enabled;
+}
+
+static int yz_gcm_callback_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("YZ_GCM_CB_TRACE") ? 1 : 0;
+    return enabled;
+}
+extern "C" void yz_ovr__cellGcmFunc15(ppu_context* ctx)
+{
+    if (getenv("YZ_GCM15_TRACE")) {
+        static unsigned calls = 0;
+        const unsigned n = ++calls;
+        if (n <= 64 || (n & 0x3FFu) == 0u) {
+            fprintf(stderr,
+                    "[gcm15] n=%u cia=0x%08llX lr=0x%08llX "
+                    "r3=0x%08llX r4=0x%08llX r5=0x%08llX r6=0x%08llX\n",
+                    n, (unsigned long long)ctx->cia,
+                    (unsigned long long)ctx->lr,
+                    (unsigned long long)ctx->gpr[3],
+                    (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5],
+                    (unsigned long long)ctx->gpr[6]);
+        }
+    }
+    ctx->gpr[3] = 0;
+}
+
+/* Default FIFO callback. Each segment reserves its final word for a jump to the
+ * next segment. Publish the jump before advancing PUT, and do not reuse a
+ * segment while GET still points into it. */
 extern "C" void yz_gcm_fifo_callback(ppu_context* ctx)
 {
+    const int use_callback_lock = yz_gcm_callback_lock_enabled();
+    if (use_callback_lock)
+        AcquireSRWLockExclusive(&g_yz_gcm_callback_lock);
+    const LONG callback_depth =
+        _InterlockedIncrement(&g_yz_gcm_callback_active);
+    if (callback_depth > 1 && yz_gcm_callback_trace_enabled()) {
+        static volatile LONG overlap_reports;
+        const LONG report = _InterlockedIncrement(&overlap_reports);
+        if (report <= 64 || (report & 0x3FF) == 0) {
+            fprintf(stderr,
+                    "[gcm] concurrent callbacks depth=%ld host_tid=%lu "
+                    "guest_lr=0x%08llX ctx=0x%08llX\n",
+                    callback_depth, (unsigned long)GetCurrentThreadId(),
+                    (unsigned long long)ctx->lr,
+                    (unsigned long long)ctx->gpr[3]);
+            fflush(stderr);
+        }
+    }
     uint32_t gctx = (uint32_t)ctx->gpr[3];          /* CellGcmContextData* */
+    yz_frontier_trace_emit(
+        YZ_FT_GCM_CALLBACK, yz_thread_current_id(), 0u,
+        gctx,
+        gctx ? vm_read32(gctx + 0x0u) : 0u,
+        gctx ? vm_read32(gctx + 0x4u) : 0u,
+        gctx ? vm_read32(gctx + 0x8u) : 0u,
+        vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET),
+        vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT));
     { static int e = 0; if (e < 16) { e++;
         fprintf(stderr, "[gcm] callback(ctx=0x%08X count=0x%llX) begin=0x%08X end=0x%08X cur=0x%08X\n",
                 gctx, (unsigned long long)ctx->gpr[4],
                 gctx ? vm_read32(gctx + 0x0) : 0, gctx ? vm_read32(gctx + 0x4) : 0,
                 gctx ? vm_read32(gctx + 0x8) : 0); } }
-    if (gctx && yz_gcm_io_addr) {
-        uint32_t begin = vm_read32(gctx + 0x0);     /* EA: segment start */
-        uint32_t cur   = vm_read32(gctx + 0x8);     /* EA: current write head */
-        uint32_t begin_off = begin - yz_gcm_io_addr;   /* io offset (linear ring) */
-        uint32_t cur_off   = cur   - yz_gcm_io_addr;
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);     /* flush pending */
-        for (int spin = 0; spin < 4000; spin++) {                 /* drain (<=4 s) */
-            if ((vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u) == cur_off) break;
-            Sleep(1);
+    if (gctx && yz_gcm_io_addr && g_yz_gcm_cmd_size &&
+        g_yz_gcm_segment_bytes) {
+        const uint32_t begin = vm_read32(gctx + 0x0);
+        const uint32_t begin_off = begin - yz_gcm_io_addr;
+        const uint32_t cur = vm_read32(gctx + 0x8);
+        const uint32_t cur_off = cur - yz_gcm_io_addr;
+        const uint32_t segment = cur_off / g_yz_gcm_segment_bytes;
+        const uint32_t segment_count =
+            g_yz_gcm_cmd_size / g_yz_gcm_segment_bytes;
+        const uint32_t next_segment =
+            segment_count ? (segment + 1u) % segment_count : 0u;
+        uint32_t next_off = next_segment * g_yz_gcm_segment_bytes;
+        if (next_segment == 0u)
+            next_off += 0x1000u;
+        const uint32_t next_begin = yz_gcm_io_addr + next_off;
+        const uint32_t next_end = yz_gcm_io_addr +
+            (next_segment + 1u) * g_yz_gcm_segment_bytes - 4u;
+
+        vm_write32(cur, 0x20000000u | (next_off & 0x1FFFFFFCu));
+        MemoryBarrier();
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);
+        vm_write32(gctx + 0x0, next_begin);
+        vm_write32(gctx + 0x4, next_end);
+        vm_write32(gctx + 0x8, next_begin);
+
+        for (;;) {
+            uint32_t get;
+            uint32_t pending_return;
+            /* GET can be in an external display list while the FIFO's pending
+             * CALL return still owns a ring segment.  Snapshot both under the
+             * consumer lock; recycling either address would overwrite work
+             * the consumer has not retired yet. */
+            yz_rsx_fifo_acquire();
+            get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
+            pending_return = g_fifo_ret;
+            yz_rsx_fifo_release();
+            const uint32_t next_end_off = next_end - yz_gcm_io_addr;
+            const int get_in_next = get >= next_off && get <= next_end_off;
+            const int return_in_next = pending_return != ~0u &&
+                pending_return >= next_off && pending_return <= next_end_off;
+            const int get_in_initial_window = get < 0x1000u;
+            if (!get_in_next && !return_in_next && !get_in_initial_window)
+                break;
+            if (return_in_next) {
+                static unsigned protected_returns = 0;
+                if (++protected_returns <= 16u) {
+                    fprintf(stderr,
+                            "[gcm] segment recycle waiting for pending FIFO "
+                            "return=0x%X next=[0x%X,0x%X] GET=0x%X\n",
+                            pending_return, next_off, next_end_off, get);
+                    fflush(stderr);
+                }
+            }
+            SwitchToThread();
         }
-        vm_write32(cur, 0x20000000u | (begin_off & 0x1FFFFFFCu));  /* jump-to-begin */
-        vm_write32(gctx + 0x8, begin);                            /* current = begin */
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, begin_off);  /* PUT = begin */
         { static int n = 0; if (n < 8) { n++;
-            fprintf(stderr, "[gcm] fifo wrap: drained to io 0x%X, rewound to io 0x%X\n",
-                    cur_off, begin_off); } }
+            fprintf(stderr,
+                    "[gcm] fifo segment: put=0x%X next=[0x%X,0x%X]\n",
+                    cur_off, next_off, next_end - yz_gcm_io_addr); } }
     }
     ctx->gpr[3] = 0;
+    yz_frontier_trace_emit(
+        YZ_FT_GCM_CALLBACK, yz_thread_current_id(), 1u,
+        gctx,
+        gctx ? vm_read32(gctx + 0x0u) : 0u,
+        gctx ? vm_read32(gctx + 0x4u) : 0u,
+        gctx ? vm_read32(gctx + 0x8u) : 0u,
+        vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET),
+        vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT));
+    _InterlockedDecrement(&g_yz_gcm_callback_active);
+    if (use_callback_lock)
+        ReleaseSRWLockExclusive(&g_yz_gcm_callback_lock);
 }
 
-/* HLE _cellGcmInitBody (root-cause fix, 2026-06-14f): replaces Sony's LLE libgcm
- * init. Sets up the guest-memory contract (reusing the sys_rsx setup, like RPCS3's
- * _cellGcmInitBody calls sys_rsx_context_allocate), maps the io command buffer, and
- * builds the gcm CONTEXT (single segment + our wrap callback). Args (RPCS3 ABI):
+/* HLE _cellGcmInitBody sets up the guest-memory contract, maps the io command
+ * buffer, and builds the segmented default command context. Args:
  * gpr[3]=CellGcmContextData**, gpr[4]=cmdSize, gpr[5]=ioSize, gpr[6]=ioAddress. */
 extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
 {
@@ -6475,8 +7378,27 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     fprintf(stderr, "[gcm-hle] _cellGcmInitBody(ctx**=0x%08X cmdSize=0x%X ioSize=0x%X "
             "ioAddr=0x%08X)\n", ctx_slot, cmd_size, io_size, io_addr);
 
+    const int32_t init_rc = cellGcmInit(cmd_size, io_size, io_addr);
+    if (init_rc != 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)init_rc;
+        return;
+    }
+
     yz_gcm_io_addr = io_addr;
     yz_gcm_io_size = io_size;
+    g_yz_gcm_cmd_size = cmd_size;
+    /* The title's Sony-libgcm lane configures this 8 MB FIFO as eight 1 MB
+     * segments (measured bufdesc +0x30 == 0x40000 words).  Do not snapshot
+     * cellGcmSys's process-wide default here: the title calls
+     * cellGcmSetDefaultFifoSize only after _cellGcmInitBody returns, and the
+     * conformance HLE currently starts at the SDK's generic 32 KB default.
+     * Caching that early value produced 256 tiny segments and eventually
+     * deadlocked the producer in the recycle callback. */
+    g_yz_gcm_segment_bytes = 0x100000u;
+    if (!g_yz_gcm_cmd_size)
+        g_yz_gcm_cmd_size = g_yz_gcm_segment_bytes;
+    if (g_yz_gcm_segment_bytes > g_yz_gcm_cmd_size)
+        g_yz_gcm_segment_bytes = g_yz_gcm_cmd_size;
 
     /* RSX local memory (0xC0000000): reserved by vm_init, commit it now -- under LLE
      * sys_rsx_memory_allocate did this; under HLE the game addresses local VRAM
@@ -6488,6 +7410,7 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     {
         static ppu_context sc;
         memset(&sc, 0, sizeof(sc));
+        sc.gpr[8] = g_yz_gcm_system_mode;
         yz_sys_rsx_context_allocate(&sc);
     }
 
@@ -6506,10 +7429,11 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
     vm_write32(YZ_GCM_CB_OPD_ADDR + 0, YZ_GCM_CB_FAKE_KEY);
     vm_write32(YZ_GCM_CB_OPD_ADDR + 4, 0);
 
-    /* CellGcmContextData: ONE segment over the whole io buffer (4 KB reserved at
-     * the front), callback @+0xC = our wrap callback. begin/end/current are EAs. */
+    /* The first segment reserves 4 KB at the front.  `end` is the address of
+     * the segment's final word; the callback writes its linking jump at the
+     * last current position before switching. */
     uint32_t begin = io_addr + 0x1000;
-    uint32_t end   = io_addr + (cmd_size ? cmd_size : 0x10000) - 4;
+    uint32_t end   = io_addr + g_yz_gcm_segment_bytes - 4u;
     vm_write32(YZ_GCM_CTX_ADDR + 0x0, begin);
     vm_write32(YZ_GCM_CTX_ADDR + 0x4, end);
     vm_write32(YZ_GCM_CTX_ADDR + 0x8, begin);
@@ -6527,8 +7451,13 @@ extern "C" void yz_ovr__cellGcmInitBody(ppu_context* ctx)
  * All io/control/label addresses point at the structures the faithful consumer
  * reads (RSX_DMA_CONTROL, RSX_REPORTS, g_rsx_iomap_ea) so the game and the RSX
  * agree by construction. Recovered from git 79869ac + reconciled. */
-extern "C" int32_t  cellGcmGetTiledPitchSize(uint32_t size, uint32_t* pitch);
+extern "C" uint32_t cellGcmGetTiledPitchSize(uint32_t size);
 extern "C" uint64_t cellGcmGetTimeStampLocation(uint32_t index, uint32_t location);
+extern "C" int32_t cellGcmSetDisplayBuffer(uint32_t buffer_id,
+                                            uint32_t offset,
+                                            uint32_t pitch,
+                                            uint32_t width,
+                                            uint32_t height);
 
 /* put/get/ref poll pointer -> the GUEST dma_control (put@+0 get@+4 ref@+8). */
 extern "C" void yz_ovr_cellGcmGetControlRegister(ppu_context* ctx)
@@ -6557,11 +7486,38 @@ extern "C" void yz_ovr_cellGcmGetConfiguration(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+extern "C" void yz_ovr_cellGcmSetDisplayBuffer(ppu_context* ctx)
+{
+    const uint32_t id = (uint32_t)ctx->gpr[3];
+    const uint32_t offset = (uint32_t)ctx->gpr[4];
+    const uint32_t pitch = (uint32_t)ctx->gpr[5];
+    const uint32_t width = (uint32_t)ctx->gpr[6];
+    const uint32_t height = (uint32_t)ctx->gpr[7];
+    const int32_t rc = cellGcmSetDisplayBuffer(
+        id, offset, pitch, width, height);
+    if (rc == 0 && id < 8u) {
+        g_rsx_dispbuf[id].width = width;
+        g_rsx_dispbuf[id].height = height;
+        g_rsx_dispbuf[id].pitch = pitch;
+        g_rsx_dispbuf[id].offset = offset;
+        if (id + 1u > g_rsx_dispbuf_count)
+            g_rsx_dispbuf_count = id + 1u;
+        rsx_live_draw_set_display_buffer(
+            id, 0, offset, pitch, width, height);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
 /* ea -> io offset via the consumer's iomap (the game computes put=AddressToOffset
  * (current)). Linear fast path for the command-buffer ring. */
 extern "C" void yz_ovr_cellGcmAddressToOffset(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];
+    if (ea >= YZ_GCM_LOCAL_BASE &&
+        ea < YZ_GCM_LOCAL_BASE + YZ_GCM_LOCAL_SIZE) {
+        if (out) vm_write32(out, ea - YZ_GCM_LOCAL_BASE);
+        ctx->gpr[3] = 0; return;
+    }
     if (yz_gcm_io_addr && ea >= yz_gcm_io_addr && ea < yz_gcm_io_addr + yz_gcm_io_size) {
         if (out) vm_write32(out, ea - yz_gcm_io_addr);
         ctx->gpr[3] = 0; return;
@@ -6592,10 +7548,7 @@ extern "C" void yz_ovr_cellGcmUnmapEaIoAddress(ppu_context* ctx) { ctx->gpr[3] =
 
 extern "C" void yz_ovr_cellGcmGetTiledPitchSize(ppu_context* ctx)
 {
-    uint32_t pitch = 0;
-    int32_t rc = cellGcmGetTiledPitchSize((uint32_t)ctx->gpr[3], &pitch);
-    if (ctx->gpr[4]) vm_write32((uint32_t)ctx->gpr[4], pitch);
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+    ctx->gpr[3] = cellGcmGetTiledPitchSize((uint32_t)ctx->gpr[3]);
 }
 
 extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
@@ -6603,25 +7556,73 @@ extern "C" void yz_ovr_cellGcmGetTimeStampLocation(ppu_context* ctx)
     ctx->gpr[3] = cellGcmGetTimeStampLocation((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
 }
 
-/* HLE flip: present the buffer + signal the flip label the game polls. These
- * entry points take the gcm CONTEXT as arg0 (r3), the buffer id in r4. */
+/* Publish a flip through the guest FIFO so draw submission, display queueing,
+ * and presentation stay ordered on the one RSX consumer thread.  The public
+ * GCM command ABI defines the head-1 queue/flip methods as 0xE944/0xE924; the
+ * flip argument's high bit selects the buffer already queued for that head. */
+static int32_t yz_gcm_append_flip_commands(uint32_t context,
+                                           uint32_t buffer_id,
+                                           int wait_for_label,
+                                           uint32_t label_index,
+                                           uint32_t label_value)
+{
+    if (!context || buffer_id >= 8u)
+        return (int32_t)CELL_GCM_ERROR_INVALID_VALUE;
+
+    const uint32_t current = vm_read32(context + 0x08u);
+    const uint32_t end = vm_read32(context + 0x04u);
+    const uint32_t words = wait_for_label ? 10u : 4u;
+    const uint32_t bytes = words * 4u;
+    if (!current || current > UINT32_MAX - bytes || current + bytes > end)
+        return (int32_t)CELL_GCM_ERROR_FAILURE;
+
+    uint32_t out = current;
+    if (wait_for_label) {
+        vm_write32(out + 0x00u, 0x00040060u); /* semaphore DMA selector */
+        vm_write32(out + 0x04u, 0x66616661u); /* report/label memory */
+        vm_write32(out + 0x08u, 0x00040064u); /* semaphore offset */
+        vm_write32(out + 0x0Cu, (label_index & 0xFFu) * 0x10u);
+        vm_write32(out + 0x10u, 0x00040068u); /* semaphore acquire */
+        vm_write32(out + 0x14u, label_value);
+        out += 0x18u;
+    }
+
+    vm_write32(out + 0x00u, 0x0004E944u); /* queue buffer on head 1 */
+    vm_write32(out + 0x04u, buffer_id);
+    vm_write32(out + 0x08u, 0x0004E924u); /* flip head 1 */
+    vm_write32(out + 0x0Cu, 0x8000010Fu); /* use queued buffer */
+
+    MemoryBarrier();
+    vm_write32(context + 0x08u, current + bytes);
+    return 0;
+}
+
+/* These entry points take the GCM context as arg0 (r3) and buffer id in r4. */
 extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 {
-    if (yz_ft_on()) yz_ft("HLE-SetFlipCommand buf=%u (label clear!)",
-                          (uint32_t)ctx->gpr[4]);
-    yz_rsx_present((uint32_t)ctx->gpr[4]);
-    vm_write32(RSX_REPORTS + 0x10, 0);             /* flip label -> done */
-    ctx->gpr[3] = 0;
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
+    const int32_t result = yz_gcm_append_flip_commands(
+        context, buffer_id, 0, 0, 0);
+    if (yz_ft_on())
+        yz_ft("HLE-SetFlipCommand ctx=0x%08X buf=%u queued result=0x%08X",
+              context, buffer_id, (uint32_t)result);
+    ctx->gpr[3] = (uint64_t)(int64_t)result;
 }
 
 extern "C" void yz_ovr__cellGcmSetFlipCommandWithWaitLabel(ppu_context* ctx)
 {
-    if (yz_ft_on()) yz_ft("HLE-SetFlipCommandWithWaitLabel buf=%u (label clear!)",
-                          (uint32_t)ctx->gpr[4]);
-    yz_rsx_present((uint32_t)ctx->gpr[4]);
-    vm_write32(RSX_REPORTS + ((uint32_t)ctx->gpr[5] & 0xFFu) * 0x10u, (uint32_t)ctx->gpr[6]);
-    vm_write32(RSX_REPORTS + 0x10, 0);
-    ctx->gpr[3] = 0;
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
+    const uint32_t label_index = (uint32_t)ctx->gpr[5];
+    const uint32_t label_value = (uint32_t)ctx->gpr[6];
+    const int32_t result = yz_gcm_append_flip_commands(
+        context, buffer_id, 1, label_index, label_value);
+    if (yz_ft_on())
+        yz_ft("HLE-SetFlipCommandWithWaitLabel ctx=0x%08X buf=%u "
+              "label=%u value=0x%08X queued result=0x%08X",
+              context, buffer_id, label_index, label_value, (uint32_t)result);
+    ctx->gpr[3] = (uint64_t)(int64_t)result;
 }
 
 /* ===========================================================================
@@ -7011,6 +8012,9 @@ extern "C" int64_t yz_sys_rsx_attribute(ppu_context* ctx) { return 0; }
 extern "C" void yz_rsx_vblank_tick(void)
 {
     if (!g_rsx_ctx_ready) return;
+#ifdef YZ_NATIVE_GCM
+    cellGcmTickVBlank();
+#endif
     yz_ft_start();   /* YZ_FLIPTRACE arm banner + label watcher (no-op if off) */
 
     /* s25: redeliver any latched SPU throw_events (spu_channels.c loss latch,

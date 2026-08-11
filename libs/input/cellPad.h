@@ -159,6 +159,8 @@ s32 cellPadEnd(void);
 
 /* NID: 0x8B72CBA1 */
 s32 cellPadGetData(u32 port_no, CellPadData* data);
+/* Monotonic guest-visible button transition serial for freeze diagnostics. */
+u32 yz_pad_guest_input_serial(void);
 
 /* NID: 0x8B8013DA */
 s32 cellPadGetInfo2(CellPadInfo2* info);

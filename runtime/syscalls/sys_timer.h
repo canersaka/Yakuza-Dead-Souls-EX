@@ -40,6 +40,14 @@ uint64_t ppu_timebase_now(void);
  * poll their wake predicate and yield to a QueryPerformanceCounter deadline
  * (same approach sys_timer_usleep already uses). */
 int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
+
+/* Guest "system time" clock: microseconds since boot, the domain of
+ * sys_time_get_system_time (Lv2 Reference p.262). Registered by the runner
+ * at startup (yakuza/import_overrides.cpp); NULL in standalone builds (the
+ * timer falls back to a local boot anchor). Any HLE producing guest-visible
+ * timestamps (sys_timer expiry/data3, cellAudioGetPortTimestamp) must use
+ * this domain, never Unix-epoch or raw-QPC host uptime. */
+extern uint64_t (*g_lv2_system_time_us)(void);
 int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
 #endif
 

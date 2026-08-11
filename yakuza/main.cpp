@@ -25,6 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(YZ_PPU_SAMPLE)
+#include <algorithm>
+#include <vector>
+#endif
 
 /* Live guest context for the current host thread, set at each guest-thread
  * entry / callback. The crash handler walks its PPC64 back-chain to print a
@@ -87,12 +91,19 @@ static uint64_t g_proc_param_vaddr = 0;
 
 /* runtime/syscalls/lv2_register.c — served by sys_process_get_sdk_version */
 extern "C" uint32_t g_ps3_sdk_version;
+extern "C" uint64_t spu_workload_fingerprint(const void*, size_t);
+extern "C" size_t spu_elf_image_size(const uint8_t*, size_t);
+extern "C" int spu_workload_register_image(uint64_t, uint32_t, int, uint32_t,
+                                            const char*);
+extern "C" void spu_workload_reset(void);
 
 /* recomp_prx/spurs_kernel2.c + spurs_sysservice.c (generated, C) — register the
  * lifted SPURS kernel and its system-service workload for SPU indirect-branch
  * dispatch. The kernel DMAs the service to LS 0xA00 and branches there. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register(void);
 extern "C" void spu_recomp_register_sysservice(void);
+#endif
 extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
 /* recomp_prx/gs_task.c (generated) — the game's Edge geometry render task
  * (gs_task.elf, EBOOT SPU img #3 @0x0127A580, LS base 0x3000, entry 0x3050).
@@ -103,7 +114,9 @@ extern "C" void spu_recomp_register_gstask(void);
  * (libsre ea 0x02023680). The kernel DMAs it to LS 0xA00 -- SAME address as the
  * system service -- so they must register under DISTINCT image ids and the
  * runtime switches ctx->image_id by DMA source EA (spu_dma.h). */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_policy(void);
+#endif
 /* recomp_prx/ts_exit.c (generated) — Sony's SPURS taskset EXIT-HANDLER blob
  * (libsre ea 0x02025500, 0x680 bytes). On a task's EXIT syscall the policy DMAs
  * it to LS 0x10000 and calls it (r3=taskset, r4=taskId, r5=exitCode, r6=args --
@@ -111,14 +124,25 @@ extern "C" void spu_recomp_register_policy(void);
  * every task exit died as "unknown branch LS 0x10000" (image 5's exit = the
  * entry-7 shader-stream gate). Own image id: the reverse image-switch adopts it
  * at the call and re-adopts the policy on its bi $r0 return. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_tsexit(void);
+#endif
 /* recomp_prx/job_module.c (generated) — Sony's SPURS JOB-CHAIN policy module
  * (libsre ea 0x0202A180, 0x3E80 bytes, loaded to LS 0xA00 like the taskset
  * policy). The game's pxd streaming layer runs a jobchain (wid 1, object
  * 0x4019C880) whose jobs signal the IWL event flag t1 blocks on after the
  * asset sweep; without this lift the kernel dispatched the jobchain into the
  * SERVICE image's code (wrong image) -> wild EA-0 lock-line atomics. */
+#ifndef YZ_NATIVE_SPURS
 extern "C" void spu_recomp_register_jobmod(void);
+#endif
+/* lv2 lwmutex HLE is compiled in every backend config; the declaration must
+ * not hide behind the native-SPURS gate (LLE oracle build, 2026-08-06). */
+extern "C" void sys_lwmutex_dump_holders(const char* tag);
+#ifdef YZ_NATIVE_SPURS
+extern "C" void cellSpursDumpNativeJobChains(const char* tag);
+extern "C" void yz_spurs_dump_tasksets(const char* tag);
+#endif
 /* recomp_prx/job_bin_{a,b}.c (generated) — the game's two jobchain JOB BINARIES
  * (runtime-loaded per-descriptor SPU code; both EBOOT-static, extracted by
  * eaBinary). A = the 14-way bulk worker (EBOOT 0x01254500, 0x9540 B, loads at
@@ -154,7 +178,7 @@ extern "C" void spu_recomp_register_jobbin_b_3bc00(void);
 extern "C" void spu_recomp_register_jobbin_b_3d000(void);
 extern "C" void spu_recomp_register_jobbin_b_3dc00(void);
 /* Third legacy job binary reached at the post-a030 loading/gameplay handoff.
- * Embedded markers delimit EBOOT EA 0x0125DA80..0x012650C0 (0x7640 bytes).
+ * Live descriptors publish a 0x76C0-byte binary at EBOOT EA 0x0125DA80.
  * Every overlapping fixed-base lift has a distinct image id. */
 extern "C" void spu_recomp_register_jobbin_c_4c00(void);
 extern "C" void spu_recomp_register_jobbin_c_e400(void);
@@ -209,6 +233,62 @@ extern "C" int g_yz_watch_dlist;
 extern "C" int g_yz_slotstore;   /* YZ_SLOTSTORE: wid4 record-store watch (spu_channels.c) */
 extern "C" int g_yz_a010_ppucmd = 0;
 extern "C" volatile LONG g_yz_a010_ppucmd_headers;
+
+#ifdef YZ_NATIVE_SPURS
+static int yz_register_native_spurs_images(void)
+{
+    spu_workload_reset();
+    for (int i = 0; i < SPU_IMAGE_COUNT; ++i) {
+        const spu_image_desc& d = g_spu_images[i];
+        const uint8_t* image = vm_base + d.elf_ea;
+        const size_t size = spu_elf_image_size(image, 16u * 1024u * 1024u);
+        if (!size || !spu_workload_register_image(
+                spu_workload_fingerprint(image, size), (uint32_t)size,
+                d.image_id, d.entry, d.name)) {
+            fprintf(stderr,
+                    "[native-spurs] failed to register exact task image "
+                    "ea=0x%08X id=%d name=%s\n",
+                    d.elf_ea, d.image_id, d.name);
+            return 0;
+        }
+    }
+    struct RawJob {
+        uint32_t ea, size;
+        int image;
+        const char* name;
+    };
+    static const RawJob jobs[] = {
+        {0x01254500u, 0x9540u, 14, "job_bin_a"},
+        {0x01275A00u, 0x14C0u, 15, "job_bin_b"},
+        {0x0125DA80u, 0x76C0u, 17, "job_bin_c"},
+        {0x01265180u, 0x10610u, 18, "job_bin_d"},
+        /* Dialogue-load submissions publish sizeBinary 0x10800 over the SAME
+         * binary (EBOOT-verified offline: FNV over the 0x10800 window at
+         * 0x01265180 = 0x3A59127372DEA154 = the boots-36/40 miss that killed
+         * the jobchain with INVALID_BIN at claim 0x4019E030). Wider
+         * descriptor window, identical image; trailing bytes are padding
+         * per the orphanage precedent below. */
+        {0x01265180u, 0x10800u, 18, "job_bin_d"},
+        /* The job descriptor publishes the logical binary length.  The lift's
+         * final 0x40 bytes are DMA/extraction padding and are not part of the
+         * exact native workload identity. */
+        {0x01252680u, 0x1E40u, 19, "job_bin_orphanage"},
+    };
+    for (const RawJob& d : jobs) {
+        const uint8_t* image = vm_base + d.ea;
+        if (!spu_workload_register_image(
+                spu_workload_fingerprint(image, d.size), d.size,
+                d.image, 0x4c00u, d.name)) {
+            fprintf(stderr,
+                    "[native-spurs] failed to register exact job image "
+                    "ea=0x%08X id=%d name=%s\n",
+                    d.ea, d.image, d.name);
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 /* YZ_HWWATCH (s26 ~04:25, the stager hunt's definitive tool): a HARDWARE
  * debug-register watchpoint (DR0, exact 4-byte write watch) on the wid4
@@ -576,16 +656,20 @@ static int replay_camera_from_guest_dump(
     return (uint32_t)ctx.gpr[3] == 1u ? 0 : 3;
 }
 
-static void guest_caller(uint32_t opd_addr,
-                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+/* Returning variant of the guest-callback hook: same dispatch, but hands the
+ * guest function's r3 back to the HLE caller. sceNpTrophyRegisterContext's
+ * status callback is the first user (a negative return aborts registration).
+ * guest_caller() below wraps this for the fire-and-forget dispatch sites. */
+static uint64_t guest_caller_ret(uint32_t opd_addr,
+                                 uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     /* One lazily-allocated guest stack + context per host thread. */
     static thread_local ppu_context cb_ctx;
     static thread_local uint32_t cb_stack = 0;
     if (!cb_stack) {
         cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);
-        if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return; }
+        if (!cb_stack) { fprintf(stderr, "[boot] callback stack alloc failed\n"); return 0; }
         cb_ctx.gpr[1] = ((uint64_t)cb_stack + 256 * 1024 - 0x100) & ~0xFull;
         /* Null back-chain terminator: a platform stack-trace walker (e.g. libsre's
          * assertion handler) follows [r1] up until it reads 0. Without this the
@@ -614,6 +698,14 @@ static void guest_caller(uint32_t opd_addr,
     g_yz_cur_ctx = &cb_ctx;
     yz_call_guest_opd(opd_addr, &cb_ctx);
     g_yz_cur_ctx = prev;
+    return cb_ctx.gpr[3];
+}
+
+static void guest_caller(uint32_t opd_addr,
+                         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    (void)guest_caller_ret(opd_addr, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
 /* ---------------------------------------------------------------------------
@@ -634,6 +726,7 @@ static void guest_caller(uint32_t opd_addr,
 extern "C" volatile LONG g_yz_a010_root_active;
 static DWORD WINAPI yz_vblank_thread(LPVOID)
 {
+    yz_thread_adopt_host("vblank");
     /* YZ_VBL_DIV=N (s21, H4 discriminator): divide the vblank rate by N so a
      * ~5-7 FPS boot sees ~2 vblanks/frame (what a 30fps title expects) instead
      * of 8-12. A/B lever for the flip-label stall: if the stall vanishes or
@@ -752,6 +845,51 @@ extern "C" uint32_t yz_guest_addr_from_host(const void* rip)
 {
     const yz_func_entry* fe = yz_func_from_host(rip);
     return fe ? fe->addr : 0u;
+}
+
+/* Runtime vm helpers are linked BETWEEN lifted chunks, so yz_func_from_host
+ * (lifted table only) attributes a fault inside them to the preceding lifted
+ * function with a bogus offset -- boot 12's "func_00E7E1EC +0x1333" was really
+ * vm_read32+0x13 (map-verified), which mislabeled the frontier crash as the
+ * effect walk for weeks. Check the helper table FIRST when naming a host RIP.
+ * Each helper's span is bounded by the next helper's start (they are emitted
+ * adjacently from shims.cpp), capped at 0x400 for the last / stray layouts.
+ * (All eight are declared extern "C" by ppu_recomp.h, included above.) */
+static const char* yz_vm_helper_from_host(const void* rip, unsigned* off_out)
+{
+    struct ent { uintptr_t a; const char* n; };
+    static ent tab[8];
+    static int n = 0;
+    if (!n) {
+        ent t[8] = {
+            { (uintptr_t)&vm_read8,   "vm_read8"   },
+            { (uintptr_t)&vm_read16,  "vm_read16"  },
+            { (uintptr_t)&vm_read32,  "vm_read32"  },
+            { (uintptr_t)&vm_read64,  "vm_read64"  },
+            { (uintptr_t)&vm_write8,  "vm_write8"  },
+            { (uintptr_t)&vm_write16, "vm_write16" },
+            { (uintptr_t)&vm_write32, "vm_write32" },
+            { (uintptr_t)&vm_write64, "vm_write64" },
+        };
+        for (int i = 0; i < 8; i++) {           /* insertion sort by address */
+            int j = i;
+            while (j > 0 && t[j - 1].a > t[j].a) { ent s = t[j]; t[j] = t[j - 1]; t[j - 1] = s; j--; }
+        }
+        memcpy(tab, t, sizeof(t));
+        n = 8;
+    }
+    uintptr_t r = (uintptr_t)rip;
+    for (int i = n - 1; i >= 0; i--) {
+        if (r < tab[i].a) continue;
+        uintptr_t end = (i + 1 < n) ? tab[i + 1].a : tab[i].a + 0x400;
+        if (end > tab[i].a + 0x400) end = tab[i].a + 0x400;
+        if (r < end) {
+            if (off_out) *off_out = (unsigned)(r - tab[i].a);
+            return tab[i].n;
+        }
+        break;
+    }
+    return nullptr;
 }
 
 extern "C" void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
@@ -1058,6 +1196,31 @@ static LONG CALLBACK yz_watch_wr_veh(EXCEPTION_POINTERS* ep)
             }
             fprintf(stderr, "[watch-wr] tid=%u ea=0x%08X old=0x%08X new=0x%08X bt: %s\n",
                     wtid, g_wwr_ea[i], old_be, new_be, chain);
+            /* HOST frames too. A writer that is RUNTIME code (not lifted guest
+             * code) resolves to NOTHING above -- boot 22 caught the fatal
+             * motion-descriptor write with an empty guest chain AND an empty
+             * trampoline ring, i.e. a host thread that has never run lifted
+             * code. Print module-relative RVAs (resolvable against
+             * yakuza_recomp.map) plus any PDB symbol so that writer is named. */
+            {
+                const uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
+                fprintf(stderr, "[watch-wr]   host frames:");
+                for (unsigned k = 0; k < got && k < 14; k++) {
+                    const uintptr_t r = (uintptr_t)bt[k];
+                    char sbuf[sizeof(SYMBOL_INFO) + 256];
+                    SYMBOL_INFO* sym = (SYMBOL_INFO*)sbuf;
+                    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                    sym->MaxNameLen = 255;
+                    DWORD64 disp = 0;
+                    if (SymFromAddr(GetCurrentProcess(), (DWORD64)r, &disp, sym))
+                        fprintf(stderr, " %s+0x%llX", sym->Name,
+                                (unsigned long long)disp);
+                    else
+                        fprintf(stderr, " rva:0x%llX",
+                                (unsigned long long)(r - mod));
+                }
+                fprintf(stderr, "\n");
+            }
             /* Trampoline-ring fallback/supplement (reliable across memcpy/data-lr
              * hops the host back-chain mis-symbolizes -- same rationale as the
              * existing yz_watch_veh). */
@@ -2164,6 +2327,85 @@ static DWORD WINAPI yz_lookahead_thread(LPVOID)
     return 0;
 }
 
+/* ---- motion-block fixup watcher (2026-08-05, env YZ_MOTBLK_WATCH) ----------
+ * Boot-12 decode (scratch/boot12_nullcall_decode_20260805.md): the frontier
+ * crash is guest 0x00AA0434 dereferencing *(block+0x14) of the motion bank
+ * header @0x62B40880 while +0x14/+0x18 still hold FILE-RELATIVE offsets
+ * (0xC520/0xC58C) -- the block was consumed mid-stream (t9 reading
+ * motion/adventure.par at that instant). This watcher answers the fork the
+ * static decode cannot: does the loader's pointer fixup ever run (race window,
+ * order vs t1's submit), or never (dropped parse step)?
+ * 1 ms poll, TRANSITIONS ONLY, of {+0x00,+0x08,+0x14,+0x18} at the (boot-
+ * stable) block plus the fast/slow gate u16 @0x42800D32 (crash gate obj+0x32).
+ * YZ_MOTBLK_WATCH=1 uses the boot-12 addresses; a hex value overrides the
+ * block EA. Read-only, uncapped (transitions are rare), kill = unset env. */
+static void yz_dump_all_threads(const char* tag);   /* defined below */
+static DWORD WINAPI yz_motblk_watch_thread(LPVOID)
+{
+    const char* env = getenv("YZ_MOTBLK_WATCH");
+    uint32_t blk = 0x62B40880u;
+    if (env && env[0] && !(env[0] == '1' && !env[1]))
+        blk = (uint32_t)strtoul(env, NULL, 16);
+    const uint32_t gate_ea = 0x42800D32u;
+    fprintf(stderr, "[motblk] ARMED: block=0x%08X fields {+0,+8,+14,+18} + gate16 @0x%08X (1ms poll)\n",
+            blk, gate_ea);
+    fflush(stderr);
+    uint32_t last[4] = { 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu };
+    uint32_t last_gate = 0xDEADBEEFu;
+    const uint32_t offs[4] = { 0x00u, 0x08u, 0x14u, 0x18u };
+    unsigned rearm_tick = 0;
+    for (;;) {
+        Sleep(1);
+        if (!vm_base) continue;
+        if (IsBadReadPtr(vm_base + blk, 0x20)) continue;
+        /* Keep any YZ_WATCH_WR page guard on this block ALIVE. The block lives
+         * in the lazily-committed sys_vm window, so the guard armed at startup
+         * is silently replaced by PAGE_READWRITE when the heap commits/recommits
+         * the page -- boot 16 printed its armed banner and then logged ZERO
+         * events for a region provably being written. Re-arm ~1/s (the existing
+         * helper is idempotent) so the watch is live for the whole scene; this
+         * is the only instrument that catches a writer on a path none of the
+         * vm_write / DMA traps cover. */
+        if ((++rearm_tick % 1000u) == 0u) {
+            extern void yz_watch_wr_rearm(void);
+            yz_watch_wr_rearm();
+        }
+        uint32_t cur[4];
+        for (int i = 0; i < 4; i++) cur[i] = vm_read32(blk + offs[i]);
+        uint32_t gate = IsBadReadPtr(vm_base + (gate_ea & ~3u), 4)
+                            ? 0xDEADBEEFu : (uint32_t)vm_read16(gate_ea);
+        int changed = (gate != last_gate);
+        for (int i = 0; i < 4; i++) changed |= (cur[i] != last[i]);
+        if (!changed) continue;
+        fprintf(stderr, "[motblk] frame=%u +00=0x%08X +08=0x%08X +14=0x%08X +18=0x%08X gate=0x%04X%s\n",
+                rsx_live_draw_get_frames(), cur[0], cur[1], cur[2], cur[3],
+                gate & 0xFFFFu,
+                (cur[2] && cur[2] < 0x01000000u) ? "  << +14 RAW-OFFSET (unfixed)" : "");
+        fflush(stderr);
+        /* Boot-14 escalation: the valid->raw flip of +0x14 IS the fatal reload
+         * write (crash follows within ~1 ms, boots 12/13/14). Snapshot every
+         * thread the instant the poller sees it — the writer thread is still
+         * inside the reload path, so its guest chain names the path the static
+         * decode is hunting (who rewrites a LIVE bank header and under which
+         * guard). Cap 2 (first flip may be a benign boot-era transition). */
+        /* "valid pointer -> raw file offset" (boot 16: 0x62B408A0 -> 0x00015D20;
+         * raw offsets are NOT always < 64 KB, which is why the boot-16 snapshot
+         * never fired -- threshold widened to the whole low 16 MB). */
+        if (last[2] >= 0x01000000u && cur[2] && cur[2] < 0x01000000u) {
+            static int flips = 0;
+            if (flips < 2) {
+                flips++;
+                fprintf(stderr, "[motblk] RAW FLIP #%d -> all-thread snapshot\n", flips);
+                fflush(stderr);
+                yz_dump_all_threads("motblk-flip");
+            }
+        }
+        memcpy(last, cur, sizeof(cur));
+        last_gate = gate;
+    }
+    return 0;
+}
+
 void yz_dump_guest_state(const ppu_context* gc, const char* tag)
 {
     if (!gc) return;
@@ -2320,6 +2562,31 @@ void yz_dump_guest_state(const ppu_context* gc, const char* tag)
                         n, hit >= 0 ? "IS" : "is NOT");
             }
         }
+        /* FRAME-CREDIT SAMPLE (2026-08-07, boot-66 producer-stall decode):
+         * t1's frame append (func_00E5F094, called from func_00E5F248 with
+         * bits=0x8000) takes a CREDIT via lwarx/stwcx decrement of
+         * *(obj+4), obj = *( *(TOC-0x7B28) + 0x20 ); zero credits diverts
+         * to the wait path (func_00E5F240) — the boot-66 terminal park.
+         * The gradual fps decay (5.0 -> 4.7 -> 1.6 -> frozen) is the
+         * credit-LEAK signature: completions failing to return credits.
+         * Sample the counter each watchdog tick so the decay shows as a
+         * monotonic credit drop with timestamps. */
+        {
+            uint32_t fobj_p = vm_read32(g_yz_game_toc - 0x7B28);
+            if (fobj_p >= 0x10000u && fobj_p < 0xE0000000u) {
+                uint32_t fobj = vm_read32(fobj_p + 0x20);
+                if (fobj >= 0x10000u && fobj < 0xE0000000u)
+                    /* Counter is at +8 (boot-67 correction: F094's lwarx
+                     * target is arg+4 where arg was already obj+4; +4
+                     * holds a pointer, 0x4019CA00). */
+                    fprintf(stderr,
+                            "    [framecredit] obj=0x%08X credits[+8]=%d "
+                            "wC=0x%08X w4=0x%08X w10=0x%08X w18=0x%08X\n",
+                            fobj, (int32_t)vm_read32(fobj + 8),
+                            vm_read32(fobj + 0xC), vm_read32(fobj + 4),
+                            vm_read32(fobj + 0x10), vm_read32(fobj + 0x18));
+            }
+        }
     }
 }
 
@@ -2451,6 +2718,10 @@ static void yz_dump_one_thread_cb(uint32_t tid, const char* name, void* handle)
     yz_dump_host_stack_of((HANDLE)handle, tag);
 }
 /* Dump every guest thread's host stack -- finds the blocked producer. */
+/* C-callable wrapper so cross-TU forensics (cellSync's frozen-ticket dump)
+ * can capture every thread's state at the instant of a deadlock. */
+extern "C" void yz_dump_all_threads_c(const char* tag) { yz_dump_all_threads(tag); }
+
 static void yz_dump_all_threads(const char* tag)
 {
     fprintf(stderr, "[%s] === all guest threads ===\n", tag);
@@ -2510,12 +2781,20 @@ static void yz_sample_t1_spin(const char* tag)
 {
     if (!g_yz_main_hthread) return;
     uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
-    struct { uint32_t addr; uint64_t off; int n; } hist[48]; int hn = 0, taken = 0;
+    struct {
+        uintptr_t rip;
+        uint32_t addr;
+        uint64_t off;
+        int n;
+    } hist[48];
+    int hn = 0, taken = 0;
     for (int s = 0; s < 24; s++) {
         if (SuspendThread(g_yz_main_hthread) == (DWORD)-1) { Sleep(60); continue; }
         CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_CONTROL;
+        uintptr_t rip = 0;
         uint32_t fa = 0xFFFFFFFFu; uint64_t fo = 0;
         if (GetThreadContext(g_yz_main_hthread, &cx)) {
+            rip = (uintptr_t)cx.Rip;
             if (const yz_func_entry* fe = yz_func_from_host((void*)cx.Rip)) {
                 fa = fe->addr; fo = (uintptr_t)cx.Rip - (uintptr_t)fe->fn;
             } else { fo = (uintptr_t)cx.Rip - mod; }
@@ -2523,18 +2802,40 @@ static void yz_sample_t1_spin(const char* tag)
         ResumeThread(g_yz_main_hthread);
         taken++;
         int idx = -1;
-        for (int i = 0; i < hn; i++) if (hist[i].addr == fa && hist[i].off == fo) { idx = i; break; }
-        if (idx < 0 && hn < 48) { idx = hn++; hist[idx].addr = fa; hist[idx].off = fo; hist[idx].n = 0; }
+        for (int i = 0; i < hn; i++) {
+            if (hist[i].rip == rip) { idx = i; break; }
+        }
+        if (idx < 0 && hn < 48) {
+            idx = hn++;
+            hist[idx].rip = rip;
+            hist[idx].addr = fa;
+            hist[idx].off = fo;
+            hist[idx].n = 0;
+        }
         if (idx >= 0) hist[idx].n++;
         Sleep(60);
     }
     fprintf(stderr, "[%s] t1 host-RIP profile (%d samples, host-RIP is RELIABLE):\n", tag, taken);
     for (int i = 0; i < hn; i++) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized =
+            hist[i].rip != 0 &&
+            SymFromAddr(GetCurrentProcess(), (DWORD64)hist[i].rip,
+                        &displacement, symbol) != FALSE;
         if (hist[i].addr == 0xFFFFFFFFu)
-            fprintf(stderr, "    [%2d] rva-only +0x%llX\n", hist[i].n, (unsigned long long)hist[i].off);
-        else
-            fprintf(stderr, "    [%2d] func_%08X +0x%llX\n", hist[i].n, hist[i].addr,
+            fprintf(stderr, "    [%2d] rva-only +0x%llX", hist[i].n,
                     (unsigned long long)hist[i].off);
+        else
+            fprintf(stderr, "    [%2d] func_%08X +0x%llX", hist[i].n,
+                    hist[i].addr, (unsigned long long)hist[i].off);
+        if (symbolized)
+            fprintf(stderr, " [sym %s+0x%llX]", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
     }
     fflush(stderr);
 }
@@ -2593,6 +2894,11 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
      * measures; the read-only guest-state dump below is the only default. */
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-30s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-30s"); }
+#ifdef YZ_NATIVE_SPURS
+    cellSpursDumpNativeJobChains("watchdog-30s");
+    if (getenv("YZ_NATIVE_SPURS_TASKSETS"))
+        yz_spurs_dump_tasksets("watchdog-30s");
+#endif
     /* s31 W2LIFE (ledger #71): one early (usually pre-CRI-transition) sample of
      * the SPURS wid accounting + per-SPU liveness, then one per watchdog minute
      * below -- the healthy-vs-dead comparison for the wid2 journal consumer. */
@@ -2602,9 +2908,11 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-45s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-45s"); }
+    sys_lwmutex_dump_holders("watchdog-45s");
     Sleep(15000);
     if (g_yz_main_ctx) { yz_dump_guest_state(g_yz_main_ctx, "watchdog-60s");
                          if (getenv("YZ_L1SNAP")) yz_dump_main_host_stack("watchdog-60s"); }
+    sys_lwmutex_dump_holders("watchdog-60s");
     /* s24: keep sampling forever (read-only dumps only). The fixed 30/45/60 s
      * schedule missed every late wedge — e.g. the iteration-4 wedge at ~207 s
      * had no dump. Every 60 s: t1 guest state + the chain-probe census (the
@@ -2614,6 +2922,13 @@ static DWORD WINAPI yz_stall_watchdog(LPVOID)
         char tag[32];
         snprintf(tag, sizeof tag, "watchdog-%dm", mins);
         if (g_yz_main_ctx) yz_dump_guest_state(g_yz_main_ctx, tag);
+        sys_lwmutex_dump_holders(tag);
+#ifdef YZ_NATIVE_SPURS
+        if (getenv("YZ_NATIVE_SPURS_LEDGER"))
+            cellSpursDumpNativeJobChains(tag);
+        if (getenv("YZ_NATIVE_SPURS_TASKSETS"))
+            yz_spurs_dump_tasksets(tag);
+#endif
         yz_chain_census_dump(tag);
         yz_w2life_dump(tag);   /* s31 W2LIFE */
     }
@@ -2652,6 +2967,7 @@ extern "C" void yz_rsx_fifo_release(void);
 extern "C" int  yz_rsx_flip_pending_any(void);
 static DWORD WINAPI yz_flip_advance(LPVOID)
 {
+    yz_thread_adopt_host("flip-advance");
     const uint32_t FIFO_BASE = 0x40400000u;   /* bufdesc+0x14 io base */
     const uint32_t RING_LO = 0x1000u, RING_HI = 0x800000u;
     const uint32_t FLIP_CMD = 0x0004E944u;    /* NV DRIVER_QUEUE flip method, count 1 */
@@ -3109,6 +3425,766 @@ static DWORD WINAPI yz_t1_sample_thread(LPVOID)
     return 0;
 }
 
+#if defined(YZ_PPU_SAMPLE)
+/* Time-weighted main-PPU sampler for the fixed performance windows.  Read the
+ * actual host RIP: the trampoline's last-target field stays stale across
+ * direct lifted calls and host waits, which makes epilogues look artificially
+ * hot.  This is profile-build-only and resumes t1 immediately after each
+ * control-context sample. */
+static volatile LONG g_yz_ppu_perf_active;
+static volatile LONG g_yz_ppu_perf_sample_count;
+static void* g_yz_ppu_perf_samples[131072];
+static void* g_yz_ppu_perf_host_callers[131072];
+static void* g_yz_ppu_perf_host_unwinds[131072];
+static uint32_t g_yz_ppu_perf_frames[131072];
+static uint32_t g_yz_ppu_perf_syscalls[131072];
+static uint32_t g_yz_ppu_perf_syscall_lrs[131072];
+static uint64_t g_yz_ppu_perf_syscall_args[131072];
+static volatile LONG g_yz_ppu_perf_present_target;
+static volatile LONG g_yz_ppu_perf_target_tid = 1;
+
+static bool yz_ppu_perf_is_executable_image_address(uintptr_t candidate)
+{
+    const uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)module;
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const IMAGE_NT_HEADERS64* nt =
+        (const IMAGE_NT_HEADERS64*)(module + (uintptr_t)dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+        if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        const uintptr_t begin = module + sections[s].VirtualAddress;
+        const uintptr_t span = sections[s].Misc.VirtualSize >
+                                       sections[s].SizeOfRawData
+            ? sections[s].Misc.VirtualSize : sections[s].SizeOfRawData;
+        if (candidate >= begin && candidate < begin + span)
+            return true;
+    }
+    return false;
+}
+
+/* For a sample parked in ntdll/kernelbase, retain the first executable return
+ * address from our image.  This is deliberately profile-only: it attributes
+ * an otherwise opaque host wait to the bridge/runtime call site without
+ * instrumenting every possible lock and wait in the production binary. */
+static void* yz_ppu_perf_find_host_caller(const CONTEXT& context)
+{
+    MEMORY_BASIC_INFORMATION mbi = {};
+    const uintptr_t stack = (uintptr_t)context.Rsp;
+    if (!VirtualQuery((const void*)stack, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT)
+        return nullptr;
+    const uintptr_t region_end =
+        (uintptr_t)mbi.BaseAddress + (uintptr_t)mbi.RegionSize;
+    size_t words = region_end > stack
+        ? (size_t)((region_end - stack) / sizeof(uintptr_t)) : 0;
+    if (words > 192) words = 192;
+
+    const uintptr_t* sp = (const uintptr_t*)stack;
+    for (size_t i = 0; i < words; ++i) {
+        const uintptr_t candidate = sp[i];
+        if (yz_ppu_perf_is_executable_image_address(candidate))
+            return (void*)candidate;
+    }
+    return nullptr;
+}
+
+static bool yz_ppu_perf_is_leaf_helper_symbol(const char* name)
+{
+    return name &&
+        (!strcmp(name, "vrf") || !strcmp(name, "vstf") ||
+         !strcmp(name, "vstw") || !strcmp(name, "memcpy"));
+}
+
+/* Raw stack words above are a useful cheap witness, but only an x64 unwind can
+ * distinguish an active caller from a stale executable address in the stack
+ * allocation.  Keep both results so the next A/B is self-validating. */
+static void* yz_ppu_perf_unwind_host_caller(
+    HANDLE thread, const CONTEXT& sampled_context)
+{
+    CONTEXT context = sampled_context;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    const uintptr_t sampled_pc = (uintptr_t)sampled_context.Rip;
+    DWORD64 sampled_symbol_base = 0;
+    {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)sampled_pc,
+                        &displacement, symbol))
+            sampled_symbol_base = symbol->Address;
+    }
+    for (unsigned depth = 0; depth < 24; ++depth) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), thread,
+                         &frame, &context, NULL, SymFunctionTableAccess64,
+                         SymGetModuleBase64, NULL))
+            break;
+        const uintptr_t pc = (uintptr_t)frame.AddrPC.Offset;
+        if (!pc) break;
+        if (pc == sampled_pc)
+            continue;
+        if (yz_ppu_perf_is_executable_image_address(pc)) {
+            char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+            SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = 255;
+            DWORD64 displacement = 0;
+            if (SymFromAddr(GetCurrentProcess(), (DWORD64)pc,
+                            &displacement, symbol)) {
+                if ((sampled_symbol_base &&
+                     symbol->Address == sampled_symbol_base) ||
+                    yz_ppu_perf_is_leaf_helper_symbol(symbol->Name))
+                    continue;
+            }
+            return (void*)pc;
+        }
+    }
+    return nullptr;
+}
+
+static DWORD WINAPI yz_ppu_perf_sample_thread(LPVOID)
+{
+    for (;;) {
+        Sleep(2);
+        if (!g_yz_ppu_perf_active)
+            continue;
+        const bool present_target = g_yz_ppu_perf_present_target != 0;
+        const uint32_t target_tid =
+            (uint32_t)g_yz_ppu_perf_target_tid;
+        HANDLE thread = present_target
+            ? (HANDLE)rsx_live_draw_get_present_thread_handle()
+            : target_tid == 1u
+                ? g_yz_main_hthread
+                : (HANDLE)yz_thread_handle(target_tid);
+        ppu_context* guest = present_target
+            ? nullptr : (ppu_context*)yz_thread_context(target_tid);
+        const uint32_t frame = present_target
+            ? rsx_live_draw_get_frames() + 1u
+            : rsx_live_draw_get_frames();
+        if (!thread || SuspendThread(thread) == (DWORD)-1)
+            continue;
+        CONTEXT context = {};
+        context.ContextFlags = CONTEXT_CONTROL;
+        void* rip = nullptr;
+        void* host_caller = nullptr;
+        void* host_unwind = nullptr;
+        if (GetThreadContext(thread, &context)) {
+            rip = (void*)context.Rip;
+            HMODULE rip_module = NULL;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)rip, &rip_module);
+            if (rip_module != GetModuleHandleW(NULL))
+                host_caller = yz_ppu_perf_find_host_caller(context);
+            /* Always unwind one host frame. When RIP is a TU-local helper
+             * such as vrf/vstf or memcpy, the caller is the real lifted guest
+             * function; reverse-mapping RIP itself falsely assigns helpers to
+             * the nearest function-table entry in the object file. */
+            host_unwind = yz_ppu_perf_unwind_host_caller(thread, context);
+        }
+        uint32_t syscall = 0;
+        uint32_t syscall_lr = 0;
+        uint64_t syscall_arg = 0;
+        uint64_t unused4 = 0, unused5 = 0;
+        uint32_t unused_held = 0;
+        if (!present_target &&
+            yz_wait_get(target_tid, &syscall, &syscall_arg, &unused4,
+                        &unused5, &unused_held)) {
+            /* The live guest context supplies the exact syscall caller. Raw
+             * native stack words are not an unwind and routinely name stale
+             * lifted return addresses. */
+            if (guest) syscall_lr = (uint32_t)guest->lr;
+        }
+        const LONG slot = InterlockedIncrement(&g_yz_ppu_perf_sample_count) - 1;
+        if ((unsigned long)slot <
+            sizeof(g_yz_ppu_perf_samples) / sizeof(g_yz_ppu_perf_samples[0])) {
+            g_yz_ppu_perf_samples[slot] = rip;
+            g_yz_ppu_perf_host_callers[slot] = host_caller;
+            g_yz_ppu_perf_host_unwinds[slot] = host_unwind;
+            g_yz_ppu_perf_frames[slot] = frame;
+            g_yz_ppu_perf_syscalls[slot] = syscall;
+            g_yz_ppu_perf_syscall_lrs[slot] = syscall_lr;
+            g_yz_ppu_perf_syscall_args[slot] = syscall_arg;
+        }
+        ResumeThread(thread);
+    }
+    return 0;
+}
+
+extern "C" void yz_ppu_perf_window_begin(uint32_t guest_frame)
+{
+    g_yz_ppu_perf_active = 0;
+    InterlockedExchange(&g_yz_ppu_perf_sample_count, 0);
+    g_yz_ppu_perf_present_target =
+        getenv("YZ_PPU_SAMPLE_PRESENT") ? 1 : 0;
+    g_yz_ppu_perf_target_tid = 1;
+    if (const char* value = getenv("YZ_PPU_SAMPLE_TID")) {
+        const unsigned long parsed = strtoul(value, nullptr, 0);
+        if (parsed >= 1u && parsed <= 255u)
+            g_yz_ppu_perf_target_tid = (LONG)parsed;
+    }
+    g_yz_ppu_perf_active = 1;
+    fprintf(stderr,
+            "[ppu-perf-window-begin] guest_frame=%u target=%s%ld\n",
+            guest_frame,
+            g_yz_ppu_perf_present_target ? "present" : "guest-tid-",
+            g_yz_ppu_perf_present_target ? 0L :
+                g_yz_ppu_perf_target_tid);
+}
+
+extern "C" void yz_ppu_perf_window_dump(uint32_t guest_frame)
+{
+    g_yz_ppu_perf_active = 0;
+    Sleep(2);
+    LONG count = g_yz_ppu_perf_sample_count;
+    const LONG capacity =
+        (LONG)(sizeof(g_yz_ppu_perf_samples) /
+               sizeof(g_yz_ppu_perf_samples[0]));
+    if (count > capacity) count = capacity;
+    if (count < 0) count = 0;
+
+    std::vector<uint32_t> samples;
+    samples.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        const yz_func_entry* function =
+            yz_func_from_host(g_yz_ppu_perf_samples[i]);
+        if (function) samples.push_back(function->addr);
+    }
+    std::sort(samples.begin(), samples.end());
+    struct bucket { uint32_t address; uint32_t count; };
+    std::vector<bucket> buckets;
+    for (size_t i = 0; i < samples.size();) {
+        size_t end = i + 1;
+        while (end < samples.size() && samples[end] == samples[i]) ++end;
+        buckets.push_back({samples[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(buckets.begin(), buckets.end(),
+              [](const bucket& a, const bucket& b) {
+                  return a.count > b.count;
+              });
+    fprintf(stderr,
+            "[ppu-perf-window-range] guest_end=%u samples=%zu raw=%ld\n",
+            guest_frame, samples.size(), count);
+    const size_t top = buckets.size() < 20 ? buckets.size() : 20;
+    for (size_t i = 0; i < top; ++i) {
+        fprintf(stderr,
+                "[ppu-perf-hot] rank=%zu func=0x%08X samples=%u pct=%.2f\n",
+                i + 1, buckets[i].address, buckets[i].count,
+                samples.empty() ? 0.0 :
+                    100.0 * (double)buckets[i].count / (double)samples.size());
+    }
+    std::vector<uintptr_t> raw_samples;
+    raw_samples.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i)
+        raw_samples.push_back((uintptr_t)g_yz_ppu_perf_samples[i]);
+    std::sort(raw_samples.begin(), raw_samples.end());
+    struct raw_bucket { uintptr_t rip; uint32_t count; };
+    std::vector<raw_bucket> raw_buckets;
+    for (size_t i = 0; i < raw_samples.size();) {
+        size_t end = i + 1;
+        while (end < raw_samples.size() && raw_samples[end] == raw_samples[i])
+            ++end;
+        raw_buckets.push_back({raw_samples[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(raw_buckets.begin(), raw_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t raw_top = raw_buckets.size() < 20 ? raw_buckets.size() : 20;
+    const uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    for (size_t i = 0; i < raw_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)raw_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)raw_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-rip] rank=%zu rva=0x%llX samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(raw_buckets[i].rip - module),
+                raw_buckets[i].count,
+                count ? 100.0 * (double)raw_buckets[i].count / (double)count
+                      : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(raw_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uintptr_t> host_callers;
+    host_callers.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_host_callers[i])
+            host_callers.push_back(
+                (uintptr_t)g_yz_ppu_perf_host_callers[i]);
+    }
+    std::sort(host_callers.begin(), host_callers.end());
+    std::vector<raw_bucket> host_caller_buckets;
+    for (size_t i = 0; i < host_callers.size();) {
+        size_t end = i + 1;
+        while (end < host_callers.size() &&
+               host_callers[end] == host_callers[i])
+            ++end;
+        host_caller_buckets.push_back(
+            {host_callers[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_caller_buckets.begin(), host_caller_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_caller_top = host_caller_buckets.size() < 20
+        ? host_caller_buckets.size() : 20;
+    for (size_t i = 0; i < host_caller_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)host_caller_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)host_caller_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-host-caller] rank=%zu rva=0x%llX "
+                "samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(host_caller_buckets[i].rip - module),
+                host_caller_buckets[i].count,
+                count ? 100.0 * (double)host_caller_buckets[i].count /
+                            (double)count : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(host_caller_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uintptr_t> host_unwinds;
+    host_unwinds.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_host_unwinds[i])
+            host_unwinds.push_back(
+                (uintptr_t)g_yz_ppu_perf_host_unwinds[i]);
+    }
+    std::sort(host_unwinds.begin(), host_unwinds.end());
+    std::vector<raw_bucket> host_unwind_buckets;
+    for (size_t i = 0; i < host_unwinds.size();) {
+        size_t end = i + 1;
+        while (end < host_unwinds.size() &&
+               host_unwinds[end] == host_unwinds[i])
+            ++end;
+        host_unwind_buckets.push_back(
+            {host_unwinds[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_unwind_buckets.begin(), host_unwind_buckets.end(),
+              [](const raw_bucket& a, const raw_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_unwind_top = host_unwind_buckets.size() < 20
+        ? host_unwind_buckets.size() : 20;
+    for (size_t i = 0; i < host_unwind_top; ++i) {
+        char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        const bool symbolized = SymFromAddr(
+            GetCurrentProcess(), (DWORD64)host_unwind_buckets[i].rip,
+            &displacement, symbol) != FALSE;
+        const yz_func_entry* function =
+            yz_func_from_host((void*)host_unwind_buckets[i].rip);
+        fprintf(stderr,
+                "[ppu-perf-host-unwind] rank=%zu rva=0x%llX "
+                "samples=%u pct=%.2f",
+                i + 1,
+                (unsigned long long)(host_unwind_buckets[i].rip - module),
+                host_unwind_buckets[i].count,
+                count ? 100.0 * (double)host_unwind_buckets[i].count /
+                            (double)count : 0.0);
+        if (function)
+            fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                    (unsigned long long)(host_unwind_buckets[i].rip -
+                                         (uintptr_t)function->fn));
+        if (symbolized)
+            fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                    (unsigned long long)displacement);
+        fprintf(stderr, "\n");
+    }
+    std::vector<uint32_t> host_unwind_functions;
+    host_unwind_functions.reserve(host_unwinds.size());
+    for (uintptr_t pc : host_unwinds) {
+        if (const yz_func_entry* function = yz_func_from_host((void*)pc))
+            host_unwind_functions.push_back(function->addr);
+    }
+    std::sort(host_unwind_functions.begin(), host_unwind_functions.end());
+    std::vector<bucket> host_unwind_function_buckets;
+    for (size_t i = 0; i < host_unwind_functions.size();) {
+        size_t end = i + 1;
+        while (end < host_unwind_functions.size() &&
+               host_unwind_functions[end] == host_unwind_functions[i])
+            ++end;
+        host_unwind_function_buckets.push_back(
+            {host_unwind_functions[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(host_unwind_function_buckets.begin(),
+              host_unwind_function_buckets.end(),
+              [](const bucket& a, const bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t host_unwind_function_top =
+        host_unwind_function_buckets.size() < 20
+            ? host_unwind_function_buckets.size() : 20;
+    for (size_t i = 0; i < host_unwind_function_top; ++i) {
+        const bucket& current = host_unwind_function_buckets[i];
+        fprintf(stderr,
+                "[ppu-perf-host-unwind-func] rank=%zu func=0x%08X "
+                "samples=%u raw_pct=%.2f mapped_pct=%.2f\n",
+                i + 1, current.address, current.count,
+                count ? 100.0 * (double)current.count / (double)count : 0.0,
+                host_unwind_functions.empty() ? 0.0 :
+                    100.0 * (double)current.count /
+                        (double)host_unwind_functions.size());
+    }
+    {
+        struct frame_bucket { uint32_t frame, count; };
+        std::vector<uint32_t> frame_samples;
+        frame_samples.reserve((size_t)count);
+        for (LONG i = 0; i < count; ++i)
+            frame_samples.push_back(g_yz_ppu_perf_frames[i]);
+        std::sort(frame_samples.begin(), frame_samples.end());
+        std::vector<frame_bucket> frame_buckets;
+        for (size_t i = 0; i < frame_samples.size();) {
+            size_t end = i + 1;
+            while (end < frame_samples.size() &&
+                   frame_samples[end] == frame_samples[i])
+                ++end;
+            frame_buckets.push_back(
+                {frame_samples[i], (uint32_t)(end - i)});
+            i = end;
+        }
+        std::sort(frame_buckets.begin(), frame_buckets.end(),
+                  [](const frame_bucket& a, const frame_bucket& b) {
+                      return a.count > b.count;
+                  });
+        const size_t frame_top =
+            frame_buckets.size() < 12 ? frame_buckets.size() : 12;
+        for (size_t frame_rank = 0; frame_rank < frame_top; ++frame_rank) {
+            const frame_bucket hot_frame = frame_buckets[frame_rank];
+            fprintf(stderr,
+                    "[ppu-perf-frame] rank=%zu frame=%u samples=%u\n",
+                    frame_rank + 1, hot_frame.frame, hot_frame.count);
+            std::vector<uintptr_t> frame_rips;
+            frame_rips.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame)
+                    frame_rips.push_back(
+                        (uintptr_t)g_yz_ppu_perf_samples[i]);
+            }
+            std::sort(frame_rips.begin(), frame_rips.end());
+            std::vector<raw_bucket> frame_rip_buckets;
+            for (size_t i = 0; i < frame_rips.size();) {
+                size_t end = i + 1;
+                while (end < frame_rips.size() &&
+                       frame_rips[end] == frame_rips[i])
+                    ++end;
+                frame_rip_buckets.push_back(
+                    {frame_rips[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_rip_buckets.begin(), frame_rip_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t rip_top = frame_rip_buckets.size() < 6
+                ? frame_rip_buckets.size() : 6;
+            for (size_t rip_rank = 0; rip_rank < rip_top; ++rip_rank) {
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const raw_bucket hot_rip = frame_rip_buckets[rip_rank];
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)hot_rip.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)hot_rip.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-rip] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, rip_rank + 1,
+                        (unsigned long long)(hot_rip.rip - module),
+                        hot_rip.count,
+                        hot_frame.count
+                            ? 100.0 * (double)hot_rip.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX",
+                            function->addr,
+                            (unsigned long long)(
+                                hot_rip.rip - (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            std::vector<uintptr_t> frame_host_callers;
+            frame_host_callers.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_host_callers[i])
+                    frame_host_callers.push_back(
+                        (uintptr_t)g_yz_ppu_perf_host_callers[i]);
+            }
+            std::sort(frame_host_callers.begin(), frame_host_callers.end());
+            std::vector<raw_bucket> frame_host_caller_buckets;
+            for (size_t i = 0; i < frame_host_callers.size();) {
+                size_t end = i + 1;
+                while (end < frame_host_callers.size() &&
+                       frame_host_callers[end] == frame_host_callers[i])
+                    ++end;
+                frame_host_caller_buckets.push_back(
+                    {frame_host_callers[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_host_caller_buckets.begin(),
+                      frame_host_caller_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_host_caller_top =
+                frame_host_caller_buckets.size() < 4
+                    ? frame_host_caller_buckets.size() : 4;
+            for (size_t caller_rank = 0;
+                 caller_rank < frame_host_caller_top; ++caller_rank) {
+                const raw_bucket caller =
+                    frame_host_caller_buckets[caller_rank];
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)caller.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)caller.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-host-caller] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, caller_rank + 1,
+                        (unsigned long long)(caller.rip - module),
+                        caller.count,
+                        hot_frame.count
+                            ? 100.0 * (double)caller.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                            (unsigned long long)(caller.rip -
+                                                 (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            std::vector<uintptr_t> frame_host_unwinds;
+            frame_host_unwinds.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_host_unwinds[i])
+                    frame_host_unwinds.push_back(
+                        (uintptr_t)g_yz_ppu_perf_host_unwinds[i]);
+            }
+            std::sort(frame_host_unwinds.begin(), frame_host_unwinds.end());
+            std::vector<raw_bucket> frame_host_unwind_buckets;
+            for (size_t i = 0; i < frame_host_unwinds.size();) {
+                size_t end = i + 1;
+                while (end < frame_host_unwinds.size() &&
+                       frame_host_unwinds[end] == frame_host_unwinds[i])
+                    ++end;
+                frame_host_unwind_buckets.push_back(
+                    {frame_host_unwinds[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_host_unwind_buckets.begin(),
+                      frame_host_unwind_buckets.end(),
+                      [](const raw_bucket& a, const raw_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_host_unwind_top =
+                frame_host_unwind_buckets.size() < 4
+                    ? frame_host_unwind_buckets.size() : 4;
+            for (size_t unwind_rank = 0;
+                 unwind_rank < frame_host_unwind_top; ++unwind_rank) {
+                const raw_bucket unwind =
+                    frame_host_unwind_buckets[unwind_rank];
+                char symbol_buffer[sizeof(SYMBOL_INFO) + 256] = {};
+                SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbol_buffer;
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                const bool symbolized = SymFromAddr(
+                    GetCurrentProcess(), (DWORD64)unwind.rip,
+                    &displacement, symbol) != FALSE;
+                const yz_func_entry* function =
+                    yz_func_from_host((void*)unwind.rip);
+                fprintf(stderr,
+                        "[ppu-perf-frame-host-unwind] frame=%u rank=%zu "
+                        "rva=0x%llX samples=%u pct=%.2f",
+                        hot_frame.frame, unwind_rank + 1,
+                        (unsigned long long)(unwind.rip - module),
+                        unwind.count,
+                        hot_frame.count
+                            ? 100.0 * (double)unwind.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+                if (function)
+                    fprintf(stderr, " func=0x%08X+0x%llX", function->addr,
+                            (unsigned long long)(unwind.rip -
+                                                 (uintptr_t)function->fn));
+                if (symbolized)
+                    fprintf(stderr, " symbol=%s+0x%llX", symbol->Name,
+                            (unsigned long long)displacement);
+                fprintf(stderr, "\n");
+            }
+            struct frame_wait_sample {
+                uint32_t syscall, lr;
+                uint64_t arg;
+            };
+            std::vector<frame_wait_sample> frame_waits;
+            frame_waits.reserve(hot_frame.count);
+            for (LONG i = 0; i < count; ++i) {
+                if (g_yz_ppu_perf_frames[i] == hot_frame.frame &&
+                    g_yz_ppu_perf_syscalls[i]) {
+                    frame_waits.push_back({g_yz_ppu_perf_syscalls[i],
+                                           g_yz_ppu_perf_syscall_lrs[i],
+                                           g_yz_ppu_perf_syscall_args[i]});
+                }
+            }
+            std::sort(frame_waits.begin(), frame_waits.end(),
+                      [](const frame_wait_sample& a,
+                         const frame_wait_sample& b) {
+                          if (a.syscall != b.syscall)
+                              return a.syscall < b.syscall;
+                          if (a.lr != b.lr) return a.lr < b.lr;
+                          return a.arg < b.arg;
+                      });
+            struct frame_wait_bucket {
+                frame_wait_sample sample;
+                uint32_t count;
+            };
+            std::vector<frame_wait_bucket> frame_wait_buckets;
+            for (size_t i = 0; i < frame_waits.size();) {
+                size_t end = i + 1;
+                while (end < frame_waits.size() &&
+                       frame_waits[end].syscall == frame_waits[i].syscall &&
+                       frame_waits[end].lr == frame_waits[i].lr &&
+                       frame_waits[end].arg == frame_waits[i].arg)
+                    ++end;
+                frame_wait_buckets.push_back(
+                    {frame_waits[i], (uint32_t)(end - i)});
+                i = end;
+            }
+            std::sort(frame_wait_buckets.begin(), frame_wait_buckets.end(),
+                      [](const frame_wait_bucket& a,
+                         const frame_wait_bucket& b) {
+                          return a.count > b.count;
+                      });
+            const size_t frame_wait_top = frame_wait_buckets.size() < 4
+                ? frame_wait_buckets.size() : 4;
+            for (size_t wait_rank = 0; wait_rank < frame_wait_top;
+                 ++wait_rank) {
+                const frame_wait_bucket& wait =
+                    frame_wait_buckets[wait_rank];
+                fprintf(stderr,
+                        "[ppu-perf-frame-wait] frame=%u rank=%zu sc=%u "
+                        "lr=0x%08X arg=0x%llX samples=%u pct=%.2f\n",
+                        hot_frame.frame, wait_rank + 1,
+                        wait.sample.syscall, wait.sample.lr,
+                        (unsigned long long)wait.sample.arg, wait.count,
+                        hot_frame.count
+                            ? 100.0 * (double)wait.count /
+                                  (double)hot_frame.count
+                            : 0.0);
+            }
+        }
+    }
+    struct wait_sample { uint32_t syscall, lr; uint64_t arg; };
+    std::vector<wait_sample> waits;
+    waits.reserve((size_t)count);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_yz_ppu_perf_syscalls[i])
+            waits.push_back({g_yz_ppu_perf_syscalls[i],
+                             g_yz_ppu_perf_syscall_lrs[i],
+                             g_yz_ppu_perf_syscall_args[i]});
+    }
+    std::sort(waits.begin(), waits.end(),
+              [](const wait_sample& a, const wait_sample& b) {
+                  if (a.syscall != b.syscall) return a.syscall < b.syscall;
+                  if (a.lr != b.lr) return a.lr < b.lr;
+                  return a.arg < b.arg;
+              });
+    struct wait_bucket { wait_sample sample; uint32_t count; };
+    std::vector<wait_bucket> wait_buckets;
+    for (size_t i = 0; i < waits.size();) {
+        size_t end = i + 1;
+        while (end < waits.size() &&
+               waits[end].syscall == waits[i].syscall &&
+               waits[end].lr == waits[i].lr &&
+               waits[end].arg == waits[i].arg)
+            ++end;
+        wait_buckets.push_back({waits[i], (uint32_t)(end - i)});
+        i = end;
+    }
+    std::sort(wait_buckets.begin(), wait_buckets.end(),
+              [](const wait_bucket& a, const wait_bucket& b) {
+                  return a.count > b.count;
+              });
+    const size_t wait_top = wait_buckets.size() < 20 ? wait_buckets.size() : 20;
+    for (size_t i = 0; i < wait_top; ++i)
+        fprintf(stderr,
+                "[ppu-perf-wait] rank=%zu sc=%u lr=0x%08X arg=0x%llX "
+                "samples=%u pct=%.2f\n",
+                i + 1, wait_buckets[i].sample.syscall,
+                wait_buckets[i].sample.lr,
+                (unsigned long long)wait_buckets[i].sample.arg,
+                wait_buckets[i].count,
+                count ? 100.0 * (double)wait_buckets[i].count / (double)count
+                      : 0.0);
+    fflush(stderr);
+}
+#endif
+
 /* Lightweight high-frequency RSX state tracer (TEMP DEBUG, env YZ_TRACE_RSX).
  * Samples the FIFO GET/PUT, the command word at GET, the flip fence, and t1's
  * ctr every ~120ms WITHOUT suspending any thread, and logs ONLY on change -- so
@@ -3212,10 +4288,106 @@ extern "C" __declspec(thread) uint64_t g_yz_tramp_r31[256];
 extern "C" __declspec(thread) uint64_t g_yz_tramp_r1[256];
 extern "C" __declspec(thread) unsigned g_yz_tramp_idx;
 
+extern "C" uint32_t yz_pad_guest_input_serial(void);
+extern "C" uint32_t yz_frontier_job_completion_serial(void);
+
+static bool yz_frontier_guest_word(uint32_t ea, uint32_t* value)
+{
+    if (!vm_base || ea < 0x10000u || ea > 0xFFFFFFFBu)
+        return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(vm_base + ea, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
+        (mbi.Protect & PAGE_GUARD))
+        return false;
+    *value = vm_read32(ea);
+    return true;
+}
+
+static void yz_frontier_snapshot_context(uint32_t tid, ppu_context* ctx)
+{
+    if (!ctx) return;
+    uint32_t syscall = 0, age = 0;
+    uint64_t a3 = 0, a4 = 0, a5 = 0;
+    (void)yz_wait_get(tid, &syscall, &a3, &a4, &a5, &age);
+    yz_frontier_trace_emit(
+        YZ_FT_PPU_THREAD, tid, (uint32_t)ctx->cia,
+        (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1], (uint32_t)ctx->ctr,
+        syscall, (uint32_t)a3, age);
+
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    for (uint32_t depth = 0; depth < 12u; ++depth) {
+        if (sp < 0x10000u || sp > 0xFFFFFFE7u) break;
+        uint32_t next = 0, ret = 0, alternate = 0;
+        if (!yz_frontier_guest_word(sp, &next) ||
+            !yz_frontier_guest_word(sp + 0x14u, &ret))
+            break;
+        if (!ret && yz_frontier_guest_word(sp + 0x10u, &alternate))
+            ret = alternate;
+        yz_frontier_trace_emit(
+            YZ_FT_PPU_STACK, tid, ret, sp, next, depth, 0u, 0u, 0u);
+        if (next <= sp || next - sp > 0x100000u) break;
+        sp = next;
+    }
+
+    /* General poll witness plus the currently symbolized completion protocol:
+     * func_00454C90 sleeps with LR=00454F90 while r30 addresses the word it
+     * requires to become zero and r31 is its descriptor base. */
+    const uint32_t wait_word = (uint32_t)ctx->gpr[30];
+    uint32_t actual = 0;
+    if ((uint32_t)ctx->lr == 0x00454F90u &&
+        yz_frontier_guest_word(wait_word, &actual))
+        yz_frontier_trace_emit(
+            YZ_FT_COMPLETION, tid, 5u,
+            (uint32_t)ctx->gpr[31], wait_word, actual, 0u,
+            (uint32_t)ctx->gpr[27], (uint32_t)ctx->gpr[26]);
+}
+
+static void yz_frontier_snapshot_thread_cb(
+    uint32_t tid, const char*, void*)
+{
+    yz_frontier_snapshot_context(
+        tid, (ppu_context*)yz_thread_context(tid));
+}
+
+static void yz_frontier_frame_credit_snapshot(void)
+{
+    if (!g_yz_game_toc || !vm_base) return;
+    const uint32_t owner = vm_read32(g_yz_game_toc - 0x7B28u);
+    if (owner < 0x10000u || owner > 0xFFFFFFDBu) return;
+    const uint32_t object = vm_read32(owner + 0x20u);
+    if (object < 0x10000u || object > 0xFFFFFFE3u) return;
+    yz_frontier_trace_emit(
+        YZ_FT_FRAME_CREDIT, 0u, 0u,
+        object, vm_read32(object + 0x08u),
+        vm_read32(object + 0x0Cu), vm_read32(object + 0x04u),
+        vm_read32(object + 0x10u), vm_read32(object + 0x18u));
+}
+
+static void yz_frontier_autopsy_snapshot(
+    uint32_t phase, uint32_t get, uint32_t put, uint32_t fence,
+    uint32_t frame, uint32_t dependency_word, uint32_t dependency_value)
+{
+    yz_frontier_trace_emit(
+        YZ_FT_AUTOPSY, 0u, phase,
+        get, put, fence, frame, dependency_word, dependency_value);
+    yz_frontier_snapshot_context(1u, g_yz_main_ctx);
+    yz_for_each_thread(yz_frontier_snapshot_thread_cb);
+    yz_frontier_sync_snapshot();
+    yz_frontier_event_snapshot();
+    yz_frontier_spurs_snapshot();
+    yz_frontier_spu_snapshot();
+    yz_frontier_fifo_snapshot(get, put);
+    yz_frontier_frame_credit_snapshot();
+}
+
 /*
- * Non-formatting frontier stall detector. It is dormant until the semantic
- * completion-job arm and records only state changes. A five-second quiet
- * interval produces one read-only worker snapshot and one ring dump.
+ * Progress-based freeze detector. A 10-second stable dependency signature is
+ * a soft snapshot only. The process keeps running; a hard snapshot/dump is
+ * taken only after that same signature survives another 10 seconds. Logical
+ * stalls are tracked independently: presented frames and jobs may advance,
+ * but accepted input with an unchanged guest-control signature for 60 seconds
+ * produces phase 3.
  */
 static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
 {
@@ -3223,10 +4395,26 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
     uint32_t last_put = ~0u;
     uint32_t last_fence = ~0u;
     uint32_t last_frame = ~0u;
+    uint32_t last_lr = ~0u;
+    uint32_t last_wait_word = ~0u;
+    uint32_t last_wait_value = ~0u;
+    uint32_t last_wait_descriptor = ~0u;
     DWORD unchanged_since = 0;
+    bool soft_captured = false;
+    bool hard_captured = false;
+    uint32_t last_input = 0;
+    uint32_t last_semantic = ~0u;
+    uint32_t semantic_input = 0;
+    uint32_t semantic_worker = 0;
+    DWORD semantic_since = 0;
+    bool logical_captured = false;
 
     for (;;) {
         Sleep(50);
+        /* Progress feed BEFORE the armed gate — mode 3 arms FROM this call
+         * (boot 56: records=0 because the old order made arming impossible:
+         * not-armed -> continue -> progress never reported). */
+        yz_frontier_trace_progress(rsx_live_draw_get_frames());
         if (!yz_frontier_trace_is_armed() || !vm_base)
             continue;
 
@@ -3235,9 +4423,63 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
         const uint32_t fence = vm_read32(0x40C00000u);
         const uint32_t frame = rsx_live_draw_get_frames();
         const DWORD now = GetTickCount();
+        const uint32_t main_lr =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u;
+        const uint32_t wait_word =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->gpr[30] : 0u;
+        const uint32_t wait_descriptor =
+            g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->gpr[31] : 0u;
+        uint32_t wait_value = 0u;
+        if (!yz_frontier_guest_word(wait_word, &wait_value))
+            wait_value = 0u;
+
+        const uint32_t input = yz_pad_guest_input_serial();
+        const uint32_t worker = yz_frontier_job_completion_serial();
+        const uint32_t semantic = g_yz_main_ctx
+            ? (uint32_t)g_yz_main_ctx->lr ^
+                  (uint32_t)g_yz_main_ctx->gpr[3] ^
+                  (uint32_t)g_yz_main_ctx->gpr[27] ^
+                  (uint32_t)g_yz_main_ctx->gpr[29] ^
+                  (uint32_t)g_yz_main_ctx->gpr[30] ^
+                  (uint32_t)g_yz_main_ctx->gpr[31]
+            : 0u;
+        if (semantic != last_semantic) {
+            last_semantic = semantic;
+            semantic_since = now;
+            semantic_input = input;
+            semantic_worker = worker;
+            logical_captured = false;
+        }
+        if (input != last_input) {
+            last_input = input;
+            yz_frontier_trace_emit(
+                YZ_FT_LOGICAL_STATE, 0u, 0u,
+                frame, input, semantic, worker,
+                main_lr, wait_descriptor);
+        }
+        if (!logical_captured && semantic_since &&
+            now - semantic_since >= 60000u && input != semantic_input &&
+            worker != semantic_worker && frame != last_frame) {
+            logical_captured = true;
+            yz_frontier_trace_emit(
+                YZ_FT_LOGICAL_STATE, 0u, 1u,
+                frame, input, semantic, worker,
+                main_lr, wait_descriptor);
+            yz_frontier_autopsy_snapshot(
+                3u, get, put, fence, frame, wait_word, wait_value);
+            yz_frontier_trace_dump(2u);
+            fprintf(stderr,
+                    "[freeze-autopsy] LOGICAL stall: frames/workers advance "
+                    "but accepted input left the guest-control signature "
+                    "unchanged for 60s\n");
+            fflush(stderr);
+        }
 
         if (get != last_get || put != last_put ||
-            fence != last_fence || frame != last_frame) {
+            fence != last_fence || frame != last_frame ||
+            main_lr != last_lr || wait_word != last_wait_word ||
+            wait_value != last_wait_value ||
+            wait_descriptor != last_wait_descriptor) {
             yz_frontier_trace_emit(
                 YZ_FT_RSX_STATE, 0, 0,
                 get, put, fence, frame,
@@ -3247,7 +4489,13 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
             last_put = put;
             last_fence = fence;
             last_frame = frame;
+            last_lr = main_lr;
+            last_wait_word = wait_word;
+            last_wait_value = wait_value;
+            last_wait_descriptor = wait_descriptor;
             unchanged_since = now;
+            soft_captured = false;
+            hard_captured = false;
             continue;
         }
 
@@ -3256,18 +4504,40 @@ static DWORD WINAPI yz_frontier_ring_watchdog(LPVOID)
             continue;
         }
 
-        if (now - unchanged_since >= 5000u) {
-            yz_frontier_fifo_snapshot(get, put);
-            yz_frontier_spu_snapshot();
-            yz_frontier_event_snapshot();
+        if (now - unchanged_since >= 10000u && !soft_captured) {
+            soft_captured = true;
+            yz_frontier_autopsy_snapshot(
+                1u, get, put, fence, frame, wait_word, wait_value);
+            fprintf(stderr,
+                    "[freeze-autopsy] SOFT snapshot frame=%u flip=%u "
+                    "lr=%08X dependency=%08X:%08X; confirming\n",
+                    frame, fence, main_lr, wait_word, wait_value);
+            fflush(stderr);
+        }
+        if (now - unchanged_since >= 20000u && soft_captured &&
+            !hard_captured) {
+            hard_captured = true;
+            yz_frontier_autopsy_snapshot(
+                2u, get, put, fence, frame, wait_word, wait_value);
             yz_frontier_trace_emit(
-                YZ_FT_STALL, 0, 0,
-                get, put, fence, frame,
-                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->ctr : 0u,
-                g_yz_main_ctx ? (uint32_t)g_yz_main_ctx->lr : 0u);
-            yz_frontier_edge_dump(0u, get, put);
+                YZ_FT_STALL, 0u, 2u,
+                get, put, fence, frame, wait_word, wait_value);
             yz_frontier_trace_dump(1u);
-            return 0;
+            fprintf(stderr,
+                    "[freeze-autopsy] HARD freeze confirmed: unchanged "
+                    "dependency chain for 20s frame=%u flip=%u lr=%08X "
+                    "dependency=%08X actual=%08X\n",
+                    frame, fence, main_lr, wait_word, wait_value);
+            fflush(stderr);
+            /* Expensive suspension/host-stack capture is terminal-only. The
+             * flight ring and non-invasive guest snapshots are already safe
+             * on disk before this corroborating dump begins. */
+            if (g_yz_main_ctx)
+                yz_dump_guest_state(g_yz_main_ctx, "freeze-autopsy-hard");
+            yz_dump_all_threads("freeze-autopsy-hard");
+            cellSpursDumpNativeJobChains("freeze-autopsy-hard");
+            yz_spurs_dump_tasksets("freeze-autopsy-hard");
+            yz_frontier_edge_dump(0u, get, put);
         }
     }
 }
@@ -3282,10 +4552,16 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
     fprintf(stderr, " (rva 0x%llX)",
             (unsigned long long)((uintptr_t)er->ExceptionAddress -
                                  (uintptr_t)GetModuleHandleW(NULL)));
-    if (const yz_func_entry* fe = yz_func_from_host(er->ExceptionAddress))
-        fprintf(stderr, " (in func_%08X +0x%llX)", fe->addr,
-                (unsigned long long)((uintptr_t)er->ExceptionAddress -
-                                     (uintptr_t)fe->fn));
+    {
+        unsigned hoff = 0;
+        if (const char* hn = yz_vm_helper_from_host(er->ExceptionAddress, &hoff))
+            fprintf(stderr, " (in %s +0x%X -- runtime vm helper; the guest "
+                    "faulter is the next lifted frame below)", hn, hoff);
+        else if (const yz_func_entry* fe = yz_func_from_host(er->ExceptionAddress))
+            fprintf(stderr, " (in func_%08X +0x%llX)", fe->addr,
+                    (unsigned long long)((uintptr_t)er->ExceptionAddress -
+                                         (uintptr_t)fe->fn));
+    }
     /* PDB symbol for the faulting host code — authoritative for runtime/HLE
      * code, and disambiguates when the table hit above is a tiny stub the
      * linker happened to place just before the real function. */
@@ -3332,12 +4608,60 @@ static LONG WINAPI yz_crash_handler(EXCEPTION_POINTERS* ep)
         uintptr_t mod = (uintptr_t)GetModuleHandleW(NULL);
         fprintf(stderr, "\n[crash] HOST call stack (%u frames, newest first):", nf);
         for (USHORT i = 0; i < nf; i++) {
-            const yz_func_entry* fe = yz_func_from_host(frames[i]);
-            if (fe)
+            unsigned hoff = 0;
+            const char* hn = yz_vm_helper_from_host(frames[i], &hoff);
+            const yz_func_entry* fe = hn ? nullptr : yz_func_from_host(frames[i]);
+            if (hn)
+                fprintf(stderr, "\n    %s +0x%X (runtime vm helper)", hn, hoff);
+            else if (fe)
                 fprintf(stderr, "\n    func_%08X +0x%llX", fe->addr,
                         (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)fe->fn));
             else
                 fprintf(stderr, "\n    rva 0x%llX", (unsigned long long)((uintptr_t)frames[i] - mod));
+        }
+    }
+
+    /* Effect-manager chain at fault time (the Akiyama/Hana null-getter
+     * crash): the global at 0x14EC864, the object slot the crashing walk
+     * reads ([mgr+0x230..0x25F]), and — if the +0x23C object is live — its
+     * vtable slot 0x28 OPD. Names which link is null/garbage without a
+     * debugger attach. */
+    {
+        extern uint8_t* vm_base;
+        auto rd_ok = [](uint32_t a) { return a >= 0x00010000u && a < 0xE0000000u; };
+        #define addr_readable rd_ok
+        uint32_t mgr = vm_read32(0x14EC864u);
+        fprintf(stderr, "\n[crash] effect-mgr @0x14EC864 = 0x%08X", mgr);
+        if (mgr && addr_readable(mgr + 0x260u)) {
+            fprintf(stderr, "\n[crash] effect-mgr +0x230:");
+            for (uint32_t off = 0x230; off < 0x260; off += 4)
+                fprintf(stderr, " %08X", vm_read32(mgr + off));
+            uint32_t obj = vm_read32(mgr + 0x23Cu);
+            if (obj && addr_readable(obj + 0x30u)) {
+                uint32_t vt = vm_read32(obj);
+                fprintf(stderr, "\n[crash] effect-obj 0x%08X vt=0x%08X", obj, vt);
+                if (vt && addr_readable(vt + 0x2Cu)) {
+                    uint32_t opd = vm_read32(vt + 0x28u);
+                    fprintf(stderr, " opd@0x28=0x%08X", opd);
+                    if (opd && addr_readable(opd + 8u))
+                        fprintf(stderr, " code=0x%08X toc=0x%08X",
+                                vm_read32(opd), vm_read32(opd + 4u));
+                }
+            }
+        }
+        #undef addr_readable
+    }
+
+    /* Every thread parked in a syscall at fault time, with age. A creation
+     * pipeline stalled for minutes shows up here as one ancient wait. */
+    {
+        fprintf(stderr, "\n[crash] parked syscalls (tid num a3 a4 a5 age_ms):");
+        for (uint32_t tid = 1; tid < 256; tid++) {
+            uint32_t num, age; uint64_t a3, a4, a5;
+            if (yz_wait_get(tid, &num, &a3, &a4, &a5, &age))
+                fprintf(stderr, "\n    t%u sc%u 0x%llX 0x%llX 0x%llX %ums",
+                        tid, num, (unsigned long long)a3,
+                        (unsigned long long)a4, (unsigned long long)a5, age);
         }
     }
 
@@ -3471,17 +4795,25 @@ int main(int argc, char** argv)
         return 1;
     yz_apply_builtin_text_overrides();
 
+#ifndef YZ_NATIVE_SPURS
     /* LLE firmware: Sony's libsre at its lift_prx relocation base. Must be
      * in place before yz_install_imports patches its import slots. */
     if (load_prx_image("recomp_prx/libsre_image.bin", YZ_LIBSRE_BASE) != 0)
         return 1;
+#else
+    printf("[boot] SPURS backend=NATIVE firmware-free "
+           "(libsre image/PPU lift/kernel modules requested=0)\n");
+#endif
 
-    /* LLE firmware: Sony's libgcm_sys (RSX driver). Same contract as libsre --
-     * the flat image includes its TOC (0x02114000) referenced by the export
-     * OPDs the game's cellGcmSys imports bind to. Must be loaded before
-     * yz_install_imports. The driver issues sys_rsx syscalls (668-677). */
+#ifndef YZ_NATIVE_GCM
+    /* The oracle lane binds cellGcmSys imports to its relocated driver image.
+     * The native lane resolves every one of those imports to independent host
+     * implementations and must leave the firmware address range unmapped. */
     if (load_prx_image("recomp_prx/libgcm_sys_image.bin", YZ_LIBGCM_BASE) != 0)
         return 1;
+#else
+    printf("[boot] GCM backend=NATIVE firmware image requested=0\n");
+#endif
 
     /* LLE the GAME's own runtime-loaded engine PRX: pxd_shader (OgreZ shader
      * module). The game sys_prx_load_module's it from data/module/ps3/; we
@@ -3511,9 +4843,11 @@ int main(int argc, char** argv)
      * #34/#49; adoption-trace analysis). Group-start now adopts 16 for every
      * thread (lv2_register.c); spu_lookup refuses wildcard service for
      * kernel contexts (kill-switch YZ_KERN_WILDCARD_OK). */
+#ifndef YZ_NATIVE_SPURS
     spu_begin_image(16); spu_recomp_register();           /* kernel  */
     spu_begin_image(1); spu_recomp_register_sysservice(); /* system service @0xA00 */
     spu_begin_image(2); spu_recomp_register_policy();     /* taskset policy @0xA00 */
+#endif
     /* cri_audio (image 3) BEFORE gs_task (image 0): both overlap LS 0x3000+, and
      * spu_lookup returns the first match -- registering the codec first lets its
      * image-3 entries win for codec (image 3) lookups over gs_task's image-0
@@ -3521,8 +4855,10 @@ int main(int argc, char** argv)
     spu_begin_image(3); cri_audio_register_functions();   /* CRI SOFDEC/ADX codec @0x3000 (wid 3) */
     spu_begin_image(4); wkl4_register_functions();        /* 4-task worker pool @0x3000 (wid 4, EBOOT img #5 @0x01284200) */
     spu_images_register_extra();                          /* remaining EBOOT task images (ids 5+, generated table) */
+#ifndef YZ_NATIVE_SPURS
     spu_begin_image(12); spu_recomp_register_tsexit();    /* taskset exit-handler overlay @0x10000 (libsre 0x02025500) */
     spu_begin_image(13); spu_recomp_register_jobmod();    /* jobchain policy module @0xA00 (libsre 0x0202A180) */
+#endif
     spu_begin_image(14); spu_recomp_register_jobbin_a();  /* jobchain bulk-worker job binary (EBOOT 0x01254500, slot base 0x4C00) */
     spu_recomp_register_jobbin_a_e400();                  /*   ...same binary lifted at the other slot base 0xE400 (same image) */
     spu_recomp_register_jobbin_a_24400();                 /*   ...same binary at non-overlapping LS 0x24400 */
@@ -3576,8 +4912,16 @@ int main(int argc, char** argv)
     spu_begin_image(19);
     spu_recomp_register_jobbin_orphanage_37c00();                 /*   ...same binary at the live Kamurocho slot 0x37C00 */
     spu_begin_image(0); spu_recomp_register_gstask();     /* Edge geometry task @0x3000 (image-0 wildcard: LAST) */
+#ifdef YZ_NATIVE_SPURS
+    if (!yz_register_native_spurs_images())
+        return 1;
+    printf("[boot] native SPURS images registered "
+           "(%d exact EBOOT tasks + 5 exact game jobs; no firmware)\n",
+           SPU_IMAGE_COUNT);
+#else
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
            SPU_IMAGE_COUNT);
+#endif
 
     /* DIAG (1f): function-level spin profiler. YZ_SPU_PROF histograms every
      * SPU tail-call trampoline hop by target LS addr -> pins which lifted
@@ -3628,6 +4972,7 @@ int main(int argc, char** argv)
     yz_install_imports();
     printf("[boot] installed %u import bridges\n", g_yz_import_count);
     g_ps3_guest_caller = guest_caller;
+    g_ps3_guest_caller_ret = guest_caller_ret;
 
     /* Read the real title id (+ title/version) from the game's PARAM.SFO so every
      * title-id-based path (cellGame content/boot/data, cellDiscGame) is correct for
@@ -3696,6 +5041,8 @@ int main(int argc, char** argv)
     CreateThread(NULL, 0, yz_stall_watchdog, NULL, 0, NULL);
     if (getenv("YZ_DEFERWATCH"))
         CreateThread(NULL, 0, yz_deferwatch_thread, NULL, 0, NULL);
+    if (getenv("YZ_MOTBLK_WATCH"))
+        CreateThread(NULL, 0, yz_motblk_watch_thread, NULL, 0, NULL);
     /* s24: lookahead REFUTED on its first boot (DONT_RECHASE #50 — reproduced
      * the June eager-applier wedge: releases without the preceding patch
      * entries hand GET torn content). Explicit opt-in only. */
@@ -3713,6 +5060,9 @@ int main(int argc, char** argv)
      * silent (no-syscall) t1 stall without perturbing the thread. */
     if (getenv("YZ_T1SAMPLE"))
         CreateThread(NULL, 0, yz_t1_sample_thread, NULL, 0, NULL);
+#if defined(YZ_PPU_SAMPLE)
+    CreateThread(NULL, 0, yz_ppu_perf_sample_thread, NULL, 0, NULL);
+#endif
     /* RSX FIFO flow-control band-aid -- RETIRED AGAIN (default OFF,
      * 2026-07-02 layer-1 root-cause session; opt back in with YZ_FLOWCTL=1).
      * The race it covered is root-caused: OUR deferred-release applier

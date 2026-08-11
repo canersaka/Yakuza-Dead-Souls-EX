@@ -6,7 +6,6 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
-#include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,19 +31,23 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
 
 typedef struct {
     uint64_t            fp;
+    uint32_t            image_size;
     spu_lifted_entry_fn fn;
+    int                 image_id;
+    uint32_t            entry_pc;
     const char*         name;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
+static spu_workload_image_executor_fn s_image_executor = NULL;
 
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
                            const char* name)
 {
     if (!fn) return;
     for (unsigned i = 0; i < s_registry_count; i++) {
-        if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
+        if (s_registry[i].fp == fingerprint && s_registry[i].image_size == 0) {
             s_registry[i].fn   = fn;
             s_registry[i].name = name;
             return;
@@ -61,6 +64,99 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
     s_registry_count++;
 }
 
+int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
+                                 spu_lifted_entry_fn fn, const char* name)
+{
+    if (!image_size || !fn) return 0;
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].fp == fingerprint &&
+            s_registry[i].image_size == image_size) {
+            s_registry[i].fn = fn;
+            s_registry[i].image_id = -1;
+            s_registry[i].entry_pc = 0;
+            s_registry[i].name = name;
+            return 1;
+        }
+    }
+    if (s_registry_count >= SPU_WORKLOAD_MAX) {
+        fprintf(stderr, "[spu_workload] registry full; rejected '%s'\n",
+                name ? name : "?");
+        return 0;
+    }
+    s_registry[s_registry_count++] = (spu_workload_entry){
+        fingerprint, image_size, fn, -1, 0, name
+    };
+    return 1;
+}
+
+int spu_workload_register_image(uint64_t fingerprint, uint32_t image_size,
+                                int image_id, uint32_t entry_pc,
+                                const char* name)
+{
+    if (!image_size || image_id < 0) return 0;
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].fp == fingerprint &&
+            s_registry[i].image_size == image_size) {
+            s_registry[i].fn = NULL;
+            s_registry[i].image_id = image_id;
+            s_registry[i].entry_pc = entry_pc;
+            s_registry[i].name = name;
+            return 1;
+        }
+    }
+    if (s_registry_count >= SPU_WORKLOAD_MAX) {
+        fprintf(stderr, "[spu_workload] registry full; rejected '%s'\n",
+                name ? name : "?");
+        return 0;
+    }
+    s_registry[s_registry_count++] = (spu_workload_entry){
+        fingerprint, image_size, NULL, image_id, entry_pc, name
+    };
+    return 1;
+}
+
+void spu_workload_set_image_executor(spu_workload_image_executor_fn executor)
+{
+    s_image_executor = executor;
+}
+
+int spu_workload_resolve(const void* image, uint32_t image_size,
+                         spu_workload_image* out)
+{
+    if (!image || !image_size || !out) return 0;
+    const uint64_t fp = spu_workload_fingerprint(image, image_size);
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        const spu_workload_entry* e = &s_registry[i];
+        if (e->fp == fp && e->image_size == image_size) {
+            *out = (spu_workload_image){
+                e->fp, image_size, e->image_id, e->entry_pc, e->fn, e->name
+            };
+            return 1;
+        }
+    }
+    fprintf(stderr,
+            "[spu_workload] exact image miss fp=0x%016llX size=%u\n",
+            (unsigned long long)fp, image_size);
+    return 0;
+}
+
+int spu_workload_execute(const spu_workload_image* image, spu_context* ctx)
+{
+    if (!image || !ctx) return 0;
+    if (image->direct_entry) {
+        image->direct_entry(ctx);
+        return 1;
+    }
+    if (!s_image_executor) {
+        fprintf(stderr,
+                "[spu_workload] no image executor for '%s' (id=%d pc=0x%05X)\n",
+                image->name ? image->name : "?", image->image_id,
+                image->entry_pc);
+        return 0;
+    }
+    return s_image_executor(ctx, image->image_id, image->entry_pc);
+}
+
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
 {
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -70,6 +166,12 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
 }
 
 unsigned spu_workload_count(void) { return s_registry_count; }
+void spu_workload_reset(void)
+{
+    memset(s_registry, 0, sizeof(s_registry));
+    s_registry_count = 0;
+    s_image_executor = NULL;
+}
 
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
 
@@ -167,13 +269,8 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
-    spu_lifted_entry_fn fn = spu_workload_find(fp);
-    if (!fn) {
-        fprintf(stderr,
-            "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
-            "(no lifted SPU binary registered for this image)\n",
-            (unsigned long long)fp, image_size);
+    spu_workload_image registered;
+    if (!spu_workload_resolve(image, image_size, &registered)) {
         return 0;
     }
 
@@ -185,18 +282,29 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     uint32_t entry = 0;
     if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
-        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n",
-                (unsigned long long)fp);
+        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: invalid SPU ELF\n",
+                (unsigned long long)registered.fingerprint);
         free(ls);
         return 0;
     }
 
     fprintf(stderr,
         "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X -> running\n",
-        (unsigned long long)fp, entry, args_ea);
+        (unsigned long long)registered.fingerprint, entry, args_ea);
 
-    spu_run_lifted_job(fn, ls, args_ea);
+    spu_context* ctx = (spu_context*)malloc(sizeof(*ctx));
+    if (!ctx) {
+        free(ls);
+        return 0;
+    }
+    spu_context_init(ctx, 0);
+    memcpy(ctx->ls, ls, SPU_LS_SIZE);
+    ctx->gpr[3]._u32[0] = args_ea;
+    int ok = spu_workload_execute(&registered, ctx);
+    memcpy(ls, ctx->ls, SPU_LS_SIZE);
+    spu_mfc_unregister(ctx);
+    free(ctx);
 
     free(ls);
-    return 1;
+    return ok;
 }

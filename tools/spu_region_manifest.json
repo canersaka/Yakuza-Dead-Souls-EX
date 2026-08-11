@@ -18,6 +18,7 @@
       "description": "EBOOT-embedded SPURS task images, batch-lifted from scratch/spu_imgs (gen_spu_images.py command shape: --auto-functions <elf> --seed-all)",
       "images": [
         { "stem": "gs_task",   "elf": "scratch/spu_imgs/spu_0003_at_0126A580.elf", "diag": "recomp_prx/gs_task.c",   "image_id": 0,  "expect_handedit": true,
+          "conformance_entries": ["0x62F0", "0x6350", "0x6550", "0x69D8", "0x7B00"],
           "note": "reference model; yakuza/generated/fast/gs_task_fast.c is the validated region lift and is retained instead of the regenerated oracle" },
         { "stem": "cri_audio", "elf": "scratch/spu_imgs/spu_0007_at_012A4980.elf", "diag": "recomp_prx/cri_audio.c", "image_id": 3 },
         { "stem": "wkl4_task", "elf": "scratch/spu_imgs/spu_0005_at_01274200.elf", "diag": "recomp_prx/wkl4_task.c", "image_id": 4 },
@@ -82,7 +83,7 @@
       "eboot_ea": "0x0125DA80",
       "ref_elf": "recomp_prx/job_bin_c_17800.elf",
       "ref_base": "0x17800",
-      "description": "post-a030 transition job",
+      "description": "post-a030 transition job; live sizeBinary contract is 0x76C0 bytes",
       "placements": [
         { "stem": "job_bin_c_4c00",  "base": "0x4C00",  "diag": "recomp_prx/job_bin_c_4c00.c",  "image_id": 38 },
         { "stem": "job_bin_c_e400",  "base": "0xE400",  "diag": "recomp_prx/job_bin_c_e400.c",  "image_id": 17 },
@@ -106,12 +107,14 @@
         { "stem": "job_bin_d_5000",  "base": "0x5000",  "diag": "recomp_prx/job_bin_d_5000.c",  "image_id": 26 },
         { "stem": "job_bin_d_c400",  "base": "0xC400",  "diag": "yakuza/generated/job_bin_d_c400.c",  "image_id": 42 },
         { "stem": "job_bin_d_e400",  "base": "0xE400",  "elf": "recomp_prx/job_bin_d_e400.elf", "diag": "recomp_prx/job_bin_d_e400.c",  "image_id": 18 },
+        { "stem": "job_bin_d_15c00", "base": "0x15C00", "diag": "yakuza/generated/job_bin_d_15c00.c", "image_id": 47 },
         { "stem": "job_bin_d_15800", "base": "0x15800", "diag": "recomp_prx/job_bin_d_15800.c", "image_id": 25 },
         { "stem": "job_bin_d_20c00", "base": "0x20C00", "diag": "recomp_prx/job_bin_d_20c00.c", "image_id": 18 },
         { "stem": "job_bin_d_23000", "base": "0x23000", "diag": "recomp_prx/job_bin_d_23000.c", "image_id": 21 },
         { "stem": "job_bin_d_27400", "base": "0x27400", "diag": "recomp_prx/job_bin_d_27400.c", "image_id": 32 },
         { "stem": "job_bin_d_2a800", "base": "0x2A800", "diag": "recomp_prx/job_bin_d_2a800.c", "image_id": 33 },
         { "stem": "job_bin_d_2b400", "base": "0x2B400", "diag": "recomp_prx/job_bin_d_2b400.c", "image_id": 29 },
+        { "stem": "job_bin_d_2b800", "base": "0x2B800", "diag": "yakuza/generated/job_bin_d_2b800.c", "image_id": 45 },
         { "stem": "job_bin_d_2c400", "base": "0x2C400", "diag": "recomp_prx/job_bin_d_2c400.c", "image_id": 36 },
         { "stem": "job_bin_d_2d400", "base": "0x2D400", "diag": "recomp_prx/job_bin_d_2d400.c", "image_id": 31 },
         { "stem": "job_bin_d_2e400", "base": "0x2E400", "diag": "recomp_prx/job_bin_d_2e400.c", "image_id": 34 },
@@ -122,8 +125,9 @@
       "kind": "job",
       "eboot_ea": "0x01252680",
       "eboot_size": "0x1E80",
+      "logical_size": "0x1E40",
       "eboot": "game/EBOOT.elf",
-      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated. Placement identity contract (07-30): a numeric PC alone does NOT identify a loaded job; the runtime must resolve (source identity, exact LS base) to a placement BEFORE mapping PC to a region. 0x3BC00 is both offset 0xC00 inside the 0x3B000 placement and offset 0 of the 0x3BC00 placement; range-based fallback to the older image is the diagnosed 07-30 live failure.",
+      "description": "a010 orphanage worker JOB binary; instruction twins live in yakuza/generated. The native workload identity covers the documented logical 0x1E40-byte binary, while lift generation includes the final 0x40 bytes of DMA/extraction padding so fall-through observes the zero/STOP tail. Placement identity contract (07-30): a numeric PC alone does NOT identify a loaded job; the runtime must resolve (source identity, exact LS base) to a placement BEFORE mapping PC to a region. 0x3BC00 is both offset 0xC00 inside the 0x3B000 placement and offset 0 of the 0x3BC00 placement; range-based fallback to the older image is the diagnosed 07-30 live failure.",
       "placements": [
         { "stem": "job_bin_orphanage",       "base": "0x4C00",  "diag": "yakuza/generated/job_bin_orphanage.c",       "image_id": 19 },
         { "stem": "job_bin_orphanage_e400",  "base": "0xE400",  "diag": "yakuza/generated/job_bin_orphanage_e400.c",  "image_id": 19 },
@@ -134,7 +138,9 @@
           "prefix": "spu_jobO3BC_", "register": "spu_recomp_register_jobbin_orphanage_3bc00",
           "image_id": 44,
           "entry_evidence": "runtime handoff observed 07-30: launch branch target equals the placement base; A010 full-tuple dispatch assigns image 44",
-          "note": "exact tracked instruction twin; overlaps the 0x3B000 placement span and is covered by the collision regression" }
+          "note": "exact tracked instruction twin; overlaps the 0x3B000 placement span and is covered by the collision regression" },
+        { "stem": "job_bin_orphanage_3c000", "base": "0x3C000", "diag": "yakuza/generated/job_bin_orphanage_3c000.c", "image_id": 48 },
+        { "stem": "job_bin_orphanage_3cc00", "base": "0x3CC00", "diag": "yakuza/generated/job_bin_orphanage_3cc00.c", "image_id": 46 }
       ]
     }
   }

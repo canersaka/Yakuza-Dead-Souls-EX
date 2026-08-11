@@ -1,4 +1,5 @@
 #include "../rsx_vertex_compact.h"
+#include "../rsx_commands.h"
 #include "../rsx_vp_decompiler.h"
 
 #include <math.h>
@@ -11,6 +12,7 @@
 #define M_VTXFMT           0x1740u
 #define M_VTX_ATTR_4F      0x1C00u
 #define M_FREQUENCY_DIV    0x1FC0u
+#define M_FRONT_FACE       0x1834u
 
 typedef struct test_memory {
     u8 bytes[4096];
@@ -67,6 +69,22 @@ static u32 float_bits(float value)
     u32 bits;
     memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+static int float4_bits_equal(const float left[4], const float right[4])
+{
+    for (u32 component = 0; component < 4; component++)
+        if (float_bits(left[component]) != float_bits(right[component]))
+            return 0;
+    return 1;
+}
+
+static void test_dispatch_reset_defaults(void)
+{
+    rsx_dispatch rsx;
+    rsx_dispatch_init(&rsx, NULL);
+    CHECK(rsx_dsp_reg(&rsx, M_FRONT_FACE) == 0x0901u,
+          "NV40 reset front-face winding is counter-clockwise");
 }
 
 static void set_attr(
@@ -168,7 +186,7 @@ static void test_formats(void)
             (((u32)z & 0x3FFu) << 22);
         put_be32(data, packed);
         CHECK(rsx_vertex_decode_element(
-            RSX_VTX_TYPE_CMP32, 4, data, value), "cmp32 decode accepted");
+            RSX_VTX_TYPE_CMP32, 1, data, value), "cmp32 decode accepted");
         CHECK(nearf(value[0], 1.0f / 1023.0f) &&
               nearf(value[1], -1.0f / 1023.0f) &&
               nearf(value[2], 1.0f), "cmp32 endian/sign conversion");
@@ -360,6 +378,29 @@ static void test_vp_masks(void)
               strstr(hlsl, "v[5]=input.a5;") != NULL,
               "compact HLSL preserves selected semantic identity");
     }
+
+    vp_instruction(
+        program, 2, 0, 2, vp_src(2), vp_src(1), 0, 1, 0, 0);
+    vp_instruction(
+        program + 16, 4, 0, 8,
+        vp_src(1), vp_src(2), vp_src(1), 1, 0, 1);
+    {
+        char hlsl[256 * 1024];
+        const u32 normal_uv_mask = (1u << 2) | (1u << 8);
+        CHECK(rsx_vp_analyze_inputs(
+                  program, sizeof(program), &analysis) == 2 &&
+              analysis.exact && analysis.input_mask == normal_uv_mask,
+              "VP analysis retains normal and UV shader inputs");
+        CHECK(rsx_vp_decompile_compact_ex(
+                  program, sizeof(program), 0, normal_uv_mask,
+                  hlsl, sizeof(hlsl)) == 2,
+              "normal/UV compact VP decompile");
+        CHECK(strstr(hlsl, "float4 a2:ATTR2;") != NULL &&
+              strstr(hlsl, "float4 a8:ATTR8;") != NULL &&
+              strstr(hlsl, "v[2]=input.a2;") != NULL &&
+              strstr(hlsl, "v[8]=input.a8;") != NULL,
+              "normal and UV keep their original semantic indices");
+    }
 }
 
 static void test_vp_opcode_source_tables(void)
@@ -454,14 +495,164 @@ static void test_vp_opcode_source_tables(void)
           "scalar flow control falls back to all inputs");
 }
 
+static void test_compact_matches_full_legacy_layout(void)
+{
+    rsx_dispatch rsx;
+    test_memory memory = {0};
+    memset(&rsx, 0, sizeof(rsx));
+
+    /* Character-like inputs cover the formats most likely to affect the
+     * orphanage faces: position, compressed normal, half tangent/UV,
+     * normalized color, and integer bone indices. */
+    set_attr(&rsx, 0, RSX_VTX_TYPE_FLOAT,   3, 32, 1, 0,  64);
+    set_attr(&rsx, 2, RSX_VTX_TYPE_CMP32,   1,  4, 1, 0, 512);
+    set_attr(&rsx, 6, RSX_VTX_TYPE_HALF,    4,  8, 1, 0, 640);
+    set_attr(&rsx, 8, RSX_VTX_TYPE_HALF,    2,  4, 1, 0, 768);
+    set_attr(&rsx, 3, RSX_VTX_TYPE_UNORM8,  4,  4, 2, 0, 896);
+    set_attr(&rsx, 7, RSX_VTX_TYPE_UINT8,   4,  4, 2, 0, 960);
+    rsx.regs[M_VERTEX_DATA_BASE >> 2] = 16;
+
+    for (u32 element = 0; element < 16; element++) {
+        u8* position = memory.bytes + 16 + 64 + element * 32;
+        put_be_float(position + 0, (float)element + 0.25f);
+        put_be_float(position + 4, -(float)element - 0.5f);
+        put_be_float(position + 8, (float)element * 2.0f);
+
+        const s32 nx = (s32)((element * 97u) & 0x7FFu) - 1024;
+        const s32 ny = (s32)((element * 53u) & 0x7FFu) - 1024;
+        const s32 nz = (s32)((element * 29u) & 0x3FFu) - 512;
+        const u32 packed =
+            ((u32)nx & 0x7FFu) |
+            (((u32)ny & 0x7FFu) << 11) |
+            (((u32)nz & 0x3FFu) << 22);
+        put_be32(memory.bytes + 16 + 512 + element * 4, packed);
+
+        u8* tangent = memory.bytes + 16 + 640 + element * 8;
+        put_be16(tangent + 0, 0x3C00u);
+        put_be16(tangent + 2, (u16)(0xBC00u + (element & 1u)));
+        put_be16(tangent + 4, 0x3800u);
+        put_be16(tangent + 6, 0x4000u);
+
+        u8* uv = memory.bytes + 16 + 768 + element * 4;
+        put_be16(uv + 0, (u16)(0x3400u + element));
+        put_be16(uv + 2, (u16)(0x3800u + element));
+    }
+    for (u32 element = 0; element < 8; element++) {
+        u8* color = memory.bytes + 16 + 896 + element * 4;
+        u8* bones = memory.bytes + 16 + 960 + element * 4;
+        for (u32 lane = 0; lane < 4; lane++) {
+            color[lane] = (u8)(element * 23u + lane * 17u);
+            bones[lane] = (u8)(element * 4u + lane);
+        }
+    }
+
+    const rsx_vertex_ref refs[] = {
+        {0, 0}, {1, 0}, {4, 0}, {7, 0}, {8, 0}, {11, 0}
+    };
+    const u32 compact_mask =
+        (1u << 0) | (1u << 2) | (1u << 3) |
+        (1u << 6) | (1u << 7) | (1u << 8);
+    rsx_vertex_layout_plan full_layout, compact_layout;
+    rsx_vertex_fetch_plan full_fetch, compact_fetch;
+    rsx_vertex_layout_plan_init(&full_layout, 0xFFFFu);
+    rsx_vertex_layout_plan_init(&compact_layout, compact_mask);
+    rsx_vertex_fetch_plan_init(
+        &full_fetch, &rsx, &full_layout, test_guest_ptr, &memory);
+    rsx_vertex_fetch_plan_init(
+        &compact_fetch, &rsx, &compact_layout, test_guest_ptr, &memory);
+    rsx_vertex_fetch_plan_prepare(
+        &full_fetch, refs, (u32)(sizeof(refs) / sizeof(refs[0])));
+    rsx_vertex_fetch_plan_prepare(
+        &compact_fetch, refs, (u32)(sizeof(refs) / sizeof(refs[0])));
+
+    for (u32 vertex = 0; vertex < sizeof(refs) / sizeof(refs[0]); vertex++) {
+        float full[16][4];
+        float compact[16][4];
+        memset(full, 0xCD, sizeof(full));
+        memset(compact, 0xCD, sizeof(compact));
+        CHECK(rsx_vertex_fetch_one(
+                  &full_fetch, &refs[vertex], (u8*)full),
+              "full legacy-layout character fetch accepted");
+        CHECK(rsx_vertex_fetch_one(
+                  &compact_fetch, &refs[vertex], (u8*)compact),
+              "compact character fetch accepted");
+        for (u32 slot = 0; slot < compact_layout.count; slot++) {
+            const u32 attr = compact_layout.attrs[slot];
+            CHECK(float4_bits_equal(compact[slot], full[attr]),
+                  "compact attribute matches full legacy-layout bits");
+        }
+    }
+}
+
+static void test_vertex_reference_remap(void)
+{
+    rsx_vertex_ref refs[] = {
+        {7, 0}, {2, 0}, {7, 0}, {7, 4}, {2, 0}, {9, 4}, {7, 4}
+    };
+    const u32 expected_map[] = {0, 1, 0, 2, 1, 3, 2};
+    const rsx_vertex_ref expected_unique[] = {
+        {7, 0}, {2, 0}, {7, 4}, {9, 4}
+    };
+    rsx_vertex_remap remap = {0};
+    u32 unique_count = 0;
+    CHECK(rsx_vertex_remap_build(
+              &remap, refs,
+              (u32)(sizeof(refs) / sizeof(refs[0])),
+              &unique_count),
+          "vertex reference remap builds");
+    CHECK(unique_count == 4, "vertex reference remap unique count");
+    for (u32 i = 0; i < unique_count; i++) {
+        CHECK(refs[i].vertex_id == expected_unique[i].vertex_id &&
+              refs[i].base_index == expected_unique[i].base_index,
+              "vertex reference remap preserves first-use order");
+    }
+    for (u32 i = 0; i < sizeof(expected_map) / sizeof(expected_map[0]); i++)
+        CHECK(rsx_vertex_remap_index(&remap, i) == expected_map[i],
+              "vertex reference remap reconstructs occurrences");
+
+    {
+        int indexed = 0;
+        CHECK(rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_TRIANGLES, unique_count < 7, &indexed) &&
+              indexed,
+              "duplicate triangle list remains supported and indexed");
+        CHECK(rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_TRIANGLES, 0, &indexed) && !indexed,
+              "ordinary triangle list remains unindexed");
+        CHECK(rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_TRIANGLE_STRIP, 0, &indexed) && indexed &&
+              rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_TRIANGLE_FAN, 0, &indexed) && indexed &&
+              rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_QUADS, 0, &indexed) && indexed,
+              "converted triangle primitives remain indexed");
+        CHECK(!rsx_vertex_topology_plan(
+                  RSX_PRIMITIVE_LINES, 0, &indexed),
+              "unsupported primitive remains rejected");
+    }
+
+    rsx_vertex_ref second[] = {{3, 1}, {3, 1}, {4, 1}};
+    CHECK(rsx_vertex_remap_build(&remap, second, 3, &unique_count),
+          "vertex reference remap reuses storage");
+    CHECK(unique_count == 2 &&
+          rsx_vertex_remap_index(&remap, 0) == 0 &&
+          rsx_vertex_remap_index(&remap, 1) == 0 &&
+          rsx_vertex_remap_index(&remap, 2) == 1,
+          "vertex reference remap resets its generation");
+    rsx_vertex_remap_destroy(&remap);
+}
+
 int main(void)
 {
+    test_dispatch_reset_defaults();
     test_layout();
     test_formats();
+    test_compact_matches_full_legacy_layout();
     test_defaults_and_bounds();
     test_stride_base_frequency_and_span();
     test_vp_masks();
     test_vp_opcode_source_tables();
+    test_vertex_reference_remap();
     if (failures) {
         fprintf(stderr, "test_vertex_compact: %d failure(s)\n", failures);
         return 1;
