@@ -70,6 +70,16 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
+/* Publish the FIFO bounds associated with the next flip method.  The live
+ * consumer calls this only for driver-queue methods; ordinary method traffic
+ * pays no extra synchronization cost. */
+void rsx_live_draw_set_fifo_position(u32 get, u32 put);
+
+/* Record an NV308A inline-to-memory write that overlaps a registered color
+ * surface.  Guest memory changes are deliberately tracked separately from
+ * actual D3D render-target mutations. */
+void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
+
 /* Block until the GPU finishes all queued draws (RSX SET_REFERENCE / sync
  * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only
  * after the GPU has really caught up. */
