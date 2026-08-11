@@ -260,6 +260,18 @@ int rsx_fp_constant_ring_plan(
     return 1;
 }
 
+int rsx_vertex_constant_ring_plan(
+    u32 used, u32 capacity, u32 block_bytes, u32* out_offset)
+{
+    if (!out_offset || block_bytes == 0 || (block_bytes & 255u) != 0 ||
+        block_bytes > capacity)
+        return -1;
+    if (used > capacity || block_bytes > capacity - used)
+        return 0;
+    *out_offset = used;
+    return 1;
+}
+
 /* Bounded string appender. */
 typedef struct { char* p; u32 cap; u32 len; int ok; } Out;
 
