@@ -18,6 +18,9 @@ extern "C" {
 #  define SPURS_ALIGNAS(n) _Alignas(n)
 #endif
 
+/* Cache optional host-side diagnostic outputs before SPURS workers start. */
+void cellSpursRuntimeConfigInit(void);
+
 #define CELL_SPURS_CORE_ERROR_AGAIN        ((s32)0x80410701u)
 #define CELL_SPURS_CORE_ERROR_INVAL        ((s32)0x80410702u)
 #define CELL_SPURS_CORE_ERROR_NOSYS        ((s32)0x80410703u)
@@ -192,6 +195,9 @@ s32 cellSpursJobGuardReset(CellSpursJobGuard*);
  * predicates that re-read the guest bytes. */
 void cellSpursNotifyGuestWrite(u32 ea, u32 size);
 void cellSpursNotifyPpuGuestWrite(u32 ea, u32 size);
+/* Complete staged PPU descriptor publications after the lifted guest barrier
+ * that orders their body before the SPURS-visible readiness state. */
+void cellSpursNotifyPpuFence(void);
 /* Test support: is the jobchain's worker parked waiting at guest EA? */
 int yz_spurs_jobchain_is_parked_at(CellSpursJobChain* object, u32 ea);
 #if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
@@ -199,6 +205,9 @@ int yz_spurs_test_watch_pending_descriptor(
     CellSpursJobChain* object, u32 descriptor);
 int yz_spurs_test_pending_ticket_publish_candidate(
     CellSpursJobChain* object, u32 ea, u32 size, u32* descriptor_out);
+int yz_spurs_test_guest_write_route_count(u32 ea, u32 size);
+int yz_spurs_test_guest_write_route_overflow_alias(
+    u32 source_ea, u32 alias_ea);
 #endif
 
 /* Compatibility surface used elsewhere in the generic runtime. */

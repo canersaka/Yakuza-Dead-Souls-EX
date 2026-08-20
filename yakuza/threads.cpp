@@ -126,6 +126,25 @@ extern "C" void* yz_thread_context(uint32_t tid)
     return c;
 }
 
+/* A raw pointer returned above is suitable only for the owning thread or for
+ * a caller that has already suspended it: thr_proc stores ppu_context on its
+ * host stack. Both normal return and sys_ppu_thread_exit clear the registry
+ * pointer before that stack frame is retired. Cross-thread watchdogs must copy
+ * under s_thr_cs so teardown cannot retire the frame between lookup and read. */
+extern "C" int yz_thread_context_snapshot(uint32_t tid, ppu_context* out)
+{
+    if (!out) return 0;
+    int found = 0;
+    thr_lock();
+    thr_rec* t = thr_find(tid);
+    if (t && t->ctx) {
+        memcpy(out, t->ctx, sizeof(*out));
+        found = 1;
+    }
+    thr_unlock();
+    return found;
+}
+
 /* Profile/watchdog access to the host thread that owns a guest PPU thread.
  * Thread records retain their handles for their lifetime; callers use this
  * only for a short suspend/context/resume sample. */
@@ -638,9 +657,19 @@ extern "C" void yz_ovr_sys_ppu_thread_exit(ppu_context* ctx)
     uint64_t code = ctx->gpr[3];
     thr_lock();
     thr_rec* t = thr_find(s_cur_tid);
-    if (t)
+    if (t) {
         t->exit_code = code;
+        /* ExitThread bypasses thr_proc's normal-return cleanup, so retire the
+         * stack-local context while holding the same lock used by diagnostic
+         * snapshots. Leaving this published produced a use-after-return when
+         * Frontier's watchdog sampled a worker that had just exited. */
+        t->ctx = NULL;
+    }
     thr_unlock();
+    g_yz_cur_ctx = NULL;
+    /* This path also bypasses thr_proc's release below. Do not permanently
+     * consume a bounded PPU scheduler slot when a guest exits explicitly. */
+    yz_gate_release();
     fprintf(stderr, "[thread %u] sys_ppu_thread_exit(0x%llX)\n",
             s_cur_tid, (unsigned long long)code);
     /* Does not return. For the main thread this still only ends the thread,

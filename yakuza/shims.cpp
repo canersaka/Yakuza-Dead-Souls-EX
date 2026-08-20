@@ -34,6 +34,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <intrin.h>
 #pragma intrinsic(_ReturnAddress)
 #define WIN32_LEAN_AND_MEAN
@@ -170,15 +171,27 @@ extern "C" void yz_watch_bd(uint32_t addr, const void* src, unsigned n);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 #if defined(YZ_NATIVE_SPURS)
 extern "C" void cellSpursNotifyPpuGuestWrite(uint32_t addr, uint32_t size);
-extern "C" volatile uint32_t g_native_spurs_ppu_watch_lo;
-extern "C" volatile uint32_t g_native_spurs_ppu_watch_hi;
+extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
+static inline uint64_t yz_native_spurs_watch_page_word(uint32_t word)
+{
+    return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(
+        g_native_spurs_watch_page_bits[word])).load(std::memory_order_relaxed);
+}
 static inline void yz_native_spurs_notify_write(uint32_t addr, uint32_t size)
 {
-    const uint64_t first = addr;
-    const uint64_t last = first + size;
-    if (first < g_native_spurs_ppu_watch_hi &&
-        last > g_native_spurs_ppu_watch_lo)
-        cellSpursNotifyPpuGuestWrite(addr, size);
+    if (!size) return;
+    const uint64_t end = static_cast<uint64_t>(addr) + size - 1u;
+    const uint32_t first_page = addr >> 12;
+    const uint32_t last_page = static_cast<uint32_t>(
+        (end > UINT32_MAX ? UINT32_MAX : end) >> 12);
+    for (uint32_t page = first_page; ; ++page) {
+        if (yz_native_spurs_watch_page_word(page >> 6) &
+            (1ull << (page & 63u))) {
+            cellSpursNotifyPpuGuestWrite(addr, size);
+            return;
+        }
+        if (page == last_page) return;
+    }
 }
 #else
 static inline void yz_native_spurs_notify_write(uint32_t, uint32_t) {}

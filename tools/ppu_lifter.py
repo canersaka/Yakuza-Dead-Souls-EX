@@ -121,10 +121,22 @@ SOURCE_PREAMBLE = """\
  * reordering break the driver->worker completion handoff (s37, 2026-07-13). */
 #ifdef __cplusplus
 #include <atomic>
-#define PPU_FENCE(o) std::atomic_thread_fence(std::memory_order_##o)
+#if defined(YZ_NATIVE_SPURS)
+extern "C" void cellSpursNotifyPpuFence(void);
+#define PPU_NOTIFY_SPURS_FENCE() cellSpursNotifyPpuFence()
+#else
+#define PPU_NOTIFY_SPURS_FENCE() ((void)0)
+#endif
+#define PPU_FENCE(o) do { std::atomic_thread_fence(std::memory_order_##o); PPU_NOTIFY_SPURS_FENCE(); } while (0)
 #else
 #include <stdatomic.h>
-#define PPU_FENCE(o) atomic_thread_fence(memory_order_##o)
+#if defined(YZ_NATIVE_SPURS)
+extern void cellSpursNotifyPpuFence(void);
+#define PPU_NOTIFY_SPURS_FENCE() cellSpursNotifyPpuFence()
+#else
+#define PPU_NOTIFY_SPURS_FENCE() ((void)0)
+#endif
+#define PPU_FENCE(o) do { atomic_thread_fence(memory_order_##o); PPU_NOTIFY_SPURS_FENCE(); } while (0)
 #endif
 
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the

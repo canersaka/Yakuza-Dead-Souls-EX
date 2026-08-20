@@ -28,6 +28,9 @@ typedef CONDITION_VARIABLE ncond;
 typedef HANDLE nthread;
 #define NTHREAD_INVALID NULL
 #define NATIVE_SPU_HOST_STACK_SIZE (64u * 1024u * 1024u)
+static SRWLOCK g_unknown_job_capture_mutex = SRWLOCK_INIT;
+static void unknown_job_capture_lock(void) { AcquireSRWLockExclusive(&g_unknown_job_capture_mutex); }
+static void unknown_job_capture_unlock(void) { ReleaseSRWLockExclusive(&g_unknown_job_capture_mutex); }
 static void mx_init(nmutex* m) { InitializeCriticalSection(m); }
 static void mx_destroy(nmutex* m) { DeleteCriticalSection(m); }
 static void mx_lock(nmutex* m) { EnterCriticalSection(m); }
@@ -66,6 +69,9 @@ typedef pthread_cond_t ncond;
 typedef pthread_t nthread;
 #define NTHREAD_INVALID ((pthread_t)0)
 #define NATIVE_SPU_HOST_STACK_SIZE (64u * 1024u * 1024u)
+static pthread_mutex_t g_unknown_job_capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void unknown_job_capture_lock(void) { pthread_mutex_lock(&g_unknown_job_capture_mutex); }
+static void unknown_job_capture_unlock(void) { pthread_mutex_unlock(&g_unknown_job_capture_mutex); }
 static void mx_init(nmutex* m) { pthread_mutex_init(m, NULL); }
 static void mx_destroy(nmutex* m) { pthread_mutex_destroy(m); }
 static void mx_lock(nmutex* m) { pthread_mutex_lock(m); }
@@ -97,6 +103,53 @@ static int nthread_create_spu(nthread* thread, void* (*entry)(void*), void* opaq
     const int create_rc = stack_rc ? stack_rc : pthread_create(thread, &attr, entry, opaque);
     pthread_attr_destroy(&attr);
     return create_rc == 0;
+}
+#endif
+
+#if !defined(YZ_PERF_CLEAN)
+static FILE* g_jobdone_diag_output;
+static char g_jobdone_diag_buffer[256u * 1024u];
+
+static void jobdone_diag_close(void)
+{
+    if (!g_jobdone_diag_output) return;
+    fclose(g_jobdone_diag_output);
+    g_jobdone_diag_output = NULL;
+}
+#endif
+
+void cellSpursRuntimeConfigInit(void)
+{
+#if !defined(YZ_PERF_CLEAN)
+    const char* path;
+    if (g_jobdone_diag_output) return;
+    path = getenv("YZ_NATIVE_SPURS_JOBDONE_LOG");
+    if (!path || !path[0]) return;
+    g_jobdone_diag_output = fopen(path, "w");
+    if (!g_jobdone_diag_output) {
+        fprintf(stderr,
+                "[jobdone] cannot open YZ_NATIVE_SPURS_JOBDONE_LOG: %s\n",
+                path);
+        return;
+    }
+    setvbuf(g_jobdone_diag_output, g_jobdone_diag_buffer, _IOFBF,
+            sizeof(g_jobdone_diag_buffer));
+    atexit(jobdone_diag_close);
+#endif
+}
+
+#if defined(_WIN32)
+volatile LONG g_yz_frontier_bridge_success_count;
+static void jobchain_note_bridge_success(void)
+{
+    InterlockedIncrement(&g_yz_frontier_bridge_success_count);
+}
+#else
+volatile long g_yz_frontier_bridge_success_count;
+static void jobchain_note_bridge_success(void)
+{
+    __atomic_add_fetch(&g_yz_frontier_bridge_success_count, 1,
+                       __ATOMIC_RELEASE);
 }
 #endif
 
@@ -232,6 +285,119 @@ static int jobchain_ledger_enabled(void)
     return enabled;
 }
 
+/* Persist exact unknown-job identities for the next build's inventory gate.
+ * The runner sets YZ_SPU_INVENTORY_CAPTURE beside the game inputs, so normal
+ * boots require no special logging command.  A bounded atomic set suppresses
+ * duplicate worker reports in one process; the existing file is checked too
+ * so repeated boots do not grow it indefinitely. */
+#define MAX_UNKNOWN_JOB_CAPTURES 64
+static atomic_ullong g_unknown_job_capture_keys[MAX_UNKNOWN_JOB_CAPTURES];
+
+static int unknown_job_capture_first(u32 binary_ea, u32 binary_size, u64 fingerprint)
+{
+    u64 key = fingerprint ^ ((u64)binary_ea << 32) ^ binary_size;
+    if (!key) key = 1;
+    u32 index = (u32)(key ^ (key >> 32)) % MAX_UNKNOWN_JOB_CAPTURES;
+    for (u32 probe = 0; probe < MAX_UNKNOWN_JOB_CAPTURES; ++probe) {
+        atomic_ullong* slot = &g_unknown_job_capture_keys[
+            (index + probe) % MAX_UNKNOWN_JOB_CAPTURES];
+        unsigned long long seen = atomic_load_explicit(slot, memory_order_acquire);
+        if ((u64)seen == key) return 0;
+        if (!seen) {
+            unsigned long long empty = 0;
+            if (atomic_compare_exchange_strong_explicit(
+                    slot, &empty, (unsigned long long)key,
+                    memory_order_acq_rel, memory_order_acquire))
+                return 1;
+        }
+    }
+    return 1; /* table saturation must not lose evidence */
+}
+
+static int unknown_job_capture_file_has(
+    const char* path, u32 binary_ea, u32 binary_size, u64 fingerprint)
+{
+    FILE* file = fopen(path, "rb");
+    if (!file) return 0;
+    char ea_token[48], size_token[48], fingerprint_token[64], line[1024];
+    snprintf(ea_token, sizeof(ea_token),
+             "\"binary_ea\":\"0x%08X\"", binary_ea);
+    snprintf(size_token, sizeof(size_token),
+             "\"binary_size\":\"0x%X\"", binary_size);
+    snprintf(fingerprint_token, sizeof(fingerprint_token),
+             "\"fingerprint\":\"0x%016llX\"",
+             (unsigned long long)fingerprint);
+    int found = 0;
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, ea_token) && strstr(line, size_token) &&
+            strstr(line, fingerprint_token)) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static int unknown_job_capture_write(
+    const char* path, u32 descriptor_ea, u32 descriptor_size,
+    u32 binary_ea, u32 binary_size, u64 fingerprint, u32 next_slot)
+{
+    if (!path || !*path) return 0;
+    unknown_job_capture_lock();
+    if (!unknown_job_capture_first(binary_ea, binary_size, fingerprint)) {
+        unknown_job_capture_unlock();
+        return 0;
+    }
+    if (unknown_job_capture_file_has(path, binary_ea, binary_size, fingerprint)) {
+        unknown_job_capture_unlock();
+        return 0;
+    }
+    FILE* file = fopen(path, "ab");
+    if (!file) {
+        unknown_job_capture_unlock();
+        return -1;
+    }
+    const int rc = fprintf(file,
+        "{\"schema\":1,\"kind\":\"native_spurs_unknown_job\","
+        "\"binary_ea\":\"0x%08X\",\"binary_size\":\"0x%X\","
+        "\"descriptor_ea\":\"0x%08X\",\"descriptor_size\":\"0x%X\","
+        "\"fingerprint\":\"0x%016llX\",\"next_slot\":\"0x%05X\"}\n",
+        binary_ea, binary_size, descriptor_ea, descriptor_size,
+        (unsigned long long)fingerprint, next_slot);
+    const int close_rc = fclose(file);
+    unknown_job_capture_unlock();
+    return rc > 0 && close_rc == 0 ? 1 : -1;
+}
+
+static void unknown_job_capture(
+    u32 descriptor_ea, u32 descriptor_size, u32 binary_ea,
+    u32 binary_size, u64 fingerprint, u32 next_slot)
+{
+    const char* path = getenv("YZ_SPU_INVENTORY_CAPTURE");
+    if (!path || !*path) return;
+    const int rc = unknown_job_capture_write(
+        path, descriptor_ea, descriptor_size, binary_ea,
+        binary_size, fingerprint, next_slot);
+    if (rc > 0) {
+        fprintf(stderr, "[spu-inventory] captured unknown job -> %s\n", path);
+    } else if (rc < 0) {
+        fprintf(stderr, "[spu-inventory] WARNING: could not append %s\n", path);
+    }
+    fflush(stderr);
+}
+
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+int cellSpursTestCaptureUnknownJob(
+    const char* path, u32 descriptor_ea, u32 descriptor_size,
+    u32 binary_ea, u32 binary_size, u64 fingerprint, u32 next_slot)
+{
+    return unknown_job_capture_write(
+        path, descriptor_ea, descriptor_size, binary_ea,
+        binary_size, fingerprint, next_slot);
+}
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Side-table synchronization registry                                       */
 
@@ -241,6 +407,363 @@ static int jobchain_ledger_enabled(void)
 #define MAX_QUEUES 128
 #define MAX_JOBCHAINS 32
 #define MAX_JOB_GUARDS 64
+
+/* Exact guest-write routing.
+ *
+ * VM writes are overwhelmingly unrelated to SPURS.  The old notification
+ * path first used one process-wide min/max envelope and then linearly scanned
+ * every side table.  A distant CALL target widened that envelope across all
+ * memory between the two command lists, so ordinary RSX register writes paid
+ * for every SPURS registry and frequently woke every jobchain worker.
+ *
+ * This table maps each watched eight-byte guest cell directly to one live
+ * side-table slot.  Entries are append-only and lock-free for readers.  A
+ * target generation makes old entries inert when a bounded side-table slot is
+ * recycled or a jobchain starts a fresh run.  The page bitmap is only the
+ * inlined VM-hook fast reject; an address on a populated page still has to
+ * match an exact router entry below. */
+#define GUEST_WRITE_ROUTE_CAPACITY (1u << 20)
+#define GUEST_WRITE_ROUTE_MASK (GUEST_WRITE_ROUTE_CAPACITY - 1u)
+#define GUEST_WRITE_PAGE_SHIFT 12u
+#define GUEST_WRITE_PAGE_COUNT (1u << (32u - GUEST_WRITE_PAGE_SHIFT))
+#define GUEST_WRITE_PAGE_WORDS (GUEST_WRITE_PAGE_COUNT / 64u)
+
+enum GuestWriteRouteKind {
+    GUEST_WRITE_ROUTE_TASKSET = 1,
+    GUEST_WRITE_ROUTE_EVENT = 2,
+    GUEST_WRITE_ROUTE_QUEUE = 3,
+    GUEST_WRITE_ROUTE_JOBGUARD = 4,
+    GUEST_WRITE_ROUTE_JOBCHAIN_COMMAND = 5,
+    GUEST_WRITE_ROUTE_JOBCHAIN_BRIDGE = 6,
+    GUEST_WRITE_ROUTE_KIND_COUNT = 7
+};
+
+typedef struct {
+    u64 tasksets;
+    u64 events[2];
+    u64 queues[2];
+    u64 jobguards;
+    u32 jobchain_commands;
+    u32 jobchain_bridges;
+} GuestWriteTargets;
+
+static _Atomic u64 g_guest_write_route[GUEST_WRITE_ROUTE_CAPACITY];
+static _Atomic u32 g_guest_write_generation[GUEST_WRITE_ROUTE_KIND_COUNT][128];
+static _Atomic int g_guest_write_route_overflow;
+
+typedef struct GuestWriteRouteOverflow {
+    u64 encoded;
+    struct GuestWriteRouteOverflow* next;
+} GuestWriteRouteOverflow;
+
+/* Saturation is not expected in normal play, but it must be correctness-safe.
+ * Once the fixed, cache-friendly table fills, registrations move to this
+ * append-only exact list. Readers take an atomic snapshot of the head and
+ * never need a lock because nodes are immutable and live until process exit. */
+static _Atomic(GuestWriteRouteOverflow*) g_guest_write_route_overflow_head;
+
+/* Read directly by the lifted-PPU VM write hooks.  Bits are monotonic: stale
+ * pages can cause one exact lookup, but can never route a stale target because
+ * the generation check below rejects it. */
+#if defined(_WIN32)
+__declspec(align(64)) volatile u64
+    g_native_spurs_watch_page_bits[GUEST_WRITE_PAGE_WORDS];
+#else
+_Alignas(64) volatile u64
+    g_native_spurs_watch_page_bits[GUEST_WRITE_PAGE_WORDS];
+#endif
+
+static u32 guest_write_route_hash(u32 cell)
+{
+    u32 x = cell;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x & GUEST_WRITE_ROUTE_MASK;
+}
+
+static u32 guest_write_route_begin_target(u32 kind, u32 index)
+{
+    u32 generation = atomic_fetch_add_explicit(
+        &g_guest_write_generation[kind][index], 1u,
+        memory_order_acq_rel) + 1u;
+    /* Zero is reserved for an unregistered target.  A 16-bit wrap would need
+     * 65,535 lifecycles of the same bounded slot in one process. */
+    if (!(generation & 0xffffu))
+        generation = atomic_fetch_add_explicit(
+            &g_guest_write_generation[kind][index], 1u,
+            memory_order_acq_rel) + 1u;
+    return generation & 0xffffu;
+}
+
+static u32 guest_write_route_target_generation(u32 kind, u32 index)
+{
+    return atomic_load_explicit(
+        &g_guest_write_generation[kind][index], memory_order_acquire) & 0xffffu;
+}
+
+static void guest_write_route_mark_page(u32 ea)
+{
+    const u32 page = ea >> GUEST_WRITE_PAGE_SHIFT;
+    const u32 word = page >> 6;
+    const u64 bit = 1ull << (page & 63u);
+#if defined(_WIN32)
+    InterlockedOr64((volatile LONG64*)&g_native_spurs_watch_page_bits[word],
+                    (LONG64)bit);
+#else
+    __atomic_fetch_or(&g_native_spurs_watch_page_bits[word], bit,
+                      __ATOMIC_RELEASE);
+#endif
+}
+
+static u64 guest_write_route_page_word(u32 word)
+{
+    return atomic_load_explicit(
+        (const _Atomic u64*)&g_native_spurs_watch_page_bits[word],
+        memory_order_relaxed);
+}
+
+static void guest_write_route_overflow_add(u64 encoded)
+{
+    GuestWriteRouteOverflow* node =
+        (GuestWriteRouteOverflow*)malloc(sizeof(*node));
+    if (!node) {
+        /* Missing a registered wake can deadlock the guest. An explicit hard
+         * failure is safer than continuing with silently incomplete routing. */
+        fprintf(stderr,
+                "[native-spurs] exact guest-write router overflow allocation "
+                "failed; refusing to run with incomplete notifications\n");
+        fflush(stderr);
+        abort();
+    }
+    node->encoded = encoded;
+    GuestWriteRouteOverflow* head = atomic_load_explicit(
+        &g_guest_write_route_overflow_head, memory_order_acquire);
+    for (;;) {
+        /* Re-check on every failed CAS. Two registering threads can discover
+         * the same missing cell concurrently; only one immutable node should
+         * survive or a repeatedly watched saturated cell would grow forever. */
+        for (GuestWriteRouteOverflow* existing = head;
+             existing; existing = existing->next) {
+            if (existing->encoded == encoded) {
+                free(node);
+                return;
+            }
+        }
+        node->next = head;
+        if (atomic_compare_exchange_weak_explicit(
+                &g_guest_write_route_overflow_head, &head, node,
+                memory_order_release, memory_order_acquire))
+            break;
+    }
+    if (!atomic_exchange_explicit(&g_guest_write_route_overflow, 1,
+                                  memory_order_release)) {
+        fprintf(stderr,
+                "[native-spurs] exact guest-write router saturated; "
+                "using exact overflow routing\n");
+        fflush(stderr);
+    }
+}
+
+static void guest_write_route_watch_cell(u32 kind, u32 index,
+                                         u32 generation, u32 cell)
+{
+    const u32 key = cell + 1u;
+    const u32 token = ((generation & 0xffffu) << 16) |
+                      ((kind & 0xffu) << 8) | (index & 0xffu);
+    const u64 encoded = ((u64)key << 32) | token;
+    u32 slot = guest_write_route_hash(cell);
+    for (u32 probe = 0; probe < GUEST_WRITE_ROUTE_CAPACITY; ++probe) {
+        u64 existing = atomic_load_explicit(
+            &g_guest_write_route[slot], memory_order_acquire);
+        if (existing == encoded) return;
+        if (!existing) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &g_guest_write_route[slot], &existing, encoded,
+                    memory_order_release, memory_order_acquire))
+                return;
+            if (existing == encoded) return;
+        }
+        slot = (slot + 1u) & GUEST_WRITE_ROUTE_MASK;
+    }
+    guest_write_route_overflow_add(encoded);
+}
+
+static void guest_write_route_watch(u32 kind, u32 index, u32 ea, u32 size)
+{
+    if (!size || kind == 0 || kind >= GUEST_WRITE_ROUTE_KIND_COUNT ||
+        index >= 128u)
+        return;
+    const u32 generation = guest_write_route_target_generation(kind, index);
+    if (!generation) return;
+    const u64 last64 = (u64)ea + size - 1u;
+    const u32 last = last64 > UINT32_MAX ? UINT32_MAX : (u32)last64;
+    const u32 first_cell = ea >> 3;
+    const u32 last_cell = last >> 3;
+    for (u32 cell = first_cell; ; ++cell) {
+        guest_write_route_watch_cell(kind, index, generation, cell);
+        guest_write_route_mark_page(cell << 3);
+        if (cell == last_cell) break;
+    }
+}
+
+static void guest_write_targets_add(GuestWriteTargets* targets,
+                                    u32 kind, u32 index)
+{
+    switch (kind) {
+    case GUEST_WRITE_ROUTE_TASKSET:
+        targets->tasksets |= 1ull << index;
+        break;
+    case GUEST_WRITE_ROUTE_EVENT:
+        targets->events[index >> 6] |= 1ull << (index & 63u);
+        break;
+    case GUEST_WRITE_ROUTE_QUEUE:
+        targets->queues[index >> 6] |= 1ull << (index & 63u);
+        break;
+    case GUEST_WRITE_ROUTE_JOBGUARD:
+        targets->jobguards |= 1ull << index;
+        break;
+    case GUEST_WRITE_ROUTE_JOBCHAIN_COMMAND:
+        targets->jobchain_commands |= 1u << index;
+        break;
+    case GUEST_WRITE_ROUTE_JOBCHAIN_BRIDGE:
+        targets->jobchain_bridges |= 1u << index;
+        break;
+    default:
+        break;
+    }
+}
+
+static int guest_write_route_lookup(u32 ea, u32 size,
+                                    GuestWriteTargets* targets)
+{
+    memset(targets, 0, sizeof(*targets));
+    if (!size) return 0;
+    const u64 last64 = (u64)ea + size - 1u;
+    const u32 last = last64 > UINT32_MAX ? UINT32_MAX : (u32)last64;
+    const u32 first_page = ea >> GUEST_WRITE_PAGE_SHIFT;
+    const u32 last_page = last >> GUEST_WRITE_PAGE_SHIFT;
+    int matched = 0;
+    for (u32 page = first_page; ; ++page) {
+        const u64 page_word = guest_write_route_page_word(page >> 6);
+        if (page_word & (1ull << (page & 63u))) {
+            const u32 page_first_cell = page << (GUEST_WRITE_PAGE_SHIFT - 3u);
+            const u32 page_last_cell = page_first_cell +
+                ((1u << (GUEST_WRITE_PAGE_SHIFT - 3u)) - 1u);
+            const u32 first_cell = page == first_page ?
+                ea >> 3 : page_first_cell;
+            const u32 last_cell = page == last_page ?
+                last >> 3 : page_last_cell;
+            for (u32 cell = first_cell; ; ++cell) {
+                const u32 key = cell + 1u;
+                u32 slot = guest_write_route_hash(cell);
+                for (u32 probe = 0; probe < GUEST_WRITE_ROUTE_CAPACITY;
+                     ++probe) {
+                    const u64 encoded = atomic_load_explicit(
+                        &g_guest_write_route[slot], memory_order_acquire);
+                    if (!encoded) break;
+                    if ((u32)(encoded >> 32) == key) {
+                        const u32 token = (u32)encoded;
+                        const u32 kind = (token >> 8) & 0xffu;
+                        const u32 index = token & 0xffu;
+                        const u32 generation = token >> 16;
+                        if (kind < GUEST_WRITE_ROUTE_KIND_COUNT &&
+                            index < 128u && generation ==
+                                guest_write_route_target_generation(
+                                    kind, index)) {
+                            guest_write_targets_add(targets, kind, index);
+                            matched = 1;
+                        }
+                    }
+                    slot = (slot + 1u) & GUEST_WRITE_ROUTE_MASK;
+                }
+                if (atomic_load_explicit(&g_guest_write_route_overflow,
+                                         memory_order_acquire)) {
+                    const u32 key = cell + 1u;
+                    const GuestWriteRouteOverflow* overflow =
+                        atomic_load_explicit(
+                            &g_guest_write_route_overflow_head,
+                            memory_order_acquire);
+                    for (; overflow; overflow = overflow->next) {
+                        const u64 encoded = overflow->encoded;
+                        if ((u32)(encoded >> 32) != key) continue;
+                        const u32 token = (u32)encoded;
+                        const u32 kind = (token >> 8) & 0xffu;
+                        const u32 index = token & 0xffu;
+                        const u32 generation = token >> 16;
+                        if (kind < GUEST_WRITE_ROUTE_KIND_COUNT &&
+                            index < 128u && generation ==
+                                guest_write_route_target_generation(
+                                    kind, index)) {
+                            guest_write_targets_add(targets, kind, index);
+                            matched = 1;
+                        }
+                    }
+                }
+                if (cell == last_cell) break;
+            }
+        }
+        if (page == last_page) break;
+    }
+    return matched;
+}
+
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+static u32 guest_write_route_popcount64(u64 value)
+{
+    u32 count = 0;
+    while (value) {
+        value &= value - 1u;
+        ++count;
+    }
+    return count;
+}
+
+int yz_spurs_test_guest_write_route_count(u32 ea, u32 size)
+{
+    GuestWriteTargets targets;
+    if (!guest_write_route_lookup(ea, size, &targets)) return 0;
+    return (int)(guest_write_route_popcount64(targets.tasksets) +
+                 guest_write_route_popcount64(targets.events[0]) +
+                 guest_write_route_popcount64(targets.events[1]) +
+                 guest_write_route_popcount64(targets.queues[0]) +
+                 guest_write_route_popcount64(targets.queues[1]) +
+                 guest_write_route_popcount64(targets.jobguards) +
+                 guest_write_route_popcount64(targets.jobchain_commands) +
+                 guest_write_route_popcount64(targets.jobchain_bridges));
+}
+
+int yz_spurs_test_guest_write_route_overflow_alias(u32 source_ea, u32 alias_ea)
+{
+    const u32 source_cell = source_ea >> 3;
+    const u32 source_key = source_cell + 1u;
+    u32 slot = guest_write_route_hash(source_cell);
+    for (u32 probe = 0; probe < GUEST_WRITE_ROUTE_CAPACITY; ++probe) {
+        const u64 encoded = atomic_load_explicit(
+            &g_guest_write_route[slot], memory_order_acquire);
+        if (!encoded) return -1;
+        if ((u32)(encoded >> 32) == source_key) {
+            const u32 token = (u32)encoded;
+            const u32 kind = (token >> 8) & 0xffu;
+            const u32 index = token & 0xffu;
+            const u32 generation = token >> 16;
+            if (kind < GUEST_WRITE_ROUTE_KIND_COUNT && index < 128u &&
+                generation ==
+                    guest_write_route_target_generation(kind, index)) {
+                const u64 alias =
+                    ((u64)((alias_ea >> 3) + 1u) << 32) | token;
+                guest_write_route_overflow_add(alias);
+                guest_write_route_mark_page(alias_ea);
+                return 0;
+            }
+        }
+        slot = (slot + 1u) & GUEST_WRITE_ROUTE_MASK;
+    }
+    return -1;
+}
+#endif
 
 typedef struct {
     void* key;
@@ -461,12 +984,20 @@ typedef struct {
     int reaping;
     int waiting;
     int signalled;
+    /* Diagnostic provenance for the currently latched host signal.  Zero is
+     * the ordinary user-callback SendSignal path; 4 is the exact event-edge
+     * bridge, 5 is an exact taskset guest-latch write, and 6 is the HLE
+     * LFQueue waiter bridge.  It never participates in the wake predicate. */
+    u32 signal_origin;
     int exit_code;
     u32 exit_container_ea;   /* guest CellSpursTaskExitCode (0 = none) */
     unsigned idle_poll_count;
     unsigned trace_syscalls;
     unsigned profile_poll_workload_hits;
     unsigned profile_yield_calls;
+    u32 fe0_timeline_cause;
+    u32 fe0_timeline_epoch;
+    u32 fe0_barrier_wait_count;
 } TaskState;
 
 struct TasksetState {
@@ -482,6 +1013,8 @@ struct TasksetState {
     TaskState tasks[128];
 };
 static TasksetState g_tasksets[MAX_TASKSETS];
+static void event_observe_native_wait(TasksetState* ts, TaskState* task,
+                                      u32 candidate_ea);
 
 /* Frozen-ticket forensics (2026-08-05, boots 3+10): one call dumps every
  * live taskset's guest state bitsets + host task flags so a stuck cellSync
@@ -699,7 +1232,7 @@ static int task_syscall(spu_context* ctx, void* opaque)
             task_bit(ts->sync.key, 0x00, t->id, 0);
             taskset_refresh_runnable_locked(ts);
             mx_unlock(&ts->sync.mutex);
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && !defined(YZ_PERF_CLEAN)
             if (++t->profile_yield_calls == 1)
                 fprintf(stderr,
                         "[native-spurs-profile] task=%u wid=%u first-yield\n",
@@ -762,6 +1295,7 @@ static int task_syscall(spu_context* ctx, void* opaque)
                                        0, 0);
             }
             t->signalled = 0;
+            t->signal_origin = 0;
             task_bit(ts->sync.key, 0x40, t->id, 0);
             task_bit(ts->sync.key, 0x50, t->id, 0);
             if (!ts->shutdown) {
@@ -816,7 +1350,7 @@ static int task_syscall(spu_context* ctx, void* opaque)
                     t->trace_syscalls, t->id, result, found_task,
                     found_workload, t->idle_poll_count);
         }
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && !defined(YZ_PERF_CLEAN)
         if (found_workload && ++t->profile_poll_workload_hits == 1)
             fprintf(stderr,
                     "[native-spurs-profile] task=%u wid=%u "
@@ -841,7 +1375,7 @@ static int task_syscall(spu_context* ctx, void* opaque)
 
 static void task_run(TaskState* task)
 {
-#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32) && !defined(YZ_PERF_CLEAN)
     fprintf(stderr,
             "[native-spurs-profile] task=%u wid=%u image=%d host_tid=%lu\n",
             task->id, task->owner->wid, task->image.image_id,
@@ -1093,6 +1627,14 @@ static s32 create_taskset_common(CellSpurs* spurs, void* taskset, u32 size,
     ((u8*)taskset)[0x72] = 0x80; /* no task waits on the workload flag */
     wr32((u8*)taskset + 0x74, wid);
     if (size >= 0x1894) wr32((u8*)taskset + 0x1890, size);
+    {
+        const u32 index = (u32)(ts - g_tasksets);
+        guest_write_route_begin_target(GUEST_WRITE_ROUTE_TASKSET, index);
+        /* Lifted tasks publish signals in this 128-bit field.  No other
+         * taskset byte is a host-worker wake predicate. */
+        guest_write_route_watch(GUEST_WRITE_ROUTE_TASKSET, index,
+                                guest_ea(taskset) + 0x40u, 0x10u);
+    }
     if (native_trace_enabled())
         fprintf(stderr,
                 "[native-spurs-trace] taskset-create object=0x%08X "
@@ -1178,6 +1720,8 @@ s32 cellSpursJoinTaskset(CellSpursTaskset* object)
         registry_init();
         mx_lock(&g_registry_mutex);
         ts->sync.live = 0;
+        guest_write_route_begin_target(
+            GUEST_WRITE_ROUTE_TASKSET, (u32)(ts - g_tasksets));
         mx_unlock(&g_registry_mutex);
     }
     return CELL_OK;
@@ -1340,7 +1884,8 @@ s32 cellSpursCreateTask2WithBinInfo(CellSpursTaskset2* ts, CellSpursTaskId* out,
  * EventFlagSet (zero event-set records in every window while broadcasts
  * flowed) — they come from another SendSignal path. Tag the origin so the
  * ring names the producer: 0=direct guest import, 1=eventflag-wake,
- * 2=queue-push consumer wake, 3=queue-pop producer wake. */
+ * 2=queue-push consumer wake, 3=queue-pop producer wake,
+ * 4=lifted-SPU exact event-flag publication. */
 #if defined(_MSC_VER)
 static __declspec(thread) int g_yz_sendsig_origin;
 #else
@@ -1494,46 +2039,172 @@ s32 cellSpursTaskGetContextSaveAreaSize(u32* out, const CellSpursTaskLsPattern* 
 /* Event flags                                                               */
 
 static SyncKey g_event_flags[MAX_EVENT_FLAGS];
-static void queue_notify_guest_write(u32 ea, u32 size);
-static void jobchain_notify_guest_write(u32 ea, u32 size);
-static void jobguard_notify_guest_write(u32 ea, u32 size);
+/* Exact-write publication snapshot: event bits, SPU pending waiter bits,
+ * and the PPU pending-receive byte.  Pending must be part of the snapshot:
+ * CLEAR_AUTO setters can publish a task wake while leaving the event bits
+ * unchanged. */
+static u64 g_event_watch_state[MAX_EVENT_FLAGS];
+static void queue_notify_guest_write(u32 ea, u32 size, const u64 mask[2]);
+static void jobchain_notify_guest_write(u32 ea, u32 size, int ppu_store,
+                                        u32 command_mask, u32 bridge_mask);
+static void jobguard_notify_guest_write(u32 ea, u32 size, u64 mask);
+static TasksetState* event_waiter_taskset(const CellSpursEventFlag* ef,
+                                          u32 slot);
 
-void cellSpursNotifyGuestWrite(u32 ea, u32 size)
+static u64 event_watch_snapshot(const u8* object)
 {
-    if (g_registry_ready != 2 || !vm_base || !size) return;
+    return (u64)rd16(object) |
+           ((u64)rd16(object + 0x02) << 16) |
+           ((u64)object[0x07] << 32);
+}
+
+#define EVENT_WATCH_EVENTS      0x000000000000ffffull
+#define EVENT_WATCH_SPU_PENDING 0x00000000ffff0000ull
+#define EVENT_WATCH_PPU_PENDING 0x000000ff00000000ull
+#define EVENT_WATCH_ALL (EVENT_WATCH_EVENTS | EVENT_WATCH_SPU_PENDING | \
+                         EVENT_WATCH_PPU_PENDING)
+
+static void event_watch_refresh_fields_locked(SyncKey* sync, u64 fields)
+{
+    const u32 index = (u32)(sync - g_event_flags);
+    const u64 current = event_watch_snapshot((const u8*)sync->key);
+    g_event_watch_state[index] =
+        (g_event_watch_state[index] & ~fields) | (current & fields);
+}
+
+static u32 guest_write_take_bit64(u64* mask)
+{
+    u32 bit = 0;
+    u64 value = *mask;
+    while (!(value & 1u)) {
+        value >>= 1;
+        ++bit;
+    }
+    *mask &= *mask - 1u;
+    return bit;
+}
+
+static void taskset_notify_guest_write(u32 ea, u32 size, u64 mask)
+{
     const u64 first = ea;
     const u64 last = first + size;
-    for (u32 i = 0; i < MAX_TASKSETS; ++i) {
+    while (mask) {
+        const u32 i = guest_write_take_bit64(&mask);
         TasksetState* ts = &g_tasksets[i];
         if (!ts->sync.live || !ts->sync.key) continue;
-        const u64 object_ea = guest_ea(ts->sync.key);
-        if (first >= object_ea + 128 || last <= object_ea) continue;
+        const u32 object_ea = guest_ea(ts->sync.key);
+        const u64 signal_first = (u64)object_ea + 0x40u;
+        const u64 signal_last = signal_first + 0x10u;
+        if (first >= signal_last || last <= signal_first) continue;
+        const u32 byte_first = first <= signal_first ? 0u :
+            (u32)(first - signal_first);
+        const u32 byte_last = last >= signal_last ? 0x10u :
+            (u32)(last - signal_first);
         int wake = 0;
         mx_lock(&ts->sync.mutex);
         const u8* object = (const u8*)ts->sync.key;
-        for (u32 id = 0; id < CELL_SPURS_MAX_TASK; ++id) {
-            const u8 mask = (u8)(0x80u >> (id & 7));
-            if (!(object[0x40 + id / 8] & mask)) continue;
-            TaskState* task = &ts->tasks[id];
-            if (!task->thread_valid || task->complete) continue;
-            task->signalled = 1;
-            wake = 1;
+        for (u32 byte = byte_first; byte < byte_last; ++byte) {
+            const u8 signals = object[0x40u + byte];
+            for (u32 lane = 0; lane < 8u; ++lane) {
+                if (!(signals & (0x80u >> lane))) continue;
+                TaskState* task = &ts->tasks[byte * 8u + lane];
+                if (!task->thread_valid || task->complete || task->signalled)
+                    continue;
+                task->signalled = 1;
+                task->signal_origin = 5u;
+                wake = 1;
+            }
         }
         if (wake) cv_wake_all(&ts->sync.cond);
         mx_unlock(&ts->sync.mutex);
     }
-    for (u32 i = 0; i < MAX_EVENT_FLAGS; ++i) {
-        SyncKey* sync = &g_event_flags[i];
-        if (!sync->live || !sync->key) continue;
-        const u64 object_ea = guest_ea(sync->key);
-        if (first >= object_ea + 128 || last <= object_ea) continue;
-        mx_lock(&sync->mutex);
-        cv_wake_all(&sync->cond);
-        mx_unlock(&sync->mutex);
+}
+
+static void event_notify_guest_write(u32 ea, u32 size, const u64 routed[2])
+{
+    const u64 first = ea;
+    const u64 last = first + size;
+    for (u32 half = 0; half < 2; ++half) {
+        u64 mask = routed[half];
+        while (mask) {
+            const u32 i = half * 64u + guest_write_take_bit64(&mask);
+            SyncKey* sync = &g_event_flags[i];
+            if (!sync->live || !sync->key) continue;
+            const u32 object_ea = guest_ea(sync->key);
+            if (first >= (u64)object_ea + 8u || last <= object_ea) continue;
+            TasksetState* wake_tasksets[16] = {0};
+            u8 wake_task_ids[16] = {0};
+            u32 wake_count = 0;
+            mx_lock(&sync->mutex);
+            const u8* object = (const u8*)sync->key;
+            const u64 previous = g_event_watch_state[i];
+            const u64 state = event_watch_snapshot(object);
+            u16 new_pending = 0;
+            if (state != previous) {
+                /* A lifted SPU EventFlagSet publishes completed task slots
+                 * by setting pending bits at +0x02.  The old bridge woke the
+                 * PPU event condvar but never delivered the corresponding
+                 * depth-one task signal, leaving image-4 blocked until the
+                 * broad user-command replay happened to signal every task.
+                 * Only newly-pending exact slot edges are dispatched. */
+                const u16 pending = (u16)(state >> 16);
+                const u16 previous_pending = (u16)(previous >> 16);
+                const u16 used = rd16(object + 0x08);
+                new_pending =
+                    (u16)(pending & (u16)~previous_pending & used);
+                g_event_watch_state[i] = state;
+                cv_wake_all(&sync->cond);
+                for (u32 slot = 0; slot < 16; ++slot) {
+                    if (!(new_pending & (0x8000u >> slot))) continue;
+                    TasksetState* taskset = event_waiter_taskset(
+                        (const CellSpursEventFlag*)object, slot);
+                    if (!taskset) continue;
+                    wake_tasksets[wake_count] = taskset;
+                    wake_task_ids[wake_count] = object[0x50 + slot];
+                    ++wake_count;
+                }
+            }
+            mx_unlock(&sync->mutex);
+            yz_fe0_timeline_emit(
+                YZ_FE0_EVENT_WKL4_EVENT_WRITE, 0u, object_ea,
+                (u32)previous, (u32)state,
+                ((u32)new_pending << 16) | wake_count, size);
+            /* Never nest a taskset mutex below an event-flag mutex.  The
+             * guest publication is already complete before the VM-write
+             * hook reaches this point, and SendSignal is the SDK's
+             * lost-wake-safe depth-one latch. */
+            g_yz_sendsig_origin = 4;
+            for (u32 wake = 0; wake < wake_count; ++wake)
+                _cellSpursSendSignal(
+                    (CellSpursTaskset*)wake_tasksets[wake]->sync.key,
+                    wake_task_ids[wake]);
+            g_yz_sendsig_origin = 0;
+        }
     }
-    queue_notify_guest_write(ea, size);
-    jobguard_notify_guest_write(ea, size);
-    jobchain_notify_guest_write(ea, size);
+}
+
+static void cellSpursNotifyGuestWriteSource(u32 ea, u32 size, int ppu_store)
+{
+    if (g_registry_ready != 2 || !vm_base || !size) return;
+    GuestWriteTargets targets;
+    if (!guest_write_route_lookup(ea, size, &targets)) return;
+    if (targets.tasksets)
+        taskset_notify_guest_write(ea, size, targets.tasksets);
+    if (targets.events[0] || targets.events[1])
+        event_notify_guest_write(ea, size, targets.events);
+    if (targets.queues[0] || targets.queues[1])
+        queue_notify_guest_write(ea, size, targets.queues);
+    if (targets.jobguards)
+        jobguard_notify_guest_write(ea, size, targets.jobguards);
+    if (targets.jobchain_commands || targets.jobchain_bridges)
+        jobchain_notify_guest_write(
+            ea, size, ppu_store, targets.jobchain_commands,
+            targets.jobchain_bridges);
+}
+
+void cellSpursNotifyGuestWrite(u32 ea, u32 size)
+{
+    cellSpursNotifyGuestWriteSource(ea, size, 0);
 }
 
 static SyncKey* sync_get(SyncKey* table, u32 count, void* key, int make)
@@ -1574,6 +2245,118 @@ static TasksetState* event_waiter_taskset(const CellSpursEventFlag* ef,
     }
     return NULL;
 }
+
+static void event_observe_native_wait(TasksetState* ts, TaskState* task,
+                                      u32 candidate_ea)
+{
+    if (!ts || !task || (candidate_ea & 127u) ||
+        !job_guest_range_valid(candidate_ea, 128u)) {
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_EVENT_OBSERVE,
+            task ? task->fe0_timeline_cause : 0u,
+            task ? task->id : 0xffffffffu,
+            candidate_ea, 0u, 0u, 1u);
+        return;
+    }
+
+    CellSpursEventFlag* ef =
+        (CellSpursEventFlag*)(vm_base + candidate_ea);
+    if (ef->bytes[0x0e] > CELL_SPURS_EVENT_FLAG_ANY2ANY ||
+        ef->bytes[0x0f] > CELL_SPURS_EVENT_FLAG_CLEAR_MANUAL) {
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_EVENT_OBSERVE,
+            task->fe0_timeline_cause, task->id,
+            candidate_ea, (u32)event_watch_snapshot(ef->bytes),
+            (u32)rd16(ef->bytes + 0x08),
+            2u | ((u32)ef->bytes[0x0d] << 8) |
+                ((u32)ef->bytes[0x0e] << 16) |
+                ((u32)ef->bytes[0x0f] << 24));
+        return;
+    }
+
+    const u16 used = rd16(ef->bytes + 0x08);
+    int matched_waiter = 0;
+    for (u32 slot = 0; slot < 16; ++slot) {
+        if (!(used & (0x8000u >> slot)) ||
+            ef->bytes[0x50 + slot] != task->id)
+            continue;
+        if (event_waiter_taskset(ef, slot) == ts) {
+            matched_waiter = 1;
+            break;
+        }
+    }
+    if (!matched_waiter) {
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_EVENT_OBSERVE,
+            task->fe0_timeline_cause, task->id,
+            candidate_ea, (u32)event_watch_snapshot(ef->bytes),
+            (u32)used,
+            3u | ((u32)ef->bytes[0x0d] << 8) |
+                ((u32)ef->bytes[0x0e] << 16) |
+                ((u32)ef->bytes[0x0f] << 24));
+        return;
+    }
+
+    SyncKey* sync = sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 1);
+    if (!sync) {
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_EVENT_OBSERVE,
+            task->fe0_timeline_cause, task->id,
+            candidate_ea, (u32)event_watch_snapshot(ef->bytes),
+            (u32)used, 4u);
+        return;
+    }
+    const u32 index = (u32)(sync - g_event_flags);
+    TasksetState* wake_tasksets[16] = {0};
+    u8 wake_task_ids[16] = {0};
+    u32 wake_count = 0;
+
+    mx_lock(&sync->mutex);
+    if (!guest_write_route_target_generation(
+            GUEST_WRITE_ROUTE_EVENT, index)) {
+        guest_write_route_begin_target(GUEST_WRITE_ROUTE_EVENT, index);
+        guest_write_route_watch(GUEST_WRITE_ROUTE_EVENT, index,
+                                candidate_ea, 8u);
+        /* Registration races a setter.  Treat every already-pending slot as
+         * an undelivered edge, then snapshot the complete state below. */
+        g_event_watch_state[index] =
+            event_watch_snapshot(ef->bytes) & ~EVENT_WATCH_SPU_PENDING;
+    }
+
+    const u64 previous = g_event_watch_state[index];
+    const u64 state = event_watch_snapshot(ef->bytes);
+    const u16 pending = (u16)(state >> 16);
+    const u16 previous_pending = (u16)(previous >> 16);
+    const u16 new_pending =
+        (u16)(pending & (u16)~previous_pending & rd16(ef->bytes + 0x08));
+    if (state != previous) {
+        g_event_watch_state[index] = state;
+        cv_wake_all(&sync->cond);
+    }
+    for (u32 slot = 0; slot < 16; ++slot) {
+        if (!(new_pending & (0x8000u >> slot))) continue;
+        TasksetState* waiter = event_waiter_taskset(ef, slot);
+        if (!waiter) continue;
+        wake_tasksets[wake_count] = waiter;
+        wake_task_ids[wake_count] = ef->bytes[0x50 + slot];
+        ++wake_count;
+    }
+    mx_unlock(&sync->mutex);
+
+    yz_fe0_timeline_emit(
+        YZ_FE0_EVENT_WKL4_EVENT_OBSERVE,
+        task->fe0_timeline_cause, task->id,
+        candidate_ea, (u32)state,
+        ((u32)new_pending << 16) | wake_count,
+        5u | (index << 8));
+
+    g_yz_sendsig_origin = 4;
+    for (u32 wake = 0; wake < wake_count; ++wake)
+        _cellSpursSendSignal(
+            (CellSpursTaskset*)wake_tasksets[wake]->sync.key,
+            wake_task_ids[wake]);
+    g_yz_sendsig_origin = 0;
+}
 s32 _cellSpursEventFlagInitialize(CellSpurs* spurs, CellSpursTaskset* ts,
                                   CellSpursEventFlag* ef, u32 clear, u32 direction)
 {
@@ -1586,8 +2369,14 @@ s32 _cellSpursEventFlagInitialize(CellSpurs* spurs, CellSpursTaskset* ts,
     ef->bytes[0x0f] = (u8)clear;
     ef->bytes[0x0c] = 0xff;
     wr64(ef->bytes + 0x70, guest_ea(spurs ? (void*)spurs : (void*)ts));
-    return sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 1) ?
-           CELL_OK : CELL_SPURS_TASK_ERROR_NOMEM;
+    SyncKey* sync = sync_get(g_event_flags, MAX_EVENT_FLAGS, ef, 1);
+    if (!sync) return CELL_SPURS_TASK_ERROR_NOMEM;
+    const u32 index = (u32)(sync - g_event_flags);
+    guest_write_route_begin_target(GUEST_WRITE_ROUTE_EVENT, index);
+    guest_write_route_watch(GUEST_WRITE_ROUTE_EVENT, index,
+                            guest_ea(ef), 8u);
+    g_event_watch_state[index] = event_watch_snapshot(ef->bytes);
+    return CELL_OK;
 }
 s32 cellSpursEventFlagInitialize(CellSpursTaskset* ts, CellSpursEventFlag* ef,
                                  u32 clear, u32 direction)
@@ -1667,6 +2456,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
     TasksetState* wake_tasksets[16] = {0};
     u8 wake_task_ids[16] = {0};
     u32 wake_count = 0;
+    const u32 event_index = (u32)(sync - g_event_flags);
     mx_lock(&sync->mutex);
     /* 2026-08-06 (boot 50 flight recorder): SERIALIZE this whole RMW section
      * against SPU lock-line commits, exactly as the queue paths do (line
@@ -1725,8 +2515,16 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
     }
     if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) events &= (u16)~consumed;
     wr16(ef->bytes, events);
+    /* Deliver every pending edge not yet represented by the exact-write
+     * bridge, including a lifted-SPU publication that completed just before
+     * this HLE setter acquired the lock line.  This closes the
+     * writer-before-notifier race without ever replaying an old pending bit. */
+    const u16 routed_pending = (u16)(
+        rd16(ef->bytes + 0x02) &
+        (u16)~(u16)(g_event_watch_state[event_index] >> 16) &
+        rd16(ef->bytes + 0x08));
     for (u32 slot = 0; slot < 16; ++slot) {
-        if (!(pending & (0x8000u >> slot))) continue;
+        if (!(routed_pending & (0x8000u >> slot))) continue;
         TasksetState* taskset = event_waiter_taskset(ef, slot);
         if (taskset) {
             wake_tasksets[wake_count] = taskset;
@@ -1734,6 +2532,10 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* ef, u16 bits)
             ++wake_count;
         }
     }
+    /* Snapshot while the lock line still belongs to this setter.  Refreshing
+     * after unlock could absorb a newer lifted-SPU edge before its notifier
+     * ran, falsely marking that wake as delivered. */
+    event_watch_refresh_fields_locked(sync, EVENT_WATCH_ALL);
     if (!ef_no_lockline) spu_lockline_unlock();
     /* Set-path witness (flight recorder): before/after slot state + wake
      * fanout. The boot-50 exclusion face reads as pend02-before holding the
@@ -1790,6 +2592,7 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
         wr16(bits, got);
         if (ef->bytes[0x0f] == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
             wr16(ef->bytes, (u16)(rd16(ef->bytes) & ~got));
+        event_watch_refresh_fields_locked(sync, EVENT_WATCH_EVENTS);
         mx_unlock(&sync->mutex);
         return CELL_OK;
     }
@@ -1846,6 +2649,8 @@ static s32 event_wait(CellSpursEventFlag* ef, u16* bits, u32 mode, int try_only)
      * the entry gate (permanent). We are the only PPU waiter; any pending
      * delivery was ours, so consume the marker on the way out. */
     ef->bytes[0x07] = 0;
+    event_watch_refresh_fields_locked(
+        sync, EVENT_WATCH_EVENTS | EVENT_WATCH_PPU_PENDING);
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
@@ -1859,6 +2664,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* ef, u16 bits)
     if (!sync) return CELL_SPURS_TASK_ERROR_STAT;
     mx_lock(&sync->mutex);
     wr16(ef->bytes, (u16)(rd16(ef->bytes) & ~bits));
+    event_watch_refresh_fields_locked(sync, EVENT_WATCH_EVENTS);
     mx_unlock(&sync->mutex);
     return CELL_OK;
 }
@@ -1873,6 +2679,7 @@ typedef struct {
     u32 element_size, depth, direction;
     u32 iwl;
     int kind;
+    u64 watch_state[2];
 } QueueState;
 static QueueState g_queues[MAX_QUEUES];
 static _Atomic unsigned g_lfqueue_trace_dumps;
@@ -1966,6 +2773,7 @@ static void lfqueue_signal_one_waiter(const QueueState* q, const void* object,
          * slot, and drop the wake permanently (textbook lost wakeup). */
         if (task->thread_valid && !task->complete) {
             task->signalled = 1;
+            task->signal_origin = 6u;
             task_bit(ts->sync.key, 0x40, task_id, 1);
             cv_wake_all(&ts->sync.cond);
             mx_unlock(&ts->sync.mutex);
@@ -1986,19 +2794,32 @@ static void queue_notify_range_locked(const void* address, u32 size)
     }
 }
 
-static void queue_notify_guest_write(u32 ea, u32 size)
+static void queue_notify_guest_write(u32 ea, u32 size, const u64 routed[2])
 {
-    if (g_registry_ready != 2 || !vm_base || !size) return;
     const u64 first = ea;
     const u64 last = first + size;
-    for (u32 i = 0; i < MAX_QUEUES; ++i) {
-        QueueState* q = &g_queues[i];
-        if (!q->sync.live || !q->sync.key) continue;
-        const u64 object_ea = guest_ea(q->sync.key);
-        if (first >= object_ea + 128 || last <= object_ea) continue;
-        mx_lock(&q->sync.mutex);
-        cv_wake_all(&q->sync.cond);
-        mx_unlock(&q->sync.mutex);
+    for (u32 half = 0; half < 2; ++half) {
+        u64 mask = routed[half];
+        while (mask) {
+            const u32 i = half * 64u + guest_write_take_bit64(&mask);
+            QueueState* q = &g_queues[i];
+            if (!q->sync.live || !q->sync.key) continue;
+            const u64 object_ea = guest_ea(q->sync.key);
+            if (first >= object_ea + 16u || last <= object_ea) continue;
+            mx_lock(&q->sync.mutex);
+            const u8* object = (const u8*)q->sync.key;
+            const u64 state0 = rd64(object + 0x00);
+            const u64 state1 = rd64(object + 0x08);
+            if (state0 != q->watch_state[0] ||
+                state1 != q->watch_state[1]) {
+                const u64 previous0 = q->watch_state[0];
+                const u64 previous1 = q->watch_state[1];
+                q->watch_state[0] = state0;
+                q->watch_state[1] = state1;
+                cv_wake_all(&q->sync.cond);
+            }
+            mx_unlock(&q->sync.mutex);
+        }
     }
 }
 
@@ -2031,6 +2852,14 @@ static s32 spurs_queue_init(void* owner, void* spurs, void* taskset,
     wr32((u8*)object + 0x1c, direction);
     wr64((u8*)object + 0x60, guest_ea(taskset));
     wr64((u8*)object + 0x68, guest_ea(spurs));
+    q->watch_state[0] = rd64((u8*)object + 0x00);
+    q->watch_state[1] = rd64((u8*)object + 0x08);
+    {
+        const u32 index = (u32)(q - g_queues);
+        guest_write_route_begin_target(GUEST_WRITE_ROUTE_QUEUE, index);
+        guest_write_route_watch(GUEST_WRITE_ROUTE_QUEUE, index,
+                                guest_ea(object), 16u);
+    }
     mx_unlock(&q->sync.mutex);
     return CELL_OK;
 }
@@ -2084,6 +2913,20 @@ static s32 lf_queue_init(void* owner_raw, void* object, const void* buffer,
         wr16((u8*)object + 0x50, 0xffff);
     }
     wr64((u8*)object + 0x70, guest_ea(owner) | iwl);
+    q->watch_state[0] = rd64((u8*)object + 0x00);
+    q->watch_state[1] = rd64((u8*)object + 0x08);
+    {
+        const u32 index = (u32)(q - g_queues);
+        guest_write_route_begin_target(GUEST_WRITE_ROUTE_QUEUE, index);
+        guest_write_route_watch(GUEST_WRITE_ROUTE_QUEUE, index,
+                                guest_ea(object), 16u);
+    }
+    if (g_yz_fe0_timeline_enabled) {
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_QUEUE_INIT, 0u,
+            (u32)(q - g_queues), guest_ea(object), guest_ea(owner),
+            (size << 16) | depth, (direction << 16) | q->kind);
+    }
     lfqueue_trace_dump(q, "initialize");
     mx_unlock(&q->sync.mutex);
     return CELL_OK;
@@ -2374,6 +3217,7 @@ typedef struct {
     u64 publication_sequence;
     u16 descriptor_size;
     u8 descriptor_status; /* 0=not a job, 1=stable snapshot, 2=fault */
+    u8 bridge_publication;
     u8 descriptor[0x400];
 } JobCommandSnapshot;
 
@@ -2422,6 +3266,15 @@ typedef struct JobChainState {
      * dispatcher.  Keep the acquired slot -> descriptor relationship instead
      * of trying to reconstruct it from the recycled guest word. */
     u32 command_last_descriptor[MAX_JOB_PARKED_SLOTS];
+    /* A descriptor address is no more durable than its command-ring slot.
+     * Retained mappings therefore also remember the immutable binary identity
+     * acquired with the command.  This prevents a recycled descriptor arena
+     * containing ordinary data from satisfying the very broad kind-6 ticket
+     * predicate and being redispatched as a job. */
+    u64 command_last_binary[MAX_JOB_PARKED_SLOTS];
+    u16 command_last_binary_blocks[MAX_JOB_PARKED_SLOTS];
+    u8 command_last_job_type[MAX_JOB_PARKED_SLOTS];
+    u8 command_last_identity_valid[MAX_JOB_PARKED_SLOTS];
     u64 command_last_dispatch_sequence[MAX_JOB_PARKED_SLOTS];
     u64 command_dispatch_sequence_next;
     u32 command_state_count;
@@ -2453,9 +3306,35 @@ static JobGuardState g_jobguards[MAX_JOB_GUARDS];
 volatile u32 g_native_spurs_ppu_watch_lo = UINT32_MAX;
 volatile u32 g_native_spurs_ppu_watch_hi = 0;
 
+/* A lifted PPU store callback runs after the individual store, not after the
+ * guest's publication barrier. Keep candidate descriptor addresses local to
+ * that producer thread and release them only when its next lifted sync/hwsync
+ * executes. This is the host-side acquire edge that a free-running SPURS
+ * kernel gets from the PPU's memory-ordering protocol. */
+#define MAX_PPU_BRIDGE_CANDIDATES 16
+#if defined(_WIN32)
+static __declspec(thread) u32 g_ppu_bridge_candidate[MAX_PPU_BRIDGE_CANDIDATES];
+static __declspec(thread) u32 g_ppu_bridge_candidate_count;
+#else
+static _Thread_local u32 g_ppu_bridge_candidate[MAX_PPU_BRIDGE_CANDIDATES];
+static _Thread_local u32 g_ppu_bridge_candidate_count;
+#endif
+
+static void jobchain_stage_ppu_bridge_candidate(u32 descriptor)
+{
+    for (u32 i = 0; i < g_ppu_bridge_candidate_count; ++i)
+        if (g_ppu_bridge_candidate[i] == descriptor)
+            return;
+    if (g_ppu_bridge_candidate_count < MAX_PPU_BRIDGE_CANDIDATES)
+        g_ppu_bridge_candidate[g_ppu_bridge_candidate_count++] = descriptor;
+}
+
 static void jobchain_watch_ea_locked(JobChainState* jc, u32 ea)
 {
     if (!ea) return;
+    guest_write_route_watch(
+        GUEST_WRITE_ROUTE_JOBCHAIN_COMMAND,
+        (u32)(jc - g_jobchains), ea, sizeof(u64));
     if (ea < jc->watch_lo) jc->watch_lo = ea;
     if (ea <= 0xfffffff7u && ea + 8u > jc->watch_hi)
         jc->watch_hi = ea + 8u;
@@ -2468,6 +3347,9 @@ static void jobchain_watch_ea_locked(JobChainState* jc, u32 ea)
 static void jobchain_bridge_watch_ea_locked(JobChainState* jc, u32 ea)
 {
     if (!ea) return;
+    guest_write_route_watch(
+        GUEST_WRITE_ROUTE_JOBCHAIN_BRIDGE,
+        (u32)(jc - g_jobchains), ea, sizeof(u64));
     if (ea < jc->bridge_lo) jc->bridge_lo = ea;
     if (ea <= 0xfffffff7u && ea + 8u > jc->bridge_hi)
         jc->bridge_hi = ea + 8u;
@@ -2520,10 +3402,31 @@ static int job_command_is_publication_barrier(u64 command)
            command == 0x12ull || command == 0x1aull;
 }
 
+static int job_command_is_job(u64 command)
+{
+    /* CellSpursJobChain commands carry a 32-bit main-storage EA.  The upper
+     * word is reserved and zero for JOB.  Rejecting a nonzero upper word is
+     * also the publication-completeness check for producers that replace the
+     * 0x00000008_00000012 empty marker with narrower stores: the intermediate
+     * mixed generation must not be executed as a descriptor pointer. */
+    return command && (command >> 32) == 0u && (command & 7u) == 0u;
+}
+
+static int job_command_is_partial_publication(u64 command)
+{
+    /* Every SDK job-chain command is a 32-bit main-storage EA/opcode in the
+     * low word; the upper word is reserved and zero.  The title replaces its
+     * 0x00000008_00000012 empty marker with narrower stores, so every opcode
+     * (not only JOB) can briefly be paired with the marker's stale upper
+     * word.  The marker itself is a stable empty predicate, not a torn
+     * command. */
+    return command != 0x0000000800000012ull && (command >> 32) != 0u;
+}
+
 static int job_command_starts_work(u64 command)
 {
     const u32 op = (u32)(command & 7u);
-    return (command && op == 0u) || op == 6u;
+    return job_command_is_job(command) || op == 6u;
 }
 
 static int job_descriptor_copy_stable(u32 ea, u16 size, u8* destination)
@@ -2548,6 +3451,111 @@ static int job_descriptor_copy_stable(u32 ea, u16 size, u8* destination)
     return 0;
 }
 
+static int job_descriptor_snapshot_publishable(const u8* descriptor,
+                                                u16 size)
+{
+    if (!descriptor || size < 0x30u)
+        return 0;
+    const u64 binary = rd64(descriptor + 0x00) & ~1ull;
+    const u32 binary_size = (u32)rd16(descriptor + 0x08) * 16u;
+    return binary != 0u && binary_size != 0u &&
+           binary <= 0xffffffffull &&
+           job_guest_range_valid((u32)binary, binary_size);
+}
+
+static int job_descriptor_acquire_published(u32 ea, u16 size,
+                                            u8* destination)
+{
+    for (u32 attempt = 0; attempt < 64u; ++attempt) {
+        if (job_descriptor_copy_stable(ea, size, destination) &&
+            job_descriptor_snapshot_publishable(destination, size))
+            return 1;
+        if (attempt < 8u)
+            nthread_yield();
+        else
+            nthread_reschedule();
+    }
+    return 0;
+}
+
+typedef struct {
+    u32 count;
+    u32 descriptor_size;
+    u32 first_descriptor;
+} JobListView;
+
+/* A JOBLIST command can become visible to the native worker while the lifted
+ * PPU producer is still publishing the 16-byte CellSpursJobList it names.
+ * Real SPURS observes the producer's synchronization ordering; scheduling the
+ * native worker from a per-store callback can instead expose an intermediate
+ * {numJobs, sizeOfJob, eaJobList} generation.  Acquire two identical copies
+ * and give an incomplete/invalid generation a short publication grace before
+ * reporting the SDK error.  This is deliberately local to the 16-byte object:
+ * widening the chain's coarse command watch window down to a low-EA JobList
+ * would route most title stores through the job-chain mutex. */
+static int joblist_acquire_published(JobChainState* jc, u32 ea,
+                                     JobListView* view)
+{
+    u8 bytes[16];
+    u8 verify[16];
+    int last_error = CELL_SPURS_JOB_ERROR_FAULT;
+    for (u32 attempt = 0; attempt < 64u; ++attempt) {
+        memcpy(bytes, vm_base + ea, sizeof(bytes));
+        atomic_thread_fence(memory_order_seq_cst);
+        memcpy(verify, vm_base + ea, sizeof(verify));
+        atomic_thread_fence(memory_order_acquire);
+        if (!memcmp(bytes, verify, sizeof(bytes))) {
+            const u32 count = rd32(bytes + 0x00);
+            const u32 descriptor_size = rd32(bytes + 0x04);
+            const u64 first = rd64(bytes + 0x08);
+            if (descriptor_size < 0x30u ||
+                (descriptor_size & 0x0fu)) {
+                last_error = CELL_SPURS_JOB_ERROR_DESCRIPTOR;
+            } else {
+                const u64 list_bytes = (u64)count * descriptor_size;
+                if ((first >> 32) != 0u ||
+                    (count && !job_guest_range_valid((u32)first,
+                                                     list_bytes))) {
+                    last_error = CELL_SPURS_JOB_ERROR_FAULT;
+                } else {
+                    view->count = count;
+                    view->descriptor_size = descriptor_size;
+                    view->first_descriptor = (u32)first;
+                    if (attempt) {
+                        fprintf(stderr,
+                                "[jc-joblist] acquired published list=%08X "
+                                "after %u retries count=%u size=0x%X "
+                                "first=%08X\n",
+                                ea, attempt, count, descriptor_size,
+                                (u32)first);
+                        fflush(stderr);
+                    }
+                    return CELL_OK;
+                }
+            }
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+            extern void yz_spurs_joblist_publication_test_hook(u32, u32);
+            yz_spurs_joblist_publication_test_hook(ea, attempt);
+#endif
+        }
+        if (atomic_load(&jc->shutdown))
+            return CELL_SPURS_JOB_ERROR_ABORT;
+        if (attempt < 8u)
+            nthread_yield();
+        else
+            nthread_reschedule();
+    }
+    memcpy(bytes, vm_base + ea, sizeof(bytes));
+    fprintf(stderr,
+            "[jc-joblist] invalid after publication grace list=%08X "
+            "words=%08X/%08X/%08X/%08X error=0x%08X\n",
+            ea, rd32(bytes + 0x00), rd32(bytes + 0x04),
+            rd32(bytes + 0x08), rd32(bytes + 0x0c),
+            (u32)last_error);
+    fflush(stderr);
+    return last_error;
+}
+
 static int jobchain_command_slot(JobChainState* jc, u32 ea, int create)
 {
     if (!ea || (ea & 7u)) return -1;
@@ -2567,6 +3575,34 @@ static int jobchain_command_slot(JobChainState* jc, u32 ea, int create)
     const u32 slot = jc->command_state_count++;
     jc->command_state_ea[slot] = ea;
     return (int)slot;
+}
+
+static int jobchain_plausible_publication_head_locked(
+    const JobChainState* jc, u32 ea)
+{
+    if (ea == jc->entry_ea || ea == jc->current_ea)
+        return 1;
+    /* A producer publishes the head of a sequential command prefix last.
+     * Before the worker reaches that head, its predecessor is the strongest
+     * exact evidence available.  Keep this sparse: watch_lo/watch_hi is only
+     * a cheap callback prefilter and may span megabytes when CALL jumps from
+     * a main-storage ring into a distant sub-list. */
+    for (u32 i = 0; i < jc->command_state_count; ++i) {
+        const u32 known = jc->command_state_ea[i];
+        if (known == ea || (known <= 0xfffffff7u && known + 8u == ea))
+            return 1;
+    }
+    for (u32 i = 0; i < jc->parked_slot_count; ++i) {
+        const u32 known = jc->parked_slot_ea[i];
+        if (known == ea || (known <= 0xfffffff7u && known + 8u == ea))
+            return 1;
+    }
+    for (u32 i = 0; i < jc->command_snapshot_count; ++i) {
+        const u32 known = jc->command_snapshot[i].ea;
+        if (known == ea || (known <= 0xfffffff7u && known + 8u == ea))
+            return 1;
+    }
+    return 0;
 }
 
 /*
@@ -2621,9 +3657,18 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
         const u64 command = rd64(vm_base + pc);
         const u32 op = (u32)(command & 7u);
         const u32 ext = (u32)(command & 127u);
-        if (job_command_is_empty(pc, command))
+        if (!command || job_command_is_empty(pc, command))
             break;
-        if (grab_bounded && command && op == 0u) {
+        /* Never immortalize an unpublished zero or a mixed upper/lower word
+         * in an immutable generation.  Acceptance run 6 exposed why this is
+         * essential for CALL: a snapshot followed the published CALL into a
+         * dynamic sub-list before its tail RET appeared, preserved that zero,
+         * and then walked through unrelated guest data until it decoded an
+         * accidental END.  The completing store must instead remain visible
+         * to the live executor. */
+        if (job_command_is_partial_publication(command))
+            break;
+        if (grab_bounded && job_command_is_job(command)) {
             if (jobs_grabbed == grab_cap)
                 break;                    /* maxGrabbedJob bound */
             ++jobs_grabbed;
@@ -2633,25 +3678,36 @@ static u32 jobchain_capture_commands(JobChainState* jc, u32 start_ea,
         snapshot[count].command = command;
         snapshot[count].descriptor_size = 0;
         snapshot[count].descriptor_status = 0;
+        snapshot[count].bridge_publication = 0;
         {
             const int slot = jobchain_command_slot(jc, pc, 0);
             snapshot[count].publication_sequence = slot >= 0 ?
                 jc->command_publication_sequence[slot] : 0;
         }
-        if (command && op == 0u && jc->descriptor_size <= 0x400u) {
+        if (job_command_is_job(command) &&
+            jc->descriptor_size <= 0x400u) {
             const u32 descriptor_ea = (u32)command;
             snapshot[count].descriptor_status = 2;
             if (job_descriptor_copy_stable(descriptor_ea,
                                            jc->descriptor_size,
-                                           snapshot[count].descriptor)) {
+                                           snapshot[count].descriptor) &&
+                job_descriptor_snapshot_publishable(
+                    snapshot[count].descriptor, jc->descriptor_size)) {
                 snapshot[count].descriptor_size = jc->descriptor_size;
                 snapshot[count].descriptor_status = 1;
+            } else {
+                /* A stable all-zero arena is not a published descriptor.
+                 * Stop the immutable claim before this JOB so a later live
+                 * fetch can acquire the generation after the producer has
+                 * completed it.  Acceptance run 19 captured an old zero copy
+                 * of 0x401B7F80, then failed INVALID_BIN even though the live
+                 * descriptor was complete by the time execution arrived. */
+                break;
             }
         }
         ++count;
 
-        if ((command && op == 0u) || command == 0 || op == 2u ||
-            op == 5u || op == 6u) {
+        if (job_command_is_job(command) || op == 2u || op == 5u || op == 6u) {
             pc += 8;
             continue;
         }
@@ -2705,11 +3761,29 @@ static u32 jobchain_claim_current(JobChainState* jc, u32 start_ea)
 }
 
 static u32 jobchain_claim_persistent_job(JobChainState* jc, u32 slot_ea,
-                                         u32 descriptor_ea)
+                                         u32 descriptor_ea,
+                                         const u8* acquired_descriptor)
 {
     const u64 live_command = rd64(vm_base + slot_ea);
-    if ((live_command & 7u) == 0u && (u32)live_command == descriptor_ea)
-        return jobchain_claim_current(jc, slot_ea);
+    if (job_command_is_job(live_command) &&
+        (u32)live_command == descriptor_ea) {
+        const u32 count = jobchain_claim_current(jc, slot_ea);
+        if (count && jc->command_snapshot[0].ea == slot_ea &&
+            job_command_is_job(jc->command_snapshot[0].command) &&
+            (u32)jc->command_snapshot[0].command == descriptor_ea) {
+            /* Selection below already acquired a stable descriptor while this
+             * exact command generation was live.  Do not replace it with a
+             * later descriptor-arena generation captured while walking the
+             * rest of the newly published command prefix. */
+            JobCommandSnapshot* snapshot = &jc->command_snapshot[0];
+            snapshot->descriptor_size = jc->descriptor_size;
+            snapshot->descriptor_status = 1;
+            snapshot->bridge_publication = 1;
+            memcpy(snapshot->descriptor, acquired_descriptor,
+                   jc->descriptor_size);
+            return count;
+        }
+    }
 
     /* The SPURS kernel has already acquired this persistent JOB command.  A
      * producer is therefore free to recycle the main-memory ring slot while
@@ -2720,14 +3794,10 @@ static u32 jobchain_claim_persistent_job(JobChainState* jc, u32 slot_ea,
     snapshot->ea = slot_ea;
     snapshot->command = descriptor_ea;
     snapshot->publication_sequence = 0;
-    snapshot->descriptor_size = 0;
-    snapshot->descriptor_status = 2;
-    if (jc->descriptor_size <= sizeof(snapshot->descriptor) &&
-        job_descriptor_copy_stable(descriptor_ea, jc->descriptor_size,
-                                   snapshot->descriptor)) {
-        snapshot->descriptor_size = jc->descriptor_size;
-        snapshot->descriptor_status = 1;
-    }
+    snapshot->descriptor_size = jc->descriptor_size;
+    snapshot->descriptor_status = 1;
+    snapshot->bridge_publication = 1;
+    memcpy(snapshot->descriptor, acquired_descriptor, jc->descriptor_size);
     jc->command_snapshot_count = 1;
     jc->command_snapshot_index = 0;
     jobchain_ledger_record(jc, 'C', slot_ea, 1, descriptor_ea);
@@ -2815,7 +3885,8 @@ static void jobchain_clear_queued_snapshots(JobChainState* jc)
     jc->pending_snapshot_tail = NULL;
 }
 
-static u32 jobchain_queue_snapshot(JobChainState* jc, u32 start_ea)
+static u32 jobchain_queue_snapshot(JobChainState* jc, u32 start_ea,
+                                   int replace_unconsumed)
 {
     PendingJobSnapshot* snapshot =
         (PendingJobSnapshot*)malloc(sizeof(*snapshot));
@@ -2833,6 +3904,27 @@ static u32 jobchain_queue_snapshot(JobChainState* jc, u32 start_ea)
         return 0;
     }
     snapshot->sequence = ++jc->pending_snapshot_sequence;
+    if (replace_unconsumed) {
+        PendingJobSnapshot* previous = NULL;
+        PendingJobSnapshot* queued = jc->pending_snapshot_head;
+        while (queued && queued->start_ea != start_ea) {
+            previous = queued;
+            queued = queued->next;
+        }
+        if (queued) {
+            snapshot->next = queued->next;
+            if (previous)
+                previous->next = snapshot;
+            else
+                jc->pending_snapshot_head = snapshot;
+            if (jc->pending_snapshot_tail == queued)
+                jc->pending_snapshot_tail = snapshot;
+            free(queued);
+            jobchain_ledger_record(jc, 'U', start_ea, snapshot->count,
+                                   snapshot->command[0].command);
+            return snapshot->count;
+        }
+    }
     if (jc->pending_snapshot_tail)
         jc->pending_snapshot_tail->next = snapshot;
     else
@@ -2841,6 +3933,64 @@ static u32 jobchain_queue_snapshot(JobChainState* jc, u32 start_ea)
     jobchain_ledger_record(jc, 'Q', start_ea, snapshot->count,
                            snapshot->command[0].command);
     return snapshot->count;
+}
+
+static void jobchain_discard_consumed_snapshot(JobChainState* jc,
+                                               u32 start_ea,
+                                               u64 publication_sequence)
+{
+    if (!publication_sequence) return;
+    PendingJobSnapshot* previous = NULL;
+    PendingJobSnapshot* snapshot = jc->pending_snapshot_head;
+    while (snapshot) {
+        PendingJobSnapshot* next = snapshot->next;
+        const u64 queued_sequence = snapshot->count ?
+            snapshot->command[0].publication_sequence : 0;
+        if (snapshot->start_ea == start_ea && queued_sequence &&
+            queued_sequence <= publication_sequence) {
+            if (previous)
+                previous->next = next;
+            else
+                jc->pending_snapshot_head = next;
+            if (jc->pending_snapshot_tail == snapshot)
+                jc->pending_snapshot_tail = previous;
+            jobchain_ledger_record(jc, 'V', start_ea,
+                                   (u32)queued_sequence, 0);
+            free(snapshot);
+        } else {
+            previous = snapshot;
+        }
+        snapshot = next;
+    }
+}
+
+static u32 jobchain_queue_persistent_job(
+    JobChainState* jc, u32 slot_ea, u32 descriptor_ea,
+    const u8* acquired_descriptor)
+{
+    PendingJobSnapshot* snapshot =
+        (PendingJobSnapshot*)calloc(1, sizeof(*snapshot));
+    if (!snapshot) {
+        jobchain_ledger_record(jc, 'F', slot_ea, 0, descriptor_ea);
+        return 0;
+    }
+    snapshot->start_ea = slot_ea;
+    snapshot->count = 1;
+    snapshot->sequence = ++jc->pending_snapshot_sequence;
+    snapshot->command[0].ea = slot_ea;
+    snapshot->command[0].command = descriptor_ea;
+    snapshot->command[0].descriptor_size = jc->descriptor_size;
+    snapshot->command[0].descriptor_status = 1;
+    snapshot->command[0].bridge_publication = 1;
+    memcpy(snapshot->command[0].descriptor, acquired_descriptor,
+           jc->descriptor_size);
+    if (jc->pending_snapshot_tail)
+        jc->pending_snapshot_tail->next = snapshot;
+    else
+        jc->pending_snapshot_head = snapshot;
+    jc->pending_snapshot_tail = snapshot;
+    jobchain_ledger_record(jc, 'Q', slot_ea, 1, descriptor_ea);
+    return 1;
 }
 
 static u32 jobchain_take_queued_snapshot(JobChainState* jc, u32 start_ea)
@@ -2869,61 +4019,97 @@ static u32 jobchain_take_queued_snapshot(JobChainState* jc, u32 start_ea)
     return count;
 }
 
-/* The title's synchronous ticket producer writes descriptor+0x10 = 6 and
- * then waits for the persistent dispatcher JOB to clear it.  Normally the
- * PPU-store notification below turns that edge into a re-dispatch.  The real
- * SPURS kernel does not depend on observing that single store, though: while
- * the command ring is parked it continues to orbit persistent JOB commands.
- *
- * Keep the event-driven fast path, but share it with the bounded parked-state
- * poll in wait_job_slot().  That fallback is required for lifted stores that
- * bypass notification and for a notification that races command tracking.
- * A nonzero size_io is also the title-observed descriptor-ready edge: the
- * producer writes kind 6 before finishing the rest of the descriptor. */
+/* The title's synchronous producer exposes descriptor+0x10 = 6 and a nonzero
+ * size_io before it finishes the descriptor body, executes hwsync, and waits
+ * for the persistent dispatcher JOB to clear the ticket. A raw store edge is
+ * therefore only a candidate. Lifted PPU writes become eligible at the same
+ * producer thread's next guest fence; completed SPU DMA/HLE transfers carry
+ * their own publication edge. This preserves the hardware orbit without a
+ * timing-based poll of partially constructed guest memory. */
+enum JobchainBridgeSource {
+    JC_BRIDGE_GUEST_PUBLISH = 0,
+    JC_BRIDGE_PPU_FENCE = 1
+};
+
 static u32 jobchain_resume_pending_ticket_locked(JobChainState* jc,
                                                  u32 descriptor_filter,
-                                                 int polled)
+                                                 int source)
 {
     int selected = 0;
     u32 selected_slot_ea = 0;
     u32 selected_desc = 0;
     u64 selected_command = 0;
     u64 selected_sequence = 0;
+    u8 selected_descriptor[0x400];
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+    /* Make accidental use before acquisition deterministic in the native
+     * bridge-race regression instead of depending on host stack contents. */
+    memset(selected_descriptor, 0xa5, sizeof(selected_descriptor));
+#endif
     for (u32 m = 0; m < jc->command_state_count; ++m) {
         const u32 slot_ea = jc->command_state_ea[m];
         if (!job_guest_range_valid(slot_ea, 8)) continue;
         const u64 command = rd64(vm_base + slot_ea);
-        const u32 live_desc = command && (command & 7u) == 0u ?
+        const u32 live_desc = job_command_is_job(command) ?
             (u32)command : 0u;
+        if (!live_desc && command && (command & 7u) == 0u &&
+            (command >> 32) != 0u)
+            continue;
         const u32 desc = live_desc ? live_desc :
             jc->command_last_descriptor[m];
         if (!desc) continue;
         if (descriptor_filter && desc != descriptor_filter) continue;
-        /* A retained mapping represents a command already acquired by the
-         * kernel, not a newly published ring generation.  It may restart the
-         * dispatcher only from its parked orbit.  Deferring it while another
-         * generation is running stacks stale dispatcher executions (the live
-         * title publishes adjacent tickets in a burst) and corrupts ordering.
-         * A command still present in the live slot keeps the existing busy ->
-         * deferred-publication behavior. */
-        /* A retained command is an asynchronous kernel-orbit dependency.  The
-         * PPU write callback runs inside the producer's lifted store helper;
-         * executing the retained JOB from that callback lets the consumer
-         * clear the ticket before the producer instruction/transition has
-         * returned.  Observe retained mappings only from the worker's bounded
-         * parked poll.  Live commands keep their existing event/defer path. */
-        if (!live_desc && (!polled || !jc->waiting_command))
-            continue;
+        /* A retained mapping represents the persistent dispatcher command the
+         * kernel already acquired. The raw PPU store callback only stages a
+         * candidate; reaching here means the producer's barrier has published
+         * the complete descriptor. If the dispatcher is still running, queue
+         * this immutable generation for its next orbit instead of re-reading
+         * the recyclable command or descriptor arenas later. */
         if (desc > 0xffffffebu ||
             !job_guest_range_valid(desc + 0x10u, 8u))
             continue;
-        const u32 ticket = rd32(vm_base + desc + 0x10u);
-        const u32 ready = rd32(vm_base + desc + 0x14u);
+        u8 candidate_descriptor[0x400];
+        if (jc->descriptor_size > sizeof(candidate_descriptor) ||
+            !job_descriptor_copy_stable(
+                desc, jc->descriptor_size, candidate_descriptor) ||
+            !job_descriptor_snapshot_publishable(
+                candidate_descriptor, jc->descriptor_size))
+            continue;
+        if (live_desc) {
+            /* Acquire the descriptor and command as one generation.  The
+             * producer may recycle either arena as soon as this persistent
+             * command has been observed, so the later claim must never depend
+             * on re-reading mutable guest memory. */
+            atomic_thread_fence(memory_order_seq_cst);
+            if (rd64(vm_base + slot_ea) != command)
+                continue;
+        } else {
+            /* The command slot and descriptor arena are independently
+             * recyclable.  A retained slot->descriptor address is usable
+             * only while the descriptor still names the exact binary that
+             * was acquired with that command generation. */
+            if (!jc->command_last_identity_valid[m] ||
+                (rd64(candidate_descriptor) & ~1ull) !=
+                    jc->command_last_binary[m] ||
+                rd16(candidate_descriptor + 0x08) !=
+                    jc->command_last_binary_blocks[m] ||
+                (jc->descriptor_size > 0x2cu &&
+                 candidate_descriptor[0x2c] !=
+                    jc->command_last_job_type[m])) {
+                jc->command_last_descriptor[m] = 0;
+                jc->command_last_dispatch_sequence[m] = 0;
+                jc->command_last_identity_valid[m] = 0;
+                continue;
+            }
+        }
+        const u8* ticket_descriptor = candidate_descriptor;
+        const u32 ticket = rd32(ticket_descriptor + 0x10u);
+        const u32 ready = rd32(ticket_descriptor + 0x14u);
         if (descriptor_filter && desc == descriptor_filter)
             yz_frontier_trace_emit(
                 YZ_FT_COMPLETION, jc->wid, 2u,
                 desc, desc + 0x10u, ticket, 6u, ready,
-                polled ? 2u : 1u);
+                source == JC_BRIDGE_PPU_FENCE ? 2u : 1u);
         if (ticket != 6u || ready == 0u)
             continue;
         /* A long-lived circular list can acquire the same persistent
@@ -2937,6 +4123,8 @@ static u32 jobchain_resume_pending_ticket_locked(JobChainState* jc,
             selected_desc = desc;
             selected_command = command;
             selected_sequence = sequence;
+            memcpy(selected_descriptor, candidate_descriptor,
+                   jc->descriptor_size);
         }
     }
     if (!selected)
@@ -2947,7 +4135,7 @@ static u32 jobchain_resume_pending_ticket_locked(JobChainState* jc,
         selected_desc, selected_desc + 0x10u,
         rd32(vm_base + selected_desc + 0x10u), 6u,
         rd32(vm_base + selected_desc + 0x14u),
-        polled ? 2u : 1u);
+        source == JC_BRIDGE_PPU_FENCE ? 2u : 1u);
 
     jobchain_ledger_record(jc, 'B', selected_slot_ea, selected_desc,
                            selected_command);
@@ -2961,35 +4149,53 @@ static u32 jobchain_resume_pending_ticket_locked(JobChainState* jc,
                     "(#%u)\n",
                     selected_desc, selected_slot_ea,
                     jc->waiting_command,
-                    polled ? "park-poll" : "ppu-store", k + 1u);
+                    source == JC_BRIDGE_PPU_FENCE ?
+                        "ppu-fence" : "guest-publish",
+                    k + 1u);
             fflush(stderr);
         }
     }
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+    {
+        extern void yz_spurs_pending_ticket_claim_test_hook(u32, u32);
+        yz_spurs_pending_ticket_claim_test_hook(
+            selected_slot_ea, selected_desc);
+    }
+#endif
     if (jc->waiting_command) {
         jc->current_ea = selected_slot_ea;
         if (jobchain_claim_persistent_job(
-                jc, selected_slot_ea, selected_desc))
+                jc, selected_slot_ea, selected_desc,
+                selected_descriptor))
             jc->waiting_command = 0;
     } else {
         const int cs = jobchain_command_slot(jc, selected_slot_ea, 1);
-        jobchain_defer_resume(jc, selected_slot_ea, selected_command,
-                              cs >= 0 ?
-                              ++jc->command_publication_sequence[cs] : 0);
+        if (jobchain_queue_persistent_job(
+                jc, selected_slot_ea, selected_desc,
+                selected_descriptor))
+            jobchain_defer_resume(jc, selected_slot_ea, selected_desc,
+                                  cs >= 0 ?
+                                  ++jc->command_publication_sequence[cs] : 0);
     }
     return 1;
 }
 
 static int jobchain_pending_ticket_publish_candidate(
-    JobChainState* jc, u32 ea, u32 size, u32* descriptor_out)
+    JobChainState* jc, u32 ea, u32 size, int exact_watched,
+    u32* descriptor_out)
 {
     const u64 first = ea;
     const u64 last = first + size;
-    const u32 descriptor = ea & ~0x7fu;
-    const u32 descriptor_offset = ea & 0x7fu;
-    const int in_bridge_window =
-        first < jc->bridge_hi && last > jc->bridge_lo;
+    /* CellSpursJob descriptors are 16-byte aligned, not necessarily
+     * 128-byte aligned. The readiness pair lives in the following aligned
+     * 16-byte lane. Acceptance run 13 exposed descriptor 0x40603BB0; the old
+     * 128-byte mask attributed its +0x14 store to unrelated storage. */
+    const u32 header_lane = size ? (u32)(last - 1u) & ~0x0fu : 0u;
+    const u32 descriptor = header_lane >= 0x10u ?
+        header_lane - 0x10u : 0u;
+    const u32 descriptor_offset = ea - descriptor;
     const int candidate =
-        in_bridge_window && size <= 8u &&
+        exact_watched && size <= 8u &&
         descriptor_offset < 0x18u &&
         descriptor_offset + size > 0x10u &&
         job_guest_range_valid(descriptor + 0x10u, 8u) &&
@@ -3019,37 +4225,43 @@ int yz_spurs_test_pending_ticket_publish_candidate(
 {
     for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
         JobChainState* jc = &g_jobchains[i];
-        if (jc->sync.live && jc->sync.key == object)
+        if (jc->sync.live && jc->sync.key == object) {
+            GuestWriteTargets targets;
+            guest_write_route_lookup(ea, size, &targets);
             return jobchain_pending_ticket_publish_candidate(
-                jc, ea, size, descriptor_out);
+                jc, ea, size,
+                (targets.jobchain_bridges & (1u << i)) != 0,
+                descriptor_out);
+        }
     }
     return -1;
 }
 #endif
 
-static void jobchain_notify_guest_write(u32 ea, u32 size)
+static void jobchain_notify_guest_write(u32 ea, u32 size, int ppu_store,
+                                        u32 command_mask, u32 bridge_mask)
 {
     const u64 first = ea;
     const u64 last = first + size;
-    for (u32 i = 0; i < MAX_JOBCHAINS; ++i) {
+    u32 routed = command_mask | bridge_mask;
+    while (routed) {
+        u64 routed64 = routed;
+        const u32 i = guest_write_take_bit64(&routed64);
+        routed &= ~(1u << i);
         JobChainState* jc = &g_jobchains[i];
         if (!jc->sync.live) continue;
-        const u64 chain_first = jc->watch_lo;
-        const u64 chain_last = jc->watch_hi;
-        const int in_command_window =
-            first < chain_last && last > chain_first;
+        const int in_command_window = (command_mask & (1u << i)) != 0;
         /* Cheap LOCK-FREE pre-filter: only a small store landing on a ring
          * descriptor's kind word with the pending value is a bridge
          * candidate. Ordinary ring traffic (whole-slot builds, thousands
          * per second on t1's submit path) must NOT take the chain mutex —
          * boots 37-41 showed the early frame-drain wedge rate exploding
          * under exactly that contention. */
-        const int in_bridge_window =
-            first < jc->bridge_hi && last > jc->bridge_lo;
+        const int in_bridge_window = (bridge_mask & (1u << i)) != 0;
         u32 bridge_descriptor = 0;
         const int bridge_candidate =
             jobchain_pending_ticket_publish_candidate(
-                jc, ea, size, &bridge_descriptor);
+                jc, ea, size, in_bridge_window, &bridge_descriptor);
         /* Record both halves of a completion descriptor's two-store publish.
          * Redispatch becomes eligible only when either write completes the
          * tuple { ticket == 6, ready != 0 }. */
@@ -3072,6 +4284,7 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                 bridge_candidate ? 1u : 0u);
         if (!in_command_window && !bridge_candidate) continue;
         mx_lock(&jc->sync.mutex);
+        int wake_transition = 0;
         u64 exact_publication_sequence = 0;
         if (in_command_window && size == sizeof(u64) && !(ea & 7u) &&
             job_guest_range_valid(ea, sizeof(u64))) {
@@ -3085,7 +4298,10 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                 jobchain_remember_parked_slot(jc, ea, exact_command);
             else if (job_command_starts_work(exact_command) ||
                      job_command_is_publication_barrier(exact_command)) {
-                const int slot = jobchain_command_slot(jc, ea, 1);
+                int slot = jobchain_command_slot(jc, ea, 0);
+                if (slot < 0 &&
+                    jobchain_plausible_publication_head_locked(jc, ea))
+                    slot = jobchain_command_slot(jc, ea, 1);
                 if (slot >= 0)
                     exact_publication_sequence =
                         ++jc->command_publication_sequence[slot];
@@ -3114,9 +4330,21 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
              * structurally (no map to evict).
              * The stale JOB command for it persists in guest memory in one
              * of the command slots this chain has already seen. */
-            bridge_resumed = jobchain_resume_pending_ticket_locked(
-                jc, bridge_descriptor, /*polled=*/0);
+            if (ppu_store) {
+                /* The descriptor header is deliberately written before the
+                 * DMA list and job-specific body. Dispatching here can grab
+                 * a stable but incomplete generation. The producer's PPU
+                 * fence publishes this staged address below. */
+                jobchain_stage_ppu_bridge_candidate(bridge_descriptor);
+            } else {
+                /* SPU DMA and runtime/HLE bulk writers notify only after the
+                 * complete transfer, so their notification is itself the
+                 * publication edge. */
+                bridge_resumed = jobchain_resume_pending_ticket_locked(
+                    jc, bridge_descriptor, JC_BRIDGE_GUEST_PUBLISH);
+            }
         }
+        wake_transition |= bridge_resumed;
         int exact_barrier_handled = 0;
         for (u32 p = 0; in_command_window && p < jc->parked_slot_count; ++p) {
             const u32 slot_ea = jc->parked_slot_ea[p];
@@ -3171,13 +4399,15 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                 jobchain_defer_resume(jc, slot_ea, command,
                                       publication_sequence);
                 if (job_command_is_publication_barrier(command))
-                    queued = jobchain_queue_snapshot(jc, slot_ea);
+                    queued = jobchain_queue_snapshot(
+                        jc, slot_ea, /*replace_unconsumed=*/0);
             } else if (job_command_is_publication_barrier(command)) {
                 /* Future publications must be claimed before the producer is
                  * allowed to reuse their body.  Ordinary NEXT/JOB maintenance
                  * is not a publication head and must not consume the bounded
                  * pending-snapshot slots. */
-                queued = jobchain_queue_snapshot(jc, slot_ea);
+                queued = jobchain_queue_snapshot(
+                    jc, slot_ea, /*replace_unconsumed=*/1);
             }
             if (native_trace_enabled()) {
                 fprintf(stderr,
@@ -3187,17 +4417,28 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                         ea, size, slot_ea,
                         (unsigned long long)command, claimed, queued);
             }
+            wake_transition |= claimed != 0;
+            wake_transition |= queued != 0 && jc->waiting_command;
         }
         /* The first publication of a circular slot can race ahead of the
-         * native worker ever parking there.  A completed aligned 8-byte write
-         * of the documented synchronization commands is itself sufficient to
-         * identify a publication head; claim it even when it is not yet in
-         * the remembered-slot set. */
+         * native worker ever parking there.  Claim a complete synchronization
+         * command only at a known command slot or the immediate successor of
+         * one.  The broad watch envelope can span distant CALL lists; treating
+         * every value 2/10/18/26 inside that gap as a barrier queued unrelated
+         * title data during acceptance run 20. */
         if (!exact_barrier_handled && size == sizeof(u64) && !(ea & 7u) &&
-            job_guest_range_valid(ea, sizeof(u64))) {
+            job_guest_range_valid(ea, sizeof(u64)) &&
+            jobchain_plausible_publication_head_locked(jc, ea)) {
             const u64 command = rd64(vm_base + ea);
             if (job_command_is_publication_barrier(command)) {
-                const u32 queued = jobchain_queue_snapshot(jc, ea);
+                const int command_slot = jobchain_command_slot(jc, ea, 1);
+                const int reused = command_slot >= 0 ?
+                    atomic_exchange_explicit(
+                        &jc->command_consumed[command_slot], 0,
+                        memory_order_acq_rel) : 0;
+                const u32 queued = jobchain_queue_snapshot(
+                    jc, ea, /*replace_unconsumed=*/!reused);
+                wake_transition |= queued != 0 && jc->waiting_command;
                 if (native_trace_enabled()) {
                     fprintf(stderr,
                             "[native-spurs-trace] jobchain-barrier "
@@ -3206,10 +4447,9 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
                 }
             }
         }
-        /* A bridge-only retained-map notification deliberately does not wake
-         * the worker reentrantly; its 4 ms parked poll observes the completed
-         * producer transition. */
-        if (in_command_window || bridge_resumed)
+        /* A PPU bridge-only store is staged until its publishing fence, which
+         * performs the wake. Completed non-PPU publications wake here. */
+        if (wake_transition)
             cv_wake_all(&jc->sync.cond);
         mx_unlock(&jc->sync.mutex);
     }
@@ -3217,7 +4457,42 @@ static void jobchain_notify_guest_write(u32 ea, u32 size)
 
 void cellSpursNotifyPpuGuestWrite(u32 ea, u32 size)
 {
-    cellSpursNotifyGuestWrite(ea, size);
+    cellSpursNotifyGuestWriteSource(ea, size, 1);
+}
+
+void cellSpursNotifyPpuFence(void)
+{
+    const u32 count = g_ppu_bridge_candidate_count;
+    if (!count) return;
+    u32 candidate[MAX_PPU_BRIDGE_CANDIDATES];
+    memcpy(candidate, g_ppu_bridge_candidate, count * sizeof(candidate[0]));
+    g_ppu_bridge_candidate_count = 0;
+    atomic_thread_fence(memory_order_seq_cst);
+    if (jobchain_bridge_disabled()) return;
+    u32 routed = 0;
+    for (u32 p = 0; p < count; ++p) {
+        GuestWriteTargets targets;
+        if (guest_write_route_lookup(candidate[p] + 0x10u, 8u, &targets))
+            routed |= targets.jobchain_bridges;
+    }
+    while (routed) {
+        u64 routed64 = routed;
+        const u32 i = guest_write_take_bit64(&routed64);
+        routed &= ~(1u << i);
+        JobChainState* jc = &g_jobchains[i];
+        if (!jc->sync.live) continue;
+        int resumed = 0;
+        mx_lock(&jc->sync.mutex);
+        for (u32 p = 0; p < count; ++p) {
+            GuestWriteTargets targets;
+            guest_write_route_lookup(candidate[p] + 0x10u, 8u, &targets);
+            if (targets.jobchain_bridges & (1u << i))
+                resumed |= jobchain_resume_pending_ticket_locked(
+                    jc, candidate[p], JC_BRIDGE_PPU_FENCE) != 0;
+        }
+        if (resumed) cv_wake_all(&jc->sync.cond);
+        mx_unlock(&jc->sync.mutex);
+    }
 }
 
 static JobChainState* jobchain_find(const void* key)
@@ -3247,6 +4522,20 @@ int yz_spurs_jobchain_is_parked_at(CellSpursJobChain* object, u32 ea)
     mx_unlock(&jc->sync.mutex);
     return parked;
 }
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+int yz_spurs_test_pending_snapshot_count(CellSpursJobChain* object)
+{
+    JobChainState* jc = jobchain_find(object);
+    if (!jc) return -1;
+    int count = 0;
+    mx_lock(&jc->sync.mutex);
+    for (PendingJobSnapshot* snapshot = jc->pending_snapshot_head;
+         snapshot; snapshot = snapshot->next)
+        ++count;
+    mx_unlock(&jc->sync.mutex);
+    return count;
+}
+#endif
 static JobChainState* jobchain_make(void* key)
 {
     registry_init(); mx_lock(&g_registry_mutex);
@@ -3266,18 +4555,20 @@ static JobGuardState* jobguard_make(void* key)
     mx_unlock(&g_registry_mutex); return g;
 }
 
-static void jobguard_notify_guest_write(u32 ea, u32 size)
+static void jobguard_notify_guest_write(u32 ea, u32 size, u64 mask)
 {
     const u64 first = ea;
     const u64 last = first + size;
-    for (u32 i = 0; i < MAX_JOB_GUARDS; ++i) {
+    while (mask) {
+        const u32 i = guest_write_take_bit64(&mask);
         JobGuardState* g = &g_jobguards[i];
         if (!g->sync.live || !g->sync.key) continue;
         const u64 guard_ea = guest_ea(g->sync.key);
         if (first >= guard_ea + 4u || last <= guard_ea) continue;
         mx_lock(&g->sync.mutex);
+        const u32 previous = g->count;
         g->count = rd32(g->sync.key);
-        if (!g->count)
+        if (previous && !g->count)
             cv_wake_all(&g->sync.cond);
         mx_unlock(&g->sync.mutex);
     }
@@ -3375,6 +4666,14 @@ s32 cellSpursCreateJobChainWithAttribute(CellSpurs* s, CellSpursJobChain* object
     memset(jc->command_state_ea, 0, sizeof(jc->command_state_ea));
     memset(jc->command_last_descriptor, 0,
            sizeof(jc->command_last_descriptor));
+    memset(jc->command_last_binary, 0,
+           sizeof(jc->command_last_binary));
+    memset(jc->command_last_binary_blocks, 0,
+           sizeof(jc->command_last_binary_blocks));
+    memset(jc->command_last_job_type, 0,
+           sizeof(jc->command_last_job_type));
+    memset(jc->command_last_identity_valid, 0,
+           sizeof(jc->command_last_identity_valid));
     memset(jc->command_last_dispatch_sequence, 0,
            sizeof(jc->command_last_dispatch_sequence));
     jc->command_dispatch_sequence_next = 0;
@@ -3416,6 +4715,13 @@ s32 cellSpursCreateJobChainWithAttribute(CellSpurs* s, CellSpursJobChain* object
     wr64(object->bytes + 0x78, guest_ea(s));
     wr32(object->bytes + 0x90, rd32(a->bytes + 0x04));
     object->bytes[0x94] = a->bytes[0x3c] ? 2 : 0;
+    {
+        const u32 index = (u32)(jc - g_jobchains);
+        guest_write_route_begin_target(
+            GUEST_WRITE_ROUTE_JOBCHAIN_COMMAND, index);
+        guest_write_route_begin_target(
+            GUEST_WRITE_ROUTE_JOBCHAIN_BRIDGE, index);
+    }
     jobchain_watch_ea_locked(jc, jc->entry_ea);
     if (native_trace_enabled())
         fprintf(stderr,
@@ -3434,6 +4740,42 @@ static u32 job_alloc(u32* cursor, u32 limit, u32 size, u32 alignment)
     if (at > limit || size > limit - at) return 0;
     *cursor = at + size;
     return at;
+}
+
+/* Mirror the native runner's LS allocation without writing anything. SPURS
+ * jobchains have two standard binary slots; large jobs may fit at only one of
+ * them once their input, cache, scratch and stack reservations are included.
+ * Blind alternation is therefore not a valid slot-selection rule. */
+static int job_layout_fits(const u8* d, u32 bin_size,
+                           u32 dma_list_size, u32 cache_list_size, u32 slot)
+{
+    const u32 descriptor_ls = 0x3f000;
+    const u32 size_io = rd32(d + 0x14) & 0x3ffffu;
+    const u32 size_out = rd32(d + 0x18) & 0x3ffffu;
+    const u32 size_stack = rd16(d + 0x1c) ?
+                           (u32)rd16(d + 0x1c) * 16u : 8192u;
+    const u32 size_scratch = (u32)rd16(d + 0x1e) * 16u;
+    /* The SPU ABI's initial stack consists of a minimal caller frame, a
+     * link-register save area and the entry frame's backchain. */
+    if (size_stack < 0x30u)
+        return 0;
+    if (bin_size > descriptor_ls - slot)
+        return 0;
+
+    u32 cursor = (slot + bin_size + 1023u) & ~1023u;
+    if (size_io && !job_alloc(&cursor, descriptor_ls, size_io, 1024))
+        return 0;
+    if (size_out && !job_alloc(&cursor, descriptor_ls, size_out, 1024))
+        return 0;
+    for (u32 i = 0; i < cache_list_size / 8; ++i) {
+        const u64 item = rd64(d + 0x30 + dma_list_size + i * 8);
+        const u32 item_size = (u32)(item >> 32);
+        if (item_size && !job_alloc(
+                &cursor, descriptor_ls, item_size, 1024))
+            return 0;
+    }
+    return job_alloc(&cursor, descriptor_ls,
+                     size_scratch + size_stack, 1024) != 0;
 }
 
 static void job_publish_copy_internal(u32 ea, const void* source, u32 size,
@@ -3486,6 +4828,30 @@ static int job_io_trace_enabled(void)
     if (enabled < 0)
         enabled = getenv("YZ_NATIVE_SPURS_JOB_IO_TRACE") ? 1 : 0;
     return enabled;
+}
+
+static u32 job_io_trace_binary(void)
+{
+    static u32 binary;
+    static int configured;
+    if (!configured) {
+        const char* text = getenv("YZ_NATIVE_SPURS_JOB_IO_TRACE_BINARY");
+        binary = text && *text ? (u32)strtoul(text, NULL, 0) : 0x01252680u;
+        configured = 1;
+    }
+    return binary;
+}
+
+static u32 job_io_trace_min_kind(void)
+{
+    static u32 kind;
+    static int configured;
+    if (!configured) {
+        const char* text = getenv("YZ_NATIVE_SPURS_JOB_IO_TRACE_MIN_KIND");
+        kind = text && *text ? (u32)strtoul(text, NULL, 0) : 0u;
+        configured = 1;
+    }
+    return kind;
 }
 
 /* Kill-switch YZ_JOB_INOUT_WB=1 restores the RETIRED automatic inout
@@ -3642,9 +5008,8 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     const u8* const guest_descriptor = vm_base + descriptor_ea;
     if (acquired_descriptor)
         memcpy(descriptor_copy, acquired_descriptor, descriptor_size);
-    else if (!job_descriptor_copy_stable(descriptor_ea,
-                                         (u16)descriptor_size,
-                                         descriptor_copy))
+    else if (!job_descriptor_acquire_published(
+                 descriptor_ea, (u16)descriptor_size, descriptor_copy))
         return CELL_SPURS_JOB_ERROR_FAULT;
     const u8* const d = descriptor_copy;
     /* 2026-08-05 (audit H1 / task-ledger #16): jobType at d[0x2C] selects
@@ -3675,7 +5040,16 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                 "[native-spurs-trace] job-start descriptor=0x%08X "
                 "bin=0x%08X size=0x%X slot=0x%05X\n",
                 descriptor_ea, bin_ea, bin_size, jc->alternate_slot);
-    if (!bin_ea || !bin_size) return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+    if (!bin_ea || !bin_size) {
+        fprintf(stderr,
+                "[native-spurs] incomplete job descriptor publication: "
+                "descriptor=0x%08X bin=0x%08X blocks=0x%X "
+                "kind=0x%08X ready=0x%08X\n",
+                descriptor_ea, bin_ea, bin_size / 16u,
+                rd32(d + 0x10), rd32(d + 0x14));
+        fflush(stderr);
+        return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+    }
     if (!job_guest_range_valid(bin_ea, bin_size))
         return CELL_SPURS_JOB_ERROR_FAULT;
     const u32 dma_list_size = rd16(d + 0x0a);
@@ -3685,12 +5059,64 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
         cache_list_size / 8 > 4)
         return CELL_SPURS_JOB_ERROR_DESCRIPTOR;
     spu_workload_image image;
-    if (!spu_workload_resolve(vm_base + bin_ea, bin_size, &image))
+    if (!spu_workload_resolve(vm_base + bin_ea, bin_size, &image)) {
+        const u64 fingerprint = spu_workload_fingerprint(
+            vm_base + bin_ea, bin_size);
+        unknown_job_capture(
+            descriptor_ea, descriptor_size, bin_ea, bin_size,
+            fingerprint, jc->alternate_slot);
+        fprintf(stderr,
+                "[native-spurs] unregistered job image: descriptor=0x%08X "
+                "bin=0x%08X size=0x%X fingerprint=0x%016llX "
+                "next-slot=0x%05X; extract/lift this exact binary and add "
+                "both native alternate-slot placements\n",
+                descriptor_ea, bin_ea, bin_size,
+                (unsigned long long)fingerprint,
+                jc->alternate_slot);
+        fflush(stderr);
         return CELL_SPURS_JOB_ERROR_INVALID_BIN;
+    }
+    const u32 size_io = rd32(d + 0x14) & 0x3ffffu;
+    const u32 size_out = rd32(d + 0x18) & 0x3ffffu;
+    const u32 size_stack = rd16(d + 0x1c) ?
+                           (u32)rd16(d + 0x1c) * 16u : 8192u;
+    const u32 size_scratch = (u32)rd16(d + 0x1e) * 16u;
+    const u32 preferred_slot = jc->alternate_slot;
+    const u32 fallback_slot =
+        preferred_slot == 0x4c00u ? 0xe400u : 0x4c00u;
+    u32 slot = preferred_slot;
+    if (!job_layout_fits(
+            d, bin_size, dma_list_size, cache_list_size, slot)) {
+        if (!job_layout_fits(
+                d, bin_size, dma_list_size, cache_list_size,
+                fallback_slot)) {
+            fprintf(stderr,
+                    "[native-spurs] job LS layout does not fit either slot: "
+                    "descriptor=0x%08X bin=0x%08X/0x%X io=0x%X "
+                    "out=0x%X stack=0x%X scratch=0x%X cache-list=0x%X\n",
+                    descriptor_ea, bin_ea, bin_size, size_io, size_out,
+                    size_stack, size_scratch, cache_list_size);
+            return CELL_SPURS_JOB_ERROR_NOMEM;
+        }
+        slot = fallback_slot;
+        {
+            /* A large load batch can contain thousands of descriptors with
+             * the same valid fallback.  Logging every one materially starves
+             * the renderer during the Frontier transition, so retain an
+             * exponentially sampled audit trail instead. */
+            static atomic_uint fallback_slot_n;
+            const unsigned k = atomic_fetch_add(&fallback_slot_n, 1u);
+            if (k < 16u || (k & (k + 1u)) == 0u) {
+                fprintf(stderr,
+                        "[native-spurs] job 0x%08X does not fit preferred "
+                        "LS slot 0x%05X; using 0x%05X (#%u)\n",
+                        descriptor_ea, preferred_slot, slot, k + 1u);
+            }
+        }
+    }
     spu_context* ctx = (spu_context*)malloc(sizeof(*ctx));
     if (!ctx) return CELL_SPURS_JOB_ERROR_NOMEM;
     spu_context_init(ctx, 0);
-    u32 slot = jc->alternate_slot;
     jc->alternate_slot = slot == 0x4c00 ? 0xe400 : 0x4c00;
     /* Current title lifts give overlapping placements distinct image ids.
      * Select from the exact descriptor identity and the native scheduler's
@@ -3703,11 +5129,6 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
 
     const u32 context_ls = 0x4940;
     const u32 descriptor_ls = 0x3f000;
-    const u32 size_io = rd32(d + 0x14) & 0x3ffffu;
-    const u32 size_out = rd32(d + 0x18) & 0x3ffffu;
-    const u32 size_stack = rd16(d + 0x1c) ?
-                           (u32)rd16(d + 0x1c) * 16u : 8192u;
-    const u32 size_scratch = (u32)rd16(d + 0x1e) * 16u;
     u32 cursor = (slot + bin_size + 1023u) & ~1023u;
     const u32 io_ls = job_alloc(&cursor, descriptor_ls, size_io, 1024);
     const u32 out_ls = job_alloc(&cursor, descriptor_ls, size_out, 1024);
@@ -3748,7 +5169,8 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     const u32 io_count = dma_list_size / 8;
     static atomic_uint job_io_trace_count;
     const unsigned job_io_trace_index =
-        (job_io_trace_enabled() && bin_ea == 0x01252680u)
+        (job_io_trace_enabled() && bin_ea == job_io_trace_binary() &&
+         rd32(d + 0x10) >= job_io_trace_min_kind())
             ? atomic_fetch_add(&job_io_trace_count, 1u)
             : ~0u;
     if (job_io_trace_index < 32u) {
@@ -3761,6 +5183,13 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                 io_count, rd32(d + 0x10), d[0x2c],
                 descriptor_size >= 0x38 ? rd32(d + 0x30) : 0,
                 descriptor_size >= 0x38 ? rd32(d + 0x34) : 0);
+        for (u32 offset = 0; offset < descriptor_size; offset += 16u) {
+            fprintf(stderr,
+                    "[native-job-io] #%u desc+%03X %08X %08X %08X %08X\n",
+                    job_io_trace_index, offset,
+                    rd32(d + offset + 0u), rd32(d + offset + 4u),
+                    rd32(d + offset + 8u), rd32(d + offset + 12u));
+        }
     }
     for (u32 i = 0; i < io_count; ++i) {
         u64 item = rd64(d + 0x30 + i * 8);
@@ -3779,7 +5208,14 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                     item_size >= 8 ? rd32(vm_base + item_ea + 4) : 0,
                     io_ls + item_ls_offset);
         }
-        if (item_size > 0x4000u || (item_flags & 0x80000000u) ||
+        /* A DMA-list element's top bit is the MFC stall-and-notify flag,
+         * not part of its 15-bit transfer size.  The flag is legal on a
+         * zero-length final element (acceptance run 9 observed the title's
+         * exact 0x8000000000000001 sentinel); synchronous host acquisition
+         * has already completed by job entry, and hardware ignores a stall
+         * on the final element.  Keep rejecting the genuinely reserved bits
+         * between that flag and the transfer-size field. */
+        if (item_size > 0x4000u || (item_flags & 0x7fff8000u) ||
             (item_size && !item_ea) ||
             (item_size < 16u && item_size != 0u && item_size != 1u &&
              item_size != 2u && item_size != 4u && item_size != 8u) ||
@@ -3830,11 +5266,35 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     jc->next_dma_tag ^= 1u;
     wr64(ctx->ls + context_ls + 0x28, descriptor_ea);
 
+    ctx->native_job_descriptor_ea = descriptor_ea;
+    ctx->native_job_binary_ea = bin_ea;
+    ctx->native_job_descriptor_ls = descriptor_ls;
+    ctx->native_job_descriptor_size = descriptor_size;
+    ctx->native_job_context_ls = context_ls;
+    ctx->native_job_io_ls = io_ls;
+    ctx->native_job_io_size = size_io;
+
     const u32 job_io_trace_input_hash = job_io_trace_index < 32u
         ? job_io_trace_hash(ctx->ls + io_ls, size_io) : 0;
 
     ctx->gpr[0]._u32[0] = 0x0a70;
-    ctx->gpr[1]._u32[0] = scratch_stack_ls + size_scratch + size_stack;
+    {
+        /* SPU ABI 2.5.1: entry starts 0x30 below the stack boundary.  The
+         * initial frame points to the minimal root frame at end-0x10, whose
+         * backchain is NULL; end-0x20 is reserved for the entry LR save.
+         * Placing r1 at stack_end made an ordinary stqd r0,0x10(r1)
+         * overwrite the following LS allocation (Frontier's descriptor when
+         * a job layout ended exactly at 0x3f000). */
+        const u32 stack_end =
+            scratch_stack_ls + size_scratch + size_stack;
+        const u32 initial_sp = stack_end - 0x30u;
+        const u32 root_sp = stack_end - 0x10u;
+        wr32(ctx->ls + initial_sp, root_sp);
+        wr32(ctx->ls + root_sp, 0u);
+        ctx->gpr[1]._u32[0] = initial_sp;
+        /* ABI word element 1 is Available Stack Space. */
+        ctx->gpr[1]._u32[1] = size_stack;
+    }
     ctx->gpr[3]._u32[0] = context_ls;
     ctx->gpr[4]._u32[0] = descriptor_ls;
     ctx->native_spurs_syscall = job_return_syscall;
@@ -3960,7 +5420,9 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
      * set at job end while the boot stays healthy), or nobody (the wedge).
      * io0 identifies whether the slot itself is an inout item — the path
      * by which the retired write-back used to publish the LS-side zero. */
-    {
+#if !defined(YZ_PERF_CLEAN)
+    if (g_jobdone_diag_output) {
+        FILE* const output = g_jobdone_diag_output;
         static atomic_uint jobdone_any_n, jobdone_ring_n, jobdone_stale_n;
         const u32 d10_now = rd32(vm_base + descriptor_ea + 0x10);
         const u32 d10_ls = rd32(ctx->ls + descriptor_ls + 0x10);
@@ -3990,7 +5452,7 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
             load_kind ? &jobdone_load_n :
             in_ring ? &jobdone_ring_n : &jobdone_any_n, 1u);
         if (k < (stale || load_kind ? 64u : 24u)) {
-            fprintf(stderr,
+            fprintf(output,
                     "[jobdone]%s desc=%08X bin=%08X ok=%d d10 snap=%08X "
                     "now=%08X lsdesc=%08X io0=%08X/%X io0ls10=%08X\n",
                     stale ? " STALE" : load_kind ? " ringload" :
@@ -3998,21 +5460,20 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                     descriptor_ea, bin_ea, ok,
                     jobdone_d10_snap, d10_now, d10_ls,
                     io0_ea, io0_size, io0_ls10);
-            fflush(stderr);
         }
         {
             const unsigned t = atomic_fetch_add(&jobdone_total_n, 1u);
             if ((t & 2047u) == 2047u) {
-                fprintf(stderr,
+                fprintf(output,
                         "[jobdone] totals jobs=%u ring=%u ringload=%u "
                         "stale=%u\n", t + 1u,
                         atomic_load(&jobdone_ring_n),
                         atomic_load(&jobdone_load_n),
                         atomic_load(&jobdone_stale_n));
-                fflush(stderr);
             }
         }
     }
+#endif
 
     if (job_io_trace_index < 32u) {
         fprintf(stderr,
@@ -4023,6 +5484,16 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
                 job_io_trace_input_hash,
                 job_io_trace_hash(ctx->ls + io_ls, size_io),
                 job_io_trace_hash(ctx->ls + out_ls, size_out));
+        if (!ok) {
+            for (u32 reg = 0; reg < 128u; ++reg) {
+                fprintf(stderr,
+                        "[native-job-io] #%u fail-r%03u="
+                        "%08X_%08X_%08X_%08X\n",
+                        job_io_trace_index, reg,
+                        ctx->gpr[reg]._u32[0], ctx->gpr[reg]._u32[1],
+                        ctx->gpr[reg]._u32[2], ctx->gpr[reg]._u32[3]);
+            }
+        }
         io_offset = 0;
         for (u32 i = 0; i < io_count; ++i) {
             const u64 item = rd64(d + 0x30 + i * 8);
@@ -4269,10 +5740,12 @@ static int wait_job_slot(JobChainState* jc, u32 pc, u64 empty_command)
         /* Timed: the producer's append may be an un-notified lifted vector
          * store (see cv_wait_ms). Every wake re-reads the slot. */
         cv_wait_ms(&jc->sync.cond, &jc->sync.mutex, 4u);
-        if (!jobchain_bridge_disabled() && jc->waiting_command &&
-            jobchain_resume_pending_ticket_locked(
-                jc, /*descriptor_filter=*/0, /*polled=*/1))
-            break;
+        /* Descriptor readiness is not a publication marker: the title writes
+         * it before the descriptor body and only publishes that body at a
+         * later PPU barrier. An unrestricted parked poll can therefore grab
+         * an internally consistent but incomplete descriptor. PPU writes are
+         * resumed by cellSpursNotifyPpuFence(); SPU DMA/HLE transfers are
+         * resumed by their completion notification. */
     }
     if (parked && !atomic_load(&jc->shutdown))
         spurs_set_workload_runnable(jc->spurs, jc->wid, 1);
@@ -4293,6 +5766,36 @@ static int wait_job_slot(JobChainState* jc, u32 pc, u64 empty_command)
                     : rd64(vm_base + pc)),
                 jc->command_snapshot_count);
     return CELL_OK;
+}
+
+/* A CALL command is the publication head for a dynamically assembled
+ * sub-list.  Per-store callbacks can schedule the native worker between that
+ * head store and the sub-list's final RET store, which is an ordering window
+ * real SPURS does not expose.  A zero still has legitimate NOP semantics, so
+ * give an active CALL frame a bounded acquisition grace rather than parking
+ * forever.  Immutable captures stop before zero; this live read is therefore
+ * able to observe the completing RET (or any other tail command). */
+static u64 jobchain_acquire_call_command(JobChainState* jc, u32 pc)
+{
+    for (u32 attempt = 0; attempt < 64u; ++attempt) {
+        const u64 first = rd64(vm_base + pc);
+        atomic_thread_fence(memory_order_seq_cst);
+#if defined(YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST)
+        extern void yz_spurs_call_tail_publication_test_hook(u32, u32);
+        yz_spurs_call_tail_publication_test_hook(pc, attempt);
+#endif
+        const u64 second = rd64(vm_base + pc);
+        atomic_thread_fence(memory_order_acquire);
+        if (first == second && first != 0u)
+            return first;
+        if (atomic_load(&jc->shutdown))
+            return 0;
+        if (attempt < 8u)
+            nthread_yield();
+        else
+            nthread_reschedule();
+    }
+    return rd64(vm_base + pc);
 }
 
 static u32 jobchain_get_current(JobChainState* jc)
@@ -4542,6 +6045,8 @@ static int execute_chain(JobChainState* jc)
         u64 publication_sequence = 0;
         const u8* acquired_descriptor = NULL;
         int acquired_descriptor_fault = 0;
+        int acquired_bridge_publication = 0;
+        int acquire_call_tail = 0;
         mx_lock(&jc->sync.mutex);
         if (jc->command_snapshot_index < jc->command_snapshot_count &&
             jc->command_snapshot[jc->command_snapshot_index].ea == pc) {
@@ -4557,6 +6062,9 @@ static int execute_chain(JobChainState* jc)
             else if (jc->command_snapshot[jc->command_snapshot_index]
                          .descriptor_status == 2)
                 acquired_descriptor_fault = 1;
+            acquired_bridge_publication =
+                jc->command_snapshot[jc->command_snapshot_index]
+                    .bridge_publication != 0;
             ++jc->command_snapshot_index;
         } else {
             jc->command_snapshot_count = 0;
@@ -4574,6 +6082,8 @@ static int execute_chain(JobChainState* jc)
                         jc->command_snapshot[0].descriptor;
                 else if (jc->command_snapshot[0].descriptor_status == 2)
                     acquired_descriptor_fault = 1;
+                acquired_bridge_publication =
+                    jc->command_snapshot[0].bridge_publication != 0;
                 jc->command_snapshot_index = 1;
             } else {
                 cmd = rd64(vm_base + pc);
@@ -4583,18 +6093,46 @@ static int execute_chain(JobChainState* jc)
                         jc->command_publication_sequence[command_slot];
             }
         }
+        acquire_call_tail = cmd == 0u && jc->call_depth != 0u;
+        if (acquire_call_tail) {
+            /* Do not hold the chain mutex while allowing the PPU producer to
+             * finish publishing the dynamic sub-list. */
+            mx_unlock(&jc->sync.mutex);
+            cmd = jobchain_acquire_call_command(jc, pc);
+            mx_lock(&jc->sync.mutex);
+        }
+        jobchain_discard_consumed_snapshot(
+            jc, pc, publication_sequence);
         jobchain_cancel_deferred_resume(jc, pc, publication_sequence);
         {
-            const int is_job = cmd && (cmd & 7u) == 0u;
+            const int is_job = job_command_is_job(cmd);
             const int command_slot = jobchain_command_slot(jc, pc, is_job);
             if (command_slot >= 0) {
                 atomic_store_explicit(&jc->command_consumed[command_slot], 1,
                                       memory_order_release);
-                if (is_job)
+                if (is_job) {
                     jc->command_last_descriptor[command_slot] = (u32)cmd;
-                if (is_job)
+                    const u8* identity = acquired_descriptor;
+                    u8 identity_copy[0x400];
+                    if (!identity && !acquired_descriptor_fault &&
+                        jc->descriptor_size <= sizeof(identity_copy) &&
+                        job_descriptor_copy_stable(
+                            (u32)cmd, jc->descriptor_size, identity_copy))
+                        identity = identity_copy;
+                    jc->command_last_identity_valid[command_slot] =
+                        identity != NULL;
+                    if (identity) {
+                        jc->command_last_binary[command_slot] =
+                            rd64(identity) & ~1ull;
+                        jc->command_last_binary_blocks[command_slot] =
+                            rd16(identity + 0x08);
+                        jc->command_last_job_type[command_slot] =
+                            jc->descriptor_size > 0x2cu ?
+                                identity[0x2c] : 0;
+                    }
                     jc->command_last_dispatch_sequence[command_slot] =
                         ++jc->command_dispatch_sequence_next;
+                }
             }
         }
         jobchain_watch_ea_locked(jc, pc);
@@ -4608,7 +6146,17 @@ static int execute_chain(JobChainState* jc)
             pc = jobchain_get_current(jc);
             continue;
         }
-        if (cmd && op == 0) {
+        if (job_command_is_partial_publication(cmd)) {
+            /* Narrow producer stores can leave the old empty-marker upper
+             * word paired with any new command lower word while the write
+             * callback is running.  Park on that exact mixed value until the
+             * command generation is complete. */
+            int rc = wait_job_slot(jc, pc, cmd);
+            if (rc) return rc;
+            pc = jobchain_get_current(jc);
+            continue;
+        }
+        if (job_command_is_job(cmd)) {
             if (acquired_descriptor_fault)
                 return CELL_SPURS_JOB_ERROR_FAULT;
             /* Pending-ticket bridge: keep every dispatched descriptor's
@@ -4622,6 +6170,8 @@ static int execute_chain(JobChainState* jc)
             int rc = run_job(jc, (u32)cmd, jc->descriptor_size,
                              acquired_descriptor);
             if (rc) return rc;
+            if (acquired_bridge_publication)
+                jobchain_note_bridge_success();
             pc += 8; jobchain_set_current(jc, pc); continue;
         }
         if (cmd == 0 || op == 2 || op == 5) {
@@ -4657,20 +6207,15 @@ static int execute_chain(JobChainState* jc)
                 return CELL_SPURS_JOB_ERROR_JOBLIST_ALIGN;
             if (!job_guest_range_valid(list, 16))
                 return CELL_SPURS_JOB_ERROR_FAULT;
-            u32 count = rd32(vm_base + list);
-            u32 list_descriptor_size = rd32(vm_base + list + 4);
-            u32 first = (u32)rd64(vm_base + list + 8);
-            if (list_descriptor_size < 0x30 ||
-                (list_descriptor_size & 0x0f))
-                return CELL_SPURS_JOB_ERROR_DESCRIPTOR;
-            const u64 list_bytes = (u64)count * list_descriptor_size;
-            if (!job_guest_range_valid(first, list_bytes))
-                return CELL_SPURS_JOB_ERROR_FAULT;
-            for (u32 i = 0; i < count; ++i) {
+            JobListView joblist;
+            int rc = joblist_acquire_published(jc, list, &joblist);
+            if (rc) return rc;
+            for (u32 i = 0; i < joblist.count; ++i) {
                 const u32 descriptor_ea =
-                    (u32)((u64)first + (u64)i * list_descriptor_size);
-                int rc = run_job(jc, descriptor_ea,
-                                  list_descriptor_size, NULL);
+                    (u32)((u64)joblist.first_descriptor +
+                          (u64)i * joblist.descriptor_size);
+                rc = run_job(jc, descriptor_ea,
+                             joblist.descriptor_size, NULL);
                 if (rc) return rc;
             }
             pc += 8; jobchain_set_current(jc, pc); continue;
@@ -4736,6 +6281,14 @@ static void jobchain_reset_run_locked(JobChainState* jc)
     memset(jc->command_state_ea, 0, sizeof(jc->command_state_ea));
     memset(jc->command_last_descriptor, 0,
            sizeof(jc->command_last_descriptor));
+    memset(jc->command_last_binary, 0,
+           sizeof(jc->command_last_binary));
+    memset(jc->command_last_binary_blocks, 0,
+           sizeof(jc->command_last_binary_blocks));
+    memset(jc->command_last_job_type, 0,
+           sizeof(jc->command_last_job_type));
+    memset(jc->command_last_identity_valid, 0,
+           sizeof(jc->command_last_identity_valid));
     memset(jc->command_last_dispatch_sequence, 0,
            sizeof(jc->command_last_dispatch_sequence));
     jc->command_dispatch_sequence_next = 0;
@@ -4757,11 +6310,21 @@ static void jobchain_reset_run_locked(JobChainState* jc)
     jc->bridge_hi = 0;
     jc->alternate_slot = 0x4c00;
     jc->next_dma_tag = 0;
+    {
+        const u32 index = (u32)(jc - g_jobchains);
+        /* Retire exact command/descriptor watches from the previous run.
+         * Append-only router entries remain harmless because their generation
+         * no longer matches this target. */
+        guest_write_route_begin_target(
+            GUEST_WRITE_ROUTE_JOBCHAIN_COMMAND, index);
+        guest_write_route_begin_target(
+            GUEST_WRITE_ROUTE_JOBCHAIN_BRIDGE, index);
+    }
     jobchain_watch_ea_locked(jc, jc->entry_ea);
 }
 static void jobchain_run(JobChainState* jc)
 {
-#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32) && !defined(YZ_PERF_CLEAN)
     fprintf(stderr,
             "[native-spurs-profile] jobchain=0x%08X host_tid=%lu\n",
             guest_ea(jc->sync.key), GetCurrentThreadId());
@@ -4872,6 +6435,12 @@ s32 cellSpursJobGuardInitialize(const CellSpursJobChain* chain,
     wr64(object->bytes + 0x08, guest_ea(chain));
     object->bytes[0x13] = request;
     object->bytes[0x23] = auto_reset;
+    {
+        const u32 index = (u32)(g - g_jobguards);
+        guest_write_route_begin_target(GUEST_WRITE_ROUTE_JOBGUARD, index);
+        guest_write_route_watch(GUEST_WRITE_ROUTE_JOBGUARD, index,
+                                guest_ea(object), sizeof(u32));
+    }
     return CELL_OK;
 }
 s32 cellSpursJobGuardNotify(CellSpursJobGuard* object)
