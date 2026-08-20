@@ -16,9 +16,11 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "edge_journal_hle.h"
+#include "rsx_wait_classifier.h"
 
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
+#include "ps3emu/yz_fe0_timeline.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
@@ -2787,8 +2789,9 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int fps = (int)(movie_framerate(mv) + 0.5);
     if (fps <= 0) fps = 30;
     const int mwply_hle = yz_movie_hle_armed();
-    const int accept_fast = getenv("YZ_A010_ACCEPT_FAST") &&
-        (strstr(path, "hd_sega_logo") || strstr(path, "advertise.sfd"));
+    const int accept_fast = getenv("YZ_FRONTIER_ACCEPT_FAST") ||
+        (getenv("YZ_A010_ACCEPT_FAST") &&
+         (strstr(path, "hd_sega_logo") || strstr(path, "advertise.sfd")));
     /* Decode the first picture before starting the audio clock. MPEG frame
      * startup can cost roughly one frame, which otherwise makes audio lead
      * from the first visible image even though steady-state cadence is sound. */
@@ -2818,6 +2821,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     int cancelled = 0;
     int skip_requested = 0;
     int skip_guest_acked = 0;
+    int skip_stop_queued = 0;
     int natural_completion = 0;
 
     InterlockedExchange(&g_movie_present_timescale, fps);
@@ -2855,7 +2859,23 @@ static void yz_play_queued_movie(const char* path, LONG serial)
             cellPad_host_movie_skip_guest_seen()) {
             skip_guest_acked = 1;
             fprintf(stderr,
-                    "[movie] guest received Start; awaiting Stop/Close serial=%ld\n",
+                    "[movie] guest received Start serial=%ld\n",
+                    serial);
+            fflush(stderr);
+        }
+        if (skip_guest_acked && !skip_stop_queued && !mwply_hle) {
+            /* The legacy fd bridge cannot rely on the original player to
+             * translate a guest-visible Start edge into Stop while the host
+             * owns presentation.  Queue the same guest-thread Stop wrapper
+             * used at natural EOS, but only after both host edge detection
+             * and cellPadGetData prove that this is a fresh, guest-visible
+             * press.  This preserves the held-button guard at movie entry
+             * and keeps all CRI lifecycle calls on their owning PPU thread. */
+            skip_stop_queued = 1;
+            InterlockedExchange(&g_yz_movie_stop_pending_serial, serial);
+            fprintf(stderr,
+                    "[movie] guest-confirmed Start; queued guest-thread "
+                    "mwPlyStop wrapper serial=%ld\n",
                     serial);
             fflush(stderr);
         }
@@ -3110,6 +3130,7 @@ static DWORD WINAPI yz_window_thread(LPVOID)
 #if defined(YZ_PERF_PROFILE)
     spu_perf_dump();
 #endif
+    yz_rsx_wait_classifier_shutdown_serialized();
     fprintf(stderr, "[window] closed; terminating host process\n");
     fflush(stderr);
     /* Exit dump (reason 3): ExitProcess skips CRT atexit, and the stall
@@ -3236,6 +3257,22 @@ static int yz_a010_fifo_publication_repair_enabled(void)
         getenv("YZ_A010_MISSING_REL") ? 1 : 0;
     return enabled;
 #endif
+}
+
+/* Historical FE0 recovery re-ran the complete user callback whenever an
+ * acquire found all five image-4 tasks parked.  The callback itself signals
+ * all five tasks, so each retry injected another complete workload round and
+ * masked the barrier's real lifted-SPU -> taskset signal publication.  Exact
+ * taskset guest-write routing now carries that edge.  Keep the old replay as
+ * an explicit diagnostic fallback only; production never redelivers a
+ * callback that has already completed. */
+static int yz_fe0_callback_replay_enabled(void)
+{
+    static const int enabled = [] {
+        const char* value = getenv("YZ_FE0_CALLBACK_REPLAY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
 }
 
 static int64_t yz_rsx_ev_send(uint64_t bits)
@@ -3446,7 +3483,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     switch (method) {
     case 0xEB00:                                  /* GCM_SET_USER_COMMAND (user interrupt) */
     case 0xEB04: {
-        /* s22 ROOT FIX (2026-07-08): the RSX USER INTERRUPT — the mechanism the
+        /* s22 ROOT FIX: the RSX USER INTERRUPT — the mechanism the
          * game uses to pump its wid4 SPU decode pool. The game registers
          * func_00E7DB10 (the ONLY _cellSpursSendSignal path in the EBOOT) via
          * cellGcmSetUserHandler (handlers bit 0x80, measured 0x86 live), then
@@ -3486,6 +3523,9 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         }
         vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
 #ifdef YZ_NATIVE_GCM
+        yz_fe0_timeline_emit(YZ_FE0_EVENT_UCMD_DISPATCH, arg, method,
+                             yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e,
+                             0, 0);
         cellGcmDispatchUserCommand(arg);
         { static unsigned long un = 0; un++;
           if (un <= 40 || (un & 0xFFu) == 0) {
@@ -3632,7 +3672,8 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
                  * two-second spacing also prevents a slow live worker from
                  * receiving a burst of duplicate callbacks.
                  */
-                if (lag != 0u && lag <= 8u &&
+                if (yz_fe0_callback_replay_enabled() &&
+                    lag != 0u && lag <= 8u &&
                     vm_read32(RSX_DRIVER_INFO + 0x12CCu) == arg &&
                     (uint32_t)_InterlockedCompareExchange(
                         &g_yz_ucmd_handler_completed, 0, 0) == arg &&
@@ -5850,6 +5891,20 @@ static void yz_rsx_fifo_lock_ensure(void)
     InitOnceExecuteOnce(&g_rsx_fifo_once, yz_rsx_fifo_init_cb, NULL, NULL);
 }
 
+extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
+{
+    if (!g_yz_rsx_wait_classifier_enabled &&
+        !g_yz_fe0_timeline_enabled)
+        return;
+    yz_rsx_fifo_lock_ensure();
+    EnterCriticalSection(&g_rsx_fifo_lock);
+    if (g_yz_rsx_wait_classifier_enabled)
+        yz_rsx_wait_classifier_shutdown();
+    if (g_yz_fe0_timeline_enabled)
+        yz_fe0_timeline_shutdown();
+    LeaveCriticalSection(&g_rsx_fifo_lock);
+}
+
 /* Exported for the flow-control band-aid (main.cpp yz_flip_advance). Audit
  * 2026-07-01: the band-aid wrote GET and the fence with NO lock, racing this
  * consumer's read-decide-write window -- GET could be clobbered BACKWARD
@@ -6018,19 +6073,52 @@ extern "C" volatile long g_yz_t1_sample_seq;
 extern "C" volatile void* g_yz_t1_last_tf;   /* s25 spin-witness feed (dispatch.cpp) */
 extern "C" volatile uint32_t g_yz_jrnl_cur_ea;  /* s34 live journal-consumer cursor EA (spu_channels.c / spu_dma.h) */
 
-/* Process exactly ONE FIFO command at GET (self-locked). Returns 1 if it made
- * progress (GET advanced / a method dispatched), 0 if idle or stalled (drained,
- * parked on a stopper, segment not finalised, off-ring, or an unsatisfied
- * semaphore). The RPCS3 run_FIFO step, factored out of the old consumer loop so
+/* Process exactly ONE FIFO command at GET (self-locked). Returns an observation
+ * category: ADVANCING if GET advanced / a method dispatched, otherwise the
+ * precise reason it remained idle or stalled. The RPCS3 run_FIFO step, factored
+ * out of the old consumer loop so
  * it can run EITHER on the free-running async thread OR inline on the producer
  * thread (YZ_RSX_INLINE: drain coupled to the producer's PUT flush so it can't lap). */
-static int yz_rsx_fifo_step(void)
+template <bool WaitClassify>
+static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
 {
+    if (!g_rsx_ctx_ready) {
+        if constexpr (WaitClassify) {
+            yz_rsx_wait_classifier_record(
+                YZ_RSX_WAIT_NO_CONTEXT, 0,
+                rsx_live_draw_get_completed_draws(), 0, 0);
+        }
+        return YZ_RSX_WAIT_NO_CONTEXT;
+    }
     EnterCriticalSection(&g_rsx_fifo_lock);
     uint32_t       get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
     const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
+    uint32_t wait_dispatched_methods = 0;
+    const auto transition = [](yz_rsx_wait_category category) {
+        if constexpr (WaitClassify)
+            yz_rsx_wait_classifier_transition(category);
+    };
+    const auto finish = [&](yz_rsx_wait_category category) {
+        if constexpr (WaitClassify) {
+            yz_rsx_wait_classifier_record(
+                category, wait_dispatched_methods,
+                rsx_live_draw_get_completed_draws(), put, 1);
+        }
+        LeaveCriticalSection(&g_rsx_fifo_lock);
+        return category;
+    };
+#if defined(YZ_PERF_CLEAN)
+    /* This is a read-only lifetime test on the per-command production path.
+     * InterlockedCompareExchange emits a locked read/modify/write even when
+     * both operands are zero; the Akiyama production profile attributed
+     * 0.715 CPU-s here.  ReadAcquire preserves the publication ordering and
+     * aligned 32-bit atomicity without taking cache-line ownership.  Keep the
+     * interlocked diagnostic posture outside the clean performance build. */
+    const int a010_root = ReadAcquire(&g_yz_a010_root_active) != 0;
+#else
     const int a010_root =
         InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0;
+#endif
     static unsigned long a010_packet_n = 0;
     static unsigned long a010_arg_n = 0;
     static unsigned long a010_jump_n = 0;
@@ -6106,7 +6194,8 @@ static int yz_rsx_fifo_step(void)
               fflush(stderr); } } }
 
     /* FIFO_EMPTY: ring drained. Never reach/pass PUT. (RPCS3 read(): put==get) */
-    if (get == put) { LeaveCriticalSection(&g_rsx_fifo_lock); return 0; }
+    if (get == put)
+        return finish(YZ_RSX_WAIT_EMPTY);
 
     const uint32_t ea = yz_rsx_io_to_ea(get);
     if (!ea) {
@@ -6116,23 +6205,37 @@ static int yz_rsx_fifo_step(void)
                 fprintf(stderr, "[rsx] GET=0x%08X off-ring -> resync to PUT 0x%08X (recover)\n", get, put); }
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
             g_fifo_ret = ~0u;
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 1;
+            return finish(YZ_RSX_WAIT_ADVANCING);
         }
         static int warned = 0;
         if (!warned) { warned = 1;
             fprintf(stderr, "[rsx] GET=0x%08X (PUT=0x%08X) not io-mapped; idling\n", get, put); }
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 0;
+        return finish(YZ_RSX_WAIT_BAD_FLOW);
     }
 
     const uint32_t cmd = vm_read32(ea);
+    if constexpr (WaitClassify) {
+        const yz_rsx_stopper_wait observed = {
+            get, ea, put, (put - get + 0x800000u) & 0x7FFFFFu, cmd
+        };
+        /* If a previously observed stopper was patched, retain the published
+         * exit word/PUT without taking a timestamp.  A later genuine phase
+         * transition closes the episode. */
+        yz_rsx_wait_classifier_stopper_observe(&observed, 0);
+    }
 
     /* ---- control transfer ---- */
     if ((cmd & 0xE0000003u) == 0x20000000u || (cmd & 3u) == 1u) {   /* old | new jump */
         uint32_t tgt = (cmd & 3u) == 1u ? (cmd & 0xFFFFFFFCu)   /* NEW offset mask */
                                        : (cmd & 0x1FFFFFFCu);  /* OLD offset mask */
         if (tgt == get) {
+            if constexpr (WaitClassify) {
+                const yz_rsx_stopper_wait stopper = {
+                    get, ea, put,
+                    (put - get + 0x800000u) & 0x7FFFFFu, cmd
+                };
+                yz_rsx_wait_classifier_stopper_observe(&stopper, 1);
+            }
             /* The reserved default-buffer head is initially guarded by a
              * self-jump.  Release only that startup guard from the consumer
              * side, after PUT proves a later command boundary was published.
@@ -6160,8 +6263,7 @@ static int yz_rsx_fifo_step(void)
                                     get, put);
                             fflush(stderr);
                         }
-                        LeaveCriticalSection(&g_rsx_fifo_lock);
-                        return 1;
+                        return finish(YZ_RSX_WAIT_ADVANCING);
                     }
                 }
             }
@@ -6435,8 +6537,7 @@ static int yz_rsx_fifo_step(void)
             const uint32_t ring  = 0x800000u;
             const uint32_t ahead = (put - get + ring) % ring;   /* PUT distance ahead of GET (ring-wrapped) */
             if (yz_a010_missing_release_try(ea, get, put)) {
-                LeaveCriticalSection(&g_rsx_fifo_lock);
-                return 1;
+                return finish(YZ_RSX_WAIT_ADVANCING);
             }
             if (journal_hle) {
                 if (ahead != 0u && ahead < (ring >> 1) &&
@@ -6445,14 +6546,12 @@ static int yz_rsx_fifo_step(void)
                      * wrote the faithful jump-forward release word. Advance GET
                      * past the released stopper exactly like the lever does. */
                     vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
-                    LeaveCriticalSection(&g_rsx_fifo_lock);
-                    return 1;
+                    return finish(YZ_RSX_WAIT_ADVANCING);
                 }
                 /* Never fall through to a release-only lever while the HLE owns
                  * the recovery decision. Unsupported entries intentionally stay
                  * parked so a partial journal can never reach RSX. */
-                LeaveCriticalSection(&g_rsx_fifo_lock);
-                return 0;
+                return finish(YZ_RSX_WAIT_SELF_STOPPER);
             }
             const uint32_t rel_entry = ((apply || parked3s || parkedfast) && ahead != 0u && ahead < (ring >> 1))
                                            ? yz_gcm_stopper_release_entry(ea) : 0u;
@@ -6500,8 +6599,7 @@ static int yz_rsx_fifo_step(void)
                    * journal consumer did NOT release this stopper. Sampled so a
                    * long boot can't exhaust the dump's 64-print cap. */
                   if (n == 1 || (n & 63u) == 0u) yz_w2life_dump("lever"); }
-                LeaveCriticalSection(&g_rsx_fifo_lock);
-                return 1;
+                return finish(YZ_RSX_WAIT_ADVANCING);
             }
             if (parked3s) {   /* parked past threshold but NO journal entry: say so once per EA
                                * (discriminates "deferred entry exists" from "immediate release
@@ -6512,8 +6610,7 @@ static int yz_rsx_fifo_step(void)
                             get, ahead); fflush(stderr); }
             }
             /* not yet committed (no tag-0x7F entry, or PUT not past) -- spin in place */
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 0;
+            return finish(YZ_RSX_WAIT_SELF_STOPPER);
         }
         /* a010 missing generated-link patch.  A clean replay followed
          * 0x205E1BA0 directly into vertex-program payload (0x60405F80);
@@ -6559,11 +6656,9 @@ static int yz_rsx_fifo_step(void)
             if (put != get && pea) {
                 vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, put);
                 g_fifo_ret = ~0u;
-                LeaveCriticalSection(&g_rsx_fifo_lock);
-                return 1;
+                return finish(YZ_RSX_WAIT_ADVANCING);
             }
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 0;
+            return finish(YZ_RSX_WAIT_BAD_FLOW);
         }
         if (yz_fifo_flowlog()) {
             fprintf(stderr, "[fifo-flow] JUMP io=0x%08X -> 0x%08X (word 0x%08X)\n", get, tgt, cmd);
@@ -6588,14 +6683,12 @@ static int yz_rsx_fifo_step(void)
         g_fifo_last_flow_target = tgt;
         g_fifo_last_flow_kind = 1u;
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, tgt);
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 1;
+        return finish(YZ_RSX_WAIT_ADVANCING);
     }
     if ((cmd & 3u) == 2u) {                                          /* call */
         const uint32_t ctgt = cmd & 0x1FFFFFFCu;                     /* CALL offset mask */
         if (!yz_rsx_io_to_ea(ctgt)) {
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 0;
+            return finish(YZ_RSX_WAIT_BAD_FLOW);
         }
         if (g_fifo_ret != ~0u) {
             /* Nested CALL (s29, scratch/s29_terminal_park_re.md Q4a): RPCS3
@@ -6613,8 +6706,7 @@ static int yz_rsx_fifo_step(void)
                  * GET) -- the outer return address survives. Retry/escalate
                  * exactly like the RETURN-without-CALL path below. */
                 yz_fifo_ret_recover(get, "CALL-inside-subroutine");
-                LeaveCriticalSection(&g_rsx_fifo_lock);
-                return 0;
+                return finish(YZ_RSX_WAIT_BAD_FLOW);
             }
             /* flag off: preserve the pre-existing default (clobber-and-proceed),
              * now with the loud log above instead of silence. */
@@ -6643,8 +6735,7 @@ static int yz_rsx_fifo_step(void)
         g_fifo_last_flow_kind = 2u;
         g_fifo_ret = get + 4u;                /* one-level return */
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, ctgt);
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 1;
+        return finish(YZ_RSX_WAIT_ADVANCING);
     }
     if ((cmd & 0xFFFF0003u) == 0x00020000u) {                        /* return */
         if (g_fifo_ret != ~0u) {
@@ -6666,8 +6757,7 @@ static int yz_rsx_fifo_step(void)
             g_fifo_last_flow_kind = 3u;
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, g_fifo_ret);
             g_fifo_ret = ~0u;
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 1;
+            return finish(YZ_RSX_WAIT_ADVANCING);
         }
         /* s29 terminal park (scratch/s29_terminal_park_re.md): RPCS3 logs
          * "RET found without corresponding CALL" and calls recover_fifo() here
@@ -6680,8 +6770,7 @@ static int yz_rsx_fifo_step(void)
             fprintf(stderr, "[rsx] RETURN without CALL at io=0x%08X; idling\n", get); }
         if (yz_fifo_recover_ret_enabled())
             yz_fifo_ret_recover(get, "RETURN-without-CALL");
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 0;
+        return finish(YZ_RSX_WAIT_BAD_FLOW);
     }
 
     /* ---- method packet ---- */
@@ -6689,6 +6778,7 @@ static int yz_rsx_fifo_step(void)
      * tests, a finalised method has those bits clear. If set, GET reached the
      * end of finalised commands in this segment -- wait, don't parse data. */
     if (cmd & 0xA0030003u) {
+        transition(YZ_RSX_WAIT_UNFINALIZED_HOLE);
         /* s33 FIX (user-confirmed; scratch/s33_fifo_return_audit.md): the s28
          * default here modeled RPCS3's recover_fifo as "skip GET forward one
          * word" for illegal (cmd&3==3) headers. That MIS-MODELED the oracle —
@@ -6788,8 +6878,7 @@ static int yz_rsx_fifo_step(void)
             }
             g_fifo_ret = ~0u;
             fflush(stderr);
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 1;
+            return finish(YZ_RSX_WAIT_ADVANCING);
         }
         if (skip4 && (cmd & 3u) == 3u && now - stuck_t0 >= 30) {
             static unsigned long recn = 0; recn++;
@@ -6797,11 +6886,9 @@ static int yz_rsx_fifo_step(void)
                     recn, cmd, get);
             fflush(stderr);
             vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, get + 4u);
-            LeaveCriticalSection(&g_rsx_fifo_lock);
-            return 1;
+            return finish(YZ_RSX_WAIT_ADVANCING);
         }
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 0;
+        return finish(YZ_RSX_WAIT_UNFINALIZED_HOLE);
     }
 
     const uint32_t count   = (cmd >> 18) & 0x7FFu;
@@ -6824,8 +6911,7 @@ static int yz_rsx_fifo_step(void)
      * past the last committed word). Linear within a segment; wrap is handled
      * by the producer's JUMP. If PUT is mid-packet, wait. */
     if (count && get < put && pkt_end > put) {
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 0;
+        return finish(YZ_RSX_WAIT_PARTIAL_PACKET);
     }
 
     int stalled = 0;
@@ -7041,12 +7127,35 @@ static int yz_rsx_fifo_step(void)
         if (eff >= 0xE940u && eff <= 0xE95Cu)
             rsx_live_draw_set_fifo_position(get, put);
         stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
+        if (g_yz_fe0_timeline_enabled && eff == 0x068u) {
+            const uint32_t sem_addr =
+                yz_rsx_sem_addr(yz_rsx_sem_dma_406e,
+                                yz_rsx_sem_off_406e);
+            if (sem_addr == 0x10200FE0u) {
+                yz_fe0_timeline_rsx_acquire(
+                    yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e, sem_addr,
+                    val, vm_read32(sem_addr), stalled);
+            }
+        }
+        if constexpr (WaitClassify) {
+            ++wait_dispatched_methods;
+            if (eff == 0x068u) {
+                const uint32_t sem_addr =
+                    yz_rsx_sem_addr(yz_rsx_sem_dma_406e,
+                                    yz_rsx_sem_off_406e);
+                const yz_rsx_semaphore_wait semaphore = {
+                    yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e, sem_addr,
+                    val, sem_addr ? vm_read32(sem_addr) : 0u
+                };
+                yz_rsx_wait_classifier_semaphore_attempt(
+                    &semaphore, stalled);
+            }
+        }
     }
     if (stalled) {
         /* Leave GET on this packet header and retry (RPCS3: GET un-advanced on
          * an unsatisfied acquire) so the same method re-issues when ready. */
-        LeaveCriticalSection(&g_rsx_fifo_lock);
-        return 0;
+        return finish(YZ_RSX_WAIT_SEMAPHORE);
     }
     vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, pkt_end);
 
@@ -7102,8 +7211,14 @@ static int yz_rsx_fifo_step(void)
         }
     }
 
-    LeaveCriticalSection(&g_rsx_fifo_lock);
-    return 1;
+    return finish(YZ_RSX_WAIT_ADVANCING);
+}
+
+static yz_rsx_wait_category yz_rsx_fifo_step(void)
+{
+    return g_yz_rsx_wait_classifier_enabled
+        ? yz_rsx_fifo_step_impl<true>()
+        : yz_rsx_fifo_step_impl<false>();
 }
 
 /* Drain the FIFO inline until it stalls/drains (bounded). Called on the PRODUCER
@@ -7114,7 +7229,8 @@ extern "C" void yz_rsx_fifo_pump(void)
 {
     if (!g_rsx_ctx_ready) return;
     int budget = 4096, steps = 0;
-    while (budget-- > 0 && yz_rsx_fifo_step()) { steps++; }
+    while (budget-- > 0 &&
+           yz_rsx_fifo_step() == YZ_RSX_WAIT_ADVANCING) { steps++; }
     /* Lightweight liveness: total pump calls + total advanced steps, every 8192 calls. */
     static long calls = 0, total = 0; total += steps;
     if ((++calls & 0x1FFFu) == 1u)
@@ -7155,7 +7271,11 @@ static DWORD WINAPI yz_rsx_consumer(LPVOID)
     ULONGLONG idle_t0 = 0; uint32_t idle_get = ~0u;
     for (;;) {
         if (!g_rsx_ctx_ready) { SwitchToThread(); continue; }
-        if (yz_rsx_fifo_step()) { idle_t0 = 0; continue; }
+        const yz_rsx_wait_category result = yz_rsx_fifo_step();
+        if (result == YZ_RSX_WAIT_ADVANCING) {
+            idle_t0 = 0;
+            continue;
+        }
         const uint32_t g = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET);
         const ULONGLONG now = GetTickCount64();
         if (g != idle_get || !idle_t0) { idle_get = g; idle_t0 = now; }
@@ -7751,6 +7871,11 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
     static int started = 0;
     if (!started) {
         started = 1;
+        yz_fe0_timeline_init();
+        if (yz_rsx_wait_classifier_init()) {
+            yz_rsx_wait_classifier_set_completed_draw_baseline(
+                rsx_live_draw_get_completed_draws());
+        }
         rsx_state_init(&g_rsx_state);
         CreateThread(NULL, 0, yz_window_thread, NULL, 0, NULL);
         if (getenv("YZ_RSX_INLINE")) {
