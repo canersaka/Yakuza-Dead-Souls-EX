@@ -102,6 +102,10 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
  * and stopped producing. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);
 
+/* Monotonic count of draw groups actually submitted by the live renderer.
+ * Used by the optional FIFO wait aggregate; no synchronization or reset. */
+u64  rsx_live_draw_get_completed_draws(void);
+
 /* Profile-only access to the host thread that consumes the live FIFO and
  * presents game frames. Returns NULL outside the instrumented sampler build.
  * The opaque handle keeps windows.h out of this public header. */
