@@ -193,6 +193,10 @@ int main(void)
                  13, 0x1D800u, 0x0125DA80u, 22);
     expect_image("job C live-observed 1E800 slot",
                  24, 0x1E800u, 0x0125DA80u, 28);
+    expect_image("frontier Job E observed E400 slot",
+                 13, 0x0E400u, 0x01241400u, 49);
+    expect_image("frontier Job E native alternate 4C00 slot",
+                 49, 0x04C00u, 0x01241400u, 50);
     expect_image("unknown binary at shared entry",
                  13, 0x04C00u, 0x01250000u, -1);
     expect_image("descriptor outside job module",
@@ -274,6 +278,20 @@ int main(void)
                           4, 0x3C000u, 48);
     expect_resident_image("orphanage internal call at 3CC00",
                           4, 0x3CC00u, 46);
+    expect_resident_image("frontier Job E internal call at E400",
+                          5, 0x0E400u, 49);
+    expect_resident_image("frontier Job E internal call at 4C00",
+                          5, 0x04C00u, 50);
+
+    checks += 2;
+    if (spu_job_binary_slot(0x01241400u) != 5) {
+        fprintf(stderr, "FAIL frontier Job E family slot\n");
+        failures++;
+    }
+    if (spu_job_family_span(5) != 0x11280u) {
+        fprintf(stderr, "FAIL frontier Job E family span\n");
+        failures++;
+    }
 
     check_span_slot_consistency();
 

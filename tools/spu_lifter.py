@@ -867,6 +867,7 @@ class SPULifter:
                     pc_set = ""
                     callee = f"{self.func_prefix}{tgt:08X}(ctx);"
                 return (f"{link} {pc_set}{{ int32_t _si = (int32_t)ctx->image_id; "
+                        f"ctx->debug_indirect_source_pc = 0x{addr:X}u; "
                         f"ctx->host_depth++; "
                         f"{callee} SPU_DRAIN(ctx); "
                         f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
@@ -899,7 +900,8 @@ class SPULifter:
             else:
                 pc_set = ""
                 tgt_sym = f"{self.func_prefix}{tgt:08X}"
-            return (f"if ({cond}) {{ {pc_set}g_spu_trampoline_fn = {tgt_sym}; "
+            return (f"if ({cond}) {{ {pc_set}ctx->debug_indirect_source_pc = 0x{addr:X}u; "
+                    f"g_spu_trampoline_fn = {tgt_sym}; "
                     f"return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
@@ -916,14 +918,16 @@ class SPULifter:
             # `lqa $r0,savedContextLr; bi $r0`), flagged by
             # compute_bi_r0_jumps() — emit the unconditional indirect dispatch.
             if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return "SPU_RET(ctx);"
+                return f"ctx->debug_indirect_source_pc = 0x{addr:X}u; SPU_RET(ctx);"
             # Indirect tail branch: set pc and trampoline to the dispatcher,
             # then unwind so an enclosing SPU_DRAIN re-enters (no nesting).
-            return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"ctx->debug_indirect_source_pc = 0x{addr:X}u; "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
-            return ("ctx->pc = ctx->srr0; "
+            return (f"ctx->debug_indirect_source_pc = 0x{addr:X}u; "
+                    "ctx->pc = ctx->srr0; "
                     "g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
             link_rt = insn.raw & 0x7F
@@ -940,6 +944,7 @@ class SPULifter:
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
+                    f"ctx->debug_indirect_source_pc = 0x{addr:X}u; "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
@@ -950,6 +955,7 @@ class SPULifter:
             tr = f" spu_trace_rt(ctx, {link_rt});" if self.trace else ""
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X});{tr} "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+                    f"ctx->debug_indirect_source_pc = 0x{addr:X}u; "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
@@ -961,8 +967,10 @@ class SPULifter:
             # above: host return while a lifted call frame is live, dispatch
             # to r0 when the frame was consumed by a resume/restack unwind).
             if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return f"if ({cond}) SPU_RET(ctx);"
-            return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
+                return (f"if ({cond}) {{ ctx->debug_indirect_source_pc = 0x{addr:X}u; "
+                        f"SPU_RET(ctx); }}")
+            return (f"if ({cond}) {{ ctx->debug_indirect_source_pc = 0x{addr:X}u; "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
@@ -1018,7 +1026,8 @@ class SPULifter:
         else:
             pc_set = ""
             tgt_sym = f"{self.func_prefix}{tgt:08X}"
-        return f"{{ {pc_set}g_spu_trampoline_fn = {tgt_sym}; return; }}"
+        return (f"{{ {pc_set}ctx->debug_indirect_source_pc = 0x{site:X}u; "
+                f"g_spu_trampoline_fn = {tgt_sym}; return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
