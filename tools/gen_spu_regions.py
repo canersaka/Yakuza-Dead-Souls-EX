@@ -339,7 +339,11 @@ def main():
     seen_reg, by_pfx, spans = {}, {}, []
     fam_code_cache = {}
     for famname, fam in manifest["families"].items():
+        if fams and famname not in fams:
+            continue
         for plc in fam.get("images", fam.get("placements", [])):
+            if args.only and plc["stem"] not in args.only:
+                continue
             if plc.get("diag"):
                 try:
                     pfx, reg, _h = read_header_identity(
