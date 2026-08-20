@@ -17,18 +17,18 @@
       "kind": "elf",
       "description": "EBOOT-embedded SPURS task images, batch-lifted from scratch/spu_imgs (gen_spu_images.py command shape: --auto-functions <elf> --seed-all)",
       "images": [
-        { "stem": "gs_task",   "elf": "scratch/spu_imgs/spu_0003_at_0126A580.elf", "diag": "recomp_prx/gs_task.c",   "image_id": 0,  "expect_handedit": true,
+        { "stem": "gs_task",   "elf": "scratch/spu_imgs/spu_0003_at_0126A580.elf", "eboot_ea": "0x0127A580", "diag": "recomp_prx/gs_task.c",   "image_id": 0,  "expect_handedit": true,
           "conformance_entries": ["0x62F0", "0x6350", "0x6550", "0x69D8", "0x7B00"],
           "note": "reference model; yakuza/generated/fast/gs_task_fast.c is the validated region lift and is retained instead of the regenerated oracle" },
-        { "stem": "cri_audio", "elf": "scratch/spu_imgs/spu_0007_at_012A4980.elf", "diag": "recomp_prx/cri_audio.c", "image_id": 3 },
-        { "stem": "wkl4_task", "elf": "scratch/spu_imgs/spu_0005_at_01274200.elf", "diag": "recomp_prx/wkl4_task.c", "image_id": 4 },
-        { "stem": "spuimg_00", "elf": "scratch/spu_imgs/spu_0000_at_01266F00.elf", "diag": "recomp_prx/spuimg_00.c", "image_id": 5 },
-        { "stem": "spuimg_01", "elf": "scratch/spu_imgs/spu_0001_at_01268700.elf", "diag": "recomp_prx/spuimg_01.c", "image_id": 6 },
-        { "stem": "spuimg_02", "elf": "scratch/spu_imgs/spu_0002_at_01268E80.elf", "diag": "recomp_prx/spuimg_02.c", "image_id": 7 },
-        { "stem": "spuimg_04", "elf": "scratch/spu_imgs/spu_0004_at_01273300.elf", "diag": "recomp_prx/spuimg_04.c", "image_id": 8 },
-        { "stem": "spuimg_06", "elf": "scratch/spu_imgs/spu_0006_at_0127C780.elf", "diag": "recomp_prx/spuimg_06.c", "image_id": 9 },
-        { "stem": "spuimg_08", "elf": "scratch/spu_imgs/spu_0008_at_012CED00.elf", "diag": "recomp_prx/spuimg_08.c", "image_id": 10 },
-        { "stem": "spuimg_09", "elf": "scratch/spu_imgs/spu_0009_at_012D9780.elf", "diag": "recomp_prx/spuimg_09.c", "image_id": 11 }
+        { "stem": "cri_audio", "elf": "scratch/spu_imgs/spu_0007_at_012A4980.elf", "eboot_ea": "0x012B4980", "diag": "recomp_prx/cri_audio.c", "image_id": 3 },
+        { "stem": "wkl4_task", "elf": "scratch/spu_imgs/spu_0005_at_01274200.elf", "eboot_ea": "0x01284200", "diag": "recomp_prx/wkl4_task.c", "image_id": 4 },
+        { "stem": "spuimg_00", "elf": "scratch/spu_imgs/spu_0000_at_01266F00.elf", "eboot_ea": "0x01276F00", "diag": "recomp_prx/spuimg_00.c", "image_id": 5 },
+        { "stem": "spuimg_01", "elf": "scratch/spu_imgs/spu_0001_at_01268700.elf", "eboot_ea": "0x01278700", "diag": "recomp_prx/spuimg_01.c", "image_id": 6 },
+        { "stem": "spuimg_02", "elf": "scratch/spu_imgs/spu_0002_at_01268E80.elf", "eboot_ea": "0x01278E80", "diag": "recomp_prx/spuimg_02.c", "image_id": 7 },
+        { "stem": "spuimg_04", "elf": "scratch/spu_imgs/spu_0004_at_01273300.elf", "eboot_ea": "0x01283300", "diag": "recomp_prx/spuimg_04.c", "image_id": 8 },
+        { "stem": "spuimg_06", "elf": "scratch/spu_imgs/spu_0006_at_0127C780.elf", "eboot_ea": "0x0128C780", "diag": "recomp_prx/spuimg_06.c", "image_id": 9 },
+        { "stem": "spuimg_08", "elf": "scratch/spu_imgs/spu_0008_at_012CED00.elf", "eboot_ea": "0x012DED00", "diag": "recomp_prx/spuimg_08.c", "image_id": 10 },
+        { "stem": "spuimg_09", "elf": "scratch/spu_imgs/spu_0009_at_012D9780.elf", "eboot_ea": "0x012E9780", "diag": "recomp_prx/spuimg_09.c", "image_id": 11 }
       ]
     },
     "sony": {
@@ -46,6 +46,7 @@
     "job_a": {
       "kind": "job",
       "eboot_ea": "0x01254500",
+      "logical_size": "0x9540",
       "raw": "recomp_prx/jobA_raw.bin",
       "ref_elf": "recomp_prx/job_bin_a.elf",
       "description": "jobchain bulk-worker JOB binary (measured hop leader: ~72,988,243 instruction hops in the 07-30 clean aggregate window, user-reported)",
@@ -60,6 +61,7 @@
     "job_b": {
       "kind": "job",
       "eboot_ea": "0x01275A00",
+      "logical_size": "0x14C0",
       "raw": "recomp_prx/jobB_raw.bin",
       "ref_elf": "recomp_prx/job_bin_b.elf",
       "description": "jobchain notify JOB binary; the high-LS placements are the post-movie / orphanage-era frontier slots",
@@ -81,6 +83,8 @@
     "job_c": {
       "kind": "job",
       "eboot_ea": "0x0125DA80",
+      "logical_size": "0x76C0",
+      "code_size": "0x7640",
       "ref_elf": "recomp_prx/job_bin_c_17800.elf",
       "ref_base": "0x17800",
       "description": "post-a030 transition job; live sizeBinary contract is 0x76C0 bytes",
@@ -99,6 +103,8 @@
     "job_d": {
       "kind": "job",
       "eboot_ea": "0x01265180",
+      "logical_size": "0x10610",
+      "runtime_sizes": ["0x10800"],
       "ref_elf": "recomp_prx/job_bin_d_e400.elf",
       "ref_base": "0xE400",
       "description": "sibling post-a030 job (declared 0x10610 bytes)",
@@ -119,6 +125,24 @@
         { "stem": "job_bin_d_2d400", "base": "0x2D400", "diag": "recomp_prx/job_bin_d_2d400.c", "image_id": 31 },
         { "stem": "job_bin_d_2e400", "base": "0x2E400", "diag": "recomp_prx/job_bin_d_2e400.c", "image_id": 34 },
         { "stem": "job_bin_d_2e800", "base": "0x2E800", "diag": "recomp_prx/job_bin_d_2e800.c", "image_id": 30 }
+      ]
+    },
+    "job_e": {
+      "kind": "job",
+      "eboot_ea": "0x01241400",
+      "logical_size": "0x11280",
+      "ref_elf": "recomp_prx/job_bin_e_e400.elf",
+      "ref_base": "0xE400",
+      "description": "frontier loading-screen job discovered from descriptor 0x401B2900; logical sizeBinary is 0x11280 bytes",
+      "placements": [
+        { "stem": "job_bin_e_e400", "base": "0xE400", "elf": "recomp_prx/job_bin_e_e400.elf", "diag": "yakuza/generated/diag/job_bin_e_e400.c",
+          "prefix": "spu_jobEE4_", "register": "spu_recomp_register_jobbin_e_e400",
+          "image_id": 49,
+          "entry_evidence": "live native-SPURS launch at the frozen loading frontier" },
+        { "stem": "job_bin_e_4c00", "base": "0x4C00", "elf": "recomp_prx/job_bin_e_4c00.elf", "diag": "yakuza/generated/diag/job_bin_e_4c00.c",
+          "prefix": "spu_jobE4C_", "register": "spu_recomp_register_jobbin_e_4c00",
+          "image_id": 50,
+          "entry_evidence": "native-SPURS job runner alternates fresh contexts between 0xE400 and 0x4C00" }
       ]
     },
     "orphanage": {
