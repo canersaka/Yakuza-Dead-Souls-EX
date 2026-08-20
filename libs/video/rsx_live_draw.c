@@ -44,6 +44,7 @@ void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
 u32  rsx_live_draw_get_frames(void) { return 0; }
+u64  rsx_live_draw_get_completed_draws(void) { return 0; }
 void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
 u32  rsx_live_draw_get_last_draws(void) { return 0; }
 double rsx_live_draw_get_present_fps(void) { return 0.0; }
@@ -98,7 +99,14 @@ extern volatile LONG g_yz_a010_reference_camera_active;
 extern volatile LONG g_yz_a010_root_active;
 /* Opt-in headless gameplay-proof handshake, owned jointly with cellPad.c. */
 extern volatile LONG g_yz_movement_proof_phase;
+extern volatile LONG g_yz_movement_post_dialogue_seen;
+extern volatile LONG g_yz_movement_gameplay_returned;
+extern volatile LONG g_yz_movement_stable_gameplay;
+extern volatile LONG g_yz_movement_proof_leg;
 extern volatile unsigned long long g_yz_auto_start_tick;
+/* Incremented only after a barrier-published persistent SPURS dispatcher
+ * generation finishes successfully. */
+extern volatile LONG g_yz_frontier_bridge_success_count;
 
 /* ---------------------------------------------------------------------------
  * Engine state (module-static; single live RSX)
@@ -425,6 +433,19 @@ static u32 g_ld_last_requested_buffer = UINT32_MAX;
 static u32 g_ld_last_consumed_buffer = UINT32_MAX;
 static u32 g_ld_last_present_target = UINT32_MAX;
 static u64 g_ld_last_dump_fingerprint = 0;
+/* Resolution-independent score for the pale, low-saturation pixels which
+ * fill the circular gameplay minimap in the lower-left HUD.  This is updated
+ * by the sparse acceptance readback only; normal presentation never pays for
+ * it. */
+static u64 g_ld_last_dump_hud_pale_ppm = 0;
+/* Independent pale-text anchors for the post-Frontier gun tutorial HUD:
+ * weapon/ammo (top left), kill counter (top right), and instruction prompt
+ * (bottom right).  Requiring all three lets the sparse route probe infer a
+ * completed Frontier load even when the loading screen begins and ends
+ * between probe intervals. */
+static u64 g_ld_last_dump_gun_tl_ppm = 0;
+static u64 g_ld_last_dump_gun_tr_ppm = 0;
+static u64 g_ld_last_dump_gun_br_ppm = 0;
 #if !defined(YZ_PERF_CLEAN)
 static u32 g_ld_surface_generation = 0;
 static u32 g_ld_surface_resource_serial = 0;
@@ -672,14 +693,14 @@ static void ld_present_measure_record(u32 guest_frame)
     else if (guest_frame == 1582u)
         spu_perf_window_dump(guest_frame);
 #endif
-    /*
-     * The controlled A010 benchmark ends at guest frame 2293.  Flush the
-     * already-recorded fixed ring exactly at that endpoint so an unrelated
-     * host-window teardown cannot truncate the authoritative raw samples.
-     * This is outside the measured timestamp operation and runs once.
-     */
+    /* Legacy diagnostic runs ended at guest frame 2293.  A clean semantic
+     * route reaches its checkpoint later, so that early write misses the
+     * selected interval and prevents the shutdown hook from preserving it.
+     * PERF_CLEAN writes the fixed ring once from normal window teardown. */
+#if !defined(YZ_PERF_CLEAN)
     if (guest_frame == 2293u)
         ld_present_measure_dump();
+#endif
 }
 
 static void ld_present_measure_dump(void)
@@ -1123,9 +1144,13 @@ typedef struct {
     u64 rejected_pso_requests[LD_REJECT_CLASS_COUNT];
     u32 rejected_pso_unique[LD_REJECT_CLASS_COUNT];
     u32 first_pso_full_frame;
+    FILE* output;
+    u32 output_interval_ms;
+    LONGLONG next_output_qpc;
 } ld_profile_state;
 
 static ld_profile_state g_ld_profile;
+static char g_ld_profile_output_buffer[256u * 1024u];
 
 static LONGLONG ld_profile_qpc(void)
 {
@@ -3658,6 +3683,7 @@ static ID3D12PipelineState* get_pso(
 
     render_state_t rs;
     decode_render_state(&rs);
+
     if (rsx_fp_collect_constants(
             fp_uc, fp_size, &g.fp_constants) < 0)
         return NULL;
@@ -4439,34 +4465,26 @@ static void ld_profile_present(u32 frame)
         g_ld_profile.compile_free_frames++;
         g_ld_profile.compile_free_frame_ms += frame_ms;
     }
-    /*
-     * The two matched visual-validation windows are deliberately small.
-     * Emit one aggregate line per presented frame there so an improvement
-     * below the generic 250 ms slow-frame threshold remains measurable.
-     * Scene identity is still established by the run driver's asset marker
-     * and screenshots; these values are only run-local capture locators.
-     */
-    const int matched_window =
-        (frame >= 2240u && frame <= 2300u) ||
-        (frame >= 4800u && frame <= 4900u);
-    const int emit =
-        frame <= 16u || matched_window || (frame & 63u) == 0u ||
-        frame_ms >= 250.0 ||
-        LD_PROFILE_DELTA(pso_misses) != 0 ||
-        LD_PROFILE_DELTA(pso_full) != 0 ||
-        LD_PROFILE_DELTA(flush_reason[LD_FLUSH_VERTEX_RING]) != 0 ||
-        LD_PROFILE_DELTA(flush_reason[LD_FLUSH_RETIRE_QUEUE]) != 0 ||
-        LD_PROFILE_DELTA(
-            flush_reason[LD_FLUSH_PIXEL_CONSTANT_RING]) != 0 ||
-        LD_PROFILE_DELTA(ps_constant_capacity_failures) != 0;
+    /* Profile collection remains available in the symbolized lane, but
+     * output is deliberately default-off. The old slow-frame rule wrote
+     * three large unbuffered stderr records for every 250+ ms frame, turning
+     * the profiler into a material part of the measured frame. An explicit
+     * YZ_RSX_PERF_LOG path enables buffered output, limited to the configured
+     * interval (one second by default). */
+    const int emit = g_ld_profile.output &&
+        now >= g_ld_profile.next_output_qpc;
 
     if (emit) {
+        FILE* const output = g_ld_profile.output;
+        g_ld_profile.next_output_qpc = now +
+            (g_ld_profile.qpc_frequency *
+             (LONGLONG)g_ld_profile.output_interval_ms) / 1000ll;
         DXGI_QUERY_VIDEO_MEMORY_INFO memory = {0};
         if (g_ld_profile.adapter)
             g_ld_profile.adapter->lpVtbl->QueryVideoMemoryInfo(
                 g_ld_profile.adapter, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
                 &memory);
-        fprintf(stderr,
+        fprintf(output,
                 "[rsx-perf] frame=%u dt_ms=%.3f "
                 "pso{look=%llu hit=%llu miss=%llu miss_total=%llu "
                 "probes=%llu full=%llu cached=%u capacity=%u mem_kb=%.1f} "
@@ -4596,7 +4614,7 @@ static void ld_profile_present(u32 frame)
                 (double)memory.CurrentUsage / (1024.0 * 1024.0),
                 (double)memory.Budget / (1024.0 * 1024.0),
                 (double)memory.CurrentReservation / (1024.0 * 1024.0));
-        fprintf(stderr,
+        fprintf(output,
                 "[shader-cache-perf] frame=%u "
                 "vs{count=%u capacity=%u lookups=%llu hits=%llu "
                 "misses=%llu inserts=%llu full_rejects=%llu "
@@ -4648,7 +4666,7 @@ static void ld_profile_present(u32 frame)
                       g_ld_profile.n_ps_constant_specialized_hashes
                 : 0;
         fprintf(
-            stderr,
+            output,
             "[fp-constant-perf] frame=%u mode=%s "
             "variants{exact_source=%u constant_specialized=%u "
             "canonical=%u collapsed_constants=%u collapsed_alpha=%u "
@@ -4678,7 +4696,6 @@ static void ld_profile_present(u32 frame)
                 flush_reason_qpc[LD_FLUSH_PIXEL_CONSTANT_RING])),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(
                 fence_reason_qpc[LD_FLUSH_PIXEL_CONSTANT_RING])));
-        fflush(stderr);
     }
 
     g_ld_profile.previous = g_ld_profile.total;
@@ -5177,6 +5194,45 @@ static u64 live_decoded_vertex_hash(u64 attr_hash[16])
     return hash;
 }
 
+#if !defined(YZ_PERF_CLEAN) || defined(YZ_PERF_PROFILE)
+static FILE* g_live_draw_csv_file = NULL;
+static u64 g_live_draw_csv_draw = 0;
+static int g_live_draw_csv_a010_only = 0;
+
+/* Renderer initialization runs before the RSX consumer starts, so these
+ * immutable process settings can be read once without a hot-path once-check
+ * or CRT environment-lock acquisition on every draw. */
+static void live_draw_csv_init(void)
+{
+    const char* path;
+    g_live_draw_csv_a010_only =
+        getenv("YZ_RSX_DRAW_CSV_A010_ONLY") != NULL;
+    path = getenv("YZ_RSX_DRAW_CSV");
+    if (!path || !path[0])
+        return;
+    g_live_draw_csv_file = fopen(path, "w");
+    if (g_live_draw_csv_file) {
+        fprintf(g_live_draw_csv_file,
+            "draw,frame,outcome,surf,prim,verts,source_verts,decoded_hash,"
+            "pso_key,regs_hash,vp_hash,"
+            "const_hash,blend,dtest,dwrite,dfunc,cull,cullface,"
+            "frontface,cmask,vpx,vpy,vpw,vph,sclx,scly,sclz,"
+            "trnx,trny,trnz,clipw,cliph,zeta_off,zeta_pitch,zeta_loc,"
+            "seen_vtex,seen_vtxfmt,seen_freqdiv,"
+            "attr0_hash,attr1_hash,attr2_hash,attr3_hash,"
+            "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
+            "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
+            "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
+            "active_attr_mask,used_attr_mask\n");
+        fprintf(stderr, "[live-diff] YZ_RSX_DRAW_CSV armed: %s\n", path);
+    } else {
+        fprintf(stderr, "[live-diff] cannot open YZ_RSX_DRAW_CSV: %s\n",
+                path);
+    }
+    fflush(stderr);
+}
+#endif
+
 /* YZ_RSX_DRAW_CSV=path: uncapped per-draw fingerprints for direct comparison
  * with the working RPCS3 .rxs replay.  Default-off and renderer-neutral. */
 static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
@@ -5186,40 +5242,11 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     (void)n_tri;
     (void)outcome;
 #else
-    static int inited = 0;
-    static FILE* file = NULL;
-    static u64 draw = 0;
-    const int a010_only = getenv("YZ_RSX_DRAW_CSV_A010_ONLY") != NULL;
-    if (a010_only) {
+    FILE* const file = g_live_draw_csv_file;
+    if (g_live_draw_csv_a010_only) {
         if (InterlockedCompareExchange(
                 &g_yz_a010_root_active, 0, 0) == 0)
             return;
-    }
-    if (!inited) {
-        inited = 1;
-        const char* path = getenv("YZ_RSX_DRAW_CSV");
-        if (path && path[0]) {
-            file = fopen(path, "w");
-            if (file) {
-                fprintf(file,
-                    "draw,frame,outcome,surf,prim,verts,source_verts,decoded_hash,"
-                    "pso_key,regs_hash,vp_hash,"
-                    "const_hash,blend,dtest,dwrite,dfunc,cull,cullface,"
-                    "frontface,cmask,vpx,vpy,vpw,vph,sclx,scly,sclz,"
-                    "trnx,trny,trnz,clipw,cliph,zeta_off,zeta_pitch,zeta_loc,"
-                    "seen_vtex,seen_vtxfmt,seen_freqdiv,"
-                    "attr0_hash,attr1_hash,attr2_hash,attr3_hash,"
-                    "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
-                    "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
-                    "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
-                    "active_attr_mask,used_attr_mask\n");
-                fprintf(stderr, "[live-diff] YZ_RSX_DRAW_CSV armed: %s\n", path);
-            } else {
-                fprintf(stderr, "[live-diff] cannot open YZ_RSX_DRAW_CSV: %s\n",
-                        path);
-            }
-            fflush(stderr);
-        }
     }
     if (!file)
         return;
@@ -5260,7 +5287,8 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         "%u,%u,%u,0x%X,%u,0x%X,0x%X,0x%08X,"
         "%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
         "%u,%u,0x%X,%u,%u,%u,%u,%u",
-        (unsigned long long)draw++, g_ld_frames, outcome, surf, prim, n_tri,
+        (unsigned long long)g_live_draw_csv_draw++, g_ld_frames, outcome,
+        surf, prim, n_tri,
         dc.n_source_refs ? dc.n_source_refs : dc.n_verts,
         (unsigned long long)decoded_hash,
         (unsigned long long)live_legacy_pso_key(),
@@ -6522,10 +6550,37 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
     {
         LARGE_INTEGER frequency;
+        const char* output_path;
+        const char* interval_text;
         QueryPerformanceFrequency(&frequency);
         g_ld_profile.qpc_frequency = frequency.QuadPart;
         g_ld_profile.previous_present_qpc = ld_profile_qpc();
+        output_path = getenv("YZ_RSX_PERF_LOG");
+        interval_text = getenv("YZ_RSX_PERF_LOG_INTERVAL_MS");
+        g_ld_profile.output_interval_ms = 1000u;
+        if (interval_text && interval_text[0]) {
+            unsigned long interval = strtoul(interval_text, NULL, 0);
+            if (interval < 250u) interval = 250u;
+            if (interval > 60000u) interval = 60000u;
+            g_ld_profile.output_interval_ms = (u32)interval;
+        }
+        if (output_path && output_path[0]) {
+            g_ld_profile.output = fopen(output_path, "w");
+            if (g_ld_profile.output) {
+                setvbuf(g_ld_profile.output, g_ld_profile_output_buffer,
+                        _IOFBF, sizeof(g_ld_profile_output_buffer));
+                g_ld_profile.next_output_qpc =
+                    g_ld_profile.previous_present_qpc;
+            } else {
+                fprintf(stderr,
+                        "[rsx-perf] cannot open YZ_RSX_PERF_LOG: %s\n",
+                        output_path);
+            }
+        }
     }
+#endif
+#if !defined(YZ_PERF_CLEAN) || defined(YZ_PERF_PROFILE)
+    live_draw_csv_init();
 #endif
     g.width = width; g.height = height;
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
@@ -6624,6 +6679,10 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     InterlockedExchange(&g_ld_diag_post_movie_presents, 0);
 #endif
     g_ld_last_dump_fingerprint = 0;
+    g_ld_last_dump_hud_pale_ppm = 0;
+    g_ld_last_dump_gun_tl_ppm = 0;
+    g_ld_last_dump_gun_tr_ppm = 0;
+    g_ld_last_dump_gun_br_ppm = 0;
     memset(g_ld_layout_cache, 0, sizeof(g_ld_layout_cache));
     g_ld_layout_cache_count = 0;
 
@@ -6973,6 +7032,10 @@ void rsx_live_draw_set_movie_mode(int on)
 }
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
+u64 rsx_live_draw_get_completed_draws(void)
+{
+    return (u64)g_ld_stats.groups_executed;
+}
 
 void rsx_live_draw_set_fifo_position(u32 get, u32 put)
 {
@@ -7239,6 +7302,33 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 
     u64 nonblack = UINT64_MAX;
     u64 fingerprint = 1469598103934665603ull;
+    u64 hud_pale = 0;
+    u64 gun_tl_pale = 0;
+    u64 gun_tr_pale = 0;
+    u64 gun_br_pale = 0;
+    const u32 hud_x0 = width * 5u / 100u;
+    const u32 hud_x1 = width * 27u / 100u;
+    const u32 hud_y0 = height * 64u / 100u;
+    const u32 hud_y1 = height * 98u / 100u;
+    const u64 hud_pixels = (u64)(hud_x1 - hud_x0) * (hud_y1 - hud_y0);
+    const u32 gun_tl_x0 = width * 4u / 100u;
+    const u32 gun_tl_x1 = width * 34u / 100u;
+    const u32 gun_tl_y0 = height * 4u / 100u;
+    const u32 gun_tl_y1 = height * 21u / 100u;
+    const u32 gun_tr_x0 = width * 72u / 100u;
+    const u32 gun_tr_x1 = width * 97u / 100u;
+    const u32 gun_tr_y0 = height * 8u / 100u;
+    const u32 gun_tr_y1 = height * 28u / 100u;
+    const u32 gun_br_x0 = width * 60u / 100u;
+    const u32 gun_br_x1 = width * 98u / 100u;
+    const u32 gun_br_y0 = height * 70u / 100u;
+    const u32 gun_br_y1 = height * 98u / 100u;
+    const u64 gun_tl_pixels =
+        (u64)(gun_tl_x1 - gun_tl_x0) * (gun_tl_y1 - gun_tl_y0);
+    const u64 gun_tr_pixels =
+        (u64)(gun_tr_x1 - gun_tr_x0) * (gun_tr_y1 - gun_tr_y0);
+    const u64 gun_br_pixels =
+        (u64)(gun_br_x1 - gun_br_x0) * (gun_br_y1 - gun_br_y0);
     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
         nonblack = 0;
@@ -7251,6 +7341,33 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                     const u8* pixel = row + x * 4;
                     if (pixel[0] || pixel[1] || pixel[2])
                         nonblack++;
+                    if (x >= hud_x0 && x < hud_x1 &&
+                        y >= hud_y0 && y < hud_y1 &&
+                        pixel[0] >= 110 && pixel[1] >= 110 &&
+                        pixel[2] >= 110) {
+                        const u8 maximum = max(pixel[0], max(pixel[1], pixel[2]));
+                        const u8 minimum = min(pixel[0], min(pixel[1], pixel[2]));
+                        if ((u32)maximum - minimum < 35u)
+                            hud_pale++;
+                    }
+                    if (pixel[0] >= 150 && pixel[1] >= 150 &&
+                        pixel[2] >= 150) {
+                        const u8 maximum =
+                            max(pixel[0], max(pixel[1], pixel[2]));
+                        const u8 minimum =
+                            min(pixel[0], min(pixel[1], pixel[2]));
+                        if ((u32)maximum - minimum < 40u) {
+                            if (x >= gun_tl_x0 && x < gun_tl_x1 &&
+                                y >= gun_tl_y0 && y < gun_tl_y1)
+                                gun_tl_pale++;
+                            if (x >= gun_tr_x0 && x < gun_tr_x1 &&
+                                y >= gun_tr_y0 && y < gun_tr_y1)
+                                gun_tr_pale++;
+                            if (x >= gun_br_x0 && x < gun_br_x1 &&
+                                y >= gun_br_y0 && y < gun_br_y1)
+                                gun_br_pale++;
+                        }
+                    }
                     fingerprint = fnv1a(pixel, 3, fingerprint);
                     fwrite(pixel, 1, 3, f);  /* RGBA->RGB */
                 }
@@ -7264,6 +7381,33 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                     const u8* pixel = row + x * 4;
                     if (pixel[0] || pixel[1] || pixel[2])
                         nonblack++;
+                    if (x >= hud_x0 && x < hud_x1 &&
+                        y >= hud_y0 && y < hud_y1 &&
+                        pixel[0] >= 110 && pixel[1] >= 110 &&
+                        pixel[2] >= 110) {
+                        const u8 maximum = max(pixel[0], max(pixel[1], pixel[2]));
+                        const u8 minimum = min(pixel[0], min(pixel[1], pixel[2]));
+                        if ((u32)maximum - minimum < 35u)
+                            hud_pale++;
+                    }
+                    if (pixel[0] >= 150 && pixel[1] >= 150 &&
+                        pixel[2] >= 150) {
+                        const u8 maximum =
+                            max(pixel[0], max(pixel[1], pixel[2]));
+                        const u8 minimum =
+                            min(pixel[0], min(pixel[1], pixel[2]));
+                        if ((u32)maximum - minimum < 40u) {
+                            if (x >= gun_tl_x0 && x < gun_tl_x1 &&
+                                y >= gun_tl_y0 && y < gun_tl_y1)
+                                gun_tl_pale++;
+                            if (x >= gun_tr_x0 && x < gun_tr_x1 &&
+                                y >= gun_tr_y0 && y < gun_tr_y1)
+                                gun_tr_pale++;
+                            if (x >= gun_br_x0 && x < gun_br_x1 &&
+                                y >= gun_br_y0 && y < gun_br_y1)
+                                gun_br_pale++;
+                        }
+                    }
                     fingerprint = fnv1a(pixel, 3, fingerprint);
                 }
             }
@@ -7271,9 +7415,238 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
         D3D12_RANGE wr = {0, 0};
         rb->lpVtbl->Unmap(rb, 0, &wr);
         g_ld_last_dump_fingerprint = fingerprint;
+        g_ld_last_dump_hud_pale_ppm = hud_pixels
+            ? hud_pale * 1000000ull / hud_pixels : 0ull;
+        g_ld_last_dump_gun_tl_ppm = gun_tl_pixels
+            ? gun_tl_pale * 1000000ull / gun_tl_pixels : 0ull;
+        g_ld_last_dump_gun_tr_ppm = gun_tr_pixels
+            ? gun_tr_pale * 1000000ull / gun_tr_pixels : 0ull;
+        g_ld_last_dump_gun_br_ppm = gun_br_pixels
+            ? gun_br_pale * 1000000ull / gun_br_pixels : 0ull;
     }
     rb->lpVtbl->Release(rb);
     return nonblack;
+}
+
+static void ld_movement_probe_mark_ready(
+    const char* directory, u32 serial, u64 nonblack)
+{
+    static int configured;
+    static u64 minimum_nonblack;
+    static u32 minimum_serial;
+    static u32 required_visible_probes;
+    static u32 required_stable_probes;
+    static u32 frontier_leg;
+    static u64 loading_nonblack_max;
+    static u64 minimum_hud_pale_ppm;
+    static u64 minimum_gun_hud_ppm;
+    static LONG observed_bridge_successes;
+    static u32 visible_after_boundary;
+    static u32 stable_gameplay_probes;
+    static LONG tracked_leg;
+    static int frontier_transition_seen;
+    static int frontier_loading_observed;
+    if (!configured) {
+        const char* pixels = getenv("YZ_MOVEMENT_PROOF_READY_NONBLACK");
+        const char* first = getenv("YZ_MOVEMENT_PROOF_READY_MIN_SERIAL");
+        const char* visible =
+            getenv("YZ_MOVEMENT_PROOF_READY_VISIBLE_PROBES");
+        const char* hud = getenv("YZ_MOVEMENT_PROOF_READY_HUD_PALE_PPM");
+        const char* stable = getenv(
+            "YZ_MOVEMENT_PROOF_STABLE_VISIBLE_PROBES");
+        const char* frontier = getenv("YZ_MOVEMENT_PROOF_FRONTIER_LEG");
+        const char* loading = getenv(
+            "YZ_MOVEMENT_PROOF_LOADING_NONBLACK_MAX");
+        const char* gun_hud = getenv(
+            "YZ_MOVEMENT_PROOF_GUN_HUD_PALE_PPM");
+        minimum_nonblack = pixels && *pixels
+            ? _strtoui64(pixels, NULL, 10) : 0ull;
+        minimum_serial = first && *first
+            ? (u32)strtoul(first, NULL, 10) : 0u;
+        required_visible_probes = visible && *visible
+            ? (u32)strtoul(visible, NULL, 10) : 3u;
+        minimum_hud_pale_ppm = hud && *hud
+            ? _strtoui64(hud, NULL, 10) : 0ull;
+        required_stable_probes = stable && *stable
+            ? (u32)strtoul(stable, NULL, 10) : 3u;
+        frontier_leg = frontier && *frontier
+            ? (u32)strtoul(frontier, NULL, 10) : 2u;
+        loading_nonblack_max = loading && *loading
+            ? _strtoui64(loading, NULL, 10) : 20000ull;
+        minimum_gun_hud_ppm = gun_hud && *gun_hud
+            ? _strtoui64(gun_hud, NULL, 10) : 5000ull;
+        if (!required_visible_probes)
+            required_visible_probes = 1u;
+        if (!required_stable_probes)
+            required_stable_probes = 1u;
+        configured = 1;
+    }
+    const LONG bridge_successes = InterlockedCompareExchange(
+        &g_yz_frontier_bridge_success_count, 0, 0);
+    const int hud_ready = minimum_hud_pale_ppm &&
+        g_ld_last_dump_hud_pale_ppm >= minimum_hud_pale_ppm;
+    const int visible_ready = minimum_nonblack &&
+        serial >= minimum_serial && nonblack != UINT64_MAX &&
+        nonblack >= minimum_nonblack;
+    const LONG movement_leg = InterlockedCompareExchange(
+        &g_yz_movement_proof_leg, 0, 0);
+    if (tracked_leg != movement_leg) {
+        tracked_leg = movement_leg;
+        stable_gameplay_probes = 0;
+        frontier_transition_seen = 0;
+        frontier_loading_observed = 0;
+    }
+    if (InterlockedCompareExchange(
+            &g_yz_movement_proof_phase, 0, 0) == 6 &&
+        minimum_hud_pale_ppm) {
+        if ((u32)movement_leg == frontier_leg &&
+            nonblack != UINT64_MAX &&
+            nonblack <= loading_nonblack_max &&
+            !frontier_transition_seen) {
+            frontier_transition_seen = 1;
+            frontier_loading_observed = 1;
+            fprintf(stderr,
+                    "[movement-proof] Frontier loading observed leg=%ld "
+                    "serial=%u nonblack=%llu\n",
+                    movement_leg, serial, (unsigned long long)nonblack);
+            fflush(stderr);
+        }
+        const int gun_hud_ready = minimum_gun_hud_ppm &&
+            g_ld_last_dump_gun_tl_ppm >= minimum_gun_hud_ppm &&
+            g_ld_last_dump_gun_tr_ppm >= minimum_gun_hud_ppm &&
+            g_ld_last_dump_gun_br_ppm >= minimum_gun_hud_ppm;
+        if ((u32)movement_leg == frontier_leg && gun_hud_ready &&
+            !frontier_transition_seen) {
+            frontier_transition_seen = 1;
+            fprintf(stderr,
+                    "[movement-proof] Frontier transition inferred from "
+                    "post-load gun HUD leg=%ld serial=%u "
+                    "gun_hud_ppm=%llu/%llu/%llu; sparse probes missed "
+                    "the loading frame\n",
+                    movement_leg, serial,
+                    (unsigned long long)g_ld_last_dump_gun_tl_ppm,
+                    (unsigned long long)g_ld_last_dump_gun_tr_ppm,
+                    (unsigned long long)g_ld_last_dump_gun_br_ppm);
+            fflush(stderr);
+        }
+        const LONG dialogue_seen = InterlockedCompareExchange(
+            &g_yz_movement_post_dialogue_seen, 0, 0);
+        const int transition_ready =
+            (u32)movement_leg < frontier_leg ? dialogue_seen != 0 :
+            ((u32)movement_leg == frontier_leg ? frontier_transition_seen : 1);
+        /* The city legs have a minimap.  The post-Frontier gun tutorial does
+         * not, so after the real loading transition use several substantial
+         * visible frames as the semantic gameplay signal. */
+        const int gameplay_ready = visible_ready &&
+            ((u32)movement_leg >= frontier_leg || hud_ready);
+        if (gameplay_ready && transition_ready) {
+            if (stable_gameplay_probes < required_stable_probes)
+                stable_gameplay_probes++;
+            const int release_now = (u32)movement_leg != frontier_leg ||
+                stable_gameplay_probes >= required_stable_probes;
+            if (release_now && InterlockedCompareExchange(
+                    &g_yz_movement_gameplay_returned, 1, 0) == 0) {
+                fprintf(stderr,
+                        "[movement-proof] gameplay returned leg=%ld "
+                        "serial=%u readiness=%s; synthetic input release "
+                        "requested\n",
+                        movement_leg, serial,
+                        (u32)movement_leg >= frontier_leg ?
+                            "post-frontier-visible" : "city-hud");
+                fflush(stderr);
+            }
+            if (stable_gameplay_probes >= required_stable_probes &&
+                InterlockedCompareExchange(
+                    &g_yz_movement_stable_gameplay, 1, 0) == 0) {
+                char stable_path[MAX_PATH * 2];
+                snprintf(stable_path, sizeof(stable_path),
+                         "%s\\stable_gameplay_leg_%ld_%03u.txt",
+                         directory, movement_leg, serial);
+                FILE* stable_marker = fopen(stable_path, "wb");
+                if (stable_marker) {
+                    fprintf(stable_marker,
+                            "leg=%ld serial=%u nonblack=%llu "
+                            "hud_pale_ppm=%llu "
+                            "visible_probes=%u dialogue_seen=%ld "
+                            "frontier_loading_observed=%d readiness=%s\n",
+                            movement_leg, serial,
+                            (unsigned long long)nonblack,
+                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                            stable_gameplay_probes,
+                            InterlockedCompareExchange(
+                                &g_yz_movement_post_dialogue_seen, 0, 0),
+                            frontier_loading_observed,
+                            (u32)movement_leg >= frontier_leg ?
+                                "post-frontier-visible" : "city-hud");
+                    fclose(stable_marker);
+                }
+                fprintf(stderr,
+                        "[movement-proof] stable gameplay confirmed leg=%ld "
+                        "serial=%u visible_probes=%u hud_pale_ppm=%llu\n",
+                        movement_leg, serial, stable_gameplay_probes,
+                        (unsigned long long)g_ld_last_dump_hud_pale_ppm);
+                fflush(stderr);
+            }
+        } else if (!gameplay_ready) {
+            stable_gameplay_probes = 0;
+            InterlockedExchange(&g_yz_movement_gameplay_returned, 0);
+            if (InterlockedCompareExchange(
+                    &g_yz_movement_stable_gameplay, 0, 0) == 0)
+                InterlockedExchange(
+                    &g_yz_movement_post_dialogue_seen, 1);
+        }
+    }
+    if (!hud_ready && bridge_successes <= 0) {
+        visible_after_boundary = 0;
+        return;
+    }
+    if (bridge_successes > 0 && !observed_bridge_successes) {
+        observed_bridge_successes = bridge_successes;
+        visible_after_boundary = 0;
+    }
+    if (!visible_ready) {
+        visible_after_boundary = 0;
+        return;
+    }
+    if (!hud_ready && minimum_hud_pale_ppm) {
+        visible_after_boundary = 0;
+        return;
+    }
+    if (++visible_after_boundary < required_visible_probes)
+        return;
+
+    /* The route watcher consumes this renderer-owned proof marker. It requires
+     * either the live gameplay HUD or a successful barrier-published
+     * dispatcher orbit, followed by several consecutive visible
+     * presentations.  The HUD lane is the acceptance route's semantic scene
+     * boundary; authored cutscenes and loading fades do not contain it. */
+    char path[MAX_PATH * 2];
+    snprintf(path, sizeof(path), "%s\\frontier_ready_%03u.txt",
+             directory, serial);
+    FILE* marker = fopen(path, "wb");
+    if (marker) {
+        fprintf(marker,
+                "serial=%u nonblack=%llu bridge_successes=%ld "
+                "hud_pale_ppm=%llu visible_probes=%u\n",
+                serial, (unsigned long long)nonblack,
+                bridge_successes,
+                (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                visible_after_boundary);
+        fclose(marker);
+    }
+}
+
+static u64 ld_movement_proof_hold_ms_for_leg(u32 leg)
+{
+    const char* text = getenv("YZ_MOVEMENT_PROOF_HOLD_MS");
+    const char* final_text = getenv("YZ_MOVEMENT_PROOF_FINAL_HOLD_MS");
+    const char* maximum_text = getenv("YZ_MOVEMENT_PROOF_MAX_LEGS");
+    const u32 maximum = maximum_text && *maximum_text
+        ? (u32)strtoul(maximum_text, NULL, 10) : 0u;
+    u64 result = maximum && leg >= maximum && final_text && *final_text
+        ? _strtoui64(final_text, NULL, 10)
+        : (text && *text ? _strtoui64(text, NULL, 10) : 60000ull);
+    return result < 1000ull ? 1000ull : result;
 }
 
 #if !defined(YZ_PERF_CLEAN)
@@ -7788,15 +8161,19 @@ void rsx_live_draw_present(u32 buffer_id)
                     {
                         const u64 nonblack =
                             ld_dump_surface_ppm(path, &g.surfaces[target]);
+                        ld_movement_probe_mark_ready(
+                            movement_dir, serial, nonblack);
                         fprintf(stderr,
                                 "[movement-proof] frontier-probe serial=%u "
                                 "elapsed_ms=%llu frame=%u nonblack=%s%llu "
-                                "path=%s\n",
+                                "hud_pale_ppm=%llu path=%s\n",
                                 serial, (unsigned long long)elapsed,
                                 g_ld_frames,
                                 nonblack == UINT64_MAX ? "unknown:" : "",
                                 (unsigned long long)(
                                     nonblack == UINT64_MAX ? 0 : nonblack),
+                                (unsigned long long)
+                                    g_ld_last_dump_hud_pale_ppm,
                                 path);
                         fflush(stderr);
                     }
@@ -7812,7 +8189,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 name = "camera_after.ppm";
                 next_phase = 4;
             } else if (phase == 5) {
-                name = "movement_after_60s.ppm";
+                name = "movement_after_hold.ppm";
                 next_phase = 6;
             }
             if (name) {
@@ -7824,12 +8201,14 @@ void rsx_live_draw_present(u32 buffer_id)
                         ld_dump_surface_ppm(path, &g.surfaces[target]);
                     fprintf(stderr,
                             "[movement-proof] capture phase=%ld frame=%u "
-                            "flip=%llu nonblack=%s%llu path=%s\n",
+                            "flip=%llu nonblack=%s%llu hud_pale_ppm=%llu "
+                            "path=%s\n",
                             phase, g_ld_frames,
                             (unsigned long long)g_ld_flip_requested,
                             nonblack == UINT64_MAX ? "unknown:" : "",
                             (unsigned long long)(
                                 nonblack == UINT64_MAX ? 0 : nonblack),
+                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
                             path);
                     fflush(stderr);
                 }
@@ -7837,8 +8216,13 @@ void rsx_live_draw_present(u32 buffer_id)
                     &g_yz_movement_proof_phase, next_phase, phase);
                 if (next_phase == 6) {
                     fprintf(stderr,
-                            "[movement-proof] COMPLETE sustained_ms=60000 "
-                            "camera_ms=5000 frame=%u\n", g_ld_frames);
+                            "[movement-proof] COMPLETE sustained_ms=%llu "
+                            "camera_ms=5000 frame=%u\n",
+                            (unsigned long long)
+                                ld_movement_proof_hold_ms_for_leg(
+                                    (u32)InterlockedCompareExchange(
+                                        &g_yz_movement_proof_leg, 0, 0)),
+                            g_ld_frames);
                     fflush(stderr);
                 }
             }
@@ -7913,11 +8297,183 @@ void rsx_live_draw_present(u32 buffer_id)
         }
     }
 #endif
-    /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
-     * making the TRUE frame count measurable from the log. (The old hard cap
-     * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
-    if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
-        fprintf(stderr,
+#if defined(YZ_PERF_CLEAN) && defined(YZ_FRONTIER_VISUAL_PROBE)
+    /* PERF_CLEAN intentionally excludes the promotion readback controller
+     * above.  Long, headless frontier routes still need a semantic scene
+     * boundary, so an explicitly compiled diagnostic lane may take one sparse
+     * renderer-owned image at the requested interval.  The option is OFF by
+     * default, leaving ordinary clean builds with no extra per-frame branch. */
+    {
+        static int probe_enabled = -1;
+        static char probe_dir[MAX_PATH * 2];
+        static char route_stop_file[MAX_PATH * 2];
+        static int akiyama_route;
+        static u64 probe_delay_ms;
+        static u64 probe_interval_ms;
+        static u64 next_probe_tick;
+        static u32 probe_serial;
+        if (probe_enabled < 0) {
+            const char* enabled = getenv("YZ_MOVEMENT_PROOF");
+            const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
+            const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
+            const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
+            const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+            akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
+            probe_enabled = ((enabled && *enabled) || akiyama_route) &&
+                directory && *directory;
+            if (probe_enabled) {
+                strncpy(probe_dir, directory, sizeof(probe_dir) - 1u);
+                probe_dir[sizeof(probe_dir) - 1u] = '\0';
+                if (akiyama_route && stop && *stop) {
+                    strncpy(route_stop_file, stop,
+                            sizeof(route_stop_file) - 1u);
+                    route_stop_file[sizeof(route_stop_file) - 1u] = '\0';
+                } else if (akiyama_route) {
+                    probe_enabled = 0;
+                    fprintf(stderr,
+                            "[akiyama-route] visual probe disabled: "
+                            "stop file is required\n");
+                    fflush(stderr);
+                }
+                probe_delay_ms = delay && *delay
+                    ? _strtoui64(delay, NULL, 10) :
+                    (akiyama_route ? 120000ull : 780000ull);
+                probe_interval_ms = interval && *interval
+                    ? _strtoui64(interval, NULL, 10) : 30000ull;
+                if (probe_interval_ms < (akiyama_route ? 2000ull : 30000ull))
+                    probe_interval_ms =
+                        akiyama_route ? 2000ull : 30000ull;
+            }
+        }
+        if (probe_enabled && g_yz_auto_start_tick) {
+            const u64 now = GetTickCount64();
+            const u64 elapsed = now - g_yz_auto_start_tick;
+            if (elapsed >= probe_delay_ms &&
+                (!next_probe_tick || now >= next_probe_tick)) {
+                if (akiyama_route &&
+                    GetFileAttributesA(route_stop_file) !=
+                        INVALID_FILE_ATTRIBUTES) {
+                    probe_enabled = 0;
+                    fprintf(stderr,
+                            "[akiyama-route] visual probe stopped at "
+                            "confirmed checkpoint present_id=%llu\n",
+                            (unsigned long long)g_ld_present_total);
+                    fflush(stderr);
+                }
+            }
+            if (probe_enabled && elapsed >= probe_delay_ms &&
+                (!next_probe_tick || now >= next_probe_tick)) {
+                char path[MAX_PATH * 2];
+                const u32 serial = ++probe_serial;
+                snprintf(path, sizeof(path), "%s\\frontier_probe_%03u.ppm",
+                         probe_dir, serial);
+                {
+                    const u64 nonblack =
+                        ld_dump_surface_ppm(path, &g.surfaces[target]);
+                    if (!akiyama_route)
+                        ld_movement_probe_mark_ready(
+                            probe_dir, serial, nonblack);
+                    fprintf(stderr,
+                            "[%s] clean-frontier-probe serial=%u "
+                            "elapsed_ms=%llu frame=%u nonblack=%s%llu "
+                            "hud_pale_ppm=%llu path=%s\n",
+                            akiyama_route ? "akiyama-route" :
+                                "movement-proof",
+                            serial, (unsigned long long)elapsed, g_ld_frames,
+                            nonblack == UINT64_MAX ? "unknown:" : "",
+                            (unsigned long long)(
+                                nonblack == UINT64_MAX ? 0 : nonblack),
+                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                            path);
+                    fflush(stderr);
+                }
+                next_probe_tick = now + probe_interval_ms;
+            }
+
+            /* PERF_CLEAN omits the broad promotion capture controller, but
+             * this explicitly compiled acceptance lane still owns the three
+             * movement handshakes. Preserve before/after surfaces and require
+             * a changed presented fingerprint before writing proof. */
+            {
+                const LONG phase = InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, 0, 0);
+                if (phase == 1 || phase == 3 || phase == 5) {
+                    static u64 before_fingerprint;
+                    const LONG capture_leg = InterlockedCompareExchange(
+                        &g_yz_movement_proof_leg, 0, 0);
+                    const char* suffix = phase == 1 ? "before" :
+                        (phase == 3 ? "after_camera" : "after_hold");
+                    char name[96];
+                    snprintf(name, sizeof(name),
+                             "movement_leg_%ld_%s.ppm", capture_leg, suffix);
+                    char path[MAX_PATH * 2];
+                    snprintf(path, sizeof(path), "%s\\%s", probe_dir, name);
+                    const u64 nonblack =
+                        ld_dump_surface_ppm(path, &g.surfaces[target]);
+                    const u64 fingerprint = g_ld_last_dump_fingerprint;
+                    if (phase == 1)
+                        before_fingerprint = fingerprint;
+                    const char* final_hud_text = getenv(
+                        "YZ_MOVEMENT_PROOF_FINAL_HUD_PPM");
+                    const u64 final_hud_ppm = final_hud_text &&
+                        *final_hud_text
+                            ? _strtoui64(final_hud_text, NULL, 10) : 0ull;
+                    const int final_hud_ready = !final_hud_ppm ||
+                        g_ld_last_dump_hud_pale_ppm >= final_hud_ppm;
+                    if (phase == 5 && nonblack != UINT64_MAX &&
+                        fingerprint != before_fingerprint &&
+                        final_hud_ready) {
+                        char proof_path[MAX_PATH * 2];
+                        snprintf(proof_path, sizeof(proof_path),
+                                 "%s\\movement_proof_leg_%ld.txt",
+                                 probe_dir, capture_leg);
+                        FILE* proof = fopen(proof_path, "wb");
+                        if (proof) {
+                            fprintf(proof,
+                                    "leg=%ld before=%016llX after=%016llX "
+                                    "nonblack=%llu hold_ms=%llu "
+                                    "hud_pale_ppm=%llu bridge_successes=%ld\n",
+                                    capture_leg,
+                                    (unsigned long long)before_fingerprint,
+                                    (unsigned long long)fingerprint,
+                                    (unsigned long long)nonblack,
+                                    (unsigned long long)
+                                        ld_movement_proof_hold_ms_for_leg(
+                                            (u32)capture_leg),
+                                    (unsigned long long)
+                                        g_ld_last_dump_hud_pale_ppm,
+                                    InterlockedCompareExchange(
+                                        &g_yz_frontier_bridge_success_count,
+                                        0, 0));
+                            fclose(proof);
+                        }
+                    }
+                    fprintf(stderr,
+                            "[movement-proof] clean-capture phase=%ld "
+                            "frame=%u nonblack=%s%llu fingerprint=%016llX "
+                            "hud_pale_ppm=%llu path=%s\n",
+                            phase, g_ld_frames,
+                            nonblack == UINT64_MAX ? "unknown:" : "",
+                            (unsigned long long)(nonblack == UINT64_MAX ?
+                                0 : nonblack),
+                            (unsigned long long)fingerprint,
+                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                            path);
+                    fflush(stderr);
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, phase + 1, phase);
+                }
+            }
+        }
+    }
+#endif
+#if defined(YZ_PERF_PROFILE)
+    /* Explicit YZ_RSX_PERF_LOG output only: buffered and rate-limited, never
+     * synchronous stderr on the frame thread. */
+    FILE* const summary_output = g_ld_profile.output;
+    if (summary_output &&
+        (g_ld_frames <= 32 || (g_ld_frames & 31) == 0))
+        fprintf(summary_output,
                 "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
                 "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
                 "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
@@ -7955,15 +8511,18 @@ void rsx_live_draw_present(u32 buffer_id)
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one
      * night (s42). Volume-bounded per LESSONS #6c. */
-    { static ULONGLONG fps_t0 = 0; static u32 fps_f0 = 0;
+    if (summary_output) {
+      static ULONGLONG fps_t0 = 0; static u32 fps_f0 = 0;
       ULONGLONG now = GetTickCount64();
       if (fps_t0 == 0) { fps_t0 = now; fps_f0 = g_ld_frames; }
       else if (now - fps_t0 >= 5000) {
-          fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
+          fprintf(summary_output, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
           fps_t0 = now; fps_f0 = g_ld_frames;
-      } }
+      }
+    }
+#endif
     if (LD_DIAG_ENABLED("YZ_RSX_DUMP") && g_ld_frames <= 8) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
@@ -8099,7 +8658,9 @@ void rsx_live_draw_shutdown(void)
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
 #if defined(YZ_PERF_PROFILE)
-    fprintf(stderr,
+    if (g_ld_profile.output) {
+        FILE* const output = g_ld_profile.output;
+        fprintf(output,
             "[rsx-perf-summary] frames=%u "
             "pso{look=%llu hit=%llu miss=%llu probes=%llu full=%llu "
             "cached=%u capacity=%u mem_kb=%.1f} "
@@ -8202,7 +8763,7 @@ void rsx_live_draw_shutdown(void)
             (double)g_ld_profile.total_upload_high / (1024.0 * 1024.0),
             (double)g_ld_profile.total_vb_high / (1024.0 * 1024.0),
             g_ld_profile.total_retired_high);
-    fprintf(stderr,
+        fprintf(output,
             "[shader-cache-summary] "
             "vs{count=%u capacity=%u lookups=%llu hits=%llu "
             "misses=%llu inserts=%llu full_rejects=%llu "
@@ -8244,8 +8805,8 @@ void rsx_live_draw_shutdown(void)
                 g_ld_profile.total.ps_post_boundary_repeats,
             (unsigned long long)g.ps_blobs.retained_source_bytes,
             (unsigned long long)g.ps_blobs.retained_blob_bytes);
-    fprintf(
-        stderr,
+        fprintf(
+            output,
         "[fp-constant-summary] mode=%s "
         "variants{exact_source=%u constant_specialized=%u canonical=%u "
         "collapsed_constants=%u collapsed_alpha=%u "
@@ -8284,7 +8845,10 @@ void rsx_live_draw_shutdown(void)
             LD_FLUSH_PIXEL_CONSTANT_RING]),
         ld_profile_ticks_ms(g_ld_profile.total.fence_reason_qpc[
             LD_FLUSH_PIXEL_CONSTANT_RING]));
-    fflush(stderr);
+        fflush(output);
+        fclose(output);
+        g_ld_profile.output = NULL;
+    }
 #endif
     if (g_ld_shader_disk_ready > 0) {
         fprintf(stderr,

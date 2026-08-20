@@ -283,7 +283,7 @@ int rsx_vertex_remap_build(
             memset(remap->slots, 0,
                    (size_t)remap->slot_capacity * sizeof(*remap->slots));
             remap->generation = 1u;
-        }
+    }
     }
 
     u32 unique = 0;
