@@ -351,6 +351,23 @@ static void flush_inline(rsx_nir_adapter* ad)
         ad->inline_count = 0;
         return;
     }
+    /* Hardware skips COLOR operands whose window index is >= SIZE_OUT.x:
+     * the SDK's SetInlineTransfer pads every run to an even word count
+     * with a zero word (SetInlineTransfer
+     * paddedSizeInWords), and the live consumer skips
+     * index >= SIZE_OUT.x (import_overrides.cpp NV308A window). Clamp
+     * the payload to the valid window so the fold equals a typed
+     * producer's natural emission and no executor writes the padding. */
+    {
+        const u32 out_x = ad->inline_size_out & 0xFFFFu;
+        const u32 valid = ad->inline_first_index < out_x
+                              ? out_x - ad->inline_first_index
+                              : 0;
+        if (ad->inline_count > valid)
+            ad->inline_count = valid;
+        if (!ad->inline_count)
+            return;                  /* run was padding/out-of-range only */
+    }
     stage_state(ad);
     rsx_nir_transfer t;
     memset(&t, 0, sizeof(t));
