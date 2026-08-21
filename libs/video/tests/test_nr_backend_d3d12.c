@@ -514,10 +514,49 @@ int main(int argc, char** argv)
     CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF), "indexed inside pixel");
     CHECK(pix_is(61, 2, 0xFF, 0x00, 0x00), "indexed outside pixel");
 
+    /* ---- scissored clear ------------------------------------------------
+     * CLEAR_SURFACE clears only within the scissor box
+     * (cellGcmSetClearSurface). Blue full clear, then a green clear
+     * confined to the top-left 32x32 scissor: inside green, outside
+     * stays blue. */
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);   /* blue     */
+    rsx_nir_scissor scz;
+    memset(&scz, 0, sizeof(scz));
+    scz.w = 32;
+    scz.h = 32;
+    rsx_nir_em_scissor(&em, &scz);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF00FF00u, 0xFFFFFF, 0);   /* green    */
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "scissor clear leg exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 2, 0x00, 0xFF, 0x00), "inside-scissor pixel %02X %02X %02X",
+          pix(2, 2)[0], pix(2, 2)[1], pix(2, 2)[2]);
+    CHECK(pix_is(40, 40, 0xFF, 0x00, 0x00), "outside-scissor pixel "
+          "%02X %02X %02X", pix(40, 40)[0], pix(40, 40)[1], pix(40, 40)[2]);
+    scz.w = RT_W;                    /* restore full scissor for later legs */
+    scz.h = RT_H;
+    rsx_nir_em_scissor(&em, &scz);
+
+    /* ---- partial-channel clear refused (counted, never approximated) ---
+     * CELL_GCM_CLEAR_R/G/B/A are individually maskable on hardware
+     * (distinct CELL_GCM_CLEAR_* mask bits); D3D12 clears whole
+     * targets, so a partial color mask must be refused to the core. */
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0x13, 0xFF000000u, 0, 0);   /* Z+S+R only      */
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 1, "partial clear not surfaced (%llu)",
+          be.stats.exec_errors);
+
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
-    CHECK(st.clears == 3 && st.draws == 3 && st.presents == 4,
+    CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
+          st.unsupported_clears);
+    CHECK(st.clears == 5 && st.draws == 3 && st.presents == 5,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
