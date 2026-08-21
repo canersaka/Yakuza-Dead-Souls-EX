@@ -867,6 +867,11 @@ static void test_transfers(void)
     rsx_nir_adapter_method(&ad, 0xA400, 0x11111111);
     rsx_nir_adapter_method(&ad, 0xA404, 0x22222222);
     rsx_nir_adapter_method(&ad, 0xA408, 0x33333333);
+    /* the SDK pads inline runs to an even word count with a zero word
+     * (SetInlineTransfer paddedSizeInWords); hardware skips operands at
+     * window index >= SIZE_OUT.x, so this word must NOT reach the
+     * payload */
+    rsx_nir_adapter_method(&ad, 0xA40C, 0x00000000);
     /* run ends at the next non-COLOR method */
     rsx_nir_adapter_method(&ad, 0xC184, 0xFEED0001);   /* 3089 src dma    */
     rsx_nir_adapter_method(&ad, 0xC300, 0xA);          /* src color fmt   */
