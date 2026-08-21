@@ -185,6 +185,13 @@ void rsx_nr_intercept_note_equivalence_failure(rsx_nr_intercept* it);
  * "nr: native f=1 c=2 ... | fb d=... cap=... unk=... | shadow=... eps=..." */
 u32 rsx_nr_stats_format(const rsx_nr_stats* st, char* buf, u32 buf_size);
 
+/* Shutdown-only passive-shadow census.  This scans only the adapter's fixed
+ * register metadata and formats one compact aggregate: decoded state/exec
+ * writes, stored-only writes, unclassified FIFO-engine writes, and the most
+ * frequent stored-only methods.  It performs no allocation or I/O. */
+u32 rsx_nr_shadow_census_format(const rsx_nr_intercept* it,
+                                char* buf, u32 buf_size);
+
 /* Test/diagnostic helper: the exact packet-path FIFO words for a flip
  * (the committed spec this layer intercepts; from the retired HLE body
  * yz_gcm_append_flip_commands, functional match of lifted func_02108948).
