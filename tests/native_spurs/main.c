@@ -19,6 +19,8 @@ static _Alignas(128) uint8_t guest[MEM_SIZE];
 uint8_t* vm_base = guest;
 static volatile int task_phase;
 static volatile int task_abi_ok;
+static volatile int event_route_phase;
+static volatile uint32_t event_route_ea;
 static volatile int one_shot_runs;
 static volatile int job_runs;
 static volatile int job_abi_ok;
@@ -26,6 +28,10 @@ static volatile int job_hold;
 static volatile int job_entered;
 static volatile uint32_t job_dma_tag_seen_mask;
 static volatile int sub_qword_job_runs;
+static volatile int large_job_runs;
+static volatile uint32_t large_job_slot;
+static volatile int large_job_layout_ok;
+static volatile int joblist_job_runs;
 static volatile int ticket_job_runs;
 static volatile int ticket_job_hold;
 static volatile int ticket_job_entered;
@@ -42,6 +48,10 @@ static volatile uint32_t poll_dma_wait_mask;
 static volatile uint32_t poll_dma_wait_input_mask;
 static volatile int poll_context_switch_count;
 static atomic_flag test_lockline = ATOMIC_FLAG_INIT;
+static _Atomic int test_coh_reserved;
+static _Atomic uint32_t test_lockline_acquires;
+static _Atomic uint32_t test_coh_notifies;
+static _Atomic uint32_t test_coh_last_ea;
 static _Atomic int lock_order_hook_armed;
 static _Atomic int lock_order_queue_mutex_held;
 static _Atomic int lock_order_queue_mutex_release;
@@ -49,8 +59,24 @@ static _Atomic int descriptor_snapshot_hook_armed;
 static _Atomic int descriptor_snapshot_hook_count;
 static uint32_t descriptor_snapshot_hook_ea;
 static uint32_t descriptor_snapshot_replacement_ea;
+static _Atomic int joblist_publication_hook_armed;
+static uint32_t joblist_publication_hook_ea;
+static uint32_t joblist_publication_descriptor_ea;
+static _Atomic int call_tail_publication_hook_armed;
+static uint32_t call_tail_publication_hook_ea;
+static _Atomic int pending_ticket_claim_hook_armed;
+static uint32_t pending_ticket_claim_hook_slot;
+static uint32_t pending_ticket_claim_hook_descriptor;
+static volatile int call_tail_job_runs;
 extern volatile uint32_t g_native_spurs_ppu_watch_hi;
 extern int cellSpursTestProductionMainStorageRange(uint32_t ea, uint64_t size);
+extern int cellSpursTestCaptureUnknownJob(
+    const char* path, uint32_t descriptor_ea, uint32_t descriptor_size,
+    uint32_t binary_ea, uint32_t binary_size, uint64_t fingerprint,
+    uint32_t next_slot);
+extern int yz_spurs_test_pending_snapshot_count(CellSpursJobChain* object);
+extern void cellSpursTestTaskBit(
+    void* taskset, uint32_t offset, uint32_t id, int value);
 
 typedef struct EventWaitArgs {
     CellSpursEventFlag* flag;
@@ -75,8 +101,16 @@ static void* event_wait_thread(void* raw)
 }
 
 uint64_t ppu_timebase_now(void) { return (uint64_t)clock(); }
-int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
-void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+int spu_coh_is_reserved(uint32_t ea)
+{
+    (void)ea;
+    return atomic_load_explicit(&test_coh_reserved, memory_order_acquire);
+}
+void spu_coh_notify_write(uint32_t ea)
+{
+    atomic_store_explicit(&test_coh_last_ea, ea, memory_order_relaxed);
+    atomic_fetch_add_explicit(&test_coh_notifies, 1u, memory_order_release);
+}
 void spu_lockline_lock(void)
 {
     while (atomic_flag_test_and_set_explicit(
@@ -87,6 +121,8 @@ void spu_lockline_lock(void)
         sched_yield();
 #endif
     }
+    atomic_fetch_add_explicit(
+        &test_lockline_acquires, 1u, memory_order_release);
 }
 void spu_lockline_unlock(void)
 {
@@ -137,6 +173,7 @@ static uint32_t be32(const void* v)
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
 }
+
 static void put16(void* v, uint16_t x)
 {
     uint8_t* p = (uint8_t*)v; p[0] = (uint8_t)(x >> 8); p[1] = (uint8_t)x;
@@ -170,12 +207,94 @@ void yz_spurs_descriptor_snapshot_test_hook(
     atomic_fetch_add_explicit(
         &descriptor_snapshot_hook_count, 1, memory_order_release);
 }
+void yz_spurs_joblist_publication_test_hook(uint32_t ea, uint32_t attempt)
+{
+    if (attempt != 0 || ea != joblist_publication_hook_ea)
+        return;
+    int expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &joblist_publication_hook_armed, &expected, 0,
+            memory_order_acq_rel, memory_order_acquire))
+        return;
+    /* Reproduce Frontier acceptance run 5: the JOBLIST command is already
+     * executable while sizeOfJob/eaJobList still belong to the incomplete
+     * generation.  Publish the remaining fields after the first invalid
+     * observation; the worker must retry instead of halting the chain. */
+    put32(guest + ea + 0x04, 0x40);
+    put64(guest + ea + 0x08, joblist_publication_descriptor_ea);
+}
+void yz_spurs_call_tail_publication_test_hook(uint32_t ea, uint32_t attempt)
+{
+    if (attempt != 0 || ea != call_tail_publication_hook_ea)
+        return;
+    int expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &call_tail_publication_hook_armed, &expected, 0,
+            memory_order_acq_rel, memory_order_acquire))
+        return;
+    /* Reproduce Frontier acceptance run 6: CALL is executable before the
+     * dynamically assembled sub-list's final RET has been stored. */
+    put64(guest + ea, 0x77ull);
+}
+void yz_spurs_pending_ticket_claim_test_hook(
+    uint32_t slot_ea, uint32_t descriptor_ea)
+{
+    if (slot_ea != pending_ticket_claim_hook_slot ||
+        descriptor_ea != pending_ticket_claim_hook_descriptor)
+        return;
+    int expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &pending_ticket_claim_hook_armed, &expected, 0,
+            memory_order_acq_rel, memory_order_acquire))
+        return;
+    /* Reproduce acceptance run 10's live-command race: once the kernel has
+     * selected the persistent command, the producer may immediately recycle
+     * its ring slot.  Execution must use the descriptor acquired with that
+     * command generation, never an uninitialized/stale fallback buffer. */
+    put64(guest + slot_ea, 0x0000000800000012ull);
+}
 static int fail(const char* what, int line)
 {
     fprintf(stderr, "FAIL line %d: %s\n", line, what);
     return 1;
 }
 #define CHECK(x) do { if (!(x)) return fail(#x, __LINE__); } while (0)
+
+static int test_task_bit_reservation_coherence(void)
+{
+    uint8_t* taskset = guest + 0x1C000u;
+    memset(taskset, 0, 128u);
+    atomic_store_explicit(&test_coh_reserved, 0, memory_order_release);
+    atomic_store_explicit(&test_lockline_acquires, 0u, memory_order_relaxed);
+    atomic_store_explicit(&test_coh_notifies, 0u, memory_order_relaxed);
+    atomic_store_explicit(&test_coh_last_ea, 0u, memory_order_relaxed);
+
+    cellSpursTestTaskBit(taskset, 0x40u, 3u, 1);
+    CHECK(taskset[0x40] == 0x10u);
+    CHECK(atomic_load_explicit(
+              &test_lockline_acquires, memory_order_acquire) == 0u);
+    CHECK(atomic_load_explicit(
+              &test_coh_notifies, memory_order_acquire) == 0u);
+
+    atomic_store_explicit(&test_coh_reserved, 1, memory_order_release);
+    cellSpursTestTaskBit(taskset, 0x50u, 4u, 1);
+    CHECK(taskset[0x50] == 0x08u);
+    CHECK(atomic_load_explicit(
+              &test_lockline_acquires, memory_order_acquire) == 1u);
+    CHECK(atomic_load_explicit(
+              &test_coh_notifies, memory_order_acquire) == 1u);
+    CHECK(atomic_load_explicit(
+              &test_coh_last_ea, memory_order_acquire) == 0x1C050u);
+
+    cellSpursTestTaskBit(taskset, 0x40u, 3u, 0);
+    CHECK(taskset[0x40] == 0u);
+    CHECK(atomic_load_explicit(
+              &test_lockline_acquires, memory_order_acquire) == 2u);
+    CHECK(atomic_load_explicit(
+              &test_coh_notifies, memory_order_acquire) == 2u);
+    atomic_store_explicit(&test_coh_reserved, 0, memory_order_release);
+    return 0;
+}
 
 static void make_elf(uint8_t* e)
 {
@@ -218,6 +337,25 @@ static void synthetic_task(spu_context* ctx)
     /* The SDK task exit wrapper saves the public exit code here before it
      * repurposes r4 for the native syscall entry. */
     put32(ctx->ls + 0x2fd0, 0x2468);
+    (void)ctx->native_spurs_syscall(ctx, ctx->native_spurs_opaque);
+}
+static void synthetic_event_route_task(spu_context* ctx)
+{
+    /* A lifted SDK EventFlagWait preserves only its MFC EAH/EAL address pair
+     * here.  Extra buffer/geometry lanes identify the title's unrelated
+     * CellSync queue descriptor and must not trigger EventFlag discovery. */
+    memset(&ctx->gpr[81], 0, sizeof(ctx->gpr[81]));
+    ctx->gpr[81]._u32[0] = 0;
+    ctx->gpr[81]._u32[1] = event_route_ea;
+    event_route_phase = 1;
+    ctx->gpr[3]._u32[0] = 2; /* WAIT_SIGNAL */
+    if (ctx->native_spurs_syscall(ctx, ctx->native_spurs_opaque) <= 0) return;
+    event_route_phase = 2;
+    ctx->gpr[3]._u32[0] = 2; /* WAIT_SIGNAL again: duplicate edge guard */
+    if (ctx->native_spurs_syscall(ctx, ctx->native_spurs_opaque) <= 0) return;
+    event_route_phase = 3;
+    ctx->gpr[3]._u32[0] = 0; /* EXIT */
+    put32(ctx->ls + 0x2fd0, 0x4e46);
     (void)ctx->native_spurs_syscall(ctx, ctx->native_spurs_opaque);
 }
 static void synthetic_exit_task(spu_context* ctx)
@@ -326,11 +464,15 @@ static void synthetic_job(spu_context* ctx)
     const uint32_t descriptor_ls = ctx->gpr[4]._u32[0];
     const uint32_t io_ls = be32(ctx->ls + context_ls);
     const int slot_abi_ok =
-        (ctx->gpr[1]._u32[0] == 0x7400 && io_ls == 0x5000) ||
-        (ctx->gpr[1]._u32[0] == 0x10c00 && io_ls == 0xe800);
+        (ctx->gpr[1]._u32[0] == 0x73d0 && io_ls == 0x5000) ||
+        (ctx->gpr[1]._u32[0] == 0x10bd0 && io_ls == 0xe800);
     job_abi_ok =
         ctx->gpr[0]._u32[0] == 0x0a70 &&
         slot_abi_ok &&
+        ctx->gpr[1]._u32[1] == 0x2000 &&
+        be32(ctx->ls + ctx->gpr[1]._u32[0]) ==
+            ctx->gpr[1]._u32[0] + 0x20 &&
+        be32(ctx->ls + ctx->gpr[1]._u32[0] + 0x20) == 0 &&
         context_ls == 0x4940 &&
         descriptor_ls == 0x3f000 &&
         ctx->ls[context_ls + 0x18] == 0 &&
@@ -389,7 +531,7 @@ static void synthetic_sub_qword_job(spu_context* ctx)
         ctx->gpr[0]._u32[0] == 0x0a70 &&
         context_ls == 0x4940 &&
         ctx->ls[context_ls + 0x18] == 0 &&
-        ctx->ls[context_ls + 0x19] == 4;
+        ctx->ls[context_ls + 0x19] == 5;
     for (uint32_t i = 0; i < 4; ++i) {
         if (be32(ctx->ls + io_ls + ls_offset[i]) != input[i])
             sub_qword_layout_ok = 0;
@@ -397,6 +539,49 @@ static void synthetic_sub_qword_job(spu_context* ctx)
     }
     ++sub_qword_job_runs;
     job_put_io_items(ctx);
+}
+
+static void synthetic_layout_warmup_job(spu_context* ctx)
+{
+    (void)ctx;
+}
+
+static void synthetic_joblist_job(spu_context* ctx)
+{
+    (void)ctx;
+    ++joblist_job_runs;
+}
+
+static void synthetic_call_tail_job(spu_context* ctx)
+{
+    (void)ctx;
+    ++call_tail_job_runs;
+}
+
+static void synthetic_large_layout_job(spu_context* ctx)
+{
+    const uint32_t context_ls = ctx->gpr[3]._u32[0];
+    const uint32_t descriptor_ls = ctx->gpr[4]._u32[0];
+    const uint32_t initial_sp = ctx->gpr[1]._u32[0];
+    large_job_slot = ctx->pc;
+    large_job_layout_ok =
+        ctx->pc == 0x04c00u &&
+        be32(ctx->ls + context_ls + 0x00) == 0x16000u &&
+        be32(ctx->ls + context_ls + 0x04) == 0x1e000u &&
+        be32(ctx->ls + context_ls + 0x20) == 0x1f000u &&
+        descriptor_ls == 0x3f000u &&
+        initial_sp == 0x3efd0u &&
+        ctx->gpr[1]._u32[1] == 0x8000u &&
+        be32(ctx->ls + initial_sp) == 0x3eff0u &&
+        be32(ctx->ls + 0x3eff0u) == 0 &&
+        be32(ctx->ls + descriptor_ls + 0x10) == 0x13579bdfu;
+    /* Emulate the entry prologue that exposed the bug.  Its LR save must be
+     * inside the stack allocation, not at descriptor+0x10. */
+    put32(ctx->ls + initial_sp + 0x10, ctx->gpr[0]._u32[0]);
+    large_job_layout_ok = large_job_layout_ok &&
+        be32(ctx->ls + initial_sp + 0x10) == 0x0a70u &&
+        be32(ctx->ls + descriptor_ls + 0x10) == 0x13579bdfu;
+    ++large_job_runs;
 }
 
 static int wait_value(volatile int* value, int expected)
@@ -629,6 +814,7 @@ static int test_task_event_queue(void)
         (CellSpursTasksetAttribute2*)(guest + 0x6400);
     CellSpursEventFlag* ef = (CellSpursEventFlag*)(guest + 0x6800);
     CellSpursEventFlag* iwl_ef = (CellSpursEventFlag*)(guest + 0x6880);
+    CellSpursEventFlag* raw_ef = (CellSpursEventFlag*)(guest + 0x6c00);
     CellSpursQueue* push_queue = (CellSpursQueue*)(guest + 0x6900);
     CellSpursQueue* pop_queue = (CellSpursQueue*)(guest + 0x6a00);
     CellSpursLFQueue* lf_queue = (CellSpursLFQueue*)(guest + 0x6b00);
@@ -727,6 +913,81 @@ static int test_task_event_queue(void)
     }
     CHECK(task_phase == 2);
     CHECK(be32(exit_code) == 0x2468);
+
+    /* Lifted SPU EventFlagSet does not call the HLE Set entry point.  It
+     * publishes the event line through MFC PUTLLC, so the exact guest-write
+     * router must turn a newly-pending task slot into the SDK depth-one task
+     * signal.  CLEAR_AUTO can leave event bits at zero, making +0x02 the
+     * only observable state edge.  An unchanged pending bit must not signal
+     * the task a second time; clearing and re-arming it creates a new edge. */
+    {
+        uint8_t* route_elf = guest + 0x1c000;
+        CellSpursTaskBinInfo bin;
+        CellSpursTaskArgument arg;
+        uint32_t task_id;
+        uint8_t task_mask;
+        make_elf(route_elf);
+        route_elf[0x102] ^= 0x40;
+        spu_workload_reset();
+        CHECK(spu_workload_register_direct(
+                  spu_workload_fingerprint(route_elf, 0x104), 0x104,
+                  synthetic_event_route_task, "synthetic-event-route-task"));
+        memset(&bin, 0, sizeof(bin));
+        memset(&arg, 0, sizeof(arg));
+        put64((uint8_t*)&bin + 0x00, 0x1c000);
+        put32((uint8_t*)&bin + 0x08, 1024);
+        /* Reproduce a flag initialized entirely by lifted guest code.  It is
+         * deliberately absent from the HLE event registry before the task's
+         * semantic EventFlagWait handoff discovers it. */
+        memset(raw_ef, 0, sizeof(*raw_ef));
+        raw_ef->bytes[0x0c] = 0xff;
+        raw_ef->bytes[0x0d] = 1; /* IWL: owner at +0x70 is SPURS */
+        raw_ef->bytes[0x0e] = CELL_SPURS_EVENT_FLAG_ANY2ANY;
+        raw_ef->bytes[0x0f] = CELL_SPURS_EVENT_FLAG_CLEAR_AUTO;
+        put64(raw_ef->bytes + 0x70, 0x1000);
+        put16(raw_ef->bytes + 0x08, 0x8000); /* used slot 0 */
+        put16(raw_ef->bytes + 0x10, 0x0001); /* wait mask */
+        raw_ef->bytes[0x50] = 0;             /* next reclaimed task id */
+        raw_ef->bytes[0x60] = (uint8_t)be32(ts->bytes + 0x74);
+        event_route_ea = 0x6c00;
+        event_route_phase = 0;
+        CHECK(cellSpursCreateTask2WithBinInfo(
+                  ts, id, &bin, &arg, task_context + 0x800,
+                  "event-route-task", NULL) == 0);
+        task_id = be32(id);
+        CHECK(task_id == 0);
+        task_mask = (uint8_t)(0x80u >> (task_id & 7));
+        CHECK(wait_value(&event_route_phase, 1));
+        CHECK(wait_byte_mask(ts->bytes + 0x50 + task_id / 8,
+                             task_mask, task_mask));
+
+        put16(raw_ef->bytes + 0x30, 0x0001); /* received bits */
+        put16(raw_ef->bytes + 0x02, 0x8000); /* lifted Set publish */
+        atomic_thread_fence(memory_order_release);
+        cellSpursNotifyGuestWrite(0x6c00, 128);
+        CHECK(wait_value(&event_route_phase, 2));
+        CHECK(wait_byte_mask(ts->bytes + 0x50 + task_id / 8,
+                             task_mask, task_mask));
+
+        /* The same publication is not another event. */
+        cellSpursNotifyGuestWrite(0x6c00, 128);
+        brief_sleep();
+        CHECK(event_route_phase == 2);
+        CHECK((ts->bytes[0x50 + task_id / 8] & task_mask) == task_mask);
+
+        /* The SPU waiter consumes pending before it can be re-armed. */
+        put16(raw_ef->bytes + 0x02, 0);
+        atomic_thread_fence(memory_order_release);
+        cellSpursNotifyGuestWrite(0x6c00, 128);
+        brief_sleep();
+        CHECK(event_route_phase == 2);
+        put16(raw_ef->bytes + 0x02, 0x8000);
+        atomic_thread_fence(memory_order_release);
+        cellSpursNotifyGuestWrite(0x6c00, 128);
+        CHECK(cellSpursJoinTask2(ts, task_id, exit_code) == 0);
+        CHECK(event_route_phase == 3);
+        CHECK(be32(exit_code) == 0x4e46);
+    }
 
     /* A taskset has 128 concurrent IDs.  Joined one-shot tasks must release
      * their ID so a long-lived taskset can create more than 128 tasks over
@@ -1031,7 +1292,9 @@ static int test_unnotified_pending_ticket_orbit(void)
         (CellSpursJobChainAttribute*)(guest + 0x59800);
     CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x5a000);
     uint64_t* commands = (uint64_t*)(guest + 0x5a800);
-    uint8_t* descriptor = guest + 0x5b000;
+    /* Deliberately only 16-byte aligned. CellSpursJob does not require the
+     * 128-byte alignment that the old bridge-address reconstruction assumed. */
+    uint8_t* descriptor = guest + 0x5b030;
     uint8_t* binary = guest + 0x5c000;
     uint8_t priority[8] = {1,1,1,1,1,1,1,1};
 
@@ -1064,14 +1327,14 @@ static int test_unnotified_pending_ticket_orbit(void)
      * is the first point at which redispatch is valid. */
     {
         uint32_t candidate_descriptor = 0;
-        CHECK(yz_spurs_test_watch_pending_descriptor(jc, 0x5b000) == 0);
+        CHECK(yz_spurs_test_watch_pending_descriptor(jc, 0x5b030) == 0);
         put32(descriptor + 0x10, 6);
         CHECK(yz_spurs_test_pending_ticket_publish_candidate(
-                  jc, 0x5b010, 4, &candidate_descriptor) == 0);
+                  jc, 0x5b040, 4, &candidate_descriptor) == 0);
         put32(descriptor + 0x14, 16);
         CHECK(yz_spurs_test_pending_ticket_publish_candidate(
-                  jc, 0x5b014, 4, &candidate_descriptor) == 1);
-        CHECK(candidate_descriptor == 0x5b000);
+                  jc, 0x5b044, 4, &candidate_descriptor) == 1);
+        CHECK(candidate_descriptor == 0x5b030);
         put32(descriptor + 0x10, 0);
     }
     ticket_job_runs = 0;
@@ -1089,16 +1352,67 @@ static int test_unnotified_pending_ticket_orbit(void)
         }
         CHECK(parked);
     }
-    put64(commands + 0, 0x5b000);
+
+    /* A narrow producer store can transiently combine the old empty-marker
+     * upper word with the new JOB lower word.  That mixed 64-bit generation
+     * is not a descriptor command and must remain parked until the producer
+     * publishes the reserved-zero upper word (Frontier acceptance run 4 saw
+     * 0x00000008_001ACB80 captured ahead of live 0x00000000_401ACB80). */
+    put64(commands + 0, 0x000000080005b030ull);
+    cellSpursNotifyPpuGuestWrite(0x5a804, 4);
+    brief_sleep();
+    CHECK(ticket_job_runs == 0);
+
+    put64(commands + 0, 0x5b030);
     cellSpursNotifyGuestWrite(0x5a800, 8);
     CHECK(wait_value(&ticket_job_runs, 1));
+    {
+        int parked = 0;
+        for (unsigned i = 0; i < 1000000 && !parked; ++i) {
+            parked = yz_spurs_jobchain_is_parked_at(jc, 0x5a808);
+            if (!parked)
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+        }
+        CHECK(parked);
+    }
+
+    /* Force the live command to be recycled in the narrow interval between
+     * bridge selection and claim.  This used to make the fallback copy an
+     * unrelated stack buffer into the JobCommandSnapshot. */
+    pending_ticket_claim_hook_slot = 0x5a800;
+    pending_ticket_claim_hook_descriptor = 0x5b030;
+    atomic_store_explicit(
+        &pending_ticket_claim_hook_armed, 1, memory_order_release);
+    /* The live producer exposes kind/ready before finishing the descriptor
+     * body. A parked poll used to acquire this stable partial generation and
+     * terminate the chain with INVALID_BIN. The PPU store now stages the
+     * candidate until the producer's publication fence. */
+    put64(descriptor + 0x00, 0);
+    put16(descriptor + 0x08, 0);
+    put32(descriptor + 0x10, 6);
+    put32(descriptor + 0x14, 16);
+    cellSpursNotifyPpuGuestWrite(0x5b044, 4);
+    brief_sleep();
+    CHECK(ticket_job_runs == 1);
+    CHECK(be32(descriptor + 0x10) == 6);
+    put64(descriptor + 0x00, 0x5c000);
+    put16(descriptor + 0x08, 1);
+    cellSpursNotifyPpuFence();
+    CHECK(wait_value(&ticket_job_runs, 2));
+    CHECK(wait_be32_value(descriptor + 0x10, 0));
+    CHECK(atomic_load_explicit(
+              &pending_ticket_claim_hook_armed, memory_order_acquire) == 0);
 
     /* Acquire the same persistent dispatcher through a newer ring slot.  A
      * retained descriptor map now has two historical owners; only this latest
      * acquisition carries the continuation context for the active orbit. */
-    put64(commands + 1, 0x5b000);
+    put64(commands + 1, 0x5b030);
     cellSpursNotifyGuestWrite(0x5a808, 8);
-    CHECK(wait_value(&ticket_job_runs, 2));
+    CHECK(wait_value(&ticket_job_runs, 3));
 
     /* Once the persistent dispatcher JOB has been acquired, the producer may
      * recycle its command-ring slot before publishing the next descriptor
@@ -1108,8 +1422,9 @@ static int test_unnotified_pending_ticket_orbit(void)
     put64(commands + 1, 0x0000000800000012ull);
     put32(descriptor + 0x10, 6);
     put32(descriptor + 0x14, 16);
-    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
-    CHECK(wait_value(&ticket_job_runs, 3));
+    cellSpursNotifyPpuGuestWrite(0x5b044, 4);
+    cellSpursNotifyPpuFence();
+    CHECK(wait_value(&ticket_job_runs, 4));
     CHECK(wait_be32_value(descriptor + 0x10, 0));
     {
         int parked = 0;
@@ -1125,11 +1440,18 @@ static int test_unnotified_pending_ticket_orbit(void)
         CHECK(parked);
     }
 
-    /* Deliberately omit cellSpursNotifyGuestWrite(): the native worker must
-     * still make a hardware-like pass over the persistent JOB while parked. */
-    put64(commands + 1, 0x5b000);
+    /* Without a write notification there is no sound way to associate this
+     * storage with the publishing PPU thread. In particular, a timing-based
+     * parked poll must not execute it before a barrier. Once the store edge
+     * and fence are supplied, the persistent orbit resumes. */
+    put64(commands + 1, 0x5b030);
     put32(descriptor + 0x10, 6);
-    CHECK(wait_value(&ticket_job_runs, 4));
+    brief_sleep();
+    CHECK(ticket_job_runs == 4);
+    CHECK(be32(descriptor + 0x10) == 6);
+    cellSpursNotifyPpuGuestWrite(0x5b040, 4);
+    cellSpursNotifyPpuFence();
+    CHECK(wait_value(&ticket_job_runs, 5));
     CHECK(wait_be32_value(descriptor + 0x10, 0));
 
     /* The live title can publish the next ticket while the persistent
@@ -1140,16 +1462,37 @@ static int test_unnotified_pending_ticket_orbit(void)
     ticket_job_entered = 0;
     put32(descriptor + 0x10, 6);
     put32(descriptor + 0x14, 16);
-    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
-    CHECK(wait_value(&ticket_job_runs, 5));
+    cellSpursNotifyPpuGuestWrite(0x5b044, 4);
+    cellSpursNotifyPpuFence();
+    CHECK(wait_value(&ticket_job_runs, 6));
     CHECK(wait_value(&ticket_job_entered, 1));
     CHECK(wait_be32_value(descriptor + 0x10, 0));
     put32(descriptor + 0x10, 6);
     put32(descriptor + 0x14, 16);
-    cellSpursNotifyPpuGuestWrite(0x5b014, 4);
+    cellSpursNotifyPpuGuestWrite(0x5b044, 4);
+    cellSpursNotifyPpuFence();
     ticket_job_hold = 0;
-    CHECK(wait_value(&ticket_job_runs, 6));
+    CHECK(wait_value(&ticket_job_runs, 7));
     CHECK(wait_be32_value(descriptor + 0x10, 0));
+
+    /* Frontier reuses both arenas after this persistent command has parked:
+     * its old command slot becomes DDS payload and its old descriptor becomes
+     * an unrelated pointer table.  The ordinary data can coincidentally have
+     * kind=6 and a nonzero ready word.  A retained address alone must not turn
+     * that recycled storage back into a JOB (acceptance run 3 reproduced this
+     * with command 0x40000080 and descriptor 0x40004080). */
+    put64(commands + 0, 0x0000000800000012ull);
+    put64(commands + 1, 0x0000000800000012ull);
+    put64(descriptor + 0x00, 0x0000000260814d00ull);
+    put16(descriptor + 0x08, 3);
+    put32(descriptor + 0x14, 0x60814f00);
+    descriptor[0x2c] = 0x60;
+    put32(descriptor + 0x10, 6); /* publish the accidental lookalike last */
+    for (unsigned i = 0; i < 10; ++i)
+        brief_sleep();
+    CHECK(ticket_job_runs == 7);
+    CHECK(be32(descriptor + 0x10) == 6);
+
     CHECK(cellSpursShutdownJobChain(jc) == 0);
     CHECK(cellSpursJoinJobChain(jc) == 0);
     CHECK(cellSpursFinalize(spurs) == 0);
@@ -1319,12 +1662,16 @@ static int test_job_sub_qword_dma_layout(void)
 
     put64(descriptor, 0x6f000);
     put16(descriptor + 8, 1);
-    put16(descriptor + 0x0a, 32);
+    put16(descriptor + 0x0a, 40);
     put32(descriptor + 0x10, 1);  /* publish the four in/out elements */
     put32(descriptor + 0x14, 64); /* one 16-byte LS slot per element */
     for (uint32_t i = 0; i < 4; ++i)
         put64(descriptor + 0x30 + i * 8,
               ((uint64_t)4 << 32) | (0x70000u + data_offset[i]));
+    /* MFC list bit 31 is stall-and-notify.  A zero-size final element is a
+     * valid title-observed sentinel; it transfers no bytes and consumes no
+     * IO slot, but remains part of the descriptor's list count. */
+    put64(descriptor + 0x50, 0x8000000000000001ull);
     put64(commands + 0, 0x6e000);
     put64(commands + 1, 0x7f);
 
@@ -1345,6 +1692,78 @@ static int test_job_sub_qword_dma_layout(void)
     CHECK(sub_qword_job_runs == 1);
     CHECK(sub_qword_layout_ok);
     CHECK(!memcmp(data, expected, sizeof(expected)));
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
+static int test_large_job_slot_fallback(void)
+{
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x74000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x75000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x75800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x76000);
+    uint64_t* commands = (uint64_t*)(guest + 0x77000);
+    uint8_t* warmup_desc = guest + 0x78000;
+    uint8_t* large_desc = guest + 0x78080;
+    uint8_t* warmup_binary = guest + 0x79000;
+    uint8_t* large_binary = guest + 0x80000;
+    uint8_t* input = guest + 0x92000;
+    uint8_t* cache = guest + 0x93000;
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(warmup_desc, 0, 0x80);
+    memset(large_desc, 0, 0x80);
+    memset(warmup_binary, 0x6c, 16);
+    memset(large_binary, 0x7d, 0x11280);
+    memset(input, 0x2a, 0x40);
+    memset(cache, 0x3b, 0x1000);
+
+    put64(warmup_desc, 0x79000);
+    put16(warmup_desc + 8, 1);
+
+    put64(large_desc, 0x80000);
+    put16(large_desc + 8, 0x1128); /* 0x11280-byte job binary */
+    put16(large_desc + 0x0a, 8);
+    put32(large_desc + 0x10, 0x13579bdf);
+    put32(large_desc + 0x14, 0x8000);
+    put16(large_desc + 0x1c, 0x0800); /* 0x8000-byte stack */
+    put16(large_desc + 0x1e, 0x1800); /* 0x18000-byte scratch */
+    put32(large_desc + 0x24, 8);
+    put64(large_desc + 0x30, ((uint64_t)0x40 << 32) | 0x92000u);
+    put64(large_desc + 0x38, ((uint64_t)0x1000 << 32) | 0x93000u);
+
+    /* The warmup consumes the initial 0x4C00 preference. The large job is
+     * then offered 0xE400, where its complete layout cannot fit.  At 0x4C00
+     * the allocation ends exactly at the descriptor boundary (0x3F000),
+     * matching Frontier's fifth Job E descriptor. */
+    put64(commands + 0, 0x78000);
+    put64(commands + 1, 0x78080);
+    put64(commands + 2, 0x7f);
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(warmup_binary, 16), 16,
+              synthetic_layout_warmup_job, "layout-warmup-job"));
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(large_binary, 0x11280), 0x11280,
+              synthetic_large_layout_job, "large-layout-job"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x80, 1, priority,
+              1, 0, 0, 1, 0, 0x200, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    large_job_runs = 0;
+    large_job_slot = 0;
+    large_job_layout_ok = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    CHECK(cellSpursJoinJobChain(jc) == 0);
+    CHECK(large_job_runs == 1);
+    CHECK(large_job_slot == 0x04c00u);
+    CHECK(large_job_layout_ok);
     CHECK(cellSpursFinalize(spurs) == 0);
     return 0;
 }
@@ -1605,6 +2024,157 @@ static int test_job_barrier_snapshot(void)
     return 0;
 }
 
+static int test_incomplete_barrier_descriptor_publication(void)
+{
+    /* Reuse the barrier test's SPURS key after finalization. */
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x20000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x21000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x94800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x95000);
+    uint64_t* commands = (uint64_t*)(guest + 0x95800);
+    uint8_t* descriptor = guest + 0xe000;
+    uint8_t* binary = guest + 0xf000;
+    uint8_t* inout = guest + 0x10000;
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(descriptor, 0, 0x40);
+    memset(binary, 0x5a, 16);
+    for (uint32_t i = 0; i < 16; ++i) inout[i] = (uint8_t)i;
+    put64(descriptor + 0x00, 0xf000);
+    put16(descriptor + 0x08, 1);
+    put16(descriptor + 0x0a, 8);
+    put32(descriptor + 0x10, 1);
+    put32(descriptor + 0x14, 16);
+    put64(descriptor + 0x30, ((uint64_t)16 << 32) | 0x10000);
+    put64(commands + 0, 0xe000);
+    put64(commands + 1, 0x000000000009580bull); /* empty self NEXT */
+    put64(commands + 2, 0);
+    put64(commands + 3, 0x7f);
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(binary, 16), 16,
+              synthetic_job, "synthetic-job-incomplete-publication"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x40, 1, priority,
+              1, 0, 0, 1, 0, 0x100, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    job_runs = 0;
+    job_abi_ok = 0;
+    job_hold = 1;
+    job_entered = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    CHECK(wait_value(&job_entered, 1));
+
+    /* Acceptance run 19: a SYNC claim observed a stable all-zero copy of a
+     * later descriptor. The producer completed that same descriptor before
+     * the worker reached it, but the old immutable zero copy killed the chain
+     * with INVALID_BIN. A claim must stop before an unpublished JOB and let
+     * the later live fetch acquire the completed generation. */
+    put64(descriptor + 0x00, 0);
+    put16(descriptor + 0x08, 0);
+    put64(commands + 1, 0x02ull);
+    put64(commands + 2, 0xe000);
+    cellSpursNotifyGuestWrite(0x95808, 8);
+    put64(descriptor + 0x00, 0xf000);
+    put16(descriptor + 0x08, 1);
+    job_hold = 0;
+    CHECK(cellSpursJoinJobChain(jc) == 0);
+    CHECK(job_runs == 2);
+    CHECK(job_abi_ok);
+    CHECK(yz_spurs_test_pending_snapshot_count(jc) == 0);
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
+static int test_call_tail_late_publication(void)
+{
+    /* Reuse the barrier test's registered SPURS key: the harness deliberately
+     * keeps finalized instance slots for same-key reinitialization. */
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x20000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x21000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x61800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x62000);
+    uint64_t* commands = (uint64_t*)(guest + 0x63000);
+    uint64_t* callee = (uint64_t*)(guest + 0x64000);
+    uint8_t* descriptor = guest + 0x65000;
+    uint8_t* binary = guest + 0x66000;
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(commands, 0, 3 * sizeof(*commands));
+    memset(callee, 0, 2 * sizeof(*callee));
+    memset(descriptor, 0, 0x40);
+    memset(binary, 0x6c, 16);
+    put64(descriptor + 0x00, 0x66000);
+    put16(descriptor + 0x08, 1);
+    put64(commands + 0, 0x0000000000063003ull); /* empty self NEXT */
+    put64(commands + 2, 0x7full);                /* END after CALL returns */
+    put64(callee + 0, 0x65000);                  /* body published first */
+    put64(callee + 1, 0);                        /* RET not published yet */
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(binary, 16), 16,
+              synthetic_call_tail_job, "synthetic-call-tail-job"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x40, 1, priority,
+              1, 0, 0, 1, 0, 0x100, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    call_tail_job_runs = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    {
+        int parked = 0;
+        for (unsigned i = 0; i < 1000000 && !parked; ++i) {
+            parked = yz_spurs_jobchain_is_parked_at(jc, 0x63000);
+            if (!parked)
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+        }
+        CHECK(parked);
+    }
+
+    /* Publish SYNC last.  Its immutable view follows CALL into the callee,
+     * where the test hook supplies RET only after the worker first observes
+     * the zero tail.  The chain must return to commands[2], not preserve the
+     * zero and walk into arbitrary guest memory. */
+    put64(commands + 1, 0x0000000000064004ull); /* CALL 0x64000 */
+    call_tail_publication_hook_ea = 0x64008;
+    atomic_store_explicit(
+        &call_tail_publication_hook_armed, 1, memory_order_release);
+    put64(commands + 0, 0x02ull);               /* SYNC publication head */
+    cellSpursNotifyGuestWrite(0x63000, 8);
+    CHECK(cellSpursJoinJobChain(jc) == 0);
+    CHECK(call_tail_job_runs == 1);
+    CHECK(atomic_load_explicit(
+              &call_tail_publication_hook_armed, memory_order_acquire) == 0);
+    const int pending_before_unrelated =
+        yz_spurs_test_pending_snapshot_count(jc);
+    CHECK(pending_before_unrelated >= 0);
+    /* The main list and CALL target make watch_lo/watch_hi cover this address,
+     * but it was never a command slot.  A broad-envelope observer used to
+     * queue this ordinary value as an immutable SYNC generation, exactly like
+     * the unrelated 0x015C7Bxx values in acceptance run 20. */
+    put64(guest + 0x63800, 0x02ull);
+    cellSpursNotifyGuestWrite(0x63800, 8);
+    CHECK(yz_spurs_test_pending_snapshot_count(jc) ==
+          pending_before_unrelated);
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
 static int test_streamed_job_generation(void)
 {
     CellSpurs* spurs = (CellSpurs*)(guest + 0x36000);
@@ -1744,9 +2314,10 @@ static int test_repeated_barrier_publications(void)
     CHECK(cellSpursRunJobChain(jc) == 0);
     CHECK(wait_value(&job_entered, 1));
 
-    /* Both completed SYNC stores publish distinct immutable generations at
-     * the same command address.  Neither may overwrite the other while the
-     * worker is still occupied by the preceding job. */
+    /* Two identical stores before the command is consumed are one observable
+     * main-memory generation, not an event queue. Keep only the newest claim;
+     * otherwise a per-frame rewrite grows an unbounded snapshot backlog and
+     * eventually replays ancient descriptor storage. */
     put64(commands + 1, 0x0000000000000002ull);
     put64(commands + 2, 0xe000);
     cellSpursNotifyGuestWrite(0x3d008, 8);
@@ -1754,8 +2325,9 @@ static int test_repeated_barrier_publications(void)
     put64(commands + 1, 0x7f); /* live tail after both claimed generations */
     job_hold = 0;
     CHECK(cellSpursJoinJobChain(jc) == 0);
-    CHECK(job_runs == 3);
+    CHECK(job_runs == 2);
     CHECK(job_abi_ok);
+    CHECK(yz_spurs_test_pending_snapshot_count(jc) == 0);
     CHECK(cellSpursFinalize(spurs) == 0);
     return 0;
 }
@@ -1833,6 +2405,22 @@ static int test_far_command_wakeup(void)
     job_hold = 0;
     CHECK(cellSpursRunJobChain(jc) == 0);
     CHECK(wait_u32_at_least(&g_native_spurs_ppu_watch_hi, 0xd0008));
+    /* A distant NEXT used to widen one global min/max envelope across this
+     * entire 64 KiB gap.  The exact router must retain the real target while
+     * proving that an ordinary write in the middle has no SPURS recipient. */
+    CHECK(yz_spurs_test_guest_write_route_count(0xc8000, 8) == 0);
+    CHECK(yz_spurs_test_guest_write_route_count(0xd0000, 8) == 1);
+    /* Exercise the correctness path used after the fixed router saturates.
+     * Put its exact alias at a page boundary, then verify every write shape
+     * that previously risked being lost by a coarse single-page check. */
+    CHECK(yz_spurs_test_guest_write_route_count(0x1f0000, 8) == 0);
+    CHECK(yz_spurs_test_guest_write_route_overflow_alias(
+              0xd0000, 0x1f0000) == 0);
+    CHECK(yz_spurs_test_guest_write_route_count(0x1f0002, 2) == 1); /* partial */
+    CHECK(yz_spurs_test_guest_write_route_count(0x1f0003, 4) == 1); /* unaligned */
+    CHECK(yz_spurs_test_guest_write_route_count(0x1efff0, 0x40) == 1); /* bulk */
+    CHECK(yz_spurs_test_guest_write_route_count(0x1effff, 2) == 1); /* cross-page */
+    CHECK(yz_spurs_test_guest_write_route_count(0x1f0800, 8) == 0);
     put64(far_commands, 0xe000);
     cellSpursNotifyPpuGuestWrite(0xd0000, 8);
     CHECK(cellSpursJoinJobChain(jc) == 0);
@@ -1905,6 +2493,56 @@ static int test_job_guest_range_validation(void)
     return 0;
 }
 
+static int test_joblist_late_publication(void)
+{
+    CellSpurs* spurs = (CellSpurs*)(guest + 0x56000);
+    CellSpursAttribute* sa = (CellSpursAttribute*)(guest + 0x57000);
+    CellSpursJobChainAttribute* ja =
+        (CellSpursJobChainAttribute*)(guest + 0x57800);
+    CellSpursJobChain* jc = (CellSpursJobChain*)(guest + 0x58000);
+    uint64_t* commands = (uint64_t*)(guest + 0x59000);
+    uint8_t* list = guest + 0x5a000;
+    uint8_t* descriptor = guest + 0x5b000;
+    uint8_t* binary = guest + 0x5c000;
+    uint8_t priority[8] = {1,1,1,1,1,1,1,1};
+
+    memset(spurs, 0, sizeof(*spurs));
+    memset(jc, 0, sizeof(*jc));
+    memset(list, 0, 16);
+    memset(descriptor, 0, 0x40);
+    memset(binary, 0x9d, 16);
+    put64(descriptor + 0x00, 0x5c000);
+    put16(descriptor + 0x08, 1);
+    put32(list + 0x00, 1);       /* count visible first */
+    put32(list + 0x04, 0);       /* size not published yet */
+    put64(list + 0x08, 0);       /* descriptor EA not published yet */
+    put64(commands + 0, 0x000000000005a006ull);
+    put64(commands + 1, 0x7f);
+
+    spu_workload_reset();
+    CHECK(spu_workload_register_direct(
+              spu_workload_fingerprint(binary, 16), 16,
+              synthetic_joblist_job, "synthetic-joblist-job"));
+    CHECK(cellSpursAttributeInitialize(sa, 2, 100, 1000, 0) == 0);
+    CHECK(cellSpursInitializeWithAttribute(spurs, sa) == 0);
+    CHECK(_cellSpursJobChainAttributeInitialize(
+              3, 0x475001, ja, commands, 0x40, 1, priority,
+              1, 0, 0, 1, 0, 0x100, 1) == 0);
+    CHECK(cellSpursCreateJobChainWithAttribute(spurs, jc, ja) == 0);
+    joblist_publication_hook_ea = 0x5a000;
+    joblist_publication_descriptor_ea = 0x5b000;
+    atomic_store_explicit(
+        &joblist_publication_hook_armed, 1, memory_order_release);
+    joblist_job_runs = 0;
+    CHECK(cellSpursRunJobChain(jc) == 0);
+    CHECK(cellSpursJoinJobChain(jc) == 0);
+    CHECK(joblist_job_runs == 1);
+    CHECK(atomic_load_explicit(
+              &joblist_publication_hook_armed, memory_order_acquire) == 0);
+    CHECK(cellSpursFinalize(spurs) == 0);
+    return 0;
+}
+
 static int test_ticket_mutex(void)
 {
     CellSyncMutex* m = (CellSyncMutex*)(guest + 0x11000);
@@ -1919,23 +2557,51 @@ static int test_ticket_mutex(void)
     return 0;
 }
 
+static int test_unknown_job_inventory_capture(void)
+{
+    const char* path = "native_spurs_unknown_job_test.jsonl";
+    char line[1024];
+    remove(path);
+    CHECK(cellSpursTestCaptureUnknownJob(
+              path, 0x401b2900u, 0x40u, 0x01241400u, 0x11280u,
+              0x3dafc265bd3e4da2ull, 0xe400u) == 1);
+    /* Identical evidence is deduplicated in memory and on disk. */
+    CHECK(cellSpursTestCaptureUnknownJob(
+              path, 0x401b2900u, 0x40u, 0x01241400u, 0x11280u,
+              0x3dafc265bd3e4da2ull, 0xe400u) == 0);
+    FILE* file = fopen(path, "rb");
+    CHECK(file != NULL);
+    CHECK(fgets(line, sizeof(line), file) != NULL);
+    CHECK(fgetc(file) == EOF);
+    fclose(file);
+    CHECK(strstr(line, "\"binary_ea\":\"0x01241400\"") != NULL);
+    CHECK(strstr(line, "\"binary_size\":\"0x11280\"") != NULL);
+    CHECK(strstr(line, "\"fingerprint\":\"0x3DAFC265BD3E4DA2\"") != NULL);
+    CHECK(remove(path) == 0);
+    return 0;
+}
+
 int main(void)
 {
+    if (test_task_bit_reservation_coherence()) return 1;
     if (test_layouts() || test_native_syscall_return_depth() ||
         test_multiple_instances() ||
         test_task_poll_workload_yield() ||
         test_task_event_queue() || test_spurs_queue_lock_order() ||
         test_job_logical_binary_size() ||
         test_job_sub_qword_dma_layout() ||
+        test_large_job_slot_fallback() ||
         test_job_chain() || test_unnotified_pending_ticket_orbit() ||
         test_job_descriptor_snapshot() ||
         test_job_descriptor_stable_acquisition() ||
         test_job_barrier_snapshot() ||
+        test_incomplete_barrier_descriptor_publication() ||
+        test_call_tail_late_publication() ||
         test_streamed_job_generation() ||
         test_repeated_barrier_publications() ||
         test_long_lived_job_chain() || test_far_command_wakeup() ||
-        test_job_guest_range_validation() ||
-        test_ticket_mutex()) return 1;
+        test_job_guest_range_validation() || test_joblist_late_publication() ||
+        test_ticket_mutex() || test_unknown_job_inventory_capture()) return 1;
     puts("native_spurs_tests: PASS");
     return 0;
 }

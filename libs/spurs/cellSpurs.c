@@ -1087,12 +1087,42 @@ static TasksetState* taskset_make(void* key)
     mx_unlock(&g_registry_mutex);
     return result;
 }
+
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
+extern int spu_coh_is_reserved(u32);
+extern void spu_coh_notify_write(u32);
+
 static void task_bit(void* ts, u32 off, u32 id, int value)
 {
     u8* p = (u8*)ts + off + id / 8;
     u8 mask = (u8)(0x80u >> (id & 7));
-    if (value) *p |= mask; else *p &= (u8)~mask;
+    const u32 ea = guest_ea(p);
+    /* The taskset header is also mutated by lifted SPU GETLLAR/PUTLLC
+     * transactions.  Native task workers used to update its bitsets with a
+     * raw host byte store while an SPU could own a reservation on the same
+     * 128-byte line.  A later successful full-line PUTLLC could therefore
+     * restore an old running/ready/waiting/signal byte and lose a barrier
+     * wake.  Taskset lines become permanently marked by the first GETLLAR,
+     * so the ordinary initialization path remains lock-free while every
+     * concurrent native transition serializes with the SPU transaction and
+     * publishes reservation loss. */
+    if (spu_coh_is_reserved(ea)) {
+        spu_lockline_lock();
+        if (value) *p |= mask; else *p &= (u8)~mask;
+        spu_coh_notify_write(ea);
+        spu_lockline_unlock();
+    } else {
+        if (value) *p |= mask; else *p &= (u8)~mask;
+    }
 }
+
+#if defined(YZ_SPURS_TEST_GUEST_SIZE)
+void cellSpursTestTaskBit(void* taskset, u32 offset, u32 id, int value)
+{
+    task_bit(taskset, offset, id, value);
+}
+#endif
 static void spurs_set_workload_runnable(void* object, u32 wid, int runnable)
 {
     SpursState* spurs = spurs_find(object);
