@@ -70,6 +70,12 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
+/* Native-render flip-family bridge.  This deliberately re-enters the
+ * existing E944 dispatch path so movie handoff, renderer serialization,
+ * presentation counters, and swap-chain behavior stay identical while the
+ * typed backend owns the action's ordering. */
+void rsx_live_draw_native_present(u32 buffer_id);
+
 /* Publish the FIFO bounds associated with the next flip method.  The live
  * consumer calls this only for driver-queue methods; ordinary method traffic
  * pays no extra synchronization cost. */

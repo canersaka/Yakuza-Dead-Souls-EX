@@ -36,6 +36,7 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
@@ -6962,6 +6963,14 @@ void rsx_live_draw_method(u32 method, u32 arg)
         if (!g_ld_movie_track_rsx) return;
     }
     rsx_dispatch_method(&g.rsx, method, arg);
+}
+
+void rsx_live_draw_native_present(u32 buffer_id)
+{
+    /* Keep this bridge semantically identical to a FIFO E944 dispatch.  In
+     * particular, do not bypass rsx_live_draw_method's movie/debug locking or
+     * sink_flip's requested/consumed counters. */
+    rsx_live_draw_method(0xE944u, buffer_id);
 }
 
 void rsx_live_draw_set_movie_mode(int on)

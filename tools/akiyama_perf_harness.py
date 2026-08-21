@@ -404,6 +404,8 @@ def run(args):
         yz["YZ_FE0_CALLBACK_REPLAY"] = "1"
     if args.nr_shadow_census:
         yz["YZ_NR_INTERCEPT"] = "state"
+    if args.nr_flip:
+        yz["YZ_NR_INTERCEPT"] = "flip"
     environment.update(yz)
 
     result = {
@@ -451,9 +453,11 @@ def run(args):
         deadline = time.monotonic() + args.route_timeout
         seen = set()
         consecutive = 0
+        last_capture_progress = time.monotonic()
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during route: {process.returncode}")
+            captured_this_poll = False
             for path in sorted(capture_dir.glob("frontier_probe_*.ppm")):
                 if path in seen:
                     continue
@@ -462,6 +466,8 @@ def run(args):
                 except (OSError, ValueError):
                     continue  # renderer may still be finishing the file
                 seen.add(path)
+                captured_this_poll = True
+                last_capture_progress = time.monotonic()
                 comparison["path"] = str(path)
                 result["captures"].append(comparison)
                 consecutive = consecutive + 1 if comparison["match"] else 0
@@ -483,6 +489,29 @@ def run(args):
                     break
             if stop_path.exists():
                 break
+            # A healthy route produces a new sparse framebuffer every few
+            # seconds.  Fail early only when visual progress has stopped AND
+            # the runtime itself reports a durable FIFO no-progress state;
+            # slow but advancing boots remain governed by route_timeout.
+            no_capture_for = time.monotonic() - last_capture_progress
+            if (not captured_this_poll and seen and no_capture_for >= 15.0 and
+                    stderr_path.exists()):
+                tail = stderr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-131072:]
+                if ("still parked on non-command" in tail or
+                        re.search(r"\[rsx-idle\].*no-advance", tail)):
+                    result["route_failure_class"] = "fifo-no-progress"
+                    result["route_failure_last_capture"] = max(
+                        path.name for path in seen
+                    )
+                    result["route_failure_no_capture_seconds"] = round(
+                        no_capture_for, 3
+                    )
+                    raise RuntimeError(
+                        "route FIFO stopped advancing after "
+                        f"{result['route_failure_last_capture']}"
+                    )
             time.sleep(0.25)
         if not stop_path.exists():
             raise TimeoutError("Akiyama first-dialogue visual checkpoint not reached")
@@ -530,14 +559,23 @@ def run(args):
 
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
         shadow_lines = re.findall(r"^\[nr-shadow:.*\]$", stderr_text, re.MULTILINE)
+        live_lines = re.findall(r"^\[nr-live:.*\]$", stderr_text, re.MULTILINE)
         result["nr_shadow_census"] = shadow_lines
-        if args.nr_shadow_census and len(shadow_lines) != 1:
+        result["nr_live_census"] = live_lines
+        if (args.nr_shadow_census or args.nr_flip) and len(shadow_lines) != 1:
             raise RuntimeError(
                 "native-render shadow run must emit exactly one shutdown census: "
                 f"found {len(shadow_lines)}"
             )
-        if not args.nr_shadow_census and shadow_lines:
+        if not (args.nr_shadow_census or args.nr_flip) and shadow_lines:
             raise RuntimeError("shadow census was active in the clean OFF lane")
+        if args.nr_flip and len(live_lines) != 1:
+            raise RuntimeError(
+                "native flip run must emit exactly one live aggregate: "
+                f"found {len(live_lines)}"
+            )
+        if not args.nr_flip and live_lines:
+            raise RuntimeError("native live family was active outside its lane")
         completion_marker = (
             "[auto-new-game] completion latched; Confirm released and route disabled"
         )
@@ -613,12 +651,15 @@ def main():
     parser.add_argument("--fe0", action="store_true")
     parser.add_argument("--fe0-callback-replay", action="store_true")
     parser.add_argument("--nr-shadow-census", action="store_true")
+    parser.add_argument("--nr-flip", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)
     args = parser.parse_args()
     if args.fe0_callback_replay and not args.fe0:
         parser.error("--fe0-callback-replay requires --fe0")
+    if args.nr_shadow_census and args.nr_flip:
+        parser.error("select only one native-render diagnostic/family lane")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]
