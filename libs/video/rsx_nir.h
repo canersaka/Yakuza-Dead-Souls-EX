@@ -157,6 +157,7 @@ typedef struct rsx_nir_vertex_bindings {
     rsx_nir_vertex_attr attr[RSX_NIR_NUM_VERTEX_ATTR];
     u32 base_offset;                             /* VERTEX_DATA_BASE_OFFSET */
     u32 base_index;                              /* VB_ELEMENT_BASE         */
+    u32 freq_divider_op;                         /* FREQUENCY_DIVIDER_OP    */
 } rsx_nir_vertex_bindings;
 
 typedef struct rsx_nir_index_binding {

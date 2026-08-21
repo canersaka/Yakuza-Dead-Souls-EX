@@ -353,6 +353,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_nir_adapter.c
             libs/video/rsx_nr_intercept.c
             libs/video/rsx_nr_ring.c
+            libs/video/rsx_nr_backend.c
             libs/video/rsx_dispatch.c
         )
         target_include_directories(rsx_nir_tests PRIVATE

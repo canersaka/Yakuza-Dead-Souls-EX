@@ -105,6 +105,17 @@ int rsx_vertex_pull_plan_init(rsx_vertex_pull_plan* plan,
                               const rsx_vertex_layout_plan* layout,
                               u32 allowed_types);
 
+/* Same plan from already-decoded state (the native-render backend consumes
+ * rsx_nir pipeline state, not a dispatch register file). attrs/defaults
+ * are the 16 decoded descriptors and disabled-read values; the ATTR3
+ * neutral-default quirk is applied here identically. */
+int rsx_vertex_pull_plan_init_decoded(rsx_vertex_pull_plan* plan,
+                                      const rsx_dsp_vertex_attr* attrs,
+                                      const float defaults[][4],
+                                      u32 base_offset, u32 divider_mask,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 allowed_types);
+
 /* Shader-cache key: hashes exactly what the generated text depends on
  * (used mask + per-attr type/size/pulled). */
 u64 rsx_vertex_pull_signature(const rsx_vertex_pull_plan* plan);
