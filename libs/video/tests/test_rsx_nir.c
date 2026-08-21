@@ -1027,37 +1027,56 @@ static void test_fixed_capacity(void)
 
 /* ---- submission ring: SPSC order, side wrap, stats, tokens ------------- */
 
+/* side-payload location of an op: fills *ofs/*count, returns 1 when the
+ * op carries a payload */
+static int op_side(const rsx_nir_op* op, u32* ofs, u32* count)
+{
+    switch (op->kind) {
+    case RSX_NIR_OP_DRAW:
+        *ofs = op->u.draw.batches_ofs;
+        *count = op->u.draw.batch_count * 2;
+        break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM:
+        *ofs = op->u.vertex_program.words_ofs;
+        *count = op->u.vertex_program.word_count;
+        break;
+    case RSX_NIR_OP_SET_CONSTANTS:
+        *ofs = op->u.constants.words_ofs;
+        *count = op->u.constants.slot_count * 4;
+        break;
+    case RSX_NIR_OP_TRANSFER:
+        *ofs = op->u.transfer.words_ofs;
+        *count = op->u.transfer.word_count;
+        break;
+    default:
+        *ofs = 0;
+        *count = 0;
+        return 0;
+    }
+    return *count != 0;
+}
+
+static void op_set_side_ofs(rsx_nir_op* op, u32 ofs)
+{
+    switch (op->kind) {
+    case RSX_NIR_OP_DRAW:               op->u.draw.batches_ofs = ofs; break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM: op->u.vertex_program.words_ofs = ofs; break;
+    case RSX_NIR_OP_SET_CONSTANTS:      op->u.constants.words_ofs = ofs; break;
+    case RSX_NIR_OP_TRANSFER:           op->u.transfer.words_ofs = ofs; break;
+    default: break;
+    }
+}
+
 /* copy a popped op (side payload included) into a plain stream so the
  * ring's output can be refolded/compared like any other producer */
 static void copy_op_to_stream(const rsx_nr_ring* r, const rsx_nir_op* op,
                               rsx_nir_stream* out)
 {
     rsx_nir_op c = *op;
-    u32 ofs = ~0u, count = 0;
-    switch (op->kind) {
-    case RSX_NIR_OP_DRAW:
-        ofs = op->u.draw.batches_ofs; count = op->u.draw.batch_count * 2; break;
-    case RSX_NIR_OP_SET_VERTEX_PROGRAM:
-        ofs = op->u.vertex_program.words_ofs;
-        count = op->u.vertex_program.word_count; break;
-    case RSX_NIR_OP_SET_CONSTANTS:
-        ofs = op->u.constants.words_ofs;
-        count = op->u.constants.slot_count * 4; break;
-    case RSX_NIR_OP_TRANSFER:
-        ofs = op->u.transfer.words_ofs;
-        count = op->u.transfer.word_count; break;
-    default:
-        break;
-    }
-    if (count) {
+    u32 ofs, count;
+    if (op_side(op, &ofs, &count)) {
         u32 nofs = rsx_nir_side_push(out, rsx_nr_ring_side_ptr(r, ofs), count);
-        switch (op->kind) {
-        case RSX_NIR_OP_DRAW:               c.u.draw.batches_ofs = nofs; break;
-        case RSX_NIR_OP_SET_VERTEX_PROGRAM: c.u.vertex_program.words_ofs = nofs; break;
-        case RSX_NIR_OP_SET_CONSTANTS:      c.u.constants.words_ofs = nofs; break;
-        case RSX_NIR_OP_TRANSFER:           c.u.transfer.words_ofs = nofs; break;
-        default: break;
-        }
+        op_set_side_ofs(&c, nofs);
     }
     rsx_nir_push(out, &c);
 }
@@ -1354,6 +1373,234 @@ static void test_backend_core(void)
     rsx_nr_ring_destroy(&ring);
 }
 
+/* ---- adversarial: SPU-patched (self-modifying) command groups ---------- */
+
+/* Models gs_task's patch-then-release protocol at the parser level: the
+ * consumer parks on a jump-to-self stopper; the SPU patches later command
+ * bytes (plain PUTs), then releases the stopper (fenced PUT). The decode
+ * of the patched buffer must equal the decode of a buffer that was never
+ * patched — i.e. the parser reads CURRENT bytes on resume, never a stale
+ * snapshot. */
+static void test_spu_patched_commands(void)
+{
+    u32 buf[64];
+    u32 n = 0;
+    /* packet 1: depth func */
+    buf[n++] = (1u << 18) | 0x0A6C;
+    buf[n++] = 0x0203;
+    const u32 stopper_at = n;
+    buf[n++] = 0x20000000u | (stopper_at * 4);   /* jump-to-self stopper  */
+    /* the "unpatched hole": junk the SPU will overwrite */
+    buf[n++] = 0xDEADBEEFu;
+    buf[n++] = 0xDEADBEEFu;
+    buf[n++] = 0xDEADBEEFu;
+    buf[n++] = 0xDEADBEEFu;
+    const u32 total = n;
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+
+    /* leg 1: parse until the stopper parks us */
+    u32 stop = 0;
+    u32 used = rsx_nir_adapter_fifo(&ad, buf, total, &stop);
+    CHECK(used == stopper_at, "parser did not park at the stopper (%u)",
+          used);
+    CHECK((stop & 0xE0000003u) == 0x20000000u, "stop word %08X", stop);
+
+    /* the SPU patches the hole with a real packet, then releases the
+     * stopper by rewriting it as a jump PAST itself (modeled here by the
+     * consumer resuming at the patched words, since the linear parser has
+     * no address space to follow jumps through) */
+    u32 p = stopper_at + 1;
+    buf[p++] = (1u << 18) | 0x1D90;              /* clear color           */
+    buf[p++] = 0xFF112233u;
+    buf[p++] = (1u << 18) | 0x1D94;              /* CLEAR_BUFFERS         */
+    buf[p++] = 0xF3;
+    used = rsx_nir_adapter_fifo(&ad, buf + stopper_at + 1,
+                                total - stopper_at - 1, &stop);
+    CHECK(used == total - stopper_at - 1, "resume consumed %u", used);
+    rsx_nir_adapter_finish(&ad);
+
+    /* reference: the same logical stream that was never patched */
+    u32 ref[8];
+    u32 rn = 0;
+    ref[rn++] = (1u << 18) | 0x0A6C;
+    ref[rn++] = 0x0203;
+    ref[rn++] = (1u << 18) | 0x1D90;
+    ref[rn++] = 0xFF112233u;
+    ref[rn++] = (1u << 18) | 0x1D94;
+    ref[rn++] = 0xF3;
+    rsx_nir_adapter ad2;
+    rsx_nir_adapter_init(&ad2, &sb);
+    used = rsx_nir_adapter_fifo(&ad2, ref, rn, &stop);
+    CHECK(used == rn, "reference consumed %u", used);
+    rsx_nir_adapter_finish(&ad2);
+
+    char err[256] = {0};
+    CHECK(rsx_nir_compare(&sa, &sb, err, sizeof(err)) == 0,
+          "patched vs unpatched decode: %s", err);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- adversarial: partial publication ---------------------------------- */
+
+static void test_partial_publication(void)
+{
+    /* a method packet whose args are not yet published: the parser must
+     * refuse the truncated tail and resume exactly there once the
+     * producer publishes the rest */
+    u32 buf[16];
+    u32 n = 0;
+    buf[n++] = (2u << 18) | 0x1D8C;              /* two args promised     */
+    buf[n++] = 0xFFFFFF00u;                      /* only one published    */
+    const u32 published = n;
+    buf[n++] = 0x11111111u;                      /* arrives later         */
+    buf[n++] = (1u << 18) | 0x1D94;
+    buf[n++] = 0x01;
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    u32 stop = 0;
+    u32 used = rsx_nir_adapter_fifo(&ad, buf, published, &stop);
+    CHECK(used == 0, "truncated packet was consumed (%u)", used);
+    /* nothing executed: no ops beyond (possibly) none at all */
+    CHECK(sa.op_count == 0, "partial publication emitted ops");
+    /* full publication: parse from the packet start */
+    used = rsx_nir_adapter_fifo(&ad, buf, n, &stop);
+    CHECK(used == n, "full parse consumed %u of %u", used, n);
+    rsx_nir_adapter_finish(&ad);
+
+    rsx_nir_adapter ad2;
+    rsx_nir_adapter_init(&ad2, &sb);
+    rsx_nir_adapter_fifo(&ad2, buf, n, &stop);
+    rsx_nir_adapter_finish(&ad2);
+    char err[256] = {0};
+    CHECK(rsx_nir_compare(&sa, &sb, err, sizeof(err)) == 0,
+          "resumed vs whole parse: %s", err);
+
+    /* ring-side atomicity: state ops without their action execute no
+     * action at the backend */
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 256, 8192) == 0, "ring init");
+    exec_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.user = &rec;
+    ops.clear = rec_clear;
+    ops.draw = rec_draw;
+    ops.present = rec_present;
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+    rsx_nir_op op;
+    memset(&op, 0, sizeof(op));
+    op.kind = RSX_NIR_OP_SET_BLEND;
+    op.u.blend.blend_enable = 1;
+    rsx_nr_ring_push(&ring, &op);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.n == 0, "state-only partial command executed an action");
+    CHECK(be.st.blend.blend_enable == 1, "state op not folded");
+    rsx_nr_ring_destroy(&ring);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- adversarial: reset semantics -------------------------------------- */
+
+static void test_reset_semantics(void)
+{
+    /* after a stream reset + emitter re-init, the new stream must be
+     * self-contained: the first action re-emits every state group, and
+     * comparison against a fresh producer of the same commands holds */
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sa);
+    typed_stage_defaults(&em);
+    build_scene_typed(&em);
+    u32 ops_before = sa.op_count;
+    CHECK(ops_before > 0, "scene emitted nothing");
+
+    rsx_nir_stream_reset(&sa);
+    rsx_nir_emitter_init_stream(&em, &sa);   /* renderer reset            */
+    typed_stage_defaults(&em);
+    rsx_nir_em_clear(&em, 1, 0xAB, 0, 0);
+
+    rsx_nir_emitter e2;
+    rsx_nir_emitter_init_stream(&e2, &sb);
+    typed_stage_defaults(&e2);
+    rsx_nir_em_clear(&e2, 1, 0xAB, 0, 0);
+    char err[256] = {0};
+    CHECK(rsx_nir_compare(&sa, &sb, err, sizeof(err)) == 0,
+          "post-reset stream not self-contained: %s", err);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- end-to-end: intercept + backend + FIFO-consumer simulator --------- */
+
+static void test_intercept_backend_end_to_end(void)
+{
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 1024, 32768) == 0, "ring init");
+    rsx_nr_intercept it;
+    rsx_nr_intercept_init(&it, &ring, &tokens,
+                          (1u << RSX_NR_FAM_CLEAR) |
+                          (1u << RSX_NR_FAM_FLIP), 1);
+    typed_stage_defaults(&it.shadow.em);
+
+    exec_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.user = &rec;
+    ops.clear = rec_clear;
+    ops.draw = rec_draw;
+    ops.present = rec_present;
+    ops.sem_write = rec_sem_write;
+    ops.sem_read = rec_sem_read;
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+
+    /* frame: native clear; FIFO-owned draw (family off); native flip.
+     * The backend must execute the clear, park at the drain wait, and
+     * present only after the FIFO consumer reports the episode done. */
+    CHECK(rsx_nr_try_clear(&it, 0xF3, 0x40, 0xFFFFFF, 0) == 1, "clear");
+    u32 batch[2] = { 0, 3 };
+    CHECK(rsx_nr_try_draw(&it, 5, 0, batch, 1) == 0, "draw intercepted");
+    /* (the FIFO path executes the draw on its own consumer here) */
+    CHECK(rsx_nr_try_flip(&it, 0, 0, 0, 0) == 1, "flip");
+
+    rsx_nr_backend_run(&be, 0);
+    CHECK(strcmp(rec.kinds, "C") == 0,
+          "backend ran past the drain gate: '%s'", rec.kinds);
+    CHECK(rsx_nr_backend_step(&be) == RSX_NR_STEP_BLOCKED_TOKEN,
+          "not parked on the drain token");
+
+    rsx_nr_intercept_fifo_drained(&it, 1);   /* FIFO consumer catches up  */
+    rsx_nr_backend_run(&be, 0);
+    CHECK(strcmp(rec.kinds, "CP") == 0, "post-drain execution '%s'",
+          rec.kinds);
+    CHECK(rec.last_present == 0, "flip buffer %u", rec.last_present);
+    CHECK(be.stats.fallback_enters == 1 && be.stats.fallback_exits == 1,
+          "fallback marker accounting %llu/%llu",
+          be.stats.fallback_enters, be.stats.fallback_exits);
+
+    rsx_nr_ring_destroy(&ring);
+}
+
 /* ---- optional real-capture leg ----------------------------------------- */
 
 typedef struct rxs_head {
@@ -1525,6 +1772,69 @@ static int run_capture(const char* path)
         char err[256] = {0};
         int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
         CHECK(rc == 0, "capture determinism: %s", err);
+
+        /* ring-transport determinism: pump the whole capture stream
+         * through a deliberately small ring (thousands of wraps) and
+         * require a byte-identical refold */
+        {
+            rsx_nr_ring ring;
+            CHECK(rsx_nr_ring_init(&ring, 1024, 1u << 15) == 0,
+                  "capture ring init");
+            rsx_nir_stream rb;
+            rsx_nir_stream_init(&rb);
+            const rsx_nr_slot* slot;
+            u32 pumped = 0;
+            for (u32 i = 0; i < sa.op_count; i++) {
+                const rsx_nir_op* op = &sa.ops[i];
+                u32 ofs, cnt;
+                op_side(op, &ofs, &cnt);
+                if (!rsx_nr_ring_can_accept(&ring, 1, cnt)) {
+                    while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+                        copy_op_to_stream(&ring, &slot->op, &rb);
+                        rsx_nr_ring_pop(&ring);
+                    }
+                    if (!rsx_nr_ring_can_accept(&ring, 1, cnt)) {
+                        CHECK(0, "capture op %u exceeds ring capacity "
+                              "(side %u)", i, cnt);
+                        break;
+                    }
+                }
+                rsx_nir_op c = *op;
+                if (cnt) {
+                    u32* dst = NULL;
+                    u32 nofs = rsx_nr_ring_side_reserve(&ring, cnt, &dst);
+                    if (nofs == ~0u || !dst) {
+                        CHECK(0, "capture side reserve failed at op %u", i);
+                        break;
+                    }
+                    memcpy(dst, rsx_nir_side(&sa, ofs, cnt),
+                           (size_t)cnt * 4);
+                    op_set_side_ofs(&c, nofs);
+                }
+                if (rsx_nr_ring_push(&ring, &c) != 0) {
+                    CHECK(0, "capture ring push failed at op %u", i);
+                    break;
+                }
+                pumped++;
+            }
+            while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+                copy_op_to_stream(&ring, &slot->op, &rb);
+                rsx_nr_ring_pop(&ring);
+            }
+            CHECK(pumped == sa.op_count, "pumped %u of %u ops", pumped,
+                  sa.op_count);
+            err[0] = 0;
+            rc = rsx_nir_compare(&sa, &rb, err, sizeof(err));
+            CHECK(rc == 0, "capture ring transport: %s", err);
+            printf("capture ring transport: %u ops, %u side words, "
+                   "%llu wrap-pad words, high water %llu\n",
+                   sa.op_count, sa.side_count,
+                   (unsigned long long)ring.side_pad_words,
+                   (unsigned long long)ring.op_high_water);
+            rsx_nir_stream_free(&rb);
+            rsx_nr_ring_destroy(&ring);
+        }
+
         rsx_nir_stream_free(&sa);
         rsx_nir_stream_free(&sb);
     }
@@ -1554,6 +1864,10 @@ int main(int argc, char** argv)
     test_fixed_capacity();
     test_ring();
     test_backend_core();
+    test_spu_patched_commands();
+    test_partial_publication();
+    test_reset_semantics();
+    test_intercept_backend_end_to_end();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])
