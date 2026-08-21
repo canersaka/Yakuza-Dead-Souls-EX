@@ -19,7 +19,7 @@
  */
 
 #include "../rsx_nir_adapter.h"
-#include "../rsx_nir_intercept.h"
+#include "../rsx_nr_intercept.h"
 #include "../rsx_nr_ring.h"
 
 #include <stdio.h>
@@ -584,20 +584,30 @@ static void test_fifo_front_end(void)
     rsx_nir_stream_free(&sb);
 }
 
+/* defined with the ring tests below */
+static void copy_op_to_stream(const rsx_nr_ring* r, const rsx_nir_op* op,
+                              rsx_nir_stream* out);
+static void drain_ring_to_stream(rsx_nr_ring* r, rsx_nir_stream* out);
+
 static void test_flip_intercept(void)
 {
-    /* default-disabled contract: with the env var absent, the scaffold
-     * reports disabled */
-#ifdef _WIN32
-    _putenv("YZ_NIR_INTERCEPT=");
-#endif
-    CHECK(rsx_nir_intercept_enabled() == 0,
-          "intercept scaffold must default to disabled");
+    /* family parsing */
+    CHECK(rsx_nr_parse_families(NULL) == 0, "NULL spec not disabled");
+    CHECK(rsx_nr_parse_families("") == 0, "empty spec not disabled");
+    CHECK(rsx_nr_parse_families("0") == 0, "0 spec not disabled");
+    CHECK(rsx_nr_parse_families("1") == (1u << RSX_NR_FAM_COUNT) - 1,
+          "1 spec not all");
+    CHECK(rsx_nr_parse_families("all") == (1u << RSX_NR_FAM_COUNT) - 1,
+          "all spec not all");
+    CHECK(rsx_nr_parse_families("flip,draw") ==
+              ((1u << RSX_NR_FAM_FLIP) | (1u << RSX_NR_FAM_DRAW)),
+          "flip,draw parse wrong");
+    CHECK(rsx_nr_parse_families("bogus,clear") == (1u << RSX_NR_FAM_CLEAR),
+          "unknown family name not ignored");
 
-    /* packet path: the exact yz_gcm_append_flip_commands word sequence,
-     * decoded by the adapter */
+    /* packet path: the exact committed flip word sequence, decoded */
     u32 pkt[10];
-    u32 n = rsx_nir_intercept_flip_packet(pkt, 2, 1, 0x40, 0x1234);
+    u32 n = rsx_nr_flip_packet_spec(pkt, 2, 1, 0x40, 0x1234);
     CHECK(n == 10, "flip packet word count %u", n);
 
     rsx_nir_stream sa, sb;
@@ -609,12 +619,18 @@ static void test_flip_intercept(void)
     u32 used = rsx_nir_adapter_fifo(&ad, pkt, n, NULL);
     CHECK(used == n, "flip packet consumed %u of %u", used, n);
 
-    /* native path: typed flip, no packet encode/decode */
-    rsx_nir_emitter em;
-    rsx_nir_emitter_init_stream(&em, &sb);
-    typed_stage_defaults(&em);
-    int rc = rsx_nir_intercept_flip(&em, 2, 1, 0x40, 0x1234);
-    CHECK(rc == 0, "intercept flip rejected valid args");
+    /* native path: intercept layer -> ring -> rebuilt stream */
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 1024, 32768) == 0, "ring init");
+    rsx_nr_intercept it;
+    rsx_nr_intercept_init(&it, &ring, &tokens,
+                          1u << RSX_NR_FAM_FLIP, 1);
+    typed_stage_defaults(&it.shadow.em);
+    int rc = rsx_nr_try_flip(&it, 2, 1, 0x40, 0x1234);
+    CHECK(rc == 1, "try_flip refused valid args");
+    drain_ring_to_stream(&ring, &sb);
 
     char err[256] = {0};
     rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
@@ -627,7 +643,7 @@ static void test_flip_intercept(void)
     if (na == 2) {
         CHECK(acts[0].kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE, "a0 kind %u",
               acts[0].kind);
-        CHECK(acts[0].u.semaphore.dma_context == RSX_NIR_DMA_SEMAPHORE_RW &&
+        CHECK(acts[0].u.semaphore.dma_context == RSX_NR_DMA_SEMAPHORE_RW &&
               acts[0].u.semaphore.offset == 0x400 &&
               acts[0].u.semaphore.value == 0x1234,
               "acquire payload %08X/%08X/%08X",
@@ -638,32 +654,185 @@ static void test_flip_intercept(void)
     }
     free(acts);
 
-    /* no-label variant folds to PRESENT alone */
+    /* invalid buffer id refused: no flip ops, but the refusal correctly
+     * opens a fallback episode (the caller will run the FIFO path) */
+    rc = rsx_nr_try_flip(&it, 8, 0, 0, 0);
+    CHECK(rc == 0, "buffer_id 8 accepted");
+    CHECK(rsx_nr_ring_depth(&ring) == 1, "refusal should emit exactly the "
+          "fallback ENTER marker (depth %u)", rsx_nr_ring_depth(&ring));
+    const rsx_nr_slot* ms = rsx_nr_ring_peek(&ring);
+    CHECK(ms && ms->op.kind == RSX_NIR_OP_FALLBACK &&
+          ms->op.u.fallback.dir == RSX_NIR_FALLBACK_ENTER &&
+          ms->op.u.fallback.family == RSX_NR_FAM_FLIP &&
+          ms->op.u.fallback.reason == RSX_NR_FB_UNSUPPORTED,
+          "marker is not the flip UNSUPPORTED ENTER");
+    rsx_nr_ring_pop(&ring);
+
+    /* disabled default: every try_* refuses with reason DISABLED and the
+     * ring receives nothing (fully-off = no ordering markers either) */
+    rsx_nr_intercept off;
+    rsx_nr_intercept_init(&off, &ring, &tokens, 0, 0);
+    CHECK(rsx_nr_try_flip(&off, 1, 0, 0, 0) == 0, "disabled flip accepted");
+    CHECK(rsx_nr_try_user_command(&off, 3) == 0, "disabled user accepted");
+    CHECK(rsx_nr_ring_depth(&ring) == 0, "disabled layer touched the ring");
+    rsx_nr_stats st;
+    rsx_nr_intercept_get_stats(&off, &st);
+    CHECK(st.fallbacks[RSX_NR_FAM_FLIP][RSX_NR_FB_DISABLED] == 1 &&
+          st.fallbacks[RSX_NR_FAM_USER][RSX_NR_FB_DISABLED] == 1,
+          "disabled fallbacks not counted");
+    CHECK(st.fallback_episodes == 0, "disabled layer opened episodes");
+
     rsx_nir_stream_free(&sa);
     rsx_nir_stream_free(&sb);
-    rsx_nir_stream_init(&sa);
-    rsx_nir_stream_init(&sb);
-    rsx_nir_adapter_init(&ad, &sa);
-    n = rsx_nir_intercept_flip_packet(pkt, 5, 0, 0, 0);
-    CHECK(n == 4, "no-label packet word count %u", n);
-    used = rsx_nir_adapter_fifo(&ad, pkt, n, NULL);
-    CHECK(used == n, "no-label packet consumed %u of %u", used, n);
-    rsx_nir_emitter_init_stream(&em, &sb);
+    rsx_nr_ring_destroy(&ring);
+}
+
+/* Mixed-mode: some families native, the rest through the FIFO with the
+ * decode-side shadow keeping state coherent; ordering markers + the
+ * FIFO-drain token gate the native consumer. */
+static void test_intercept_mixed_mode(void)
+{
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 1024, 32768) == 0, "ring init");
+    rsx_nr_intercept it;
+    rsx_nr_intercept_init(&it, &ring, &tokens,
+                          (1u << RSX_NR_FAM_CLEAR) |
+                          (1u << RSX_NR_FAM_SEMAPHORE) |
+                          (1u << RSX_NR_FAM_FLIP), 1);
+    typed_stage_defaults(&it.shadow.em);
+
+    /* state arrives through the shadowed FIFO stream */
+    rsx_nr_intercept_shadow_method(&it, 0x0310, 1);        /* BLEND_ENABLE */
+    rsx_nr_intercept_shadow_method(&it, 0x1D90, 0x11223344); /* CLEAR_COLOR */
+
+    /* native clear observes the shadowed state */
+    CHECK(rsx_nr_try_clear(&it, 0xF3, 0x11223344, 0xFFFFFF, 0) == 1,
+          "try_clear refused");
+
+    /* a draw falls back (family off): caller runs the FIFO path, which the
+     * shadow mirrors state-only */
+    u32 one_batch[2] = { 0, 12 };
+    CHECK(rsx_nr_try_draw(&it, 5, 0, one_batch, 1) == 0,
+          "draw intercepted though family off");
+    rsx_nr_intercept_shadow_method(&it, 0x1808, 5);        /* BEGIN tris   */
+    rsx_nr_intercept_shadow_method(&it, 0x1814, (11u << 24) | 0);
+    rsx_nr_intercept_shadow_method(&it, 0x1808, 0);        /* END          */
+
+    /* native again: semaphore release must be ordered behind the drain */
+    CHECK(rsx_nr_try_semaphore_release(&it, 0x66616661, 0x40, 7, 0) == 1,
+          "sem release refused");
+    CHECK(rsx_nr_try_flip(&it, 1, 0, 0, 0) == 1, "flip refused");
+
+    /* expected ring action sequence */
+    rsx_nir_stream got;
+    rsx_nir_stream_init(&got);
+    /* consume with the ordering contract: stop at an unsatisfied wait */
+    int waited_at_token = 0;
+    const rsx_nr_slot* slot;
+    while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+        if (slot->op.kind == RSX_NIR_OP_TOKEN_WAIT &&
+            !rsx_nr_tokens_satisfied(&tokens, slot->op.u.token.token,
+                                     slot->op.u.token.value)) {
+            waited_at_token = 1;
+            break;
+        }
+        copy_op_to_stream(&ring, &slot->op, &got);
+        rsx_nr_ring_pop(&ring);
+    }
+    CHECK(waited_at_token, "consumer never blocked on the drain token");
+    /* the FIFO consumer reports the episode drained; consumption resumes */
+    rsx_nr_intercept_fifo_drained(&it, 1);
+    while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+        if (slot->op.kind == RSX_NIR_OP_TOKEN_WAIT &&
+            !rsx_nr_tokens_satisfied(&tokens, slot->op.u.token.token,
+                                     slot->op.u.token.value)) {
+            CHECK(0, "drain token still unsatisfied after signal");
+            break;
+        }
+        copy_op_to_stream(&ring, &slot->op, &got);
+        rsx_nr_ring_pop(&ring);
+    }
+
+    rsx_nir_action* acts = NULL;
+    int na = rsx_nir_fold(&got, &acts);
+    CHECK(na == 6, "mixed-mode action count %d", na);
+    if (na == 6) {
+        CHECK(acts[0].kind == RSX_NIR_OP_CLEAR, "a0 %u", acts[0].kind);
+        CHECK(acts[0].state.blend.blend_enable == 1,
+              "shadowed blend state missing at native clear");
+        CHECK(acts[1].kind == RSX_NIR_OP_FALLBACK &&
+              acts[1].u.fallback.dir == RSX_NIR_FALLBACK_ENTER &&
+              acts[1].u.fallback.family == RSX_NR_FAM_DRAW &&
+              acts[1].u.fallback.reason == RSX_NR_FB_DISABLED,
+              "a1 not the draw fallback ENTER");
+        CHECK(acts[2].kind == RSX_NIR_OP_FALLBACK &&
+              acts[2].u.fallback.dir == RSX_NIR_FALLBACK_EXIT,
+              "a2 not fallback EXIT");
+        CHECK(acts[3].kind == RSX_NIR_OP_TOKEN_WAIT &&
+              acts[3].u.token.token == RSX_NR_TOKEN_FIFO_DRAIN &&
+              acts[3].u.token.value == 1, "a3 not the drain wait");
+        CHECK(acts[4].kind == RSX_NIR_OP_SEMAPHORE_RELEASE, "a4 %u",
+              acts[4].kind);
+        CHECK(acts[5].kind == RSX_NIR_OP_PRESENT &&
+              acts[5].u.present.buffer == 1, "a5 %u", acts[5].kind);
+    }
+    free(acts);
+
+    /* the filtered compare drops the markers: the render-relevant
+     * subsequence equals a pure typed emission of the same commands */
+    rsx_nir_stream pure;
+    rsx_nir_stream_init(&pure);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &pure);
     typed_stage_defaults(&em);
-    rc = rsx_nir_intercept_flip(&em, 5, 0, 0, 0);
-    CHECK(rc == 0, "intercept flip (no label) rejected");
-    err[0] = 0;
-    rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
-    CHECK(rc == 0, "no-label flip packet vs native: %s", err);
+    rsx_nir_blend bl;
+    memset(&bl, 0, sizeof(bl));
+    bl.blend_enable = 1;
+    rsx_nir_em_blend(&em, &bl);
+    rsx_nir_em_clear(&em, 0xF3, 0x11223344, 0xFFFFFF, 0);
+    rsx_nir_em_semaphore_release(&em, 0x66616661, 0x40, 7, 0);
+    rsx_nir_em_present(&em, 1);
+    char err[256] = {0};
+    u32 skip = (1u << RSX_NIR_OP_FALLBACK) | (1u << RSX_NIR_OP_TOKEN_WAIT) |
+               (1u << RSX_NIR_OP_TOKEN_SIGNAL);
+    int rc = rsx_nir_compare_ex(&got, &pure, skip, err, sizeof(err));
+    CHECK(rc == 0, "mixed vs pure (markers skipped): %s", err);
 
-    /* invalid buffer id refused with nothing emitted (packet-path parity) */
-    u32 ops_before = sb.op_count;
-    rc = rsx_nir_intercept_flip(&em, 8, 0, 0, 0);
-    CHECK(rc != 0, "buffer_id 8 accepted");
-    CHECK(sb.op_count == ops_before, "refused flip still emitted ops");
+    /* stats + formatter sanity */
+    rsx_nr_stats st;
+    rsx_nr_intercept_get_stats(&it, &st);
+    CHECK(st.native_ops[RSX_NR_FAM_CLEAR] == 1 &&
+          st.native_ops[RSX_NR_FAM_SEMAPHORE] == 1 &&
+          st.native_ops[RSX_NR_FAM_FLIP] == 1, "native counts wrong");
+    CHECK(st.fallbacks[RSX_NR_FAM_DRAW][RSX_NR_FB_DISABLED] == 1,
+          "draw fallback not counted");
+    CHECK(st.fallback_episodes == 1, "episode count %llu",
+          st.fallback_episodes);
+    CHECK(st.shadow_methods == 5, "shadow methods %llu", st.shadow_methods);
+    char line[256];
+    u32 ln = rsx_nr_stats_format(&st, line, sizeof(line));
+    CHECK(ln > 0 && strstr(line, "native=3") && strstr(line, "eps=1"),
+          "stats line malformed: %s", line);
 
-    rsx_nir_stream_free(&sa);
-    rsx_nir_stream_free(&sb);
+    /* capacity refusal falls back cleanly (tiny ring) */
+    rsx_nr_ring tiny;
+    CHECK(rsx_nr_ring_init(&tiny, 16, 256) == 0, "tiny ring init");
+    rsx_nr_intercept it2;
+    rsx_nr_intercept_init(&it2, &tiny, &tokens,
+                          (1u << RSX_NR_FAM_CLEAR), 1);
+    CHECK(rsx_nr_try_clear(&it2, 1, 0, 0, 0) == 0,
+          "clear accepted despite capacity");
+    rsx_nr_intercept_get_stats(&it2, &st);
+    CHECK(st.fallbacks[RSX_NR_FAM_CLEAR][RSX_NR_FB_CAPACITY] == 1,
+          "capacity fallback not counted");
+    CHECK(!rsx_nr_ring_reject_sticky(&tiny), "pre-check tripped the ring");
+
+    rsx_nir_stream_free(&got);
+    rsx_nir_stream_free(&pure);
+    rsx_nr_ring_destroy(&ring);
+    rsx_nr_ring_destroy(&tiny);
 }
 
 /* ---- data-move equivalence: packet path vs typed ----------------------- */
@@ -890,6 +1059,15 @@ static void copy_op_to_stream(const rsx_nr_ring* r, const rsx_nir_op* op,
         }
     }
     rsx_nir_push(out, &c);
+}
+
+static void drain_ring_to_stream(rsx_nr_ring* r, rsx_nir_stream* out)
+{
+    const rsx_nr_slot* slot;
+    while ((slot = rsx_nr_ring_peek(r)) != NULL) {
+        copy_op_to_stream(r, &slot->op, out);
+        rsx_nr_ring_pop(r);
+    }
 }
 
 static void test_ring(void)
@@ -1182,6 +1360,7 @@ int main(int argc, char** argv)
     test_ordering();
     test_fifo_front_end();
     test_flip_intercept();
+    test_intercept_mixed_mode();
     test_transfers();
     test_reference_user_tokens();
     test_fixed_capacity();

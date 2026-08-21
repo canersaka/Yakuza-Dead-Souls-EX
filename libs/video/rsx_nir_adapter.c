@@ -337,10 +337,19 @@ static void stage_state(rsx_nir_adapter* ad)
 
 /* ---- NV308A inline-color accumulation ---------------------------------- */
 
+void rsx_nir_adapter_stage_state(rsx_nir_adapter* ad)
+{
+    stage_state(ad);
+}
+
 static void flush_inline(rsx_nir_adapter* ad)
 {
     if (!ad->inline_count)
         return;
+    if (ad->shadow_mode) {
+        ad->inline_count = 0;
+        return;
+    }
     stage_state(ad);
     rsx_nir_transfer t;
     memset(&t, 0, sizeof(t));
@@ -361,6 +370,8 @@ static void flush_inline(rsx_nir_adapter* ad)
 
 static void add_inline_word(rsx_nir_adapter* ad, u32 index, u32 arg)
 {
+    if (ad->shadow_mode)
+        return;         /* payload delivery is the FIFO path's job */
     if (ad->inline_count &&
         index != ad->inline_first_index + ad->inline_count) {
         /* non-contiguous run: the previous transfer is complete */
@@ -381,6 +392,8 @@ static void add_inline_word(rsx_nir_adapter* ad, u32 index, u32 arg)
 static void sink_clear(void* user, const rsx_dispatch* rsx, u32 mask)
 {
     rsx_nir_adapter* ad = user;
+    if (ad->shadow_mode)
+        return;
     stage_state(ad);
     u32 zs = rsx_dsp_clear_zstencil(rsx);
     rsx_nir_em_clear(&ad->em, mask, rsx_dsp_clear_color(rsx),
@@ -428,6 +441,10 @@ static void sink_draw_index_array(void* user, const rsx_dispatch* rsx,
 static void sink_end(void* user, const rsx_dispatch* rsx)
 {
     rsx_nir_adapter* ad = user;
+    if (ad->shadow_mode) {
+        ad->batch_count = 0;
+        return;
+    }
     if (!ad->batch_count)
         return;   /* state-only or immediate-mode begin/end: no batched draw */
     stage_state(ad);
@@ -441,6 +458,8 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
 {
     rsx_nir_adapter* ad = user;
     (void)rsx;
+    if (ad->shadow_mode)
+        return;
     stage_state(ad);
     rsx_nir_em_present(&ad->em, arg);
     ad->actions_seen++;
@@ -499,6 +518,8 @@ static int fifo_engine_method(rsx_nir_adapter* ad, u32 m, u32 arg)
 {
     switch (m) {
     case M406E_SET_REFERENCE:
+        if (ad->shadow_mode)
+            return 1;
         stage_state(ad);
         rsx_nir_em_set_reference(&ad->em, arg);
         ad->actions_seen++;
@@ -510,12 +531,16 @@ static int fifo_engine_method(rsx_nir_adapter* ad, u32 m, u32 arg)
         ad->fifo_semaphore_offset = arg;
         return 1;
     case M406E_SEMAPHORE_ACQUIRE:
+        if (ad->shadow_mode)
+            return 1;
         stage_state(ad);
         rsx_nir_em_semaphore_acquire(&ad->em, ad->fifo_semaphore_dma,
                                      ad->fifo_semaphore_offset, arg);
         ad->actions_seen++;
         return 1;
     case M406E_SEMAPHORE_RELEASE:
+        if (ad->shadow_mode)
+            return 1;
         stage_state(ad);
         rsx_nir_em_semaphore_release(&ad->em, ad->fifo_semaphore_dma,
                                      ad->fifo_semaphore_offset, arg, 0);
@@ -550,11 +575,15 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
      * silently */
     switch (method) {
     case M_WAIT_FOR_IDLE:
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_em_barrier(&ad->em, 0);
         ad->actions_seen++;
         break;
     case M_BACK_END_SEM_RELEASE:
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_em_semaphore_release(&ad->em,
                                      rsx_dsp_reg(&ad->rsx, M_CTX_DMA_SEMAPHORE_3D),
@@ -563,6 +592,8 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         ad->actions_seen++;
         break;
     case M_TEX_READ_SEM_RELEASE:
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_em_semaphore_release(&ad->em,
                                      rsx_dsp_reg(&ad->rsx, M_CTX_DMA_SEMAPHORE_3D),
@@ -571,12 +602,16 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         ad->actions_seen++;
         break;
     case M_GET_REPORT:
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_em_report(&ad->em, 0, arg,
                           rsx_dsp_reg(&ad->rsx, M_CONTEXT_DMA_REPORT));
         ad->actions_seen++;
         break;
     case M_CLEAR_REPORT_VALUE:
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_em_report(&ad->em, 1, arg,
                           rsx_dsp_reg(&ad->rsx, M_CONTEXT_DMA_REPORT));
@@ -584,6 +619,8 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         break;
     case M_USER_COMMAND_CAUSE:
     case M_USER_COMMAND_FIRE:
+        if (ad->shadow_mode)
+            break;
         /* the live consumer treats both words as one delivery carrying the
          * cause argument; model the pair as one ordered action per method
          * (coalescing is a delivery-side behavior, not a stream one) */
@@ -603,6 +640,8 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
     case M0039_LINE_COUNT:      ad->m2mf_line_count = arg; break;
     case M0039_FORMAT:          ad->m2mf_format = arg; break;
     case M0039_BUFFER_NOTIFY: {
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_transfer t;
         memset(&t, 0, sizeof(t));
@@ -649,6 +688,8 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
     case M3089_IN_FORMAT:    ad->sif_in_format = arg; break;
     case M3089_IN_OFFSET:    ad->sif_in_offset = arg; break;
     case M3089_IN_POINT: {
+        if (ad->shadow_mode)
+            break;
         stage_state(ad);
         rsx_nir_transfer t;
         memset(&t, 0, sizeof(t));

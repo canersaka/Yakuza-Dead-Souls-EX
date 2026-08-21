@@ -103,6 +103,12 @@ typedef struct rsx_nir_adapter {
     /* stats */
     u32 methods_seen;
     u32 actions_seen;
+
+    /* Shadow mode (rsx_nr_intercept): mirror every method into the
+     * register file and emitter staging WITHOUT emitting action ops —
+     * the FIFO path owns execution of shadowed commands. State-group
+     * knowledge stays fresh for the next native action. */
+    int shadow_mode;
 } rsx_nir_adapter;
 
 void rsx_nir_adapter_init(rsx_nir_adapter* ad, rsx_nir_stream* out);
@@ -119,6 +125,12 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg);
 /* Flush any pending NV308A inline-color run (call at stream end; the
  * method path flushes automatically when a non-COLOR method arrives). */
 void rsx_nir_adapter_finish(rsx_nir_adapter* ad);
+
+/* Stage the register file's complete decoded state into the emitter's
+ * pending set (no ops emitted until the next action flush). The native
+ * interception layer calls this before emitting a typed action so the
+ * action observes all state that arrived through the shadowed FIFO. */
+void rsx_nir_adapter_stage_state(rsx_nir_adapter* ad);
 
 /* Feed raw FIFO words from a linear buffer. Returns the number of words
  * consumed; a JUMP/CALL/RET control word stops the parse (the return value
