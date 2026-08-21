@@ -16,6 +16,8 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_job_dispatch.h"
+#include "../../include/ps3emu/yz_fe0_timeline.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -400,6 +402,12 @@ static inline int mfc_is_atomic(uint32_t cmd)
 {
     return cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
            cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD;
+}
+
+static inline uint32_t mfc_diag_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 static inline int mfc_uses_tag(uint32_t cmd)
@@ -1059,6 +1067,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
+    const uint32_t fe0_put_ea =
+        (uint32_t)(ea & ~0x80000000ull);
+    const int fe0_timeline_put =
+        g_yz_fe0_timeline_enabled && spu->image_id == 4 &&
+        mfc_is_put(cmd) && fe0_put_ea <= 0x10200FE0u &&
+        (uint64_t)fe0_put_ea + size >= 0x10200FE4ull;
 
 #ifdef SPU_DMA_LOG
     { extern int g_spu_dma_log; if (g_spu_dma_log-- > 0)
@@ -1425,6 +1439,24 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         }
 #endif
                     }
+                    if (g_yz_fe0_timeline_enabled) {
+                        const uint32_t word0 =
+                            ((uint32_t)ls_ptr[0] << 24) |
+                            ((uint32_t)ls_ptr[1] << 16) |
+                            ((uint32_t)ls_ptr[2] << 8) |
+                            (uint32_t)ls_ptr[3];
+                        const uint32_t word1 =
+                            ((uint32_t)ls_ptr[4] << 24) |
+                            ((uint32_t)ls_ptr[5] << 16) |
+                            ((uint32_t)ls_ptr[6] << 8) |
+                            (uint32_t)ls_ptr[7];
+                        yz_fe0_timeline_emit(
+                            YZ_FE0_EVENT_WKL4_RECORD,
+                            spu->fe0_timeline_cause,
+                            ((spu->spu_id & 0xffffu) << 16) |
+                                (spu->fe0_timeline_task & 0xffffu),
+                            spu->fe0_timeline_epoch, rea, word0, word1);
+                    }
                 }
             }
 #if !defined(YZ_PERF_CLEAN)
@@ -1517,34 +1549,43 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * spu_indirect_branch can select the matching fixed relocation.
              * NOT image-gated: a mid-cycle kernel adoption can leave the
              * module's SPU on a stale image id, while eaBinary is an exact
-             * identity key. */
+            * identity key. */
             if ((lsa & SPU_LS_MASK) >= 0x4880u) {
-                static const uint32_t job_ea[5] = {
-                    0x01254500u, 0x01275A00u, 0x0125DA80u, 0x01265180u,
-                    0x01252680u
-                };
-                static const uint32_t job_span[5] = {
-                    0x9540u, 0x14C0u, 0x7640u, 0x10610u, 0x1E80u
-                };
-                for (int ji = 0; ji < 5; ji++) {
-                    if ((uint32_t)ea != job_ea[ji])
-                        continue;
+                const int ji = spu_job_binary_slot((uint32_t)ea);
+                if (ji >= 0) {
+                    const uint32_t job_span = spu_job_family_span(ji);
                     uint32_t base = lsa & SPU_LS_MASK;
                     /* A newly loaded binary owns its entire LS range. Forget
                      * any older recorded occupant that it overlaps. */
-                    for (int oi = 0; oi < 5; oi++) {
-                        uint32_t other = spu->job_bin_base[oi];
+                    for (int oi = 0; oi < SPU_JOB_FAMILY_COUNT; oi++) {
+                        uint32_t other = spu_job_bin_base_get(spu, oi);
+                        const uint32_t other_span =
+                            spu_job_family_span(oi);
                         if (oi != ji && other
-                                && base < other + job_span[oi]
-                                && other < base + job_span[ji])
-                            spu->job_bin_base[oi] = 0;
+                                && base < other + other_span
+                                && other < base + job_span)
+                            spu_job_bin_base_set(spu, oi, 0);
                     }
-                    spu->job_bin_base[ji] = base;
-                    break;
+                    spu_job_bin_base_set(spu, ji, base);
                 }
             }
         } else if (mfc_is_put(cmd)) {
             /* PUT: local store -> main memory */
+            uint32_t fe0_timeline_value = 0;
+            if (fe0_timeline_put) {
+                const uint32_t off = 0x10200FE0u - fe0_put_ea;
+                fe0_timeline_value =
+                    ((uint32_t)ls_ptr[off + 0] << 24) |
+                    ((uint32_t)ls_ptr[off + 1] << 16) |
+                    ((uint32_t)ls_ptr[off + 2] << 8) |
+                    (uint32_t)ls_ptr[off + 3];
+                yz_fe0_timeline_emit(
+                    YZ_FE0_EVENT_DMA_BEGIN, spu->fe0_timeline_cause,
+                    ((spu->spu_id & 0xffffu) << 16) |
+                        (spu->fe0_timeline_task & 0xffffu),
+                    spu->fe0_timeline_epoch, fe0_put_ea,
+                    fe0_timeline_value, spu->pc & SPU_LS_MASK);
+            }
             /* YZ_EA_TRAP SPU leg (2026-08-05 frontier): the PPU-side trap
              * proved the fatal motion-descriptor write is NOT any PPU store
              * path (boot 19: header flipped to file-relative pointers with
@@ -2009,14 +2050,81 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_put(cmd)) {
             extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
             cellSpursNotifyGuestWrite((uint32_t)ea, size);
+            if (fe0_timeline_put) {
+                const uint8_t* visible = vm_base + 0x10200FE0u;
+                const uint32_t readback =
+                    ((uint32_t)visible[0] << 24) |
+                    ((uint32_t)visible[1] << 16) |
+                    ((uint32_t)visible[2] << 8) |
+                    (uint32_t)visible[3];
+                yz_fe0_timeline_emit(
+                    YZ_FE0_EVENT_PUBLISHED, spu->fe0_timeline_cause,
+                    ((spu->spu_id & 0xffffu) << 16) |
+                        (spu->fe0_timeline_task & 0xffffu),
+                    spu->fe0_timeline_epoch, 0x10200FE0u,
+                    readback, spu->pc & SPU_LS_MASK);
+            }
         }
 #ifdef _WIN32
     } __except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION */
                 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         static int w = 0; if (w < 24) { w++;
             fprintf(stderr, "[spu-dma] SKIP faulting %s ea=0x%08X size=%u lsa=0x%05X "
+                    "spu=%X image=%d pc=0x%05X "
                     "(reserved/uncommitted guest mem -- e.g. unconfigured SPURS trace buffer)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", (uint32_t)ea, size, lsa);
+                    mfc_is_get(cmd) ? "GET" : "PUT", (uint32_t)ea, size, lsa,
+                    spu->spu_id, spu->image_id, spu->pc & SPU_LS_MASK);
+            if (spu->native_job_descriptor_ea) {
+                fprintf(stderr,
+                        "[spu-dma-fault] job desc=%08X bin=%08X "
+                        "desc-ls=%05X/%X ctx-ls=%05X io-ls=%05X/%X\n",
+                        spu->native_job_descriptor_ea,
+                        spu->native_job_binary_ea,
+                        spu->native_job_descriptor_ls,
+                        spu->native_job_descriptor_size,
+                        spu->native_job_context_ls,
+                        spu->native_job_io_ls,
+                        spu->native_job_io_size);
+                {
+                    static const uint8_t regs[] = {
+                        0, 1, 3, 4, 21, 24, 28, 29, 30, 31
+                    };
+                    for (unsigned i = 0; i < sizeof(regs); ++i) {
+                        const unsigned r = regs[i];
+                        fprintf(stderr,
+                                "[spu-dma-fault] r%u=%08X_%08X_%08X_%08X\n",
+                                r, spu->gpr[r]._u32[0], spu->gpr[r]._u32[1],
+                                spu->gpr[r]._u32[2], spu->gpr[r]._u32[3]);
+                    }
+                }
+                for (uint32_t off = 0;
+                     off < spu->native_job_descriptor_size && off < 0x80u;
+                     off += 16u) {
+                    const uint8_t* p = spu->ls +
+                        spu->native_job_descriptor_ls + off;
+                    fprintf(stderr,
+                            "[spu-dma-fault] desc+%03X %08X %08X %08X %08X\n",
+                            off, mfc_diag_be32(p + 0), mfc_diag_be32(p + 4),
+                            mfc_diag_be32(p + 8), mfc_diag_be32(p + 12));
+                }
+                for (uint32_t off = 0; off < 0x30u; off += 16u) {
+                    const uint8_t* p = spu->ls +
+                        spu->native_job_context_ls + off;
+                    fprintf(stderr,
+                            "[spu-dma-fault] ctx+%02X %08X %08X %08X %08X\n",
+                            off, mfc_diag_be32(p + 0), mfc_diag_be32(p + 4),
+                            mfc_diag_be32(p + 8), mfc_diag_be32(p + 12));
+                }
+                for (uint32_t off = 0;
+                     off < spu->native_job_io_size && off < 0x80u;
+                     off += 16u) {
+                    const uint8_t* p = spu->ls + spu->native_job_io_ls + off;
+                    fprintf(stderr,
+                            "[spu-dma-fault] io+%03X %08X %08X %08X %08X\n",
+                            off, mfc_diag_be32(p + 0), mfc_diag_be32(p + 4),
+                            mfc_diag_be32(p + 8), mfc_diag_be32(p + 12));
+                }
+            }
             fflush(stderr); }
         return 0;   /* benign skip */
     }
@@ -3968,10 +4076,30 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   fflush(stderr);
               } }
 #endif
-            if (mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
-                memcmp(line, mfc->resv_data, 128) == 0) {
+            const int putllc_success =
+                mfc->resv_active && mfc->resv_ea == (ea & ~127ull) &&
+                memcmp(line, mfc->resv_data, 128) == 0;
+            if (g_yz_fe0_timeline_enabled && spu->image_id == 4 &&
+                (spu->pc & SPU_LS_MASK) == 0xAA48u) {
+                yz_fe0_timeline_observe_wkl4_taskset_attempt(
+                    (uint32_t)spu->image_id, spu->spu_id,
+                    spu->pc & SPU_LS_MASK,
+                    spu->fe0_timeline_cause,
+                    spu->fe0_timeline_task,
+                    (uint32_t)(ea & ~127ull), putllc_success,
+                    line, ls_ptr);
+            }
+            if (putllc_success) {
                 const int made_progress =
                     memcmp(mfc->resv_data, ls_ptr, 128) != 0;
+                if (g_yz_fe0_timeline_enabled && spu->image_id == 4) {
+                    yz_fe0_timeline_observe_wkl4_atomic(
+                        (uint32_t)spu->image_id, spu->spu_id,
+                        spu->pc & SPU_LS_MASK,
+                        spu->fe0_timeline_cause,
+                        spu->fe0_timeline_task,
+                        (uint32_t)(ea & ~127ull), line, ls_ptr);
+                }
 #if !defined(YZ_PERF_CLEAN)
                 yz_a010_reltrace_spu_atomic(
                     spu->spu_id, (uint32_t)spu->image_id,

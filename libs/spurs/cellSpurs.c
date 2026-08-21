@@ -10,6 +10,7 @@
 #include "../../runtime/spu/spu_job_dispatch.h"
 #include "../../runtime/memory/vm.h"
 #include "ps3emu/yz_frontier_trace.h"
+#include "ps3emu/yz_fe0_timeline.h"
 #if !defined(YZ_SPURS_TEST_GUEST_SIZE)
 #include "../../runtime/syscalls/sys_vm.h"
 #endif
@@ -1249,10 +1250,79 @@ static int task_syscall(spu_context* ctx, void* opaque)
         return -1;
     }
     if (op == 1 || op == 2) {
+        /* A yield or WAIT_SIGNAL is an image-4 execution boundary, not a
+         * polling event.  Record the exact guest return PC before context
+         * save so a delayed FE0 publication can be attributed to the
+         * task-side primitive that handed control back to SPURS. */
+        if (t->image.image_id == 4) {
+            yz_fe0_timeline_emit(
+                YZ_FE0_EVENT_WKL4_HANDOFF,
+                t->fe0_timeline_cause, t->id,
+                t->fe0_timeline_epoch, ts->wid, op,
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        }
         /* Both scheduler handoffs save LS/context for another dispatch.
          * Complete all task DMA first so WAIT_SIGNAL cannot expose a partial
          * context any more than YIELD can. */
         spu_task_wait_all_dma(ctx);
+        if (op == 2) {
+            if (t->image.image_id == 4) {
+                yz_fe0_timeline_emit(
+                    YZ_FE0_EVENT_WKL4_WAIT_ABI,
+                    t->fe0_timeline_cause, t->id,
+                    ctx->gpr[81]._u32[0], ctx->gpr[81]._u32[1],
+                    ctx->gpr[81]._u32[2], ctx->gpr[81]._u32[3]);
+            }
+            /* Image 4 preserves a CellSpursBarrier EA in r81 lane 1 across
+             * WAIT_SIGNAL.  The live object proves the SDK layout: total at
+             * +0x04 and owning taskset EA at +0x34.  Earlier diagnostics
+             * misread lanes 2/3 as LFQueue geometry and consequently
+             * registered a queue observer over the barrier.  Accept only the
+             * structural barrier signature and retain bounded snapshots; the
+             * other r81 lanes remain opaque task context. */
+            const u32 event_eah = ctx->gpr[81]._u32[0];
+            const u32 event_eal = ctx->gpr[81]._u32[1];
+            if (g_yz_fe0_timeline_enabled &&
+                t->image.image_id == 4 && ts->wid == 4 &&
+                t->fe0_timeline_cause != 0u && event_eah == 0 &&
+                !(event_eal & 127u) &&
+                job_guest_range_valid(event_eal, 128u)) {
+                const u8* barrier = vm_base + event_eal;
+                const u32 total = rd32(barrier + 0x04u);
+                const u32 taskset_ea = rd32(barrier + 0x34u);
+                if (total != 0u && total <= 128u &&
+                    taskset_ea == guest_ea(ts->sync.key)) {
+                    yz_fe0_timeline_set_wkl4_barrier(
+                        event_eal, taskset_ea);
+                    yz_fe0_timeline_emit(
+                        YZ_FE0_EVENT_WKL4_BARRIER_WAIT,
+                        t->fe0_timeline_cause, t->id,
+                        event_eal,
+                        rd32(barrier + 0x00u), total,
+                        rd32(barrier + 0x10u));
+                    /* Full layout is diagnostic evidence only.  Sampling a
+                     * complete line once per 256 waits keeps the ring bounded
+                     * while retaining the phase and participant masks. */
+                    if ((++t->fe0_barrier_wait_count & 0xffu) == 1u) {
+                        for (u32 off = 0; off < 128u; off += 16u) {
+                            yz_fe0_timeline_emit(
+                                YZ_FE0_EVENT_WKL4_BARRIER_LAYOUT,
+                                t->fe0_timeline_cause, off,
+                                rd32(barrier + off + 0x00u),
+                                rd32(barrier + off + 0x04u),
+                                rd32(barrier + off + 0x08u),
+                                rd32(barrier + off + 0x0cu));
+                        }
+                    }
+                }
+            }
+            /* A real lifted EventFlagWait has only the MFC address pair in
+             * r81.  Keep discovery for that ABI, but never reinterpret the
+             * barrier-plus-context tuple as an event flag. */
+            if (event_eah == 0 && ctx->gpr[81]._u32[2] == 0u &&
+                ctx->gpr[81]._u32[3] == 0u)
+                event_observe_native_wait(ts, t, event_eal);
+        }
         task_save_context(t, ctx);
         spu_mfc_context_switch(ctx);
         mx_lock(&ts->sync.mutex);
@@ -1305,6 +1375,15 @@ static int task_syscall(spu_context* ctx, void* opaque)
                        !ts->shutdown)
                     /* Timed: lifted-SPU signalers bypass the HLE wake. */
                     cv_wait_ms(&ts->sync.cond, &ts->sync.mutex, 2u);
+                if (!ts->shutdown && t->image.image_id == 4) {
+                    yz_fe0_timeline_emit(
+                        YZ_FE0_EVENT_WKL4_WAKE,
+                        t->fe0_timeline_cause, t->id,
+                        t->fe0_timeline_epoch, ts->wid,
+                        guest_ea(ts->sync.key),
+                        (t->signalled ? 1u : 2u) |
+                            (t->signal_origin << 8));
+                }
                 /* Witness (2026-08-05): a guest-latch-only wake means a
                  * lifted-SPU signaler delivered while the host flag never
                  * set -- the path the 08-04 fix opened. First 8 only. */
@@ -1337,6 +1416,15 @@ static int task_syscall(spu_context* ctx, void* opaque)
         }
         mx_unlock(&ts->sync.mutex);
         task_restore_context(t, ctx);
+        if (t->image.image_id == 4) {
+            ctx->fe0_timeline_cause = t->fe0_timeline_cause;
+            ctx->fe0_timeline_epoch = t->fe0_timeline_epoch;
+            ctx->fe0_timeline_task = t->id;
+            yz_fe0_timeline_emit(
+                YZ_FE0_EVENT_WKL4_RESUME,
+                t->fe0_timeline_cause, t->id,
+                t->fe0_timeline_epoch, ts->wid, t->spu_num, ctx->pc);
+        }
         ctx->gpr[3] = spu_make_preferred_u32(ts->shutdown ?
                                              (u32)CELL_SPURS_TASK_ERROR_SHUTDOWN : 0);
         return ts->shutdown ? 0 : 1;
@@ -1485,6 +1573,11 @@ static void task_run(TaskState* task)
     ctx->gpr[1] = spu_make_preferred_u32(0x2c30);
     ctx->native_spurs_syscall = task_syscall;
     ctx->native_spurs_opaque = task;
+    if (task->image.image_id == 4) {
+        ctx->fe0_timeline_cause = task->fe0_timeline_cause;
+        ctx->fe0_timeline_epoch = task->fe0_timeline_epoch;
+        ctx->fe0_timeline_task = task->id;
+    }
     ctx->pc = task->image.entry_pc ? task->image.entry_pc : entry;
     if (native_trace_enabled())
         fprintf(stderr,
@@ -1982,7 +2075,25 @@ s32 _cellSpursSendSignal(CellSpursTaskset* object, CellSpursTaskId id)
                            0u,
 #endif
                            0);
+    if (ts->tasks[id].image.image_id == 4 &&
+        g_yz_fe0_timeline_enabled) {
+        u32 cause = 0u;
+        u32 epoch = 0u;
+        const int active = yz_fe0_timeline_callback_snapshot(
+            &cause, &epoch);
+        /* Signals outside a user callback remain visible but uncorrelated. */
+        ts->tasks[id].fe0_timeline_cause =
+            active ? cause : 0u;
+        ts->tasks[id].fe0_timeline_epoch =
+            active ? epoch : 0u;
+        yz_fe0_timeline_emit(
+            YZ_FE0_EVENT_WKL4_SIGNAL,
+            ts->tasks[id].fe0_timeline_cause, id,
+            ts->tasks[id].fe0_timeline_epoch, ts->wid,
+            guest_ea(object), (u32)g_yz_sendsig_origin);
+    }
     ts->tasks[id].signalled = 1;
+    ts->tasks[id].signal_origin = (u32)g_yz_sendsig_origin;
     task_bit(object, 0x40, id, 1);
     cv_wake_all(&ts->sync.cond);
     mx_unlock(&ts->sync.mutex);

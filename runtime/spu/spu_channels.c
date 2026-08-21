@@ -17,6 +17,7 @@
 #include "spu_job_dispatch.h"
 #include "../../include/ps3emu/error_codes.h"   /* CELL_EBUSY: send_event ack mapping */
 #include "../../include/ps3emu/yz_frontier_trace.h"
+#include "../../include/ps3emu/yz_fe0_timeline.h"
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
@@ -1597,11 +1598,14 @@ long yz_ucmd_handler_begin(long cause)
     _InterlockedIncrement(&g_yz_ucmd_handler_active);
     const long epoch = _InterlockedIncrement(&g_yz_ucmd_handler_epoch);
     _InterlockedExchange(&g_yz_ucmd_handler_arg, cause);
+    yz_fe0_timeline_callback_begin((uint32_t)cause, (uint32_t)epoch);
     return epoch;
 #else
     ++g_yz_ucmd_handler_active;
     g_yz_ucmd_handler_arg = cause;
-    return ++g_yz_ucmd_handler_epoch;
+    const long epoch = ++g_yz_ucmd_handler_epoch;
+    yz_fe0_timeline_callback_begin((uint32_t)cause, (uint32_t)epoch);
+    return epoch;
 #endif
 }
 
@@ -1619,11 +1623,13 @@ void yz_ucmd_handler_end(long cause, long epoch)
     }
     _InterlockedDecrement(&g_yz_ucmd_handler_active);
     WakeByAddressAll(&g_yz_ucmd_handler_active);
+    yz_fe0_timeline_callback_end((uint32_t)cause, (uint32_t)epoch);
 #else
     g_yz_ucmd_handler_completed = cause;
     if (g_yz_ucmd_handler_completed_epoch < epoch)
         g_yz_ucmd_handler_completed_epoch = epoch;
     --g_yz_ucmd_handler_active;
+    yz_fe0_timeline_callback_end((uint32_t)cause, (uint32_t)epoch);
 #endif
 }
 
@@ -3523,6 +3529,16 @@ static uint32_t s_registry_count = 0;
  * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
+
+/* Process environment is immutable once the runner starts. Cache this
+ * diagnostic gate on the startup thread so spu_indirect_branch never enters
+ * the CRT environment lock in its per-branch dispatch path. */
+static int s_yz_task_state_trace_enabled = 0;
+void spu_runtime_config_init(void)
+{
+    s_yz_task_state_trace_enabled =
+        getenv("YZ_TASK_STATE_TRACE") != NULL;
+}
 
 /* ===========================================================================
  * s48 LS-CODE-WATCH (env YZ_LS_CODE_WATCH, diag, default OFF) -- the
@@ -5839,7 +5855,7 @@ volatile int g_yz_task_dma_trace_phase = 0;
 void spu_indirect_branch(spu_context* ctx)
 {
     if ((ctx->pc & SPU_LS_MASK) == 0x0A70u && ctx->image_id == 0 &&
-        getenv("YZ_TASK_STATE_TRACE")) {
+        s_yz_task_state_trace_enabled) {
         static int first_poll_traced = 0;
         static int first_yield_seen = 0;
         static int after_yield_traced = 0;
@@ -6190,47 +6206,29 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
-    /* SPURS JOBCHAIN job dispatch (images 14/15/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/33/34/35/36). The job module
+    /* SPURS JOBCHAIN job dispatch. The job module
      * (image 13) loads each descriptor's binary into free LS past its own end
      * (module spans LS [0xA00,0x4880)) and `bisl`s to its entry. The DMA
      * recorder (spu_dma.h) captured WHERE each known binary is resident in
      * this context; switch to that lifted image so the job's code resolves.
-     * Spans are the measured descriptor sizeBinary values. */
+     * Spans and placement identities come from the shared job catalog. */
     {
-        static const uint32_t job_span[5] = {
-            0x9540u, 0x14C0u, 0x7640u, 0x10610u, 0x1E80u
-        };
         uint32_t jpc = ctx->pc & SPU_LS_MASK;
-        int family = ctx->image_id == 13 || ctx->image_id == 14
-                  || ctx->image_id == 15 || ctx->image_id == 17
-                  || ctx->image_id == 18 || ctx->image_id == 19
-                  || ctx->image_id == 20 || ctx->image_id == 21
-                  || ctx->image_id == 22 || ctx->image_id == 23
-                  || ctx->image_id == 24 || ctx->image_id == 25
-                  || ctx->image_id == 26 || ctx->image_id == 27
-                  || ctx->image_id == 28 || ctx->image_id == 29
-                  || ctx->image_id == 30 || ctx->image_id == 31
-                  || ctx->image_id == 32 || ctx->image_id == 33
-                  || ctx->image_id == 34 || ctx->image_id == 35
-                  || ctx->image_id == 36 || ctx->image_id == 37
-                  || ctx->image_id == 38 || ctx->image_id == 39
-                  || ctx->image_id == 40 || ctx->image_id == 41
-                  || ctx->image_id == 44 || ctx->image_id == 45
-                  || ctx->image_id == 46 || ctx->image_id == 47
-                  || ctx->image_id == 48;
+        int family = ctx->image_id == 13 ||
+                     spu_job_image_is_known(ctx->image_id);
         int jimg = -1;
         if (family && jpc >= 0xA00u && jpc < 0x4880u) {
             jimg = 13;                       /* back into the resident module */
         } else {
-            for (int i = 0; i < 5; i++)
-                if (ctx->job_bin_base[i]
-                        && jpc >= ctx->job_bin_base[i]
-                        && jpc <  ctx->job_bin_base[i] + job_span[i])
+            for (int i = 0; i < SPU_JOB_FAMILY_COUNT; i++) {
+                const uint32_t base = spu_job_bin_base_get(ctx, i);
+                const uint32_t span = spu_job_family_span(i);
+                if (base && jpc >= base && jpc < base + span)
                     {
-                        jimg = spu_job_resident_image(
-                            i, ctx->job_bin_base[i]);
+                        jimg = spu_job_resident_image(i, base);
                         break;
                     }
+            }
             /*
              * Sunshine orphanage job-launch census.
              *
@@ -6355,14 +6353,17 @@ void spu_indirect_branch(spu_context* ctx)
                                vm_base + binary_ea,
                                descriptor_span);
 
-                    for (int i = 0; i < 5; i++) {
-                        const uint32_t base = ctx->job_bin_base[i];
+                    for (int i = 0; i < SPU_JOB_FAMILY_COUNT; i++) {
+                        const uint32_t base =
+                            spu_job_bin_base_get(ctx, i);
+                        const uint32_t span = spu_job_family_span(i);
                         if (i != descriptor_slot && base != 0 &&
                             base < descriptor_base + descriptor_span &&
-                            descriptor_base < base + job_span[i])
-                            ctx->job_bin_base[i] = 0;
+                            descriptor_base < base + span)
+                            spu_job_bin_base_set(ctx, i, 0);
                     }
-                    ctx->job_bin_base[descriptor_slot] = descriptor_base;
+                    spu_job_bin_base_set(
+                        ctx, descriptor_slot, descriptor_base);
                     jimg = descriptor_image;
 
                     if (stale) {
@@ -7712,12 +7713,17 @@ void spu_indirect_branch(spu_context* ctx)
             unk_log--;
             uint32_t a = ctx->pc & SPU_LS_MASK;
             fprintf(stderr, "[SPU] unknown branch full_pc=0x%08X LS 0x%05X (image %d) "
+                    "source_pc=0x%05X "
                     "gpr0=%08X_%08X gpr1=%08X_%08X gpr2=%08X_%08X "
+                    "gpr32=%08X_%08X gpr85=%08X_%08X "
                     "jobbase=[%05X %05X %05X %05X] bytes:",
                     ctx->pc, a, ctx->image_id,
+                    ctx->debug_indirect_source_pc,
                     ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[1],
                     ctx->gpr[1]._u32[0], ctx->gpr[1]._u32[1],
                     ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1],
+                    ctx->gpr[32]._u32[0], ctx->gpr[32]._u32[1],
+                    ctx->gpr[85]._u32[0], ctx->gpr[85]._u32[1],
                     ctx->job_bin_base[0], ctx->job_bin_base[1],
                     ctx->job_bin_base[2], ctx->job_bin_base[3]);
             for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[(a + i) & SPU_LS_MASK]);
