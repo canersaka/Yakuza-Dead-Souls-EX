@@ -346,6 +346,68 @@ u32 rsx_nr_stats_format(const rsx_nr_stats* st, char* buf, u32 buf_size)
     return n < buf_size ? n : buf_size - 1;
 }
 
+u32 rsx_nr_shadow_census_format(const rsx_nr_intercept* it,
+                                char* buf, u32 buf_size)
+{
+    u64 by_class[3] = {0, 0, 0};
+    u32 top_reg[8] = {0};
+    u32 top_count[8] = {0};
+    unsigned long long native = 0, fallback = 0;
+
+    if (!buf_size)
+        return 0;
+
+    for (u32 f = 0; f < RSX_NR_FAM_COUNT; f++) {
+        native += it->stats.native_ops[f];
+        for (u32 reason = 0; reason < RSX_NR_FB_REASON_COUNT; reason++)
+            fallback += it->stats.fallbacks[f][reason];
+    }
+
+    for (u32 reg = 0; reg < RSX_DSP_NUM_REGS; reg++) {
+        const u32 seen = it->shadow.rsx.seen[reg];
+        if (!seen)
+            continue;
+        const u32 klass = it->shadow.rsx.klass[reg] <= RSX_DSP_CLASS_EXEC
+                              ? it->shadow.rsx.klass[reg]
+                              : RSX_DSP_CLASS_TODO;
+        by_class[klass] += seen;
+        if (klass != RSX_DSP_CLASS_TODO)
+            continue;
+        for (u32 slot = 0; slot < 8; slot++) {
+            if (seen <= top_count[slot])
+                continue;
+            for (u32 move = 7; move > slot; move--) {
+                top_count[move] = top_count[move - 1];
+                top_reg[move] = top_reg[move - 1];
+            }
+            top_count[slot] = seen;
+            top_reg[slot] = reg;
+            break;
+        }
+    }
+
+    const u64 classified = by_class[0] + by_class[1] + by_class[2];
+    const u64 unclassified = it->stats.shadow_methods > classified
+                                 ? it->stats.shadow_methods - classified
+                                 : 0;
+    u32 n = (u32)snprintf(
+        buf, buf_size,
+        "nr-shadow: methods=%llu state=%llu exec=%llu stored=%llu "
+        "unclassified=%llu native=%llu fb=%llu eps=%llu top-stored=",
+        it->stats.shadow_methods,
+        (unsigned long long)by_class[RSX_DSP_CLASS_STATE],
+        (unsigned long long)by_class[RSX_DSP_CLASS_EXEC],
+        (unsigned long long)by_class[RSX_DSP_CLASS_TODO],
+        (unsigned long long)unclassified, native, fallback,
+        it->stats.fallback_episodes);
+    for (u32 slot = 0; slot < 8 && top_count[slot] && n < buf_size; slot++) {
+        n += (u32)snprintf(buf + n, buf_size > n ? buf_size - n : 0,
+                           "%s0x%05X:%u", slot ? "," : "",
+                           top_reg[slot] << 2, top_count[slot]);
+    }
+    return n < buf_size ? n : buf_size - 1;
+}
+
 /* ---- packet spec helper ------------------------------------------------ */
 
 u32 rsx_nr_flip_packet_spec(u32* out, u32 buffer_id, int wait_for_label,

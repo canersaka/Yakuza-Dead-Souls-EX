@@ -402,6 +402,8 @@ def run(args):
         yz["YZ_FE0_TIMELINE"] = "1"
     if args.fe0_callback_replay:
         yz["YZ_FE0_CALLBACK_REPLAY"] = "1"
+    if args.nr_shadow_census:
+        yz["YZ_NR_INTERCEPT"] = "state"
     environment.update(yz)
 
     result = {
@@ -527,6 +529,15 @@ def run(args):
         result["forced_close"] = forced
 
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        shadow_lines = re.findall(r"^\[nr-shadow:.*\]$", stderr_text, re.MULTILINE)
+        result["nr_shadow_census"] = shadow_lines
+        if args.nr_shadow_census and len(shadow_lines) != 1:
+            raise RuntimeError(
+                "native-render shadow run must emit exactly one shutdown census: "
+                f"found {len(shadow_lines)}"
+            )
+        if not args.nr_shadow_census and shadow_lines:
+            raise RuntimeError("shadow census was active in the clean OFF lane")
         completion_marker = (
             "[auto-new-game] completion latched; Confirm released and route disabled"
         )
@@ -601,6 +612,7 @@ def main():
     parser.add_argument("--hold-seconds", type=float, default=35)
     parser.add_argument("--fe0", action="store_true")
     parser.add_argument("--fe0-callback-replay", action="store_true")
+    parser.add_argument("--nr-shadow-census", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)

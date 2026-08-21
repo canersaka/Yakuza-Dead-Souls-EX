@@ -17,6 +17,7 @@
 #include "yakuza_runner.h"
 #include "edge_journal_hle.h"
 #include "rsx_wait_classifier.h"
+#include "rsx_nr_intercept.h"
 
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
@@ -36,6 +37,52 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+/* Stage-1 native-render integration: a passive, fixed-memory shadow census.
+ * YZ_NR_INTERCEPT is read exactly once before the RSX consumer starts.  When
+ * it is unset/empty/0, the hot path is one false branch and performs no
+ * initialization, allocation, timing, or output.  No typed producer is wired
+ * at this stage, so the FIFO/live renderer remains the sole owner. */
+static rsx_nr_intercept g_yz_nr_shadow;
+static rsx_nr_ring g_yz_nr_shadow_ring;
+static rsx_nr_tokens g_yz_nr_shadow_tokens;
+static rsx_nr_slot g_yz_nr_shadow_slots[64];
+static uint32_t g_yz_nr_shadow_side[1024];
+static volatile LONG g_yz_nr_shadow_enabled;
+static int g_yz_nr_shadow_init_attempted;
+
+static void yz_nr_shadow_init(void)
+{
+    if (g_yz_nr_shadow_init_attempted)
+        return;
+    g_yz_nr_shadow_init_attempted = 1;
+    const uint32_t families = rsx_nr_parse_families(getenv("YZ_NR_INTERCEPT"));
+    if (!families)
+        return;
+    rsx_nr_tokens_init(&g_yz_nr_shadow_tokens);
+    if (rsx_nr_ring_init_fixed(&g_yz_nr_shadow_ring,
+                               g_yz_nr_shadow_slots,
+                               (uint32_t)(sizeof(g_yz_nr_shadow_slots) /
+                                          sizeof(g_yz_nr_shadow_slots[0])),
+                               g_yz_nr_shadow_side,
+                               (uint32_t)(sizeof(g_yz_nr_shadow_side) /
+                                          sizeof(g_yz_nr_shadow_side[0]))) != 0)
+        return;
+    rsx_nr_intercept_init(&g_yz_nr_shadow, &g_yz_nr_shadow_ring,
+                          &g_yz_nr_shadow_tokens, families, 1);
+    InterlockedExchange(&g_yz_nr_shadow_enabled, 1);
+}
+
+static void yz_nr_shadow_shutdown(void)
+{
+    if (!InterlockedExchange(&g_yz_nr_shadow_enabled, 0))
+        return;
+    char line[1024];
+    rsx_nr_shadow_census_format(&g_yz_nr_shadow, line, sizeof(line));
+    fprintf(stderr, "[%s]\n", line);
+    fflush(stderr);
+    rsx_nr_ring_destroy(&g_yz_nr_shadow_ring);
+}
 
 #if defined(YZ_PERF_PROFILE)
 extern "C" void spu_perf_dump(void);
@@ -5894,7 +5941,8 @@ static void yz_rsx_fifo_lock_ensure(void)
 extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
 {
     if (!g_yz_rsx_wait_classifier_enabled &&
-        !g_yz_fe0_timeline_enabled)
+        !g_yz_fe0_timeline_enabled &&
+        !g_yz_nr_shadow_enabled)
         return;
     yz_rsx_fifo_lock_ensure();
     EnterCriticalSection(&g_rsx_fifo_lock);
@@ -5902,6 +5950,7 @@ extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
         yz_rsx_wait_classifier_shutdown();
     if (g_yz_fe0_timeline_enabled)
         yz_fe0_timeline_shutdown();
+    yz_nr_shadow_shutdown();
     LeaveCriticalSection(&g_rsx_fifo_lock);
 }
 
@@ -7127,6 +7176,8 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         if (eff >= 0xE940u && eff <= 0xE95Cu)
             rsx_live_draw_set_fifo_position(get, put);
         stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
+        if (!stalled && g_yz_nr_shadow_enabled)
+            rsx_nr_intercept_shadow_method(&g_yz_nr_shadow, eff, val);
         if (g_yz_fe0_timeline_enabled && eff == 0x068u) {
             const uint32_t sem_addr =
                 yz_rsx_sem_addr(yz_rsx_sem_dma_406e,
@@ -7871,6 +7922,7 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
     static int started = 0;
     if (!started) {
         started = 1;
+        yz_nr_shadow_init();
         yz_fe0_timeline_init();
         if (yz_rsx_wait_classifier_init()) {
             yz_rsx_wait_classifier_set_completed_draw_baseline(

@@ -816,6 +816,10 @@ static void test_intercept_mixed_mode(void)
     u32 ln = rsx_nr_stats_format(&st, line, sizeof(line));
     CHECK(ln > 0 && strstr(line, "native=3") && strstr(line, "eps=1"),
           "stats line malformed: %s", line);
+    ln = rsx_nr_shadow_census_format(&it, line, sizeof(line));
+    CHECK(ln > 0 && strstr(line, "methods=5") &&
+          strstr(line, "native=3") && strstr(line, "eps=1"),
+          "shadow census malformed: %s", line);
 
     /* capacity refusal falls back cleanly (tiny ring) */
     rsx_nr_ring tiny;
