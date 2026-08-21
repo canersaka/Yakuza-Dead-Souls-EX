@@ -302,13 +302,35 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
         return -1;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv;
     nrb_rt_handles(b, rt, &rtv, &dsv);
+    /* CLEAR_SURFACE respects the scissor box (cellGcmSetClearSurface:
+     * the cleared area is within the
+     * scissor box). Clear only the folded scissor when it is a proper
+     * sub-rect; zero/unset scissor means the full target. */
+    D3D12_RECT sc_rect;
+    const D3D12_RECT* rects = NULL;
+    UINT nrects = 0;
+    if (st->scissor.w && st->scissor.h &&
+        (st->scissor.x || st->scissor.y || st->scissor.w < rt->w ||
+         st->scissor.h < rt->h)) {
+        sc_rect.left = (LONG)st->scissor.x;
+        sc_rect.top = (LONG)st->scissor.y;
+        sc_rect.right = (LONG)(st->scissor.x + st->scissor.w);
+        sc_rect.bottom = (LONG)(st->scissor.y + st->scissor.h);
+        if (sc_rect.right > (LONG)rt->w)
+            sc_rect.right = (LONG)rt->w;
+        if (sc_rect.bottom > (LONG)rt->h)
+            sc_rect.bottom = (LONG)rt->h;
+        rects = &sc_rect;
+        nrects = 1;
+    }
     if (color_bits) {
         float col[4];
         col[0] = (float)((c->color_value >> 16) & 0xFF) / 255.0f;
         col[1] = (float)((c->color_value >> 8) & 0xFF) / 255.0f;
         col[2] = (float)(c->color_value & 0xFF) / 255.0f;
         col[3] = (float)((c->color_value >> 24) & 0xFF) / 255.0f;
-        b->list->lpVtbl->ClearRenderTargetView(b->list, rtv, col, 0, NULL);
+        b->list->lpVtbl->ClearRenderTargetView(b->list, rtv, col, nrects,
+                                               rects);
     }
     D3D12_CLEAR_FLAGS df = 0;
     if (c->mask & 0x01u)
@@ -318,7 +340,7 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
     if (df)
         b->list->lpVtbl->ClearDepthStencilView(
             b->list, dsv, df, (float)c->depth_value / 16777215.0f,
-            (UINT8)c->stencil_value, 0, NULL);
+            (UINT8)c->stencil_value, nrects, rects);
     nrb_exec_wait(b);
     b->stats.clears++;
     return 0;
@@ -513,12 +535,12 @@ static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
         b->idx_scratch = nbuf;
         b->idx_scratch_cap = ncap;
     }
-    const u32 restart = st->index_binding.restart_enable
-                            ? (st->index_binding.is_u32
-                                   ? st->index_binding.restart_index
-                                   : (st->index_binding.restart_index &
-                                      0xFFFFu))
-                            : 0xFFFFFFFFu;
+    /* The restart comparison is always evaluated against the FULL 32-bit
+     * restart register, with 16-bit indices zero-extended
+     * (cellGcmSetRestartIndex). A register
+     * value above 0xFFFF therefore never matches a 16-bit index — which
+     * is exactly what the width gate in restart_enable already encodes. */
+    const u32 restart = st->index_binding.restart_index;
     const int have_restart = st->index_binding.restart_enable;
     u32 n = 0;
     for (u32 i = 0; i < count; i++) {
@@ -739,6 +761,15 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
     }
     switch (t->kind) {
     case RSX_NIR_XFER_BUFFER: {
+        /* NV0039 format bytes are byte-address increments {1,2,4}, not
+         * pixel formats (cellGcmSetTransferDataFormat): values > 1
+         * subsample bytes.
+         * Only the tightly-packed case (0/unset or 1) is a straight
+         * copy; refuse subsampling loudly. */
+        if (t->src_format > 1 || t->dst_format > 1) {
+            b->stats.unsupported_transfers++;
+            return -1;
+        }
         const u32 total_in = t->src_pitch * (t->line_count ? t->line_count - 1
                                                            : 0) +
                              t->line_length;
