@@ -501,9 +501,12 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
     sink.flip = sink_flip;
     rsx_dispatch_init(&ad->rsx, &sink);
 
-    /* NV308A defaults matching the live consumer's initializers */
+    /* NV308A defaults matching the live consumer's initializers.
+     * 0xB = CELL_GCM_TRANSFER_SURFACE_FORMAT_Y32, the SDK inline-
+     * transfer default (the live consumer's "a8r8g8b8" comment for 0xB
+     * is mislabeled; A8R8G8B8 is 0xA — both are 4-byte raw copies). */
     ad->s2d_pitch = 64;
-    ad->s2d_color_format = 0xB;               /* a8r8g8b8               */
+    ad->s2d_color_format = 0xB;
     ad->inline_size_out = 0x00010001;
 }
 

@@ -943,6 +943,88 @@ static void test_transfers(void)
     rsx_nir_stream_free(&sb);
 }
 
+/* ---- SDK SetInlineTransfer shape (conformance) -------------------------
+ * The SDK's SetInlineTransfer emitter handles the 64-byte destination-alignment
+ * restriction by programming the ALIGNED base as OFFSET_DESTIN and the
+ * residue as POINT.x (pixelShift = (dst & 63) >> 2), format Y32 (0xB)
+ * with pitch 0x1000, SIZE_OUT/IN = (n,1), and pads the COLOR run to an
+ * even word count with a zero word. The folded transfer must carry the
+ * unpadded count at the shifted point. */
+static void test_sdk_inline_transfer_shape(void)
+{
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+
+    const u32 dst = 0x12344;         /* 4-aligned, not 64-aligned        */
+    const u32 aligned = dst & ~63u;  /* 0x12340                          */
+    const u32 shift = (dst & 63u) >> 2;   /* 1                           */
+    rsx_nir_adapter_method(&ad, 0x6188, 0xFEED0000);   /* dst dma local  */
+    rsx_nir_adapter_method(&ad, 0x630C, aligned);      /* OFFSET_DESTIN  */
+    rsx_nir_adapter_method(&ad, 0x6300, 0xB);          /* Y32            */
+    rsx_nir_adapter_method(&ad, 0x6304, 0x10001000);   /* pitch pair     */
+    rsx_nir_adapter_method(&ad, 0xA304, shift);        /* POINT y=0 x=1  */
+    rsx_nir_adapter_method(&ad, 0xA308, 0x00010003);   /* SIZE_OUT 3x1   */
+    rsx_nir_adapter_method(&ad, 0xA30C, 0x00010003);   /* SIZE_IN 3x1    */
+    rsx_nir_adapter_method(&ad, 0xA400, 0xCAFE0001);
+    rsx_nir_adapter_method(&ad, 0xA404, 0xCAFE0002);
+    rsx_nir_adapter_method(&ad, 0xA408, 0xCAFE0003);
+    rsx_nir_adapter_method(&ad, 0xA40C, 0);            /* SDK pad word   */
+    rsx_nir_adapter_finish(&ad);
+
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+    rsx_nir_transfer t;
+    memset(&t, 0, sizeof(t));
+    t.kind = RSX_NIR_XFER_INLINE;
+    t.dst_location = RSX_NIR_LOCATION_LOCAL;
+    t.dst_offset = aligned;
+    t.dst_pitch = 0x1000;
+    t.dst_format = 0xB;
+    t.point_x = shift;
+    t.point_y = 0;
+    t.size_w = 3;
+    t.size_h = 1;
+    t.word_count = 3;
+    const u32 words[3] = { 0xCAFE0001, 0xCAFE0002, 0xCAFE0003 };
+    rsx_nir_em_transfer(&em, &t, words);
+
+    char err[256] = {0};
+    CHECK(rsx_nir_compare(&sa, &sb, err, sizeof(err)) == 0,
+          "SDK inline shape packet vs typed: %s", err);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- FIFO control-word classification (SDK encodings) ------------------
+ * CELL_GCM_METHOD_FLAG_JUMP = 0x20000000, _CALL = 0x00000002, _RETURN =
+ * 0x00020000 (SDK gcm control-word encodings). The linear parser must stop
+ * at each without consuming it — following them needs the live consumer's
+ * address space. */
+static void test_fifo_control_words(void)
+{
+    rsx_nir_stream s;
+    rsx_nir_stream_init(&s);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &s);
+
+    const u32 words[][3] = {
+        { (1u << 18) | 0x0A6C, 0x0203, 0x1000 | 0x20000000u },  /* JUMP   */
+        { (1u << 18) | 0x0A6C, 0x0203, 0x1000 | 0x00000002u },  /* CALL   */
+        { (1u << 18) | 0x0A6C, 0x0203, 0x00020000u },           /* RETURN */
+    };
+    for (int i = 0; i < 3; i++) {
+        u32 stop = 0;
+        u32 used = rsx_nir_adapter_fifo(&ad, words[i], 3, &stop);
+        CHECK(used == 2, "control word %d consumed at %u", i, used);
+        CHECK(stop == words[i][2], "control word %d stop %08X", i, stop);
+    }
+    rsx_nir_stream_free(&s);
+}
+
 /* ---- SET_REFERENCE / user command / tokens / fallback markers ---------- */
 
 static void test_reference_user_tokens(void)
@@ -1880,6 +1962,8 @@ int main(int argc, char** argv)
     test_flip_intercept();
     test_intercept_mixed_mode();
     test_transfers();
+    test_sdk_inline_transfer_shape();
+    test_fifo_control_words();
     test_reference_user_tokens();
     test_fixed_capacity();
     test_ring();
