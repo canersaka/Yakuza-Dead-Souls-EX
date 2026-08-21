@@ -280,9 +280,20 @@ typedef struct rsx_nir_semaphore {
     u32 dma_context;                             /* semaphore DMA selector
                                                     (0x66616661 = labels)   */
     u32 offset;                                  /* semaphore ctx offset    */
-    u32 value;
-    u32 texture_read;                            /* release: 1 = 0x1D74 path
-                                                    (word-swizzled write)   */
+    u32 value;                                   /* WIRE value (the method
+                                                    argument, untransformed) */
+    u32 texture_read;                            /* release path: 0 = back-
+                                                    end 0x1D70, whose store
+                                                    swizzles bytes 0<->2 (the
+                                                    SDK's SetWriteBackEndLabel
+                                                    pre-swaps to compensate);
+                                                    1 = texture pipe 0x1D74,
+                                                    stored as-is (SDK
+                                                    SetWriteBackEnd/
+                                                    TextureLabel). Executors
+                                                    apply the store transform;
+                                                    the IR carries the wire
+                                                    value on both producers. */
 } rsx_nir_semaphore;
 
 typedef struct rsx_nir_report {
