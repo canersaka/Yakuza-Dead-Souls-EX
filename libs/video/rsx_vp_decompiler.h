@@ -66,6 +66,19 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* Vertex-pulling variant (true GPU vertex fetch, rsx_vertex_pull.h): no
+ * VSInput struct and no input layout — main() receives only
+ * `uint yz_sysvid : SV_VertexID`.  `pull_globals` is emitted at global
+ * scope (guest-memory SRVs, the pull cbuffer, fetch helpers) and
+ * `pull_loads` inside main() to fill v[0..15]; attributes the loads block
+ * skips read the register default (0,0,0,1).  Both blocks come from
+ * rsx_vertex_pull_emit_globals/_loads.  The program body, constants,
+ * vertex textures and varyings are identical to rsx_vp_decompile_ex. */
+int rsx_vp_decompile_pull_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask,
+    const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);
