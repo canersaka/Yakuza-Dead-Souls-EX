@@ -221,7 +221,8 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size);
+    u32 input_mask, const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size);
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -232,7 +233,7 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
+        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, NULL, NULL, out, out_size);
 }
 
 int rsx_vp_decompile_compact_ex(
@@ -247,12 +248,26 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
+        ucode, max_bytes, vtex_mask, 1, input_mask, NULL, NULL,
+        out, out_size);
+}
+
+int rsx_vp_decompile_pull_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask,
+    const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size)
+{
+    if (!pull_globals || !pull_loads)
+        return -1;
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, pull_globals, pull_loads,
+        out, out_size);
 }
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size)
+    u32 input_mask, const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -426,7 +441,10 @@ static int rsx_vp_decompile_impl(
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
-    if (!compact_inputs) {
+    if (pull_loads) {
+        /* Vertex pulling: no VSInput struct, no input layout; inputs are
+         * fetched from raw guest memory by the pull_globals helpers. */
+    } else if (!compact_inputs) {
         emit(&o,
             /* All 16 RSX vertex attributes arrive as float4 (the harness
              * fetches and converts them on the CPU). */
@@ -475,8 +493,19 @@ static int rsx_vp_decompile_impl(
         emit(&o, decl);
     }
 
-    emit(&o, "VSOutput main(VSInput input) {\n");
-    if (!compact_inputs) {
+    if (pull_loads)
+        emit(&o, pull_globals);
+
+    if (pull_loads)
+        emit(&o, "VSOutput main(uint yz_sysvid : SV_VertexID) {\n");
+    else
+        emit(&o, "VSOutput main(VSInput input) {\n");
+    if (pull_loads) {
+        emit(&o,
+            "    float4 v[16];\n"
+            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
+        emit(&o, pull_loads);
+    } else if (!compact_inputs) {
         emit(&o,
             "    float4 v[16];\n"
             "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"

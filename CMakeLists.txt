@@ -195,6 +195,98 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND rsx_vertex_compact_tests
         )
 
+        add_executable(rsx_guest_pages_tests
+            libs/video/tests/test_guest_pages.c
+            libs/video/rsx_guest_pages.c
+        )
+        target_include_directories(rsx_guest_pages_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_guest_pages_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_guest_pages_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(
+            NAME rsx_guest_pages
+            COMMAND rsx_guest_pages_tests
+        )
+
+        add_executable(rsx_gpu_mirror_tests
+            libs/video/tests/test_gpu_mirror.c
+            libs/video/rsx_gpu_mirror.c
+            libs/video/rsx_guest_pages.c
+        )
+        target_include_directories(rsx_gpu_mirror_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_gpu_mirror_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_gpu_mirror_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(
+            NAME rsx_gpu_mirror
+            COMMAND rsx_gpu_mirror_tests
+        )
+
+        add_executable(rsx_vertex_pull_tests
+            libs/video/tests/test_vertex_pull.c
+            libs/video/rsx_vertex_pull.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vp_decompiler.c
+        )
+        target_include_directories(rsx_vertex_pull_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_vertex_pull_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_vertex_pull
+            COMMAND rsx_vertex_pull_tests
+        )
+
+        # WARP execution parity: generated GPU decode vs the CPU vertex
+        # path, on top of the real tracker -> mirror -> D3D12 upload chain.
+        # Exit 2 = no WARP device on this machine (skip, not failure).
+        add_executable(rsx_vertex_pull_gpu_tests
+            libs/video/tests/test_vertex_pull_gpu.c
+            libs/video/rsx_vertex_pull.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_guest_pages.c
+            libs/video/rsx_gpu_mirror.c
+            libs/video/rsx_gpu_mirror_d3d12.c
+        )
+        target_include_directories(rsx_vertex_pull_gpu_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_vertex_pull_gpu_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_vertex_pull_gpu_tests PRIVATE
+            /experimental:c11atomics
+        )
+        target_link_libraries(rsx_vertex_pull_gpu_tests PRIVATE
+            d3d12 dxgi d3dcompiler
+        )
+        add_test(
+            NAME rsx_vertex_pull_gpu
+            COMMAND rsx_vertex_pull_gpu_tests
+        )
+        set_tests_properties(rsx_vertex_pull_gpu PROPERTIES
+            SKIP_RETURN_CODE 2
+        )
+
         add_executable(rsx_fp_despecialization_tests
             libs/video/tests/test_fp_despecialization.c
             libs/video/rsx_fp_decompiler.c
