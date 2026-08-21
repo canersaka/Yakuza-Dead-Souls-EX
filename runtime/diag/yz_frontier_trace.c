@@ -59,6 +59,12 @@ static int s_tsv_enabled;
  * the default recorder unchanged; this opt-in compact mode drops only those
  * two high-rate scheduling samples. */
 static int s_compact;
+/* Exact-job capture for long unattended routes.  A full frontier trace can
+ * produce tens of millions of events before the relevant job is selected,
+ * slowing the title and evicting the event we care about.  When a binary EA
+ * is supplied, reject unrelated events before the atomic/QPC hot path. */
+static int s_job_only;
+static uint32_t s_job_binary;
 /* Focused animation/render ping-pong diagnostic.  When selected, the shared
  * recorder retains only the three low-rate parity event families below.  It
  * avoids letting unrelated syscall/FIFO/SPURS traffic evict the correlation
@@ -190,6 +196,7 @@ int yz_frontier_trace_init(void)
     const char* path = getenv("YZ_FRONTIER_RING_PATH");
     const char* compact = getenv("YZ_FRONTIER_RING_COMPACT");
     const char* parity = getenv("YZ_FRONTIER_RING_PARITY");
+    const char* job_binary = getenv("YZ_FRONTIER_RING_JOB_BINARY");
     if (!enabled || !*enabled || *enabled == '0')
         return 0;
 
@@ -199,6 +206,15 @@ int yz_frontier_trace_init(void)
     }
     s_compact = compact && *compact == '1';
     s_parity_only = parity && *parity == '1';
+    if (job_binary && *job_binary) {
+        char* end = NULL;
+        const unsigned long parsed = strtoul(job_binary, &end, 0);
+        if (end != job_binary && *end == '\0' && parsed <= UINT32_MAX &&
+            parsed != 0u) {
+            s_job_binary = (uint32_t)parsed;
+            s_job_only = 1;
+        }
+    }
 #ifdef _WIN32
     {
         LARGE_INTEGER frequency;
@@ -211,9 +227,9 @@ int yz_frontier_trace_init(void)
     atomic_store_explicit(&s_enabled, 1, memory_order_release);
 #endif
     fprintf(stderr,
-            "[frontier-ring] configured dormant capacity=%u bytes=%zu compact=%d parity=%d\n",
+            "[frontier-ring] configured dormant capacity=%u bytes=%zu compact=%d parity=%d job_binary=%08" PRIX32 "\n",
             YZ_FRONTIER_CAPACITY, sizeof(s_records), s_compact,
-            s_parity_only);
+            s_parity_only, s_job_binary);
     fflush(stderr);
     /* YZ_FRONTIER_RING=2 (2026-08-06 handoff-ordering frontier): arm at init
      * instead of waiting for the semantic Job B selection. The ring is a
@@ -280,6 +296,12 @@ void yz_frontier_trace_emit(uint32_t type, uint32_t actor, uint32_t pc,
     yz_frontier_record* record;
     uint64_t sequence;
     if (!yz_frontier_trace_is_armed())
+        return;
+    if (s_job_only &&
+        type != YZ_FT_ARM &&
+        type != YZ_FT_STALL &&
+        type != YZ_FT_AUTOPSY &&
+        !(type == YZ_FT_JOB && a1 == s_job_binary))
         return;
     if (s_parity_only &&
         type != YZ_FT_PARITY_FLIP &&

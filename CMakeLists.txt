@@ -214,6 +214,41 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND rsx_fp_despecialization_tests
         )
 
+        add_executable(rsx_wait_classifier_tests
+            yakuza/tests/test_rsx_wait_classifier.cpp
+            yakuza/rsx_wait_classifier.cpp
+        )
+        target_include_directories(rsx_wait_classifier_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/yakuza"
+        )
+        target_compile_definitions(rsx_wait_classifier_tests PRIVATE
+            YZ_RSX_WAIT_CLASSIFIER_TEST=1
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_wait_classifier
+            COMMAND rsx_wait_classifier_tests
+        )
+
+        add_executable(fe0_timeline_tests
+            tests/fe0_timeline/main.c
+            runtime/diag/yz_fe0_timeline.c
+        )
+        target_include_directories(fe0_timeline_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_compile_definitions(fe0_timeline_tests PRIVATE
+            YZ_FE0_TIMELINE_TEST=1
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(fe0_timeline_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(
+            NAME fe0_timeline
+            COMMAND fe0_timeline_tests
+        )
+
         # Manual capture differential: feeds one RXS frame through the exact
         # production live renderer.  It is intentionally not a CTest because
         # the title capture is a large, local, untracked oracle.
@@ -250,8 +285,16 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_movie_handoff.py"
         )
         add_test(
+            NAME rsx_wait_classifier_mapping
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_wait_classifier_mapping.py"
+        )
+        add_test(
             NAME spu_profile_guest_pc
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_profile_pc.py"
+        )
+        add_test(
+            NAME spu_inventory_completeness
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_inventory.py"
         )
         set_tests_properties(
             ppu_lifter_conformance
@@ -281,6 +324,13 @@ if(PS3RECOMP_BUILD_TESTS)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 30
                 LABELS "regression;spu;profiling"
+        )
+        set_tests_properties(
+            spu_inventory_completeness
+            PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 30
+                LABELS "regression;spu;inventory"
         )
     endif()
 endif()

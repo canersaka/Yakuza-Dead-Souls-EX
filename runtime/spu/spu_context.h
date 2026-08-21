@@ -206,11 +206,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
-    /* Runtime LS bases for the five EBOOT-resident SPURS job binaries reached
+    /* Runtime LS bases for the first five EBOOT-resident SPURS job binaries
      * on the path to gameplay. mfc_do_transfer records descriptor eaBinary
      * loads here; spu_indirect_branch uses the recorded residency to select
-     * images 14-15, 17-38 as applicable. Zero means that binary is not
-     * resident. */
+     * the matching lifted placement. Zero means that binary is not resident.
+     * This legacy array cannot grow without moving generated-code-visible
+     * fields; later family slots therefore live in the append-only extension
+     * at the end of this structure and are accessed through the helpers below. */
     uint32_t job_bin_base[5];
 
     /*
@@ -395,6 +397,20 @@ typedef struct spu_context {
      * layout rule above. */
     uint32_t parity_motion_generation;
 
+    /* Native job provenance for terminal fault diagnostics.  run_job owns
+     * these fields for the lifetime of its private context.  Keeping the
+     * acquired descriptor/IO placement on the architectural context lets a
+     * DMA exception report the exact immutable job generation that issued
+     * it, rather than re-reading a descriptor arena the PPU may already have
+     * recycled.  Zero means the context is not executing a native job. */
+    uint32_t native_job_descriptor_ea;
+    uint32_t native_job_binary_ea;
+    uint32_t native_job_descriptor_ls;
+    uint32_t native_job_descriptor_size;
+    uint32_t native_job_context_ls;
+    uint32_t native_job_io_ls;
+    uint32_t native_job_io_size;
+
 #if defined(YZ_PERF_PROFILE)
     /*
      * Aggregate-only profile lane counters. Each context is driven by one SPU
@@ -420,7 +436,53 @@ typedef struct spu_context {
     uint32_t perf_compact_sample_counter;
 #endif
 
+    /* Extra job-family residency slots. Keep this at the physical end of the
+     * context so adding a sixth family does not violate the append-only layout
+     * contract above. The spare entries avoid another ABI change for the next
+     * two discovered families. */
+    uint32_t job_bin_extra_base[3];
+
+    /* Exact source PC for focused computed-tail diagnostics.  Generated Job E
+     * probes set this immediately before their three data-dependent `bi`
+     * sites; ordinary images leave it zero.  Keep it at the physical end to
+     * preserve the generated-code-visible historical prefix. */
+    uint32_t debug_indirect_source_pc;
+
+    /* Default-off FE0 semantic timeline correlation.  A native-SPURS image-4
+     * signal carries the originating user-command cause/epoch through the
+     * task handoff and into its DMA publication.  Append-only by contract. */
+    uint32_t fe0_timeline_cause;
+    uint32_t fe0_timeline_epoch;
+    uint32_t fe0_timeline_task;
+
 } spu_context;
+
+enum {
+    SPU_JOB_BIN_LEGACY_COUNT = 5,
+    SPU_JOB_BIN_EXTRA_COUNT = 3,
+    SPU_JOB_BIN_CAPACITY = SPU_JOB_BIN_LEGACY_COUNT + SPU_JOB_BIN_EXTRA_COUNT
+};
+
+static inline uint32_t spu_job_bin_base_get(
+    const spu_context* ctx, int slot)
+{
+    if (slot < 0 || slot >= SPU_JOB_BIN_CAPACITY)
+        return 0;
+    return slot < SPU_JOB_BIN_LEGACY_COUNT
+        ? ctx->job_bin_base[slot]
+        : ctx->job_bin_extra_base[slot - SPU_JOB_BIN_LEGACY_COUNT];
+}
+
+static inline void spu_job_bin_base_set(
+    spu_context* ctx, int slot, uint32_t base)
+{
+    if (slot < 0 || slot >= SPU_JOB_BIN_CAPACITY)
+        return;
+    if (slot < SPU_JOB_BIN_LEGACY_COUNT)
+        ctx->job_bin_base[slot] = base;
+    else
+        ctx->job_bin_extra_base[slot - SPU_JOB_BIN_LEGACY_COUNT] = base;
+}
 
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
  * clock the PPU decrementer/mftb use -- CBEA v1.02 Section 9.7 p145 ties the
