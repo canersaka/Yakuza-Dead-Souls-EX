@@ -43,7 +43,13 @@ typedef struct rsx_nr_d3d12 rsx_nr_d3d12;
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long pso_hits, pso_builds;
-    unsigned long long unsupported_draws;    /* refused to the core        */
+    unsigned long long unsupported_draws;    /* refused to the core (sum)  */
+    unsigned long long unsup_draw_topology;  /* fan/loop/quads/polygon     */
+    unsigned long long unsup_draw_rt;        /* surface format/target      */
+    unsigned long long unsup_draw_plan;      /* pull plan unsupported      */
+    unsigned long long unsup_draw_pso;       /* compile/build failed       */
+    unsigned long long unsup_draw_index;     /* index list unreadable      */
+    unsigned long long restart_draws;        /* executed via strip-cut IB  */
     unsigned long long unsupported_clears;
     unsigned long long unsupported_transfers;
     unsigned long long approx_fp_draws;      /* solid PS stood in for FP   */

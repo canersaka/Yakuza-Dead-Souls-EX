@@ -140,7 +140,279 @@ static int pix_is(u32 x, u32 y, u8 bb, u8 gg, u8 rr)
     return p[0] == bb && p[1] == gg && p[2] == rr;
 }
 
-int main(void)
+/* ---- optional real-capture execution leg -------------------------------
+ * Feed an exported .rxs stream through adapter -> ring -> backend with the
+ * D3D12 sink: real captured vertex programs run through the pull
+ * decompiler on WARP; guest memory comes from the capture's own data
+ * blocks, applied at their recorded stream positions through the dirty-
+ * page tracker (the real mirror re-upload flow at capture scale).
+ * Refusals (non-A8R8G8B8 surfaces, restart/fan/quad draws, FP stand-in)
+ * are measured coverage, not failures; the leg fails only on parse
+ * errors, ring faults, or nondeterminism between two identical runs. */
+
+#include "../rsx_nir_adapter.h"
+
+typedef struct cap_mem {
+    u8* arena[2];
+    u32 size[2];
+} cap_mem;
+
+static cap_mem g_cap;
+
+static const u8* cap_ptr(void* user, u32 space, u32 offset, u32 min_bytes)
+{
+    (void)user;
+    if (space > 1 || !g_cap.arena[space] || offset > g_cap.size[space] ||
+        min_bytes > g_cap.size[space] - offset)
+        return NULL;
+    return g_cap.arena[space] + offset;
+}
+
+static u8* cap_wptr(void* user, u32 space, u32 offset, u32 min_bytes)
+{
+    return (u8*)cap_ptr(user, space, offset, min_bytes);
+}
+
+typedef struct cap_data {
+    u32 n_blocks, n_records, reg_words, vp_words, const_words;
+    u32* regs;
+    u32* vp;
+    u32* consts;
+    u32* blocks;                     /* {location, offset, size, data_off} */
+    u8* data;
+    u64 data_size;
+    u32* records;
+} cap_data;
+
+static int cap_load(const char* path, cap_data* c)
+{
+    memset(c, 0, sizeof(*c));
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "capture: cannot open %s\n", path);
+        return -1;
+    }
+    u32 header[8];
+    u32 disp_count;
+    u32 disp[8][4];
+    if (fread(header, 4, 8, fp) != 8 || memcmp(header, "RXS1", 4) != 0 ||
+        (header[1] != 2 && header[1] != 3) ||
+        fread(&disp_count, 4, 1, fp) != 1 || fread(disp, 16, 8, fp) != 8 ||
+        (header[1] >= 3 && fread(&c->const_words, 4, 1, fp) != 1)) {
+        fclose(fp);
+        return -1;
+    }
+    c->n_blocks = header[2];
+    c->n_records = header[3];
+    c->reg_words = header[4];
+    c->vp_words = header[5];
+    c->regs = malloc((size_t)c->reg_words * 4 + 4);
+    c->vp = malloc((size_t)c->vp_words * 4 + 4);
+    c->consts = malloc((size_t)c->const_words * 4 + 4);
+    c->blocks = malloc((size_t)c->n_blocks * 16 + 4);
+    c->records = malloc((size_t)c->n_records * 8 + 4);
+    if (!c->regs || !c->vp || !c->consts || !c->blocks || !c->records ||
+        fread(c->regs, 4, c->reg_words, fp) != c->reg_words ||
+        fread(c->vp, 4, c->vp_words, fp) != c->vp_words ||
+        (c->const_words &&
+         fread(c->consts, 4, c->const_words, fp) != c->const_words) ||
+        fread(c->blocks, 16, c->n_blocks, fp) != c->n_blocks) {
+        fclose(fp);
+        return -1;
+    }
+    for (u32 i = 0; i < c->n_blocks; i++) {
+        u64 end = (u64)c->blocks[i * 4 + 3] + c->blocks[i * 4 + 2];
+        if (end > c->data_size)
+            c->data_size = end;
+    }
+    c->data = malloc(c->data_size ? (size_t)c->data_size : 1);
+    if (!c->data || (c->data_size &&
+                     fread(c->data, 1, (size_t)c->data_size, fp) !=
+                         (size_t)c->data_size) ||
+        fread(c->records, 8, c->n_records, fp) != c->n_records) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static void cap_free(cap_data* c)
+{
+    free(c->regs); free(c->vp); free(c->consts);
+    free(c->blocks); free(c->data); free(c->records);
+}
+
+static void cap_apply_block(cap_data* c, rsx_guest_pages* pages, u32 index)
+{
+    if (index >= c->n_blocks)
+        return;
+    const u32 loc = c->blocks[index * 4];
+    const u32 ofs = c->blocks[index * 4 + 1];
+    const u32 size = c->blocks[index * 4 + 2];
+    const u32 dofs = c->blocks[index * 4 + 3];
+    if (loc > 1 || !g_cap.arena[loc] || ofs > g_cap.size[loc] ||
+        size > g_cap.size[loc] - ofs)
+        return;
+    memcpy(g_cap.arena[loc] + ofs, c->data + dofs, size);
+    rsx_guest_pages_note_write(pages, loc, ofs, size);
+}
+
+static u64 fnv64(const u8* p, size_t n)
+{
+    u64 h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
+static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
+                        size_t stats_size)
+{
+    /* arena sizes: max block end per location, 64K aligned */
+    u32 need[2] = { 0, 0 };
+    for (u32 i = 0; i < c->n_blocks; i++) {
+        u32 loc = c->blocks[i * 4];
+        u64 end = (u64)c->blocks[i * 4 + 1] + c->blocks[i * 4 + 2];
+        if (loc <= 1 && end > need[loc])
+            need[loc] = (u32)end;
+    }
+    for (int s = 0; s < 2; s++) {
+        g_cap.size[s] = (need[s] + 0xFFFFu) & ~0xFFFFu;
+        if (!g_cap.size[s])
+            g_cap.size[s] = 0x10000;
+        g_cap.arena[s] = calloc(1, g_cap.size[s]);
+        if (!g_cap.arena[s])
+            return -1;
+    }
+
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(NULL, g_cap.size[0],
+                                             g_cap.size[1], cap_ptr,
+                                             cap_wptr, NULL);
+    if (!sink) {
+        free(g_cap.arena[0]);
+        free(g_cap.arena[1]);
+        memset(&g_cap, 0, sizeof(g_cap));
+        return -2;                   /* no device                          */
+    }
+
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    if (rsx_nr_ring_init(&ring, 4096, 1u << 19))
+        return -1;
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+
+    rsx_nir_adapter* ad = malloc(sizeof(*ad));
+    if (!ad)
+        return -1;
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_adapter_init_sink(ad, &k);
+    rsx_nir_adapter_seed(ad, c->regs, c->reg_words, c->vp, c->vp_words,
+                         c->consts, c->const_words);
+
+    u32 rt_space = 0, rt_offset = 0, rt_w = 0, rt_h = 0;
+    int ring_fault = 0;
+    for (u32 i = 0; i < c->n_records; i++) {
+        u32 m = c->records[i * 2];
+        u32 a = c->records[i * 2 + 1];
+        if (m & 0x80000000u) {
+            /* drain so preceding draws see pre-apply bytes, then apply */
+            while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
+                ;
+            cap_apply_block(c, rsx_nr_d3d12_pages(sink), a);
+            continue;
+        }
+        rsx_nir_adapter_method(ad, m, a);
+        if (rsx_nr_ring_reject_sticky(&ring)) {
+            ring_fault = 1;
+            break;
+        }
+        /* keep the ring shallow */
+        while (rsx_nr_ring_depth(&ring) > 2048 &&
+               rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
+            ;
+        /* remember the last color target the stream configured */
+        if ((be.st.surface.color_format == 4 ||
+             be.st.surface.color_format == 5 ||
+             be.st.surface.color_format == 8) && be.st.surface.clip_w) {
+            rt_space = be.st.surface.color_location[0];
+            rt_offset = be.st.surface.color_offset[0];
+            rt_w = be.st.surface.clip_w;
+            rt_h = be.st.surface.clip_h;
+        }
+    }
+    rsx_nir_adapter_finish(ad);
+    while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
+        ;
+
+    rsx_nr_d3d12_stats st;
+    rsx_nr_d3d12_get_stats(sink, &st);
+    snprintf(stats_line, stats_size,
+             "clears=%llu draws=%llu (restart=%llu) batches=%llu "
+             "presents=%llu xfers=%llu pso=%llu(+%lluh) unsup_draw=%llu "
+             "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu] "
+             "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
+             "exec_err=%llu",
+             st.clears, st.draws, st.restart_draws, st.draw_batches,
+             st.presents, st.transfers, st.pso_builds, st.pso_hits,
+             st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
+             st.unsup_draw_plan, st.unsup_draw_pso, st.unsup_draw_index,
+             st.unsupported_clears, st.unsupported_transfers,
+             st.compile_failures, be.stats.exec_errors);
+
+    *rt_hash = 0;
+    if (rt_w && rt_h) {
+        u8* px = malloc((size_t)rt_w * rt_h * 4);
+        if (px && rsx_nr_d3d12_read_rt(sink, rt_space, rt_offset, rt_w, rt_h,
+                                       px) == 0)
+            *rt_hash = fnv64(px, (size_t)rt_w * rt_h * 4);
+        free(px);
+    }
+
+    free(ad);
+    rsx_nr_ring_destroy(&ring);
+    rsx_nr_d3d12_destroy(sink);
+    free(g_cap.arena[0]);
+    free(g_cap.arena[1]);
+    memset(&g_cap, 0, sizeof(g_cap));
+    return ring_fault ? -1 : 0;
+}
+
+static void run_capture_backend(const char* path)
+{
+    cap_data c;
+    if (cap_load(path, &c)) {
+        CHECK(0, "capture %s failed to load", path);
+        return;
+    }
+    char line1[512], line2[512];
+    u64 h1 = 0, h2 = 0;
+    int r1 = cap_run_once(&c, &h1, line1, sizeof(line1));
+    if (r1 == -2) {
+        printf("capture backend leg: SKIP (no WARP device)\n");
+        cap_free(&c);
+        return;
+    }
+    CHECK(r1 == 0, "capture backend run 1 faulted");
+    int r2 = cap_run_once(&c, &h2, line2, sizeof(line2));
+    CHECK(r2 == 0, "capture backend run 2 faulted");
+    CHECK(strcmp(line1, line2) == 0, "capture stats nondeterministic:\n  %s\n  %s",
+          line1, line2);
+    CHECK(h1 == h2, "capture RT hash nondeterministic %016llX/%016llX",
+          (unsigned long long)h1, (unsigned long long)h2);
+    printf("capture backend %s:\n  %s\n  rt_hash=%016llX\n", path, line1,
+           (unsigned long long)h1);
+    cap_free(&c);
+}
+
+int main(int argc, char** argv)
 {
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(NULL, LOCAL_SIZE, MAIN_SIZE,
                                              arena_ptr, arena_wptr, NULL);
@@ -256,6 +528,14 @@ int main(void)
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
+
+    /* optional real-capture execution leg (large local untracked oracle:
+     * absent capture = SKIP so CTest stays hermetic) */
+    const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
+    if (rxs && rxs[0])
+        run_capture_backend(rxs);
+    else
+        printf("capture backend leg: SKIP (no .rxs via argv[1]/YZ_NIR_RXS)\n");
 
     if (g_failures) {
         fprintf(stderr, "rsx_nr_backend_d3d12: %d FAILURE(S)\n", g_failures);

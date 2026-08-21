@@ -81,6 +81,11 @@ struct rsx_nr_d3d12 {
     u8* (*writable_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
     void* guest_user;
 
+    /* restart-draw index conversion scratch (offline model grows on
+     * demand; a live integration preallocates its high-water size) */
+    u32* idx_scratch;
+    u32 idx_scratch_cap;
+
     rsx_nr_d3d12_stats stats;
     char vs_text[NRB_VS_TEXT];
     char pull_globals[48 * 1024];
@@ -246,11 +251,18 @@ static void nrb_rt_handles(rsx_nr_d3d12* b, const nrb_rt* rt,
     dsv->ptr += (SIZE_T)rt->dsv_slot * b->dsv_size;
 }
 
+/* BGRA8-class gcm surface color formats the sink can host directly:
+ * 4/5 = X8R8G8B8 (Z/O alpha-ignore variants), 8 = A8R8G8B8. */
+static int nrb_color_format_ok(u32 fmt)
+{
+    return fmt == 4 || fmt == 5 || fmt == 8;
+}
+
 static nrb_rt* nrb_rt_from_state(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
                                  int create)
 {
     const rsx_nir_surface* s = &st->surface;
-    if (s->color_format != 5)        /* A8R8G8B8 only for now              */
+    if (!nrb_color_format_ok(s->color_format))
         return NULL;
     u32 w = s->clip_w ? s->clip_w : 1280;
     u32 h = s->clip_h ? s->clip_h : 720;
@@ -378,13 +390,15 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                                         const rsx_nir_pipeline* st,
                                         const u32* vp_words, u32 vp_word_count,
                                         const rsx_vertex_pull_plan* plan,
-                                        D3D12_PRIMITIVE_TOPOLOGY_TYPE tt)
+                                        D3D12_PRIMITIVE_TOPOLOGY_TYPE tt,
+                                        int strip_cut)
 {
-    /* PSO identity: VP content + pull signature + topology class + the
-     * depth/raster state words that shape the PSO */
+    /* PSO identity: VP content + pull signature + topology class + strip
+     * cut + the depth/raster state words that shape the PSO */
     u64 key = rsx_nir_hash_words(vp_words, vp_word_count);
     key = rsx_nr_hash_fold(key ^ rsx_vertex_pull_signature(plan), &tt,
                            sizeof(tt));
+    key = rsx_nr_hash_fold(key, &strip_cut, sizeof(strip_cut));
     key = rsx_nr_hash_fold(key, &st->depth_stencil,
                            sizeof(st->depth_stencil));
     u64 cached = 0;
@@ -453,6 +467,9 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pd.DepthStencilState.DepthFunc =
         nrb_depth_func(st->depth_stencil.depth_func);
     pd.InputLayout.NumElements = 0;  /* vertex pulling: no IA              */
+    pd.IBStripCutValue = strip_cut
+        ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     pd.PrimitiveTopologyType = tt;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -473,6 +490,55 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     return pso;
 }
 
+/* Read one batch of the guest index array [first, first+count) as u32
+ * values, translating the restart sentinel: strips keep it as the D3D12
+ * cut value 0xFFFFFFFF; list topologies drop it. Returns the converted
+ * count into b->idx_scratch, or ~0u when the span is unreadable. */
+static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+                            u32 first, u32 count, int strips)
+{
+    const u32 esize = st->index_binding.is_u32 ? 4u : 2u;
+    const u8* src = b->guest_ptr(b->guest_user, st->index_binding.location,
+                                 st->index_binding.offset + first * esize,
+                                 count * esize);
+    if (!src)
+        return ~0u;
+    if (count > b->idx_scratch_cap) {
+        u32 ncap = b->idx_scratch_cap ? b->idx_scratch_cap : 4096;
+        while (ncap < count)
+            ncap *= 2;
+        u32* nbuf = realloc(b->idx_scratch, (size_t)ncap * 4);
+        if (!nbuf)
+            return ~0u;
+        b->idx_scratch = nbuf;
+        b->idx_scratch_cap = ncap;
+    }
+    const u32 restart = st->index_binding.restart_enable
+                            ? (st->index_binding.is_u32
+                                   ? st->index_binding.restart_index
+                                   : (st->index_binding.restart_index &
+                                      0xFFFFu))
+                            : 0xFFFFFFFFu;
+    const int have_restart = st->index_binding.restart_enable;
+    u32 n = 0;
+    for (u32 i = 0; i < count; i++) {
+        u32 v;
+        if (esize == 4)
+            v = ((u32)src[i * 4] << 24) | ((u32)src[i * 4 + 1] << 16) |
+                ((u32)src[i * 4 + 2] << 8) | src[i * 4 + 3];
+        else
+            v = ((u32)src[i * 2] << 8) | src[i * 2 + 1];
+        if (have_restart && v == restart) {
+            if (strips)
+                b->idx_scratch[n++] = 0xFFFFFFFFu;
+            /* list topologies: the cut carries no geometry; drop it */
+            continue;
+        }
+        b->idx_scratch[n++] = v;
+    }
+    return n;
+}
+
 static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                     const u32* vp_words, u32 vp_word_count,
                     const rsx_nir_draw* d, const u32* batches)
@@ -481,14 +547,17 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
 
     D3D12_PRIMITIVE_TOPOLOGY topo;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE tt;
-    if (nrb_topology(d->primitive, &topo, &tt) != 0 ||
-        (d->indexed && st->index_binding.restart_enable)) {
+    if (nrb_topology(d->primitive, &topo, &tt) != 0) {
         b->stats.unsupported_draws++;
+        b->stats.unsup_draw_topology++;
         return -1;
     }
+    const int strips = d->primitive == 4 || d->primitive == 6;
+    const int use_cut_ib = d->indexed && st->index_binding.restart_enable;
     nrb_rt* rt = nrb_rt_from_state(b, st, 1);
     if (!rt) {
         b->stats.unsupported_draws++;
+        b->stats.unsup_draw_rt++;
         return -1;
     }
 
@@ -517,13 +586,15 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             st->vertex_bindings.freq_divider_op, &layout,
             RSX_PULL_TYPES_ALL)) {
         b->stats.unsupported_draws++;
+        b->stats.unsup_draw_plan++;
         return -1;
     }
 
-    ID3D12PipelineState* pso =
-        nrb_get_pso(b, st, vp_words, vp_word_count, &plan, tt);
+    ID3D12PipelineState* pso = nrb_get_pso(b, st, vp_words, vp_word_count,
+                                           &plan, tt, use_cut_ib && strips);
     if (!pso) {
         b->stats.unsupported_draws++;
+        b->stats.unsup_draw_pso++;
         return -1;
     }
     b->stats.approx_fp_draws++;      /* solid PS stands in for the FP      */
@@ -577,33 +648,82 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->list->lpVtbl->SetGraphicsRootShaderResourceView(
             b->list, 3, rm->lpVtbl->GetGPUVirtualAddress(rm));
 
-    const u32 source = d->indexed
+    /* Restart draws go through a host-built u32 index buffer with the
+     * D3D12 strip-cut sentinel (strips) or cuts dropped (lists); the
+     * shader then runs the ARRAYS source with first = 0, so SV_VertexID
+     * IS the fetched index and base_index still applies in-shader —
+     * exactly the pull module's documented host-index integration. All
+     * other draws use the in-shader guest index fetch. */
+    const u32 source = (d->indexed && !use_cut_ib)
                            ? (st->index_binding.is_u32
                                   ? RSX_PULL_SOURCE_INDEX_U32
                                   : RSX_PULL_SOURCE_INDEX_U16)
                            : RSX_PULL_SOURCE_ARRAYS;
+    int failed = 0;
 
     for (u32 bi = 0; bi < d->batch_count; bi++) {
         const u32 first = batches[bi * 2];
         const u32 count = batches[bi * 2 + 1];
+        u32 draw_count = count;
+        u32 pc_first = first;
+
+        if (use_cut_ib) {
+            u32 n = nrb_read_indices(b, st, first, count, strips);
+            if (n == ~0u) {
+                b->stats.unsup_draw_index++;
+                failed = 1;
+                break;
+            }
+            if (!n) {
+                b->stats.draw_batches++;
+                continue;            /* batch was cuts only               */
+            }
+            u64 ib_va = 0;
+            u8* ip = nrb_upload_alloc(b, n * 4, &ib_va);
+            if (!ip) {
+                failed = 1;
+                break;
+            }
+            memcpy(ip, b->idx_scratch, (size_t)n * 4);
+            D3D12_INDEX_BUFFER_VIEW ibv;
+            ibv.BufferLocation = ib_va;
+            ibv.SizeInBytes = n * 4;
+            ibv.Format = DXGI_FORMAT_R32_UINT;
+            b->list->lpVtbl->IASetIndexBuffer(b->list, &ibv);
+            draw_count = n;
+            pc_first = 0;
+        }
+
         rsx_vertex_pull_constants pc;
         rsx_vertex_pull_fill_constants(
-            &plan, st->vertex_bindings.base_index, first, source,
+            &plan, st->vertex_bindings.base_index, pc_first, source,
             st->index_binding.offset, st->index_binding.location,
             rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 0),
             rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 1), &pc);
         u64 pull_va = 0;
         u8* pp = nrb_upload_alloc(b, sizeof(pc), &pull_va);
-        if (!pp)
+        if (!pp) {
+            failed = 1;
             break;
+        }
         memcpy(pp, &pc, sizeof(pc));
         b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 1,
                                                            pull_va);
-        b->list->lpVtbl->DrawInstanced(b->list, count, 1, 0, 0);
+        if (use_cut_ib)
+            b->list->lpVtbl->DrawIndexedInstanced(b->list, draw_count, 1, 0,
+                                                  0, 0);
+        else
+            b->list->lpVtbl->DrawInstanced(b->list, draw_count, 1, 0, 0);
         b->stats.draw_batches++;
     }
 
     nrb_exec_wait(b);
+    if (failed) {
+        b->stats.unsupported_draws++;
+        return -1;
+    }
+    if (use_cut_ib)
+        b->stats.restart_draws++;
     b->stats.draws++;
     return 0;
 }
@@ -907,6 +1027,7 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         rsx_gpu_mirror_d3d12_destroy(b->mirror_be);
     if (b->pages.space[0].page_gen || b->pages.space[1].page_gen)
         rsx_guest_pages_destroy(&b->pages);
+    free(b->idx_scratch);
     if (b->readback)
         b->readback->lpVtbl->Release(b->readback);
     if (b->upload)
