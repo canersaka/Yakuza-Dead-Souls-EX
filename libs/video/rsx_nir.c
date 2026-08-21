@@ -353,6 +353,25 @@ static const char* pipeline_diverges(const rsx_nir_pipeline* x,
 int rsx_nir_compare(const rsx_nir_stream* a, const rsx_nir_stream* b,
                     char* errbuf, unsigned errbuf_size)
 {
+    return rsx_nir_compare_ex(a, b, 0, errbuf, errbuf_size);
+}
+
+/* cursor_next that skips masked action kinds */
+static int next_unmasked(rsx_nir_cursor* c, rsx_nir_action* act, u32 mask)
+{
+    for (;;) {
+        int h = rsx_nir_cursor_next(c, act);
+        if (!h)
+            return 0;
+        if (act->kind < 32 && (mask & (1u << act->kind)))
+            continue;
+        return 1;
+    }
+}
+
+int rsx_nir_compare_ex(const rsx_nir_stream* a, const rsx_nir_stream* b,
+                       u32 skip_kind_mask, char* errbuf, unsigned errbuf_size)
+{
     /* Two streaming cursors: memory stays bounded on capture-sized input. */
     rsx_nir_action* fa = malloc(sizeof(*fa));
     rsx_nir_action* fb = malloc(sizeof(*fb));
@@ -363,8 +382,8 @@ int rsx_nir_compare(const rsx_nir_stream* a, const rsx_nir_stream* b,
         FAIL("compare: allocation failure");
 
     for (int i = 0;; i++) {
-        int ha = rsx_nir_cursor_next(&ca, fa);
-        int hb = rsx_nir_cursor_next(&cb, fb);
+        int ha = next_unmasked(&ca, fa, skip_kind_mask);
+        int hb = next_unmasked(&cb, fb, skip_kind_mask);
         if (ha != hb)
             FAIL("action count differs at %d: stream %s ended first", i,
                  ha ? "B" : "A");

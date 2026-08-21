@@ -490,6 +490,13 @@ int rsx_nir_fold(const rsx_nir_stream* s, rsx_nir_action** out);
 int rsx_nir_compare(const rsx_nir_stream* a, const rsx_nir_stream* b,
                     char* errbuf, unsigned errbuf_size);
 
+/* Compare with a skip mask: action kinds whose bit ((1u << kind)) is set
+ * are dropped from BOTH folded sequences before comparison. Used to
+ * compare a mixed native/fallback stream (which carries FALLBACK and
+ * TOKEN ordering markers) against a pure single-producer stream. */
+int rsx_nir_compare_ex(const rsx_nir_stream* a, const rsx_nir_stream* b,
+                       u32 skip_kind_mask, char* errbuf, unsigned errbuf_size);
+
 /* FNV-1a 64 over words — the vertex-program identity hash. */
 u64 rsx_nir_hash_words(const u32* words, u32 count);
 
