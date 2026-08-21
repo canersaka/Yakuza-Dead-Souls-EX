@@ -55,6 +55,9 @@ option(YZ_PERF_PROFILE
 option(YZ_PPU_SAMPLE
     "Add the low-noise, fixed-window main-PPU instruction sampler."
     OFF)
+option(YZ_FRONTIER_VISUAL_PROBE
+    "Allow sparse renderer-owned frontier screenshots in a PERF_CLEAN diagnostic build."
+    OFF)
 if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
     message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
 endif()
@@ -86,6 +89,10 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${PS3RECOMP_DIR}/yakuza/generated")
 target_compile_definitions(ps3recomp_runtime PRIVATE
     PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h")
+if(YZ_FRONTIER_VISUAL_PROBE)
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        YZ_FRONTIER_VISUAL_PROBE=1)
+endif()
 
 # The lifted PPU code is split into ppu_recomp_NNN.cpp chunks (one giant file
 # exceeds the MSVC source-line limit). The chunks go into their own object
@@ -177,6 +184,7 @@ option(YZ_SPU_FAST_JOB_A "every Job A placement from region-lifted FAST sources.
 option(YZ_SPU_FAST_JOB_B "every Job B placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_JOB_C "every Job C placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_JOB_D "every Job D placement from region-lifted FAST sources." OFF)
+option(YZ_SPU_FAST_JOB_E "every frontier Job E placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_ORPHANAGE "every orphanage-worker placement from region-lifted FAST sources." OFF)
 option(YZ_SPU_FAST_SPURS_EXPERIMENTAL "EXPERIMENTAL: the five libsre SPURS payloads (kernel2/sysservice/policy/job_module/ts_exit) from region-lifted FAST sources -- an LLE oracle/fallback lane for the native-HLE track, not its destination." OFF)
 option(YZ_SPU_FAST_SPURS_KERNEL2 "Bisect override: region-lift only spurs_kernel2." OFF)
@@ -247,6 +255,9 @@ endforeach()
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c" job_bin_d_15c00)
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c" job_bin_d_2b800)
 _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
+foreach(stem job_bin_e_e400 job_bin_e_4c00)
+    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_JOB_E "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+endforeach()
 foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
         job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
         job_bin_orphanage_3c000 job_bin_orphanage_3cc00)
@@ -254,6 +265,37 @@ foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
 endforeach()
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+
+# Inventory every EBOOT-resident SPU payload before compiling the runner.  A
+# CellSpurs job descriptor may be assembled only at runtime, so the gate also
+# verifies dense-section coverage: a missing raw job leaves a large unexplained
+# hole even when no finished descriptor exists in the executable.  The JSON
+# report is a build artifact suitable for attaching to a devlog/release.
+set(YZ_SPU_INVENTORY_REPORT
+    "${CMAKE_CURRENT_BINARY_DIR}/spu_inventory.json")
+set(YZ_SPU_RUNTIME_EVIDENCE
+    "${YZ_GAME_INPUT_DIR}/spu_unknown_jobs.jsonl" CACHE FILEPATH
+    "Append-only unknown native-SPURS jobs captured by boot runs")
+add_custom_target(yz_spu_inventory ALL
+    COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/spu_inventory.py"
+            --input "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
+            --manifest "${PS3RECOMP_DIR}/tools/spu_region_manifest.json"
+            --artifact-root "${PS3RECOMP_DIR}"
+            --artifact-root "${YZ_GAME_INPUT_DIR}"
+            --max-padding 0x400
+            --runtime-evidence "${YZ_SPU_RUNTIME_EVIDENCE}"
+            --report "${YZ_SPU_INVENTORY_REPORT}"
+            --strict
+    BYPRODUCTS "${YZ_SPU_INVENTORY_REPORT}"
+    DEPENDS
+        "${PS3RECOMP_DIR}/tools/spu_inventory.py"
+        "${PS3RECOMP_DIR}/tools/spu_region_manifest.json"
+        "${PS3RECOMP_DIR}/tools/elf_parser.py"
+        "${PS3RECOMP_DIR}/tools/extract_spu_images.py"
+        "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
+    COMMENT "Verifying complete EBOOT SPU payload inventory"
+    VERBATIM)
+
 set(YZ_IMPORT_BRIDGES "${CMAKE_CURRENT_BINARY_DIR}/import_bridges_gen.cpp")
 # Import binding is derived from function definitions across the independent
 # HLE/runtime sources.  Keep those files in the generator dependency graph so
@@ -312,9 +354,11 @@ add_executable(yakuza_recomp
     "${YZ_IMPORT_BRIDGES}"
     import_overrides.cpp
     edge_journal_hle.cpp
+    rsx_wait_classifier.cpp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )
+add_dependencies(yakuza_recomp yz_spu_inventory)
 if(YZ_PPU_SAMPLE)
     target_compile_definitions(yakuza_recomp PRIVATE YZ_PPU_SAMPLE=1)
     target_compile_definitions(ps3recomp_runtime PRIVATE YZ_PPU_SAMPLE=1)
