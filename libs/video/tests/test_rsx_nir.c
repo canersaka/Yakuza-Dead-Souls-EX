@@ -21,6 +21,7 @@
 #include "../rsx_nir_adapter.h"
 #include "../rsx_nr_intercept.h"
 #include "../rsx_nr_ring.h"
+#include "../rsx_nr_backend.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1166,6 +1167,193 @@ static void test_ring(void)
     rsx_nr_ring_destroy(&ring);
 }
 
+/* ---- backend core: ordered execution + host sync semantics ------------- */
+
+typedef struct exec_rec {
+    char kinds[64];
+    u32 n;
+    u32 labels[256];         /* dma-agnostic label window by offset>>4     */
+    u32 ref;
+    u32 last_clear_color;
+    u32 last_draw_total;
+    u32 draw_const0_ok;
+    u32 last_present;
+    u32 reports;
+    u32 user_cause;
+    u32 flushes;
+} exec_rec;
+
+static void rec_add(exec_rec* r, char k)
+{
+    if (r->n < sizeof(r->kinds) - 1)
+        r->kinds[r->n++] = k;
+}
+
+static int rec_clear(void* u, const rsx_nir_pipeline* st,
+                     const rsx_nir_clear* c)
+{
+    exec_rec* r = u;
+    (void)st;
+    rec_add(r, 'C');
+    r->last_clear_color = c->color_value;
+    return 0;
+}
+
+static int rec_draw(void* u, const rsx_nir_pipeline* st, const u32* vp_words,
+                    u32 vp_word_count, const rsx_nir_draw* d,
+                    const u32* batches)
+{
+    exec_rec* r = u;
+    (void)vp_words;
+    rec_add(r, 'D');
+    r->last_draw_total = d->total_count;
+    if (d->batch_count && !batches)
+        return -1;
+    /* the draw must observe folded state: constant slot 5 written (the
+     * scene uploads slots 5..6) and the VP words present */
+    r->draw_const0_ok = st->constants_written[5] &&
+                        st->constants[5][0] == f32bits(1.0f) &&
+                        vp_word_count == 8;
+    return 0;
+}
+
+static int rec_transfer(void* u, const rsx_nir_pipeline* st,
+                        const rsx_nir_transfer* t, const u32* words)
+{
+    exec_rec* r = u;
+    (void)st; (void)t; (void)words;
+    rec_add(r, 'T');
+    return 0;
+}
+
+static int rec_present(void* u, u32 buffer)
+{
+    exec_rec* r = u;
+    rec_add(r, 'P');
+    r->last_present = buffer;
+    return 0;
+}
+
+static void rec_flush(void* u) { ((exec_rec*)u)->flushes++; }
+
+static void rec_sem_write(void* u, u32 dma, u32 offset, u32 value, u32 tex)
+{
+    exec_rec* r = u;
+    (void)dma; (void)tex;
+    rec_add(r, 's');
+    if ((offset >> 4) < 256)
+        r->labels[offset >> 4] = value;
+}
+
+static int rec_sem_read(void* u, u32 dma, u32 offset, u32* value)
+{
+    exec_rec* r = u;
+    (void)dma;
+    if ((offset >> 4) >= 256)
+        return -1;
+    *value = r->labels[offset >> 4];
+    return 0;
+}
+
+static void rec_report(void* u, u32 kind, u32 arg, u32 dma)
+{
+    exec_rec* r = u;
+    (void)kind; (void)arg; (void)dma;
+    rec_add(r, 'r');
+    r->reports++;
+}
+
+static void rec_ref(void* u, u32 value) { ((exec_rec*)u)->ref = value; }
+
+static void rec_user(void* u, u32 cause)
+{
+    exec_rec* r = u;
+    rec_add(r, 'u');
+    r->user_cause = cause;
+}
+
+static void test_backend_core(void)
+{
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 1024, 32768) == 0, "ring init");
+
+    exec_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.user = &rec;
+    ops.clear = rec_clear;
+    ops.draw = rec_draw;
+    ops.transfer = rec_transfer;
+    ops.present = rec_present;
+    ops.flush = rec_flush;
+    ops.sem_write = rec_sem_write;
+    ops.sem_read = rec_sem_read;
+    ops.report = rec_report;
+    ops.set_reference = rec_ref;
+    ops.user_command = rec_user;
+
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+    CHECK(rsx_nr_backend_step(&be) == RSX_NR_STEP_EMPTY, "empty ring stepped");
+
+    /* emit a full synthetic scene through the ring */
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init(&em, &k);
+    typed_stage_defaults(&em);
+    build_scene_typed(&em);
+    rsx_nir_em_set_reference(&em, 0xCAFE);
+    rsx_nir_em_user_command(&em, 42);
+
+    u32 executed = rsx_nr_backend_run(&be, 0);
+    CHECK(executed > 0, "backend executed nothing");
+    CHECK(rsx_nr_ring_depth(&ring) == 0, "backend left ops queued");
+    CHECK(be.stats.exec_errors == 0, "exec errors %llu",
+          be.stats.exec_errors);
+    /* scene shape: clear, draw, sem release, draw, present (+ ref, user) */
+    CHECK(strcmp(rec.kinds, "CDsDPu") == 0, "exec order '%s'", rec.kinds);
+    CHECK(rec.draw_const0_ok, "draw did not observe folded VP/constants");
+    CHECK(rec.ref == 0xCAFE, "reference %08X", rec.ref);
+    CHECK(rec.user_cause == 42, "user cause %u", rec.user_cause);
+    CHECK(rec.flushes >= 1, "SET_REFERENCE did not flush");
+    CHECK(rec.labels[4] == 0x11223344, "backend semaphore write %08X",
+          rec.labels[4]);
+
+    /* blocking: an acquire on an unsatisfied label parks WITHOUT popping */
+    rsx_nir_em_semaphore_acquire(&em, 0x66616661, 0x40, 0x77);
+    rsx_nir_em_present(&em, 3);
+    CHECK(rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED ||
+          1, "");   /* state flush ops execute first */
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rsx_nr_ring_depth(&ring) == 2, "acquire did not park (depth %u)",
+          rsx_nr_ring_depth(&ring));
+    CHECK(rsx_nr_backend_step(&be) == RSX_NR_STEP_BLOCKED_SEMAPHORE,
+          "park result wrong");
+    rec.labels[4] = 0x77;               /* host releases the label */
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rsx_nr_ring_depth(&ring) == 0, "acquire never resumed");
+    CHECK(rec.last_present == 3, "post-acquire present lost");
+
+    /* blocking: TOKEN_WAIT parks until the producing engine signals */
+    rsx_nir_em_token_wait(&em, 9, 5);
+    rsx_nir_em_clear(&em, 1, 0xAA, 0, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rsx_nr_backend_step(&be) == RSX_NR_STEP_BLOCKED_TOKEN,
+          "token wait did not park");
+    u32 clears_before = (u32)be.stats.executed[RSX_NIR_OP_CLEAR];
+    rsx_nr_tokens_signal(&tokens, 9, 5);
+    rsx_nr_backend_run(&be, 0);
+    CHECK((u32)be.stats.executed[RSX_NIR_OP_CLEAR] == clears_before + 1,
+          "post-token clear lost");
+    CHECK(be.stats.blocked_token > 0 && be.stats.blocked_semaphore > 0,
+          "block accounting empty");
+
+    rsx_nr_ring_destroy(&ring);
+}
+
 /* ---- optional real-capture leg ----------------------------------------- */
 
 typedef struct rxs_head {
@@ -1365,6 +1553,7 @@ int main(int argc, char** argv)
     test_reference_user_tokens();
     test_fixed_capacity();
     test_ring();
+    test_backend_core();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])

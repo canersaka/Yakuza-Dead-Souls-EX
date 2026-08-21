@@ -44,23 +44,14 @@ static void pull_emitf(pull_out* o, const char* fmt, ...)
     pull_emit(o, line);
 }
 
-int rsx_vertex_pull_plan_init(rsx_vertex_pull_plan* plan,
-                              const rsx_dispatch* rsx,
-                              const rsx_vertex_layout_plan* layout,
-                              u32 allowed_types)
+/* Shared classification once plan->attr[] descriptors and defaults are
+ * populated (from a dispatch register file or from decoded state). */
+static int pull_plan_classify(rsx_vertex_pull_plan* plan, u32 allowed_types)
 {
-    if (!plan || !rsx || !layout)
-        return 0;
-    memset(plan, 0, sizeof(*plan));
-    plan->layout = *layout;
-    plan->base_offset = rsx_dsp_vertex_data_base_offset(rsx);
-    plan->divider_mask = rsx_dsp_reg(rsx, 0x1FC0);
     for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
         rsx_vertex_pull_attr* a = &plan->attr[attr];
-        rsx_dsp_get_vertex_attr(rsx, attr, &a->desc);
         a->elem_size = rsx_vertex_attrib_size(a->desc.type, a->desc.size);
         a->stride = a->desc.stride ? a->desc.stride : a->elem_size;
-        rsx_dsp_vertex_default(rsx, attr, a->default_value);
         /* Same ATTR3 (diffuse-color) neutral-default quirk as
          * rsx_vertex_fetch_plan_init. */
         if (attr == 3 &&
@@ -83,6 +74,46 @@ int rsx_vertex_pull_plan_init(rsx_vertex_pull_plan* plan,
         plan->pulled_mask |= 1u << attr;
     }
     return plan->unsupported_mask == 0;
+}
+
+int rsx_vertex_pull_plan_init(rsx_vertex_pull_plan* plan,
+                              const rsx_dispatch* rsx,
+                              const rsx_vertex_layout_plan* layout,
+                              u32 allowed_types)
+{
+    if (!plan || !rsx || !layout)
+        return 0;
+    memset(plan, 0, sizeof(*plan));
+    plan->layout = *layout;
+    plan->base_offset = rsx_dsp_vertex_data_base_offset(rsx);
+    plan->divider_mask = rsx_dsp_reg(rsx, 0x1FC0);
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
+        rsx_vertex_pull_attr* a = &plan->attr[attr];
+        rsx_dsp_get_vertex_attr(rsx, attr, &a->desc);
+        rsx_dsp_vertex_default(rsx, attr, a->default_value);
+    }
+    return pull_plan_classify(plan, allowed_types);
+}
+
+int rsx_vertex_pull_plan_init_decoded(rsx_vertex_pull_plan* plan,
+                                      const rsx_dsp_vertex_attr* attrs,
+                                      const float defaults[][4],
+                                      u32 base_offset, u32 divider_mask,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 allowed_types)
+{
+    if (!plan || !attrs || !defaults || !layout)
+        return 0;
+    memset(plan, 0, sizeof(*plan));
+    plan->layout = *layout;
+    plan->base_offset = base_offset;
+    plan->divider_mask = divider_mask;
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
+        rsx_vertex_pull_attr* a = &plan->attr[attr];
+        a->desc = attrs[attr];
+        memcpy(a->default_value, defaults[attr], sizeof(a->default_value));
+    }
+    return pull_plan_classify(plan, allowed_types);
 }
 
 u64 rsx_vertex_pull_signature(const rsx_vertex_pull_plan* plan)

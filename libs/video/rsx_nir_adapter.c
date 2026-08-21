@@ -281,6 +281,7 @@ static void stage_state(rsx_nir_adapter* ad)
     }
     vb.base_offset = rsx_dsp_vertex_data_base_offset(rsx);
     vb.base_index  = rsx_dsp_vertex_data_base_index(rsx);
+    vb.freq_divider_op = rsx_dsp_reg(rsx, 0x1FC0);
     rsx_nir_em_vertex_bindings(em, &vb);
 
     /* index binding */
