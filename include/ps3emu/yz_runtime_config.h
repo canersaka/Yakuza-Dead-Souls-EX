@@ -18,6 +18,7 @@ typedef struct yz_runtime_config {
     int auto_start;
     int auto_new_game;
     int auto_new_game_circle;
+    int akiyama_dialogue_route;
 
     int skip_voice;
     int a010_render_enable;
