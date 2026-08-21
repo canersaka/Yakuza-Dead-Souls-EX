@@ -18,6 +18,7 @@
 #include "edge_journal_hle.h"
 #include "rsx_wait_classifier.h"
 #include "rsx_nr_intercept.h"
+#include "rsx_nr_backend.h"
 
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
@@ -38,18 +39,29 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-/* Stage-1 native-render integration: a passive, fixed-memory shadow census.
+/* Staged native-render integration: a passive, fixed-memory shadow census and
+ * one optional typed flip action at the already-serialized FIFO-consumer
+ * boundary.  All queue/head/event plumbing continues through yz_rsx_method.
  * YZ_NR_INTERCEPT is read exactly once before the RSX consumer starts.  When
  * it is unset/empty/0, the hot path is one false branch and performs no
- * initialization, allocation, timing, or output.  No typed producer is wired
- * at this stage, so the FIFO/live renderer remains the sole owner. */
+ * initialization, allocation, timing, or output. */
 static rsx_nr_intercept g_yz_nr_shadow;
 static rsx_nr_ring g_yz_nr_shadow_ring;
 static rsx_nr_tokens g_yz_nr_shadow_tokens;
-static rsx_nr_slot g_yz_nr_shadow_slots[64];
-static uint32_t g_yz_nr_shadow_side[1024];
+static rsx_nr_backend g_yz_nr_backend;
+static rsx_nr_slot g_yz_nr_shadow_slots[128];
+static uint32_t g_yz_nr_shadow_side[16384];
 static volatile LONG g_yz_nr_shadow_enabled;
 static int g_yz_nr_shadow_init_attempted;
+static unsigned long long g_yz_nr_live_flip_owned;
+static unsigned long long g_yz_nr_live_flip_fallback;
+static unsigned long long g_yz_nr_live_faults;
+
+static int yz_nr_live_present(void*, uint32_t buffer_id)
+{
+    rsx_live_draw_native_present(buffer_id);
+    return 0;
+}
 
 static void yz_nr_shadow_init(void)
 {
@@ -70,16 +82,64 @@ static void yz_nr_shadow_init(void)
         return;
     rsx_nr_intercept_init(&g_yz_nr_shadow, &g_yz_nr_shadow_ring,
                           &g_yz_nr_shadow_tokens, families, 1);
+    rsx_nr_exec_ops ops = {};
+    ops.present = yz_nr_live_present;
+    rsx_nr_backend_init(&g_yz_nr_backend, &g_yz_nr_shadow_ring,
+                        &g_yz_nr_shadow_tokens, &ops);
     InterlockedExchange(&g_yz_nr_shadow_enabled, 1);
+}
+
+/* Called under g_rsx_fifo_lock from yz_rsx_method.  The FIFO has already
+ * serialized every earlier method, so synchronous backend drain preserves
+ * exact command order without a second consumer thread. */
+static int yz_nr_try_live_flip(uint32_t buffer_id)
+{
+    if (!g_yz_nr_shadow_enabled ||
+        !rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_FLIP))
+        return 0;
+    if (!rsx_nr_try_flip(&g_yz_nr_shadow, buffer_id, 0, 0, 0)) {
+        g_yz_nr_live_flip_fallback++;
+        return 0;
+    }
+    g_yz_nr_live_flip_owned++;
+    rsx_nr_backend_run(&g_yz_nr_backend, 0);
+    if (rsx_nr_ring_depth(&g_yz_nr_shadow_ring) != 0 ||
+        g_yz_nr_backend.stats.exec_errors != 0)
+        g_yz_nr_live_faults++;
+    return 1;
+}
+
+/* A refused typed flip runs through the unchanged FIFO renderer first.  At
+ * this consumer-side boundary that means its fallback episode is already
+ * drained, so publish the token and consume only the aggregate marker. */
+static void yz_nr_live_flip_fallback_complete(void)
+{
+    rsx_nr_intercept_fifo_drained(&g_yz_nr_shadow,
+                                  g_yz_nr_shadow.drain_seq);
+    rsx_nr_backend_run(&g_yz_nr_backend, 0);
+    if (rsx_nr_ring_depth(&g_yz_nr_shadow_ring) != 0 ||
+        g_yz_nr_backend.stats.exec_errors != 0)
+        g_yz_nr_live_faults++;
 }
 
 static void yz_nr_shadow_shutdown(void)
 {
     if (!InterlockedExchange(&g_yz_nr_shadow_enabled, 0))
         return;
+    rsx_nr_backend_run(&g_yz_nr_backend, 0);
     char line[1024];
     rsx_nr_shadow_census_format(&g_yz_nr_shadow, line, sizeof(line));
     fprintf(stderr, "[%s]\n", line);
+    if (rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_FLIP)) {
+        fprintf(stderr,
+                "[nr-live: family=flip owned=%llu fallback=%llu "
+                "present=%llu errors=%llu faults=%llu depth=%u rejects=%lld]\n",
+                g_yz_nr_live_flip_owned, g_yz_nr_live_flip_fallback,
+                g_yz_nr_backend.stats.executed[RSX_NIR_OP_PRESENT],
+                g_yz_nr_backend.stats.exec_errors, g_yz_nr_live_faults,
+                rsx_nr_ring_depth(&g_yz_nr_shadow_ring),
+                g_yz_nr_shadow_ring.rejects);
+    }
     fflush(stderr);
     rsx_nr_ring_destroy(&g_yz_nr_shadow_ring);
 }
@@ -3388,7 +3448,16 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
      * engine (no-op unless YZ_RSX_DRAW + init succeeded). It accumulates
      * clears/state/geometry and self-presents on the 0xE944 flip method. This
      * runs before the plumbing below so the engine also sees the flip. */
-    rsx_live_draw_method(method, arg);
+    const int nr_flip_selected =
+        method == 0xE944u && g_yz_nr_shadow_enabled &&
+        rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_FLIP);
+    const int nr_flip_owned =
+        nr_flip_selected ? yz_nr_try_live_flip(arg) : 0;
+    if (!nr_flip_owned) {
+        rsx_live_draw_method(method, arg);
+        if (nr_flip_selected)
+            yz_nr_live_flip_fallback_complete();
+    }
 
     if (method >= 0xA400 && method < 0xAB00) {     /* NV308A_COLOR window */
         uint32_t index = (method - 0xA400) >> 2;

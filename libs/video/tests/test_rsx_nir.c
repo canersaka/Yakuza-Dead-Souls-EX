@@ -834,10 +834,35 @@ static void test_intercept_mixed_mode(void)
           "capacity fallback not counted");
     CHECK(!rsx_nr_ring_reject_sticky(&tiny), "pre-check tripped the ring");
 
+    /* Fixed-memory shape used by the first live typed family.  The IR oracle
+     * deliberately snapshots folded state on the first ordered action, so
+     * size this for the full bounded snapshot and prove exactly one present
+     * emerges before the ring drains. */
+    rsx_nr_ring flip_ring;
+    CHECK(rsx_nr_ring_init(&flip_ring, 128, 16384) == 0, "flip ring init");
+    rsx_nr_intercept flip_it;
+    rsx_nr_intercept_init(&flip_it, &flip_ring, &tokens,
+                          (1u << RSX_NR_FAM_FLIP), 1);
+    CHECK(rsx_nr_try_flip(&flip_it, 3, 0, 0, 0) == 1,
+          "state-independent flip refused by side capacity");
+    unsigned flip_presents = 0;
+    const rsx_nr_slot* flip_slot;
+    while ((flip_slot = rsx_nr_ring_peek(&flip_ring)) != NULL) {
+        if (flip_slot->op.kind == RSX_NIR_OP_PRESENT) {
+            flip_presents++;
+            CHECK(flip_slot->op.u.present.buffer == 3,
+                  "typed flip buffer changed");
+        }
+        rsx_nr_ring_pop(&flip_ring);
+    }
+    CHECK(flip_presents == 1, "typed flip present count %u", flip_presents);
+    CHECK(rsx_nr_ring_depth(&flip_ring) == 0, "typed flip did not drain");
+
     rsx_nir_stream_free(&got);
     rsx_nir_stream_free(&pure);
     rsx_nr_ring_destroy(&ring);
     rsx_nr_ring_destroy(&tiny);
+    rsx_nr_ring_destroy(&flip_ring);
 }
 
 /* ---- data-move equivalence: packet path vs typed ----------------------- */
