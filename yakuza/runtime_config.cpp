@@ -45,6 +45,7 @@ yz_runtime_config read_runtime_config()
         env_enabled("YZ_AUTO_START"),
         env_enabled("YZ_AUTO_NEW_GAME"),
         env_enabled("YZ_AUTO_NEW_GAME_CIRCLE"),
+        env_enabled("YZ_AKIYAMA_DIALOGUE_ROUTE"),
 
         env_enabled("YZ_SKIP_VOICE"),
         env_enabled("YZ_A010_RENDER_ENABLE"),
@@ -146,6 +147,8 @@ extern "C" void yz_runtime_config_print_fingerprint(void)
         YZ_OPTION(auto_start, "YZ_AUTO_START"),
         YZ_OPTION(auto_new_game, "YZ_AUTO_NEW_GAME"),
         YZ_OPTION(auto_new_game_circle, "YZ_AUTO_NEW_GAME_CIRCLE"),
+        YZ_OPTION(akiyama_dialogue_route,
+                  "YZ_AKIYAMA_DIALOGUE_ROUTE"),
         YZ_OPTION(skip_voice, "YZ_SKIP_VOICE"),
         YZ_OPTION(a010_render_enable, "YZ_A010_RENDER_ENABLE"),
         YZ_OPTION(a010_model_retry, "YZ_A010_MODEL_RETRY"),

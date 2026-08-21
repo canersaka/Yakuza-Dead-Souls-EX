@@ -83,6 +83,13 @@ static volatile long s_accepted_input_serial;
  * boundary by advancing this phase, so input cannot race the "before" image.
  * Zero in ordinary builds/runs; YZ_MOVEMENT_PROOF is required to arm it. */
 volatile long g_yz_movement_proof_phase;
+/* Renderer-owned semantic state for the unavoidable post-movement authored
+ * dialogue.  The pad route remains idle until the HUD disappears, advances
+ * that dialogue, and stops permanently after free gameplay is stable again. */
+volatile long g_yz_movement_post_dialogue_seen;
+volatile long g_yz_movement_gameplay_returned;
+volatile long g_yz_movement_stable_gameplay;
+volatile long g_yz_movement_proof_leg = 1;
 /* Boundary-only diagnostic owned by the recompiled title.  It snapshots the
  * game's cached input object and camera producer without adding per-poll log
  * traffic to the timing-sensitive pad path. */
@@ -368,6 +375,7 @@ static void pad_merge_keyboard(void)
     {
         extern volatile unsigned long long g_yz_auto_start_tick;
         extern volatile long g_yz_a010_root_active;
+        extern volatile long g_yz_auto_new_game_complete;
         static u16 prior_auto_accept = 0;
         /* s_host_state is persistent when the keyboard is the only connected
          * controller.  Remove our previous synthetic bit before evaluating
@@ -383,12 +391,21 @@ static void pad_merge_keyboard(void)
                 hs->press_up = 0;
             prior_auto_accept = 0;
         }
+        if (g_yz_a010_root_active)
+            InterlockedExchange(&g_yz_auto_new_game_complete, 1);
         if (g_yz_runtime_config.auto_new_game &&
-            g_yz_auto_start_tick && !g_yz_a010_root_active) {
+            g_yz_auto_start_tick &&
+            !InterlockedCompareExchange(
+                &g_yz_auto_new_game_complete, 0, 0)) {
             const unsigned long long elapsed =
                 GetTickCount64() - g_yz_auto_start_tick;
             const unsigned long long period = 3000u;
-            const unsigned attempts = 5u;
+            /* The unattended acceptance route must be state-driven: a slow
+             * menu can miss every one of the old five pulses even though the
+             * same cadence succeeds on another boot.  Keep trying until the
+             * a010 root proves New Game was accepted.  Ordinary/manual runs
+             * retain the bounded five-pulse handoff below. */
+            const unsigned attempts = getenv("YZ_A010_ACCEPT_FAST") ? 60u : 5u;
             /*
              * The main-menu hook first moves Load Game -> New Game and accepts
              * it through the game's cached input.  Do not begin the generic
@@ -423,6 +440,74 @@ static void pad_merge_keyboard(void)
         }
     }
 
+    /* Dedicated unattended route to the first Akiyama/Hana dialogue.  New
+     * Game remains owned by the state-driven Confirm route above.  Once the
+     * a010 root proves gameplay has started, pulse Start (never Confirm) to
+     * skip authored cutscenes.  The external visual classifier creates the
+     * exact stop file after it has recognized the first X-to-continue
+     * dialogue; checking that file at a bounded cadence keeps filesystem I/O
+     * out of the pad hot path and makes the route permanently quiescent at
+     * the measurement checkpoint. */
+    {
+        extern volatile long g_yz_a010_root_active;
+        static int configured;
+        static int route_started;
+        static int route_stopped;
+        static u16 prior_route_start;
+        static unsigned long long route_start_tick;
+        static unsigned long long next_stop_poll;
+        static char stop_file[MAX_PATH * 2];
+
+        if (prior_route_start) {
+            hs->buttons &= (u16)~CELL_PAD_CTRL_START;
+            prior_route_start = 0;
+        }
+        if (g_yz_runtime_config.akiyama_dialogue_route && !configured) {
+            const char* path = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+            configured = 1;
+            if (path && *path) {
+                strncpy(stop_file, path, sizeof(stop_file) - 1u);
+                stop_file[sizeof(stop_file) - 1u] = '\0';
+            } else {
+                route_stopped = 1;
+                fprintf(stderr,
+                        "[akiyama-route] disabled: stop file is required\n");
+                fflush(stderr);
+            }
+        }
+        if (g_yz_runtime_config.akiyama_dialogue_route &&
+            !route_stopped) {
+            const unsigned long long now = GetTickCount64();
+            if (!route_started && g_yz_a010_root_active) {
+                route_started = 1;
+                route_start_tick = now;
+                next_stop_poll = now;
+                fprintf(stderr,
+                        "[akiyama-route] Start-only cutscene route armed\n");
+                fflush(stderr);
+            }
+            if (route_started && now >= next_stop_poll) {
+                const DWORD attrs = GetFileAttributesA(stop_file);
+                next_stop_poll = now + 250ull;
+                if (attrs != INVALID_FILE_ATTRIBUTES &&
+                    !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    route_stopped = 1;
+                    fprintf(stderr,
+                            "[akiyama-route] input stopped at visual checkpoint\n");
+                    fflush(stderr);
+                }
+            }
+            if (route_started && !route_stopped) {
+                const unsigned long long phase =
+                    (now - route_start_tick) % 8000ull;
+                if (phase < 250ull) {
+                    hs->buttons |= CELL_PAD_CTRL_START;
+                    prior_route_start = CELL_PAD_CTRL_START;
+                }
+            }
+        }
+    }
+
     /* Headless-safe acceptance controller for the promotion proof.  Desktop
      * key injection cannot reach a deliberately hidden D3D window, so drive
      * the same guest-visible PadHostState used by real XInput/keyboard input.
@@ -431,15 +516,37 @@ static void pad_merge_keyboard(void)
      *   input:    0 -> 1, 2 -> 3, 4 -> 5
      *   renderer: 1 -> 2, 3 -> 4, 5 -> 6
      * This handshake proves that the pre-movement surface was captured before
-     * the first stick sample, then sustains movement for a measured 60 seconds
-     * before the paired image is taken. */
+     * the first stick sample, then sustains movement for a measured,
+     * configurable interval before the paired image is taken.  Phase 6
+     * resumes Confirm pulses and
+     * accepts numbered arm files so an unattended route can cross multiple
+     * gameplay/dialogue boundaries without another build or restart. */
     if (pad_movement_proof_enabled()) {
         extern volatile unsigned long long g_yz_auto_start_tick;
         static unsigned long long movement_tick = 0;
         static unsigned long long last_logged_pulse = ~0ull;
         static unsigned long long next_arm_file_poll = 0;
+        static unsigned long long next_route_arm_file_poll = 0;
         static int arm_file_mode = -1;
+        static unsigned long long dialogue_period_ms;
+        static unsigned long long dialogue_hold_ms;
+        static int dialogue_timing_configured;
+        static int skip_camera = -1;
+        static unsigned movement_leg = 1;
+        static unsigned max_movement_legs;
+        static int max_movement_legs_configured;
+        static unsigned long long movement_hold_ms;
+        static unsigned long long final_movement_hold_ms;
+        static int movement_hold_configured;
+        static u8 movement_lx;
+        static u8 movement_ly;
+        static int route_complete_logged;
+        static int route_wait_logged;
+        static unsigned long long post_dialogue_tick = 0;
+        static unsigned long long last_post_logged_pulse = ~0ull;
+        static int next_arm_path_logged = 0;
         static char arm_file[MAX_PATH * 2];
+        static char next_arm_file[MAX_PATH * 2];
         const unsigned long long now = GetTickCount64();
         const unsigned long long elapsed = g_yz_auto_start_tick
             ? now - g_yz_auto_start_tick : 0;
@@ -464,6 +571,51 @@ static void pad_merge_keyboard(void)
             }
         }
 
+        if (!dialogue_timing_configured) {
+            const char* period_text = getenv("YZ_DIALOGUE_PULSE_PERIOD_MS");
+            const char* hold_text = getenv("YZ_DIALOGUE_PULSE_HOLD_MS");
+            dialogue_period_ms = period_text && *period_text
+                ? _strtoui64(period_text, NULL, 10) : 3000ull;
+            dialogue_hold_ms = hold_text && *hold_text
+                ? _strtoui64(hold_text, NULL, 10) : 1800ull;
+            if (dialogue_period_ms < 1000ull)
+                dialogue_period_ms = 1000ull;
+            if (dialogue_hold_ms < 500ull)
+                dialogue_hold_ms = 500ull;
+            if (dialogue_hold_ms >= dialogue_period_ms)
+                dialogue_hold_ms = dialogue_period_ms - 100ull;
+            dialogue_timing_configured = 1;
+        }
+        if (skip_camera < 0)
+            skip_camera = getenv("YZ_MOVEMENT_PROOF_SKIP_CAMERA") ? 1 : 0;
+        if (!max_movement_legs_configured) {
+            const char* max_legs_text =
+                getenv("YZ_MOVEMENT_PROOF_MAX_LEGS");
+            max_movement_legs = max_legs_text && *max_legs_text
+                ? strtoul(max_legs_text, NULL, 10) : 0u;
+            max_movement_legs_configured = 1;
+        }
+        if (!movement_hold_configured) {
+            const char* hold_text = getenv("YZ_MOVEMENT_PROOF_HOLD_MS");
+            const char* final_hold_text = getenv(
+                "YZ_MOVEMENT_PROOF_FINAL_HOLD_MS");
+            const char* lx_text = getenv("YZ_MOVEMENT_PROOF_LX");
+            const char* ly_text = getenv("YZ_MOVEMENT_PROOF_LY");
+            movement_hold_ms = hold_text && *hold_text
+                ? _strtoui64(hold_text, NULL, 10) : 60000ull;
+            if (movement_hold_ms < 1000ull)
+                movement_hold_ms = 1000ull;
+            final_movement_hold_ms = final_hold_text && *final_hold_text
+                ? _strtoui64(final_hold_text, NULL, 10) : movement_hold_ms;
+            if (final_movement_hold_ms < 1000ull)
+                final_movement_hold_ms = 1000ull;
+            movement_lx = (u8)(lx_text && *lx_text
+                ? min(strtoul(lx_text, NULL, 10), 255ul) : 128ul);
+            movement_ly = (u8)(ly_text && *ly_text
+                ? min(strtoul(ly_text, NULL, 10), 255ul) : 0ul);
+            movement_hold_configured = 1;
+        }
+
         /* Advance authored dialogue with distinct rising edges while the
          * story continues to render.  Stop before the capture handshake so
          * no face button contaminates the movement samples. */
@@ -477,10 +629,11 @@ static void pad_merge_keyboard(void)
              * cleared before the dialogue consumer sampled it.  Match the
              * proven menu-input cadence: hold across several guest frames,
              * then leave a full release interval for a distinct next edge. */
-            const unsigned long long pulse = (elapsed - 180000ull) / 3000ull;
+            const unsigned long long pulse =
+                (elapsed - 180000ull) / dialogue_period_ms;
             const unsigned long long pulse_phase =
-                (elapsed - 180000ull) % 3000ull;
-            if (pulse_phase < 1800ull) {
+                (elapsed - 180000ull) % dialogue_period_ms;
+            if (pulse_phase < dialogue_hold_ms) {
                 hs->buttons |= CELL_PAD_CTRL_CROSS;
                 hs->press_cross = 255;
                 if (pulse != last_logged_pulse) {
@@ -513,25 +666,160 @@ static void pad_merge_keyboard(void)
             }
         }
 
+        /* A route leg may end in another authored encounter rather than open
+         * gameplay.  Resume the same conservative Confirm cadence at phase 6,
+         * while sparse renderer probes keep showing what it is advancing.
+         * Once gameplay is visible again, arm the next forward leg by creating
+         * arm-movement-2.txt, then -3.txt, and so on beside the first file. */
+        if (arm_file_mode &&
+            InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0) == 6) {
+            const char* extension = strrchr(arm_file, '.');
+            const unsigned next_leg = movement_leg + 1u;
+            const int route_complete =
+                max_movement_legs && movement_leg >= max_movement_legs;
+            if (route_complete) {
+                const LONG stable = InterlockedCompareExchange(
+                    &g_yz_movement_stable_gameplay, 0, 0);
+                const LONG dialogue_seen = InterlockedCompareExchange(
+                    &g_yz_movement_post_dialogue_seen, 0, 0);
+                const LONG gameplay_returned = InterlockedCompareExchange(
+                    &g_yz_movement_gameplay_returned, 0, 0);
+                if (stable && !route_complete_logged) {
+                    fprintf(stderr,
+                            "[movement-proof] route complete legs=%u; "
+                            "stable gameplay confirmed; synthetic input "
+                            "stopped\n",
+                            movement_leg);
+                    fflush(stderr);
+                    route_complete_logged = 1;
+                } else if (!stable) {
+                    if (!route_wait_logged) {
+                        fprintf(stderr,
+                                "[movement-proof] movement leg complete; "
+                                "waiting for post-movement stable gameplay\n");
+                        fflush(stderr);
+                        route_wait_logged = 1;
+                    }
+                    if (dialogue_seen && !gameplay_returned) {
+                        if (!post_dialogue_tick) {
+                            post_dialogue_tick = now;
+                            last_post_logged_pulse = ~0ull;
+                            fprintf(stderr,
+                                    "[movement-proof] post-movement authored "
+                                    "dialogue detected; Confirm pulses resumed\n");
+                            fflush(stderr);
+                        }
+                        const unsigned long long post_elapsed =
+                            now - post_dialogue_tick;
+                        const unsigned long long pulse =
+                            post_elapsed / dialogue_period_ms;
+                        const unsigned long long pulse_phase =
+                            post_elapsed % dialogue_period_ms;
+                        if (pulse_phase < dialogue_hold_ms) {
+                            hs->buttons |= CELL_PAD_CTRL_CROSS;
+                            hs->press_cross = 255;
+                            if (pulse != last_post_logged_pulse) {
+                                last_post_logged_pulse = pulse;
+                                fprintf(stderr,
+                                        "[movement-proof] final-dialogue "
+                                        "pulse=%llu elapsed_ms=%llu\n",
+                                        pulse, elapsed);
+                                fflush(stderr);
+                            }
+                        }
+                    }
+                }
+            } else {
+            if (!post_dialogue_tick) {
+                post_dialogue_tick = now;
+                last_post_logged_pulse = ~0ull;
+                next_arm_path_logged = 0;
+            }
+            if (extension) {
+                _snprintf_s(next_arm_file, sizeof(next_arm_file), _TRUNCATE,
+                    "%.*s-%u%s", (int)(extension - arm_file), arm_file,
+                    next_leg, extension);
+            } else {
+                _snprintf_s(next_arm_file, sizeof(next_arm_file), _TRUNCATE,
+                    "%s-%u", arm_file, next_leg);
+            }
+            if (!next_arm_path_logged) {
+                fprintf(stderr,
+                        "[movement-proof] leg=%u complete; waiting for "
+                        "visual dialogue/transition evidence; next arm "
+                        "path=%s\n",
+                        movement_leg, next_arm_file);
+                fflush(stderr);
+                next_arm_path_logged = 1;
+            }
+
+            if (now >= next_route_arm_file_poll) {
+                const DWORD attrs = GetFileAttributesA(next_arm_file);
+                next_route_arm_file_poll = now + 1000ull;
+                if (attrs != INVALID_FILE_ATTRIBUTES &&
+                    !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, 1, 6) == 6) {
+                    movement_leg = next_leg;
+                    InterlockedExchange(
+                        &g_yz_movement_proof_leg, (LONG)movement_leg);
+                    InterlockedExchange(
+                        &g_yz_movement_post_dialogue_seen, 0);
+                    InterlockedExchange(
+                        &g_yz_movement_gameplay_returned, 0);
+                    InterlockedExchange(
+                        &g_yz_movement_stable_gameplay, 0);
+                    post_dialogue_tick = 0;
+                    fprintf(stderr,
+                            "[movement-proof] visually armed leg=%u "
+                            "elapsed_ms=%llu path=%s\n",
+                            movement_leg, elapsed, next_arm_file);
+                    fflush(stderr);
+                }
+            }
+
+            if (InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, 0, 0) == 6) {
+                const LONG gameplay_returned = InterlockedCompareExchange(
+                    &g_yz_movement_gameplay_returned, 0, 0);
+                const LONG dialogue_seen = InterlockedCompareExchange(
+                    &g_yz_movement_post_dialogue_seen, 0, 0);
+                const unsigned long long post_elapsed =
+                    now - post_dialogue_tick;
+                const unsigned long long pulse =
+                    post_elapsed / dialogue_period_ms;
+                const unsigned long long pulse_phase =
+                    post_elapsed % dialogue_period_ms;
+                if (dialogue_seen && !gameplay_returned &&
+                    pulse_phase < dialogue_hold_ms) {
+                    hs->buttons |= CELL_PAD_CTRL_CROSS;
+                    hs->press_cross = 255;
+                    if (pulse != last_post_logged_pulse) {
+                        last_post_logged_pulse = pulse;
+                        fprintf(stderr,
+                                "[movement-proof] post-leg dialogue pulse=%llu "
+                                "leg=%u elapsed_ms=%llu\n",
+                                pulse, movement_leg, elapsed);
+                        fflush(stderr);
+                    }
+                }
+            }
+            }
+        }
+
         {
             LONG phase = InterlockedCompareExchange(
                 &g_yz_movement_proof_phase, 0, 0);
-#if defined(YZ_PERF_CLEAN)
-            /* Clean promotion builds intentionally compile renderer readback
-             * and automatic image dumping out.  Preserve the optional input
-             * controller without reintroducing a renderer hot-path check: in
-             * this opt-in branch, acknowledge the three former capture
-             * handshakes locally and continue with the same camera/movement
-             * cadence.  Ordinary runs never enter this block. */
-            if (phase == 1 || phase == 3 || phase == 5) {
-                InterlockedCompareExchange(
-                    &g_yz_movement_proof_phase, phase + 1, phase);
-                phase = InterlockedCompareExchange(
-                    &g_yz_movement_proof_phase, 0, 0);
-            }
-#endif
             if (phase == 2) {
-                if (!movement_tick) {
+                if (skip_camera) {
+                    yz_movement_frontier_snapshot("camera-skipped");
+                    InterlockedCompareExchange(
+                        &g_yz_movement_proof_phase, 3, 2);
+                    fprintf(stderr,
+                            "[movement-proof] right-stick camera skipped\n");
+                    fflush(stderr);
+                } else if (!movement_tick) {
                     movement_tick = now;
                     yz_movement_frontier_snapshot("before-camera");
                     fprintf(stderr,
@@ -539,8 +827,9 @@ static void pad_merge_keyboard(void)
                             "elapsed_ms=%llu\n", elapsed);
                     fflush(stderr);
                 }
-                hs->analog_rx = 255;
-                if (now - movement_tick >= 5000ull) {
+                if (!skip_camera)
+                    hs->analog_rx = 255;
+                if (!skip_camera && now - movement_tick >= 5000ull) {
                     yz_movement_frontier_snapshot("camera-held");
                     movement_tick = 0;
                     InterlockedCompareExchange(
@@ -551,22 +840,30 @@ static void pad_merge_keyboard(void)
                     fflush(stderr);
                 }
             } else if (phase == 4) {
+                const unsigned long long active_hold_ms =
+                    max_movement_legs && movement_leg >= max_movement_legs
+                        ? final_movement_hold_ms : movement_hold_ms;
                 if (!movement_tick) {
                     movement_tick = now;
                     yz_movement_frontier_snapshot("before-movement");
                     fprintf(stderr,
-                            "[movement-proof] left-stick movement begin\n");
+                            "[movement-proof] left-stick movement begin "
+                            "leg=%u lx=%u ly=%u\n",
+                            movement_leg, (unsigned)movement_lx,
+                            (unsigned)movement_ly);
                     fflush(stderr);
                 }
-                hs->analog_ly = 0;
-                if (now - movement_tick >= 60000ull) {
+                hs->analog_lx = movement_lx;
+                hs->analog_ly = movement_ly;
+                if (now - movement_tick >= active_hold_ms) {
                     yz_movement_frontier_snapshot("movement-held");
                     movement_tick = 0;
                     InterlockedCompareExchange(
                         &g_yz_movement_proof_phase, 5, 4);
                     fprintf(stderr,
                             "[movement-proof] left-stick movement complete "
-                            "duration_ms=60000\n");
+                            "leg=%u duration_ms=%llu\n", movement_leg,
+                            active_hold_ms);
                     fflush(stderr);
                 }
             }
