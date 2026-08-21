@@ -398,6 +398,49 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        # Native-render D3D12 sink on WARP: the typed command path drives
+        # real rasterization offline (clear, vertex-pulled draws over the
+        # guest mirror, dirty re-upload, in-shader index fetch, readback).
+        # Exit 2 = no WARP device on this machine (skip, not failure).
+        add_executable(rsx_nr_backend_d3d12_tests
+            libs/video/tests/test_nr_backend_d3d12.c
+            libs/video/rsx_nir.c
+            libs/video/rsx_nir_emitter.c
+            libs/video/rsx_nr_ring.c
+            libs/video/rsx_nr_backend.c
+            libs/video/rsx_nr_backend_d3d12.c
+            libs/video/rsx_nr_resources.c
+            libs/video/rsx_guest_pages.c
+            libs/video/rsx_gpu_mirror.c
+            libs/video/rsx_gpu_mirror_d3d12.c
+            libs/video/rsx_vertex_pull.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_dispatch.c
+        )
+        target_include_directories(rsx_nr_backend_d3d12_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nr_backend_d3d12_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_nr_backend_d3d12_tests PRIVATE
+            /experimental:c11atomics
+        )
+        target_link_libraries(rsx_nr_backend_d3d12_tests PRIVATE
+            d3d12 dxgi d3dcompiler
+        )
+        add_test(
+            NAME rsx_nr_backend_d3d12
+            COMMAND rsx_nr_backend_d3d12_tests
+        )
+        set_tests_properties(rsx_nr_backend_d3d12 PROPERTIES
+            SKIP_RETURN_CODE 2
+            TIMEOUT 60
+            LABELS "regression;renderer;native-render"
+        )
+
         # Manual capture differential: feeds one RXS frame through the exact
         # production live renderer.  It is intentionally not a CTest because
         # the title capture is a large, local, untracked oracle.
