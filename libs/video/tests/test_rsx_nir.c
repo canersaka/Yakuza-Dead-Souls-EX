@@ -1,0 +1,1203 @@
+﻿/*
+ * NIR equivalence tests: the packet path (FIFO words / method stream ->
+ * rsx_dispatch -> rsx_nir_adapter) versus the typed native path
+ * (rsx_nir_emitter calls) must fold to identical action sequences.
+ *
+ * Also covers: state persistence across draws, emission dedup, ordering
+ * of synchronization actions, divergence detection (negative cases), the
+ * FIFO-word front end, and an optional real-capture replay leg.
+ *
+ * The capture leg feeds an exported .rxs stream (tools/rrc_export.py
+ * format, same loader layout as live_replay_main.c) through TWO adapter
+ * instances and requires identical folded IR plus basic invariants. It
+ * runs only when a capture is supplied (argv[1] or YZ_NIR_RXS) because
+ * captures are large, local, untracked oracles — absent capture = SKIP,
+ * not FAIL, so CTest stays hermetic.
+ *
+ * Build (see top-level CMakeLists.txt rsx_nir_tests): compiles
+ * rsx_dispatch.c + rsx_nir*.c directly; no runtime lib, no GPU, no game.
+ */
+
+#include "../rsx_nir_adapter.h"
+#include "../rsx_nir_intercept.h"
+#include "../rsx_nr_ring.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_failures;
+
+#define CHECK(cond, ...)                                                     \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            fprintf(stderr, "FAIL %s:%d: ", __func__, __LINE__);             \
+            fprintf(stderr, __VA_ARGS__);                                    \
+            fprintf(stderr, "\n");                                           \
+            g_failures++;                                                    \
+        }                                                                    \
+    } while (0)
+
+/* ---- FIFO word builder ------------------------------------------------- */
+
+typedef struct fifo_buf {
+    u32 words[4096];
+    u32 n;
+} fifo_buf;
+
+static void fput(fifo_buf* f, u32 w)
+{
+    if (f->n < 4096)
+        f->words[f->n++] = w;
+}
+
+/* increment-mode method header: count args at method, method+4, ... */
+static void fmethod(fifo_buf* f, u32 method, u32 count)
+{
+    fput(f, (count << 18) | (method & 0x1FFC));
+}
+
+static void fm1(fifo_buf* f, u32 method, u32 arg)
+{
+    fmethod(f, method, 1);
+    fput(f, arg);
+}
+
+/* non-increment header (all args to the same method) */
+static void fmethod_ni(fifo_buf* f, u32 method, u32 count)
+{
+    fput(f, 0x40000000u | (count << 18) | (method & 0x1FFC));
+}
+
+static u32 f32bits(float v)
+{
+    u32 w;
+    memcpy(&w, &v, 4);
+    return w;
+}
+
+/* ---- shared synthetic scene -------------------------------------------- */
+/* Method-level constants (same sources as rsx_dispatch.c). */
+#define M_DMA_COLOR0     0x0194
+#define M_DMA_ZETA       0x0198
+#define M_RT_HORIZ       0x0200
+#define M_RT_VERT        0x0204
+#define M_RT_FORMAT      0x0208
+#define M_COLOR0_PITCH   0x020C
+#define M_COLOR0_OFFSET  0x0210
+#define M_ZETA_OFFSET    0x0214
+#define M_RT_ENABLE      0x0220
+#define M_ZETA_PITCH     0x022C
+#define M_BLEND_ENABLE   0x0310
+#define M_BLEND_SFACTOR  0x0314
+#define M_BLEND_DFACTOR  0x0318
+#define M_DEPTH_FUNC     0x0A6C
+#define M_DEPTH_WRITE    0x0A70
+#define M_DEPTH_TEST     0x0A74
+#define M_SCISSOR_HORIZ  0x08C0
+#define M_SCISSOR_VERT   0x08C4
+#define M_VIEWPORT_HORIZ 0x0A00
+#define M_VIEWPORT_VERT  0x0A04
+#define M_VIEWPORT_TRANSLATE 0x0A20
+#define M_VIEWPORT_SCALE 0x0A30
+#define M_VP_UPLOAD_INST 0x0B80
+#define M_FP_PROGRAM     0x08E4
+#define M_FP_CONTROL     0x1D60
+#define M_VTXBUF_OFFSET  0x1680
+#define M_VTXFMT         0x1740
+#define M_BEGIN_END      0x1808
+#define M_DRAW_ARRAYS    0x1814
+#define M_IDXBUF_OFFSET  0x181C
+#define M_IDXBUF_FORMAT  0x1820
+#define M_DRAW_INDEX     0x1824
+#define M_TEX_OFFSET_U2  (0x1A00 + 2 * 0x20)
+#define M_TEX_SIZE1_U2   (0x1840 + 2 * 4)
+#define M_CLEAR_DEPTH    0x1D8C
+#define M_CLEAR_COLOR    0x1D90
+#define M_CLEAR_BUFFERS  0x1D94
+#define M_SEM_OFFSET_3D  0x1D6C
+#define M_BACKEND_SEM    0x1D70
+#define M_VP_UPLOAD_FROM 0x1E9C
+#define M_VP_START       0x1EA0
+#define M_VP_CONST_ID    0x1EFC
+#define M_VP_CONST       0x1F00
+#define M_GCM_FLIP       0xE944
+
+/* A tiny 2-instruction vertex program, END bit on the second instruction */
+static const u32 VP_WORDS[8] = {
+    0x00000000, 0x0040001D, 0x8106C083, 0x60403F80,
+    0x00000000, 0x004C009D, 0x8106C083, 0x60409F81, /* bit0 set = END */
+};
+
+/* Typed-path defaults matching the rsx_dispatch reset register file:
+ * everything zero except the seeded registers (COLOR_MASK, FRONT_FACE,
+ * ZSTENCIL_CLEAR_VALUE) and decode artifacts (index fmt 0 -> u32). */
+static void typed_stage_defaults(rsx_nir_emitter* em)
+{
+    rsx_nir_raster ra;
+    memset(&ra, 0, sizeof(ra));
+    ra.color_mask = 0x01010101u;
+    ra.front_face = 0x0901u;
+    rsx_nir_em_raster(em, &ra);
+
+    rsx_nir_index_binding ib;
+    memset(&ib, 0, sizeof(ib));
+    ib.is_u32 = 1;               /* IDXBUF_FORMAT 0 decodes as 32-bit */
+    rsx_nir_em_index_binding(em, &ib);
+}
+
+/* Build the packet-path scene into a FIFO buffer. One frame:
+ * surface+viewport+scissor setup, clear, VP+constants upload, texture,
+ * vertex attr, depth+blend state, draw (2 batches), semaphore release,
+ * state change, indexed draw, flip. */
+static void build_scene_fifo(fifo_buf* f)
+{
+    /* surface */
+    fm1(f, M_DMA_COLOR0, 0xFEED0000u);
+    fm1(f, M_DMA_ZETA, 0xFEED0000u);
+    fm1(f, M_RT_FORMAT, 0x145);                 /* A8R8G8B8, Z24S8, pitch */
+    fm1(f, M_RT_HORIZ, 1280u << 16);
+    fm1(f, M_RT_VERT, 720u << 16);
+    fm1(f, M_COLOR0_OFFSET, 0x00000000u);
+    fm1(f, M_COLOR0_PITCH, 5120);
+    fm1(f, M_ZETA_OFFSET, 0x00E00000u);
+    fm1(f, M_ZETA_PITCH, 5120);
+    fm1(f, M_RT_ENABLE, 1);
+
+    /* viewport + scissor */
+    fm1(f, M_VIEWPORT_HORIZ, 1280u << 16);
+    fm1(f, M_VIEWPORT_VERT, 720u << 16);
+    fmethod(f, M_VIEWPORT_SCALE, 4);
+    fput(f, f32bits(640.0f)); fput(f, f32bits(-360.0f));
+    fput(f, f32bits(0.5f));   fput(f, f32bits(0.0f));
+    fmethod(f, M_VIEWPORT_TRANSLATE, 4);
+    fput(f, f32bits(640.0f)); fput(f, f32bits(360.0f));
+    fput(f, f32bits(0.5f));   fput(f, f32bits(0.0f));
+    fm1(f, M_SCISSOR_HORIZ, 1280u << 16);
+    fm1(f, M_SCISSOR_VERT, 720u << 16);
+
+    /* clear */
+    fm1(f, M_CLEAR_COLOR, 0xFF204060u);
+    fm1(f, M_CLEAR_BUFFERS, 0xF3);
+
+    /* vertex program upload + start (increment burst: the 0xB80..0xBFC
+     * window advances the load pointer per completed vec4) */
+    fm1(f, M_VP_UPLOAD_FROM, 0);
+    fmethod(f, M_VP_UPLOAD_INST, 8);
+    for (int i = 0; i < 8; i++)
+        fput(f, VP_WORDS[i]);
+    fm1(f, M_VP_START, 0);
+
+    /* constants: slots 5..6 */
+    fm1(f, M_VP_CONST_ID, 5);
+    fmethod(f, M_VP_CONST, 8);
+    for (int i = 0; i < 8; i++)
+        fput(f, f32bits(1.0f + (float)i));
+
+    /* fragment program */
+    fm1(f, M_FP_PROGRAM, 0x00124500u | 1);      /* offset | local */
+    fm1(f, M_FP_CONTROL, 0x00000400u);
+
+    /* texture unit 2 */
+    fm1(f, M_TEX_OFFSET_U2, 0x00100000u);
+    fm1(f, M_TEX_OFFSET_U2 + 4, 0x00018521u);   /* local, 2D, A8R8G8B8, 1 mip */
+    fm1(f, M_TEX_OFFSET_U2 + 0x0C, 0x80000000u);/* enable */
+    fm1(f, M_TEX_OFFSET_U2 + 0x18, (64u << 16) | 32u);
+    fm1(f, M_TEX_SIZE1_U2, 256);
+
+    /* vertex attr 0: float3, stride 12, offset 0x2000, local */
+    fm1(f, M_VTXFMT, (12u << 8) | (3u << 4) | 2u);
+    fm1(f, M_VTXBUF_OFFSET, 0x00002000u);
+
+    /* depth + blend */
+    fm1(f, M_DEPTH_TEST, 1);
+    fm1(f, M_DEPTH_FUNC, 0x0203);
+    fm1(f, M_DEPTH_WRITE, 1);
+    fm1(f, M_BLEND_ENABLE, 0);
+
+    /* draw 1: two array batches */
+    fm1(f, M_BEGIN_END, 5);                     /* TRIANGLES */
+    fmethod_ni(f, M_DRAW_ARRAYS, 2);
+    fput(f, (0u) | ((64u - 1u) << 24));
+    fput(f, (64u) | ((32u - 1u) << 24));
+    fm1(f, M_BEGIN_END, 0);
+
+    /* ordered semaphore release between draws */
+    fm1(f, M_SEM_OFFSET_3D, 0x40);
+    fm1(f, M_BACKEND_SEM, 0x11223344u);
+
+    /* state change: enable blend */
+    fm1(f, M_BLEND_ENABLE, 1);
+    fm1(f, M_BLEND_SFACTOR, 0x03020302u);
+    fm1(f, M_BLEND_DFACTOR, 0x03030303u);
+
+    /* indexed draw: u16 indices at 0x4000 */
+    fm1(f, M_IDXBUF_OFFSET, 0x00004000u);
+    fm1(f, M_IDXBUF_FORMAT, 0x10);              /* type 1 = u16, location 0 */
+    fm1(f, M_BEGIN_END, 6);                     /* TRIANGLE_STRIP */
+    fm1(f, M_DRAW_INDEX, (0u) | ((96u - 1u) << 24));
+    fm1(f, M_BEGIN_END, 0);
+
+    /* flip: the driver-queue methods live at flat address 0xE944, i.e.
+     * FIFO subchannel 7, engine-relative 0x944 */
+    fput(f, (1u << 18) | (7u << 13) | (M_GCM_FLIP & 0x1FFCu));
+    fput(f, 1);
+}
+
+/* Build the same scene through the typed native path: what an intercepted
+ * producer would emit directly, with no packet encode/decode. */
+static void build_scene_typed(rsx_nir_emitter* em)
+{
+    typed_stage_defaults(em);
+
+    rsx_nir_surface s;
+    memset(&s, 0, sizeof(s));
+    s.color_format = 5;                          /* 0x145 decoded            */
+    s.depth_format = 2;
+    s.raster_type = 1;
+    s.clip_w = 1280; s.clip_h = 720;
+    s.color_offset[0] = 0;
+    s.color_pitch[0] = 5120;
+    s.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    s.color_target = 1;
+    s.zeta_offset = 0x00E00000u;
+    s.zeta_pitch = 5120;
+    s.zeta_location = RSX_NIR_LOCATION_LOCAL;
+    rsx_nir_em_surface(em, &s);
+
+    rsx_nir_viewport v;
+    memset(&v, 0, sizeof(v));
+    v.w = 1280; v.h = 720;
+    v.scale[0] = 640.0f; v.scale[1] = -360.0f; v.scale[2] = 0.5f;
+    v.translate[0] = 640.0f; v.translate[1] = 360.0f; v.translate[2] = 0.5f;
+    rsx_nir_em_viewport(em, &v);
+
+    rsx_nir_scissor sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.w = 1280; sc.h = 720;
+    rsx_nir_em_scissor(em, &sc);
+
+    /* clear (depth value = seeded ZSTENCIL default 0xFFFFFF00 >> 8) */
+    rsx_nir_em_clear(em, 0xF3, 0xFF204060u, 0xFFFFFF, 0x00);
+
+    rsx_nir_em_vertex_program(em, 0, VP_WORDS, 8, 0, 0);
+
+    u32 cw[8];
+    for (int i = 0; i < 8; i++)
+        cw[i] = f32bits(1.0f + (float)i);
+    rsx_nir_em_constants(em, 5, 2, cw);
+
+    rsx_nir_fragment_program fp;
+    memset(&fp, 0, sizeof(fp));
+    fp.offset = 0x00124500u;                     /* location bits stripped   */
+    fp.location = RSX_NIR_LOCATION_LOCAL;
+    fp.control = 0x00000400u;
+    rsx_nir_em_fragment_program(em, &fp);
+
+    rsx_nir_texture t;
+    memset(&t, 0, sizeof(t));
+    t.enabled = 1;
+    t.offset = 0x00100000u;
+    t.location = RSX_NIR_LOCATION_LOCAL;
+    t.format = 0x85; t.dimension = 2; t.mipmaps = 1;
+    t.width = 64; t.height = 32; t.pitch = 256;
+    t.control0 = 0x80000000u;
+    rsx_nir_em_texture(em, 2, &t);
+
+    rsx_nir_vertex_bindings vb;
+    memset(&vb, 0, sizeof(vb));
+    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++)
+        vb.attr[i].def[3] = 1.0f;
+    vb.attr[0].type = RSX_VTX_TYPE_FLOAT;
+    vb.attr[0].size = 3;
+    vb.attr[0].stride = 12;
+    vb.attr[0].offset = 0x00002000u;
+    vb.attr[0].location = RSX_NIR_LOCATION_LOCAL;
+    rsx_nir_em_vertex_bindings(em, &vb);
+
+    rsx_nir_depth_stencil ds;
+    memset(&ds, 0, sizeof(ds));
+    ds.depth_test_enable = 1;
+    ds.depth_func = 0x0203;
+    ds.depth_write_enable = 1;
+    rsx_nir_em_depth_stencil(em, &ds);
+
+    /* draw 1 */
+    u32 batches1[4] = { 0, 64, 64, 32 };
+    rsx_nir_em_draw(em, 5, 0, batches1, 2);
+
+    rsx_nir_em_semaphore_release(em, 0, 0x40, 0x11223344u, 0);
+
+    rsx_nir_blend bl;
+    memset(&bl, 0, sizeof(bl));
+    bl.blend_enable = 1;
+    bl.sfactor = 0x03020302u;
+    bl.dfactor = 0x03030303u;
+    rsx_nir_em_blend(em, &bl);
+
+    rsx_nir_index_binding ib;
+    memset(&ib, 0, sizeof(ib));
+    ib.offset = 0x00004000u;
+    ib.is_u32 = 0;                               /* type 1 = u16             */
+    rsx_nir_em_index_binding(em, &ib);
+
+    u32 batches2[2] = { 0, 96 };
+    rsx_nir_em_draw(em, 6, 1, batches2, 1);
+
+    rsx_nir_em_present(em, 1);
+}
+
+/* ---- tests ------------------------------------------------------------- */
+
+static void test_fifo_vs_typed(void)
+{
+    fifo_buf f = {0};
+    build_scene_fifo(&f);
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    u32 stop = 0;
+    u32 used = rsx_nir_adapter_fifo(&ad, f.words, f.n, &stop);
+    CHECK(used == f.n, "fifo parse consumed %u of %u (stop %08X)",
+          used, f.n, stop);
+    CHECK(ad.batch_overflow == 0, "batch overflow %u", ad.batch_overflow);
+
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    build_scene_typed(&em);
+
+    char err[256];
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "packet vs typed: %s", rc ? err : "");
+
+    /* the scene has 5 actions: clear, draw, sem-release, draw, present */
+    rsx_nir_action* acts = NULL;
+    int n = rsx_nir_fold(&sa, &acts);
+    CHECK(n == 5, "action count %d", n);
+    if (n == 5) {
+        CHECK(acts[0].kind == RSX_NIR_OP_CLEAR, "a0 kind %u", acts[0].kind);
+        CHECK(acts[1].kind == RSX_NIR_OP_DRAW, "a1 kind %u", acts[1].kind);
+        CHECK(acts[2].kind == RSX_NIR_OP_SEMAPHORE_RELEASE, "a2 kind %u",
+              acts[2].kind);
+        CHECK(acts[3].kind == RSX_NIR_OP_DRAW, "a3 kind %u", acts[3].kind);
+        CHECK(acts[4].kind == RSX_NIR_OP_PRESENT, "a4 kind %u", acts[4].kind);
+    }
+    free(acts);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+static void test_state_persistence_and_dedup(void)
+{
+    fifo_buf f = {0};
+    build_scene_fifo(&f);
+
+    rsx_nir_stream s;
+    rsx_nir_stream_init(&s);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &s);
+    rsx_nir_adapter_fifo(&ad, f.words, f.n, NULL);
+
+    rsx_nir_action* acts = NULL;
+    int n = rsx_nir_fold(&s, &acts);
+    CHECK(n == 5, "action count %d", n);
+    if (n == 5) {
+        /* draw 1 has blend off, draw 2 has blend on; viewport persists */
+        CHECK(acts[1].state.blend.blend_enable == 0, "draw1 blend on");
+        CHECK(acts[3].state.blend.blend_enable == 1, "draw2 blend off");
+        CHECK(acts[3].state.viewport.w == 1280 &&
+              acts[3].state.viewport.h == 720, "draw2 viewport lost");
+        CHECK(acts[3].state.depth_stencil.depth_func == 0x0203,
+              "draw2 depth func lost");
+        /* texture persisted across the state change */
+        CHECK(acts[3].state.textures[2].enabled == 1 &&
+              acts[3].state.textures[2].width == 64, "draw2 texture lost");
+        /* constants folded */
+        CHECK(acts[1].state.constants_written[5] == 1 &&
+              acts[1].state.constants_written[6] == 1 &&
+              acts[1].state.constants_written[7] == 0, "constants written set");
+        float c50;
+        memcpy(&c50, &acts[1].state.constants[5][0], 4);
+        CHECK(c50 == 1.0f, "constant 5.x %f", c50);
+        /* vertex program identity */
+        CHECK(acts[1].state.vertex_program.word_count == 8, "vp words %u",
+              acts[1].state.vertex_program.word_count);
+        CHECK(acts[1].state.vertex_program.hash ==
+              rsx_nir_hash_words(VP_WORDS, 8), "vp hash");
+    }
+
+    /* dedup: between the semaphore release (after draw 1) and draw 2 only
+     * blend + index binding changed, so exactly those two SET ops appear */
+    if (n == 5) {
+        u32 between = acts[3].op_index - acts[2].op_index - 1;
+        CHECK(between == 2, "expected 2 SET ops between sem and draw2, got %u",
+              between);
+    }
+    free(acts);
+    rsx_nir_stream_free(&s);
+}
+
+static void test_divergence_detected(void)
+{
+    fifo_buf f = {0};
+    build_scene_fifo(&f);
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    rsx_nir_adapter_fifo(&ad, f.words, f.n, NULL);
+
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    build_scene_typed(&em);
+
+    /* perturb: an extra draw-time depth-func change never in the packets */
+    rsx_nir_depth_stencil ds;
+    memset(&ds, 0, sizeof(ds));
+    ds.depth_test_enable = 1;
+    ds.depth_func = 0x0207;                      /* ALWAYS instead of LEQUAL */
+    ds.depth_write_enable = 1;
+    rsx_nir_em_depth_stencil(&em, &ds);
+    u32 batch[2] = { 0, 3 };
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc != 0, "divergent streams compared equal");
+    CHECK(strstr(err, "action count") != NULL,
+          "unexpected divergence report: %s", err);
+
+    /* same action count, different state: two fresh minimal scenes whose
+     * only difference is the depth func at the draw */
+    rsx_nir_stream_free(&sb);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF204060u, 0xFFFFFF, 0x00);
+    u32 b1[2] = { 0, 4 };
+    rsx_nir_em_draw(&em, 5, 0, b1, 1);
+
+    rsx_nir_stream sc;
+    rsx_nir_stream_init(&sc);
+    rsx_nir_emitter em2;
+    rsx_nir_emitter_init_stream(&em2, &sc);
+    typed_stage_defaults(&em2);
+    rsx_nir_em_clear(&em2, 0xF3, 0xFF204060u, 0xFFFFFF, 0x00);
+    rsx_nir_depth_stencil ds2;
+    memset(&ds2, 0, sizeof(ds2));
+    ds2.depth_func = 0x0207;
+    rsx_nir_em_depth_stencil(&em2, &ds2);
+    rsx_nir_em_draw(&em2, 5, 0, b1, 1);
+
+    err[0] = 0;
+    rc = rsx_nir_compare(&sb, &sc, err, sizeof(err));
+    CHECK(rc != 0, "state-divergent streams compared equal");
+    CHECK(strstr(err, "depth_stencil") != NULL,
+          "divergence did not name depth_stencil: %s", err);
+
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+    rsx_nir_stream_free(&sc);
+}
+
+static void test_ordering(void)
+{
+    /* A: draw, semaphore, draw   B: draw, draw, semaphore  -> kind diff */
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_emitter ea, eb;
+    rsx_nir_emitter_init_stream(&ea, &sa);
+    rsx_nir_emitter_init_stream(&eb, &sb);
+    u32 b[2] = { 0, 3 };
+
+    typed_stage_defaults(&ea);
+    rsx_nir_em_draw(&ea, 5, 0, b, 1);
+    rsx_nir_em_semaphore_release(&ea, 0, 0x40, 7, 0);
+    rsx_nir_em_draw(&ea, 5, 0, b, 1);
+
+    typed_stage_defaults(&eb);
+    rsx_nir_em_draw(&eb, 5, 0, b, 1);
+    rsx_nir_em_draw(&eb, 5, 0, b, 1);
+    rsx_nir_em_semaphore_release(&eb, 0, 0x40, 7, 0);
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc != 0, "reordered sync compared equal");
+    CHECK(strstr(err, "kind") != NULL, "report lacks kind diff: %s", err);
+
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+static void test_fifo_front_end(void)
+{
+    /* same methods, once through the FIFO parser, once via method calls */
+    fifo_buf f = {0};
+    fm1(&f, M_CLEAR_COLOR, 0xAABBCCDDu);
+    fm1(&f, M_CLEAR_BUFFERS, 0xF3);
+    fput(&f, 0);                                 /* FIFO NOP word            */
+    /* NV406E semaphore on subchannel 3: engine methods work anywhere */
+    fput(&f, (1u << 18) | (3u << 13) | 0x0064);
+    fput(&f, 0x30);
+    fput(&f, (1u << 18) | (3u << 13) | 0x006C);
+    fput(&f, 99);
+    fput(&f, (1u << 18) | (7u << 13) | (M_GCM_FLIP & 0x1FFCu));
+    fput(&f, 0);
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter aa, ab;
+    rsx_nir_adapter_init(&aa, &sa);
+    rsx_nir_adapter_init(&ab, &sb);
+
+    u32 used = rsx_nir_adapter_fifo(&aa, f.words, f.n, NULL);
+    CHECK(used == f.n, "fifo consumed %u of %u", used, f.n);
+
+    /* B: same methods via the flat entry; the NV406E release (a FIFO-word
+     * construct with no flat-method form) maps to a typed release carrying
+     * the FIFO-context offset. The direct emitter call rides on the state
+     * the adapter already staged at the CLEAR action. */
+    rsx_nir_adapter_method(&ab, M_CLEAR_COLOR, 0xAABBCCDDu);
+    rsx_nir_adapter_method(&ab, M_CLEAR_BUFFERS, 0xF3);
+    rsx_nir_em_semaphore_release(&ab.em, 0, 0x30, 99, 0);
+    rsx_nir_adapter_method(&ab, M_GCM_FLIP, 0);
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "fifo vs method: %s", err);
+
+    /* jump word stops the linear parser */
+    u32 jump[2] = { 0x20000000u | 0x1000u, 0 };
+    u32 stop = 0;
+    used = rsx_nir_adapter_fifo(&aa, jump, 2, &stop);
+    CHECK(used == 0 && stop == jump[0], "jump not reported (used %u)", used);
+
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+static void test_flip_intercept(void)
+{
+    /* default-disabled contract: with the env var absent, the scaffold
+     * reports disabled */
+#ifdef _WIN32
+    _putenv("YZ_NIR_INTERCEPT=");
+#endif
+    CHECK(rsx_nir_intercept_enabled() == 0,
+          "intercept scaffold must default to disabled");
+
+    /* packet path: the exact yz_gcm_append_flip_commands word sequence,
+     * decoded by the adapter */
+    u32 pkt[10];
+    u32 n = rsx_nir_intercept_flip_packet(pkt, 2, 1, 0x40, 0x1234);
+    CHECK(n == 10, "flip packet word count %u", n);
+
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    u32 used = rsx_nir_adapter_fifo(&ad, pkt, n, NULL);
+    CHECK(used == n, "flip packet consumed %u of %u", used, n);
+
+    /* native path: typed flip, no packet encode/decode */
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+    int rc = rsx_nir_intercept_flip(&em, 2, 1, 0x40, 0x1234);
+    CHECK(rc == 0, "intercept flip rejected valid args");
+
+    char err[256] = {0};
+    rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "flip packet vs native: %s", err);
+
+    /* fold shape: acquire (dma/offset/value) then present(buffer) */
+    rsx_nir_action* acts = NULL;
+    int na = rsx_nir_fold(&sa, &acts);
+    CHECK(na == 2, "flip action count %d", na);
+    if (na == 2) {
+        CHECK(acts[0].kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE, "a0 kind %u",
+              acts[0].kind);
+        CHECK(acts[0].u.semaphore.dma_context == RSX_NIR_DMA_SEMAPHORE_RW &&
+              acts[0].u.semaphore.offset == 0x400 &&
+              acts[0].u.semaphore.value == 0x1234,
+              "acquire payload %08X/%08X/%08X",
+              acts[0].u.semaphore.dma_context, acts[0].u.semaphore.offset,
+              acts[0].u.semaphore.value);
+        CHECK(acts[1].kind == RSX_NIR_OP_PRESENT &&
+              acts[1].u.present.buffer == 2, "present payload");
+    }
+    free(acts);
+
+    /* no-label variant folds to PRESENT alone */
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+    rsx_nir_adapter_init(&ad, &sa);
+    n = rsx_nir_intercept_flip_packet(pkt, 5, 0, 0, 0);
+    CHECK(n == 4, "no-label packet word count %u", n);
+    used = rsx_nir_adapter_fifo(&ad, pkt, n, NULL);
+    CHECK(used == n, "no-label packet consumed %u of %u", used, n);
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+    rc = rsx_nir_intercept_flip(&em, 5, 0, 0, 0);
+    CHECK(rc == 0, "intercept flip (no label) rejected");
+    err[0] = 0;
+    rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "no-label flip packet vs native: %s", err);
+
+    /* invalid buffer id refused with nothing emitted (packet-path parity) */
+    u32 ops_before = sb.op_count;
+    rc = rsx_nir_intercept_flip(&em, 8, 0, 0, 0);
+    CHECK(rc != 0, "buffer_id 8 accepted");
+    CHECK(sb.op_count == ops_before, "refused flip still emitted ops");
+
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- data-move equivalence: packet path vs typed ----------------------- */
+
+static void test_transfers(void)
+{
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+
+    /* packet path: NV0039 buffer copy + NV3062/NV308A inline + NV3089 blit */
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    rsx_nir_adapter_method(&ad, 0x2184, 0xFEED0001);   /* DMA in (main)   */
+    rsx_nir_adapter_method(&ad, 0x2188, 0xFEED0000);   /* DMA out (local) */
+    rsx_nir_adapter_method(&ad, 0x230C, 0x1000);       /* OFFSET_IN       */
+    rsx_nir_adapter_method(&ad, 0x2310, 0x2000);       /* OFFSET_OUT      */
+    rsx_nir_adapter_method(&ad, 0x2314, 256);          /* PITCH_IN        */
+    rsx_nir_adapter_method(&ad, 0x2318, 256);          /* PITCH_OUT       */
+    rsx_nir_adapter_method(&ad, 0x231C, 256);          /* LINE_LENGTH_IN  */
+    rsx_nir_adapter_method(&ad, 0x2320, 4);            /* LINE_COUNT      */
+    rsx_nir_adapter_method(&ad, 0x2324, 0x0101);       /* FORMAT          */
+    rsx_nir_adapter_method(&ad, 0x2328, 0);            /* BUFFER_NOTIFY   */
+
+    rsx_nir_adapter_method(&ad, 0x6188, 0xFEED0001);   /* 3062 dst dma    */
+    rsx_nir_adapter_method(&ad, 0x6300, 0xB);          /* color fmt       */
+    rsx_nir_adapter_method(&ad, 0x6304, 0x00400040);   /* pitch           */
+    rsx_nir_adapter_method(&ad, 0x630C, 0x3000);       /* dst offset      */
+    rsx_nir_adapter_method(&ad, 0xA304, 0x00020001);   /* point y=2 x=1   */
+    rsx_nir_adapter_method(&ad, 0xA308, 0x00010003);   /* size out 3x1    */
+    rsx_nir_adapter_method(&ad, 0xA400, 0x11111111);
+    rsx_nir_adapter_method(&ad, 0xA404, 0x22222222);
+    rsx_nir_adapter_method(&ad, 0xA408, 0x33333333);
+    /* run ends at the next non-COLOR method */
+    rsx_nir_adapter_method(&ad, 0xC184, 0xFEED0001);   /* 3089 src dma    */
+    rsx_nir_adapter_method(&ad, 0xC300, 0xA);          /* src color fmt   */
+    rsx_nir_adapter_method(&ad, 0xC308, 0x00000000);   /* clip point      */
+    rsx_nir_adapter_method(&ad, 0xC30C, 0x00F00140);   /* clip 320x240    */
+    rsx_nir_adapter_method(&ad, 0xC310, 0x00000000);   /* out point       */
+    rsx_nir_adapter_method(&ad, 0xC314, 0x00F00140);   /* out size        */
+    rsx_nir_adapter_method(&ad, 0xC318, 0x00100000);   /* ds_dx 1.0       */
+    rsx_nir_adapter_method(&ad, 0xC31C, 0x00100000);   /* dt_dy 1.0       */
+    rsx_nir_adapter_method(&ad, 0xC400, 0x00F00140);   /* in size         */
+    rsx_nir_adapter_method(&ad, 0xC404, 0x00010280);   /* pitch|origin    */
+    rsx_nir_adapter_method(&ad, 0xC408, 0x4000);       /* in offset       */
+    rsx_nir_adapter_method(&ad, 0xC40C, 0x00000000);   /* IN_POINT: fire  */
+    rsx_nir_adapter_finish(&ad);
+
+    /* typed path: the same three moves */
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+
+    rsx_nir_transfer t;
+    memset(&t, 0, sizeof(t));
+    t.kind = RSX_NIR_XFER_BUFFER;
+    t.src_location = RSX_NIR_LOCATION_MAIN;  t.src_offset = 0x1000; t.src_pitch = 256;
+    t.dst_location = RSX_NIR_LOCATION_LOCAL; t.dst_offset = 0x2000; t.dst_pitch = 256;
+    t.src_format = 1; t.dst_format = 1;
+    t.line_length = 256; t.line_count = 4;
+    rsx_nir_em_transfer(&em, &t, NULL);
+
+    memset(&t, 0, sizeof(t));
+    t.kind = RSX_NIR_XFER_INLINE;
+    t.dst_location = RSX_NIR_LOCATION_MAIN;
+    t.dst_offset = 0x3000; t.dst_pitch = 0x40; t.dst_format = 0xB;
+    t.point_x = 1; t.point_y = 2; t.size_w = 3; t.size_h = 1;
+    t.word_count = 3;
+    const u32 inline_words[3] = { 0x11111111, 0x22222222, 0x33333333 };
+    rsx_nir_em_transfer(&em, &t, inline_words);
+
+    memset(&t, 0, sizeof(t));
+    t.kind = RSX_NIR_XFER_SCALED;
+    t.src_location = RSX_NIR_LOCATION_MAIN;
+    t.src_offset = 0x4000; t.src_pitch = 0x280; t.src_format = 0xA;
+    t.dst_location = RSX_NIR_LOCATION_MAIN;
+    t.dst_offset = 0x3000; t.dst_pitch = 0x40; t.dst_format = 0xB;
+    t.in_w = 0x140; t.in_h = 0xF0;
+    t.out_w = 0x140; t.out_h = 0xF0;
+    t.clip_w = 0x140; t.clip_h = 0xF0;
+    t.ds_dx = 0x00100000; t.dt_dy = 0x00100000;
+    t.origin = 1; t.interpolator = 0;
+    rsx_nir_em_transfer(&em, &t, NULL);
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "transfers packet vs typed: %s", err);
+
+    rsx_nir_action* acts = NULL;
+    int na = rsx_nir_fold(&sa, &acts);
+    CHECK(na == 3, "transfer action count %d", na);
+    if (na == 3) {
+        CHECK(acts[0].u.transfer.kind == RSX_NIR_XFER_BUFFER, "a0 kind");
+        CHECK(acts[1].u.transfer.kind == RSX_NIR_XFER_INLINE &&
+              acts[1].u.transfer.point_x == 1 &&
+              acts[1].u.transfer.word_count == 3, "a1 inline shape");
+        CHECK(acts[2].u.transfer.kind == RSX_NIR_XFER_SCALED &&
+              acts[2].u.transfer.src_offset == 0x4000, "a2 scaled shape");
+    }
+    free(acts);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- SET_REFERENCE / user command / tokens / fallback markers ---------- */
+
+static void test_reference_user_tokens(void)
+{
+    rsx_nir_stream sa, sb;
+    rsx_nir_stream_init(&sa);
+    rsx_nir_stream_init(&sb);
+
+    /* packet path: SET_REFERENCE arrives through the raw FIFO front end
+     * (NV406E method 0x50), user command through the method stream */
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &sa);
+    fifo_buf f;
+    memset(&f, 0, sizeof(f));
+    fm1(&f, 0x0050, 0xBEEF);
+    u32 stop = 0;
+    u32 used = rsx_nir_adapter_fifo(&ad, f.words, f.n, &stop);
+    CHECK(used == f.n, "reference packet consumed %u of %u", used, f.n);
+    rsx_nir_adapter_method(&ad, 0xEB00, 7);
+
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init_stream(&em, &sb);
+    typed_stage_defaults(&em);
+    rsx_nir_em_set_reference(&em, 0xBEEF);
+    rsx_nir_em_user_command(&em, 7);
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+    CHECK(rc == 0, "reference/user packet vs typed: %s", err);
+
+    /* tokens + fallback markers are native-only ordered actions: equal
+     * sequences compare equal; any payload difference is detected */
+    rsx_nir_stream ta, tb;
+    rsx_nir_stream_init(&ta);
+    rsx_nir_stream_init(&tb);
+    rsx_nir_emitter ea, eb;
+    rsx_nir_emitter_init_stream(&ea, &ta);
+    rsx_nir_emitter_init_stream(&eb, &tb);
+    rsx_nir_em_token_wait(&ea, 3, 41);
+    rsx_nir_em_fallback(&ea, RSX_NIR_FALLBACK_ENTER, 2, 1);
+    rsx_nir_em_token_signal(&ea, 3, 42);
+    rsx_nir_em_token_wait(&eb, 3, 41);
+    rsx_nir_em_fallback(&eb, RSX_NIR_FALLBACK_ENTER, 2, 1);
+    rsx_nir_em_token_signal(&eb, 3, 42);
+    err[0] = 0;
+    CHECK(rsx_nir_compare(&ta, &tb, err, sizeof(err)) == 0,
+          "identical token streams differ: %s", err);
+    rsx_nir_em_token_signal(&eb, 3, 43);
+    CHECK(rsx_nir_compare(&ta, &tb, err, sizeof(err)) != 0,
+          "extra token signal not detected");
+    rsx_nir_stream_free(&ta);
+    rsx_nir_stream_free(&tb);
+    rsx_nir_stream_free(&sa);
+    rsx_nir_stream_free(&sb);
+}
+
+/* ---- fixed-capacity stream: allocation-free + sticky overflow ---------- */
+
+static void test_fixed_capacity(void)
+{
+    static rsx_nir_op ops[8];
+    static u32 side[64];
+    rsx_nir_stream s;
+    rsx_nir_stream_init_fixed(&s, ops, 8, side, 64);
+
+    rsx_nir_op op;
+    memset(&op, 0, sizeof(op));
+    op.kind = RSX_NIR_OP_BARRIER;
+    for (int i = 0; i < 8; i++)
+        CHECK(rsx_nir_push(&s, &op) == 0, "fixed push %d refused", i);
+    CHECK(s.overflow == 0, "premature overflow");
+    CHECK(rsx_nir_push(&s, &op) == -1, "push past capacity accepted");
+    CHECK(s.overflow == 1, "overflow flag not sticky");
+    CHECK(rsx_nir_push(&s, &op) == -1, "sticky overflow allowed a push");
+    CHECK(s.op_count == 8, "op_count corrupted by refused push");
+
+    /* side capacity refusal is sticky too */
+    rsx_nir_stream_reset(&s);
+    u32 w[64];
+    memset(w, 0xAB, sizeof(w));
+    CHECK(rsx_nir_side_push(&s, w, 64) == 0, "side fill refused");
+    CHECK(rsx_nir_side_push(&s, w, 1) == ~0u, "side overflow accepted");
+    CHECK(s.overflow == 1, "side overflow not sticky");
+
+    rsx_nir_stream_free(&s);   /* must not free caller storage (no crash) */
+}
+
+/* ---- submission ring: SPSC order, side wrap, stats, tokens ------------- */
+
+/* copy a popped op (side payload included) into a plain stream so the
+ * ring's output can be refolded/compared like any other producer */
+static void copy_op_to_stream(const rsx_nr_ring* r, const rsx_nir_op* op,
+                              rsx_nir_stream* out)
+{
+    rsx_nir_op c = *op;
+    u32 ofs = ~0u, count = 0;
+    switch (op->kind) {
+    case RSX_NIR_OP_DRAW:
+        ofs = op->u.draw.batches_ofs; count = op->u.draw.batch_count * 2; break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM:
+        ofs = op->u.vertex_program.words_ofs;
+        count = op->u.vertex_program.word_count; break;
+    case RSX_NIR_OP_SET_CONSTANTS:
+        ofs = op->u.constants.words_ofs;
+        count = op->u.constants.slot_count * 4; break;
+    case RSX_NIR_OP_TRANSFER:
+        ofs = op->u.transfer.words_ofs;
+        count = op->u.transfer.word_count; break;
+    default:
+        break;
+    }
+    if (count) {
+        u32 nofs = rsx_nir_side_push(out, rsx_nr_ring_side_ptr(r, ofs), count);
+        switch (op->kind) {
+        case RSX_NIR_OP_DRAW:               c.u.draw.batches_ofs = nofs; break;
+        case RSX_NIR_OP_SET_VERTEX_PROGRAM: c.u.vertex_program.words_ofs = nofs; break;
+        case RSX_NIR_OP_SET_CONSTANTS:      c.u.constants.words_ofs = nofs; break;
+        case RSX_NIR_OP_TRANSFER:           c.u.transfer.words_ofs = nofs; break;
+        default: break;
+        }
+    }
+    rsx_nir_push(out, &c);
+}
+
+static void test_ring(void)
+{
+    rsx_nr_ring bad;
+    CHECK(rsx_nr_ring_init(&bad, 63, 1024) != 0, "non-pow2 op cap accepted");
+    CHECK(rsx_nr_ring_init(&bad, 64, 1000) != 0, "non-pow2 side cap accepted");
+
+    rsx_nr_ring ring;
+    CHECK(rsx_nr_ring_init(&ring, 64, 1024) == 0, "ring init failed");
+
+    /* reference stream: the synthetic scene emitted typed */
+    rsx_nir_stream ref;
+    rsx_nir_stream_init(&ref);
+    rsx_nir_emitter er;
+    rsx_nir_emitter_init_stream(&er, &ref);
+    typed_stage_defaults(&er);
+    build_scene_typed(&er);
+
+    /* ring path: same scene through the ring sink, popped incrementally
+     * into a rebuild stream (interleaved push/pop exercises wrap) */
+    rsx_nir_stream rebuilt;
+    rsx_nir_stream_init(&rebuilt);
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init(&em, &k);
+    typed_stage_defaults(&em);
+
+    /* drain helper pattern: emit the scene, draining continuously so the
+     * fixed ring never fills */
+    build_scene_typed(&em);
+    const rsx_nr_slot* slot;
+    while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+        copy_op_to_stream(&ring, &slot->op, &rebuilt);
+        rsx_nr_ring_pop(&ring);
+    }
+    CHECK(!rsx_nr_ring_reject_sticky(&ring), "ring rejected during scene");
+    CHECK(rsx_nr_ring_depth(&ring) == 0, "ring not drained");
+
+    char err[256] = {0};
+    int rc = rsx_nir_compare(&ref, &rebuilt, err, sizeof(err));
+    CHECK(rc == 0, "ring round trip diverges: %s", err);
+
+    /* wrap stress: repeat the scene many times through the small ring,
+     * draining after each action-sized burst; side allocations must stay
+     * contiguous and content-intact across wraps */
+    for (int pass = 0; pass < 50 && !g_failures; pass++) {
+        rsx_nir_stream ref2, got2;
+        rsx_nir_stream_init(&ref2);
+        rsx_nir_stream_init(&got2);
+        rsx_nir_emitter e2, e3;
+        rsx_nir_emitter_init_stream(&e2, &ref2);
+        typed_stage_defaults(&e2);
+        build_scene_typed(&e2);
+        rsx_nir_emitter_init(&e3, &k);
+        typed_stage_defaults(&e3);
+        build_scene_typed(&e3);
+        while ((slot = rsx_nr_ring_peek(&ring)) != NULL) {
+            copy_op_to_stream(&ring, &slot->op, &got2);
+            rsx_nr_ring_pop(&ring);
+        }
+        err[0] = 0;
+        if (rsx_nir_compare(&ref2, &got2, err, sizeof(err)) != 0) {
+            CHECK(0, "ring wrap pass %d diverges: %s", pass, err);
+        }
+        rsx_nir_stream_free(&ref2);
+        rsx_nir_stream_free(&got2);
+    }
+    CHECK(!rsx_nr_ring_reject_sticky(&ring), "ring rejected during wrap");
+
+    /* capacity refusal: a too-large single command must be refused loudly
+     * and leave the ring usable */
+    CHECK(!rsx_nr_ring_can_accept(&ring, 1, 2048),
+          "can_accept oversize side approved");
+    u32* p = NULL;
+    CHECK(rsx_nr_ring_side_reserve(&ring, 2048, &p) == ~0u,
+          "oversize reserve succeeded");
+    CHECK(rsx_nr_ring_reject_sticky(&ring), "oversize reserve not sticky");
+    rsx_nr_ring_clear_reject(&ring);
+    CHECK(rsx_nr_ring_can_accept(&ring, 1, 16), "ring unusable after reject");
+
+    /* tokens: monotonic signal, wrapping compare */
+    rsx_nr_tokens tk;
+    rsx_nr_tokens_init(&tk);
+    CHECK(rsx_nr_tokens_satisfied(&tk, 5, 0), "token 0 not satisfied");
+    CHECK(!rsx_nr_tokens_satisfied(&tk, 5, 1), "unsignaled token satisfied");
+    rsx_nr_tokens_signal(&tk, 5, 10);
+    CHECK(rsx_nr_tokens_satisfied(&tk, 5, 10), "signaled token unsatisfied");
+    CHECK(rsx_nr_tokens_satisfied(&tk, 5, 3), "lower want unsatisfied");
+    CHECK(!rsx_nr_tokens_satisfied(&tk, 5, 11), "future want satisfied");
+    rsx_nr_tokens_signal(&tk, 5, 4);      /* stale signal must not regress */
+    CHECK(rsx_nr_tokens_value(&tk, 5) == 10, "token regressed");
+
+    rsx_nir_stream_free(&ref);
+    rsx_nir_stream_free(&rebuilt);
+    rsx_nr_ring_destroy(&ring);
+}
+
+/* ---- optional real-capture leg ----------------------------------------- */
+
+typedef struct rxs_head {
+    u32 n_blocks, n_records, reg_words, vp_words;
+    u32 const_words;
+} rxs_head;
+
+static int run_capture(const char* path)
+{
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "capture leg: cannot open %s\n", path);
+        return -1;
+    }
+    u32 header[8];
+    if (fread(header, 4, 8, fp) != 8 || memcmp(header, "RXS1", 4) != 0 ||
+        (header[1] != 2 && header[1] != 3)) {
+        fprintf(stderr, "capture leg: %s is not RXS1 v2/v3\n", path);
+        fclose(fp);
+        return -1;
+    }
+    rxs_head h;
+    h.n_blocks = header[2];
+    h.n_records = header[3];
+    h.reg_words = header[4];
+    h.vp_words = header[5];
+    h.const_words = 0;
+
+    u32 disp_count;
+    u32 disp[8][4];
+    if (fread(&disp_count, 4, 1, fp) != 1 ||
+        fread(disp, 16, 8, fp) != 8 ||
+        (header[1] >= 3 && fread(&h.const_words, 4, 1, fp) != 1)) {
+        fclose(fp);
+        return -1;
+    }
+
+    u32* regs = malloc((size_t)h.reg_words * 4);
+    u32* vp = malloc((size_t)h.vp_words * 4);
+    u32* consts = malloc(h.const_words ? (size_t)h.const_words * 4 : 4);
+    u32* blocks = malloc((size_t)h.n_blocks * 16);
+    u32* records = malloc((size_t)h.n_records * 8);
+    if (!regs || !vp || !consts || !blocks || !records ||
+        fread(regs, 4, h.reg_words, fp) != h.reg_words ||
+        fread(vp, 4, h.vp_words, fp) != h.vp_words ||
+        (h.const_words && fread(consts, 4, h.const_words, fp) != h.const_words) ||
+        fread(blocks, 16, h.n_blocks, fp) != h.n_blocks) {
+        fprintf(stderr, "capture leg: truncated state sections\n");
+        goto fail;
+    }
+    /* skip the guest-memory data section: block bounds give its size */
+    {
+        u64 data_size = 0;
+        for (u32 i = 0; i < h.n_blocks; i++) {
+            u64 end = (u64)blocks[i * 4 + 3] + blocks[i * 4 + 2];
+            if (end > data_size)
+                data_size = end;
+        }
+        /* seek from current position */
+        if (data_size) {
+#ifdef _WIN32
+            if (_fseeki64(fp, (long long)data_size, SEEK_CUR)) {
+#else
+            if (fseek(fp, (long)data_size, SEEK_CUR)) {
+#endif
+                fprintf(stderr, "capture leg: data section seek failed\n");
+                goto fail;
+            }
+        }
+    }
+    if (fread(records, 8, h.n_records, fp) != h.n_records) {
+        fprintf(stderr, "capture leg: truncated records\n");
+        goto fail;
+    }
+    fclose(fp);
+    fp = NULL;
+
+    {
+        /* two independent adapter instances over the same stream */
+        rsx_nir_stream sa, sb;
+        rsx_nir_stream_init(&sa);
+        rsx_nir_stream_init(&sb);
+        for (int pass = 0; pass < 2; pass++) {
+            rsx_nir_adapter* ad = malloc(sizeof(*ad));
+            if (!ad)
+                goto fail;
+            rsx_nir_adapter_init(ad, pass ? &sb : &sa);
+            rsx_nir_adapter_seed(ad, regs, h.reg_words, vp, h.vp_words,
+                                 consts, h.const_words);
+            for (u32 i = 0; i < h.n_records; i++) {
+                u32 m = records[i * 2];
+                u32 a = records[i * 2 + 1];
+                if (m & 0x80000000u)
+                    continue;                    /* memory-apply record      */
+                rsx_nir_adapter_method(ad, m, a);
+            }
+            rsx_nir_adapter_finish(ad);          /* flush pending inline run */
+            if (!pass) {
+                u32 draws = 0, clears = 0, sems = 0, presents = 0, reports = 0;
+                rsx_nir_cursor c;
+                rsx_nir_action act;
+                rsx_nir_cursor_init(&c, &sa);
+                u32 bad_draw = 0;
+                while (rsx_nir_cursor_next(&c, &act)) {
+                    switch (act.kind) {
+                    case RSX_NIR_OP_DRAW:
+                        draws++;
+                        if (act.u.draw.batch_count == 0 ||
+                            act.u.draw.primitive == 0 ||
+                            act.u.draw.primitive > 10)
+                            bad_draw++;
+                        break;
+                    case RSX_NIR_OP_CLEAR: clears++; break;
+                    case RSX_NIR_OP_SEMAPHORE_RELEASE:
+                    case RSX_NIR_OP_SEMAPHORE_ACQUIRE: sems++; break;
+                    case RSX_NIR_OP_PRESENT: presents++; break;
+                    case RSX_NIR_OP_REPORT: reports++; break;
+                    default: break;
+                    }
+                }
+                printf("capture %s: methods=%u actions=%u draws=%u clears=%u "
+                       "sems=%u reports=%u presents=%u ops=%u side=%u\n",
+                       path, ad->methods_seen, ad->actions_seen, draws,
+                       clears, sems, reports, presents, sa.op_count,
+                       sa.side_count);
+                /* method-write census by decoder class: how much of the
+                 * real stream the register-file model actively decodes
+                 * (STATE/EXEC) vs merely stores (TODO). */
+                {
+                    u64 by_class[3] = {0, 0, 0};
+                    for (u32 r = 0; r < RSX_DSP_NUM_REGS; r++)
+                        if (ad->rsx.seen[r])
+                            by_class[ad->rsx.klass[r] <= 2 ?
+                                     ad->rsx.klass[r] : 0] += ad->rsx.seen[r];
+                    u64 total = by_class[0] + by_class[1] + by_class[2];
+                    printf("capture method census: total=%llu "
+                           "decoded(state)=%llu exec=%llu stored-only=%llu "
+                           "(%.2f%% decoded)\n",
+                           (unsigned long long)total,
+                           (unsigned long long)by_class[1],
+                           (unsigned long long)by_class[2],
+                           (unsigned long long)by_class[0],
+                           total ? 100.0 * (double)(by_class[1] + by_class[2]) /
+                                       (double)total : 0.0);
+                    /* top stored-only methods: the honest gap list */
+                    for (int t = 0; t < 8; t++) {
+                        u32 best = 0, best_r = 0;
+                        for (u32 r = 0; r < RSX_DSP_NUM_REGS; r++)
+                            if (ad->rsx.klass[r] == RSX_DSP_CLASS_TODO &&
+                                ad->rsx.seen[r] > best) {
+                                best = ad->rsx.seen[r];
+                                best_r = r;
+                            }
+                        if (!best)
+                            break;
+                        printf("  stored-only method 0x%05X x%u\n",
+                               best_r << 2, best);
+                        ad->rsx.seen[best_r] = 0;
+                    }
+                }
+                CHECK(draws > 0, "capture produced no draws");
+                CHECK(bad_draw == 0, "capture produced %u malformed draws",
+                      bad_draw);
+                CHECK(ad->batch_overflow == 0, "capture batch overflow %u",
+                      ad->batch_overflow);
+            }
+            free(ad);
+        }
+        char err[256] = {0};
+        int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
+        CHECK(rc == 0, "capture determinism: %s", err);
+        rsx_nir_stream_free(&sa);
+        rsx_nir_stream_free(&sb);
+    }
+
+    free(regs); free(vp); free(consts); free(blocks); free(records);
+    return 0;
+
+fail:
+    if (fp)
+        fclose(fp);
+    free(regs); free(vp); free(consts); free(blocks); free(records);
+    g_failures++;
+    return -1;
+}
+
+int main(int argc, char** argv)
+{
+    test_fifo_vs_typed();
+    test_state_persistence_and_dedup();
+    test_divergence_detected();
+    test_ordering();
+    test_fifo_front_end();
+    test_flip_intercept();
+    test_transfers();
+    test_reference_user_tokens();
+    test_fixed_capacity();
+    test_ring();
+
+    const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
+    if (rxs && rxs[0])
+        run_capture(rxs);
+    else
+        printf("capture leg: SKIP (no .rxs supplied via argv[1] or "
+               "YZ_NIR_RXS)\n");
+
+    if (g_failures) {
+        fprintf(stderr, "rsx_nir equivalence: %d FAILURE(S)\n", g_failures);
+        return 1;
+    }
+    printf("rsx_nir equivalence: PASS\n");
+    return 0;
+}

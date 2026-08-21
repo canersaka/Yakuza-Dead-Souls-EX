@@ -249,6 +249,36 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND fe0_timeline_tests
         )
 
+        # Native-render IR equivalence: packet path (FIFO/method stream ->
+        # rsx_dispatch -> adapter) vs typed native path must fold to
+        # identical action sequences; plus the submission ring and an
+        # optional real-capture leg — captures are large untracked local
+        # oracles, so CTest never depends on one.
+        add_executable(rsx_nir_tests
+            libs/video/tests/test_rsx_nir.c
+            libs/video/rsx_nir.c
+            libs/video/rsx_nir_emitter.c
+            libs/video/rsx_nir_adapter.c
+            libs/video/rsx_nir_intercept.c
+            libs/video/rsx_nr_ring.c
+            libs/video/rsx_dispatch.c
+        )
+        target_include_directories(rsx_nir_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nir_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_nir_equivalence
+            COMMAND rsx_nir_tests
+        )
+        set_tests_properties(
+            rsx_nir_equivalence
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
         # Manual capture differential: feeds one RXS frame through the exact
         # production live renderer.  It is intentionally not a CTest because
         # the title capture is a large, local, untracked oracle.
