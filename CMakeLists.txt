@@ -406,6 +406,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/tests/test_nr_backend_d3d12.c
             libs/video/rsx_nir.c
             libs/video/rsx_nir_emitter.c
+            libs/video/rsx_nir_adapter.c
             libs/video/rsx_nr_ring.c
             libs/video/rsx_nr_backend.c
             libs/video/rsx_nr_backend_d3d12.c
