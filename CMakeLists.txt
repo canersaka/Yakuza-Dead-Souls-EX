@@ -371,6 +371,32 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        # Native-render resource model: mapping epochs, resource lifetime
+        # cache over the guest-page tracker, PSO cache, timeline fences.
+        add_executable(rsx_nr_resources_tests
+            libs/video/tests/test_nr_resources.c
+            libs/video/rsx_nr_resources.c
+            libs/video/rsx_guest_pages.c
+        )
+        target_include_directories(rsx_nr_resources_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nr_resources_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_nr_resources_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(
+            NAME rsx_nr_resources
+            COMMAND rsx_nr_resources_tests
+        )
+        set_tests_properties(
+            rsx_nr_resources
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
         # Manual capture differential: feeds one RXS frame through the exact
         # production live renderer.  It is intentionally not a CTest because
         # the title capture is a large, local, untracked oracle.
