@@ -47,6 +47,9 @@ typedef struct rsx_nr_exec_ops {
                      const rsx_nir_transfer* t, const u32* words);
     int  (*present)(void* u, u32 buffer);
     void (*flush)(void* u);                       /* barrier / pre-REF     */
+    /* value is the FINAL memory value: the core has already applied the
+     * hardware store transform (back-end releases swizzle bytes 0<->2;
+     * texture-pipe releases are verbatim — see rsx_nir_semaphore). */
     void (*sem_write)(void* u, u32 dma, u32 offset, u32 value,
                       u32 texture_read);
     int  (*sem_read)(void* u, u32 dma, u32 offset, u32* value);

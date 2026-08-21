@@ -100,12 +100,25 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
         rsx_nr_tokens_signal(be->tokens, op->u.token.token,
                              op->u.token.value);
         break;
-    case RSX_NIR_OP_SEMAPHORE_RELEASE:
+    case RSX_NIR_OP_SEMAPHORE_RELEASE: {
+        /* The back-end (0x1D70) store swizzles bytes 0<->2 on real
+         * hardware — the SDK's SetWriteBackEndLabel pre-swaps its value
+         * to compensate, and the live FIFO consumer applies the same
+         * swizzle at store time (import_overrides.cpp 0x1D70). The
+         * texture-pipe (0x1D74) store is verbatim. Apply the hardware
+         * store transform HERE so sem_write callbacks always receive the
+         * final memory value (SDK SetWriteBackEndLabel "swap byte 0 and
+         * 2" vs SetWriteTextureLabel). */
+        u32 v = op->u.semaphore.value;
+        if (!op->u.semaphore.texture_read)
+            v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) |
+                ((v >> 16) & 0xFFu);
         if (x->sem_write)
             x->sem_write(x->user, op->u.semaphore.dma_context,
-                         op->u.semaphore.offset, op->u.semaphore.value,
+                         op->u.semaphore.offset, v,
                          op->u.semaphore.texture_read);
         break;
+    }
     case RSX_NIR_OP_CLEAR:
         if (x->clear)
             rc = x->clear(x->user, &be->st, &op->u.clear);

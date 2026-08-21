@@ -1338,8 +1338,23 @@ static void test_backend_core(void)
     CHECK(rec.ref == 0xCAFE, "reference %08X", rec.ref);
     CHECK(rec.user_cause == 42, "user cause %u", rec.user_cause);
     CHECK(rec.flushes >= 1, "SET_REFERENCE did not flush");
-    CHECK(rec.labels[4] == 0x11223344, "backend semaphore write %08X",
+    /* SDK-conformance: the scene's release is a BACK-END (0x1D70) write,
+     * whose hardware store swizzles bytes 0<->2 — the wire value
+     * 0x11223344 must land in memory as 0x11443322, matching both the
+     * SDK's SetWriteBackEndLabel pre-swap compensation and the live
+     * consumer's store transform. */
+    CHECK(rec.labels[4] == 0x11443322, "backend BE semaphore store %08X",
           rec.labels[4]);
+    /* texture-pipe (0x1D74) releases store verbatim */
+    rsx_nir_em_semaphore_release(&em, 0, 0x50, 0x11223344u, 1);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.labels[5] == 0x11223344, "backend TEX semaphore store %08X",
+          rec.labels[5]);
+    /* and a second BE release directly (regression pin for the transform) */
+    rsx_nir_em_semaphore_release(&em, 0, 0x60, 0xAABBCCDDu, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.labels[6] == 0xAADDCCBBu, "backend BE swizzle %08X",
+          rec.labels[6]);
 
     /* blocking: an acquire on an unsatisfied label parks WITHOUT popping */
     rsx_nir_em_semaphore_acquire(&em, 0x66616661, 0x40, 0x77);
