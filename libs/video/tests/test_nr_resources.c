@@ -163,6 +163,29 @@ static void test_res_cache(void)
     CHECK(st.arena_exhausted == 0, "arena exhausted (%llu)",
           (unsigned long long)st.arena_exhausted);
 
+    /* generation rollover: an entry snapshotted at the pre-wrap counter
+     * value still detects the wrapping write (equality compare), and
+     * revalidation across the wrap works */
+    {
+        rsx_nr_res_key kr = k;
+        kr.offset = 0x80000;
+        kr.size = 0x1000;
+        u32 page = kr.offset >> RSX_GUEST_PAGE_SHIFT;
+        rsx_guest_pages_debug_set_page_gen(&pages, RSX_NR_SPACE_LOCAL, page,
+                                           0xFFFFFFFFu);
+        rsx_nr_res* er = rsx_nr_res_insert(&c, &kr, 0xDD88);
+        CHECK(er && rsx_nr_res_current(&c, er) == 1,
+              "pre-wrap entry not current");
+        rsx_guest_pages_note_write(&pages, RSX_NR_SPACE_LOCAL, kr.offset, 4);
+        CHECK(rsx_guest_pages_page_gen(&pages, RSX_NR_SPACE_LOCAL, page) == 0,
+              "counter did not wrap");
+        CHECK(rsx_nr_res_current(&c, er) == 0, "wrap write undetected");
+        rsx_nr_res_revalidate(&c, er);
+        CHECK(rsx_nr_res_current(&c, er) == 1, "post-wrap revalidate");
+        rsx_guest_pages_note_write(&pages, RSX_NR_SPACE_LOCAL, kr.offset, 4);
+        CHECK(rsx_nr_res_current(&c, er) == 0, "post-wrap write undetected");
+    }
+
     rsx_nr_res_cache_destroy(&c);
     rsx_guest_pages_destroy(&pages);
 }
