@@ -16,6 +16,7 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "rsx_live_draw.h"
+#include "rsx_wait_classifier.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "../runtime/memory/vm.h"
@@ -207,6 +208,10 @@ extern "C" void spu_recomp_register_jobbin_d_2c400(void);
 extern "C" void spu_recomp_register_jobbin_d_2d400(void);
 extern "C" void spu_recomp_register_jobbin_d_2e400(void);
 extern "C" void spu_recomp_register_jobbin_d_2e800(void);
+/* Loading-frontier job discovered from the exact native descriptor at
+ * 0x401B2900 (EBOOT EA 0x01241400, sizeBinary 0x11280). */
+extern "C" void spu_recomp_register_jobbin_e_e400(void);
+extern "C" void spu_recomp_register_jobbin_e_4c00(void);
 /* Sunshine orphanage geometry worker. Its descriptor identifies the distinct
  * EBOOT binary at 0x01252680; treating it as Job A ran the wrong program at the
  * same LS 0x4C00 slot and produced malformed, incomplete scene commands. */
@@ -227,6 +232,9 @@ extern "C" void cri_audio_register_functions(void);
 extern "C" void wkl4_register_functions(void);
 #include "generated/spu_image_table.h"   /* generated: remaining EBOOT images + registry */
 extern "C" void spu_begin_image(int image_id);
+extern "C" void spu_runtime_config_init(void);
+extern "C" void yz_dispatch_runtime_config_init(void);
+extern "C" void cellSpursRuntimeConfigInit(void);
 /* runtime/spu/spu_channels.c — SPU spin-profiler gate (env YZ_SPU_PROF) */
 extern "C" int g_spu_prof_on;
 extern "C" int g_yz_watch_dlist;
@@ -269,6 +277,7 @@ static int yz_register_native_spurs_images(void)
          * descriptor window, identical image; trailing bytes are padding
          * per the orphanage precedent below. */
         {0x01265180u, 0x10800u, 18, "job_bin_d"},
+        {0x01241400u, 0x11280u, 49, "job_bin_e"},
         /* The job descriptor publishes the logical binary length.  The lift's
          * final 0x40 bytes are DMA/extraction padding and are not part of the
          * exact native workload identity. */
@@ -2087,9 +2096,22 @@ extern "C" void yz_chain_probe(void* ctxv, unsigned addr)
      * default-OFF, kill-switch; SwitchToThread is a cheap no-op when nothing else is ready. */
     {
         extern volatile LONG g_yz_cri_yield_phase;
-        const int cy = !getenv("YZ_CRI_NO_YIELD") &&
-            (getenv("YZ_CRI_YIELD") ? 1 :
-             (InterlockedCompareExchange(&g_yz_cri_yield_phase, 0, 0) != 0));
+        struct CriYieldEnvironment {
+            bool disabled;
+            bool forced;
+        };
+        /* Environment configuration is immutable after process startup. This
+         * probe runs at lifted-function frequency, so querying the CRT here
+         * consumed 6.18% of the stationary gun-scene profile. C++ local-static
+         * initialization reads both settings exactly once while the dynamic
+         * phase flag remains live on every probe. */
+        static const CriYieldEnvironment environment = {
+            getenv("YZ_CRI_NO_YIELD") != nullptr,
+            getenv("YZ_CRI_YIELD") != nullptr,
+        };
+        const int cy = !environment.disabled &&
+            (environment.forced ||
+             InterlockedCompareExchange(&g_yz_cri_yield_phase, 0, 0) != 0);
         if (cy && (addr == 0x00EEF88Cu || addr == 0x00E55C84u ||
                    addr == 0x00EEEE04u || addr == 0x00EEECDCu)) {
             SwitchToThread();
@@ -4346,8 +4368,9 @@ static void yz_frontier_snapshot_context(uint32_t tid, ppu_context* ctx)
 static void yz_frontier_snapshot_thread_cb(
     uint32_t tid, const char*, void*)
 {
-    yz_frontier_snapshot_context(
-        tid, (ppu_context*)yz_thread_context(tid));
+    ppu_context snapshot;
+    if (yz_thread_context_snapshot(tid, &snapshot))
+        yz_frontier_snapshot_context(tid, &snapshot);
 }
 
 static void yz_frontier_frame_credit_snapshot(void)
@@ -4778,6 +4801,35 @@ int main(int argc, char** argv)
             argv[2], root, argc >= 5 ? argv[4] : nullptr);
     }
 
+#ifdef YZ_NATIVE_SPURS
+    /* Make runtime unknown-job discovery automatic.  Unless explicitly
+     * overridden, put the append-only evidence file beside the tree that owns
+     * game/EBOOT.elf; the next CMake build consumes this exact path. */
+    if (!getenv("YZ_SPU_INVENTORY_CAPTURE")) {
+        char full_path[32768], capture_path[32768];
+        char* file_part = nullptr;
+        const DWORD path_len = GetFullPathNameA(
+            elf_path, (DWORD)sizeof(full_path), full_path, &file_part);
+        if (path_len && path_len < sizeof(full_path) && file_part) {
+            char* end = file_part;
+            while (end > full_path && (end[-1] == '\\' || end[-1] == '/')) --end;
+            *end = '\0'; /* containing game/ directory */
+            char* parent = strrchr(full_path, '\\');
+            char* parent_alt = strrchr(full_path, '/');
+            if (!parent || (parent_alt && parent_alt > parent)) parent = parent_alt;
+            if (parent) {
+                *parent = '\0';
+                const int written = snprintf(
+                    capture_path, sizeof(capture_path),
+                    "%s\\spu_unknown_jobs.jsonl", full_path);
+                if (written > 0 && (size_t)written < sizeof(capture_path) &&
+                    _putenv_s("YZ_SPU_INVENTORY_CAPTURE", capture_path) == 0)
+                    printf("[spu-inventory] runtime evidence: %s\n", capture_path);
+            }
+        }
+    }
+#endif
+
     /* Arm the YZ_WATCH_EA write-watch BEFORE any guest code runs -- the gcm
      * device-object corruptor (0x01622200) races _cellGcmInitBody, which is far
      * too early for the RSX-thread arm to catch. */
@@ -4829,6 +4881,12 @@ int main(int argc, char** argv)
      * writer (init + any later) with its reliable trampoline-ring; if it's only written
      * once (to the sentinel) and never again while t1 spins, the producer is missing. */
     if (getenv("YZ_WATCH_FLAG")) yz_watch_arm(0x013618B8u + 0x18u);
+
+    /* Cache immutable SPU diagnostic configuration before any worker can
+     * enter the indirect-branch dispatcher. */
+    spu_runtime_config_init();
+    yz_dispatch_runtime_config_init();
+    cellSpursRuntimeConfigInit();
 
     /* Lifted SPU images: register Sony's SPURS kernel (recomp_prx/
      * spurs_kernel2.c) and the system-service workload (spurs_sysservice.c,
@@ -4902,6 +4960,8 @@ int main(int argc, char** argv)
     spu_begin_image(45); spu_recomp_register_jobbin_d_2b800(); /* exact later A010 instruction placement */
     spu_begin_image(31); spu_recomp_register_jobbin_d_2d400();
     spu_begin_image(30); spu_recomp_register_jobbin_d_2e800();
+    spu_begin_image(49); spu_recomp_register_jobbin_e_e400(); /* loading-frontier job, native alternate slot E400 */
+    spu_begin_image(50); spu_recomp_register_jobbin_e_4c00(); /* same binary in native alternate slot 4C00 */
     spu_begin_image(19); spu_recomp_register_jobbin_orphanage(); /* a010 geometry job (EBOOT 0x01252680, LS 0x4C00) */
     spu_recomp_register_jobbin_orphanage_e400();                  /*   ...same binary at the shared alternate slot 0xE400 */
     spu_recomp_register_jobbin_orphanage_2d800();                 /*   ...same binary at the live Kamurocho slot 0x2D800 */
@@ -4916,7 +4976,7 @@ int main(int argc, char** argv)
     if (!yz_register_native_spurs_images())
         return 1;
     printf("[boot] native SPURS images registered "
-           "(%d exact EBOOT tasks + 5 exact game jobs; no firmware)\n",
+           "(%d exact EBOOT tasks + 6 exact game jobs; no firmware)\n",
            SPU_IMAGE_COUNT);
 #else
     printf("[boot] SPU images registered (kernel + service + policy + %d EBOOT task images)\n",
@@ -5255,6 +5315,7 @@ int main(int argc, char** argv)
     yz_drain_trampolines(&ctx);
 
     printf("[boot] entry returned, r3=0x%llX\n", (unsigned long long)ctx.gpr[3]);
+    yz_rsx_wait_classifier_shutdown_serialized();
     vm_shutdown();
     return (int)(uint32_t)ctx.gpr[3];
 }

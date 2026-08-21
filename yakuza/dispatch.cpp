@@ -19,6 +19,7 @@
 #include "rsx_live_draw.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
+#include "ps3emu/yz_fe0_timeline.h"
 
 #include <cstdio>
 #include <chrono>
@@ -860,10 +861,45 @@ extern "C" void yz_a010_auth_probe_poll(void)
 /* Timestamp shared with the unattended New Game acceptance input route. */
 extern "C" volatile unsigned long long g_yz_auto_start_tick = 0;
 extern "C" volatile long g_yz_a010_root_active;
+/* A010 root visibility is transient.  Once it has proved that New Game was
+ * accepted, every synthetic Confirm producer must stay off for the rest of
+ * the process so later dialogue cannot be advanced accidentally. */
+extern "C" volatile long g_yz_auto_new_game_complete = 0;
 static uint32_t g_yz_auto_input_cached;
 static uint32_t g_yz_auto_input_mask;
 static uint32_t g_yz_frontier_input_cached;
 static uint32_t g_yz_frontier_input_mask;
+
+static bool yz_auto_new_game_is_complete()
+{
+    static bool completion_logged;
+    if (g_yz_a010_root_active)
+        _InterlockedExchange(&g_yz_auto_new_game_complete, 1);
+    const bool complete = _InterlockedCompareExchange(
+        &g_yz_auto_new_game_complete, 0, 0) != 0;
+    if (complete && !completion_logged) {
+        completion_logged = true;
+        const uint32_t accept_bit = addr_readable(0x014EE698u)
+            ? vm_read32(0x014EE698u) : 0x1u;
+        const auto release_confirm = [accept_bit](
+            uint32_t cached, uint32_t mask) {
+            if (addr_readable(mask))
+                vm_write32(mask, vm_read32(mask) & ~accept_bit);
+            if (addr_readable(cached + 0x4u))
+                vm_write32(cached + 0x4u,
+                           vm_read32(cached + 0x4u) & ~accept_bit);
+        };
+        release_confirm(g_yz_auto_input_cached, g_yz_auto_input_mask);
+        if (g_yz_frontier_input_cached != g_yz_auto_input_cached)
+            release_confirm(
+                g_yz_frontier_input_cached, g_yz_frontier_input_mask);
+        fprintf(stderr,
+                "[auto-new-game] completion latched; Confirm released and "
+                "route disabled\n");
+        fflush(stderr);
+    }
+    return complete;
+}
 
 /* Four proof-boundary snapshots separate raw cellPad acceptance from the
  * game's high-level input cache and from its final camera producer.  Keep the
@@ -1010,6 +1046,15 @@ static void yz_title_auto_start(ppu_context* ctx, uint32_t address)
     fflush(stderr);
 }
 
+/* Static recomp calls do not pass through the indirect dispatcher.  Keep the
+ * title acceptance seam callable from the generated function entry so the
+ * unattended route cannot remain parked at PRESS START when that call is
+ * direct. */
+extern "C" void yz_title_auto_start_direct(ppu_context* ctx)
+{
+    yz_title_auto_start(ctx, 0x00AF1DD0u);
+}
+
 /* The title/menu state machine consumes the game's cached input abstraction,
  * not cellPadGetData directly.  Keep the unattended New Game route on that
  * same authoritative seam as the Start injection above.  The menu handler
@@ -1023,14 +1068,17 @@ static void yz_auto_new_game_cached_input()
     static unsigned long long logged;
     if (!g_yz_runtime_config.auto_new_game ||
         !g_yz_auto_start_tick || !g_yz_auto_input_cached ||
-        !g_yz_auto_input_mask || g_yz_a010_root_active)
+        !g_yz_auto_input_mask || yz_auto_new_game_is_complete())
         return;
 
     const unsigned long long elapsed =
         GetTickCount64() - g_yz_auto_start_tick;
     const unsigned long long first = 12000u;
     const unsigned long long period = 3000u;
-    const unsigned attempts = 5u;
+    /* YZ_A010_ACCEPT_FAST marks the unattended acceptance route.  Do not let
+     * a timing-dependent five-pulse miss strand that route on the menu; the
+     * a010 root marker above is the authoritative completion condition. */
+    const unsigned attempts = getenv("YZ_A010_ACCEPT_FAST") ? 60u : 5u;
     if (elapsed < first || elapsed >= first + period * attempts)
         return;
 
@@ -1078,7 +1126,7 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
     static bool selected_new_game;
     static unsigned logged_pulse = ~0u;
     if (!g_yz_runtime_config.auto_new_game ||
-        g_yz_a010_root_active) return;
+        yz_auto_new_game_is_complete()) return;
 
     const uint32_t menu = (uint32_t)ctx->gpr[3];
     if (!addr_readable(menu + 0x13Cu)) return;
@@ -1159,7 +1207,8 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
      * visible menu impossible to operate manually.  Five attempts retain
      * unattended startup while handing the cache back after 15 seconds.
      */
-    if (pulse >= 5u) {
+    const unsigned attempts = getenv("YZ_A010_ACCEPT_FAST") ? 60u : 5u;
+    if (pulse >= attempts) {
         return;
     }
     if (pressed) {
@@ -1997,16 +2046,48 @@ extern "C" volatile void*    g_yz_t1_last_tf     = 0;
  * per 10M hops. Counters are per-process, racy-increment tolerable (census). */
 extern "C" unsigned long long g_yz_hops_total = 0, g_yz_hops_indirect = 0;
 
+#if !defined(YZ_PERF_CLEAN)
+static FILE* g_yz_hops_output;
+static char g_yz_hops_output_buffer[64u * 1024u];
+
+static void yz_hops_output_close()
+{
+    if (!g_yz_hops_output) return;
+    std::fclose(g_yz_hops_output);
+    g_yz_hops_output = nullptr;
+}
+#endif
+
+extern "C" void yz_dispatch_runtime_config_init(void)
+{
+#if !defined(YZ_PERF_CLEAN)
+    const char* path = std::getenv("YZ_HOPS_LOG");
+    if (!path || !path[0] || g_yz_hops_output) return;
+    g_yz_hops_output = std::fopen(path, "w");
+    if (!g_yz_hops_output) {
+        std::fprintf(stderr, "[hops] cannot open YZ_HOPS_LOG: %s\n", path);
+        return;
+    }
+    std::setvbuf(g_yz_hops_output, g_yz_hops_output_buffer, _IOFBF,
+                 sizeof(g_yz_hops_output_buffer));
+    std::atexit(yz_hops_output_close);
+#endif
+}
+
 extern "C" void yz_tramp_guard(void* tf, void* ctxv)
 {
     ppu_context* ctx0 = (ppu_context*)ctxv;
     yz_mwply_lifecycle_boundary(tf, ctx0);
     yz_a010_auth_probe_poll();
-    if ((++g_yz_hops_total & 0x9FFFFFull) == 0) /* ~every 10.5M */
-        fprintf(stderr, "[hops] total=%llu indirect=%llu static=%llu (%.1f%% static)\n",
+#if !defined(YZ_PERF_CLEAN)
+    if (g_yz_hops_output &&
+        (++g_yz_hops_total & 0x9FFFFFull) == 0) /* ~every 10.5M */
+        std::fprintf(g_yz_hops_output,
+                "[hops] total=%llu indirect=%llu static=%llu (%.1f%% static)\n",
                 g_yz_hops_total, g_yz_hops_indirect,
                 g_yz_hops_total - g_yz_hops_indirect,
                 100.0 * (double)(g_yz_hops_total - g_yz_hops_indirect) / (double)g_yz_hops_total);
+#endif
     unsigned _ri = g_yz_tramp_idx++ & 255;
     g_yz_tramp_ring[_ri] = tf;
     g_yz_tramp_r31[_ri]  = ctx0->gpr[31];
@@ -2440,7 +2521,10 @@ static thread_local unsigned g_yz_mt_entry_count;
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+#if !defined(YZ_PERF_CLEAN)
+    if (g_yz_hops_output)
     g_yz_hops_indirect++;                     /* s21 hop census (see yz_tramp_guard) */
+#endif
     uint32_t target = (uint32_t)ctx->ctr;
     const uint32_t dispatch_object = (uint32_t)ctx->gpr[3];
     g_yz_last_targets[g_yz_last_idx++ & 15] = target;
@@ -4230,6 +4314,15 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         fn(ctx);
         yz_drain_trampolines(ctx);
         yz_ucmd_handler_end(cause, epoch);
+        if (g_yz_fe0_timeline_enabled) {
+            const uint32_t manager = vm_read32((uint32_t)ctx->gpr[2] - 0x7948u);
+            const uint32_t record = manager ? vm_read32(manager + 0x94u) : 0u;
+            yz_fe0_timeline_emit(
+                YZ_FE0_EVENT_CALLBACK_STATE, (uint32_t)cause,
+                (uint32_t)epoch, manager, record,
+                record ? vm_read32(record) : 0u,
+                manager ? vm_read32(manager + 0x88u) : 0u);
+        }
         g_trampoline_fn = saved_trampoline;
         return;
     }
@@ -5438,6 +5531,15 @@ extern "C" void yz_call_guest_opd(uint32_t opd_addr, ppu_context* ctx)
         fn(ctx);
         yz_drain_trampolines(ctx);
         yz_ucmd_handler_end(cause, epoch);
+        if (g_yz_fe0_timeline_enabled) {
+            const uint32_t manager = vm_read32((uint32_t)ctx->gpr[2] - 0x7948u);
+            const uint32_t record = manager ? vm_read32(manager + 0x94u) : 0u;
+            yz_fe0_timeline_emit(
+                YZ_FE0_EVENT_CALLBACK_STATE, (uint32_t)cause,
+                (uint32_t)epoch, manager, record,
+                record ? vm_read32(record) : 0u,
+                manager ? vm_read32(manager + 0x88u) : 0u);
+        }
         g_trampoline_fn = saved_trampoline;
     } else {
         fn(ctx);
