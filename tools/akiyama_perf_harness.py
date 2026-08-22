@@ -43,6 +43,7 @@ EXPECTED_CACHE = {
     "YZ_SPU_FAST_JOB_E": "ON",
     "YZ_SPU_FAST_ORPHANAGE": "ON",
     "YZ_SPU_FAST_SPURS_EXPERIMENTAL": "OFF",
+    "YZ_SPU_SIMD_ABSDB": "ON",
     "YZ_SPU_SIMD_XFLOAT": "ON",
     "YZ_WKL4_CYCLE_DIAGNOSTIC": "OFF",
 }
@@ -575,6 +576,8 @@ def run_gun(args):
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
     if args.expect_ls128:
         expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
+    if args.expect_absdb:
+        expected_cache["YZ_SPU_SIMD_ABSDB"] = args.expect_absdb
     if args.expect_xfloat:
         expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
     mismatches = {
@@ -916,6 +919,8 @@ def run(args):
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
     if args.expect_ls128:
         expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
+    if args.expect_absdb:
+        expected_cache["YZ_SPU_SIMD_ABSDB"] = args.expect_absdb
     if args.expect_xfloat:
         expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
     if args.wkl4_cycle:
@@ -990,6 +995,7 @@ def run(args):
                 *EXPECTED_CACHE,
                 "YZ_SPU_SIMD_SHUFB",
                 "YZ_SPU_SIMD_LS128",
+                "YZ_SPU_SIMD_ABSDB",
                 "YZ_SPU_SIMD_XFLOAT",
             )
         },
@@ -1286,6 +1292,7 @@ def main():
     parser.add_argument("--route-start-delay-ms", type=int, default=0)
     parser.add_argument("--expect-shufb", choices=("ON", "OFF"))
     parser.add_argument("--expect-ls128", choices=("ON", "OFF"))
+    parser.add_argument("--expect-absdb", choices=("ON", "OFF"))
     parser.add_argument("--expect-xfloat", choices=("ON", "OFF"))
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)

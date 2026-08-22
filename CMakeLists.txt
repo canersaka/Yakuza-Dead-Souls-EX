@@ -394,6 +394,32 @@ if(PS3RECOMP_BUILD_TESTS)
             )
         endforeach()
 
+        foreach(absdb_mode IN ITEMS scalar simd)
+            add_executable(spu_absdb_${absdb_mode}_tests
+                tests/spu_absdb/main.c
+            )
+            target_include_directories(spu_absdb_${absdb_mode}_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+            )
+            target_compile_definitions(spu_absdb_${absdb_mode}_tests PRIVATE
+                YZ_SPU_SIMD_ABSDB=$<STREQUAL:${absdb_mode},simd>
+                _CRT_SECURE_NO_WARNINGS
+            )
+            if(MSVC)
+                target_compile_options(spu_absdb_${absdb_mode}_tests PRIVATE
+                    /experimental:c11atomics
+                )
+            endif()
+            add_test(
+                NAME spu_absdb_${absdb_mode}
+                COMMAND spu_absdb_${absdb_mode}_tests
+            )
+            set_tests_properties(spu_absdb_${absdb_mode} PROPERTIES
+                TIMEOUT 120
+                LABELS "firmware-free;native;spu;performance;regression")
+        endforeach()
+
         add_executable(spu_xfloat_simd_tests
             tests/spu_xfloat_simd/main.c
             runtime/spu/spu_xfloat_simd.c
