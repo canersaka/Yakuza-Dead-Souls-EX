@@ -61,6 +61,9 @@ option(YZ_FRONTIER_VISUAL_PROBE
 option(YZ_SPU_SIMD_SHUFB
     "Use the bit-exact SSSE3 SPU shufb helper; OFF selects its scalar reference twin."
     ON)
+option(YZ_WKL4_CYCLE_DIAGNOSTIC
+    "Compile the default-off, fixed-memory image-4 hot-region cycle classifier."
+    OFF)
 if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
     message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
 endif()
@@ -93,6 +96,10 @@ target_include_directories(ps3recomp_runtime PRIVATE
 target_compile_definitions(ps3recomp_runtime PRIVATE
     PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h"
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
+if(YZ_WKL4_CYCLE_DIAGNOSTIC)
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        YZ_WKL4_CYCLE_DIAGNOSTIC=1)
+endif()
 if(YZ_FRONTIER_VISUAL_PROBE)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         YZ_FRONTIER_VISUAL_PROBE=1)
@@ -377,6 +384,10 @@ if(YZ_PERF_DEFINITIONS)
 endif()
 target_compile_definitions(yakuza_recomp PRIVATE
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
+if(YZ_WKL4_CYCLE_DIAGNOSTIC)
+    target_compile_definitions(yakuza_recomp PRIVATE
+        YZ_WKL4_CYCLE_DIAGNOSTIC=1)
+endif()
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
         $<$<CONFIG:Release>:/O2>

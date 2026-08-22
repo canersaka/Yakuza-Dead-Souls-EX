@@ -22,6 +22,7 @@
 #include "rsx_live_draw.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
+#include "ps3emu/yz_wkl4_cycle_interval.h"
 
 #if !defined(_WIN32)
 
@@ -8529,6 +8530,7 @@ void rsx_live_draw_present(u32 buffer_id)
                     GetFileAttributesA(route_stop_file) !=
                         INVALID_FILE_ATTRIBUTES) {
                     probe_enabled = 0;
+                    YZ_WKL4_CYCLE_BEGIN_INTERVAL();
                     fprintf(stderr,
                             "[akiyama-route] visual probe stopped at "
                             "confirmed checkpoint present_id=%llu\n",

@@ -43,6 +43,7 @@ EXPECTED_CACHE = {
     "YZ_SPU_FAST_JOB_E": "ON",
     "YZ_SPU_FAST_ORPHANAGE": "ON",
     "YZ_SPU_FAST_SPURS_EXPERIMENTAL": "OFF",
+    "YZ_WKL4_CYCLE_DIAGNOSTIC": "OFF",
 }
 
 
@@ -541,6 +542,8 @@ def run(args):
     expected_cache = dict(EXPECTED_CACHE)
     if args.expect_shufb:
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
+    if args.wkl4_cycle:
+        expected_cache["YZ_WKL4_CYCLE_DIAGNOSTIC"] = "ON"
     mismatches = {
         name: {"expected": expected, "actual": cache.get(name)}
         for name, expected in expected_cache.items()
@@ -593,6 +596,8 @@ def run(args):
         yz["YZ_NR_INTERCEPT"] = "draw"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
+    if args.wkl4_cycle:
+        yz["YZ_WKL4_CYCLE"] = "1"
     environment.update(yz)
 
     result = {
@@ -783,9 +788,13 @@ def run(args):
         draw_phase_lines = re.findall(
             r"^\[draw-phase:.*\]$", stderr_text, re.MULTILINE
         )
+        wkl4_cycle_lines = re.findall(
+            r"^\[wkl4-cycle\].*$", stderr_text, re.MULTILINE
+        )
         result["nr_shadow_census"] = shadow_lines
         result["nr_live_census"] = live_lines
         result["draw_phase_aggregate"] = draw_phase_lines
+        result["wkl4_cycle_aggregate"] = wkl4_cycle_lines
         if ((args.nr_shadow_census or args.nr_flip or args.nr_clear or
              args.nr_draw) and
                 len(shadow_lines) != 1):
@@ -807,6 +816,13 @@ def run(args):
             raise RuntimeError("draw-phase run did not emit bounded shutdown aggregate")
         if not args.draw_phases and draw_phase_lines:
             raise RuntimeError("draw-phase classifier was active in a clean lane")
+        if args.wkl4_cycle and len(wkl4_cycle_lines) != 13:
+            raise RuntimeError(
+                "image-4 cycle run must emit one total plus twelve segment lines: "
+                f"found {len(wkl4_cycle_lines)}"
+            )
+        if not args.wkl4_cycle and wkl4_cycle_lines:
+            raise RuntimeError("image-4 cycle classifier was active in a clean lane")
         completion_marker = (
             "[auto-new-game] completion latched; Confirm released and route disabled"
         )
@@ -897,15 +913,16 @@ def main():
     parser.add_argument("--nr-clear", action="store_true")
     parser.add_argument("--nr-draw", action="store_true")
     parser.add_argument("--draw-phases", action="store_true")
+    parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)
     args = parser.parse_args()
     if args.fe0_callback_replay and not args.fe0:
         parser.error("--fe0-callback-replay requires --fe0")
-    if sum((args.nr_shadow_census, args.nr_flip, args.nr_clear,
-            args.nr_draw, args.draw_phases)) > 1:
-        parser.error("select only one native-render diagnostic/family lane")
+    if sum((args.fe0, args.nr_shadow_census, args.nr_flip, args.nr_clear,
+            args.nr_draw, args.draw_phases, args.wkl4_cycle)) > 1:
+        parser.error("select only one diagnostic/family lane")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

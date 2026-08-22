@@ -341,6 +341,27 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND fe0_timeline_tests
         )
 
+        add_executable(wkl4_cycle_tests
+            tests/wkl4_cycle/main.c
+            runtime/diag/yz_wkl4_cycle.c
+        )
+        target_include_directories(wkl4_cycle_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_compile_definitions(wkl4_cycle_tests PRIVATE
+            YZ_WKL4_CYCLE_TEST=1
+            YZ_WKL4_CYCLE_DIAGNOSTIC=1
+        )
+        if(MSVC)
+            target_compile_options(wkl4_cycle_tests PRIVATE
+                /experimental:c11atomics
+            )
+        endif()
+        add_test(
+            NAME wkl4_cycle
+            COMMAND wkl4_cycle_tests
+        )
+
         # Native-render IR equivalence: packet path (FIFO/method stream ->
         # rsx_dispatch -> adapter) vs typed native path must fold to
         # identical action sequences; plus the submission ring and an

@@ -23,6 +23,7 @@
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
 #include "ps3emu/yz_fe0_timeline.h"
+#include "ps3emu/yz_wkl4_cycle.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
 #include "rsx_live_draw.h"      /* Track B: live NV4097 -> D3D12 draw engine */
@@ -6111,6 +6112,7 @@ extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
 {
     if (!g_yz_rsx_wait_classifier_enabled &&
         !g_yz_fe0_timeline_enabled &&
+        !g_yz_wkl4_cycle_enabled &&
         !g_yz_nr_shadow_enabled)
         return;
     yz_rsx_fifo_lock_ensure();
@@ -6119,6 +6121,8 @@ extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
         yz_rsx_wait_classifier_shutdown();
     if (g_yz_fe0_timeline_enabled)
         yz_fe0_timeline_shutdown();
+    if (g_yz_wkl4_cycle_enabled)
+        yz_wkl4_cycle_shutdown();
     yz_nr_shadow_shutdown();
     LeaveCriticalSection(&g_rsx_fifo_lock);
 }
@@ -8093,6 +8097,7 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
         started = 1;
         yz_nr_shadow_init();
         yz_fe0_timeline_init();
+        yz_wkl4_cycle_init();
         if (yz_rsx_wait_classifier_init()) {
             yz_rsx_wait_classifier_set_completed_draw_baseline(
                 rsx_live_draw_get_completed_draws());
