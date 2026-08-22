@@ -38,6 +38,7 @@ void rsx_live_draw_set_display_buffer(
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
+void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
@@ -6977,6 +6978,11 @@ void rsx_live_draw_native_present(u32 buffer_id)
 void rsx_live_draw_native_clear(u32 mask)
 {
     rsx_live_draw_method(0x1D94u, mask);
+}
+
+void rsx_live_draw_native_end(void)
+{
+    rsx_live_draw_method(0x1808u, 0u);
 }
 
 void rsx_live_draw_set_movie_mode(int on)
