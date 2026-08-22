@@ -361,6 +361,15 @@ def exact_processes(executable: Path):
     ]
 
 
+def game_processes():
+    """Return every live yakuza_recomp process without mutating any of them."""
+    return {
+        pid: path
+        for pid, path in process_paths().items()
+        if os.path.basename(path).lower() == "yakuza_recomp.exe"
+    }
+
+
 def post_close(pid: int):
     user32 = ctypes.windll.user32
     windows = []
@@ -522,6 +531,365 @@ def self_test(root: Path, reference_path: Path):
         "the first Akiyama X-prompt accepted at the correct boundary"
     )
 
+    gun_dir = (
+        root / "scratch" / "frontier-fullroute-20260820-accept20-capture"
+    )
+    gun_refs = [
+        scene_features(gun_dir / f"frontier_probe_{serial:03d}.ppm")
+        for serial in (20, 21, 23, 28)
+    ]
+    stable = scene_features(gun_dir / "frontier_probe_028.ppm")
+    best = min(coarse_scene_mae(reference, stable) for reference in gun_refs)
+    if best > 0.22:
+        raise AssertionError(f"archived gun reference mismatch: {best}")
+    print(
+        "[akiyama-harness-test] PASS: archived leg-3 gun tutorial frame "
+        f"recognized (best coarse MAE {best:.6f})"
+    )
+
+
+def run_gun(args):
+    """Drive the established three-leg route and measure stable gun gameplay."""
+    executable = args.exe.resolve()
+    game_dir = args.game_dir.resolve()
+    game_elf = game_dir / "game" / "EBOOT.elf"
+    cache_path = executable.parent / "CMakeCache.txt"
+    reference_dir = args.gun_reference_dir.resolve()
+    reference_paths = [
+        reference_dir / f"frontier_probe_{serial:03d}.ppm"
+        for serial in (20, 21, 23, 28)
+    ]
+    for path, label in (
+        (executable, "executable"),
+        (game_elf, "game ELF"),
+        (cache_path, "CMake cache"),
+        *((path, "gun scene reference") for path in reference_paths),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"missing {label}: {path}")
+
+    cache = parse_cache(cache_path)
+    expected_cache = dict(EXPECTED_CACHE)
+    if args.expect_shufb:
+        expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
+    if args.expect_ls128:
+        expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
+    mismatches = {
+        name: {"expected": expected, "actual": cache.get(name)}
+        for name, expected in expected_cache.items()
+        if cache.get(name) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"production configuration mismatch: {mismatches}")
+    existing = game_processes()
+    if existing:
+        raise RuntimeError(f"game process already running: {existing}")
+
+    scratch = game_dir / "scratch"
+    scratch.mkdir(exist_ok=True)
+    run_dir = scratch / args.tag
+    capture_dir = scratch / f"{args.tag}-capture"
+    if run_dir.exists() or capture_dir.exists():
+        raise FileExistsError(f"refusing to reuse run tag {args.tag}")
+    run_dir.mkdir()
+    capture_dir.mkdir()
+    stdout_path = run_dir / "game.out"
+    stderr_path = run_dir / "game.err"
+    stop_path = run_dir / "gun-route-ready.txt"
+    result_path = run_dir / "result.json"
+    first_arm = capture_dir / "arm-movement.txt"
+
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("YZ_")}
+    yz = {
+        "YZ_MOVIE_HLE": "1",
+        "YZ_AUTO_START": "1",
+        "YZ_AUTO_NEW_GAME": "1",
+        "YZ_A010_ACCEPT_FAST": "1",
+        "YZ_FRONTIER_ACCEPT_FAST": "1",
+        "YZ_MOVEMENT_PROOF": "1",
+        "YZ_MOVEMENT_PROOF_DELAY_MS": "180000",
+        "YZ_MOVEMENT_PROOF_ARM_FILE": str(first_arm),
+        "YZ_MOVEMENT_PROOF_MAX_LEGS": "3",
+        "YZ_MOVEMENT_PROOF_FRONTIER_LEG": "2",
+        "YZ_MOVEMENT_PROOF_READY_MIN_SERIAL": "1",
+        "YZ_MOVEMENT_PROOF_READY_NONBLACK": "100000",
+        "YZ_MOVEMENT_PROOF_READY_HUD_PALE_PPM": "100000",
+        "YZ_MOVEMENT_PROOF_READY_VISIBLE_PROBES": "3",
+        # Two consecutive positive gameplay probes are required.  At the
+        # first city return, authored dialogue obscures the minimap on every
+        # third 30-second sample; requiring three uninterrupted minimap
+        # samples therefore cannot complete even though the same city state
+        # is positively re-established twice.  Frontier/gun acceptance still
+        # additionally requires the transition marker, three-region gun HUD,
+        # leg-3 state marker, and archived framebuffer match.
+        "YZ_MOVEMENT_PROOF_STABLE_VISIBLE_PROBES": "2",
+        "YZ_MOVEMENT_PROOF_HOLD_MS": "60000",
+        "YZ_MOVEMENT_PROOF_FINAL_HOLD_MS": "10000",
+        "YZ_MOVEMENT_PROOF_LX": "128",
+        "YZ_MOVEMENT_PROOF_LY": "0",
+        "YZ_MOVEMENT_PROOF_FINAL_HUD_PPM": "0",
+        "YZ_MOVEMENT_PROOF_LOADING_NONBLACK_MAX": "20000",
+        "YZ_MOVEMENT_PROOF_GUN_HUD_PALE_PPM": "5000",
+        "YZ_MOVEMENT_PROOF_SKIP_CAMERA": "1",
+        "YZ_MOVEMENT_PROBE_INTERVAL_MS": "30000",
+        "YZ_MOVEMENT_PROOF_STOP_FILE": str(stop_path),
+        "YZ_RSX_VALIDATION_CAPTURE": "1",
+        "YZ_RSX_VALIDATION_DIR": str(capture_dir),
+        "YZ_DIALOGUE_PULSE_PERIOD_MS": "2200",
+        "YZ_DIALOGUE_PULSE_HOLD_MS": "1400",
+    }
+    environment.update(yz)
+    result = {
+        "tag": args.tag,
+        "route": "three-leg-post-frontier-gun",
+        "status": "launching",
+        "executable": str(executable),
+        "executable_sha256": sha256_file(executable),
+        "game_elf": str(game_elf),
+        "configuration": {
+            name: cache.get(name)
+            for name in (
+                *EXPECTED_CACHE,
+                "YZ_SPU_SIMD_SHUFB",
+                "YZ_SPU_SIMD_LS128",
+            )
+        },
+        "active_yz": yz,
+        "gun_reference_dir": str(reference_dir),
+        "captures": [],
+        "route_markers": {},
+    }
+    gun_references = [scene_features(path) for path in reference_paths]
+    stdout_handle = stdout_path.open("wb")
+    stderr_handle = stderr_path.open("wb")
+    process = None
+    forced = False
+    seen = set()
+    try:
+        process = subprocess.Popen(
+            [str(executable), str(game_elf)], cwd=str(game_dir),
+            env=environment, stdout=stdout_handle, stderr=stderr_handle,
+        )
+        result["pid"] = process.pid
+        stale_qpc = scratch / f"present_qpc_{process.pid}.csv"
+        if stale_qpc.exists():
+            stale_qpc.unlink()
+        result["status"] = "routing"
+        print(f"[gun-harness] launched exact PID {process.pid}", flush=True)
+        time.sleep(1.0)
+        live_games = game_processes()
+        if live_games != {process.pid: str(executable)}:
+            normalized = {
+                pid: os.path.normcase(os.path.abspath(path))
+                for pid, path in live_games.items()
+            }
+            wanted = os.path.normcase(str(executable))
+            if normalized != {process.pid: wanted}:
+                raise RuntimeError(f"single-game-process invariant failed: {live_games}")
+        config_match, _ = wait_log(
+            stderr_path, r"\[config\].*lane=clean", 60, process
+        )
+        result["runtime_config_line"] = config_match.group(0)
+
+        deadline = time.monotonic() + args.gun_route_timeout
+        last_capture_progress = time.monotonic()
+        stable_three = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"game exited during gun route: {process.returncode}")
+            for path in sorted(capture_dir.glob("frontier_probe_*.ppm")):
+                if path in seen:
+                    continue
+                try:
+                    features = scene_features(path)
+                except (OSError, ValueError):
+                    continue
+                seen.add(path)
+                last_capture_progress = time.monotonic()
+                serial = int(path.stem.rsplit("_", 1)[-1])
+                best_gun_mae = min(
+                    coarse_scene_mae(reference, features)
+                    for reference in gun_references
+                )
+                result["captures"].append({
+                    "serial": serial,
+                    "path": str(path),
+                    "best_gun_mae": round(best_gun_mae, 6),
+                })
+                print(
+                    f"[gun-harness] {path.name}: best_gun_mae={best_gun_mae:.4f}",
+                    flush=True,
+                )
+
+            ready = sorted(capture_dir.glob("frontier_ready_*.txt"))
+            if ready and not first_arm.exists():
+                first_arm.write_text(
+                    f"armed after {ready[0].name}\n", encoding="ascii"
+                )
+                result["route_markers"]["initial_ready"] = str(ready[0])
+                print(f"[gun-harness] armed leg 1 after {ready[0].name}", flush=True)
+            for leg in (1, 2):
+                stable = sorted(capture_dir.glob(f"stable_gameplay_leg_{leg}_*.txt"))
+                next_arm = capture_dir / f"arm-movement-{leg + 1}.txt"
+                if stable and not next_arm.exists():
+                    next_arm.write_text(
+                        f"armed after {stable[0].name}\n", encoding="ascii"
+                    )
+                    result["route_markers"][f"stable_leg_{leg}"] = str(stable[0])
+                    print(
+                        f"[gun-harness] armed leg {leg + 1} after {stable[0].name}",
+                        flush=True,
+                    )
+
+            stable_files = sorted(
+                capture_dir.glob("stable_gameplay_leg_3_*.txt")
+            )
+            if stable_files:
+                candidate = stable_files[0]
+                serial = int(candidate.stem.rsplit("_", 1)[-1])
+                capture = next(
+                    (item for item in result["captures"]
+                     if item["serial"] == serial), None
+                )
+                if capture and capture["best_gun_mae"] <= args.gun_anchor_mae:
+                    stable_three = candidate
+                    result["route_markers"]["stable_leg_3"] = str(candidate)
+                    result["gun_checkpoint_capture"] = capture
+                    stop_path.write_text(
+                        f"stable gun checkpoint {candidate.name}\n",
+                        encoding="ascii",
+                    )
+                    break
+
+            no_capture_for = time.monotonic() - last_capture_progress
+            if no_capture_for >= 150.0 and stderr_path.exists():
+                tail = stderr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-262144:]
+                idle_states = re.findall(
+                    r"\[rsx-idle\] 10s no-advance GET=([^\r\n]+)", tail
+                )
+                if len(idle_states) >= 3 and len(set(idle_states[-3:])) == 1:
+                    result["route_failure_class"] = "fifo-no-progress"
+                    result["route_failure_state"] = idle_states[-1]
+                    raise RuntimeError(
+                        "gun route repeated one FIFO no-progress state"
+                    )
+            time.sleep(0.25)
+        if stable_three is None:
+            raise TimeoutError("stable post-Frontier gun tutorial not reached")
+
+        route_match, _ = wait_log(
+            stderr_path,
+            r"\[movement-proof\] route complete legs=3; stable gameplay "
+            r"confirmed; synthetic input stopped",
+            20, process,
+        )
+        stop_match, _ = wait_log(
+            stderr_path,
+            r"\[movement-proof\] visual probe stopped at confirmed route "
+            r"checkpoint present_id=([0-9]+)",
+            20, process,
+        )
+        result["route_complete_line"] = route_match.group(0)
+        result["measurement_start_present_id"] = int(stop_match.group(1))
+        result["capture_count_at_checkpoint"] = len(
+            list(capture_dir.glob("frontier_probe_*.ppm"))
+        )
+        result["status"] = "measuring"
+        print(
+            f"[gun-harness] stable gun scene; measuring {args.hold_seconds}s",
+            flush=True,
+        )
+        end = time.monotonic() + args.hold_seconds
+        while time.monotonic() < end:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"game exited during gun measurement: {process.returncode}"
+                )
+            time.sleep(min(0.5, end - time.monotonic()))
+
+        result["status"] = "closing"
+        windows = post_close(process.pid)
+        result["wm_close_windows"] = windows
+        if not windows:
+            raise RuntimeError("no visible exact-PID window found for normal shutdown")
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            forced = True
+            process.terminate()
+            process.wait(timeout=10)
+        result["exit_code"] = process.returncode
+        result["forced_close"] = forced
+
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        if not re.search(r"Frontier (?:loading observed|transition inferred)",
+                         stderr_text):
+            raise RuntimeError("route lacked a positive Frontier transition marker")
+        probe_present_ids = {
+            int(serial): int(present_id)
+            for serial, present_id in re.findall(
+                r"\[movement-proof\] clean-frontier-probe serial=([0-9]+).*? "
+                r"present_id=([0-9]+)", stderr_text,
+            )
+        }
+        result["probe_present_ids"] = probe_present_ids
+        for capture in result["captures"]:
+            capture["present_id"] = probe_present_ids.get(capture["serial"])
+        capture_count_after = len(list(capture_dir.glob("frontier_probe_*.ppm")))
+        result["capture_count_after_shutdown"] = capture_count_after
+        if capture_count_after != result["capture_count_at_checkpoint"]:
+            raise RuntimeError(
+                "renderer capture continued after gun checkpoint: "
+                f"{result['capture_count_at_checkpoint']} -> {capture_count_after}"
+            )
+        qpc_path = scratch / f"present_qpc_{process.pid}.csv"
+        result["present_qpc_path"] = str(qpc_path)
+        if not qpc_path.is_file():
+            raise RuntimeError(f"shutdown did not preserve Present QPC ring: {qpc_path}")
+        metrics = qpc_metrics(
+            qpc_path, result["measurement_start_present_id"], bucket_seconds=5.0
+        )
+        result.update(metrics)
+        result["scenes"] = {
+            "post_frontier_gun_tutorial": {
+                "kind": "stationary",
+                "route_valid": True,
+                "input_stopped": True,
+                "readback_stopped": True,
+                **metrics,
+            }
+        }
+        fps = result["fps_samples"]
+        if forced:
+            result["status"] = "forced-close"
+        elif process.returncode != 0:
+            result["status"] = "nonzero-exit"
+        elif len(fps) < max(3, int(args.hold_seconds // 5) - 1):
+            result["status"] = "insufficient-fps-samples"
+        else:
+            result["status"] = "passed"
+    except Exception as exc:
+        result["status"] = "failed"
+        result["failure"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            post_close(process.pid)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                forced = True
+                process.terminate()
+                process.wait(timeout=10)
+        stdout_handle.close()
+        stderr_handle.close()
+        result["forced_close"] = forced
+        result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"[gun-harness] result: {result_path}", flush=True)
+    return 0 if result["status"] == "passed" else 2
+
 
 def run(args):
     executable = args.exe.resolve()
@@ -553,9 +921,9 @@ def run(args):
     }
     if mismatches:
         raise RuntimeError(f"production configuration mismatch: {mismatches}")
-    existing = exact_processes(executable)
+    existing = game_processes()
     if existing:
-        raise RuntimeError(f"exact executable already running as PID(s) {existing}")
+        raise RuntimeError(f"game process already running: {existing}")
 
     scratch = game_dir / "scratch"
     scratch.mkdir(exist_ok=True)
@@ -640,9 +1008,9 @@ def run(args):
         result["status"] = "routing"
         print(f"[akiyama-harness] launched exact PID {process.pid}", flush=True)
         time.sleep(1.0)
-        if exact_processes(executable) != [process.pid]:
+        if list(game_processes()) != [process.pid]:
             raise RuntimeError(
-                f"single-process invariant failed: {exact_processes(executable)}"
+                f"single-game-process invariant failed: {game_processes()}"
             )
         config_match, _ = wait_log(
             stderr_path,
@@ -911,6 +1279,10 @@ def main():
     parser.add_argument("--expect-ls128", choices=("ON", "OFF"))
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
+    parser.add_argument("--gun-route", action="store_true")
+    parser.add_argument("--gun-reference-dir", type=Path)
+    parser.add_argument("--gun-anchor-mae", type=float, default=0.22)
+    parser.add_argument("--gun-route-timeout", type=float, default=1500)
     parser.add_argument("--required-matches", type=int, default=3)
     parser.add_argument("--hold-seconds", type=float, default=35)
     parser.add_argument("--fe0", action="store_true")
@@ -942,6 +1314,12 @@ def main():
         )
     if args.game_dir is None:
         args.game_dir = root
+    if args.gun_reference_dir is None:
+        args.gun_reference_dir = (
+            root
+            / "scratch"
+            / "frontier-fullroute-20260820-accept20-capture"
+        )
     if args.reference is None:
         args.reference = (
             root
@@ -987,6 +1365,12 @@ def main():
             "measurement_presents": result["measurement_presents"],
         }))
         return 0 if result["status"] == "passed" else 2
+    if args.gun_route:
+        if any((args.fe0, args.fe0_callback_replay, args.nr_shadow_census,
+                args.nr_flip, args.nr_clear, args.nr_draw,
+                args.draw_phases, args.wkl4_cycle)):
+            parser.error("gun route accepts no diagnostic/family lane")
+        return run_gun(args)
     return run(args)
 
 

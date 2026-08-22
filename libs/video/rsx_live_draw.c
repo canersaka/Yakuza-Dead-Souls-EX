@@ -7763,7 +7763,14 @@ static void ld_movement_probe_mark_ready(
                         (unsigned long long)g_ld_last_dump_hud_pale_ppm);
                 fflush(stderr);
             }
-        } else if (!gameplay_ready) {
+        } else if (!gameplay_ready || !transition_ready) {
+            /* A substantial frame at the Frontier leg is not necessarily
+             * post-Frontier gameplay.  In particular, the authored X-prompt
+             * reached after leg 2 is visible but still precedes loading.  It
+             * must resume the bounded Confirm cadence; treating visibility
+             * alone as gameplay left the unattended route parked forever.
+             * Leg 3 remains impossible to arm until the independent loading
+             * or three-region gun-HUD transition proof above succeeds. */
             stable_gameplay_probes = 0;
             InterlockedExchange(&g_yz_movement_gameplay_returned, 0);
             if (InterlockedCompareExchange(
@@ -8483,10 +8490,12 @@ void rsx_live_draw_present(u32 buffer_id)
         static int probe_enabled = -1;
         static char probe_dir[MAX_PATH * 2];
         static char route_stop_file[MAX_PATH * 2];
+        static char movement_stop_file[MAX_PATH * 2];
         static int akiyama_route;
         static u64 probe_delay_ms;
         static u64 probe_interval_ms;
         static u64 next_probe_tick;
+        static u64 next_movement_stop_poll;
         static u32 probe_serial;
         if (probe_enabled < 0) {
             const char* enabled = getenv("YZ_MOVEMENT_PROOF");
@@ -8494,6 +8503,8 @@ void rsx_live_draw_present(u32 buffer_id)
             const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
             const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
             const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+            const char* movement_stop =
+                getenv("YZ_MOVEMENT_PROOF_STOP_FILE");
             akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
             probe_enabled = ((enabled && *enabled) || akiyama_route) &&
                 directory && *directory;
@@ -8511,6 +8522,12 @@ void rsx_live_draw_present(u32 buffer_id)
                             "stop file is required\n");
                     fflush(stderr);
                 }
+                if (!akiyama_route && movement_stop && *movement_stop) {
+                    strncpy(movement_stop_file, movement_stop,
+                            sizeof(movement_stop_file) - 1u);
+                    movement_stop_file[
+                        sizeof(movement_stop_file) - 1u] = '\0';
+                }
                 probe_delay_ms = delay && *delay
                     ? _strtoui64(delay, NULL, 10) :
                     (akiyama_route ? 120000ull : 780000ull);
@@ -8519,6 +8536,21 @@ void rsx_live_draw_present(u32 buffer_id)
                 if (probe_interval_ms < (akiyama_route ? 2000ull : 30000ull))
                     probe_interval_ms =
                         akiyama_route ? 2000ull : 30000ull;
+            }
+        }
+        if (probe_enabled && !akiyama_route && movement_stop_file[0]) {
+            const u64 now = GetTickCount64();
+            if (now >= next_movement_stop_poll) {
+                next_movement_stop_poll = now + 250ull;
+                if (GetFileAttributesA(movement_stop_file) !=
+                        INVALID_FILE_ATTRIBUTES) {
+                    probe_enabled = 0;
+                    fprintf(stderr,
+                            "[movement-proof] visual probe stopped at "
+                            "confirmed route checkpoint present_id=%llu\n",
+                            (unsigned long long)g_ld_present_total);
+                    fflush(stderr);
+                }
             }
         }
         if (probe_enabled && g_yz_auto_start_tick) {
