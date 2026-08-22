@@ -20,6 +20,14 @@
 #include <stdatomic.h>     /* FIX 2 (2026-07-17): channel/event cross-thread atomics */
 #include "ps3emu/yz_runtime_config.h"
 
+#if defined(_MSC_VER)
+#include <tmmintrin.h>
+#endif
+
+#ifndef YZ_SPU_SIMD_LS128
+#define YZ_SPU_SIMD_LS128 0
+#endif
+
 /*
  * Profiling itself is observation-only and disappears from clean lanes.
  * Do not redefine getenv here: this header also reaches behavior/repair
@@ -561,12 +569,24 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     u128 v;
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
+#if YZ_SPU_SIMD_LS128 && (defined(_MSC_VER) || defined(__SSSE3__))
+    /* Reverse bytes independently inside each architectural 32-bit word.
+     * This is exactly the scalar conversion below expressed as one PSHUFB. */
+    const __m128i bytes = _mm_loadu_si128(
+        (const __m128i*)(const void*)p);
+    const __m128i word_reverse = _mm_setr_epi8(
+        3, 2, 1, 0, 7, 6, 5, 4,
+        11, 10, 9, 8, 15, 14, 13, 12);
+    _mm_storeu_si128((__m128i*)(void*)&v,
+                     _mm_shuffle_epi8(bytes, word_reverse));
+#else
     for (int i = 0; i < 4; i++) {
         v._u32[i] = ((uint32_t)p[i*4]     << 24) |
                     ((uint32_t)p[i*4 + 1] << 16) |
                     ((uint32_t)p[i*4 + 2] <<  8) |
                     (uint32_t)p[i*4 + 3];
     }
+#endif
     yz_tagread_repair_read((spu_context*)ctx, lsa, v._u32);
 #if defined(YZ_PERF_CLEAN)
     return v;
@@ -1021,6 +1041,15 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
 #endif
     uint8_t* p = &ctx->ls[lsa];
+#if YZ_SPU_SIMD_LS128 && (defined(_MSC_VER) || defined(__SSSE3__))
+    const __m128i words = _mm_loadu_si128(
+        (const __m128i*)(const void*)&val);
+    const __m128i word_reverse = _mm_setr_epi8(
+        3, 2, 1, 0, 7, 6, 5, 4,
+        11, 10, 9, 8, 15, 14, 13, 12);
+    _mm_storeu_si128((__m128i*)(void*)p,
+                     _mm_shuffle_epi8(words, word_reverse));
+#else
     for (int i = 0; i < 4; i++) {
         uint32_t w = val._u32[i];
         p[i*4]     = (uint8_t)(w >> 24);
@@ -1028,6 +1057,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+#endif
 #if !defined(YZ_PERF_CLEAN)
     /* DIAG (YZ_SPU_PROF): watch ActivateWorkload's write to the kernel-context
      * wklRunnable1 field (LS 0x1EC, word2 of the 0x1E0 quadword). Logs when the
