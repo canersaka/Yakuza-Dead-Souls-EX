@@ -1732,6 +1732,51 @@ static void test_intercept_backend_end_to_end(void)
     rsx_nr_ring_destroy(&ring);
 }
 
+/* Exact shape of the first live draw bridge: BEGIN and batches are mirrored
+ * through FIFO shadow mode; before END reaches the shadow, the typed backend
+ * owns one DRAW action; shadowing END then resets the batch accumulator. */
+static void test_live_draw_end_bridge_shape(void)
+{
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 1024, 32768) == 0, "ring init");
+    rsx_nr_intercept it;
+    rsx_nr_intercept_init(&it, &ring, &tokens,
+                          (1u << RSX_NR_FAM_DRAW), 1);
+
+    rsx_nr_intercept_shadow_method(&it, 0x1808, 5); /* BEGIN triangles */
+    rsx_nr_intercept_shadow_method(&it, 0x1814, (11u << 24) | 4u);
+    CHECK(it.shadow.batch_count == 1 && !it.shadow.draw_indexed &&
+          !it.shadow.draw_mixed,
+          "shadow did not retain live draw batch");
+
+    exec_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.user = &rec;
+    ops.draw = rec_draw;
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+
+    CHECK(rsx_nr_try_draw(&it, it.shadow.rsx.current_primitive,
+                          it.shadow.draw_indexed, it.shadow.batches,
+                          it.shadow.batch_count) == 1,
+          "live-shape typed draw refused");
+    rsx_nr_backend_run(&be, 0);
+    CHECK(strcmp(rec.kinds, "D") == 0, "live-shape execution '%s'",
+          rec.kinds);
+    CHECK(be.stats.executed[RSX_NIR_OP_DRAW] == 1 &&
+          be.stats.exec_errors == 0,
+          "live-shape backend accounting wrong");
+
+    rsx_nr_intercept_shadow_method(&it, 0x1808, 0); /* END after ownership */
+    CHECK(it.shadow.batch_count == 0,
+          "shadow END did not reset live batch accumulator");
+    rsx_nr_ring_destroy(&ring);
+}
+
 /* ---- optional real-capture leg ----------------------------------------- */
 
 typedef struct rxs_head {
@@ -2001,6 +2046,7 @@ int main(int argc, char** argv)
     test_partial_publication();
     test_reset_semantics();
     test_intercept_backend_end_to_end();
+    test_live_draw_end_bridge_shape();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])

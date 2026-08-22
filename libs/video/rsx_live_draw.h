@@ -81,6 +81,11 @@ void rsx_live_draw_native_present(u32 buffer_id);
  * ordered CLEAR action. */
 void rsx_live_draw_native_clear(u32 mask);
 
+/* Native-render draw-family bridge.  Prior BEGIN/batch/state methods have
+ * already populated the legacy live renderer; this invokes only its END
+ * action after typed ordering/state validation. */
+void rsx_live_draw_native_end(void);
+
 /* Publish the FIFO bounds associated with the next flip method.  The live
  * consumer calls this only for driver-queue methods; ordinary method traffic
  * pays no extra synchronization cost. */

@@ -57,6 +57,8 @@ static unsigned long long g_yz_nr_live_flip_owned;
 static unsigned long long g_yz_nr_live_flip_fallback;
 static unsigned long long g_yz_nr_live_clear_owned;
 static unsigned long long g_yz_nr_live_clear_fallback;
+static unsigned long long g_yz_nr_live_draw_owned;
+static unsigned long long g_yz_nr_live_draw_fallback;
 static unsigned long long g_yz_nr_live_faults;
 
 static int yz_nr_live_present(void*, uint32_t buffer_id)
@@ -69,6 +71,14 @@ static int yz_nr_live_clear(void*, const rsx_nir_pipeline*,
                             const rsx_nir_clear* clear)
 {
     rsx_live_draw_native_clear(clear->mask);
+    return 0;
+}
+
+static int yz_nr_live_draw(void*, const rsx_nir_pipeline*,
+                           const uint32_t*, uint32_t,
+                           const rsx_nir_draw*, const uint32_t*)
+{
+    rsx_live_draw_native_end();
     return 0;
 }
 
@@ -94,6 +104,7 @@ static void yz_nr_shadow_init(void)
     rsx_nr_exec_ops ops = {};
     ops.present = yz_nr_live_present;
     ops.clear = yz_nr_live_clear;
+    ops.draw = yz_nr_live_draw;
     rsx_nr_backend_init(&g_yz_nr_backend, &g_yz_nr_shadow_ring,
                         &g_yz_nr_shadow_tokens, &ops);
     InterlockedExchange(&g_yz_nr_shadow_enabled, 1);
@@ -140,6 +151,33 @@ static int yz_nr_try_live_clear(uint32_t mask)
     return 1;
 }
 
+static int yz_nr_try_live_draw(void)
+{
+    if (!g_yz_nr_shadow_enabled ||
+        !rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_DRAW))
+        return 0;
+    rsx_nir_adapter* shadow = &g_yz_nr_shadow.shadow;
+    if (!shadow->batch_count || shadow->draw_mixed) {
+        rsx_nr_note_fallback(&g_yz_nr_shadow, RSX_NR_FAM_DRAW,
+                             RSX_NR_FB_UNSUPPORTED);
+        g_yz_nr_live_draw_fallback++;
+        return 0;
+    }
+    if (!rsx_nr_try_draw(&g_yz_nr_shadow,
+                         shadow->rsx.current_primitive,
+                         shadow->draw_indexed,
+                         shadow->batches, shadow->batch_count)) {
+        g_yz_nr_live_draw_fallback++;
+        return 0;
+    }
+    g_yz_nr_live_draw_owned++;
+    rsx_nr_backend_run(&g_yz_nr_backend, 0);
+    if (rsx_nr_ring_depth(&g_yz_nr_shadow_ring) != 0 ||
+        g_yz_nr_backend.stats.exec_errors != 0)
+        g_yz_nr_live_faults++;
+    return 1;
+}
+
 /* A refused typed flip runs through the unchanged FIFO renderer first.  At
  * this consumer-side boundary that means its fallback episode is already
  * drained, so publish the token and consume only the aggregate marker. */
@@ -177,6 +215,16 @@ static void yz_nr_shadow_shutdown(void)
                 "clear=%llu errors=%llu faults=%llu depth=%u rejects=%lld]\n",
                 g_yz_nr_live_clear_owned, g_yz_nr_live_clear_fallback,
                 g_yz_nr_backend.stats.executed[RSX_NIR_OP_CLEAR],
+                g_yz_nr_backend.stats.exec_errors, g_yz_nr_live_faults,
+                rsx_nr_ring_depth(&g_yz_nr_shadow_ring),
+                g_yz_nr_shadow_ring.rejects);
+    }
+    if (rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_DRAW)) {
+        fprintf(stderr,
+                "[nr-live: family=draw owned=%llu fallback=%llu "
+                "draw=%llu errors=%llu faults=%llu depth=%u rejects=%lld]\n",
+                g_yz_nr_live_draw_owned, g_yz_nr_live_draw_fallback,
+                g_yz_nr_backend.stats.executed[RSX_NIR_OP_DRAW],
                 g_yz_nr_backend.stats.exec_errors, g_yz_nr_live_faults,
                 rsx_nr_ring_depth(&g_yz_nr_shadow_ring),
                 g_yz_nr_shadow_ring.rejects);
@@ -3495,13 +3543,19 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     const int nr_clear_selected =
         (method & 0x1FFCu) == 0x1D94u && g_yz_nr_shadow_enabled &&
         rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_CLEAR);
+    const int nr_draw_selected =
+        (method & 0x1FFCu) == 0x1808u && arg == 0u &&
+        g_yz_nr_shadow_enabled &&
+        rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_DRAW);
     const int nr_flip_owned =
         nr_flip_selected ? yz_nr_try_live_flip(arg) : 0;
     const int nr_clear_owned =
         nr_clear_selected ? yz_nr_try_live_clear(arg) : 0;
-    if (!nr_flip_owned && !nr_clear_owned) {
+    const int nr_draw_owned =
+        nr_draw_selected ? yz_nr_try_live_draw() : 0;
+    if (!nr_flip_owned && !nr_clear_owned && !nr_draw_owned) {
         rsx_live_draw_method(method, arg);
-        if (nr_flip_selected || nr_clear_selected)
+        if (nr_flip_selected || nr_clear_selected || nr_draw_selected)
             yz_nr_live_flip_fallback_complete();
     }
 
