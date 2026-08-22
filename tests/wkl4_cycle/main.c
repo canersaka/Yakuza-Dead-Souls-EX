@@ -75,6 +75,29 @@ static void hot_loop_subphases_are_separate(void)
     CHECK(yz_wkl4_cycle_test_clock_reads() == 5u);
 }
 
+static void region_7e50_subphases_are_separate(void)
+{
+    yz_wkl4_cycle_test_reset(1);
+    yz_wkl4_cycle_test_set_clock(10u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_7E50_LOOP);
+    yz_wkl4_cycle_test_set_clock(40u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_7E50_SCATTER);
+    yz_wkl4_cycle_test_set_clock(90u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_7E50_SHUFFLE);
+    yz_wkl4_cycle_test_set_clock(160u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_7E50_COMMIT);
+    yz_wkl4_cycle_test_set_clock(180u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_7E50_LOOP);
+    yz_wkl4_cycle_test_set_clock(220u);
+    yz_wkl4_cycle_leave();
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_7E50_LOOP) == 70u);
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_7E50_SCATTER) == 50u);
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_7E50_SHUFFLE) == 70u);
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_7E50_COMMIT) == 20u);
+    CHECK(yz_wkl4_cycle_test_entries(YZ_WKL4_CYCLE_7E50_LOOP) == 2u);
+    CHECK(yz_wkl4_cycle_test_clock_reads() == 6u);
+}
+
 static void interval_boundary_excludes_prior_work(void)
 {
     yz_wkl4_cycle_test_reset(1);
@@ -96,6 +119,7 @@ int main(void)
     repeated_loop_marks_do_not_read_the_clock();
     region_change_closes_the_previous_segment();
     hot_loop_subphases_are_separate();
+    region_7e50_subphases_are_separate();
     interval_boundary_excludes_prior_work();
     if (failures) {
         fprintf(stderr, "wkl4 cycle tests: %d failure(s)\n", failures);

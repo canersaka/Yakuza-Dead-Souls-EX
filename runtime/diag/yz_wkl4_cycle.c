@@ -186,7 +186,8 @@ const char* yz_wkl4_cycle_tag_name(yz_wkl4_cycle_tag tag)
 {
     static const char* names[YZ_WKL4_CYCLE_TAG_COUNT] = {
         "none",
-        "7e50_setup", "7e50_loop", "7e50_tail",
+        "7e50_setup", "7e50_loop_load", "7e50_loop_scatter",
+        "7e50_loop_shuffle", "7e50_loop_commit", "7e50_tail",
         "8230_setup", "8230_loop_prepare", "8230_loop_compare",
         "8230_loop_store", "8230_tail",
         "8680_setup", "8680_loop", "8680_tail",
