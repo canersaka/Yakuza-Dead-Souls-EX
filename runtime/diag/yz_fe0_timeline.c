@@ -13,7 +13,7 @@
 #include <unistd.h>
 #endif
 
-/* 65,536 records / 64 bytes = 4 MiB of fixed BSS, with no heap activity. */
+/* 65,536 fixed records, with no heap activity. */
 #define YZ_FE0_TIMELINE_CAPACITY 65536u
 #define YZ_FE0_TIMELINE_MASK (YZ_FE0_TIMELINE_CAPACITY - 1u)
 #define YZ_FE0_BARRIER_FIRST_CAPACITY 64u
@@ -23,6 +23,9 @@ typedef struct yz_fe0_slot {
     _Atomic uint64_t published_sequence;
     yz_fe0_timeline_record record;
 } yz_fe0_slot;
+
+_Static_assert(sizeof(yz_fe0_slot) == 72u,
+               "FE0 timeline slot size changed unexpectedly");
 
 static yz_fe0_slot g_records[YZ_FE0_TIMELINE_CAPACITY];
 static _Atomic uint64_t g_claimed;
@@ -92,6 +95,10 @@ static yz_fe0_acquire_state g_acquire;
 #if defined(YZ_FE0_TIMELINE_TEST)
 static uint64_t g_test_clock;
 static uint64_t g_test_clock_reads;
+static uint64_t g_test_thread_time;
+static uint64_t g_test_thread_time_reads;
+static uint64_t g_test_thread_cycles;
+static uint64_t g_test_thread_cycle_reads;
 #endif
 
 volatile long g_yz_fe0_timeline_enabled;
@@ -119,6 +126,46 @@ static uint64_t yz_fe0_clock(void)
     clock_gettime(CLOCK_MONOTONIC, &value);
     return (uint64_t)value.tv_sec * 1000000000ull +
            (uint64_t)value.tv_nsec;
+#endif
+}
+
+static uint64_t yz_fe0_thread_time_100ns(void)
+{
+#if defined(YZ_FE0_TIMELINE_TEST)
+    ++g_test_thread_time_reads;
+    return g_test_thread_time;
+#elif defined(_WIN32)
+    FILETIME created, exited, kernel, user;
+    ULARGE_INTEGER kernel_value, user_value;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited,
+                        &kernel, &user))
+        return 0;
+    kernel_value.LowPart = kernel.dwLowDateTime;
+    kernel_value.HighPart = kernel.dwHighDateTime;
+    user_value.LowPart = user.dwLowDateTime;
+    user_value.HighPart = user.dwHighDateTime;
+    return kernel_value.QuadPart + user_value.QuadPart;
+#else
+    struct timespec value;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0)
+        return 0;
+    return (uint64_t)value.tv_sec * 10000000ull +
+           (uint64_t)value.tv_nsec / 100ull;
+#endif
+}
+
+static uint64_t yz_fe0_thread_cycles(void)
+{
+#if defined(YZ_FE0_TIMELINE_TEST)
+    ++g_test_thread_cycle_reads;
+    return g_test_thread_cycles;
+#elif defined(_WIN32)
+    ULONG64 cycles = 0;
+    return QueryThreadCycleTime(GetCurrentThread(), &cycles)
+        ? (uint64_t)cycles : 0u;
+#else
+    /* The portable CPU-time value is already retained above. */
+    return 0u;
 #endif
 }
 
@@ -298,6 +345,14 @@ void yz_fe0_timeline_emit(yz_fe0_event_type type, uint32_t cause,
     atomic_store_explicit(&slot->published_sequence, 0, memory_order_relaxed);
     slot->record.sequence = sequence;
     slot->record.qpc = yz_fe0_clock();
+    if (type == YZ_FE0_EVENT_WKL4_RESUME ||
+        type == YZ_FE0_EVENT_WKL4_HANDOFF) {
+        slot->record.thread_time_100ns = yz_fe0_thread_time_100ns();
+        slot->record.thread_cycles = yz_fe0_thread_cycles();
+    } else {
+        slot->record.thread_time_100ns = 0u;
+        slot->record.thread_cycles = 0u;
+    }
     slot->record.type = (uint32_t)type;
     slot->record.thread_id = yz_fe0_thread_id();
     slot->record.cause = cause;
@@ -406,7 +461,7 @@ void yz_fe0_timeline_shutdown(void)
     const uint64_t retained = total < YZ_FE0_TIMELINE_CAPACITY
         ? total : YZ_FE0_TIMELINE_CAPACITY;
     fprintf(stderr,
-            "[fe0-timeline] version=1 frequency=%llu claimed=%llu retained=%llu dropped=%llu\n",
+            "[fe0-timeline] version=3 frequency=%llu claimed=%llu retained=%llu dropped=%llu\n",
             (unsigned long long)g_frequency,
             (unsigned long long)total,
             (unsigned long long)retained,
@@ -472,9 +527,11 @@ void yz_fe0_timeline_shutdown(void)
         char line[256];
         const int formatted = snprintf(
             line, sizeof(line),
-            "[fe0-event] seq=%llu qpc=%llu type=%s tid=%u cause=%08X actor=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
+            "[fe0-event] seq=%llu qpc=%llu cpu100ns=%llu cycles=%llu type=%s tid=%u cause=%08X actor=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
             (unsigned long long)record->sequence,
             (unsigned long long)record->qpc,
+            (unsigned long long)record->thread_time_100ns,
+            (unsigned long long)record->thread_cycles,
             yz_fe0_event_name(record->type), record->thread_id,
             record->cause, record->actor, record->a0, record->a1,
             record->a2, record->a3);
@@ -520,6 +577,10 @@ void yz_fe0_timeline_test_reset(uint64_t frequency, int enabled)
     g_shutdown = 0;
     g_test_clock = 0;
     g_test_clock_reads = 0;
+    g_test_thread_time = 0;
+    g_test_thread_time_reads = 0;
+    g_test_thread_cycles = 0;
+    g_test_thread_cycle_reads = 0;
     g_yz_fe0_timeline_enabled = enabled ? 1 : 0;
 }
 
@@ -531,6 +592,26 @@ void yz_fe0_timeline_test_set_clock(uint64_t qpc)
 uint64_t yz_fe0_timeline_test_clock_reads(void)
 {
     return g_test_clock_reads;
+}
+
+void yz_fe0_timeline_test_set_thread_time(uint64_t time_100ns)
+{
+    g_test_thread_time = time_100ns;
+}
+
+uint64_t yz_fe0_timeline_test_thread_time_reads(void)
+{
+    return g_test_thread_time_reads;
+}
+
+void yz_fe0_timeline_test_set_thread_cycles(uint64_t cycles)
+{
+    g_test_thread_cycles = cycles;
+}
+
+uint64_t yz_fe0_timeline_test_thread_cycle_reads(void)
+{
+    return g_test_thread_cycle_reads;
 }
 
 uint64_t yz_fe0_timeline_test_claimed(void)

@@ -60,6 +60,11 @@ typedef enum yz_fe0_event_type {
 typedef struct yz_fe0_timeline_record {
     uint64_t sequence;
     uint64_t qpc;
+    /* Per-thread user+kernel time in 100 ns units. Populated only for the
+     * image-4 RESUME/HANDOFF boundaries; zero for every other event. */
+    uint64_t thread_time_100ns;
+    /* Precise cycle counter from the same host thread and boundaries. */
+    uint64_t thread_cycles;
     uint32_t type;
     uint32_t thread_id;
     uint32_t cause;
@@ -112,6 +117,10 @@ void yz_fe0_timeline_observe_wkl4_taskset_attempt(
 void yz_fe0_timeline_test_reset(uint64_t frequency, int enabled);
 void yz_fe0_timeline_test_set_clock(uint64_t qpc);
 uint64_t yz_fe0_timeline_test_clock_reads(void);
+void yz_fe0_timeline_test_set_thread_time(uint64_t time_100ns);
+uint64_t yz_fe0_timeline_test_thread_time_reads(void);
+void yz_fe0_timeline_test_set_thread_cycles(uint64_t cycles);
+uint64_t yz_fe0_timeline_test_thread_cycle_reads(void);
 uint64_t yz_fe0_timeline_test_claimed(void);
 int yz_fe0_timeline_test_record(uint64_t sequence,
                                 yz_fe0_timeline_record* out);

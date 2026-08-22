@@ -16,6 +16,8 @@ static void disabled_is_inert(void)
                                 7u, 6u, 1);
     CHECK(yz_fe0_timeline_test_claimed() == 0);
     CHECK(yz_fe0_timeline_test_clock_reads() == 0);
+    CHECK(yz_fe0_timeline_test_thread_time_reads() == 0);
+    CHECK(yz_fe0_timeline_test_thread_cycle_reads() == 0);
 }
 
 static void semantic_order_is_retained(void)
@@ -66,6 +68,8 @@ static void task_handoff_retains_callsite(void)
 {
     yz_fe0_timeline_test_reset(1000000u, 1);
     yz_fe0_timeline_test_set_clock(77u);
+    yz_fe0_timeline_test_set_thread_time(1234u);
+    yz_fe0_timeline_test_set_thread_cycles(5678u);
     yz_fe0_timeline_emit(YZ_FE0_EVENT_WKL4_HANDOFF,
                          0x42u, 3u, 9u, 4u, 2u, 0x5D34u);
     yz_fe0_timeline_record record;
@@ -74,7 +78,20 @@ static void task_handoff_retains_callsite(void)
     CHECK(record.cause == 0x42u && record.actor == 3u);
     CHECK(record.a0 == 9u && record.a1 == 4u);
     CHECK(record.a2 == 2u && record.a3 == 0x5D34u);
+    CHECK(record.thread_time_100ns == 1234u);
+    CHECK(record.thread_cycles == 5678u);
     CHECK(yz_fe0_timeline_test_clock_reads() == 1u);
+    CHECK(yz_fe0_timeline_test_thread_time_reads() == 1u);
+    CHECK(yz_fe0_timeline_test_thread_cycle_reads() == 1u);
+
+    yz_fe0_timeline_test_set_clock(78u);
+    yz_fe0_timeline_emit(YZ_FE0_EVENT_WKL4_RECORD,
+                         0x42u, 3u, 9u, 4u, 2u, 0x5D34u);
+    CHECK(yz_fe0_timeline_test_record(2u, &record));
+    CHECK(record.thread_time_100ns == 0u);
+    CHECK(record.thread_cycles == 0u);
+    CHECK(yz_fe0_timeline_test_thread_time_reads() == 1u);
+    CHECK(yz_fe0_timeline_test_thread_cycle_reads() == 1u);
 }
 
 static void key_change_starts_new_episode(void)
