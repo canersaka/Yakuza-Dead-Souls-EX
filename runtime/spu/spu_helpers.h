@@ -17,6 +17,15 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#if !defined(_MSC_VER) && defined(__SSSE3__)
+#include <tmmintrin.h>
+#elif !defined(_MSC_VER) && defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+#ifndef YZ_SPU_SIMD_ABSDB
+#define YZ_SPU_SIMD_ABSDB 0
+#endif
 
 #ifndef YZ_SPU_SIMD_XFLOAT
 #define YZ_SPU_SIMD_XFLOAT 0
@@ -640,7 +649,25 @@ static inline u128 spu_cgx(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++)
  * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
 static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
 static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
-static inline u128 spu_absdb(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
+static inline u128 spu_absdb(u128 a, u128 b)  {
+#if YZ_SPU_SIMD_ABSDB && (defined(_MSC_VER) || defined(__SSE2__))
+    /* ABSDB is max(a-b, 0) | max(b-a, 0) independently in every byte. */
+    const __m128i va = _mm_loadu_si128((const __m128i*)(const void*)&a);
+    const __m128i vb = _mm_loadu_si128((const __m128i*)(const void*)&b);
+    const __m128i value = _mm_or_si128(_mm_subs_epu8(va, vb),
+                                       _mm_subs_epu8(vb, va));
+    u128 r;
+    _mm_storeu_si128((__m128i*)(void*)&r, value);
+    return r;
+#else
+    u128 r;
+    for(int i=0;i<16;i++){
+        uint8_t x=a._u8[i],y=b._u8[i];
+        r._u8[i]=(uint8_t)(x>y?x-y:y-x);
+    }
+    return r;
+#endif
+}
 static inline u128 spu_avgb(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
 /* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
 static inline u128 spu_mpyhha(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }

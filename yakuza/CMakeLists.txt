@@ -64,6 +64,9 @@ option(YZ_SPU_SIMD_SHUFB
 option(YZ_SPU_SIMD_LS128
     "Use bit-exact SSSE3 word-byte conversion for SPU 128-bit local-store accesses."
     ON)
+option(YZ_SPU_SIMD_ABSDB
+    "Use the bit-exact SSE2 SPU absolute byte-difference helper."
+    ON)
 option(YZ_SPU_SIMD_XFLOAT
     "Use the bit-exact AVX2 ordinary-lane fast path for SPU xfloat arithmetic."
     ON)
@@ -103,6 +106,7 @@ target_compile_definitions(ps3recomp_runtime PRIVATE
     PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h"
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
+    YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
     YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
@@ -393,6 +397,7 @@ endif()
 target_compile_definitions(yakuza_recomp PRIVATE
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
+    YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
     YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(yakuza_recomp PRIVATE
