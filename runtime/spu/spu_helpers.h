@@ -215,7 +215,8 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-#if defined(_MSC_VER) || defined(__SSSE3__)
+#if (!defined(YZ_SPU_SIMD_SHUFB) || YZ_SPU_SIMD_SHUFB) && \
+    (defined(_MSC_VER) || defined(__SSSE3__))
     /*
      * PSHUFB performs the same lane-local byte lookup once the runtime's
      * within-word SPU byte mapping is folded into the selector.  SPU_W(p) is

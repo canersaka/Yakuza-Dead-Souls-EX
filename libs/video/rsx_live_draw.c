@@ -8550,11 +8550,13 @@ void rsx_live_draw_present(u32 buffer_id)
                             probe_dir, serial, nonblack);
                     fprintf(stderr,
                             "[%s] clean-frontier-probe serial=%u "
-                            "elapsed_ms=%llu frame=%u nonblack=%s%llu "
+                            "elapsed_ms=%llu frame=%u present_id=%llu "
+                            "nonblack=%s%llu "
                             "hud_pale_ppm=%llu path=%s\n",
                             akiyama_route ? "akiyama-route" :
                                 "movement-proof",
                             serial, (unsigned long long)elapsed, g_ld_frames,
+                            (unsigned long long)(g_ld_present_total + 1u),
                             nonblack == UINT64_MAX ? "unknown:" : "",
                             (unsigned long long)(
                                 nonblack == UINT64_MAX ? 0 : nonblack),

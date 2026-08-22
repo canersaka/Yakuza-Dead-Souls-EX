@@ -454,7 +454,8 @@ static void pad_merge_keyboard(void)
         static int route_started;
         static int route_stopped;
         static u16 prior_route_start;
-        static unsigned long long route_start_tick;
+        static unsigned long long route_input_tick;
+        static unsigned long long route_input_delay_ms;
         static unsigned long long next_stop_poll;
         static char stop_file[MAX_PATH * 2];
 
@@ -464,7 +465,13 @@ static void pad_merge_keyboard(void)
         }
         if (g_yz_runtime_config.akiyama_dialogue_route && !configured) {
             const char* path = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+            const char* delay = getenv("YZ_AKIYAMA_ROUTE_START_DELAY_MS");
             configured = 1;
+            if (delay && *delay) {
+                route_input_delay_ms = _strtoui64(delay, NULL, 10);
+                if (route_input_delay_ms > 120000ull)
+                    route_input_delay_ms = 120000ull;
+            }
             if (path && *path) {
                 strncpy(stop_file, path, sizeof(stop_file) - 1u);
                 stop_file[sizeof(stop_file) - 1u] = '\0';
@@ -480,10 +487,11 @@ static void pad_merge_keyboard(void)
             const unsigned long long now = GetTickCount64();
             if (!route_started && g_yz_a010_root_active) {
                 route_started = 1;
-                route_start_tick = now;
+                route_input_tick = now + route_input_delay_ms;
                 next_stop_poll = now;
                 fprintf(stderr,
-                        "[akiyama-route] Start-only cutscene route armed\n");
+                        "[akiyama-route] Start-only cutscene route armed "
+                        "delay_ms=%llu\n", route_input_delay_ms);
                 fflush(stderr);
             }
             if (route_started && now >= next_stop_poll) {
@@ -497,9 +505,9 @@ static void pad_merge_keyboard(void)
                     fflush(stderr);
                 }
             }
-            if (route_started && !route_stopped) {
+            if (route_started && !route_stopped && now >= route_input_tick) {
                 const unsigned long long phase =
-                    (now - route_start_tick) % 8000ull;
+                    (now - route_input_tick) % 8000ull;
                 if (phase < 250ull) {
                     hs->buttons |= CELL_PAD_CTRL_START;
                     prior_route_start = CELL_PAD_CTRL_START;

@@ -58,6 +58,9 @@ option(YZ_PPU_SAMPLE
 option(YZ_FRONTIER_VISUAL_PROBE
     "Allow sparse renderer-owned frontier screenshots in a PERF_CLEAN diagnostic build."
     OFF)
+option(YZ_SPU_SIMD_SHUFB
+    "Use the bit-exact SSSE3 SPU shufb helper; OFF selects its scalar reference twin."
+    ON)
 if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
     message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
 endif()
@@ -88,7 +91,8 @@ endif()
 target_include_directories(ps3recomp_runtime PRIVATE
     "${PS3RECOMP_DIR}/yakuza/generated")
 target_compile_definitions(ps3recomp_runtime PRIVATE
-    PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h")
+    PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h"
+    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
 if(YZ_FRONTIER_VISUAL_PROBE)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         YZ_FRONTIER_VISUAL_PROBE=1)
@@ -371,6 +375,8 @@ endif()
 if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
 endif()
+target_compile_definitions(yakuza_recomp PRIVATE
+    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
         $<$<CONFIG:Release>:/O2>
