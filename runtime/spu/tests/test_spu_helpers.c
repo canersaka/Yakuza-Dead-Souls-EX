@@ -53,6 +53,32 @@ static int u128_eq(u128 a, u128 b) {
     return a._u64[0] == b._u64[0] && a._u64[1] == b._u64[1];
 }
 
+static u128 reference_shufb(u128 a, u128 b, u128 c) {
+    uint8_t cat[32];
+    u128 r;
+    for (int j = 0; j < 16; ++j) cat[j] = a._u8[SPU_W(j)];
+    for (int j = 0; j < 16; ++j) cat[16 + j] = b._u8[SPU_W(j)];
+    for (int t = 0; t < 16; ++t) {
+        const uint8_t s = c._u8[SPU_W(t)];
+        uint8_t v;
+        if ((s & 0xE0) == 0xE0) v = 0x80;
+        else if ((s & 0xC0) == 0xC0) v = 0xFF;
+        else if ((s & 0xC0) == 0x80) v = 0x00;
+        else v = cat[s & 0x1F];
+        r._u8[SPU_W(t)] = v;
+    }
+    return r;
+}
+
+static uint32_t shufb_prng(uint32_t* state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
 static void print_u128(const char* label, u128 v) {
     fprintf(stderr, "  %-8s %016llX %016llX\n", label,
             (unsigned long long)v._u64[0],
@@ -266,6 +292,20 @@ static void test_shufb(void) {
                                 0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,
                                 0x1C,0x1D,0x1E,0x1F};
         EXPECT_EQ(spu_shufb(a, b, from_bytes(sel)), from_bytes(expected));
+    }
+
+    TEST("shufb SIMD path matches scalar ISA reference for randomized vectors");
+    {
+        uint32_t state = 0x6D2B79F5u;
+        for (int sample = 0; sample < 100000; ++sample) {
+            u128 ra, rb, rc;
+            for (int lane = 0; lane < 4; ++lane) {
+                ra._u32[lane] = shufb_prng(&state);
+                rb._u32[lane] = shufb_prng(&state);
+                rc._u32[lane] = shufb_prng(&state);
+            }
+            EXPECT_EQ(spu_shufb(ra, rb, rc), reference_shufb(ra, rb, rc));
+        }
     }
 }
 
