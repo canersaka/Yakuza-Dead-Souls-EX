@@ -71,6 +71,7 @@ void rsx_live_draw_shutdown(void) {}
 #include "rsx_vp_decompiler.h"
 
 #include <ctype.h>
+#include <intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -373,6 +374,135 @@ typedef struct {
 } ld_state;
 
 static ld_state g;
+
+/* Default-off, production-safe draw phase classifier.  The hot path uses one
+ * QPC read to select a fixed one-second bucket and RDTSC at semantic phase
+ * boundaries; it allocates nothing and emits only during normal shutdown.
+ * Unset means a single predictable false branch at sink_end. */
+#define LD_DRAW_PHASE_BUCKETS 1024u
+typedef enum {
+    LD_DRAW_PHASE_PREP = 0,
+    LD_DRAW_PHASE_FETCH,
+    LD_DRAW_PHASE_GEOMETRY,
+    LD_DRAW_PHASE_PSO,
+    LD_DRAW_PHASE_CONSTANTS,
+    LD_DRAW_PHASE_RESOURCES,
+    LD_DRAW_PHASE_RECORD,
+    LD_DRAW_PHASE_POST,
+    LD_DRAW_PHASE_COUNT
+} ld_draw_phase;
+
+typedef struct {
+    u64 calls;
+    u64 completed;
+    u64 cycles[LD_DRAW_PHASE_COUNT];
+} ld_draw_phase_bucket;
+
+typedef struct {
+    int enabled;
+    int dumped;
+    LONGLONG qpc_origin;
+    LONGLONG qpc_frequency;
+    u32 last_bucket;
+    u64 overflow_calls;
+    ld_draw_phase_bucket buckets[LD_DRAW_PHASE_BUCKETS];
+} ld_draw_phase_state;
+
+typedef struct {
+    ld_draw_phase_bucket* bucket;
+    u64 stamp;
+    u32 phase;
+} ld_draw_phase_sample;
+
+static ld_draw_phase_state g_ld_draw_phases;
+static void ld_draw_phases_init(void)
+{
+    LARGE_INTEGER frequency, now;
+    memset(&g_ld_draw_phases, 0, sizeof(g_ld_draw_phases));
+    if (!getenv("YZ_RSX_DRAW_PHASES"))
+        return;
+    if (!QueryPerformanceFrequency(&frequency) ||
+        !QueryPerformanceCounter(&now) || frequency.QuadPart <= 0)
+        return;
+    g_ld_draw_phases.qpc_frequency = frequency.QuadPart;
+    g_ld_draw_phases.qpc_origin = now.QuadPart;
+    g_ld_draw_phases.enabled = 1;
+}
+
+static ld_draw_phase_sample ld_draw_phase_begin(void)
+{
+    ld_draw_phase_sample sample = {0};
+    LARGE_INTEGER now;
+    u64 elapsed;
+    u32 bucket;
+    if (!g_ld_draw_phases.enabled)
+        return sample;
+    QueryPerformanceCounter(&now);
+    elapsed = now.QuadPart > g_ld_draw_phases.qpc_origin
+        ? (u64)(now.QuadPart - g_ld_draw_phases.qpc_origin) : 0;
+    bucket = (u32)(elapsed / (u64)g_ld_draw_phases.qpc_frequency);
+    if (bucket >= LD_DRAW_PHASE_BUCKETS) {
+        g_ld_draw_phases.overflow_calls++;
+        return sample;
+    }
+    sample.bucket = &g_ld_draw_phases.buckets[bucket];
+    sample.bucket->calls++;
+    sample.phase = LD_DRAW_PHASE_PREP;
+    sample.stamp = __rdtsc();
+    if (bucket > g_ld_draw_phases.last_bucket)
+        g_ld_draw_phases.last_bucket = bucket;
+    return sample;
+}
+
+static void ld_draw_phase_mark(ld_draw_phase_sample* sample, u32 next)
+{
+    u64 now;
+    if (!sample->bucket)
+        return;
+    now = __rdtsc();
+    sample->bucket->cycles[sample->phase] += now - sample->stamp;
+    sample->stamp = now;
+    sample->phase = next;
+}
+
+static void ld_draw_phase_end(ld_draw_phase_sample* sample, int completed)
+{
+    u64 now;
+    if (!sample->bucket)
+        return;
+    now = __rdtsc();
+    sample->bucket->cycles[sample->phase] += now - sample->stamp;
+    if (completed)
+        sample->bucket->completed++;
+    sample->bucket = NULL;
+}
+
+static void ld_draw_phases_dump(void)
+{
+    static const char* const names[LD_DRAW_PHASE_COUNT] = {
+        "prep", "fetch", "geometry", "pso", "constants", "resources",
+        "record", "post"
+    };
+    if (!g_ld_draw_phases.enabled || g_ld_draw_phases.dumped)
+        return;
+    g_ld_draw_phases.dumped = 1;
+    for (u32 bucket = 0; bucket <= g_ld_draw_phases.last_bucket; bucket++) {
+        const ld_draw_phase_bucket* b = &g_ld_draw_phases.buckets[bucket];
+        if (!b->calls)
+            continue;
+        fprintf(stderr,
+                "[draw-phase:b=%u calls=%llu complete=%llu",
+                bucket, (unsigned long long)b->calls,
+                (unsigned long long)b->completed);
+        for (u32 phase = 0; phase < LD_DRAW_PHASE_COUNT; phase++)
+            fprintf(stderr, " %s=%llu", names[phase],
+                    (unsigned long long)b->cycles[phase]);
+        fprintf(stderr, "]\n");
+    }
+    fprintf(stderr, "[draw-phase:summary buckets=%u overflow=%llu]\n",
+            g_ld_draw_phases.last_bucket + 1u,
+            (unsigned long long)g_ld_draw_phases.overflow_calls);
+}
 
 #define LD_VERTEX_HOIST_FETCH       (1u << 0)
 #define LD_VERTEX_MASK_SIGNATURE    (1u << 1)
@@ -5762,9 +5892,16 @@ static void write_topology_indices(u32 prim, u32* indices)
 
 static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
+    ld_draw_phase_sample phase_sample = ld_draw_phase_begin();
+#define LD_DRAW_PHASE_RETURN() \
+    do { ld_draw_phase_end(&phase_sample, 0); return; } while (0)
     (void)user; (void)r;
-    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
-    if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled())
+        LD_DRAW_PHASE_RETURN();
+    if (!dc.n_packets) {
+        g_ld_stats.groups_empty++;
+        LD_DRAW_PHASE_RETURN();
+    }
     g_ld_stats.groups_seen++;
     /*
      * a010's native per-mesh constant builder can overwrite the otherwise
@@ -5807,6 +5944,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 prim = g.rsx.current_primitive;
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_FETCH);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.used_attribute_draws++;
     g_ld_profile.total.used_attribute_sum += used_layout.count;
@@ -5827,18 +5965,22 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
     if (!dc.n_source_refs)
         dc.n_source_refs = dc.n_verts;
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_GEOMETRY);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.vertex_fetch_pack_qpc +=
         (u64)(ld_profile_qpc() - fetch_pack_begin);
 #endif
-    if (!dc.n_verts || !dc.fetch_ok) { g_ld_stats.group_drop_fetch++; return; }
+    if (!dc.n_verts || !dc.fetch_ok) {
+        g_ld_stats.group_drop_fetch++;
+        LD_DRAW_PHASE_RETURN();
+    }
 
     /* Preserve validated occurrence order while allowing repeated compact
      * vertex references to share one fetched and uploaded payload. */
     int indexed = 0;
     if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) {
         g_ld_stats.group_drop_primitive++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
     u32 n_tri = indexed
         ? topology_index_count(prim)
@@ -5846,7 +5988,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     if (!n_tri) {
         g_ld_stats.group_drop_degenerate++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
 
     live_a010_geom_trace(prim, n_tri);
@@ -5862,7 +6004,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BUFFER_SIZE) {
         live_draw_csv_emit(prim, n_tri, "drop_vbring_oversize");
         g_ld_stats.group_drop_ring++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
     if ((u64)g.vb_used + draw_vb_bytes > vb_capacity ||
         (u64)g.ib_used + draw_ib_bytes > INDEX_BUFFER_SIZE) {
@@ -5889,6 +6031,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
 
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_PSO);
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
         ld_vertex_compact_payload());
@@ -5898,8 +6041,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 #endif
         live_draw_csv_emit(prim, n_tri, "drop_pso");
         g_ld_stats.group_drop_pso++;
-        return;   /* no fallback in live path */
+        LD_DRAW_PHASE_RETURN();   /* no fallback in live path */
     }
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_CONSTANTS);
     u32 vertex_cb_offset = 0;
     int vertex_cb_plan = rsx_vertex_constant_ring_plan(
         g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED, &vertex_cb_offset);
@@ -5915,7 +6059,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 #endif
         ld_flush(LD_FLUSH_VERTEX_CONSTANT_RING);
         if (!g.ready)
-            return;
+            LD_DRAW_PHASE_RETURN();
         g.cb_used = 0;
         vertex_cb_plan = rsx_vertex_constant_ring_plan(
             g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED,
@@ -5924,21 +6068,22 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (vertex_cb_plan != 1) {
         live_draw_csv_emit(prim, n_tri, "drop_cbring_invalid");
         g_ld_stats.group_drop_ring++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
     g.cb_used = vertex_cb_offset;
     u32 ps_cb_offset = 0;
     if (!ld_upload_pixel_constants(&ps_cb_offset)) {
         live_draw_csv_emit(prim, n_tri, "drop_ps_cbring");
         g_ld_stats.group_drop_ring++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
 
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_RESOURCES);
     const u32 target = current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
-        return;
+        LD_DRAW_PHASE_RETURN();
     }
     live_draw_csv_emit(prim, n_tri, "execute");
     if (rsx_live_draw_a010_probe_active() && target < 64)
@@ -6049,7 +6194,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * commands recorded while resolving slots are also completed here;
          * no render-state command for this draw has been recorded yet. */
         ld_flush(LD_FLUSH_DESCRIPTOR_RING);
-        if (!g.ready) return;
+        if (!g.ready) LD_DRAW_PHASE_RETURN();
         g.srv_ring_used = 0;
         g.smp_ring_used = 0;
     }
@@ -6102,6 +6247,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         descriptor_signature =
             fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
 
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_RECORD);
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
     float xf[8] = {1, 1, 1, 0, 0, 0, 0, 0};
@@ -6231,6 +6377,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             z->had_write = 1;
     }
     g_ld_stats.groups_executed++;
+    ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_POST);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.input_vertices += dc.n_source_refs;
     g_ld_profile.total.expanded_vertices += n_tri;
@@ -6287,6 +6434,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     g.vb_used += (u32)draw_vb_bytes;
     g.ib_used += (u32)draw_ib_bytes;
     ld_profile_note_ring_highwater();
+    ld_draw_phase_end(&phase_sample, 1);
+#undef LD_DRAW_PHASE_RETURN
 }
 
 static void sink_end(void* user, const rsx_dispatch* r)
@@ -6549,6 +6698,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
     ld_present_measure_init();
+    ld_draw_phases_init();
 #if defined(YZ_PERF_PROFILE)
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
     {
@@ -7157,6 +7307,10 @@ double rsx_live_draw_get_present_fps(void)
 void rsx_live_draw_dump_present_samples(void)
 {
     ld_present_measure_dump();
+    /* WM_CLOSE terminates this runtime with ExitProcess rather than normal
+     * renderer destruction. Preserve shutdown-only diagnostic aggregates at
+     * the same safe, already-established close boundary as Present QPC. */
+    ld_draw_phases_dump();
 }
 
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
@@ -8675,6 +8829,7 @@ void rsx_live_draw_shutdown(void)
     if (!g.ready) return;
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
+    ld_draw_phases_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);

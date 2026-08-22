@@ -410,6 +410,8 @@ def run(args):
         yz["YZ_NR_INTERCEPT"] = "clear"
     if args.nr_draw:
         yz["YZ_NR_INTERCEPT"] = "draw"
+    if args.draw_phases:
+        yz["YZ_RSX_DRAW_PHASES"] = "1"
     environment.update(yz)
 
     result = {
@@ -564,8 +566,12 @@ def run(args):
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
         shadow_lines = re.findall(r"^\[nr-shadow:.*\]$", stderr_text, re.MULTILINE)
         live_lines = re.findall(r"^\[nr-live:.*\]$", stderr_text, re.MULTILINE)
+        draw_phase_lines = re.findall(
+            r"^\[draw-phase:.*\]$", stderr_text, re.MULTILINE
+        )
         result["nr_shadow_census"] = shadow_lines
         result["nr_live_census"] = live_lines
+        result["draw_phase_aggregate"] = draw_phase_lines
         if ((args.nr_shadow_census or args.nr_flip or args.nr_clear or
              args.nr_draw) and
                 len(shadow_lines) != 1):
@@ -583,6 +589,10 @@ def run(args):
             )
         if not (args.nr_flip or args.nr_clear or args.nr_draw) and live_lines:
             raise RuntimeError("native live family was active outside its lane")
+        if args.draw_phases and len(draw_phase_lines) < 2:
+            raise RuntimeError("draw-phase run did not emit bounded shutdown aggregate")
+        if not args.draw_phases and draw_phase_lines:
+            raise RuntimeError("draw-phase classifier was active in a clean lane")
         completion_marker = (
             "[auto-new-game] completion latched; Confirm released and route disabled"
         )
@@ -661,6 +671,7 @@ def main():
     parser.add_argument("--nr-flip", action="store_true")
     parser.add_argument("--nr-clear", action="store_true")
     parser.add_argument("--nr-draw", action="store_true")
+    parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)
@@ -668,7 +679,7 @@ def main():
     if args.fe0_callback_replay and not args.fe0:
         parser.error("--fe0-callback-replay requires --fe0")
     if sum((args.nr_shadow_census, args.nr_flip, args.nr_clear,
-            args.nr_draw)) > 1:
+            args.nr_draw, args.draw_phases)) > 1:
         parser.error("select only one native-render diagnostic/family lane")
 
     root = Path(__file__).resolve().parents[3]
