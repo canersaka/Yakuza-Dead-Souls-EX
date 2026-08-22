@@ -542,6 +542,8 @@ def run(args):
     expected_cache = dict(EXPECTED_CACHE)
     if args.expect_shufb:
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
+    if args.expect_ls128:
+        expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
     if args.wkl4_cycle:
         expected_cache["YZ_WKL4_CYCLE_DIAGNOSTIC"] = "ON"
     mismatches = {
@@ -608,7 +610,11 @@ def run(args):
         "game_elf": str(game_elf),
         "configuration": {
             name: cache.get(name)
-            for name in (*EXPECTED_CACHE, "YZ_SPU_SIMD_SHUFB")
+            for name in (
+                *EXPECTED_CACHE,
+                "YZ_SPU_SIMD_SHUFB",
+                "YZ_SPU_SIMD_LS128",
+            )
         },
         "active_yz": yz,
         "reference": str(reference_path),
@@ -902,6 +908,7 @@ def main():
     parser.add_argument("--capture-interval-ms", type=int, default=2000)
     parser.add_argument("--route-start-delay-ms", type=int, default=0)
     parser.add_argument("--expect-shufb", choices=("ON", "OFF"))
+    parser.add_argument("--expect-ls128", choices=("ON", "OFF"))
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--required-matches", type=int, default=3)

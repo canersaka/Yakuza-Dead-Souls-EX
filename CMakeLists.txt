@@ -362,6 +362,29 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND wkl4_cycle_tests
         )
 
+        foreach(ls128_mode IN ITEMS scalar simd)
+            add_executable(spu_ls128_${ls128_mode}_tests
+                tests/spu_ls128/main.c
+            )
+            target_include_directories(spu_ls128_${ls128_mode}_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+            )
+            target_compile_definitions(spu_ls128_${ls128_mode}_tests PRIVATE
+                YZ_SPU_SIMD_LS128=$<STREQUAL:${ls128_mode},simd>
+                _CRT_SECURE_NO_WARNINGS
+            )
+            if(MSVC)
+                target_compile_options(spu_ls128_${ls128_mode}_tests PRIVATE
+                    /experimental:c11atomics
+                )
+            endif()
+            add_test(
+                NAME spu_ls128_${ls128_mode}
+                COMMAND spu_ls128_${ls128_mode}_tests
+            )
+        endforeach()
+
         # Native-render IR equivalence: packet path (FIFO/method stream ->
         # rsx_dispatch -> adapter) vs typed native path must fold to
         # identical action sequences; plus the submission ring and an

@@ -61,6 +61,9 @@ option(YZ_FRONTIER_VISUAL_PROBE
 option(YZ_SPU_SIMD_SHUFB
     "Use the bit-exact SSSE3 SPU shufb helper; OFF selects its scalar reference twin."
     ON)
+option(YZ_SPU_SIMD_LS128
+    "Use bit-exact SSSE3 word-byte conversion for SPU 128-bit local-store accesses."
+    ON)
 option(YZ_WKL4_CYCLE_DIAGNOSTIC
     "Compile the default-off, fixed-memory image-4 hot-region cycle classifier."
     OFF)
@@ -95,7 +98,8 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${PS3RECOMP_DIR}/yakuza/generated")
 target_compile_definitions(ps3recomp_runtime PRIVATE
     PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h"
-    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
+    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
+    YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         YZ_WKL4_CYCLE_DIAGNOSTIC=1)
@@ -383,7 +387,8 @@ if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
 endif()
 target_compile_definitions(yakuza_recomp PRIVATE
-    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>)
+    YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
+    YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(yakuza_recomp PRIVATE
         YZ_WKL4_CYCLE_DIAGNOSTIC=1)
