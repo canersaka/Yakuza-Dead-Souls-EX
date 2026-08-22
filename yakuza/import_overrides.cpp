@@ -55,11 +55,20 @@ static volatile LONG g_yz_nr_shadow_enabled;
 static int g_yz_nr_shadow_init_attempted;
 static unsigned long long g_yz_nr_live_flip_owned;
 static unsigned long long g_yz_nr_live_flip_fallback;
+static unsigned long long g_yz_nr_live_clear_owned;
+static unsigned long long g_yz_nr_live_clear_fallback;
 static unsigned long long g_yz_nr_live_faults;
 
 static int yz_nr_live_present(void*, uint32_t buffer_id)
 {
     rsx_live_draw_native_present(buffer_id);
+    return 0;
+}
+
+static int yz_nr_live_clear(void*, const rsx_nir_pipeline*,
+                            const rsx_nir_clear* clear)
+{
+    rsx_live_draw_native_clear(clear->mask);
     return 0;
 }
 
@@ -84,6 +93,7 @@ static void yz_nr_shadow_init(void)
                           &g_yz_nr_shadow_tokens, families, 1);
     rsx_nr_exec_ops ops = {};
     ops.present = yz_nr_live_present;
+    ops.clear = yz_nr_live_clear;
     rsx_nr_backend_init(&g_yz_nr_backend, &g_yz_nr_shadow_ring,
                         &g_yz_nr_shadow_tokens, &ops);
     InterlockedExchange(&g_yz_nr_shadow_enabled, 1);
@@ -102,6 +112,27 @@ static int yz_nr_try_live_flip(uint32_t buffer_id)
         return 0;
     }
     g_yz_nr_live_flip_owned++;
+    rsx_nr_backend_run(&g_yz_nr_backend, 0);
+    if (rsx_nr_ring_depth(&g_yz_nr_shadow_ring) != 0 ||
+        g_yz_nr_backend.stats.exec_errors != 0)
+        g_yz_nr_live_faults++;
+    return 1;
+}
+
+static int yz_nr_try_live_clear(uint32_t mask)
+{
+    if (!g_yz_nr_shadow_enabled ||
+        !rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_CLEAR))
+        return 0;
+    const uint32_t color = rsx_dsp_clear_color(&g_yz_nr_shadow.shadow.rsx);
+    const uint32_t zstencil =
+        rsx_dsp_clear_zstencil(&g_yz_nr_shadow.shadow.rsx);
+    if (!rsx_nr_try_clear(&g_yz_nr_shadow, mask, color,
+                          zstencil >> 8, zstencil & 0xFFu)) {
+        g_yz_nr_live_clear_fallback++;
+        return 0;
+    }
+    g_yz_nr_live_clear_owned++;
     rsx_nr_backend_run(&g_yz_nr_backend, 0);
     if (rsx_nr_ring_depth(&g_yz_nr_shadow_ring) != 0 ||
         g_yz_nr_backend.stats.exec_errors != 0)
@@ -136,6 +167,16 @@ static void yz_nr_shadow_shutdown(void)
                 "present=%llu errors=%llu faults=%llu depth=%u rejects=%lld]\n",
                 g_yz_nr_live_flip_owned, g_yz_nr_live_flip_fallback,
                 g_yz_nr_backend.stats.executed[RSX_NIR_OP_PRESENT],
+                g_yz_nr_backend.stats.exec_errors, g_yz_nr_live_faults,
+                rsx_nr_ring_depth(&g_yz_nr_shadow_ring),
+                g_yz_nr_shadow_ring.rejects);
+    }
+    if (rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_CLEAR)) {
+        fprintf(stderr,
+                "[nr-live: family=clear owned=%llu fallback=%llu "
+                "clear=%llu errors=%llu faults=%llu depth=%u rejects=%lld]\n",
+                g_yz_nr_live_clear_owned, g_yz_nr_live_clear_fallback,
+                g_yz_nr_backend.stats.executed[RSX_NIR_OP_CLEAR],
                 g_yz_nr_backend.stats.exec_errors, g_yz_nr_live_faults,
                 rsx_nr_ring_depth(&g_yz_nr_shadow_ring),
                 g_yz_nr_shadow_ring.rejects);
@@ -3451,11 +3492,16 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     const int nr_flip_selected =
         method == 0xE944u && g_yz_nr_shadow_enabled &&
         rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_FLIP);
+    const int nr_clear_selected =
+        (method & 0x1FFCu) == 0x1D94u && g_yz_nr_shadow_enabled &&
+        rsx_nr_family_enabled(&g_yz_nr_shadow, RSX_NR_FAM_CLEAR);
     const int nr_flip_owned =
         nr_flip_selected ? yz_nr_try_live_flip(arg) : 0;
-    if (!nr_flip_owned) {
+    const int nr_clear_owned =
+        nr_clear_selected ? yz_nr_try_live_clear(arg) : 0;
+    if (!nr_flip_owned && !nr_clear_owned) {
         rsx_live_draw_method(method, arg);
-        if (nr_flip_selected)
+        if (nr_flip_selected || nr_clear_selected)
             yz_nr_live_flip_fallback_complete();
     }
 
