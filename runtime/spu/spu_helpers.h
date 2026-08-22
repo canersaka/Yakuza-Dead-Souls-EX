@@ -24,6 +24,7 @@ extern "C" {
 
 #ifdef _MSC_VER
 #include <intrin.h>
+#include <tmmintrin.h>
 static inline int spu_clz32(uint32_t x) {
     unsigned long idx;
     if (!x) return 32;
@@ -214,6 +215,48 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+#if defined(_MSC_VER) || defined(__SSSE3__)
+    /*
+     * PSHUFB performs the same lane-local byte lookup once the runtime's
+     * within-word SPU byte mapping is folded into the selector.  SPU_W(p) is
+     * p ^ 3, so toggling the selector's low two bits maps an architectural
+     * byte index to the corresponding host byte index.  Bit 4 still selects
+     * the second source vector; bits 5 and 6 are ignored by the ISA.
+     *
+     * SPU's special selectors need one extra mask pass:
+     *   80..BF -> 00, C0..DF -> FF, E0..FF -> 80.
+     * Keeping this branch-free is important: this helper is the largest
+     * named exclusive image-4 cost in the production Akiyama sample.
+     */
+    const __m128i va = _mm_loadu_si128((const __m128i*)(const void*)&a);
+    const __m128i vb = _mm_loadu_si128((const __m128i*)(const void*)&b);
+    const __m128i vc = _mm_loadu_si128((const __m128i*)(const void*)&c);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i mapped = _mm_xor_si128(vc, _mm_set1_epi8(3));
+    const __m128i a_bytes = _mm_shuffle_epi8(va, mapped);
+    const __m128i b_bytes = _mm_shuffle_epi8(vb, mapped);
+    const __m128i select_a = _mm_cmpeq_epi8(
+        _mm_and_si128(vc, _mm_set1_epi8(0x10)), zero);
+    const __m128i selected = _mm_or_si128(
+        _mm_and_si128(a_bytes, select_a),
+        _mm_andnot_si128(select_a, b_bytes));
+
+    const __m128i special = _mm_cmpgt_epi8(zero, vc);
+    const __m128i c0 = _mm_cmpeq_epi8(
+        _mm_and_si128(vc, _mm_set1_epi8((char)0xC0)),
+        _mm_set1_epi8((char)0xC0));
+    const __m128i e0 = _mm_cmpeq_epi8(
+        _mm_and_si128(vc, _mm_set1_epi8((char)0xE0)),
+        _mm_set1_epi8((char)0xE0));
+    const __m128i special_value = _mm_or_si128(
+        _mm_andnot_si128(e0, c0),
+        _mm_and_si128(e0, _mm_set1_epi8((char)0x80)));
+    const __m128i value = _mm_or_si128(
+        _mm_andnot_si128(special, selected), special_value);
+    u128 r;
+    _mm_storeu_si128((__m128i*)(void*)&r, value);
+    return r;
+#else
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
      * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
      * control, and the result) through SPU_W so a control supplied as an immediate
@@ -234,6 +277,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
         r._u8[SPU_W(t)] = v;
     }
     return r;
+#endif
 }
 
 /* ---- shift / rotate immediate (word lanes) ---- */
