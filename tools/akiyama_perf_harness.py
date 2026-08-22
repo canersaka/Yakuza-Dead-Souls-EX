@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended production Akiyama-dialogue route and FPS measurement.
+"""Unattended production route and visual/QPC performance measurement.
 
 The route uses only Start after New Game has been accepted.  Sparse renderer
 PPMs are compared with the archived first Akiyama/Hana dialogue reference.
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,19 @@ EXPECTED_CACHE = {
     "YZ_SPURS_BACKEND": "NATIVE",
     "YZ_GCM_BACKEND": "NATIVE",
     "YZ_FRONTIER_VISUAL_PROBE": "ON",
+    "YZ_A010_FUNC_TRACE": "OFF",
+    "YZ_RECOMP_OPT": "ON",
+    "YZ_SPU_FAST": "ON",
+    "YZ_SPU_FAST_CRI": "ON",
+    "YZ_SPU_FAST_WKL4": "ON",
+    "YZ_SPU_FAST_SPUIMG": "ON",
+    "YZ_SPU_FAST_JOB_A": "ON",
+    "YZ_SPU_FAST_JOB_B": "ON",
+    "YZ_SPU_FAST_JOB_C": "ON",
+    "YZ_SPU_FAST_JOB_D": "ON",
+    "YZ_SPU_FAST_JOB_E": "ON",
+    "YZ_SPU_FAST_ORPHANAGE": "ON",
+    "YZ_SPU_FAST_SPURS_EXPERIMENTAL": "OFF",
 }
 
 
@@ -162,6 +176,135 @@ def compare_scene(reference, candidate):
     }
 
 
+def coarse_scene_mae(reference, candidate):
+    if (reference["width"], reference["height"]) != (
+        candidate["width"], candidate["height"]
+    ):
+        return None
+    return sum(
+        abs(a - b) for a, b in zip(reference["rgb"], candidate["rgb"])
+    ) / (len(reference["rgb"]) * 255.0)
+
+
+MULTI_SCENE_ANCHORS = {
+    "beach": {"serials": (11, 12, 13)},
+    "orphanage_sign": {"serials": (20, 21, 22)},
+    "sink": {"serials": (23, 24)},
+    # Title cards are mostly black, so their generic coarse distance from a
+    # blank transition frame is deceptively small.  Require a near-exact
+    # authored card match for these two anchors.
+    "part_title": {"serials": (27, 28), "maximum_mae": 0.02},
+    "chapter_title": {"serials": (30, 31), "maximum_mae": 0.02},
+}
+
+
+def locate_anchor(captures, references, minimum_serial, maximum_mae):
+    best = None
+    for capture in captures:
+        if capture["serial"] < minimum_serial or capture.get("present_id") is None:
+            continue
+        features = scene_features(Path(capture["path"]))
+        mae = min(
+            value for value in (
+                coarse_scene_mae(reference, features)
+                for reference in references
+            ) if value is not None
+        )
+        if mae <= maximum_mae:
+            return {
+                "serial": capture["serial"],
+                "present_id": capture["present_id"],
+                "path": capture["path"],
+                "coarse_mae": round(mae, 6),
+            }
+        if best is None or mae < best["coarse_mae"]:
+            best = {
+                "serial": capture["serial"],
+                "present_id": capture["present_id"],
+                "path": capture["path"],
+                "coarse_mae": round(mae, 6),
+            }
+    return {"match": False, "best": best}
+
+
+def multi_scene_metrics(result, qpc_path, reference_dir, maximum_mae):
+    reference_dir = reference_dir.resolve()
+    anchor_refs = {}
+    for name, spec in MULTI_SCENE_ANCHORS.items():
+        serials = spec["serials"]
+        paths = [
+            reference_dir / f"frontier_probe_{serial:03d}.ppm"
+            for serial in serials
+        ]
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"missing multi-scene {name} reference(s): {missing}"
+            )
+        anchor_refs[name] = [scene_features(path) for path in paths]
+
+    captures = result["captures"]
+    anchors = {}
+    next_serial = 1
+    for name, spec in MULTI_SCENE_ANCHORS.items():
+        anchor = locate_anchor(
+            captures, anchor_refs[name], next_serial,
+            min(maximum_mae, spec.get("maximum_mae", maximum_mae)),
+        )
+        anchors[name] = anchor
+        if anchor.get("present_id") is not None:
+            next_serial = anchor["serial"] + 1
+    result["multi_scene_reference_dir"] = str(reference_dir)
+    result["multi_scene_anchor_mae"] = maximum_mae
+    result["multi_scene_anchors"] = anchors
+
+    windows = {
+        "orphanage_route": ("beach", "sink"),
+        "orphanage_moving_exterior": ("beach", "orphanage_sign"),
+        "part_to_chapter_transition": ("part_title", "chapter_title"),
+    }
+    scenes = {}
+    for scene_name, (start_name, end_name) in windows.items():
+        start = anchors[start_name]
+        end = anchors[end_name]
+        valid = (
+            start.get("present_id") is not None and
+            end.get("present_id") is not None and
+            end["present_id"] > start["present_id"] + 1
+        )
+        scene = {
+            "kind": "moving",
+            "route_valid": valid,
+            "start_anchor": start,
+            "end_anchor": end,
+        }
+        if valid:
+            scene.update(qpc_metrics(
+                qpc_path,
+                start["present_id"],
+                end["present_id"] - 1,
+                bucket_seconds=1.0,
+            ))
+        scenes[scene_name] = scene
+
+    stationary = qpc_metrics(
+        qpc_path, int(result["measurement_start_present_id"]),
+        bucket_seconds=5.0,
+    )
+    stationary.update({
+        "kind": "stationary",
+        "route_valid": result.get("checkpoint_match", {}).get("match", False),
+        "input_stopped": True,
+        "readback_stopped": (
+            result.get("capture_count_at_checkpoint") ==
+            result.get("capture_count_after_shutdown")
+        ),
+    })
+    scenes["akiyama_hana_prompt"] = stationary
+    result["scenes"] = scenes
+    return scenes
+
+
 def parse_cache(cache_path: Path):
     values = {}
     for line in cache_path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -171,6 +314,14 @@ def parse_cache(cache_path: Path):
         name = lhs.split(":", 1)[0]
         values[name] = value
     return values
+
+
+def sha256_file(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def process_paths():
@@ -245,7 +396,18 @@ def wait_log(path: Path, pattern: str, timeout: float, process=None, start=0):
     raise TimeoutError(f"timeout waiting for log pattern: {pattern}")
 
 
-def qpc_metrics(qpc_path: Path, start_present_id: int):
+def percentile(sorted_values, fraction):
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def qpc_metrics(qpc_path: Path, start_present_id: int, end_present_id=None,
+                bucket_seconds=5.0):
     with qpc_path.open("r", encoding="ascii", newline="") as handle:
         lines = list(handle)
     frequency = None
@@ -256,11 +418,14 @@ def qpc_metrics(qpc_path: Path, start_present_id: int):
         elif not line.startswith("#"):
             data_lines.append(line)
     rows = list(csv.DictReader(data_lines))
-    selected = [
-        (int(row["present_id"]), int(row["qpc"]))
-        for row in rows
-        if int(row["present_id"]) > start_present_id
-    ]
+    selected = []
+    for row in rows:
+        present_id = int(row["present_id"])
+        if present_id <= start_present_id:
+            continue
+        if end_present_id is not None and present_id > end_present_id:
+            continue
+        selected.append((present_id, int(row["qpc"])))
     if frequency is None:
         native_frequency = ctypes.c_longlong()
         if not ctypes.windll.kernel32.QueryPerformanceFrequency(
@@ -275,19 +440,31 @@ def qpc_metrics(qpc_path: Path, start_present_id: int):
         "fps_mean": None,
         "fps_min": None,
         "fps_max": None,
+        "frame_time_ms": {},
     }
     if len(selected) < 2:
         return metrics
     elapsed = (selected[-1][1] - selected[0][1]) / frequency
     metrics["measurement_qpc_seconds"] = round(elapsed, 6)
     metrics["fps_mean"] = round((len(selected) - 1) / elapsed, 3)
-    full_buckets = int(elapsed // 5.0)
+    intervals = sorted(
+        (selected[index][1] - selected[index - 1][1]) * 1000.0 / frequency
+        for index in range(1, len(selected))
+    )
+    metrics["frame_time_ms"] = {
+        "min": round(intervals[0], 3),
+        "median": round(percentile(intervals, 0.5), 3),
+        "p95": round(percentile(intervals, 0.95), 3),
+        "p99": round(percentile(intervals, 0.99), 3),
+        "max": round(intervals[-1], 3),
+    }
+    full_buckets = int(elapsed // bucket_seconds)
     first_tick = selected[0][1]
     for bucket in range(full_buckets):
-        lo = first_tick + bucket * 5 * frequency
-        hi = lo + 5 * frequency
+        lo = first_tick + int(bucket * bucket_seconds * frequency)
+        hi = first_tick + int((bucket + 1) * bucket_seconds * frequency)
         count = sum(lo <= qpc < hi for _, qpc in selected)
-        metrics["fps_samples"].append(round(count / 5.0, 3))
+        metrics["fps_samples"].append(round(count / bucket_seconds, 3))
     if metrics["fps_samples"]:
         metrics["fps_min"] = min(metrics["fps_samples"])
         metrics["fps_max"] = max(metrics["fps_samples"])
@@ -361,9 +538,12 @@ def run(args):
             raise FileNotFoundError(f"missing {label}: {path}")
 
     cache = parse_cache(cache_path)
+    expected_cache = dict(EXPECTED_CACHE)
+    if args.expect_shufb:
+        expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
     mismatches = {
         name: {"expected": expected, "actual": cache.get(name)}
-        for name, expected in EXPECTED_CACHE.items()
+        for name, expected in expected_cache.items()
         if cache.get(name) != expected
     }
     if mismatches:
@@ -394,6 +574,7 @@ def run(args):
         "YZ_FRONTIER_ACCEPT_FAST": "1",
         "YZ_AKIYAMA_DIALOGUE_ROUTE": "1",
         "YZ_AKIYAMA_DIALOGUE_STOP_FILE": str(stop_path),
+        "YZ_AKIYAMA_ROUTE_START_DELAY_MS": str(args.route_start_delay_ms),
         "YZ_MOVEMENT_PROOF_DELAY_MS": str(args.capture_delay_ms),
         "YZ_MOVEMENT_PROBE_INTERVAL_MS": str(args.capture_interval_ms),
         "YZ_RSX_VALIDATION_DIR": str(capture_dir),
@@ -418,8 +599,12 @@ def run(args):
         "tag": args.tag,
         "status": "launching",
         "executable": str(executable),
+        "executable_sha256": sha256_file(executable),
         "game_elf": str(game_elf),
-        "configuration": {name: cache.get(name) for name in EXPECTED_CACHE},
+        "configuration": {
+            name: cache.get(name)
+            for name in (*EXPECTED_CACHE, "YZ_SPU_SIMD_SHUFB")
+        },
         "active_yz": yz,
         "reference": str(reference_path),
         "captures": [],
@@ -475,6 +660,7 @@ def run(args):
                 captured_this_poll = True
                 last_capture_progress = time.monotonic()
                 comparison["path"] = str(path)
+                comparison["serial"] = int(path.stem.rsplit("_", 1)[-1])
                 result["captures"].append(comparison)
                 consecutive = consecutive + 1 if comparison["match"] else 0
                 print(
@@ -500,6 +686,22 @@ def run(args):
             # the runtime itself reports a durable FIFO no-progress state;
             # slow but advancing boots remain governed by route_timeout.
             no_capture_for = time.monotonic() - last_capture_progress
+            if (not seen and no_capture_for >= 75.0 and stderr_path.exists()):
+                tail = stderr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-262144:]
+                idle_states = re.findall(
+                    r"\[rsx-idle\] 10s no-advance GET=([^\r\n]+)", tail
+                )
+                if (len(idle_states) >= 3 and
+                        len(set(idle_states[-3:])) == 1):
+                    result["route_failure_class"] = (
+                        "startup-fifo-no-progress"
+                    )
+                    result["route_failure_state"] = idle_states[-1]
+                    raise RuntimeError(
+                        "startup FIFO repeated one no-progress state three times"
+                    )
             if (not captured_this_poll and seen and no_capture_for >= 15.0 and
                     stderr_path.exists()):
                 tail = stderr_path.read_text(
@@ -564,6 +766,18 @@ def run(args):
         result["forced_close"] = forced
 
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        probe_present_ids = {
+            int(serial): int(present_id)
+            for serial, present_id in re.findall(
+                r"\[(?:akiyama-route|movement-proof)\] "
+                r"clean-frontier-probe serial=([0-9]+).*? "
+                r"present_id=([0-9]+)",
+                stderr_text,
+            )
+        }
+        result["probe_present_ids"] = probe_present_ids
+        for capture in result["captures"]:
+            capture["present_id"] = probe_present_ids.get(capture["serial"])
         shadow_lines = re.findall(r"^\[nr-shadow:.*\]$", stderr_text, re.MULTILINE)
         live_lines = re.findall(r"^\[nr-live:.*\]$", stderr_text, re.MULTILINE)
         draw_phase_lines = re.findall(
@@ -624,6 +838,13 @@ def run(args):
         result.update(qpc_metrics(
             qpc_path, result["measurement_start_present_id"]
         ))
+        if args.multi_scene_reference_dir:
+            multi_scene_metrics(
+                result,
+                qpc_path,
+                args.multi_scene_reference_dir,
+                args.anchor_mae,
+            )
         fps = result["fps_samples"]
         if forced:
             result["status"] = "forced-close"
@@ -663,6 +884,10 @@ def main():
     parser.add_argument("--route-timeout", type=float, default=720)
     parser.add_argument("--capture-delay-ms", type=int, default=30000)
     parser.add_argument("--capture-interval-ms", type=int, default=2000)
+    parser.add_argument("--route-start-delay-ms", type=int, default=0)
+    parser.add_argument("--expect-shufb", choices=("ON", "OFF"))
+    parser.add_argument("--multi-scene-reference-dir", type=Path)
+    parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--required-matches", type=int, default=3)
     parser.add_argument("--hold-seconds", type=float, default=35)
     parser.add_argument("--fe0", action="store_true")
@@ -713,6 +938,13 @@ def main():
             Path(result["present_qpc_path"]),
             int(result["measurement_start_present_id"]),
         ))
+        if args.multi_scene_reference_dir:
+            multi_scene_metrics(
+                result,
+                Path(result["present_qpc_path"]),
+                args.multi_scene_reference_dir,
+                args.anchor_mae,
+            )
         required = max(3, int(args.hold_seconds // 5) - 1)
         result.pop("failure", None)
         result["status"] = (
