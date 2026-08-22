@@ -76,6 +76,11 @@ void rsx_live_draw_method(u32 method, u32 arg);
  * typed backend owns the action's ordering. */
 void rsx_live_draw_native_present(u32 buffer_id);
 
+/* Native-render clear-family bridge, preserving the original live renderer's
+ * state/register ownership and serialization while the typed backend owns the
+ * ordered CLEAR action. */
+void rsx_live_draw_native_clear(u32 mask);
+
 /* Publish the FIFO bounds associated with the next flip method.  The live
  * consumer calls this only for driver-queue methods; ordinary method traffic
  * pays no extra synchronization cost. */
