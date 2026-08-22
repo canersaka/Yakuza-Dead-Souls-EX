@@ -53,6 +53,28 @@ static void region_change_closes_the_previous_segment(void)
     CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_8680_SETUP) == 40u);
 }
 
+static void hot_loop_subphases_are_separate(void)
+{
+    yz_wkl4_cycle_test_reset(1);
+    yz_wkl4_cycle_test_set_clock(100u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_8230_LOOP);
+    yz_wkl4_cycle_test_set_clock(180u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_8230_COMPARE);
+    yz_wkl4_cycle_test_set_clock(300u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_8230_STORE);
+    yz_wkl4_cycle_test_set_clock(350u);
+    yz_wkl4_cycle_mark(YZ_WKL4_CYCLE_8230_LOOP);
+    yz_wkl4_cycle_test_set_clock(440u);
+    yz_wkl4_cycle_leave();
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_8230_LOOP) == 170u);
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_8230_COMPARE) == 120u);
+    CHECK(yz_wkl4_cycle_test_cycles(YZ_WKL4_CYCLE_8230_STORE) == 50u);
+    CHECK(yz_wkl4_cycle_test_entries(YZ_WKL4_CYCLE_8230_LOOP) == 2u);
+    CHECK(yz_wkl4_cycle_test_entries(YZ_WKL4_CYCLE_8230_COMPARE) == 1u);
+    CHECK(yz_wkl4_cycle_test_entries(YZ_WKL4_CYCLE_8230_STORE) == 1u);
+    CHECK(yz_wkl4_cycle_test_clock_reads() == 5u);
+}
+
 static void interval_boundary_excludes_prior_work(void)
 {
     yz_wkl4_cycle_test_reset(1);
@@ -73,6 +95,7 @@ int main(void)
     disabled_is_inert();
     repeated_loop_marks_do_not_read_the_clock();
     region_change_closes_the_previous_segment();
+    hot_loop_subphases_are_separate();
     interval_boundary_excludes_prior_work();
     if (failures) {
         fprintf(stderr, "wkl4 cycle tests: %d failure(s)\n", failures);
