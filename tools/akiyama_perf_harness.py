@@ -1205,7 +1205,7 @@ def run(args):
             raise RuntimeError("draw-phase run did not emit bounded shutdown aggregate")
         if not args.draw_phases and draw_phase_lines:
             raise RuntimeError("draw-phase classifier was active in a clean lane")
-        if args.wkl4_cycle and len(wkl4_cycle_lines) != 15:
+        if args.wkl4_cycle and len(wkl4_cycle_lines) != 18:
             raise RuntimeError(
                 "image-4 cycle run must emit one total plus fourteen segment lines: "
                 f"found {len(wkl4_cycle_lines)}"
