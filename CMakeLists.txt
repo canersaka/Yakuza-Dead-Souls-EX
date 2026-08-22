@@ -59,6 +59,15 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+# Keep AVX2 isolated to the checked xfloat adapter.  The remainder of the
+# runtime retains the production baseline ISA and the adapter performs its
+# own OS/CPU availability check before any packed instruction is dispatched.
+if(DEFINED YZ_SPU_SIMD_XFLOAT AND YZ_SPU_SIMD_XFLOAT AND MSVC)
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/spu_xfloat_simd.c"
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
@@ -384,6 +393,32 @@ if(PS3RECOMP_BUILD_TESTS)
                 COMMAND spu_ls128_${ls128_mode}_tests
             )
         endforeach()
+
+        add_executable(spu_xfloat_simd_tests
+            tests/spu_xfloat_simd/main.c
+            runtime/spu/spu_xfloat_simd.c
+        )
+        target_include_directories(spu_xfloat_simd_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        )
+        target_compile_definitions(spu_xfloat_simd_tests PRIVATE
+            YZ_SPU_SIMD_XFLOAT=1
+            _CRT_SECURE_NO_WARNINGS
+        )
+        if(MSVC)
+            target_compile_options(spu_xfloat_simd_tests PRIVATE
+                /experimental:c11atomics
+                /arch:AVX2
+            )
+        endif()
+        add_test(
+            NAME spu_xfloat_simd
+            COMMAND spu_xfloat_simd_tests
+        )
+        set_tests_properties(spu_xfloat_simd PROPERTIES
+            TIMEOUT 120
+            LABELS "firmware-free;native;spu;performance;regression")
 
         # Native-render IR equivalence: packet path (FIFO/method stream ->
         # rsx_dispatch -> adapter) vs typed native path must fold to

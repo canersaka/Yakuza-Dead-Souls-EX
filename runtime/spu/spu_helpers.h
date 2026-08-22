@@ -18,6 +18,13 @@
 #include <math.h>
 #include <stdlib.h>
 
+#ifndef YZ_SPU_SIMD_XFLOAT
+#define YZ_SPU_SIMD_XFLOAT 0
+#endif
+#if YZ_SPU_SIMD_XFLOAT
+#include "spu_xfloat_simd.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -418,21 +425,37 @@ static inline uint32_t spu_xf_encode(double val)
     return ((uint32_t)sign << 31) | ((uint32_t)biased << 23) | frac;
 }
 
+static inline u128 spu_xf_scalar_fa(u128 a, u128 b)
+{
+    u128 r;
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) + spu_xf_decode(b._u32[i]));
+    return r;
+}
 static inline u128 spu_fa(u128 a, u128 b)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] + b._f32[i]; return r; }
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fa(&r, &a, &b)) return r;
+#endif
+    return spu_xf_scalar_fa(a, b);
+}
+static inline u128 spu_xf_scalar_fs(u128 a, u128 b)
+{
+    u128 r;
     for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) + spu_xf_decode(b._u32[i]));
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) - spu_xf_decode(b._u32[i]));
     return r;
 }
 static inline u128 spu_fs(u128 a, u128 b)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] - b._f32[i]; return r; }
-    for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) - spu_xf_decode(b._u32[i]));
-    return r;
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fs(&r, &a, &b)) return r;
+#endif
+    return spu_xf_scalar_fs(a, b);
 }
 
 /* Float<->int conversions with scale (RI8). HW/RPCS3 semantics (verified vs
@@ -461,13 +484,21 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+static inline u128 spu_xf_scalar_fm(u128 a, u128 b)
+{
+    u128 r;
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
+    return r;
+}
 static inline u128 spu_fm(u128 a, u128 b)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] * b._f32[i]; return r; }
-    for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
-    return r;
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fm(&r, &a, &b)) return r;
+#endif
+    return spu_xf_scalar_fm(a, b);
 }
 /* fma/fms/fnms: the SPU multiply is EXACT (single final rounding = true fused
  * multiply-add), ISA v1.2 p208/210/212 "the multiplication is exact and not
@@ -482,29 +513,53 @@ static inline u128 spu_fm(u128 a, u128 b)
  * encodes once at the end -- the same "exact multiply, one final rounding"
  * property, but in the SPU's own extended-range/no-NaN/no-Inf format rather
  * than IEEE. */
+static inline u128 spu_xf_scalar_fma(u128 a, u128 b, u128 c)
+{
+    u128 r;
+    for (int i = 0; i < 4; i++)
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) + spu_xf_decode(c._u32[i]));
+    return r;
+}
 static inline u128 spu_fma(u128 a, u128 b, u128 c)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fma(&r, &a, &b, &c)) return r;
+#endif
+    return spu_xf_scalar_fma(a, b, c);
+}
+static inline u128 spu_xf_scalar_fms(u128 a, u128 b, u128 c)
+{
+    u128 r;
     for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) + spu_xf_decode(c._u32[i]));
+        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) - spu_xf_decode(c._u32[i]));
     return r;
 }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fms(&r, &a, &b, &c)) return r;
+#endif
+    return spu_xf_scalar_fms(a, b, c);
+}
+static inline u128 spu_xf_scalar_fnms(u128 a, u128 b, u128 c)
+{
+    u128 r;
     for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]) - spu_xf_decode(c._u32[i]));
+        r._u32[i] = spu_xf_encode(spu_xf_decode(c._u32[i]) - spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
     return r;
 }
 static inline u128 spu_fnms(u128 a, u128 b, u128 c)
 {
     u128 r;
     if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
-    for (int i = 0; i < 4; i++)
-        r._u32[i] = spu_xf_encode(spu_xf_decode(c._u32[i]) - spu_xf_decode(a._u32[i]) * spu_xf_decode(b._u32[i]));
-    return r;
+#if YZ_SPU_SIMD_XFLOAT
+    if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fnms(&r, &a, &b, &c)) return r;
+#endif
+    return spu_xf_scalar_fnms(a, b, c);
 }
 /* FIX 2 -- compare family (2026-07-17, s43 review -- closes the gap the FIX 3
  * scope note above used to leave open; distinct from the OTHER "FIX 2" used
