@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(YZ_SPU_SIMD_XFLOAT) && YZ_SPU_SIMD_XFLOAT
+#include "spu_xfloat_simd.h"
+#endif
 
 /* ---- fingerprint ------------------------------------------------------- */
 
@@ -143,6 +146,11 @@ int spu_workload_resolve(const void* image, uint32_t image_size,
 int spu_workload_execute(const spu_workload_image* image, spu_context* ctx)
 {
     if (!image || !ctx) return 0;
+#if defined(YZ_SPU_SIMD_XFLOAT) && YZ_SPU_SIMD_XFLOAT
+    /* MXCSR is host-thread local; establish SPU's truncation mode before
+     * either a direct lift or the generated image executor can do xfloat. */
+    spu_xfloat_simd_thread_enter();
+#endif
     if (image->direct_entry) {
         image->direct_entry(ctx);
         return 1;

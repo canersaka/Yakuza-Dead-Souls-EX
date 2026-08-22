@@ -43,6 +43,7 @@ EXPECTED_CACHE = {
     "YZ_SPU_FAST_JOB_E": "ON",
     "YZ_SPU_FAST_ORPHANAGE": "ON",
     "YZ_SPU_FAST_SPURS_EXPERIMENTAL": "OFF",
+    "YZ_SPU_SIMD_XFLOAT": "ON",
     "YZ_WKL4_CYCLE_DIAGNOSTIC": "OFF",
 }
 
@@ -574,6 +575,8 @@ def run_gun(args):
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
     if args.expect_ls128:
         expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
+    if args.expect_xfloat:
+        expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
     mismatches = {
         name: {"expected": expected, "actual": cache.get(name)}
         for name, expected in expected_cache.items()
@@ -652,6 +655,7 @@ def run_gun(args):
                 *EXPECTED_CACHE,
                 "YZ_SPU_SIMD_SHUFB",
                 "YZ_SPU_SIMD_LS128",
+                "YZ_SPU_SIMD_XFLOAT",
             )
         },
         "active_yz": yz,
@@ -912,6 +916,8 @@ def run(args):
         expected_cache["YZ_SPU_SIMD_SHUFB"] = args.expect_shufb
     if args.expect_ls128:
         expected_cache["YZ_SPU_SIMD_LS128"] = args.expect_ls128
+    if args.expect_xfloat:
+        expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
     if args.wkl4_cycle:
         expected_cache["YZ_WKL4_CYCLE_DIAGNOSTIC"] = "ON"
     mismatches = {
@@ -968,6 +974,8 @@ def run(args):
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
         yz["YZ_WKL4_CYCLE"] = "1"
+    if args.xf_ieee:
+        yz["YZ_XF_IEEE"] = "1"
     environment.update(yz)
 
     result = {
@@ -982,6 +990,7 @@ def run(args):
                 *EXPECTED_CACHE,
                 "YZ_SPU_SIMD_SHUFB",
                 "YZ_SPU_SIMD_LS128",
+                "YZ_SPU_SIMD_XFLOAT",
             )
         },
         "active_yz": yz,
@@ -1277,6 +1286,7 @@ def main():
     parser.add_argument("--route-start-delay-ms", type=int, default=0)
     parser.add_argument("--expect-shufb", choices=("ON", "OFF"))
     parser.add_argument("--expect-ls128", choices=("ON", "OFF"))
+    parser.add_argument("--expect-xfloat", choices=("ON", "OFF"))
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--gun-route", action="store_true")
@@ -1293,6 +1303,7 @@ def main():
     parser.add_argument("--nr-draw", action="store_true")
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
+    parser.add_argument("--xf-ieee", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)
