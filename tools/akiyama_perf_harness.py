@@ -648,6 +648,8 @@ def run_gun(args):
         "YZ_DIALOGUE_PULSE_PERIOD_MS": "2200",
         "YZ_DIALOGUE_PULSE_HOLD_MS": "1400",
     }
+    if args.nr_vertical_active_basic:
+        yz["YZ_NR_VERTICAL"] = "active-basic"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -984,6 +986,10 @@ def run(args):
         yz["YZ_NR_INTERCEPT"] = "clear"
     if args.nr_draw:
         yz["YZ_NR_INTERCEPT"] = "draw"
+    if args.nr_vertical_shadow:
+        yz["YZ_NR_VERTICAL"] = "shadow"
+    if args.nr_vertical_active_basic:
+        yz["YZ_NR_VERTICAL"] = "active-basic"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1321,6 +1327,8 @@ def main():
     parser.add_argument("--nr-flip", action="store_true")
     parser.add_argument("--nr-clear", action="store_true")
     parser.add_argument("--nr-draw", action="store_true")
+    parser.add_argument("--nr-vertical-shadow", action="store_true")
+    parser.add_argument("--nr-vertical-active-basic", action="store_true")
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--xf-ieee", action="store_true")
@@ -1331,7 +1339,9 @@ def main():
     if args.fe0_callback_replay and not args.fe0:
         parser.error("--fe0-callback-replay requires --fe0")
     if sum((args.fe0, args.nr_shadow_census, args.nr_flip, args.nr_clear,
-            args.nr_draw, args.draw_phases, args.wkl4_cycle)) > 1:
+            args.nr_draw, args.nr_vertical_shadow,
+            args.nr_vertical_active_basic, args.draw_phases,
+            args.wkl4_cycle)) > 1:
         parser.error("select only one diagnostic/family lane")
 
     root = Path(__file__).resolve().parents[3]
@@ -1399,6 +1409,7 @@ def main():
     if args.gun_route:
         if any((args.fe0, args.fe0_callback_replay, args.nr_shadow_census,
                 args.nr_flip, args.nr_clear, args.nr_draw,
+                args.nr_vertical_shadow,
                 args.draw_phases, args.wkl4_cycle)):
             parser.error("gun route accepts no diagnostic/family lane")
         return run_gun(args)

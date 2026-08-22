@@ -477,6 +477,29 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        add_executable(rsx_nr_span_router_tests
+            libs/video/tests/test_nr_span_router.c
+            libs/video/rsx_nr_span_router.c
+        )
+        target_include_directories(rsx_nr_span_router_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nr_span_router_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(rsx_nr_span_router_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(
+            NAME rsx_nr_span_router
+            COMMAND rsx_nr_span_router_tests
+        )
+        set_tests_properties(
+            rsx_nr_span_router
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
         # Native-render resource model: mapping epochs, resource lifetime
         # cache over the guest-page tracker, PSO cache, timeline fences.
         add_executable(rsx_nr_resources_tests

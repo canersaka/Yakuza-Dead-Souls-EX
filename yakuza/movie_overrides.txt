@@ -1,5 +1,7 @@
 # Game-owned PPU override set. The mwPly entries form the Route 1 video-HLE
-# vertical slice.
+# vertical slice. The native-GCM entries form the first correctness-only
+# graphics producer slice; their handwritten wrappers are pass-through unless
+# YZ_NR_VERTICAL=shadow is explicitly selected.
 # Passed to tools/ppu_lifter.py via --override-funcs: these guest functions are
 # emitted as func_XXXXXXXX_lifted bodies + extern func_XXXXXXXX declarations;
 # yakuza/mwply_hle.cpp owns the plain symbols (pass-through until armed).
@@ -21,3 +23,6 @@
 0x00C97CE0  # AUTH presentation-clock update (a010 timeline diagnostic)
 0x00C98028  # AUTH state-16 update (a010 timeline diagnostic)
 0x00E7E1EC  # final camera-matrix consumer (a010 CMT camera repair)
+0x00EBC034  # GCM SetReferenceCommand producer boundary
+0x00EBC330  # GCM WaitLabel producer boundary
+0x00EBD6FC  # GCM SetUserCommand producer boundary

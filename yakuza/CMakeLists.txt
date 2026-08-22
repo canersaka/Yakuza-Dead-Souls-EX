@@ -375,6 +375,7 @@ add_executable(yakuza_recomp
     mwply_hle.cpp
     presentation_clock_hle.cpp
     auth_clock_probe.cpp
+    native_gcm_vertical.cpp
     shims.cpp
     threads.cpp
     "${YZ_FUNC_TABLE}"
