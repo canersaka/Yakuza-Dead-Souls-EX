@@ -23,6 +23,8 @@ typedef struct yz_wkl4_cycle_thread_state {
     uint64_t start;
     uint32_t tag;
     uint32_t generation;
+    uint64_t cycles[YZ_WKL4_CYCLE_TAG_COUNT];
+    uint64_t entries[YZ_WKL4_CYCLE_TAG_COUNT];
 } yz_wkl4_cycle_thread_state;
 
 static yz_wkl4_cycle_aggregate g_aggregates[2][YZ_WKL4_CYCLE_TAG_COUNT];
@@ -59,6 +61,35 @@ static uint64_t yz_wkl4_cycle_clock(void)
 #endif
 }
 
+static void yz_wkl4_cycle_reset_pending(yz_wkl4_cycle_thread_state* state)
+{
+    state->start = 0u;
+    state->tag = YZ_WKL4_CYCLE_NONE;
+    memset(state->cycles, 0, sizeof(state->cycles));
+    memset(state->entries, 0, sizeof(state->entries));
+}
+
+static void yz_wkl4_cycle_flush_pending(
+    yz_wkl4_cycle_thread_state* state, uint32_t generation)
+{
+    yz_wkl4_cycle_aggregate* aggregates =
+        yz_wkl4_cycle_current_aggregates(generation);
+    for (uint32_t tag = 1u; tag < YZ_WKL4_CYCLE_TAG_COUNT; ++tag) {
+        if (state->cycles[tag]) {
+            atomic_fetch_add_explicit(&aggregates[tag].cycles,
+                                      state->cycles[tag],
+                                      memory_order_relaxed);
+            state->cycles[tag] = 0u;
+        }
+        if (state->entries[tag]) {
+            atomic_fetch_add_explicit(&aggregates[tag].entries,
+                                      state->entries[tag],
+                                      memory_order_relaxed);
+            state->entries[tag] = 0u;
+        }
+    }
+}
+
 static int yz_wkl4_cycle_exact_flag(const char* name)
 {
     const char* value = getenv(name);
@@ -93,26 +124,20 @@ void yz_wkl4_cycle_mark(yz_wkl4_cycle_tag tag)
         return;
 
     if (state->generation != generation) {
-        state->start = 0u;
-        state->tag = YZ_WKL4_CYCLE_NONE;
+        yz_wkl4_cycle_reset_pending(state);
         state->generation = generation;
     } else if (state->tag == (uint32_t)tag) {
         return;
     }
 
     const uint64_t now = yz_wkl4_cycle_clock();
-    yz_wkl4_cycle_aggregate* aggregates =
-        yz_wkl4_cycle_current_aggregates(generation);
     if (state->tag > YZ_WKL4_CYCLE_NONE &&
         state->tag < YZ_WKL4_CYCLE_TAG_COUNT) {
-        atomic_fetch_add_explicit(&aggregates[state->tag].cycles,
-                                  now - state->start,
-                                  memory_order_relaxed);
+        state->cycles[state->tag] += now - state->start;
     }
     state->tag = (uint32_t)tag;
     state->start = now;
-    atomic_fetch_add_explicit(&aggregates[tag].entries, 1u,
-                              memory_order_relaxed);
+    ++state->entries[tag];
 }
 
 void yz_wkl4_cycle_leave(void)
@@ -126,19 +151,16 @@ void yz_wkl4_cycle_leave(void)
         return;
 
     if (state->generation != generation) {
-        state->start = 0u;
-        state->tag = YZ_WKL4_CYCLE_NONE;
+        yz_wkl4_cycle_reset_pending(state);
         state->generation = generation;
         return;
     }
 
     const uint64_t now = yz_wkl4_cycle_clock();
-    yz_wkl4_cycle_aggregate* aggregates =
-        yz_wkl4_cycle_current_aggregates(generation);
-    atomic_fetch_add_explicit(&aggregates[state->tag].cycles,
-                              now - state->start, memory_order_relaxed);
+    state->cycles[state->tag] += now - state->start;
     state->tag = YZ_WKL4_CYCLE_NONE;
     state->start = 0u;
+    yz_wkl4_cycle_flush_pending(state, generation);
 }
 
 void yz_wkl4_cycle_begin_interval(void)
@@ -165,7 +187,8 @@ const char* yz_wkl4_cycle_tag_name(yz_wkl4_cycle_tag tag)
     static const char* names[YZ_WKL4_CYCLE_TAG_COUNT] = {
         "none",
         "7e50_setup", "7e50_loop", "7e50_tail",
-        "8230_setup", "8230_loop", "8230_tail",
+        "8230_setup", "8230_loop_prepare", "8230_loop_compare",
+        "8230_loop_store", "8230_tail",
         "8680_setup", "8680_loop", "8680_tail",
         "9808_setup", "9808_loop", "9808_tail"
     };
@@ -234,10 +257,13 @@ uint64_t yz_wkl4_cycle_test_cycles(yz_wkl4_cycle_tag tag)
         &g_generation, memory_order_relaxed);
     yz_wkl4_cycle_aggregate* aggregates =
         yz_wkl4_cycle_current_aggregates(generation);
-    return tag < YZ_WKL4_CYCLE_TAG_COUNT
-        ? atomic_load_explicit(&aggregates[tag].cycles,
-                               memory_order_relaxed)
-        : 0u;
+    if (tag >= YZ_WKL4_CYCLE_TAG_COUNT)
+        return 0u;
+    uint64_t value = atomic_load_explicit(&aggregates[tag].cycles,
+                                          memory_order_relaxed);
+    if (g_thread_state.generation == generation)
+        value += g_thread_state.cycles[tag];
+    return value;
 }
 
 uint64_t yz_wkl4_cycle_test_entries(yz_wkl4_cycle_tag tag)
@@ -246,9 +272,12 @@ uint64_t yz_wkl4_cycle_test_entries(yz_wkl4_cycle_tag tag)
         &g_generation, memory_order_relaxed);
     yz_wkl4_cycle_aggregate* aggregates =
         yz_wkl4_cycle_current_aggregates(generation);
-    return tag < YZ_WKL4_CYCLE_TAG_COUNT
-        ? atomic_load_explicit(&aggregates[tag].entries,
-                               memory_order_relaxed)
-        : 0u;
+    if (tag >= YZ_WKL4_CYCLE_TAG_COUNT)
+        return 0u;
+    uint64_t value = atomic_load_explicit(&aggregates[tag].entries,
+                                          memory_order_relaxed);
+    if (g_thread_state.generation == generation)
+        value += g_thread_state.entries[tag];
+    return value;
 }
 #endif
