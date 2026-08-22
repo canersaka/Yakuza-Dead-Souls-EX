@@ -94,8 +94,8 @@ static uint64_t g_proc_param_vaddr = 0;
 extern "C" uint32_t g_ps3_sdk_version;
 extern "C" uint64_t spu_workload_fingerprint(const void*, size_t);
 extern "C" size_t spu_elf_image_size(const uint8_t*, size_t);
-extern "C" int spu_workload_register_image(uint64_t, uint32_t, int, uint32_t,
-                                            const char*);
+extern "C" int spu_workload_register_image_bytes(
+    uint64_t, const void*, uint32_t, int, uint32_t, const char*);
 extern "C" void spu_workload_reset(void);
 
 /* recomp_prx/spurs_kernel2.c + spurs_sysservice.c (generated, C) — register the
@@ -250,8 +250,8 @@ static int yz_register_native_spurs_images(void)
         const spu_image_desc& d = g_spu_images[i];
         const uint8_t* image = vm_base + d.elf_ea;
         const size_t size = spu_elf_image_size(image, 16u * 1024u * 1024u);
-        if (!size || !spu_workload_register_image(
-                spu_workload_fingerprint(image, size), (uint32_t)size,
+        if (!size || !spu_workload_register_image_bytes(
+                spu_workload_fingerprint(image, size), image, (uint32_t)size,
                 d.image_id, d.entry, d.name)) {
             fprintf(stderr,
                     "[native-spurs] failed to register exact task image "
@@ -285,8 +285,8 @@ static int yz_register_native_spurs_images(void)
     };
     for (const RawJob& d : jobs) {
         const uint8_t* image = vm_base + d.ea;
-        if (!spu_workload_register_image(
-                spu_workload_fingerprint(image, d.size), d.size,
+        if (!spu_workload_register_image_bytes(
+                spu_workload_fingerprint(image, d.size), image, d.size,
                 d.image, 0x4c00u, d.name)) {
             fprintf(stderr,
                     "[native-spurs] failed to register exact job image "

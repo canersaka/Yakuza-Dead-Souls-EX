@@ -580,6 +580,10 @@ def run_gun(args):
         expected_cache["YZ_SPU_SIMD_ABSDB"] = args.expect_absdb
     if args.expect_xfloat:
         expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
+    if args.expect_exact_image_bytes:
+        expected_cache["YZ_SPU_EXACT_IMAGE_BYTES"] = (
+            args.expect_exact_image_bytes
+        )
     mismatches = {
         name: {"expected": expected, "actual": cache.get(name)}
         for name, expected in expected_cache.items()
@@ -659,6 +663,7 @@ def run_gun(args):
                 "YZ_SPU_SIMD_SHUFB",
                 "YZ_SPU_SIMD_LS128",
                 "YZ_SPU_SIMD_XFLOAT",
+                "YZ_SPU_EXACT_IMAGE_BYTES",
             )
         },
         "active_yz": yz,
@@ -923,6 +928,10 @@ def run(args):
         expected_cache["YZ_SPU_SIMD_ABSDB"] = args.expect_absdb
     if args.expect_xfloat:
         expected_cache["YZ_SPU_SIMD_XFLOAT"] = args.expect_xfloat
+    if args.expect_exact_image_bytes:
+        expected_cache["YZ_SPU_EXACT_IMAGE_BYTES"] = (
+            args.expect_exact_image_bytes
+        )
     if args.wkl4_cycle:
         expected_cache["YZ_WKL4_CYCLE_DIAGNOSTIC"] = "ON"
     mismatches = {
@@ -997,6 +1006,7 @@ def run(args):
                 "YZ_SPU_SIMD_LS128",
                 "YZ_SPU_SIMD_ABSDB",
                 "YZ_SPU_SIMD_XFLOAT",
+                "YZ_SPU_EXACT_IMAGE_BYTES",
             )
         },
         "active_yz": yz,
@@ -1294,6 +1304,9 @@ def main():
     parser.add_argument("--expect-ls128", choices=("ON", "OFF"))
     parser.add_argument("--expect-absdb", choices=("ON", "OFF"))
     parser.add_argument("--expect-xfloat", choices=("ON", "OFF"))
+    parser.add_argument(
+        "--expect-exact-image-bytes", choices=("ON", "OFF")
+    )
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--gun-route", action="store_true")

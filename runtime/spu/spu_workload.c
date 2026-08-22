@@ -13,6 +13,10 @@
 #include "spu_xfloat_simd.h"
 #endif
 
+#ifndef YZ_SPU_EXACT_IMAGE_BYTES
+#define YZ_SPU_EXACT_IMAGE_BYTES 0
+#endif
+
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -39,6 +43,7 @@ typedef struct {
     int                 image_id;
     uint32_t            entry_pc;
     const char*         name;
+    uint8_t*            exact_bytes;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -74,6 +79,8 @@ int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++) {
         if (s_registry[i].fp == fingerprint &&
             s_registry[i].image_size == image_size) {
+            free(s_registry[i].exact_bytes);
+            s_registry[i].exact_bytes = NULL;
             s_registry[i].fn = fn;
             s_registry[i].image_id = -1;
             s_registry[i].entry_pc = 0;
@@ -100,6 +107,8 @@ int spu_workload_register_image(uint64_t fingerprint, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++) {
         if (s_registry[i].fp == fingerprint &&
             s_registry[i].image_size == image_size) {
+            free(s_registry[i].exact_bytes);
+            s_registry[i].exact_bytes = NULL;
             s_registry[i].fn = NULL;
             s_registry[i].image_id = image_id;
             s_registry[i].entry_pc = entry_pc;
@@ -118,6 +127,44 @@ int spu_workload_register_image(uint64_t fingerprint, uint32_t image_size,
     return 1;
 }
 
+int spu_workload_register_image_bytes(
+    uint64_t fingerprint, const void* image, uint32_t image_size,
+    int image_id, uint32_t entry_pc, const char* name)
+{
+#if !YZ_SPU_EXACT_IMAGE_BYTES
+    (void)image;
+    return spu_workload_register_image(
+        fingerprint, image_size, image_id, entry_pc, name);
+#else
+    if (!image || !image_size || image_id < 0) return 0;
+    uint8_t* exact = (uint8_t*)malloc(image_size);
+    if (!exact) return 0;
+    memcpy(exact, image, image_size);
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].fp == fingerprint &&
+            s_registry[i].image_size == image_size) {
+            free(s_registry[i].exact_bytes);
+            s_registry[i].exact_bytes = exact;
+            s_registry[i].fn = NULL;
+            s_registry[i].image_id = image_id;
+            s_registry[i].entry_pc = entry_pc;
+            s_registry[i].name = name;
+            return 1;
+        }
+    }
+    if (s_registry_count >= SPU_WORKLOAD_MAX) {
+        free(exact);
+        fprintf(stderr, "[spu_workload] registry full; rejected '%s'\n",
+                name ? name : "?");
+        return 0;
+    }
+    s_registry[s_registry_count++] = (spu_workload_entry){
+        fingerprint, image_size, NULL, image_id, entry_pc, name, exact
+    };
+    return 1;
+#endif
+}
+
 void spu_workload_set_image_executor(spu_workload_image_executor_fn executor)
 {
     s_image_executor = executor;
@@ -127,6 +174,21 @@ int spu_workload_resolve(const void* image, uint32_t image_size,
                          spu_workload_image* out)
 {
     if (!image || !image_size || !out) return 0;
+#if YZ_SPU_EXACT_IMAGE_BYTES
+    /* Exact size is checked before touching the retained bytes.  memcmp is an
+     * identity proof, not a hash shortcut: a modified/reused guest range can
+     * never return a stale registered image from this path. */
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        const spu_workload_entry* e = &s_registry[i];
+        if (e->image_size == image_size && e->exact_bytes &&
+            memcmp(image, e->exact_bytes, image_size) == 0) {
+            *out = (spu_workload_image){
+                e->fp, image_size, e->image_id, e->entry_pc, e->fn, e->name
+            };
+            return 1;
+        }
+    }
+#endif
     const uint64_t fp = spu_workload_fingerprint(image, image_size);
     for (unsigned i = 0; i < s_registry_count; i++) {
         const spu_workload_entry* e = &s_registry[i];
@@ -176,6 +238,8 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
 unsigned spu_workload_count(void) { return s_registry_count; }
 void spu_workload_reset(void)
 {
+    for (unsigned i = 0; i < s_registry_count; i++)
+        free(s_registry[i].exact_bytes);
     memset(s_registry, 0, sizeof(s_registry));
     s_registry_count = 0;
     s_image_executor = NULL;

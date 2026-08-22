@@ -1631,6 +1631,50 @@ static int test_job_logical_binary_size(void)
     return 0;
 }
 
+static int test_workload_exact_byte_resolution(void)
+{
+    enum { IMAGE_SIZE = 0x9540, ITERATIONS = 20000 };
+    static uint8_t registered[IMAGE_SIZE];
+    static uint8_t probe[IMAGE_SIZE];
+    spu_workload_image image;
+    volatile uint64_t fingerprint_sink = 0;
+
+    for (uint32_t i = 0; i < IMAGE_SIZE; ++i)
+        registered[i] = (uint8_t)(i * 37u + (i >> 5));
+    memcpy(probe, registered, sizeof(probe));
+    const uint64_t fingerprint =
+        spu_workload_fingerprint(registered, sizeof(registered));
+    spu_workload_reset();
+    CHECK(spu_workload_register_image_bytes(
+              fingerprint, registered, sizeof(registered),
+              77, 0x4c00u, "exact-byte-test"));
+
+    /* The registry owns its reference.  Changing the registration source
+     * after return cannot silently redefine the accepted image. */
+    registered[17] ^= 0x5au;
+    CHECK(spu_workload_resolve(probe, sizeof(probe), &image));
+    CHECK(image.image_id == 77 && image.entry_pc == 0x4c00u);
+    probe[IMAGE_SIZE / 2] ^= 1u;
+    CHECK(!spu_workload_resolve(probe, sizeof(probe), &image));
+    probe[IMAGE_SIZE / 2] ^= 1u;
+    CHECK(spu_workload_resolve(probe, sizeof(probe), &image));
+
+    const clock_t exact_begin = clock();
+    for (unsigned i = 0; i < ITERATIONS; ++i)
+        CHECK(spu_workload_resolve(probe, sizeof(probe), &image));
+    const clock_t exact_end = clock();
+    const clock_t hash_begin = clock();
+    for (unsigned i = 0; i < ITERATIONS; ++i)
+        fingerprint_sink ^= spu_workload_fingerprint(probe, sizeof(probe));
+    const clock_t hash_end = clock();
+    printf("spu_workload_exact_bench: memcmp=%lld ticks fnv=%lld ticks sink=%llu\n",
+           (long long)(exact_end - exact_begin),
+           (long long)(hash_end - hash_begin),
+           (unsigned long long)fingerprint_sink);
+    spu_workload_reset();
+    return 0;
+}
+
 static int test_job_sub_qword_dma_layout(void)
 {
     CellSpurs* spurs = (CellSpurs*)(guest + 0x68000);
@@ -2588,6 +2632,7 @@ int main(void)
         test_multiple_instances() ||
         test_task_poll_workload_yield() ||
         test_task_event_queue() || test_spurs_queue_lock_order() ||
+        test_workload_exact_byte_resolution() ||
         test_job_logical_binary_size() ||
         test_job_sub_qword_dma_layout() ||
         test_large_job_slot_fallback() ||

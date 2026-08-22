@@ -64,6 +64,14 @@ int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
 int spu_workload_register_image(uint64_t fingerprint, uint32_t image_size,
                                 int image_id, uint32_t entry_pc,
                                 const char* name);
+/* Register the same exact identity while retaining an owned byte-for-byte
+ * reference image.  When YZ_SPU_EXACT_IMAGE_BYTES is enabled, resolve can use
+ * the CRT's optimized memcmp instead of recomputing scalar FNV for every
+ * dispatch.  Any changed byte misses this path and falls back to the original
+ * fingerprint lookup, so dynamic/replaced images retain existing semantics. */
+int spu_workload_register_image_bytes(
+    uint64_t fingerprint, const void* image, uint32_t image_size,
+    int image_id, uint32_t entry_pc, const char* name);
 void spu_workload_set_image_executor(spu_workload_image_executor_fn executor);
 int spu_native_image_executor(spu_context* ctx, int image_id, uint32_t entry_pc);
 int spu_workload_resolve(const void* image, uint32_t image_size,
