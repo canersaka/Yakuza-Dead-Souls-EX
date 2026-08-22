@@ -73,6 +73,9 @@ option(YZ_SPU_SIMD_XFLOAT
 option(YZ_WKL4_CYCLE_DIAGNOSTIC
     "Compile the default-off, fixed-memory image-4 hot-region cycle classifier."
     OFF)
+option(YZ_SPU_EXACT_IMAGE_BYTES
+    "Resolve registered SPU images with an owned exact-byte reference before the legacy fingerprint fallback."
+    ON)
 if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
     message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
 endif()
@@ -107,7 +110,8 @@ target_compile_definitions(ps3recomp_runtime PRIVATE
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
     YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
-    YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>)
+    YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>
+    YZ_SPU_EXACT_IMAGE_BYTES=$<BOOL:${YZ_SPU_EXACT_IMAGE_BYTES}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         YZ_WKL4_CYCLE_DIAGNOSTIC=1)
@@ -398,7 +402,8 @@ target_compile_definitions(yakuza_recomp PRIVATE
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
     YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
-    YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>)
+    YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>
+    YZ_SPU_EXACT_IMAGE_BYTES=$<BOOL:${YZ_SPU_EXACT_IMAGE_BYTES}>)
 if(YZ_WKL4_CYCLE_DIAGNOSTIC)
     target_compile_definitions(yakuza_recomp PRIVATE
         YZ_WKL4_CYCLE_DIAGNOSTIC=1)

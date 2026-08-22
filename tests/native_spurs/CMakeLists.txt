@@ -19,7 +19,8 @@ add_executable(native_spurs_tests
 target_compile_definitions(native_spurs_tests PRIVATE
     YZ_SPURS_LOCK_ORDER_TEST=1
     YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST=1
-    YZ_SPURS_TEST_GUEST_SIZE=2097152)
+    YZ_SPURS_TEST_GUEST_SIZE=2097152
+    YZ_SPU_EXACT_IMAGE_BYTES=1)
 target_include_directories(native_spurs_tests PRIVATE
     "${PS3RECOMP_ROOT}/include"
     "${PS3RECOMP_ROOT}/libs/spurs"
