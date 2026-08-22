@@ -19,6 +19,7 @@
 #include "rsx_wait_classifier.h"
 #include "rsx_nr_intercept.h"
 #include "rsx_nr_backend.h"
+#include "native_gcm_vertical.h"
 
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
@@ -3520,6 +3521,107 @@ static void yz_ucmd_retry_pending(void)
     }
 }
 
+/* Semantic actions shared by the legacy packet decoder and the vertical
+ * typed-command backend.  Keeping these below the packet layer is important:
+ * an owned typed span must not reconstruct a legacy method and feed it back
+ * through yz_rsx_method, otherwise the native path would still pay the
+ * decoder/renderer bridge it is intended to replace. */
+static void yz_rsx_exec_user_command(uint32_t method, uint32_t arg)
+{
+    /* s22 ROOT FIX: the RSX USER INTERRUPT pumps the title's
+     * wid4 SPU decode pool.  Preserve the exact delivery and stale-recovery
+     * rules for both legacy and typed producers. */
+    static int nu = -1;
+    if (nu < 0) {
+        nu = getenv("YZ_NO_UCMD") ? 1 : 0;
+        fprintf(stderr, "[ucmd] armed (user-interrupt dispatch %s)\n",
+                nu ? "DISABLED by YZ_NO_UCMD" : "on");
+        fflush(stderr);
+    }
+    if (nu)
+        return;
+    if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
+        yz_a010_fifo_publication_repair_enabled()) {
+        const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
+        const uint32_t behind = have - arg;
+        if (behind < 0x10000u && arg <= have) {
+            static unsigned long stale_ucmd = 0;
+            stale_ucmd++;
+            if (stale_ucmd <= 16 || (stale_ucmd & 0xFFu) == 0u) {
+                fprintf(stderr,
+                        "[a010-stale-ucmd] skipped n=%lu cause=0x%08X "
+                        "completed=0x%08X\n",
+                        stale_ucmd, arg, have);
+                fflush(stderr);
+            }
+            return;
+        }
+    }
+    vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);
+#ifdef YZ_NATIVE_GCM
+    yz_fe0_timeline_emit(YZ_FE0_EVENT_UCMD_DISPATCH, arg, method,
+                         yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e,
+                         0, 0);
+    cellGcmDispatchUserCommand(arg);
+    {
+        static unsigned long un = 0;
+        un++;
+        if (un <= 40 || (un & 0xFFu) == 0) {
+            fprintf(stderr, "[ucmd-hle] n=%lu cause=0x%08X dispatched\n",
+                    un, arg);
+            fflush(stderr);
+        }
+    }
+#else
+    if (g_rsx_event_port) {
+        const int64_t r = yz_rsx_ev_send(0x80ull);
+        static unsigned long un = 0;
+        un++;
+        if (un <= 40 || (un & 0xFFu) == 0) {
+            fprintf(stderr,
+                    "[ucmd] n=%lu cause=0x%08X handlers=0x%08X send=%lld\n",
+                    un, arg, vm_read32(RSX_DRIVER_INFO + 0x12C0),
+                    (long long)r);
+            fflush(stderr);
+        }
+    } else {
+        static int w = 0;
+        if (w < 4) {
+            w++;
+            fprintf(stderr,
+                    "[ucmd] DROPPED cause=0x%08X (no event port yet)\n",
+                    arg);
+            fflush(stderr);
+        }
+    }
+#endif
+}
+
+static void yz_rsx_exec_set_reference(uint32_t arg)
+{
+    /* RPCS3's SET_REFERENCE flushes before publishing REF.  The live backend
+     * keeps this optional compatibility fence in one semantic implementation
+     * regardless of whether the action came from packets or typed GCM. */
+    static int fs = -1;
+    if (fs < 0)
+        fs = getenv("YZ_RSX_FENCE_SYNC") ? 1 : 0;
+    if (fs) {
+        extern void rsx_live_draw_flush(void);
+        rsx_live_draw_flush();
+    }
+    vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_REF, arg);
+}
+
+extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value)
+{
+    yz_rsx_exec_set_reference(value);
+}
+
+extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause)
+{
+    yz_rsx_exec_user_command(0xEB00u, cause);
+}
+
 static int yz_rsx_method(uint32_t method, uint32_t arg)
 {
     /* Deliver any latched (queue-full) RSX event bits before consuming more
@@ -3699,88 +3801,11 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     }
     switch (method) {
     case 0xEB00:                                  /* GCM_SET_USER_COMMAND (user interrupt) */
-    case 0xEB04: {
-        /* s22 ROOT FIX: the RSX USER INTERRUPT — the mechanism the
-         * game uses to pump its wid4 SPU decode pool. The game registers
-         * func_00E7DB10 (the ONLY _cellSpursSendSignal path in the EBOOT) via
-         * cellGcmSetUserHandler (handlers bit 0x80, measured 0x86 live), then
-         * queues THIS method in the frame stream; the consumer must deliver it
-         * to Sony's _gcm_intr_thread, which calls the handler with the cause
-         * arg. We silently dropped it — the pool starved and the movie-boundary
-         * bootstrap deadlocked on the 0xFE0 decode label (DONT_RECHASE #29/#31).
-         * Oracle: RPCS3 gcm_enums.h:821 (0xEB00 "User interrupt"),
-         * rsx_methods.cpp:68/1728 (user_command, bound over 0xEB00-0xEB04),
-         * sys_rsx.cpp:931 case 0xFEF (userCmdParam=arg + send_event
-         * SYS_RSX_EVENT_USER_CMD=1<<7), sys_rsx.h:46 (userCmdParam @ +0x12CC).
-         * Same delivery path as our vblank/flip events. Kill-switch YZ_NO_UCMD. */
-        static int nu = -1; if (nu < 0) { nu = getenv("YZ_NO_UCMD") ? 1 : 0;
-            fprintf(stderr, "[ucmd] armed (user-interrupt dispatch %s)\n",
-                    nu ? "DISABLED by YZ_NO_UCMD" : "on"); fflush(stderr); }
-        if (nu) break;
-        /* The a010 missing-link recovery can traverse valid older command
-         * chains still resident in the ring.  Their user-command causes must
-         * not move the monotonic decode-completion label backwards after a
-         * newer cause has already completed. */
-        if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0 &&
-            yz_a010_fifo_publication_repair_enabled()) {
-            const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
-            const uint32_t behind = have - arg;
-            if (behind < 0x10000u && arg <= have) {
-                static unsigned long stale_ucmd = 0;
-                stale_ucmd++;
-                if (stale_ucmd <= 16 || (stale_ucmd & 0xFFu) == 0u) {
-                    fprintf(stderr,
-                            "[a010-stale-ucmd] skipped n=%lu cause=0x%08X "
-                            "completed=0x%08X\n",
-                            stale_ucmd, arg, have);
-                    fflush(stderr);
-                }
-                break;
-            }
-        }
-        vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
-#ifdef YZ_NATIVE_GCM
-        yz_fe0_timeline_emit(YZ_FE0_EVENT_UCMD_DISPATCH, arg, method,
-                             yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e,
-                             0, 0);
-        cellGcmDispatchUserCommand(arg);
-        { static unsigned long un = 0; un++;
-          if (un <= 40 || (un & 0xFFu) == 0) {
-              fprintf(stderr, "[ucmd-hle] n=%lu cause=0x%08X dispatched\n",
-                      un, arg);
-              fflush(stderr);
-          } }
-#else
-        if (g_rsx_event_port) {
-            /* A newer cause supersedes any latched one (lv1 coalescing: ONE
-             * pending cause register, latest wins; userCmdParam above already
-             * carries it). Failure latches into the shared pending mask. */
-            int64_t r = yz_rsx_ev_send(0x80ull);          /* SYS_RSX_EVENT_USER_CMD */
-            static unsigned long un = 0; un++;
-            if (un <= 40 || (un & 0xFFu) == 0) {
-                fprintf(stderr, "[ucmd] n=%lu cause=0x%08X handlers=0x%08X send=%lld\n",
-                        un, arg, vm_read32(RSX_DRIVER_INFO + 0x12C0), (long long)r);
-                fflush(stderr);
-            }
-        } else {
-            static int w = 0; if (w < 4) { w++;
-                fprintf(stderr, "[ucmd] DROPPED cause=0x%08X (no event port yet)\n", arg);
-                fflush(stderr); }
-        }
-#endif
-        break; }
+    case 0xEB04:
+        yz_rsx_exec_user_command(method, arg);
+        break;
     case 0x050:                                   /* NV406E SET_REFERENCE */
-        /* FAITHFUL FENCE TIMING (env YZ_RSX_FENCE_SYNC, opt-in A/B). RPCS3's
-         * nv406e::set_reference calls sync() -- flush + wait for the GPU pipeline
-         * -- BEFORE writing REF, so the game's REF poll blocks until the GPU has
-         * really caught up. Our async consumer otherwise writes REF instantly and
-         * races ahead of real GPU time (measured via the PPU trace-diff at
-         * func_00EBBFB4: ours skips the fence wait RPCS3 performs). Flush the
-         * D3D12 backend (a real GPU fence wait) first to pace the consumer to
-         * actual GPU completion, matching RPCS3. */
-        { static int fs = -1; if (fs < 0) fs = getenv("YZ_RSX_FENCE_SYNC") ? 1 : 0;
-          if (fs) { extern void rsx_live_draw_flush(void); rsx_live_draw_flush(); } }
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_REF, arg);
+        yz_rsx_exec_set_reference(arg);
         break;
     case 0x060:                                   /* NV406E SET_CONTEXT_DMA_SEMAPHORE */
         yz_rsx_sem_dma_406e = arg;
@@ -6110,6 +6135,10 @@ static void yz_rsx_fifo_lock_ensure(void)
 
 extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
 {
+    /* The producer-boundary shadow has its own enable bit and lock. Disable
+     * it before consulting the older consumer-shadow guard so a vertical-only
+     * run still emits its shutdown aggregate exactly once. */
+    yz_nr_vertical_shutdown();
     if (!g_yz_rsx_wait_classifier_enabled &&
         !g_yz_fe0_timeline_enabled &&
         !g_yz_wkl4_cycle_enabled &&
@@ -6432,6 +6461,36 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         static int warned = 0;
         if (!warned) { warned = 1;
             fprintf(stderr, "[rsx] GET=0x%08X (PUT=0x%08X) not io-mapped; idling\n", get, put); }
+        return finish(YZ_RSX_WAIT_BAD_FLOW);
+    }
+
+    /* Highest-safe producer interception owns typed spans by their exact
+     * guest FIFO address.  A miss is the overwhelmingly common legacy path;
+     * a claim executes once through the ordered typed backend and advances
+     * GET across the reserved wire span without decoding its NOP words. */
+    uint32_t native_words = 0;
+    const yz_nr_vertical_consume_result native_result =
+        yz_nr_vertical_consume(ea, &native_words);
+    if (native_result == YZ_NR_VERTICAL_CONSUME_EXECUTED) {
+        if (!native_words || native_words > 0x1000u)
+            return finish(YZ_RSX_WAIT_BAD_FLOW);
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET,
+                   get + native_words * 4u);
+        if constexpr (WaitClassify)
+            wait_dispatched_methods += native_words;
+        return finish(YZ_RSX_WAIT_ADVANCING);
+    }
+    if (native_result == YZ_NR_VERTICAL_CONSUME_WAIT)
+        return finish(YZ_RSX_WAIT_UNFINALIZED_HOLE);
+    if (native_result == YZ_NR_VERTICAL_CONSUME_FATAL) {
+        static int reported = 0;
+        if (!reported++) {
+            fprintf(stderr,
+                    "[nr-vertical] fatal typed span at GET=0x%08X EA=0x%08X; "
+                    "refusing legacy decode of reserved words\n",
+                    get, ea);
+            fflush(stderr);
+        }
         return finish(YZ_RSX_WAIT_BAD_FLOW);
     }
 
@@ -7349,8 +7408,11 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         if (eff >= 0xE940u && eff <= 0xE95Cu)
             rsx_live_draw_set_fifo_position(get, put);
         stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
-        if (!stalled && g_yz_nr_shadow_enabled)
-            rsx_nr_intercept_shadow_method(&g_yz_nr_shadow, eff, val);
+        if (!stalled) {
+            if (g_yz_nr_shadow_enabled)
+                rsx_nr_intercept_shadow_method(&g_yz_nr_shadow, eff, val);
+            yz_nr_vertical_observe_method(eff, val, yz_rsx_io_to_ea(get));
+        }
         if (g_yz_fe0_timeline_enabled && eff == 0x068u) {
             const uint32_t sem_addr =
                 yz_rsx_sem_addr(yz_rsx_sem_dma_406e,
@@ -8095,6 +8157,7 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
     static int started = 0;
     if (!started) {
         started = 1;
+        yz_nr_vertical_init();
         yz_nr_shadow_init();
         yz_fe0_timeline_init();
         yz_wkl4_cycle_init();

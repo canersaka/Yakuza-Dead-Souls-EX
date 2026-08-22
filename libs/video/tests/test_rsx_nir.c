@@ -1062,13 +1062,17 @@ static void test_reference_user_tokens(void)
     rsx_nir_stream_init(&sa);
     rsx_nir_stream_init(&sb);
 
-    /* packet path: SET_REFERENCE arrives through the raw FIFO front end
-     * (NV406E method 0x50), user command through the method stream */
+    /* Packet path: the exact words emitted by the first three vertical
+     * producer gates.  SET_REFERENCE and WAIT_LABEL arrive through the raw
+     * NV406E FIFO front end; user command uses the same flattened method
+     * stream as the live consumer. */
     rsx_nir_adapter ad;
     rsx_nir_adapter_init(&ad, &sa);
     fifo_buf f;
     memset(&f, 0, sizeof(f));
     fm1(&f, 0x0050, 0xBEEF);
+    fm1(&f, 0x0064, 0x3A0);
+    fm1(&f, 0x0068, 0x12345678);
     u32 stop = 0;
     u32 used = rsx_nir_adapter_fifo(&ad, f.words, f.n, &stop);
     CHECK(used == f.n, "reference packet consumed %u of %u", used, f.n);
@@ -1078,11 +1082,12 @@ static void test_reference_user_tokens(void)
     rsx_nir_emitter_init_stream(&em, &sb);
     typed_stage_defaults(&em);
     rsx_nir_em_set_reference(&em, 0xBEEF);
+    rsx_nir_em_semaphore_acquire(&em, 0, 0x3A0, 0x12345678);
     rsx_nir_em_user_command(&em, 7);
 
     char err[256] = {0};
     int rc = rsx_nir_compare(&sa, &sb, err, sizeof(err));
-    CHECK(rc == 0, "reference/user packet vs typed: %s", err);
+    CHECK(rc == 0, "reference/wait-label/user packet vs typed: %s", err);
 
     /* tokens + fallback markers are native-only ordered actions: equal
      * sequences compare equal; any payload difference is detected */

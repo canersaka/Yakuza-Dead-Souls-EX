@@ -7718,7 +7718,14 @@ static void ld_movement_probe_mark_ready(
         if (gameplay_ready && transition_ready) {
             if (stable_gameplay_probes < required_stable_probes)
                 stable_gameplay_probes++;
-            const int release_now = (u32)movement_leg != frontier_leg ||
+            /* Do not release the bounded post-dialogue Confirm cadence after
+             * the first positive city probe.  Authored dialogue can cover the
+             * minimap again before the next sparse probe; releasing here left
+             * the route parked with one retained positive forever.  Release
+             * only after the same required visual confidence used to publish
+             * the stable marker.  Frontier keeps its stricter transition gate
+             * through transition_ready above. */
+            const int release_now =
                 stable_gameplay_probes >= required_stable_probes;
             if (release_now && InterlockedCompareExchange(
                     &g_yz_movement_gameplay_returned, 1, 0) == 0) {
@@ -7771,8 +7778,21 @@ static void ld_movement_probe_mark_ready(
              * alone as gameplay left the unattended route parked forever.
              * Leg 3 remains impossible to arm until the independent loading
              * or three-region gun-HUD transition proof above succeeds. */
-            stable_gameplay_probes = 0;
-            InterlockedExchange(&g_yz_movement_gameplay_returned, 0);
+            /* City dialogue transiently covers the minimap between repeated
+             * positive gameplay frames.  Treat that as an uncounted sample,
+             * not proof that the established city scene disappeared: the old
+             * reset made two-positive confirmation impossible whenever the
+             * authored dialogue cadence alternated with the 30 s probes.
+             * Frontier remains strictly consecutive because a visible
+             * pre-load prompt must never be accumulated into gun acceptance. */
+            const int retain_city_evidence =
+                (u32)movement_leg < frontier_leg &&
+                transition_ready && visible_ready &&
+                stable_gameplay_probes != 0;
+            if (!retain_city_evidence) {
+                stable_gameplay_probes = 0;
+                InterlockedExchange(&g_yz_movement_gameplay_returned, 0);
+            }
             if (InterlockedCompareExchange(
                     &g_yz_movement_stable_gameplay, 0, 0) == 0)
                 InterlockedExchange(
