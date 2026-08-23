@@ -43,8 +43,13 @@ extern "C" uint8_t* yz_nr_vertical_guest_writable_ptr(uint32_t location,
 extern "C" int yz_nr_vertical_space_page_to_ea(uint32_t location,
                                                  uint32_t page_offset,
                                                  uint32_t* out_ea);
+extern "C" int yz_nr_vertical_space_range_to_ea(uint32_t location,
+                                                  uint32_t offset,
+                                                  uint32_t size,
+                                                  uint32_t* out_ea);
 extern "C" void cellSpursSetGuestWriteObserver(
     void (*observer)(uint32_t ea, uint32_t size));
+extern "C" void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size);
 extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
 extern "C" void yz_drain_trampolines(ppu_context* ctx);
 
@@ -232,6 +237,8 @@ struct yz_nr_vertical_active_state {
     unsigned long long consumer_draw_fallback;
     unsigned long long consumer_clear_owned;
     unsigned long long consumer_clear_fallback;
+    unsigned long long consumer_transfer_owned;
+    unsigned long long consumer_transfer_fallback;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
@@ -319,6 +326,15 @@ static int yz_nr_d3d_watch_page(void*, uint32_t space, uint32_t page_offset)
                 ea_page >> 6])),
         static_cast<LONG64>(1ull << (ea_page & 63u)));
     return 0;
+}
+
+static void yz_nr_d3d_publish_write(void*, uint32_t space, uint32_t offset,
+                                    uint32_t size)
+{
+    uint32_t ea = 0;
+    if (yz_nr_vertical_space_range_to_ea(
+            space, offset, size, &ea) == 0)
+        cellSpursNotifyGuestWrite(ea, size);
 }
 
 static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
@@ -414,6 +430,8 @@ static void yz_nr_active_ensure_graphics(void)
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
     rsx_nr_d3d12_set_resource_broker(
         d3d12, yz_nr_borrow_color, yz_nr_borrow_depth, nullptr);
+    rsx_nr_d3d12_set_publish_write(
+        d3d12, yz_nr_d3d_publish_write, nullptr);
     for (uint32_t i = 0; i < 8u; ++i) {
         const yz_nr_vertical_display* const display = &g_active.displays[i];
         if (display->valid)
@@ -1449,15 +1467,21 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
      * twice. */
     const bool is_draw = method == 0x1808u && arg == 0u;
     const bool is_clear = method == 0x1D94u;
-    if (!is_draw && !is_clear)
+    const bool is_transfer = method == 0x2328u || method == 0xC40Cu;
+    if (!is_draw && !is_clear && !is_transfer)
         return 0;
+    const auto note_fallback = [&]() {
+        if (is_draw)
+            g_active.consumer_draw_fallback++;
+        else if (is_clear)
+            g_active.consumer_clear_fallback++;
+        else
+            g_active.consumer_transfer_fallback++;
+    };
     if (!rsx_nr_ring_can_accept(&g_active.ring,
                                 YZ_NR_ACTIVE_ACTION_OP_BOUND,
                                 YZ_NR_ACTIVE_ACTION_SIDE_BOUND)) {
-        if (is_draw)
-            g_active.consumer_draw_fallback++;
-        else
-            g_active.consumer_clear_fallback++;
+        note_fallback();
         return 0;
     }
 
@@ -1469,10 +1493,7 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         !rsx_nr_ring_depth(&g_active.ring)) {
         while (rsx_nr_ring_depth(&g_active.ring))
             rsx_nr_ring_pop(&g_active.ring);
-        if (is_draw)
-            g_active.consumer_draw_fallback++;
-        else
-            g_active.consumer_clear_fallback++;
+        note_fallback();
         return 0;
     }
 
@@ -1481,25 +1502,21 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
             RSX_NR_STEP_EXECUTED) {
             while (rsx_nr_ring_depth(&g_active.ring))
                 rsx_nr_ring_pop(&g_active.ring);
-            if (is_draw)
-                g_active.consumer_draw_fallback++;
-            else
-                g_active.consumer_clear_fallback++;
+            note_fallback();
             return 0;
         }
     }
     if (g_active.backend.stats.exec_errors != errors_before) {
-        if (is_draw)
-            g_active.consumer_draw_fallback++;
-        else
-            g_active.consumer_clear_fallback++;
+        note_fallback();
         return 0;
     }
     if (is_draw) {
         g_active.consumer_draw_owned++;
         g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
-    } else {
+    } else if (is_clear) {
         g_active.consumer_clear_owned++;
+    } else {
+        g_active.consumer_transfer_owned++;
     }
     return 1;
 }
@@ -2064,6 +2081,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
                 "consumer-draw=%llu/%llu "
                 "consumer-clear=%llu/%llu "
+                "consumer-transfer=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
@@ -2083,7 +2101,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.consumer_draw_owned,
                 g_active.consumer_draw_fallback,
                 g_active.consumer_clear_owned,
-                g_active.consumer_clear_fallback, g_active.wait,
+                g_active.consumer_clear_fallback,
+                g_active.consumer_transfer_owned,
+                g_active.consumer_transfer_fallback, g_active.wait,
                 g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);

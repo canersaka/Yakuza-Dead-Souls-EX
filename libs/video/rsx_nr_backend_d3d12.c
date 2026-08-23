@@ -118,6 +118,8 @@ struct rsx_nr_d3d12 {
     rsx_nr_d3d12_borrow_color_fn borrow_color;
     rsx_nr_d3d12_borrow_depth_fn borrow_depth;
     void* broker_user;
+    rsx_nr_d3d12_publish_write_fn publish_write;
+    void* publish_write_user;
     u32 local_size, main_size;
 
     rsx_nr_pso_cache psos;
@@ -2576,6 +2578,17 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     return 0;
 }
 
+static void nrb_publish_guest_write(rsx_nr_d3d12* b, u32 space,
+                                    u32 offset, u32 size)
+{
+    if (!size)
+        return;
+    if (b->publish_write)
+        b->publish_write(b->publish_write_user, space, offset, size);
+    else
+        rsx_guest_pages_note_write(&b->pages, space, offset, size);
+}
+
 static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
                         const rsx_nir_transfer* t, const u32* words)
 {
@@ -2612,13 +2625,13 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             b->stats.unsupported_transfers++;
             return -1;
         }
-        for (u32 l = 0; l < t->line_count; l++)
+        for (u32 l = 0; l < t->line_count; l++) {
             memmove(dst + (size_t)l * t->dst_pitch,
                     src + (size_t)l * t->src_pitch, t->line_length);
-        rsx_guest_pages_note_write(
-            &b->pages, t->dst_location, t->dst_offset,
-            t->dst_pitch * (t->line_count ? t->line_count - 1 : 0) +
+            nrb_publish_guest_write(
+                b, t->dst_location, t->dst_offset + l * t->dst_pitch,
                 t->line_length);
+        }
         break;
     }
     case RSX_NIR_XFER_INLINE: {
@@ -2635,11 +2648,11 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
         u8* row = dst + (size_t)t->point_y * t->dst_pitch;
         for (u32 i = 0; i < t->word_count; i++)
             memcpy(row + (size_t)(t->point_x + i) * 4, &words[i], 4);
-        rsx_guest_pages_note_write(&b->pages, t->dst_location,
-                                   t->dst_offset +
-                                       t->point_y * t->dst_pitch +
-                                       t->point_x * 4,
-                                   t->word_count * 4);
+        nrb_publish_guest_write(b, t->dst_location,
+                                t->dst_offset +
+                                    t->point_y * t->dst_pitch +
+                                    t->point_x * 4,
+                                t->word_count * 4);
         break;
     }
     case RSX_NIR_XFER_SCALED: {
@@ -2661,13 +2674,18 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             b->stats.unsupported_transfers++;
             return -1;
         }
-        for (u32 y = 0; y < t->out_h && y < t->in_h; y++)
+        const u32 copy_w = t->out_w < t->in_w ? t->out_w : t->in_w;
+        for (u32 y = 0; y < t->out_h && y < t->in_h; y++) {
             memmove(dst + (size_t)(t->out_y + y) * t->dst_pitch +
                         (size_t)t->out_x * bpp,
                     src + (size_t)y * t->src_pitch,
-                    (size_t)(t->out_w < t->in_w ? t->out_w : t->in_w) * bpp);
-        rsx_guest_pages_note_write(&b->pages, t->dst_location, t->dst_offset,
-                                   (t->out_y + t->out_h) * t->dst_pitch);
+                    (size_t)copy_w * bpp);
+            nrb_publish_guest_write(
+                b, t->dst_location,
+                t->dst_offset + (t->out_y + y) * t->dst_pitch +
+                    t->out_x * bpp,
+                copy_w * bpp);
+        }
         break;
     }
     default:
@@ -2770,6 +2788,15 @@ void rsx_nr_d3d12_set_resource_broker(
     b->borrow_color = color;
     b->borrow_depth = depth;
     b->broker_user = broker_user;
+}
+
+void rsx_nr_d3d12_set_publish_write(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user)
+{
+    if (!b)
+        return;
+    b->publish_write = publish;
+    b->publish_write_user = user;
 }
 
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
@@ -3195,6 +3222,11 @@ void rsx_nr_d3d12_set_resource_broker(
     rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user)
 {
     (void)b; (void)color; (void)depth; (void)broker_user;
+}
+void rsx_nr_d3d12_set_publish_write(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user)
+{
+    (void)b; (void)publish; (void)user;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)

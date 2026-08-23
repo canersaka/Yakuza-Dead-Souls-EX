@@ -31,6 +31,8 @@ static int g_failures;
 static u32 g_present_handoffs;
 static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
+static u32 g_published_writes;
+static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
@@ -72,6 +74,17 @@ static int test_watch_page(void* user, u32 space, u32 page_offset)
     g_watched_pages[space]++;
     g_last_watched_offset[space] = page_offset;
     return 0;
+}
+
+static void test_publish_write(void* user, u32 space, u32 offset, u32 size)
+{
+    if (g_published_writes < 4u) {
+        g_published_space[g_published_writes] = space;
+        g_published_offset[g_published_writes] = offset;
+        g_published_size[g_published_writes] = size;
+    }
+    g_published_writes++;
+    rsx_nr_d3d12_note_guest_write((rsx_nr_d3d12*)user, space, offset, size);
 }
 
 static u8 g_local[LOCAL_SIZE];
@@ -619,6 +632,7 @@ int main(int argc, char** argv)
               sink, 0, test_present_handoff, NULL) == 0,
           "present handoff configuration failed");
     rsx_nr_d3d12_set_watch_page(sink, test_watch_page, NULL);
+    rsx_nr_d3d12_set_publish_write(sink, test_publish_write, sink);
     rsx_nr_d3d12_set_display_buffer(
         sink, 0, RSX_NIR_LOCATION_LOCAL, RT_OFFSET, RT_W, RT_H);
 
@@ -966,6 +980,49 @@ int main(int argc, char** argv)
     rsx_nr_backend_run(&be, 0);
     CHECK(be.stats.exec_errors == 2, "partial clear not surfaced (%llu)",
           be.stats.exec_errors);
+
+    /* ---- exact post-publication transfer route -----------------------
+     * A pitched two-line copy must notify only the bytes actually written,
+     * not the untouched pitch envelope between them. The callback then
+     * publishes those exact spans into the mirror generation tracker. */
+    {
+        const u32 src = 0x5000u, dst = 0x6000u;
+        memset(g_local + src, 0, 32);
+        memset(g_main + dst, 0, 32);
+        memcpy(g_local + src, "ABCDEFGH", 8);
+        memcpy(g_local + src + 16, "IJKLMNOP", 8);
+        g_published_writes = 0;
+        rsx_nir_transfer transfer;
+        memset(&transfer, 0, sizeof(transfer));
+        transfer.kind = RSX_NIR_XFER_BUFFER;
+        transfer.src_location = RSX_NIR_LOCATION_LOCAL;
+        transfer.dst_location = RSX_NIR_LOCATION_MAIN;
+        transfer.src_offset = src;
+        transfer.dst_offset = dst;
+        transfer.src_pitch = 16;
+        transfer.dst_pitch = 16;
+        transfer.line_length = 8;
+        transfer.line_count = 2;
+        rsx_nir_em_transfer(&em, &transfer, NULL);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(be.stats.exec_errors == 2,
+              "exact transfer added exec error (%llu)",
+              be.stats.exec_errors);
+        CHECK(memcmp(g_main + dst, "ABCDEFGH", 8) == 0 &&
+              memcmp(g_main + dst + 16, "IJKLMNOP", 8) == 0,
+              "pitched transfer bytes mismatch");
+        CHECK(g_published_writes == 2 &&
+              g_published_space[0] == RSX_NIR_LOCATION_MAIN &&
+              g_published_offset[0] == dst && g_published_size[0] == 8 &&
+              g_published_space[1] == RSX_NIR_LOCATION_MAIN &&
+              g_published_offset[1] == dst + 16 &&
+              g_published_size[1] == 8,
+              "published transfer spans count=%u first=%u:%X+%u "
+              "second=%u:%X+%u", g_published_writes,
+              g_published_space[0], g_published_offset[0],
+              g_published_size[0], g_published_space[1],
+              g_published_offset[1], g_published_size[1]);
+    }
 
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;

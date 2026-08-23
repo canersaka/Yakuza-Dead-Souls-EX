@@ -60,6 +60,8 @@ typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
     void* user, u32 space, u32 offset, u32 depth_format,
     u32 width, u32 height, void** resource, u32* resource_format,
     u32* dsv_format, u32* srv_format);
+typedef void (*rsx_nr_d3d12_publish_write_fn)(
+    void* user, u32 space, u32 offset, u32 size);
 
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
@@ -132,6 +134,13 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
 void rsx_nr_d3d12_set_resource_broker(
     rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
     rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user);
+
+/* Optional post-publication route for host-memory transfer writes. When set,
+ * the callback owns generation notification after the bytes are visible; the
+ * backend's private page tracker is used directly only when no callback is
+ * installed (the offline default). */
+void rsx_nr_d3d12_set_publish_write(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user);
 
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
