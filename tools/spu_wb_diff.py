@@ -265,13 +265,26 @@ def main():
     os.makedirs(WORK, exist_ok=True)
     report_path = args.report or os.path.join(WORK, "report.json")
     manifest = json.load(open(GW.MANIFEST))
+    # resume: keep prior MATCH results (a paused run can restart without
+    # redoing placements whose verdict is already conclusive)
     results = []
+    done = set()
+    if os.path.exists(report_path):
+        try:
+            for e in json.load(open(report_path)):
+                if e.get("verdict") == "MATCH":
+                    results.append(e)
+                    done.add(e["stem"])
+        except (OSError, json.JSONDecodeError):
+            pass
     for famname, fam in manifest["families"].items():
         if famname in GW.SKIP_FAMILIES:
             continue
         if fams and famname not in fams:
             continue
         for plc in fam.get("images", fam.get("placements", [])):
+            if plc["stem"] in done:
+                continue
             process(famname, fam, plc, args, results)
             D.write_report(report_path, results)
 
