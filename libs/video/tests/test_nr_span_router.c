@@ -182,11 +182,22 @@ int main(void)
     b.payload.ops[0].u.user_command.cause = 2;
     CHECK(rsx_nr_span_fingerprint(&a) != rsx_nr_span_fingerprint(&b),
           "used payload missing from fingerprint");
+    b = a;
+    b.flags = RSX_NR_SPAN_RETAINED_FALLBACK;
+    CHECK(rsx_nr_span_fingerprint(&a) != rsx_nr_span_fingerprint(&b),
+          "fallback ownership guarantee missing from fingerprint");
+    CHECK(rsx_nr_span_router_publish(&router, &b) ==
+              RSX_NR_SPAN_PUBLISH_FULL,
+          "valid retained-fallback flag rejected before capacity gate");
+    b.flags = 0x80000000u;
+    CHECK(rsx_nr_span_router_publish(&router, &b) ==
+              RSX_NR_SPAN_PUBLISH_INVALID,
+          "unknown ownership flag accepted");
 
     rsx_nr_span_router_stats stats;
     rsx_nr_span_router_get_stats(&router, &stats);
     CHECK(stats.published == 14 && stats.claimed == 5 &&
-              stats.duplicates == 2 && stats.full == 1,
+              stats.duplicates == 2 && stats.full == 2,
           "stats p=%llu c=%llu dup=%llu full=%llu",
           stats.published, stats.claimed, stats.duplicates, stats.full);
 

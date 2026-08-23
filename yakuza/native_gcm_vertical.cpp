@@ -191,13 +191,13 @@ struct yz_nr_vertical_active_state {
     unsigned long long fallback[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long executed[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long wait;
+    unsigned long long late_fallback;
     unsigned long long fatal;
     unsigned long long wrong_context;
     unsigned long long no_room;
     unsigned long long publish_failure;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
-    unsigned long long pending_errors;
     uint32_t pending_executed;
     uint32_t pending_valid;
     uint32_t last_miss_ea;
@@ -285,6 +285,7 @@ static int yz_nr_active_publish(ppu_context* ctx, uint32_t family,
     span.ea = current;
     span.word_count = 2;
     span.generation = rsx_nr_span_router_generation(&g_active.router);
+    span.flags = RSX_NR_SPAN_RETAINED_FALLBACK;
     span.payload.op_count = 1;
     if (family == YZ_NR_VERT_REFERENCE) {
         span.payload.ops[0].kind = RSX_NIR_OP_SET_REFERENCE;
@@ -346,6 +347,7 @@ static int yz_nr_active_publish_flip(uint32_t context,
     span.ea = current;
     span.word_count = flip->word_count;
     span.generation = rsx_nr_span_router_generation(&g_active.router);
+    span.flags = RSX_NR_SPAN_RETAINED_FALLBACK;
     span.payload.op_count = flip->wait_for_label ? 2u : 1u;
     uint32_t op = 0;
     if (flip->wait_for_label) {
@@ -1427,14 +1429,52 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
             g_active.fatal++;
             return YZ_NR_VERTICAL_CONSUME_FATAL;
         }
-        const uint32_t remaining =
-            g_active.pending_span.payload.op_count -
-            g_active.pending_executed;
-        g_active.pending_executed +=
-            rsx_nr_backend_run(&g_active.backend, remaining);
-        if (g_active.backend.stats.exec_errors != g_active.pending_errors) {
-            g_active.fatal++;
-            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        while (g_active.pending_executed <
+               g_active.pending_span.payload.op_count) {
+            const unsigned long long errors_before =
+                g_active.backend.stats.exec_errors;
+            const rsx_nr_step_result step =
+                rsx_nr_backend_step(&g_active.backend);
+            if (step == RSX_NR_STEP_BLOCKED_TOKEN ||
+                step == RSX_NR_STEP_BLOCKED_SEMAPHORE) {
+                g_active.wait++;
+                return YZ_NR_VERTICAL_CONSUME_WAIT;
+            }
+            if (step != RSX_NR_STEP_EXECUTED) {
+                g_active.fatal++;
+                return YZ_NR_VERTICAL_CONSUME_FATAL;
+            }
+            g_active.pending_executed++;
+
+            if (g_active.backend.stats.exec_errors != errors_before) {
+                /* A producer may grant this escape hatch only when it left
+                 * the exact complete packet in guest memory and the failing
+                 * action has an all-or-nothing backend contract. Stop before
+                 * later typed ops, discard them, and leave GET unchanged so
+                 * the ordinary decoder executes that retained packet once. */
+                if (!(g_active.pending_span.flags &
+                      RSX_NR_SPAN_RETAINED_FALLBACK)) {
+                    g_active.fatal++;
+                    return YZ_NR_VERTICAL_CONSUME_FATAL;
+                }
+                while (rsx_nr_ring_depth(&g_active.ring))
+                    rsx_nr_ring_pop(&g_active.ring);
+                if (rsx_nr_span_router_retire(
+                        &g_active.router, &g_active.pending_claim) != 0) {
+                    g_active.fatal++;
+                    return YZ_NR_VERTICAL_CONSUME_FATAL;
+                }
+                g_active.pending_valid = 0;
+                g_active.pending_executed = 0;
+                memset(&g_active.pending_span, 0,
+                       sizeof(g_active.pending_span));
+                memset(&g_active.pending_claim, 0,
+                       sizeof(g_active.pending_claim));
+                g_active.last_miss_ea = ~0u;
+                g_active.last_miss_epoch = 0;
+                g_active.late_fallback++;
+                return YZ_NR_VERTICAL_CONSUME_FALLBACK;
+            }
         }
         if (rsx_nr_ring_depth(&g_active.ring) != 0) {
             g_active.wait++;
@@ -1507,7 +1547,6 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
     }
     g_active.pending_span = span;
     g_active.pending_claim = claim;
-    g_active.pending_errors = g_active.backend.stats.exec_errors;
     g_active.pending_executed = 0;
     g_active.pending_valid = 1;
     return yz_nr_vertical_consume(packet_ea, word_count);
@@ -1524,7 +1563,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "ref=%llu/%llu user=%llu/%llu flip=%llu/%llu "
                 "fallback-ref=%llu fallback-user=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
-                "wait=%llu fatal=%llu depth=%u errors=%llu]\n",
+                "wait=%llu late-fallback=%llu fatal=%llu "
+                "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],
@@ -1535,7 +1575,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.fallback[YZ_NR_VERT_USER],
                 g_active.fallback[YZ_NR_VERT_FLIP],
                 g_active.wrong_context, g_active.no_room,
-                g_active.publish_failure, g_active.wait, g_active.fatal,
+                g_active.publish_failure, g_active.wait,
+                g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);
         fprintf(stderr,

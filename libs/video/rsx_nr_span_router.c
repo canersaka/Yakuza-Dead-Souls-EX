@@ -72,6 +72,7 @@ u32 rsx_nr_span_fingerprint(const rsx_nr_span* span)
     hash = fnv_bytes(hash, &span->ea, sizeof(span->ea));
     hash = fnv_bytes(hash, &span->word_count, sizeof(span->word_count));
     hash = fnv_bytes(hash, &span->generation, sizeof(span->generation));
+    hash = fnv_bytes(hash, &span->flags, sizeof(span->flags));
     hash = fnv_bytes(hash, &span->payload.op_count,
                      sizeof(span->payload.op_count));
     hash = fnv_bytes(hash, &span->payload.side_count,
@@ -163,6 +164,7 @@ static int span_valid(const rsx_nr_span_router* r, const rsx_nr_span* span)
            span->payload.op_count &&
            span->payload.op_count <= RSX_NR_SPAN_MAX_OPS &&
            span->payload.side_count <= RSX_NR_SPAN_MAX_SIDE &&
+           !(span->flags & ~RSX_NR_SPAN_KNOWN_FLAGS) &&
            span->generation == rsx_nr_span_router_generation(r);
 }
 
