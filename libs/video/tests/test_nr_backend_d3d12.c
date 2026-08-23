@@ -29,6 +29,8 @@ int main(void) { return 2; }
 
 static int g_failures;
 static u32 g_present_handoffs;
+static u32 g_watched_pages[2];
+static u32 g_last_watched_offset[2];
 
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
@@ -59,6 +61,16 @@ static int test_present_handoff(void* user, void* texture, u32 format,
     if (!texture || !format || width != RT_W || height != RT_H || buffer_id)
         return -1;
     g_present_handoffs++;
+    return 0;
+}
+
+static int test_watch_page(void* user, u32 space, u32 page_offset)
+{
+    (void)user;
+    if (space >= 2u || (page_offset & (RSX_GUEST_PAGE_SIZE - 1u)))
+        return -1;
+    g_watched_pages[space]++;
+    g_last_watched_offset[space] = page_offset;
     return 0;
 }
 
@@ -606,6 +618,7 @@ int main(int argc, char** argv)
     CHECK(rsx_nr_d3d12_set_live_output(
               sink, 0, test_present_handoff, NULL) == 0,
           "present handoff configuration failed");
+    rsx_nr_d3d12_set_watch_page(sink, test_watch_page, NULL);
     rsx_nr_d3d12_set_display_buffer(
         sink, 0, RSX_NIR_LOCATION_LOCAL, RT_OFFSET, RT_W, RT_H);
 
@@ -656,6 +669,18 @@ int main(int argc, char** argv)
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     CHECK(pix_is(61, 2, 0xFF, 0x00, 0x00), "outside pixel %02X %02X %02X",
           pix(61, 2)[0], pix(61, 2)[1], pix(61, 2)[2]);
+    {
+        rsx_nr_d3d12_stats resident;
+        rsx_nr_d3d12_get_stats(sink, &resident);
+        CHECK(resident.resident_pages[0] == 1u &&
+                  resident.resident_pages[1] == 0u &&
+                  g_watched_pages[0] == 1u &&
+                  g_last_watched_offset[0] == VTX_OFFSET,
+              "array draw did not register only its exact vertex page "
+              "local=%llu main=%llu watch=%u offset=%X",
+              resident.resident_pages[0], resident.resident_pages[1],
+              g_watched_pages[0], g_last_watched_offset[0]);
+    }
 
     /* ---- leg 3: dirty-page re-upload flips the covered half ------------ */
     stage_frame_state(&em);
@@ -701,6 +726,18 @@ int main(int argc, char** argv)
           "RT readback failed");
     CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF), "indexed inside pixel");
     CHECK(pix_is(61, 2, 0xFF, 0x00, 0x00), "indexed outside pixel");
+    {
+        rsx_nr_d3d12_stats resident;
+        rsx_nr_d3d12_get_stats(sink, &resident);
+        CHECK(resident.resident_pages[0] == 1u &&
+                  resident.resident_pages[1] == 1u &&
+                  g_watched_pages[1] == 1u &&
+                  g_last_watched_offset[1] == IDX_OFFSET,
+              "indexed draw residency was not sparse/exact "
+              "local=%llu main=%llu watch=%u offset=%X",
+              resident.resident_pages[0], resident.resident_pages[1],
+              g_watched_pages[1], g_last_watched_offset[1]);
+    }
 
     /* ---- real FP constants + structural PSO reuse ---------------------
      * Two byte-distinct inline-CONST payloads must share one structural PSO

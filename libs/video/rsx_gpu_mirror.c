@@ -115,6 +115,22 @@ void rsx_gpu_mirror_destroy(rsx_gpu_mirror* m)
     free(m);
 }
 
+int rsx_gpu_mirror_reserve_ranges(rsx_gpu_mirror* m, u32 capacity)
+{
+    if (!m || m->slot_count || capacity > 0xFFFFFu)
+        return -1;
+    if (capacity <= m->slot_cap)
+        return 0;
+    gm_range_slot* slots = (gm_range_slot*)calloc(
+        capacity, sizeof(*slots));
+    if (!slots)
+        return -1;
+    free(m->slots);
+    m->slots = slots;
+    m->slot_cap = capacity;
+    return 0;
+}
+
 static gm_space* gm_get_space(rsx_gpu_mirror* m, u32 space)
 {
     if (!m || space >= RSX_GUEST_NUM_SPACES || !m->space[space].npages)

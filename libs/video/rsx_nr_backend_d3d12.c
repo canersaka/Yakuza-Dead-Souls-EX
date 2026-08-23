@@ -43,6 +43,7 @@
 #define NRB_TEX_SNAP_WORDS (256u * 1024u)
 #define NRB_TEX_UNITS    RSX_NIR_NUM_TEXTURES
 #define NRB_MAX_DRAW_BATCHES 4096u
+#define NRB_MAX_REQUIRED_SPANS (RSX_NIR_NUM_VERTEX_ATTR * 2u + 2u)
 
 typedef struct nrb_prepared_batch {
     u64 index_va;
@@ -50,6 +51,10 @@ typedef struct nrb_prepared_batch {
     u32 draw_count;
     u32 skip;
 } nrb_prepared_batch;
+
+typedef struct nrb_required_span {
+    u32 space, offset, size;
+} nrb_required_span;
 
 typedef struct nrb_rt {
     ID3D12Resource* tex;
@@ -104,7 +109,10 @@ struct rsx_nr_d3d12 {
     rsx_guest_pages pages;
     rsx_gpu_mirror* mirror;
     rsx_gpu_mirror_d3d12* mirror_be;
-    rsx_gpu_mirror_range range_local, range_main;
+    rsx_gpu_mirror_range* resident_page[RSX_GUEST_NUM_SPACES];
+    u32 resident_page_count[RSX_GUEST_NUM_SPACES];
+    rsx_nr_d3d12_watch_page_fn watch_page;
+    void* watch_page_user;
     u32 local_size, main_size;
 
     rsx_nr_pso_cache psos;
@@ -425,6 +433,77 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
 }
 
 /* ---- mirror session helper --------------------------------------------- */
+
+/* Permanently arm each exact page a native shader can read.  Registrations
+ * are deliberately page-sized and deduplicated in a fixed array: the first
+ * use pays a bounded loop, subsequent draws only test existing handles. */
+static int nrb_require_span(rsx_nr_d3d12* b, u32 space, u32 offset, u32 size)
+{
+    if (!size || space >= RSX_GUEST_NUM_SPACES ||
+        (u64)offset + size > b->pages.space[space].size)
+        return -1;
+    const u32 first = offset >> RSX_GUEST_PAGE_SHIFT;
+    const u32 last = (u32)(((u64)offset + size - 1u) >>
+                           RSX_GUEST_PAGE_SHIFT);
+    if (last >= b->resident_page_count[space])
+        return -1;
+    for (u32 page = first; page <= last; ++page) {
+        if (b->resident_page[space][page])
+            continue;
+        const u32 page_offset = page << RSX_GUEST_PAGE_SHIFT;
+        u32 page_size = RSX_GUEST_PAGE_SIZE;
+        if ((u64)page_offset + page_size > b->pages.space[space].size)
+            page_size = b->pages.space[space].size - page_offset;
+        /* Refuse holes in a sparse IO map before publishing the watch. */
+        if (!b->guest_ptr(b->guest_user, space, page_offset, page_size))
+            return -1;
+        const rsx_gpu_mirror_range range = rsx_gpu_mirror_register(
+            b->mirror, space, page_offset, page_size);
+        if (!range)
+            return -1;
+        if (b->watch_page && b->watch_page(
+                b->watch_page_user, space, page_offset) != 0) {
+            rsx_gpu_mirror_unregister(b->mirror, range);
+            b->stats.residency_failures++;
+            return -1;
+        }
+        b->resident_page[space][page] = range;
+        b->stats.resident_pages[space]++;
+    }
+    return 0;
+}
+
+static int nrb_span_current(const rsx_nr_d3d12* b, u32 space, u32 offset,
+                            u32 size)
+{
+    if (!size || space >= RSX_GUEST_NUM_SPACES ||
+        (u64)offset + size > b->pages.space[space].size)
+        return 0;
+    const u32 first = offset >> RSX_GUEST_PAGE_SHIFT;
+    const u32 last = (u32)(((u64)offset + size - 1u) >>
+                           RSX_GUEST_PAGE_SHIFT);
+    for (u32 page = first; page <= last; ++page) {
+        const rsx_gpu_mirror_range range =
+            b->resident_page[space][page];
+        if (!range || !rsx_gpu_mirror_range_current(b->mirror, range))
+            return 0;
+    }
+    return 1;
+}
+
+static int nrb_add_required_span(nrb_required_span* spans, u32* count,
+                                 u32 space, u64 offset, u64 size)
+{
+    if (!size || offset > UINT32_MAX || size > UINT32_MAX ||
+        offset + size > 0x100000000ull ||
+        *count >= NRB_MAX_REQUIRED_SPANS)
+        return -1;
+    spans[*count].space = space;
+    spans[*count].offset = (u32)offset;
+    spans[*count].size = (u32)size;
+    (*count)++;
+    return 0;
+}
 
 static void nrb_mirror_sync(rsx_nr_d3d12* b)
 {
@@ -1807,6 +1886,179 @@ static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
     return n;
 }
 
+static int nrb_index_bounds(rsx_nr_d3d12* b,
+                            const rsx_nir_pipeline* st,
+                            const rsx_nir_draw* draw, const u32* batches,
+                            u32* out_min, u32* out_max,
+                            nrb_required_span* spans, u32* span_count,
+                            int mirror_indices)
+{
+    const u32 esize = st->index_binding.is_u32 ? 4u : 2u;
+    u32 min_value = UINT32_MAX, max_value = 0;
+    u64 min_byte = UINT64_MAX, max_byte = 0;
+    int have_value = 0;
+    for (u32 bi = 0; bi < draw->batch_count; ++bi) {
+        const u32 first = batches[bi * 2u];
+        const u32 count = batches[bi * 2u + 1u];
+        if (!count)
+            continue;
+        const u64 byte = (u64)st->index_binding.offset +
+                         (u64)first * esize;
+        const u64 bytes = (u64)count * esize;
+        if (byte > UINT32_MAX || bytes > UINT32_MAX ||
+            byte + bytes > 0x100000000ull)
+            return -1;
+        const u8* src = b->guest_ptr(
+            b->guest_user, st->index_binding.location, (u32)byte,
+            (u32)bytes);
+        if (!src)
+            return -1;
+        if (byte < min_byte)
+            min_byte = byte;
+        if (byte + bytes > max_byte)
+            max_byte = byte + bytes;
+        for (u32 i = 0; i < count; ++i) {
+            u32 value;
+            if (esize == 4u)
+                value = ((u32)src[i * 4u] << 24) |
+                        ((u32)src[i * 4u + 1u] << 16) |
+                        ((u32)src[i * 4u + 2u] << 8) |
+                        (u32)src[i * 4u + 3u];
+            else
+                value = ((u32)src[i * 2u] << 8) |
+                        (u32)src[i * 2u + 1u];
+            if (st->index_binding.restart_enable &&
+                value == st->index_binding.restart_index)
+                continue;
+            if (!have_value || value < min_value)
+                min_value = value;
+            if (!have_value || value > max_value)
+                max_value = value;
+            have_value = 1;
+        }
+    }
+    if (mirror_indices && min_byte != UINT64_MAX &&
+        nrb_add_required_span(spans, span_count,
+                              st->index_binding.location, min_byte,
+                              max_byte - min_byte) != 0)
+        return -1;
+    if (!have_value)
+        return 1;                   /* restart-only draw: no vertex fetch */
+    *out_min = min_value;
+    *out_max = max_value;
+    return 0;
+}
+
+static int nrb_add_attr_element_span(rsx_nr_d3d12* b,
+                                     const rsx_vertex_pull_plan* plan,
+                                     u32 attr, u32 elem_min, u32 elem_max,
+                                     nrb_required_span* spans,
+                                     u32* span_count)
+{
+    const rsx_vertex_pull_attr* a = &plan->attr[attr];
+    if (!a->pulled || elem_max < elem_min)
+        return 0;
+    const u64 first = (u64)plan->base_offset + a->desc.offset +
+                      (u64)elem_min * a->stride;
+    const u64 last = (u64)plan->base_offset + a->desc.offset +
+                     (u64)elem_max * a->stride + a->elem_size;
+    /* HLSL address arithmetic is uint. Refuse a draw whose address would
+     * wrap rather than approximating its modulo-2^32 reads. */
+    if (first > UINT32_MAX || last > 0x100000000ull || last < first)
+        return -1;
+    const u32 space = a->desc.location ? 1u : 0u;
+    const u64 limit = b->pages.space[space].size;
+    if (first >= limit)
+        return 0;                   /* shader returns the RSX default */
+    const u64 clipped_last = last < limit ? last : limit;
+    return nrb_add_required_span(spans, span_count, space, first,
+                                 clipped_last - first);
+}
+
+static int nrb_prepare_draw_residency(rsx_nr_d3d12* b,
+                                      const rsx_nir_pipeline* st,
+                                      const rsx_vertex_pull_plan* plan,
+                                      const rsx_nir_draw* draw,
+                                      const u32* batches,
+                                      int mirror_indices,
+                                      nrb_required_span* spans,
+                                      u32* span_count)
+{
+    u32 ref_min = UINT32_MAX, ref_max = 0;
+    int have_refs = 0;
+    if (draw->indexed) {
+        const int bounds = nrb_index_bounds(
+            b, st, draw, batches, &ref_min, &ref_max, spans, span_count,
+            mirror_indices);
+        if (bounds < 0)
+            return -2;              /* unreadable index source */
+        have_refs = bounds == 0;
+    } else {
+        for (u32 bi = 0; bi < draw->batch_count; ++bi) {
+            const u32 first = batches[bi * 2u];
+            const u32 count = batches[bi * 2u + 1u];
+            if (!count)
+                continue;
+            const u64 last = (u64)first + count - 1u;
+            if (last > UINT32_MAX)
+                return -1;
+            if (!have_refs || first < ref_min)
+                ref_min = first;
+            if (!have_refs || last > ref_max)
+                ref_max = (u32)last;
+            have_refs = 1;
+        }
+    }
+    if (!have_refs)
+        return 0;
+
+    const u64 domain = 1ull << 20;
+    for (u32 attr = 0; attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+        const rsx_vertex_pull_attr* a = &plan->attr[attr];
+        if (!a->pulled)
+            continue;
+        if (a->desc.frequency <= 1u) {
+            const u64 lo = (u64)ref_min + st->vertex_bindings.base_index;
+            const u64 hi = (u64)ref_max + st->vertex_bindings.base_index;
+            if (hi - lo >= domain - 1u) {
+                if (nrb_add_attr_element_span(
+                        b, plan, attr, 0, (u32)domain - 1u,
+                        spans, span_count) != 0)
+                    return -1;
+            } else if ((lo >> 20) == (hi >> 20)) {
+                if (nrb_add_attr_element_span(
+                        b, plan, attr, (u32)lo & 0xFFFFFu,
+                        (u32)hi & 0xFFFFFu, spans, span_count) != 0)
+                    return -1;
+            } else {
+                if (nrb_add_attr_element_span(
+                        b, plan, attr, (u32)lo & 0xFFFFFu, 0xFFFFFu,
+                        spans, span_count) != 0 ||
+                    nrb_add_attr_element_span(
+                        b, plan, attr, 0, (u32)hi & 0xFFFFFu,
+                        spans, span_count) != 0)
+                    return -1;
+            }
+        } else if ((plan->divider_mask >> attr) & 1u) {
+            if (nrb_add_attr_element_span(
+                    b, plan, attr, 0, a->desc.frequency - 1u,
+                    spans, span_count) != 0)
+                return -1;
+        } else {
+            if (nrb_add_attr_element_span(
+                    b, plan, attr, ref_min / a->desc.frequency,
+                    ref_max / a->desc.frequency, spans, span_count) != 0)
+                return -1;
+        }
+    }
+
+    for (u32 i = 0; i < *span_count; ++i)
+        if (nrb_require_span(b, spans[i].space, spans[i].offset,
+                             spans[i].size) != 0)
+            return -1;
+    return 0;
+}
+
 static u32 nrb_expand_primitives(rsx_nr_d3d12* b,
                                  const rsx_nir_pipeline* st,
                                  const rsx_nir_draw* draw,
@@ -2019,9 +2271,37 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.unsup_draw_pso++;
         return -1;
     }
+
+    nrb_required_span required[NRB_MAX_REQUIRED_SPANS];
+    u32 required_count = 0;
+    const int residency = nrb_prepare_draw_residency(
+        b, st, &plan, d, batches, d->indexed && !use_host_ib,
+        required, &required_count);
+    if (residency != 0) {
+        b->stats.unsupported_draws++;
+        if (residency == -2)
+            b->stats.unsup_draw_index++;
+        else
+            b->stats.unsup_draw_plan++;
+        b->stats.residency_failures++;
+        return -1;
+    }
     if (nrb_open_list(b))
         return -1;
     nrb_mirror_sync(b);
+    for (u32 i = 0; i < required_count; ++i) {
+        if (!nrb_span_current(b, required[i].space, required[i].offset,
+                              required[i].size)) {
+            /* Any successfully recorded page uploads are harmless and remain
+             * useful. Execute them without a draw, then hand the exact packet
+             * back to the ordered legacy fallback. */
+            nrb_exec_wait(b);
+            b->stats.unsupported_draws++;
+            b->stats.unsup_draw_plan++;
+            b->stats.residency_failures++;
+            return -1;
+        }
+    }
 
     nrb_rt* texture_aliases[NRB_TEX_UNITS] = {0};
     nrb_depth* texture_depth_aliases[NRB_TEX_UNITS] = {0};
@@ -2431,6 +2711,23 @@ void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
     display->valid = 1;
 }
 
+void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
+                                 rsx_nr_d3d12_watch_page_fn watch,
+                                 void* watch_user)
+{
+    if (!b)
+        return;
+    b->watch_page = watch;
+    b->watch_page_user = watch_user;
+}
+
+void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
+                                   u32 offset, u32 size)
+{
+    if (b)
+        rsx_guest_pages_note_write(&b->pages, space, offset, size);
+}
+
 /* ---- lifecycle --------------------------------------------------------- */
 
 static const u8* nrb_mirror_guest(void* user, u32 space, u32 offset,
@@ -2636,10 +2933,25 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     b->mirror = rsx_gpu_mirror_create(&b->pages, &mops);
     if (!b->mirror)
         goto fail;
-    if (local_size)
-        b->range_local = rsx_gpu_mirror_register(b->mirror, 0, 0, local_size);
-    if (main_size)
-        b->range_main = rsx_gpu_mirror_register(b->mirror, 1, 0, main_size);
+    {
+        u32 total_pages = 0;
+        for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space) {
+            const u32 count = b->pages.space[space].npages;
+            b->resident_page_count[space] = count;
+            total_pages += count;
+            if (count) {
+                b->resident_page[space] = calloc(
+                    count, sizeof(b->resident_page[space][0]));
+                if (!b->resident_page[space])
+                    goto fail;
+            }
+        }
+        /* One permanent mirror handle per exact 4 KiB page is the maximum.
+         * Reserving it here proves the render-thread registration path cannot
+         * allocate, reallocate, or lose a page under memory pressure. */
+        if (rsx_gpu_mirror_reserve_ranges(b->mirror, total_pages) != 0)
+            goto fail;
+    }
 
     if (rsx_nr_pso_cache_init(&b->psos, NRB_PSO_CAP))
         goto fail;
@@ -2684,6 +2996,8 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (b->pages.space[0].page_gen || b->pages.space[1].page_gen)
         rsx_guest_pages_destroy(&b->pages);
     free(b->idx_scratch);
+    for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space)
+        free(b->resident_page[space]);
     if (b->readback)
         b->readback->lpVtbl->Release(b->readback);
     if (b->upload)
@@ -2818,6 +3132,17 @@ void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
 {
     (void)b; (void)buffer_id; (void)location; (void)offset;
     (void)width; (void)height;
+}
+void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
+                                 rsx_nr_d3d12_watch_page_fn watch,
+                                 void* watch_user)
+{
+    (void)b; (void)watch; (void)watch_user;
+}
+void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
+                                   u32 offset, u32 size)
+{
+    (void)b; (void)space; (void)offset; (void)size;
 }
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)

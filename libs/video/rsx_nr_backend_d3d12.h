@@ -48,6 +48,12 @@ typedef struct rsx_nr_d3d12 rsx_nr_d3d12;
 typedef int (*rsx_nr_d3d12_present_fn)(void* user, void* texture, u32 format,
                                        u32 width, u32 height, u32 buffer_id);
 
+/* Called exactly once when a guest page first becomes GPU-resident.  A live
+ * embedder uses it to arm the VM write hook for that exact page.  Returning
+ * nonzero refuses residency (and therefore the native draw) safely. */
+typedef int (*rsx_nr_d3d12_watch_page_fn)(void* user, u32 space,
+                                          u32 page_offset);
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long pso_hits, pso_builds;
@@ -73,6 +79,8 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long rt_alias_binds;       /* current native RT sampled  */
     unsigned long long compile_failures;
     unsigned long long rt_builds;
+    unsigned long long resident_pages[2];
+    unsigned long long residency_failures;
 } rsx_nr_d3d12_stats;
 
 /* guest_ptr resolves (space, offset, min_bytes) like rsx_live_guest_ptr_fn;
@@ -106,6 +114,17 @@ int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
 void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
                                      u32 location, u32 offset,
                                      u32 width, u32 height);
+
+/* Install the exact-page VM hook before executing native draws.  NULL is
+ * valid for offline arenas whose writers publish directly through
+ * rsx_nr_d3d12_note_guest_write(). */
+void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
+                                 rsx_nr_d3d12_watch_page_fn watch,
+                                 void* watch_user);
+
+/* Publish a completed guest write to the lock-free generation tracker. */
+void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
+                                   u32 offset, u32 size);
 
 /* Read back a rendered RT registered by (space, offset): w*h*4 BGRA bytes
  * into out. Returns 0, or -1 when no such RT exists. Flushes first. */

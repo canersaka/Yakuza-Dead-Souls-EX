@@ -64,6 +64,12 @@ rsx_gpu_mirror* rsx_gpu_mirror_create(rsx_guest_pages* pages,
                                       const rsx_gpu_mirror_ops* ops);
 void rsx_gpu_mirror_destroy(rsx_gpu_mirror* m);
 
+/* Reserve range slots before entering a live render loop.  Registering up to
+ * `capacity` simultaneous ranges after this succeeds performs no allocation.
+ * The call is only valid before the first registration; it returns 0 on
+ * success and -1 on invalid input/allocation failure. */
+int rsx_gpu_mirror_reserve_ranges(rsx_gpu_mirror* m, u32 capacity);
+
 /* Register a guest range a graphics resource reads.  Overlapping ranges
  * share pages (each page is uploaded once no matter how many ranges cover
  * it).  Returns 0 on failure (empty/out-of-space range, allocation).  The
