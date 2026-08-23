@@ -81,6 +81,16 @@ void rsx_live_draw_native_present(u32 buffer_id);
  * through rsx_dispatch_method or decode a legacy packet. */
 void rsx_live_draw_typed_present(u32 buffer_id);
 
+/* Borrow the initialized live D3D12 device for the default-off vertical
+ * backend. The pointer remains owned by rsx_live_draw and is NULL until the
+ * window/device is ready. A native queue may submit on this same device.
+ * present_external copies a fully retired native RENDER_TARGET resource into
+ * the existing swap chain, restores its state, and records the normal QPC
+ * present sample without routing through rsx_dispatch or the legacy sink. */
+void* rsx_live_draw_get_d3d12_device(void);
+int rsx_live_draw_present_external(void* texture, u32 dxgi_format,
+                                   u32 width, u32 height, u32 buffer_id);
+
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the
  * ordered CLEAR action. */

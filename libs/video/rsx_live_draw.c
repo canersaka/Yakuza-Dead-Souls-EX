@@ -39,6 +39,9 @@ void rsx_live_draw_set_display_buffer(
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_typed_present(u32 b) { (void)b; }
+void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
+int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
+{ (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
@@ -547,6 +550,7 @@ static const char* ld_fp_constant_mode_name(void)
 
 static int g_ld_dred_dumped = 0;
 static u32 g_ld_frames = 0;
+static u32 g_ld_last_frame_draws = 0;
 static ID3D12InfoQueue* g_ld_info_queue = NULL;
 static int g_ld_debug_layer_enabled = 0;
 
@@ -7254,6 +7258,99 @@ void rsx_live_draw_set_movie_mode(int on)
     }
 }
 
+void* rsx_live_draw_get_d3d12_device(void)
+{
+    return g.ready ? g.dev : NULL;
+}
+
+static int ld_present_external_impl(ID3D12Resource* source, u32 format,
+                                    u32 width, u32 height, u32 buffer_id)
+{
+    if (!g.ready || !source || format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        width != g.width || height != g.height)
+        return -1;
+
+    D3D12_RESOURCE_DESC source_desc;
+    source->lpVtbl->GetDesc(source, &source_desc);
+    if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        source_desc.Width != width || source_desc.Height != height)
+        return -1;
+
+    g_ld_flip_requested++;
+    g_ld_last_requested_buffer = buffer_id & 7u;
+    if (g_ld_movie_mode) {
+        /* The host movie remains the sole swap-chain owner. The typed GPU
+         * frame is complete, but presentation is intentionally consumed just
+         * like sink_flip's movie branch. */
+        g_ld_flip_consumed++;
+        g_ld_last_consumed_buffer = buffer_id & 7u;
+        return 0;
+    }
+
+    /* Retire any preceding legacy fallback work before the native resource
+     * crosses queues. The native backend has already retired its own queue.
+     * Both queues belong to this exact device. */
+    ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready)
+        return -1;
+
+    const u32 back_index = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+    ID3D12Resource* back = g.backbuf[back_index];
+    D3D12_RESOURCE_BARRIER barriers[2] = {0};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = source;
+    barriers[0].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = back;
+    barriers[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    g.list->lpVtbl->CopyResource(g.list, back, source);
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready)
+        return -1;
+
+    const HRESULT hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+    if (FAILED(hr)) {
+        ld_dump_dred("native Present", hr);
+        g.ready = 0;
+        return -1;
+    }
+    ld_present_measure_record(g_ld_frames + 1u);
+    g_ld_last_frame_draws = 0;
+    g_ld_frames++;
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_present(g_ld_frames);
+#endif
+    g_ld_flip_consumed++;
+    g_ld_last_consumed_buffer = buffer_id & 7u;
+    return 0;
+}
+
+int rsx_live_draw_present_external(void* texture, u32 format,
+                                   u32 width, u32 height, u32 buffer_id)
+{
+    int result;
+    /* Host movie presentation uses this lock for the same D3D12 list/swap
+     * chain. Native gameplay takes it once per present, never per draw. */
+    AcquireSRWLockExclusive(&g_ld_access_lock);
+    result = ld_present_external_impl(
+        (ID3D12Resource*)texture, format, width, height, buffer_id);
+    ReleaseSRWLockExclusive(&g_ld_access_lock);
+    return result;
+}
+
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
 u64 rsx_live_draw_get_completed_draws(void)
 {
@@ -7309,7 +7406,6 @@ void* rsx_live_draw_get_present_thread_handle(void)
 #endif
 }
 
-static u32 g_ld_last_frame_draws = 0;
 /* Draws in the last COMPLETED frame (title-bar telemetry: distinguishes
  * "presenting fresh content" from "flipping a static image" -- the dead
  * journal-consumer limp state renders ~0 draws/frame while flips tick). */

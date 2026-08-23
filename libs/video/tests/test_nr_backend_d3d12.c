@@ -28,6 +28,7 @@ int main(void) { return 2; }
 #include <string.h>
 
 static int g_failures;
+static u32 g_present_handoffs;
 
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
@@ -50,6 +51,16 @@ static int g_failures;
 #define IDX_OFFSET 0x4000u
 #define FP_OFFSET  0x6000u
 #define TEX_OFFSET 0x8000u
+
+static int test_present_handoff(void* user, void* texture, u32 format,
+                                u32 width, u32 height, u32 buffer_id)
+{
+    (void)user;
+    if (!texture || !format || width != RT_W || height != RT_H || buffer_id)
+        return -1;
+    g_present_handoffs++;
+    return 0;
+}
 
 static u8 g_local[LOCAL_SIZE];
 static u8 g_main[MAIN_SIZE];
@@ -592,6 +603,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "no WARP D3D12 device: SKIP\n");
         return 2;
     }
+    CHECK(rsx_nr_d3d12_set_live_output(
+              sink, 0, test_present_handoff, NULL) == 0,
+          "present handoff configuration failed");
+    rsx_nr_d3d12_set_display_buffer(
+        sink, 0, RSX_NIR_LOCATION_LOCAL, RT_OFFSET, RT_W, RT_H);
 
     rsx_nr_ring ring;
     rsx_nr_tokens tokens;
@@ -937,6 +953,8 @@ int main(int argc, char** argv)
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
     CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
+    CHECK(g_present_handoffs == 13,
+          "native scanout handoffs=%u expected=13", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
