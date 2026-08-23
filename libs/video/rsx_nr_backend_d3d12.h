@@ -53,6 +53,13 @@ typedef int (*rsx_nr_d3d12_present_fn)(void* user, void* texture, u32 format,
  * nonzero refuses residency (and therefore the native draw) safely. */
 typedef int (*rsx_nr_d3d12_watch_page_fn)(void* user, u32 space,
                                           u32 page_offset);
+typedef int (*rsx_nr_d3d12_borrow_color_fn)(
+    void* user, u32 space, u32 offset, u32 width, u32 height,
+    void** resource, u32* dxgi_format);
+typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
+    void* user, u32 space, u32 offset, u32 depth_format,
+    u32 width, u32 height, void** resource, u32* resource_format,
+    u32* dsv_format, u32* srv_format);
 
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
@@ -121,6 +128,9 @@ void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
 void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
                                  rsx_nr_d3d12_watch_page_fn watch,
                                  void* watch_user);
+void rsx_nr_d3d12_set_resource_broker(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
+    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user);
 
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,

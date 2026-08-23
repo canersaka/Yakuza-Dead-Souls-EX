@@ -2324,8 +2324,14 @@ static void event_notify_guest_write(u32 ea, u32 size, const u64 routed[2])
     }
 }
 
+static _Atomic(uintptr_t) g_guest_write_observer;
+
 static void cellSpursNotifyGuestWriteSource(u32 ea, u32 size, int ppu_store)
 {
+    const uintptr_t observer_bits = atomic_load_explicit(
+        &g_guest_write_observer, memory_order_acquire);
+    if (observer_bits)
+        ((CellSpursGuestWriteObserver)observer_bits)(ea, size);
     if (g_registry_ready != 2 || !vm_base || !size) return;
     GuestWriteTargets targets;
     if (!guest_write_route_lookup(ea, size, &targets)) return;
@@ -2341,6 +2347,12 @@ static void cellSpursNotifyGuestWriteSource(u32 ea, u32 size, int ppu_store)
         jobchain_notify_guest_write(
             ea, size, ppu_store, targets.jobchain_commands,
             targets.jobchain_bridges);
+}
+
+void cellSpursSetGuestWriteObserver(CellSpursGuestWriteObserver observer)
+{
+    atomic_store_explicit(&g_guest_write_observer, (uintptr_t)observer,
+                          memory_order_release);
 }
 
 void cellSpursNotifyGuestWrite(u32 ea, u32 size)

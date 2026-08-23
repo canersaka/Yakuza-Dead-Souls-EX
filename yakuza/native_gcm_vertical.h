@@ -30,6 +30,14 @@ void yz_nr_vertical_init(void);
 void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                    uint32_t packet_ea);
 
+/* Live integration hooks. Display identities may arrive before the shared
+ * D3D12 device; they are retained and applied when active graphics becomes
+ * ready. Guest-write notifications are called only after bytes publish. */
+void yz_nr_vertical_set_display_buffer(uint32_t buffer_id, uint32_t location,
+                                       uint32_t offset, uint32_t width,
+                                       uint32_t height);
+void yz_nr_vertical_notify_guest_write(uint32_t ea, uint32_t size);
+
 /* Highest-safe imported flip producer. Shadow mode records the typed
  * queue+present contract and returns 0 so the caller emits the legacy packet.
  * active-present may return 1 after publishing an exact-EA typed span; in

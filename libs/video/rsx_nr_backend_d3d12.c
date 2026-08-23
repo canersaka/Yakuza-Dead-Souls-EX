@@ -63,6 +63,7 @@ typedef struct nrb_rt {
     u32 rtv_slot;
     D3D12_RESOURCE_STATES color_state;
     int live;
+    int external;
 } nrb_rt;
 
 typedef struct nrb_depth {
@@ -72,6 +73,7 @@ typedef struct nrb_depth {
     DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi;
     D3D12_RESOURCE_STATES state;
     int live;
+    int external;
 } nrb_depth;
 
 typedef struct nrb_display {
@@ -113,6 +115,9 @@ struct rsx_nr_d3d12 {
     u32 resident_page_count[RSX_GUEST_NUM_SPACES];
     rsx_nr_d3d12_watch_page_fn watch_page;
     void* watch_page_user;
+    rsx_nr_d3d12_borrow_color_fn borrow_color;
+    rsx_nr_d3d12_borrow_depth_fn borrow_depth;
+    void* broker_user;
     u32 local_size, main_size;
 
     rsx_nr_pso_cache psos;
@@ -254,22 +259,38 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
     if (!rt || b->rtv_used >= 64)
         return NULL;
 
-    D3D12_HEAP_PROPERTIES hp = {0};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd = {0};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = color_dxgi;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
-            b->dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource,
-            (void**)&rt->tex)))
-        return NULL;
+    if (b->borrow_color) {
+        void* resource = NULL;
+        u32 borrowed_format = 0;
+        if (b->borrow_color(
+                b->broker_user, space, offset, w, h, &resource,
+                &borrowed_format) != 0 || !resource ||
+            borrowed_format != (u32)color_dxgi) {
+            if (resource)
+                ((ID3D12Resource*)resource)->lpVtbl->Release(
+                    (ID3D12Resource*)resource);
+            return NULL;
+        }
+        rt->tex = (ID3D12Resource*)resource;
+        rt->external = 1;
+    } else {
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = color_dxgi;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
+                b->dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+                &IID_ID3D12Resource, (void**)&rt->tex)))
+            return NULL;
+    }
 
     rt->space = space;
     rt->offset = offset;
@@ -337,8 +358,10 @@ static int nrb_depth_formats(u32 fmt, DXGI_FORMAT* resource,
     return -1;
 }
 
-static DXGI_FORMAT nrb_depth_dsv_dxgi(u32 fmt)
+static DXGI_FORMAT nrb_depth_dsv_dxgi(const rsx_nr_d3d12* b, u32 fmt)
 {
+    if (b->borrow_depth && fmt == 2u)
+        return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     DXGI_FORMAT resource, dsv, srv;
     return nrb_depth_formats(fmt, &resource, &dsv, &srv) == 0
         ? dsv : DXGI_FORMAT_UNKNOWN;
@@ -368,25 +391,43 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     if (!depth || b->dsv_used >= 64u)
         return NULL;
 
-    D3D12_HEAP_PROPERTIES heap = {0};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc = {0};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = w;
-    desc.Height = h;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = resource_dxgi;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    D3D12_CLEAR_VALUE clear = {0};
-    clear.Format = dsv_dxgi;
-    clear.DepthStencil.Depth = 1.0f;
-    if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
-            b->dev, &heap, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, &IID_ID3D12Resource,
-            (void**)&depth->tex)))
-        return NULL;
+    if (b->borrow_depth) {
+        void* resource = NULL;
+        u32 rf = 0, df = 0, sf = 0;
+        if (b->borrow_depth(
+                b->broker_user, space, offset, fmt, w, h, &resource,
+                &rf, &df, &sf) != 0 || !resource) {
+            if (resource)
+                ((ID3D12Resource*)resource)->lpVtbl->Release(
+                    (ID3D12Resource*)resource);
+            return NULL;
+        }
+        depth->tex = (ID3D12Resource*)resource;
+        depth->external = 1;
+        resource_dxgi = (DXGI_FORMAT)rf;
+        dsv_dxgi = (DXGI_FORMAT)df;
+        srv_dxgi = (DXGI_FORMAT)sf;
+    } else {
+        D3D12_HEAP_PROPERTIES heap = {0};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {0};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = w;
+        desc.Height = h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = resource_dxgi;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE clear = {0};
+        clear.Format = dsv_dxgi;
+        clear.DepthStencil.Depth = 1.0f;
+        if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
+                b->dev, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                &IID_ID3D12Resource, (void**)&depth->tex)))
+            return NULL;
+    }
 
     depth->space = space;
     depth->offset = offset;
@@ -1810,7 +1851,7 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pd.PrimitiveTopologyType = tt;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = nrb_color_dxgi(b, st->surface.color_format);
-    pd.DSVFormat = nrb_depth_dsv_dxgi(st->surface.depth_format);
+    pd.DSVFormat = nrb_depth_dsv_dxgi(b, st->surface.depth_format);
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
@@ -2721,6 +2762,17 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
     b->watch_page_user = watch_user;
 }
 
+void rsx_nr_d3d12_set_resource_broker(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
+    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user)
+{
+    if (!b || b->rtv_used || b->dsv_used)
+        return;
+    b->borrow_color = color;
+    b->borrow_depth = depth;
+    b->broker_user = broker_user;
+}
+
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
 {
@@ -3138,6 +3190,12 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
                                  void* watch_user)
 {
     (void)b; (void)watch; (void)watch_user;
+}
+void rsx_nr_d3d12_set_resource_broker(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
+    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user)
+{
+    (void)b; (void)color; (void)depth; (void)broker_user;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)

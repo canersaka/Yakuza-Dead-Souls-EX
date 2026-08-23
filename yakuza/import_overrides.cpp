@@ -2049,6 +2049,37 @@ extern "C" const u8* yz_nr_vertical_guest_ptr(u32 location, u32 offset,
     return yz_rsx_live_guest_ptr(nullptr, location, offset, min_bytes);
 }
 
+extern "C" u8* yz_nr_vertical_guest_writable_ptr(u32 location, u32 offset,
+                                                   u32 min_bytes)
+{
+    return const_cast<u8*>(
+        yz_rsx_live_guest_ptr(nullptr, location, offset, min_bytes));
+}
+
+/* Resolve one exact graphics page to its guest EA.  The native renderer arms
+ * a VM watch only after this proves the full 4 KiB page is contiguous. */
+extern "C" int yz_nr_vertical_space_page_to_ea(u32 location,
+                                                 u32 page_offset,
+                                                 u32* out_ea)
+{
+    if (!out_ea || (page_offset & 0xFFFu) ||
+        !yz_rsx_live_guest_ptr(nullptr, location, page_offset, 0x1000u))
+        return -1;
+    if (location == 0u) {
+        *out_ea = YZ_GCM_LOCAL_BASE + page_offset;
+        return 0;
+    }
+    if (location == 1u) {
+        const u32 ea = yz_rsx_io_to_ea(page_offset);
+        const u32 last = yz_rsx_io_to_ea(page_offset + 0xFFFu);
+        if (!ea || last != ea + 0xFFFu)
+            return -1;
+        *out_ea = ea;
+        return 0;
+    }
+    return -1;
+}
+
 /* The guest movie player owns sequencing and post-movie state, but its decoded
  * surface is not yet reaching the live RSX draw path and its software decode
  * runs far below the authored frame rate. The game opens each .sfd once for a
@@ -3648,6 +3679,8 @@ extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause)
     yz_rsx_exec_user_command(0xEB00u, cause);
 }
 
+extern "C" void yz_nr_vertical_exec_present_complete(uint32_t buffer_id);
+
 extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id)
 {
     /* Direct semantic equivalent of E944 followed by E924. Presentation of
@@ -3655,6 +3688,13 @@ extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id)
      * decoder is called—then the existing queue/flip packages preserve the
      * guest-visible head state, event delivery, completion, and movie route. */
     rsx_live_draw_typed_present(buffer_id);
+    yz_nr_vertical_exec_present_complete(buffer_id);
+}
+
+extern "C" void yz_nr_vertical_exec_present_complete(uint32_t buffer_id)
+{
+    /* The native D3D12 sink has already copied/presented its exact scanout.
+     * Publish only the guest-visible queue/head packages here. */
     ppu_context sc = {};
     sc.gpr[4] = 0x103u;
     sc.gpr[5] = 1u;
@@ -7959,6 +7999,7 @@ extern "C" void yz_ovr_cellGcmSetDisplayBuffer(ppu_context* ctx)
             g_rsx_dispbuf_count = id + 1u;
         rsx_live_draw_set_display_buffer(
             id, 0, offset, pitch, width, height);
+        yz_nr_vertical_set_display_buffer(id, 0, offset, width, height);
     }
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
@@ -8407,6 +8448,9 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
             if (id + 1 > g_rsx_dispbuf_count) g_rsx_dispbuf_count = id + 1;
             rsx_live_draw_set_display_buffer(
                 id, 0, g_rsx_dispbuf[id].offset, g_rsx_dispbuf[id].pitch,
+                g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
+            yz_nr_vertical_set_display_buffer(
+                id, 0, g_rsx_dispbuf[id].offset,
                 g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
         }
         break;

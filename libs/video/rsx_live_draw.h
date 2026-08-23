@@ -91,6 +91,18 @@ void* rsx_live_draw_get_d3d12_device(void);
 int rsx_live_draw_present_external(void* texture, u32 dxgi_format,
                                    u32 width, u32 height, u32 buffer_id);
 
+/* Shared-resource broker for the vertical renderer. Returned resources carry
+ * one COM reference owned by the caller and are left in RENDER_TARGET or
+ * DEPTH_WRITE state. This preserves framebuffer history when ordered native
+ * and legacy actions alternate; it does not invoke the legacy decoder. */
+int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
+                               u32 height, void** resource,
+                               u32* dxgi_format);
+int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
+                               u32 width, u32 height, void** resource,
+                               u32* resource_format, u32* dsv_format,
+                               u32* srv_format);
+
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the
  * ordered CLEAR action. */

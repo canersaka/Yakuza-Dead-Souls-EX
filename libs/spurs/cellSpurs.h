@@ -195,6 +195,10 @@ s32 cellSpursJobGuardReset(CellSpursJobGuard*);
  * predicates that re-read the guest bytes. */
 void cellSpursNotifyGuestWrite(u32 ea, u32 size);
 void cellSpursNotifyPpuGuestWrite(u32 ea, u32 size);
+typedef void (*CellSpursGuestWriteObserver)(u32 ea, u32 size);
+/* Optional post-publication observer. The pointer is read atomically on the
+ * existing write chokepoint; NULL is the default and adds no callback work. */
+void cellSpursSetGuestWriteObserver(CellSpursGuestWriteObserver observer);
 /* Complete staged PPU descriptor publications after the lifted guest barrier
  * that orders their body before the SPURS-visible readiness state. */
 void cellSpursNotifyPpuFence(void);
