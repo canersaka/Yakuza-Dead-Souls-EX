@@ -66,7 +66,8 @@ FLOAT_RE = re.compile(
     r"fesd|frds|cflts|cfltu|csflt|cuflt|dfa|dfs|dfm|dfma|dfms|dfnms|dfnma|"
     r"dfceq|dfcmeq|dfcgt|dfcmgt|dftsv|xf_\w+|clz\w*|gbh|gbb|shlh|roth|rothm|"
     r"rothma|mfspr)\b|ldexp|frexp|exp2|fmaf?$|pow|_CI\w+|__libm\w*|_dtest)")
-MEMORY = {"memcpy", "memset", "memmove"}
+MEMORY = {"memcpy", "memset", "memmove",
+          "__chkstk"}   # MSVC stack probe for >4KB frames -- compiler runtime
 
 _FLAGS_NOBIGOBJ = [f for f in D.CLFLAGS if f != "/bigobj"]
 
