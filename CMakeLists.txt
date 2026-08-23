@@ -562,6 +562,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_vertex_pull.c
             libs/video/rsx_vertex_compact.c
             libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
             libs/video/rsx_dispatch.c
         )
         target_include_directories(rsx_nr_backend_d3d12_tests PRIVATE
