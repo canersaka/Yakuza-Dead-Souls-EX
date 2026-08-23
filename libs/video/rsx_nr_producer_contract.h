@@ -87,6 +87,52 @@ int rsx_nr_vertex_program_contract_init(
     rsx_nr_vertex_program_contract* out, u32 instruction_count,
     u32 start_slot, u32 attrib_input_mask, const u32* words);
 
+/* func_00EB0D90 is the game's highest complete fragment-package producer.
+ * It owns allocation, microcode relocation and construction of the reusable
+ * shader command segment. Passive validation obtains the final referenced
+ * byte span once, but semantic identity is independent of that segment's
+ * address so copied and SPU-published replays remain valid.
+ *
+ * Fragment inline constants live inside the program image. Exact content
+ * identity therefore changes when parameters are patched; structural shader
+ * identity is computed separately by rsx_fp_decompiler. */
+#define RSX_NR_FRAGMENT_PROGRAM_FUNCTION 0x00EB0D90u
+#define RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES 0x10000u
+
+typedef struct rsx_nr_fragment_program_contract {
+    u32 byte_count;
+    u32 control;
+    u64 content_hash;
+    u64 semantic_hash;
+} rsx_nr_fragment_program_contract;
+
+u64 rsx_nr_fragment_program_content_hash(const u8* bytes, u32 byte_count);
+u64 rsx_nr_fragment_program_semantic_hash(u64 program_hash,
+                                          u32 byte_count, u32 control);
+int rsx_nr_fragment_program_contract_init(
+    rsx_nr_fragment_program_contract* out, const u8* bytes,
+    u32 byte_count, u32 control);
+
+/* NV4097_SET_SHADER_PROGRAM and NV4097_SET_SHADER_CONTROL are independent,
+ * persistent state. A draw is classifiable only after both have been seen;
+ * repeated updates replace one field without consuming or clearing the
+ * other. This tiny state machine is shared by the passive live oracle and
+ * deterministic tests so adjacency is never inferred. */
+typedef struct rsx_nr_fragment_binding_state {
+    u32 program_word;
+    u32 control;
+    u32 valid_mask;
+} rsx_nr_fragment_binding_state;
+
+void rsx_nr_fragment_binding_init(rsx_nr_fragment_binding_state* state);
+void rsx_nr_fragment_binding_set_program(
+    rsx_nr_fragment_binding_state* state, u32 program_word);
+void rsx_nr_fragment_binding_set_control(
+    rsx_nr_fragment_binding_state* state, u32 control);
+int rsx_nr_fragment_binding_snapshot(
+    const rsx_nr_fragment_binding_state* state,
+    u32* program_word, u32* control);
+
 /* Native-GCM's imported flip wrapper is a fixed queue+flip template.  The
  * wait-label variant prefixes the same template with one NV406E acquire.
  * Keeping the byte-exact words in this audited contract lets an exact-EA

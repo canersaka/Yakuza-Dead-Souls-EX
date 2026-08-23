@@ -52,4 +52,5 @@
 0x00EBD48C  # direct state setter: 0x17C8
 0x00EBD5CC  # direct state setter: 0x1804
 0x00EBD92C  # full transform-program producer ABI entry (not 00EBD968 continuation)
+0x00EB0D90  # fragment-package producer ABI entry; reusable shader template builder
 0x00EBEA48  # thin DrawArrays producer: ctx, primitive, first, count
