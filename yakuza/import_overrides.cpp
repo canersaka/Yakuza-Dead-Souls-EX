@@ -7496,8 +7496,11 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         }
         if (eff >= 0xE940u && eff <= 0xE95Cu)
             rsx_live_draw_set_fifo_position(get, put);
-        stalled = yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
-        if (!stalled) {
+        const int native_method = (eff == 0x1808u && val == 0u) ?
+            yz_nr_vertical_try_method(eff, val, yz_rsx_io_to_ea(get)) : 0;
+        stalled = native_method ? 0 :
+            yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
+        if (!stalled && !native_method) {
             if (g_yz_nr_shadow_enabled)
                 rsx_nr_intercept_shadow_method(&g_yz_nr_shadow, eff, val);
             yz_nr_vertical_observe_method(eff, val, yz_rsx_io_to_ea(get));
