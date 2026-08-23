@@ -37,7 +37,8 @@ enum : uint32_t {
     YZ_NR_VERT_ACQUIRE = 2,
     YZ_NR_VERT_USER = 3,
     YZ_NR_VERT_STATE_DIRECT = 4,
-    YZ_NR_VERT_FAMILY_COUNT = 5,
+    YZ_NR_VERT_DRAW_ARRAYS = 5,
+    YZ_NR_VERT_FAMILY_COUNT = 6,
     YZ_NR_VERT_SOURCE_COUNT = 16,
     YZ_NR_VERT_EVENT_COUNT = 8192,
 };
@@ -86,8 +87,15 @@ struct yz_nr_vertical_state {
     unsigned long long exact_unaddressed;
     unsigned long long exact_overflow;
     unsigned long long state_unowned_methods;
+    unsigned long long draw_unowned;
+    unsigned long long draw_unsupported;
+    unsigned long long draw_bad_sequence;
     uint32_t fifo_semaphore_offset;
     uint32_t fifo_semaphore_packet_ea;
+    uint32_t draw_state;          /* 0 none, 1 exact wrapper, 2 fallback */
+    uint32_t draw_event_ea;
+    uint32_t draw_primitive;
+    uint32_t draw_hash;
     volatile LONG mode_shadow;
     volatile LONG mode_active_basic;
     volatile LONG initialized;
@@ -303,6 +311,26 @@ static void yz_nr_event_observe(uint32_t packet_ea, uint32_t family,
     g_vertical.exact_unexpected++;
 }
 
+/* Find, but do not retire, an exact event. The draw contract is observed
+ * across BEGIN, one or more batch packets, and END, so its event remains
+ * ready until the normalized action is complete. g_vertical.lock is held. */
+static yz_nr_vertical_event* yz_nr_event_find(uint32_t packet_ea,
+                                              uint32_t family)
+{
+    const uint32_t first = yz_nr_event_hash(packet_ea);
+    for (uint32_t probe = 0; probe < YZ_NR_VERT_EVENT_COUNT; ++probe) {
+        yz_nr_vertical_event* const event =
+            &g_vertical.events[(first + probe) &
+                               (YZ_NR_VERT_EVENT_COUNT - 1u)];
+        if (event->state == YZ_NR_EVENT_EMPTY)
+            break;
+        if (event->state == YZ_NR_EVENT_READY &&
+            event->packet_ea == packet_ea && event->family == family)
+            return event;
+    }
+    return nullptr;
+}
+
 /* State methods may also be emitted by prebuilt, copied, or SPU-published
  * command groups.  Those are valid fallback producers, not mismatches in the
  * selected wrapper contract.  Match only an exact outstanding wrapper EA;
@@ -351,6 +379,37 @@ static void yz_nr_note(yz_nr_vertical_lane* lane, uint32_t family,
     lane->sum_hash[family] += event;
 }
 
+/* g_vertical.lock must be held. */
+static void yz_nr_note_source(uint32_t context, uint32_t current,
+                              uint32_t family)
+{
+    uint32_t free_slot = YZ_NR_VERT_SOURCE_COUNT;
+    for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
+        yz_nr_vertical_source* const source = &g_vertical.sources[i];
+        if (source->context == context) {
+            if (current < source->current_min)
+                source->current_min = current;
+            if (current > source->current_max)
+                source->current_max = current;
+            source->family_mask |= 1u << family;
+            source->count++;
+            return;
+        }
+        if (!source->count && free_slot == YZ_NR_VERT_SOURCE_COUNT)
+            free_slot = i;
+    }
+    if (free_slot < YZ_NR_VERT_SOURCE_COUNT) {
+        yz_nr_vertical_source* const source = &g_vertical.sources[free_slot];
+        source->context = context;
+        source->current_min = current;
+        source->current_max = current;
+        source->family_mask = 1u << family;
+        source->count = 1;
+    } else {
+        g_vertical.source_overflow++;
+    }
+}
+
 static void yz_nr_expected_from(ppu_context* ctx, uint32_t family,
                                 uint32_t a, uint32_t b,
                                 uint32_t packet_bytes)
@@ -367,40 +426,7 @@ static void yz_nr_expected_from(ppu_context* ctx, uint32_t family,
         yz_nr_event_expect(current, family, a, b);
     else
         g_vertical.exact_unaddressed++;
-    uint32_t free_slot = YZ_NR_VERT_SOURCE_COUNT;
-    for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
-        yz_nr_vertical_source* const source = &g_vertical.sources[i];
-        if (source->context == context) {
-            if (current < source->current_min)
-                source->current_min = current;
-            if (current > source->current_max)
-                source->current_max = current;
-            source->family_mask |= 1u << family;
-            source->count++;
-            free_slot = YZ_NR_VERT_SOURCE_COUNT;
-            break;
-        }
-        if (!source->count && free_slot == YZ_NR_VERT_SOURCE_COUNT)
-            free_slot = i;
-    }
-    if (free_slot < YZ_NR_VERT_SOURCE_COUNT) {
-        yz_nr_vertical_source* const source = &g_vertical.sources[free_slot];
-        source->context = context;
-        source->current_min = current;
-        source->current_max = current;
-        source->family_mask = 1u << family;
-        source->count = 1;
-    } else {
-        bool found = false;
-        for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
-            if (g_vertical.sources[i].context == context) {
-                found = true;
-                break;
-            }
-        }
-        if (!found)
-            g_vertical.source_overflow++;
-    }
+    yz_nr_note_source(context, current, family);
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
@@ -415,6 +441,42 @@ static void yz_nr_expected_direct_setter(ppu_context* ctx,
         return;
     yz_nr_expected_from(ctx, YZ_NR_VERT_STATE_DIRECT, contract->method,
                         (uint32_t)ctx->gpr[4], 8u);
+}
+
+static void yz_nr_expected_draw_arrays(ppu_context* ctx)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
+        return;
+
+    rsx_nr_draw_arrays_contract draw = {};
+    if (!rsx_nr_draw_arrays_contract_init(
+            &draw, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+            (uint32_t)ctx->gpr[6])) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.draw_unsupported++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t current = vm_read32((uint64_t)context + 8u);
+    const uint32_t end = vm_read32((uint64_t)context + 4u);
+    AcquireSRWLockExclusive(&g_vertical.lock);
+    /* The audited wrapper's BEGIN header starts 16 bytes after its leading
+     * three-word 0x1714 state packet. If the initial 0x20-byte reservation
+     * cannot fit, its callback may move to another segment; leave that call
+     * explicitly unaddressed instead of guessing across the callback. */
+    if (!(current & 3u) && current <= end && 0x20u <= end - current) {
+        const uint32_t begin_ea = current + 16u;
+        yz_nr_note(&g_vertical.expected, YZ_NR_VERT_DRAW_ARRAYS,
+                   draw.primitive, draw.semantic_hash);
+        yz_nr_event_expect(begin_ea, YZ_NR_VERT_DRAW_ARRAYS,
+                           draw.primitive, draw.semantic_hash);
+        yz_nr_note_source(context, current, YZ_NR_VERT_DRAW_ARRAYS);
+    } else {
+        g_vertical.exact_unaddressed++;
+    }
+    ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
 } // namespace
@@ -442,6 +504,68 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
         return;
+
+    /* Normalize complete DrawArrays actions at the consumer. An exact
+     * wrapper event is keyed by the BEGIN packet address and stays live until
+     * END, while copied/dynamic/SPU-authored draws are counted as fallback. */
+    if (method == 0x1808u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (arg) {
+            if (g_vertical.draw_state)
+                g_vertical.draw_bad_sequence++;
+            yz_nr_vertical_event* const event =
+                yz_nr_event_find(packet_ea, YZ_NR_VERT_DRAW_ARRAYS);
+            g_vertical.draw_event_ea = packet_ea;
+            g_vertical.draw_primitive = arg;
+            g_vertical.draw_hash = rsx_nr_draw_hash_begin(arg, 0);
+            if (event) {
+                g_vertical.draw_state = 1;
+            } else {
+                g_vertical.draw_state = 2;
+                g_vertical.draw_unowned++;
+            }
+        } else {
+            if (g_vertical.draw_state == 1) {
+                yz_nr_note(&g_vertical.observed, YZ_NR_VERT_DRAW_ARRAYS,
+                           g_vertical.draw_primitive,
+                           g_vertical.draw_hash);
+                yz_nr_event_observe(g_vertical.draw_event_ea,
+                                    YZ_NR_VERT_DRAW_ARRAYS,
+                                    g_vertical.draw_primitive,
+                                    g_vertical.draw_hash);
+                const uint32_t family = YZ_NR_VERT_DRAW_ARRAYS;
+                if (g_vertical.observed.count[family] == 1 ||
+                    g_vertical.draw_event_ea <
+                        g_vertical.observed_ea_min[family])
+                    g_vertical.observed_ea_min[family] =
+                        g_vertical.draw_event_ea;
+                if (g_vertical.draw_event_ea >
+                    g_vertical.observed_ea_max[family])
+                    g_vertical.observed_ea_max[family] =
+                        g_vertical.draw_event_ea;
+            } else if (!g_vertical.draw_state) {
+                g_vertical.draw_bad_sequence++;
+            }
+            g_vertical.draw_state = 0;
+            g_vertical.draw_event_ea = 0;
+            g_vertical.draw_primitive = 0;
+            g_vertical.draw_hash = 0;
+        }
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method == 0x1814u || method == 0x1824u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.draw_state == 1) {
+            if (method == 0x1824u)
+                g_vertical.draw_bad_sequence++;
+            g_vertical.draw_hash = rsx_nr_draw_hash_batch(
+                g_vertical.draw_hash, arg & 0x00FFFFFFu,
+                (arg >> 24) + 1u);
+        }
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
 
     /* yz_rsx_method receives subchannel-flattened methods. NV406E methods
      * remain in the low window; the game user-command method is 0xEB00/04. */
@@ -635,6 +759,10 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const unsigned long long exact_overflow = g_vertical.exact_overflow;
     const unsigned long long state_unowned_methods =
         g_vertical.state_unowned_methods;
+    const unsigned long long draw_unowned = g_vertical.draw_unowned;
+    const unsigned long long draw_unsupported = g_vertical.draw_unsupported;
+    const unsigned long long draw_bad_sequence =
+        g_vertical.draw_bad_sequence;
     uint32_t observed_ea_min[YZ_NR_VERT_FAMILY_COUNT];
     uint32_t observed_ea_max[YZ_NR_VERT_FAMILY_COUNT];
     memcpy(observed_ea_min, g_vertical.observed_ea_min,
@@ -661,6 +789,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const bool state_ok = expected.count[YZ_NR_VERT_STATE_DIRECT] ==
                               observed.count[YZ_NR_VERT_STATE_DIRECT] +
                               outstanding_by_family[YZ_NR_VERT_STATE_DIRECT];
+    const bool draw_ok = expected.count[YZ_NR_VERT_DRAW_ARRAYS] ==
+                             observed.count[YZ_NR_VERT_DRAW_ARRAYS] +
+                             outstanding_by_family[YZ_NR_VERT_DRAW_ARRAYS];
     unsigned sequence_mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
         if (!outstanding_by_family[family] &&
@@ -671,6 +802,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
             "[nr-vertical-shadow ref=%llu/%llu+%llu:%s "
             "acq=%llu/%llu+%llu:%s user=%llu/%llu+%llu:%s "
             "state=%llu/%llu+%llu:%s state-unowned=%llu "
+            "draw=%llu/%llu+%llu:%s draw-unowned=%llu "
+            "draw-unsupported=%llu draw-seq=%llu "
             "mismatch=%u seqdiff=%u]\n",
             expected.count[YZ_NR_VERT_REFERENCE],
             observed.count[YZ_NR_VERT_REFERENCE],
@@ -688,6 +821,11 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed.count[YZ_NR_VERT_STATE_DIRECT],
             outstanding_by_family[YZ_NR_VERT_STATE_DIRECT],
             state_ok ? "ok" : "bad", state_unowned_methods,
+            expected.count[YZ_NR_VERT_DRAW_ARRAYS],
+            observed.count[YZ_NR_VERT_DRAW_ARRAYS],
+            outstanding_by_family[YZ_NR_VERT_DRAW_ARRAYS],
+            draw_ok ? "ok" : "bad", draw_unowned, draw_unsupported,
+            draw_bad_sequence,
             mismatches, sequence_mismatches);
     for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
         if (!sources[i].count)
@@ -704,7 +842,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 source_overflow);
     fprintf(stderr,
             "[nr-vertical-observed-ea ref=%08X-%08X "
-            "acq=%08X-%08X user=%08X-%08X state=%08X-%08X]\n",
+            "acq=%08X-%08X user=%08X-%08X state=%08X-%08X "
+            "draw=%08X-%08X]\n",
             observed_ea_min[YZ_NR_VERT_REFERENCE],
             observed_ea_max[YZ_NR_VERT_REFERENCE],
             observed_ea_min[YZ_NR_VERT_ACQUIRE],
@@ -712,7 +851,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed_ea_min[YZ_NR_VERT_USER],
             observed_ea_max[YZ_NR_VERT_USER],
             observed_ea_min[YZ_NR_VERT_STATE_DIRECT],
-            observed_ea_max[YZ_NR_VERT_STATE_DIRECT]);
+            observed_ea_max[YZ_NR_VERT_STATE_DIRECT],
+            observed_ea_min[YZ_NR_VERT_DRAW_ARRAYS],
+            observed_ea_max[YZ_NR_VERT_DRAW_ARRAYS]);
     fprintf(stderr,
             "[nr-vertical-exact matched=%llu mismatch=%llu unexpected=%llu "
             "outstanding=%llu unaddressed=%llu overflow=%llu]\n",
@@ -747,6 +888,15 @@ void func_00EBD6FC(ppu_context* ctx)
     if (!yz_nr_active_publish(ctx, YZ_NR_VERT_USER,
                               (uint32_t)ctx->gpr[4]))
         func_00EBD6FC_lifted(ctx);
+}
+
+/* Thin DrawArrays producer: passive mode derives the typed draw directly
+ * from the wrapper ABI, while the unchanged lifted body remains the only
+ * executor. Active graphics ownership is deliberately not enabled here. */
+void func_00EBEA48(ppu_context* ctx)
+{
+    yz_nr_expected_draw_arrays(ctx);
+    func_00EBEA48_lifted(ctx);
 }
 
 /* Direct (context,value) state setters.  Shadow mode records a typed

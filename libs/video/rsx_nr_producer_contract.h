@@ -33,6 +33,30 @@ u32 rsx_nr_direct_setter_count(void);
  * wrapper and does not call this encoder or a packet decoder. */
 int rsx_nr_direct_setter_packet(u32 function_ea, u32 value, u32 out[2]);
 
+/* func_00EBEA48 is the title's out-of-line CellGcmSetDrawArrays-style
+ * producer. Its arguments are (context, primitive, first, count). The wire
+ * format splits the range into at most 256 vertices per DRAW_ARRAYS word;
+ * this contract hashes the normalized typed draw rather than its packet
+ * headers, so the producer and consumer can be compared without routing the
+ * producer through an RSX decoder. */
+#define RSX_NR_DRAW_ARRAYS_FUNCTION 0x00EBEA48u
+#define RSX_NR_DRAW_CONTRACT_MAX_BATCHES 4096u
+
+typedef struct rsx_nr_draw_arrays_contract {
+    u32 primitive;
+    u32 first;
+    u32 count;
+    u32 batch_count;
+    u32 semantic_hash;
+} rsx_nr_draw_arrays_contract;
+
+u32 rsx_nr_draw_hash_begin(u32 primitive, u32 indexed);
+u32 rsx_nr_draw_hash_batch(u32 hash, u32 first, u32 count);
+
+/* Returns zero for an invalid/unsupported argument shape. */
+int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
+                                     u32 primitive, u32 first, u32 count);
+
 #ifdef __cplusplus
 }
 #endif

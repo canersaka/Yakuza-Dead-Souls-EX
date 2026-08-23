@@ -67,3 +67,56 @@ int rsx_nr_direct_setter_packet(u32 function_ea, u32 value, u32 out[2])
     out[1] = value;
     return 1;
 }
+
+static u32 draw_hash_word(u32 hash, u32 word)
+{
+    for (u32 i = 0; i < 4; ++i) {
+        hash ^= (word >> (i * 8u)) & 0xFFu;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+u32 rsx_nr_draw_hash_begin(u32 primitive, u32 indexed)
+{
+    u32 hash = 2166136261u;
+    hash = draw_hash_word(hash, primitive);
+    return draw_hash_word(hash, indexed ? 1u : 0u);
+}
+
+u32 rsx_nr_draw_hash_batch(u32 hash, u32 first, u32 count)
+{
+    hash = draw_hash_word(hash, first & 0x00FFFFFFu);
+    return draw_hash_word(hash, count);
+}
+
+int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
+                                     u32 primitive, u32 first, u32 count)
+{
+    if (!out || !primitive || !count)
+        return 0;
+    const u32 full_batches = (count - 1u) >> 8;
+    const u32 batches = 1u + full_batches;
+    if (batches > RSX_NR_DRAW_CONTRACT_MAX_BATCHES)
+        return 0;
+
+    u32 hash = rsx_nr_draw_hash_begin(primitive, 0);
+    /* The audited SDK body intentionally emits the remainder first, then
+     * full 256-vertex batches. This is observably different from the common
+     * full-batches-first normalization when count > 256. */
+    const u32 first_count = ((count - 1u) & 0xFFu) + 1u;
+    u32 cursor = first;
+    hash = rsx_nr_draw_hash_batch(hash, cursor, first_count);
+    cursor += first_count;
+    for (u32 i = 0; i < full_batches; ++i) {
+        hash = rsx_nr_draw_hash_batch(hash, cursor, 256u);
+        cursor += 256u;
+    }
+
+    out->primitive = primitive;
+    out->first = first;
+    out->count = count;
+    out->batch_count = batches;
+    out->semantic_hash = hash;
+    return 1;
+}
