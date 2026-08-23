@@ -46,6 +46,7 @@ static int g_failures;
 #define RT_H 64u
 #define VTX_OFFSET 0x2000u
 #define IDX_OFFSET 0x4000u
+#define FP_OFFSET  0x6000u
 
 static u8 g_local[LOCAL_SIZE];
 static u8 g_main[MAIN_SIZE];
@@ -71,6 +72,44 @@ static void put_be32(u8* p, u32 v)
     p[1] = (u8)(v >> 16);
     p[2] = (u8)(v >> 8);
     p[3] = (u8)v;
+}
+
+static u32 fbits(float f);
+
+/* Store one host-order NV40 fragment word in the guest byte order consumed
+ * by rsx_fp_read_word (big-endian with 16-bit halves exchanged). */
+static void put_fp_word(u8* p, u32 word)
+{
+    put_be32(p, (word << 16) | (word >> 16));
+}
+
+static void write_test_fp(void)
+{
+    /* MOV r0, COL0; END, unconditional.  The passthrough test VS supplies
+     * magenta COL0, so the existing pixel oracle now proves a real guest FP
+     * rather than a hard-coded D3D12 stand-in. */
+    u8* p = g_local + FP_OFFSET;
+    put_fp_word(p + 0, (0x01u << 24) | (0xFu << 9) | (1u << 13) | 1u);
+    put_fp_word(p + 4, 1u | ((0u << 9) | (1u << 11) |
+                             (2u << 13) | (3u << 15)) |
+                              (7u << 18));
+    put_fp_word(p + 8, 0);
+    put_fp_word(p + 12, 0);
+}
+
+static void write_const_fp(float r, float g, float b, float a)
+{
+    u8* p = g_local + FP_OFFSET;
+    put_fp_word(p + 0, (0x01u << 24) | (0xFu << 9) | 1u);
+    put_fp_word(p + 4, 2u | ((0u << 9) | (1u << 11) |
+                             (2u << 13) | (3u << 15)) |
+                              (7u << 18));
+    put_fp_word(p + 8, 0);
+    put_fp_word(p + 12, 0);
+    put_fp_word(p + 16, fbits(r));
+    put_fp_word(p + 20, fbits(g));
+    put_fp_word(p + 24, fbits(b));
+    put_fp_word(p + 28, fbits(a));
 }
 
 static u32 fbits(float f)
@@ -113,6 +152,18 @@ static void stage_frame_state(rsx_nir_emitter* em)
     v.w = RT_W;
     v.h = RT_H;
     rsx_nir_em_viewport(em, &v);
+
+    rsx_nir_raster r;
+    memset(&r, 0, sizeof(r));
+    r.color_mask = 0x01010101u;
+    rsx_nir_em_raster(em, &r);
+
+    rsx_nir_fragment_program fp;
+    memset(&fp, 0, sizeof(fp));
+    fp.offset = FP_OFFSET;
+    fp.location = RSX_NIR_LOCATION_LOCAL;
+    fp.control = 0x40u;              /* r0 is the color export             */
+    rsx_nir_em_fragment_program(em, &fp);
 
     rsx_nir_vertex_bindings vb;
     memset(&vb, 0, sizeof(vb));
@@ -414,6 +465,7 @@ static void run_capture_backend(const char* path)
 
 int main(int argc, char** argv)
 {
+    write_test_fp();
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(NULL, LOCAL_SIZE, MAIN_SIZE,
                                              arena_ptr, arena_wptr, NULL);
     if (!sink) {
@@ -514,6 +566,43 @@ int main(int argc, char** argv)
     CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF), "indexed inside pixel");
     CHECK(pix_is(61, 2, 0xFF, 0x00, 0x00), "indexed outside pixel");
 
+    /* ---- real FP constants + structural PSO reuse ---------------------
+     * Two byte-distinct inline-CONST payloads must share one structural PSO
+     * while b1 changes the rendered result. */
+    write_const_fp(0.0f, 1.0f, 0.0f, 1.0f);
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "green constant FP exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "green constant FP pixel");
+    rsx_nr_d3d12_stats before_constant_change;
+    rsx_nr_d3d12_get_stats(sink, &before_constant_change);
+
+    write_const_fp(1.0f, 0.0f, 0.0f, 1.0f);
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "red constant FP exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0x00, 0xFF), "red constant FP pixel");
+    rsx_nr_d3d12_stats after_constant_change;
+    rsx_nr_d3d12_get_stats(sink, &after_constant_change);
+    CHECK(after_constant_change.pso_builds ==
+              before_constant_change.pso_builds &&
+          after_constant_change.pso_hits > before_constant_change.pso_hits,
+          "inline constant rebuilt PSO builds=%llu/%llu hits=%llu/%llu",
+          before_constant_change.pso_builds, after_constant_change.pso_builds,
+          before_constant_change.pso_hits, after_constant_change.pso_hits);
+
     /* ---- scissored clear ------------------------------------------------
      * CLEAR_SURFACE clears only within the scissor box
      * (cellGcmSetClearSurface). Blue full clear, then a green clear
@@ -556,7 +645,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 5 && st.draws == 3 && st.presents == 5,
+    CHECK(st.clears == 7 && st.draws == 5 && st.presents == 7,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
@@ -564,6 +653,9 @@ int main(int argc, char** argv)
           st.compile_failures);
     CHECK(st.pso_builds >= 1 && st.pso_hits >= 1,
           "pso cache builds=%llu hits=%llu", st.pso_builds, st.pso_hits);
+    CHECK(st.real_fp_draws == st.draws,
+          "real fragment programs=%llu draws=%llu", st.real_fp_draws,
+          st.draws);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);

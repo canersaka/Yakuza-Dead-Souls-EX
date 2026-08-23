@@ -17,9 +17,9 @@
  * passthrough of ATTR0 is generated — the offline pixel tests use that
  * mode. Draw shapes the sink cannot yet execute faithfully (unsupported
  * primitive/format, primitive restart, scaled blits with real scaling,
- * fragment programs — the solid test PS stands in) return failure to the
- * core, which counts them; nothing is silently approximated without a
- * counter.
+ * fragment programs) return failure to the core, which counts them; nothing
+ * is silently approximated. Fragment programs execute only when their exact
+ * guest bytes are readable and every opcode/resource family is supported.
  *
  * Upload hazards: per-draw constants come from a fence-gated upload ring;
  * mirror staging reuse is governed by the mirror backend's three-slice
@@ -49,10 +49,12 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long unsup_draw_plan;      /* pull plan unsupported      */
     unsigned long long unsup_draw_pso;       /* compile/build failed       */
     unsigned long long unsup_draw_index;     /* index list unreadable      */
+    unsigned long long unsup_draw_fp;        /* FP unreadable/unsupported  */
+    unsigned long long unsup_draw_texture;   /* FP texture lane pending    */
     unsigned long long restart_draws;        /* executed via strip-cut IB  */
     unsigned long long unsupported_clears;
     unsigned long long unsupported_transfers;
-    unsigned long long approx_fp_draws;      /* solid PS stood in for FP   */
+    unsigned long long real_fp_draws;        /* real guest FP executed     */
     unsigned long long compile_failures;
     unsigned long long rt_builds;
 } rsx_nr_d3d12_stats;

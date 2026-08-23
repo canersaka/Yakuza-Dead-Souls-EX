@@ -29,12 +29,14 @@
 #include <string.h>
 
 #include "rsx_gpu_mirror_d3d12.h"
+#include "rsx_fp_decompiler.h"
 #include "rsx_nr_resources.h"
 #include "rsx_vertex_pull.h"
 
 #define NRB_MAX_RTS      32
 #define NRB_UPLOAD_BYTES (4u << 20)
 #define NRB_VS_TEXT      (256 * 1024)
+#define NRB_PS_TEXT      (256 * 1024)
 #define NRB_PSO_CAP      1024
 
 typedef struct nrb_rt {
@@ -88,6 +90,7 @@ struct rsx_nr_d3d12 {
 
     rsx_nr_d3d12_stats stats;
     char vs_text[NRB_VS_TEXT];
+    char ps_text[NRB_PS_TEXT];
     char pull_globals[48 * 1024];
     char pull_loads[8 * 1024];
 };
@@ -378,8 +381,211 @@ static int nrb_topology(u32 prim, D3D12_PRIMITIVE_TOPOLOGY* topo,
     }
 }
 
-static const char NRB_PS_SOLID[] =
-    "float4 main() : SV_Target { return float4(1.0, 0.0, 1.0, 1.0); }\n";
+typedef struct nrb_fp_info {
+    const u8* bytes;
+    u32 size;
+    u32 texture_mask;
+    u32 unsupported;
+    u64 structural_hash;
+    rsx_fp_constant_block constants;
+} nrb_fp_info;
+
+/* Validate the exact subset translated by rsx_fp_decompiler before a draw
+ * can become native-owned.  The decompiler deliberately emits comments for
+ * unknown instructions so offline shader-corpus work can continue; the live
+ * execution sink is stricter and must never turn those comments into a
+ * visually plausible but incorrect draw. */
+static int nrb_fp_opcode_supported(u32 opcode)
+{
+    switch (opcode) {
+    case 0x00: /* NOP */
+    case 0x01: /* MOV */
+    case 0x02: /* MUL */
+    case 0x03: /* ADD */
+    case 0x04: /* MAD */
+    case 0x05: /* DP3 */
+    case 0x06: /* DP4 */
+    case 0x08: /* MIN */
+    case 0x09: /* MAX */
+    case 0x0A: /* SLT */
+    case 0x0B: /* SGE */
+    case 0x0C: /* SLE */
+    case 0x0D: /* SGT */
+    case 0x0E: /* SNE */
+    case 0x0F: /* SEQ */
+    case 0x10: /* FRC */
+    case 0x11: /* FLR */
+    case 0x12: /* KIL */
+    case 0x17: /* TEX */
+    case 0x18: /* TXP */
+    case 0x1A: /* RCP */
+    case 0x1B: /* RSQ */
+    case 0x1C: /* EX2 */
+    case 0x1D: /* LG2 */
+    case 0x1F: /* LRP */
+    case 0x22: /* COS */
+    case 0x23: /* SIN */
+    case 0x26: /* POW */
+    case 0x38: /* DP2 */
+    case 0x39: /* NRM */
+    case 0x3A: /* DIV */
+    case 0x3B: /* DIVSQ */
+    case 0x3D: /* FENCT */
+    case 0x3E: /* FENCB */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int nrb_resolve_fp(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+                          nrb_fp_info* out)
+{
+    memset(out, 0, sizeof(*out));
+    const rsx_nir_fragment_program* fp = &st->fragment_program;
+    const u32 space_size = fp->location ? b->main_size : b->local_size;
+    if (fp->location > 1 || fp->offset >= space_size)
+        return -1;
+    u32 max_bytes = space_size - fp->offset;
+    if (max_bytes > 0x10000u)
+        max_bytes = 0x10000u;
+    const u8* first = b->guest_ptr(
+        b->guest_user, fp->location, fp->offset,
+        max_bytes < 16u ? max_bytes : 16u);
+    if (!first || max_bytes < 16u)
+        return -1;
+    const u32 size = rsx_fp_program_size(first, max_bytes);
+    if (!size)
+        return -1;
+    const u8* bytes = b->guest_ptr(
+        b->guest_user, fp->location, fp->offset, size);
+    if (!bytes)
+        return -1;
+
+    u32 off = 0;
+    while (off + 16u <= size) {
+        const u32 w0 = rsx_fp_read_word(bytes + off);
+        const u32 w1 = rsx_fp_read_word(bytes + off + 4u);
+        const u32 w2 = rsx_fp_read_word(bytes + off + 8u);
+        const u32 w3 = rsx_fp_read_word(bytes + off + 12u);
+        const u32 opcode = (w0 >> 24) & 0x3Fu;
+        if (!nrb_fp_opcode_supported(opcode) || (w2 & 0x80000000u))
+            out->unsupported++;
+        if (opcode == 0x17u || opcode == 0x18u)
+            out->texture_mask |= 1u << ((w0 >> 17) & 0xFu);
+        off += 16u;
+        if ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u)
+            off += 16u;
+        if (w0 & 1u)
+            break;
+    }
+    if (off > size || rsx_fp_collect_constants(bytes, size, &out->constants) < 0)
+        return -1;
+    out->structural_hash = rsx_fp_structural_hash(
+        bytes, size, 1469598103934665603ull);
+    if (!out->structural_hash)
+        return -1;
+    out->bytes = bytes;
+    out->size = size;
+    return 0;
+}
+
+static D3D12_BLEND nrb_blend_factor(u32 f, int alpha)
+{
+    switch (f) {
+    case 0x0000: return D3D12_BLEND_ZERO;
+    case 0x0001: return D3D12_BLEND_ONE;
+    case 0x0300: return alpha ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_SRC_COLOR;
+    case 0x0301: return alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
+    case 0x0302: return D3D12_BLEND_SRC_ALPHA;
+    case 0x0303: return D3D12_BLEND_INV_SRC_ALPHA;
+    case 0x0304: return D3D12_BLEND_DEST_ALPHA;
+    case 0x0305: return D3D12_BLEND_INV_DEST_ALPHA;
+    case 0x0306: return alpha ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_DEST_COLOR;
+    case 0x0307: return alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
+    case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
+    case 0x8001:
+    case 0x8003: return D3D12_BLEND_BLEND_FACTOR;
+    case 0x8002:
+    case 0x8004: return D3D12_BLEND_INV_BLEND_FACTOR;
+    default: return D3D12_BLEND_ONE;
+    }
+}
+
+static D3D12_BLEND_OP nrb_blend_op(u32 op)
+{
+    switch (op) {
+    case 0x8007: return D3D12_BLEND_OP_MIN;
+    case 0x8008: return D3D12_BLEND_OP_MAX;
+    case 0x800A: return D3D12_BLEND_OP_SUBTRACT;
+    case 0x800B: return D3D12_BLEND_OP_REV_SUBTRACT;
+    default: return D3D12_BLEND_OP_ADD;
+    }
+}
+
+static D3D12_STENCIL_OP nrb_stencil_op(u32 op)
+{
+    switch (op) {
+    case 0x0000: return D3D12_STENCIL_OP_ZERO;
+    case 0x1E01: return D3D12_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D12_STENCIL_OP_INCR_SAT;
+    case 0x1E03: return D3D12_STENCIL_OP_DECR_SAT;
+    case 0x150A: return D3D12_STENCIL_OP_INVERT;
+    case 0x8507: return D3D12_STENCIL_OP_INCR;
+    case 0x8508: return D3D12_STENCIL_OP_DECR;
+    default: return D3D12_STENCIL_OP_KEEP;
+    }
+}
+
+static void nrb_apply_render_state(
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const rsx_nir_pipeline* st)
+{
+    const rsx_nir_blend* bl = &st->blend;
+    const rsx_nir_raster* ra = &st->raster;
+    const rsx_nir_depth_stencil* ds = &st->depth_stencil;
+    D3D12_RENDER_TARGET_BLEND_DESC* rt = &pd->BlendState.RenderTarget[0];
+    rt->RenderTargetWriteMask =
+        ((ra->color_mask & 0x000000FFu) ? D3D12_COLOR_WRITE_ENABLE_BLUE : 0) |
+        ((ra->color_mask & 0x0000FF00u) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
+        ((ra->color_mask & 0x00FF0000u) ? D3D12_COLOR_WRITE_ENABLE_RED : 0) |
+        ((ra->color_mask & 0xFF000000u) ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0);
+    if (bl->blend_enable) {
+        rt->BlendEnable = TRUE;
+        rt->SrcBlend = nrb_blend_factor(bl->sfactor & 0xFFFFu, 0);
+        rt->DestBlend = nrb_blend_factor(bl->dfactor & 0xFFFFu, 0);
+        rt->BlendOp = nrb_blend_op(bl->equation & 0xFFFFu);
+        rt->SrcBlendAlpha = nrb_blend_factor(bl->sfactor >> 16, 1);
+        rt->DestBlendAlpha = nrb_blend_factor(bl->dfactor >> 16, 1);
+        rt->BlendOpAlpha = nrb_blend_op(bl->equation >> 16);
+    }
+    pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd->RasterizerState.CullMode = !ra->cull_face_enable
+        ? D3D12_CULL_MODE_NONE
+        : ra->cull_face == 0x0404u ? D3D12_CULL_MODE_FRONT
+        : ra->cull_face == 0x0405u ? D3D12_CULL_MODE_BACK
+                                    : D3D12_CULL_MODE_NONE;
+    pd->RasterizerState.FrontCounterClockwise =
+        ra->front_face == 0x0901u ? TRUE : FALSE;
+    pd->RasterizerState.DepthClipEnable = TRUE;
+    pd->DepthStencilState.DepthEnable = ds->depth_test_enable ? TRUE : FALSE;
+    pd->DepthStencilState.DepthWriteMask = ds->depth_write_enable
+        ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd->DepthStencilState.DepthFunc = nrb_depth_func(ds->depth_func);
+    if (ds->stencil_test_enable) {
+        pd->DepthStencilState.StencilEnable = TRUE;
+        pd->DepthStencilState.StencilReadMask = (UINT8)ds->stencil_mask;
+        pd->DepthStencilState.StencilWriteMask = (UINT8)ds->stencil_mask;
+        pd->DepthStencilState.FrontFace.StencilFunc =
+            nrb_depth_func(ds->stencil_func);
+        pd->DepthStencilState.FrontFace.StencilFailOp =
+            nrb_stencil_op(ds->stencil_op_fail);
+        pd->DepthStencilState.FrontFace.StencilDepthFailOp =
+            nrb_stencil_op(ds->stencil_op_zfail);
+        pd->DepthStencilState.FrontFace.StencilPassOp =
+            nrb_stencil_op(ds->stencil_op_zpass);
+        pd->DepthStencilState.BackFace = pd->DepthStencilState.FrontFace;
+    }
+}
 
 static ID3DBlob* nrb_compile(rsx_nr_d3d12* b, const char* text, size_t len,
                              const char* target)
@@ -411,18 +617,36 @@ static ID3DBlob* nrb_compile(rsx_nr_d3d12* b, const char* text, size_t len,
 static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                                         const rsx_nir_pipeline* st,
                                         const u32* vp_words, u32 vp_word_count,
+                                        const nrb_fp_info* fp,
                                         const rsx_vertex_pull_plan* plan,
                                         D3D12_PRIMITIVE_TOPOLOGY_TYPE tt,
                                         int strip_cut)
 {
-    /* PSO identity: VP content + pull signature + topology class + strip
-     * cut + the depth/raster state words that shape the PSO */
+    /* Structural shader identity deliberately excludes inline FP constants
+     * and alpha-ref: both are uploaded through b1.  Everything that shapes
+     * the compiled source or PSO remains in the key. */
     u64 key = rsx_nir_hash_words(vp_words, vp_word_count);
     key = rsx_nr_hash_fold(key ^ rsx_vertex_pull_signature(plan), &tt,
                            sizeof(tt));
     key = rsx_nr_hash_fold(key, &strip_cut, sizeof(strip_cut));
+    key = rsx_nr_hash_fold(key, &fp->structural_hash,
+                           sizeof(fp->structural_hash));
+    const u32 fp_ctrl = st->fragment_program.control & 0x40u;
+    key = rsx_nr_hash_fold(key, &fp_ctrl, sizeof(fp_ctrl));
+    const u32 alpha_enable = st->blend.alpha_test_enable ? 1u : 0u;
+    const u32 alpha_func = alpha_enable ? st->blend.alpha_func : 0u;
+    key = rsx_nr_hash_fold(key, &alpha_enable, sizeof(alpha_enable));
+    key = rsx_nr_hash_fold(key, &alpha_func, sizeof(alpha_func));
+    key = rsx_nr_hash_fold(key, &st->surface.color_format,
+                           sizeof(st->surface.color_format));
+    key = rsx_nr_hash_fold(key, &st->raster, sizeof(st->raster));
     key = rsx_nr_hash_fold(key, &st->depth_stencil,
                            sizeof(st->depth_stencil));
+    rsx_nir_blend pso_blend = st->blend;
+    /* These are draw data in buffered/dynamic state, not PSO identity. */
+    pso_blend.alpha_ref = 0;
+    pso_blend.blend_color = 0;
+    key = rsx_nr_hash_fold(key, &pso_blend, sizeof(pso_blend));
     u64 cached = 0;
     if (rsx_nr_pso_lookup(&b->psos, key, &cached)) {
         b->stats.pso_hits++;
@@ -444,16 +668,24 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
         if (n < 0)
             return NULL;
     } else {
-        /* clip-space passthrough of ATTR0 (offline pixel tests) */
+        /* Clip-space passthrough of ATTR0 (offline pixel tests), with the
+         * complete varying interface expected by a real fragment program. */
         n = snprintf(b->vs_text, sizeof(b->vs_text),
                      "%s\n"
-                     "void main(uint yz_sysvid : SV_VertexID,\n"
-                     "          out float4 yz_pos : SV_Position) {\n"
+                     "struct VSOutput {\n"
+                     " float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+                     " float4 fog:FOG;\n"
+                     " float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+                     " float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+                     "};\n"
+                     "VSOutput main(uint yz_sysvid : SV_VertexID) {\n"
                      "    float4 v[16];\n"
                      "    [unroll] for (uint i = 0u; i < 16u; i++)\n"
                      "        v[i] = float4(0.0, 0.0, 0.0, 1.0);\n"
                      "%s"
-                     "    yz_pos = v[0];\n"
+                     "    VSOutput o; o.pos=v[0]; o.col0=float4(1,0,1,1);\n"
+                     "    o.col1=0; o.fog=0; o.t0=0; o.t1=0; o.t2=0; o.t3=0;\n"
+                     "    o.t4=0; o.t5=0; o.t6=0; o.t7=0; return o;\n"
                      "}\n",
                      b->pull_globals, b->pull_loads);
         if (n <= 0 || n >= (int)sizeof(b->vs_text))
@@ -463,8 +695,18 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     ID3DBlob* vs = nrb_compile(b, b->vs_text, strlen(b->vs_text), "vs_5_0");
     if (!vs)
         return NULL;
-    ID3DBlob* ps = nrb_compile(b, NRB_PS_SOLID, sizeof(NRB_PS_SOLID) - 1,
-                               "ps_5_0");
+    u32 constant_count = 0;
+    int fi = rsx_fp_decompile_buffered_ex(
+        fp->bytes, fp->size, st->fragment_program.control, 0,
+        b->ps_text, sizeof(b->ps_text), &constant_count);
+    if (fi <= 0 || constant_count != fp->constants.count ||
+        (alpha_enable && rsx_fp_apply_alpha_test_buffered(
+            b->ps_text, sizeof(b->ps_text), alpha_func) < 0)) {
+        vs->lpVtbl->Release(vs);
+        return NULL;
+    }
+    ID3DBlob* ps = nrb_compile(
+        b, b->ps_text, strlen(b->ps_text), "ps_5_0");
     if (!ps) {
         vs->lpVtbl->Release(vs);
         return NULL;
@@ -476,18 +718,8 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
     pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
-    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0x0F;
     pd.SampleMask = 0xFFFFFFFFu;
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
-    pd.DepthStencilState.DepthEnable =
-        st->depth_stencil.depth_test_enable ? TRUE : FALSE;
-    pd.DepthStencilState.DepthWriteMask =
-        st->depth_stencil.depth_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL
-                                             : D3D12_DEPTH_WRITE_MASK_ZERO;
-    pd.DepthStencilState.DepthFunc =
-        nrb_depth_func(st->depth_stencil.depth_func);
+    nrb_apply_render_state(&pd, st);
     pd.InputLayout.NumElements = 0;  /* vertex pulling: no IA              */
     pd.IBStripCutValue = strip_cut
         ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
@@ -583,6 +815,21 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    nrb_fp_info fp;
+    if (nrb_resolve_fp(b, st, &fp) != 0 || fp.unsupported) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_fp++;
+        return -1;
+    }
+    /* Texture descriptors/resources are the next correctness-gated family.
+     * A texture instruction is refused here instead of reaching D3D12 with
+     * an incomplete root signature or a fabricated white binding. */
+    if (fp.texture_mask) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_texture++;
+        return -1;
+    }
+
     /* pull plan from folded state */
     rsx_vertex_layout_plan layout;
     u32 input_mask = st->vertex_program.attrib_input_mask;
@@ -612,15 +859,14 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
-    ID3D12PipelineState* pso = nrb_get_pso(b, st, vp_words, vp_word_count,
-                                           &plan, tt, use_cut_ib && strips);
+    ID3D12PipelineState* pso = nrb_get_pso(
+        b, st, vp_words, vp_word_count, &fp, &plan, tt,
+        use_cut_ib && strips);
     if (!pso) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_pso++;
         return -1;
     }
-    b->stats.approx_fp_draws++;      /* solid PS stands in for the FP      */
-
     if (nrb_open_list(b))
         return -1;
     nrb_mirror_sync(b);
@@ -647,16 +893,60 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     b->list->lpVtbl->SetPipelineState(b->list, pso);
     b->list->lpVtbl->IASetPrimitiveTopology(b->list, topo);
 
-    /* b0: transform constants */
+    /* b0: transform constants + the RSX viewport mapping consumed by the
+     * generated VP epilogue. */
     u64 const_va = 0;
-    u8* cp = nrb_upload_alloc(b, sizeof(st->constants), &const_va);
+    const u32 vp_cb_bytes = sizeof(st->constants) + 8u * sizeof(float);
+    u8* cp = nrb_upload_alloc(b, vp_cb_bytes, &const_va);
     if (!cp) {
         nrb_exec_wait(b);
         b->stats.unsupported_draws++;
         return -1;
     }
     memcpy(cp, st->constants, sizeof(st->constants));
+    float* xf = (float*)(cp + sizeof(st->constants));
+    const float w = (float)(st->surface.clip_w ? st->surface.clip_w : rt->w);
+    const float h = (float)(st->surface.clip_h ? st->surface.clip_h : rt->h);
+    xf[0] = 1.0f; xf[1] = 1.0f; xf[2] = 1.0f; xf[3] = 0.0f;
+    xf[4] = 0.0f; xf[5] = 0.0f; xf[6] = 0.0f; xf[7] = 0.0f;
+    if (st->viewport.scale[0] != 0.0f ||
+        st->viewport.translate[0] != 0.0f) {
+        xf[0] = st->viewport.scale[0] / (w * 0.5f);
+        xf[1] = -(st->viewport.scale[1] / (h * 0.5f));
+        xf[2] = st->viewport.scale[2];
+        xf[4] = (st->viewport.translate[0] - w * 0.5f) / (w * 0.5f);
+        xf[5] = -((st->viewport.translate[1] - h * 0.5f) / (h * 0.5f));
+        xf[6] = st->viewport.translate[2];
+    }
     b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 0, const_va);
+
+    /* b1 (pixel): exact inline CONST words plus dynamic alpha reference.
+     * A one-slot placeholder preserves the HLSL layout for no-CONST FPs. */
+    const u32 fp_slots = fp.constants.count ? fp.constants.count : 1u;
+    const u32 fp_cb_bytes = (fp_slots + 1u) * 16u;
+    u64 fp_va = 0;
+    u8* fp_cp = nrb_upload_alloc(b, fp_cb_bytes, &fp_va);
+    if (!fp_cp) {
+        nrb_exec_wait(b);
+        b->stats.unsupported_draws++;
+        return -1;
+    }
+    memset(fp_cp, 0, fp_cb_bytes);
+    if (fp.constants.count)
+        memcpy(fp_cp, fp.constants.values, fp.constants.count * 16u);
+    const float alpha_ref = rsx_fp_alpha_ref(
+        st->blend.alpha_ref, st->surface.color_format);
+    memcpy(fp_cp + fp_slots * 16u, &alpha_ref, sizeof(alpha_ref));
+    b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 4, fp_va);
+
+    float blend_factor[4];
+    blend_factor[0] = (float)((st->blend.blend_color >> 16) & 0xFFu) / 255.0f;
+    blend_factor[1] = (float)((st->blend.blend_color >> 8) & 0xFFu) / 255.0f;
+    blend_factor[2] = (float)(st->blend.blend_color & 0xFFu) / 255.0f;
+    blend_factor[3] = (float)((st->blend.blend_color >> 24) & 0xFFu) / 255.0f;
+    b->list->lpVtbl->OMSetBlendFactor(b->list, blend_factor);
+    b->list->lpVtbl->OMSetStencilRef(
+        b->list, st->depth_stencil.stencil_ref & 0xFFu);
 
     /* t20/t21: mirror buffers */
     ID3D12Resource* rl =
@@ -746,6 +1036,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     }
     if (use_cut_ib)
         b->stats.restart_draws++;
+    b->stats.real_fp_draws++;
     b->stats.draws++;
     return 0;
 }
@@ -956,9 +1247,10 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     b->dsv_size = b->dev->lpVtbl->GetDescriptorHandleIncrementSize(
         b->dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
-    /* root signature: b0 constants, b1 pull cbuffer, t20/t21 raw SRVs */
+    /* root signature: b0 vertex constants, b1 vertex-pull constants,
+     * t20/t21 mirror buffers, and pixel b1 for buffered FP constants. */
     {
-        D3D12_ROOT_PARAMETER params[4];
+        D3D12_ROOT_PARAMETER params[5];
         memset(params, 0, sizeof(params));
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
@@ -972,8 +1264,11 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[3].Descriptor.ShaderRegister = 21;
         params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[4].Descriptor.ShaderRegister = 1;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-        rsd.NumParameters = 4;
+        rsd.NumParameters = 5;
         rsd.pParameters = params;
         ID3DBlob* sig = NULL;
         ID3DBlob* err = NULL;
