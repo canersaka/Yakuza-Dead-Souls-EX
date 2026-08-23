@@ -594,7 +594,7 @@ class BlockEmitter:
             self.write_reg(rt(), v)
             return
         if mn == "fscrwr":
-            v = self.read_reg(_reg(ops[1]) if len(ops) > 1 else ops[0])
+            v = self.read_reg(_reg(ops[1] if len(ops) > 1 else ops[0]))
             self.ops.append(IROp(kind="fscrwr", args=(v,)))
             return
 
