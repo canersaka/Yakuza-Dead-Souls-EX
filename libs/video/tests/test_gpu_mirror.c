@@ -264,12 +264,33 @@ static void test_lifetime(void)
     fixture_down(&f);
 }
 
+static void test_slot_reservation(void)
+{
+    static fixture f;
+    fixture_up(&f);
+    CHECK(rsx_gpu_mirror_reserve_ranges(f.m, 96) == 0,
+          "pre-reserve range slots");
+    rsx_gpu_mirror_range handles[96];
+    for (u32 i = 0; i < 96; ++i) {
+        handles[i] = rsx_gpu_mirror_register(
+            f.m, i & 1u, (i % 16u) * PG, PG);
+        CHECK(handles[i] != 0, "register from reserved slots");
+    }
+    CHECK(rsx_gpu_mirror_reserve_ranges(f.m, 128) == -1,
+          "cannot reserve after registration");
+    for (u32 i = 0; i < 96; ++i)
+        CHECK(rsx_gpu_mirror_unregister(f.m, handles[i]) == 1,
+              "unregister reserved slot");
+    fixture_down(&f);
+}
+
 int main(void)
 {
     test_register_sync_reuse();
     test_disjoint_and_overlap();
     test_budget_and_reject();
     test_lifetime();
+    test_slot_reservation();
     if (failures) {
         fprintf(stderr, "test_gpu_mirror: %d failure(s)\n", failures);
         return 1;
