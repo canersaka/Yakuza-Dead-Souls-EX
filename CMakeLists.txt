@@ -446,6 +446,38 @@ if(PS3RECOMP_BUILD_TESTS)
             TIMEOUT 120
             LABELS "firmware-free;native;spu;performance;regression")
 
+        # WB (whole-block SPU backend) kernel differential: every SIMD
+        # kernel in runtime/spu/spu_wb_simd.h vs its spu_helpers.h twin.
+        # The kernels compile /arch:AVX2 (as WB generated TUs do); the
+        # reference TU stays baseline ISA (as FAST/DIAG TUs do), so the
+        # comparison also pins AVX2-codegen neutrality of the wrapped
+        # scalar paths. See docs/SPU_WB_BACKEND.md.
+        add_executable(spu_wb_kernels_tests
+            tests/spu_wb_kernels/main.c
+            tests/spu_wb_kernels/reference.c
+        )
+        target_include_directories(spu_wb_kernels_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        )
+        target_compile_definitions(spu_wb_kernels_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        if(MSVC)
+            target_compile_options(spu_wb_kernels_tests PRIVATE
+                /experimental:c11atomics
+            )
+            set_source_files_properties(tests/spu_wb_kernels/main.c
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        endif()
+        add_test(
+            NAME spu_wb_kernels
+            COMMAND spu_wb_kernels_tests 50000
+        )
+        set_tests_properties(spu_wb_kernels PROPERTIES
+            TIMEOUT 300
+            LABELS "firmware-free;native;spu;performance;regression")
+
         # Native-render IR equivalence: packet path (FIFO/method stream ->
         # rsx_dispatch -> adapter) vs typed native path must fold to
         # identical action sequences; plus the submission ring and an
