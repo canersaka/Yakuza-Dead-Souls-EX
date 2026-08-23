@@ -53,7 +53,7 @@ typedef struct rsx_nr_exec_ops {
     void (*sem_write)(void* u, u32 dma, u32 offset, u32 value,
                       u32 texture_read);
     int  (*sem_read)(void* u, u32 dma, u32 offset, u32* value);
-    void (*report)(void* u, u32 kind, u32 arg, u32 dma);
+    int (*report)(void* u, u32 kind, u32 arg, u32 dma);
     void (*set_reference)(void* u, u32 value);
     void (*user_command)(void* u, u32 cause);
 } rsx_nr_exec_ops;

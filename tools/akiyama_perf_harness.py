@@ -672,6 +672,8 @@ def run_gun(args):
     first_arm = capture_dir / "arm-movement.txt"
 
     environment = {k: v for k, v in os.environ.items() if not k.startswith("YZ_")}
+    if args.d3d_debug:
+        environment["RSX_D3D_DEBUG"] = "1"
     yz = {
         "YZ_MOVIE_HLE": "1",
         "YZ_AUTO_START": "1",
@@ -721,6 +723,8 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "active-present"
     if args.nr_vertical_active_graphics:
         yz["YZ_NR_VERTICAL"] = "active-graphics"
+        if args.nr_graphics_families:
+            yz["YZ_NR_GRAPHICS_FAMILIES"] = args.nr_graphics_families
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -745,6 +749,8 @@ def run_gun(args):
             )
         },
         "active_yz": yz,
+        "active_diagnostics": ({"RSX_D3D_DEBUG": "1"}
+                               if args.d3d_debug else {}),
         "gun_reference_dir": str(reference_dir),
         "captures": [],
         "route_markers": {},
@@ -1111,6 +1117,8 @@ def run(args):
     result_path = run_dir / "result.json"
 
     environment = {k: v for k, v in os.environ.items() if not k.startswith("YZ_")}
+    if args.d3d_debug:
+        environment["RSX_D3D_DEBUG"] = "1"
     yz = {
         "YZ_MOVIE_HLE": "1",
         "YZ_AUTO_START": "1",
@@ -1144,6 +1152,8 @@ def run(args):
         yz["YZ_NR_VERTICAL"] = "active-present"
     if args.nr_vertical_active_graphics:
         yz["YZ_NR_VERTICAL"] = "active-graphics"
+        if args.nr_graphics_families:
+            yz["YZ_NR_GRAPHICS_FAMILIES"] = args.nr_graphics_families
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1170,6 +1180,8 @@ def run(args):
             )
         },
         "active_yz": yz,
+        "active_diagnostics": ({"RSX_D3D_DEBUG": "1"}
+                               if args.d3d_debug else {}),
         "reference": str(reference_path),
         "captures": [],
     }
@@ -1486,9 +1498,14 @@ def main():
     parser.add_argument("--nr-vertical-active-basic", action="store_true")
     parser.add_argument("--nr-vertical-active-present", action="store_true")
     parser.add_argument("--nr-vertical-active-graphics", action="store_true")
+    parser.add_argument(
+        "--nr-graphics-families",
+        help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
+    )
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--xf-ieee", action="store_true")
+    parser.add_argument("--d3d-debug", action="store_true")
     parser.add_argument("--scan", nargs="+")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--reprocess-result", type=Path)
@@ -1502,6 +1519,8 @@ def main():
             args.draw_phases,
             args.wkl4_cycle)) > 1:
         parser.error("select only one diagnostic/family lane")
+    if args.nr_graphics_families and not args.nr_vertical_active_graphics:
+        parser.error("--nr-graphics-families requires --nr-vertical-active-graphics")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

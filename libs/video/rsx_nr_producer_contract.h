@@ -163,6 +163,13 @@ int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
                               int wait_for_label, u32 label_index,
                               u32 label_value);
 
+/* NV4097 main-memory report offsets are relative to Sony's dedicated
+ * 16 MiB report IO aperture, not raw RSX IO addresses.  Keeping this
+ * translation in the audited contract prevents a report timestamp from
+ * being published over a command-buffer word at the same low offset. */
+#define RSX_NR_MAIN_REPORT_IO_BASE 0x0E000000u
+int rsx_nr_main_report_io_range(u32 offset, u32 size, u32* io_offset);
+
 #ifdef __cplusplus
 }
 #endif
