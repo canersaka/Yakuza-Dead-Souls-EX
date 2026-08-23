@@ -317,6 +317,8 @@ class WBLifter:
         self.fallback_blocks = []   # (leader, reason)
         self.unresolved_calls = []
         self.unsupported = {}
+        self.n_blocks_helper_free = 0   # compiled blocks with zero wrapped kernels
+        self.n_insns_compiled = 0       # insns inside compiled blocks
 
     # -- CFG ---------------------------------------------------------------
     def compute_leaders(self):
@@ -737,7 +739,16 @@ class BlockEmitter:
             return
         if mn in VECI:
             tok = ops[2]
-            if mn in _SHIMM_REGTOKEN and tok.startswith("$r"):
+            if tok.startswith("$r"):
+                # RR-decode-priority RI7 forms (quad shifts/rotates, dftsv):
+                # the disassembler prints the raw i7 field as a register
+                # token; the digits ARE the unsigned field value. Consumers
+                # mask (&0x3F/&0x1F/&7 -- unchanged by sign) or ignore it
+                # (dftsv), so the raw value is exact. The DIAG lifter has the
+                # same decode quirk but only strips it for the shift forms;
+                # for dftsv it would emit the token verbatim (invalid C) --
+                # a latent hole no shipped image reaches, found by the WB
+                # fuzzer (randomized-block campaign, 2026-08-23).
                 imm = int(tok[2:], 0)
             else:
                 imm = int(_imm(tok), 0)
@@ -1176,9 +1187,13 @@ def emit_wb(wl: WBLifter, header_name):
             # block-scoped braces: value locals are per-block, and jumping to
             # the label enters the compound at its top (no VLAs, so legal C)
             src.append(f"b_{blk.leader:08X}: {{")
+            wrapped_before = wl.metrics["kernel_wrapped"]
             em = BlockEmitter(wl, fn, blk)
             src.extend(em.translate_block())
             src.append("}")
+            wl.n_insns_compiled += len(blk.insns)
+            if wl.metrics["kernel_wrapped"] == wrapped_before:
+                wl.n_blocks_helper_free += 1
         src.append("}")
         src.append("")
 
@@ -1338,6 +1353,8 @@ def main():
             "n_blocks": n_blocks,
             "n_blocks_compiled": n_blocks - n_fb,
             "n_blocks_fallback": n_fb,
+            "n_blocks_helper_free": wl.n_blocks_helper_free,
+            "n_insns_compiled": wl.n_insns_compiled,
             "fallback_blocks": [[pc, r] for pc, r in wl.fallback_blocks],
             "wb_leader_pcs": n_wb,
             "unsupported": wl.unsupported,
