@@ -241,6 +241,8 @@ struct yz_nr_vertical_active_state {
     unsigned long long consumer_transfer_fallback;
     unsigned long long consumer_sync_owned;
     unsigned long long consumer_sync_fallback;
+    unsigned long long consumer_report_owned;
+    unsigned long long consumer_report_fallback;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
@@ -261,6 +263,8 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
 extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
                                            uint32_t value,
                                            uint32_t texture_read);
+extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
+                                        uint32_t dma);
 
 static void yz_nr_exec_reference(void*, uint32_t value)
 {
@@ -299,6 +303,12 @@ static void yz_nr_exec_sem_write(void*, uint32_t dma, uint32_t offset,
                                  uint32_t value, uint32_t texture_read)
 {
     yz_nr_vertical_sem_write(dma, offset, value, texture_read);
+}
+
+static void yz_nr_exec_report(void*, uint32_t kind, uint32_t arg,
+                              uint32_t dma)
+{
+    yz_nr_vertical_report(kind, arg, dma);
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -463,6 +473,7 @@ static void yz_nr_active_ensure_graphics(void)
     combined.user_command = yz_nr_exec_user;
     combined.sem_read = yz_nr_exec_sem_read;
     combined.sem_write = yz_nr_exec_sem_write;
+    combined.report = yz_nr_exec_report;
     g_active.backend.ops = combined;
     g_active.d3d12 = d3d12;
     MemoryBarrier();
@@ -1482,7 +1493,8 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
     const bool is_transfer = method == 0x2328u || method == 0xC40Cu;
     const bool is_sync =
         method == 0x0110u || method == 0x1D70u || method == 0x1D74u;
-    if (!is_draw && !is_clear && !is_transfer && !is_sync)
+    const bool is_report = method == 0x17C8u || method == 0x1800u;
+    if (!is_draw && !is_clear && !is_transfer && !is_sync && !is_report)
         return 0;
     const auto note_fallback = [&]() {
         if (is_draw)
@@ -1491,8 +1503,10 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
             g_active.consumer_clear_fallback++;
         else if (is_transfer)
             g_active.consumer_transfer_fallback++;
-        else
+        else if (is_sync)
             g_active.consumer_sync_fallback++;
+        else
+            g_active.consumer_report_fallback++;
     };
     if (!rsx_nr_ring_can_accept(&g_active.ring,
                                 YZ_NR_ACTIVE_ACTION_OP_BOUND,
@@ -1533,8 +1547,10 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         g_active.consumer_clear_owned++;
     } else if (is_transfer) {
         g_active.consumer_transfer_owned++;
-    } else {
+    } else if (is_sync) {
         g_active.consumer_sync_owned++;
+    } else {
+        g_active.consumer_report_owned++;
     }
     return 1;
 }
@@ -2104,6 +2120,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "consumer-clear=%llu/%llu "
                 "consumer-transfer=%llu/%llu "
                 "consumer-sync=%llu/%llu "
+                "consumer-report=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
@@ -2127,7 +2144,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.consumer_transfer_owned,
                 g_active.consumer_transfer_fallback,
                 g_active.consumer_sync_owned,
-                g_active.consumer_sync_fallback, g_active.wait,
+                g_active.consumer_sync_fallback,
+                g_active.consumer_report_owned,
+                g_active.consumer_report_fallback, g_active.wait,
                 g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);
