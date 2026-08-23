@@ -42,6 +42,14 @@
 #define NRB_TEX_CAP      2048
 #define NRB_TEX_SNAP_WORDS (256u * 1024u)
 #define NRB_TEX_UNITS    RSX_NIR_NUM_TEXTURES
+#define NRB_MAX_DRAW_BATCHES 4096u
+
+typedef struct nrb_prepared_batch {
+    u64 index_va;
+    u64 pull_va;
+    u32 draw_count;
+    u32 skip;
+} nrb_prepared_batch;
 
 typedef struct nrb_rt {
     ID3D12Resource* tex;
@@ -107,6 +115,10 @@ struct rsx_nr_d3d12 {
      * demand; a live integration preallocates its high-water size) */
     u32* idx_scratch;
     u32 idx_scratch_cap;
+    /* Every fallible batch read/expansion and upload reservation completes
+     * before the first Draw* is recorded. A refused draw is therefore safe
+     * to hand to the ordered legacy fallback without a partial render. */
+    nrb_prepared_batch prepared_batches[NRB_MAX_DRAW_BATCHES];
 
     rsx_nr_d3d12_stats stats;
     char vs_text[NRB_VS_TEXT];
@@ -1916,6 +1928,11 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     const int filter_restart =
         d->indexed && st->index_binding.restart_enable;
     const int use_host_ib = expand_primitive || filter_restart;
+    if (!d->batch_count || d->batch_count > NRB_MAX_DRAW_BATCHES) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_index++;
+        return -1;
+    }
     nrb_rt* rt = nrb_rt_from_state(b, st, 1);
     if (!rt) {
         b->stats.unsupported_draws++;
@@ -2007,6 +2024,73 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_texture++;
         b->stats.texture_failures++;
+        return -1;
+    }
+
+    /* Refusal-safe reservation: finish every host index read/expansion and
+     * every upload-ring allocation before binding a target or recording the
+     * first draw. In particular, an unreadable later batch can no longer
+     * leave an earlier batch rendered before the action reports fallback. */
+    const u32 source = (d->indexed && !use_host_ib)
+                           ? (st->index_binding.is_u32
+                                  ? RSX_PULL_SOURCE_INDEX_U32
+                                  : RSX_PULL_SOURCE_INDEX_U16)
+                           : RSX_PULL_SOURCE_ARRAYS;
+    int prepare_failed = 0;
+    int prepare_index_failed = 0;
+    memset(b->prepared_batches, 0,
+           d->batch_count * sizeof(b->prepared_batches[0]));
+    for (u32 bi = 0; bi < d->batch_count; ++bi) {
+        const u32 first = batches[bi * 2u];
+        const u32 count = batches[bi * 2u + 1u];
+        nrb_prepared_batch* prepared = &b->prepared_batches[bi];
+        prepared->draw_count = count;
+
+        if (use_host_ib) {
+            const u32 n = expand_primitive
+                ? nrb_expand_primitives(b, st, d, first, count)
+                : nrb_read_indices(b, st, first, count, strips);
+            if (n == ~0u) {
+                prepare_failed = 1;
+                prepare_index_failed = 1;
+                break;
+            }
+            if (!n) {
+                prepared->skip = 1;
+                continue;
+            }
+            u8* index_bytes = nrb_upload_alloc(
+                b, n * sizeof(u32), &prepared->index_va);
+            if (!index_bytes) {
+                prepare_failed = 1;
+                break;
+            }
+            memcpy(index_bytes, b->idx_scratch, (size_t)n * sizeof(u32));
+            prepared->draw_count = n;
+        }
+
+        rsx_vertex_pull_constants pull;
+        rsx_vertex_pull_fill_constants(
+            &plan, st->vertex_bindings.base_index,
+            use_host_ib ? 0u : first, source,
+            st->index_binding.offset, st->index_binding.location,
+            rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 0),
+            rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 1), &pull);
+        u8* pull_bytes = nrb_upload_alloc(
+            b, sizeof(pull), &prepared->pull_va);
+        if (!pull_bytes) {
+            prepare_failed = 1;
+            break;
+        }
+        memcpy(pull_bytes, &pull, sizeof(pull));
+    }
+    if (prepare_failed) {
+        if (prepare_index_failed)
+            b->stats.unsup_draw_index++;
+        nrb_restore_texture_aliases(
+            b, texture_aliases, texture_depth_aliases);
+        nrb_exec_wait(b);
+        b->stats.unsupported_draws++;
         return -1;
     }
 
@@ -2124,77 +2208,32 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
      * IS the fetched index and base_index still applies in-shader —
      * exactly the pull module's documented host-index integration. All
      * other draws use the in-shader guest index fetch. */
-    const u32 source = (d->indexed && !use_host_ib)
-                           ? (st->index_binding.is_u32
-                                  ? RSX_PULL_SOURCE_INDEX_U32
-                                  : RSX_PULL_SOURCE_INDEX_U16)
-                           : RSX_PULL_SOURCE_ARRAYS;
-    int failed = 0;
-
     for (u32 bi = 0; bi < d->batch_count; bi++) {
-        const u32 first = batches[bi * 2];
-        const u32 count = batches[bi * 2 + 1];
-        u32 draw_count = count;
-        u32 pc_first = first;
-
+        const nrb_prepared_batch* prepared = &b->prepared_batches[bi];
+        if (prepared->skip) {
+            b->stats.draw_batches++;
+            continue;                /* batch was restart cuts only       */
+        }
         if (use_host_ib) {
-            u32 n = expand_primitive
-                ? nrb_expand_primitives(b, st, d, first, count)
-                : nrb_read_indices(b, st, first, count, strips);
-            if (n == ~0u) {
-                b->stats.unsup_draw_index++;
-                failed = 1;
-                break;
-            }
-            if (!n) {
-                b->stats.draw_batches++;
-                continue;            /* batch was cuts only               */
-            }
-            u64 ib_va = 0;
-            u8* ip = nrb_upload_alloc(b, n * 4, &ib_va);
-            if (!ip) {
-                failed = 1;
-                break;
-            }
-            memcpy(ip, b->idx_scratch, (size_t)n * 4);
             D3D12_INDEX_BUFFER_VIEW ibv;
-            ibv.BufferLocation = ib_va;
-            ibv.SizeInBytes = n * 4;
+            ibv.BufferLocation = prepared->index_va;
+            ibv.SizeInBytes = prepared->draw_count * sizeof(u32);
             ibv.Format = DXGI_FORMAT_R32_UINT;
             b->list->lpVtbl->IASetIndexBuffer(b->list, &ibv);
-            draw_count = n;
-            pc_first = 0;
         }
-
-        rsx_vertex_pull_constants pc;
-        rsx_vertex_pull_fill_constants(
-            &plan, st->vertex_bindings.base_index, pc_first, source,
-            st->index_binding.offset, st->index_binding.location,
-            rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 0),
-            rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 1), &pc);
-        u64 pull_va = 0;
-        u8* pp = nrb_upload_alloc(b, sizeof(pc), &pull_va);
-        if (!pp) {
-            failed = 1;
-            break;
-        }
-        memcpy(pp, &pc, sizeof(pc));
         b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 1,
-                                                           pull_va);
+                                                           prepared->pull_va);
         if (use_host_ib)
-            b->list->lpVtbl->DrawIndexedInstanced(b->list, draw_count, 1, 0,
-                                                  0, 0);
+            b->list->lpVtbl->DrawIndexedInstanced(
+                b->list, prepared->draw_count, 1, 0, 0, 0);
         else
-            b->list->lpVtbl->DrawInstanced(b->list, draw_count, 1, 0, 0);
+            b->list->lpVtbl->DrawInstanced(
+                b->list, prepared->draw_count, 1, 0, 0);
         b->stats.draw_batches++;
     }
 
     nrb_restore_texture_aliases(b, texture_aliases, texture_depth_aliases);
     nrb_exec_wait(b);
-    if (failed) {
-        b->stats.unsupported_draws++;
-        return -1;
-    }
     if (filter_restart)
         b->stats.restart_draws++;
     b->stats.real_fp_draws++;
