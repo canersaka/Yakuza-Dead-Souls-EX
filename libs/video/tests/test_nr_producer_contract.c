@@ -127,6 +127,71 @@ int main(void)
                                                 vp_words));
     CHECK(!rsx_nr_vertex_program_contract_init(&vp, 1u, 0u, 0u, 0));
 
+    u8 fp_bytes[64];
+    for (u32 i = 0; i < (u32)sizeof(fp_bytes); ++i)
+        fp_bytes[i] = (u8)(i * 37u + 11u);
+    rsx_nr_fragment_program_contract fp = {0};
+    CHECK(rsx_nr_fragment_program_contract_init(
+        &fp, fp_bytes, sizeof(fp_bytes), 0x00000440u));
+    CHECK(fp.byte_count == sizeof(fp_bytes));
+    CHECK(fp.control == 0x00000440u);
+    CHECK(fp.content_hash == rsx_nr_fragment_program_content_hash(
+                                  fp_bytes, sizeof(fp_bytes)));
+    CHECK(fp.semantic_hash == rsx_nr_fragment_program_semantic_hash(
+                                   fp.content_hash, sizeof(fp_bytes),
+                                   0x00000440u));
+    const u64 original_content = fp.content_hash;
+    const u64 original_semantic = fp.semantic_hash;
+    fp_bytes[31] ^= 0x80u;
+    CHECK(rsx_nr_fragment_program_contract_init(
+        &fp, fp_bytes, sizeof(fp_bytes), 0x00000440u));
+    CHECK(fp.content_hash != original_content);
+    CHECK(fp.semantic_hash != original_semantic);
+    const u64 patched_content = fp.content_hash;
+    const u64 patched_semantic = fp.semantic_hash;
+    CHECK(rsx_nr_fragment_program_contract_init(
+        &fp, fp_bytes, sizeof(fp_bytes), 0x00000400u));
+    CHECK(fp.content_hash == patched_content);
+    CHECK(fp.semantic_hash != patched_semantic);
+    CHECK(!rsx_nr_fragment_program_contract_init(&fp, fp_bytes, 15u, 0u));
+    CHECK(!rsx_nr_fragment_program_contract_init(
+        &fp, fp_bytes, RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES + 16u, 0u));
+    CHECK(!rsx_nr_fragment_program_contract_init(
+        &fp, 0, sizeof(fp_bytes), 0u));
+    CHECK(!rsx_nr_fragment_program_contract_init(
+        0, fp_bytes, sizeof(fp_bytes), 0u));
+
+    rsx_nr_fragment_binding_state fp_binding;
+    u32 bound_program = 0xFFFFFFFFu;
+    u32 bound_control = 0xFFFFFFFFu;
+    rsx_nr_fragment_binding_init(&fp_binding);
+    CHECK(!rsx_nr_fragment_binding_snapshot(
+        &fp_binding, &bound_program, &bound_control));
+    rsx_nr_fragment_binding_set_program(&fp_binding, 0x00123402u);
+    CHECK(!rsx_nr_fragment_binding_snapshot(
+        &fp_binding, &bound_program, &bound_control));
+    rsx_nr_fragment_binding_set_program(&fp_binding, 0x00567801u);
+    rsx_nr_fragment_binding_set_control(&fp_binding, 0x02008400u);
+    CHECK(rsx_nr_fragment_binding_snapshot(
+        &fp_binding, &bound_program, &bound_control));
+    CHECK(bound_program == 0x00567801u &&
+          bound_control == 0x02008400u);
+    /* Neither setter consumes the other persistent state. */
+    rsx_nr_fragment_binding_set_program(&fp_binding, 0x00ABC002u);
+    CHECK(rsx_nr_fragment_binding_snapshot(
+        &fp_binding, &bound_program, &bound_control));
+    CHECK(bound_program == 0x00ABC002u &&
+          bound_control == 0x02008400u);
+    rsx_nr_fragment_binding_set_control(&fp_binding, 0x03008400u);
+    CHECK(rsx_nr_fragment_binding_snapshot(
+        &fp_binding, &bound_program, &bound_control));
+    CHECK(bound_program == 0x00ABC002u &&
+          bound_control == 0x03008400u);
+    CHECK(!rsx_nr_fragment_binding_snapshot(
+        0, &bound_program, &bound_control));
+    CHECK(!rsx_nr_fragment_binding_snapshot(
+        &fp_binding, 0, &bound_control));
+
     rsx_nr_flip_contract flip = {0};
     CHECK(rsx_nr_flip_contract_init(&flip, 3u, 0, 0u, 0u));
     CHECK(flip.word_count == 4u && flip.flip_word_index == 0u);
@@ -154,6 +219,6 @@ int main(void)
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;
     }
-    printf("nr producer contract: 25 setters + draw arrays + vertex program + flip verified\n");
+    printf("nr producer contract: 25 setters + draw arrays + vertex/fragment programs + flip verified\n");
     return 0;
 }

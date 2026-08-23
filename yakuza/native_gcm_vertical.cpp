@@ -20,6 +20,7 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "rsx_nr_backend.h"
+#include "rsx_fp_decompiler.h"
 #include "rsx_nr_producer_contract.h"
 #include "rsx_nr_span_router.h"
 
@@ -29,6 +30,11 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+extern "C" const uint8_t* yz_nr_vertical_guest_ptr(uint32_t location,
+                                                     uint32_t offset,
+                                                     uint32_t min_bytes);
+extern "C" void yz_drain_trampolines(ppu_context* ctx);
 
 namespace {
 
@@ -40,10 +46,13 @@ enum : uint32_t {
     YZ_NR_VERT_DRAW_ARRAYS = 5,
     YZ_NR_VERT_FLIP = 6,
     YZ_NR_VERT_VERTEX_PROGRAM = 7,
-    YZ_NR_VERT_FAMILY_COUNT = 8,
+    YZ_NR_VERT_FRAGMENT_PROGRAM = 8,
+    YZ_NR_VERT_FAMILY_COUNT = 9,
     YZ_NR_VERT_SOURCE_COUNT = 16,
     YZ_NR_VERT_EVENT_COUNT = 8192,
     YZ_NR_VERT_VP_TEMPLATE_COUNT = 512,
+    YZ_NR_VERT_FP_TEMPLATE_COUNT = 4096,
+    YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT = 8192,
 };
 
 enum : uint32_t {
@@ -83,6 +92,18 @@ struct yz_nr_vertical_vp_template {
     uint32_t semantic_hash;
     unsigned long long build_count;
     unsigned long long replay_count;
+};
+
+struct yz_nr_vertical_fp_template {
+    unsigned long long content_hash;
+    unsigned long long structural_hash;
+    unsigned long long semantic_hash;
+    unsigned long long structural_semantic_hash;
+    uint32_t byte_count;
+    uint32_t control;
+    unsigned long long build_count;
+    unsigned long long replay_count;
+    unsigned long long parameter_replay_count;
 };
 
 struct yz_nr_vertical_state {
@@ -130,6 +151,20 @@ struct yz_nr_vertical_state {
     unsigned long long vp_template_unknown;
     unsigned long long vp_template_overflow;
     unsigned long long vp_unknown_overflow;
+    rsx_nr_fragment_binding_state fp_binding;
+    uint32_t fp_packet_ea;
+    yz_nr_vertical_fp_template fp_templates[YZ_NR_VERT_FP_TEMPLATE_COUNT];
+    uint16_t fp_structural_index[YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT];
+    yz_nr_vertical_fp_template fp_unknown_templates[
+        YZ_NR_VERT_FP_TEMPLATE_COUNT];
+    unsigned long long fp_template_builds;
+    unsigned long long fp_template_replays;
+    unsigned long long fp_template_parameter_replays;
+    unsigned long long fp_template_unknown;
+    unsigned long long fp_template_overflow;
+    unsigned long long fp_unknown_overflow;
+    unsigned long long fp_unresolved;
+    unsigned long long fp_bad_sequence;
     volatile LONG mode_shadow;
     volatile LONG mode_active_basic;
     volatile LONG mode_active_present;
@@ -664,6 +699,306 @@ static void yz_nr_expected_vertex_program(ppu_context* ctx)
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
+struct yz_nr_fragment_identity {
+    uint32_t byte_count;
+    unsigned long long content_hash;
+    unsigned long long structural_hash;
+};
+
+static bool yz_nr_fragment_identity_from_binding(
+    uint32_t program_word, yz_nr_fragment_identity* out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    /* Match the live dispatcher's audited NV4097 location interpretation:
+     * low bits 2 select MAIN; all other title-produced encodings select
+     * LOCAL. The address itself is always four-byte aligned. */
+    const uint32_t location = (program_word & 3u) == 2u ? 1u : 0u;
+    const uint32_t offset = program_word & ~3u;
+    const uint8_t* bytes = yz_nr_vertical_guest_ptr(
+        location, offset, RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES);
+    if (!bytes)
+        return false;
+    const uint32_t byte_count = rsx_fp_program_size(
+        bytes, RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES);
+    if (!byte_count)
+        return false;
+    const unsigned long long content =
+        rsx_nr_fragment_program_content_hash(bytes, byte_count);
+    const unsigned long long structural = rsx_fp_structural_hash(
+        bytes, byte_count, 1469598103934665603ull);
+    if (!content || !structural)
+        return false;
+    out->byte_count = byte_count;
+    out->content_hash = content;
+    out->structural_hash = structural;
+    return true;
+}
+
+/* Fixed-memory open addressing keeps the default-off shadow census bounded
+ * without turning every draw into a linear scan of all built programs.  The
+ * tables never delete entries, so an empty slot terminates a miss. */
+static yz_nr_vertical_fp_template* yz_nr_find_fragment_exact(
+    yz_nr_vertical_fp_template* table, unsigned long long semantic)
+{
+    const uint32_t mask = YZ_NR_VERT_FP_TEMPLATE_COUNT - 1u;
+    uint32_t slot = (uint32_t)semantic & mask;
+    for (uint32_t probe = 0; probe < YZ_NR_VERT_FP_TEMPLATE_COUNT; ++probe) {
+        yz_nr_vertical_fp_template* const entry = &table[slot];
+        if (!entry->build_count && !entry->replay_count)
+            return nullptr;
+        if (entry->semantic_hash == semantic)
+            return entry;
+        slot = (slot + 1u) & mask;
+    }
+    return nullptr;
+}
+
+static uint32_t yz_nr_find_fragment_free(
+    yz_nr_vertical_fp_template* table, unsigned long long semantic)
+{
+    const uint32_t mask = YZ_NR_VERT_FP_TEMPLATE_COUNT - 1u;
+    uint32_t slot = (uint32_t)semantic & mask;
+    for (uint32_t probe = 0; probe < YZ_NR_VERT_FP_TEMPLATE_COUNT; ++probe) {
+        yz_nr_vertical_fp_template* const entry = &table[slot];
+        if (!entry->build_count && !entry->replay_count)
+            return slot;
+        if (entry->semantic_hash == semantic)
+            return slot;
+        slot = (slot + 1u) & mask;
+    }
+    return YZ_NR_VERT_FP_TEMPLATE_COUNT;
+}
+
+/* g_vertical.lock must be held. */
+static bool yz_nr_register_fragment_template(
+    const yz_nr_fragment_identity* identity, uint32_t control)
+{
+    if (!identity || !identity->byte_count)
+        return false;
+    const unsigned long long semantic =
+        rsx_nr_fragment_program_semantic_hash(
+            identity->content_hash, identity->byte_count, control);
+    const unsigned long long structural_semantic =
+        rsx_nr_fragment_program_semantic_hash(
+            identity->structural_hash, identity->byte_count, control);
+    if (!semantic || !structural_semantic)
+        return false;
+
+    const uint32_t free_slot = yz_nr_find_fragment_free(
+        g_vertical.fp_templates, semantic);
+    if (free_slot == YZ_NR_VERT_FP_TEMPLATE_COUNT) {
+        g_vertical.fp_template_overflow++;
+        return false;
+    }
+    yz_nr_vertical_fp_template* const entry =
+        &g_vertical.fp_templates[free_slot];
+    if (entry->build_count) {
+        entry->build_count++;
+        return true;
+    }
+    entry->content_hash = identity->content_hash;
+    entry->structural_hash = identity->structural_hash;
+    entry->semantic_hash = semantic;
+    entry->structural_semantic_hash = structural_semantic;
+    entry->byte_count = identity->byte_count;
+    entry->control = control;
+    entry->build_count = 1;
+
+    const uint32_t structural_mask =
+        YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT - 1u;
+    uint32_t structural_slot =
+        (uint32_t)structural_semantic & structural_mask;
+    for (uint32_t probe = 0;
+         probe < YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT; ++probe) {
+        const uint16_t encoded =
+            g_vertical.fp_structural_index[structural_slot];
+        if (!encoded) {
+            g_vertical.fp_structural_index[structural_slot] =
+                (uint16_t)(free_slot + 1u);
+            break;
+        }
+        const yz_nr_vertical_fp_template* const indexed =
+            &g_vertical.fp_templates[(uint32_t)encoded - 1u];
+        if (indexed->structural_semantic_hash == structural_semantic)
+            break;
+        structural_slot = (structural_slot + 1u) & structural_mask;
+    }
+    return true;
+}
+
+/* Passive-only postcondition oracle for the game's package builder. The
+ * wrapper is entered before packet construction; after the unchanged lifted
+ * body completes, output+4/output+8 identify its relocated reusable segment.
+ * We inspect only the two exact one-argument shader words needed to prove the
+ * future pre-packet typed contract. No active path calls this oracle. */
+static void yz_nr_expected_fragment_program(uint32_t output)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
+        return;
+    const uint32_t segment = vm_read32((uint64_t)output + 4u);
+    const uint32_t byte_count = vm_read32((uint64_t)output + 8u);
+    if (!segment || byte_count < 16u || (byte_count & 3u) ||
+        byte_count > 0x100000u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.fp_unresolved++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    uint32_t program_word = 0;
+    uint32_t control = 0;
+    bool have_program = false;
+    bool have_control = false;
+    const uint32_t words = byte_count / 4u;
+    for (uint32_t i = 0; i + 1u < words; ++i) {
+        const uint32_t word = vm_read32((uint64_t)segment + i * 4u);
+        if (!have_program && word == 0x000408E4u) {
+            program_word = vm_read32((uint64_t)segment + (i + 1u) * 4u);
+            have_program = true;
+        } else if (!have_control && word == 0x00041D60u) {
+            control = vm_read32((uint64_t)segment + (i + 1u) * 4u);
+            have_control = true;
+        }
+        if (have_program && have_control)
+            break;
+    }
+
+    yz_nr_fragment_identity identity = {};
+    if (!have_program || !have_control ||
+        !yz_nr_fragment_identity_from_binding(program_word, &identity)) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.fp_unresolved++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_vertical.lock);
+    g_vertical.fp_template_builds++;
+    yz_nr_register_fragment_template(&identity, control);
+    ReleaseSRWLockExclusive(&g_vertical.lock);
+}
+
+/* g_vertical.lock must be held. */
+static void yz_nr_observe_fragment_template(
+    const yz_nr_fragment_identity* identity, uint32_t control,
+    uint32_t packet_ea)
+{
+    if (!identity || !identity->byte_count) {
+        g_vertical.fp_unresolved++;
+        return;
+    }
+    const unsigned long long semantic =
+        rsx_nr_fragment_program_semantic_hash(
+            identity->content_hash, identity->byte_count, control);
+    const unsigned long long structural_semantic =
+        rsx_nr_fragment_program_semantic_hash(
+            identity->structural_hash, identity->byte_count, control);
+    yz_nr_vertical_fp_template* entry = yz_nr_find_fragment_exact(
+        g_vertical.fp_templates, semantic);
+    bool matched = entry && entry->build_count;
+    if (matched) {
+        entry->replay_count++;
+        g_vertical.fp_template_replays++;
+    }
+    if (!matched) {
+        /* UpdateFragmentProgramParameter mutates inline constants in place.
+         * Buffered native shaders deliberately retain the structural shader
+         * and upload the new exact constants, so this is a covered data
+         * variant rather than an unknown program. */
+        const uint32_t structural_mask =
+            YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT - 1u;
+        uint32_t structural_slot =
+            (uint32_t)structural_semantic & structural_mask;
+        for (uint32_t probe = 0;
+             probe < YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT; ++probe) {
+            const uint16_t encoded =
+                g_vertical.fp_structural_index[structural_slot];
+            if (!encoded)
+                break;
+            entry = &g_vertical.fp_templates[(uint32_t)encoded - 1u];
+            if (entry->build_count &&
+                entry->structural_semantic_hash == structural_semantic) {
+                entry->replay_count++;
+                entry->parameter_replay_count++;
+                g_vertical.fp_template_replays++;
+                g_vertical.fp_template_parameter_replays++;
+                matched = true;
+                break;
+            }
+            structural_slot = (structural_slot + 1u) & structural_mask;
+        }
+    }
+    if (!matched) {
+        g_vertical.fp_template_unknown++;
+        yz_nr_vertical_fp_template* const known_unknown =
+            yz_nr_find_fragment_exact(
+                g_vertical.fp_unknown_templates, semantic);
+        if (known_unknown) {
+            known_unknown->replay_count++;
+        } else {
+            const uint32_t free_slot = yz_nr_find_fragment_free(
+                g_vertical.fp_unknown_templates, semantic);
+            if (free_slot < YZ_NR_VERT_FP_TEMPLATE_COUNT) {
+                yz_nr_vertical_fp_template* const unknown_entry =
+                    &g_vertical.fp_unknown_templates[free_slot];
+                unknown_entry->content_hash = identity->content_hash;
+                unknown_entry->structural_hash = identity->structural_hash;
+                unknown_entry->semantic_hash = semantic;
+                unknown_entry->structural_semantic_hash =
+                    structural_semantic;
+                unknown_entry->byte_count = identity->byte_count;
+                unknown_entry->control = control;
+                unknown_entry->replay_count = 1;
+            } else {
+                g_vertical.fp_unknown_overflow++;
+            }
+        }
+    }
+    if (!g_vertical.observed_ea_min[YZ_NR_VERT_FRAGMENT_PROGRAM] ||
+        packet_ea <
+            g_vertical.observed_ea_min[YZ_NR_VERT_FRAGMENT_PROGRAM])
+        g_vertical.observed_ea_min[YZ_NR_VERT_FRAGMENT_PROGRAM] = packet_ea;
+    if (packet_ea >
+        g_vertical.observed_ea_max[YZ_NR_VERT_FRAGMENT_PROGRAM])
+        g_vertical.observed_ea_max[YZ_NR_VERT_FRAGMENT_PROGRAM] = packet_ea;
+}
+
+/* Program and control are independent persistent RSX state. Observe their
+ * effective pair only at a real draw begin; repeated setters are ordinary
+ * state updates, not malformed two-packet transactions. */
+static void yz_nr_observe_active_fragment(uint32_t draw_packet_ea)
+{
+    uint32_t program_word = 0;
+    uint32_t control = 0;
+    uint32_t program_packet_ea = 0;
+    AcquireSRWLockShared(&g_vertical.lock);
+    const bool complete = rsx_nr_fragment_binding_snapshot(
+        &g_vertical.fp_binding, &program_word, &control) != 0;
+    program_packet_ea = g_vertical.fp_packet_ea;
+    ReleaseSRWLockShared(&g_vertical.lock);
+
+    if (!complete) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.fp_bad_sequence++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    yz_nr_fragment_identity identity = {};
+    const bool resolved =
+        yz_nr_fragment_identity_from_binding(program_word, &identity);
+    AcquireSRWLockExclusive(&g_vertical.lock);
+    if (resolved)
+        yz_nr_observe_fragment_template(
+            &identity, control,
+            program_packet_ea ? program_packet_ea : draw_packet_ea);
+    else
+        g_vertical.fp_unresolved++;
+    ReleaseSRWLockExclusive(&g_vertical.lock);
+}
+
 static void yz_nr_expected_flip(uint32_t context,
                                 const rsx_nr_flip_contract* flip)
 {
@@ -740,6 +1075,25 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
         return;
+
+    /* Fragment program and shader control are persistent independent state.
+     * Keep their latest values; draw begin below validates the effective
+     * pair against a producer-built content template. */
+    if (method == 0x08E4u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        rsx_nr_fragment_binding_set_program(
+            &g_vertical.fp_binding, arg);
+        g_vertical.fp_packet_ea = packet_ea;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method == 0x1D60u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        rsx_nr_fragment_binding_set_control(
+            &g_vertical.fp_binding, arg);
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
 
     /* Normalize the transform-program producer's multi-packet operation.
      * The exact event begins at LOAD, hashes instruction words as the RSX
@@ -929,6 +1283,8 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
      * wrapper event is keyed by the BEGIN packet address and stays live until
      * END, while copied/dynamic/SPU-authored draws are counted as fallback. */
     if (method == 0x1808u) {
+        if (arg)
+            yz_nr_observe_active_fragment(packet_ea);
         AcquireSRWLockExclusive(&g_vertical.lock);
         if (arg) {
             if (g_vertical.draw_state)
@@ -1250,6 +1606,29 @@ extern "C" void yz_nr_vertical_shutdown(void)
         g_vertical.vp_template_overflow;
     const unsigned long long vp_unknown_overflow =
         g_vertical.vp_unknown_overflow;
+    unsigned long long fp_template_unique = 0;
+    unsigned long long fp_template_seen = 0;
+    for (uint32_t i = 0; i < YZ_NR_VERT_FP_TEMPLATE_COUNT; ++i) {
+        if (g_vertical.fp_templates[i].build_count) {
+            fp_template_unique++;
+            if (g_vertical.fp_templates[i].replay_count)
+                fp_template_seen++;
+        }
+    }
+    const unsigned long long fp_template_builds =
+        g_vertical.fp_template_builds;
+    const unsigned long long fp_template_replays =
+        g_vertical.fp_template_replays;
+    const unsigned long long fp_template_parameter_replays =
+        g_vertical.fp_template_parameter_replays;
+    const unsigned long long fp_template_unknown =
+        g_vertical.fp_template_unknown;
+    const unsigned long long fp_template_overflow =
+        g_vertical.fp_template_overflow;
+    const unsigned long long fp_unknown_overflow =
+        g_vertical.fp_unknown_overflow;
+    const unsigned long long fp_unresolved = g_vertical.fp_unresolved;
+    const unsigned long long fp_bad_sequence = g_vertical.fp_bad_sequence;
     uint32_t observed_ea_min[YZ_NR_VERT_FAMILY_COUNT];
     uint32_t observed_ea_max[YZ_NR_VERT_FAMILY_COUNT];
     memcpy(observed_ea_min, g_vertical.observed_ea_min,
@@ -1287,6 +1666,13 @@ extern "C" void yz_nr_vertical_shutdown(void)
                        vp_template_unknown == 0 &&
                        vp_template_overflow == 0 &&
                        vp_bad_sequence == 0;
+    const bool fp_ok = fp_template_builds != 0 &&
+                       fp_template_replays != 0 &&
+                       fp_template_unknown == 0 &&
+                       fp_template_overflow == 0 &&
+                       fp_unknown_overflow == 0 &&
+                       fp_unresolved == 0 &&
+                       fp_bad_sequence == 0;
     unsigned sequence_mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
         if (!outstanding_by_family[family] &&
@@ -1303,6 +1689,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             "vp-builds=%llu templates=%llu seen=%llu replays=%llu "
             "mask-variants=%llu "
             "unknown=%llu overflow=%llu/%llu:%s vp-seq=%llu "
+            "fp-builds=%llu templates=%llu seen=%llu replays=%llu "
+            "param-variants=%llu unknown=%llu overflow=%llu/%llu "
+            "unresolved=%llu:%s fp-seq=%llu "
             "mismatch=%u seqdiff=%u]\n",
             expected.count[YZ_NR_VERT_REFERENCE],
             observed.count[YZ_NR_VERT_REFERENCE],
@@ -1335,6 +1724,11 @@ extern "C" void yz_nr_vertical_shutdown(void)
             vp_template_overflow, vp_unknown_overflow,
             vp_ok ? "ok" : "bad",
             vp_bad_sequence,
+            fp_template_builds, fp_template_unique, fp_template_seen,
+            fp_template_replays, fp_template_parameter_replays,
+            fp_template_unknown, fp_template_overflow,
+            fp_unknown_overflow, fp_unresolved, fp_ok ? "ok" : "bad",
+            fp_bad_sequence,
             mismatches, sequence_mismatches);
     /* Compact fixed-memory identity census.  These are semantic hashes of
      * complete uploads, not packet addresses or per-event logs. */
@@ -1385,6 +1779,56 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 entry->word_count, entry->input_mask, entry->semantic_hash,
                 entry->replay_count);
     }
+    bool selected_fp_known[YZ_NR_VERT_FP_TEMPLATE_COUNT] = {};
+    bool selected_fp_unknown[YZ_NR_VERT_FP_TEMPLATE_COUNT] = {};
+    for (uint32_t rank = 0; rank < 16u; ++rank) {
+        uint32_t best = YZ_NR_VERT_FP_TEMPLATE_COUNT;
+        for (uint32_t i = 0; i < YZ_NR_VERT_FP_TEMPLATE_COUNT; ++i) {
+            if (selected_fp_known[i] ||
+                !g_vertical.fp_templates[i].replay_count)
+                continue;
+            if (best == YZ_NR_VERT_FP_TEMPLATE_COUNT ||
+                g_vertical.fp_templates[i].replay_count >
+                    g_vertical.fp_templates[best].replay_count)
+                best = i;
+        }
+        if (best == YZ_NR_VERT_FP_TEMPLATE_COUNT)
+            break;
+        selected_fp_known[best] = true;
+        const yz_nr_vertical_fp_template* const entry =
+            &g_vertical.fp_templates[best];
+        fprintf(stderr,
+                "[nr-vertical-fp-known rank=%u bytes=%u ctrl=%08X "
+                "content=%016llX structural=%016llX builds=%llu "
+                "replays=%llu params=%llu]\n",
+                rank + 1u, entry->byte_count, entry->control,
+                entry->content_hash, entry->structural_hash,
+                entry->build_count, entry->replay_count,
+                entry->parameter_replay_count);
+    }
+    for (uint32_t rank = 0; rank < 16u; ++rank) {
+        uint32_t best = YZ_NR_VERT_FP_TEMPLATE_COUNT;
+        for (uint32_t i = 0; i < YZ_NR_VERT_FP_TEMPLATE_COUNT; ++i) {
+            if (selected_fp_unknown[i] ||
+                !g_vertical.fp_unknown_templates[i].replay_count)
+                continue;
+            if (best == YZ_NR_VERT_FP_TEMPLATE_COUNT ||
+                g_vertical.fp_unknown_templates[i].replay_count >
+                    g_vertical.fp_unknown_templates[best].replay_count)
+                best = i;
+        }
+        if (best == YZ_NR_VERT_FP_TEMPLATE_COUNT)
+            break;
+        selected_fp_unknown[best] = true;
+        const yz_nr_vertical_fp_template* const entry =
+            &g_vertical.fp_unknown_templates[best];
+        fprintf(stderr,
+                "[nr-vertical-fp-unknown rank=%u bytes=%u ctrl=%08X "
+                "content=%016llX structural=%016llX replays=%llu]\n",
+                rank + 1u, entry->byte_count, entry->control,
+                entry->content_hash, entry->structural_hash,
+                entry->replay_count);
+    }
     for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
         if (!sources[i].count)
             continue;
@@ -1401,7 +1845,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
     fprintf(stderr,
             "[nr-vertical-observed-ea ref=%08X-%08X "
             "acq=%08X-%08X user=%08X-%08X state=%08X-%08X "
-            "draw=%08X-%08X flip=%08X-%08X vp=%08X-%08X]\n",
+            "draw=%08X-%08X flip=%08X-%08X vp=%08X-%08X "
+            "fp=%08X-%08X]\n",
             observed_ea_min[YZ_NR_VERT_REFERENCE],
             observed_ea_max[YZ_NR_VERT_REFERENCE],
             observed_ea_min[YZ_NR_VERT_ACQUIRE],
@@ -1415,7 +1860,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed_ea_min[YZ_NR_VERT_FLIP],
             observed_ea_max[YZ_NR_VERT_FLIP],
             observed_ea_min[YZ_NR_VERT_VERTEX_PROGRAM],
-            observed_ea_max[YZ_NR_VERT_VERTEX_PROGRAM]);
+            observed_ea_max[YZ_NR_VERT_VERTEX_PROGRAM],
+            observed_ea_min[YZ_NR_VERT_FRAGMENT_PROGRAM],
+            observed_ea_max[YZ_NR_VERT_FRAGMENT_PROGRAM]);
     fprintf(stderr,
             "[nr-vertical-exact matched=%llu mismatch=%llu unexpected=%llu "
             "outstanding=%llu unaddressed=%llu overflow=%llu]\n",
@@ -1450,6 +1897,20 @@ void func_00EBD6FC(ppu_context* ctx)
     if (!yz_nr_active_publish(ctx, YZ_NR_VERT_USER,
                               (uint32_t)ctx->gpr[4]))
         func_00EBD6FC_lifted(ctx);
+}
+
+/* Highest complete fragment-package producer. The active design will derive
+ * a typed shader template from the package ABI before invoking legacy code.
+ * Shadow mode currently lets the builder and all of its continuations finish,
+ * then validates that its relocated packet segment names the same exact and
+ * structural fragment-program identities. This postcondition scan is an
+ * oracle only and is never part of native execution. */
+void func_00EB0D90(ppu_context* ctx)
+{
+    const uint32_t output = (uint32_t)ctx->gpr[3];
+    func_00EB0D90_lifted(ctx);
+    yz_drain_trampolines(ctx);
+    yz_nr_expected_fragment_program(output);
 }
 
 /* Complete transform-program producer ABI entry. Passive mode derives the

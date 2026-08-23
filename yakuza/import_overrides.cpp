@@ -2040,6 +2040,15 @@ static const u8* yz_rsx_live_guest_ptr(void* user, u32 location, u32 offset,
     return (const u8*)(vm_base + ea);
 }
 
+/* Read-only resolver for the explicit passive vertical shader oracle. It
+ * shares the live renderer's complete range and IO-map validation instead of
+ * maintaining a second interpretation of RSX address spaces. */
+extern "C" const u8* yz_nr_vertical_guest_ptr(u32 location, u32 offset,
+                                                u32 min_bytes)
+{
+    return yz_rsx_live_guest_ptr(nullptr, location, offset, min_bytes);
+}
+
 /* The guest movie player owns sequencing and post-movie state, but its decoded
  * surface is not yet reaching the live RSX draw path and its software decode
  * runs far below the authored frame rate. The game opens each .sfd once for a

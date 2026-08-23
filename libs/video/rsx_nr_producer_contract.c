@@ -177,6 +177,96 @@ int rsx_nr_vertex_program_contract_init(
     return 1;
 }
 
+static u64 fragment_hash_bytes(u64 hash, const void* data, u32 size)
+{
+    const u8* const bytes = (const u8*)data;
+    for (u32 i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+u64 rsx_nr_fragment_program_content_hash(const u8* bytes, u32 byte_count)
+{
+    if (!bytes || !byte_count ||
+        byte_count > RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES ||
+        (byte_count & 15u) != 0)
+        return 0;
+    static const u32 tag = 0x31435046u; /* "FPC1" */
+    u64 hash = 1469598103934665603ull;
+    hash = fragment_hash_bytes(hash, &tag, sizeof(tag));
+    return fragment_hash_bytes(hash, bytes, byte_count);
+}
+
+u64 rsx_nr_fragment_program_semantic_hash(u64 program_hash,
+                                          u32 byte_count, u32 control)
+{
+    if (!program_hash || !byte_count ||
+        byte_count > RSX_NR_FRAGMENT_PROGRAM_MAX_BYTES ||
+        (byte_count & 15u) != 0)
+        return 0;
+    u64 hash = fragment_hash_bytes(program_hash, &byte_count,
+                                   sizeof(byte_count));
+    return fragment_hash_bytes(hash, &control, sizeof(control));
+}
+
+int rsx_nr_fragment_program_contract_init(
+    rsx_nr_fragment_program_contract* out, const u8* bytes,
+    u32 byte_count, u32 control)
+{
+    if (!out)
+        return 0;
+    const u64 content =
+        rsx_nr_fragment_program_content_hash(bytes, byte_count);
+    const u64 semantic = rsx_nr_fragment_program_semantic_hash(
+        content, byte_count, control);
+    if (!content || !semantic)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    out->byte_count = byte_count;
+    out->control = control;
+    out->content_hash = content;
+    out->semantic_hash = semantic;
+    return 1;
+}
+
+void rsx_nr_fragment_binding_init(rsx_nr_fragment_binding_state* state)
+{
+    if (state)
+        memset(state, 0, sizeof(*state));
+}
+
+void rsx_nr_fragment_binding_set_program(
+    rsx_nr_fragment_binding_state* state, u32 program_word)
+{
+    if (!state)
+        return;
+    state->program_word = program_word;
+    state->valid_mask |= 1u;
+}
+
+void rsx_nr_fragment_binding_set_control(
+    rsx_nr_fragment_binding_state* state, u32 control)
+{
+    if (!state)
+        return;
+    state->control = control;
+    state->valid_mask |= 2u;
+}
+
+int rsx_nr_fragment_binding_snapshot(
+    const rsx_nr_fragment_binding_state* state,
+    u32* program_word, u32* control)
+{
+    if (!state || !program_word || !control ||
+        (state->valid_mask & 3u) != 3u)
+        return 0;
+    *program_word = state->program_word;
+    *control = state->control;
+    return 1;
+}
+
 int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
                               int wait_for_label, u32 label_index,
                               u32 label_value)
