@@ -36,7 +36,8 @@ import spu_wb_diff as WD             # noqa: E402
 WORK = os.path.join(ROOT, "scratch", "wbbench")
 BENCH = os.path.join(TOOLS, "spu_wb_bench_driver.c")
 FAST = WD.FAST
-WB = WD.WB
+WB = os.path.join(ROOT, "yakuza", "generated", "wb")
+WJ = os.path.join(ROOT, "yakuza", "generated", "wj")
 
 
 def compile_bench(stem, twin, register, outdir):
@@ -59,9 +60,12 @@ def compile_bench(stem, twin, register, outdir):
                                     f"/DTWIN_HEADER={stem}_fast.h",
                                     f"/DREGISTER_FN={register}"]]
     else:
-        # three-object: bench driver (wb header), renamed fast, AVX2 wb
+        # three-object: bench driver (lane header), renamed fast, AVX2 lane TU
+        lane_dir = WJ if twin == "wj" else WB
+        lane_sfx = "_wj" if twin == "wj" else "_wb"
         steps = [
-            (D.CLFLAGS + inc + ["/I", WB, f"/DTWIN_HEADER={stem}_wb.h",
+            (D.CLFLAGS + inc + ["/I", lane_dir,
+                                f"/DTWIN_HEADER={stem}{lane_sfx}.h",
                                 f"/DREGISTER_FN={register}",
                                 "/c", BENCH, f"/Fo{objdir}\\bench.obj"]),
             (D.CLFLAGS + inc + ["/I", FAST,
@@ -69,7 +73,8 @@ def compile_bench(stem, twin, register, outdir):
                                 "/c", os.path.join(FAST, f"{stem}_fast.c"),
                                 f"/Fo{objdir}\\fast_rn.obj"]),
             (D.CLFLAGS + WD.WB_EXTRA + inc +
-             ["/I", WB, "/c", os.path.join(WB, f"{stem}_wb.c"),
+             ["/I", lane_dir, "/c",
+              os.path.join(lane_dir, f"{stem}{lane_sfx}.c"),
               f"/Fo{objdir}\\wb.obj"]),
         ]
         for s in steps:
@@ -135,8 +140,11 @@ def process(famname, fam, plc, args, results):
     with open(codebin, "wb") as f:
         f.write(code)
 
+    twins = ["diag", "fast", "wb"]
+    if os.path.exists(os.path.join(WJ, f"{stem}_wj.c")):
+        twins.append("wj")
     exes = {}
-    for twin in ("diag", "fast", "wb"):
+    for twin in twins:
         exe, err = compile_bench(stem, twin, register, outdir)
         if not exe:
             print(f"[{famname}] {stem}: bench compile fail ({twin}): "
@@ -151,7 +159,7 @@ def process(famname, fam, plc, args, results):
     for e in entries:
         row = {"entry": e}
         ok = True
-        for twin in ("diag", "fast", "wb"):
+        for twin in twins:
             b = run_bench(exes[twin], codebin, base, e, args.seed,
                           args.evbudget, args.hopmax, args.reps, args.timeout)
             if b is None:
@@ -161,8 +169,8 @@ def process(famname, fam, plc, args, results):
         if not ok:
             continue
         # identical architectural work only
-        if not (row["diag"]["term"] == row["fast"]["term"] == row["wb"]["term"]
-                and row["diag"]["ev"] == row["fast"]["ev"] == row["wb"]["ev"]
+        if not (all(row[t]["term"] == row["diag"]["term"] and
+                    row[t]["ev"] == row["diag"]["ev"] for t in twins)
                 and row["diag"]["term"] in ("EVCUT", "RETURNED", "STOPPED",
                                             "HALTED", "DRAINED")):
             continue
@@ -170,15 +178,24 @@ def process(famname, fam, plc, args, results):
                                   if row["wb"]["avg_us"] > 0 else None)
         row["speedup_diag_wb"] = (row["diag"]["avg_us"] / row["wb"]["avg_us"]
                                   if row["wb"]["avg_us"] > 0 else None)
+        line = (f"  e{e:05X} {row['diag']['term']:8s} "
+                f"diag={row['diag']['avg_us']:10.1f}us "
+                f"fast={row['fast']['avg_us']:10.1f}us "
+                f"wb={row['wb']['avg_us']:10.1f}us")
+        if "wj" in row:
+            row["speedup_fast_wj"] = (row["fast"]["avg_us"] /
+                                      row["wj"]["avg_us"]
+                                      if row["wj"]["avg_us"] > 0 else None)
+            row["speedup_wb_wj"] = (row["wb"]["avg_us"] / row["wj"]["avg_us"]
+                                    if row["wj"]["avg_us"] > 0 else None)
+            line += (f" wj={row['wj']['avg_us']:10.1f}us "
+                     f"fast/wj={row['speedup_fast_wj']:.2f}x "
+                     f"wb/wj={row['speedup_wb_wj']:.2f}x")
+        else:
+            line += (f"  fast/wb={row['speedup_fast_wb']:.2f}x "
+                     f"diag/wb={row['speedup_diag_wb']:.2f}x")
         rows.append(row)
-        print(f"  e{e:05X} {row['diag']['term']:8s} "
-              f"diag={row['diag']['avg_us']:10.1f}us "
-              f"fast={row['fast']['avg_us']:10.1f}us "
-              f"wb={row['wb']['avg_us']:10.1f}us  "
-              f"fast/wb={row['speedup_fast_wb']:.2f}x "
-              f"diag/wb={row['speedup_diag_wb']:.2f}x "
-              f"hops d/f/w={row['diag']['hops']}/{row['fast']['hops']}/"
-              f"{row['wb']['hops']}")
+        print(line)
     ent = {"family": famname, "stem": stem, "windows": rows}
     su = [r["speedup_fast_wb"] for r in rows
           if r.get("speedup_fast_wb") and r["fast"]["avg_us"] >= args.min_us]
@@ -186,9 +203,15 @@ def process(famname, fam, plc, args, results):
         ent["geomean_fast_wb"] = round(math.exp(sum(math.log(x) for x in su)
                                                 / len(su)), 3)
         ent["n_timed_windows"] = len(su)
+    su_wj = [r["speedup_fast_wj"] for r in rows
+             if r.get("speedup_fast_wj") and r["fast"]["avg_us"] >= args.min_us]
+    if su_wj:
+        ent["geomean_fast_wj"] = round(
+            math.exp(sum(math.log(x) for x in su_wj) / len(su_wj)), 3)
     results.append(ent)
     print(f"[{famname}] {stem:26s} windows={len(rows)} "
           f"geomean fast/wb={ent.get('geomean_fast_wb', '-')} "
+          f"fast/wj={ent.get('geomean_fast_wj', '-')} "
           f"(>= {args.min_us}us windows: {len(su)})")
 
 

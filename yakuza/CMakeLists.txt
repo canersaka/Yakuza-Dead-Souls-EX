@@ -259,6 +259,21 @@ option(YZ_SPU_WB_JOB_D "Job D placements: whole-block backend." OFF)
 option(YZ_SPU_WB_JOB_E "Job E placements: whole-block backend." OFF)
 option(YZ_SPU_WB_ORPHANAGE "orphanage-worker placements: whole-block backend." OFF)
 
+# WJ (whole-job native compiler, stage 2): guest registers retained across
+# blocks and loops inside whole-job compile groups; same FAST-twin fallback
+# contract. Mutually exclusive with the WB flag of the same family (both
+# lanes define the family's register symbols).
+option(YZ_SPU_WJ_GSTASK "gs_task: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_CRI "cri_audio: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_WKL4 "wkl4_task: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_SPUIMG "spuimg_* task images: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_JOB_A "Job A placements: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_JOB_B "Job B placements: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_JOB_C "Job C placements: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_JOB_D "Job D placements: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_JOB_E "Job E placements: whole-job native compiler." OFF)
+option(YZ_SPU_WJ_ORPHANAGE "orphanage-worker placements: whole-job native compiler." OFF)
+
 # _yz_spu_pick(<listvar> <fast_flag> <diag_path> <stem>): append either the
 # instruction-lifted DIAG source or its tracked region-lifted twin.
 function(_yz_spu_pick outvar fast diag stem)
