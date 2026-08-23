@@ -51,3 +51,4 @@
 0x00EBD3F8  # direct state setter: 0x17CC
 0x00EBD48C  # direct state setter: 0x17C8
 0x00EBD5CC  # direct state setter: 0x1804
+0x00EBEA48  # thin DrawArrays producer: ctx, primitive, first, count

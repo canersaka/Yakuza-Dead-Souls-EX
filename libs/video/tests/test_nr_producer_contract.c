@@ -54,10 +54,45 @@ int main(void)
     CHECK(words[0] == 0xDEADBEEFu && words[1] == 0xDEADBEEFu);
     CHECK(!rsx_nr_direct_setter_packet(functions[0], 1u, 0));
 
+    rsx_nr_draw_arrays_contract draw = {0};
+    CHECK(rsx_nr_draw_arrays_contract_init(&draw, 5u, 7u, 1u));
+    CHECK(draw.primitive == 5u && draw.first == 7u && draw.count == 1u);
+    CHECK(draw.batch_count == 1u);
+    CHECK(draw.semantic_hash ==
+          rsx_nr_draw_hash_batch(rsx_nr_draw_hash_begin(5u, 0), 7u, 1u));
+
+    CHECK(rsx_nr_draw_arrays_contract_init(&draw, 6u, 0x1234u, 256u));
+    CHECK(draw.batch_count == 1u);
+    CHECK(draw.semantic_hash == rsx_nr_draw_hash_batch(
+                                    rsx_nr_draw_hash_begin(6u, 0),
+                                    0x1234u, 256u));
+
+    CHECK(rsx_nr_draw_arrays_contract_init(&draw, 7u, 0xFFFFF0u, 257u));
+    CHECK(draw.batch_count == 2u);
+    u32 split_hash = rsx_nr_draw_hash_begin(7u, 0);
+    split_hash = rsx_nr_draw_hash_batch(split_hash, 0xFFFFF0u, 1u);
+    split_hash = rsx_nr_draw_hash_batch(split_hash, 0xFFFFF1u, 256u);
+    CHECK(draw.semantic_hash == split_hash);
+
+    CHECK(rsx_nr_draw_arrays_contract_init(&draw, 8u, 1000u, 600u));
+    CHECK(draw.batch_count == 3u);
+    split_hash = rsx_nr_draw_hash_begin(8u, 0);
+    split_hash = rsx_nr_draw_hash_batch(split_hash, 1000u, 88u);
+    split_hash = rsx_nr_draw_hash_batch(split_hash, 1088u, 256u);
+    split_hash = rsx_nr_draw_hash_batch(split_hash, 1344u, 256u);
+    CHECK(draw.semantic_hash == split_hash);
+
+    CHECK(!rsx_nr_draw_arrays_contract_init(&draw, 0u, 0u, 1u));
+    CHECK(!rsx_nr_draw_arrays_contract_init(&draw, 5u, 0u, 0u));
+    CHECK(!rsx_nr_draw_arrays_contract_init(
+        &draw, 5u, 0u,
+        RSX_NR_DRAW_CONTRACT_MAX_BATCHES * 256u + 1u));
+    CHECK(!rsx_nr_draw_arrays_contract_init(0, 5u, 0u, 1u));
+
     if (failures) {
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;
     }
-    printf("nr producer contract: 25 direct setters verified\n");
+    printf("nr producer contract: 25 direct setters + draw arrays verified\n");
     return 0;
 }
