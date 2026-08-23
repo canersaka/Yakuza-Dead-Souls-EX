@@ -251,6 +251,9 @@ def main():
     ap.add_argument("--hopmax", type=int, default=2000000)
     ap.add_argument("--timeout", type=int, default=45)
     ap.add_argument("--input-roots", default=None)
+    ap.add_argument("--report", default=None,
+                    help="report path (default scratch/wbdiff/report.json); "
+                         "give each parallel family slice its own")
     args = ap.parse_args()
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None
@@ -260,6 +263,7 @@ def main():
     if not D.CL_EXE:
         raise SystemExit("cl not found; run from a vcvars64-initialized shell")
     os.makedirs(WORK, exist_ok=True)
+    report_path = args.report or os.path.join(WORK, "report.json")
     manifest = json.load(open(GW.MANIFEST))
     results = []
     for famname, fam in manifest["families"].items():
@@ -269,12 +273,12 @@ def main():
             continue
         for plc in fam.get("images", fam.get("placements", [])):
             process(famname, fam, plc, args, results)
-            D.write_report(os.path.join(WORK, "report.json"), results)
+            D.write_report(report_path, results)
 
     n_mis = sum(1 for r in results if r.get("verdict") == "MISMATCH")
     n_cf = sum(1 for r in results if r.get("verdict") == "COMPILE-FAIL")
     print(f"\n{len(results)} placement(s); {n_mis} MISMATCH, {n_cf} COMPILE-FAIL; "
-          f"report -> {os.path.join(WORK, 'report.json')}")
+          f"report -> {report_path}")
     sys.exit(1 if (n_mis or n_cf) else 0)
 
 
