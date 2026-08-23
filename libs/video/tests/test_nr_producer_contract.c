@@ -58,17 +58,20 @@ int main(void)
     CHECK(rsx_nr_draw_arrays_contract_init(&draw, 5u, 7u, 1u));
     CHECK(draw.primitive == 5u && draw.first == 7u && draw.count == 1u);
     CHECK(draw.batch_count == 1u);
+    CHECK(draw.packet_word_count == 10u);
     CHECK(draw.semantic_hash ==
           rsx_nr_draw_hash_batch(rsx_nr_draw_hash_begin(5u, 0), 7u, 1u));
 
     CHECK(rsx_nr_draw_arrays_contract_init(&draw, 6u, 0x1234u, 256u));
     CHECK(draw.batch_count == 1u);
+    CHECK(draw.packet_word_count == 10u);
     CHECK(draw.semantic_hash == rsx_nr_draw_hash_batch(
                                     rsx_nr_draw_hash_begin(6u, 0),
                                     0x1234u, 256u));
 
     CHECK(rsx_nr_draw_arrays_contract_init(&draw, 7u, 0xFFFFF0u, 257u));
     CHECK(draw.batch_count == 2u);
+    CHECK(draw.packet_word_count == 12u);
     u32 split_hash = rsx_nr_draw_hash_begin(7u, 0);
     split_hash = rsx_nr_draw_hash_batch(split_hash, 0xFFFFF0u, 1u);
     split_hash = rsx_nr_draw_hash_batch(split_hash, 0xFFFFF1u, 256u);
@@ -76,11 +79,41 @@ int main(void)
 
     CHECK(rsx_nr_draw_arrays_contract_init(&draw, 8u, 1000u, 600u));
     CHECK(draw.batch_count == 3u);
+    CHECK(draw.packet_word_count == 13u);
     split_hash = rsx_nr_draw_hash_begin(8u, 0);
     split_hash = rsx_nr_draw_hash_batch(split_hash, 1000u, 88u);
     split_hash = rsx_nr_draw_hash_batch(split_hash, 1088u, 256u);
     split_hash = rsx_nr_draw_hash_batch(split_hash, 1344u, 256u);
     CHECK(draw.semantic_hash == split_hash);
+
+    u32 draw_packet[32] = {0};
+    CHECK(rsx_nr_draw_arrays_packet(&draw, draw_packet, 32u) == 13u);
+    CHECK(draw_packet[0] == 0x400C1714u &&
+          draw_packet[1] == 0u && draw_packet[2] == 0u &&
+          draw_packet[3] == 0u);
+    CHECK(draw_packet[4] == 0x00041808u && draw_packet[5] == 8u);
+    CHECK(draw_packet[6] == 0x00041814u &&
+          draw_packet[7] == (0x57000000u | 1000u));
+    CHECK(draw_packet[8] == 0x40081814u &&
+          draw_packet[9] == (0xFF000000u | 1088u) &&
+          draw_packet[10] == (0xFF000000u | 1344u));
+    CHECK(draw_packet[11] == 0x00041808u && draw_packet[12] == 0u);
+    CHECK(!rsx_nr_draw_arrays_packet(&draw, draw_packet, 12u));
+
+    /* A 2048-full-batch boundary starts a second legal non-increment packet
+     * instead of overflowing the 11-bit method count. */
+    CHECK(rsx_nr_draw_arrays_contract_init(
+        &draw, 5u, 0u, 2048u * 256u + 1u));
+    CHECK(draw.batch_count == 2049u && draw.packet_word_count == 2060u);
+    u32 large_packet[2060];
+    CHECK(rsx_nr_draw_arrays_packet(&draw, large_packet, 2060u) == 2060u);
+    CHECK(large_packet[8] == 0x5FFC1814u);
+    CHECK(large_packet[2056] == 0x40041814u);
+    CHECK(large_packet[2058] == 0x00041808u &&
+          large_packet[2059] == 0u);
+
+    CHECK(rsx_nr_draw_arrays_contract_init(&draw, 5u, 0xFFFFF0u, 257u));
+    CHECK(!rsx_nr_draw_arrays_packet(&draw, draw_packet, 32u));
 
     CHECK(!rsx_nr_draw_arrays_contract_init(&draw, 0u, 0u, 1u));
     CHECK(!rsx_nr_draw_arrays_contract_init(&draw, 5u, 0u, 0u));

@@ -47,6 +47,7 @@ typedef struct rsx_nr_draw_arrays_contract {
     u32 first;
     u32 count;
     u32 batch_count;
+    u32 packet_word_count;
     u32 semantic_hash;
 } rsx_nr_draw_arrays_contract;
 
@@ -56,6 +57,13 @@ u32 rsx_nr_draw_hash_batch(u32 hash, u32 first, u32 count);
 /* Returns zero for an invalid/unsupported argument shape. */
 int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
                                      u32 primitive, u32 first, u32 count);
+
+/* Byte-exact retained fallback packet emitted by func_00EBEA48: three
+ * non-incrementing VTX_CACHE_INVALIDATE zeros, BEGIN, remainder-first batch,
+ * groups of at most 2047 full 256-vertex batches, then END. Returns the
+ * encoded word count, or zero for an invalid contract/output capacity. */
+u32 rsx_nr_draw_arrays_packet(const rsx_nr_draw_arrays_contract* draw,
+                              u32* out, u32 out_capacity);
 
 /* func_00EBD92C is the real ABI entry for the title's transform-program
  * producer (00EBD968 is only its post-prologue continuation).  The wrapper
