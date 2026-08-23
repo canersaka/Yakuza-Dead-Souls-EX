@@ -40,6 +40,12 @@ void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_typed_present(u32 b) { (void)b; }
 void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
+int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, void** r, u32* f)
+{ (void)l; (void)o; (void)w; (void)h; (void)r; (void)f; return -1; }
+int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
+                               void** r, u32* rf, u32* d, u32* s)
+{ (void)l; (void)o; (void)df; (void)w; (void)h; (void)r; (void)rf; (void)d;
+  (void)s; return -1; }
 int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
@@ -7261,6 +7267,60 @@ void rsx_live_draw_set_movie_mode(int on)
 void* rsx_live_draw_get_d3d12_device(void)
 {
     return g.ready ? g.dev : NULL;
+}
+
+int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
+                               u32 height, void** resource,
+                               u32* dxgi_format)
+{
+    if (!resource || !dxgi_format)
+        return -1;
+    *resource = NULL;
+    AcquireSRWLockExclusive(&g_ld_access_lock);
+    if (!g.ready) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        return -1;
+    }
+    const u32 slot = surface_get(location, offset, width, height);
+    if (slot == LD_INVALID_SURFACE || !g.surfaces[slot].tex) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        return -1;
+    }
+    ID3D12Resource* const texture = g.surfaces[slot].tex;
+    texture->lpVtbl->AddRef(texture);
+    *resource = texture;
+    *dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ReleaseSRWLockExclusive(&g_ld_access_lock);
+    return 0;
+}
+
+int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
+                               u32 width, u32 height, void** resource,
+                               u32* resource_format, u32* dsv_format,
+                               u32* srv_format)
+{
+    if (!resource || !resource_format || !dsv_format || !srv_format ||
+        depth_format != 2u)
+        return -1; /* live shared cache is D32S8; Z16 remains legacy */
+    *resource = NULL;
+    AcquireSRWLockExclusive(&g_ld_access_lock);
+    if (!g.ready) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        return -1;
+    }
+    const u32 slot = zdepth_get(location, offset, width, height);
+    if (!slot || slot > g.n_zdepths || !g.zdepths[slot - 1u].tex) {
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+        return -1;
+    }
+    ID3D12Resource* const texture = g.zdepths[slot - 1u].tex;
+    texture->lpVtbl->AddRef(texture);
+    *resource = texture;
+    *resource_format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    *dsv_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    *srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    ReleaseSRWLockExclusive(&g_ld_access_lock);
+    return 0;
 }
 
 static int ld_present_external_impl(ID3D12Resource* source, u32 format,

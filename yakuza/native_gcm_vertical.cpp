@@ -20,7 +20,10 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "rsx_nr_backend.h"
+#include "rsx_nr_backend_d3d12.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_live_draw.h"
+#include "rsx_nir_adapter.h"
 #include "rsx_nr_producer_contract.h"
 #include "rsx_nr_span_router.h"
 
@@ -34,6 +37,15 @@
 extern "C" const uint8_t* yz_nr_vertical_guest_ptr(uint32_t location,
                                                      uint32_t offset,
                                                      uint32_t min_bytes);
+extern "C" uint8_t* yz_nr_vertical_guest_writable_ptr(uint32_t location,
+                                                        uint32_t offset,
+                                                        uint32_t min_bytes);
+extern "C" int yz_nr_vertical_space_page_to_ea(uint32_t location,
+                                                 uint32_t page_offset,
+                                                 uint32_t* out_ea);
+extern "C" void cellSpursSetGuestWriteObserver(
+    void (*observer)(uint32_t ea, uint32_t size));
+extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
 extern "C" void yz_drain_trampolines(ppu_context* ctx);
 
 namespace {
@@ -168,6 +180,7 @@ struct yz_nr_vertical_state {
     volatile LONG mode_shadow;
     volatile LONG mode_active_basic;
     volatile LONG mode_active_present;
+    volatile LONG mode_active_graphics;
     volatile LONG initialized;
 };
 
@@ -175,8 +188,14 @@ static yz_nr_vertical_state g_vertical = {SRWLOCK_INIT};
 
 enum : uint32_t {
     YZ_NR_ACTIVE_ROUTER_CAPACITY = 8192,
-    YZ_NR_ACTIVE_RING_CAPACITY = 16,
-    YZ_NR_ACTIVE_SIDE_CAPACITY = 64,
+    YZ_NR_ACTIVE_RING_CAPACITY = 128,
+    YZ_NR_ACTIVE_SIDE_CAPACITY = 16384,
+    YZ_NR_ACTIVE_GUEST_PAGE_COUNT = 1u << 20,
+};
+
+struct yz_nr_vertical_display {
+    uint32_t location, offset, width, height;
+    uint32_t valid;
 };
 
 struct yz_nr_vertical_active_state {
@@ -185,8 +204,15 @@ struct yz_nr_vertical_active_state {
     rsx_nr_ring ring;
     rsx_nr_tokens tokens;
     rsx_nr_backend backend;
+    rsx_nir_adapter adapter;
+    rsx_nr_d3d12* d3d12;
+    rsx_nr_exec_ops gpu_ops;
     rsx_nr_slot slots[YZ_NR_ACTIVE_RING_CAPACITY];
     uint32_t side[YZ_NR_ACTIVE_SIDE_CAPACITY];
+    yz_nr_vertical_display displays[8];
+    volatile LONG graphics_ready;
+    volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
+    volatile LONG* guest_page_route;
     unsigned long long owned[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long fallback[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long executed[YZ_NR_VERT_FAMILY_COUNT];
@@ -199,6 +225,7 @@ struct yz_nr_vertical_active_state {
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
+    uint32_t pending_expected;
     uint32_t pending_valid;
     uint32_t last_miss_ea;
     uint32_t last_miss_epoch;
@@ -209,6 +236,7 @@ static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value);
 extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause);
 extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id);
+extern "C" void yz_nr_vertical_exec_present_complete(uint32_t buffer_id);
 extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
                                         uint32_t* value);
 
@@ -228,13 +256,180 @@ static int yz_nr_exec_present(void*, uint32_t buffer_id)
     return 0;
 }
 
+static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
+                             uint32_t width, uint32_t height,
+                             uint32_t buffer_id)
+{
+    const int result = rsx_live_draw_present_external(
+        texture, format, width, height, buffer_id);
+    if (!result)
+        yz_nr_vertical_exec_present_complete(buffer_id);
+    return result;
+}
+
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
                                uint32_t* value)
 {
     return yz_nr_vertical_sem_read(dma, offset, value);
 }
 
-static int yz_nr_active_init(void)
+static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
+                                           uint32_t offset,
+                                           uint32_t min_bytes)
+{
+    return yz_nr_vertical_guest_ptr(space, offset, min_bytes);
+}
+
+static uint8_t* yz_nr_d3d_guest_writable_ptr(void*, uint32_t space,
+                                              uint32_t offset,
+                                              uint32_t min_bytes)
+{
+    return yz_nr_vertical_guest_writable_ptr(space, offset, min_bytes);
+}
+
+static int yz_nr_d3d_watch_page(void*, uint32_t space, uint32_t page_offset)
+{
+    if (!g_active.guest_page_route || space > 1u ||
+        (page_offset & 0xFFFu))
+        return -1;
+    uint32_t ea = 0;
+    if (yz_nr_vertical_space_page_to_ea(space, page_offset, &ea) != 0 ||
+        (ea & 0xFFFu))
+        return -1;
+    const uint32_t ea_page = ea >> 12;
+    const LONG encoded = (LONG)(((space + 1u) << 28) |
+                                (page_offset >> 12));
+    const LONG prior = InterlockedCompareExchange(
+        &g_active.guest_page_route[ea_page], encoded, 0);
+    if (prior && prior != encoded)
+        return -1; /* one EA page aliased by two RSX offsets: stay legacy */
+    InterlockedOr64(
+        reinterpret_cast<volatile LONG64*>(
+            const_cast<uint64_t*>(&g_native_spurs_watch_page_bits[
+                ea_page >> 6])),
+        static_cast<LONG64>(1ull << (ea_page & 63u)));
+    return 0;
+}
+
+static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
+                           const rsx_nir_clear* clear)
+{
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+        rsx_live_draw_flush();
+    const int result = g_active.gpu_ops.clear
+        ? g_active.gpu_ops.clear(g_active.gpu_ops.user, st, clear) : -1;
+    if (result)
+        InterlockedExchange(&g_active.renderer_owner, 0);
+    return result;
+}
+
+static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
+                          const uint32_t* vp, uint32_t vp_words,
+                          const rsx_nir_draw* draw, const uint32_t* batches)
+{
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+        rsx_live_draw_flush();
+    const int result = g_active.gpu_ops.draw
+        ? g_active.gpu_ops.draw(g_active.gpu_ops.user, st, vp, vp_words,
+                                draw, batches) : -1;
+    if (result)
+        InterlockedExchange(&g_active.renderer_owner, 0);
+    return result;
+}
+
+static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
+                              const rsx_nir_transfer* transfer,
+                              const uint32_t* words)
+{
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+        rsx_live_draw_flush();
+    const int result = g_active.gpu_ops.transfer
+        ? g_active.gpu_ops.transfer(g_active.gpu_ops.user, st, transfer,
+                                    words) : -1;
+    if (result)
+        InterlockedExchange(&g_active.renderer_owner, 0);
+    return result;
+}
+
+static int yz_nr_gpu_present(void*, uint32_t buffer)
+{
+    return g_active.gpu_ops.present
+        ? g_active.gpu_ops.present(g_active.gpu_ops.user, buffer) : -1;
+}
+
+static void yz_nr_gpu_flush(void*)
+{
+    if (g_active.gpu_ops.flush)
+        g_active.gpu_ops.flush(g_active.gpu_ops.user);
+}
+
+static int yz_nr_borrow_color(void*, uint32_t space, uint32_t offset,
+                              uint32_t width, uint32_t height,
+                              void** resource, uint32_t* format)
+{
+    return rsx_live_draw_borrow_color(
+        space, offset, width, height, resource, format);
+}
+
+static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
+                              uint32_t depth_format, uint32_t width,
+                              uint32_t height, void** resource,
+                              uint32_t* resource_format,
+                              uint32_t* dsv_format, uint32_t* srv_format)
+{
+    return rsx_live_draw_borrow_depth(
+        space, offset, depth_format, width, height, resource,
+        resource_format, dsv_format, srv_format);
+}
+
+static void yz_nr_active_ensure_graphics(void)
+{
+    if (!InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0) ||
+        InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return;
+    void* const device = rsx_live_draw_get_d3d12_device();
+    if (!device)
+        return;
+    rsx_nr_d3d12* const d3d12 = rsx_nr_d3d12_create(
+        device, YZ_GCM_LOCAL_SIZE, 0x10000000u,
+        yz_nr_d3d_guest_ptr, yz_nr_d3d_guest_writable_ptr, nullptr);
+    if (!d3d12)
+        return;
+    if (rsx_nr_d3d12_set_live_output(
+            d3d12, 1, yz_nr_d3d_present, nullptr) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        return;
+    }
+    rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
+    rsx_nr_d3d12_set_resource_broker(
+        d3d12, yz_nr_borrow_color, yz_nr_borrow_depth, nullptr);
+    for (uint32_t i = 0; i < 8u; ++i) {
+        const yz_nr_vertical_display* const display = &g_active.displays[i];
+        if (display->valid)
+            rsx_nr_d3d12_set_display_buffer(
+                d3d12, i, display->location, display->offset,
+                display->width, display->height);
+    }
+
+    memset(&g_active.gpu_ops, 0, sizeof(g_active.gpu_ops));
+    rsx_nr_d3d12_get_exec_ops(d3d12, &g_active.gpu_ops);
+    rsx_nr_exec_ops combined = {};
+    combined.clear = yz_nr_gpu_clear;
+    combined.draw = yz_nr_gpu_draw;
+    combined.transfer = yz_nr_gpu_transfer;
+    combined.present = yz_nr_gpu_present;
+    combined.flush = yz_nr_gpu_flush;
+    combined.set_reference = yz_nr_exec_reference;
+    combined.user_command = yz_nr_exec_user;
+    combined.sem_read = yz_nr_exec_sem_read;
+    g_active.backend.ops = combined;
+    g_active.d3d12 = d3d12;
+    MemoryBarrier();
+    InterlockedExchange(&g_active.graphics_ready, 1);
+}
+
+static int yz_nr_active_init(int graphics)
 {
     if (rsx_nr_span_router_init(&g_active.router,
                                 YZ_NR_ACTIVE_ROUTER_CAPACITY) != 0)
@@ -248,6 +443,18 @@ static int yz_nr_active_init(void)
                                YZ_NR_ACTIVE_SIDE_CAPACITY) != 0) {
         rsx_nr_span_router_destroy(&g_active.router);
         return 0;
+    }
+    const rsx_nir_sink sink = rsx_nr_ring_sink(&g_active.ring);
+    rsx_nir_adapter_init_sink(&g_active.adapter, &sink);
+    g_active.adapter.shadow_mode = 1;
+    if (graphics) {
+        g_active.guest_page_route = (volatile LONG*)calloc(
+            YZ_NR_ACTIVE_GUEST_PAGE_COUNT, sizeof(LONG));
+        if (!g_active.guest_page_route) {
+            rsx_nr_ring_destroy(&g_active.ring);
+            rsx_nr_span_router_destroy(&g_active.router);
+            return 0;
+        }
     }
     rsx_nr_exec_ops ops = {};
     ops.set_reference = yz_nr_exec_reference;
@@ -372,6 +579,87 @@ static int yz_nr_active_publish_flip(uint32_t context,
     MemoryBarrier();
     vm_write32((uint64_t)context + 8u, current + bytes);
     g_active.owned[YZ_NR_VERT_FLIP]++;
+    ReleaseSRWLockExclusive(&g_active.producer_lock);
+    return 1;
+}
+
+static int yz_nr_active_publish_draw_arrays(ppu_context* ctx)
+{
+    if (!InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0) ||
+        !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return 0;
+    const uint32_t context = static_cast<uint32_t>(ctx->gpr[3]);
+    if (context != YZ_GCM_CTX_ADDR) {
+        g_active.wrong_context++;
+        g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS]++;
+        return 0;
+    }
+    rsx_nr_draw_arrays_contract draw = {};
+    if (!rsx_nr_draw_arrays_contract_init(
+            &draw, static_cast<uint32_t>(ctx->gpr[4]),
+            static_cast<uint32_t>(ctx->gpr[5]),
+            static_cast<uint32_t>(ctx->gpr[6])) ||
+        draw.batch_count > RSX_NR_SPAN_MAX_SIDE / 2u ||
+        draw.packet_word_count > 64u) {
+        g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS]++;
+        return 0;
+    }
+
+    uint32_t packet[64] = {};
+    if (rsx_nr_draw_arrays_packet(&draw, packet, 64u) !=
+        draw.packet_word_count) {
+        g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS]++;
+        return 0;
+    }
+
+    AcquireSRWLockExclusive(&g_active.producer_lock);
+    const uint32_t current = vm_read32(static_cast<uint64_t>(context) + 8u);
+    const uint32_t end = vm_read32(static_cast<uint64_t>(context) + 4u);
+    const uint32_t bytes = draw.packet_word_count * 4u;
+    if ((current & 3u) || current > end || bytes > end - current) {
+        g_active.no_room++;
+        g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS]++;
+        ReleaseSRWLockExclusive(&g_active.producer_lock);
+        return 0;
+    }
+
+    rsx_nr_span span = {};
+    span.ea = current;
+    span.word_count = draw.packet_word_count;
+    span.generation = rsx_nr_span_router_generation(&g_active.router);
+    span.flags = RSX_NR_SPAN_RETAINED_FALLBACK;
+    span.payload.op_count = 1u;
+    span.payload.side_count = draw.batch_count * 2u;
+    rsx_nir_op* const op = &span.payload.ops[0];
+    op->kind = RSX_NIR_OP_DRAW;
+    op->u.draw.primitive = draw.primitive;
+    op->u.draw.indexed = 0;
+    op->u.draw.batch_count = draw.batch_count;
+    op->u.draw.total_count = draw.count;
+    const uint32_t first_count = ((draw.count - 1u) & 0xFFu) + 1u;
+    uint32_t cursor = draw.first;
+    span.payload.side[0] = cursor;
+    span.payload.side[1] = first_count;
+    cursor += first_count;
+    for (uint32_t i = 1u; i < draw.batch_count; ++i) {
+        span.payload.side[i * 2u] = cursor;
+        span.payload.side[i * 2u + 1u] = 256u;
+        cursor += 256u;
+    }
+
+    for (uint32_t i = 0; i < draw.packet_word_count; ++i)
+        vm_write32(static_cast<uint64_t>(current) + i * 4u, packet[i]);
+    if (rsx_nr_span_router_publish(&g_active.router, &span) !=
+        RSX_NR_SPAN_PUBLISHED) {
+        g_active.publish_failure++;
+        g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS]++;
+        ReleaseSRWLockExclusive(&g_active.producer_lock);
+        return 0;
+    }
+    MemoryBarrier();
+    vm_write32(static_cast<uint64_t>(context) + 8u, current + bytes);
+    g_active.owned[YZ_NR_VERT_DRAW_ARRAYS]++;
     ReleaseSRWLockExclusive(&g_active.producer_lock);
     return 1;
 }
@@ -1039,8 +1327,10 @@ extern "C" void yz_nr_vertical_init(void)
     if (mode && strcmp(mode, "shadow") == 0)
         InterlockedExchange(&g_vertical.mode_shadow, 1);
     else if (mode && (strcmp(mode, "active-basic") == 0 ||
-                      strcmp(mode, "active-present") == 0)) {
-        if (yz_nr_active_init())
+                      strcmp(mode, "active-present") == 0 ||
+                      strcmp(mode, "active-graphics") == 0)) {
+        const int graphics = strcmp(mode, "active-graphics") == 0;
+        if (yz_nr_active_init(graphics))
             InterlockedExchange(&g_vertical.mode_active_basic, 1);
         else {
             fprintf(stderr,
@@ -1048,8 +1338,65 @@ extern "C" void yz_nr_vertical_init(void)
             fflush(stderr);
         }
         if (InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0) &&
-            strcmp(mode, "active-present") == 0)
+            (strcmp(mode, "active-present") == 0 || graphics))
             InterlockedExchange(&g_vertical.mode_active_present, 1);
+        if (InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0) &&
+            graphics) {
+            InterlockedExchange(&g_vertical.mode_active_graphics, 1);
+            cellSpursSetGuestWriteObserver(yz_nr_vertical_notify_guest_write);
+        }
+    }
+}
+
+extern "C" void yz_nr_vertical_set_display_buffer(
+    uint32_t buffer_id, uint32_t location, uint32_t offset,
+    uint32_t width, uint32_t height)
+{
+    if (buffer_id >= 8u)
+        return;
+    yz_nr_vertical_display* const display = &g_active.displays[buffer_id];
+    display->location = location;
+    display->offset = offset;
+    display->width = width;
+    display->height = height;
+    display->valid = 1;
+    if (InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) &&
+        g_active.d3d12)
+        rsx_nr_d3d12_set_display_buffer(
+            g_active.d3d12, buffer_id, location, offset, width, height);
+}
+
+extern "C" void yz_nr_vertical_notify_guest_write(uint32_t ea,
+                                                    uint32_t size)
+{
+    if (!size || !g_active.guest_page_route ||
+        !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
+        !g_active.d3d12)
+        return;
+    const uint64_t end64 = static_cast<uint64_t>(ea) + size;
+    if (end64 > 0x100000000ull)
+        return;
+    const uint32_t last = static_cast<uint32_t>(end64 - 1u);
+    uint32_t page = ea >> 12;
+    const uint32_t last_page = last >> 12;
+    for (;;) {
+        const LONG encoded = InterlockedCompareExchange(
+            &g_active.guest_page_route[page], 0, 0);
+        if (encoded) {
+            const uint32_t space = (static_cast<uint32_t>(encoded) >> 28) - 1u;
+            const uint32_t rsx_page =
+                (static_cast<uint32_t>(encoded) & 0x0FFFFFFFu) << 12;
+            const uint32_t guest_page = page << 12;
+            const uint32_t begin = ea > guest_page ? ea : guest_page;
+            const uint32_t page_last = guest_page | 0xFFFu;
+            const uint32_t finish = last < page_last ? last : page_last;
+            rsx_nr_d3d12_note_guest_write(
+                g_active.d3d12, space, rsx_page + (begin - guest_page),
+                finish - begin + 1u);
+        }
+        if (page == last_page)
+            break;
+        ++page;
     }
 }
 
@@ -1075,6 +1422,15 @@ extern "C" int yz_nr_vertical_try_flip(uint32_t context,
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                                 uint32_t packet_ea)
 {
+    if (InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0))
+        rsx_nir_adapter_method(&g_active.adapter, method, arg);
+    if (InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0) &&
+        ((method == 0x1808u && arg == 0u) || method == 0x1D94u ||
+         method == 0x2328u || method == 0xC40Cu ||
+         (method >= 0xA400u && method <= 0xAAFCu)))
+        InterlockedExchange(&g_active.renderer_owner, 0);
     if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
         return;
 
@@ -1420,6 +1776,7 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
         *word_count = 0;
     if (!InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0))
         return YZ_NR_VERTICAL_CONSUME_MISS;
+    yz_nr_active_ensure_graphics();
 
     /* A retained claim owns GET until every typed op has completed. In
      * particular, an unsatisfied semaphore remains at the ring head; retries
@@ -1430,7 +1787,7 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
             return YZ_NR_VERTICAL_CONSUME_FATAL;
         }
         while (g_active.pending_executed <
-               g_active.pending_span.payload.op_count) {
+               g_active.pending_expected) {
             const unsigned long long errors_before =
                 g_active.backend.stats.exec_errors;
             const rsx_nr_step_result step =
@@ -1466,6 +1823,7 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
                 }
                 g_active.pending_valid = 0;
                 g_active.pending_executed = 0;
+                g_active.pending_expected = 0;
                 memset(&g_active.pending_span, 0,
                        sizeof(g_active.pending_span));
                 memset(&g_active.pending_claim, 0,
@@ -1481,7 +1839,7 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
             return YZ_NR_VERTICAL_CONSUME_WAIT;
         }
         if (g_active.pending_executed !=
-                g_active.pending_span.payload.op_count ||
+                g_active.pending_expected ||
             rsx_nr_span_router_retire(&g_active.router,
                                       &g_active.pending_claim) != 0) {
             g_active.fatal++;
@@ -1498,11 +1856,14 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
                 g_active.executed[YZ_NR_VERT_USER]++;
             else if (kind == RSX_NIR_OP_PRESENT)
                 g_active.executed[YZ_NR_VERT_FLIP]++;
+            else if (kind == RSX_NIR_OP_DRAW)
+                g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
         }
         if (word_count)
             *word_count = g_active.pending_span.word_count;
         g_active.pending_valid = 0;
         g_active.pending_executed = 0;
+        g_active.pending_expected = 0;
         memset(&g_active.pending_span, 0, sizeof(g_active.pending_span));
         memset(&g_active.pending_claim, 0, sizeof(g_active.pending_claim));
         g_active.last_miss_ea = ~0u;
@@ -1531,23 +1892,55 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
         g_active.wait++;
         return YZ_NR_VERTICAL_CONSUME_WAIT;
     }
-    if (take != RSX_NR_SPAN_TAKE_CLAIMED ||
-        span.payload.side_count != 0 ||
-        !rsx_nr_ring_can_accept(&g_active.ring,
-                                span.payload.op_count, 0)) {
+    if (take != RSX_NR_SPAN_TAKE_CLAIMED) {
         g_active.fatal++;
         return YZ_NR_VERTICAL_CONSUME_FATAL;
     }
 
-    for (uint32_t i = 0; i < span.payload.op_count; ++i) {
-        if (rsx_nr_ring_push(&g_active.ring, &span.payload.ops[i]) != 0) {
+    const int typed_draw = span.payload.op_count == 1u &&
+        span.payload.ops[0].kind == RSX_NIR_OP_DRAW;
+    if (typed_draw) {
+        const rsx_nir_draw* const draw = &span.payload.ops[0].u.draw;
+        if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
+            !draw->batch_count ||
+            span.payload.side_count != draw->batch_count * 2u ||
+            !rsx_nr_ring_can_accept(&g_active.ring, 64u, 8192u)) {
             g_active.fatal++;
             return YZ_NR_VERTICAL_CONSUME_FATAL;
         }
+        rsx_nr_ring_clear_reject(&g_active.ring);
+        rsx_nir_adapter_stage_state(&g_active.adapter);
+        rsx_nir_em_draw(&g_active.adapter.em, draw->primitive,
+                        draw->indexed, span.payload.side,
+                        draw->batch_count);
+        if (rsx_nr_ring_reject_sticky(&g_active.ring)) {
+            g_active.fatal++;
+            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        }
+    } else {
+        if (span.payload.side_count != 0 ||
+            !rsx_nr_ring_can_accept(&g_active.ring,
+                                    span.payload.op_count, 0)) {
+            g_active.fatal++;
+            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        }
+        for (uint32_t i = 0; i < span.payload.op_count; ++i) {
+            if (rsx_nr_ring_push(&g_active.ring,
+                                 &span.payload.ops[i]) != 0) {
+                g_active.fatal++;
+                return YZ_NR_VERTICAL_CONSUME_FATAL;
+            }
+        }
+    }
+    const uint32_t expected = rsx_nr_ring_depth(&g_active.ring);
+    if (!expected) {
+        g_active.fatal++;
+        return YZ_NR_VERTICAL_CONSUME_FATAL;
     }
     g_active.pending_span = span;
     g_active.pending_claim = claim;
     g_active.pending_executed = 0;
+    g_active.pending_expected = expected;
     g_active.pending_valid = 1;
     return yz_nr_vertical_consume(packet_ea, word_count);
 }
@@ -1556,12 +1949,16 @@ extern "C" void yz_nr_vertical_shutdown(void)
 {
     if (InterlockedExchange(&g_vertical.mode_active_basic, 0)) {
         InterlockedExchange(&g_vertical.mode_active_present, 0);
+        InterlockedExchange(&g_vertical.mode_active_graphics, 0);
+        cellSpursSetGuestWriteObserver(nullptr);
+        InterlockedExchange(&g_active.graphics_ready, 0);
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
                 "[nr-vertical-active "
-                "ref=%llu/%llu user=%llu/%llu flip=%llu/%llu "
-                "fallback-ref=%llu fallback-user=%llu fallback-flip=%llu "
+                "ref=%llu/%llu user=%llu/%llu draw=%llu/%llu "
+                "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
+                "fallback-draw=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
@@ -1569,10 +1966,13 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],
                 g_active.executed[YZ_NR_VERT_USER],
+                g_active.owned[YZ_NR_VERT_DRAW_ARRAYS],
+                g_active.executed[YZ_NR_VERT_DRAW_ARRAYS],
                 g_active.owned[YZ_NR_VERT_FLIP],
                 g_active.executed[YZ_NR_VERT_FLIP],
                 g_active.fallback[YZ_NR_VERT_REFERENCE],
                 g_active.fallback[YZ_NR_VERT_USER],
+                g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS],
                 g_active.fallback[YZ_NR_VERT_FLIP],
                 g_active.wrong_context, g_active.no_room,
                 g_active.publish_failure, g_active.wait,
@@ -1587,6 +1987,25 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 stats.exact_misses, stats.not_ready, stats.duplicates,
                 stats.busy, stats.full, stats.corrupt);
         fflush(stderr);
+        if (g_active.d3d12) {
+            rsx_nr_d3d12_stats d3d_stats = {};
+            rsx_nr_d3d12_get_stats(g_active.d3d12, &d3d_stats);
+            fprintf(stderr,
+                    "[nr-vertical-d3d draws=%llu batches=%llu clears=%llu "
+                    "presents=%llu fallback=%llu resident=%llu/%llu "
+                    "residency-fail=%llu pso=%llu/%llu]\n",
+                    d3d_stats.draws, d3d_stats.draw_batches,
+                    d3d_stats.clears, d3d_stats.presents,
+                    d3d_stats.unsupported_draws,
+                    d3d_stats.resident_pages[0],
+                    d3d_stats.resident_pages[1],
+                    d3d_stats.residency_failures,
+                    d3d_stats.pso_hits, d3d_stats.pso_builds);
+            rsx_nr_d3d12_destroy(g_active.d3d12);
+            g_active.d3d12 = nullptr;
+        }
+        free(const_cast<LONG*>(g_active.guest_page_route));
+        g_active.guest_page_route = nullptr;
         rsx_nr_ring_destroy(&g_active.ring);
         rsx_nr_span_router_destroy(&g_active.router);
     }
@@ -1963,13 +2382,15 @@ void func_00EBD92C(ppu_context* ctx)
     func_00EBD92C_lifted(ctx);
 }
 
-/* Thin DrawArrays producer: passive mode derives the typed draw directly
- * from the wrapper ABI, while the unchanged lifted body remains the only
- * executor. Active graphics ownership is deliberately not enabled here. */
+/* Thin DrawArrays producer: active graphics publishes a typed action plus a
+ * byte-exact complete fallback packet before advancing the command context.
+ * Any readiness, range, router, or backend refusal leaves the lifted wrapper
+ * as the sole producer. */
 void func_00EBEA48(ppu_context* ctx)
 {
     yz_nr_expected_draw_arrays(ctx);
-    func_00EBEA48_lifted(ctx);
+    if (!yz_nr_active_publish_draw_arrays(ctx))
+        func_00EBEA48_lifted(ctx);
 }
 
 /* Direct (context,value) state setters.  Shadow mode records a typed
