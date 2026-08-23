@@ -55,6 +55,12 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long unsupported_clears;
     unsigned long long unsupported_transfers;
     unsigned long long real_fp_draws;        /* real guest FP executed     */
+    unsigned long long texture_draws;        /* real sampled draws         */
+    unsigned long long texture_builds;       /* persistent guest uploads   */
+    unsigned long long texture_hits;         /* unchanged cached resources */
+    unsigned long long texture_refreshes;    /* dirty guest resource rebuilt */
+    unsigned long long texture_failures;     /* exact texture refusal      */
+    unsigned long long rt_alias_binds;       /* current native RT sampled  */
     unsigned long long compile_failures;
     unsigned long long rt_builds;
 } rsx_nr_d3d12_stats;

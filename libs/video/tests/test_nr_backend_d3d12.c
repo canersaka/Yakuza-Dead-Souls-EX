@@ -47,6 +47,7 @@ static int g_failures;
 #define VTX_OFFSET 0x2000u
 #define IDX_OFFSET 0x4000u
 #define FP_OFFSET  0x6000u
+#define TEX_OFFSET 0x8000u
 
 static u8 g_local[LOCAL_SIZE];
 static u8 g_main[MAIN_SIZE];
@@ -110,6 +111,52 @@ static void write_const_fp(float r, float g, float b, float a)
     put_fp_word(p + 20, fbits(g));
     put_fp_word(p + 24, fbits(b));
     put_fp_word(p + 28, fbits(a));
+}
+
+static void write_tex_fp(void)
+{
+    /* TEX r0, TC0, unit 0; END.  The passthrough test VS emits TC0=(0,0),
+     * and the texture is deliberately solid so interpolation is irrelevant. */
+    u8* p = g_local + FP_OFFSET;
+    put_fp_word(p + 0, (0x17u << 24) | (0xFu << 9) |
+                         (0x4u << 13) | 1u);
+    put_fp_word(p + 4, 1u | ((0u << 9) | (1u << 11) |
+                             (2u << 13) | (3u << 15)) |
+                              (7u << 18));
+    put_fp_word(p + 8, 0);
+    put_fp_word(p + 12, 0);
+}
+
+static void write_solid_texture(rsx_guest_pages* pages,
+                                u8 r, u8 g, u8 b, u8 a)
+{
+    u8* p = g_local + TEX_OFFSET;
+    for (u32 i = 0; i < 4; i++) {
+        p[i * 4 + 0] = a;            /* RSX A8R8G8B8 guest order          */
+        p[i * 4 + 1] = r;
+        p[i * 4 + 2] = g;
+        p[i * 4 + 3] = b;
+    }
+    rsx_guest_pages_note_write(pages, 0, TEX_OFFSET, 16);
+}
+
+static void stage_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = TEX_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xA5u;          /* LINEAR | A8R8G8B8                */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = 2;
+    texture.height = 2;
+    texture.pitch = 8;
+    texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
 }
 
 static u32 fbits(float f)
@@ -409,7 +456,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              "clears=%llu draws=%llu (restart=%llu) batches=%llu "
              "presents=%llu xfers=%llu pso=%llu(+%lluh) unsup_draw=%llu "
              "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu fp=%llu "
-             "tex=%llu] real_fp=%llu "
+             "tex=%llu] real_fp=%llu tex_draw=%llu "
+             "tex_cache=%llu(+%lluh,%llur) tex_fail=%llu alias=%llu "
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
              "exec_err=%llu",
              st.clears, st.draws, st.restart_draws, st.draw_batches,
@@ -417,6 +465,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
              st.unsup_draw_plan, st.unsup_draw_pso, st.unsup_draw_index,
              st.unsup_draw_fp, st.unsup_draw_texture, st.real_fp_draws,
+             st.texture_draws, st.texture_builds, st.texture_hits,
+             st.texture_refreshes, st.texture_failures, st.rt_alias_binds,
              st.unsupported_clears, st.unsupported_transfers,
              st.compile_failures, be.stats.exec_errors);
 
@@ -605,6 +655,58 @@ int main(int argc, char** argv)
           before_constant_change.pso_builds, after_constant_change.pso_builds,
           before_constant_change.pso_hits, after_constant_change.pso_hits);
 
+    /* ---- real texture + exact dirty-page refresh ----------------------
+     * Execute an actual TEX instruction through a dynamic SRV/sampler.
+     * Rewriting the same guest range must rebuild the persistent GPU
+     * resource while retaining the structurally identical PSO. */
+    write_tex_fp();
+    write_solid_texture(rsx_nr_d3d12_pages(sink), 0, 255, 0, 255);
+    stage_frame_state(&em);
+    stage_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "green texture exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "green texture pixel");
+    rsx_nr_d3d12_stats before_texture_change;
+    rsx_nr_d3d12_get_stats(sink, &before_texture_change);
+
+    write_solid_texture(rsx_nr_d3d12_pages(sink), 255, 0, 0, 255);
+    stage_frame_state(&em);
+    stage_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "red texture exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0x00, 0xFF), "red texture pixel");
+    rsx_nr_d3d12_stats after_texture_change;
+    rsx_nr_d3d12_get_stats(sink, &after_texture_change);
+    CHECK(after_texture_change.texture_builds ==
+              before_texture_change.texture_builds &&
+          after_texture_change.texture_refreshes ==
+              before_texture_change.texture_refreshes + 1,
+          "texture refresh builds=%llu/%llu refresh=%llu/%llu",
+          before_texture_change.texture_builds,
+          after_texture_change.texture_builds,
+          before_texture_change.texture_refreshes,
+          after_texture_change.texture_refreshes);
+    CHECK(after_texture_change.pso_builds ==
+              before_texture_change.pso_builds &&
+          after_texture_change.pso_hits > before_texture_change.pso_hits,
+          "texture data change rebuilt PSO builds=%llu/%llu hits=%llu/%llu",
+          before_texture_change.pso_builds, after_texture_change.pso_builds,
+          before_texture_change.pso_hits, after_texture_change.pso_hits);
+
+    write_test_fp();
+
     /* ---- scissored clear ------------------------------------------------
      * CLEAR_SURFACE clears only within the scissor box
      * (cellGcmSetClearSurface). Blue full clear, then a green clear
@@ -647,7 +749,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 7 && st.draws == 5 && st.presents == 7,
+    CHECK(st.clears == 9 && st.draws == 7 && st.presents == 9,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
@@ -658,6 +760,11 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
+    CHECK(st.texture_draws == 2 && st.texture_builds == 1 &&
+              st.texture_refreshes == 1 && st.texture_failures == 0,
+          "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
+          st.texture_draws, st.texture_builds, st.texture_refreshes,
+          st.texture_failures);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
