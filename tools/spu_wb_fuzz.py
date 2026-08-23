@@ -73,7 +73,11 @@ DATA_MNEMONICS = {
     "fceq", "fcgt", "fcmeq", "fcmgt", "frest", "frsqest",
     "fesd", "frds", "cflts", "cfltu", "csflt", "cuflt",
     "dfa", "dfs", "dfm", "dfma", "dfms", "dfnms", "dfnma",
-    "dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv",
+    "dfceq", "dfcmeq", "dfcgt", "dfcmgt",
+    # dftsv EXCLUDED: its RI7 field decodes through an RR-priority path as a
+    # "$rN" token that the DIAG reference lifter emits verbatim (invalid C),
+    # so the per-instruction reference cannot express it. The WB lifter
+    # handles it (raw-field strip; see spu_wb_lifter VECI token handling).
     "lqd", "stqd", "lqa", "stqa", "lqx", "stqx", "lqr", "stqr",
     "xsbh", "eqv", "nop", "lnop",
     "hgt", "hlgt", "heq", "hgti", "hlgti", "heqi",

@@ -79,12 +79,19 @@ static inline __m128i wb_pref_set(uint32_t v) { return _mm_cvtsi32_si128((int)v)
 
 /* LS access through the canonical helpers (keeps the tagread-repair hook and
  * env-gated witnesses; WB TUs define YZ_SPU_SIMD_LS128=1 so the swap itself
- * is the validated PSHUFB path). */
-static inline __m128i wbk_ls_read(const spu_context* ctx, uint32_t lsa)
+ * is the validated PSHUFB path). Force-inlined: MSVC's heuristics outline
+ * them at hundreds of call sites (MEASURED by the asm audit), and a call per
+ * LS access defeats the point. */
+#if defined(_MSC_VER)
+#define SPU_WB_FORCEINLINE __forceinline
+#else
+#define SPU_WB_FORCEINLINE __attribute__((always_inline)) inline
+#endif
+static SPU_WB_FORCEINLINE __m128i wbk_ls_read(const spu_context* ctx, uint32_t lsa)
 {
     return wb_from_u128(spu_ls_read128(ctx, lsa));
 }
-static inline void wbk_ls_write(spu_context* ctx, uint32_t lsa, __m128i v)
+static SPU_WB_FORCEINLINE void wbk_ls_write(spu_context* ctx, uint32_t lsa, __m128i v)
 {
     spu_ls_write128(ctx, lsa, wb_to_u128(v));
 }
