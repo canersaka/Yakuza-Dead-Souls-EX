@@ -35,9 +35,18 @@ typedef struct rsx_nr_span {
     u32 ea;                    /* exact first guest FIFO byte              */
     u32 word_count;            /* guest span replaced by this payload     */
     u32 generation;            /* command-context/reset generation        */
+    u32 flags;                 /* RSX_NR_SPAN_* ownership guarantees       */
     u32 fingerprint;           /* payload integrity + copied-list guard   */
     rsx_nr_span_payload payload;
 } rsx_nr_span;
+
+/* The producer left a complete byte-exact legacy packet at .ea. If the
+ * native backend refuses the typed action before any externally visible
+ * effect, the consumer may retire this claim without advancing GET and run
+ * that retained packet through the legacy path. This is deliberately an
+ * explicit per-span proof, never an inference from the operation kind. */
+#define RSX_NR_SPAN_RETAINED_FALLBACK 0x00000001u
+#define RSX_NR_SPAN_KNOWN_FLAGS       RSX_NR_SPAN_RETAINED_FALLBACK
 
 typedef enum rsx_nr_span_publish_result {
     RSX_NR_SPAN_PUBLISHED = 0,
@@ -128,8 +137,8 @@ int rsx_nr_span_router_retire(rsx_nr_span_router* r,
 rsx_nr_span_take_result
 rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out);
 
-/* Deterministic fingerprint over address/length/generation and the used
- * typed ops/side words.  Exposed for producer templates and tests. */
+/* Deterministic fingerprint over address/length/generation/flags and the
+ * used typed ops/side words. Exposed for producer templates and tests. */
 u32 rsx_nr_span_fingerprint(const rsx_nr_span* span);
 
 void rsx_nr_span_router_get_stats(const rsx_nr_span_router* r,

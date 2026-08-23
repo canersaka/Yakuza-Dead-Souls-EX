@@ -44,6 +44,9 @@ typedef enum yz_nr_vertical_consume_result {
     YZ_NR_VERTICAL_CONSUME_MISS = 0,
     YZ_NR_VERTICAL_CONSUME_EXECUTED,
     YZ_NR_VERTICAL_CONSUME_WAIT,
+    /* Native execution refused atomically; decode the retained packet at
+     * the same GET through the legacy path. word_count remains zero. */
+    YZ_NR_VERTICAL_CONSUME_FALLBACK,
     YZ_NR_VERTICAL_CONSUME_FATAL,
 } yz_nr_vertical_consume_result;
 

@@ -6527,6 +6527,10 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
     }
     if (native_result == YZ_NR_VERTICAL_CONSUME_WAIT)
         return finish(YZ_RSX_WAIT_UNFINALIZED_HOLE);
+    if (native_result == YZ_NR_VERTICAL_CONSUME_FALLBACK) {
+        /* Native execution refused atomically. GET is deliberately unchanged;
+         * continue below and decode the retained complete packet once. */
+    }
     if (native_result == YZ_NR_VERTICAL_CONSUME_FATAL) {
         static int reported = 0;
         if (!reported++) {
