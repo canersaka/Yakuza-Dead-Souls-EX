@@ -123,6 +123,60 @@ int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
     return 1;
 }
 
+u32 rsx_nr_vertex_program_hash_begin(u32 start_slot)
+{
+    return draw_hash_word(2166136261u, start_slot);
+}
+
+u32 rsx_nr_vertex_program_hash_word(u32 hash, u32 word)
+{
+    return draw_hash_word(hash, word);
+}
+
+u32 rsx_nr_vertex_program_hash_end(u32 hash, u32 word_count,
+                                   u32 attrib_input_mask)
+{
+    hash = draw_hash_word(hash, word_count);
+    return draw_hash_word(hash, attrib_input_mask);
+}
+
+int rsx_nr_vertex_program_contract_init(
+    rsx_nr_vertex_program_contract* out, u32 instruction_count,
+    u32 start_slot, u32 attrib_input_mask, const u32* words)
+{
+    if (!out || !words || !instruction_count ||
+        instruction_count > RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u ||
+        start_slot >= RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u ||
+        instruction_count >
+            RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u - start_slot)
+        return 0;
+
+    const u32 word_count = instruction_count * 4u;
+    u32 hash = rsx_nr_vertex_program_hash_begin(start_slot);
+    for (u32 i = 0; i < word_count; ++i)
+        hash = rsx_nr_vertex_program_hash_word(hash, words[i]);
+    const u32 code_hash = hash;
+    hash = rsx_nr_vertex_program_hash_end(hash, word_count,
+                                          attrib_input_mask);
+
+    const u32 full_groups = instruction_count >> 3;
+    const u32 remainder_words = (instruction_count & 7u) * 4u;
+    const u32 upload_words = full_groups * 33u +
+        (remainder_words ? 1u + remainder_words : 0u);
+
+    memset(out, 0, sizeof(*out));
+    out->start_slot = start_slot;
+    out->instruction_count = instruction_count;
+    out->word_count = word_count;
+    out->attrib_input_mask = attrib_input_mask;
+    out->code_hash = code_hash;
+    out->semantic_hash = hash;
+    /* Three LOAD+START words, upload packets, ATTRIB_EN, then the always
+     * emitted 1EF8 program-limit packet. */
+    out->packet_word_count = 3u + upload_words + 2u + 2u;
+    return 1;
+}
+
 int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
                               int wait_for_label, u32 label_index,
                               u32 label_value)

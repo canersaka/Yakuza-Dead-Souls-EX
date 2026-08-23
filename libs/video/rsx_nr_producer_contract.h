@@ -57,6 +57,36 @@ u32 rsx_nr_draw_hash_batch(u32 hash, u32 first, u32 count);
 int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
                                      u32 primitive, u32 first, u32 count);
 
+/* func_00EBD92C is the real ABI entry for the title's transform-program
+ * producer (00EBD968 is only its post-prologue continuation).  The wrapper
+ * emits LOAD+START, the complete instruction image, and ATTRIB_EN before any
+ * program-associated constant metadata.  This compact semantic contract is
+ * intentionally independent of the legacy packet encoding. */
+#define RSX_NR_VERTEX_PROGRAM_FUNCTION 0x00EBD92Cu
+/* The NV4097 transform store has 544 instruction slots, four words each
+ * (the same limit as RSX_DSP_VP_INSTR). */
+#define RSX_NR_VERTEX_PROGRAM_MAX_WORDS (544u * 4u)
+
+typedef struct rsx_nr_vertex_program_contract {
+    u32 start_slot;
+    u32 instruction_count;
+    u32 word_count;
+    u32 attrib_input_mask;
+    u32 code_hash;      /* start slot + instruction words only */
+    u32 semantic_hash;
+    u32 packet_word_count; /* through ATTRIB_EN + the 1EF8 metadata word */
+} rsx_nr_vertex_program_contract;
+
+u32 rsx_nr_vertex_program_hash_begin(u32 start_slot);
+u32 rsx_nr_vertex_program_hash_word(u32 hash, u32 word);
+u32 rsx_nr_vertex_program_hash_end(u32 hash, u32 word_count,
+                                   u32 attrib_input_mask);
+
+/* words contains instruction_count * 4 host-order guest words. */
+int rsx_nr_vertex_program_contract_init(
+    rsx_nr_vertex_program_contract* out, u32 instruction_count,
+    u32 start_slot, u32 attrib_input_mask, const u32* words);
+
 /* Native-GCM's imported flip wrapper is a fixed queue+flip template.  The
  * wait-label variant prefixes the same template with one NV406E acquire.
  * Keeping the byte-exact words in this audited contract lets an exact-EA

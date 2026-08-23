@@ -138,6 +138,48 @@ def prompt_blue_pixels(width: int, height: int, pixels: bytes):
     return count
 
 
+def gun_hud_mask(width: int, height: int, pixels: bytes):
+    """Fixed-screen pale-glyph mask for the post-Frontier gun HUD.
+
+    Full-frame colour distance is deliberately insufficient here: bright city
+    dialogue frames can be closer to the archived gun scene than a different
+    camera angle inside the gun tutorial.  The health/ammo panel and KILLS
+    counter occupy invariant screen-space rectangles, so their glyph overlap
+    is a much stronger semantic gate and is independent of world geometry.
+    """
+    mask = []
+    boxes_1280x720 = (
+        (40, 35, 390, 145),
+        (960, 115, 1240, 215),
+    )
+    for left, top, right, bottom in boxes_1280x720:
+        x0 = left * width // 1280
+        x1 = right * width // 1280
+        y0 = top * height // 720
+        y1 = bottom * height // 720
+        step_x = max(1, width // 640)
+        step_y = max(1, height // 360)
+        for y in range(y0, y1, step_y):
+            row = y * width * 3
+            for x in range(x0, x1, step_x):
+                offset = row + x * 3
+                r, g, b = pixels[offset : offset + 3]
+                maximum = max(r, g, b)
+                minimum = min(r, g, b)
+                mask.append(1 if maximum > 160 and maximum - minimum < 65 else 0)
+    return mask
+
+
+def gun_hud_iou(reference, candidate):
+    mask_a = reference["gun_hud"]
+    mask_b = candidate["gun_hud"]
+    if len(mask_a) != len(mask_b):
+        return 0.0
+    intersection = sum(a and b for a, b in zip(mask_a, mask_b))
+    union = sum(a or b for a, b in zip(mask_a, mask_b))
+    return intersection / union if union else 0.0
+
+
 def scene_features(path: Path):
     width, height, pixels = read_ppm(path)
     return {
@@ -146,6 +188,7 @@ def scene_features(path: Path):
         "rgb": sample_rgb(width, height, pixels),
         "dialogue": dialogue_mask(width, height, pixels),
         "prompt_blue_pixels": prompt_blue_pixels(width, height, pixels),
+        "gun_hud": gun_hud_mask(width, height, pixels),
     }
 
 
@@ -542,11 +585,28 @@ def self_test(root: Path, reference_path: Path):
     ]
     stable = scene_features(gun_dir / "frontier_probe_028.ppm")
     best = min(coarse_scene_mae(reference, stable) for reference in gun_refs)
+    best_hud = max(gun_hud_iou(reference, stable) for reference in gun_refs)
     if best > 0.22:
         raise AssertionError(f"archived gun reference mismatch: {best}")
+    if best_hud < 0.20:
+        raise AssertionError(f"archived gun HUD mismatch: {best_hud}")
+    hana_path = (
+        root / "scratch" / "native-vertical-shadow-vp-gun-20260822-f-capture"
+        / "frontier_probe_028.ppm"
+    )
+    hana_hud = None
+    if hana_path.is_file():
+        hana = scene_features(hana_path)
+        hana_hud = max(gun_hud_iou(reference, hana) for reference in gun_refs)
+        if hana_hud >= 0.20:
+            raise AssertionError(
+                f"Hana dialogue falsely recognized as gun HUD: {hana_hud}"
+            )
     print(
         "[akiyama-harness-test] PASS: archived leg-3 gun tutorial frame "
-        f"recognized (best coarse MAE {best:.6f})"
+        f"recognized (best coarse MAE {best:.6f}, HUD IoU {best_hud:.6f})" +
+        (f"; Hana dialogue rejected (HUD IoU {hana_hud:.6f})"
+         if hana_hud is not None else "")
     )
 
 
@@ -606,6 +666,8 @@ def run_gun(args):
     stdout_path = run_dir / "game.out"
     stderr_path = run_dir / "game.err"
     stop_path = run_dir / "gun-route-ready.txt"
+    frontier_visual_gate = run_dir / "frontier-gun-visual.txt"
+    hana_visual_gate = run_dir / "first-hana-prompt.txt"
     result_path = run_dir / "result.json"
     first_arm = capture_dir / "arm-movement.txt"
 
@@ -619,6 +681,7 @@ def run_gun(args):
         "YZ_MOVEMENT_PROOF": "1",
         "YZ_MOVEMENT_PROOF_DELAY_MS": "180000",
         "YZ_MOVEMENT_PROOF_ARM_FILE": str(first_arm),
+        "YZ_MOVEMENT_PROOF_DIALOGUE_ARM_FILE": str(hana_visual_gate),
         "YZ_MOVEMENT_PROOF_MAX_LEGS": "3",
         "YZ_MOVEMENT_PROOF_FRONTIER_LEG": "2",
         "YZ_MOVEMENT_PROOF_READY_MIN_SERIAL": "1",
@@ -641,8 +704,12 @@ def run_gun(args):
         "YZ_MOVEMENT_PROOF_LOADING_NONBLACK_MAX": "20000",
         "YZ_MOVEMENT_PROOF_GUN_HUD_PALE_PPM": "5000",
         "YZ_MOVEMENT_PROOF_SKIP_CAMERA": "1",
-        "YZ_MOVEMENT_PROBE_INTERVAL_MS": "30000",
+        # Route readback is deliberately frequent until the final checkpoint:
+        # it bounds the interval in which Confirm remains active after the
+        # first Hana prompt.  Capture is stopped before QPC measurement.
+        "YZ_MOVEMENT_PROBE_INTERVAL_MS": "2000",
         "YZ_MOVEMENT_PROOF_STOP_FILE": str(stop_path),
+        "YZ_MOVEMENT_PROOF_FRONTIER_VISUAL_FILE": str(frontier_visual_gate),
         "YZ_RSX_VALIDATION_CAPTURE": "1",
         "YZ_RSX_VALIDATION_DIR": str(capture_dir),
         "YZ_DIALOGUE_PULSE_PERIOD_MS": "2200",
@@ -652,6 +719,11 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "active-basic"
     if args.nr_vertical_active_present:
         yz["YZ_NR_VERTICAL"] = "active-present"
+    if args.nr_vertical_shadow:
+        # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
+        # is safe on the extended route: it neither owns commands nor emits
+        # per-event output, timing, or synthetic graphics work.
+        yz["YZ_NR_VERTICAL"] = "shadow"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -676,6 +748,7 @@ def run_gun(args):
         "route_markers": {},
     }
     gun_references = [scene_features(path) for path in reference_paths]
+    hana_reference = scene_features(args.reference.resolve())
     stdout_handle = stdout_path.open("wb")
     stderr_handle = stderr_path.open("wb")
     process = None
@@ -727,23 +800,75 @@ def run_gun(args):
                     coarse_scene_mae(reference, features)
                     for reference in gun_references
                 )
+                best_gun_hud_iou = max(
+                    gun_hud_iou(reference, features)
+                    for reference in gun_references
+                )
+                hana_comparison = compare_scene(hana_reference, features)
                 result["captures"].append({
                     "serial": serial,
                     "path": str(path),
                     "best_gun_mae": round(best_gun_mae, 6),
+                    "best_gun_hud_iou": round(best_gun_hud_iou, 6),
+                    "hana_prompt_match": hana_comparison["match"],
                 })
                 print(
-                    f"[gun-harness] {path.name}: best_gun_mae={best_gun_mae:.4f}",
+                    f"[gun-harness] {path.name}: "
+                    f"best_gun_mae={best_gun_mae:.4f} "
+                    f"gun_hud_iou={best_gun_hud_iou:.4f}",
                     flush=True,
                 )
+                if hana_comparison["match"] and not hana_visual_gate.exists():
+                    hana_visual_gate.write_text(
+                        f"verified {path.name} "
+                        f"mae={hana_comparison['coarse_mae']:.6f}\n",
+                        encoding="ascii",
+                    )
+                    result["route_markers"]["first_hana_prompt"] = str(
+                        hana_visual_gate
+                    )
+                    result["first_hana_serial"] = serial
+                    print(
+                        f"[gun-harness] verified first Hana X-prompt at "
+                        f"{path.name}; enabling bounded Confirm",
+                        flush=True,
+                    )
+                if (best_gun_mae <= args.gun_anchor_mae and
+                        best_gun_hud_iou >= args.gun_hud_iou and
+                        not frontier_visual_gate.exists()):
+                    frontier_visual_gate.write_text(
+                        f"verified {path.name} mae={best_gun_mae:.6f} "
+                        f"hud_iou={best_gun_hud_iou:.6f}\n",
+                        encoding="ascii",
+                    )
+                    result["route_markers"]["frontier_gun_visual"] = str(
+                        frontier_visual_gate
+                    )
+                    print(
+                        f"[gun-harness] verified post-Frontier gun HUD at "
+                        f"{path.name}", flush=True,
+                    )
 
             ready = sorted(capture_dir.glob("frontier_ready_*.txt"))
-            if ready and not first_arm.exists():
+            first_hana_serial = result.get("first_hana_serial")
+            post_hana_ready = next((
+                marker for marker in ready
+                if first_hana_serial is not None and
+                int(marker.stem.rsplit("_", 1)[-1]) > first_hana_serial and
+                not next((
+                    item["hana_prompt_match"] for item in result["captures"]
+                    if item["serial"] == int(marker.stem.rsplit("_", 1)[-1])
+                ), True)
+            ), None)
+            if post_hana_ready and not first_arm.exists():
                 first_arm.write_text(
-                    f"armed after {ready[0].name}\n", encoding="ascii"
+                    f"armed after {post_hana_ready.name}\n", encoding="ascii"
                 )
-                result["route_markers"]["initial_ready"] = str(ready[0])
-                print(f"[gun-harness] armed leg 1 after {ready[0].name}", flush=True)
+                result["route_markers"]["initial_ready"] = str(post_hana_ready)
+                print(
+                    f"[gun-harness] Hana cleared and city HUD restored; "
+                    f"armed leg 1 after {post_hana_ready.name}", flush=True,
+                )
             for leg in (1, 2):
                 stable = sorted(capture_dir.glob(f"stable_gameplay_leg_{leg}_*.txt"))
                 next_arm = capture_dir / f"arm-movement-{leg + 1}.txt"
@@ -767,7 +892,9 @@ def run_gun(args):
                     (item for item in result["captures"]
                      if item["serial"] == serial), None
                 )
-                if capture and capture["best_gun_mae"] <= args.gun_anchor_mae:
+                if (capture and
+                        capture["best_gun_mae"] <= args.gun_anchor_mae and
+                        capture["best_gun_hud_iou"] >= args.gun_hud_iou):
                     stable_three = candidate
                     result["route_markers"]["stable_leg_3"] = str(candidate)
                     result["gun_checkpoint_capture"] = capture
@@ -840,7 +967,26 @@ def run_gun(args):
         result["forced_close"] = forced
 
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
-        if not re.search(r"Frontier (?:loading observed|transition inferred)",
+        vertical_shadow = re.findall(
+            r"^\[nr-vertical-(?:shadow|exact|observed-ea|source).*$",
+            stderr_text, re.MULTILINE,
+        )
+        result["nr_vertical_shadow"] = vertical_shadow
+        if args.nr_vertical_shadow:
+            summaries = [line for line in vertical_shadow
+                         if line.startswith("[nr-vertical-shadow ")]
+            exact = [line for line in vertical_shadow
+                     if line.startswith("[nr-vertical-exact ")]
+            if len(summaries) != 1 or len(exact) != 1:
+                raise RuntimeError(
+                    "vertical shadow gun run must emit exactly one summary "
+                    f"and exact line: found {len(summaries)}/{len(exact)}"
+                )
+        elif vertical_shadow:
+            raise RuntimeError("vertical shadow was active in the clean gun lane")
+        if not re.search(
+                r"Frontier (?:loading observed|transition inferred|"
+                r"transition verified by archived gun-HUD framebuffer gate)",
                          stderr_text):
             raise RuntimeError("route lacked a positive Frontier transition marker")
         probe_present_ids = {
@@ -1322,6 +1468,7 @@ def main():
     parser.add_argument("--gun-route", action="store_true")
     parser.add_argument("--gun-reference-dir", type=Path)
     parser.add_argument("--gun-anchor-mae", type=float, default=0.22)
+    parser.add_argument("--gun-hud-iou", type=float, default=0.20)
     parser.add_argument("--gun-route-timeout", type=float, default=1500)
     parser.add_argument("--required-matches", type=int, default=3)
     parser.add_argument("--hold-seconds", type=float, default=35)
@@ -1415,7 +1562,6 @@ def main():
     if args.gun_route:
         if any((args.fe0, args.fe0_callback_replay, args.nr_shadow_census,
                 args.nr_flip, args.nr_clear, args.nr_draw,
-                args.nr_vertical_shadow,
                 args.draw_phases, args.wkl4_cycle)):
             parser.error("gun route accepts no diagnostic/family lane")
         return run_gun(args)

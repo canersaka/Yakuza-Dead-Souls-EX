@@ -536,6 +536,9 @@ static void pad_merge_keyboard(void)
         static unsigned long long next_arm_file_poll = 0;
         static unsigned long long next_route_arm_file_poll = 0;
         static int arm_file_mode = -1;
+        static int dialogue_arm_file_mode;
+        static int dialogue_arm_ready;
+        static unsigned long long next_dialogue_arm_poll;
         static unsigned long long dialogue_period_ms;
         static unsigned long long dialogue_hold_ms;
         static int dialogue_timing_configured;
@@ -554,6 +557,7 @@ static void pad_merge_keyboard(void)
         static unsigned long long last_post_logged_pulse = ~0ull;
         static int next_arm_path_logged = 0;
         static char arm_file[MAX_PATH * 2];
+        static char dialogue_arm_file[MAX_PATH * 2];
         static char next_arm_file[MAX_PATH * 2];
         const unsigned long long now = GetTickCount64();
         const unsigned long long elapsed = g_yz_auto_start_tick
@@ -568,13 +572,42 @@ static void pad_merge_keyboard(void)
 
         if (arm_file_mode < 0) {
             const char* requested = getenv("YZ_MOVEMENT_PROOF_ARM_FILE");
+            const char* dialogue_requested = getenv(
+                "YZ_MOVEMENT_PROOF_DIALOGUE_ARM_FILE");
             arm_file_mode = requested && *requested;
+            dialogue_arm_file_mode = dialogue_requested &&
+                *dialogue_requested;
+            dialogue_arm_ready = !dialogue_arm_file_mode;
             if (arm_file_mode) {
                 strncpy(arm_file, requested, sizeof(arm_file) - 1u);
                 arm_file[sizeof(arm_file) - 1u] = '\0';
                 fprintf(stderr,
                         "[movement-proof] visual arm required path=%s\n",
                         arm_file);
+                fflush(stderr);
+            }
+            if (dialogue_arm_file_mode) {
+                strncpy(dialogue_arm_file, dialogue_requested,
+                        sizeof(dialogue_arm_file) - 1u);
+                dialogue_arm_file[sizeof(dialogue_arm_file) - 1u] = '\0';
+                fprintf(stderr,
+                        "[movement-proof] initial Confirm waits for first "
+                        "dialogue visual path=%s\n",
+                        dialogue_arm_file);
+                fflush(stderr);
+            }
+        }
+
+        if (dialogue_arm_file_mode && !dialogue_arm_ready &&
+            now >= next_dialogue_arm_poll) {
+            const DWORD attrs = GetFileAttributesA(dialogue_arm_file);
+            next_dialogue_arm_poll = now + 250ull;
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                dialogue_arm_ready = 1;
+                fprintf(stderr,
+                        "[movement-proof] first dialogue visual verified; "
+                        "bounded Confirm enabled\n");
                 fflush(stderr);
             }
         }
@@ -630,6 +663,7 @@ static void pad_merge_keyboard(void)
         if (g_yz_auto_start_tick && elapsed >= 180000ull &&
             InterlockedCompareExchange(
                 &g_yz_movement_proof_phase, 0, 0) == 0 &&
+            dialogue_arm_ready &&
             (arm_file_mode || elapsed < proof_delay)) {
             /* The raw pad service can be polled much faster than the title's
              * high-level input cache.  At ~4 rendered FPS, the old 350 ms
