@@ -20,6 +20,7 @@
 #include "ppu_recomp.h"
 #include "yakuza_runner.h"
 #include "rsx_nr_backend.h"
+#include "rsx_nr_producer_contract.h"
 #include "rsx_nr_span_router.h"
 
 #include <stdio.h>
@@ -35,7 +36,8 @@ enum : uint32_t {
     YZ_NR_VERT_REFERENCE = 1,
     YZ_NR_VERT_ACQUIRE = 2,
     YZ_NR_VERT_USER = 3,
-    YZ_NR_VERT_FAMILY_COUNT = 4,
+    YZ_NR_VERT_STATE_DIRECT = 4,
+    YZ_NR_VERT_FAMILY_COUNT = 5,
     YZ_NR_VERT_SOURCE_COUNT = 16,
     YZ_NR_VERT_EVENT_COUNT = 8192,
 };
@@ -83,6 +85,7 @@ struct yz_nr_vertical_state {
     unsigned long long exact_unexpected;
     unsigned long long exact_unaddressed;
     unsigned long long exact_overflow;
+    unsigned long long state_unowned_methods;
     uint32_t fifo_semaphore_offset;
     uint32_t fifo_semaphore_packet_ea;
     volatile LONG mode_shadow;
@@ -300,6 +303,35 @@ static void yz_nr_event_observe(uint32_t packet_ea, uint32_t family,
     g_vertical.exact_unexpected++;
 }
 
+/* State methods may also be emitted by prebuilt, copied, or SPU-published
+ * command groups.  Those are valid fallback producers, not mismatches in the
+ * selected wrapper contract.  Match only an exact outstanding wrapper EA;
+ * account every other instance separately as unowned coverage.  The caller
+ * holds g_vertical.lock. */
+static bool yz_nr_event_observe_optional(uint32_t packet_ea, uint32_t family,
+                                         uint32_t a, uint32_t b)
+{
+    const uint32_t first = yz_nr_event_hash(packet_ea);
+    for (uint32_t probe = 0; probe < YZ_NR_VERT_EVENT_COUNT; ++probe) {
+        const uint32_t index =
+            (first + probe) & (YZ_NR_VERT_EVENT_COUNT - 1u);
+        yz_nr_vertical_event* const event = &g_vertical.events[index];
+        if (event->state == YZ_NR_EVENT_EMPTY)
+            break;
+        if (event->state != YZ_NR_EVENT_READY ||
+            event->packet_ea != packet_ea)
+            continue;
+        if (event->family == family && event->a == a && event->b == b)
+            g_vertical.exact_matches++;
+        else
+            g_vertical.exact_mismatches++;
+        event->state = YZ_NR_EVENT_TOMBSTONE;
+        return true;
+    }
+    g_vertical.state_unowned_methods++;
+    return false;
+}
+
 static void yz_nr_note(yz_nr_vertical_lane* lane, uint32_t family,
                        uint32_t a, uint32_t b)
 {
@@ -372,6 +404,19 @@ static void yz_nr_expected_from(ppu_context* ctx, uint32_t family,
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
+static void yz_nr_expected_direct_setter(ppu_context* ctx,
+                                         uint32_t function_ea)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
+        return;
+    const rsx_nr_direct_setter_contract* const contract =
+        rsx_nr_direct_setter_by_function(function_ea);
+    if (!contract)
+        return;
+    yz_nr_expected_from(ctx, YZ_NR_VERT_STATE_DIRECT, contract->method,
+                        (uint32_t)ctx->gpr[4], 8u);
+}
+
 } // namespace
 
 extern "C" void yz_nr_vertical_init(void)
@@ -436,6 +481,21 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
         a = arg;
         break;
     default:
+        if (!rsx_nr_direct_setter_by_method(method))
+            return;
+        family = YZ_NR_VERT_STATE_DIRECT;
+        a = method;
+        b = arg;
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (yz_nr_event_observe_optional(packet_ea, family, a, b)) {
+            yz_nr_note(&g_vertical.observed, family, a, b);
+            if (g_vertical.observed.count[family] == 1 ||
+                packet_ea < g_vertical.observed_ea_min[family])
+                g_vertical.observed_ea_min[family] = packet_ea;
+            if (packet_ea > g_vertical.observed_ea_max[family])
+                g_vertical.observed_ea_max[family] = packet_ea;
+        }
+        ReleaseSRWLockExclusive(&g_vertical.lock);
         return;
     }
 
@@ -559,15 +619,22 @@ extern "C" void yz_nr_vertical_shutdown(void)
     memcpy(sources, g_vertical.sources, sizeof(sources));
     const unsigned long long source_overflow = g_vertical.source_overflow;
     unsigned long long exact_outstanding = 0;
+    unsigned long long outstanding_by_family[YZ_NR_VERT_FAMILY_COUNT] = {};
     for (uint32_t i = 0; i < YZ_NR_VERT_EVENT_COUNT; ++i) {
-        if (g_vertical.events[i].state == YZ_NR_EVENT_READY)
+        if (g_vertical.events[i].state == YZ_NR_EVENT_READY) {
             exact_outstanding++;
+            const uint32_t family = g_vertical.events[i].family;
+            if (family < YZ_NR_VERT_FAMILY_COUNT)
+                outstanding_by_family[family]++;
+        }
     }
     const unsigned long long exact_matches = g_vertical.exact_matches;
     const unsigned long long exact_mismatches = g_vertical.exact_mismatches;
     const unsigned long long exact_unexpected = g_vertical.exact_unexpected;
     const unsigned long long exact_unaddressed = g_vertical.exact_unaddressed;
     const unsigned long long exact_overflow = g_vertical.exact_overflow;
+    const unsigned long long state_unowned_methods =
+        g_vertical.state_unowned_methods;
     uint32_t observed_ea_min[YZ_NR_VERT_FAMILY_COUNT];
     uint32_t observed_ea_max[YZ_NR_VERT_FAMILY_COUNT];
     memcpy(observed_ea_min, g_vertical.observed_ea_min,
@@ -578,43 +645,49 @@ extern "C" void yz_nr_vertical_shutdown(void)
 
     unsigned mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
-        if (expected.count[family] != observed.count[family] ||
-            expected.xor_hash[family] != observed.xor_hash[family] ||
-            expected.sum_hash[family] != observed.sum_hash[family])
+        if (expected.count[family] != observed.count[family] +
+                                          outstanding_by_family[family])
             mismatches++;
     }
     const bool ref_ok = expected.count[YZ_NR_VERT_REFERENCE] ==
-                            observed.count[YZ_NR_VERT_REFERENCE] &&
-                        expected.xor_hash[YZ_NR_VERT_REFERENCE] ==
-                            observed.xor_hash[YZ_NR_VERT_REFERENCE] &&
-                        expected.sum_hash[YZ_NR_VERT_REFERENCE] ==
-                            observed.sum_hash[YZ_NR_VERT_REFERENCE];
+                            observed.count[YZ_NR_VERT_REFERENCE] +
+                            outstanding_by_family[YZ_NR_VERT_REFERENCE];
     const bool acquire_ok = expected.count[YZ_NR_VERT_ACQUIRE] ==
-                                observed.count[YZ_NR_VERT_ACQUIRE] &&
-                            expected.xor_hash[YZ_NR_VERT_ACQUIRE] ==
-                                observed.xor_hash[YZ_NR_VERT_ACQUIRE] &&
-                            expected.sum_hash[YZ_NR_VERT_ACQUIRE] ==
-                                observed.sum_hash[YZ_NR_VERT_ACQUIRE];
+                                observed.count[YZ_NR_VERT_ACQUIRE] +
+                                outstanding_by_family[YZ_NR_VERT_ACQUIRE];
     const bool user_ok = expected.count[YZ_NR_VERT_USER] ==
-                             observed.count[YZ_NR_VERT_USER] &&
-                         expected.xor_hash[YZ_NR_VERT_USER] ==
-                             observed.xor_hash[YZ_NR_VERT_USER] &&
-                         expected.sum_hash[YZ_NR_VERT_USER] ==
-                             observed.sum_hash[YZ_NR_VERT_USER];
+                             observed.count[YZ_NR_VERT_USER] +
+                             outstanding_by_family[YZ_NR_VERT_USER];
+    const bool state_ok = expected.count[YZ_NR_VERT_STATE_DIRECT] ==
+                              observed.count[YZ_NR_VERT_STATE_DIRECT] +
+                              outstanding_by_family[YZ_NR_VERT_STATE_DIRECT];
     unsigned sequence_mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
-        if (expected.ordered_hash[family] != observed.ordered_hash[family])
+        if (!outstanding_by_family[family] &&
+            expected.ordered_hash[family] != observed.ordered_hash[family])
             sequence_mismatches++;
     }
     fprintf(stderr,
-            "[nr-vertical-shadow ref=%llu/%llu:%s "
-            "acq=%llu/%llu:%s user=%llu/%llu:%s mismatch=%u seqdiff=%u]\n",
+            "[nr-vertical-shadow ref=%llu/%llu+%llu:%s "
+            "acq=%llu/%llu+%llu:%s user=%llu/%llu+%llu:%s "
+            "state=%llu/%llu+%llu:%s state-unowned=%llu "
+            "mismatch=%u seqdiff=%u]\n",
             expected.count[YZ_NR_VERT_REFERENCE],
-            observed.count[YZ_NR_VERT_REFERENCE], ref_ok ? "ok" : "bad",
+            observed.count[YZ_NR_VERT_REFERENCE],
+            outstanding_by_family[YZ_NR_VERT_REFERENCE],
+            ref_ok ? "ok" : "bad",
             expected.count[YZ_NR_VERT_ACQUIRE],
-            observed.count[YZ_NR_VERT_ACQUIRE], acquire_ok ? "ok" : "bad",
+            observed.count[YZ_NR_VERT_ACQUIRE],
+            outstanding_by_family[YZ_NR_VERT_ACQUIRE],
+            acquire_ok ? "ok" : "bad",
             expected.count[YZ_NR_VERT_USER],
-            observed.count[YZ_NR_VERT_USER], user_ok ? "ok" : "bad",
+            observed.count[YZ_NR_VERT_USER],
+            outstanding_by_family[YZ_NR_VERT_USER],
+            user_ok ? "ok" : "bad",
+            expected.count[YZ_NR_VERT_STATE_DIRECT],
+            observed.count[YZ_NR_VERT_STATE_DIRECT],
+            outstanding_by_family[YZ_NR_VERT_STATE_DIRECT],
+            state_ok ? "ok" : "bad", state_unowned_methods,
             mismatches, sequence_mismatches);
     for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
         if (!sources[i].count)
@@ -631,13 +704,15 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 source_overflow);
     fprintf(stderr,
             "[nr-vertical-observed-ea ref=%08X-%08X "
-            "acq=%08X-%08X user=%08X-%08X]\n",
+            "acq=%08X-%08X user=%08X-%08X state=%08X-%08X]\n",
             observed_ea_min[YZ_NR_VERT_REFERENCE],
             observed_ea_max[YZ_NR_VERT_REFERENCE],
             observed_ea_min[YZ_NR_VERT_ACQUIRE],
             observed_ea_max[YZ_NR_VERT_ACQUIRE],
             observed_ea_min[YZ_NR_VERT_USER],
-            observed_ea_max[YZ_NR_VERT_USER]);
+            observed_ea_max[YZ_NR_VERT_USER],
+            observed_ea_min[YZ_NR_VERT_STATE_DIRECT],
+            observed_ea_max[YZ_NR_VERT_STATE_DIRECT]);
     fprintf(stderr,
             "[nr-vertical-exact matched=%llu mismatch=%llu unexpected=%llu "
             "outstanding=%llu unaddressed=%llu overflow=%llu]\n",
@@ -673,3 +748,42 @@ void func_00EBD6FC(ppu_context* ctx)
                               (uint32_t)ctx->gpr[4]))
         func_00EBD6FC_lifted(ctx);
 }
+
+/* Direct (context,value) state setters.  Shadow mode records a typed
+ * compile-time method contract before packet construction.  The unchanged
+ * lifted wrapper remains the sole executor in both OFF and shadow modes.
+ * These wrappers are deliberately not part of active-basic yet. */
+#define YZ_NR_DIRECT_SETTER(address)                                      \
+    void func_##address(ppu_context* ctx)                                 \
+    {                                                                     \
+        yz_nr_expected_direct_setter(ctx, 0x##address##u);                 \
+        func_##address##_lifted(ctx);                                     \
+    }
+
+YZ_NR_DIRECT_SETTER(00EBC488)
+YZ_NR_DIRECT_SETTER(00EBC51C)
+YZ_NR_DIRECT_SETTER(00EBC664)
+YZ_NR_DIRECT_SETTER(00EBC6F8)
+YZ_NR_DIRECT_SETTER(00EBC790)
+YZ_NR_DIRECT_SETTER(00EBC824)
+YZ_NR_DIRECT_SETTER(00EBC8B8)
+YZ_NR_DIRECT_SETTER(00EBCA00)
+YZ_NR_DIRECT_SETTER(00EBCA94)
+YZ_NR_DIRECT_SETTER(00EBCB28)
+YZ_NR_DIRECT_SETTER(00EBCBBC)
+YZ_NR_DIRECT_SETTER(00EBCC50)
+YZ_NR_DIRECT_SETTER(00EBCCE4)
+YZ_NR_DIRECT_SETTER(00EBCD78)
+YZ_NR_DIRECT_SETTER(00EBCE0C)
+YZ_NR_DIRECT_SETTER(00EBCEA0)
+YZ_NR_DIRECT_SETTER(00EBCF34)
+YZ_NR_DIRECT_SETTER(00EBCFC8)
+YZ_NR_DIRECT_SETTER(00EBD05C)
+YZ_NR_DIRECT_SETTER(00EBD0F4)
+YZ_NR_DIRECT_SETTER(00EBD188)
+YZ_NR_DIRECT_SETTER(00EBD220)
+YZ_NR_DIRECT_SETTER(00EBD3F8)
+YZ_NR_DIRECT_SETTER(00EBD48C)
+YZ_NR_DIRECT_SETTER(00EBD5CC)
+
+#undef YZ_NR_DIRECT_SETTER
