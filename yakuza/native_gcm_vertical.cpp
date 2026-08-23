@@ -132,6 +132,11 @@ struct yz_nr_vertical_active_state {
     unsigned long long wrong_context;
     unsigned long long no_room;
     unsigned long long publish_failure;
+    rsx_nr_span pending_span;
+    rsx_nr_span_claim pending_claim;
+    unsigned long long pending_errors;
+    uint32_t pending_executed;
+    uint32_t pending_valid;
     uint32_t last_miss_ea;
     uint32_t last_miss_epoch;
 };
@@ -141,6 +146,8 @@ static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value);
 extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause);
 extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id);
+extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
+                                        uint32_t* value);
 
 static void yz_nr_exec_reference(void*, uint32_t value)
 {
@@ -156,6 +163,12 @@ static int yz_nr_exec_present(void*, uint32_t buffer_id)
 {
     yz_nr_vertical_exec_present(buffer_id);
     return 0;
+}
+
+static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
+                               uint32_t* value)
+{
+    return yz_nr_vertical_sem_read(dma, offset, value);
 }
 
 static int yz_nr_active_init(void)
@@ -177,6 +190,7 @@ static int yz_nr_active_init(void)
     ops.set_reference = yz_nr_exec_reference;
     ops.user_command = yz_nr_exec_user;
     ops.present = yz_nr_exec_present;
+    ops.sem_read = yz_nr_exec_sem_read;
     rsx_nr_backend_init(&g_active.backend, &g_active.ring,
                         &g_active.tokens, &ops);
     return 1;
@@ -248,13 +262,6 @@ static int yz_nr_active_publish_flip(uint32_t context,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_active_present, 0, 0))
         return 0;
-    /* A typed acquire may block. The current exact router destructively
-     * claims a span before execution, so wait-label ownership stays disabled
-     * until claimed spans can remain pending without losing their identity. */
-    if (flip->wait_for_label) {
-        g_active.fallback[YZ_NR_VERT_FLIP]++;
-        return 0;
-    }
     if (context != YZ_GCM_CTX_ADDR) {
         g_active.wrong_context++;
         g_active.fallback[YZ_NR_VERT_FLIP]++;
@@ -276,9 +283,17 @@ static int yz_nr_active_publish_flip(uint32_t context,
     span.ea = current;
     span.word_count = flip->word_count;
     span.generation = rsx_nr_span_router_generation(&g_active.router);
-    span.payload.op_count = 1;
-    span.payload.ops[0].kind = RSX_NIR_OP_PRESENT;
-    span.payload.ops[0].u.present.buffer = flip->buffer_id;
+    span.payload.op_count = flip->wait_for_label ? 2u : 1u;
+    uint32_t op = 0;
+    if (flip->wait_for_label) {
+        span.payload.ops[op].kind = RSX_NIR_OP_SEMAPHORE_ACQUIRE;
+        span.payload.ops[op].u.semaphore.dma_context = 0x66616661u;
+        span.payload.ops[op].u.semaphore.offset = flip->label_offset;
+        span.payload.ops[op].u.semaphore.value = flip->label_value;
+        op++;
+    }
+    span.payload.ops[op].kind = RSX_NIR_OP_PRESENT;
+    span.payload.ops[op].u.present.buffer = flip->buffer_id;
 
     for (uint32_t i = 0; i < flip->word_count; ++i)
         vm_write32((uint64_t)current + i * 4u, flip->words[i]);
@@ -810,6 +825,57 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
     if (!InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0))
         return YZ_NR_VERTICAL_CONSUME_MISS;
 
+    /* A retained claim owns GET until every typed op has completed. In
+     * particular, an unsatisfied semaphore remains at the ring head; retries
+     * re-read the label but never re-claim, re-push, or duplicate PRESENT. */
+    if (g_active.pending_valid) {
+        if (packet_ea != g_active.pending_span.ea) {
+            g_active.fatal++;
+            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        }
+        const uint32_t remaining =
+            g_active.pending_span.payload.op_count -
+            g_active.pending_executed;
+        g_active.pending_executed +=
+            rsx_nr_backend_run(&g_active.backend, remaining);
+        if (g_active.backend.stats.exec_errors != g_active.pending_errors) {
+            g_active.fatal++;
+            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        }
+        if (rsx_nr_ring_depth(&g_active.ring) != 0) {
+            g_active.wait++;
+            return YZ_NR_VERTICAL_CONSUME_WAIT;
+        }
+        if (g_active.pending_executed !=
+                g_active.pending_span.payload.op_count ||
+            rsx_nr_span_router_retire(&g_active.router,
+                                      &g_active.pending_claim) != 0) {
+            g_active.fatal++;
+            return YZ_NR_VERTICAL_CONSUME_FATAL;
+        }
+
+        for (uint32_t i = 0;
+             i < g_active.pending_span.payload.op_count; ++i) {
+            const uint32_t kind =
+                g_active.pending_span.payload.ops[i].kind;
+            if (kind == RSX_NIR_OP_SET_REFERENCE)
+                g_active.executed[YZ_NR_VERT_REFERENCE]++;
+            else if (kind == RSX_NIR_OP_USER_COMMAND)
+                g_active.executed[YZ_NR_VERT_USER]++;
+            else if (kind == RSX_NIR_OP_PRESENT)
+                g_active.executed[YZ_NR_VERT_FLIP]++;
+        }
+        if (word_count)
+            *word_count = g_active.pending_span.word_count;
+        g_active.pending_valid = 0;
+        g_active.pending_executed = 0;
+        memset(&g_active.pending_span, 0, sizeof(g_active.pending_span));
+        memset(&g_active.pending_claim, 0, sizeof(g_active.pending_claim));
+        g_active.last_miss_ea = ~0u;
+        g_active.last_miss_epoch = 0;
+        return YZ_NR_VERTICAL_CONSUME_EXECUTED;
+    }
+
     const uint32_t epoch =
         rsx_nr_span_router_publication_epoch(&g_active.router);
     if (g_active.last_miss_ea == packet_ea &&
@@ -818,8 +884,9 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
     }
 
     rsx_nr_span span = {};
+    rsx_nr_span_claim claim = {};
     const rsx_nr_span_take_result take =
-        rsx_nr_span_router_take(&g_active.router, packet_ea, &span);
+        rsx_nr_span_router_claim(&g_active.router, packet_ea, &span, &claim);
     if (take == RSX_NR_SPAN_TAKE_FAST_MISS ||
         take == RSX_NR_SPAN_TAKE_MISS) {
         g_active.last_miss_ea = packet_ea;
@@ -838,36 +905,18 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
         return YZ_NR_VERTICAL_CONSUME_FATAL;
     }
 
-    const unsigned long long errors_before = g_active.backend.stats.exec_errors;
     for (uint32_t i = 0; i < span.payload.op_count; ++i) {
         if (rsx_nr_ring_push(&g_active.ring, &span.payload.ops[i]) != 0) {
             g_active.fatal++;
             return YZ_NR_VERTICAL_CONSUME_FATAL;
         }
     }
-    const uint32_t executed =
-        rsx_nr_backend_run(&g_active.backend, span.payload.op_count);
-    if (executed != span.payload.op_count ||
-        rsx_nr_ring_depth(&g_active.ring) != 0 ||
-        g_active.backend.stats.exec_errors != errors_before) {
-        g_active.fatal++;
-        return YZ_NR_VERTICAL_CONSUME_FATAL;
-    }
-
-    for (uint32_t i = 0; i < span.payload.op_count; ++i) {
-        const uint32_t kind = span.payload.ops[i].kind;
-        if (kind == RSX_NIR_OP_SET_REFERENCE)
-            g_active.executed[YZ_NR_VERT_REFERENCE]++;
-        else if (kind == RSX_NIR_OP_USER_COMMAND)
-            g_active.executed[YZ_NR_VERT_USER]++;
-        else if (kind == RSX_NIR_OP_PRESENT)
-            g_active.executed[YZ_NR_VERT_FLIP]++;
-    }
-    g_active.last_miss_ea = ~0u;
-    g_active.last_miss_epoch = 0;
-    if (word_count)
-        *word_count = span.word_count;
-    return YZ_NR_VERTICAL_CONSUME_EXECUTED;
+    g_active.pending_span = span;
+    g_active.pending_claim = claim;
+    g_active.pending_errors = g_active.backend.stats.exec_errors;
+    g_active.pending_executed = 0;
+    g_active.pending_valid = 1;
+    return yz_nr_vertical_consume(packet_ea, word_count);
 }
 
 extern "C" void yz_nr_vertical_shutdown(void)

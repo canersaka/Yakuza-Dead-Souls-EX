@@ -3522,6 +3522,22 @@ static void yz_ucmd_retry_pending(void)
     }
 }
 
+/* Exact typed-command semaphore acquire. This resolves the same DMA/address
+ * contract as the legacy NV406E path, but does not synthesize a method or
+ * enter yz_rsx_method. A retained typed span rechecks this value while GET
+ * remains on the owned packet. */
+extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
+                                        uint32_t* value)
+{
+    if (!value)
+        return -1;
+    const uint32_t address = yz_rsx_sem_addr(dma, offset);
+    if (!address)
+        return -1;
+    *value = vm_read32(address);
+    return 0;
+}
+
 /* Semantic actions shared by the legacy packet decoder and the vertical
  * typed-command backend.  Keeping these below the packet layer is important:
  * an owned typed span must not reconstruct a legacy method and feed it back

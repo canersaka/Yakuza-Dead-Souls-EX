@@ -189,7 +189,7 @@ rsx_nr_span_router_publish(rsx_nr_span_router* r, const rsx_nr_span* span)
         const u32 index = (first + probe) & mask;
         const u32 state = atomic_load_explicit(&slots[index].state,
                                                memory_order_acquire);
-        if (state == SPAN_READY &&
+        if ((state == SPAN_READY || state == SPAN_CLAIMED) &&
             slots[index].span.ea == span->ea &&
             slots[index].span.generation == span->generation) {
             atomic_store_explicit((_Atomic long*)&r->producer_lock, 0,
@@ -251,10 +251,13 @@ rsx_nr_span_router_publish(rsx_nr_span_router* r, const rsx_nr_span* span)
 }
 
 rsx_nr_span_take_result
-rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out)
+rsx_nr_span_router_claim(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out,
+                         rsx_nr_span_claim* claim)
 {
-    if (!r || !r->slots || !r->page_counts || !out || (ea & 3u))
+    if (!r || !r->slots || !r->page_counts || !out || !claim || (ea & 3u))
         return RSX_NR_SPAN_TAKE_MISS;
+
+    memset(claim, 0, sizeof(*claim));
 
     span_page_count* pages = (span_page_count*)r->page_counts;
     const u32 page = ea >> 12;
@@ -268,7 +271,8 @@ rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out)
     const u32 mask = r->capacity - 1u;
     const u32 first = span_hash(ea, generation) & mask;
     for (u32 probe = 0; probe < r->capacity; ++probe) {
-        span_slot* const slot = &slots[(first + probe) & mask];
+        const u32 index = (first + probe) & mask;
+        span_slot* const slot = &slots[index];
         u32 state = atomic_load_explicit(&slot->state, memory_order_acquire);
         if (state == SPAN_EMPTY)
             break;
@@ -288,19 +292,67 @@ rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out)
         }
         *out = slot->span;
         const u32 fingerprint = rsx_nr_span_fingerprint(out);
-        atomic_store_explicit(&slot->state, SPAN_TOMBSTONE,
-                              memory_order_release);
-        atomic_fetch_sub_explicit(&pages[page], 1u, memory_order_release);
         if (!fingerprint || fingerprint != out->fingerprint) {
+            atomic_store_explicit(&slot->state, SPAN_TOMBSTONE,
+                                  memory_order_release);
+            atomic_fetch_sub_explicit(&pages[page], 1u,
+                                      memory_order_release);
             span_count(r, SPAN_C_CORRUPT);
             return RSX_NR_SPAN_TAKE_CORRUPT;
         }
+        claim->slot = index + 1u;
+        claim->generation = out->generation;
+        claim->fingerprint = out->fingerprint;
+        claim->ea = out->ea;
         span_count(r, SPAN_C_CLAIMED);
         return RSX_NR_SPAN_TAKE_CLAIMED;
     }
 
     span_count(r, SPAN_C_EXACT_MISS);
     return RSX_NR_SPAN_TAKE_MISS;
+}
+
+int rsx_nr_span_router_retire(rsx_nr_span_router* r,
+                              const rsx_nr_span_claim* claim)
+{
+    if (!r || !r->slots || !r->page_counts || !claim || !claim->slot ||
+        claim->slot > r->capacity || (claim->ea & 3u))
+        return -1;
+
+    span_slot* const slot =
+        &((span_slot*)r->slots)[claim->slot - 1u];
+    if (atomic_load_explicit(&slot->state, memory_order_acquire) !=
+            SPAN_CLAIMED ||
+        slot->span.ea != claim->ea ||
+        slot->span.generation != claim->generation ||
+        slot->span.fingerprint != claim->fingerprint ||
+        claim->generation != rsx_nr_span_router_generation(r))
+        return -1;
+
+    u32 expected = SPAN_CLAIMED;
+    if (!atomic_compare_exchange_strong_explicit(
+            &slot->state, &expected, SPAN_TOMBSTONE,
+            memory_order_acq_rel, memory_order_acquire))
+        return -1;
+
+    span_page_count* pages = (span_page_count*)r->page_counts;
+    atomic_fetch_sub_explicit(&pages[claim->ea >> 12], 1u,
+                              memory_order_release);
+    return 0;
+}
+
+rsx_nr_span_take_result
+rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out)
+{
+    rsx_nr_span_claim claim;
+    const rsx_nr_span_take_result result =
+        rsx_nr_span_router_claim(r, ea, out, &claim);
+    if (result == RSX_NR_SPAN_TAKE_CLAIMED &&
+        rsx_nr_span_router_retire(r, &claim) != 0) {
+        span_count(r, SPAN_C_CORRUPT);
+        return RSX_NR_SPAN_TAKE_CORRUPT;
+    }
+    return result;
 }
 
 void rsx_nr_span_router_get_stats(const rsx_nr_span_router* r,
