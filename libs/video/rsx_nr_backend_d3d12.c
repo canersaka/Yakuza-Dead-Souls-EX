@@ -69,6 +69,11 @@ typedef struct nrb_depth {
     int live;
 } nrb_depth;
 
+typedef struct nrb_display {
+    u32 location, offset, width, height;
+    int valid;
+} nrb_display;
+
 struct rsx_nr_d3d12 {
     ID3D12Device* dev;
     ID3D12CommandQueue* queue;
@@ -106,6 +111,11 @@ struct rsx_nr_d3d12 {
     rsx_nr_res_cache textures;
     nrb_rt rts[NRB_MAX_RTS];
     nrb_depth depths[NRB_MAX_DEPTHS];
+    nrb_rt* last_rt;
+    nrb_display displays[8];
+    rsx_nr_d3d12_present_fn present_cb;
+    void* present_user;
+    int rgba_targets;
 
     const u8* (*guest_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
     u8* (*writable_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
@@ -200,13 +210,14 @@ static ID3D12Resource* nrb_make_buffer(ID3D12Device* dev, u64 size,
 
 /* ---- render targets ---------------------------------------------------- */
 
-static DXGI_FORMAT nrb_color_dxgi(u32 fmt)
+static DXGI_FORMAT nrb_color_dxgi(const rsx_nr_d3d12* b, u32 fmt)
 {
     switch (fmt) {
     case 3: return DXGI_FORMAT_B5G6R5_UNORM;
     case 4:
     case 5:
-    case 8: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case 8: return b->rgba_targets ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                   : DXGI_FORMAT_B8G8R8A8_UNORM;
     default: return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -222,7 +233,7 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
     }
     if (!create)
         return NULL;
-    const DXGI_FORMAT color_dxgi = nrb_color_dxgi(fmt);
+    const DXGI_FORMAT color_dxgi = nrb_color_dxgi(b, fmt);
     if (color_dxgi == DXGI_FORMAT_UNKNOWN)
         return NULL;
     nrb_rt* rt = NULL;
@@ -283,16 +294,16 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_rt_handle(rsx_nr_d3d12* b,
 
 /* Capture-observed pitch-linear color formats with an exact D3D12 RTV.
  * 3 = R5G6B5; 4/5 = X8R8G8B8; 8 = A8R8G8B8. */
-static int nrb_color_format_ok(u32 fmt)
+static int nrb_color_format_ok(const rsx_nr_d3d12* b, u32 fmt)
 {
-    return nrb_color_dxgi(fmt) != DXGI_FORMAT_UNKNOWN;
+    return nrb_color_dxgi(b, fmt) != DXGI_FORMAT_UNKNOWN;
 }
 
 static nrb_rt* nrb_rt_from_state(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
                                  int create)
 {
     const rsx_nir_surface* s = &st->surface;
-    if (!nrb_color_format_ok(s->color_format))
+    if (!nrb_color_format_ok(b, s->color_format))
         return NULL;
     u32 w = s->clip_w ? s->clip_w : 1280;
     u32 h = s->clip_h ? s->clip_h : 720;
@@ -504,6 +515,7 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             (UINT8)c->stencil_value, nrects, rects);
     }
     nrb_exec_wait(b);
+    b->last_rt = rt;
     b->stats.clears++;
     return 0;
 }
@@ -1718,7 +1730,7 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
         : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     pd.PrimitiveTopologyType = tt;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = nrb_color_dxgi(st->surface.color_format);
+    pd.RTVFormats[0] = nrb_color_dxgi(b, st->surface.color_format);
     pd.DSVFormat = nrb_depth_dsv_dxgi(st->surface.depth_format);
     pd.SampleDesc.Count = 1;
 
@@ -2239,6 +2251,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     b->stats.real_fp_draws++;
     if (fp.texture_mask)
         b->stats.texture_draws++;
+    b->last_rt = rt;
     b->stats.draws++;
     return 0;
 }
@@ -2348,8 +2361,28 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
 static int nrb_present(void* user, u32 buffer)
 {
     rsx_nr_d3d12* b = user;
-    (void)buffer;
     nrb_exec_wait(b);                /* offscreen: complete the frame      */
+    nrb_rt* scanout = NULL;
+    if (buffer < 8u && b->displays[buffer].valid) {
+        const nrb_display* display = &b->displays[buffer];
+        for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+            nrb_rt* candidate = &b->rts[i];
+            if (candidate->live &&
+                candidate->space == display->location &&
+                candidate->offset == display->offset &&
+                (!display->width || candidate->w == display->width) &&
+                (!display->height || candidate->h == display->height)) {
+                scanout = candidate;
+                break;
+            }
+        }
+    }
+    if (!scanout)
+        scanout = b->last_rt;
+    if (b->present_cb && (!scanout || b->present_cb(
+            b->present_user, scanout->tex, (u32)scanout->dxgi,
+            scanout->w, scanout->h, buffer) != 0))
+        return -1;
     rsx_nr_res_next_frame(&b->textures);
     if ((b->textures.frame & 127u) == 0u)
         rsx_nr_res_sweep(&b->textures, 600u, nrb_release_texture, b);
@@ -2370,6 +2403,32 @@ void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
     out->transfer = nrb_transfer;
     out->present = nrb_present;
     out->flush = nrb_flush;
+}
+
+int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
+                                 rsx_nr_d3d12_present_fn present,
+                                 void* present_user)
+{
+    if (!b || b->rtv_used || b->last_rt)
+        return -1;
+    b->rgba_targets = rgba_targets != 0;
+    b->present_cb = present;
+    b->present_user = present_user;
+    return 0;
+}
+
+void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
+                                     u32 location, u32 offset,
+                                     u32 width, u32 height)
+{
+    if (!b || buffer_id >= 8u)
+        return;
+    nrb_display* display = &b->displays[buffer_id];
+    display->location = location;
+    display->offset = offset;
+    display->width = width;
+    display->height = height;
+    display->valid = 1;
 }
 
 /* ---- lifecycle --------------------------------------------------------- */
@@ -2745,6 +2804,20 @@ void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
     (void)b;
     if (out)
         memset(out, 0, sizeof(*out));
+}
+int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
+                                 rsx_nr_d3d12_present_fn present,
+                                 void* present_user)
+{
+    (void)b; (void)rgba_targets; (void)present; (void)present_user;
+    return -1;
+}
+void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
+                                     u32 location, u32 offset,
+                                     u32 width, u32 height)
+{
+    (void)b; (void)buffer_id; (void)location; (void)offset;
+    (void)width; (void)height;
 }
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)

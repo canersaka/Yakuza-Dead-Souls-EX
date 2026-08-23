@@ -40,6 +40,14 @@ extern "C" {
 
 typedef struct rsx_nr_d3d12 rsx_nr_d3d12;
 
+/* Optional live presentation handoff. The native queue is fully retired
+ * before this callback, and `texture` is left in RENDER_TARGET state. The
+ * callback may copy it to the application's swap chain, but must restore that
+ * state before returning. `format` is the numeric DXGI_FORMAT value, kept
+ * opaque here so this public header remains windows.h-free. */
+typedef int (*rsx_nr_d3d12_present_fn)(void* user, void* texture, u32 format,
+                                       u32 width, u32 height, u32 buffer_id);
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long pso_hits, pso_builds;
@@ -88,6 +96,16 @@ rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b);
 /* Fill the GPU half of the exec ops (clear/draw/transfer/present/flush).
  * The embedder fills the host half before rsx_nr_backend_init. */
 void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out);
+
+/* Configure live scanout before the first native render target is created.
+ * rgba_targets selects R8G8B8A8 for direct compatibility with the title's
+ * swap chain; offline validation retains the default B8G8R8A8 targets. */
+int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
+                                 rsx_nr_d3d12_present_fn present,
+                                 void* present_user);
+void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
+                                     u32 location, u32 offset,
+                                     u32 width, u32 height);
 
 /* Read back a rendered RT registered by (space, offset): w*h*4 BGRA bytes
  * into out. Returns 0, or -1 when no such RT exists. Flushes first. */
