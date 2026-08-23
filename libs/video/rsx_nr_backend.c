@@ -160,6 +160,8 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
             x->set_reference(x->user, op->u.reference.value);
         break;
     case RSX_NIR_OP_REPORT:
+        if (x->flush)
+            x->flush(x->user);
         if (x->report)
             x->report(x->user, op->u.report.kind, op->u.report.arg,
                       op->u.report.dma_report);

@@ -3593,6 +3593,8 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
     return 0;
 }
 
+extern "C" uint64_t cellGcmReportTimestampNs(void);
+
 extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
                                            uint32_t value,
                                            uint32_t texture_read)
@@ -3606,6 +3608,45 @@ extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
     const uint32_t address = yz_rsx_sem_addr(dma, offset);
     if (address)
         yz_rsx_w32(address, value);
+}
+
+extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
+                                        uint32_t dma)
+{
+    if (kind != 0u)
+        return; /* CLEAR_REPORT_VALUE: no ZCULL accumulator is modeled. */
+
+    const uint32_t type = arg >> 24;
+    const uint32_t offset = arg & 0x00FFFFFFu;
+    uint32_t address = 0;
+    switch (dma) {
+    case RSX_DMA_REPORT_LOCATION_LOCAL:
+    case RSX_DMA_MEMORY_FRAME_BUFFER:
+        if (offset < RSX_REPORT_AREA_SIZE &&
+            offset <= RSX_REPORT_AREA_SIZE - 16u)
+            address = RSX_REPORTS + offset;
+        break;
+    case RSX_DMA_REPORT_LOCATION_MAIN:
+    case RSX_DMA_MEMORY_HOST_BUFFER:
+        if (yz_rsx_live_guest_ptr(nullptr, 1u, offset, 16u))
+            address = yz_rsx_io_to_ea(offset);
+        break;
+    default:
+        break;
+    }
+    if (!address)
+        return;
+
+    const uint64_t timestamp = cellGcmReportTimestampNs();
+    vm_write64(address, timestamp);
+    if (type >= RSX_REPORT_TYPE_ZPASS_PIXEL_CNT &&
+        type <= RSX_REPORT_TYPE_ZCULL_STATS3) {
+        vm_write32(address + 8u, 0u);
+        vm_write32(address + 12u, 0u);
+    } else {
+        /* Ordinary reports leave value@+8 untouched and clear only pad. */
+        vm_write32(address + 12u, 0u);
+    }
 }
 
 /* Semantic actions shared by the legacy packet decoder and the vertical
@@ -7529,7 +7570,8 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         const int native_method =
             ((eff == 0x1808u && val == 0u) || eff == 0x1D94u ||
              eff == 0x2328u || eff == 0xC40Cu || eff == 0x0110u ||
-             eff == 0x1D70u || eff == 0x1D74u) ?
+             eff == 0x1D70u || eff == 0x1D74u || eff == 0x17C8u ||
+             eff == 0x1800u) ?
             yz_nr_vertical_try_method(eff, val, yz_rsx_io_to_ea(get)) : 0;
         if (!native_method)
             yz_nr_vertical_prepare_legacy_method(eff, val);

@@ -1479,6 +1479,13 @@ static void test_backend_core(void)
     CHECK(rec.labels[6] == 0xAADDCCBBu, "backend BE swizzle %08X",
           rec.labels[6]);
 
+    const u32 flushes_before_report = rec.flushes;
+    rsx_nir_em_report(&em, 0, 0x01000080u, 0x66626660u);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.reports == 1 && rec.flushes == flushes_before_report + 1,
+          "report did not flush/publish reports=%u flushes=%u/%u",
+          rec.reports, flushes_before_report, rec.flushes);
+
     /* blocking: an acquire on an unsatisfied label parks WITHOUT popping */
     rsx_nir_em_semaphore_acquire(&em, 0x66616661, 0x40, 0x77);
     rsx_nir_em_present(&em, 3);
@@ -2131,6 +2138,18 @@ static void test_shadow_terminal_action(void)
         CHECK(sem->dma_context == 0x66606660u && sem->offset == 0x80u &&
               sem->value == 0x11223344u && sem->texture_read == 0u,
               "terminal back-end release payload mismatch");
+    }
+    rsx_nir_adapter_method(&ad, 0x01A8u, 0x66626660u);
+    CHECK(rsx_nir_adapter_shadow_action(&ad, 0x1800u, 0x01000080u) == 1,
+          "shadow GET_REPORT was not emitted");
+    CHECK(ad.shadow_mode == 1 && s.op_count &&
+          s.ops[s.op_count - 1].kind == RSX_NIR_OP_REPORT,
+          "terminal report did not restore shadow mode/emit REPORT");
+    if (s.op_count && s.ops[s.op_count - 1].kind == RSX_NIR_OP_REPORT) {
+        const rsx_nir_report* report = &s.ops[s.op_count - 1].u.report;
+        CHECK(report->kind == 0u && report->arg == 0x01000080u &&
+              report->dma_report == 0x66626660u,
+              "terminal report payload mismatch");
     }
     rsx_nir_stream_free(&s);
 }
