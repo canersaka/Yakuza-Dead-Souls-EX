@@ -230,6 +230,8 @@ struct yz_nr_vertical_active_state {
     unsigned long long publish_failure;
     unsigned long long consumer_draw_owned;
     unsigned long long consumer_draw_fallback;
+    unsigned long long consumer_clear_owned;
+    unsigned long long consumer_clear_fallback;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
@@ -1439,18 +1441,23 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         g_active.pending_valid || rsx_nr_ring_depth(&g_active.ring))
         return 0;
 
-    /* BEGIN and batch methods continue through the legacy register decoder
-     * and mirror into the shadow adapter. At END, emit the complete folded
-     * state/draw episode before legacy sink_end_impl can run. Unsupported or
-     * render-atomic refusal returns to the unchanged legacy END at the same
-     * GET; success suppresses that one method so the draw cannot execute
+    /* State and draw-batch methods continue through the legacy register
+     * decoder and mirror into the shadow adapter. At a terminal action,
+     * emit the complete folded state/action before the matching legacy sink
+     * can run. Unsupported or atomic refusal returns to the unchanged method
+     * at the same GET; success suppresses it so the action cannot execute
      * twice. */
-    if (method != 0x1808u || arg != 0u)
+    const bool is_draw = method == 0x1808u && arg == 0u;
+    const bool is_clear = method == 0x1D94u;
+    if (!is_draw && !is_clear)
         return 0;
     if (!rsx_nr_ring_can_accept(&g_active.ring,
                                 YZ_NR_ACTIVE_ACTION_OP_BOUND,
                                 YZ_NR_ACTIVE_ACTION_SIDE_BOUND)) {
-        g_active.consumer_draw_fallback++;
+        if (is_draw)
+            g_active.consumer_draw_fallback++;
+        else
+            g_active.consumer_clear_fallback++;
         return 0;
     }
 
@@ -1462,7 +1469,10 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         !rsx_nr_ring_depth(&g_active.ring)) {
         while (rsx_nr_ring_depth(&g_active.ring))
             rsx_nr_ring_pop(&g_active.ring);
-        g_active.consumer_draw_fallback++;
+        if (is_draw)
+            g_active.consumer_draw_fallback++;
+        else
+            g_active.consumer_clear_fallback++;
         return 0;
     }
 
@@ -1471,17 +1481,44 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
             RSX_NR_STEP_EXECUTED) {
             while (rsx_nr_ring_depth(&g_active.ring))
                 rsx_nr_ring_pop(&g_active.ring);
-            g_active.consumer_draw_fallback++;
+            if (is_draw)
+                g_active.consumer_draw_fallback++;
+            else
+                g_active.consumer_clear_fallback++;
             return 0;
         }
     }
     if (g_active.backend.stats.exec_errors != errors_before) {
-        g_active.consumer_draw_fallback++;
+        if (is_draw)
+            g_active.consumer_draw_fallback++;
+        else
+            g_active.consumer_clear_fallback++;
         return 0;
     }
-    g_active.consumer_draw_owned++;
-    g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
+    if (is_draw) {
+        g_active.consumer_draw_owned++;
+        g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
+    } else {
+        g_active.consumer_clear_owned++;
+    }
     return 1;
+}
+
+extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
+                                                        uint32_t arg)
+{
+    if (!InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0))
+        return;
+    const bool action =
+        (method == 0x1808u && arg == 0u) || method == 0x1D94u ||
+        method == 0x2328u || method == 0xC40Cu ||
+        (method >= 0xE920u && method <= 0xE95Cu);
+    if (!action)
+        return;
+    if (InterlockedExchange(&g_active.renderer_owner, 0) == 1 &&
+        g_active.gpu_ops.flush)
+        g_active.gpu_ops.flush(g_active.gpu_ops.user);
 }
 
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
@@ -2026,6 +2063,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "fallback-draw=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
                 "consumer-draw=%llu/%llu "
+                "consumer-clear=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
@@ -2043,7 +2081,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.wrong_context, g_active.no_room,
                 g_active.publish_failure,
                 g_active.consumer_draw_owned,
-                g_active.consumer_draw_fallback, g_active.wait,
+                g_active.consumer_draw_fallback,
+                g_active.consumer_clear_owned,
+                g_active.consumer_clear_fallback, g_active.wait,
                 g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);
@@ -2060,10 +2100,11 @@ extern "C" void yz_nr_vertical_shutdown(void)
             rsx_nr_d3d12_get_stats(g_active.d3d12, &d3d_stats);
             fprintf(stderr,
                     "[nr-vertical-d3d draws=%llu batches=%llu clears=%llu "
-                    "presents=%llu fallback=%llu resident=%llu/%llu "
+                    "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
                     "residency-fail=%llu pso=%llu/%llu]\n",
                     d3d_stats.draws, d3d_stats.draw_batches,
                     d3d_stats.clears, d3d_stats.presents,
+                    d3d_stats.queue_submissions,
                     d3d_stats.unsupported_draws,
                     d3d_stats.resident_pages[0],
                     d3d_stats.resident_pages[1],

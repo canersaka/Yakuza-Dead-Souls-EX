@@ -36,6 +36,11 @@ void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
                               uint32_t packet_ea);
 
+/* Retire queued native graphics only when an actual legacy action is about
+ * to touch shared resources. State-only legacy methods do not cross the
+ * ownership boundary. */
+void yz_nr_vertical_prepare_legacy_method(uint32_t method, uint32_t arg);
+
 /* Live integration hooks. Display identities may arrive before the shared
  * D3D12 device; they are retained and applied when active graphics becomes
  * ready. Guest-write notifications are called only after bytes publish. */

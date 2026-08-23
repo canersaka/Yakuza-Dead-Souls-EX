@@ -183,6 +183,7 @@ static void nrb_exec_wait(rsx_nr_d3d12* b)
     b->queue->lpVtbl->ExecuteCommandLists(b->queue, 1, lists);
     nrb_wait_idle(b);
     b->list_open = 0;
+    b->stats.queue_submissions++;
 }
 
 /* fence-gated upload-ring slice (the exec-and-wait model retires the whole
@@ -634,7 +635,6 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             (float)c->depth_value / 16777215.0f,
             (UINT8)c->stencil_value, nrects, rects);
     }
-    nrb_exec_wait(b);
     b->last_rt = rt;
     b->stats.clears++;
     return 0;
@@ -2566,7 +2566,6 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     }
 
     nrb_restore_texture_aliases(b, texture_aliases, texture_depth_aliases);
-    nrb_exec_wait(b);
     if (filter_restart)
         b->stats.restart_draws++;
     b->stats.real_fp_draws++;
