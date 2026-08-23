@@ -2088,6 +2088,32 @@ static void test_shadow_terminal_action(void)
               "terminal clear payload mask=%X color=%08X",
               clear->mask, clear->color_value);
     }
+
+    rsx_nir_adapter_method(&ad, 0x2184u, 0xFEED0000u);
+    rsx_nir_adapter_method(&ad, 0x2188u, 0xFEED0001u);
+    rsx_nir_adapter_method(&ad, 0x230Cu, 0x1000u);
+    rsx_nir_adapter_method(&ad, 0x2310u, 0x2000u);
+    rsx_nir_adapter_method(&ad, 0x2314u, 16u);
+    rsx_nir_adapter_method(&ad, 0x2318u, 16u);
+    rsx_nir_adapter_method(&ad, 0x231Cu, 8u);
+    rsx_nir_adapter_method(&ad, 0x2320u, 2u);
+    rsx_nir_adapter_method(&ad, 0x2324u, 0x0101u);
+    CHECK(rsx_nir_adapter_shadow_action(&ad, 0x2328u, 0u) == 1,
+          "shadow terminal buffer transfer was not emitted");
+    CHECK(ad.shadow_mode == 1 && s.op_count &&
+          s.ops[s.op_count - 1].kind == RSX_NIR_OP_TRANSFER,
+          "terminal transfer did not restore shadow mode/emit TRANSFER");
+    if (s.op_count && s.ops[s.op_count - 1].kind == RSX_NIR_OP_TRANSFER) {
+        const rsx_nir_transfer* transfer =
+            &s.ops[s.op_count - 1].u.transfer;
+        CHECK(transfer->kind == RSX_NIR_XFER_BUFFER &&
+              transfer->src_location == RSX_NIR_LOCATION_LOCAL &&
+              transfer->dst_location == RSX_NIR_LOCATION_MAIN &&
+              transfer->src_offset == 0x1000u &&
+              transfer->dst_offset == 0x2000u &&
+              transfer->line_length == 8u && transfer->line_count == 2u,
+              "terminal buffer transfer payload mismatch");
+    }
     rsx_nir_stream_free(&s);
 }
 

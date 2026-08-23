@@ -2056,28 +2056,43 @@ extern "C" u8* yz_nr_vertical_guest_writable_ptr(u32 location, u32 offset,
         yz_rsx_live_guest_ptr(nullptr, location, offset, min_bytes));
 }
 
+extern "C" int yz_nr_vertical_space_range_to_ea(u32 location, u32 offset,
+                                                   u32 size, u32* out_ea)
+{
+    if (!out_ea || !size ||
+        !yz_rsx_live_guest_ptr(nullptr, location, offset, size))
+        return -1;
+    if (location == 0u) {
+        *out_ea = YZ_GCM_LOCAL_BASE + offset;
+        return 0;
+    }
+    if (location == 1u) {
+        const u32 ea = yz_rsx_io_to_ea(offset);
+        const uint64_t last_io64 =
+            static_cast<uint64_t>(offset) + size - 1u;
+        if (!ea || last_io64 > UINT32_MAX)
+            return -1;
+        const u32 last = yz_rsx_io_to_ea(static_cast<u32>(last_io64));
+        if (!last || static_cast<uint64_t>(last) !=
+                         static_cast<uint64_t>(ea) + size - 1u)
+            return -1;
+        *out_ea = ea;
+        return 0;
+    }
+    return -1;
+}
+
 /* Resolve one exact graphics page to its guest EA.  The native renderer arms
  * a VM watch only after this proves the full 4 KiB page is contiguous. */
 extern "C" int yz_nr_vertical_space_page_to_ea(u32 location,
                                                  u32 page_offset,
                                                  u32* out_ea)
 {
-    if (!out_ea || (page_offset & 0xFFFu) ||
-        !yz_rsx_live_guest_ptr(nullptr, location, page_offset, 0x1000u))
+    if ((page_offset & 0xFFFu) ||
+        yz_nr_vertical_space_range_to_ea(
+            location, page_offset, 0x1000u, out_ea) != 0)
         return -1;
-    if (location == 0u) {
-        *out_ea = YZ_GCM_LOCAL_BASE + page_offset;
-        return 0;
-    }
-    if (location == 1u) {
-        const u32 ea = yz_rsx_io_to_ea(page_offset);
-        const u32 last = yz_rsx_io_to_ea(page_offset + 0xFFFu);
-        if (!ea || last != ea + 0xFFFu)
-            return -1;
-        *out_ea = ea;
-        return 0;
-    }
-    return -1;
+    return (*out_ea & 0xFFFu) == 0u ? 0 : -1;
 }
 
 /* The guest movie player owns sequencing and post-movie state, but its decoded
@@ -7497,7 +7512,8 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         if (eff >= 0xE940u && eff <= 0xE95Cu)
             rsx_live_draw_set_fifo_position(get, put);
         const int native_method =
-            ((eff == 0x1808u && val == 0u) || eff == 0x1D94u) ?
+            ((eff == 0x1808u && val == 0u) || eff == 0x1D94u ||
+             eff == 0x2328u || eff == 0xC40Cu) ?
             yz_nr_vertical_try_method(eff, val, yz_rsx_io_to_ea(get)) : 0;
         if (!native_method)
             yz_nr_vertical_prepare_legacy_method(eff, val);
