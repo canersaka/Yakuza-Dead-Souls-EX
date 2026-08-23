@@ -119,8 +119,52 @@ int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
     out->first = first;
     out->count = count;
     out->batch_count = batches;
+    out->packet_word_count = 10u + full_batches +
+        (full_batches ? (full_batches + 2046u) / 2047u : 0u);
     out->semantic_hash = hash;
     return 1;
+}
+
+u32 rsx_nr_draw_arrays_packet(const rsx_nr_draw_arrays_contract* draw,
+                              u32* out, u32 out_capacity)
+{
+    if (!draw || !out || !draw->primitive || !draw->count ||
+        !draw->batch_count ||
+        draw->batch_count > RSX_NR_DRAW_CONTRACT_MAX_BATCHES ||
+        draw->first > 0x00FFFFFFu ||
+        draw->count - 1u > 0x00FFFFFFu - draw->first ||
+        draw->packet_word_count > out_capacity)
+        return 0;
+
+    u32 at = 0;
+    out[at++] = 0x400C1714u;
+    out[at++] = 0u;
+    out[at++] = 0u;
+    out[at++] = 0u;
+    out[at++] = 0x00041808u;
+    out[at++] = draw->primitive & 0xFFu;
+
+    const u32 full_batches = (draw->count - 1u) >> 8;
+    const u32 first_count = ((draw->count - 1u) & 0xFFu) + 1u;
+    u32 cursor = draw->first;
+    out[at++] = 0x00041814u;
+    out[at++] = ((first_count - 1u) << 24) | cursor;
+    cursor += first_count;
+
+    u32 remaining = full_batches;
+    while (remaining) {
+        const u32 group = remaining > 2047u ? 2047u : remaining;
+        out[at++] = 0x40000000u | (group << 18) | 0x1814u;
+        for (u32 i = 0; i < group; ++i) {
+            out[at++] = 0xFF000000u | cursor;
+            cursor += 256u;
+        }
+        remaining -= group;
+    }
+
+    out[at++] = 0x00041808u;
+    out[at++] = 0u;
+    return at == draw->packet_word_count ? at : 0u;
 }
 
 u32 rsx_nr_vertex_program_hash_begin(u32 start_slot)
