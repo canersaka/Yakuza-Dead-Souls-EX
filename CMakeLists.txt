@@ -478,6 +478,29 @@ if(PS3RECOMP_BUILD_TESTS)
             TIMEOUT 300
             LABELS "firmware-free;native;spu;performance;regression")
 
+        # Native job scheduler foundation (stage 4 groundwork): descriptor
+        # parse conformance, run_job LS-construction goldens, and
+        # dependency/barrier scheduler semantics. Zero live consumers --
+        # runtime/spu/spu_njs.c only builds here (and under YZ_SPU_NJS).
+        add_executable(spu_njs_tests
+            tests/spu_njs/main.c
+            runtime/spu/spu_njs.c
+        )
+        target_include_directories(spu_njs_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        )
+        target_compile_definitions(spu_njs_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME spu_njs
+            COMMAND spu_njs_tests
+        )
+        set_tests_properties(spu_njs PROPERTIES
+            TIMEOUT 60
+            LABELS "firmware-free;native;spu;spurs;regression")
+
         # Native-render IR equivalence: packet path (FIFO/method stream ->
         # rsx_dispatch -> adapter) vs typed native path must fold to
         # identical action sequences; plus the submission ring and an
