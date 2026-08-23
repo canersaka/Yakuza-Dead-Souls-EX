@@ -7673,6 +7673,8 @@ static void ld_movement_probe_mark_ready(
     static LONG tracked_leg;
     static int frontier_transition_seen;
     static int frontier_loading_observed;
+    static char frontier_visual_path[MAX_PATH * 2];
+    static int frontier_visual_required;
     if (!configured) {
         const char* pixels = getenv("YZ_MOVEMENT_PROOF_READY_NONBLACK");
         const char* first = getenv("YZ_MOVEMENT_PROOF_READY_MIN_SERIAL");
@@ -7686,6 +7688,8 @@ static void ld_movement_probe_mark_ready(
             "YZ_MOVEMENT_PROOF_LOADING_NONBLACK_MAX");
         const char* gun_hud = getenv(
             "YZ_MOVEMENT_PROOF_GUN_HUD_PALE_PPM");
+        const char* frontier_visual = getenv(
+            "YZ_MOVEMENT_PROOF_FRONTIER_VISUAL_FILE");
         minimum_nonblack = pixels && *pixels
             ? _strtoui64(pixels, NULL, 10) : 0ull;
         minimum_serial = first && *first
@@ -7702,6 +7706,12 @@ static void ld_movement_probe_mark_ready(
             ? _strtoui64(loading, NULL, 10) : 20000ull;
         minimum_gun_hud_ppm = gun_hud && *gun_hud
             ? _strtoui64(gun_hud, NULL, 10) : 5000ull;
+        frontier_visual_required = frontier_visual && *frontier_visual;
+        if (frontier_visual_required) {
+            strncpy(frontier_visual_path, frontier_visual,
+                    sizeof(frontier_visual_path) - 1u);
+            frontier_visual_path[sizeof(frontier_visual_path) - 1u] = '\0';
+        }
         if (!required_visible_probes)
             required_visible_probes = 1u;
         if (!required_stable_probes)
@@ -7726,12 +7736,19 @@ static void ld_movement_probe_mark_ready(
     if (InterlockedCompareExchange(
             &g_yz_movement_proof_phase, 0, 0) == 6 &&
         minimum_hud_pale_ppm) {
+        const DWORD frontier_visual_attrs = frontier_visual_required
+            ? GetFileAttributesA(frontier_visual_path)
+            : INVALID_FILE_ATTRIBUTES;
+        const int frontier_visual_ready = frontier_visual_required &&
+            frontier_visual_attrs != INVALID_FILE_ATTRIBUTES &&
+            !(frontier_visual_attrs & FILE_ATTRIBUTE_DIRECTORY);
         if ((u32)movement_leg == frontier_leg &&
             nonblack != UINT64_MAX &&
             nonblack <= loading_nonblack_max &&
             !frontier_transition_seen) {
-            frontier_transition_seen = 1;
             frontier_loading_observed = 1;
+            if (!frontier_visual_required)
+                frontier_transition_seen = 1;
             fprintf(stderr,
                     "[movement-proof] Frontier loading observed leg=%ld "
                     "serial=%u nonblack=%llu\n",
@@ -7743,6 +7760,7 @@ static void ld_movement_probe_mark_ready(
             g_ld_last_dump_gun_tr_ppm >= minimum_gun_hud_ppm &&
             g_ld_last_dump_gun_br_ppm >= minimum_gun_hud_ppm;
         if ((u32)movement_leg == frontier_leg && gun_hud_ready &&
+            !frontier_visual_required &&
             !frontier_transition_seen) {
             frontier_transition_seen = 1;
             fprintf(stderr,
@@ -7754,6 +7772,16 @@ static void ld_movement_probe_mark_ready(
                     (unsigned long long)g_ld_last_dump_gun_tl_ppm,
                     (unsigned long long)g_ld_last_dump_gun_tr_ppm,
                     (unsigned long long)g_ld_last_dump_gun_br_ppm);
+            fflush(stderr);
+        }
+        if ((u32)movement_leg == frontier_leg && frontier_visual_ready &&
+            !frontier_transition_seen) {
+            frontier_transition_seen = 1;
+            fprintf(stderr,
+                    "[movement-proof] Frontier transition verified by "
+                    "archived gun-HUD framebuffer gate leg=%ld serial=%u "
+                    "path=%s\n",
+                    movement_leg, serial, frontier_visual_path);
             fflush(stderr);
         }
         const LONG dialogue_seen = InterlockedCompareExchange(

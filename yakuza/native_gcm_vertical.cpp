@@ -39,9 +39,11 @@ enum : uint32_t {
     YZ_NR_VERT_STATE_DIRECT = 4,
     YZ_NR_VERT_DRAW_ARRAYS = 5,
     YZ_NR_VERT_FLIP = 6,
-    YZ_NR_VERT_FAMILY_COUNT = 7,
+    YZ_NR_VERT_VERTEX_PROGRAM = 7,
+    YZ_NR_VERT_FAMILY_COUNT = 8,
     YZ_NR_VERT_SOURCE_COUNT = 16,
     YZ_NR_VERT_EVENT_COUNT = 8192,
+    YZ_NR_VERT_VP_TEMPLATE_COUNT = 512,
 };
 
 enum : uint32_t {
@@ -73,6 +75,16 @@ struct yz_nr_vertical_event {
     uint32_t b;
 };
 
+struct yz_nr_vertical_vp_template {
+    uint32_t start_slot;
+    uint32_t code_hash;
+    uint32_t word_count;
+    uint32_t input_mask;
+    uint32_t semantic_hash;
+    unsigned long long build_count;
+    unsigned long long replay_count;
+};
+
 struct yz_nr_vertical_state {
     SRWLOCK lock;
     yz_nr_vertical_lane expected;
@@ -102,6 +114,22 @@ struct yz_nr_vertical_state {
     uint32_t flip_buffer;
     unsigned long long flip_unowned;
     unsigned long long flip_bad_sequence;
+    uint32_t vp_state;            /* 0 none, 1 exact wrapper, 2 fallback */
+    uint32_t vp_event_ea;
+    uint32_t vp_start_slot;
+    uint32_t vp_hash;
+    uint32_t vp_word_count;
+    unsigned long long vp_unowned;
+    unsigned long long vp_bad_sequence;
+    yz_nr_vertical_vp_template vp_templates[YZ_NR_VERT_VP_TEMPLATE_COUNT];
+    yz_nr_vertical_vp_template vp_unknown_templates[
+        YZ_NR_VERT_VP_TEMPLATE_COUNT];
+    unsigned long long vp_template_builds;
+    unsigned long long vp_template_replays;
+    unsigned long long vp_template_mask_replays;
+    unsigned long long vp_template_unknown;
+    unsigned long long vp_template_overflow;
+    unsigned long long vp_unknown_overflow;
     volatile LONG mode_shadow;
     volatile LONG mode_active_basic;
     volatile LONG mode_active_present;
@@ -562,6 +590,80 @@ static void yz_nr_expected_draw_arrays(ppu_context* ctx)
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
+static void yz_nr_expected_vertex_program(ppu_context* ctx)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
+        return;
+
+    const uint32_t program = (uint32_t)ctx->gpr[4];
+    const uint32_t ucode = (uint32_t)ctx->gpr[5];
+    const uint32_t descriptor = program + vm_read32((uint64_t)program + 0x14u);
+    const uint32_t instruction_count = vm_read32(descriptor);
+    const uint32_t start_slot = vm_read32((uint64_t)descriptor + 4u);
+    const uint32_t input_mask = vm_read32((uint64_t)descriptor + 0xCu);
+    if (!instruction_count ||
+        instruction_count > RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.exact_unaddressed++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    uint32_t words[RSX_NR_VERTEX_PROGRAM_MAX_WORDS];
+    const uint32_t word_count = instruction_count * 4u;
+    for (uint32_t i = 0; i < word_count; ++i)
+        words[i] = vm_read32((uint64_t)ucode + i * 4u);
+
+    rsx_nr_vertex_program_contract vp = {};
+    if (!rsx_nr_vertex_program_contract_init(
+            &vp, instruction_count, start_slot, input_mask, words)) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        g_vertical.exact_unaddressed++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_vertical.lock);
+    g_vertical.vp_template_builds++;
+    uint32_t free_slot = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+    for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+        yz_nr_vertical_vp_template* const entry =
+            &g_vertical.vp_templates[i];
+        if (entry->build_count && entry->start_slot == vp.start_slot &&
+            entry->semantic_hash == vp.semantic_hash) {
+            entry->build_count++;
+            free_slot = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+            break;
+        }
+        if (!entry->build_count && free_slot == YZ_NR_VERT_VP_TEMPLATE_COUNT)
+            free_slot = i;
+    }
+    if (free_slot < YZ_NR_VERT_VP_TEMPLATE_COUNT) {
+        yz_nr_vertical_vp_template* const entry =
+            &g_vertical.vp_templates[free_slot];
+        entry->start_slot = vp.start_slot;
+        entry->code_hash = vp.code_hash;
+        entry->word_count = vp.word_count;
+        entry->input_mask = vp.attrib_input_mask;
+        entry->semantic_hash = vp.semantic_hash;
+        entry->build_count = 1;
+    } else {
+        bool found = false;
+        for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+            const yz_nr_vertical_vp_template* const entry =
+                &g_vertical.vp_templates[i];
+            if (entry->build_count && entry->start_slot == vp.start_slot &&
+                entry->semantic_hash == vp.semantic_hash) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            g_vertical.vp_template_overflow++;
+    }
+    ReleaseSRWLockExclusive(&g_vertical.lock);
+}
+
 static void yz_nr_expected_flip(uint32_t context,
                                 const rsx_nr_flip_contract* flip)
 {
@@ -638,6 +740,141 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
         return;
+
+    /* Normalize the transform-program producer's multi-packet operation.
+     * The exact event begins at LOAD, hashes instruction words as the RSX
+     * sees them, and closes at ATTRIB_EN.  Program-associated constants that
+     * follow remain separately ordered state and are never swallowed here. */
+    if (method == 0x1E9Cu) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.vp_state)
+            g_vertical.vp_bad_sequence++;
+        g_vertical.vp_event_ea = packet_ea;
+        g_vertical.vp_start_slot = arg;
+        g_vertical.vp_hash = rsx_nr_vertex_program_hash_begin(arg);
+        g_vertical.vp_word_count = 0;
+        g_vertical.vp_state = 1;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method == 0x1EA0u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.vp_state && arg != g_vertical.vp_start_slot)
+            g_vertical.vp_bad_sequence++;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method >= 0x0B80u && method <= 0x0BFCu) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.vp_state) {
+            g_vertical.vp_hash = rsx_nr_vertex_program_hash_word(
+                g_vertical.vp_hash, arg);
+            g_vertical.vp_word_count++;
+        } else if (!g_vertical.vp_state) {
+            g_vertical.vp_bad_sequence++;
+        }
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method == 0x1FF0u) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.vp_state) {
+            const uint32_t hash = rsx_nr_vertex_program_hash_end(
+                g_vertical.vp_hash, g_vertical.vp_word_count, arg);
+            bool matched = false;
+            for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+                yz_nr_vertical_vp_template* const entry =
+                    &g_vertical.vp_templates[i];
+                if (entry->build_count &&
+                    entry->start_slot == g_vertical.vp_start_slot &&
+                    entry->semantic_hash == hash) {
+                    entry->replay_count++;
+                    g_vertical.vp_template_replays++;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                /* EDGE journals may patch ATTRIB_EN while replaying an
+                 * otherwise byte-identical static program template. Accept
+                 * that as code-template coverage only when slot, complete
+                 * word count and code hash all agree; the observed mask
+                 * remains a dynamic ordered state value. */
+                for (uint32_t i = 0;
+                     i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+                    yz_nr_vertical_vp_template* const entry =
+                        &g_vertical.vp_templates[i];
+                    if (entry->build_count &&
+                        entry->start_slot == g_vertical.vp_start_slot &&
+                        entry->code_hash == g_vertical.vp_hash &&
+                        entry->word_count == g_vertical.vp_word_count) {
+                        entry->replay_count++;
+                        g_vertical.vp_template_replays++;
+                        g_vertical.vp_template_mask_replays++;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched) {
+                g_vertical.vp_template_unknown++;
+                g_vertical.vp_unowned++;
+                uint32_t free_slot = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+                for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+                    yz_nr_vertical_vp_template* const entry =
+                        &g_vertical.vp_unknown_templates[i];
+                    if (entry->build_count &&
+                        entry->start_slot == g_vertical.vp_start_slot &&
+                        entry->semantic_hash == hash) {
+                        entry->replay_count++;
+                        free_slot = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+                        break;
+                    }
+                    if (!entry->build_count &&
+                        free_slot == YZ_NR_VERT_VP_TEMPLATE_COUNT)
+                        free_slot = i;
+                }
+                if (free_slot < YZ_NR_VERT_VP_TEMPLATE_COUNT) {
+                    yz_nr_vertical_vp_template* const entry =
+                        &g_vertical.vp_unknown_templates[free_slot];
+                    entry->start_slot = g_vertical.vp_start_slot;
+                    entry->code_hash = g_vertical.vp_hash;
+                    entry->word_count = g_vertical.vp_word_count;
+                    entry->input_mask = arg;
+                    entry->semantic_hash = hash;
+                    entry->build_count = 1;
+                    entry->replay_count = 1;
+                } else {
+                    bool found = false;
+                    for (uint32_t i = 0;
+                         i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+                        const yz_nr_vertical_vp_template* const entry =
+                            &g_vertical.vp_unknown_templates[i];
+                        if (entry->build_count &&
+                            entry->start_slot == g_vertical.vp_start_slot &&
+                            entry->semantic_hash == hash) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                        g_vertical.vp_unknown_overflow++;
+                }
+            }
+        } else if (!g_vertical.vp_state) {
+            /* A direct ATTRIB_EN setter is handled by the ordinary state
+             * contract below; it is not a malformed program sequence. */
+            ReleaseSRWLockExclusive(&g_vertical.lock);
+            goto observe_single_method;
+        }
+        g_vertical.vp_state = 0;
+        g_vertical.vp_event_ea = 0;
+        g_vertical.vp_start_slot = 0;
+        g_vertical.vp_hash = 0;
+        g_vertical.vp_word_count = 0;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
 
     /* The imported flip producer emits queue-buffer followed by flip-head.
      * Keep the exact event live until both ordered methods agree. Other flip
@@ -752,6 +989,7 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 
     /* yz_rsx_method receives subchannel-flattened methods. NV406E methods
      * remain in the low window; the game user-command method is 0xEB00/04. */
+observe_single_method:
     uint32_t family = 0, a = 0, b = 0;
     switch (method) {
     case 0x0050:
@@ -989,6 +1227,29 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const unsigned long long flip_unowned = g_vertical.flip_unowned;
     const unsigned long long flip_bad_sequence =
         g_vertical.flip_bad_sequence;
+    const unsigned long long vp_bad_sequence =
+        g_vertical.vp_bad_sequence;
+    unsigned long long vp_template_unique = 0;
+    unsigned long long vp_template_seen = 0;
+    for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+        if (g_vertical.vp_templates[i].build_count) {
+            vp_template_unique++;
+            if (g_vertical.vp_templates[i].replay_count)
+                vp_template_seen++;
+        }
+    }
+    const unsigned long long vp_template_builds =
+        g_vertical.vp_template_builds;
+    const unsigned long long vp_template_replays =
+        g_vertical.vp_template_replays;
+    const unsigned long long vp_template_mask_replays =
+        g_vertical.vp_template_mask_replays;
+    const unsigned long long vp_template_unknown =
+        g_vertical.vp_template_unknown;
+    const unsigned long long vp_template_overflow =
+        g_vertical.vp_template_overflow;
+    const unsigned long long vp_unknown_overflow =
+        g_vertical.vp_unknown_overflow;
     uint32_t observed_ea_min[YZ_NR_VERT_FAMILY_COUNT];
     uint32_t observed_ea_max[YZ_NR_VERT_FAMILY_COUNT];
     memcpy(observed_ea_min, g_vertical.observed_ea_min,
@@ -1021,6 +1282,11 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const bool flip_ok = expected.count[YZ_NR_VERT_FLIP] ==
                              observed.count[YZ_NR_VERT_FLIP] +
                              outstanding_by_family[YZ_NR_VERT_FLIP];
+    const bool vp_ok = vp_template_builds != 0 &&
+                       vp_template_replays != 0 &&
+                       vp_template_unknown == 0 &&
+                       vp_template_overflow == 0 &&
+                       vp_bad_sequence == 0;
     unsigned sequence_mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
         if (!outstanding_by_family[family] &&
@@ -1034,6 +1300,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             "draw=%llu/%llu+%llu:%s draw-unowned=%llu "
             "draw-unsupported=%llu draw-seq=%llu "
             "flip=%llu/%llu+%llu:%s flip-unowned=%llu flip-seq=%llu "
+            "vp-builds=%llu templates=%llu seen=%llu replays=%llu "
+            "mask-variants=%llu "
+            "unknown=%llu overflow=%llu/%llu:%s vp-seq=%llu "
             "mismatch=%u seqdiff=%u]\n",
             expected.count[YZ_NR_VERT_REFERENCE],
             observed.count[YZ_NR_VERT_REFERENCE],
@@ -1060,7 +1329,62 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed.count[YZ_NR_VERT_FLIP],
             outstanding_by_family[YZ_NR_VERT_FLIP],
             flip_ok ? "ok" : "bad", flip_unowned, flip_bad_sequence,
+            vp_template_builds, vp_template_unique, vp_template_seen,
+            vp_template_replays, vp_template_mask_replays,
+            vp_template_unknown,
+            vp_template_overflow, vp_unknown_overflow,
+            vp_ok ? "ok" : "bad",
+            vp_bad_sequence,
             mismatches, sequence_mismatches);
+    /* Compact fixed-memory identity census.  These are semantic hashes of
+     * complete uploads, not packet addresses or per-event logs. */
+    bool selected_known[YZ_NR_VERT_VP_TEMPLATE_COUNT] = {};
+    bool selected_unknown[YZ_NR_VERT_VP_TEMPLATE_COUNT] = {};
+    for (uint32_t rank = 0; rank < 16u; ++rank) {
+        uint32_t best = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+        for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+            if (selected_known[i] || !g_vertical.vp_templates[i].replay_count)
+                continue;
+            if (best == YZ_NR_VERT_VP_TEMPLATE_COUNT ||
+                g_vertical.vp_templates[i].replay_count >
+                    g_vertical.vp_templates[best].replay_count)
+                best = i;
+        }
+        if (best == YZ_NR_VERT_VP_TEMPLATE_COUNT)
+            break;
+        selected_known[best] = true;
+        const yz_nr_vertical_vp_template* const entry =
+            &g_vertical.vp_templates[best];
+        fprintf(stderr,
+                "[nr-vertical-vp-known rank=%u start=%u code=%08X "
+                "words=%u mask=%08X hash=%08X builds=%llu replays=%llu]\n",
+                rank + 1u, entry->start_slot, entry->code_hash,
+                entry->word_count, entry->input_mask, entry->semantic_hash,
+                entry->build_count, entry->replay_count);
+    }
+    for (uint32_t rank = 0; rank < 16u; ++rank) {
+        uint32_t best = YZ_NR_VERT_VP_TEMPLATE_COUNT;
+        for (uint32_t i = 0; i < YZ_NR_VERT_VP_TEMPLATE_COUNT; ++i) {
+            if (selected_unknown[i] ||
+                !g_vertical.vp_unknown_templates[i].replay_count)
+                continue;
+            if (best == YZ_NR_VERT_VP_TEMPLATE_COUNT ||
+                g_vertical.vp_unknown_templates[i].replay_count >
+                    g_vertical.vp_unknown_templates[best].replay_count)
+                best = i;
+        }
+        if (best == YZ_NR_VERT_VP_TEMPLATE_COUNT)
+            break;
+        selected_unknown[best] = true;
+        const yz_nr_vertical_vp_template* const entry =
+            &g_vertical.vp_unknown_templates[best];
+        fprintf(stderr,
+                "[nr-vertical-vp-unknown rank=%u start=%u code=%08X "
+                "words=%u mask=%08X hash=%08X replays=%llu]\n",
+                rank + 1u, entry->start_slot, entry->code_hash,
+                entry->word_count, entry->input_mask, entry->semantic_hash,
+                entry->replay_count);
+    }
     for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
         if (!sources[i].count)
             continue;
@@ -1077,7 +1401,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
     fprintf(stderr,
             "[nr-vertical-observed-ea ref=%08X-%08X "
             "acq=%08X-%08X user=%08X-%08X state=%08X-%08X "
-            "draw=%08X-%08X flip=%08X-%08X]\n",
+            "draw=%08X-%08X flip=%08X-%08X vp=%08X-%08X]\n",
             observed_ea_min[YZ_NR_VERT_REFERENCE],
             observed_ea_max[YZ_NR_VERT_REFERENCE],
             observed_ea_min[YZ_NR_VERT_ACQUIRE],
@@ -1089,7 +1413,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed_ea_min[YZ_NR_VERT_DRAW_ARRAYS],
             observed_ea_max[YZ_NR_VERT_DRAW_ARRAYS],
             observed_ea_min[YZ_NR_VERT_FLIP],
-            observed_ea_max[YZ_NR_VERT_FLIP]);
+            observed_ea_max[YZ_NR_VERT_FLIP],
+            observed_ea_min[YZ_NR_VERT_VERTEX_PROGRAM],
+            observed_ea_max[YZ_NR_VERT_VERTEX_PROGRAM]);
     fprintf(stderr,
             "[nr-vertical-exact matched=%llu mismatch=%llu unexpected=%llu "
             "outstanding=%llu unaddressed=%llu overflow=%llu]\n",
@@ -1124,6 +1450,15 @@ void func_00EBD6FC(ppu_context* ctx)
     if (!yz_nr_active_publish(ctx, YZ_NR_VERT_USER,
                               (uint32_t)ctx->gpr[4]))
         func_00EBD6FC_lifted(ctx);
+}
+
+/* Complete transform-program producer ABI entry. Passive mode derives the
+ * typed upload from the descriptor and ucode arguments before the lifted
+ * SDK body constructs LOAD/START/upload/mask packets. */
+void func_00EBD92C(ppu_context* ctx)
+{
+    yz_nr_expected_vertex_program(ctx);
+    func_00EBD92C_lifted(ctx);
 }
 
 /* Thin DrawArrays producer: passive mode derives the typed draw directly

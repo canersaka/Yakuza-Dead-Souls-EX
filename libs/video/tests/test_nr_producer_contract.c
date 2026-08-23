@@ -89,6 +89,44 @@ int main(void)
         RSX_NR_DRAW_CONTRACT_MAX_BATCHES * 256u + 1u));
     CHECK(!rsx_nr_draw_arrays_contract_init(0, 5u, 0u, 1u));
 
+    u32 vp_words[RSX_NR_VERTEX_PROGRAM_MAX_WORDS];
+    for (u32 i = 0; i < RSX_NR_VERTEX_PROGRAM_MAX_WORDS; ++i)
+        vp_words[i] = 0x10203040u ^ (i * 0x01010101u);
+    rsx_nr_vertex_program_contract vp = {0};
+    CHECK(rsx_nr_vertex_program_contract_init(&vp, 1u, 7u,
+                                               0xA5A5u, vp_words));
+    CHECK(vp.start_slot == 7u && vp.instruction_count == 1u);
+    CHECK(vp.word_count == 4u && vp.attrib_input_mask == 0xA5A5u);
+    CHECK(vp.packet_word_count == 12u); /* 3 + (1+4) + 2 + 2 */
+    u32 vp_hash = rsx_nr_vertex_program_hash_begin(7u);
+    for (u32 i = 0; i < 4u; ++i)
+        vp_hash = rsx_nr_vertex_program_hash_word(vp_hash, vp_words[i]);
+    CHECK(vp.code_hash == vp_hash);
+    vp_hash = rsx_nr_vertex_program_hash_end(vp_hash, 4u, 0xA5A5u);
+    CHECK(vp.semantic_hash == vp_hash);
+
+    CHECK(rsx_nr_vertex_program_contract_init(&vp, 8u, 0u,
+                                               0xFFFFu, vp_words));
+    CHECK(vp.word_count == 32u && vp.packet_word_count == 40u);
+    CHECK(rsx_nr_vertex_program_contract_init(&vp, 9u, 4u,
+                                               1u, vp_words));
+    CHECK(vp.word_count == 36u && vp.packet_word_count == 45u);
+    CHECK(rsx_nr_vertex_program_contract_init(
+        &vp, RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u, 0u, 1u, vp_words));
+    CHECK(vp.word_count == RSX_NR_VERTEX_PROGRAM_MAX_WORDS);
+    CHECK(!rsx_nr_vertex_program_contract_init(&vp, 0u, 0u, 0u,
+                                                vp_words));
+    CHECK(!rsx_nr_vertex_program_contract_init(
+        &vp, RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u + 1u, 0u, 0u,
+        vp_words));
+    CHECK(!rsx_nr_vertex_program_contract_init(&vp, 1u,
+        RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u, 0u, vp_words));
+    CHECK(!rsx_nr_vertex_program_contract_init(&vp, 2u,
+        RSX_NR_VERTEX_PROGRAM_MAX_WORDS / 4u - 1u, 0u, vp_words));
+    CHECK(!rsx_nr_vertex_program_contract_init(0, 1u, 0u, 0u,
+                                                vp_words));
+    CHECK(!rsx_nr_vertex_program_contract_init(&vp, 1u, 0u, 0u, 0));
+
     rsx_nr_flip_contract flip = {0};
     CHECK(rsx_nr_flip_contract_init(&flip, 3u, 0, 0u, 0u));
     CHECK(flip.word_count == 4u && flip.flip_word_index == 0u);
@@ -116,6 +154,6 @@ int main(void)
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;
     }
-    printf("nr producer contract: 25 setters + draw arrays + flip verified\n");
+    printf("nr producer contract: 25 setters + draw arrays + vertex program + flip verified\n");
     return 0;
 }
