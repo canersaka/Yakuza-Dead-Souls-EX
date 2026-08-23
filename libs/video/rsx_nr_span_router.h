@@ -55,6 +55,17 @@ typedef enum rsx_nr_span_take_result {
     RSX_NR_SPAN_TAKE_CORRUPT,
 } rsx_nr_span_take_result;
 
+/* Opaque single-consumer ownership token. A claimed slot is not recyclable
+ * and its watched-page count remains live until retire. This is required for
+ * typed operations such as semaphore acquires that can block while GET stays
+ * on the same guest span. Zero is never a valid slot token. */
+typedef struct rsx_nr_span_claim {
+    u32 slot;                  /* private slot index + 1                    */
+    u32 generation;
+    u32 fingerprint;
+    u32 ea;
+} rsx_nr_span_claim;
+
 typedef struct rsx_nr_span_router_stats {
     unsigned long long published;
     unsigned long long claimed;
@@ -97,8 +108,23 @@ void rsx_nr_span_router_set_miss_counting(rsx_nr_span_router* r, int enabled);
 rsx_nr_span_publish_result
 rsx_nr_span_router_publish(rsx_nr_span_router* r, const rsx_nr_span* span);
 
-/* Exact, destructive claim.  On CLAIMED, *out owns a complete copy and the
- * slot is immediately recyclable.  The caller executes that payload once. */
+/* Exact retained claim. On CLAIMED, *out owns a complete copy but the slot
+ * remains reserved and its page stays watched. The single consumer must call
+ * retire exactly once after the typed payload has completed. A blocked
+ * payload may keep the claim across retries without re-publishing or
+ * re-claiming it. */
+rsx_nr_span_take_result
+rsx_nr_span_router_claim(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out,
+                         rsx_nr_span_claim* claim);
+
+/* Retire a completed retained claim. Returns zero on success. A stale,
+ * reset, mismatched, or already-retired token is rejected without touching
+ * another slot. */
+int rsx_nr_span_router_retire(rsx_nr_span_router* r,
+                              const rsx_nr_span_claim* claim);
+
+/* Compatibility one-shot claim+retire for payloads known not to block. On
+ * CLAIMED, *out owns a complete copy and the slot is already recyclable. */
 rsx_nr_span_take_result
 rsx_nr_span_router_take(rsx_nr_span_router* r, u32 ea, rsx_nr_span* out);
 

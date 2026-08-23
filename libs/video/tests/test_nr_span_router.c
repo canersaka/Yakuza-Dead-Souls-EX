@@ -68,6 +68,43 @@ int main(void)
               RSX_NR_SPAN_TAKE_FAST_MISS,
           "last claim did not clear the exact page count");
 
+    /* A retained claim remains exact-owned and keeps its page watched while
+     * a consumer-side dependency is blocked. It cannot be duplicated,
+     * claimed twice, retired twice, or confused with a stale token. */
+    rsx_nr_span blocked = make_span(&router, 0x40401800, 10,
+                                    RSX_NIR_OP_SEMAPHORE_ACQUIRE,
+                                    0x230, 0xAABBCCDD);
+    CHECK(rsx_nr_span_router_publish(&router, &blocked) ==
+              RSX_NR_SPAN_PUBLISHED,
+          "blocked publish");
+    rsx_nr_span_claim retained = {0};
+    CHECK(rsx_nr_span_router_claim(&router, blocked.ea, &out, &retained) ==
+              RSX_NR_SPAN_TAKE_CLAIMED,
+          "blocked retained claim");
+    CHECK(retained.slot && retained.ea == blocked.ea &&
+              retained.generation == blocked.generation &&
+              retained.fingerprint == out.fingerprint,
+          "retained token identity");
+    rsx_nr_span_claim duplicate_claim = {0};
+    CHECK(rsx_nr_span_router_claim(&router, blocked.ea, &out,
+                                   &duplicate_claim) ==
+              RSX_NR_SPAN_TAKE_MISS,
+          "claimed span was claimable twice");
+    CHECK(rsx_nr_span_router_publish(&router, &blocked) ==
+              RSX_NR_SPAN_PUBLISH_DUPLICATE,
+          "claimed exact address was silently replaced");
+    rsx_nr_span_claim stale = retained;
+    stale.fingerprint ^= 1u;
+    CHECK(rsx_nr_span_router_retire(&router, &stale) != 0,
+          "mismatched claim token retired live span");
+    CHECK(rsx_nr_span_router_retire(&router, &retained) == 0,
+          "retained retire");
+    CHECK(rsx_nr_span_router_retire(&router, &retained) != 0,
+          "retained double retire");
+    CHECK(rsx_nr_span_router_take(&router, blocked.ea, &out) ==
+              RSX_NR_SPAN_TAKE_FAST_MISS,
+          "retained retire did not clear watched page");
+
     /* The page count remains watched until every exact span on that page is
      * retired, then returns to the one-load fast-miss path. */
     rsx_nr_span same_page_a = make_span(&router, 0x40402000, 2,
@@ -148,8 +185,8 @@ int main(void)
 
     rsx_nr_span_router_stats stats;
     rsx_nr_span_router_get_stats(&router, &stats);
-    CHECK(stats.published == 13 && stats.claimed == 4 &&
-              stats.duplicates == 1 && stats.full == 1,
+    CHECK(stats.published == 14 && stats.claimed == 5 &&
+              stats.duplicates == 2 && stats.full == 1,
           "stats p=%llu c=%llu dup=%llu full=%llu",
           stats.published, stats.claimed, stats.duplicates, stats.full);
 

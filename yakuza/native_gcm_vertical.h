@@ -34,8 +34,8 @@ void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
  * queue+present contract and returns 0 so the caller emits the legacy packet.
  * active-present may return 1 after publishing an exact-EA typed span; in
  * that case *result is the wrapper's completed return value and the caller
- * must not append the packet again. Wait-label flips remain fallback until a
- * blocking claimed-span protocol is enabled. */
+ * must not append the packet again. Wait-label spans retain their exact claim
+ * while the label is unsatisfied, then execute PRESENT once in order. */
 int yz_nr_vertical_try_flip(uint32_t context, uint32_t buffer_id,
                             int wait_for_label, uint32_t label_index,
                             uint32_t label_value, int32_t* result);
