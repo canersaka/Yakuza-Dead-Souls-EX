@@ -43,6 +43,7 @@ static int g_failures;
 #define MAIN_SIZE  (1u << 16)
 #define RT_OFFSET  0x00300000u   /* outside the arena on purpose: the RT  */
 #define RT565_OFFSET 0x00310000u
+#define ZETA_OFFSET  0x00320000u
 #define RT_W 64u                 /* is a GPU object keyed by (space,ofs)  */
 #define RT_H 64u
 #define VTX_OFFSET 0x2000u
@@ -179,6 +180,25 @@ static void stage_rt565_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
+static void stage_depth_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = ZETA_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xB0u;          /* LINEAR | DEPTH24_D8               */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = RT_W;
+    texture.height = RT_H;
+    texture.pitch = RT_W * 4u;
+    texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
 static u32 fbits(float f)
 {
     u32 v;
@@ -226,6 +246,9 @@ static void stage_frame_state(rsx_nir_emitter* em)
     s.color_pitch[0] = RT_W * 4;
     s.color_location[0] = RSX_NIR_LOCATION_LOCAL;
     s.color_target = 1;
+    s.zeta_offset = ZETA_OFFSET;
+    s.zeta_pitch = RT_W * 4u;
+    s.zeta_location = RSX_NIR_LOCATION_LOCAL;
     rsx_nir_em_surface(em, &s);
 
     rsx_nir_viewport v;
@@ -804,6 +827,34 @@ int main(int argc, char** argv)
               pix_is(61, 61, 0xFF, 0x00, 0xFF),
           "quad expansion did not cover target");
 
+    /* ---- guest-identity zeta + GPU depth sampling ---------------------
+     * Clear the distinct ZETA_OFFSET resource to 0.25, then sample it in a
+     * depth-disabled pass. The address is outside guest memory, proving the
+     * sampled value comes from the prior GPU depth resource. */
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0x01, 0, 0x400000u, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "zeta clear exec errors %llu",
+          be.stats.exec_errors);
+
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0, 0xFF0000FFu, 0, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+                   -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "zeta sample exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x40, 0x40, 0x40),
+          "zeta sample pixel %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    write_test_fp();
+
     /* ---- scissored clear ------------------------------------------------
      * CLEAR_SURFACE clears only within the scissor box
      * (cellGcmSetClearSurface). Blue full clear, then a green clear
@@ -846,7 +897,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 12 && st.draws == 9 && st.presents == 11,
+    CHECK(st.clears == 14 && st.draws == 10 && st.presents == 12,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
@@ -857,7 +908,7 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 3 && st.texture_builds == 1 &&
+    CHECK(st.texture_draws == 4 && st.texture_builds == 1 &&
               st.texture_refreshes == 1 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
