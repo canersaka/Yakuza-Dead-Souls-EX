@@ -38,7 +38,8 @@ enum : uint32_t {
     YZ_NR_VERT_USER = 3,
     YZ_NR_VERT_STATE_DIRECT = 4,
     YZ_NR_VERT_DRAW_ARRAYS = 5,
-    YZ_NR_VERT_FAMILY_COUNT = 6,
+    YZ_NR_VERT_FLIP = 6,
+    YZ_NR_VERT_FAMILY_COUNT = 7,
     YZ_NR_VERT_SOURCE_COUNT = 16,
     YZ_NR_VERT_EVENT_COUNT = 8192,
 };
@@ -96,8 +97,14 @@ struct yz_nr_vertical_state {
     uint32_t draw_event_ea;
     uint32_t draw_primitive;
     uint32_t draw_hash;
+    uint32_t flip_state;          /* 0 none, 1 exact wrapper, 2 fallback */
+    uint32_t flip_event_ea;
+    uint32_t flip_buffer;
+    unsigned long long flip_unowned;
+    unsigned long long flip_bad_sequence;
     volatile LONG mode_shadow;
     volatile LONG mode_active_basic;
+    volatile LONG mode_active_present;
     volatile LONG initialized;
 };
 
@@ -133,6 +140,7 @@ static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 
 extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value);
 extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause);
+extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id);
 
 static void yz_nr_exec_reference(void*, uint32_t value)
 {
@@ -142,6 +150,12 @@ static void yz_nr_exec_reference(void*, uint32_t value)
 static void yz_nr_exec_user(void*, uint32_t cause)
 {
     yz_nr_vertical_exec_user_command(cause);
+}
+
+static int yz_nr_exec_present(void*, uint32_t buffer_id)
+{
+    yz_nr_vertical_exec_present(buffer_id);
+    return 0;
 }
 
 static int yz_nr_active_init(void)
@@ -162,6 +176,7 @@ static int yz_nr_active_init(void)
     rsx_nr_exec_ops ops = {};
     ops.set_reference = yz_nr_exec_reference;
     ops.user_command = yz_nr_exec_user;
+    ops.present = yz_nr_exec_present;
     rsx_nr_backend_init(&g_active.backend, &g_active.ring,
                         &g_active.tokens, &ops);
     return 1;
@@ -224,6 +239,59 @@ static int yz_nr_active_publish(ppu_context* ctx, uint32_t family,
     MemoryBarrier();
     vm_write32((uint64_t)context + 8u, current + 8u);
     g_active.owned[family]++;
+    ReleaseSRWLockExclusive(&g_active.producer_lock);
+    return 1;
+}
+
+static int yz_nr_active_publish_flip(uint32_t context,
+                                     const rsx_nr_flip_contract* flip)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_active_present, 0, 0))
+        return 0;
+    /* A typed acquire may block. The current exact router destructively
+     * claims a span before execution, so wait-label ownership stays disabled
+     * until claimed spans can remain pending without losing their identity. */
+    if (flip->wait_for_label) {
+        g_active.fallback[YZ_NR_VERT_FLIP]++;
+        return 0;
+    }
+    if (context != YZ_GCM_CTX_ADDR) {
+        g_active.wrong_context++;
+        g_active.fallback[YZ_NR_VERT_FLIP]++;
+        return 0;
+    }
+
+    AcquireSRWLockExclusive(&g_active.producer_lock);
+    const uint32_t current = vm_read32((uint64_t)context + 8u);
+    const uint32_t end = vm_read32((uint64_t)context + 4u);
+    const uint32_t bytes = flip->word_count * 4u;
+    if ((current & 3u) || current > end || bytes > end - current) {
+        g_active.no_room++;
+        g_active.fallback[YZ_NR_VERT_FLIP]++;
+        ReleaseSRWLockExclusive(&g_active.producer_lock);
+        return 0;
+    }
+
+    rsx_nr_span span = {};
+    span.ea = current;
+    span.word_count = flip->word_count;
+    span.generation = rsx_nr_span_router_generation(&g_active.router);
+    span.payload.op_count = 1;
+    span.payload.ops[0].kind = RSX_NIR_OP_PRESENT;
+    span.payload.ops[0].u.present.buffer = flip->buffer_id;
+
+    for (uint32_t i = 0; i < flip->word_count; ++i)
+        vm_write32((uint64_t)current + i * 4u, flip->words[i]);
+    if (rsx_nr_span_router_publish(&g_active.router, &span) !=
+        RSX_NR_SPAN_PUBLISHED) {
+        g_active.publish_failure++;
+        g_active.fallback[YZ_NR_VERT_FLIP]++;
+        ReleaseSRWLockExclusive(&g_active.producer_lock);
+        return 0;
+    }
+    MemoryBarrier();
+    vm_write32((uint64_t)context + 8u, current + bytes);
+    g_active.owned[YZ_NR_VERT_FLIP]++;
     ReleaseSRWLockExclusive(&g_active.producer_lock);
     return 1;
 }
@@ -479,6 +547,34 @@ static void yz_nr_expected_draw_arrays(ppu_context* ctx)
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
+static void yz_nr_expected_flip(uint32_t context,
+                                const rsx_nr_flip_contract* flip)
+{
+    if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
+        return;
+    const uint32_t current = vm_read32((uint64_t)context + 8u);
+    const uint32_t end = vm_read32((uint64_t)context + 4u);
+    const uint32_t bytes = flip->word_count * 4u;
+    if (!current || (current & 3u) || current > end || bytes > end - current)
+        return; /* The unchanged producer will report the same refusal. */
+
+    AcquireSRWLockExclusive(&g_vertical.lock);
+    if (flip->wait_for_label) {
+        /* The consumer identifies an acquire at its OFFSET header. */
+        yz_nr_note(&g_vertical.expected, YZ_NR_VERT_ACQUIRE,
+                   flip->label_offset, flip->label_value);
+        yz_nr_event_expect(current + 8u, YZ_NR_VERT_ACQUIRE,
+                           flip->label_offset, flip->label_value);
+    }
+    const uint32_t flip_ea = current + flip->flip_word_index * 4u;
+    yz_nr_note(&g_vertical.expected, YZ_NR_VERT_FLIP,
+               flip->buffer_id, 0x8000010Fu);
+    yz_nr_event_expect(flip_ea, YZ_NR_VERT_FLIP,
+                       flip->buffer_id, 0x8000010Fu);
+    yz_nr_note_source(context, current, YZ_NR_VERT_FLIP);
+    ReleaseSRWLockExclusive(&g_vertical.lock);
+}
+
 } // namespace
 
 extern "C" void yz_nr_vertical_init(void)
@@ -488,7 +584,8 @@ extern "C" void yz_nr_vertical_init(void)
     const char* const mode = getenv("YZ_NR_VERTICAL");
     if (mode && strcmp(mode, "shadow") == 0)
         InterlockedExchange(&g_vertical.mode_shadow, 1);
-    else if (mode && strcmp(mode, "active-basic") == 0) {
+    else if (mode && (strcmp(mode, "active-basic") == 0 ||
+                      strcmp(mode, "active-present") == 0)) {
         if (yz_nr_active_init())
             InterlockedExchange(&g_vertical.mode_active_basic, 1);
         else {
@@ -496,7 +593,29 @@ extern "C" void yz_nr_vertical_init(void)
                     "[nr-vertical-active init=failed; legacy fallback only]\n");
             fflush(stderr);
         }
+        if (InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0) &&
+            strcmp(mode, "active-present") == 0)
+            InterlockedExchange(&g_vertical.mode_active_present, 1);
     }
+}
+
+extern "C" int yz_nr_vertical_try_flip(uint32_t context,
+                                         uint32_t buffer_id,
+                                         int wait_for_label,
+                                         uint32_t label_index,
+                                         uint32_t label_value,
+                                         int32_t* result)
+{
+    rsx_nr_flip_contract flip = {};
+    if (!rsx_nr_flip_contract_init(&flip, buffer_id, wait_for_label,
+                                   label_index, label_value))
+        return 0;
+    yz_nr_expected_flip(context, &flip);
+    if (!yz_nr_active_publish_flip(context, &flip))
+        return 0;
+    if (result)
+        *result = 0;
+    return 1;
 }
 
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
@@ -504,6 +623,55 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_shadow, 0, 0))
         return;
+
+    /* The imported flip producer emits queue-buffer followed by flip-head.
+     * Keep the exact event live until both ordered methods agree. Other flip
+     * producers remain counted fallback and are never claimed. */
+    if (method >= 0xE940u && method <= 0xE95Cu) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.flip_state)
+            g_vertical.flip_bad_sequence++;
+        g_vertical.flip_event_ea = packet_ea;
+        g_vertical.flip_buffer = arg;
+        if (method == 0xE944u &&
+            yz_nr_event_find(packet_ea, YZ_NR_VERT_FLIP)) {
+            g_vertical.flip_state = 1;
+        } else {
+            g_vertical.flip_state = 2;
+            g_vertical.flip_unowned++;
+        }
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
+    if (method >= 0xE920u && method <= 0xE93Cu) {
+        AcquireSRWLockExclusive(&g_vertical.lock);
+        if (g_vertical.flip_state == 1) {
+            if (method != 0xE924u || arg != 0x8000010Fu) {
+                g_vertical.flip_bad_sequence++;
+            } else {
+                yz_nr_note(&g_vertical.observed, YZ_NR_VERT_FLIP,
+                           g_vertical.flip_buffer, arg);
+                yz_nr_event_observe(g_vertical.flip_event_ea,
+                                    YZ_NR_VERT_FLIP,
+                                    g_vertical.flip_buffer, arg);
+                const uint32_t family = YZ_NR_VERT_FLIP;
+                if (g_vertical.observed.count[family] == 1 ||
+                    g_vertical.flip_event_ea <
+                        g_vertical.observed_ea_min[family])
+                    g_vertical.observed_ea_min[family] =
+                        g_vertical.flip_event_ea;
+                if (g_vertical.flip_event_ea >
+                    g_vertical.observed_ea_max[family])
+                    g_vertical.observed_ea_max[family] =
+                        g_vertical.flip_event_ea;
+            }
+        }
+        g_vertical.flip_state = 0;
+        g_vertical.flip_event_ea = 0;
+        g_vertical.flip_buffer = 0;
+        ReleaseSRWLockExclusive(&g_vertical.lock);
+        return;
+    }
 
     /* Normalize complete DrawArrays actions at the consumer. An exact
      * wrapper event is keyed by the BEGIN packet address and stays live until
@@ -692,6 +860,8 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
             g_active.executed[YZ_NR_VERT_REFERENCE]++;
         else if (kind == RSX_NIR_OP_USER_COMMAND)
             g_active.executed[YZ_NR_VERT_USER]++;
+        else if (kind == RSX_NIR_OP_PRESENT)
+            g_active.executed[YZ_NR_VERT_FLIP]++;
     }
     g_active.last_miss_ea = ~0u;
     g_active.last_miss_epoch = 0;
@@ -703,20 +873,24 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
 extern "C" void yz_nr_vertical_shutdown(void)
 {
     if (InterlockedExchange(&g_vertical.mode_active_basic, 0)) {
+        InterlockedExchange(&g_vertical.mode_active_present, 0);
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
                 "[nr-vertical-active "
-                "ref=%llu/%llu user=%llu/%llu "
-                "fallback-ref=%llu fallback-user=%llu "
+                "ref=%llu/%llu user=%llu/%llu flip=%llu/%llu "
+                "fallback-ref=%llu fallback-user=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
                 "wait=%llu fatal=%llu depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],
                 g_active.executed[YZ_NR_VERT_USER],
+                g_active.owned[YZ_NR_VERT_FLIP],
+                g_active.executed[YZ_NR_VERT_FLIP],
                 g_active.fallback[YZ_NR_VERT_REFERENCE],
                 g_active.fallback[YZ_NR_VERT_USER],
+                g_active.fallback[YZ_NR_VERT_FLIP],
                 g_active.wrong_context, g_active.no_room,
                 g_active.publish_failure, g_active.wait, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
@@ -763,6 +937,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const unsigned long long draw_unsupported = g_vertical.draw_unsupported;
     const unsigned long long draw_bad_sequence =
         g_vertical.draw_bad_sequence;
+    const unsigned long long flip_unowned = g_vertical.flip_unowned;
+    const unsigned long long flip_bad_sequence =
+        g_vertical.flip_bad_sequence;
     uint32_t observed_ea_min[YZ_NR_VERT_FAMILY_COUNT];
     uint32_t observed_ea_max[YZ_NR_VERT_FAMILY_COUNT];
     memcpy(observed_ea_min, g_vertical.observed_ea_min,
@@ -792,6 +969,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
     const bool draw_ok = expected.count[YZ_NR_VERT_DRAW_ARRAYS] ==
                              observed.count[YZ_NR_VERT_DRAW_ARRAYS] +
                              outstanding_by_family[YZ_NR_VERT_DRAW_ARRAYS];
+    const bool flip_ok = expected.count[YZ_NR_VERT_FLIP] ==
+                             observed.count[YZ_NR_VERT_FLIP] +
+                             outstanding_by_family[YZ_NR_VERT_FLIP];
     unsigned sequence_mismatches = 0;
     for (uint32_t family = 1; family < YZ_NR_VERT_FAMILY_COUNT; ++family) {
         if (!outstanding_by_family[family] &&
@@ -804,6 +984,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
             "state=%llu/%llu+%llu:%s state-unowned=%llu "
             "draw=%llu/%llu+%llu:%s draw-unowned=%llu "
             "draw-unsupported=%llu draw-seq=%llu "
+            "flip=%llu/%llu+%llu:%s flip-unowned=%llu flip-seq=%llu "
             "mismatch=%u seqdiff=%u]\n",
             expected.count[YZ_NR_VERT_REFERENCE],
             observed.count[YZ_NR_VERT_REFERENCE],
@@ -826,6 +1007,10 @@ extern "C" void yz_nr_vertical_shutdown(void)
             outstanding_by_family[YZ_NR_VERT_DRAW_ARRAYS],
             draw_ok ? "ok" : "bad", draw_unowned, draw_unsupported,
             draw_bad_sequence,
+            expected.count[YZ_NR_VERT_FLIP],
+            observed.count[YZ_NR_VERT_FLIP],
+            outstanding_by_family[YZ_NR_VERT_FLIP],
+            flip_ok ? "ok" : "bad", flip_unowned, flip_bad_sequence,
             mismatches, sequence_mismatches);
     for (uint32_t i = 0; i < YZ_NR_VERT_SOURCE_COUNT; ++i) {
         if (!sources[i].count)
@@ -843,7 +1028,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
     fprintf(stderr,
             "[nr-vertical-observed-ea ref=%08X-%08X "
             "acq=%08X-%08X user=%08X-%08X state=%08X-%08X "
-            "draw=%08X-%08X]\n",
+            "draw=%08X-%08X flip=%08X-%08X]\n",
             observed_ea_min[YZ_NR_VERT_REFERENCE],
             observed_ea_max[YZ_NR_VERT_REFERENCE],
             observed_ea_min[YZ_NR_VERT_ACQUIRE],
@@ -853,7 +1038,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
             observed_ea_min[YZ_NR_VERT_STATE_DIRECT],
             observed_ea_max[YZ_NR_VERT_STATE_DIRECT],
             observed_ea_min[YZ_NR_VERT_DRAW_ARRAYS],
-            observed_ea_max[YZ_NR_VERT_DRAW_ARRAYS]);
+            observed_ea_max[YZ_NR_VERT_DRAW_ARRAYS],
+            observed_ea_min[YZ_NR_VERT_FLIP],
+            observed_ea_max[YZ_NR_VERT_FLIP]);
     fprintf(stderr,
             "[nr-vertical-exact matched=%llu mismatch=%llu unexpected=%llu "
             "outstanding=%llu unaddressed=%llu overflow=%llu]\n",

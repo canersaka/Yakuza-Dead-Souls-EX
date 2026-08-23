@@ -30,6 +30,16 @@ void yz_nr_vertical_init(void);
 void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                    uint32_t packet_ea);
 
+/* Highest-safe imported flip producer. Shadow mode records the typed
+ * queue+present contract and returns 0 so the caller emits the legacy packet.
+ * active-present may return 1 after publishing an exact-EA typed span; in
+ * that case *result is the wrapper's completed return value and the caller
+ * must not append the packet again. Wait-label flips remain fallback until a
+ * blocking claimed-span protocol is enabled. */
+int yz_nr_vertical_try_flip(uint32_t context, uint32_t buffer_id,
+                            int wait_for_label, uint32_t label_index,
+                            uint32_t label_value, int32_t* result);
+
 typedef enum yz_nr_vertical_consume_result {
     YZ_NR_VERTICAL_CONSUME_MISS = 0,
     YZ_NR_VERTICAL_CONSUME_EXECUTED,

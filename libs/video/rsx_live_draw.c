@@ -38,6 +38,7 @@ void rsx_live_draw_set_display_buffer(
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
+void rsx_live_draw_typed_present(u32 b) { (void)b; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
@@ -7124,6 +7125,56 @@ void rsx_live_draw_native_present(u32 buffer_id)
      * particular, do not bypass rsx_live_draw_method's movie/debug locking or
      * sink_flip's requested/consumed counters. */
     rsx_live_draw_method(0xE944u, buffer_id);
+}
+
+void rsx_live_draw_typed_present(u32 buffer_id)
+{
+    const int composite = ld_movie_composite_ui_enabled();
+    const int serialized = composite || g_ld_debug_layer_enabled;
+    if (serialized) {
+        for (;;) {
+            if (g_ld_movie_mode || g_ld_host_waiting) {
+                while (g_ld_host_waiting)
+                    SwitchToThread();
+                AcquireSRWLockExclusive(&g_ld_access_lock);
+                if (!g.ready) {
+                    ReleaseSRWLockExclusive(&g_ld_access_lock);
+                    return;
+                }
+                if (g_ld_movie_mode && !composite) {
+                    if (g_ld_movie_track_rsx < 0)
+                        g_ld_movie_track_rsx =
+                            getenv("YZ_MOVIE_TRACK_RSX") ? 1 : 0;
+                    if (!g_ld_movie_track_rsx) {
+                        ReleaseSRWLockExclusive(&g_ld_access_lock);
+                        return;
+                    }
+                }
+                sink_flip(NULL, &g.rsx, buffer_id);
+                ReleaseSRWLockExclusive(&g_ld_access_lock);
+                return;
+            }
+            InterlockedIncrement(&g_ld_guest_active);
+            MemoryBarrier();
+            if (!g_ld_movie_mode && !g_ld_host_waiting) {
+                if (g.ready)
+                    sink_flip(NULL, &g.rsx, buffer_id);
+                InterlockedDecrement(&g_ld_guest_active);
+                return;
+            }
+            InterlockedDecrement(&g_ld_guest_active);
+        }
+    }
+
+    if (!g.ready)
+        return;
+    if (g_ld_movie_mode) {
+        if (g_ld_movie_track_rsx < 0)
+            g_ld_movie_track_rsx = getenv("YZ_MOVIE_TRACK_RSX") ? 1 : 0;
+        if (!g_ld_movie_track_rsx)
+            return;
+    }
+    sink_flip(NULL, &g.rsx, buffer_id);
 }
 
 void rsx_live_draw_native_clear(u32 mask)

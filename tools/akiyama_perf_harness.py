@@ -650,6 +650,8 @@ def run_gun(args):
     }
     if args.nr_vertical_active_basic:
         yz["YZ_NR_VERTICAL"] = "active-basic"
+    if args.nr_vertical_active_present:
+        yz["YZ_NR_VERTICAL"] = "active-present"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -990,6 +992,8 @@ def run(args):
         yz["YZ_NR_VERTICAL"] = "shadow"
     if args.nr_vertical_active_basic:
         yz["YZ_NR_VERTICAL"] = "active-basic"
+    if args.nr_vertical_active_present:
+        yz["YZ_NR_VERTICAL"] = "active-present"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1329,6 +1333,7 @@ def main():
     parser.add_argument("--nr-draw", action="store_true")
     parser.add_argument("--nr-vertical-shadow", action="store_true")
     parser.add_argument("--nr-vertical-active-basic", action="store_true")
+    parser.add_argument("--nr-vertical-active-present", action="store_true")
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--xf-ieee", action="store_true")
@@ -1340,7 +1345,8 @@ def main():
         parser.error("--fe0-callback-replay requires --fe0")
     if sum((args.fe0, args.nr_shadow_census, args.nr_flip, args.nr_clear,
             args.nr_draw, args.nr_vertical_shadow,
-            args.nr_vertical_active_basic, args.draw_phases,
+            args.nr_vertical_active_basic, args.nr_vertical_active_present,
+            args.draw_phases,
             args.wkl4_cycle)) > 1:
         parser.error("select only one diagnostic/family lane")
 

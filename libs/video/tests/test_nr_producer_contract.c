@@ -89,10 +89,33 @@ int main(void)
         RSX_NR_DRAW_CONTRACT_MAX_BATCHES * 256u + 1u));
     CHECK(!rsx_nr_draw_arrays_contract_init(0, 5u, 0u, 1u));
 
+    rsx_nr_flip_contract flip = {0};
+    CHECK(rsx_nr_flip_contract_init(&flip, 3u, 0, 0u, 0u));
+    CHECK(flip.word_count == 4u && flip.flip_word_index == 0u);
+    CHECK(flip.words[0] == 0x0004E944u && flip.words[1] == 3u);
+    CHECK(flip.words[2] == 0x0004E924u &&
+          flip.words[3] == 0x8000010Fu);
+
+    CHECK(rsx_nr_flip_contract_init(&flip, 7u, 1, 0x123u,
+                                    0xAABBCCDDu));
+    CHECK(flip.word_count == 10u && flip.flip_word_index == 6u);
+    CHECK(flip.label_offset == 0x230u &&
+          flip.label_value == 0xAABBCCDDu);
+    CHECK(flip.words[0] == 0x00040060u &&
+          flip.words[1] == 0x66616661u);
+    CHECK(flip.words[2] == 0x00040064u && flip.words[3] == 0x230u);
+    CHECK(flip.words[4] == 0x00040068u &&
+          flip.words[5] == 0xAABBCCDDu);
+    CHECK(flip.words[6] == 0x0004E944u && flip.words[7] == 7u);
+    CHECK(flip.words[8] == 0x0004E924u &&
+          flip.words[9] == 0x8000010Fu);
+    CHECK(!rsx_nr_flip_contract_init(&flip, 8u, 0, 0u, 0u));
+    CHECK(!rsx_nr_flip_contract_init(0, 0u, 0, 0u, 0u));
+
     if (failures) {
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;
     }
-    printf("nr producer contract: 25 direct setters + draw arrays verified\n");
+    printf("nr producer contract: 25 setters + draw arrays + flip verified\n");
     return 0;
 }

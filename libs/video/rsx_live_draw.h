@@ -76,6 +76,11 @@ void rsx_live_draw_method(u32 method, u32 arg);
  * typed backend owns the action's ordering. */
 void rsx_live_draw_native_present(u32 buffer_id);
 
+/* Producer-boundary typed flip action. Runs sink_flip directly under the
+ * same movie/debug serialization as a FIFO E944 method, but does not route
+ * through rsx_dispatch_method or decode a legacy packet. */
+void rsx_live_draw_typed_present(u32 buffer_id);
+
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the
  * ordered CLEAR action. */
