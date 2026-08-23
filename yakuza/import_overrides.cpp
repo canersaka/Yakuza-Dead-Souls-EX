@@ -3593,6 +3593,21 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
     return 0;
 }
 
+extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
+                                           uint32_t value,
+                                           uint32_t texture_read)
+{
+    /* The typed backend has already applied the 1D70 byte-0/2 hardware
+     * transform. This callback is deliberately restricted to the two
+     * NV4097 release families; NV406E release retains its legacy flip-credit
+     * and semarm protocol until its distinct release kind is represented. */
+    if (texture_read > 1u)
+        return;
+    const uint32_t address = yz_rsx_sem_addr(dma, offset);
+    if (address)
+        yz_rsx_w32(address, value);
+}
+
 /* Semantic actions shared by the legacy packet decoder and the vertical
  * typed-command backend.  Keeping these below the packet layer is important:
  * an owned typed span must not reconstruct a legacy method and feed it back
@@ -7513,7 +7528,8 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
             rsx_live_draw_set_fifo_position(get, put);
         const int native_method =
             ((eff == 0x1808u && val == 0u) || eff == 0x1D94u ||
-             eff == 0x2328u || eff == 0xC40Cu) ?
+             eff == 0x2328u || eff == 0xC40Cu || eff == 0x0110u ||
+             eff == 0x1D70u || eff == 0x1D74u) ?
             yz_nr_vertical_try_method(eff, val, yz_rsx_io_to_ea(get)) : 0;
         if (!native_method)
             yz_nr_vertical_prepare_legacy_method(eff, val);

@@ -1458,7 +1458,9 @@ static void test_backend_core(void)
     CHECK(rec.draw_const0_ok, "draw did not observe folded VP/constants");
     CHECK(rec.ref == 0xCAFE, "reference %08X", rec.ref);
     CHECK(rec.user_cause == 42, "user cause %u", rec.user_cause);
-    CHECK(rec.flushes >= 1, "SET_REFERENCE did not flush");
+    CHECK(rec.flushes >= 2,
+          "semaphore release + SET_REFERENCE did not flush (%u)",
+          rec.flushes);
     /* SDK-conformance: the scene's release is a BACK-END (0x1D70) write,
      * whose hardware store swizzles bytes 0<->2 — the wire value
      * 0x11223344 must land in memory as 0x11443322, matching both the
@@ -2113,6 +2115,22 @@ static void test_shadow_terminal_action(void)
               transfer->dst_offset == 0x2000u &&
               transfer->line_length == 8u && transfer->line_count == 2u,
               "terminal buffer transfer payload mismatch");
+    }
+
+    rsx_nir_adapter_method(&ad, 0x01A4u, 0x66606660u);
+    rsx_nir_adapter_method(&ad, 0x1D6Cu, 0x80u);
+    CHECK(rsx_nir_adapter_shadow_action(&ad, 0x1D70u, 0x11223344u) == 1,
+          "shadow back-end release was not emitted");
+    CHECK(ad.shadow_mode == 1 && s.op_count &&
+          s.ops[s.op_count - 1].kind == RSX_NIR_OP_SEMAPHORE_RELEASE,
+          "terminal release did not restore shadow mode/emit semaphore");
+    if (s.op_count &&
+        s.ops[s.op_count - 1].kind == RSX_NIR_OP_SEMAPHORE_RELEASE) {
+        const rsx_nir_semaphore* sem =
+            &s.ops[s.op_count - 1].u.semaphore;
+        CHECK(sem->dma_context == 0x66606660u && sem->offset == 0x80u &&
+              sem->value == 0x11223344u && sem->texture_read == 0u,
+              "terminal back-end release payload mismatch");
     }
     rsx_nir_stream_free(&s);
 }

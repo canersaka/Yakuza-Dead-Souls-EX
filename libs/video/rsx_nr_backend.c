@@ -113,6 +113,11 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
         if (!op->u.semaphore.texture_read)
             v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) |
                 ((v >> 16) & 0xFFu);
+        /* Both back-end and texture-pipe releases publish completion of all
+         * preceding graphics work. Retire the native list before making the
+         * guest-visible label store observable. */
+        if (x->flush)
+            x->flush(x->user);
         if (x->sem_write)
             x->sem_write(x->user, op->u.semaphore.dma_context,
                          op->u.semaphore.offset, v,

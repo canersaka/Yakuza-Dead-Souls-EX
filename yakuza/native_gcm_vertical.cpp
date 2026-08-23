@@ -239,6 +239,8 @@ struct yz_nr_vertical_active_state {
     unsigned long long consumer_clear_fallback;
     unsigned long long consumer_transfer_owned;
     unsigned long long consumer_transfer_fallback;
+    unsigned long long consumer_sync_owned;
+    unsigned long long consumer_sync_fallback;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
@@ -256,6 +258,9 @@ extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id);
 extern "C" void yz_nr_vertical_exec_present_complete(uint32_t buffer_id);
 extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
                                         uint32_t* value);
+extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
+                                           uint32_t value,
+                                           uint32_t texture_read);
 
 static void yz_nr_exec_reference(void*, uint32_t value)
 {
@@ -288,6 +293,12 @@ static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
                                uint32_t* value)
 {
     return yz_nr_vertical_sem_read(dma, offset, value);
+}
+
+static void yz_nr_exec_sem_write(void*, uint32_t dma, uint32_t offset,
+                                 uint32_t value, uint32_t texture_read)
+{
+    yz_nr_vertical_sem_write(dma, offset, value, texture_read);
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -451,6 +462,7 @@ static void yz_nr_active_ensure_graphics(void)
     combined.set_reference = yz_nr_exec_reference;
     combined.user_command = yz_nr_exec_user;
     combined.sem_read = yz_nr_exec_sem_read;
+    combined.sem_write = yz_nr_exec_sem_write;
     g_active.backend.ops = combined;
     g_active.d3d12 = d3d12;
     MemoryBarrier();
@@ -1468,15 +1480,19 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
     const bool is_draw = method == 0x1808u && arg == 0u;
     const bool is_clear = method == 0x1D94u;
     const bool is_transfer = method == 0x2328u || method == 0xC40Cu;
-    if (!is_draw && !is_clear && !is_transfer)
+    const bool is_sync =
+        method == 0x0110u || method == 0x1D70u || method == 0x1D74u;
+    if (!is_draw && !is_clear && !is_transfer && !is_sync)
         return 0;
     const auto note_fallback = [&]() {
         if (is_draw)
             g_active.consumer_draw_fallback++;
         else if (is_clear)
             g_active.consumer_clear_fallback++;
-        else
+        else if (is_transfer)
             g_active.consumer_transfer_fallback++;
+        else
+            g_active.consumer_sync_fallback++;
     };
     if (!rsx_nr_ring_can_accept(&g_active.ring,
                                 YZ_NR_ACTIVE_ACTION_OP_BOUND,
@@ -1515,8 +1531,10 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
     } else if (is_clear) {
         g_active.consumer_clear_owned++;
-    } else {
+    } else if (is_transfer) {
         g_active.consumer_transfer_owned++;
+    } else {
+        g_active.consumer_sync_owned++;
     }
     return 1;
 }
@@ -1530,6 +1548,9 @@ extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
     const bool action =
         (method == 0x1808u && arg == 0u) || method == 0x1D94u ||
         method == 0x2328u || method == 0xC40Cu ||
+        method == 0x0050u || method == 0x006Cu || method == 0x0110u ||
+        method == 0x17C8u || method == 0x1800u ||
+        method == 0x1D70u || method == 0x1D74u ||
         (method >= 0xE920u && method <= 0xE95Cu);
     if (!action)
         return;
@@ -2082,6 +2103,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "consumer-draw=%llu/%llu "
                 "consumer-clear=%llu/%llu "
                 "consumer-transfer=%llu/%llu "
+                "consumer-sync=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
@@ -2103,7 +2125,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.consumer_clear_owned,
                 g_active.consumer_clear_fallback,
                 g_active.consumer_transfer_owned,
-                g_active.consumer_transfer_fallback, g_active.wait,
+                g_active.consumer_transfer_fallback,
+                g_active.consumer_sync_owned,
+                g_active.consumer_sync_fallback, g_active.wait,
                 g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);
