@@ -36,6 +36,14 @@ OUT_WB = os.path.join(ROOT, "yakuza", "generated", "wb")
 FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 WORK = os.path.join(ROOT, "scratch", "wbgen")
 
+# lane selection (wb = whole-block stage 1, wj = whole-job stage 2)
+LANES = {
+    "wb": {"tool": "spu_wb_lifter.py", "outdir": "wb", "suffix": "_wb",
+           "work": "wbgen"},
+    "wj": {"tool": "spu_wj_lifter.py", "outdir": "wj", "suffix": "_wj",
+           "work": "wjgen"},
+}
+
 DEFAULT_INPUT_ROOTS = [
     ROOT,
 ]
@@ -120,7 +128,12 @@ def main():
     ap.add_argument("--input-roots", default=None,
                     help="semicolon-separated search roots for untracked inputs")
     ap.add_argument("--region-cap", type=int, default=256)
+    ap.add_argument("--lane", choices=sorted(LANES), default="wb")
     args = ap.parse_args()
+    lane = LANES[args.lane]
+    global OUT_WB, WORK
+    OUT_WB = os.path.join(ROOT, "yakuza", "generated", lane["outdir"])
+    WORK = os.path.join(ROOT, "scratch", lane["work"])
     fams = set(args.families.split(",")) if args.families else None
     only = set(args.only.split(",")) if args.only else None
     roots = (args.input_roots.split(";") if args.input_roots
@@ -155,14 +168,14 @@ def main():
                 continue
             prefix, register = identity(plc)
             metrics_p = os.path.join(WORK, "metrics", f"{stem}.json")
-            argv = [sys.executable, os.path.join(TOOLS, "spu_wb_lifter.py"),
+            argv = [sys.executable, os.path.join(TOOLS, lane["tool"]),
                     "--auto-functions", elf_path,
                     "--func-prefix", prefix,
                     "--register-name", register,
                     "--fast-source", fast_c,
                     "--output", OUT_WB,
-                    "--source-name", f"{stem}_wb.c",
-                    "--header-name", f"{stem}_wb.h",
+                    "--source-name", f"{stem}{lane['suffix']}.c",
+                    "--header-name", f"{stem}{lane['suffix']}.h",
                     "--region-cap", str(args.region_cap),
                     "--metrics-json", metrics_p]
             rp = REPAIR_PCS.get(stem)

@@ -46,6 +46,8 @@ WB = os.path.join(ROOT, "yakuza", "generated", "wb")
 FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 WORK = os.path.join(ROOT, "scratch", "wbdiff")
 HARNESS = os.path.join(TOOLS, "spu_diff_harness.c")
+SUFFIX = "_wb"          # lane suffix (set by --lane)
+SYM_PREFIX = "spu_wb"   # generated-function symbol prefix for the lane
 
 WB_EXTRA = ["/arch:AVX2", "/DYZ_SPU_SIMD_LS128=1", "/DYZ_SPU_SIMD_SHUFB=1"]
 
@@ -60,8 +62,8 @@ def compile_wb_twin(stem, register, outdir):
     """Three-object link: diff harness (baseline, WB twin header), the FAST
     TU with its register symbol renamed (production shape), and the WB TU
     compiled /arch:AVX2. Returns (exe, seconds, err_log_or_obj_size)."""
-    exe = os.path.join(outdir, f"{stem}.wb.exe")
-    wb_c = os.path.join(WB, f"{stem}_wb.c")
+    exe = os.path.join(outdir, f"{stem}{SUFFIX}.exe")
+    wb_c = os.path.join(WB, f"{stem}{SUFFIX}.c")
     fast_c = os.path.join(FAST, f"{stem}_fast.c")
     if (os.path.exists(exe)
             and os.path.getmtime(exe) > os.path.getmtime(wb_c)
@@ -74,7 +76,7 @@ def compile_wb_twin(stem, register, outdir):
            "/I", os.path.join(ROOT, "runtime", "spu")]
     steps = [
         (D.CLFLAGS + inc + ["/I", WB,
-                            f"/DTWIN_HEADER={stem}_wb.h",
+                            f"/DTWIN_HEADER={stem}{SUFFIX}.h",
                             f"/DREGISTER_FN={register}",
                             "/c", HARNESS, f"/Fo{objdir}\\harness.obj"]),
         (D.CLFLAGS + inc + ["/I", FAST,
@@ -106,7 +108,7 @@ def compile_wb_twin(stem, register, outdir):
 def static_table_check(stem, insn_pcs, fast_c):
     """Prove the WB registration table covers every instruction pc and
     routes non-WB pcs to exactly the FAST twin's own mapping."""
-    wb_c = os.path.join(WB, f"{stem}_wb.c")
+    wb_c = os.path.join(WB, f"{stem}{SUFFIX}.c")
     text = open(wb_c, errors="replace").read()
     table = {}
     tbl_re = re.compile(r"^\s*\{ 0x([0-9A-F]{8})u, (\w+) \},", re.M)
@@ -117,16 +119,16 @@ def static_table_check(stem, insn_pcs, fast_c):
     wrong_fast = []
     n_wb = 0
     for pc, sym in table.items():
-        if sym.startswith("spu_wb"):
+        if sym.startswith(SYM_PREFIX):
             n_wb += 1
         else:
             if fast_table.get(pc) != sym:
                 wrong_fast.append(pc)
     # WB leader cases must appear in the WB function entry switches
-    case_re = re.compile(r"case 0x([0-9A-F]{8})u: goto b_([0-9A-F]{8});")
+    case_re = re.compile(r"case 0x([0-9A-F]{8})u: goto \w+_([0-9A-F]{8});")
     cases = {int(m.group(1), 16) for m in case_re.finditer(text)
              if m.group(1) == m.group(2)}
-    wb_pcs = {pc for pc, sym in table.items() if sym.startswith("spu_wb")}
+    wb_pcs = {pc for pc, sym in table.items() if sym.startswith(SYM_PREFIX)}
     uncased = sorted(wb_pcs - cases)
     return {
         "pcs": len(insn_pcs),
@@ -144,7 +146,7 @@ def process(famname, fam, plc, args, results):
     stem = plc["stem"]
     if args.only and stem not in args.only:
         return
-    wb_c = os.path.join(WB, f"{stem}_wb.c")
+    wb_c = os.path.join(WB, f"{stem}{SUFFIX}.c")
     fast_c = os.path.join(FAST, f"{stem}_fast.c")
     if not os.path.exists(wb_c):
         return
@@ -254,7 +256,14 @@ def main():
     ap.add_argument("--report", default=None,
                     help="report path (default scratch/wbdiff/report.json); "
                          "give each parallel family slice its own")
+    ap.add_argument("--lane", choices=("wb", "wj"), default="wb")
     args = ap.parse_args()
+    if args.lane == "wj":
+        global WB, WORK, SUFFIX, SYM_PREFIX
+        WB = os.path.join(ROOT, "yakuza", "generated", "wj")
+        WORK = os.path.join(ROOT, "scratch", "wjdiff")
+        SUFFIX = "_wj"
+        SYM_PREFIX = "spu_wj"
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None
     args.roots = (args.input_roots.split(";") if args.input_roots
