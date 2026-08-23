@@ -882,6 +882,28 @@ int main(int argc, char** argv)
     scz.h = RT_H;
     rsx_nir_em_scissor(&em, &scz);
 
+    /* ---- refusal is render-atomic across all draw batches -------------
+     * Force the host-index path, make batch 0 valid, and make batch 1 point
+     * beyond the guest arena. The blue target must remain untouched: a
+     * native refusal is safe for ordered legacy fallback only if no earlier
+     * batch has already rendered. */
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFFu, 0);
+    ib.restart_enable = 1;
+    ib.restart_index = 0xFFFFu;
+    rsx_nir_em_index_binding(&em, &ib);
+    u32 atomic_refusal_batches[4] = { 0u, 3u, 0x8000u, 3u };
+    rsx_nir_em_draw(&em, 5, 1, atomic_refusal_batches, 2);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 1,
+          "atomic draw refusal not surfaced (%llu)", be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0xFF, 0x00, 0x00),
+          "refused draw partially rendered batch 0: %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
     /* ---- partial-channel clear refused (counted, never approximated) ---
      * CELL_GCM_CLEAR_R/G/B/A are individually maskable on hardware
      * (distinct CELL_GCM_CLEAR_* mask bits); D3D12 clears whole
@@ -889,7 +911,7 @@ int main(int argc, char** argv)
     stage_frame_state(&em);
     rsx_nir_em_clear(&em, 0x13, 0xFF000000u, 0, 0);   /* Z+S+R only      */
     rsx_nr_backend_run(&be, 0);
-    CHECK(be.stats.exec_errors == 1, "partial clear not surfaced (%llu)",
+    CHECK(be.stats.exec_errors == 2, "partial clear not surfaced (%llu)",
           be.stats.exec_errors);
 
     /* ---- sink accounting ----------------------------------------------- */
@@ -897,10 +919,11 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 14 && st.draws == 10 && st.presents == 12,
+    CHECK(st.clears == 15 && st.draws == 10 && st.presents == 13,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
-    CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
+    CHECK(st.unsupported_draws == 1 && st.unsup_draw_index == 1 &&
+              st.compile_failures == 0,
           "unsupported=%llu compile_failures=%llu", st.unsupported_draws,
           st.compile_failures);
     CHECK(st.pso_builds >= 1 && st.pso_hits >= 1,
