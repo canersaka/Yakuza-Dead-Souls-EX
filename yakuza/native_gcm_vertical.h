@@ -11,8 +11,10 @@
  * lifted body, and the FIFO consumer records the corresponding decoded wire
  * operation. "active-basic" owns only the proven primary-context reference
  * and user-command wrappers, records their typed payload against the exact
- * guest FIFO address, and lets the FIFO consumer execute that payload in
- * place of the reserved NOP span. No operation is skipped in shadow mode.
+ * guest FIFO address, and lets the FIFO consumer execute that payload at
+ * that address without decoding the retained byte-exact packet. The packet
+ * remains valid fallback if a display list copies it to another address.
+ * No operation is skipped in shadow mode.
  */
 
 #ifndef YAKUZA_NATIVE_GCM_VERTICAL_H

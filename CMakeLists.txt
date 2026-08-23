@@ -500,6 +500,23 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        add_executable(rsx_nr_producer_contract_tests
+            libs/video/tests/test_nr_producer_contract.c
+            libs/video/rsx_nr_producer_contract.c
+        )
+        target_include_directories(rsx_nr_producer_contract_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        add_test(
+            NAME rsx_nr_producer_contract
+            COMMAND rsx_nr_producer_contract_tests
+        )
+        set_tests_properties(
+            rsx_nr_producer_contract
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
         # Native-render resource model: mapping epochs, resource lifetime
         # cache over the guest-page tracker, PSO cache, timeline fences.
         add_executable(rsx_nr_resources_tests
