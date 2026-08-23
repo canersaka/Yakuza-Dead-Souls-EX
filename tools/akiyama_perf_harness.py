@@ -719,6 +719,8 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "active-basic"
     if args.nr_vertical_active_present:
         yz["YZ_NR_VERTICAL"] = "active-present"
+    if args.nr_vertical_active_graphics:
+        yz["YZ_NR_VERTICAL"] = "active-graphics"
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -1140,6 +1142,8 @@ def run(args):
         yz["YZ_NR_VERTICAL"] = "active-basic"
     if args.nr_vertical_active_present:
         yz["YZ_NR_VERTICAL"] = "active-present"
+    if args.nr_vertical_active_graphics:
+        yz["YZ_NR_VERTICAL"] = "active-graphics"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1481,6 +1485,7 @@ def main():
     parser.add_argument("--nr-vertical-shadow", action="store_true")
     parser.add_argument("--nr-vertical-active-basic", action="store_true")
     parser.add_argument("--nr-vertical-active-present", action="store_true")
+    parser.add_argument("--nr-vertical-active-graphics", action="store_true")
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--xf-ieee", action="store_true")
@@ -1493,6 +1498,7 @@ def main():
     if sum((args.fe0, args.nr_shadow_census, args.nr_flip, args.nr_clear,
             args.nr_draw, args.nr_vertical_shadow,
             args.nr_vertical_active_basic, args.nr_vertical_active_present,
+            args.nr_vertical_active_graphics,
             args.draw_phases,
             args.wkl4_cycle)) > 1:
         parser.error("select only one diagnostic/family lane")
