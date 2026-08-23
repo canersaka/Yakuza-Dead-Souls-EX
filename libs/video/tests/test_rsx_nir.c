@@ -2031,6 +2031,50 @@ fail:
     return -1;
 }
 
+static void test_shadow_terminal_action(void)
+{
+    rsx_nir_stream s;
+    rsx_nir_stream_init(&s);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &s);
+    ad.shadow_mode = 1;
+
+    rsx_nir_adapter_method(&ad, M_BEGIN_END, 5);
+    rsx_nir_adapter_method(&ad, M_DRAW_ARRAYS,
+                           (2u << 24) | 7u); /* first 7, count 3 */
+    CHECK(s.op_count == 0, "shadow path emitted before terminal ownership");
+    CHECK(rsx_nir_adapter_shadow_action(&ad, M_BEGIN_END, 0) == 1,
+          "shadow terminal draw was not emitted");
+    CHECK(ad.shadow_mode == 1, "adapter did not return to shadow mode");
+    CHECK(s.op_count != 0, "terminal action produced an empty stream");
+    if (s.op_count) {
+        const rsx_nir_op* draw = &s.ops[s.op_count - 1];
+        CHECK(draw->kind == RSX_NIR_OP_DRAW,
+              "terminal op kind %u, expected DRAW", draw->kind);
+        if (draw->kind == RSX_NIR_OP_DRAW) {
+            CHECK(draw->u.draw.primitive == 5 &&
+                  draw->u.draw.indexed == 0 &&
+                  draw->u.draw.batch_count == 1 &&
+                  draw->u.draw.total_count == 3,
+                  "terminal draw shape primitive=%u indexed=%u batches=%u total=%u",
+                  draw->u.draw.primitive, draw->u.draw.indexed,
+                  draw->u.draw.batch_count, draw->u.draw.total_count);
+            const u32* batch = rsx_nir_side(
+                &s, draw->u.draw.batches_ofs, 2);
+            CHECK(batch && batch[0] == 7 && batch[1] == 3,
+                  "terminal batch payload mismatch");
+        }
+    }
+
+    const u32 before = s.op_count;
+    rsx_nir_adapter_method(&ad, M_BEGIN_END, 5);
+    CHECK(rsx_nir_adapter_shadow_action(&ad, M_BEGIN_END, 0) == 0,
+          "empty begin/end incorrectly claimed as a draw");
+    CHECK(s.op_count == before,
+          "empty begin/end changed the typed stream");
+    rsx_nir_stream_free(&s);
+}
+
 int main(int argc, char** argv)
 {
     test_fifo_vs_typed();
@@ -2052,6 +2096,7 @@ int main(int argc, char** argv)
     test_reset_semantics();
     test_intercept_backend_end_to_end();
     test_live_draw_end_bridge_shape();
+    test_shadow_terminal_action();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])

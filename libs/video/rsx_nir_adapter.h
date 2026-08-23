@@ -122,6 +122,13 @@ void rsx_nir_adapter_seed(rsx_nir_adapter* ad, const u32* regs, u32 reg_words,
 /* Feed one already-expanded method write (e.g. an .rxs record). */
 void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg);
 
+/* Emit one terminal action from an otherwise shadow-only adapter. State and
+ * draw batches must already have been mirrored through the method path. The
+ * adapter returns to shadow mode before this call returns. This lets a live
+ * FIFO consumer own a dynamic/SPU-authored terminal action without also
+ * running the legacy action sink. Returns 1 only when an action was emitted. */
+int rsx_nir_adapter_shadow_action(rsx_nir_adapter* ad, u32 method, u32 arg);
+
 /* Flush any pending NV308A inline-color run (call at stream end; the
  * method path flushes automatically when a non-COLOR method arrives). */
 void rsx_nir_adapter_finish(rsx_nir_adapter* ad);

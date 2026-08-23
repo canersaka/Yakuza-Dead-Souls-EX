@@ -188,8 +188,14 @@ static yz_nr_vertical_state g_vertical = {SRWLOCK_INIT};
 
 enum : uint32_t {
     YZ_NR_ACTIVE_ROUTER_CAPACITY = 8192,
-    YZ_NR_ACTIVE_RING_CAPACITY = 128,
-    YZ_NR_ACTIVE_SIDE_CAPACITY = 16384,
+    /* A first native action can fold every state group, a vertex program,
+     * fragmented constant runs, and the action itself. Keep this fixed ring
+     * large enough that consumer interception never partially emits before
+     * falling back. The side capacity includes worst-case wrap padding. */
+    YZ_NR_ACTIVE_RING_CAPACITY = 512,
+    YZ_NR_ACTIVE_SIDE_CAPACITY = 32768,
+    YZ_NR_ACTIVE_ACTION_OP_BOUND = 512,
+    YZ_NR_ACTIVE_ACTION_SIDE_BOUND = 16384,
     YZ_NR_ACTIVE_GUEST_PAGE_COUNT = 1u << 20,
 };
 
@@ -222,6 +228,8 @@ struct yz_nr_vertical_active_state {
     unsigned long long wrong_context;
     unsigned long long no_room;
     unsigned long long publish_failure;
+    unsigned long long consumer_draw_owned;
+    unsigned long long consumer_draw_fallback;
     rsx_nr_span pending_span;
     rsx_nr_span_claim pending_claim;
     uint32_t pending_executed;
@@ -1419,6 +1427,63 @@ extern "C" int yz_nr_vertical_try_flip(uint32_t context,
     return 1;
 }
 
+extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
+                                            uint32_t packet_ea)
+{
+    (void)packet_ea;
+    if (!InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0))
+        return 0;
+    yz_nr_active_ensure_graphics();
+    if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
+        g_active.pending_valid || rsx_nr_ring_depth(&g_active.ring))
+        return 0;
+
+    /* BEGIN and batch methods continue through the legacy register decoder
+     * and mirror into the shadow adapter. At END, emit the complete folded
+     * state/draw episode before legacy sink_end_impl can run. Unsupported or
+     * render-atomic refusal returns to the unchanged legacy END at the same
+     * GET; success suppresses that one method so the draw cannot execute
+     * twice. */
+    if (method != 0x1808u || arg != 0u)
+        return 0;
+    if (!rsx_nr_ring_can_accept(&g_active.ring,
+                                YZ_NR_ACTIVE_ACTION_OP_BOUND,
+                                YZ_NR_ACTIVE_ACTION_SIDE_BOUND)) {
+        g_active.consumer_draw_fallback++;
+        return 0;
+    }
+
+    rsx_nr_ring_clear_reject(&g_active.ring);
+    const unsigned long long errors_before =
+        g_active.backend.stats.exec_errors;
+    if (!rsx_nir_adapter_shadow_action(&g_active.adapter, method, arg) ||
+        rsx_nr_ring_reject_sticky(&g_active.ring) ||
+        !rsx_nr_ring_depth(&g_active.ring)) {
+        while (rsx_nr_ring_depth(&g_active.ring))
+            rsx_nr_ring_pop(&g_active.ring);
+        g_active.consumer_draw_fallback++;
+        return 0;
+    }
+
+    while (rsx_nr_ring_depth(&g_active.ring)) {
+        if (rsx_nr_backend_step(&g_active.backend) !=
+            RSX_NR_STEP_EXECUTED) {
+            while (rsx_nr_ring_depth(&g_active.ring))
+                rsx_nr_ring_pop(&g_active.ring);
+            g_active.consumer_draw_fallback++;
+            return 0;
+        }
+    }
+    if (g_active.backend.stats.exec_errors != errors_before) {
+        g_active.consumer_draw_fallback++;
+        return 0;
+    }
+    g_active.consumer_draw_owned++;
+    g_active.executed[YZ_NR_VERT_DRAW_ARRAYS]++;
+    return 1;
+}
+
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                                 uint32_t packet_ea)
 {
@@ -1960,6 +2025,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
                 "fallback-draw=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
+                "consumer-draw=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.owned[YZ_NR_VERT_REFERENCE],
@@ -1975,7 +2041,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.fallback[YZ_NR_VERT_DRAW_ARRAYS],
                 g_active.fallback[YZ_NR_VERT_FLIP],
                 g_active.wrong_context, g_active.no_room,
-                g_active.publish_failure, g_active.wait,
+                g_active.publish_failure,
+                g_active.consumer_draw_owned,
+                g_active.consumer_draw_fallback, g_active.wait,
                 g_active.late_fallback, g_active.fatal,
                 rsx_nr_ring_depth(&g_active.ring),
                 g_active.backend.stats.exec_errors);

@@ -30,6 +30,12 @@ void yz_nr_vertical_init(void);
 void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                    uint32_t packet_ea);
 
+/* Called before legacy method dispatch. Returns 1 only when the complete
+ * terminal action executed through the ordered native path, in which case
+ * the caller must suppress legacy dispatch for this method. */
+int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
+                              uint32_t packet_ea);
+
 /* Live integration hooks. Display identities may arrive before the shared
  * D3D12 device; they are retained and applied when active graphics becomes
  * ready. Guest-write notifications are called only after bytes publish. */

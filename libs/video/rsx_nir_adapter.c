@@ -751,6 +751,17 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
     }
 }
 
+int rsx_nir_adapter_shadow_action(rsx_nir_adapter* ad, u32 method, u32 arg)
+{
+    if (!ad || !ad->shadow_mode)
+        return 0;
+    const u32 before = ad->actions_seen;
+    ad->shadow_mode = 0;
+    rsx_nir_adapter_method(ad, method, arg);
+    ad->shadow_mode = 1;
+    return ad->actions_seen != before;
+}
+
 void rsx_nir_adapter_finish(rsx_nir_adapter* ad)
 {
     flush_inline(ad);
