@@ -23,9 +23,9 @@
  *
  * Upload hazards: per-draw constants come from a fence-gated upload ring;
  * mirror staging reuse is governed by the mirror backend's three-slice
- * fence contract. The offline execution model is execute-and-wait per
- * present, which keeps the hazard machinery exercised and the validation
- * deterministic.
+ * fence contract. Draws and clears stay on one ordered command list until
+ * present, an explicit barrier, capacity rollover, or a legacy ownership
+ * handoff retires it.
  */
 
 #ifndef PS3RECOMP_RSX_NR_BACKEND_D3D12_H
@@ -63,6 +63,7 @@ typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
 
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
+    unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long pso_hits, pso_builds;
     unsigned long long unsupported_draws;    /* refused to the core (sum)  */
     unsigned long long unsup_draw_topology;  /* fan/loop/quads/polygon     */

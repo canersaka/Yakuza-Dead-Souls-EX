@@ -2072,6 +2072,22 @@ static void test_shadow_terminal_action(void)
           "empty begin/end incorrectly claimed as a draw");
     CHECK(s.op_count == before,
           "empty begin/end changed the typed stream");
+
+    rsx_nir_adapter_method(&ad, M_CLEAR_COLOR, 0xA0B0C0D0u);
+    CHECK(rsx_nir_adapter_shadow_action(&ad, M_CLEAR_BUFFERS, 0xF0u) == 1,
+          "shadow terminal clear was not emitted");
+    CHECK(ad.shadow_mode == 1, "clear did not restore shadow mode");
+    CHECK(s.op_count > before &&
+          s.ops[s.op_count - 1].kind == RSX_NIR_OP_CLEAR,
+          "terminal clear did not end in a CLEAR op");
+    if (s.op_count > before &&
+        s.ops[s.op_count - 1].kind == RSX_NIR_OP_CLEAR) {
+        const rsx_nir_clear* clear = &s.ops[s.op_count - 1].u.clear;
+        CHECK(clear->mask == 0xF0u &&
+              clear->color_value == 0xA0B0C0D0u,
+              "terminal clear payload mask=%X color=%08X",
+              clear->mask, clear->color_value);
+    }
     rsx_nir_stream_free(&s);
 }
 

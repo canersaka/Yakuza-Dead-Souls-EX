@@ -975,6 +975,10 @@ int main(int argc, char** argv)
     CHECK(st.clears == 15 && st.draws == 10 && st.presents == 13,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
+    CHECK(st.queue_submissions < st.clears + st.draws + st.presents,
+          "draw/clear actions were not submission-batched (%llu submissions "
+          "for %llu actions)", st.queue_submissions,
+          st.clears + st.draws + st.presents);
     CHECK(st.unsupported_draws == 1 && st.unsup_draw_index == 1 &&
               st.compile_failures == 0,
           "unsupported=%llu compile_failures=%llu", st.unsupported_draws,
