@@ -1,5 +1,7 @@
 #include "rsx_nr_producer_contract.h"
 
+#include <string.h>
+
 /* Audited directly against the lifted wrapper bodies at checkpoint 311410a.
  * Every entry copies gpr4 unchanged into its sole packet argument.  Wrappers
  * that pack multiple arguments, floats, reports, transfers, or synchronization
@@ -118,5 +120,35 @@ int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
     out->count = count;
     out->batch_count = batches;
     out->semantic_hash = hash;
+    return 1;
+}
+
+int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
+                              int wait_for_label, u32 label_index,
+                              u32 label_value)
+{
+    if (!out || buffer_id >= 8u)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    out->buffer_id = buffer_id;
+    out->wait_for_label = wait_for_label ? 1u : 0u;
+    out->label_offset = (label_index & 0xFFu) * 0x10u;
+    out->label_value = label_value;
+
+    u32 at = 0;
+    if (wait_for_label) {
+        out->words[at++] = 0x00040060u;
+        out->words[at++] = 0x66616661u;
+        out->words[at++] = 0x00040064u;
+        out->words[at++] = out->label_offset;
+        out->words[at++] = 0x00040068u;
+        out->words[at++] = label_value;
+    }
+    out->flip_word_index = at;
+    out->words[at++] = 0x0004E944u;
+    out->words[at++] = buffer_id;
+    out->words[at++] = 0x0004E924u;
+    out->words[at++] = 0x8000010Fu;
+    out->word_count = at;
     return 1;
 }

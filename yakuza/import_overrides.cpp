@@ -19,6 +19,7 @@
 #include "rsx_wait_classifier.h"
 #include "rsx_nr_intercept.h"
 #include "rsx_nr_backend.h"
+#include "rsx_nr_producer_contract.h"
 #include "native_gcm_vertical.h"
 
 #include "ps3emu/error_codes.h"
@@ -3620,6 +3621,25 @@ extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value)
 extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause)
 {
     yz_rsx_exec_user_command(0xEB00u, cause);
+}
+
+extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id)
+{
+    /* Direct semantic equivalent of E944 followed by E924. Presentation of
+     * the already-rendered display surface is explicit—no legacy RSX method
+     * decoder is called—then the existing queue/flip packages preserve the
+     * guest-visible head state, event delivery, completion, and movie route. */
+    rsx_live_draw_typed_present(buffer_id);
+    ppu_context sc = {};
+    sc.gpr[4] = 0x103u;
+    sc.gpr[5] = 1u;
+    sc.gpr[6] = buffer_id;
+    yz_sys_rsx_context_attribute(&sc);
+    memset(&sc, 0, sizeof(sc));
+    sc.gpr[4] = 0x102u;
+    sc.gpr[5] = 1u;
+    sc.gpr[6] = 0x8000010Fu;
+    yz_sys_rsx_context_attribute(&sc);
 }
 
 static int yz_rsx_method(uint32_t method, uint32_t arg)
@@ -7972,31 +7992,19 @@ static int32_t yz_gcm_append_flip_commands(uint32_t context,
                                            uint32_t label_index,
                                            uint32_t label_value)
 {
-    if (!context || buffer_id >= 8u)
+    rsx_nr_flip_contract flip = {};
+    if (!context || !rsx_nr_flip_contract_init(
+            &flip, buffer_id, wait_for_label, label_index, label_value))
         return (int32_t)CELL_GCM_ERROR_INVALID_VALUE;
 
     const uint32_t current = vm_read32(context + 0x08u);
     const uint32_t end = vm_read32(context + 0x04u);
-    const uint32_t words = wait_for_label ? 10u : 4u;
-    const uint32_t bytes = words * 4u;
+    const uint32_t bytes = flip.word_count * 4u;
     if (!current || current > UINT32_MAX - bytes || current + bytes > end)
         return (int32_t)CELL_GCM_ERROR_FAILURE;
 
-    uint32_t out = current;
-    if (wait_for_label) {
-        vm_write32(out + 0x00u, 0x00040060u); /* semaphore DMA selector */
-        vm_write32(out + 0x04u, 0x66616661u); /* report/label memory */
-        vm_write32(out + 0x08u, 0x00040064u); /* semaphore offset */
-        vm_write32(out + 0x0Cu, (label_index & 0xFFu) * 0x10u);
-        vm_write32(out + 0x10u, 0x00040068u); /* semaphore acquire */
-        vm_write32(out + 0x14u, label_value);
-        out += 0x18u;
-    }
-
-    vm_write32(out + 0x00u, 0x0004E944u); /* queue buffer on head 1 */
-    vm_write32(out + 0x04u, buffer_id);
-    vm_write32(out + 0x08u, 0x0004E924u); /* flip head 1 */
-    vm_write32(out + 0x0Cu, 0x8000010Fu); /* use queued buffer */
+    for (uint32_t i = 0; i < flip.word_count; ++i)
+        vm_write32((uint64_t)current + i * 4u, flip.words[i]);
 
     MemoryBarrier();
     vm_write32(context + 0x08u, current + bytes);
@@ -8008,8 +8016,9 @@ extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)
 {
     const uint32_t context = (uint32_t)ctx->gpr[3];
     const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
-    const int32_t result = yz_gcm_append_flip_commands(
-        context, buffer_id, 0, 0, 0);
+    int32_t result = 0;
+    if (!yz_nr_vertical_try_flip(context, buffer_id, 0, 0, 0, &result))
+        result = yz_gcm_append_flip_commands(context, buffer_id, 0, 0, 0);
     if (yz_ft_on())
         yz_ft("HLE-SetFlipCommand ctx=0x%08X buf=%u queued result=0x%08X",
               context, buffer_id, (uint32_t)result);
@@ -8022,8 +8031,11 @@ extern "C" void yz_ovr__cellGcmSetFlipCommandWithWaitLabel(ppu_context* ctx)
     const uint32_t buffer_id = (uint32_t)ctx->gpr[4];
     const uint32_t label_index = (uint32_t)ctx->gpr[5];
     const uint32_t label_value = (uint32_t)ctx->gpr[6];
-    const int32_t result = yz_gcm_append_flip_commands(
-        context, buffer_id, 1, label_index, label_value);
+    int32_t result = 0;
+    if (!yz_nr_vertical_try_flip(context, buffer_id, 1, label_index,
+                                 label_value, &result))
+        result = yz_gcm_append_flip_commands(
+            context, buffer_id, 1, label_index, label_value);
     if (yz_ft_on())
         yz_ft("HLE-SetFlipCommandWithWaitLabel ctx=0x%08X buf=%u "
               "label=%u value=0x%08X queued result=0x%08X",

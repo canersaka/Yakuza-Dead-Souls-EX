@@ -57,6 +57,28 @@ u32 rsx_nr_draw_hash_batch(u32 hash, u32 first, u32 count);
 int rsx_nr_draw_arrays_contract_init(rsx_nr_draw_arrays_contract* out,
                                      u32 primitive, u32 first, u32 count);
 
+/* Native-GCM's imported flip wrapper is a fixed queue+flip template.  The
+ * wait-label variant prefixes the same template with one NV406E acquire.
+ * Keeping the byte-exact words in this audited contract lets an exact-EA
+ * native owner remain copy/replay safe: copied bytes have no sidecar owner
+ * and execute as complete legacy FIFO commands. */
+#define RSX_NR_FLIP_CONTRACT_MAX_WORDS 10u
+
+typedef struct rsx_nr_flip_contract {
+    u32 buffer_id;
+    u32 wait_for_label;
+    u32 label_offset;
+    u32 label_value;
+    u32 word_count;
+    u32 flip_word_index;
+    u32 words[RSX_NR_FLIP_CONTRACT_MAX_WORDS];
+} rsx_nr_flip_contract;
+
+/* Returns zero for buffer ids outside the eight GCM display slots. */
+int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
+                              int wait_for_label, u32 label_index,
+                              u32 label_value);
+
 #ifdef __cplusplus
 }
 #endif
