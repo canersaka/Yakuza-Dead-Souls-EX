@@ -248,6 +248,16 @@ int main(void)
     CHECK(!rsx_nr_flip_contract_init(&flip, 8u, 0, 0u, 0u));
     CHECK(!rsx_nr_flip_contract_init(0, 0u, 0, 0u, 0u));
 
+    u32 report_io = 0;
+    CHECK(rsx_nr_main_report_io_range(0x45C0u, 16u, &report_io));
+    CHECK(report_io == 0x0E0045C0u);
+    CHECK(report_io != 0x000045C0u); /* never alias the FIFO low offset */
+    CHECK(rsx_nr_main_report_io_range(0x00FFFFF0u, 16u, &report_io));
+    CHECK(report_io == 0x0EFFFFF0u);
+    CHECK(!rsx_nr_main_report_io_range(0x00FFFFF1u, 16u, &report_io));
+    CHECK(!rsx_nr_main_report_io_range(0u, 0u, &report_io));
+    CHECK(!rsx_nr_main_report_io_range(0u, 16u, 0));
+
     if (failures) {
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;

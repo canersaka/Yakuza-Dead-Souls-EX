@@ -204,6 +204,15 @@ enum : uint32_t {
     YZ_NR_ACTIVE_GUEST_PAGE_COUNT = 1u << 20,
 };
 
+enum : uint32_t {
+    YZ_NR_GRAPHICS_DRAW = 1u << 0,
+    YZ_NR_GRAPHICS_CLEAR = 1u << 1,
+    YZ_NR_GRAPHICS_TRANSFER = 1u << 2,
+    YZ_NR_GRAPHICS_SYNC = 1u << 3,
+    YZ_NR_GRAPHICS_REPORT = 1u << 4,
+    YZ_NR_GRAPHICS_ALL = (1u << 5) - 1u,
+};
+
 struct yz_nr_vertical_display {
     uint32_t location, offset, width, height;
     uint32_t valid;
@@ -222,6 +231,7 @@ struct yz_nr_vertical_active_state {
     uint32_t side[YZ_NR_ACTIVE_SIDE_CAPACITY];
     yz_nr_vertical_display displays[8];
     volatile LONG graphics_ready;
+    uint32_t graphics_families;
     volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
     volatile LONG* guest_page_route;
     unsigned long long owned[YZ_NR_VERT_FAMILY_COUNT];
@@ -254,6 +264,35 @@ struct yz_nr_vertical_active_state {
 
 static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 
+static uint32_t yz_nr_graphics_family_mask(const char* text)
+{
+    if (!text || !*text)
+        return YZ_NR_GRAPHICS_ALL;
+    uint32_t mask = 0;
+    const char* cursor = text;
+    while (*cursor) {
+        const char* comma = strchr(cursor, ',');
+        const size_t length = comma ? static_cast<size_t>(comma - cursor)
+                                    : strlen(cursor);
+        if (length == 4u && memcmp(cursor, "draw", 4u) == 0)
+            mask |= YZ_NR_GRAPHICS_DRAW;
+        else if (length == 5u && memcmp(cursor, "clear", 5u) == 0)
+            mask |= YZ_NR_GRAPHICS_CLEAR;
+        else if (length == 8u && memcmp(cursor, "transfer", 8u) == 0)
+            mask |= YZ_NR_GRAPHICS_TRANSFER;
+        else if (length == 4u && memcmp(cursor, "sync", 4u) == 0)
+            mask |= YZ_NR_GRAPHICS_SYNC;
+        else if (length == 6u && memcmp(cursor, "report", 6u) == 0)
+            mask |= YZ_NR_GRAPHICS_REPORT;
+        else
+            return 0;
+        if (!comma)
+            break;
+        cursor = comma + 1;
+    }
+    return mask;
+}
+
 extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value);
 extern "C" void yz_nr_vertical_exec_user_command(uint32_t cause);
 extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id);
@@ -263,8 +302,8 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
 extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
                                            uint32_t value,
                                            uint32_t texture_read);
-extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
-                                        uint32_t dma);
+extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
+                                       uint32_t dma);
 
 static void yz_nr_exec_reference(void*, uint32_t value)
 {
@@ -305,10 +344,10 @@ static void yz_nr_exec_sem_write(void*, uint32_t dma, uint32_t offset,
     yz_nr_vertical_sem_write(dma, offset, value, texture_read);
 }
 
-static void yz_nr_exec_report(void*, uint32_t kind, uint32_t arg,
-                              uint32_t dma)
+static int yz_nr_exec_report(void*, uint32_t kind, uint32_t arg,
+                             uint32_t dma)
 {
-    yz_nr_vertical_report(kind, arg, dma);
+    return yz_nr_vertical_report(kind, arg, dma);
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -638,6 +677,7 @@ static int yz_nr_active_publish_draw_arrays(ppu_context* ctx)
 {
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0) ||
+        !(g_active.graphics_families & YZ_NR_GRAPHICS_DRAW) ||
         !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
         return 0;
     const uint32_t context = static_cast<uint32_t>(ctx->gpr[3]);
@@ -1381,7 +1421,15 @@ extern "C" void yz_nr_vertical_init(void)
                       strcmp(mode, "active-present") == 0 ||
                       strcmp(mode, "active-graphics") == 0)) {
         const int graphics = strcmp(mode, "active-graphics") == 0;
-        if (yz_nr_active_init(graphics))
+        g_active.graphics_families = graphics
+            ? yz_nr_graphics_family_mask(getenv("YZ_NR_GRAPHICS_FAMILIES"))
+            : 0u;
+        if (graphics && !g_active.graphics_families) {
+            fprintf(stderr,
+                    "[nr-vertical-active init=failed; invalid empty "
+                    "YZ_NR_GRAPHICS_FAMILIES]\n");
+            fflush(stderr);
+        } else if (yz_nr_active_init(graphics))
             InterlockedExchange(&g_vertical.mode_active_basic, 1);
         else {
             fprintf(stderr,
@@ -1495,6 +1543,12 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         method == 0x0110u || method == 0x1D70u || method == 0x1D74u;
     const bool is_report = method == 0x17C8u || method == 0x1800u;
     if (!is_draw && !is_clear && !is_transfer && !is_sync && !is_report)
+        return 0;
+    const uint32_t family = is_draw ? YZ_NR_GRAPHICS_DRAW :
+        is_clear ? YZ_NR_GRAPHICS_CLEAR :
+        is_transfer ? YZ_NR_GRAPHICS_TRANSFER :
+        is_sync ? YZ_NR_GRAPHICS_SYNC : YZ_NR_GRAPHICS_REPORT;
+    if (!(g_active.graphics_families & family))
         return 0;
     const auto note_fallback = [&]() {
         if (is_draw)
@@ -2111,7 +2165,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
-                "[nr-vertical-active "
+                "[nr-vertical-active families=0x%02X "
                 "ref=%llu/%llu user=%llu/%llu draw=%llu/%llu "
                 "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
                 "fallback-draw=%llu fallback-flip=%llu "
@@ -2123,6 +2177,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 "consumer-report=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
+                g_active.graphics_families,
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],

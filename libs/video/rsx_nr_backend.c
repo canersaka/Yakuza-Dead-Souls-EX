@@ -163,8 +163,8 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
         if (x->flush)
             x->flush(x->user);
         if (x->report)
-            x->report(x->user, op->u.report.kind, op->u.report.arg,
-                      op->u.report.dma_report);
+            rc = x->report(x->user, op->u.report.kind, op->u.report.arg,
+                           op->u.report.dma_report);
         break;
     case RSX_NIR_OP_USER_COMMAND:
         if (x->user_command)

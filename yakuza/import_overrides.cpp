@@ -3610,11 +3610,11 @@ extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
         yz_rsx_w32(address, value);
 }
 
-extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
-                                        uint32_t dma)
+extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
+                                       uint32_t dma)
 {
     if (kind != 0u)
-        return; /* CLEAR_REPORT_VALUE: no ZCULL accumulator is modeled. */
+        return 0; /* CLEAR_REPORT_VALUE: no ZCULL accumulator is modeled. */
 
     const uint32_t type = arg >> 24;
     const uint32_t offset = arg & 0x00FFFFFFu;
@@ -3628,14 +3628,18 @@ extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
         break;
     case RSX_DMA_REPORT_LOCATION_MAIN:
     case RSX_DMA_MEMORY_HOST_BUFFER:
-        if (yz_rsx_live_guest_ptr(nullptr, 1u, offset, 16u))
-            address = yz_rsx_io_to_ea(offset);
-        break;
+        /* The correct address is report-aperture base + offset (validated by
+         * rsx_nr_main_report_io_range), never the raw low IO offset.  The
+         * retained legacy path currently refuses MAIN reports altogether;
+         * do the same until the title's MAIN report producer and completion
+         * consumer are end-to-end validated, rather than silently changing
+         * guest synchronization semantics in the active rollout. */
+        return -1;
     default:
         break;
     }
     if (!address)
-        return;
+        return -1;
 
     const uint64_t timestamp = cellGcmReportTimestampNs();
     vm_write64(address, timestamp);
@@ -3647,6 +3651,7 @@ extern "C" void yz_nr_vertical_report(uint32_t kind, uint32_t arg,
         /* Ordinary reports leave value@+8 untouched and clear only pad. */
         vm_write32(address + 12u, 0u);
     }
+    return 0;
 }
 
 /* Semantic actions shared by the legacy packet decoder and the vertical

@@ -340,3 +340,13 @@ int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
     out->word_count = at;
     return 1;
 }
+
+int rsx_nr_main_report_io_range(u32 offset, u32 size, u32* io_offset)
+{
+    const u32 aperture_size = 0x01000000u;
+    if (!io_offset || !size || offset >= aperture_size ||
+        size > aperture_size - offset)
+        return 0;
+    *io_offset = RSX_NR_MAIN_REPORT_IO_BASE + offset;
+    return 1;
+}

@@ -1828,6 +1828,11 @@ static void ld_flush(ld_flush_reason reason)
         fprintf(stderr,
                 "[d3d-fail] command-list Close hr=0x%08lX frame=%u\n",
                 (unsigned long)close_hr, g_ld_frames);
+        /* Failure-only diagnostics: when the optional D3D validation layer
+         * is enabled, preserve the exact command-list error that made Close
+         * fail.  The clean production lane has no info queue and pays only
+         * this already-failing branch. */
+        ld_drain_info_queue("close-fail");
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
         return;

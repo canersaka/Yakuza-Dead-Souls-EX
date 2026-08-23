@@ -1319,6 +1319,7 @@ typedef struct exec_rec {
     u32 draw_const0_ok;
     u32 last_present;
     u32 reports;
+    int report_result;
     u32 user_cause;
     u32 flushes;
 } exec_rec;
@@ -1395,12 +1396,13 @@ static int rec_sem_read(void* u, u32 dma, u32 offset, u32* value)
     return 0;
 }
 
-static void rec_report(void* u, u32 kind, u32 arg, u32 dma)
+static int rec_report(void* u, u32 kind, u32 arg, u32 dma)
 {
     exec_rec* r = u;
     (void)kind; (void)arg; (void)dma;
     rec_add(r, 'r');
     r->reports++;
+    return r->report_result;
 }
 
 static void rec_ref(void* u, u32 value) { ((exec_rec*)u)->ref = value; }
@@ -1485,6 +1487,15 @@ static void test_backend_core(void)
     CHECK(rec.reports == 1 && rec.flushes == flushes_before_report + 1,
           "report did not flush/publish reports=%u flushes=%u/%u",
           rec.reports, flushes_before_report, rec.flushes);
+    const u64 errors_before_report_refusal = be.stats.exec_errors;
+    rec.report_result = -1;
+    rsx_nir_em_report(&em, 0, 0x01000090u, 0xBAD68000u);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.reports == 2 &&
+          be.stats.exec_errors == errors_before_report_refusal + 1u,
+          "report refusal was silently claimed reports=%u errors=%llu/%llu",
+          rec.reports, be.stats.exec_errors, errors_before_report_refusal);
+    rec.report_result = 0;
 
     /* blocking: an acquire on an unsatisfied label parks WITHOUT popping */
     rsx_nir_em_semaphore_acquire(&em, 0x66616661, 0x40, 0x77);
