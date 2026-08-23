@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
-"""WB assembly audit: disassemble the compiled WB object and prove that
-covered ordinary blocks execute with no per-operation helper calls.
+"""WB assembly audit: disassemble the compiled WB translation unit and prove
+that covered ordinary blocks execute with no per-operation helper calls.
 
-For every `spu_wb_*` function in the WB object (dumpbin /DISASM):
-  * count instructions,
-  * classify every `call` target:
-      - platform   (channels, dispatch, halt, drain hooks -- by design)
-      - ls-hook    (yz_tagread_repair_read -- the LS repair hook, by design)
-      - float      (the wrapped scalar float stack + CRT math, by design)
-      - fast/wb    (direct twin-to-twin control transfer)
-      - VIOLATION  (anything else -- e.g. an integer/logic/shuffle helper
-                    that failed to inline)
-  * count guest-register spills/reloads: 16-byte moves against
-    [rcx + disp] with disp inside the gpr file (first 0x800 bytes of
-    spu_context -- gpr is the struct's first member).
+The TU is recompiled here WITHOUT /bigobj (dumpbin drops function-name
+labels from extended-COFF disassembly; the audit compile is otherwise
+flag-identical to the differential build). For every `spu_wb_*` function:
 
-Exit 1 on any VIOLATION. Also emits the same instruction/spill metrics for
-the FAST twin's `spu_region_*` functions when given --fast-obj, so the
-comparison lands in one report.
+  * instruction count,
+  * every `call` target classified:
+      platform  (channels, dispatch, halt, drain hooks -- by design)
+      ls-hook   (yz_tagread_repair_read -- the LS repair hook, by design)
+      float     (the wrapped scalar float stack + CRT math, by design)
+      twin      (direct FAST/WB control transfers)
+      memory    (memcpy/memset intrinsic outlining)
+      VIOLATION (anything else -- e.g. an integer/logic/shuffle helper
+                 that failed to inline)
+  * guest-register reloads/spills: 16-byte moves against [reg+disp] with
+    disp < 0x800 (the gpr file is spu_context's first member), stack
+    bases excluded.
 
-Usage (vcvars shell):
-    py -3 tools/spu_wb_asm_audit.py scratch/wbdiff/<stem>/obj_wb/wb.obj \
-        [--fast-obj .../fast_rn.obj] [--json out.json]
+Exit 1 on any VIOLATION. --fast-source additionally audits the FAST twin
+(`spu_region_*` functions, baseline flags) for the comparison row.
+
+Usage (vcvars64 shell):
+    py -3 tools/spu_wb_asm_audit.py --stem job_bin_a_e400 [--json out.json]
 """
 
 import argparse
@@ -30,47 +32,73 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(TOOLS)
+sys.path.insert(0, TOOLS)
+
+import spu_region_diff as D      # noqa: E402
+
+WB = os.path.join(ROOT, "yakuza", "generated", "wb")
+FAST = os.path.join(ROOT, "yakuza", "generated", "fast")
 
 PLATFORM = {
     "spu_rdch", "spu_wrch", "spu_rchcnt", "spu_indirect_branch", "spu_halt",
     "spu_img_restore", "spu_task_launch_check",
     "spu_task_launch_behavior_check", "yz_sguard_check", "yz_lockstep_tick",
-    "spu_prof_hop",
+    "spu_prof_hop", "spu_arch_fence",
 }
-LS_HOOK = {"yz_tagread_repair_read"}
+LS_HOOK = {"yz_tagread_repair_read", "wbk_ls_read", "wbk_ls_write"}
+# Scalar-wrapped WB kernels (the WBK_WRAP list in spu_wb_simd.h): outlining
+# these is fine -- they ARE the proven scalar paths. A native kernel showing
+# up as a call is a violation (it failed to inline).
+WRAPPED_WBK = re.compile(
+    r"^wbk_(fa|fs|fm|fi|fma|fms|fnms|fceq|fcgt|fcmeq|fcmgt|frest|frsqest|"
+    r"fesd|frds|cflts|cfltu|csflt|cuflt|dfa|dfs|dfm|dfma|dfms|dfnms|dfnma|"
+    r"dfceq|dfcmeq|dfcgt|dfcmgt|dftsv|clz|gbh|gbb|shlh|roth|rothm|rothma|"
+    r"mfspr)$")
+# register-indirect calls: the SPU_DRAIN loop's `_tf(ctx)` dispatch (the
+# same construct the FAST twins compile to)
+_INDIRECT_RE = re.compile(r"^r\w{1,3}$")
 FLOAT_RE = re.compile(
     r"^(spu_(fa|fs|fm|fi|fma|fms|fnms|fceq|fcgt|fcmeq|fcmgt|frest|frsqest|"
     r"fesd|frds|cflts|cfltu|csflt|cuflt|dfa|dfs|dfm|dfma|dfms|dfnms|dfnma|"
-    r"dfceq|dfcmeq|dfcgt|dfcmgt|dftsv|xf_\w+|clz|gbh|gbb|shlh|roth|rothm|"
-    r"rothma|mfspr)|ldexp|frexp|exp2|fmaf?|_CIpow|__libm\w*|_dtest|pow)")
-MEMORY = {"memcpy", "memset", "memmove", "_memcpy", "_memset"}
+    r"dfceq|dfcmeq|dfcgt|dfcmgt|dftsv|xf_\w+|clz\w*|gbh|gbb|shlh|roth|rothm|"
+    r"rothma|mfspr)\b|ldexp|frexp|exp2|fmaf?$|pow|_CI\w+|__libm\w*|_dtest)")
+MEMORY = {"memcpy", "memset", "memmove"}
+
+_FLAGS_NOBIGOBJ = [f for f in D.CLFLAGS if f != "/bigobj"]
 
 
-def dumpbin_disasm(obj):
-    exe = "dumpbin"
-    r = subprocess.run([exe, "/DISASM:NOBYTES", obj], capture_output=True,
-                       text=True)
+def compile_for_audit(src, out_obj, extra):
+    inc = ["/I", os.path.join(ROOT, "include"),
+           "/I", os.path.join(ROOT, "runtime", "spu"),
+           "/I", WB, "/I", FAST]
+    cmd = [D.CL_EXE] + _FLAGS_NOBIGOBJ + extra + inc + \
+        ["/c", src, f"/Fo{out_obj}"]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     if r.returncode != 0:
-        raise SystemExit(f"dumpbin failed on {obj}: {r.stderr[:400]}")
-    return r.stdout
+        raise SystemExit(f"audit compile failed:\n{r.stdout}\n{r.stderr}")
 
 
-_FUNC_RE = re.compile(r"^([A-Za-z_$][\w$@?]*):\s*$")
-_INSN_RE = re.compile(r"^\s+[0-9A-F]{8,16}:\s+(\S+)(.*)$")
+_FUNC_RE = re.compile(r"^([A-Za-z_][\w@?]*):\s*$")     # '$'-labels excluded
+_INSN_RE = re.compile(r"^\s+[0-9A-F]{16}:\s+(\S+)\s*(.*)$")
 _CALL_TGT_RE = re.compile(r"call\s+(\S+)")
-_GPR_RE = re.compile(r"\[rcx(?:\+([0-9A-Fa-f]+)h?)?\]")
+_MEM16_RE = re.compile(r"(xmmword|ymmword|oword) ptr \[(r\w+)(?:\+([0-9A-Fa-f]+)h?)?\]")
 
 
 def audit_obj(obj, func_prefix):
-    text = dumpbin_disasm(obj)
+    r = subprocess.run(["dumpbin", "/DISASM:NOBYTES", obj],
+                       capture_output=True, text=True)
+    if "File Type" not in r.stdout:
+        raise SystemExit(f"dumpbin failed on {obj}: {r.stderr[:300]}")
     funcs = {}
     cur = None
-    for line in text.splitlines():
+    for line in r.stdout.splitlines():
         m = _FUNC_RE.match(line)
         if m:
-            name = m.group(1)
-            cur = funcs.setdefault(name, {
+            cur = funcs.setdefault(m.group(1), {
                 "insns": 0, "calls": {}, "gpr_loads": 0, "gpr_stores": 0})
             continue
         if cur is None:
@@ -82,18 +110,15 @@ def audit_obj(obj, func_prefix):
         cur["insns"] += 1
         if mnem == "call":
             mt = _CALL_TGT_RE.search(line)
-            tgt = mt.group(1) if mt else "?"
+            tgt = (mt.group(1) if mt else "?").strip()
             cur["calls"][tgt] = cur["calls"].get(tgt, 0) + 1
         if mnem in ("movdqa", "movdqu", "vmovdqa", "vmovdqu", "movaps",
                     "vmovaps", "movups", "vmovups"):
-            mg = _GPR_RE.search(rest)
-            if mg:
-                disp = int(mg.group(1) or "0", 16)
-                if disp < 0x800:      # inside the gpr file
-                    # store if the memory operand comes first
-                    ops = rest.strip()
-                    if ops.startswith(("xmmword", "oword")) or \
-                            re.match(r"^\s*[a-z]+ ptr \[rcx", ops):
+            mm = _MEM16_RE.search(rest)
+            if mm and mm.group(2) not in ("rsp", "rbp", "rip"):
+                disp = int(mm.group(3) or "0", 16)
+                if disp < 0x800:
+                    if rest.strip().startswith(mm.group(1)):
                         cur["gpr_stores"] += 1
                     else:
                         cur["gpr_loads"] += 1
@@ -102,21 +127,22 @@ def audit_obj(obj, func_prefix):
         if not name.startswith(func_prefix):
             continue
         cats = {"platform": 0, "ls-hook": 0, "float": 0, "twin": 0,
-                "memory": 0, "violation": {}}
+                "memory": 0, "dispatch-indirect": 0, "violation": {}}
         for tgt, n in d["calls"].items():
-            t = tgt.strip()
-            if t in PLATFORM:
+            if tgt in PLATFORM:
                 cats["platform"] += n
-            elif t in LS_HOOK:
+            elif tgt in LS_HOOK:
                 cats["ls-hook"] += n
-            elif t in MEMORY:
+            elif tgt in MEMORY:
                 cats["memory"] += n
-            elif FLOAT_RE.match(t):
+            elif FLOAT_RE.match(tgt) or WRAPPED_WBK.match(tgt):
                 cats["float"] += n
-            elif t.startswith("spu_region_") or t.startswith("spu_wb_"):
+            elif tgt.startswith(("spu_region_", "spu_wb_", "spu_func_")):
                 cats["twin"] += n
+            elif _INDIRECT_RE.match(tgt):
+                cats["dispatch-indirect"] += n
             else:
-                cats["violation"][t] = cats["violation"].get(t, 0) + n
+                cats["violation"][tgt] = cats["violation"].get(tgt, 0) + n
         out[name] = {"insns": d["insns"], "gpr_loads": d["gpr_loads"],
                      "gpr_stores": d["gpr_stores"], "calls": cats}
     return out
@@ -125,12 +151,13 @@ def audit_obj(obj, func_prefix):
 def summarize(audit):
     tot = {"funcs": len(audit), "insns": 0, "gpr_loads": 0, "gpr_stores": 0,
            "platform": 0, "ls-hook": 0, "float": 0, "twin": 0, "memory": 0,
-           "violations": {}}
+           "dispatch-indirect": 0, "violations": {}}
     for d in audit.values():
         tot["insns"] += d["insns"]
         tot["gpr_loads"] += d["gpr_loads"]
         tot["gpr_stores"] += d["gpr_stores"]
-        for k in ("platform", "ls-hook", "float", "twin", "memory"):
+        for k in ("platform", "ls-hook", "float", "twin", "memory",
+                  "dispatch-indirect"):
             tot[k] += d["calls"][k]
         for t, n in d["calls"]["violation"].items():
             tot["violations"][t] = tot["violations"].get(t, 0) + n
@@ -139,20 +166,31 @@ def summarize(audit):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("wb_obj")
-    ap.add_argument("--fast-obj", default=None)
+    ap.add_argument("--stem", required=True)
+    ap.add_argument("--no-fast", action="store_true")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--workdir", default=None)
     args = ap.parse_args()
+    if not D.CL_EXE:
+        raise SystemExit("cl not found; run from a vcvars64 shell")
+    wd = args.workdir or os.path.join(ROOT, "scratch", "wbaudit", args.stem)
+    os.makedirs(wd, exist_ok=True)
 
-    wb = audit_obj(args.wb_obj, "spu_wb_")
+    wb_obj = os.path.join(wd, "wb_audit.obj")
+    compile_for_audit(os.path.join(WB, f"{args.stem}_wb.c"), wb_obj,
+                      ["/arch:AVX2", "/DYZ_SPU_SIMD_LS128=1",
+                       "/DYZ_SPU_SIMD_SHUFB=1"])
+    wb = audit_obj(wb_obj, "spu_wb_")
     wb_sum = summarize(wb)
-    report = {"wb": wb_sum, "wb_funcs": wb}
+    report = {"stem": args.stem, "wb": wb_sum, "wb_funcs": wb}
     print(f"WB   {wb_sum['funcs']} fn(s): {wb_sum['insns']} insns, "
           f"gpr {wb_sum['gpr_loads']}L/{wb_sum['gpr_stores']}S, calls: "
           f"platform={wb_sum['platform']} ls-hook={wb_sum['ls-hook']} "
           f"float={wb_sum['float']} twin={wb_sum['twin']} mem={wb_sum['memory']}")
-    if args.fast_obj:
-        fast = audit_obj(args.fast_obj, "spu_region_")
+    if not args.no_fast:
+        fast_obj = os.path.join(wd, "fast_audit.obj")
+        compile_for_audit(os.path.join(FAST, f"{args.stem}_fast.c"), fast_obj, [])
+        fast = audit_obj(fast_obj, "spu_region_")
         f_sum = summarize(fast)
         report["fast"] = f_sum
         print(f"FAST {f_sum['funcs']} fn(s): {f_sum['insns']} insns, "
@@ -160,15 +198,16 @@ def main():
               f"platform={f_sum['platform']} float={f_sum['float']} "
               f"mem={f_sum['memory']}")
         if f_sum["insns"]:
-            print(f"  WB/FAST instruction ratio: "
+            gwb = wb_sum["gpr_loads"] + wb_sum["gpr_stores"]
+            gfa = f_sum["gpr_loads"] + f_sum["gpr_stores"]
+            print(f"  WB/FAST host-instruction ratio: "
                   f"{wb_sum['insns'] / f_sum['insns']:.3f}; "
-                  f"gpr-access ratio: "
-                  f"{(wb_sum['gpr_loads'] + wb_sum['gpr_stores']) / max(1, f_sum['gpr_loads'] + f_sum['gpr_stores']):.3f}")
+                  f"gpr-access ratio: {gwb / max(1, gfa):.3f}")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(report, f, indent=1)
     if wb_sum["violations"]:
-        print("VIOLATIONS (unexpected helper calls in WB functions):")
+        print("VIOLATIONS (unexpected calls in WB functions):")
         for t, n in sorted(wb_sum["violations"].items(), key=lambda kv: -kv[1]):
             print(f"    {t}: {n}")
         sys.exit(1)
