@@ -408,13 +408,15 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     snprintf(stats_line, stats_size,
              "clears=%llu draws=%llu (restart=%llu) batches=%llu "
              "presents=%llu xfers=%llu pso=%llu(+%lluh) unsup_draw=%llu "
-             "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu] "
+             "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu fp=%llu "
+             "tex=%llu] real_fp=%llu "
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
              "exec_err=%llu",
              st.clears, st.draws, st.restart_draws, st.draw_batches,
              st.presents, st.transfers, st.pso_builds, st.pso_hits,
              st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
              st.unsup_draw_plan, st.unsup_draw_pso, st.unsup_draw_index,
+             st.unsup_draw_fp, st.unsup_draw_texture, st.real_fp_draws,
              st.unsupported_clears, st.unsupported_transfers,
              st.compile_failures, be.stats.exec_errors);
 
