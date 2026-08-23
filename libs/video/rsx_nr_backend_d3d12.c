@@ -46,6 +46,7 @@ typedef struct nrb_rt {
     ID3D12Resource* tex;
     ID3D12Resource* depth;
     u32 space, offset, w, h, fmt;
+    DXGI_FORMAT dxgi;
     u32 rtv_slot, dsv_slot;
     D3D12_RESOURCE_STATES color_state;
     int live;
@@ -177,6 +178,17 @@ static ID3D12Resource* nrb_make_buffer(ID3D12Device* dev, u64 size,
 
 /* ---- render targets ---------------------------------------------------- */
 
+static DXGI_FORMAT nrb_color_dxgi(u32 fmt)
+{
+    switch (fmt) {
+    case 3: return DXGI_FORMAT_B5G6R5_UNORM;
+    case 4:
+    case 5:
+    case 8: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
                           u32 w, u32 h, int create)
 {
@@ -187,6 +199,9 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
             return rt;
     }
     if (!create)
+        return NULL;
+    const DXGI_FORMAT color_dxgi = nrb_color_dxgi(fmt);
+    if (color_dxgi == DXGI_FORMAT_UNKNOWN)
         return NULL;
     nrb_rt* rt = NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
@@ -206,7 +221,7 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
     rd.Height = h;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    rd.Format = color_dxgi;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
@@ -233,6 +248,7 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
     rt->space = space;
     rt->offset = offset;
     rt->fmt = fmt;
+    rt->dxgi = color_dxgi;
     rt->w = w;
     rt->h = h;
     rt->rtv_slot = b->rtv_used++;
@@ -264,11 +280,11 @@ static void nrb_rt_handles(rsx_nr_d3d12* b, const nrb_rt* rt,
     dsv->ptr += (SIZE_T)rt->dsv_slot * b->dsv_size;
 }
 
-/* BGRA8-class gcm surface color formats the sink can host directly:
- * 4/5 = X8R8G8B8 (Z/O alpha-ignore variants), 8 = A8R8G8B8. */
+/* Capture-observed pitch-linear color formats with an exact D3D12 RTV.
+ * 3 = R5G6B5; 4/5 = X8R8G8B8; 8 = A8R8G8B8. */
 static int nrb_color_format_ok(u32 fmt)
 {
-    return fmt == 4 || fmt == 5 || fmt == 8;
+    return nrb_color_dxgi(fmt) != DXGI_FORMAT_UNKNOWN;
 }
 
 static nrb_rt* nrb_rt_from_state(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
@@ -391,8 +407,22 @@ static int nrb_topology(u32 prim, D3D12_PRIMITIVE_TOPOLOGY* topo,
             *type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; return 0;
     case 6: *topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
             *type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; return 0;
-    default: return -1;              /* loop/fan/quads: CPU path territory */
+    case 3: *topo = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+            *type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; return 0;
+    case 7:                            /* triangle fan -> host triangle IB */
+    case 8:                            /* quads                            */
+    case 9:                            /* quad strip                       */
+    case 10:                           /* polygon -> fan                   */
+            *topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            *type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; return 0;
+    default: return -1;
     }
+}
+
+static int nrb_needs_expansion(u32 primitive)
+{
+    return primitive == 3u || primitive == 7u || primitive == 8u ||
+           primitive == 9u || primitive == 10u;
 }
 
 typedef struct nrb_fp_info {
@@ -1036,7 +1066,8 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
     const u32 format = texture->format & NRB_TEX_BASE_MASK &
                        ~NRB_TEX_UNNORM;
     if (texture->cubemap || texture->dimension != 2u ||
-        texture->mipmaps > 1u || format != NRB_TEX_A8R8G8B8)
+        texture->mipmaps > 1u ||
+        (format != NRB_TEX_A8R8G8B8 && format != NRB_TEX_R5G6B5))
         return NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         nrb_rt* rt = &b->rts[i];
@@ -1044,10 +1075,14 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
             rt->offset != texture->offset || rt->w != texture->width ||
             rt->h != texture->height)
             continue;
+        if ((format == NRB_TEX_R5G6B5 && rt->fmt != 3u) ||
+            (format == NRB_TEX_A8R8G8B8 &&
+             rt->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM))
+            continue;
         if (rt == draw_rt)
             return rt;              /* input/output alias: must refuse    */
         D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Format = rt->dxgi;
         desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         desc.Shader4ComponentMapping =
             (texture->remap & 0xFFFFu) == 0xAAE4u
@@ -1427,7 +1462,7 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
         : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     pd.PrimitiveTopologyType = tt;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pd.RTVFormats[0] = nrb_color_dxgi(st->surface.color_format);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pd.SampleDesc.Count = 1;
 
@@ -1449,6 +1484,24 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
  * values, translating the restart sentinel: strips keep it as the D3D12
  * cut value 0xFFFFFFFF; list topologies drop it. Returns the converted
  * count into b->idx_scratch, or ~0u when the span is unreadable. */
+static int nrb_ensure_index_scratch(rsx_nr_d3d12* b, u32 count)
+{
+    if (count <= b->idx_scratch_cap)
+        return 0;
+    u32 capacity = b->idx_scratch_cap ? b->idx_scratch_cap : 4096u;
+    while (capacity < count) {
+        if (capacity > 0x7FFFFFFFu)
+            return -1;
+        capacity *= 2u;
+    }
+    u32* buffer = realloc(b->idx_scratch, (size_t)capacity * sizeof(u32));
+    if (!buffer)
+        return -1;
+    b->idx_scratch = buffer;
+    b->idx_scratch_cap = capacity;
+    return 0;
+}
+
 static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
                             u32 first, u32 count, int strips)
 {
@@ -1458,16 +1511,8 @@ static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
                                  count * esize);
     if (!src)
         return ~0u;
-    if (count > b->idx_scratch_cap) {
-        u32 ncap = b->idx_scratch_cap ? b->idx_scratch_cap : 4096;
-        while (ncap < count)
-            ncap *= 2;
-        u32* nbuf = realloc(b->idx_scratch, (size_t)ncap * 4);
-        if (!nbuf)
-            return ~0u;
-        b->idx_scratch = nbuf;
-        b->idx_scratch_cap = ncap;
-    }
+    if (nrb_ensure_index_scratch(b, count) != 0)
+        return ~0u;
     /* The restart comparison is always evaluated against the FULL 32-bit
      * restart register, with 16-bit indices zero-extended
      * (cellGcmSetRestartIndex). A register
@@ -1494,6 +1539,119 @@ static u32 nrb_read_indices(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
     return n;
 }
 
+static u32 nrb_expand_primitives(rsx_nr_d3d12* b,
+                                 const rsx_nir_pipeline* st,
+                                 const rsx_nir_draw* draw,
+                                 u32 first, u32 count)
+{
+    if (!nrb_needs_expansion(draw->primitive) || count > 0x55555555u ||
+        nrb_ensure_index_scratch(b, count * 3u + 2u) != 0)
+        return ~0u;
+
+    const u32 esize = st->index_binding.is_u32 ? 4u : 2u;
+    const u8* source = NULL;
+    if (draw->indexed) {
+        source = b->guest_ptr(
+            b->guest_user, st->index_binding.location,
+            st->index_binding.offset + first * esize, count * esize);
+        if (!source)
+            return ~0u;
+    }
+
+    u32 out_count = 0;
+    u32 group_count = 0;
+    u32 first_value = 0, previous = 0;
+    u32 quad[4] = {0};
+    u32 pair0 = 0;
+    const int restart_enabled =
+        draw->indexed && st->index_binding.restart_enable;
+    const u32 restart = st->index_binding.restart_index;
+
+    for (u32 i = 0; i <= count; i++) {
+        int separator = i == count;
+        u32 value = first + i;
+        if (!separator && source) {
+            if (esize == 4u)
+                value = ((u32)source[i * 4] << 24) |
+                        ((u32)source[i * 4 + 1] << 16) |
+                        ((u32)source[i * 4 + 2] << 8) |
+                        source[i * 4 + 3];
+            else
+                value = ((u32)source[i * 2] << 8) | source[i * 2 + 1];
+            separator = restart_enabled && value == restart;
+        }
+
+        if (separator) {
+            if (draw->primitive == 3u) {
+                if (group_count >= 2u) {
+                    b->idx_scratch[out_count++] = previous;
+                    b->idx_scratch[out_count++] = first_value;
+                }
+            }
+            group_count = 0;
+            continue;
+        }
+
+        switch (draw->primitive) {
+        case 3:                         /* line loop -> explicit line list */
+            if (!group_count) {
+                first_value = value;
+            } else {
+                b->idx_scratch[out_count++] = previous;
+                b->idx_scratch[out_count++] = value;
+            }
+            previous = value;
+            group_count++;
+            break;
+        case 7:                         /* triangle fan */
+        case 10:                        /* polygon */
+            if (!group_count)
+                first_value = value;
+            else if (group_count >= 2u) {
+                b->idx_scratch[out_count++] = first_value;
+                b->idx_scratch[out_count++] = previous;
+                b->idx_scratch[out_count++] = value;
+            }
+            previous = value;
+            group_count++;
+            break;
+        case 8:                         /* independent quads */
+            quad[group_count & 3u] = value;
+            group_count++;
+            if ((group_count & 3u) == 0u) {
+                b->idx_scratch[out_count++] = quad[0];
+                b->idx_scratch[out_count++] = quad[1];
+                b->idx_scratch[out_count++] = quad[2];
+                b->idx_scratch[out_count++] = quad[0];
+                b->idx_scratch[out_count++] = quad[2];
+                b->idx_scratch[out_count++] = quad[3];
+            }
+            break;
+        case 9:                         /* quad strip */
+            if ((group_count & 1u) == 0u)
+                pair0 = value;
+            else {
+                const u32 new0 = pair0, new1 = value;
+                if (group_count >= 3u) {
+                    b->idx_scratch[out_count++] = quad[0];
+                    b->idx_scratch[out_count++] = quad[1];
+                    b->idx_scratch[out_count++] = new1;
+                    b->idx_scratch[out_count++] = quad[0];
+                    b->idx_scratch[out_count++] = new1;
+                    b->idx_scratch[out_count++] = new0;
+                }
+                quad[0] = new0;
+                quad[1] = new1;
+            }
+            group_count++;
+            break;
+        default:
+            return ~0u;
+        }
+    }
+    return out_count;
+}
+
 static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                     const u32* vp_words, u32 vp_word_count,
                     const rsx_nir_draw* d, const u32* batches)
@@ -1505,14 +1663,21 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     if (nrb_topology(d->primitive, &topo, &tt) != 0) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_topology++;
+        if (d->primitive < 16u)
+            b->stats.unsup_topology_id[d->primitive]++;
         return -1;
     }
     const int strips = d->primitive == 4 || d->primitive == 6;
-    const int use_cut_ib = d->indexed && st->index_binding.restart_enable;
+    const int expand_primitive = nrb_needs_expansion(d->primitive);
+    const int filter_restart =
+        d->indexed && st->index_binding.restart_enable;
+    const int use_host_ib = expand_primitive || filter_restart;
     nrb_rt* rt = nrb_rt_from_state(b, st, 1);
     if (!rt) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_rt++;
+        if (st->surface.color_format < 32u)
+            b->stats.unsup_rt_format[st->surface.color_format]++;
         return -1;
     }
 
@@ -1567,7 +1732,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
 
     ID3D12PipelineState* pso = nrb_get_pso(
         b, st, vp_words, vp_word_count, &fp, &plan, tt,
-        use_cut_ib && strips, cube_mask);
+        filter_restart && strips && !expand_primitive, cube_mask);
     if (!pso) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_pso++;
@@ -1690,13 +1855,14 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->list->lpVtbl->SetGraphicsRootShaderResourceView(
             b->list, 3, rm->lpVtbl->GetGPUVirtualAddress(rm));
 
-    /* Restart draws go through a host-built u32 index buffer with the
-     * D3D12 strip-cut sentinel (strips) or cuts dropped (lists); the
+    /* Restart draws and non-native RSX primitive shapes go through a
+     * host-built u32 index buffer. Restart strips use D3D12's cut sentinel;
+     * list shapes drop cuts, while loops/fans/quads are expanded exactly. The
      * shader then runs the ARRAYS source with first = 0, so SV_VertexID
      * IS the fetched index and base_index still applies in-shader —
      * exactly the pull module's documented host-index integration. All
      * other draws use the in-shader guest index fetch. */
-    const u32 source = (d->indexed && !use_cut_ib)
+    const u32 source = (d->indexed && !use_host_ib)
                            ? (st->index_binding.is_u32
                                   ? RSX_PULL_SOURCE_INDEX_U32
                                   : RSX_PULL_SOURCE_INDEX_U16)
@@ -1709,8 +1875,10 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         u32 draw_count = count;
         u32 pc_first = first;
 
-        if (use_cut_ib) {
-            u32 n = nrb_read_indices(b, st, first, count, strips);
+        if (use_host_ib) {
+            u32 n = expand_primitive
+                ? nrb_expand_primitives(b, st, d, first, count)
+                : nrb_read_indices(b, st, first, count, strips);
             if (n == ~0u) {
                 b->stats.unsup_draw_index++;
                 failed = 1;
@@ -1751,7 +1919,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         memcpy(pp, &pc, sizeof(pc));
         b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 1,
                                                            pull_va);
-        if (use_cut_ib)
+        if (use_host_ib)
             b->list->lpVtbl->DrawIndexedInstanced(b->list, draw_count, 1, 0,
                                                   0, 0);
         else
@@ -1765,7 +1933,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.unsupported_draws++;
         return -1;
     }
-    if (use_cut_ib)
+    if (filter_restart)
         b->stats.restart_draws++;
     b->stats.real_fp_draws++;
     if (fp.texture_mask)
@@ -2196,12 +2364,14 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     nrb_rt* rt = NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         if (b->rts[i].live && b->rts[i].space == space &&
-            b->rts[i].offset == offset) {
+            b->rts[i].offset == offset && b->rts[i].w == w &&
+            b->rts[i].h == h &&
+            b->rts[i].dxgi == DXGI_FORMAT_B8G8R8A8_UNORM) {
             rt = &b->rts[i];
             break;
         }
     }
-    if (!rt || w != rt->w || h != rt->h)
+    if (!rt)
         return -1;
 
     const u32 row = (w * 4 + 255u) & ~255u;

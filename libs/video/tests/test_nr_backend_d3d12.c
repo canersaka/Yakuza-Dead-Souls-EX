@@ -42,6 +42,7 @@ static int g_failures;
 #define LOCAL_SIZE (1u << 20)
 #define MAIN_SIZE  (1u << 16)
 #define RT_OFFSET  0x00300000u   /* outside the arena on purpose: the RT  */
+#define RT565_OFFSET 0x00310000u
 #define RT_W 64u                 /* is a GPU object keyed by (space,ofs)  */
 #define RT_H 64u
 #define VTX_OFFSET 0x2000u
@@ -159,6 +160,25 @@ static void stage_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
+static void stage_rt565_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = RT565_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xA4u;          /* LINEAR | R5G6B5                   */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = RT_W;
+    texture.height = RT_H;
+    texture.pitch = RT_W * 2u;
+    texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
 static u32 fbits(float f)
 {
     u32 v;
@@ -177,6 +197,20 @@ static void write_triangle(rsx_guest_pages* pages, float x0, float y0,
     for (int i = 0; i < 12; i++)
         put_be32(p + i * 4, fbits(v[i]));
     rsx_guest_pages_note_write(pages, 0, VTX_OFFSET, 48);
+}
+
+static void write_quad(rsx_guest_pages* pages)
+{
+    u8* p = g_local + VTX_OFFSET;
+    const float v[16] = {
+        -1.0f, -1.0f, 0.5f, 1.0f,
+         1.0f, -1.0f, 0.5f, 1.0f,
+         1.0f,  1.0f, 0.5f, 1.0f,
+        -1.0f,  1.0f, 0.5f, 1.0f
+    };
+    for (int i = 0; i < 16; i++)
+        put_be32(p + i * 4, fbits(v[i]));
+    rsx_guest_pages_note_write(pages, 0, VTX_OFFSET, 64);
 }
 
 static void stage_frame_state(rsx_nir_emitter* em)
@@ -459,7 +493,9 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              "tex=%llu] real_fp=%llu tex_draw=%llu "
              "tex_cache=%llu(+%lluh,%llur) tex_fail=%llu alias=%llu "
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
-             "exec_err=%llu",
+             "exec_err=%llu topo_id=[3:%llu 7:%llu 8:%llu 9:%llu 10:%llu] "
+             "rtfmt=[1:%llu 2:%llu 3:%llu 6:%llu 7:%llu 9:%llu 10:%llu "
+             "11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu]",
              st.clears, st.draws, st.restart_draws, st.draw_batches,
              st.presents, st.transfers, st.pso_builds, st.pso_hits,
              st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
@@ -468,7 +504,16 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.texture_draws, st.texture_builds, st.texture_hits,
              st.texture_refreshes, st.texture_failures, st.rt_alias_binds,
              st.unsupported_clears, st.unsupported_transfers,
-             st.compile_failures, be.stats.exec_errors);
+             st.compile_failures, be.stats.exec_errors,
+             st.unsup_topology_id[3], st.unsup_topology_id[7],
+             st.unsup_topology_id[8], st.unsup_topology_id[9],
+             st.unsup_topology_id[10], st.unsup_rt_format[1],
+             st.unsup_rt_format[2], st.unsup_rt_format[3],
+             st.unsup_rt_format[6], st.unsup_rt_format[7],
+             st.unsup_rt_format[9], st.unsup_rt_format[10],
+             st.unsup_rt_format[11], st.unsup_rt_format[12],
+             st.unsup_rt_format[13], st.unsup_rt_format[14],
+             st.unsup_rt_format[15], st.unsup_rt_format[16]);
 
     *rt_hash = 0;
     if (rt_w && rt_h) {
@@ -705,7 +750,59 @@ int main(int argc, char** argv)
           before_texture_change.pso_builds, after_texture_change.pso_builds,
           before_texture_change.pso_hits, after_texture_change.pso_hits);
 
+    /* ---- R5G6B5 target sampled as an exact native alias --------------
+     * The capture's only remaining surface format is GCM color format 3.
+     * Clear a real B5G6R5 target, then sample its GPU contents into the
+     * BGRA target.  RT565_OFFSET is outside guest memory, so success cannot
+     * come from a stale guest decode. */
+    rsx_nir_surface s565;
+    memset(&s565, 0, sizeof(s565));
+    s565.color_format = 3;
+    s565.depth_format = 2;
+    s565.raster_type = 1;
+    s565.clip_w = RT_W;
+    s565.clip_h = RT_H;
+    s565.color_offset[0] = RT565_OFFSET;
+    s565.color_pitch[0] = RT_W * 2u;
+    s565.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    s565.color_target = 1;
+    rsx_nir_em_surface(&em, &s565);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF00FF00u, 0xFFFFFF, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "R5G6B5 clear exec errors %llu",
+          be.stats.exec_errors);
+
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_rt565_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "R5G6B5 alias exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "R5G6B5 alias pixel");
+
+    /* ---- exact QUADS host-index expansion -----------------------------
+     * Primitive 8 is the only non-native topology present in the archived
+     * world captures. Two native triangles must cover the same full quad. */
     write_test_fp();
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    write_quad(rsx_nr_d3d12_pages(sink));
+    u32 quad_batch[2] = { 0, 4 };
+    rsx_nir_em_draw(&em, 8, 0, quad_batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "quad expansion exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 2, 0xFF, 0x00, 0xFF) &&
+              pix_is(61, 61, 0xFF, 0x00, 0xFF),
+          "quad expansion did not cover target");
 
     /* ---- scissored clear ------------------------------------------------
      * CLEAR_SURFACE clears only within the scissor box
@@ -749,7 +846,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 9 && st.draws == 7 && st.presents == 9,
+    CHECK(st.clears == 12 && st.draws == 9 && st.presents == 11,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.unsupported_draws == 0 && st.compile_failures == 0,
@@ -760,11 +857,12 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 2 && st.texture_builds == 1 &&
+    CHECK(st.texture_draws == 3 && st.texture_builds == 1 &&
               st.texture_refreshes == 1 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
+    CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);

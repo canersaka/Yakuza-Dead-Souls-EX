@@ -51,6 +51,8 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long unsup_draw_index;     /* index list unreadable      */
     unsigned long long unsup_draw_fp;        /* FP unreadable/unsupported  */
     unsigned long long unsup_draw_texture;   /* FP texture lane pending    */
+    unsigned long long unsup_topology_id[16];/* exact primitive census     */
+    unsigned long long unsup_rt_format[32];  /* exact surface-format census */
     unsigned long long restart_draws;        /* executed via strip-cut IB  */
     unsigned long long unsupported_clears;
     unsigned long long unsupported_transfers;
