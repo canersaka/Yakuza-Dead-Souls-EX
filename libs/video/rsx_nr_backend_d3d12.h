@@ -129,6 +129,8 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long rt_refreshes;     /* broker replaced same identity */
     unsigned long long depth_builds;
     unsigned long long depth_refreshes;  /* broker replaced same identity */
+    unsigned long long depth_snapshot_builds;
+    unsigned long long depth_snapshot_resolves;
     unsigned long long resident_pages[2];
     unsigned long long watched_guest_pages[2];
     unsigned long long residency_failures;

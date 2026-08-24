@@ -131,8 +131,10 @@ typedef struct nrb_depth {
     u32 dsv_slot;
     DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi, sample_srv_dxgi;
     D3D12_RESOURCE_STATES state;
+    D3D12_RESOURCE_STATES sample_state;
     int live;
     int external;
+    int sample_valid;
 } nrb_depth;
 
 typedef struct nrb_descriptor_table_key {
@@ -180,11 +182,14 @@ struct rsx_nr_d3d12 {
     ID3D12DescriptorHeap* texture_cpu_heap;
     ID3D12DescriptorHeap* texture_gpu_heap;
     ID3D12DescriptorHeap* sampler_gpu_heap;
+    ID3D12DescriptorHeap* depth_snapshot_heap;
     u32 texture_desc_size, sampler_desc_size;
     u32 descriptor_tables_used;
     nrb_descriptor_table_key descriptor_table_keys[NRB_DRAW_TABLES];
 
     ID3D12RootSignature* rootsig;
+    ID3D12RootSignature* depth_snapshot_rootsig;
+    ID3D12PipelineState* depth_snapshot_pso;
 
     ID3D12Resource* upload;          /* fence-gated per-exec bump ring     */
     u8* upload_mapped;
@@ -449,6 +454,9 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)b->list };
     b->queue->lpVtbl->ExecuteCommandLists(b->queue, 1, lists);
     if (nrb_wait_idle(b)) {
+        nrb_dump_device_oracle(
+            b->dev, "command submission",
+            b->dev->lpVtbl->GetDeviceRemovedReason(b->dev));
         b->list_open = 0;
         return -1;
     }
@@ -816,9 +824,14 @@ static int nrb_depth_formats(u32 fmt, DXGI_FORMAT* resource,
         return 0;
     }
     if (fmt == 2u) {
-        *resource = DXGI_FORMAT_R24G8_TYPELESS;
-        *dsv = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        *srv = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        /* Match the established live renderer's physical depth resource.
+         * The guest contract remains logical D24S8, but world/shadow passes
+         * have always rasterized through D32S8 and sampled its R32 snapshot.
+         * Keeping the private full-native lane on D24 changed the producer
+         * values before the otherwise-identical snapshot conversion. */
+        *resource = DXGI_FORMAT_R32G8X24_TYPELESS;
+        *dsv = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        *srv = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         return 0;
     }
     return -1;
@@ -1010,6 +1023,9 @@ static nrb_depth* nrb_depth_from_state(rsx_nr_d3d12* b,
                          surface->depth_format, w, h, create, 1);
 }
 
+static void nrb_depth_transition(rsx_nr_d3d12* b, nrb_depth* depth,
+                                 D3D12_RESOURCE_STATES state);
+
 static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
     rsx_nr_d3d12* b, const nrb_depth* depth)
 {
@@ -1018,6 +1034,200 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
                                                             &handle);
     handle.ptr += (SIZE_T)depth->dsv_slot * b->dsv_size;
     return handle;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_snapshot_cpu_handle(
+    rsx_nr_d3d12* b, const nrb_depth* depth, u32 destination)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    b->depth_snapshot_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+        b->depth_snapshot_heap, &handle);
+    handle.ptr += (SIZE_T)(depth->dsv_slot * 2u + destination) *
+                  b->texture_desc_size;
+    return handle;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE nrb_depth_snapshot_gpu_handle(
+    rsx_nr_d3d12* b, const nrb_depth* depth, u32 destination)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    b->depth_snapshot_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
+        b->depth_snapshot_heap, &handle);
+    handle.ptr += (UINT64)(depth->dsv_slot * 2u + destination) *
+                  b->texture_desc_size;
+    return handle;
+}
+
+/* Strict full-native frames own private logical-D24S8 resources backed by the
+ * same D32S8 physical format as the established renderer. The RSX sampling
+ * contract consumes a single-channel R32_FLOAT snapshot. Keep that
+ * representation conversion entirely inside the native backend: one compute
+ * dispatch after a depth-writing generation, then reuse the snapshot until
+ * another clear/draw invalidates it. */
+static int nrb_make_depth_snapshot_pipeline(rsx_nr_d3d12* b)
+{
+    static const char source[] =
+        "Texture2D<float> depth_source : register(t0);\n"
+        "RWTexture2D<float> depth_destination : register(u0);\n"
+        "[numthreads(8, 8, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "    uint width, height;\n"
+        "    depth_destination.GetDimensions(width, height);\n"
+        "    if (id.x < width && id.y < height)\n"
+        "        depth_destination[id.xy] = "
+        "depth_source.Load(int3(id.xy, 0));\n"
+        "}\n";
+    ID3DBlob* shader = NULL;
+    ID3DBlob* errors = NULL;
+    HRESULT hr = D3DCompile(
+        source, sizeof(source) - 1u, "native_depth_snapshot", NULL, NULL,
+        "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+        &shader, &errors);
+    if (errors)
+        errors->lpVtbl->Release(errors);
+    if (FAILED(hr) || !shader)
+        return -1;
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    for (u32 i = 0; i < 2u; ++i) {
+        parameters[i].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[i].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC description = {0};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    ID3DBlob* serialized = NULL;
+    ID3DBlob* signature_errors = NULL;
+    hr = D3D12SerializeRootSignature(
+        &description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &serialized, &signature_errors);
+    if (signature_errors)
+        signature_errors->lpVtbl->Release(signature_errors);
+    if (FAILED(hr) || !serialized) {
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+    hr = b->dev->lpVtbl->CreateRootSignature(
+        b->dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
+        serialized->lpVtbl->GetBufferSize(serialized),
+        &IID_ID3D12RootSignature, (void**)&b->depth_snapshot_rootsig);
+    serialized->lpVtbl->Release(serialized);
+    if (FAILED(hr)) {
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
+    pipeline.pRootSignature = b->depth_snapshot_rootsig;
+    pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
+    pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
+    hr = b->dev->lpVtbl->CreateComputePipelineState(
+        b->dev, &pipeline, &IID_ID3D12PipelineState,
+        (void**)&b->depth_snapshot_pso);
+    shader->lpVtbl->Release(shader);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+static int nrb_resolve_private_depth_sample(
+    rsx_nr_d3d12* b, nrb_depth* depth)
+{
+    if (!b || !depth || depth->external || !b->depth_snapshot_pso ||
+        !b->depth_snapshot_rootsig || !b->depth_snapshot_heap)
+        return -1;
+    if (depth->sample_valid)
+        return 0;
+    if (!depth->sample_tex) {
+        D3D12_HEAP_PROPERTIES heap = {0};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {0};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = depth->w;
+        desc.Height = depth->h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R32_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
+                b->dev, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
+                &IID_ID3D12Resource, (void**)&depth->sample_tex)))
+            return -1;
+        depth->sample_srv_dxgi = DXGI_FORMAT_R32_FLOAT;
+        depth->sample_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
+        srv.Format = depth->srv_dxgi;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        b->dev->lpVtbl->CreateShaderResourceView(
+            b->dev, depth->tex, &srv,
+            nrb_depth_snapshot_cpu_handle(b, depth, 0u));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {0};
+        uav.Format = DXGI_FORMAT_R32_FLOAT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        b->dev->lpVtbl->CreateUnorderedAccessView(
+            b->dev, depth->sample_tex, NULL, &uav,
+            nrb_depth_snapshot_cpu_handle(b, depth, 1u));
+        b->stats.depth_snapshot_builds++;
+    }
+    if (nrb_open_list(b))
+        return -1;
+    nrb_depth_transition(
+        b, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (depth->sample_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = depth->sample_tex;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = depth->sample_state;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b->list->lpVtbl->ResourceBarrier(b->list, 1, &barrier);
+        depth->sample_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    ID3D12DescriptorHeap* heaps[1] = { b->depth_snapshot_heap };
+    b->list->lpVtbl->SetDescriptorHeaps(b->list, 1, heaps);
+    b->list->lpVtbl->SetPipelineState(b->list, b->depth_snapshot_pso);
+    b->list->lpVtbl->SetComputeRootSignature(
+        b->list, b->depth_snapshot_rootsig);
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 0, nrb_depth_snapshot_gpu_handle(b, depth, 0u));
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 1, nrb_depth_snapshot_gpu_handle(b, depth, 1u));
+    b->list->lpVtbl->Dispatch(
+        b->list, (depth->w + 7u) / 8u, (depth->h + 7u) / 8u, 1u);
+
+    D3D12_RESOURCE_BARRIER barriers[2] = {0};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[0].UAV.pResource = depth->sample_tex;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = depth->sample_tex;
+    barriers[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[1].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b->list->lpVtbl->ResourceBarrier(b->list, 2, barriers);
+    depth->sample_state = barriers[1].Transition.StateAfter;
+    nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    depth->sample_valid = 1;
+    b->stats.depth_snapshot_resolves++;
+    return 0;
 }
 
 /* ---- mirror session helper --------------------------------------------- */
@@ -1272,6 +1482,7 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             b->list, dsv, depth_flags,
             (float)c->depth_value / 16777215.0f,
             (UINT8)c->stencil_value, nrects, rects);
+        depth->sample_valid = 0;
     }
     /* A depth/stencil-only clear does not modify the color resource.  Do not
      * let a newly allocated, still-black color alias become the most recent
@@ -2419,15 +2630,15 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                 if (depth_alias && depth_alias == draw_depth)
                     return -1;
                 if (depth_alias && !depth_alias->external) {
+                    if (nrb_resolve_private_depth_sample(
+                            b, depth_alias) != 0)
+                        return -1;
                     nrb_write_depth_sample_srv(
-                        b, depth_alias->tex, depth_alias->srv_dxgi, unit);
-                    nrb_depth_transition(
-                        b, depth_alias,
-                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    depth_aliases[unit] = depth_alias;
+                        b, depth_alias->sample_tex,
+                        depth_alias->sample_srv_dxgi, unit);
                     source_slot = NRB_TEX_CAP + 1u + unit;
-                    alias_resource = (u64)(uintptr_t)depth_alias->tex;
+                    alias_resource =
+                        (u64)(uintptr_t)depth_alias->sample_tex;
                     b->stats.rt_alias_binds++;
                 } else if (depth_alias && depth_alias->sample_tex &&
                            b->resolve_depth_sample &&
@@ -4289,6 +4500,9 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.draw_batches++;
     }
 
+    if (depth && st->depth_stencil.depth_write_enable)
+        depth->sample_valid = 0;
+
     nrb_restore_texture_aliases(
         b, texture_aliases, texture_depth_aliases,
         vtex_aliases, vtex_depth_aliases);
@@ -4776,6 +4990,11 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
             b->dev, &hd, &IID_ID3D12DescriptorHeap,
             (void**)&b->texture_gpu_heap)))
         goto fail;
+    hd.NumDescriptors = NRB_MAX_DEPTHS * 2u;
+    if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
+            b->dev, &hd, &IID_ID3D12DescriptorHeap,
+            (void**)&b->depth_snapshot_heap)))
+        goto fail;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     hd.NumDescriptors = NRB_SHADER_SAMPLERS;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
@@ -4891,6 +5110,8 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         if (FAILED(hr))
             goto fail;
     }
+    if (nrb_make_depth_snapshot_pipeline(b) != 0)
+        goto fail;
 
     b->upload = nrb_make_buffer(b->dev, NRB_UPLOAD_BYTES,
                                 D3D12_HEAP_TYPE_UPLOAD,
@@ -5007,6 +5228,11 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         b->upload->lpVtbl->Release(b->upload);
     if (b->rootsig)
         b->rootsig->lpVtbl->Release(b->rootsig);
+    if (b->depth_snapshot_pso)
+        b->depth_snapshot_pso->lpVtbl->Release(b->depth_snapshot_pso);
+    if (b->depth_snapshot_rootsig)
+        b->depth_snapshot_rootsig->lpVtbl->Release(
+            b->depth_snapshot_rootsig);
     if (b->rtv_heap)
         b->rtv_heap->lpVtbl->Release(b->rtv_heap);
     if (b->dsv_heap)
@@ -5015,6 +5241,8 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         b->texture_cpu_heap->lpVtbl->Release(b->texture_cpu_heap);
     if (b->texture_gpu_heap)
         b->texture_gpu_heap->lpVtbl->Release(b->texture_gpu_heap);
+    if (b->depth_snapshot_heap)
+        b->depth_snapshot_heap->lpVtbl->Release(b->depth_snapshot_heap);
     if (b->sampler_gpu_heap)
         b->sampler_gpu_heap->lpVtbl->Release(b->sampler_gpu_heap);
     if (b->fence_event)
