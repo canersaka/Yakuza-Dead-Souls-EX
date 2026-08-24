@@ -269,8 +269,16 @@ class WJLifter(WBLifter):
                         out = carry[b.leader] | writes
                     for s in self.block_edges(b):
                         if self.leader_group.get(s) is g:
-                            if s in g.entries:
-                                continue        # entered via stub, carry: none
+                            # carry flows into ENTRY blocks too: an entry can
+                            # be reached both via its stub (carry none -- the
+                            # stub loads every touched register, so publishing
+                            # a carried-but-clean register is a mirror store,
+                            # a semantic no-op) and via intra-group gotos from
+                            # predecessors with unpublished writes. Skipping
+                            # entries here lost the fall-through carry into
+                            # brsl-target prologue helpers (MEASURED: gs_task
+                            # 0x3000 ila-ladder r2 unpublished at the 0x303C
+                            # return -- the slice-1 task-image mismatches).
                             if not out <= carry[s]:
                                 carry[s] |= out
                                 changed = True
