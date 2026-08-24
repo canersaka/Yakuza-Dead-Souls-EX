@@ -84,6 +84,7 @@
 #define M_VP_START_FROM_ID      0x1EA0
 #define M_VTX_ATTR_4F           0x1C00  /* + attr * 0x10, 4 float words      */
 #define M_CLEAR_DEPTH_VALUE     0x1D8C
+#define M_SHADER_WINDOW         0x1D88
 #define M_CLEAR_COLOR_VALUE     0x1D90
 #define M_CLEAR_BUFFERS         0x1D94
 #define M_VP_UPLOAD_FROM_ID     0x1E9C
@@ -111,10 +112,28 @@
 #define M_BLEND_FUNC_SRC        0x0314
 #define M_BLEND_FUNC_DST        0x0318
 #define M_COLOR_MASK            0x0324
+#define M_STENCIL_WRITE_MASK    0x032C
+#define M_STENCIL_FUNC_MASK     0x0338
 #define M_MRT_COLOR_MASK        0x0370
+#define M_DEPTH_BOUNDS_ENABLE   0x0380
+#define M_DEPTH_BOUNDS_MIN      0x0384
+#define M_DEPTH_BOUNDS_MAX      0x0388
+#define M_TWO_SIDED_STENCIL     0x0348
+#define M_BACK_STENCIL_MASK     0x034C
+#define M_BACK_STENCIL_FUNC     0x0350
+#define M_BACK_STENCIL_FUNC_REF 0x0354
+#define M_BACK_STENCIL_FUNC_MASK 0x0358
+#define M_BACK_STENCIL_OP_FAIL  0x035C
+#define M_BACK_STENCIL_OP_ZFAIL 0x0360
+#define M_BACK_STENCIL_OP_ZPASS 0x0364
+#define M_POLY_OFFSET_POINT_EN  0x0A60
+#define M_POLY_OFFSET_LINE_EN   0x0A64
+#define M_POLY_OFFSET_FILL_EN   0x0A68
 #define M_DEPTH_FUNC            0x0A6C
 #define M_DEPTH_WRITE_ENABLE    0x0A70
 #define M_DEPTH_TEST_ENABLE     0x0A74
+#define M_POLY_OFFSET_SCALE     0x0A78
+#define M_POLY_OFFSET_BIAS      0x0A7C
 #define M_CULL_FACE             0x1830
 #define M_FRONT_FACE            0x1834
 #define M_CULL_FACE_ENABLE      0x183C
@@ -122,6 +141,7 @@
 #define M_NV4097_NOP            0x0100
 #define M_VP_ATTRIB_EN          0x1FF0
 #define M_VP_RESULT_EN          0x1FF4
+#define M_RENDER_ENABLE         0x1E98
 
 #define DMA_HANDLE_LOCAL        0xFEED0000u
 #define DMA_HANDLE_MAIN         0xFEED0001u
@@ -153,6 +173,15 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * depth-only pass's garbage FP output (the blue-character class). */
     rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
 
+    /* NV40 resets both stencil masks to all bits enabled.  Native state
+     * folding reads these registers directly, so retain the hardware defaults
+     * until the guest explicitly changes them. */
+    rsx->regs[M_STENCIL_WRITE_MASK >> 2] = 0xFFu;
+    rsx->regs[M_STENCIL_FUNC_MASK >> 2] = 0xFFu;
+    rsx->regs[M_BACK_STENCIL_MASK >> 2] = 0xFFu;
+    rsx->regs[M_BACK_STENCIL_FUNC_MASK >> 2] = 0xFFu;
+    rsx->regs[M_DEPTH_BOUNDS_MAX >> 2] = 0x3F800000u;
+
     /* NV40 reset state is counter-clockwise front winding.  Leaving this
      * register zero made a live stream that relied on the hardware default
      * cull the exterior of orphanage meshes, while captured replay was correct
@@ -164,6 +193,11 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+
+    /* NV40 reset shader-window convention: bottom origin, half-pixel center,
+     * zero height until the guest selects the active surface convention. */
+    rsx->regs[M_SHADER_WINDOW >> 2] = 0x1000u;
+    rsx->regs[M_RENDER_ENABLE >> 2] = 0x01000000u;
 
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
@@ -205,12 +239,17 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_BLEND_FUNC_ENABLE, 5, RSX_DSP_CLASS_STATE); /* ..BLEND_EQUATION */
     mark_class(rsx, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_TWO_SIDED_STENCIL, 8, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_POLY_OFFSET_POINT_EN, 3, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_DEPTH_FUNC,        3, RSX_DSP_CLASS_STATE); /* ..TEST_ENABLE */
+    mark_class(rsx, M_POLY_OFFSET_SCALE, 2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_CULL_FACE,         1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_FRONT_FACE,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_CULL_FACE_ENABLE,  1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_ATTRIB_EN,      1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VP_RESULT_EN,      1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_RENDER_ENABLE,     1, RSX_DSP_CLASS_STATE);
 
     /* Explicit no-ops: the vertex cache invalidate hint and the reserved
      * NOP method carry no state the replay harness needs (there is no CPU

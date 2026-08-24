@@ -170,6 +170,32 @@ int rsx_nr_flip_contract_init(rsx_nr_flip_contract* out, u32 buffer_id,
 #define RSX_NR_MAIN_REPORT_IO_BASE 0x0E000000u
 int rsx_nr_main_report_io_range(u32 offset, u32 size, u32* io_offset);
 
+/* A CALL target is a separately published display-list segment.  While its
+ * one-level return is live, primary FIFO PUT does not bound the target even
+ * when its IO address happens to fall below the primary ring size.  The
+ * section scanner still validates and copies every word before ownership;
+ * this helper only answers whether [pc,pc+size) is available under the
+ * correct publication domain. */
+typedef enum rsx_nr_fifo_range_status {
+    RSX_NR_FIFO_RANGE_READY = 0,
+    RSX_NR_FIFO_RANGE_NOT_READY,
+    RSX_NR_FIFO_RANGE_WINDOW
+} rsx_nr_fifo_range_status;
+
+rsx_nr_fifo_range_status rsx_nr_fifo_section_range_status(
+    u32 pc, u32 size, u32 put, u32 call_return, u32 ring_size);
+
+/* The imported flip contract is not complete at E944 (queue buffer).  Its
+ * E924 head command is the first boundary after which a renderer may claim
+ * the preceding command-list frame without mixing clears/draws/presentation
+ * between native and legacy owners. */
+int rsx_nr_fifo_frame_boundary(u32 method, u32 arg);
+
+/* Legacy methods which can touch shared GPU/guest resources rather than only
+ * updating decoder state. An ordered native list must retire before any of
+ * these dispatch, including the A010-path NV308A inline-transfer window. */
+int rsx_nr_legacy_gpu_action(u32 method, u32 arg);
+
 #ifdef __cplusplus
 }
 #endif

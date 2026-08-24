@@ -144,6 +144,15 @@ u64 rsx_nir_hash_words(const u32* words, u32 count)
 void rsx_nir_pipeline_init(rsx_nir_pipeline* p)
 {
     memset(p, 0, sizeof(*p));
+    /* NV40 reset defaults: both stencil masks initially enable all bits.
+     * Keep packet-decoded and directly typed streams bit-equivalent before
+     * either path sees an explicit stencil-state write. */
+    p->depth_stencil.stencil_mask = 0xFFu;
+    p->depth_stencil.stencil_write_mask = 0xFFu;
+    p->depth_stencil.back_stencil_mask = 0xFFu;
+    p->depth_stencil.back_stencil_write_mask = 0xFFu;
+    p->depth_stencil.depth_bounds_max = 0x3F800000u;
+    p->fragment_program.shader_window = 0x1000u;
     /* Hardware-default vertex attribute value (0,0,0,1), matching
      * rsx_dsp_vertex_default's never-written fallback. */
     for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++)
@@ -182,6 +191,7 @@ static void apply_state(rsx_nir_pipeline* p, const rsx_nir_stream* s,
     case RSX_NIR_OP_SET_RASTER:           p->raster = op->u.raster; break;
     case RSX_NIR_OP_SET_DEPTH_STENCIL:    p->depth_stencil = op->u.depth_stencil; break;
     case RSX_NIR_OP_SET_BLEND:            p->blend = op->u.blend; break;
+    case RSX_NIR_OP_SET_RENDER_CONDITION: p->render_condition = op->u.render_condition; break;
     case RSX_NIR_OP_SET_VERTEX_PROGRAM:   p->vertex_program = op->u.vertex_program; break;
     case RSX_NIR_OP_SET_FRAGMENT_PROGRAM: p->fragment_program = op->u.fragment_program; break;
     case RSX_NIR_OP_SET_VERTEX_BINDINGS:  p->vertex_bindings = op->u.vertex_bindings; break;
@@ -211,6 +221,14 @@ static void apply_state(rsx_nir_pipeline* p, const rsx_nir_stream* s,
     default:
         break;
     }
+}
+
+void rsx_nir_pipeline_apply_op(rsx_nir_pipeline* p,
+                               const rsx_nir_stream* stream,
+                               const rsx_nir_op* op)
+{
+    if (p && stream && op && !rsx_nir_op_is_action(op->kind))
+        apply_state(p, stream, op);
 }
 
 void rsx_nir_cursor_init(rsx_nir_cursor* c, const rsx_nir_stream* s)
@@ -327,13 +345,16 @@ static const char* pipeline_diverges(const rsx_nir_pipeline* x,
     if (cmp_block(&x->depth_stencil, &y->depth_stencil,
                   sizeof(x->depth_stencil)))                                return "depth_stencil";
     if (cmp_block(&x->blend, &y->blend, sizeof(x->blend)))                  return "blend";
+    if (cmp_block(&x->render_condition, &y->render_condition,
+                  sizeof(x->render_condition)))                            return "render_condition";
     /* vertex program: compare identity (hash/count/slot/masks), not the
      * side-buffer offset, which differs between streams by construction */
     if (x->vertex_program.start_slot != y->vertex_program.start_slot ||
         x->vertex_program.word_count != y->vertex_program.word_count ||
         x->vertex_program.hash != y->vertex_program.hash ||
         x->vertex_program.attrib_input_mask != y->vertex_program.attrib_input_mask ||
-        x->vertex_program.attrib_output_mask != y->vertex_program.attrib_output_mask)
+        x->vertex_program.attrib_output_mask != y->vertex_program.attrib_output_mask ||
+        x->vertex_program.branch_bits != y->vertex_program.branch_bits)
         return "vertex_program";
     if (cmp_block(&x->fragment_program, &y->fragment_program,
                   sizeof(x->fragment_program)))                             return "fragment_program";

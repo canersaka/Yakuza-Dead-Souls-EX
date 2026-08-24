@@ -12,6 +12,7 @@
 #include "rsx_nr_backend_d3d12.h"
 
 #include <string.h>
+#include <limits.h>
 
 #ifdef _WIN32
 
@@ -32,16 +33,29 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_nr_resources.h"
 #include "rsx_vertex_pull.h"
+#include "rsx_vp_decompiler.h"
 
 #define NRB_MAX_RTS      32
 #define NRB_MAX_DEPTHS   32
 #define NRB_UPLOAD_BYTES (32u << 20)
 #define NRB_VS_TEXT      (256 * 1024)
 #define NRB_PS_TEXT      (256 * 1024)
-#define NRB_PSO_CAP      1024
+/* A complete live boot carries menu/movie shader pairs into world rendering.
+ * The established live corpus reaches about 2,296 distinct requested PSO
+ * keys before Akiyama; the former 1,024-slot table stopped inserting at 75%
+ * load and recompiled every later draw. Match the proven live-render cache
+ * headroom so native section ownership cannot fall into compile thrash. */
+#define NRB_PSO_CAP      8192
 #define NRB_TEX_CAP      2048
-#define NRB_TEX_SNAP_WORDS (256u * 1024u)
+#define NRB_TEX_SNAP_WORDS (1024u * 1024u)
 #define NRB_TEX_UNITS    RSX_NIR_NUM_TEXTURES
+#define NRB_VTEX_UNITS   RSX_NIR_NUM_VERTEX_TEXTURES
+#define NRB_DRAW_TABLES  128u       /* D3D12 sampler heap limit / 16      */
+#define NRB_SRV_TABLE_STRIDE (NRB_TEX_UNITS + NRB_VTEX_UNITS)
+#define NRB_SAMPLER_TABLE_STRIDE NRB_TEX_UNITS
+#define NRB_SHADER_DESCRIPTORS (NRB_DRAW_TABLES * NRB_SRV_TABLE_STRIDE)
+#define NRB_SHADER_SAMPLERS (NRB_DRAW_TABLES * NRB_SAMPLER_TABLE_STRIDE)
+#define NRB_MAX_RETIRED_TEXTURES NRB_SHADER_DESCRIPTORS
 #define NRB_MAX_DRAW_BATCHES 4096u
 #define NRB_MAX_REQUIRED_SPANS (RSX_NIR_NUM_VERTEX_ATTR * 2u + 2u)
 
@@ -86,10 +100,12 @@ struct rsx_nr_d3d12 {
     ID3D12CommandQueue* queue;
     ID3D12CommandAllocator* alloc;
     ID3D12GraphicsCommandList* list;
+    ID3D12GraphicsCommandList1* list1;
     ID3D12Fence* fence;
     HANDLE fence_event;
     u64 fence_value;
     int list_open;
+    int depth_bounds_supported;
 
     ID3D12DescriptorHeap* rtv_heap;
     ID3D12DescriptorHeap* dsv_heap;
@@ -98,6 +114,7 @@ struct rsx_nr_d3d12 {
     ID3D12DescriptorHeap* texture_gpu_heap;
     ID3D12DescriptorHeap* sampler_gpu_heap;
     u32 texture_desc_size, sampler_desc_size;
+    u32 descriptor_tables_used;
 
     ID3D12RootSignature* rootsig;
 
@@ -120,10 +137,14 @@ struct rsx_nr_d3d12 {
     void* broker_user;
     rsx_nr_d3d12_publish_write_fn publish_write;
     void* publish_write_user;
+    rsx_nr_d3d12_render_condition_fn render_condition_read;
+    void* render_condition_user;
     u32 local_size, main_size;
 
     rsx_nr_pso_cache psos;
     rsx_nr_res_cache textures;
+    ID3D12Resource* retired_textures[NRB_MAX_RETIRED_TEXTURES];
+    u32 retired_texture_count;
     nrb_rt rts[NRB_MAX_RTS];
     nrb_depth depths[NRB_MAX_DEPTHS];
     nrb_rt* last_rt;
@@ -173,6 +194,7 @@ static int nrb_open_list(rsx_nr_d3d12* b)
         return -1;
     b->list_open = 1;
     b->upload_used = 0;              /* previous exec was waited on        */
+    b->descriptor_tables_used = 0;   /* shader-visible tables fence-retired */
     return 0;
 }
 
@@ -185,7 +207,33 @@ static void nrb_exec_wait(rsx_nr_d3d12* b)
     b->queue->lpVtbl->ExecuteCommandLists(b->queue, 1, lists);
     nrb_wait_idle(b);
     b->list_open = 0;
+    for (u32 i = 0; i < b->retired_texture_count; ++i)
+        b->retired_textures[i]->lpVtbl->Release(b->retired_textures[i]);
+    b->retired_texture_count = 0;
     b->stats.queue_submissions++;
+}
+
+static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b)
+{
+    if (b->descriptor_tables_used >= NRB_DRAW_TABLES) {
+        nrb_exec_wait(b);
+        if (nrb_open_list(b))
+            return -1;
+    }
+    return b->retired_texture_count + NRB_TEX_UNITS <=
+        NRB_MAX_RETIRED_TEXTURES ? 0 : -1;
+}
+
+static void nrb_retire_texture(rsx_nr_d3d12* b, ID3D12Resource* resource)
+{
+    if (!resource)
+        return;
+    if (b->list_open &&
+        b->retired_texture_count < NRB_MAX_RETIRED_TEXTURES) {
+        b->retired_textures[b->retired_texture_count++] = resource;
+        return;
+    }
+    resource->lpVtbl->Release(resource);
 }
 
 /* fence-gated upload-ring slice (the exec-and-wait model retires the whole
@@ -238,20 +286,92 @@ static DXGI_FORMAT nrb_color_dxgi(const rsx_nr_d3d12* b, u32 fmt)
     }
 }
 
+static int nrb_color_rtv_dxgi_ok(DXGI_FORMAT fmt)
+{
+    switch (fmt) {
+    case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
                           u32 w, u32 h, int create)
 {
+    const DXGI_FORMAT logical_dxgi = nrb_color_dxgi(b, fmt);
+    DXGI_FORMAT color_dxgi = logical_dxgi;
+    if (logical_dxgi == DXGI_FORMAT_UNKNOWN)
+        return NULL;
+
+    ID3D12Resource* borrowed = NULL;
+    if (create && b->borrow_color) {
+        u32 borrowed_format = 0;
+        if (b->borrow_color(
+                b->broker_user, space, offset, w, h, (void**)&borrowed,
+                &borrowed_format) != 0 || !borrowed ||
+            !nrb_color_rtv_dxgi_ok((DXGI_FORMAT)borrowed_format)) {
+            if (borrowed)
+                borrowed->lpVtbl->Release(borrowed);
+            return NULL;
+        }
+        /* The live surface registry stores every logical Cell GCM color
+         * format in a canonical RGBA8 resource.  The guest format remains
+         * part of the render-target identity (and governs guest-memory
+         * interpretation), but D3D12 PSO/RTV compatibility must follow the
+         * actual shared resource.  Verify the broker's opaque format rather
+         * than silently trusting a stale registry entry. */
+        D3D12_RESOURCE_DESC borrowed_desc;
+        borrowed->lpVtbl->GetDesc(borrowed, &borrowed_desc);
+        if ((u32)borrowed_desc.Format != borrowed_format) {
+            borrowed->lpVtbl->Release(borrowed);
+            return NULL;
+        }
+        color_dxgi = (DXGI_FORMAT)borrowed_format;
+    }
+
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         nrb_rt* rt = &b->rts[i];
         if (rt->live && rt->space == space && rt->offset == offset &&
-            rt->fmt == fmt && rt->w == w && rt->h == h)
+            rt->fmt == fmt && rt->w == w && rt->h == h) {
+            if (borrowed) {
+                if (borrowed == rt->tex) {
+                    if (color_dxgi != rt->dxgi) {
+                        borrowed->lpVtbl->Release(borrowed);
+                        return NULL;
+                    }
+                    borrowed->lpVtbl->Release(borrowed);
+                } else {
+                    /* The live registry replaced the D3D resource while the
+                     * guest identity stayed constant. Retire every native
+                     * reference to the old generation before rebinding its
+                     * stable descriptor slot. */
+                    nrb_exec_wait(b);
+                    if (rt->tex)
+                        rt->tex->lpVtbl->Release(rt->tex);
+                    rt->tex = borrowed;
+                    rt->external = 1;
+                    rt->dxgi = color_dxgi;
+                    rt->color_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+                    b->rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+                        b->rtv_heap, &rtv);
+                    rtv.ptr += (SIZE_T)rt->rtv_slot * b->rtv_size;
+                    b->dev->lpVtbl->CreateRenderTargetView(
+                        b->dev, rt->tex, NULL, rtv);
+                    b->stats.rt_refreshes++;
+                }
+            }
             return rt;
+        }
     }
-    if (!create)
+    if (!create) {
+        if (borrowed)
+            borrowed->lpVtbl->Release(borrowed);
         return NULL;
-    const DXGI_FORMAT color_dxgi = nrb_color_dxgi(b, fmt);
-    if (color_dxgi == DXGI_FORMAT_UNKNOWN)
-        return NULL;
+    }
     nrb_rt* rt = NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         if (!b->rts[i].live) {
@@ -259,22 +379,14 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
             break;
         }
     }
-    if (!rt || b->rtv_used >= 64)
+    if (!rt || b->rtv_used >= 64) {
+        if (borrowed)
+            borrowed->lpVtbl->Release(borrowed);
         return NULL;
+    }
 
-    if (b->borrow_color) {
-        void* resource = NULL;
-        u32 borrowed_format = 0;
-        if (b->borrow_color(
-                b->broker_user, space, offset, w, h, &resource,
-                &borrowed_format) != 0 || !resource ||
-            borrowed_format != (u32)color_dxgi) {
-            if (resource)
-                ((ID3D12Resource*)resource)->lpVtbl->Release(
-                    (ID3D12Resource*)resource);
-            return NULL;
-        }
-        rt->tex = (ID3D12Resource*)resource;
+    if (borrowed) {
+        rt->tex = borrowed;
         rt->external = 1;
     } else {
         D3D12_HEAP_PROPERTIES hp = {0};
@@ -371,19 +483,67 @@ static DXGI_FORMAT nrb_depth_dsv_dxgi(const rsx_nr_d3d12* b, u32 fmt)
 }
 
 static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
-                                u32 fmt, u32 w, u32 h, int create)
+                                 u32 fmt, u32 w, u32 h, int create)
 {
-    for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
-        nrb_depth* depth = &b->depths[i];
-        if (depth->live && depth->space == space && depth->offset == offset &&
-            depth->fmt == fmt && depth->w == w && depth->h == h)
-            return depth;
-    }
-    if (!create)
-        return NULL;
     DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi;
     if (nrb_depth_formats(fmt, &resource_dxgi, &dsv_dxgi, &srv_dxgi) != 0)
         return NULL;
+
+    ID3D12Resource* borrowed = NULL;
+    if (create && b->borrow_depth) {
+        u32 rf = 0, df = 0, sf = 0;
+        int publication_required = 0;
+        if (b->borrow_depth(
+                b->broker_user, space, offset, fmt, w, h,
+                (void**)&borrowed, &rf, &df, &sf,
+                &publication_required) != 0 || !borrowed) {
+            if (borrowed)
+                borrowed->lpVtbl->Release(borrowed);
+            return NULL;
+        }
+        (void)publication_required; /* live wrapper completes this handoff */
+        resource_dxgi = (DXGI_FORMAT)rf;
+        dsv_dxgi = (DXGI_FORMAT)df;
+        srv_dxgi = (DXGI_FORMAT)sf;
+    }
+
+    for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
+        nrb_depth* depth = &b->depths[i];
+        if (depth->live && depth->space == space && depth->offset == offset &&
+            depth->fmt == fmt && depth->w == w && depth->h == h) {
+            if (borrowed) {
+                if (borrowed == depth->tex) {
+                    borrowed->lpVtbl->Release(borrowed);
+                } else {
+                    nrb_exec_wait(b);
+                    if (depth->tex)
+                        depth->tex->lpVtbl->Release(depth->tex);
+                    depth->tex = borrowed;
+                    depth->external = 1;
+                    depth->resource_dxgi = resource_dxgi;
+                    depth->dsv_dxgi = dsv_dxgi;
+                    depth->srv_dxgi = srv_dxgi;
+                    depth->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
+                    dsv.Format = dsv_dxgi;
+                    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+                    b->dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+                        b->dsv_heap, &handle);
+                    handle.ptr += (SIZE_T)depth->dsv_slot * b->dsv_size;
+                    b->dev->lpVtbl->CreateDepthStencilView(
+                        b->dev, depth->tex, &dsv, handle);
+                    b->stats.depth_refreshes++;
+                }
+            }
+            return depth;
+        }
+    }
+    if (!create) {
+        if (borrowed)
+            borrowed->lpVtbl->Release(borrowed);
+        return NULL;
+    }
     nrb_depth* depth = NULL;
     for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
         if (!b->depths[i].live) {
@@ -391,25 +551,15 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
             break;
         }
     }
-    if (!depth || b->dsv_used >= 64u)
+    if (!depth || b->dsv_used >= 64u) {
+        if (borrowed)
+            borrowed->lpVtbl->Release(borrowed);
         return NULL;
+    }
 
-    if (b->borrow_depth) {
-        void* resource = NULL;
-        u32 rf = 0, df = 0, sf = 0;
-        if (b->borrow_depth(
-                b->broker_user, space, offset, fmt, w, h, &resource,
-                &rf, &df, &sf) != 0 || !resource) {
-            if (resource)
-                ((ID3D12Resource*)resource)->lpVtbl->Release(
-                    (ID3D12Resource*)resource);
-            return NULL;
-        }
-        depth->tex = (ID3D12Resource*)resource;
+    if (borrowed) {
+        depth->tex = borrowed;
         depth->external = 1;
-        resource_dxgi = (DXGI_FORMAT)rf;
-        dsv_dxgi = (DXGI_FORMAT)df;
-        srv_dxgi = (DXGI_FORMAT)sf;
     } else {
         D3D12_HEAP_PROPERTIES heap = {0};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -452,6 +602,7 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     handle.ptr += (SIZE_T)depth->dsv_slot * b->dsv_size;
     b->dev->lpVtbl->CreateDepthStencilView(
         b->dev, depth->tex, &dsv, handle);
+    b->stats.depth_builds++;
     return depth;
 }
 
@@ -478,9 +629,11 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
 
 /* ---- mirror session helper --------------------------------------------- */
 
-/* Permanently arm each exact page a native shader can read.  Registrations
- * are deliberately page-sized and deduplicated in a fixed array: the first
- * use pays a bounded loop, subsequent draws only test existing handles. */
+/* Permanently arm each exact mirror subpage a native shader can read.
+ * Registrations are deliberately subpage-sized and deduplicated in a fixed
+ * array: the first use pays a bounded loop, subsequent draws only test
+ * existing handles. The host write router coalesces these to sparse 4 KiB
+ * watched pages; generation tracking below remains 1 KiB granular. */
 static int nrb_require_span(rsx_nr_d3d12* b, u32 space, u32 offset, u32 size)
 {
     if (!size || space >= RSX_GUEST_NUM_SPACES ||
@@ -549,14 +702,57 @@ static int nrb_add_required_span(nrb_required_span* spans, u32* count,
     return 0;
 }
 
-static void nrb_mirror_sync(rsx_nr_d3d12* b)
+static int nrb_mirror_sync(rsx_nr_d3d12* b)
 {
     rsx_gpu_mirror_d3d12_retire(
         b->mirror_be, b->fence->lpVtbl->GetCompletedValue(b->fence));
-    if (rsx_gpu_mirror_d3d12_begin(b->mirror_be, b->list) == 0) {
-        rsx_gpu_mirror_sync(b->mirror, 0);
-        rsx_gpu_mirror_d3d12_end(b->mirror_be, b->fence_value + 1);
+    if (rsx_gpu_mirror_d3d12_begin_fenced(
+            b->mirror_be, b->list, b->fence_value + 1) != 0)
+        return -1;
+    rsx_gpu_mirror_sync(b->mirror, 0);
+    rsx_gpu_mirror_d3d12_end(b->mirror_be, b->fence_value + 1);
+    return 0;
+}
+
+static int nrb_required_spans_current(
+    const rsx_nr_d3d12* b, const nrb_required_span* required, u32 count)
+{
+    for (u32 i = 0; i < count; ++i)
+        if (!nrb_span_current(b, required[i].space, required[i].offset,
+                              required[i].size))
+            return 0;
+    return 1;
+}
+
+/* Establish one immutable GPU-visible point for every byte this draw pulls.
+ * A write published while a page is copied leaves its generation stale; in
+ * that case append a repair copy before recording the draw. If the bounded
+ * staging slice fills, submit only the already-owned ordered prefix, retire
+ * it, and continue on a fresh slice. No draw is recorded until this returns
+ * success, so a residency retry can neither duplicate nor partially render
+ * the current action. */
+static int nrb_stabilize_required_spans(
+    rsx_nr_d3d12* b, const nrb_required_span* required, u32 count)
+{
+    if (!count)
+        return 0;
+    for (u32 attempt = 0; attempt < 8u; ++attempt) {
+        if (nrb_open_list(b) || nrb_mirror_sync(b) != 0)
+            return -1;
+        if (nrb_required_spans_current(b, required, count))
+            return 0;
+        b->stats.mirror_resyncs++;
+
+        /* One append retry repairs an ordinary generation race without a
+         * submission. If it is still stale, the fixed slice is either full
+         * or the producer is actively republishing the page; retire the
+         * ordered prefix before retrying with fresh bounded storage. */
+        if (attempt & 1u) {
+            nrb_exec_wait(b);
+            b->stats.mirror_rollovers++;
+        }
     }
+    return -1;
 }
 
 static void nrb_rt_transition(rsx_nr_d3d12* b, nrb_rt* rt,
@@ -757,6 +953,10 @@ static int nrb_fp_opcode_supported(u32 opcode)
 #define NRB_TEX_DXT45       0x88u
 #define NRB_TEX_G8B8        0x8Bu
 #define NRB_TEX_DEPTH24_D8  0x90u
+#define NRB_VTEX_W16Z16Y16X16_FLOAT 0x9Au
+#define NRB_VTEX_W32Z32Y32X32_FLOAT 0x9Bu
+#define NRB_VTEX_X32_FLOAT          0x9Cu
+#define NRB_VTEX_Y16X16_FLOAT       0x9Fu
 #define NRB_TEX_LINEAR      0x20u
 #define NRB_TEX_UNNORM      0x40u
 #define NRB_TEX_BASE_MASK   0x9Fu
@@ -1006,7 +1206,9 @@ static ID3D12Resource* nrb_create_texture_levels(
     barrier.Transition.pResource = resource;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     b->list->lpVtbl->ResourceBarrier(b->list, 1, &barrier);
     return resource;
 }
@@ -1169,6 +1371,108 @@ fail_rgba:
     return NULL;
 }
 
+typedef struct nrb_vertex_texture_format {
+    DXGI_FORMAT dxgi;
+    u32 bytes_per_texel;
+    u32 component_bytes;
+} nrb_vertex_texture_format;
+
+static int nrb_vertex_texture_format_of(
+    const rsx_nir_texture* texture, nrb_vertex_texture_format* out)
+{
+    if (!texture || texture->dimension != 2u || texture->cubemap)
+        return -1;
+    nrb_vertex_texture_format format = {DXGI_FORMAT_UNKNOWN, 0, 0};
+    switch (texture->format & NRB_TEX_BASE_MASK) {
+    case NRB_VTEX_W16Z16Y16X16_FLOAT:
+        format.dxgi = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        format.bytes_per_texel = 8u;
+        format.component_bytes = 2u;
+        break;
+    case NRB_VTEX_W32Z32Y32X32_FLOAT:
+        format.dxgi = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        format.bytes_per_texel = 16u;
+        format.component_bytes = 4u;
+        break;
+    case NRB_VTEX_X32_FLOAT:
+        format.dxgi = DXGI_FORMAT_R32_FLOAT;
+        format.bytes_per_texel = 4u;
+        format.component_bytes = 4u;
+        break;
+    case NRB_VTEX_Y16X16_FLOAT:
+        format.dxgi = DXGI_FORMAT_R16G16_FLOAT;
+        format.bytes_per_texel = 4u;
+        format.component_bytes = 2u;
+        break;
+    default:
+        return -1;
+    }
+    if (out)
+        *out = format;
+    return 0;
+}
+
+static u32 nrb_vertex_texture_span(
+    const rsx_nir_texture* texture, nrb_vertex_texture_format* format_out,
+    u32* pitch_out)
+{
+    nrb_vertex_texture_format format;
+    if (nrb_vertex_texture_format_of(texture, &format) != 0 ||
+        !texture->width || !texture->height || texture->width > 4096u ||
+        texture->height > 4096u || texture->mipmaps > 1u)
+        return 0;
+    const u64 row_bytes = (u64)texture->width * format.bytes_per_texel;
+    const u64 pitch = texture->pitch ? texture->pitch : row_bytes;
+    const u64 span = pitch * texture->height;
+    if (row_bytes > UINT32_MAX || pitch < row_bytes ||
+        pitch > UINT32_MAX || !span || span > UINT32_MAX)
+        return 0;
+    if (format_out)
+        *format_out = format;
+    if (pitch_out)
+        *pitch_out = (u32)pitch;
+    return (u32)span;
+}
+
+static ID3D12Resource* nrb_decode_guest_vertex_texture(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture)
+{
+    nrb_vertex_texture_format format;
+    u32 pitch = 0;
+    const u32 span = nrb_vertex_texture_span(texture, &format, &pitch);
+    const u8* source = span ? b->guest_ptr(
+        b->guest_user, texture->location, texture->offset, span) : NULL;
+    if (!source)
+        return NULL;
+    const u32 row_bytes = texture->width * format.bytes_per_texel;
+    const u64 staging_bytes = (u64)row_bytes * texture->height;
+    if (staging_bytes > SIZE_MAX)
+        return NULL;
+    u8* staging = malloc((size_t)staging_bytes);
+    if (!staging)
+        return NULL;
+    for (u32 y = 0; y < texture->height; ++y) {
+        const u8* source_row = source + (size_t)y * pitch;
+        u8* destination_row = staging + (size_t)y * row_bytes;
+        const u32 components = row_bytes / format.component_bytes;
+        for (u32 component = 0; component < components; ++component) {
+            const u8* s = source_row +
+                (size_t)component * format.component_bytes;
+            u8* d = destination_row +
+                (size_t)component * format.component_bytes;
+            for (u32 byte = 0; byte < format.component_bytes; ++byte)
+                d[byte] = s[format.component_bytes - 1u - byte];
+        }
+    }
+    const nrb_tex_level level = {
+        texture->width, texture->height, staging, row_bytes, texture->height
+    };
+    ID3D12Resource* resource = nrb_create_texture_levels(
+        b, format.dxgi, &level, 1u, 0);
+    free(staging);
+    return resource;
+}
+
 static D3D12_CPU_DESCRIPTOR_HANDLE nrb_texture_cpu_handle(
     rsx_nr_d3d12* b, u32 slot)
 {
@@ -1190,11 +1494,12 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_texture_gpu_cpu_handle(
 }
 
 static D3D12_GPU_DESCRIPTOR_HANDLE nrb_texture_gpu_handle(
-    rsx_nr_d3d12* b)
+    rsx_nr_d3d12* b, u32 slot)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE handle;
     b->texture_gpu_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
         b->texture_gpu_heap, &handle);
+    handle.ptr += (UINT64)slot * b->texture_desc_size;
     return handle;
 }
 
@@ -1209,11 +1514,12 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_sampler_cpu_handle(
 }
 
 static D3D12_GPU_DESCRIPTOR_HANDLE nrb_sampler_gpu_handle(
-    rsx_nr_d3d12* b)
+    rsx_nr_d3d12* b, u32 slot)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE handle;
     b->sampler_gpu_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
         b->sampler_gpu_heap, &handle);
+    handle.ptr += (UINT64)slot * b->sampler_desc_size;
     return handle;
 }
 
@@ -1311,8 +1617,7 @@ static int nrb_resolve_guest_texture(rsx_nr_d3d12* b,
         ID3D12Resource* old = (ID3D12Resource*)(uintptr_t)entry->backend_id;
         entry->backend_id = (u64)(uintptr_t)resource;
         rsx_nr_res_revalidate(&b->textures, entry);
-        if (old)
-            old->lpVtbl->Release(old);
+        nrb_retire_texture(b, old);
         b->stats.texture_refreshes++;
     } else {
         entry = rsx_nr_res_insert(
@@ -1325,6 +1630,67 @@ static int nrb_resolve_guest_texture(rsx_nr_d3d12* b,
     }
     *slot_out = (u32)(entry - b->textures.slots);
     nrb_write_texture_srv(b, *slot_out, texture, resource);
+    return 0;
+}
+
+static void nrb_write_vertex_texture_srv(
+    rsx_nr_d3d12* b, u32 slot, const rsx_nir_texture* texture,
+    ID3D12Resource* resource)
+{
+    nrb_vertex_texture_format format;
+    if (nrb_vertex_texture_format_of(texture, &format) != 0)
+        return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+    desc.Format = format.dxgi;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture2D.MostDetailedMip = 0;
+    desc.Texture2D.MipLevels = 1;
+    desc.Texture2D.ResourceMinLODClamp = 0.0f;
+    desc.Texture2D.PlaneSlice = 0;
+    b->dev->lpVtbl->CreateShaderResourceView(
+        b->dev, resource, &desc, nrb_texture_cpu_handle(b, slot));
+}
+
+static int nrb_resolve_guest_vertex_texture(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture, u32* slot_out)
+{
+    const u32 span = nrb_vertex_texture_span(texture, NULL, NULL);
+    if (!span)
+        return -1;
+    rsx_nr_res_key key = {0};
+    key.kind = 2;                    /* distinct from fragment textures   */
+    key.space = texture->location;
+    key.offset = texture->offset;
+    key.size = span;
+    key.fmt = nrb_texture_key(texture);
+    rsx_nr_res* entry = rsx_nr_res_lookup(&b->textures, &key);
+    if (entry && rsx_nr_res_current(&b->textures, entry)) {
+        b->stats.texture_hits++;
+        *slot_out = (u32)(entry - b->textures.slots);
+        return 0;
+    }
+
+    ID3D12Resource* resource = nrb_decode_guest_vertex_texture(b, texture);
+    if (!resource)
+        return -1;
+    if (entry) {
+        ID3D12Resource* old = (ID3D12Resource*)(uintptr_t)entry->backend_id;
+        entry->backend_id = (u64)(uintptr_t)resource;
+        rsx_nr_res_revalidate(&b->textures, entry);
+        nrb_retire_texture(b, old);
+        b->stats.texture_refreshes++;
+    } else {
+        entry = rsx_nr_res_insert(
+            &b->textures, &key, (u64)(uintptr_t)resource);
+        if (!entry) {
+            resource->lpVtbl->Release(resource);
+            return -1;
+        }
+        b->stats.texture_builds++;
+    }
+    *slot_out = (u32)(entry - b->textures.slots);
+    nrb_write_vertex_texture_srv(b, *slot_out, texture, resource);
     return 0;
 }
 
@@ -1383,27 +1749,41 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
 {
     const u32 format = texture->format & NRB_TEX_BASE_MASK &
                        ~NRB_TEX_UNNORM;
+    const int live_identity = b->borrow_color != NULL;
     if (texture->cubemap || texture->dimension != 2u ||
-        texture->mipmaps > 1u ||
-        (format != NRB_TEX_A8R8G8B8 && format != NRB_TEX_R5G6B5))
+        (!live_identity && (texture->mipmaps > 1u ||
+         (format != NRB_TEX_A8R8G8B8 && format != NRB_TEX_R5G6B5))))
         return NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         nrb_rt* rt = &b->rts[i];
         if (!rt->live || rt->space != texture->location ||
-            rt->offset != texture->offset || rt->w != texture->width ||
-            rt->h != texture->height)
+            rt->offset != texture->offset)
             continue;
-        if ((format == NRB_TEX_R5G6B5 && rt->fmt != 3u) ||
+        /* Live RSX surfaces are persistent GPU memory identities. The title
+         * routinely samples one through a differently declared texture view;
+         * the established renderer resolves such aliases by address, not by
+         * repeating the producer's dimensions. Offline/private resources keep
+         * the stricter byte-layout equivalence rule. */
+        if (!live_identity &&
+            (rt->w != texture->width || rt->h != texture->height))
+            continue;
+        if (!live_identity &&
+            ((format == NRB_TEX_R5G6B5 && rt->fmt != 3u) ||
             (format == NRB_TEX_A8R8G8B8 &&
-             rt->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM))
+             rt->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM)))
             continue;
         if (rt == draw_rt)
             return rt;              /* input/output alias: must refuse    */
         D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
         desc.Format = rt->dxgi;
         desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        /* The live renderer's SRV_SURFACE table exposes rendered targets in
+         * their native component order; texture remap applies when decoding
+         * guest texels, not when rebinding that already-rendered GPU image.
+         * Reapplying it here turned post-process RGB into forced/alpha
+         * channels (dark scene with an exaggerated bright border). */
         desc.Shader4ComponentMapping =
-            (texture->remap & 0xFFFFu) == 0xAAE4u
+            live_identity || (texture->remap & 0xFFFFu) == 0xAAE4u
             ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
             : nrb_component_mapping(texture->remap & 0xFFFFu);
         desc.Texture2D.MipLevels = 1;
@@ -1452,14 +1832,20 @@ static nrb_depth* nrb_texture_depth_alias(
 
 static int nrb_prepare_textures(rsx_nr_d3d12* b,
                                 const rsx_nir_pipeline* st,
-                                u32 texture_mask, nrb_rt* draw_rt,
+                                u32 texture_mask, u32 vtex_mask,
+                                nrb_rt* draw_rt,
                                 nrb_depth* draw_depth,
                                 nrb_rt* aliases[NRB_TEX_UNITS],
                                 nrb_depth* depth_aliases[NRB_TEX_UNITS],
-                                u32* cube_mask_out)
+                                nrb_rt* vtex_aliases[NRB_VTEX_UNITS],
+                                nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS],
+                                u32* cube_mask_out, u32* table_index_out)
 {
     const u32 null_slot = NRB_TEX_CAP;
     u32 cube_mask = 0;
+    u32 source_slots[NRB_TEX_UNITS];
+    u32 vtex_source_slots[NRB_VTEX_UNITS];
+    D3D12_SAMPLER_DESC samplers[NRB_TEX_UNITS];
     for (u32 unit = 0; unit < NRB_TEX_UNITS; unit++) {
         const rsx_nir_texture* texture = &st->textures[unit];
         u32 source_slot = null_slot;
@@ -1476,7 +1862,8 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                 return -1;
             if (aliases[unit]) {
                 nrb_rt_transition(b, aliases[unit],
-                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 source_slot = NRB_TEX_CAP + 1u + unit;
                 b->stats.rt_alias_binds++;
             } else {
@@ -1489,7 +1876,8 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
             if (depth_aliases[unit]) {
                 nrb_depth_transition(
                     b, depth_aliases[unit],
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 source_slot = NRB_TEX_CAP + 1u + unit;
                 b->stats.rt_alias_binds++;
             } else if (!aliases[unit] && nrb_resolve_guest_texture(
@@ -1497,23 +1885,56 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                 return -1;
             }
         }
-        b->dev->lpVtbl->CopyDescriptorsSimple(
-            b->dev, 1, nrb_texture_gpu_cpu_handle(b, unit),
-            nrb_texture_cpu_handle(b, source_slot),
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_SAMPLER_DESC sampler = nrb_sampler(texture);
-        b->dev->lpVtbl->CreateSampler(
-            b->dev, &sampler, nrb_sampler_cpu_handle(b, unit));
+        source_slots[unit] = source_slot;
+        samplers[unit] = nrb_sampler(texture);
     }
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
+        const rsx_nir_texture* texture = &st->vertex_textures[unit];
+        u32 source_slot = null_slot;
+        vtex_aliases[unit] = NULL;
+        vtex_depth_aliases[unit] = NULL;
+        if (vtex_mask & (1u << unit)) {
+            if (!texture->enabled || nrb_resolve_guest_vertex_texture(
+                    b, texture, &source_slot) != 0)
+                return -1;
+        }
+        vtex_source_slots[unit] = source_slot;
+    }
+    /* Resolve/upload may have submitted a full upload ring and therefore
+     * reset this fence generation. Allocate the immutable descriptor table
+     * only after all such work is complete. Each recorded draw receives a
+     * distinct table; descriptors are never rewritten before its fence. */
+    if (nrb_ensure_descriptor_capacity(b) != 0)
+        return -1;
+    const u32 table_index = b->descriptor_tables_used++;
+    const u32 srv_base = table_index * NRB_SRV_TABLE_STRIDE;
+    const u32 sampler_base = table_index * NRB_SAMPLER_TABLE_STRIDE;
+    for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit) {
+        b->dev->lpVtbl->CopyDescriptorsSimple(
+            b->dev, 1, nrb_texture_gpu_cpu_handle(b, srv_base + unit),
+            nrb_texture_cpu_handle(b, source_slots[unit]),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        b->dev->lpVtbl->CreateSampler(
+            b->dev, &samplers[unit],
+            nrb_sampler_cpu_handle(b, sampler_base + unit));
+    }
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        b->dev->lpVtbl->CopyDescriptorsSimple(
+            b->dev, 1,
+            nrb_texture_gpu_cpu_handle(
+                b, srv_base + NRB_TEX_UNITS + unit),
+            nrb_texture_cpu_handle(b, vtex_source_slots[unit]),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     *cube_mask_out = cube_mask;
+    *table_index_out = table_index;
     return 0;
 }
 
-static void nrb_restore_texture_aliases(
-    rsx_nr_d3d12* b, nrb_rt* aliases[NRB_TEX_UNITS],
-    nrb_depth* depth_aliases[NRB_TEX_UNITS])
+static void nrb_restore_texture_alias_set(
+    rsx_nr_d3d12* b, nrb_rt** aliases,
+    nrb_depth** depth_aliases, u32 count)
 {
-    for (u32 unit = 0; unit < NRB_TEX_UNITS; unit++) {
+    for (u32 unit = 0; unit < count; unit++) {
         if (aliases[unit])
             nrb_rt_transition(b, aliases[unit],
                               D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1521,6 +1942,18 @@ static void nrb_restore_texture_aliases(
             nrb_depth_transition(b, depth_aliases[unit],
                                  D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
+}
+
+static void nrb_restore_texture_aliases(
+    rsx_nr_d3d12* b, nrb_rt* aliases[NRB_TEX_UNITS],
+    nrb_depth* depth_aliases[NRB_TEX_UNITS],
+    nrb_rt* vtex_aliases[NRB_VTEX_UNITS],
+    nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS])
+{
+    nrb_restore_texture_alias_set(
+        b, aliases, depth_aliases, NRB_TEX_UNITS);
+    nrb_restore_texture_alias_set(
+        b, vtex_aliases, vtex_depth_aliases, NRB_VTEX_UNITS);
 }
 
 static void nrb_release_texture(void* user, u64 backend_id)
@@ -1660,8 +2093,35 @@ static D3D12_STENCIL_OP nrb_stencil_op(u32 op)
     }
 }
 
+static int nrb_stencil_state_supported(const rsx_nir_depth_stencil* ds)
+{
+    if (!ds->stencil_test_enable || !ds->two_sided_stencil_enable)
+        return 1;
+    /* D3D12 exposes independent compare/op state for front and back faces,
+     * but a single read mask, write mask and dynamic reference. */
+    return (ds->back_stencil_mask & 0xFFu) ==
+               (ds->stencil_mask & 0xFFu) &&
+           (ds->back_stencil_write_mask & 0xFFu) ==
+               (ds->stencil_write_mask & 0xFFu) &&
+           (ds->back_stencil_ref & 0xFFu) == (ds->stencil_ref & 0xFFu);
+}
+
+static int nrb_depth_bounds_state_supported(
+    const rsx_nr_d3d12* b, const rsx_nir_depth_stencil* ds)
+{
+    if (!ds->depth_bounds_test_enable)
+        return 1;
+    float zmin = 0.0f;
+    float zmax = 1.0f;
+    memcpy(&zmin, &ds->depth_bounds_min, sizeof(zmin));
+    memcpy(&zmax, &ds->depth_bounds_max, sizeof(zmax));
+    return b->depth_bounds_supported && zmin >= 0.0f && zmax <= 1.0f &&
+           zmin <= zmax;
+}
+
 static void nrb_apply_render_state(
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const rsx_nir_pipeline* st)
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const rsx_nir_pipeline* st,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type)
 {
     const rsx_nir_blend* bl = &st->blend;
     const rsx_nir_raster* ra = &st->raster;
@@ -1689,7 +2149,32 @@ static void nrb_apply_render_state(
                                     : D3D12_CULL_MODE_NONE;
     pd->RasterizerState.FrontCounterClockwise =
         ra->front_face == 0x0901u ? TRUE : FALSE;
-    pd->RasterizerState.DepthClipEnable = TRUE;
+    const int polygon_offset_enable =
+        (topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT &&
+         ra->polygon_offset_point_enable) ||
+        (topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE &&
+         ra->polygon_offset_line_enable) ||
+        (topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+         ra->polygon_offset_fill_enable);
+    if (polygon_offset_enable) {
+        float scale = 0.0f;
+        float bias = 0.0f;
+        memcpy(&scale, &ra->polygon_offset_scale, sizeof(scale));
+        memcpy(&bias, &ra->polygon_offset_bias, sizeof(bias));
+        pd->RasterizerState.SlopeScaledDepthBias = scale;
+        pd->RasterizerState.DepthBiasClamp = 0.0f;
+        if (bias >= (float)INT_MAX)
+            pd->RasterizerState.DepthBias = INT_MAX;
+        else if (bias <= (float)INT_MIN)
+            pd->RasterizerState.DepthBias = INT_MIN;
+        else
+            pd->RasterizerState.DepthBias =
+                (INT)(bias >= 0.0f ? bias + 0.5f : bias - 0.5f);
+    }
+    /* Match the established renderer.  RSX fullscreen/post-process vertex
+     * programs may emit clip-space Z outside D3D's [0,w] interval while
+     * depth testing is disabled; legacy keeps those pixels visible. */
+    pd->RasterizerState.DepthClipEnable = FALSE;
     pd->DepthStencilState.DepthEnable = ds->depth_test_enable ? TRUE : FALSE;
     pd->DepthStencilState.DepthWriteMask = ds->depth_write_enable
         ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
@@ -1697,7 +2182,8 @@ static void nrb_apply_render_state(
     if (ds->stencil_test_enable) {
         pd->DepthStencilState.StencilEnable = TRUE;
         pd->DepthStencilState.StencilReadMask = (UINT8)ds->stencil_mask;
-        pd->DepthStencilState.StencilWriteMask = (UINT8)ds->stencil_mask;
+        pd->DepthStencilState.StencilWriteMask =
+            (UINT8)ds->stencil_write_mask;
         pd->DepthStencilState.FrontFace.StencilFunc =
             nrb_depth_func(ds->stencil_func);
         pd->DepthStencilState.FrontFace.StencilFailOp =
@@ -1706,7 +2192,19 @@ static void nrb_apply_render_state(
             nrb_stencil_op(ds->stencil_op_zfail);
         pd->DepthStencilState.FrontFace.StencilPassOp =
             nrb_stencil_op(ds->stencil_op_zpass);
-        pd->DepthStencilState.BackFace = pd->DepthStencilState.FrontFace;
+        if (ds->two_sided_stencil_enable) {
+            pd->DepthStencilState.BackFace.StencilFunc =
+                nrb_depth_func(ds->back_stencil_func);
+            pd->DepthStencilState.BackFace.StencilFailOp =
+                nrb_stencil_op(ds->back_stencil_op_fail);
+            pd->DepthStencilState.BackFace.StencilDepthFailOp =
+                nrb_stencil_op(ds->back_stencil_op_zfail);
+            pd->DepthStencilState.BackFace.StencilPassOp =
+                nrb_stencil_op(ds->back_stencil_op_zpass);
+        } else {
+            pd->DepthStencilState.BackFace =
+                pd->DepthStencilState.FrontFace;
+        }
     }
 }
 
@@ -1742,32 +2240,55 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                                         const u32* vp_words, u32 vp_word_count,
                                         const nrb_fp_info* fp,
                                         const rsx_vertex_pull_plan* plan,
-                                        D3D12_PRIMITIVE_TOPOLOGY_TYPE tt,
-                                        int strip_cut, u32 cube_mask)
+                                         D3D12_PRIMITIVE_TOPOLOGY_TYPE tt,
+                                         int strip_cut, u32 cube_mask,
+                                         u32 vtex_mask,
+                                         DXGI_FORMAT color_dxgi)
 {
     /* Structural shader identity deliberately excludes inline FP constants
      * and alpha-ref: both are uploaded through b1.  Everything that shapes
      * the compiled source or PSO remains in the key. */
     u64 key = rsx_nir_hash_words(vp_words, vp_word_count);
+    key = rsx_nr_hash_fold(key, &st->vertex_program.start_slot,
+                           sizeof(st->vertex_program.start_slot));
     key = rsx_nr_hash_fold(key ^ rsx_vertex_pull_signature(plan), &tt,
                            sizeof(tt));
     key = rsx_nr_hash_fold(key, &strip_cut, sizeof(strip_cut));
     key = rsx_nr_hash_fold(key, &fp->structural_hash,
                            sizeof(fp->structural_hash));
     key = rsx_nr_hash_fold(key, &cube_mask, sizeof(cube_mask));
+    key = rsx_nr_hash_fold(key, &vtex_mask, sizeof(vtex_mask));
     const u32 fp_ctrl = st->fragment_program.control & 0x40u;
     key = rsx_nr_hash_fold(key, &fp_ctrl, sizeof(fp_ctrl));
+    key = rsx_nr_hash_fold(
+        key, &st->fragment_program.texcoord_2d_mask,
+        sizeof(st->fragment_program.texcoord_2d_mask));
+    key = rsx_nr_hash_fold(
+        key, &st->fragment_program.shader_window,
+        sizeof(st->fragment_program.shader_window));
     const u32 alpha_enable = st->blend.alpha_test_enable ? 1u : 0u;
     const u32 alpha_func = alpha_enable ? st->blend.alpha_func : 0u;
     key = rsx_nr_hash_fold(key, &alpha_enable, sizeof(alpha_enable));
     key = rsx_nr_hash_fold(key, &alpha_func, sizeof(alpha_func));
-    key = rsx_nr_hash_fold(key, &st->surface.color_format,
-                           sizeof(st->surface.color_format));
+    /* The live broker may canonicalize a guest R5G6B5 surface into RGBA8.
+     * PSO identity follows the actual RTV format, not the logical guest
+     * encoding, or CreateGraphicsPipelineState/OMSetRenderTargets disagree. */
+    key = rsx_nr_hash_fold(key, &color_dxgi, sizeof(color_dxgi));
     key = rsx_nr_hash_fold(key, &st->surface.depth_format,
                            sizeof(st->surface.depth_format));
     key = rsx_nr_hash_fold(key, &st->raster, sizeof(st->raster));
-    key = rsx_nr_hash_fold(key, &st->depth_stencil,
-                           sizeof(st->depth_stencil));
+    rsx_nir_depth_stencil pso_depth_stencil = st->depth_stencil;
+    /* OMSetDepthBounds and OMSetStencilRef are command-list state. Neither
+     * changes the D3D12 PSO, so animated limits/references must not create a
+     * fresh pair of compiled shaders. Front/back references are already
+     * required equal by preflight because D3D12 exposes one dynamic ref. */
+    pso_depth_stencil.depth_bounds_test_enable = 0;
+    pso_depth_stencil.depth_bounds_min = 0;
+    pso_depth_stencil.depth_bounds_max = 0;
+    pso_depth_stencil.stencil_ref = 0;
+    pso_depth_stencil.back_stencil_ref = 0;
+    key = rsx_nr_hash_fold(key, &pso_depth_stencil,
+                           sizeof(pso_depth_stencil));
     rsx_nir_blend pso_blend = st->blend;
     /* These are draw data in buffered/dynamic state, not PSO identity. */
     pso_blend.alpha_ref = 0;
@@ -1788,9 +2309,10 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
 
     int n;
     if (vp_word_count) {
-        n = rsx_vertex_pull_decompile(plan, (const u8*)vp_words,
-                                      vp_word_count * 4, 0, b->vs_text,
-                                      sizeof(b->vs_text));
+        n = rsx_vertex_pull_decompile_control(
+            plan, (const u8*)vp_words, vp_word_count * 4, vtex_mask,
+            st->vertex_program.start_slot,
+            b->vs_text, sizeof(b->vs_text));
         if (n < 0)
             return NULL;
     } else {
@@ -1826,6 +2348,12 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
         fp->bytes, fp->size, st->fragment_program.control, cube_mask,
         b->ps_text, sizeof(b->ps_text), &constant_count);
     if (fi <= 0 || constant_count != fp->constants.count ||
+        rsx_fp_apply_texcoord_control(
+            b->ps_text, sizeof(b->ps_text),
+            st->fragment_program.texcoord_2d_mask) < 0 ||
+        rsx_fp_apply_shader_window(
+            b->ps_text, sizeof(b->ps_text),
+            st->fragment_program.shader_window) < 0 ||
         (alpha_enable && rsx_fp_apply_alpha_test_buffered(
             b->ps_text, sizeof(b->ps_text), alpha_func) < 0)) {
         vs->lpVtbl->Release(vs);
@@ -1845,14 +2373,14 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
     pd.SampleMask = 0xFFFFFFFFu;
-    nrb_apply_render_state(&pd, st);
+    nrb_apply_render_state(&pd, st, tt);
     pd.InputLayout.NumElements = 0;  /* vertex pulling: no IA              */
     pd.IBStripCutValue = strip_cut
         ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
         : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     pd.PrimitiveTopologyType = tt;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = nrb_color_dxgi(b, st->surface.color_format);
+    pd.RTVFormats[0] = color_dxgi;
     pd.DSVFormat = nrb_depth_dsv_dxgi(b, st->surface.depth_format);
     pd.SampleDesc.Count = 1;
 
@@ -2061,8 +2589,10 @@ static int nrb_prepare_draw_residency(rsx_nr_d3d12* b,
         if (!a->pulled)
             continue;
         if (a->desc.frequency <= 1u) {
-            const u64 lo = (u64)ref_min + st->vertex_bindings.base_index;
-            const u64 hi = (u64)ref_max + st->vertex_bindings.base_index;
+            const u32 base_index = draw->indexed
+                ? st->vertex_bindings.base_index : 0u;
+            const u64 lo = (u64)ref_min + base_index;
+            const u64 hi = (u64)ref_max + base_index;
             if (hi - lo >= domain - 1u) {
                 if (nrb_add_attr_element_span(
                         b, plan, attr, 0, (u32)domain - 1u,
@@ -2215,11 +2745,297 @@ static u32 nrb_expand_primitives(rsx_nr_d3d12* b,
     return out_count;
 }
 
+static int nrb_texture_preflight(rsx_nr_d3d12* b,
+                                 const rsx_nir_texture* texture,
+                                 nrb_rt* draw_rt, nrb_depth* draw_depth,
+                                 u32 unit)
+{
+    nrb_rt* rt_alias = nrb_texture_rt_alias(b, texture, draw_rt, unit);
+    /* Live pass islands share the established renderer's exact D3D resource
+     * identities. The vertical owner flushes the producing queue before a
+     * consumer changes renderer and the backend restores sampled aliases to
+     * render-target state after each draw, so a non-self alias is the safe
+     * dependency boundary rather than a reason to decode stale guest bytes. */
+    if (rt_alias)
+        return rt_alias == draw_rt ? -1 : 0;
+    nrb_depth* depth_alias = nrb_texture_depth_alias(
+        b, texture, draw_depth, unit);
+    if (depth_alias && b->borrow_depth)
+        return -1;
+    if (depth_alias)
+        return depth_alias == draw_depth ? -1 : 0;
+
+    const u32 span = nrb_texture_span(texture);
+    if (!span || !b->guest_ptr(
+            b->guest_user, texture->location, texture->offset, span))
+        return -1;
+    const u32 format = texture->format & NRB_TEX_BASE_MASK &
+                       ~NRB_TEX_UNNORM;
+    const int linear = (texture->format & NRB_TEX_LINEAR) != 0;
+    if (!linear && ((texture->width & (texture->width - 1u)) ||
+                    (texture->height & (texture->height - 1u))))
+        return -1;
+    if (format == NRB_TEX_DEPTH24_D8 && texture->cubemap)
+        return -1;
+    return 0;
+}
+
+static int nrb_vertex_texture_preflight(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture)
+{
+    const u32 span = nrb_vertex_texture_span(texture, NULL, NULL);
+    if (!span || !b->guest_ptr(
+            b->guest_user, texture->location, texture->offset, span))
+        return -1;
+    return 0;
+}
+
+int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
+                                 const rsx_nir_pipeline* st,
+                                 const rsx_nir_clear* c)
+{
+    if (!b || !st || !c || st->surface.color_target != 1u)
+        return -1;
+    const u32 color_bits = c->mask & 0xF0u;
+    if (color_bits && color_bits != 0xF0u)
+        return -1;
+    if (!nrb_rt_from_state(b, st, 1))
+        return -1;
+    if (c->mask & 0x03u) {
+        nrb_depth* depth = nrb_depth_from_state(b, st, 1);
+        if (!depth || ((c->mask & 0x02u) && depth->fmt != 2u))
+            return -1;
+    }
+    return 0;
+}
+
+int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
+                                const rsx_nir_pipeline* st,
+                                const u32* vp_words, u32 vp_word_count,
+                                const rsx_nir_draw* d,
+                                const u32* batches)
+{
+    if (!b || !st || !d || !batches || !d->batch_count ||
+        d->batch_count > NRB_MAX_DRAW_BATCHES)
+        return -RSX_NR_DRAW_PF_BAD_ARGUMENT;
+    if (st->render_condition.enabled) {
+        u32 value = 0;
+        if (!b->render_condition_read ||
+            b->render_condition_read(
+                b->render_condition_user,
+                st->render_condition.dma_report,
+                st->render_condition.offset, &value) != 0)
+            return -RSX_NR_DRAW_PF_RENDER_CONDITION;
+    }
+    if (st->surface.color_target != 1u)
+        return -RSX_NR_DRAW_PF_SURFACE_TARGET;
+    D3D12_PRIMITIVE_TOPOLOGY topology;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+    if (nrb_topology(d->primitive, &topology, &topology_type) != 0)
+        return -RSX_NR_DRAW_PF_TOPOLOGY;
+    (void)topology;
+
+    nrb_rt* rt = nrb_rt_from_state(b, st, 1);
+    if (!rt)
+        return -RSX_NR_DRAW_PF_COLOR_TARGET;
+    const int depth_active = st->depth_stencil.depth_test_enable ||
+                             st->depth_stencil.stencil_test_enable;
+    nrb_depth* depth = depth_active ? nrb_depth_from_state(b, st, 1) : NULL;
+    if (depth_active && !depth)
+        return -RSX_NR_DRAW_PF_DEPTH_TARGET;
+    if (!nrb_stencil_state_supported(&st->depth_stencil))
+        return -RSX_NR_DRAW_PF_STENCIL_STATE;
+    if (!nrb_depth_bounds_state_supported(b, &st->depth_stencil))
+        return -RSX_NR_DRAW_PF_DEPTH_BOUNDS;
+
+    nrb_fp_info fp;
+    if (nrb_resolve_fp(b, st, &fp) != 0)
+        return -RSX_NR_DRAW_PF_FRAGMENT_RESOLVE;
+    if (fp.unsupported)
+        return -RSX_NR_DRAW_PF_FRAGMENT_UNSUPPORTED;
+    u32 vtex_mask = 0;
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        if (st->vertex_textures[unit].enabled)
+            vtex_mask |= 1u << unit;
+    if (!vp_words || !vp_word_count ||
+        !rsx_vp_program_is_native_supported_control_ex(
+            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+            st->vertex_program.start_slot))
+        return -RSX_NR_DRAW_PF_VERTEX_PROGRAM;
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        if ((vtex_mask & (1u << unit)) &&
+            nrb_vertex_texture_preflight(
+                b, &st->vertex_textures[unit]) != 0)
+            return -RSX_NR_DRAW_PF_VERTEX_TEXTURE;
+    u32 cube_mask = 0;
+    for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit) {
+        if (!(fp.texture_mask & (1u << unit)))
+            continue;
+        if (!st->textures[unit].enabled ||
+            nrb_texture_preflight(
+                b, &st->textures[unit], rt, depth, unit) != 0)
+            return st->textures[unit].enabled
+                ? -RSX_NR_DRAW_PF_TEXTURE_INVALID
+                : -RSX_NR_DRAW_PF_TEXTURE_DISABLED;
+        if (st->textures[unit].cubemap)
+            cube_mask |= 1u << unit;
+    }
+    rsx_vertex_layout_plan layout;
+    u32 input_mask = st->vertex_program.attrib_input_mask;
+    if (!input_mask)
+        input_mask = 1u;
+    rsx_vertex_layout_plan_init(&layout, input_mask);
+    rsx_dsp_vertex_attr attrs[RSX_NIR_NUM_VERTEX_ATTR];
+    float defaults[RSX_NIR_NUM_VERTEX_ATTR][4];
+    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; ++i) {
+        const rsx_nir_vertex_attr* a = &st->vertex_bindings.attr[i];
+        attrs[i].type = a->type;
+        attrs[i].size = a->size;
+        attrs[i].stride = a->stride;
+        attrs[i].frequency = a->frequency;
+        attrs[i].offset = a->offset;
+        attrs[i].location = a->location;
+        memcpy(defaults[i], a->def, sizeof(defaults[i]));
+    }
+    rsx_vertex_pull_plan plan;
+    if (!rsx_vertex_pull_plan_init_decoded(
+            &plan, attrs, defaults, st->vertex_bindings.base_offset,
+            st->vertex_bindings.freq_divider_op, &layout,
+            RSX_PULL_TYPES_ALL))
+        return -RSX_NR_DRAW_PF_VERTEX_PLAN;
+    const int expand = nrb_needs_expansion(d->primitive);
+    const int filter_restart =
+        d->indexed && st->index_binding.restart_enable;
+    const int strips = d->primitive == 4u || d->primitive == 6u;
+    if (!nrb_get_pso(b, st, vp_words, vp_word_count, &fp, &plan,
+                     topology_type,
+                     filter_restart && strips && !expand, cube_mask,
+                     vtex_mask, rt->dxgi))
+        return -RSX_NR_DRAW_PF_PSO;
+
+    nrb_required_span required[NRB_MAX_REQUIRED_SPANS];
+    u32 required_count = 0;
+    if (nrb_prepare_draw_residency(
+            b, st, &plan, d, batches,
+            d->indexed && !expand && !filter_restart,
+            required, &required_count) != 0)
+        return -RSX_NR_DRAW_PF_RESIDENCY;
+    /* Admission must establish the same immutable GPU-visible byte point
+     * used by execution. Registering page spans alone is insufficient: a
+     * guest producer can publish while the mirror copy is being recorded.
+     * Repair that race before the section becomes native-owned. */
+    if (nrb_stabilize_required_spans(
+            b, required, required_count) != 0)
+        return -RSX_NR_DRAW_PF_RESIDENCY;
+    for (u32 bi = 0; bi < d->batch_count; ++bi) {
+        const u32 count = batches[bi * 2u + 1u];
+        const u64 worst_indices = expand ? (u64)count * 3u + 2u : count;
+        if ((expand || filter_restart) &&
+            worst_indices * sizeof(u32) > NRB_UPLOAD_BYTES)
+            return -RSX_NR_DRAW_PF_UPLOAD_SCRATCH;
+    }
+    return 0;
+}
+
+int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
+                                    const rsx_nir_pipeline* st,
+                                    const rsx_nir_transfer* t,
+                                    const u32* words)
+{
+    (void)st;
+    if (!b || !t || !b->writable_ptr)
+        return -1;
+    switch (t->kind) {
+    case RSX_NIR_XFER_BUFFER: {
+        if (t->src_format > 1u || t->dst_format > 1u ||
+            !t->line_length || !t->line_count)
+            return -1;
+        const u64 src_size = (u64)t->src_pitch * (t->line_count - 1u) +
+                             t->line_length;
+        const u64 dst_size = (u64)t->dst_pitch * (t->line_count - 1u) +
+                             t->line_length;
+        if (src_size > UINT32_MAX || dst_size > UINT32_MAX ||
+            !b->guest_ptr(b->guest_user, t->src_location, t->src_offset,
+                          (u32)src_size) ||
+            !b->writable_ptr(b->guest_user, t->dst_location, t->dst_offset,
+                             (u32)dst_size))
+            return -1;
+        return 0;
+    }
+    case RSX_NIR_XFER_INLINE: {
+        const u64 bytes = (u64)t->point_y * t->dst_pitch +
+                          (u64)(t->point_x + t->word_count) * 4u;
+        return words && t->word_count && bytes <= UINT32_MAX &&
+               b->writable_ptr(b->guest_user, t->dst_location,
+                               t->dst_offset, (u32)bytes) ? 0 : -1;
+    }
+    case RSX_NIR_XFER_SCALED: {
+        if (t->ds_dx != 0x00100000u || t->dt_dy != 0x00100000u ||
+            t->src_format != t->dst_format || !t->out_w || !t->out_h)
+            return -1;
+        const u64 src_size = (u64)t->in_h * t->src_pitch;
+        const u64 dst_size = (u64)(t->out_y + t->out_h) * t->dst_pitch;
+        if (src_size > UINT32_MAX || dst_size > UINT32_MAX ||
+            !b->guest_ptr(b->guest_user, t->src_location, t->src_offset,
+                          (u32)src_size) ||
+            !b->writable_ptr(b->guest_user, t->dst_location, t->dst_offset,
+                             (u32)dst_size))
+            return -1;
+        return 0;
+    }
+    default:
+        return -1;
+    }
+}
+
+int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer)
+{
+    if (!b)
+        return -1;
+    nrb_rt* scanout = NULL;
+    if (buffer < 8u && b->displays[buffer].valid) {
+        const nrb_display* display = &b->displays[buffer];
+        for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+            nrb_rt* candidate = &b->rts[i];
+            if (candidate->live &&
+                candidate->space == display->location &&
+                candidate->offset == display->offset &&
+                (!display->width || candidate->w == display->width) &&
+                (!display->height || candidate->h == display->height)) {
+                scanout = candidate;
+                break;
+            }
+        }
+    }
+    if (!scanout)
+        scanout = b->last_rt;
+    return b->present_cb && !scanout ? -1 : 0;
+}
+
 static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                     const u32* vp_words, u32 vp_word_count,
                     const rsx_nir_draw* d, const u32* batches)
 {
     rsx_nr_d3d12* b = user;
+
+    /* Evaluate as late as possible, before allocating/opening/recording any
+     * draw work. Preflight proved only that the exact report address is
+     * resolvable; a preceding report action or guest writer may have changed
+     * its value since then. A false condition consumes this draw without
+     * side effects, exactly as NV4097 conditional rendering does. */
+    if (st->render_condition.enabled) {
+        u32 value = 0;
+        if (!b->render_condition_read ||
+            b->render_condition_read(
+                b->render_condition_user,
+                st->render_condition.dma_report,
+                st->render_condition.offset, &value) != 0)
+            return -1;
+        if (!value) {
+            b->stats.conditional_draws_skipped++;
+            return 0;
+        }
+    }
 
     D3D12_PRIMITIVE_TOPOLOGY topo;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE tt;
@@ -2256,6 +3072,16 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.unsup_draw_rt++;
         return -1;
     }
+    if (!nrb_stencil_state_supported(&st->depth_stencil)) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_pso++;
+        return -1;
+    }
+    if (!nrb_depth_bounds_state_supported(b, &st->depth_stencil)) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_pso++;
+        return -1;
+    }
 
     nrb_fp_info fp;
     if (nrb_resolve_fp(b, st, &fp) != 0 || fp.unsupported) {
@@ -2275,6 +3101,18 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         }
         if (st->textures[unit].cubemap)
             cube_mask |= 1u << unit;
+    }
+    u32 vtex_mask = 0;
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        if (st->vertex_textures[unit].enabled)
+            vtex_mask |= 1u << unit;
+    if ((vp_word_count && !vp_words) ||
+        (vp_word_count && !rsx_vp_program_is_native_supported_control_ex(
+            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+            st->vertex_program.start_slot))) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_pso++;
+        return -1;
     }
 
     /* pull plan from folded state */
@@ -2308,7 +3146,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
 
     ID3D12PipelineState* pso = nrb_get_pso(
         b, st, vp_words, vp_word_count, &fp, &plan, tt,
-        filter_restart && strips && !expand_primitive, cube_mask);
+        filter_restart && strips && !expand_primitive, cube_mask, vtex_mask,
+        rt->dxgi);
     if (!pso) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_pso++;
@@ -2329,32 +3168,34 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.residency_failures++;
         return -1;
     }
-    if (nrb_open_list(b))
+    if (nrb_stabilize_required_spans(
+            b, required, required_count) != 0) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_plan++;
+        b->stats.residency_failures++;
         return -1;
-    nrb_mirror_sync(b);
-    for (u32 i = 0; i < required_count; ++i) {
-        if (!nrb_span_current(b, required[i].space, required[i].offset,
-                              required[i].size)) {
-            /* Any successfully recorded page uploads are harmless and remain
-             * useful. Execute them without a draw, then hand the exact packet
-             * back to the ordered legacy fallback. */
-            nrb_exec_wait(b);
-            b->stats.unsupported_draws++;
-            b->stats.unsup_draw_plan++;
-            b->stats.residency_failures++;
-            return -1;
-        }
     }
 
     nrb_rt* texture_aliases[NRB_TEX_UNITS] = {0};
     nrb_depth* texture_depth_aliases[NRB_TEX_UNITS] = {0};
+    nrb_rt* vtex_aliases[NRB_VTEX_UNITS] = {0};
+    nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS] = {0};
     u32 resolved_cube_mask = 0;
-    if (nrb_prepare_textures(b, st, fp.texture_mask, rt, depth,
+    u32 descriptor_table_index = 0;
+    if (nrb_ensure_descriptor_capacity(b) != 0) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_texture++;
+        return -1;
+    }
+    if (nrb_prepare_textures(b, st, fp.texture_mask, vtex_mask, rt, depth,
                              texture_aliases, texture_depth_aliases,
-                             &resolved_cube_mask) != 0 ||
+                             vtex_aliases, vtex_depth_aliases,
+                             &resolved_cube_mask,
+                             &descriptor_table_index) != 0 ||
         resolved_cube_mask != cube_mask) {
         nrb_restore_texture_aliases(
-            b, texture_aliases, texture_depth_aliases);
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
         nrb_exec_wait(b);
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_texture++;
@@ -2405,8 +3246,14 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         }
 
         rsx_vertex_pull_constants pull;
+        /* NV4097_VERTEX_DATA_BASE_INDEX applies to indexed fetches.  The
+         * proven legacy decoder deliberately passes zero for DRAW_ARRAYS;
+         * carrying the stale indexed base into an array draw shifts every
+         * pulled attribute and corrupts otherwise valid live batches. */
+        const u32 pull_base_index =
+            d->indexed ? st->vertex_bindings.base_index : 0u;
         rsx_vertex_pull_fill_constants(
-            &plan, st->vertex_bindings.base_index,
+            &plan, pull_base_index,
             use_host_ib ? 0u : first, source,
             st->index_binding.offset, st->index_binding.location,
             rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 0),
@@ -2423,7 +3270,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         if (prepare_index_failed)
             b->stats.unsup_draw_index++;
         nrb_restore_texture_aliases(
-            b, texture_aliases, texture_depth_aliases);
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
         nrb_exec_wait(b);
         b->stats.unsupported_draws++;
         return -1;
@@ -2439,11 +3287,14 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->list->lpVtbl->OMSetRenderTargets(b->list, 1, &rtv, FALSE, NULL);
     }
 
+    /* The generated NV40 vertex-program epilogue already applies the guest
+     * viewport scale/translate and produces final D3D clip coordinates. The
+     * proven legacy renderer therefore rasterizes over the complete surface.
+     * Applying the RSX x/y/w/h again here double-transformed live geometry
+     * and could clip every world draw out of the target. */
     D3D12_VIEWPORT vp = {0};
-    vp.Width = (float)(st->viewport.w ? st->viewport.w : rt->w);
-    vp.Height = (float)(st->viewport.h ? st->viewport.h : rt->h);
-    vp.TopLeftX = (float)st->viewport.x;
-    vp.TopLeftY = (float)st->viewport.y;
+    vp.Width = (float)rt->w;
+    vp.Height = (float)rt->h;
     vp.MaxDepth = 1.0f;
     b->list->lpVtbl->RSSetViewports(b->list, 1, &vp);
     D3D12_RECT sc;
@@ -2451,28 +3302,51 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     sc.top = (LONG)st->scissor.y;
     sc.right = (LONG)(st->scissor.w ? st->scissor.x + st->scissor.w : rt->w);
     sc.bottom = (LONG)(st->scissor.h ? st->scissor.y + st->scissor.h : rt->h);
+    if (sc.left < 0) sc.left = 0;
+    if (sc.top < 0) sc.top = 0;
+    if (sc.right > (LONG)rt->w) sc.right = (LONG)rt->w;
+    if (sc.bottom > (LONG)rt->h) sc.bottom = (LONG)rt->h;
+    if (sc.right < sc.left) sc.right = sc.left;
+    if (sc.bottom < sc.top) sc.bottom = sc.top;
     b->list->lpVtbl->RSSetScissorRects(b->list, 1, &sc);
+    if (b->depth_bounds_supported && b->list1) {
+        float zmin = 0.0f;
+        float zmax = 1.0f;
+        if (st->depth_stencil.depth_bounds_test_enable) {
+            memcpy(&zmin, &st->depth_stencil.depth_bounds_min, sizeof(zmin));
+            memcpy(&zmax, &st->depth_stencil.depth_bounds_max, sizeof(zmax));
+        }
+        b->list1->lpVtbl->OMSetDepthBounds(b->list1, zmin, zmax);
+    }
 
     ID3D12DescriptorHeap* descriptor_heaps[2] = {
         b->texture_gpu_heap, b->sampler_gpu_heap
     };
     b->list->lpVtbl->SetDescriptorHeaps(b->list, 2, descriptor_heaps);
     b->list->lpVtbl->SetGraphicsRootSignature(b->list, b->rootsig);
+    const u32 srv_table_base =
+        descriptor_table_index * NRB_SRV_TABLE_STRIDE;
+    const u32 sampler_table_base =
+        descriptor_table_index * NRB_SAMPLER_TABLE_STRIDE;
     b->list->lpVtbl->SetGraphicsRootDescriptorTable(
-        b->list, 5, nrb_texture_gpu_handle(b));
+        b->list, 5, nrb_texture_gpu_handle(b, srv_table_base));
     b->list->lpVtbl->SetGraphicsRootDescriptorTable(
-        b->list, 6, nrb_sampler_gpu_handle(b));
+        b->list, 6, nrb_sampler_gpu_handle(b, sampler_table_base));
+    b->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        b->list, 7,
+        nrb_texture_gpu_handle(b, srv_table_base + NRB_TEX_UNITS));
     b->list->lpVtbl->SetPipelineState(b->list, pso);
     b->list->lpVtbl->IASetPrimitiveTopology(b->list, topo);
 
     /* b0: transform constants + the RSX viewport mapping consumed by the
      * generated VP epilogue. */
     u64 const_va = 0;
-    const u32 vp_cb_bytes = sizeof(st->constants) + 8u * sizeof(float);
+    const u32 vp_cb_bytes = sizeof(st->constants) + 12u * sizeof(float);
     u8* cp = nrb_upload_alloc(b, vp_cb_bytes, &const_va);
     if (!cp) {
         nrb_restore_texture_aliases(
-            b, texture_aliases, texture_depth_aliases);
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
         nrb_exec_wait(b);
         b->stats.unsupported_draws++;
         return -1;
@@ -2492,6 +3366,11 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         xf[5] = -((st->viewport.translate[1] - h * 0.5f) / (h * 0.5f));
         xf[6] = st->viewport.translate[2];
     }
+    u32* branch_words = (u32*)(xf + 8u);
+    branch_words[0] = st->vertex_program.branch_bits;
+    branch_words[1] = 0u;
+    branch_words[2] = 0u;
+    branch_words[3] = 0u;
     b->list->lpVtbl->SetGraphicsRootConstantBufferView(b->list, 0, const_va);
 
     /* b1 (pixel): exact inline CONST words plus dynamic alpha reference.
@@ -2502,7 +3381,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     u8* fp_cp = nrb_upload_alloc(b, fp_cb_bytes, &fp_va);
     if (!fp_cp) {
         nrb_restore_texture_aliases(
-            b, texture_aliases, texture_depth_aliases);
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
         nrb_exec_wait(b);
         b->stats.unsupported_draws++;
         return -1;
@@ -2567,11 +3447,13 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.draw_batches++;
     }
 
-    nrb_restore_texture_aliases(b, texture_aliases, texture_depth_aliases);
+    nrb_restore_texture_aliases(
+        b, texture_aliases, texture_depth_aliases,
+        vtex_aliases, vtex_depth_aliases);
     if (filter_restart)
         b->stats.restart_draws++;
     b->stats.real_fp_draws++;
-    if (fp.texture_mask)
+    if (fp.texture_mask || vtex_mask)
         b->stats.texture_draws++;
     b->last_rt = rt;
     b->stats.draws++;
@@ -2656,7 +3538,7 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
         break;
     }
     case RSX_NIR_XFER_SCALED: {
-        /* 1:1 raw copy only (ds_dx/dt_dy == 1.0 in 16.16); real scaling
+        /* 1:1 raw copy only (ds_dx/dt_dy == 1.0 in 11.20); real scaling
          * and format conversion stay on the fallback path for now */
         if (t->ds_dx != 0x00100000u || t->dt_dy != 0x00100000u ||
             t->src_format != t->dst_format) {
@@ -2799,6 +3681,15 @@ void rsx_nr_d3d12_set_publish_write(
     b->publish_write_user = user;
 }
 
+void rsx_nr_d3d12_set_render_condition_reader(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_render_condition_fn read, void* user)
+{
+    if (!b)
+        return;
+    b->render_condition_read = read;
+    b->render_condition_user = user;
+}
+
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
 {
@@ -2870,6 +3761,15 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     b->fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!b->fence_event)
         goto fail;
+    if (SUCCEEDED(b->list->lpVtbl->QueryInterface(
+            b->list, &IID_ID3D12GraphicsCommandList1, (void**)&b->list1))) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 options2 = {0};
+        if (SUCCEEDED(b->dev->lpVtbl->CheckFeatureSupport(
+                b->dev, D3D12_FEATURE_D3D12_OPTIONS2,
+                &options2, sizeof(options2))) &&
+            options2.DepthBoundsTestSupported)
+            b->depth_bounds_supported = 1;
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -2887,19 +3787,20 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         b->dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = NRB_TEX_CAP + 1u + NRB_TEX_UNITS;
+    hd.NumDescriptors = NRB_TEX_CAP + 1u + NRB_SRV_TABLE_STRIDE;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
             b->dev, &hd, &IID_ID3D12DescriptorHeap,
             (void**)&b->texture_cpu_heap)))
         goto fail;
-    hd.NumDescriptors = NRB_TEX_UNITS;
+    hd.NumDescriptors = NRB_SHADER_DESCRIPTORS;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
             b->dev, &hd, &IID_ID3D12DescriptorHeap,
             (void**)&b->texture_gpu_heap)))
         goto fail;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    hd.NumDescriptors = NRB_SHADER_SAMPLERS;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
             b->dev, &hd, &IID_ID3D12DescriptorHeap,
             (void**)&b->sampler_gpu_heap)))
@@ -2923,10 +3824,11 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     }
 
     /* root signature: b0 vertex constants, b1 vertex-pull constants,
-     * t20/t21 mirror buffers, pixel b1 for buffered FP constants, and
-     * exact fragment SRV/sampler descriptor tables t0..t15/s0..s15. */
+     * t20/t21 mirror buffers, pixel b1 for buffered FP constants, exact
+     * fragment tables t0..t15/s0..s15, and vertex textures t16..t19 with
+     * the same point/clamp static sampler contract as the legacy renderer. */
     {
-        D3D12_DESCRIPTOR_RANGE ranges[2];
+        D3D12_DESCRIPTOR_RANGE ranges[3];
         memset(ranges, 0, sizeof(ranges));
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = NRB_TEX_UNITS;
@@ -2938,7 +3840,12 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         ranges[1].BaseShaderRegister = 0;
         ranges[1].OffsetInDescriptorsFromTableStart =
             D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-        D3D12_ROOT_PARAMETER params[7];
+        ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[2].NumDescriptors = NRB_VTEX_UNITS;
+        ranges[2].BaseShaderRegister = 16;
+        ranges[2].OffsetInDescriptorsFromTableStart =
+            D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        D3D12_ROOT_PARAMETER params[8];
         memset(params, 0, sizeof(params));
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
@@ -2963,9 +3870,31 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         params[6].DescriptorTable.NumDescriptorRanges = 1;
         params[6].DescriptorTable.pDescriptorRanges = &ranges[1];
         params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[7].DescriptorTable.NumDescriptorRanges = 1;
+        params[7].DescriptorTable.pDescriptorRanges = &ranges[2];
+        params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_STATIC_SAMPLER_DESC vertex_samplers[NRB_VTEX_UNITS];
+        memset(vertex_samplers, 0, sizeof(vertex_samplers));
+        for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
+            vertex_samplers[unit].Filter =
+                D3D12_FILTER_MIN_MAG_MIP_POINT;
+            vertex_samplers[unit].AddressU =
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            vertex_samplers[unit].AddressV =
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            vertex_samplers[unit].AddressW =
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            vertex_samplers[unit].MaxLOD = D3D12_FLOAT32_MAX;
+            vertex_samplers[unit].ShaderRegister = unit;
+            vertex_samplers[unit].ShaderVisibility =
+                D3D12_SHADER_VISIBILITY_VERTEX;
+        }
         D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-        rsd.NumParameters = 7;
+        rsd.NumParameters = 8;
         rsd.pParameters = params;
+        rsd.NumStaticSamplers = NRB_VTEX_UNITS;
+        rsd.pStaticSamplers = vertex_samplers;
         ID3DBlob* sig = NULL;
         ID3DBlob* err = NULL;
         if (FAILED(D3D12SerializeRootSignature(&rsd,
@@ -3024,7 +3953,7 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
                     goto fail;
             }
         }
-        /* One permanent mirror handle per exact 4 KiB page is the maximum.
+        /* One permanent mirror handle per exact 1 KiB subpage is the maximum.
          * Reserving it here proves the render-thread registration path cannot
          * allocate, reallocate, or lose a page under memory pressure. */
         if (rsx_gpu_mirror_reserve_ranges(b->mirror, total_pages) != 0)
@@ -3096,6 +4025,8 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         CloseHandle(b->fence_event);
     if (b->fence)
         b->fence->lpVtbl->Release(b->fence);
+    if (b->list1)
+        b->list1->lpVtbl->Release(b->list1);
     if (b->list)
         b->list->lpVtbl->Release(b->list);
     if (b->alloc)
@@ -3112,6 +4043,11 @@ rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b)
     return &b->pages;
 }
 
+int rsx_nr_d3d12_depth_bounds_supported(const rsx_nr_d3d12* b)
+{
+    return b && b->depth_bounds_supported;
+}
+
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)
 {
@@ -3120,7 +4056,8 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
         if (b->rts[i].live && b->rts[i].space == space &&
             b->rts[i].offset == offset && b->rts[i].w == w &&
             b->rts[i].h == h &&
-            b->rts[i].dxgi == DXGI_FORMAT_B8G8R8A8_UNORM) {
+            (b->rts[i].dxgi == DXGI_FORMAT_B8G8R8A8_UNORM ||
+             b->rts[i].dxgi == DXGI_FORMAT_R8G8B8A8_UNORM)) {
             rt = &b->rts[i];
             break;
         }
@@ -3151,7 +4088,7 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     D3D12_TEXTURE_COPY_LOCATION dstl = {0};
     dstl.pResource = b->readback;
     dstl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dstl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    dstl.PlacedFootprint.Footprint.Format = rt->dxgi;
     dstl.PlacedFootprint.Footprint.Width = w;
     dstl.PlacedFootprint.Footprint.Height = h;
     dstl.PlacedFootprint.Footprint.Depth = 1;
@@ -3227,6 +4164,11 @@ void rsx_nr_d3d12_set_publish_write(
     rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user)
 {
     (void)b; (void)publish; (void)user;
+}
+void rsx_nr_d3d12_set_render_condition_reader(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_render_condition_fn read, void* user)
+{
+    (void)b; (void)read; (void)user;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)

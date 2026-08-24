@@ -1861,6 +1861,11 @@ static uint32_t yz_rsx_io_to_ea(uint32_t io)
     return base + (io & 0xFFFFFu);
 }
 
+extern "C" uint32_t yz_nr_vertical_io_to_ea(uint32_t io_offset)
+{
+    return yz_rsx_io_to_ea(io_offset);
+}
+
 static uint32_t yz_rsx_head_addr(uint32_t h)
 {
     return RSX_DRIVER_INFO + RSX_DRIVERINFO_HEAD + (h & 7u) * RSX_HEAD_STRIDE;
@@ -3026,14 +3031,57 @@ static void yz_movie_set_live_draw_mode(int on)
     yz_rsx_fifo_release();
 }
 
+/* Direct mwPly HLE presentation and the guest's subsequent Stop/Destroy
+ * sequence are one graphics-ownership interval.  The host presenter may
+ * finish before the guest retires the movie object; releasing ownership at
+ * that earlier point lets a native frame preflight against transition pages
+ * that the guest is still republishing.  Track the exact session serial so a
+ * late close from an older player can never disarm a newer movie. */
+static volatile LONG g_movie_live_draw_serial = 0;
+
+static void yz_movie_begin_live_draw_mode(LONG serial)
+{
+    yz_rsx_fifo_acquire();
+    rsx_live_draw_set_movie_mode(1);
+    InterlockedExchange(&g_movie_live_draw_serial, serial);
+    yz_rsx_fifo_release();
+}
+
+static void yz_movie_end_live_draw_mode(LONG serial)
+{
+    yz_rsx_fifo_acquire();
+    if (InterlockedCompareExchange(
+            &g_movie_live_draw_serial, 0, serial) == serial)
+        rsx_live_draw_set_movie_mode(0);
+    yz_rsx_fifo_release();
+}
+
+extern "C" void yz_host_movie_graphics_session_closed(long serial)
+{
+    if (serial > 0)
+        yz_movie_end_live_draw_mode((LONG)serial);
+}
+
 static void yz_play_queued_movie(const char* path, LONG serial)
 {
     if (!rsx_live_draw_enabled() || !movie_ffmpeg_available())
         return;
 
+    const int mwply_hle = yz_movie_hle_armed();
+
+    /* The movie owns graphics from the instant host decode begins, not only
+     * after the first picture has been decoded.  AIX/video preparation writes
+     * guest-backed pages which can also be referenced by the outgoing RSX
+     * frame.  Letting a transactional native frame start in that interval can
+     * make its already-preflighted mirror residency change during execution;
+     * the frame then cannot safely fall back after earlier native actions.
+     * Take the established FIFO-serialized movie handoff before opening the
+     * decoder so no native section can straddle that preparation window. */
+    yz_movie_begin_live_draw_mode(serial);
     MoviePlayer* mv = movie_open(path);
     if (!mv) {
         fprintf(stderr, "[movie] unable to decode queued movie '%s'\n", path);
+        yz_movie_end_live_draw_mode(serial);
         yz_movie_complete(serial);
         return;
     }
@@ -3042,7 +3090,6 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     const uint32_t h = (uint32_t)movie_height(mv);
     int fps = (int)(movie_framerate(mv) + 0.5);
     if (fps <= 0) fps = 30;
-    const int mwply_hle = yz_movie_hle_armed();
     const int accept_fast = getenv("YZ_FRONTIER_ACCEPT_FAST") ||
         (getenv("YZ_A010_ACCEPT_FAST") &&
          (strstr(path, "hd_sega_logo") || strstr(path, "advertise.sfd")));
@@ -3055,6 +3102,7 @@ static void yz_play_queued_movie(const char* path, LONG serial)
         fprintf(stderr, "[movie] no video frames in '%s'\n", path);
         fflush(stderr);
         movie_close(mv);
+        yz_movie_end_live_draw_mode(serial);
         yz_movie_complete(serial);
         return;
     }
@@ -3086,7 +3134,6 @@ static void yz_play_queued_movie(const char* path, LONG serial)
             mwply_hle ? "mwPly HLE" : "fd bridge",
             accept_fast ? ", acceptance=single-frame" : "");
     fflush(stderr);
-    yz_movie_set_live_draw_mode(1);
     cellPad_host_movie_skip_begin();
     for (;;) {
         if (InterlockedCompareExchange(&g_movie_open_serial, 0, 0) != serial) {
@@ -3261,7 +3308,11 @@ static void yz_play_queued_movie(const char* path, LONG serial)
     if (host_audio)
         cellAudioHostStreamStop();
     InterlockedCompareExchange(&g_movie_presenting_serial, 0, serial);
-    yz_movie_set_live_draw_mode(0);
+    /* Direct mwPly HLE keeps ownership until its guest Destroy wrapper closes
+     * this exact session.  The fd bridge has no HLE session object, so its
+     * ownership still ends with host presentation. */
+    if (!mwply_hle)
+        yz_movie_end_live_draw_mode(serial);
     movie_close(mv);
     /* The host movie is an overlay, not an RSX FIFO producer. SAIL orders
      * source EOS before Stop completion, but it does not manufacture a GPU
@@ -3595,14 +3646,113 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
 
 extern "C" uint64_t cellGcmReportTimestampNs(void);
 
+static int yz_nr_vertical_report_address(uint32_t dma, uint32_t offset,
+                                         uint32_t size,
+                                         uint32_t* out_address)
+{
+    if (!out_address || !size || size > 16u)
+        return -1;
+    uint32_t address = 0;
+    switch (dma) {
+    case RSX_DMA_REPORT_LOCATION_LOCAL:
+    case RSX_DMA_MEMORY_FRAME_BUFFER:
+        if (offset < RSX_REPORT_AREA_SIZE &&
+            offset <= RSX_REPORT_AREA_SIZE - size)
+            address = RSX_REPORTS + offset;
+        break;
+    case RSX_DMA_REPORT_LOCATION_MAIN:
+    case RSX_DMA_MEMORY_HOST_BUFFER:
+        {
+            uint32_t io = 0;
+            if (!rsx_nr_main_report_io_range(offset, size, &io))
+                return -1;
+            const uint32_t first = yz_rsx_io_to_ea(io);
+            const uint32_t last = yz_rsx_io_to_ea(io + size - 1u);
+            if (!first || last != first + size - 1u)
+                return -1;
+            address = first;
+        }
+        break;
+    default:
+        break;
+    }
+    if (!address)
+        return -1;
+    *out_address = address;
+    return 0;
+}
+
+extern "C" int yz_nr_vertical_render_condition_read(
+    uint32_t dma, uint32_t offset, uint32_t* value)
+{
+    uint32_t address = 0;
+    if (!value || yz_nr_vertical_report_address(
+            dma, offset, 16u, &address) != 0)
+        return -1;
+    *value = vm_read32(address + 8u);
+    return 0;
+}
+
+static void yz_nr_vertical_406e_release(uint32_t dma, uint32_t offset,
+                                        uint32_t value)
+{
+    const uint32_t address = yz_rsx_sem_addr(dma, offset);
+    /* Hardware flip credit: a zero release to DEVICE_R+0x30 publishes one. */
+    if (address == RSX_DEVICE_ADDR + 0x30u && value == 0u)
+        value = 1u;
+    if (yz_ft_on() &&
+        ((address >= RSX_REPORTS && address < RSX_REPORTS + 0x1000u) ||
+         address == RSX_DEVICE_ADDR + 0x30u))
+        yz_ft("REL addr=0x%08X val=0x%08X qhead=%u pending[qh]=%ld",
+              address, value, g_rsx_queued_head,
+              g_rsx_flip_pending[g_rsx_queued_head & 7u]);
+    if (address)
+        yz_rsx_w32(address, value);
+
+    /* Preserve the legacy release-arm compatibility policy exactly.  Fast
+     * production builds default it off; YZ_SEMARM can explicitly restore it
+     * for an A/B, while non-PERF builds retain their historical default. */
+    if (address == RSX_REPORTS + 0x10u && value != 0u) {
+        static int disabled = -1;
+        if (disabled < 0) {
+#if defined(YZ_PERF_CLEAN)
+            disabled = getenv("YZ_SEMARM") ? 0 : 1;
+#else
+            disabled = getenv("YZ_NO_SEMARM") ? 1 : 0;
+#endif
+            fprintf(stderr, "[semarm] armed (release-arm heuristic %s)\n",
+                    disabled ? "DISABLED" : "on");
+            fflush(stderr);
+        }
+        if (!disabled) {
+            const LONG previous = InterlockedExchange(
+                &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
+            if (previous == 0) {
+                const long n = _InterlockedIncrement(&g_yz_semarm_count);
+                if (n <= 4 || (n & 0xFF) == 0) {
+                    fprintf(stderr,
+                            "[semarm] manufactured flip arm total=%ld\n", n);
+                    fflush(stderr);
+                }
+            }
+            if (yz_ft_on())
+                yz_ft("ARM pending[%u] %ld->1",
+                      g_rsx_queued_head & 7u, previous);
+        }
+    }
+}
+
 extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
                                            uint32_t value,
                                            uint32_t texture_read)
 {
     /* The typed backend has already applied the 1D70 byte-0/2 hardware
-     * transform. This callback is deliberately restricted to the two
-     * NV4097 release families; NV406E release retains its legacy flip-credit
-     * and semarm protocol until its distinct release kind is represented. */
+     * transform. Release kind 2 is the distinct NV406E path and keeps the
+     * legacy device-credit and semarm publication contract in one helper. */
+    if (texture_read == 2u) {
+        yz_nr_vertical_406e_release(dma, offset, value);
+        return;
+    }
     if (texture_read > 1u)
         return;
     const uint32_t address = yz_rsx_sem_addr(dma, offset);
@@ -3619,26 +3769,7 @@ extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
     const uint32_t type = arg >> 24;
     const uint32_t offset = arg & 0x00FFFFFFu;
     uint32_t address = 0;
-    switch (dma) {
-    case RSX_DMA_REPORT_LOCATION_LOCAL:
-    case RSX_DMA_MEMORY_FRAME_BUFFER:
-        if (offset < RSX_REPORT_AREA_SIZE &&
-            offset <= RSX_REPORT_AREA_SIZE - 16u)
-            address = RSX_REPORTS + offset;
-        break;
-    case RSX_DMA_REPORT_LOCATION_MAIN:
-    case RSX_DMA_MEMORY_HOST_BUFFER:
-        /* The correct address is report-aperture base + offset (validated by
-         * rsx_nr_main_report_io_range), never the raw low IO offset.  The
-         * retained legacy path currently refuses MAIN reports altogether;
-         * do the same until the title's MAIN report producer and completion
-         * consumer are end-to-end validated, rather than silently changing
-         * guest synchronization semantics in the active rollout. */
-        return -1;
-    default:
-        break;
-    }
-    if (!address)
+    if (yz_nr_vertical_report_address(dma, offset, 16u, &address) != 0)
         return -1;
 
     const uint64_t timestamp = cellGcmReportTimestampNs();
@@ -3652,6 +3783,18 @@ extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
         vm_write32(address + 12u, 0u);
     }
     return 0;
+}
+
+extern "C" int yz_nr_vertical_report_can(uint32_t kind, uint32_t arg,
+                                           uint32_t dma)
+{
+    if (kind != 0u)
+        return 0; /* CLEAR_REPORT_VALUE has no guest-memory dependency. */
+
+    const uint32_t offset = arg & 0x00FFFFFFu;
+    uint32_t address = 0;
+    return yz_nr_vertical_report_address(
+        dma, offset, 16u, &address);
 }
 
 /* Semantic actions shared by the legacy packet decoder and the vertical
@@ -4171,62 +4314,8 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         }
         break;
     case 0x06C:                                   /* NV406E SEMAPHORE_RELEASE */
-        addr = yz_rsx_sem_addr(yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e);
-        /* HW flip-sync: a release of 0 to device+0x30 is written as 1 (the RSX
-         * never writes 0 there without a display-queue command). nv406e.cpp:130 */
-        if (addr == RSX_DEVICE_ADDR + 0x30 && arg == 0) arg = 1;
-        { static int st=-1; static int sl=0;
-          if (st < 0) st = getenv("YZ_RSX_SEM_TRACE") ? 1 : 0;
-          if (st && sl<60){ sl++;
-            fprintf(stderr, "[sem] RELEASE off=0x%X addr=0x%08X val=0x%08X\n",
-                    yz_rsx_sem_off_406e, addr, arg); } }
-        if (yz_ft_on() &&
-            ((addr >= RSX_REPORTS && addr < RSX_REPORTS + 0x1000u) ||
-             addr == RSX_DEVICE_ADDR + 0x30))
-            yz_ft("REL addr=0x%08X val=0x%08X qhead=%u pending[qh]=%ld",
-                  addr, arg, g_rsx_queued_head,
-                  g_rsx_flip_pending[g_rsx_queued_head & 7u]);
-        if (addr)
-            yz_rsx_w32(addr, arg);
-        /* COMPENSATING HEURISTIC (pre-fliphead era, s23 gated): a release of the
-         * flip semaphore (label+0x10) to the pending marker arms the queued head
-         * so the next vblank presents it. RPCS3's nv406e::semaphore_release does
-         * NOT do this -- the real flip is commanded by GCM_FLIP_HEAD (0xE920),
-         * which we now deliver (s23). While this stays on, any non-flip label
-         * write manufactures a phantom flip (uncommanded present + throttle
-         * bump + FLIP event). Kill-switch YZ_NO_SEMARM for the retirement A/B;
-         * flip the default to OFF once measured redundant. */
-        if (addr == RSX_REPORTS + 0x10 && arg != 0) {
-            /* Measurement integrity: while this heuristic is on, every arm it
-             * performs is a present the guest did not command, so frame-timing
-             * numbers include manufactured flips. Perf lanes therefore default
-             * it OFF (YZ_SEMARM=1 forces it back for an A/B); normal boots
-             * keep the historical default ON until a visible boot validates
-             * retirement. Every effective arm (prev==0) is counted and kept
-             * visible so any timing run can state its phantom-flip footprint. */
-            static int nsa = -1; if (nsa < 0) {
-#if defined(YZ_PERF_CLEAN)
-                nsa = getenv("YZ_SEMARM") ? 0 : 1;
-#else
-                nsa = getenv("YZ_NO_SEMARM") ? 1 : 0;
-#endif
-                fprintf(stderr, "[semarm] armed (release-arm heuristic %s)\n",
-                        nsa ? "DISABLED" : "on"); fflush(stderr); }
-            if (!nsa) {
-                LONG prev = InterlockedExchange(
-                    &g_rsx_flip_pending[g_rsx_queued_head & 7u], 1);
-                if (prev == 0) {
-                    long n = _InterlockedIncrement(&g_yz_semarm_count);
-                    if (n <= 4 || (n & 0xFF) == 0) {
-                        fprintf(stderr, "[semarm] manufactured flip arm "
-                                "total=%ld\n", n);
-                        fflush(stderr);
-                    }
-                }
-                if (yz_ft_on())
-                    yz_ft("ARM pending[%u] %ld->1", g_rsx_queued_head & 7u, prev);
-            }
-        }
+        yz_nr_vertical_406e_release(
+            yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e, arg);
         break;
     case 0x1A4:                                   /* NV4097 SET_CONTEXT_DMA_SEMAPHORE */
         yz_rsx_sem_dma_4097 = arg;
@@ -4262,6 +4351,16 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         break;
     }
     return 0;
+}
+
+extern "C" int yz_nr_vertical_mirror_legacy_method(
+    uint32_t method, uint32_t arg, uint32_t suppress_action)
+{
+    if (suppress_action) {
+        rsx_live_draw_mirror_state_method(method, arg);
+        return 0;
+    }
+    return yz_rsx_method(method, arg);
 }
 
 /* FIFO consumer (RPCS3 FIFO_control model -- Emu/RSX/RSXFIFO.cpp).
@@ -6654,6 +6753,36 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
                     "[nr-vertical] fatal typed span at GET=0x%08X EA=0x%08X; "
                     "refusing legacy decode of reserved words\n",
                     get, ea);
+            fflush(stderr);
+        }
+        return finish(YZ_RSX_WAIT_BAD_FLOW);
+    }
+
+    /* Transactional native ownership is deliberately attempted only after
+     * exact producer-owned spans have had first refusal.  The section scanner
+     * follows the live FIFO flow and either owns a complete preflighted island
+     * or leaves GET/RET untouched for the ordinary legacy decoder below. */
+    uint32_t section_get = get;
+    uint32_t section_ret = g_fifo_ret;
+    const yz_nr_vertical_section_result section_result =
+        yz_nr_vertical_consume_section(
+            get, put, g_fifo_ret, &section_get, &section_ret);
+    if (section_result == YZ_NR_VERTICAL_SECTION_EXECUTED) {
+        if (section_get == get || !yz_rsx_io_to_ea(section_get))
+            return finish(YZ_RSX_WAIT_BAD_FLOW);
+        g_fifo_ret = section_ret;
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, section_get);
+        return finish(YZ_RSX_WAIT_ADVANCING);
+    }
+    if (section_result == YZ_NR_VERTICAL_SECTION_WAIT)
+        return finish(YZ_RSX_WAIT_UNFINALIZED_HOLE);
+    if (section_result == YZ_NR_VERTICAL_SECTION_FATAL) {
+        static int section_fatal_reported = 0;
+        if (!section_fatal_reported++) {
+            fprintf(stderr,
+                    "[nr-vertical] fatal native frame island at "
+                    "GET=0x%08X PUT=0x%08X; refusing partial fallback\n",
+                    get, put);
             fflush(stderr);
         }
         return finish(YZ_RSX_WAIT_BAD_FLOW);

@@ -122,6 +122,8 @@ static u32 f32bits(float v)
 #define M_VP_START       0x1EA0
 #define M_VP_CONST_ID    0x1EFC
 #define M_VP_CONST       0x1F00
+#define M_CONTEXT_REPORT 0x01A8
+#define M_RENDER_ENABLE  0x1E98
 #define M_GCM_FLIP       0xE944
 
 /* A tiny 2-instruction vertex program, END bit on the second instruction */
@@ -140,6 +142,15 @@ static void typed_stage_defaults(rsx_nir_emitter* em)
     ra.color_mask = 0x01010101u;
     ra.front_face = 0x0901u;
     rsx_nir_em_raster(em, &ra);
+
+    rsx_nir_depth_stencil ds;
+    memset(&ds, 0, sizeof(ds));
+    ds.stencil_mask = 0xFFu;
+    ds.stencil_write_mask = 0xFFu;
+    ds.back_stencil_mask = 0xFFu;
+    ds.back_stencil_write_mask = 0xFFu;
+    ds.depth_bounds_max = 0x3F800000u;
+    rsx_nir_em_depth_stencil(em, &ds);
 
     rsx_nir_index_binding ib;
     memset(&ib, 0, sizeof(ib));
@@ -281,7 +292,7 @@ static void build_scene_typed(rsx_nir_emitter* em)
     /* clear (depth value = seeded ZSTENCIL default 0xFFFFFF00 >> 8) */
     rsx_nir_em_clear(em, 0xF3, 0xFF204060u, 0xFFFFFF, 0x00);
 
-    rsx_nir_em_vertex_program(em, 0, VP_WORDS, 8, 0, 0);
+    rsx_nir_em_vertex_program(em, 0, VP_WORDS, 8, 0, 0, 0);
 
     u32 cw[8];
     for (int i = 0; i < 8; i++)
@@ -293,6 +304,7 @@ static void build_scene_typed(rsx_nir_emitter* em)
     fp.offset = 0x00124500u;                     /* location bits stripped   */
     fp.location = RSX_NIR_LOCATION_LOCAL;
     fp.control = 0x00000400u;
+    fp.shader_window = 0x1000u;
     rsx_nir_em_fragment_program(em, &fp);
 
     rsx_nir_texture t;
@@ -321,6 +333,11 @@ static void build_scene_typed(rsx_nir_emitter* em)
     ds.depth_test_enable = 1;
     ds.depth_func = 0x0203;
     ds.depth_write_enable = 1;
+    ds.stencil_mask = 0xFFu;
+    ds.stencil_write_mask = 0xFFu;
+    ds.back_stencil_mask = 0xFFu;
+    ds.back_stencil_write_mask = 0xFFu;
+    ds.depth_bounds_max = 0x3F800000u;
     rsx_nir_em_depth_stencil(em, &ds);
 
     /* draw 1 */
@@ -568,7 +585,7 @@ static void test_fifo_front_end(void)
      * the adapter already staged at the CLEAR action. */
     rsx_nir_adapter_method(&ab, M_CLEAR_COLOR, 0xAABBCCDDu);
     rsx_nir_adapter_method(&ab, M_CLEAR_BUFFERS, 0xF3);
-    rsx_nir_em_semaphore_release(&ab.em, 0, 0x30, 99, 0);
+    rsx_nir_em_semaphore_release(&ab.em, 0x66616661u, 0x30, 99, 2);
     rsx_nir_adapter_method(&ab, M_GCM_FLIP, 0);
 
     char err[256] = {0};
@@ -1082,7 +1099,7 @@ static void test_reference_user_tokens(void)
     rsx_nir_emitter_init_stream(&em, &sb);
     typed_stage_defaults(&em);
     rsx_nir_em_set_reference(&em, 0xBEEF);
-    rsx_nir_em_semaphore_acquire(&em, 0, 0x3A0, 0x12345678);
+    rsx_nir_em_semaphore_acquire(&em, 0x66616661u, 0x3A0, 0x12345678);
     rsx_nir_em_user_command(&em, 7);
 
     char err[256] = {0};
@@ -1322,6 +1339,7 @@ typedef struct exec_rec {
     int report_result;
     u32 user_cause;
     u32 flushes;
+    u32 last_sem_kind;
 } exec_rec;
 
 static void rec_add(exec_rec* r, char k)
@@ -1380,7 +1398,8 @@ static void rec_flush(void* u) { ((exec_rec*)u)->flushes++; }
 static void rec_sem_write(void* u, u32 dma, u32 offset, u32 value, u32 tex)
 {
     exec_rec* r = u;
-    (void)dma; (void)tex;
+    (void)dma;
+    r->last_sem_kind = tex;
     rec_add(r, 's');
     if ((offset >> 4) < 256)
         r->labels[offset >> 4] = value;
@@ -1480,6 +1499,13 @@ static void test_backend_core(void)
     rsx_nr_backend_run(&be, 0);
     CHECK(rec.labels[6] == 0xAADDCCBBu, "backend BE swizzle %08X",
           rec.labels[6]);
+    /* NV406E is a distinct verbatim release kind.  Device-credit adjustment
+     * belongs to the embedder after this core callback. */
+    rsx_nir_em_semaphore_release(&em, 0, 0x70, 0x11223344u, 2);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.labels[7] == 0x11223344u && rec.last_sem_kind == 2u,
+          "backend NV406E release value=%08X kind=%u",
+          rec.labels[7], rec.last_sem_kind);
 
     const u32 flushes_before_report = rec.flushes;
     rsx_nir_em_report(&em, 0, 0x01000080u, 0x66626660u);
@@ -2165,6 +2191,219 @@ static void test_shadow_terminal_action(void)
     rsx_nir_stream_free(&s);
 }
 
+static void test_section_method_support(void)
+{
+    rsx_nir_stream stream;
+    rsx_nir_stream_init(&stream);
+    rsx_nir_adapter ad;
+    rsx_nir_adapter_init(&ad, &stream);
+    CHECK(ad.fifo_semaphore_dma == 0x66616661u,
+          "NV406E reset semaphore DMA %08X", ad.fifo_semaphore_dma);
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0050u, 0u),
+          "SET_REFERENCE not section-supported");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0068u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x006Cu, 0u),
+          "NV406E semaphore family not section-supported");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x1D94u, 0u),
+          "CLEAR_SURFACE not section-supported");
+    CHECK(rsx_nir_adapter_method_supported(
+              &ad, M_RENDER_ENABLE, 0x01000000u) &&
+              rsx_nir_adapter_method_supported(
+                  &ad, M_RENDER_ENABLE, 0x020045A0u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, M_RENDER_ENABLE, 0x000045A0u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, M_RENDER_ENABLE, 0x030045A0u),
+          "conditional-render modes were not fenced exactly");
+    rsx_nir_adapter_method(&ad, M_CONTEXT_REPORT, 0x66626660u);
+    rsx_nir_adapter_method(&ad, M_RENDER_ENABLE, 0x020045A0u);
+    rsx_nir_adapter_method(&ad, M_CONTEXT_REPORT, 0x66626661u);
+    rsx_nir_adapter_stage_state(&ad);
+    CHECK(ad.em.pending.render_condition.enabled == 1u &&
+              ad.em.pending.render_condition.dma_report == 0x66626660u &&
+              ad.em.pending.render_condition.offset == 0x45A0u,
+          "conditional report binding was retargeted after SET_RENDER_ENABLE");
+    rsx_nir_adapter_method(&ad, M_RENDER_ENABLE, 0x01000000u);
+    rsx_nir_adapter_stage_state(&ad);
+    CHECK(ad.em.pending.render_condition.enabled == 0u,
+          "conditional-render disable was not retained");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0xE924u, 0u),
+          "typed present companion not section-supported");
+    CHECK(!rsx_nir_adapter_method_supported(&ad, 0x0004u, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0xFFFFCu, 0u),
+          "unknown methods incorrectly section-supported");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x1D78u, 1u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1D78u, 0u),
+          "ZMIN/MAX non-default mode was not fenced");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x02B8u, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x02B8u, 1u),
+          "window-offset non-default mode was not fenced");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0380u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0380u, 1u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0380u, 2u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0384u, 0x3F000000u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0388u, 0x3F800000u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0384u, 0x7F800000u),
+          "depth-bounds register family was not represented/fenced exactly");
+    rsx_nir_adapter_method(&ad, 0x0384u, 0x3F000000u);
+    rsx_nir_adapter_method(&ad, 0x0388u, 0x3F600000u);
+    rsx_nir_adapter_method(&ad, 0x0380u, 1u);
+    rsx_nir_adapter_stage_state(&ad);
+    CHECK(ad.em.pending.depth_stencil.depth_bounds_test_enable == 1u &&
+              ad.em.pending.depth_stencil.depth_bounds_min == 0x3F000000u &&
+              ad.em.pending.depth_stencil.depth_bounds_max == 0x3F600000u,
+          "depth-bounds register state was not retained in typed state");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x1828u, 0x1B02u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1828u, 0x1B01u),
+          "non-fill polygon mode was not fenced");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0A60u, 1u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0A64u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0A68u, 1u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0A68u, 2u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0A78u, 0x3FC00000u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0A7Cu, 0xC0000000u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0A78u, 0x7F800000u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0A7Cu, 0x7FC00000u),
+          "polygon-offset state was not represented/fenced exactly");
+    rsx_nir_adapter_method(&ad, 0x0A60u, 1u);
+    rsx_nir_adapter_method(&ad, 0x0A64u, 0u);
+    rsx_nir_adapter_method(&ad, 0x0A68u, 1u);
+    rsx_nir_adapter_method(&ad, 0x0A78u, 0x3FC00000u);
+    rsx_nir_adapter_method(&ad, 0x0A7Cu, 0xC0000000u);
+    rsx_nir_adapter_stage_state(&ad);
+    CHECK(ad.em.pending.raster.polygon_offset_point_enable == 1u &&
+              ad.em.pending.raster.polygon_offset_line_enable == 0u &&
+              ad.em.pending.raster.polygon_offset_fill_enable == 1u &&
+              ad.em.pending.raster.polygon_offset_scale == 0x3FC00000u &&
+              ad.em.pending.raster.polygon_offset_bias == 0xC0000000u,
+          "polygon-offset register state was not retained in typed raster");
+    CHECK(rsx_nir_adapter_method_supported(
+              &ad, 0xC198u, 0x313371C3u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0xC198u, 0x31337A73u),
+          "NV3089 non-SURFACE2D context was not fenced");
+    rsx_nir_adapter_method(&ad, 0xC198u, 0x313371C3u);
+    CHECK(ad.sif_context_surface == 0x313371C3u,
+          "NV3089 surface context was not retained");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x1D88u, 0x102D0u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0x1D88u, 0x00200000u),
+          "shader-window validation mismatch");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0348u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0348u, 1u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0348u, 2u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1FF8u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1FF8u, 0x100u),
+          "two-sided stencil/VP branch routing was not fenced correctly");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x034Cu, 0xFFu) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0350u, 0x0203u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0354u, 0x12u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0358u, 0xFFu) &&
+              rsx_nir_adapter_method_supported(&ad, 0x035Cu, 0x1E00u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0360u, 0x1E01u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0364u, 0x1E02u),
+          "complete back-stencil family was not section-supported");
+    rsx_nir_adapter_method(&ad, 0x034Cu, 0xFFu);
+    rsx_nir_adapter_method(&ad, 0x0350u, 0x0203u);
+    rsx_nir_adapter_method(&ad, 0x0354u, 0x12u);
+    rsx_nir_adapter_method(&ad, 0x0358u, 0xFFu);
+    rsx_nir_adapter_method(&ad, 0x035Cu, 0x1E00u);
+    rsx_nir_adapter_method(&ad, 0x0360u, 0x1E01u);
+    rsx_nir_adapter_method(&ad, 0x0364u, 0x1E02u);
+    rsx_nir_adapter_method(&ad, 0x0348u, 1u);
+    rsx_nir_adapter_stage_state(&ad);
+    CHECK(ad.em.pending.depth_stencil.two_sided_stencil_enable == 1u &&
+              ad.em.pending.depth_stencil.back_stencil_write_mask == 0xFFu &&
+              ad.em.pending.depth_stencil.back_stencil_func == 0x0203u &&
+              ad.em.pending.depth_stencil.back_stencil_ref == 0x12u &&
+              ad.em.pending.depth_stencil.back_stencil_mask == 0xFFu &&
+              ad.em.pending.depth_stencil.back_stencil_op_fail == 0x1E00u &&
+              ad.em.pending.depth_stencil.back_stencil_op_zfail == 0x1E01u &&
+              ad.em.pending.depth_stencil.back_stencil_op_zpass == 0x1E02u,
+          "back-face stencil register state was not retained in typed state");
+    rsx_nir_adapter_method(&ad, 0x0348u, 0u);
+    CHECK(rsx_nir_adapter_method_supported(
+              &ad, 0x03B0u, 0x00100000u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x03B0u, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x0300u, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0300u, 1u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1EE4u, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1EE4u, 1u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1EE8u, 0x100u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1EE8u, 0x101u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1EA4u, 0x10u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1EA4u, 0x11u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1EA8u, 0x01000100u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x1EACu, 0xFF000002u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1EACu, 0u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x17CCu, 1u) &&
+              rsx_nir_adapter_method_supported(
+                  &ad, 0x1D7Cu, 0xFFFF0000u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1D7Cu, 1u),
+          "default CONTROL0/dither/point/query/AA modes were not fenced exactly");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0908u, 0x303u) &&
+              rsx_nir_adapter_method_supported(&ad, 0x090Cu, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0980u, 0u),
+          "vertex-texture register family routing mismatch");
+    CHECK(rsx_nir_adapter_method_supported(
+              &ad, 0xC2FCu, 1u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0xC2FCu, 3u),
+          "NV3089 non-default color conversion was not fenced");
+    rsx_nir_adapter_method(&ad, 0xC2FCu, 1u);
+    CHECK(ad.sif_color_conversion == 1u,
+          "NV3089 color conversion was not retained");
+    rsx_nir_stream_free(&stream);
+}
+
+static void test_adapter_copy_rebind(void)
+{
+    rsx_nir_stream source_stream, section_stream;
+    rsx_nir_stream_init(&source_stream);
+    rsx_nir_stream_init(&section_stream);
+    rsx_nir_adapter source;
+    rsx_nir_adapter section;
+    rsx_nir_adapter_init(&source, &source_stream);
+    source.shadow_mode = 1;
+
+    /* Model the live transactional snapshot. The copied dispatch sink still
+     * points at source until the explicit rebind. Dispatch-based DRAW must be
+     * emitted into the section stream and must not mutate the shadow owner. */
+    section = source;
+    section.em.out = rsx_nir_stream_sink(&section_stream);
+    section.shadow_mode = 0;
+    rsx_nir_adapter_rebind(&section);
+    rsx_nir_adapter_method(&section, M_BEGIN_END, 5u);
+    rsx_nir_adapter_method(&section, M_DRAW_ARRAYS,
+                           (2u << 24) | 7u);
+    rsx_nir_adapter_method(&section, M_BEGIN_END, 0u);
+    CHECK(section_stream.op_count &&
+              section_stream.ops[section_stream.op_count - 1u].kind ==
+                  RSX_NIR_OP_DRAW,
+          "copied/rebound section adapter did not emit DRAW");
+    CHECK(source_stream.op_count == 0u && source.batch_count == 0u,
+          "section dispatch escaped into the persistent shadow adapter");
+
+    /* Model committing the section snapshot back to the persistent owner.
+     * Its callback pointer must likewise be rebound away from the temporary. */
+    const u32 section_ops = section_stream.op_count;
+    source = section;
+    source.em.out = rsx_nir_stream_sink(&source_stream);
+    source.shadow_mode = 0;
+    rsx_nir_adapter_rebind(&source);
+    rsx_nir_adapter_method(&source, M_CLEAR_COLOR, 0x11223344u);
+    rsx_nir_adapter_method(&source, M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(source_stream.op_count &&
+              source_stream.ops[source_stream.op_count - 1u].kind ==
+                  RSX_NIR_OP_CLEAR,
+          "committed/rebound persistent adapter did not emit CLEAR");
+    CHECK(section_stream.op_count == section_ops,
+          "committed adapter dispatch targeted the temporary section");
+
+    rsx_nir_adapter_rebind(0);
+    rsx_nir_stream_free(&section_stream);
+    rsx_nir_stream_free(&source_stream);
+}
+
 int main(int argc, char** argv)
 {
     test_fifo_vs_typed();
@@ -2187,6 +2426,8 @@ int main(int argc, char** argv)
     test_intercept_backend_end_to_end();
     test_live_draw_end_bridge_shape();
     test_shadow_terminal_action();
+    test_section_method_support();
+    test_adapter_copy_rebind();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])

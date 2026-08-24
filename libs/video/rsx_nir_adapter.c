@@ -39,6 +39,7 @@
 #define M_WAIT_FOR_IDLE         0x0110
 #define M_CONTEXT_DMA_REPORT    0x01A8
 #define M_ALPHA_TEST_ENABLE     0x0304
+#define M_DITHER_ENABLE         0x0300
 #define M_ALPHA_FUNC            0x0308
 #define M_ALPHA_REF             0x030C
 #define M_BLEND_ENABLE          0x0310
@@ -48,6 +49,7 @@
 #define M_BLEND_EQUATION        0x0320
 #define M_COLOR_MASK            0x0324
 #define M_STENCIL_TEST_ENABLE   0x0328
+#define M_STENCIL_WRITE_MASK    0x032C
 #define M_STENCIL_FUNC          0x0330
 #define M_STENCIL_FUNC_REF      0x0334
 #define M_STENCIL_FUNC_MASK     0x0338
@@ -55,27 +57,64 @@
 #define M_STENCIL_OP_ZFAIL      0x0340
 #define M_STENCIL_OP_ZPASS      0x0344
 #define M_MRT_COLOR_MASK        0x0370
+#define M_CONTROL0              0x03B0
+#define M_WINDOW_OFFSET         0x02B8
+#define M_DEPTH_BOUNDS_ENABLE   0x0380
+#define M_DEPTH_BOUNDS_MIN      0x0384
+#define M_DEPTH_BOUNDS_MAX      0x0388
 #define M_CLIP_MIN              0x0394
 #define M_CLIP_MAX              0x0398
 #define M_SCISSOR_HORIZ         0x08C0
 #define M_SCISSOR_VERT          0x08C4
+#define M_VERTEX_TEXTURE        0x0900
+#define M_TEXCOORD_CONTROL      0x0B40
+#define M_POLY_OFFSET_POINT_EN  0x0A60
+#define M_POLY_OFFSET_LINE_EN   0x0A64
+#define M_POLY_OFFSET_FILL_EN   0x0A68
 #define M_DEPTH_FUNC            0x0A6C
 #define M_DEPTH_WRITE_ENABLE    0x0A70
 #define M_DEPTH_TEST_ENABLE     0x0A74
+#define M_POLY_OFFSET_SCALE     0x0A78
+#define M_POLY_OFFSET_BIAS      0x0A7C
 #define M_CLEAR_REPORT_VALUE    0x17C8
+#define M_ZPASS_COUNT_ENABLE    0x17CC
+#define M_ZCULL_CONTROL0        0x1EA4
+#define M_ZCULL_CONTROL1        0x1EA8
+#define M_SCULL_CONTROL         0x1EAC
 #define M_GET_REPORT            0x1800
+#define M_RENDER_ENABLE         0x1E98
 #define M_CULL_FACE             0x1830
 #define M_FRONT_FACE            0x1834
 #define M_CULL_FACE_ENABLE      0x183C
+#define M_POLYGON_MODE_FRONT    0x1828
+#define M_POLYGON_MODE_BACK     0x182C
 #define M_SEMAPHORE_OFFSET_3D   0x1D6C
 #define M_BACK_END_SEM_RELEASE  0x1D70
 #define M_TEX_READ_SEM_RELEASE  0x1D74
+#define M_ZMIN_MAX_CONTROL      0x1D78
+#define M_ANTI_ALIAS_CONTROL    0x1D7C
 #define M_CLEAR_COLOR_VALUE     0x1D90
 #define M_CLEAR_DEPTH_VALUE     0x1D8C
+#define M_SHADER_WINDOW         0x1D88
 #define M_VP_UPLOAD_CONST_ID    0x1EFC
 #define M_VP_UPLOAD_CONST       0x1F00
 #define M_VP_ATTRIB_EN          0x1FF0
 #define M_VP_RESULT_EN          0x1FF4
+#define M_FREQUENCY_DIVIDER_OP  0x1FC0
+#define M_INVALIDATE_L2         0x1FD8
+#define M_INVALIDATE_VERTEX     0x1710
+#define M_TRANSFORM_TIMEOUT     0x1EF8
+#define M_TRANSFORM_BRANCH_BITS 0x1FF8
+#define M_POINT_PARAMS_ENABLE   0x1EE4
+#define M_POINT_SPRITE_CONTROL  0x1EE8
+#define M_TWO_SIDED_STENCIL     0x0348
+#define M_BACK_STENCIL_MASK     0x034C
+#define M_BACK_STENCIL_FUNC     0x0350
+#define M_BACK_STENCIL_FUNC_REF 0x0354
+#define M_BACK_STENCIL_FUNC_MASK 0x0358
+#define M_BACK_STENCIL_OP_FAIL  0x035C
+#define M_BACK_STENCIL_OP_ZFAIL 0x0360
+#define M_BACK_STENCIL_OP_ZPASS 0x0364
 #define M_USER_COMMAND_CAUSE    0xEB00
 #define M_USER_COMMAND_FIRE     0xEB04
 
@@ -116,6 +155,8 @@
 
 /* NV3089 (sub 6) */
 #define M3089_DMA_IMAGE         0xC184
+#define M3089_CONTEXT_SURFACE   0xC198
+#define M3089_COLOR_CONVERSION  0xC2FC
 #define M3089_COLOR_FORMAT      0xC300
 #define M3089_OPERATION         0xC304
 #define M3089_CLIP_POINT        0xC308
@@ -128,6 +169,8 @@
 #define M3089_IN_FORMAT         0xC404
 #define M3089_IN_OFFSET         0xC408
 #define M3089_IN_POINT          0xC40C
+
+#define GCM_CONTEXT_SURFACE2D   0x313371C3u
 
 /* DMA context handles: bit 0 of the gcm dma selector picks main memory
  * (matching rsx_dispatch.c's location decode for surfaces/textures). */
@@ -217,24 +260,48 @@ static void stage_state(rsx_nir_adapter* ad)
     ra.cull_face_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE);
     ra.cull_face        = rsx_dsp_reg(rsx, M_CULL_FACE);
     ra.front_face       = rsx_dsp_reg(rsx, M_FRONT_FACE);
+    ra.polygon_offset_point_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_POINT_EN);
+    ra.polygon_offset_line_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_LINE_EN);
+    ra.polygon_offset_fill_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_FILL_EN);
+    ra.polygon_offset_scale = rsx_dsp_reg(rsx, M_POLY_OFFSET_SCALE);
+    ra.polygon_offset_bias  = rsx_dsp_reg(rsx, M_POLY_OFFSET_BIAS);
     ra.color_mask       = rsx_dsp_reg(rsx, M_COLOR_MASK);
     ra.mrt_color_mask   = rsx_dsp_reg(rsx, M_MRT_COLOR_MASK);
     rsx_nir_em_raster(em, &ra);
 
-    /* depth/stencil (front-face stencil; the two-sided extension block is
-     * not modeled yet — honest gap, mirrored by both producers) */
+    /* Complete front/back stencil state. D3D12 shares read/write masks and
+     * the dynamic reference between both faces; draw preflight therefore
+     * keeps unequal front/back values on the whole-section legacy path. */
     rsx_nir_depth_stencil ds;
     memset(&ds, 0, sizeof(ds));
     ds.depth_test_enable   = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE);
     ds.depth_func          = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
     ds.depth_write_enable  = rsx_dsp_reg(rsx, M_DEPTH_WRITE_ENABLE);
+    ds.depth_bounds_test_enable =
+        rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE);
+    ds.depth_bounds_min = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MIN);
+    ds.depth_bounds_max = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MAX);
     ds.stencil_test_enable = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE);
     ds.stencil_func        = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
     ds.stencil_ref         = rsx_dsp_reg(rsx, M_STENCIL_FUNC_REF);
     ds.stencil_mask        = rsx_dsp_reg(rsx, M_STENCIL_FUNC_MASK);
+    ds.stencil_write_mask  = rsx_dsp_reg(rsx, M_STENCIL_WRITE_MASK);
     ds.stencil_op_fail     = rsx_dsp_reg(rsx, M_STENCIL_OP_FAIL);
     ds.stencil_op_zfail    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZFAIL);
     ds.stencil_op_zpass    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZPASS);
+    ds.two_sided_stencil_enable =
+        rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL);
+    ds.back_stencil_write_mask =
+        rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK);
+    ds.back_stencil_func = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC);
+    ds.back_stencil_ref = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_REF);
+    ds.back_stencil_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK);
+    ds.back_stencil_op_fail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
+    ds.back_stencil_op_zfail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
+    ds.back_stencil_op_zpass = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
     rsx_nir_em_depth_stencil(em, &ds);
 
     /* blend + alpha test */
@@ -249,12 +316,18 @@ static void stage_state(rsx_nir_adapter* ad)
     bl.alpha_func        = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
     bl.alpha_ref         = rsx_dsp_reg(rsx, M_ALPHA_REF);
     rsx_nir_em_blend(em, &bl);
+    rsx_nir_em_render_condition(em, &ad->render_condition);
 
     /* fragment program */
     rsx_nir_fragment_program fp;
     memset(&fp, 0, sizeof(fp));
     fp.offset  = rsx_dsp_fragment_program(rsx, &fp.location);
     fp.control = rsx_dsp_shader_control(rsx);
+    fp.shader_window = rsx_dsp_reg(rsx, M_SHADER_WINDOW);
+    for (u32 unit = 0; unit < 10u; ++unit)
+        fp.texcoord_2d_mask |=
+            (rsx_dsp_reg(rsx, M_TEXCOORD_CONTROL + unit * 4u) & 1u)
+            << unit;
     rsx_nir_em_fragment_program(em, &fp);
 
     /* vertex program */
@@ -263,7 +336,8 @@ static void stage_state(rsx_nir_adapter* ad)
     rsx_nir_em_vertex_program(em, vp_start,
                               rsx->vp + vp_start * 4, vp_words,
                               rsx_dsp_reg(rsx, M_VP_ATTRIB_EN),
-                              rsx_dsp_reg(rsx, M_VP_RESULT_EN));
+                              rsx_dsp_reg(rsx, M_VP_RESULT_EN),
+                              rsx_dsp_reg(rsx, M_TRANSFORM_BRANCH_BITS));
 
     /* vertex bindings */
     rsx_nir_vertex_bindings vb;
@@ -281,7 +355,7 @@ static void stage_state(rsx_nir_adapter* ad)
     }
     vb.base_offset = rsx_dsp_vertex_data_base_offset(rsx);
     vb.base_index  = rsx_dsp_vertex_data_base_index(rsx);
-    vb.freq_divider_op = rsx_dsp_reg(rsx, 0x1FC0);
+    vb.freq_divider_op = rsx_dsp_reg(rsx, M_FREQUENCY_DIVIDER_OP);
     rsx_nir_em_vertex_bindings(em, &vb);
 
     /* index binding */
@@ -485,6 +559,12 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
 
 /* ---- public ------------------------------------------------------------ */
 
+void rsx_nir_adapter_rebind(rsx_nir_adapter* ad)
+{
+    if (ad)
+        ad->rsx.sink.user = ad;
+}
+
 void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
 {
     memset(ad, 0, sizeof(*ad));
@@ -500,6 +580,7 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
     sink.draw_index_array = sink_draw_index_array;
     sink.flip = sink_flip;
     rsx_dispatch_init(&ad->rsx, &sink);
+    rsx_nir_adapter_rebind(ad);
 
     /* NV308A defaults matching the live consumer's initializers.
      * 0xB = CELL_GCM_TRANSFER_SURFACE_FORMAT_Y32, the SDK inline-
@@ -508,6 +589,12 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
     ad->s2d_pitch = 64;
     ad->s2d_color_format = 0xB;
     ad->inline_size_out = 0x00010001;
+    ad->sif_context_surface = GCM_CONTEXT_SURFACE2D;
+    ad->sif_color_conversion = 1u;
+    /* NV406E's reset context matches the live FIFO engine.  Leaving this at
+     * memset-zero made a section beginning with OFFSET/ACQUIRE unresolvable
+     * until the title happened to issue SET_CONTEXT_DMA_SEMAPHORE. */
+    ad->fifo_semaphore_dma = 0x66616661u;
 }
 
 void rsx_nir_adapter_init(rsx_nir_adapter* ad, rsx_nir_stream* out)
@@ -564,12 +651,185 @@ static int fifo_engine_method(rsx_nir_adapter* ad, u32 m, u32 arg)
             return 1;
         stage_state(ad);
         rsx_nir_em_semaphore_release(&ad->em, ad->fifo_semaphore_dma,
-                                     ad->fifo_semaphore_offset, arg, 0);
+                                     ad->fifo_semaphore_offset, arg, 2);
         ad->actions_seen++;
         return 1;
     default:
         return m < 0x80;   /* other FIFO-engine controls: consumed, no op  */
     }
+}
+
+int rsx_nir_adapter_method_supported(
+    const rsx_nir_adapter* ad, u32 method, u32 arg)
+{
+    if (!ad)
+        return 0;
+    method &= 0xFFFFCu;
+    if (method < 0x100u) {
+        switch (method) {
+        case M406E_SET_REFERENCE:
+        case M406E_SET_CTX_DMA_SEM:
+        case M406E_SEMAPHORE_OFFSET:
+        case M406E_SEMAPHORE_ACQUIRE:
+        case M406E_SEMAPHORE_RELEASE:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+
+    switch (method) {
+    case M_WAIT_FOR_IDLE:
+    case M_CONTEXT_DMA_REPORT:
+    case M_CTX_DMA_SEMAPHORE_3D:
+    case M_SEMAPHORE_OFFSET_3D:
+    case M_BACK_END_SEM_RELEASE:
+    case M_TEX_READ_SEM_RELEASE:
+    case M_CLEAR_REPORT_VALUE:
+    case M_GET_REPORT:
+    case M_USER_COMMAND_CAUSE:
+    case M_USER_COMMAND_FIRE:
+    case 0xE924u: /* typed PRESENT publishes the companion head package */
+    case M0039_DMA_BUFFER_IN:
+    case M0039_DMA_BUFFER_OUT:
+    case M0039_OFFSET_IN:
+    case M0039_OFFSET_OUT:
+    case M0039_PITCH_IN:
+    case M0039_PITCH_OUT:
+    case M0039_LINE_LENGTH_IN:
+    case M0039_LINE_COUNT:
+    case M0039_FORMAT:
+    case M0039_BUFFER_NOTIFY:
+    case M3062_DMA_IMAGE_SOURCE:
+    case M3062_DMA_IMAGE_DESTIN:
+    case M3062_COLOR_FORMAT:
+    case M3062_PITCH:
+    case M3062_OFFSET_SOURCE:
+    case M3062_OFFSET_DESTIN:
+    case M308A_POINT:
+    case M308A_SIZE_OUT:
+    case M308A_SIZE_IN:
+    case M3089_DMA_IMAGE:
+    case M3089_COLOR_FORMAT:
+    case M3089_OPERATION:
+    case M3089_CLIP_POINT:
+    case M3089_CLIP_SIZE:
+    case M3089_OUT_POINT:
+    case M3089_OUT_SIZE:
+    case M3089_DS_DX:
+    case M3089_DT_DY:
+    case M3089_IN_SIZE:
+    case M3089_IN_FORMAT:
+    case M3089_IN_OFFSET:
+    case M3089_IN_POINT:
+        return 1;
+    default:
+        break;
+    }
+    if (method >= M308A_COLOR_FIRST && method <= M308A_COLOR_LAST)
+        return 1;
+    /* Preserve the complete four-unit vertex-texture register file in typed
+     * state.  Draw preflight currently rejects enabled vertex textures and
+     * TXL microcode, while ordinary disabled register programming is inert. */
+    if (method >= M_VERTEX_TEXTURE &&
+        method < M_VERTEX_TEXTURE + RSX_NIR_NUM_VERTEX_TEXTURES * 0x20u)
+        return 1;
+    /* These stored-register methods are completely represented by the
+     * derived typed state staged above, or are cache/scheduler hints whose
+     * ordering is conservatively covered by the exact dirty-page mirror.
+     * ZMIN_MAX is accepted only in the title's captured hardware-default
+     * mode: normal depth clipping on, clamp/ignore-W off. */
+    if (method == M_CLIP_MIN || method == M_CLIP_MAX ||
+        method == M_SCISSOR_HORIZ || method == M_SCISSOR_VERT ||
+        method == M_FREQUENCY_DIVIDER_OP ||
+        (method >= M_STENCIL_TEST_ENABLE &&
+         method <= M_STENCIL_OP_ZPASS) ||
+        (method >= M_TEXCOORD_CONTROL &&
+         method < M_TEXCOORD_CONTROL + 10u * 4u) ||
+        method == 0x036Cu || /* MRT blend: preflight requires TARGET_0 */
+        method == M_INVALIDATE_VERTEX || method == M_INVALIDATE_L2 ||
+        method == M_TRANSFORM_TIMEOUT)
+        return 1;
+    if (method == M_SHADER_WINDOW) {
+        const u32 origin = (arg >> 12) & 0xFu;
+        const u32 center = (arg >> 16) & 0xFu;
+        return origin <= 1u && center <= 1u && !(arg & 0xFFF00000u);
+    }
+    if (method == M_TWO_SIDED_STENCIL)
+        return arg <= 1u;
+    /* The branch register is retained in typed vertex-program state. Native
+     * admission still validates the exact bound microcode before a complete
+     * section can be owned. */
+    if (method == M_TRANSFORM_BRANCH_BITS)
+        return 1;
+    /* Back-face stencil is fully retained in typed state. Whether D3D12 can
+     * represent its independent masks/reference is decided against the
+     * complete folded draw state during transactional preflight. */
+    if (method >= M_BACK_STENCIL_MASK &&
+        method <= M_BACK_STENCIL_OP_ZPASS)
+        return 1;
+    if (method == M_CONTROL0)
+        return arg == 0x00100000u;
+    /* D3D12 has no fixed-function color dithering equivalent.  The title's
+     * live production stream explicitly disables it, which is bit-exactly
+     * represented by doing nothing.  Keep enabled dithering on legacy. */
+    if (method == M_DITHER_ENABLE)
+        return arg == 0u;
+    /* Point-distance attenuation is absent from the native pipeline.  The
+     * captured title state explicitly disables it; admit only that exact
+     * mode and retain legacy ownership for the enabled hardware feature. */
+    if (method == M_POINT_PARAMS_ENABLE)
+        return arg == 0u;
+    /* Bit 0 is the actual point-sprite enable; bits 8..17 are texcoord
+     * replacement masks and are inert while disabled.  Admit the hardware
+     * reset and the title's exact disabled/TEX0-mask form only. */
+    if (method == M_POINT_SPRITE_CONTROL)
+        return arg == 0u || arg == 0x100u;
+    if (method == M_ZPASS_COUNT_ENABLE)
+        return arg <= 1u;
+    if (method == M_RENDER_ENABLE) {
+        const u32 mode = arg >> 24;
+        return mode == 1u || mode == 2u;
+    }
+    /* ZCULL configuration changes the hardware early-Z accelerator, not
+     * rasterization results.  Reports on this path already use the same
+     * defined zero-count contract as legacy.  Fence to the captured mode. */
+    if (method == M_ZCULL_CONTROL0)
+        return arg == 0x10u;
+    if (method == M_ZCULL_CONTROL1)
+        return arg == 0x01000100u;
+    if (method == M_SCULL_CONTROL)
+        return arg == 0xFF000002u;
+    if (method == M_ANTI_ALIAS_CONTROL)
+        return arg == 0xFFFF0000u;
+    /* The native backend currently implements the hardware-default variants
+     * of these controls.  Admit only those exact values; other modes keep the
+     * complete section on the legacy path. */
+    if (method == M_WINDOW_OFFSET)
+        return arg == 0u;
+    if (method == M_DEPTH_BOUNDS_ENABLE)
+        return arg <= 1u;
+    if (method == M_DEPTH_BOUNDS_MIN || method == M_DEPTH_BOUNDS_MAX)
+        return ((arg >> 23) & 0xFFu) != 0xFFu; /* finite IEEE-754 only */
+    if (method == M_POLYGON_MODE_FRONT || method == M_POLYGON_MODE_BACK)
+        return arg == 0x1B02u; /* CELL_GCM_POLYGON_MODE_FILL */
+    if (method == M_POLY_OFFSET_POINT_EN ||
+        method == M_POLY_OFFSET_LINE_EN ||
+        method == M_POLY_OFFSET_FILL_EN)
+        return arg <= 1u;
+    if (method == M_POLY_OFFSET_SCALE || method == M_POLY_OFFSET_BIAS)
+        return ((arg >> 23) & 0xFFu) != 0xFFu; /* finite IEEE-754 only */
+    if (method == M3089_CONTEXT_SURFACE)
+        return arg == GCM_CONTEXT_SURFACE2D;
+    if (method == M3089_COLOR_CONVERSION)
+        return arg == 1u;
+    if (method == M3089_OPERATION)
+        return arg == 3u; /* CELL_GCM_TRANSFER_OPERATION_SRCCOPY */
+    if (method == M_ZMIN_MAX_CONTROL)
+        return arg == 1u;
+    if (method >= 0x10000u)
+        return 0;
+    return ad->rsx.klass[method >> 2] != RSX_DSP_CLASS_TODO;
 }
 
 void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
@@ -595,6 +855,19 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
     /* ordered synchronization + data moves the register-file model stores
      * silently */
     switch (method) {
+    case M_RENDER_ENABLE: {
+        const u32 mode = arg >> 24;
+        if (mode == 1u) {
+            memset(&ad->render_condition, 0,
+                   sizeof(ad->render_condition));
+        } else if (mode == 2u) {
+            ad->render_condition.enabled = 1u;
+            ad->render_condition.dma_report =
+                rsx_dsp_reg(&ad->rsx, M_CONTEXT_DMA_REPORT);
+            ad->render_condition.offset = arg & 0x00FFFFFFu;
+        }
+        break;
+    }
     case M_WAIT_FOR_IDLE:
         if (ad->shadow_mode)
             break;
@@ -697,6 +970,12 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
 
     /* NV3089 scaled image */
     case M3089_DMA_IMAGE:    ad->sif_dma_src = arg; break;
+    case M3089_CONTEXT_SURFACE:
+        ad->sif_context_surface = arg;
+        break;
+    case M3089_COLOR_CONVERSION:
+        ad->sif_color_conversion = arg;
+        break;
     case M3089_COLOR_FORMAT: ad->sif_color_format = arg; break;
     case M3089_OPERATION:    ad->sif_operation = arg; break;
     case M3089_CLIP_POINT:   ad->sif_clip_point = arg; break;
@@ -723,7 +1002,7 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         t.dst_offset   = ad->s2d_offset_dst;
         t.dst_pitch    = ad->s2d_pitch & 0xFFFFu;
         t.dst_format   = ad->s2d_color_format;
-        t.in_x  = arg & 0xFFFFu;             /* raw 16.16 via IN_POINT  */
+        t.in_x  = arg & 0xFFFFu;             /* raw 12.4 via IN_POINT   */
         t.in_y  = arg >> 16;
         t.in_w  = ad->sif_in_size & 0xFFFFu;
         t.in_h  = ad->sif_in_size >> 16;

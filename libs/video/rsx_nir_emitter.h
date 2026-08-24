@@ -60,6 +60,8 @@ void rsx_nir_em_scissor(rsx_nir_emitter* em, const rsx_nir_scissor* s);
 void rsx_nir_em_raster(rsx_nir_emitter* em, const rsx_nir_raster* r);
 void rsx_nir_em_depth_stencil(rsx_nir_emitter* em, const rsx_nir_depth_stencil* d);
 void rsx_nir_em_blend(rsx_nir_emitter* em, const rsx_nir_blend* b);
+void rsx_nir_em_render_condition(rsx_nir_emitter* em,
+                                 const rsx_nir_render_condition* c);
 void rsx_nir_em_fragment_program(rsx_nir_emitter* em, const rsx_nir_fragment_program* f);
 void rsx_nir_em_vertex_bindings(rsx_nir_emitter* em, const rsx_nir_vertex_bindings* v);
 void rsx_nir_em_index_binding(rsx_nir_emitter* em, const rsx_nir_index_binding* i);
@@ -72,7 +74,8 @@ void rsx_nir_em_constants(rsx_nir_emitter* em, u32 first_slot, u32 slot_count,
 
 void rsx_nir_em_vertex_program(rsx_nir_emitter* em, u32 start_slot,
                                const u32* words, u32 word_count,
-                               u32 attrib_input_mask, u32 attrib_output_mask);
+                               u32 attrib_input_mask, u32 attrib_output_mask,
+                               u32 branch_bits);
 
 /* ---- actions (flush dirty state, then append the action op) ----------- */
 

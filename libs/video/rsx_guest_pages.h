@@ -11,9 +11,12 @@
  *     RSX_LOCATION_LOCAL (0, the GDDR carve) and RSX_LOCATION_MAIN (1, the
  *     IO-mapped XDR window).  Offsets are the same byte offsets the draw
  *     path already uses with rsx_live_guest_ptr_fn.
- *   - Every 4 KiB page carries a 32-bit generation counter that increments
- *     on every write notification covering the page.  Every 64 KiB block
- *     carries a second counter so a range query can skip 16 clean pages
+ *   - Every 1 KiB mirror page carries a 32-bit generation counter that
+ *     increments on every write notification covering the page. The external
+ *     VM-write router remains sparse at the host's 4 KiB page granularity;
+ *     this finer internal split prevents unrelated dynamic vertex slices in
+ *     one watched host page from invalidating each other. Every 64 KiB block
+ *     carries a second counter so a range query can skip 64 clean pages
  *     with one compare.  A per-space 64-bit epoch counts all notifications,
  *     giving consumers an O(1) "nothing changed anywhere" early-out.
  *   - Consumers store per-range snapshots of the counters.  "Changed" is a
@@ -44,7 +47,7 @@
 extern "C" {
 #endif
 
-#define RSX_GUEST_PAGE_SHIFT   12u
+#define RSX_GUEST_PAGE_SHIFT   10u
 #define RSX_GUEST_PAGE_SIZE    (1u << RSX_GUEST_PAGE_SHIFT)
 #define RSX_GUEST_BLOCK_SHIFT  16u
 #define RSX_GUEST_BLOCK_SIZE   (1u << RSX_GUEST_BLOCK_SHIFT)

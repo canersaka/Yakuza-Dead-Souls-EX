@@ -901,3 +901,84 @@ int rsx_fp_apply_alpha_test_buffered(
     memcpy(marker, suffix, (size_t)n + 1);
     return 1;
 }
+
+int rsx_fp_apply_texcoord_control(
+    char* hlsl, u32 out_size, u32 texcoord_2d_mask)
+{
+    if (!hlsl || !out_size || (texcoord_2d_mask & ~0xFFu))
+        return -1;
+    if (!texcoord_2d_mask)
+        return 0;
+    static const char marker[] =
+        "float4 main(PSInput input) : SV_TARGET {\n";
+    char* const main = strstr(hlsl, marker);
+    if (!main)
+        return -1;
+    char insert[768];
+    size_t used = 0;
+    for (u32 unit = 0; unit < 8u; ++unit) {
+        if (!(texcoord_2d_mask & (1u << unit)))
+            continue;
+        const int n = snprintf(
+            insert + used, sizeof(insert) - used,
+            "    input.tc%u = float4(input.tc%u.xy, 0.0, "
+            "input.position.w);\n",
+            unit, unit);
+        if (n < 0 || (size_t)n >= sizeof(insert) - used)
+            return -1;
+        used += (size_t)n;
+    }
+    char* const at = main + sizeof(marker) - 1u;
+    const size_t tail = strlen(at) + 1u;
+    const size_t prefix = (size_t)(at - hlsl);
+    if (prefix + used + tail > out_size)
+        return -1;
+    memmove(at + used, at, tail);
+    memcpy(at, insert, used);
+    return 1;
+}
+
+int rsx_fp_apply_shader_window(
+    char* hlsl, u32 out_size, u32 shader_window)
+{
+    if (!hlsl || !out_size || (shader_window & 0xFFF00000u))
+        return -1;
+    const u32 height = shader_window & 0xFFFu;
+    const u32 origin = (shader_window >> 12) & 0xFu;
+    const u32 center = (shader_window >> 16) & 0xFu;
+    if (origin > 1u || center > 1u)
+        return -1;
+    if (!origin && !center)
+        return 0;
+    static const char marker[] =
+        "float4 main(PSInput input) : SV_TARGET {\n";
+    char* const main = strstr(hlsl, marker);
+    if (!main)
+        return -1;
+    char insert[256];
+    int n;
+    if (origin) {
+        n = snprintf(
+            insert, sizeof(insert),
+            "    input.position.x = input.position.x%s;\n"
+            "    input.position.y = %.9gf - input.position.y%s;\n",
+            center ? " - 0.5" : "", (double)height,
+            center ? " - 0.5" : "");
+    } else {
+        n = snprintf(
+            insert, sizeof(insert),
+            "    input.position.x = input.position.x%s;\n"
+            "    input.position.y = input.position.y%s;\n",
+            center ? " - 0.5" : "", center ? " - 0.5" : "");
+    }
+    if (n < 0 || (u32)n >= sizeof(insert))
+        return -1;
+    char* const at = main + sizeof(marker) - 1u;
+    const size_t tail = strlen(at) + 1u;
+    const size_t prefix = (size_t)(at - hlsl);
+    if (prefix + (size_t)n + tail > out_size)
+        return -1;
+    memmove(at + n, at, tail);
+    memcpy(at, insert, (size_t)n);
+    return 1;
+}

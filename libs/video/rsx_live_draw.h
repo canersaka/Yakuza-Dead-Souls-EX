@@ -43,6 +43,8 @@ extern "C" {
  * The replay harness supplies its own arena-backed version. */
 typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
                                            u32 min_bytes);
+struct rsx_nir_pipeline;
+struct rsx_nir_clear;
 
 /* Whether the live draw path is enabled this run (reads YZ_RSX_DRAW once).
  * Cheap; safe to call from the hot method hook. */
@@ -69,6 +71,11 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
+
+/* Update only the dormant legacy register/BEGIN-END state after a complete
+ * transactional native section commits. Execution callbacks are suppressed,
+ * so this can never clear, draw, transfer, or present a second time. */
+void rsx_live_draw_mirror_state_method(u32 method, u32 arg);
 
 /* Native-render flip-family bridge.  This deliberately re-enters the
  * existing E944 dispatch path so movie handoff, renderer serialization,
@@ -101,7 +108,8 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
                                u32 width, u32 height, void** resource,
                                u32* resource_format, u32* dsv_format,
-                               u32* srv_format);
+                               u32* srv_format,
+                               int* publication_required);
 
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the
@@ -134,6 +142,29 @@ void rsx_live_draw_present(u32 buffer_id);
 /* Movie playback: while on, the guest method stream is ignored so a host-decoded
  * movie can own the window without the guest's draws racing g.list. */
 void rsx_live_draw_set_movie_mode(int on);
+
+/* True only while live gameplay may be owned by the vertical native queue.
+ * Host movie playback deliberately suppresses guest rendering; an active
+ * terminal interceptor must fall through to that established suppression
+ * instead of submitting shared resources from a second queue. */
+int rsx_live_draw_native_actions_allowed(void);
+
+/* True when non-composited host movie ownership intentionally discards guest
+ * graphics methods. Shadow/native register models must make the same choice
+ * or their first post-movie terminal action will target stale, divergent
+ * state. */
+int rsx_live_draw_guest_graphics_suppressed(void);
+
+/* Validate and publish one typed CLEAR against the exact state owned by the
+ * live fallback renderer. The mismatch mask is 1=surface, 2=scissor,
+ * 4=value. Commit updates only resource-lifetime metadata after the native
+ * queue accepts the clear; it never decodes or executes a legacy method. */
+u32 rsx_live_draw_native_clear_contract_mismatch(
+    const struct rsx_nir_pipeline* state,
+    const struct rsx_nir_clear* clear);
+void rsx_live_draw_native_clear_commit(
+    const struct rsx_nir_pipeline* state,
+    const struct rsx_nir_clear* clear);
 
 /* Present a host-decoded RGBA8 frame (w*h*4, row pitch w*4) straight to the
  * swap-chain backbuffer. Call from one thread with movie mode on. */

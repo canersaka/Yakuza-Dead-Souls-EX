@@ -350,3 +350,41 @@ int rsx_nr_main_report_io_range(u32 offset, u32 size, u32* io_offset)
     *io_offset = RSX_NR_MAIN_REPORT_IO_BASE + offset;
     return 1;
 }
+
+rsx_nr_fifo_range_status rsx_nr_fifo_section_range_status(
+    u32 pc, u32 size, u32 put, u32 call_return, u32 ring_size)
+{
+    if (!size || (pc & 3u) || (size & 3u) ||
+        !ring_size || (ring_size & (ring_size - 1u)) ||
+        pc > 0xFFFFFFFFu - size)
+        return RSX_NR_FIFO_RANGE_WINDOW;
+
+    /* CALL publication is the visibility boundary for its target list.  PUT
+     * continues to describe only the caller's primary ring and can be either
+     * numerically before or after a low-address called segment. */
+    if (call_return != 0xFFFFFFFFu)
+        return RSX_NR_FIFO_RANGE_READY;
+
+    if (pc >= ring_size || put >= ring_size || size > ring_size - pc)
+        return RSX_NR_FIFO_RANGE_WINDOW;
+    const u32 available = (put - pc + ring_size) & (ring_size - 1u);
+    if (available < size)
+        return RSX_NR_FIFO_RANGE_NOT_READY;
+    return RSX_NR_FIFO_RANGE_READY;
+}
+
+int rsx_nr_fifo_frame_boundary(u32 method, u32 arg)
+{
+    return method == 0xE924u && arg == 0x8000010Fu;
+}
+
+int rsx_nr_legacy_gpu_action(u32 method, u32 arg)
+{
+    return (method == 0x1808u && arg == 0u) || method == 0x1D94u ||
+        method == 0x2328u || method == 0xC40Cu ||
+        method == 0x0050u || method == 0x006Cu || method == 0x0110u ||
+        method == 0x17C8u || method == 0x1800u ||
+        method == 0x1D70u || method == 0x1D74u ||
+        (method >= 0xA400u && method <= 0xAAFCu) ||
+        (method >= 0xE920u && method <= 0xE95Cu);
+}

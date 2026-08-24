@@ -38,6 +38,9 @@ struct rsx_gpu_mirror_d3d12 {
     u32 slice_index;
     u64 retired_fence;
     u64 session_counter;
+    ID3D12GraphicsCommandList* append_list;
+    u64 append_fence;
+    int append_valid;
     ID3D12GraphicsCommandList* list;   /* borrowed inside begin/end */
     int in_session;
     int slice_available;
@@ -198,23 +201,51 @@ static void gmb_transition(rsx_gpu_mirror_d3d12* b, gmb_space* s,
     s->in_copy_state = to_copy;
 }
 
-int rsx_gpu_mirror_d3d12_begin(rsx_gpu_mirror_d3d12* b, void* command_list)
+static int gmb_begin(rsx_gpu_mirror_d3d12* b, void* command_list,
+                     u64 submission_fence, int allow_append)
 {
     if (!b || !command_list || b->in_session)
         return -1;
     b->list = (ID3D12GraphicsCommandList*)command_list;
     b->in_session = 1;
-    b->slice_index = (u32)(b->session_counter++ % GMB_SLICES);
-    b->slice_used = 0;
-    /* The slice is reusable only once the frame that last filled it has
-     * been observed complete (retire); otherwise every upload rejects and
-     * the mirror defers — bounded staging never blocks or tears. */
-    b->slice_available = b->slice_fence[b->slice_index] <= b->retired_fence;
+    if (allow_append && b->append_valid &&
+        b->append_list == b->list && b->append_fence == submission_fence) {
+        /* Same command-list generation: all earlier copies and the draws
+         * which consume them will retire under this fence. Keep appending to
+         * its one slice; rotating per draw would exhaust all three slices
+         * before this list is ever submitted. */
+        b->slice_available = 1;
+    } else {
+        b->slice_index = (u32)(b->session_counter++ % GMB_SLICES);
+        b->slice_used = 0;
+        /* The slice is reusable only once the submission that last filled it
+         * has completed. A different command-list generation may never
+         * overwrite in-flight staging bytes. */
+        b->slice_available =
+            b->slice_fence[b->slice_index] <= b->retired_fence;
+        b->append_list = allow_append ? b->list : NULL;
+        b->append_fence = submission_fence;
+        b->append_valid = allow_append;
+    }
     for (u32 i = 0; i < RSX_GUEST_NUM_SPACES; i++) {
         b->space[i].touched = 0;
         gmb_transition(b, &b->space[i], 1);
     }
     return 0;
+}
+
+int rsx_gpu_mirror_d3d12_begin(rsx_gpu_mirror_d3d12* b, void* command_list)
+{
+    return gmb_begin(b, command_list, 0, 0);
+}
+
+int rsx_gpu_mirror_d3d12_begin_fenced(rsx_gpu_mirror_d3d12* b,
+                                      void* command_list,
+                                      u64 submission_fence)
+{
+    if (!submission_fence)
+        return -1;
+    return gmb_begin(b, command_list, submission_fence, 1);
 }
 
 void rsx_gpu_mirror_d3d12_end(rsx_gpu_mirror_d3d12* b, u64 fence_value)
@@ -273,6 +304,10 @@ void rsx_gpu_mirror_d3d12_get_ops(rsx_gpu_mirror_d3d12* b,
 { (void)b; if (out) { out->user = 0; out->guest_ptr = 0; out->upload = 0; } }
 int rsx_gpu_mirror_d3d12_begin(rsx_gpu_mirror_d3d12* b, void* command_list)
 { (void)b; (void)command_list; return -1; }
+int rsx_gpu_mirror_d3d12_begin_fenced(rsx_gpu_mirror_d3d12* b,
+                                      void* command_list,
+                                      u64 submission_fence)
+{ (void)b; (void)command_list; (void)submission_fence; return -1; }
 void rsx_gpu_mirror_d3d12_end(rsx_gpu_mirror_d3d12* b, u64 fence_value)
 { (void)b; (void)fence_value; }
 void rsx_gpu_mirror_d3d12_retire(rsx_gpu_mirror_d3d12* b,

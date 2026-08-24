@@ -315,11 +315,16 @@ static u32 vp_src(u32 type)
     return type & 3u;
 }
 
+static u32 vp_src_xyzw(u32 type)
+{
+    return (type & 3u) | (3u << 8) | (2u << 10) | (1u << 12);
+}
+
 static void vp_instruction(
     u8* bytes, u32 vec_op, u32 sca_op, u32 input,
     u32 src0, u32 src1, u32 src2, int vec_write, int sca_write, int end)
 {
-    u32 d0 = 0;
+    u32 d0 = 7u << 10; /* unconditional NV40 destination condition */
     u32 d1 =
         ((src0 >> 9) & 0xFFu) |
         ((input & 0xFu) << 8) |
@@ -365,11 +370,154 @@ static void test_vp_masks(void)
     CHECK(rsx_vp_analyze_inputs(program, 16, &analysis) == 1 &&
           !analysis.exact && analysis.input_mask == 0xFFFFu,
           "unknown VP operation falls back to all inputs");
+    CHECK(!rsx_vp_program_is_native_supported(program, 16),
+          "unknown vector opcode escaped native-program preflight");
+
+    vp_instruction(
+        program, 1, 0, 5, vp_src(2), 0, 0, 1, 0, 1);
+    CHECK(rsx_vp_program_is_native_supported(program, 16),
+          "straight-line VP was rejected by native-program preflight");
+    {
+        u32 d0;
+        memcpy(&d0, program, sizeof(d0));
+        d0 &= ~(7u << 10);
+        d0 |= (1u << 10) | (1u << 13); /* predicated LT destination */
+        memcpy(program, &d0, sizeof(d0));
+        CHECK(rsx_vp_program_is_native_supported(program, 16),
+              "exact condition-code VP was rejected by native preflight");
+    }
+    vp_instruction(
+        program, 0, 0x08, 4,
+        vp_src(1), vp_src(1), vp_src(2), 0, 0, 1);
+    CHECK(!rsx_vp_program_is_native_supported(program, 16),
+          "write-mask-free VP flow opcode escaped native-program preflight");
+    {
+        rsx_vp_native_support_analysis support;
+        CHECK(!rsx_vp_analyze_native_support(
+                  program, 16, 0u, &support) &&
+                  support.unsupported_sca_mask == (1u << 8) &&
+                  support.unsupported_vec_mask == 0u &&
+                  support.instruction_count == 1u && support.terminated,
+              "native support analysis lost scalar-flow reason");
+    }
+
+    /* Exact forward BRI/BRB are admitted only with their absolute program
+     * base and bounded targets. The generated shader walks monotonically
+     * through the instruction slots, so no arbitrary loop limit changes
+     * guest semantics. */
+    {
+        u8 flow[48] = {0};
+        u32 d0, d3;
+        vp_instruction(flow, 0x15, 0x09, 0,
+                       vp_src(1), vp_src(1), vp_src(1), 1, 0, 0);
+        memcpy(&d0, flow, 4);
+        d0 = (d0 & ~(0x3Fu << 15)) | (0x3Fu << 15) | (1u << 14);
+        memcpy(flow, &d0, 4);
+        memcpy(&d3, flow + 12, 4);
+        d3 = (d3 & ~(7u << 29)) | (6u << 29); /* absolute slot 6 */
+        memcpy(flow + 12, &d3, 4);
+        vp_instruction(flow + 16, 0x11, 0, 0,
+                       vp_src(1), vp_src(1), vp_src(1), 1, 0, 0);
+        vp_instruction(flow + 32, 0x15, 0, 0,
+                       vp_src(1), vp_src(1), vp_src(1), 1, 0, 1);
+        CHECK(rsx_vp_program_is_native_supported_control_ex(
+                  flow, sizeof(flow), 0u, 4u),
+              "bounded forward BRI was rejected");
+        CHECK(!rsx_vp_program_is_native_supported_control_ex(
+                  flow, sizeof(flow), 0u, 0u),
+              "absolute BRI target escaped the wrong start slot");
+        {
+            rsx_vp_native_support_analysis support;
+            CHECK(rsx_vp_analyze_native_support_control(
+                      flow, sizeof(flow), 0u, 4u, &support) &&
+                      support.flow_instructions == 1u &&
+                      support.invalid_branch_targets == 0u,
+                  "forward BRI analysis lost exact flow metadata");
+        }
+        {
+            static char hlsl[256 * 1024];
+            CHECK(rsx_vp_decompile_pull_control_ex(
+                      flow, sizeof(flow), 0u, 4u, "", "",
+                      hlsl, sizeof(hlsl)) == 3,
+                  "forward BRI decompile failed");
+            CHECK(strstr(hlsl, "float4 cc[2]") != NULL &&
+                  strstr(hlsl, "if (_vp_pc == 0u)") != NULL &&
+                  strstr(hlsl, "_vp_pc = (true) ? 2u : 1u") != NULL,
+                  "forward BRI HLSL lost CC or exact target");
+        }
+
+        /* Recode instruction zero as BRB b3=true to the same target. */
+        memcpy(&d0, flow, 4);
+        d0 &= ~((1u << 14) | (1u << 29));
+        memcpy(flow, &d0, 4);
+        {
+            u32 d1;
+            memcpy(&d1, flow + 4, 4);
+            d1 = (d1 & ~(0x1Fu << 27)) | (0x11u << 27);
+            memcpy(flow + 4, &d1, 4);
+        }
+        memcpy(&d3, flow + 12, 4);
+        d3 = (d3 & ~((0x1Fu << 23) | (1u << 28))) |
+             (3u << 23) | (1u << 28);
+        memcpy(flow + 12, &d3, 4);
+        {
+            static char hlsl[256 * 1024];
+            CHECK(rsx_vp_decompile_pull_control_ex(
+                      flow, sizeof(flow), 0u, 4u, "", "",
+                      hlsl, sizeof(hlsl)) == 3,
+                  "forward BRB decompile failed");
+            CHECK(strstr(hlsl,
+                         "vp_branch_bits & (1u << 3u)) != 0u") != NULL,
+                  "BRB HLSL lost dynamic branch-bit condition");
+        }
+
+        /* Flow and vertex-texture execution are each admitted in isolation,
+         * but the combined live skinned-character family remains on whole-
+         * section fallback until it has a captured execution oracle. */
+        vp_instruction(flow + 16, 0x19, 0, 0,
+                       vp_src(2), vp_src(1), vp_src(1), 1, 0, 0);
+        {
+            rsx_vp_native_support_analysis support;
+            CHECK(!rsx_vp_analyze_native_support_control(
+                      flow, sizeof(flow), 1u, 4u, &support) &&
+                      support.flow_instructions == 1u &&
+                      support.unsupported_vec_mask == (1u << 25) &&
+                      support.missing_vtex_mask == 0u,
+                  "flow+TXL interaction escaped conservative admission");
+        }
+        vp_instruction(flow + 16, 0x11, 0, 0,
+                       vp_src(1), vp_src(1), vp_src(1), 1, 0, 0);
+
+        /* Backward/cyclic branches stay on whole-section fallback. */
+        memcpy(&d3, flow + 12, 4);
+        d3 = (d3 & ~(7u << 29)) | (4u << 29);
+        memcpy(flow + 12, &d3, 4);
+        CHECK(!rsx_vp_program_is_native_supported_control_ex(
+                  flow, sizeof(flow), 0u, 4u),
+              "cyclic BRB escaped conservative native admission");
+    }
+    vp_instruction(
+        program, 0x19, 0, 0,
+        vp_src(2), vp_src(1), vp_src(1), 1, 0, 1);
+    CHECK(!rsx_vp_program_is_native_supported(program, 16),
+          "TXL escaped native preflight without vertex-texture binding");
+    CHECK(rsx_vp_program_is_native_supported_ex(program, 16, 1u),
+          "bound TXL unit was rejected by native-program preflight");
+    CHECK(!rsx_vp_program_is_native_supported_ex(program, 16, 2u),
+          "TXL accepted the wrong vertex-texture unit");
+    {
+        rsx_vp_native_support_analysis support;
+        CHECK(!rsx_vp_analyze_native_support(
+                  program, 16, 2u, &support) &&
+                  support.unsupported_vec_mask == (1u << 25) &&
+                  support.missing_vtex_mask == 1u,
+              "native support analysis lost TXL binding reason");
+    }
 
     vp_instruction(
         program, 1, 0, 5, vp_src(2), 0, 0, 1, 0, 1);
     {
-        char hlsl[256 * 1024];
+        static char hlsl[256 * 1024];
         CHECK(rsx_vp_decompile_compact_ex(
             program, 16, 0, 1u << 5, hlsl, sizeof(hlsl)) == 1,
             "compact VP decompile");
@@ -385,7 +533,7 @@ static void test_vp_masks(void)
         program + 16, 4, 0, 8,
         vp_src(1), vp_src(2), vp_src(1), 1, 0, 1);
     {
-        char hlsl[256 * 1024];
+        static char hlsl[256 * 1024];
         const u32 normal_uv_mask = (1u << 2) | (1u << 8);
         CHECK(rsx_vp_analyze_inputs(
                   program, sizeof(program), &analysis) == 2 &&
@@ -401,6 +549,37 @@ static void test_vp_masks(void)
               strstr(hlsl, "v[8]=input.a8;") != NULL,
               "normal and UV keep their original semantic indices");
     }
+}
+
+static void test_vp_scalar_component_semantics(void)
+{
+    u8 program[16] = {0};
+    static char hlsl[256 * 1024];
+
+    vp_instruction(program, 0, 0x0Fu, 3u, vp_src(1), vp_src(1),
+                   vp_src_xyzw(2), 0, 1, 1);
+    CHECK(rsx_vp_decompile_ex(
+              program, sizeof(program), 0u, hlsl, sizeof(hlsl)) == 1,
+          "component-wise scalar SIN decompile");
+    CHECK(strstr(hlsl, "sin((v[3]).xyzw)") != NULL &&
+          strstr(hlsl, "sin(((v[3]).xyzw).x)") == NULL,
+          "scalar SIN was incorrectly collapsed to source x");
+
+    vp_instruction(program, 0, 0x02u, 5u, vp_src(1), vp_src(1),
+                   vp_src_xyzw(2), 0, 1, 1);
+    CHECK(rsx_vp_decompile_ex(
+              program, sizeof(program), 0u, hlsl, sizeof(hlsl)) == 1,
+          "component-wise scalar RCP decompile");
+    CHECK(strstr(hlsl, "1.0/((v[5]).xyzw)") != NULL,
+          "scalar RCP was incorrectly collapsed to source x");
+
+    vp_instruction(program, 0, 0x04u, 7u, vp_src(1), vp_src(1),
+                   vp_src_xyzw(2), 0, 1, 1);
+    CHECK(rsx_vp_decompile_ex(
+              program, sizeof(program), 0u, hlsl, sizeof(hlsl)) == 1,
+          "scalar RSQ decompile");
+    CHECK(strstr(hlsl, "rsqrt(max(((v[7]).xyzw).x, 1e-10))") != NULL,
+          "scalar RSQ lost its defined source-x broadcast");
 }
 
 static void test_vp_opcode_source_tables(void)
@@ -651,6 +830,7 @@ int main(void)
     test_defaults_and_bounds();
     test_stride_base_frequency_and_span();
     test_vp_masks();
+    test_vp_scalar_component_semantics();
     test_vp_opcode_source_tables();
     test_vertex_reference_remap();
     if (failures) {

@@ -93,6 +93,11 @@ typedef struct rsx_nir_raster {
     u32 cull_face_enable;
     u32 cull_face;                               /* GL enum (0x404/0x405)   */
     u32 front_face;                              /* GL enum (0x900/0x901)   */
+    u32 polygon_offset_point_enable;
+    u32 polygon_offset_line_enable;
+    u32 polygon_offset_fill_enable;
+    u32 polygon_offset_scale;                    /* raw IEEE-754 factor     */
+    u32 polygon_offset_bias;                     /* raw IEEE-754 units      */
     u32 color_mask;                              /* raw ARGB byte mask word */
     u32 mrt_color_mask;
 } rsx_nir_raster;
@@ -101,9 +106,16 @@ typedef struct rsx_nir_depth_stencil {
     u32 depth_test_enable;
     u32 depth_func;
     u32 depth_write_enable;
+    u32 depth_bounds_test_enable;
+    u32 depth_bounds_min;                       /* raw IEEE-754 [0,1]      */
+    u32 depth_bounds_max;                       /* raw IEEE-754 [0,1]      */
     u32 stencil_test_enable;
-    u32 stencil_func, stencil_ref, stencil_mask;
+    u32 stencil_func, stencil_ref, stencil_mask, stencil_write_mask;
     u32 stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    u32 two_sided_stencil_enable;
+    u32 back_stencil_func, back_stencil_ref;
+    u32 back_stencil_mask, back_stencil_write_mask;
+    u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
 } rsx_nir_depth_stencil;
 
 typedef struct rsx_nir_blend {
@@ -117,6 +129,16 @@ typedef struct rsx_nir_blend {
     u32 alpha_ref;
 } rsx_nir_blend;
 
+/* NV4097 conditional-render state. SET_RENDER_ENABLE mode 2 captures the
+ * report DMA selector in effect at the method (later DMA changes must not
+ * retarget the condition); mode 1 disables the test. The report record's
+ * value word at +8 controls subsequent draws: zero skips, nonzero renders. */
+typedef struct rsx_nir_render_condition {
+    u32 enabled;
+    u32 dma_report;
+    u32 offset;
+} rsx_nir_render_condition;
+
 /* Vertex (transform) program: identified by content hash + start slot.
  * The instruction words live in the stream's side buffer so a consumer can
  * recompile them; the hash makes comparison cheap and order-safe. */
@@ -127,12 +149,15 @@ typedef struct rsx_nir_vertex_program {
     u64 hash;                                    /* FNV-1a over the words   */
     u32 attrib_input_mask;                       /* VP_ATTRIB_EN            */
     u32 attrib_output_mask;                      /* VP_RESULT_EN            */
+    u32 branch_bits;                             /* TRANSFORM_BRANCH_BITS   */
 } rsx_nir_vertex_program;
 
 typedef struct rsx_nir_fragment_program {
     u32 offset;                                  /* byte offset             */
     u32 location;                                /* RSX_NIR_LOCATION_*      */
     u32 control;                                 /* SHADER_CONTROL word     */
+    u32 texcoord_2d_mask;                        /* TEX_COORD_CONTROL[0..9] */
+    u32 shader_window;                           /* height/origin/pixel ctr  */
 } rsx_nir_fragment_program;
 
 /* Vertex transform constants: one contiguous dirty range per op.
@@ -201,6 +226,7 @@ typedef enum rsx_nir_op_kind {
     RSX_NIR_OP_SET_RASTER,
     RSX_NIR_OP_SET_DEPTH_STENCIL,
     RSX_NIR_OP_SET_BLEND,
+    RSX_NIR_OP_SET_RENDER_CONDITION,
     RSX_NIR_OP_SET_VERTEX_PROGRAM,
     RSX_NIR_OP_SET_FRAGMENT_PROGRAM,
     RSX_NIR_OP_SET_CONSTANTS,       /* cumulative: successive ops layer     */
@@ -266,7 +292,7 @@ typedef struct rsx_nir_transfer {
     u32 dst_location, dst_offset, dst_pitch;
     u32 src_format, dst_format;
     u32 line_length, line_count;                 /* BUFFER                  */
-    u32 in_x, in_y, in_w, in_h;                  /* SCALED (x/y raw 16.16)  */
+    u32 in_x, in_y, in_w, in_h;                  /* SCALED x/y raw 12.4     */
     u32 out_x, out_y, out_w, out_h;
     u32 clip_x, clip_y, clip_w, clip_h;
     u32 ds_dx, dt_dy;                            /* raw 16.16 steps         */
@@ -282,14 +308,17 @@ typedef struct rsx_nir_semaphore {
     u32 offset;                                  /* semaphore ctx offset    */
     u32 value;                                   /* WIRE value (the method
                                                     argument, untransformed) */
-    u32 texture_read;                            /* release path: 0 = back-
+    u32 texture_read;                            /* release kind: 0 = back-
                                                     end 0x1D70, whose store
                                                     swizzles bytes 0<->2 (the
                                                     SDK's SetWriteBackEndLabel
                                                     pre-swaps to compensate);
                                                     1 = texture pipe 0x1D74,
-                                                    stored as-is (SDK
-                                                    SetWriteBackEnd/
+                                                    stored as-is; 2 = NV406E
+                                                    FIFO release, stored as-is
+                                                    with its device-credit
+                                                    transform in the embedder.
+                                                    (SDK SetWriteBackEnd/
                                                     TextureLabel). Executors
                                                     apply the store transform;
                                                     the IR carries the wire
@@ -350,6 +379,7 @@ typedef struct rsx_nir_op {
         rsx_nir_raster           raster;
         rsx_nir_depth_stencil    depth_stencil;
         rsx_nir_blend            blend;
+        rsx_nir_render_condition render_condition;
         rsx_nir_vertex_program   vertex_program;
         rsx_nir_fragment_program fragment_program;
         rsx_nir_constants        constants;
@@ -444,6 +474,7 @@ typedef struct rsx_nir_pipeline {
     rsx_nir_raster           raster;
     rsx_nir_depth_stencil    depth_stencil;
     rsx_nir_blend            blend;
+    rsx_nir_render_condition render_condition;
     rsx_nir_vertex_program   vertex_program;
     rsx_nir_fragment_program fragment_program;
     rsx_nir_vertex_bindings  vertex_bindings;
@@ -475,6 +506,14 @@ typedef struct rsx_nir_action {
 } rsx_nir_action;
 
 void rsx_nir_pipeline_init(rsx_nir_pipeline* p);
+
+/* Apply one state-group op to an existing pipeline. Action ops are ignored.
+ * This is the allocation-free primitive used by transactional preflight,
+ * whose initial state is the already-executed live backend rather than the
+ * all-zero state used by an offline cursor. */
+void rsx_nir_pipeline_apply_op(rsx_nir_pipeline* p,
+                               const rsx_nir_stream* stream,
+                               const rsx_nir_op* op);
 
 /* Streaming fold: walk a stream action by action without materializing
  * every snapshot (a snapshot is ~12 KB; captures can hold thousands of

@@ -182,10 +182,12 @@ def gun_hud_iou(reference, candidate):
 
 def scene_features(path: Path):
     width, height, pixels = read_ppm(path)
+    rgb = sample_rgb(width, height, pixels)
     return {
         "width": width,
         "height": height,
-        "rgb": sample_rgb(width, height, pixels),
+        "rgb": rgb,
+        "mean_rgb": sum(rgb) / (len(rgb) * 255.0),
         "dialogue": dialogue_mask(width, height, pixels),
         "prompt_blue_pixels": prompt_blue_pixels(width, height, pixels),
         "gun_hud": gun_hud_mask(width, height, pixels),
@@ -207,18 +209,30 @@ def compare_scene(reference, candidate):
     union = sum(a or b for a, b in zip(mask_a, mask_b))
     text_iou = intersection / union if union else 1.0
     prompt_blue = candidate["prompt_blue_pixels"]
+    reference_mean = reference["mean_rgb"]
+    scene_mean_ratio = (candidate["mean_rgb"] / reference_mean
+                        if reference_mean else 0.0)
     # The requested checkpoint is semantic: the first Akiyama/Hana city
     # dialogue that displays an X-to-continue prompt.  The archived subtitle
     # frame used as the scene anchor is transient and has no prompt itself.
     # Scene similarity rejects orphanage/cutscene prompts; the blue-glyph
     # count distinguishes a completed, stationary dialogue from typed text.
-    match = coarse_mae <= 0.215 and prompt_blue >= 20
+    # The luminance ratio rejects the captured native-clear failure: its
+    # dialogue and prompt survived but both characters and almost all scene
+    # lighting were absent (0.10x reference brightness). A prompt alone is
+    # never a visual pass. The lower bound remains tolerant of camera/exposure
+    # variation in the archived healthy prompt corpus.
+    arrival = (coarse_mae <= 0.18 and mask_difference <= 0.05 and
+               0.65 <= scene_mean_ratio <= 1.5)
+    match = (arrival and prompt_blue >= 20)
     return {
         "match": match,
+        "arrival": arrival,
         "coarse_mae": round(coarse_mae, 6),
         "dialogue_mask_difference": round(mask_difference, 6),
         "dialogue_text_iou": round(text_iou, 6),
         "prompt_blue_pixels": prompt_blue,
+        "scene_mean_ratio": round(scene_mean_ratio, 6),
     }
 
 
@@ -725,6 +739,14 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "active-graphics"
         if args.nr_graphics_families:
             yz["YZ_NR_GRAPHICS_FAMILIES"] = args.nr_graphics_families
+        if args.nr_clear_scope:
+            yz["YZ_NR_CLEAR_SCOPE"] = args.nr_clear_scope
+        if args.nr_frame_islands:
+            yz["YZ_NR_FRAME_ISLANDS"] = "1"
+        if args.nr_pass_diag:
+            yz["YZ_NR_PASS_DIAG"] = "1"
+        if args.nr_draw_primitive is not None:
+            yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -1113,6 +1135,7 @@ def run(args):
     capture_dir.mkdir()
     stdout_path = run_dir / "game.out"
     stderr_path = run_dir / "game.err"
+    input_stop_path = run_dir / "akiyama-dialogue-input-stopped.txt"
     stop_path = run_dir / "akiyama-dialogue-ready.txt"
     result_path = run_dir / "result.json"
 
@@ -1126,7 +1149,11 @@ def run(args):
         "YZ_A010_ACCEPT_FAST": "1",
         "YZ_FRONTIER_ACCEPT_FAST": "1",
         "YZ_AKIYAMA_DIALOGUE_ROUTE": "1",
-        "YZ_AKIYAMA_DIALOGUE_STOP_FILE": str(stop_path),
+        # Stop Start-only navigation as soon as the Hana scene itself is
+        # positively identified. Keep sparse readback alive under the final
+        # path until the fully typed X prompt is independently confirmed.
+        "YZ_AKIYAMA_DIALOGUE_STOP_FILE": str(input_stop_path),
+        "YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE": str(stop_path),
         "YZ_AKIYAMA_ROUTE_START_DELAY_MS": str(args.route_start_delay_ms),
         "YZ_MOVEMENT_PROOF_DELAY_MS": str(args.capture_delay_ms),
         "YZ_MOVEMENT_PROBE_INTERVAL_MS": str(args.capture_interval_ms),
@@ -1154,6 +1181,14 @@ def run(args):
         yz["YZ_NR_VERTICAL"] = "active-graphics"
         if args.nr_graphics_families:
             yz["YZ_NR_GRAPHICS_FAMILIES"] = args.nr_graphics_families
+        if args.nr_clear_scope:
+            yz["YZ_NR_CLEAR_SCOPE"] = args.nr_clear_scope
+        if args.nr_frame_islands:
+            yz["YZ_NR_FRAME_ISLANDS"] = "1"
+        if args.nr_pass_diag:
+            yz["YZ_NR_PASS_DIAG"] = "1"
+        if args.nr_draw_primitive is not None:
+            yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1220,10 +1255,24 @@ def run(args):
         deadline = time.monotonic() + args.route_timeout
         seen = set()
         consecutive = 0
+        arrival_consecutive = 0
         last_capture_progress = time.monotonic()
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during route: {process.returncode}")
+            if stderr_path.exists():
+                stderr_tail = stderr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-262144:]
+                fatal = re.findall(
+                    r"\[nr-vertical-section-fatal[^\r\n]*", stderr_tail
+                )
+                if fatal:
+                    result["route_failure_class"] = (
+                        "native-section-execution-fatal"
+                    )
+                    result["route_failure_state"] = fatal[-1]
+                    raise RuntimeError(fatal[-1])
             captured_this_poll = False
             for path in sorted(capture_dir.glob("frontier_probe_*.ppm")):
                 if path in seen:
@@ -1238,9 +1287,19 @@ def run(args):
                 comparison["path"] = str(path)
                 comparison["serial"] = int(path.stem.rsplit("_", 1)[-1])
                 result["captures"].append(comparison)
+                arrival_consecutive = (
+                    arrival_consecutive + 1 if comparison["arrival"] else 0
+                )
+                if arrival_consecutive >= 1 and not input_stop_path.exists():
+                    input_stop_path.write_text(
+                        f"Hana scene arrival confirmed by {path.name}\n",
+                        encoding="ascii",
+                    )
+                    result["input_stop_capture"] = str(path)
                 consecutive = consecutive + 1 if comparison["match"] else 0
                 print(
                     f"[akiyama-harness] {path.name}: match={comparison['match']} "
+                    f"arrival={comparison['arrival']} "
                     f"mae={comparison.get('coarse_mae')} "
                     f"text_iou={comparison.get('dialogue_text_iou')} "
                     f"consecutive={consecutive}",
@@ -1502,6 +1561,18 @@ def main():
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
     )
+    parser.add_argument(
+        "--nr-clear-scope",
+        choices=("all", "color-only", "depth-only", "combined"),
+        help="limit native clear ownership to one semantic clear class",
+    )
+    parser.add_argument(
+        "--nr-frame-islands",
+        action="store_true",
+        help="transactionally own only complete preflighted FIFO sections",
+    )
+    parser.add_argument("--nr-pass-diag", action="store_true")
+    parser.add_argument("--nr-draw-primitive", type=int, choices=range(0, 11))
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
     parser.add_argument("--xf-ieee", action="store_true")
@@ -1521,6 +1592,16 @@ def main():
         parser.error("select only one diagnostic/family lane")
     if args.nr_graphics_families and not args.nr_vertical_active_graphics:
         parser.error("--nr-graphics-families requires --nr-vertical-active-graphics")
+    if args.nr_clear_scope and not args.nr_vertical_active_graphics:
+        parser.error("--nr-clear-scope requires --nr-vertical-active-graphics")
+    if args.nr_clear_scope and args.nr_graphics_families != "clear":
+        parser.error("--nr-clear-scope requires --nr-graphics-families clear")
+    if args.nr_frame_islands and not args.nr_vertical_active_graphics:
+        parser.error("--nr-frame-islands requires --nr-vertical-active-graphics")
+    if args.nr_pass_diag and not args.nr_frame_islands:
+        parser.error("--nr-pass-diag requires --nr-frame-islands")
+    if args.nr_draw_primitive is not None and not args.nr_frame_islands:
+        parser.error("--nr-draw-primitive requires --nr-frame-islands")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]
