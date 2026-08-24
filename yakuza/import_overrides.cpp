@@ -3515,7 +3515,7 @@ static uint32_t yz_rsx_sem_addr(uint32_t dma, uint32_t offset)
  * with index >= SIZE_OUT.x are skipped. */
 static uint32_t yz_rsx_blit_dst_dma = 0xFEED0000;
 static uint32_t yz_rsx_blit_dst_off;
-static uint32_t yz_rsx_blit_pitch   = 64;
+static uint32_t yz_rsx_blit_pitch   = (64u << 16) | 64u;
 static uint32_t yz_rsx_blit_fmt     = 0xB;     /* a8r8g8b8 */
 static uint32_t yz_rsx_blit_point;
 static uint32_t yz_rsx_blit_size_out = 0x00010001;
@@ -4002,7 +4002,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
         }
         uint32_t x = (yz_rsx_blit_point & 0xFFFFu) + index;
         uint32_t y = yz_rsx_blit_point >> 16;
-        uint32_t pitch = yz_rsx_blit_pitch & 0xFFFFu;
+        uint32_t pitch = yz_rsx_blit_pitch >> 16;
         uint32_t addr = yz_rsx_sem_addr(yz_rsx_blit_dst_dma,
                                         yz_rsx_blit_dst_off + x * 4 + y * pitch);
         if (addr) {
@@ -4090,7 +4090,7 @@ static int yz_rsx_method(uint32_t method, uint32_t arg)
     case 0x6300:                                  /* NV3062 SET_COLOR_FORMAT */
         yz_rsx_blit_fmt = arg & 0xFFFFu;
         break;
-    case 0x6304:                                  /* NV3062 SET_PITCH (src<<16|dst) */
+    case 0x6304:                                  /* NV3062 SET_PITCH (pitch<<16|alignment) */
         yz_rsx_blit_pitch = arg;
         break;
     case 0x630C:                                  /* NV3062 SET_OFFSET_DESTIN */

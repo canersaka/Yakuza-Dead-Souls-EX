@@ -2199,6 +2199,26 @@ static void test_section_method_support(void)
     rsx_nir_adapter_init(&ad, &stream);
     CHECK(ad.fifo_semaphore_dma == 0x66616661u,
           "NV406E reset semaphore DMA %08X", ad.fifo_semaphore_dma);
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x0300u, 1u) &&
+              rsx_nir_adapter_method_supported(
+                  &ad, 0x003C0u, 0x00010101u) &&
+              rsx_nir_adapter_method_supported(
+                  &ad, 0x00440u, 0x9AABAA98u) &&
+              rsx_nir_adapter_method_supported(
+                  &ad, 0x0A000u, 0x31337808u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0x003C0u, 0x01010101u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0x00440u, 0x9AABAA99u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0x0A000u, 0x31337809u),
+          "title context image was not admitted/rejected exactly");
+    rsx_nir_adapter_method(&ad, 0x1D94u, 0xF0u); /* first render action */
+    CHECK(!ad.context_image_open &&
+              !rsx_nir_adapter_method_supported(&ad, 0x0300u, 1u) &&
+              !rsx_nir_adapter_method_supported(
+                  &ad, 0x00440u, 0x9AABAA98u),
+          "title context image admission remained open after execution");
     CHECK(rsx_nir_adapter_method_supported(&ad, 0x0050u, 0u),
           "SET_REFERENCE not section-supported");
     CHECK(rsx_nir_adapter_method_supported(&ad, 0x0068u, 0u) &&

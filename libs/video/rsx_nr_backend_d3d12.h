@@ -282,6 +282,13 @@ void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out);
 
+/* Enumerate live render targets for deterministic offline capture validation.
+ * Ordinals are dense over the currently live target table.
+ * Returns 0 on success or -1 when ordinal is past the last live target. */
+int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
+                         u32* space, u32* offset, u32* format,
+                         u32* width, u32* height);
+
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out);
 
 #ifdef __cplusplus

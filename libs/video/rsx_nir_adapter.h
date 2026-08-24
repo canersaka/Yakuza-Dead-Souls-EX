@@ -86,7 +86,7 @@ typedef struct rsx_nir_adapter {
     /* NV3062 destination-surface staging (consumed by NV308A/NV3089) */
     u32 s2d_dma_src, s2d_dma_dst;
     u32 s2d_color_format;
-    u32 s2d_pitch;               /* src<<16 | dst                          */
+    u32 s2d_pitch;               /* output pitch<<16 | alignment           */
     u32 s2d_offset_src, s2d_offset_dst;
 
     /* NV3089 scaled-image staging (trigger: IMAGE_IN 0xC40C) */
@@ -110,6 +110,9 @@ typedef struct rsx_nir_adapter {
     /* stats */
     u32 methods_seen;
     u32 actions_seen;
+    /* Exact title context-image values are admissible only before the first
+     * observable action. Later writes must pass ordinary semantic support. */
+    int context_image_open;
 
     /* Shadow mode (rsx_nr_intercept): mirror every method into the
      * register file and emitter staging WITHOUT emitting action ops —

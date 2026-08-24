@@ -493,6 +493,8 @@ static u8* cap_wptr(void* user, u32 space, u32 offset, u32 min_bytes)
 
 typedef struct cap_data {
     u32 n_blocks, n_records, reg_words, vp_words, const_words;
+    u32 disp_count;
+    u32 disp[8][4];                  /* width, height, pitch, local offset */
     u32* regs;
     u32* vp;
     u32* consts;
@@ -501,6 +503,215 @@ typedef struct cap_data {
     u64 data_size;
     u32* records;
 } cap_data;
+
+enum {
+    CAP_METHOD_COUNT = 0x40000,
+    CAP_FAILURE_COUNT = 64,
+    CAP_TARGET_COUNT = 64,
+};
+
+typedef struct cap_method_manifest {
+    u64 count;
+    u64 supported;
+    u64 unsupported;
+    u32 first_arg;
+    u32 last_arg;
+    u32 first_unsupported_arg;
+} cap_method_manifest;
+
+typedef struct cap_action_failure {
+    u32 kind;
+    int rc;
+    u64 ordinal;
+    u32 color_location, color_offset, color_format, color_target;
+    u32 depth_location, depth_offset, depth_format;
+    u32 clip_w, clip_h;
+    u32 fp_location, fp_offset, fp_control;
+    u32 vp_start, primitive, indexed, batch_count, total_count;
+    u32 clear_mask, clear_color, clear_depth_stencil;
+    rsx_nir_transfer transfer;
+} cap_action_failure;
+
+typedef struct cap_target_manifest {
+    u32 location, offset, format, width, height;
+    u64 writes;
+} cap_target_manifest;
+
+typedef struct cap_manifest {
+    cap_method_manifest* methods;
+    u64 method_records;
+    u64 data_records;
+    u32 unique_methods;
+    u32 unique_unsupported_methods;
+    cap_action_failure failures[CAP_FAILURE_COUNT];
+    u32 failure_count;
+    u64 failure_overflow;
+    cap_target_manifest targets[CAP_TARGET_COUNT];
+    u32 target_count;
+    u64 target_overflow;
+    u32 last_target;
+    u32 last_present_buffer;
+    int saw_present;
+    u64 action_ordinal;
+} cap_manifest;
+
+typedef struct cap_exec_trace {
+    rsx_nr_exec_ops inner;
+    cap_manifest* manifest;
+} cap_exec_trace;
+
+static void cap_note_target(cap_manifest* m, const rsx_nir_pipeline* st)
+{
+    if (!m || !st || !st->surface.clip_w || !st->surface.clip_h)
+        return;
+    for (u32 i = 0; i < m->target_count; ++i) {
+        cap_target_manifest* const target = &m->targets[i];
+        if (target->location == st->surface.color_location[0] &&
+            target->offset == st->surface.color_offset[0] &&
+            target->format == st->surface.color_format &&
+            target->width == st->surface.clip_w &&
+            target->height == st->surface.clip_h) {
+            target->writes++;
+            m->last_target = i;
+            return;
+        }
+    }
+    if (m->target_count >= CAP_TARGET_COUNT) {
+        m->target_overflow++;
+        return;
+    }
+    cap_target_manifest* const target = &m->targets[m->target_count];
+    target->location = st->surface.color_location[0];
+    target->offset = st->surface.color_offset[0];
+    target->format = st->surface.color_format;
+    target->width = st->surface.clip_w;
+    target->height = st->surface.clip_h;
+    target->writes = 1;
+    m->last_target = m->target_count++;
+}
+
+static void cap_note_failure(cap_exec_trace* t, u32 kind, int rc,
+                             const rsx_nir_pipeline* st,
+                             const rsx_nir_clear* clear,
+                             const rsx_nir_draw* draw,
+                             const rsx_nir_transfer* transfer)
+{
+    cap_manifest* const m = t->manifest;
+    if (!m)
+        return;
+    if (m->failure_count >= CAP_FAILURE_COUNT) {
+        m->failure_overflow++;
+        return;
+    }
+    cap_action_failure* const failure = &m->failures[m->failure_count++];
+    memset(failure, 0, sizeof(*failure));
+    failure->kind = kind;
+    failure->rc = rc;
+    failure->ordinal = m->action_ordinal;
+    if (st) {
+        failure->color_location = st->surface.color_location[0];
+        failure->color_offset = st->surface.color_offset[0];
+        failure->color_format = st->surface.color_format;
+        failure->color_target = st->surface.color_target;
+        failure->depth_location = st->surface.zeta_location;
+        failure->depth_offset = st->surface.zeta_offset;
+        failure->depth_format = st->surface.depth_format;
+        failure->clip_w = st->surface.clip_w;
+        failure->clip_h = st->surface.clip_h;
+        failure->fp_location = st->fragment_program.location;
+        failure->fp_offset = st->fragment_program.offset;
+        failure->fp_control = st->fragment_program.control;
+        failure->vp_start = st->vertex_program.start_slot;
+    }
+    if (clear) {
+        failure->clear_mask = clear->mask;
+        failure->clear_color = clear->color_value;
+        failure->clear_depth_stencil =
+            (clear->depth_value << 8) | (clear->stencil_value & 0xFFu);
+    }
+    if (draw) {
+        failure->primitive = draw->primitive;
+        failure->indexed = draw->indexed;
+        failure->batch_count = draw->batch_count;
+        failure->total_count = draw->total_count;
+    }
+    if (transfer)
+        failure->transfer = *transfer;
+}
+
+static int cap_trace_clear(void* user, const rsx_nir_pipeline* st,
+                           const rsx_nir_clear* clear)
+{
+    cap_exec_trace* const t = user;
+    t->manifest->action_ordinal++;
+    const int rc = t->inner.clear
+        ? t->inner.clear(t->inner.user, st, clear) : -1;
+    if (rc)
+        cap_note_failure(t, RSX_NIR_OP_CLEAR, rc, st, clear, NULL, NULL);
+    else if (clear->mask & 0xF0u)
+        cap_note_target(t->manifest, st);
+    return rc;
+}
+
+static int cap_trace_draw(void* user, const rsx_nir_pipeline* st,
+                          const u32* vp_words, u32 vp_word_count,
+                          const rsx_nir_draw* draw, const u32* batches)
+{
+    cap_exec_trace* const t = user;
+    t->manifest->action_ordinal++;
+    const int rc = t->inner.draw
+        ? t->inner.draw(t->inner.user, st, vp_words, vp_word_count,
+                        draw, batches) : -1;
+    if (rc)
+        cap_note_failure(t, RSX_NIR_OP_DRAW, rc, st, NULL, draw, NULL);
+    else
+        cap_note_target(t->manifest, st);
+    return rc;
+}
+
+static int cap_trace_transfer(void* user, const rsx_nir_pipeline* st,
+                              const rsx_nir_transfer* transfer,
+                              const u32* words)
+{
+    cap_exec_trace* const t = user;
+    t->manifest->action_ordinal++;
+    const int rc = t->inner.transfer
+        ? t->inner.transfer(t->inner.user, st, transfer, words) : -1;
+    if (rc)
+        cap_note_failure(t, RSX_NIR_OP_TRANSFER, rc, st, NULL, NULL,
+                         transfer);
+    return rc;
+}
+
+static int cap_trace_present(void* user, u32 buffer)
+{
+    cap_exec_trace* const t = user;
+    t->manifest->action_ordinal++;
+    t->manifest->last_present_buffer = buffer;
+    t->manifest->saw_present = 1;
+    return t->inner.present
+        ? t->inner.present(t->inner.user, buffer) : -1;
+}
+
+static void cap_trace_flush(void* user)
+{
+    cap_exec_trace* const t = user;
+    if (t->inner.flush)
+        t->inner.flush(t->inner.user);
+}
+
+static int cap_manifest_init(cap_manifest* m)
+{
+    memset(m, 0, sizeof(*m));
+    m->methods = calloc(CAP_METHOD_COUNT, sizeof(*m->methods));
+    return m->methods ? 0 : -1;
+}
+
+static void cap_manifest_free(cap_manifest* m)
+{
+    free(m->methods);
+    memset(m, 0, sizeof(*m));
+}
 
 static int cap_load(const char* path, cap_data* c)
 {
@@ -511,11 +722,10 @@ static int cap_load(const char* path, cap_data* c)
         return -1;
     }
     u32 header[8];
-    u32 disp_count;
-    u32 disp[8][4];
     if (fread(header, 4, 8, fp) != 8 || memcmp(header, "RXS1", 4) != 0 ||
         (header[1] != 2 && header[1] != 3) ||
-        fread(&disp_count, 4, 1, fp) != 1 || fread(disp, 16, 8, fp) != 8 ||
+        fread(&c->disp_count, 4, 1, fp) != 1 ||
+        fread(c->disp, 16, 8, fp) != 8 || c->disp_count > 8u ||
         (header[1] >= 3 && fread(&c->const_words, 4, 1, fp) != 1)) {
         fclose(fp);
         return -1;
@@ -587,37 +797,18 @@ static u64 fnv64(const u8* p, size_t n)
 }
 
 static int cap_dump_rt_ppm(rsx_nr_d3d12* sink, const char* dir,
-                           u32 offset, const char* name)
+                           const cap_target_manifest* target,
+                           const char* name)
 {
-    /* Local capture oracles span the original 1280-wide captures and the
-     * current 1024x768 render configuration. The backend lookup is exact by
-     * design, so probe only these audited canvas shapes instead of creating
-     * or resizing a resource merely to dump it. */
-    static const u32 dimensions[][2] = {
-        {1024u, 720u}, {1024u, 768u}, {1280u, 720u},
-        {1280u, 768u}, {1280u, 1024u}
-    };
-    u32 width = 0, height = 0;
-    u8* pixels = NULL;
-    for (u32 i = 0; i < (u32)(sizeof(dimensions) / sizeof(dimensions[0]));
-         ++i) {
-        const size_t bytes =
-            (size_t)dimensions[i][0] * dimensions[i][1] * 4u;
-        u8* const candidate = realloc(pixels, bytes);
-        if (!candidate) {
-            free(pixels);
-            return -1;
-        }
-        pixels = candidate;
-        if (rsx_nr_d3d12_read_rt(
-                sink, 0u, offset, dimensions[i][0], dimensions[i][1],
-                pixels) == 0) {
-            width = dimensions[i][0];
-            height = dimensions[i][1];
-            break;
-        }
-    }
-    if (!width) {
+    if (!target || !target->width || !target->height)
+        return -1;
+    const u32 width = target->width;
+    const u32 height = target->height;
+    const size_t bytes = (size_t)width * height * 4u;
+    u8* const pixels = malloc(bytes);
+    if (!pixels || rsx_nr_d3d12_read_rt(
+            sink, target->location, target->offset, width, height,
+            pixels) != 0) {
         free(pixels);
         return -1;
     }
@@ -650,7 +841,8 @@ static int cap_dump_rt_ppm(rsx_nr_d3d12* sink, const char* dir,
 }
 
 static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
-                        size_t stats_size, int dump_outputs)
+                        size_t stats_size, int dump_outputs,
+                        cap_manifest* manifest)
 {
     /* arena sizes: max block end per location, 64K aligned */
     u32 need[2] = { 0, 0 };
@@ -678,6 +870,11 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         memset(&g_cap, 0, sizeof(g_cap));
         return -2;                   /* no device                          */
     }
+    for (u32 i = 0; i < c->disp_count; ++i) {
+        rsx_nr_d3d12_set_display_buffer(
+            sink, i, RSX_NIR_LOCATION_LOCAL, c->disp[i][3],
+            c->disp[i][0], c->disp[i][1]);
+    }
     const char* allow_flow_txl = getenv("YZ_NR_CAPTURE_FLOW_TXL_ORACLE");
     if (allow_flow_txl && allow_flow_txl[0] &&
         strcmp(allow_flow_txl, "0") != 0)
@@ -691,7 +888,17 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         return -1;
     rsx_nr_exec_ops ops;
     memset(&ops, 0, sizeof(ops));
-    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    cap_exec_trace trace;
+    memset(&trace, 0, sizeof(trace));
+    trace.manifest = manifest;
+    rsx_nr_d3d12_get_exec_ops(sink, &trace.inner);
+    ops = trace.inner;
+    ops.user = &trace;
+    ops.clear = cap_trace_clear;
+    ops.draw = cap_trace_draw;
+    ops.transfer = cap_trace_transfer;
+    ops.present = cap_trace_present;
+    ops.flush = cap_trace_flush;
     rsx_nr_backend be;
     rsx_nr_backend_init(&be, &ring, &tokens, &ops);
 
@@ -703,7 +910,6 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     rsx_nir_adapter_seed(ad, c->regs, c->reg_words, c->vp, c->vp_words,
                          c->consts, c->const_words);
 
-    u32 rt_space = 0, rt_offset = 0, rt_w = 0, rt_h = 0;
     u32 completed_draws = 0;
     u32 stop_after_draw = 0;
     {
@@ -720,7 +926,30 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
                 ;
             cap_apply_block(c, rsx_nr_d3d12_pages(sink), a);
+            manifest->data_records++;
             continue;
+        }
+        manifest->method_records++;
+        if (m < CAP_METHOD_COUNT) {
+            cap_method_manifest* const method = &manifest->methods[m];
+            const int supported =
+                rsx_nir_adapter_method_supported(ad, m, a);
+            if (!method->count) {
+                method->first_arg = a;
+                method->first_unsupported_arg = supported ? 0u : a;
+                manifest->unique_methods++;
+                if (!supported)
+                    manifest->unique_unsupported_methods++;
+            } else if (!supported && !method->unsupported) {
+                method->first_unsupported_arg = a;
+                manifest->unique_unsupported_methods++;
+            }
+            method->count++;
+            method->last_arg = a;
+            if (supported)
+                method->supported++;
+            else
+                method->unsupported++;
         }
         rsx_nir_adapter_method(ad, m, a);
         if (m == 0x1808u && a == 0u)
@@ -733,15 +962,6 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         while (rsx_nr_ring_depth(&ring) > 2048 &&
                rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
             ;
-        /* remember the last color target the stream configured */
-        if ((be.st.surface.color_format == 4 ||
-             be.st.surface.color_format == 5 ||
-             be.st.surface.color_format == 8) && be.st.surface.clip_w) {
-            rt_space = be.st.surface.color_location[0];
-            rt_offset = be.st.surface.color_offset[0];
-            rt_w = be.st.surface.clip_w;
-            rt_h = be.st.surface.clip_h;
-        }
         if (stop_after_draw && completed_draws >= stop_after_draw)
             break;
     }
@@ -752,6 +972,7 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
     snprintf(stats_line, stats_size,
+             "methods=%llu unique=%u unsupported_methods=%u data=%llu "
              "clears=%llu draws=%llu (restart=%llu) batches=%llu "
              "presents=%llu xfers=%llu pso=%llu(+%lluh) unsup_draw=%llu "
              "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu fp=%llu "
@@ -760,7 +981,11 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
              "exec_err=%llu topo_id=[3:%llu 7:%llu 8:%llu 9:%llu 10:%llu] "
              "rtfmt=[1:%llu 2:%llu 3:%llu 6:%llu 7:%llu 9:%llu 10:%llu "
-             "11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu]",
+             "11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu] "
+             "targets=%u target_overflow=%llu failure_keys=%u "
+             "failure_overflow=%llu",
+             manifest->method_records, manifest->unique_methods,
+             manifest->unique_unsupported_methods, manifest->data_records,
              st.clears, st.draws, st.restart_draws, st.draw_batches,
              st.presents, st.transfers, st.pso_builds, st.pso_hits,
              st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
@@ -778,14 +1003,20 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.unsup_rt_format[9], st.unsup_rt_format[10],
              st.unsup_rt_format[11], st.unsup_rt_format[12],
              st.unsup_rt_format[13], st.unsup_rt_format[14],
-             st.unsup_rt_format[15], st.unsup_rt_format[16]);
+             st.unsup_rt_format[15], st.unsup_rt_format[16],
+             manifest->target_count, manifest->target_overflow,
+             manifest->failure_count, manifest->failure_overflow);
 
     *rt_hash = 0;
-    if (rt_w && rt_h) {
-        u8* px = malloc((size_t)rt_w * rt_h * 4);
-        if (px && rsx_nr_d3d12_read_rt(sink, rt_space, rt_offset, rt_w, rt_h,
-                                       px) == 0)
-            *rt_hash = fnv64(px, (size_t)rt_w * rt_h * 4);
+    if (manifest->saw_present &&
+        manifest->last_present_buffer < c->disp_count) {
+        const u32* const display = c->disp[manifest->last_present_buffer];
+        const size_t bytes = (size_t)display[0] * display[1] * 4u;
+        u8* px = malloc(bytes);
+        if (px && rsx_nr_d3d12_read_rt(
+                sink, RSX_NIR_LOCATION_LOCAL, display[3],
+                display[0], display[1], px) == 0)
+            *rt_hash = fnv64(px, bytes);
         free(px);
     }
 
@@ -793,12 +1024,20 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         const char* dump_dir = getenv("YZ_NR_CAPTURE_DUMP_DIR");
         int dumped = 0;
         if (dump_dir && dump_dir[0]) {
-            dumped |= cap_dump_rt_ppm(
-                sink, dump_dir, 0x01800000u,
-                "native_world_01800000.ppm") == 0;
-            dumped |= cap_dump_rt_ppm(
-                sink, dump_dir, 0x00E40000u,
-                "native_final_00E40000.ppm") == 0;
+            for (u32 i = 0;; ++i) {
+                cap_target_manifest target = {0};
+                if (rsx_nr_d3d12_rt_info(
+                        sink, i, &target.location, &target.offset,
+                        &target.format, &target.width, &target.height) != 0)
+                    break;
+                char name[160];
+                snprintf(name, sizeof(name),
+                         "native_rt_%02u_%u_%08X_%ux%u_f%u.ppm",
+                         i, target.location, target.offset,
+                         target.width, target.height, target.format);
+                dumped |= cap_dump_rt_ppm(
+                    sink, dump_dir, &target, name) == 0;
+            }
         }
         if (dump_dir && dump_dir[0] && !dumped) {
             fprintf(stderr, "capture: failed to dump oracle render targets\n");
@@ -815,6 +1054,100 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     return ring_fault ? -1 : 0;
 }
 
+static void cap_write_manifest(const char* capture_path,
+                               const cap_manifest* manifest)
+{
+    const char* const dir = getenv("YZ_NR_CAPTURE_MANIFEST_DIR");
+    if (!dir || !dir[0] || !manifest || !manifest->methods)
+        return;
+    const char* base = strrchr(capture_path, '\\');
+    const char* slash = strrchr(capture_path, '/');
+    if (!base || (slash && slash > base))
+        base = slash;
+    base = base ? base + 1 : capture_path;
+    char stem[256];
+    size_t stem_length = strlen(base);
+    if (stem_length >= sizeof(stem))
+        stem_length = sizeof(stem) - 1u;
+    memcpy(stem, base, stem_length);
+    stem[stem_length] = 0;
+    for (size_t i = 0; i < stem_length; ++i)
+        if (!((stem[i] >= 'a' && stem[i] <= 'z') ||
+              (stem[i] >= 'A' && stem[i] <= 'Z') ||
+              (stem[i] >= '0' && stem[i] <= '9') || stem[i] == '-' ||
+              stem[i] == '_'))
+            stem[i] = '_';
+    char path[1024];
+    if (snprintf(path, sizeof(path), "%s\\%s.full-native-manifest.csv",
+                 dir, stem) <= 0)
+        return;
+    FILE* fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "capture: cannot write manifest %s\n", path);
+        return;
+    }
+    fprintf(fp,
+            "record,capture,method_or_kind,count,supported,unsupported,"
+            "first_arg,last_arg,first_unsupported_arg,details\n");
+    fprintf(fp,
+            "summary,%s,methods,%llu,%u,%u,0x%08X,0x%08X,0x%08X,"
+            "data=%llu;failures=%u;targets=%u\n",
+            base, manifest->method_records, manifest->unique_methods,
+            manifest->unique_unsupported_methods, 0u, 0u, 0u,
+            manifest->data_records, manifest->failure_count,
+            manifest->target_count);
+    for (u32 method = 0; method < CAP_METHOD_COUNT; ++method) {
+        const cap_method_manifest* const entry =
+            &manifest->methods[method];
+        if (!entry->count)
+            continue;
+        fprintf(fp,
+                "method,%s,0x%05X,%llu,%llu,%llu,0x%08X,0x%08X,"
+                "0x%08X,\n",
+                base, method, entry->count, entry->supported,
+                entry->unsupported, entry->first_arg, entry->last_arg,
+                entry->first_unsupported_arg);
+    }
+    for (u32 i = 0; i < manifest->failure_count; ++i) {
+        const cap_action_failure* const f = &manifest->failures[i];
+        fprintf(fp,
+                "failure,%s,%u,1,0,1,0x%08X,0x%08X,0x%08X,"
+                "ordinal=%llu;rc=%d;color=%u:0x%08X/f%u/t%u/%ux%u;"
+                "depth=%u:0x%08X/f%u;fp=%u:0x%08X/c0x%08X;vp=%u;"
+                "draw=%u/%u/%u/%u;clear=0x%08X/0x%08X/0x%08X;"
+                "xfer=%u,src=%u:0x%08X,p%u,f%u,dst=%u:0x%08X,p%u,f%u,"
+                "line=%ux%u,words=%u,in=%ux%u,out=%u,%u+%ux%u,"
+                "step=0x%08X/0x%08X\n",
+                base, f->kind, f->clear_mask, f->clear_color,
+                f->clear_depth_stencil, f->ordinal, f->rc,
+                f->color_location, f->color_offset, f->color_format,
+                f->color_target, f->clip_w, f->clip_h,
+                f->depth_location, f->depth_offset, f->depth_format,
+                f->fp_location, f->fp_offset, f->fp_control, f->vp_start,
+                f->primitive, f->indexed, f->batch_count, f->total_count,
+                f->clear_mask, f->clear_color, f->clear_depth_stencil,
+                f->transfer.kind, f->transfer.src_location,
+                f->transfer.src_offset, f->transfer.src_pitch,
+                f->transfer.src_format, f->transfer.dst_location,
+                f->transfer.dst_offset, f->transfer.dst_pitch,
+                f->transfer.dst_format, f->transfer.line_length,
+                f->transfer.line_count, f->transfer.word_count,
+                f->transfer.in_w, f->transfer.in_h, f->transfer.out_x,
+                f->transfer.out_y, f->transfer.out_w, f->transfer.out_h,
+                f->transfer.ds_dx, f->transfer.dt_dy);
+    }
+    for (u32 i = 0; i < manifest->target_count; ++i) {
+        const cap_target_manifest* const target = &manifest->targets[i];
+        fprintf(fp,
+                "target,%s,%u,%llu,0,0,0x%08X,0x%08X,0x%08X,"
+                "location=%u;format=%u;width=%u;height=%u\n",
+                base, i, target->writes, target->offset, target->width,
+                target->height, target->location, target->format,
+                target->width, target->height);
+    }
+    fclose(fp);
+}
+
 static void run_capture_backend(const char* path)
 {
     cap_data c;
@@ -822,23 +1155,36 @@ static void run_capture_backend(const char* path)
         CHECK(0, "capture %s failed to load", path);
         return;
     }
-    char line1[512], line2[512];
+    char line1[2048], line2[2048];
     u64 h1 = 0, h2 = 0;
-    int r1 = cap_run_once(&c, &h1, line1, sizeof(line1), 1);
+    cap_manifest manifest1 = {0}, manifest2 = {0};
+    if (cap_manifest_init(&manifest1) || cap_manifest_init(&manifest2)) {
+        CHECK(0, "capture manifest allocation failed");
+        cap_manifest_free(&manifest1);
+        cap_manifest_free(&manifest2);
+        cap_free(&c);
+        return;
+    }
+    int r1 = cap_run_once(&c, &h1, line1, sizeof(line1), 1, &manifest1);
     if (r1 == -2) {
         printf("capture backend leg: SKIP (no WARP device)\n");
+        cap_manifest_free(&manifest1);
+        cap_manifest_free(&manifest2);
         cap_free(&c);
         return;
     }
     CHECK(r1 == 0, "capture backend run 1 faulted");
-    int r2 = cap_run_once(&c, &h2, line2, sizeof(line2), 0);
+    int r2 = cap_run_once(&c, &h2, line2, sizeof(line2), 0, &manifest2);
     CHECK(r2 == 0, "capture backend run 2 faulted");
     CHECK(strcmp(line1, line2) == 0, "capture stats nondeterministic:\n  %s\n  %s",
           line1, line2);
     CHECK(h1 == h2, "capture RT hash nondeterministic %016llX/%016llX",
           (unsigned long long)h1, (unsigned long long)h2);
+    cap_write_manifest(path, &manifest1);
     printf("capture backend %s:\n  %s\n  rt_hash=%016llX\n", path, line1,
            (unsigned long long)h1);
+    cap_manifest_free(&manifest1);
+    cap_manifest_free(&manifest2);
     cap_free(&c);
 }
 
@@ -1504,6 +1850,21 @@ int main(int argc, char** argv)
     CHECK(pix_is(1, 1, 0xFF, 0x00, 0x00), "clear pixel %02X %02X %02X",
           pix(1, 1)[0], pix(1, 1)[1], pix(1, 1)[2]);
     CHECK(pix_is(62, 62, 0xFF, 0x00, 0x00), "clear pixel far corner");
+
+    /* A zero CLEAR_SURFACE mask is an ordered no-op and must not require
+     * seeded target state or count as an unsupported clear. */
+    {
+        rsx_nir_pipeline empty_state;
+        rsx_nir_clear no_clear = {0};
+        memset(&empty_state, 0, sizeof(empty_state));
+        CHECK(rsx_nr_d3d12_preflight_clear(
+                  sink, &empty_state, &no_clear) == 0,
+              "zero-mask clear preflight refused");
+        rsx_nir_em_clear(&em, 0u, 0u, 0u, 0u);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(be.stats.exec_errors == 0,
+              "zero-mask clear execution failed");
+    }
 
     /* ---- transactional preflight is execution-free --------------------
      * A complete section is eligible only after every action passes these
@@ -2381,6 +2742,54 @@ int main(int argc, char** argv)
               g_published_space[0], g_published_offset[0],
               g_published_size[0], g_published_space[1],
               g_published_offset[1], g_published_size[1]);
+
+        /* NV3089 and NV3062 use distinct format-enum domains. The Hana
+         * frame's source format 3 and destination format 10 are both raw
+         * A8R8G8B8, while NV3062 SET_PITCH stores pitch in its high half. */
+        const u32 scaled_src = 0x12000u, scaled_dst = 0x8000u;
+        static const u8 row0[16] = {
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
+        };
+        static const u8 row1[16] = {
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
+        };
+        memcpy(g_local + scaled_src, row0, sizeof(row0));
+        memcpy(g_local + scaled_src + 32u, row1, sizeof(row1));
+        memset(g_main + scaled_dst, 0, 48u);
+        memset(&transfer, 0, sizeof(transfer));
+        transfer.kind = RSX_NIR_XFER_SCALED;
+        transfer.src_location = RSX_NIR_LOCATION_LOCAL;
+        transfer.src_offset = scaled_src;
+        transfer.src_pitch = 32u;
+        transfer.src_format = 3u;
+        transfer.dst_location = RSX_NIR_LOCATION_MAIN;
+        transfer.dst_offset = scaled_dst;
+        transfer.dst_pitch = 32u;
+        transfer.dst_format = 10u;
+        transfer.in_w = transfer.out_w = transfer.clip_w = 4u;
+        transfer.in_h = transfer.out_h = transfer.clip_h = 2u;
+        transfer.ds_dx = transfer.dt_dy = 0x00100000u;
+        transfer.origin = transfer.interpolator = 1u;
+        CHECK(rsx_nr_d3d12_preflight_transfer(
+                  sink, &be.st, &transfer, NULL) == 0,
+              "representation-identical scaled transfer preflight refused");
+        g_published_writes = 0;
+        rsx_nir_em_transfer(&em, &transfer, NULL);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(be.stats.exec_errors == 2,
+              "representation-identical transfer added exec error (%llu)",
+              be.stats.exec_errors);
+        CHECK(memcmp(g_main + scaled_dst, row0, sizeof(row0)) == 0 &&
+                  memcmp(g_main + scaled_dst + 32u, row1, sizeof(row1)) == 0,
+              "representation-identical transfer bytes mismatch");
+        CHECK(g_published_writes == 2 &&
+                  g_published_offset[0] == scaled_dst &&
+                  g_published_size[0] == sizeof(row0) &&
+                  g_published_offset[1] == scaled_dst + 32u &&
+                  g_published_size[1] == sizeof(row1),
+              "scaled transfer publication mismatch");
     }
 
     /* ---- vertex TXL: exact float format + big-endian conversion -------
@@ -2546,7 +2955,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 25 && st.draws == 4637 && st.presents == 22,
+    CHECK(st.clears == 26 && st.draws == 4637 && st.presents == 22,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
