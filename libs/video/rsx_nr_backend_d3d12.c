@@ -613,7 +613,8 @@ static DXGI_FORMAT nrb_depth_dsv_dxgi(const rsx_nr_d3d12* b, u32 fmt)
 }
 
 static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
-                                 u32 fmt, u32 w, u32 h, int create)
+                                 u32 fmt, u32 w, u32 h, int create,
+                                 int broker_create)
 {
     DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi;
     if (nrb_depth_formats(fmt, &resource_dxgi, &dsv_dxgi, &srv_dxgi) != 0)
@@ -626,7 +627,7 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
         u32 rf = 0, df = 0, sf = 0, ssf = 0;
         int publication_required = 0;
         if (b->borrow_depth(
-                b->broker_user, space, offset, fmt, w, h,
+                b->broker_user, space, offset, fmt, w, h, broker_create,
                 (void**)&borrowed, &rf, &df, &sf,
                 (void**)&borrowed_sample, &ssf,
                 &publication_required) != 0 || !borrowed) {
@@ -648,6 +649,10 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
             borrowed_sample->lpVtbl->Release(borrowed_sample);
             return NULL;
         }
+    } else if (create && !broker_create) {
+        /* A sampled-depth lookup must never invent a native depth target.
+         * Without a broker there is no established GPU result to import. */
+        return NULL;
     }
 
     for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
@@ -781,7 +786,7 @@ static nrb_depth* nrb_depth_from_state(rsx_nr_d3d12* b,
     const u32 w = surface->clip_w ? surface->clip_w : 1280u;
     const u32 h = surface->clip_h ? surface->clip_h : 720u;
     return nrb_get_depth(b, surface->zeta_location, surface->zeta_offset,
-                         surface->depth_format, w, h, create);
+                         surface->depth_format, w, h, create, 1);
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
@@ -1996,7 +2001,29 @@ static nrb_depth* nrb_texture_depth_alias(
             return depth;           /* active DSV/SRV alias: refuse       */
         return depth;
     }
+    /* The producing pass may have remained wholly on the established
+     * renderer. Import only an already-existing exact depth identity; the
+     * lookup-only broker call is forbidden from creating/clearing a target,
+     * so unsupported content still follows the proven guest fallback without
+     * changing later producer state. */
+    if (b->borrow_depth)
+        return nrb_get_depth(
+            b, texture->location, texture->offset, 2u,
+            texture->width, texture->height, 1, 0);
     return NULL;
+}
+
+int rsx_nr_d3d12_validate_depth_sample_alias(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture)
+{
+    if (!b || !texture)
+        return -1;
+    nrb_depth* const depth = nrb_texture_depth_alias(b, texture, NULL, 0u);
+    if (!depth)
+        return -1;
+    if (!depth->external)
+        return 0;
+    return depth->sample_tex && b->resolve_depth_sample ? 0 : -1;
 }
 
 static void nrb_write_depth_sample_srv(rsx_nr_d3d12* b,
@@ -4094,7 +4121,6 @@ int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
         ? RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL : 0u;
     return 0;
 }
-
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
 {
@@ -4605,6 +4631,12 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
 {
     (void)b;
     return 0;
+}
+int rsx_nr_d3d12_validate_depth_sample_alias(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture)
+{
+    (void)b; (void)texture;
+    return -1;
 }
 int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
 {

@@ -44,9 +44,10 @@ void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
 int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, void** r, u32* f)
 { (void)l; (void)o; (void)w; (void)h; (void)r; (void)f; return -1; }
 int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
-                               void** r, u32* rf, u32* d, u32* s,
+                               int create, void** r, u32* rf, u32* d, u32* s,
                                void** sr, u32* sf, int* p)
-{ (void)l; (void)o; (void)df; (void)w; (void)h; (void)r; (void)rf; (void)d;
+{ (void)l; (void)o; (void)df; (void)w; (void)h; (void)create;
+  (void)r; (void)rf; (void)d;
   (void)s; (void)sr; (void)sf; if (p) *p = 0; return -1; }
 int rsx_live_draw_resolve_depth_sample(u32 l, u32 o, u32 w, u32 h)
 { (void)l; (void)o; (void)w; (void)h; return -1; }
@@ -7538,7 +7539,8 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
 }
 
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
-                               u32 width, u32 height, void** resource,
+                               u32 width, u32 height, int create,
+                               void** resource,
                                u32* resource_format, u32* dsv_format,
                                u32* srv_format, void** sample_resource,
                                u32* sample_srv_format,
@@ -7557,14 +7559,18 @@ int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
         return -1;
     }
     ID3D12Resource* prior = NULL;
+    u32 existing_slot = 0;
     for (u32 i = 0; i < g.n_zdepths; ++i) {
         if (g.zdepths[i].location == location &&
             g.zdepths[i].offset == offset) {
             prior = g.zdepths[i].tex;
+            if (g.zdepths[i].w >= width && g.zdepths[i].h >= height)
+                existing_slot = 1u + i;
             break;
         }
     }
-    const u32 slot = zdepth_get(location, offset, width, height);
+    const u32 slot = create
+        ? zdepth_get(location, offset, width, height) : existing_slot;
     if (!slot || slot > g.n_zdepths || !g.zdepths[slot - 1u].tex) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         return -1;

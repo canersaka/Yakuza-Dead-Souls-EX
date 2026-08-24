@@ -775,6 +775,8 @@ typedef struct broker_color_test {
     ID3D12Resource* depth;
     u32 calls;
     u32 depth_calls;
+    u32 depth_lookup_calls;
+    u32 depth_create_calls;
     u32 depth_resolve_calls;
     int depth_resolve_fail;
 } broker_color_test;
@@ -796,7 +798,7 @@ static int borrow_rgba_for_logical_565(
 
 static int borrow_depth_for_alias_test(
     void* user, u32 space, u32 offset, u32 depth_format,
-    u32 width, u32 height, void** resource, u32* resource_format,
+    u32 width, u32 height, int create, void** resource, u32* resource_format,
     u32* dsv_format, u32* srv_format, void** sample_resource,
     u32* sample_srv_format, int* publication_required)
 {
@@ -817,6 +819,10 @@ static int borrow_depth_for_alias_test(
     *sample_srv_format = (u32)DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     *publication_required = 0;
     broker->depth_calls++;
+    if (create)
+        broker->depth_create_calls++;
+    else
+        broker->depth_lookup_calls++;
     return 0;
 }
 
@@ -901,7 +907,7 @@ static void test_broker_actual_color_format(void)
         goto done;
 
     broker_color_test broker = {
-        resource, depth_resource, 0u, 0u, 0u, 0
+        resource, depth_resource, 0u, 0u, 0u, 0u, 0u, 0
     };
     rsx_nr_d3d12_set_resource_broker(
         sink, borrow_rgba_for_logical_565, borrow_depth_for_alias_test,
@@ -923,9 +929,6 @@ static void test_broker_actual_color_format(void)
     rsx_nir_sink k = rsx_nr_ring_sink(&ring);
     rsx_nir_emitter em;
     rsx_nir_emitter_init(&em, &k);
-
-    write_test_fp();
-    stage_frame_state(&em);
     rsx_nir_surface s565;
     memset(&s565, 0, sizeof(s565));
     s565.color_format = 3;
@@ -940,6 +943,54 @@ static void test_broker_actual_color_format(void)
     s565.zeta_offset = ZETA_OFFSET;
     s565.zeta_pitch = RT_W * 4u;
     s565.zeta_location = RSX_NIR_LOCATION_LOCAL;
+
+    rsx_nir_texture external_depth;
+    memset(&external_depth, 0, sizeof(external_depth));
+    external_depth.enabled = 1;
+    external_depth.offset = ZETA_OFFSET;
+    external_depth.location = RSX_NIR_LOCATION_LOCAL;
+    external_depth.format = 0xB0u;
+    external_depth.dimension = 2u;
+    external_depth.mipmaps = 1u;
+    external_depth.width = RT_W;
+    external_depth.height = RT_H;
+    external_depth.pitch = RT_W * 4u;
+    CHECK(rsx_nr_d3d12_validate_depth_sample_alias(
+              sink, &external_depth) == 0,
+          "lookup-only established depth alias was refused");
+    CHECK(broker.depth_lookup_calls == 1u &&
+              broker.depth_create_calls == 0u,
+          "depth alias validation lookup=%u create=%u",
+          broker.depth_lookup_calls, broker.depth_create_calls);
+
+    /* A producer owned entirely by the established renderer never enters
+     * this backend as a native depth target. Its first native appearance can
+     * be a sampled DEPTH24_D8 binding. Discover that existing resource with a
+     * lookup-only broker request; preflight must not create a second target. */
+    write_tex_fp();
+    stage_frame_state(&em);
+    rsx_nir_em_surface(&em, &s565);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF0000FFu, 0u, 0u);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "lookup-only borrowed zeta sample had %llu execution errors",
+          be.stats.exec_errors);
+    CHECK(broker.depth_lookup_calls >= 1u &&
+              broker.depth_create_calls == 0u &&
+              broker.depth_resolve_calls >= 1u,
+          "external depth was not lazily imported lookup=%u create=%u resolve=%u",
+          broker.depth_lookup_calls, broker.depth_create_calls,
+          broker.depth_resolve_calls);
+
+    write_test_fp();
+    stage_frame_state(&em);
     rsx_nir_em_surface(&em, &s565);
     write_triangle(rsx_nr_d3d12_pages(sink),
                    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);

@@ -58,7 +58,7 @@ typedef int (*rsx_nr_d3d12_borrow_color_fn)(
     void** resource, u32* dxgi_format);
 typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
     void* user, u32 space, u32 offset, u32 depth_format,
-    u32 width, u32 height, void** resource, u32* resource_format,
+    u32 width, u32 height, int create, void** resource, u32* resource_format,
     u32* dsv_format, u32* srv_format, void** sample_resource,
     u32* sample_srv_format, int* publication_required);
 /* Record the established renderer's depth-to-color snapshot on the same
@@ -196,6 +196,11 @@ int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
 int rsx_nr_d3d12_validate_draw_program_usage(
     rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
     const u32* vp_words, u32 vp_word_count, u32* texture_mask);
+/* Validate/import an already-existing depth target for texture sampling.
+ * The broker lookup is exact and lookup-only: it may retain the resource in
+ * the backend cache, but must not create, clear, submit, or wait for one. */
+int rsx_nr_d3d12_validate_depth_sample_alias(
+    rsx_nr_d3d12* b, const rsx_nir_texture* texture);
 int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
                                     const rsx_nir_pipeline* st,
                                     const rsx_nir_transfer* transfer,

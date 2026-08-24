@@ -701,7 +701,7 @@ static int yz_nr_borrow_color(void*, uint32_t space, uint32_t offset,
 
 static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
                                uint32_t depth_format, uint32_t width,
-                               uint32_t height, void** resource,
+                               uint32_t height, int create, void** resource,
                                uint32_t* resource_format,
                                uint32_t* dsv_format, uint32_t* srv_format,
                                void** sample_resource,
@@ -709,7 +709,7 @@ static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
                                int* publication_required)
 {
     const int result = rsx_live_draw_borrow_depth(
-        space, offset, depth_format, width, height, resource,
+        space, offset, depth_format, width, height, create, resource,
         resource_format, dsv_format, srv_format, sample_resource,
         sample_srv_format, publication_required);
     if (!result && *publication_required &&
@@ -2892,7 +2892,9 @@ static uint32_t yz_nr_section_program_preflight(void)
             const rsx_nir_texture* const texture = &state.textures[unit];
             if (rsx_nr_yz_unproven_shadow_depth_consumer(
                     texture->enabled, texture->location, texture->offset,
-                    texture->format)) {
+                    texture->format) &&
+                rsx_nr_d3d12_validate_depth_sample_alias(
+                    g_active.d3d12, texture) != 0) {
                 g_active.section_shadow_consumer_fallback++;
                 return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             }
@@ -2996,7 +2998,9 @@ static uint32_t yz_nr_section_preflight(void)
                 const rsx_nir_texture* const texture = &state.textures[unit];
                 if (rsx_nr_yz_unproven_shadow_depth_consumer(
                         texture->enabled, texture->location, texture->offset,
-                        texture->format))
+                        texture->format) &&
+                    rsx_nr_d3d12_validate_depth_sample_alias(
+                        g_active.d3d12, texture) != 0)
                     return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             }
             const uint32_t* const batches = rsx_nir_side(
