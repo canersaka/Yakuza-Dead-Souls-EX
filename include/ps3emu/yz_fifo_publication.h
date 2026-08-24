@@ -121,14 +121,16 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
  * title links the primary FIFO to the final word of a fixed-size generated
  * block; that word is producer-owned flow storage and can still contain
  * recycled vertex/constant payload when the source JUMP becomes visible.
- * Execution may move to the following block only after the caller has proven
- * both the exact generated prologue and a complete draw-balanced prefix.
+ * Execution may move to a candidate inside the following block only after the
+ * caller has proven both its exact generated prologue and a complete
+ * draw-balanced prefix.  A producer can leave recycled payload between the
+ * block boundary and the first finalized prologue.
  *
  * This helper intentionally accepts packet-shaped recycled words: that is the
  * failure this boundary proof exists to distinguish.  A real flow word is
  * never bypassed, and no arbitrary scan result can satisfy the contract. */
-static inline uint32_t yz_fifo_generated_block_tail_resume(
-    uint32_t tail, uint32_t tail_word,
+static inline uint32_t yz_fifo_generated_block_candidate_resume(
+    uint32_t tail, uint32_t tail_word, uint32_t candidate,
     uint32_t fifo_size, uint32_t block_size,
     int generated_prologue_ready, int balanced_prefix_ready)
 {
@@ -136,6 +138,7 @@ static inline uint32_t yz_fifo_generated_block_tail_resume(
         !block_size || (block_size & (block_size - 1u)) != 0u ||
         block_size > fifo_size || (tail & 3u) || tail >= fifo_size ||
         ((tail + 4u) & (block_size - 1u)) != 0u ||
+        !candidate || (candidate & 3u) || candidate >= fifo_size ||
         generated_prologue_ready == 0 || balanced_prefix_ready == 0)
         return 0u;
 
@@ -146,8 +149,22 @@ static inline uint32_t yz_fifo_generated_block_tail_resume(
     if (flow)
         return 0u;
 
-    const uint32_t resume = (tail + 4u) & (fifo_size - 1u);
-    return resume ? resume : 0u;
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t block_start = (tail + 4u) & mask;
+    const uint32_t candidate_delta = (candidate - block_start) & mask;
+    return candidate_delta < block_size ? candidate : 0u;
+}
+
+static inline uint32_t yz_fifo_generated_block_tail_resume(
+    uint32_t tail, uint32_t tail_word,
+    uint32_t fifo_size, uint32_t block_size,
+    int generated_prologue_ready, int balanced_prefix_ready)
+{
+    const uint32_t candidate = fifo_size
+        ? (tail + 4u) & (fifo_size - 1u) : 0u;
+    return yz_fifo_generated_block_candidate_resume(
+        tail, tail_word, candidate, fifo_size, block_size,
+        generated_prologue_ready, balanced_prefix_ready);
 }
 
 #endif

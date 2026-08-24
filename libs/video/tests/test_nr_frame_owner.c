@@ -457,6 +457,29 @@ static int test_jump_waits_for_exact_target_publication(void)
               RSX_NR_FRAME_ADVANCED && next == segment_next,
           "published segment-tail link did not execute");
 
+    /* EDGE generated lists use a smaller independent 128 KiB block tail.
+     * Model it at 8 KiB so the fixed fixture can prove that a packet-shaped
+     * recycled word is never admitted as the target of an incoming jump. */
+    fixture_init(&f);
+    f.owner.primary_segment_bytes = 0x4000u;
+    f.owner.generated_block_bytes = 0x2000u;
+    f.words[base >> 2] = 0x20000000u | segment_tail;
+    f.words[segment_tail >> 2] = packet(1u, 0x0050u);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, 0x3000u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && next == base,
+          "packet-shaped generated-block tail was consumed");
+    f.words[segment_tail >> 2] = 0x20000000u | segment_next;
+    f.words[segment_next >> 2] = 0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, 0x3000u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == segment_tail,
+          "generated-block tail link did not release its incoming jump");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, 0x3000u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == segment_next,
+          "generated-block tail link did not execute");
+
     return 0;
 }
 

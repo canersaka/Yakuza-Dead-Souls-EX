@@ -12,6 +12,7 @@
 #define NR_FRAME_FLOW_WAIT_BOUND (1u << 24)
 #define NR_FRAME_GENERATED_LINK_PROOF_DELAY (1u << 16)
 #define NR_FRAME_PRIMARY_SEGMENT_BYTES 0x100000u
+#define NR_FRAME_GENERATED_BLOCK_BYTES 0x20000u
 
 static rsx_nr_frame_step_result frame_fail(
     rsx_nr_frame_owner* o, u32 kind, u32 get, u32 put, u32 ret, u32 command,
@@ -91,6 +92,7 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* o,
     o->flow_wait_put = ~0u;
     o->flow_wait_limit = NR_FRAME_FLOW_WAIT_BOUND;
     o->primary_segment_bytes = NR_FRAME_PRIMARY_SEGMENT_BYTES;
+    o->generated_block_bytes = NR_FRAME_GENERATED_BLOCK_BYTES;
 }
 
 static void frame_breadcrumb(rsx_nr_frame_owner* o, u32 get, u32 put,
@@ -152,6 +154,14 @@ static int frame_is_primary_segment_tail(const rsx_nr_frame_owner* o,
            (io + 4u) % o->primary_segment_bytes == 0u;
 }
 
+static int frame_is_generated_block_tail(const rsx_nr_frame_owner* o,
+                                         u32 io, u32 ret)
+{
+    return ret == ~0u && io < NR_FRAME_RING_SIZE &&
+           o->generated_block_bytes &&
+           (io + 4u) % o->generated_block_bytes == 0u;
+}
+
 static int frame_flow_target_ready(const rsx_nr_frame_owner* o,
                                    u32 target, u32 ret, u32 command)
 {
@@ -161,7 +171,8 @@ static int frame_flow_target_ready(const rsx_nr_frame_owner* o,
      * exclusively for its link. Raw vertex/constant data can transiently
      * occupy the recycled word and can accidentally resemble a packet
      * header; only the published jump proves this dependency is ready. */
-    if (frame_is_primary_segment_tail(o, target, ret))
+    if (frame_is_primary_segment_tail(o, target, ret) ||
+        frame_is_generated_block_tail(o, target, ret))
         return frame_command_is_jump(command);
     return 1;
 }
