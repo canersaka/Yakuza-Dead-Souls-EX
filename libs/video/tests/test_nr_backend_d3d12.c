@@ -1117,7 +1117,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              "tex=%llu] real_fp=%llu tex_draw=%llu "
              "tex_cache=%llu(+%lluh,%llur) tex_fail=%llu alias=%llu "
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
-             "exec_err=%llu topo_id=[3:%llu 7:%llu 8:%llu 9:%llu 10:%llu] "
+             "exec_err=%llu submits=%llu "
+             "topo_id=[3:%llu 7:%llu 8:%llu 9:%llu 10:%llu] "
              "rtfmt=[1:%llu 2:%llu 3:%llu 6:%llu 7:%llu 9:%llu 10:%llu "
              "11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu] "
              "targets=%u target_overflow=%llu failure_keys=%u "
@@ -1133,6 +1134,7 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.texture_refreshes, st.texture_failures, st.rt_alias_binds,
              st.unsupported_clears, st.unsupported_transfers,
              st.compile_failures, be.stats.exec_errors,
+             st.queue_submissions,
              st.unsup_topology_id[3], st.unsup_topology_id[7],
              st.unsup_topology_id[8], st.unsup_topology_id[9],
              st.unsup_topology_id[10], st.unsup_rt_format[1],
@@ -1146,17 +1148,26 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              manifest->failure_count, manifest->failure_overflow);
 
     *rt_hash = 0;
+    int presented_readback = -2;
     if (manifest->saw_present &&
         manifest->last_present_buffer < c->disp_count) {
         const u32* const display = c->disp[manifest->last_present_buffer];
         const size_t bytes = (size_t)display[0] * display[1] * 4u;
         u8* px = malloc(bytes);
-        if (px && rsx_nr_d3d12_read_rt(
+        if (px)
+            presented_readback = rsx_nr_d3d12_read_rt(
                 sink, RSX_NIR_LOCATION_LOCAL, display[3],
-                display[0], display[1], px) == 0)
+                display[0], display[1], px);
+        if (px && presented_readback == 0)
             *rt_hash = fnv64(px, bytes);
         free(px);
     }
+    if (!*rt_hash)
+        fprintf(stderr,
+                "capture: presented readback unavailable saw=%d buffer=%u "
+                "display-count=%u rc=%d\n",
+                manifest->saw_present, manifest->last_present_buffer,
+                c->disp_count, presented_readback);
 
     if (dump_outputs) {
         const char* dump_dir = getenv("YZ_NR_CAPTURE_DUMP_DIR");
@@ -1323,6 +1334,8 @@ static void run_capture_backend(const char* path)
     CHECK(r2 == 0, "capture backend run 2 faulted");
     CHECK(strcmp(line1, line2) == 0, "capture stats nondeterministic:\n  %s\n  %s",
           line1, line2);
+    CHECK(h1 != 0u && h2 != 0u,
+          "capture presented target could not be read back");
     CHECK(h1 == h2, "capture RT hash nondeterministic %016llX/%016llX",
           (unsigned long long)h1, (unsigned long long)h2);
     cap_write_manifest(path, &manifest1);

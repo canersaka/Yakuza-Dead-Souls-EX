@@ -247,10 +247,20 @@ static int frame_try_resolve_generated_jump(
     o->repair_attempt_target = target;
     o->repair_attempt_word = target_word;
     o->stats.generated_link_attempts++;
-    if (!o->resolve_jump(
-            o->resolve_jump_user, get, put, command, target,
-            target_word, &resume))
+    const int resolved = o->resolve_jump(
+        o->resolve_jump_user, get, put, command, target,
+        target_word, &resume);
+    if (resolved <= 0) {
+        if (resolved < 0) {
+            /* The exact producer identity matched, but its dependent bytes
+             * were not ready. PUT need not change when a generated target is
+             * filled behind an already-published source edge. Do not rescan
+             * on every poll: begin one new fixed proof-delay interval. */
+            o->repair_attempt_valid = 0u;
+            o->flow_wait_put_polls = 0u;
+        }
         return 0;
+    }
 
     /* Success means the producer hook replaced the source JUMP. Re-read both
      * ends before advancing so a stale callback result cannot skip bytes. */
@@ -300,9 +310,15 @@ static int frame_try_resolve_generated_hole(
     o->repair_attempt_target = get;
     o->repair_attempt_word = word;
     o->stats.generated_link_attempts++;
-    if (!o->resolve_hole(
-            o->resolve_hole_user, get, put, word, &resume))
+    const int resolved = o->resolve_hole(
+        o->resolve_hole_user, get, put, word, &resume);
+    if (resolved <= 0) {
+        if (resolved < 0) {
+            o->repair_attempt_valid = 0u;
+            o->flow_wait_put_polls = 0u;
+        }
         return 0;
+    }
     if (resume == get || !frame_read(o, get, &current) || current != word ||
         !frame_read(o, resume, &resume_word) ||
         !frame_flow_target_ready(o, resume, ret, resume_word))
