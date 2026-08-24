@@ -47,9 +47,10 @@ PLATFORM = {
     "spu_rdch", "spu_wrch", "spu_rchcnt", "spu_indirect_branch", "spu_halt",
     "spu_img_restore", "spu_task_launch_check",
     "spu_task_launch_behavior_check", "yz_sguard_check", "yz_lockstep_tick",
-    "spu_prof_hop", "spu_arch_fence",
+    "spu_prof_hop", "spu_arch_fence", "spu_return_needs_dispatch",
 }
-LS_HOOK = {"yz_tagread_repair_read", "wbk_ls_read", "wbk_ls_write"}
+LS_HOOK = {"yz_tagread_repair_read", "wbk_ls_read", "wbk_ls_write",
+           "spu_ls_read128", "spu_ls_write128"}   # the canonical LS surface
 # Scalar-wrapped WB kernels (the WBK_WRAP list in spu_wb_simd.h): outlining
 # these is fine -- they ARE the proven scalar paths. A native kernel showing
 # up as a call is a violation (it failed to inline).
@@ -60,7 +61,7 @@ WRAPPED_WBK = re.compile(
     r"mfspr)$")
 # register-indirect calls: the SPU_DRAIN loop's `_tf(ctx)` dispatch (the
 # same construct the FAST twins compile to)
-_INDIRECT_RE = re.compile(r"^r\w{1,3}$")
+_INDIRECT_RE = re.compile(r"^(r\w{1,3}|qword)$")   # reg or `call qword ptr [...]`
 FLOAT_RE = re.compile(
     r"^(spu_(fa|fs|fm|fi|fma|fms|fnms|fceq|fcgt|fcmeq|fcmgt|frest|frsqest|"
     r"fesd|frds|cflts|cfltu|csflt|cuflt|dfa|dfs|dfm|dfma|dfms|dfnms|dfnma|"
