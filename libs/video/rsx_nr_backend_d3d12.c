@@ -94,6 +94,18 @@ static void nrb_enable_device_oracle(void)
 #define NRB_MAX_RETIRED_TEXTURES NRB_SHADER_DESCRIPTORS
 #define NRB_MAX_DRAW_BATCHES 4096u
 #define NRB_MAX_REQUIRED_SPANS (RSX_NIR_NUM_VERTEX_ATTR * 2u + 2u)
+#define NRB_HANA_INPUT_SAMPLES 16u
+#define NRB_HANA_INPUT_SPANS   8u
+#define NRB_HANA_DEPTH_UNITS   2u
+#define NRB_HANA_DEPTH_GRID    16u
+#define NRB_HANA_DEPTH_POINTS  \
+    (NRB_HANA_DEPTH_GRID * NRB_HANA_DEPTH_GRID)
+#define NRB_HANA_DEPTH_POINT_STRIDE 512u
+#define NRB_HANA_DEPTH_SAMPLE_BYTES \
+    (NRB_HANA_DEPTH_UNITS * NRB_HANA_DEPTH_POINTS * \
+     NRB_HANA_DEPTH_POINT_STRIDE)
+#define NRB_HANA_DEPTH_READBACK_BYTES \
+    (NRB_HANA_INPUT_SAMPLES * NRB_HANA_DEPTH_SAMPLE_BYTES)
 
 typedef struct nrb_prepared_batch {
     u64 index_va;
@@ -105,6 +117,80 @@ typedef struct nrb_prepared_batch {
 typedef struct nrb_required_span {
     u32 space, offset, size;
 } nrb_required_span;
+
+typedef struct nrb_hana_input_vtex {
+    rsx_nir_texture texture;
+    u64 source_hash;
+    u64 uploaded_hash;
+    u64 space_epoch;
+    u32 span;
+    u32 cache_slot;
+    u32 cache_current;
+    u32 resolution;
+    u32 first_page_gen;
+    u32 last_page_gen;
+} nrb_hana_input_vtex;
+
+typedef struct nrb_hana_input_depth {
+    u64 resource_identity;
+    u64 sample_identity;
+    u64 write_generation;
+    u64 resolve_generation;
+    u64 command_generation;
+    u64 recording_fence;
+    u64 completed_fence;
+    u64 content_hash;
+    u32 space;
+    u32 offset;
+    u32 resource_state;
+    u32 sample_state;
+    u32 srv_format;
+    u32 texture_format;
+    u32 texture_wrap;
+    u32 texture_remap;
+    u32 texture_filter;
+    u32 texture_control;
+    u32 texture_border;
+    u32 sampler_filter;
+    u32 sampler_address_u;
+    u32 sampler_address_v;
+    u32 sampler_address_w;
+    u32 sampler_comparison;
+    u32 zero_count;
+    u32 one_count;
+    u32 external;
+    u32 sample_valid;
+    u32 copy_recorded;
+} nrb_hana_input_depth;
+
+typedef struct nrb_hana_input_sample {
+    u64 match;
+    u64 vp_hash;
+    u64 fp_hash;
+    u64 constants_hash;
+    u64 required_hash;
+    u32 vp_start;
+    u32 vp_words;
+    u32 vp_branch_bits;
+    u32 render_condition_enabled;
+    u32 render_condition_dma;
+    u32 render_condition_offset;
+    u32 bound_vtex_mask;
+    u32 used_vtex_mask;
+    u32 required_count;
+    u32 index_location;
+    u32 index_offset;
+    u32 base_index;
+    u32 batch_count;
+    u32 total_count;
+    nrb_required_span required[NRB_HANA_INPUT_SPANS];
+    u64 required_span_hash[NRB_HANA_INPUT_SPANS];
+    u64 required_space_epoch[NRB_HANA_INPUT_SPANS];
+    u32 required_first_page_gen[NRB_HANA_INPUT_SPANS];
+    u32 required_last_page_gen[NRB_HANA_INPUT_SPANS];
+    nrb_hana_input_vtex vtex[NRB_VTEX_UNITS];
+    nrb_hana_input_depth depth[NRB_HANA_DEPTH_UNITS];
+} nrb_hana_input_sample;
 
 typedef struct nrb_rt {
     ID3D12Resource* tex;
@@ -132,6 +218,8 @@ typedef struct nrb_depth {
     DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi, sample_srv_dxgi;
     D3D12_RESOURCE_STATES state;
     D3D12_RESOURCE_STATES sample_state;
+    u64 write_generation;
+    u64 resolve_generation;
     int live;
     int external;
     int sample_valid;
@@ -235,6 +323,20 @@ struct rsx_nr_d3d12 {
     int force_draw_input_allocated;
     u32 force_draw_input_epoch;
     u32* force_draw_input_page_epoch[RSX_GUEST_NUM_SPACES];
+
+    /* Default-off, bounded live-input oracle for the exact Hana shadow
+     * consumer. It samples only the first four matches and one of each later
+     * 8192, keeps a fixed rolling table, and emits once at shutdown. The
+     * ordinary production path performs one cached flag test and nothing
+     * else. Per-texture uploaded hashes are populated only while armed. */
+    int hana_input_oracle;
+    u64 hana_input_matches;
+    u32 hana_input_writes;
+    nrb_hana_input_sample hana_input[NRB_HANA_INPUT_SAMPLES];
+    u64 hana_vtex_uploaded_hash[NRB_TEX_CAP];
+    u8 hana_vtex_resolution[NRB_TEX_CAP]; /* 1 hit, 2 build, 3 refresh */
+    ID3D12Resource* hana_depth_readback;
+    u32 hana_depth_copy_failures;
 
     const u8* (*guest_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
     u8* (*writable_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
@@ -1226,6 +1328,7 @@ static int nrb_resolve_private_depth_sample(
     depth->sample_state = barriers[1].Transition.StateAfter;
     nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     depth->sample_valid = 1;
+    depth->resolve_generation = depth->write_generation;
     b->stats.depth_snapshot_resolves++;
     return 0;
 }
@@ -1483,6 +1586,7 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             (float)c->depth_value / 16777215.0f,
             (UINT8)c->stencil_value, nrects, rects);
         depth->sample_valid = 0;
+        depth->write_generation++;
     }
     /* A depth/stencil-only clear does not modify the color resource.  Do not
      * let a newly allocated, still-black color alias become the most recent
@@ -2131,6 +2235,34 @@ static u32 nrb_vertex_texture_span(
     return (u32)span;
 }
 
+static u64 nrb_hana_hash(const void* data, size_t size)
+{
+    const u8* const bytes = data;
+    u64 hash = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 0x100000001B3ull;
+    }
+    return hash;
+}
+
+static u64 nrb_hana_fp_hash(const void* data, size_t size)
+{
+    static const u32 tag = 0x31435046u; /* producer-contract "FPC1" */
+    const u8* const bytes = data;
+    u64 hash = 1469598103934665603ull;
+    const u8* const tag_bytes = (const u8*)&tag;
+    for (size_t i = 0; i < sizeof(tag); ++i) {
+        hash ^= tag_bytes[i];
+        hash *= 1099511628211ull;
+    }
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 static ID3D12Resource* nrb_decode_guest_vertex_texture(
     rsx_nr_d3d12* b, const rsx_nir_texture* texture)
 {
@@ -2367,6 +2499,8 @@ static int nrb_resolve_guest_vertex_texture(
     if (entry && rsx_nr_res_current(&b->textures, entry)) {
         b->stats.texture_hits++;
         *slot_out = (u32)(entry - b->textures.slots);
+        if (b->hana_input_oracle)
+            b->hana_vtex_resolution[*slot_out] = 1u;
         return 0;
     }
 
@@ -2379,6 +2513,8 @@ static int nrb_resolve_guest_vertex_texture(
         rsx_nr_res_revalidate(&b->textures, entry);
         nrb_retire_texture(b, old);
         b->stats.texture_refreshes++;
+        if (b->hana_input_oracle)
+            b->hana_vtex_resolution[entry - b->textures.slots] = 3u;
     } else {
         entry = rsx_nr_res_insert(
             &b->textures, &key, (u64)(uintptr_t)resource);
@@ -2387,8 +2523,16 @@ static int nrb_resolve_guest_vertex_texture(
             return -1;
         }
         b->stats.texture_builds++;
+        if (b->hana_input_oracle)
+            b->hana_vtex_resolution[entry - b->textures.slots] = 2u;
     }
     *slot_out = (u32)(entry - b->textures.slots);
+    if (b->hana_input_oracle) {
+        const u8* const source = b->guest_ptr(
+            b->guest_user, texture->location, texture->offset, span);
+        b->hana_vtex_uploaded_hash[*slot_out] = source
+            ? nrb_hana_hash(source, span) : 0u;
+    }
     nrb_write_vertex_texture_srv(b, *slot_out, texture, resource);
     return 0;
 }
@@ -2640,6 +2784,7 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                     alias_resource =
                         (u64)(uintptr_t)depth_alias->sample_tex;
                     b->stats.rt_alias_binds++;
+                    depth_aliases[unit] = depth_alias;
                 } else if (depth_alias && depth_alias->sample_tex &&
                            b->resolve_depth_sample &&
                            b->resolve_depth_sample(
@@ -2657,6 +2802,7 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                     alias_resource =
                         (u64)(uintptr_t)depth_alias->sample_tex;
                     b->stats.rt_alias_binds++;
+                    depth_aliases[unit] = depth_alias;
                 }
             }
             if (source_slot == null_slot && !aliases[unit] &&
@@ -2737,6 +2883,245 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
     *cube_mask_out = cube_mask;
     *table_index_out = table_index;
     return 0;
+}
+
+static u32 nrb_hana_vp_txl_mask(const u32* words, u32 word_count)
+{
+    u32 mask = 0;
+    if (!words)
+        return 0;
+    for (u32 word = 0; word + 3u < word_count; word += 4u) {
+        const u32 d1 = words[word + 1u];
+        const u32 d2 = words[word + 2u];
+        if (((d1 >> 22) & 0x1Fu) == 25u)
+            mask |= 1u << ((d2 >> 8) & 3u);
+    }
+    return mask;
+}
+
+static int nrb_hana_input_match(const rsx_nir_pipeline* st,
+                                const nrb_fp_info* fp, u64 fp_hash)
+{
+    if (!st || !fp || fp->size != 80u ||
+        fp_hash != 0x5A76C48CAB4401BBull ||
+        st->fragment_program.location != 1u ||
+        st->fragment_program.offset != 0x01143600u ||
+        st->surface.color_location[0] != 0u ||
+        st->surface.color_offset[0] != 0x01800000u)
+        return 0;
+    const rsx_nir_texture* const a = &st->textures[14];
+    const rsx_nir_texture* const z = &st->textures[15];
+    return a->enabled && z->enabled && a->location == 0u && z->location == 0u &&
+           a->offset == 0x02310000u && z->offset == 0x02910000u &&
+           a->width == 1024u && a->height == 1024u &&
+           z->width == 1024u && z->height == 1024u;
+}
+
+static void nrb_hana_depth_capture(
+    rsx_nr_d3d12* b, nrb_hana_input_sample* sample, u32 sample_slot,
+    const rsx_nir_pipeline* st, nrb_depth* const* texture_depth_aliases)
+{
+    static const u32 texture_units[NRB_HANA_DEPTH_UNITS] = {14u, 15u};
+    for (u32 i = 0; i < NRB_HANA_DEPTH_UNITS; ++i) {
+        const u32 unit = texture_units[i];
+        const rsx_nir_texture* const texture = &st->textures[unit];
+        nrb_depth* const depth = texture_depth_aliases[unit];
+        nrb_hana_input_depth* const out = &sample->depth[i];
+        out->space = texture->location;
+        out->offset = texture->offset;
+        out->texture_format = texture->format;
+        out->texture_wrap = texture->wrap;
+        out->texture_remap = texture->remap;
+        out->texture_filter = texture->filter;
+        out->texture_control = texture->control0;
+        out->texture_border = texture->border_color;
+        const D3D12_SAMPLER_DESC sampler = nrb_sampler(texture);
+        out->sampler_filter = sampler.Filter;
+        out->sampler_address_u = sampler.AddressU;
+        out->sampler_address_v = sampler.AddressV;
+        out->sampler_address_w = sampler.AddressW;
+        out->sampler_comparison = sampler.ComparisonFunc;
+        if (!depth)
+            continue;
+        out->resource_identity = (u64)(UINT_PTR)depth->tex;
+        out->sample_identity = (u64)(UINT_PTR)depth->sample_tex;
+        out->write_generation = depth->write_generation;
+        out->resolve_generation = depth->resolve_generation;
+        out->command_generation = b->shared_timeline
+            ? b->shared_generation : b->stats.queue_submissions + 1u;
+        out->recording_fence = b->shared_timeline
+            ? b->shared_recording_fence : b->fence_value + 1u;
+        out->completed_fence = b->shared_timeline
+            ? b->shared_completed_fence
+            : b->fence->lpVtbl->GetCompletedValue(b->fence);
+        out->resource_state = (u32)depth->state;
+        out->sample_state = (u32)depth->sample_state;
+        out->srv_format = (u32)depth->sample_srv_dxgi;
+        out->external = depth->external != 0;
+        out->sample_valid = depth->sample_valid != 0;
+        if (!b->hana_depth_readback || !depth->sample_tex ||
+            !depth->sample_valid || depth->external ||
+            depth->sample_srv_dxgi != DXGI_FORMAT_R32_FLOAT) {
+            b->hana_depth_copy_failures++;
+            continue;
+        }
+
+        const D3D12_RESOURCE_STATES before = depth->sample_state;
+        if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = depth->sample_tex;
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b->list->lpVtbl->ResourceBarrier(b->list, 1, &barrier);
+        }
+        for (u32 gy = 0; gy < NRB_HANA_DEPTH_GRID; ++gy) {
+            const u32 y =
+                (gy * 1024u + 512u) / NRB_HANA_DEPTH_GRID;
+            for (u32 gx = 0; gx < NRB_HANA_DEPTH_GRID; ++gx) {
+                const u32 x =
+                    (gx * 1024u + 512u) / NRB_HANA_DEPTH_GRID;
+                const u32 point = gy * NRB_HANA_DEPTH_GRID + gx;
+                D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
+                source.pResource = depth->sample_tex;
+                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                destination.pResource = b->hana_depth_readback;
+                destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                destination.PlacedFootprint.Offset =
+                    (u64)sample_slot * NRB_HANA_DEPTH_SAMPLE_BYTES +
+                    (u64)(i * NRB_HANA_DEPTH_POINTS + point) *
+                        NRB_HANA_DEPTH_POINT_STRIDE;
+                destination.PlacedFootprint.Footprint.Format =
+                    DXGI_FORMAT_R32_FLOAT;
+                destination.PlacedFootprint.Footprint.Width = 1u;
+                destination.PlacedFootprint.Footprint.Height = 1u;
+                destination.PlacedFootprint.Footprint.Depth = 1u;
+                destination.PlacedFootprint.Footprint.RowPitch = 256u;
+                D3D12_BOX box = {x, y, 0u, x + 1u, y + 1u, 1u};
+                b->list->lpVtbl->CopyTextureRegion(
+                    b->list, &destination, 0, 0, 0, &source, &box);
+            }
+        }
+        if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = depth->sample_tex;
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter = before;
+            b->list->lpVtbl->ResourceBarrier(b->list, 1, &barrier);
+        }
+        out->copy_recorded = 1u;
+    }
+}
+
+static void nrb_hana_input_capture(
+    rsx_nr_d3d12* b, const rsx_nir_pipeline* st, const nrb_fp_info* fp,
+    const u32* vp_words, u32 vp_word_count, u32 bound_vtex_mask,
+    const nrb_required_span* required, u32 required_count,
+    const rsx_nir_draw* draw, nrb_depth* const* texture_depth_aliases)
+{
+    if (!b->hana_input_oracle)
+        return;
+    const u64 fp_hash = nrb_hana_fp_hash(fp->bytes, fp->size);
+    if (!nrb_hana_input_match(st, fp, fp_hash))
+        return;
+    const u64 match = ++b->hana_input_matches;
+    if (match > 4u && (match & 8191u) != 0u)
+        return;
+
+    const u32 sample_slot =
+        b->hana_input_writes++ % NRB_HANA_INPUT_SAMPLES;
+    nrb_hana_input_sample* const sample = &b->hana_input[sample_slot];
+    memset(sample, 0, sizeof(*sample));
+    sample->match = match;
+    sample->vp_hash = rsx_nir_hash_words(vp_words, vp_word_count);
+    sample->fp_hash = fp_hash;
+    sample->constants_hash = nrb_hana_hash(
+        st->constants, sizeof(st->constants));
+    sample->vp_start = st->vertex_program.start_slot;
+    sample->vp_words = vp_word_count;
+    sample->vp_branch_bits = st->vertex_program.branch_bits;
+    sample->render_condition_enabled = st->render_condition.enabled;
+    sample->render_condition_dma = st->render_condition.dma_report;
+    sample->render_condition_offset = st->render_condition.offset;
+    sample->bound_vtex_mask = bound_vtex_mask;
+    sample->used_vtex_mask = nrb_hana_vp_txl_mask(vp_words, vp_word_count);
+    sample->required_count = required_count;
+    sample->index_location = st->index_binding.location;
+    sample->index_offset = st->index_binding.offset;
+    sample->base_index = st->vertex_bindings.base_index;
+    sample->batch_count = draw->batch_count;
+    sample->total_count = draw->total_count;
+
+    u64 required_hash = 0xCBF29CE484222325ull;
+    for (u32 i = 0; i < required_count; ++i) {
+        const nrb_required_span* const span = &required[i];
+        const u8* const source = b->guest_ptr(
+            b->guest_user, span->space, span->offset, span->size);
+        const u64 hash = source ? nrb_hana_hash(source, span->size) : 0u;
+        required_hash ^= hash;
+        required_hash *= 0x100000001B3ull;
+        if (i >= NRB_HANA_INPUT_SPANS)
+            continue;
+        sample->required[i] = *span;
+        sample->required_span_hash[i] = hash;
+        sample->required_space_epoch[i] =
+            rsx_guest_pages_space_epoch(&b->pages, span->space);
+        const u32 first = span->offset >> RSX_GUEST_PAGE_SHIFT;
+        const u32 last = (u32)(((u64)span->offset + span->size - 1u) >>
+                               RSX_GUEST_PAGE_SHIFT);
+        sample->required_first_page_gen[i] =
+            rsx_guest_pages_page_gen(&b->pages, span->space, first);
+        sample->required_last_page_gen[i] =
+            rsx_guest_pages_page_gen(&b->pages, span->space, last);
+    }
+    sample->required_hash = required_hash;
+
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
+        if (!(bound_vtex_mask & (1u << unit)))
+            continue;
+        nrb_hana_input_vtex* const out = &sample->vtex[unit];
+        const rsx_nir_texture* const texture = &st->vertex_textures[unit];
+        out->texture = *texture;
+        out->span = nrb_vertex_texture_span(texture, NULL, NULL);
+        if (!out->span)
+            continue;
+        const u8* const source = b->guest_ptr(
+            b->guest_user, texture->location, texture->offset, out->span);
+        out->source_hash = source ? nrb_hana_hash(source, out->span) : 0u;
+        out->space_epoch = rsx_guest_pages_space_epoch(
+            &b->pages, texture->location);
+        const u32 first = texture->offset >> RSX_GUEST_PAGE_SHIFT;
+        const u32 last = (u32)(((u64)texture->offset + out->span - 1u) >>
+                               RSX_GUEST_PAGE_SHIFT);
+        out->first_page_gen = rsx_guest_pages_page_gen(
+            &b->pages, texture->location, first);
+        out->last_page_gen = rsx_guest_pages_page_gen(
+            &b->pages, texture->location, last);
+
+        rsx_nr_res_key key = {0};
+        key.kind = 2u;
+        key.space = texture->location;
+        key.offset = texture->offset;
+        key.size = out->span;
+        key.fmt = nrb_texture_key(texture);
+        rsx_nr_res* const entry = rsx_nr_res_lookup(&b->textures, &key);
+        if (!entry)
+            continue;
+        const u32 slot = (u32)(entry - b->textures.slots);
+        out->cache_slot = slot + 1u;
+        out->cache_current = rsx_nr_res_current(&b->textures, entry) != 0;
+        out->uploaded_hash = b->hana_vtex_uploaded_hash[slot];
+        out->resolution = b->hana_vtex_resolution[slot];
+    }
+    nrb_hana_depth_capture(
+        b, sample, sample_slot, st, texture_depth_aliases);
 }
 
 static void nrb_restore_texture_alias_set(
@@ -4201,6 +4586,10 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    nrb_hana_input_capture(
+        b, st, &fp, vp_words, vp_word_count, vtex_mask,
+        required, required_count, d, texture_depth_aliases);
+
     /* A newly uploaded texture can consume the headroom reserved above.
      * Retire its side-effect-free preparation, then rebuild the now-cached
      * descriptor table on a fresh list before allocating this draw. */
@@ -4500,8 +4889,10 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.draw_batches++;
     }
 
-    if (depth && st->depth_stencil.depth_write_enable)
+    if (depth && st->depth_stencil.depth_write_enable) {
         depth->sample_valid = 0;
+        depth->write_generation++;
+    }
 
     nrb_restore_texture_aliases(
         b, texture_aliases, texture_depth_aliases,
@@ -4902,6 +5293,11 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     b->guest_user = user;
     b->local_size = local_size;
     b->main_size = main_size;
+    {
+        const char* const oracle = getenv("YZ_NR_HANA_INPUT_ORACLE");
+        b->hana_input_oracle = oracle && oracle[0] &&
+            strcmp(oracle, "0") != 0;
+    }
 
     if (device) {
         b->dev = (ID3D12Device*)device;
@@ -5122,6 +5518,14 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     if (FAILED(b->upload->lpVtbl->Map(b->upload, 0, &none,
                                       (void**)&b->upload_mapped)))
         goto fail;
+    if (b->hana_input_oracle) {
+        b->hana_depth_readback = nrb_make_buffer(
+            b->dev, NRB_HANA_DEPTH_READBACK_BYTES,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->hana_depth_readback)
+            goto fail;
+    }
 
     if (rsx_guest_pages_init(&b->pages, local_size, main_size))
         goto fail;
@@ -5177,6 +5581,155 @@ fail:
     return NULL;
 }
 
+static void nrb_hana_input_dump(rsx_nr_d3d12* b)
+{
+    if (!b->hana_input_oracle)
+        return;
+    u8* depth_bytes = NULL;
+    HRESULT depth_map = E_FAIL;
+    if (b->hana_depth_readback) {
+        D3D12_RANGE read = {0, NRB_HANA_DEPTH_READBACK_BYTES};
+        depth_map = b->hana_depth_readback->lpVtbl->Map(
+            b->hana_depth_readback, 0, &read, (void**)&depth_bytes);
+    }
+    const u32 count = b->hana_input_writes < NRB_HANA_INPUT_SAMPLES
+        ? b->hana_input_writes : NRB_HANA_INPUT_SAMPLES;
+    const u32 start = b->hana_input_writes > NRB_HANA_INPUT_SAMPLES
+        ? b->hana_input_writes % NRB_HANA_INPUT_SAMPLES : 0u;
+    fprintf(stderr,
+            "[nr-hana-input matches=%llu samples=%u writes=%u "
+            "depth-copy-fail=%u depth-map=%08lX]\n",
+            (unsigned long long)b->hana_input_matches, count,
+            b->hana_input_writes, b->hana_depth_copy_failures,
+            (unsigned long)depth_map);
+    for (u32 ordinal = 0; ordinal < count; ++ordinal) {
+        const u32 slot = (start + ordinal) % NRB_HANA_INPUT_SAMPLES;
+        nrb_hana_input_sample* const sample = &b->hana_input[slot];
+        if (depth_bytes) {
+            for (u32 unit = 0; unit < NRB_HANA_DEPTH_UNITS; ++unit) {
+                nrb_hana_input_depth* const depth = &sample->depth[unit];
+                if (!depth->copy_recorded)
+                    continue;
+                u64 hash = 0xCBF29CE484222325ull;
+                const size_t base =
+                    (size_t)slot * NRB_HANA_DEPTH_SAMPLE_BYTES +
+                    (size_t)unit * NRB_HANA_DEPTH_POINTS *
+                        NRB_HANA_DEPTH_POINT_STRIDE;
+                depth->zero_count = 0u;
+                depth->one_count = 0u;
+                for (u32 point = 0; point < NRB_HANA_DEPTH_POINTS; ++point) {
+                    const u8* const value = depth_bytes + base +
+                        (size_t)point * NRB_HANA_DEPTH_POINT_STRIDE;
+                    u32 bits = 0u;
+                    memcpy(&bits, value, sizeof(bits));
+                    for (u32 byte = 0; byte < sizeof(bits); ++byte) {
+                        hash ^= value[byte];
+                        hash *= 0x100000001B3ull;
+                    }
+                    depth->zero_count += bits == 0u;
+                    depth->one_count += bits == 0x3F800000u;
+                }
+                depth->content_hash = hash;
+            }
+        }
+        fprintf(stderr,
+                "[nr-hana-input-sample slot=%u match=%llu "
+                "vp=%016llX/%u+%u/br=%08X fp=%016llX "
+                "condition=%u/%08X:%08X "
+                "vtex=bound:%X/used:%X constants=%016llX "
+                "required=%016llX/%u index=%u:%08X base=%08X "
+                "batches=%u count=%u]\n",
+                slot, (unsigned long long)sample->match,
+                (unsigned long long)sample->vp_hash,
+                sample->vp_start, sample->vp_words,
+                sample->vp_branch_bits,
+                (unsigned long long)sample->fp_hash,
+                sample->render_condition_enabled,
+                sample->render_condition_dma,
+                sample->render_condition_offset,
+                sample->bound_vtex_mask, sample->used_vtex_mask,
+                (unsigned long long)sample->constants_hash,
+                (unsigned long long)sample->required_hash,
+                sample->required_count, sample->index_location,
+                sample->index_offset, sample->base_index,
+                sample->batch_count, sample->total_count);
+        const u32 spans = sample->required_count < NRB_HANA_INPUT_SPANS
+            ? sample->required_count : NRB_HANA_INPUT_SPANS;
+        for (u32 i = 0; i < spans; ++i) {
+            const nrb_required_span* const span = &sample->required[i];
+            fprintf(stderr,
+                    "[nr-hana-input-span slot=%u i=%u %u:%08X+%X "
+                    "hash=%016llX epoch=%llu gen=%u..%u]\n",
+                    slot, i, span->space, span->offset, span->size,
+                    (unsigned long long)sample->required_span_hash[i],
+                    (unsigned long long)sample->required_space_epoch[i],
+                    sample->required_first_page_gen[i],
+                    sample->required_last_page_gen[i]);
+        }
+        for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
+            const nrb_hana_input_vtex* const vtex = &sample->vtex[unit];
+            if (!vtex->texture.enabled)
+                continue;
+            fprintf(stderr,
+                    "[nr-hana-input-vtex slot=%u unit=%u "
+                    "%u:%08X+%X fmt=%02X/%ux%u/pitch=%u "
+                    "wrap=%08X/remap=%08X/filter=%08X/ctl=%08X "
+                    "source=%016llX uploaded=%016llX cache=%u/%u/%u "
+                    "epoch=%llu gen=%u..%u]\n",
+                    slot, unit, vtex->texture.location,
+                    vtex->texture.offset, vtex->span,
+                    vtex->texture.format, vtex->texture.width,
+                    vtex->texture.height, vtex->texture.pitch,
+                    vtex->texture.wrap, vtex->texture.remap,
+                    vtex->texture.filter, vtex->texture.control0,
+                    (unsigned long long)vtex->source_hash,
+                    (unsigned long long)vtex->uploaded_hash,
+                    vtex->cache_slot, vtex->cache_current,
+                    vtex->resolution,
+                    (unsigned long long)vtex->space_epoch,
+                    vtex->first_page_gen, vtex->last_page_gen);
+        }
+        for (u32 unit = 0; unit < NRB_HANA_DEPTH_UNITS; ++unit) {
+            const nrb_hana_input_depth* const depth = &sample->depth[unit];
+            fprintf(stderr,
+                    "[nr-hana-input-depth slot=%u unit=%u guest=%u:%08X "
+                    "resource=%016llX sample=%016llX owner=%s "
+                    "generation=%llu/%llu command=%llu "
+                    "fence=%llu/%llu state=%u/%u valid=%u "
+                    "srv=%u texture=%02X/wrap=%08X/remap=%08X/"
+                    "filter=%08X/ctl=%08X/border=%08X "
+                    "sampler=%u/%u,%u,%u/cmp=%u "
+                    "grid=%ux%u content=%s%016llX zero=%u one=%u]\n",
+                    slot, unit, depth->space, depth->offset,
+                    (unsigned long long)depth->resource_identity,
+                    (unsigned long long)depth->sample_identity,
+                    depth->external ? "external" : "private",
+                    (unsigned long long)depth->write_generation,
+                    (unsigned long long)depth->resolve_generation,
+                    (unsigned long long)depth->command_generation,
+                    (unsigned long long)depth->recording_fence,
+                    (unsigned long long)depth->completed_fence,
+                    depth->resource_state, depth->sample_state,
+                    depth->sample_valid, depth->srv_format,
+                    depth->texture_format, depth->texture_wrap,
+                    depth->texture_remap, depth->texture_filter,
+                    depth->texture_control, depth->texture_border,
+                    depth->sampler_filter, depth->sampler_address_u,
+                    depth->sampler_address_v, depth->sampler_address_w,
+                    depth->sampler_comparison,
+                    NRB_HANA_DEPTH_GRID, NRB_HANA_DEPTH_GRID,
+                    depth_bytes && depth->copy_recorded ? "" : "unavailable/",
+                    (unsigned long long)depth->content_hash,
+                    depth->zero_count, depth->one_count);
+        }
+    }
+    if (depth_bytes) {
+        D3D12_RANGE written = {0, 0};
+        b->hana_depth_readback->lpVtbl->Unmap(
+            b->hana_depth_readback, 0, &written);
+    }
+}
+
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
 {
     if (!b)
@@ -5186,6 +5739,7 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     nrb_release_timeline_lease(b);
     if (b->queue && b->fence)
         nrb_wait_idle(b);
+    nrb_hana_input_dump(b);
     for (u32 i = 0; i < b->psos.cap && b->psos.keys; i++) {
         if (b->psos.keys[i]) {
             ID3D12PipelineState* p =
@@ -5224,6 +5778,9 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     }
     if (b->readback)
         b->readback->lpVtbl->Release(b->readback);
+    if (b->hana_depth_readback)
+        b->hana_depth_readback->lpVtbl->Release(
+            b->hana_depth_readback);
     if (b->upload)
         b->upload->lpVtbl->Release(b->upload);
     if (b->rootsig)
@@ -5331,10 +5888,67 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
         nrb_dump_device_oracle(b->dev, "readback Map", map_result);
         return -1;
     }
+
     for (u32 y = 0; y < h; y++)
         memcpy(out + (size_t)y * w * 4, mapped + (size_t)y * row, w * 4);
     D3D12_RANGE nw = {0, 0};
     b->readback->lpVtbl->Unmap(b->readback, 0, &nw);
+    return 0;
+}
+
+int rsx_nr_d3d12_read_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
+                            u32 format, u32 w, u32 h, float* out)
+{
+    if (!b || !out)
+        return -1;
+    nrb_depth* const depth = nrb_get_depth(
+        b, space, offset, format, w, h, 0, 0);
+    if (!depth || depth->external ||
+        depth->srv_dxgi != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
+        return -1;
+
+    const u32 row = (w * (u32)sizeof(float) + 255u) & ~255u;
+    const u32 need = row * h;
+    if (!b->readback || b->readback_size < need) {
+        if (b->readback)
+            b->readback->lpVtbl->Release(b->readback);
+        b->readback = nrb_make_buffer(b->dev, need,
+                                      D3D12_HEAP_TYPE_READBACK,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->readback)
+            return -1;
+        b->readback_size = need;
+    }
+
+    if (nrb_open_list(b))
+        return -1;
+    nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
+    source.pResource = depth->tex;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.pResource = b->readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+    destination.PlacedFootprint.Footprint.Width = w;
+    destination.PlacedFootprint.Footprint.Height = h;
+    destination.PlacedFootprint.Footprint.Depth = 1;
+    destination.PlacedFootprint.Footprint.RowPitch = row;
+    b->list->lpVtbl->CopyTextureRegion(
+        b->list, &destination, 0, 0, 0, &source, NULL);
+    nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (nrb_exec_wait(b))
+        return -1;
+
+    u8* mapped = NULL;
+    D3D12_RANGE read = {0, need};
+    if (FAILED(b->readback->lpVtbl->Map(
+            b->readback, 0, &read, (void**)&mapped)))
+        return -1;
+    for (u32 y = 0; y < h; ++y)
+        memcpy(out + (size_t)y * w, mapped + (size_t)y * row,
+               (size_t)w * sizeof(float));
+    D3D12_RANGE written = {0, 0};
+    b->readback->lpVtbl->Unmap(b->readback, 0, &written);
     return 0;
 }
 
@@ -5514,6 +6128,13 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)
 {
     (void)b; (void)space; (void)offset; (void)w; (void)h; (void)out;
+    return -1;
+}
+int rsx_nr_d3d12_read_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
+                            u32 format, u32 w, u32 h, float* out)
+{
+    (void)b; (void)space; (void)offset; (void)format;
+    (void)w; (void)h; (void)out;
     return -1;
 }
 int rsx_nr_d3d12_set_scanout_provenance(rsx_nr_d3d12* b, int enabled)
