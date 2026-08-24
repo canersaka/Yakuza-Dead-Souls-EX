@@ -66,6 +66,7 @@ extern "C" int yz_rsx_resolve_published_generated_link(
     uint32_t target, uint32_t target_word, uint32_t* resume_get);
 extern "C" int yz_rsx_resolve_published_generated_hole(
     void* user, uint32_t get, uint32_t put, uint32_t word,
+    uint32_t previous_get, uint32_t previous_command,
     uint32_t* resume_get);
 extern "C" int yz_nr_vertical_mirror_legacy_method(
     uint32_t method, uint32_t arg, int suppress_action);
@@ -443,6 +444,7 @@ struct yz_nr_vertical_active_state {
     uint32_t section_diag_enabled;
     uint32_t section_shadow_consumer_admit;
     uint32_t force_draw_input_refresh;
+    uint32_t scanout_provenance;
     volatile LONG section_state_resync_pending;
     unsigned long long section_state_resyncs;
     unsigned long long section_state_resync_failures;
@@ -852,6 +854,12 @@ static void yz_nr_active_ensure_graphics(void)
         rsx_nr_d3d12_destroy(d3d12);
         if (g_active.strict_full_native)
             InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
+    if (g_active.scanout_provenance &&
+        rsx_nr_d3d12_set_scanout_provenance(d3d12, 1) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
     if (g_active.strict_full_native &&
@@ -2165,6 +2173,8 @@ extern "C" void yz_nr_vertical_init(void)
             getenv("YZ_NR_SHADOW_CONSUMER_ADMIT") != nullptr;
         g_active.force_draw_input_refresh = graphics && !strict &&
             getenv("YZ_NR_FORCE_DRAW_INPUT_REFRESH") != nullptr;
+        g_active.scanout_provenance = strict &&
+            getenv("YZ_NR_SCANOUT_PROVENANCE") != nullptr;
         g_active.draw_primitive_filter = UINT32_MAX;
         if (graphics && !strict) {
             const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
@@ -3836,6 +3846,38 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
                         i, crumb->get, crumb->put, crumb->call_return,
                         crumb->command);
             }
+            /* A strict owner must make the first unsupported dependency
+             * actionable without enabling a second tracing build. Preserve
+             * one bounded read-only window beginning at the failed cursor;
+             * this is emitted only with the already one-shot fatal report.
+             * Sixteen words cover a complete generated-list prologue and its
+             * first state packet while remaining fixed-size. */
+            fprintf(stderr, "[nr-full-native-window get=%08X words=",
+                    failure->get);
+            for (uint32_t i = 0; i < 16u; ++i) {
+                uint32_t word = 0xDEADDEADu;
+                (void)yz_nr_frame_read32(
+                    nullptr,
+                    (failure->get + i * 4u) & 0x7FFFFFu,
+                    &word);
+                fprintf(stderr, "%s%08X", i ? "," : "", word);
+            }
+            fprintf(stderr, "]\n");
+            if (failure->kind == RSX_NR_FRAME_FAILURE_BAD_FLOW &&
+                failure->get < 0x800000u &&
+                failure->call_return == UINT32_MAX) {
+                uint32_t probe_resume = 0u;
+                const int probe_result =
+                    yz_rsx_resolve_published_generated_hole(
+                        nullptr, failure->get, failure->put,
+                        failure->command,
+                        owner->packet_get, owner->packet_command,
+                        &probe_resume);
+                fprintf(stderr,
+                        "[nr-full-native-hole-selfcheck result=%d "
+                        "resume=%08X]\n",
+                        probe_result, probe_resume);
+            }
             fflush(stderr);
         }
         return YZ_NR_VERTICAL_FRAME_FATAL;
@@ -4835,6 +4877,39 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.shared_timeline_acquires,
                     d3d_stats.shared_timeline_generations,
                     d3d_stats.shared_timeline_forced_submissions);
+            if (g_active.scanout_provenance) {
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    const yz_nr_vertical_display* const display =
+                        &g_active.displays[i];
+                    if (!display->valid)
+                        continue;
+                    fprintf(stderr,
+                            "[nr-full-native-scanout-display id=%u "
+                            "space=%u offset=%08X size=%ux%u]\n",
+                            i, display->location, display->offset,
+                            display->width, display->height);
+                }
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    rsx_nr_d3d12_rt_provenance provenance = {};
+                    if (rsx_nr_d3d12_get_rt_provenance(
+                            g_active.d3d12, i, &provenance) != 0)
+                        break;
+                    fprintf(stderr,
+                            "[nr-full-native-scanout-rt ordinal=%u "
+                            "resource=%016llX space=%u offset=%08X "
+                            "format=%u size=%ux%u state=%08X external=%u "
+                            "write-serial=%llu color-clears=%llu "
+                            "draws=%llu presents=%llu]\n",
+                            i, provenance.resource_identity,
+                            provenance.space, provenance.offset,
+                            provenance.format, provenance.width,
+                            provenance.height, provenance.resource_state,
+                            provenance.external, provenance.write_serial,
+                            provenance.color_clear_writes,
+                            provenance.draw_writes,
+                            provenance.present_count);
+                }
+            }
             rsx_nr_d3d12_destroy(g_active.d3d12);
             g_active.d3d12 = nullptr;
             InterlockedExchange(&g_active.shared_timeline, 0);

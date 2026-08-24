@@ -47,9 +47,12 @@ typedef int (*rsx_nr_frame_resolve_jump_fn)(
 /* Equivalent fail-closed proof for a primary-ring cursor parked on an inline
  * generated-data gap, with the same 1/0/-1 result contract. The hook may
  * return a cursor only for the first structurally proven command prologue
- * following that exact unchanged word. */
+ * following that exact unchanged word. previous_get/previous_command name
+ * the packet the owner itself executed immediately before this cursor; they
+ * are UINT32_MAX/0 when no such sequential provenance exists. */
 typedef int (*rsx_nr_frame_resolve_hole_fn)(
-    void* user, u32 get, u32 put, u32 word, u32* resume_get);
+    void* user, u32 get, u32 put, u32 word,
+    u32 previous_get, u32 previous_command, u32* resume_get);
 
 typedef enum rsx_nr_frame_step_result {
     RSX_NR_FRAME_ADVANCED = 0,

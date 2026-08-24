@@ -114,6 +114,9 @@ typedef struct nrb_rt {
      * different logical color formats).  Presentation must choose the
      * identity most recently written, not the oldest table slot. */
     u64 last_write_serial;
+    u64 color_clear_writes;
+    u64 draw_writes;
+    u64 present_count;
     DXGI_FORMAT dxgi;
     u32 rtv_slot;
     D3D12_RESOURCE_STATES color_state;
@@ -221,6 +224,7 @@ struct rsx_nr_d3d12 {
     rsx_nr_d3d12_present_fn present_cb;
     void* present_user;
     int rgba_targets;
+    int scanout_provenance;
     u32 coherent_vp_options;
     int force_draw_input_refresh;
     int force_draw_input_allocated;
@@ -759,7 +763,8 @@ static nrb_rt* nrb_latest_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     nrb_rt* selected = NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
         nrb_rt* const candidate = &b->rts[i];
-        if (!candidate->live || candidate->space != space ||
+        if (!candidate->live || !candidate->last_write_serial ||
+            candidate->space != space ||
             candidate->offset != offset || (w && candidate->w != w) ||
             (h && candidate->h != h) ||
             (rgba_only &&
@@ -1268,7 +1273,13 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             (float)c->depth_value / 16777215.0f,
             (UINT8)c->stencil_value, nrects, rects);
     }
-    nrb_note_rt_write(b, rt);
+    /* A depth/stencil-only clear does not modify the color resource.  Do not
+     * let a newly allocated, still-black color alias become the most recent
+     * scanout merely because it shared the pipeline's surface declaration. */
+    if (color_bits && b->scanout_provenance)
+        rt->color_clear_writes++;
+    if (color_bits)
+        nrb_note_rt_write(b, rt);
     b->stats.clears++;
     return 0;
 }
@@ -4288,6 +4299,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     b->stats.real_fp_draws++;
     if (fp.texture_mask || vtex_mask)
         b->stats.texture_draws++;
+    if (b->scanout_provenance)
+        rt->draw_writes++;
     nrb_note_rt_write(b, rt);
     b->stats.draws++;
     return 0;
@@ -4422,6 +4435,8 @@ static int nrb_present(void* user, u32 buffer)
             b->present_user, scanout->tex, (u32)scanout->dxgi,
             scanout->w, scanout->h, buffer) != 0))
         return -1;
+    if (scanout && b->scanout_provenance)
+        scanout->present_count++;
     if (b->shared_timeline) {
         /* The shared presenter appended its copy to this exact list and
          * synchronously retired/reset the generation. */
@@ -5097,6 +5112,15 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     return 0;
 }
 
+int rsx_nr_d3d12_set_scanout_provenance(rsx_nr_d3d12* b, int enabled)
+{
+    if (!b || b->rt_write_serial || b->stats.clears || b->stats.draws ||
+        b->stats.presents)
+        return -1;
+    b->scanout_provenance = enabled != 0;
+    return 0;
+}
+
 int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
                          u32* space, u32* offset, u32* format,
                          u32* width, u32* height)
@@ -5121,6 +5145,38 @@ int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
             *width = rt->w;
         if (height)
             *height = rt->h;
+        return 0;
+    }
+    return -1;
+}
+
+int rsx_nr_d3d12_get_rt_provenance(
+    const rsx_nr_d3d12* b, u32 ordinal,
+    rsx_nr_d3d12_rt_provenance* out)
+{
+    if (!b || !b->scanout_provenance || !out)
+        return -1;
+    for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+        const nrb_rt* const rt = &b->rts[i];
+        if (!rt->live)
+            continue;
+        if (ordinal) {
+            --ordinal;
+            continue;
+        }
+        memset(out, 0, sizeof(*out));
+        out->resource_identity = (unsigned long long)(UINT_PTR)rt->tex;
+        out->write_serial = rt->last_write_serial;
+        out->color_clear_writes = rt->color_clear_writes;
+        out->draw_writes = rt->draw_writes;
+        out->present_count = rt->present_count;
+        out->space = rt->space;
+        out->offset = rt->offset;
+        out->format = rt->fmt;
+        out->width = rt->w;
+        out->height = rt->h;
+        out->resource_state = (u32)rt->color_state;
+        out->external = rt->external != 0;
         return 0;
     }
     return -1;
@@ -5234,12 +5290,24 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     (void)b; (void)space; (void)offset; (void)w; (void)h; (void)out;
     return -1;
 }
+int rsx_nr_d3d12_set_scanout_provenance(rsx_nr_d3d12* b, int enabled)
+{
+    (void)b; (void)enabled;
+    return -1;
+}
 int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
                          u32* space, u32* offset, u32* format,
                          u32* width, u32* height)
 {
     (void)b; (void)ordinal; (void)space; (void)offset; (void)format;
     (void)width; (void)height;
+    return -1;
+}
+int rsx_nr_d3d12_get_rt_provenance(
+    const rsx_nr_d3d12* b, u32 ordinal,
+    rsx_nr_d3d12_rt_provenance* out)
+{
+    (void)b; (void)ordinal; (void)out;
     return -1;
 }
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out)

@@ -180,9 +180,13 @@ static rsx_nr_frame_step_result frame_wait_for_flow_target(
         /* PUT is the producer publication generation for this dependency.
          * A proof made against an earlier snapshot cannot permanently latch
          * out data published later.  Require the new generation itself to
-         * remain stable for the full proof delay before rescanning it. */
+         * remain stable for the full proof delay before rescanning it.  A
+         * moving PUT is also concrete producer progress, so the fatal bound
+         * belongs to the new unchanged generation rather than accumulating
+         * across every publication made while this target is being built. */
         o->flow_wait_put = put;
         o->flow_wait_put_polls = 0u;
+        o->flow_wait_polls = 0u;
     }
     o->flow_wait_word = target_word;
     o->flow_wait_put_polls++;
@@ -207,6 +211,7 @@ static rsx_nr_frame_step_result frame_wait_for_unsupported_candidate(
     } else if (o->flow_wait_put != put) {
         o->flow_wait_put = put;
         o->flow_wait_put_polls = 0u;
+        o->flow_wait_polls = 0u;
     }
     o->flow_wait_word = command;
     o->flow_wait_put_polls++;
@@ -270,8 +275,15 @@ static int frame_try_resolve_generated_jump(
         ((repaired & 3u) == 1u
              ? (repaired & 0xFFFFFFFCu)
              : (repaired & 0x1FFFFFFCu)) != resume ||
-        !frame_flow_target_ready(o, resume, ret, resume_word))
+        !frame_flow_target_ready(o, resume, ret, resume_word)) {
+        /* Callback success is only the first half of the publication proof.
+         * If the independent owner reread races the producer, this attempt is
+         * pending rather than definitively refused.  Do not latch it forever
+         * under an unchanged PUT; require another complete proof interval. */
+        o->repair_attempt_valid = 0u;
+        o->flow_wait_put_polls = 0u;
         return 0;
+    }
 
     o->repair_attempt_valid = 0u;
     o->flow_wait_source = ~0u;
@@ -310,8 +322,17 @@ static int frame_try_resolve_generated_hole(
     o->repair_attempt_target = get;
     o->repair_attempt_word = word;
     o->stats.generated_link_attempts++;
+    const int sequential_previous =
+        !o->packet_active && o->packet_count &&
+        o->packet_next_get == get && o->packet_next_ret == ret &&
+        o->packet_get != get;
+    const u32 previous_get = sequential_previous
+        ? o->packet_get : ~0u;
+    const u32 previous_command = sequential_previous
+        ? o->packet_command : 0u;
     const int resolved = o->resolve_hole(
-        o->resolve_hole_user, get, put, word, &resume);
+        o->resolve_hole_user, get, put, word,
+        previous_get, previous_command, &resume);
     if (resolved <= 0) {
         if (resolved < 0) {
             o->repair_attempt_valid = 0u;
@@ -321,8 +342,11 @@ static int frame_try_resolve_generated_hole(
     }
     if (resume == get || !frame_read(o, get, &current) || current != word ||
         !frame_read(o, resume, &resume_word) ||
-        !frame_flow_target_ready(o, resume, ret, resume_word))
+        !frame_flow_target_ready(o, resume, ret, resume_word)) {
+        o->repair_attempt_valid = 0u;
+        o->flow_wait_put_polls = 0u;
         return 0;
+    }
 
     o->repair_attempt_valid = 0u;
     o->flow_wait_source = ~0u;
@@ -512,10 +536,19 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
             o->stats.waits_stopper++;
             return RSX_NR_FRAME_WAIT_STOPPER;
         }
-        if (!frame_read(o, target, &target_word))
+        if (!frame_read(o, target, &target_word)) {
+            /* A producer may be replacing recycled payload in place when its
+             * low bits transiently resemble an absolute JUMP.  An unmapped
+             * target from the primary ring is not executable evidence yet;
+             * retain the exact source word in the ordinary bounded
+             * publication wait.  Called lists remain strict failures. */
+            if (call_return == ~0u && get < NR_FRAME_RING_SIZE)
+                return frame_wait_for_flow_target(
+                    o, get, put, call_return, command, get, command);
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_BAD_FLOW, get, put, call_return,
                 command, 0u, target, 0u);
+        }
         if (!frame_flow_target_ready(
                 o, target, call_return, target_word)) {
             if (call_return == ~0u && target < NR_FRAME_RING_SIZE &&
@@ -550,10 +583,14 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
         if (call_return != ~0u)
             return frame_wait_for_flow_target(
                 o, get, put, call_return, command, get, command);
-        if (!frame_read(o, target, &target_word))
+        if (!frame_read(o, target, &target_word)) {
+            if (call_return == ~0u && get < NR_FRAME_RING_SIZE)
+                return frame_wait_for_flow_target(
+                    o, get, put, call_return, command, get, command);
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_BAD_FLOW, get, put, call_return,
                 command, 0u, target, 0u);
+        }
         if (!frame_flow_target_ready(
                 o, target, call_return, target_word)) {
             if (call_return == ~0u && target < NR_FRAME_RING_SIZE)
