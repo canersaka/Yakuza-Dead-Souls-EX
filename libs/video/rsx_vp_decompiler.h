@@ -41,6 +41,12 @@ typedef struct rsx_vp_native_support_analysis {
     u32 terminated;
 } rsx_vp_native_support_analysis;
 
+/* Low-level coherent-section option. A caller may enable this only when the
+ * complete render section (including its depth and later color work) has
+ * been preflighted and will execute through one renderer. Ordinary callers
+ * retain the captured mixed-ownership flow+vertex-texture safety gate. */
+#define RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL 1u
+
 /* Report the guest input registers statically read by the program.  `exact`
  * is zero and input_mask is 0xFFFF when an unsupported opcode/control-flow
  * construct makes the result unsafe to narrow.  Returns the instruction
@@ -78,6 +84,9 @@ int rsx_vp_analyze_native_support(
 int rsx_vp_analyze_native_support_control(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     rsx_vp_native_support_analysis* analysis);
+int rsx_vp_analyze_native_support_control_options(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options, rsx_vp_native_support_analysis* analysis);
 
 /* Decompile an NV40 vertex program into an HLSL vertex shader.
  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
@@ -128,6 +137,10 @@ int rsx_vp_decompile_pull_ex(
 int rsx_vp_decompile_pull_control_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size);
+int rsx_vp_decompile_pull_control_options_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options, const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
