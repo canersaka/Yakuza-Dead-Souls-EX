@@ -507,25 +507,43 @@ def capture_process_window(pid: int, path: Path):
         width = max(0, rect.right - rect.left)
         height = max(0, rect.bottom - rect.top)
         if width and height:
-            candidates.append((width * height, hwnd))
+            candidates.append((
+                width * height, hwnd,
+                (rect.left, rect.top, rect.right, rect.bottom),
+            ))
     if not candidates:
         return None
-    _, hwnd = max(candidates)
+    _, hwnd, bounds = max(candidates)
     try:
         from PIL import ImageGrab
 
         image = ImageGrab.grab(window=int(hwnd), include_layered_windows=True)
         if image.width <= 0 or image.height <= 0:
             return None
+        method = "window"
+        sample = image.convert("RGB").resize((64, 36)).tobytes()
+        # Pillow's HWND capture can return a synthetic all-white surface for
+        # this D3D12 window even while the visible client area is rendering.
+        # Fall back to the exact screen rectangle; never use a blank capture
+        # as evidence that the game image itself stopped progressing.
+        if not window_sample_usable(sample):
+            screen = ImageGrab.grab(bbox=bounds, all_screens=True)
+            screen_sample = screen.convert("RGB").resize((64, 36)).tobytes()
+            if window_sample_usable(screen_sample):
+                image = screen
+                sample = screen_sample
+                method = "screen-bounds"
         path.parent.mkdir(parents=True, exist_ok=True)
         image.save(path)
-        sample = image.convert("RGB").resize((64, 36)).tobytes()
         return {
             "path": str(path),
             "width": image.width,
             "height": image.height,
             "sample_sha256": hashlib.sha256(sample).hexdigest(),
             "mean_channel": round(sum(sample) / len(sample), 3),
+            "sample_range": max(sample) - min(sample),
+            "capture_method": method,
+            "usable": window_sample_usable(sample),
             "sample": sample,
         }
     except (OSError, ImportError):
@@ -536,6 +554,16 @@ def sample_mae(first: bytes, second: bytes):
     if not first or len(first) != len(second):
         return float("inf")
     return sum(abs(a - b) for a, b in zip(first, second)) / len(first)
+
+
+def window_sample_usable(sample: bytes):
+    if not sample:
+        return False
+    # Uniform black is a valid authored transition/loading image. Uniform
+    # white is the observed failed HWND-capture sentinel, not a useful visual
+    # route oracle.
+    return not (sum(sample) / len(sample) >= 252.0 and
+                max(sample) - min(sample) <= 6)
 
 
 def post_close(pid: int):
@@ -645,6 +673,10 @@ def scan_command(reference_path: Path, paths):
 
 
 def self_test(root: Path, reference_path: Path):
+    if window_sample_usable(bytes([255]) * 64):
+        raise AssertionError("all-white failed capture accepted as visual")
+    if not window_sample_usable(bytes([0]) * 64):
+        raise AssertionError("authored black transition rejected as visual")
     reference = scene_features(reference_path)
     runs = [
         root / "scratch" / "frontier-fullroute-20260820-accept19-capture",
@@ -1379,6 +1411,8 @@ def run(args):
         arrival_consecutive = 0
         last_capture_progress = time.monotonic()
         startup_idle_visual = []
+        startup_idle_invalid = []
+        startup_idle_attempts = 0
         next_startup_idle_visual = 0.0
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -1455,10 +1489,11 @@ def run(args):
                         len(set(idle_states[-3:])) == 1):
                     now = time.monotonic()
                     if now >= next_startup_idle_visual:
-                        serial = len(startup_idle_visual) + 1
+                        startup_idle_attempts += 1
+                        serial = startup_idle_attempts
                         capture = capture_process_window(
                             process.pid,
-                            scratch / f"startup_idle_{serial:03d}.png",
+                            run_dir / f"startup_idle_{serial:03d}.png",
                         )
                         next_startup_idle_visual = now + 10.0
                         if capture:
@@ -1466,15 +1501,25 @@ def run(args):
                             capture["seconds_without_route_capture"] = round(
                                 no_capture_for, 3
                             )
-                            startup_idle_visual.append(capture)
+                            target = (startup_idle_visual
+                                      if capture["usable"]
+                                      else startup_idle_invalid)
+                            target.append(capture)
                             result["startup_idle_visual_probes"] = [
                                 {key: value for key, value in item.items()
                                  if key != "sample"}
                                 for item in startup_idle_visual
                             ]
+                            result["startup_idle_invalid_visual_probes"] = [
+                                {key: value for key, value in item.items()
+                                 if key != "sample"}
+                                for item in startup_idle_invalid
+                            ]
                             print(
                                 "[akiyama-harness] startup idle visual "
-                                f"{serial}: mean={capture['mean_channel']}",
+                                f"{serial}: mean={capture['mean_channel']} "
+                                f"method={capture['capture_method']} "
+                                f"usable={capture['usable']}",
                                 flush=True,
                             )
                     if len(startup_idle_visual) >= 3:
