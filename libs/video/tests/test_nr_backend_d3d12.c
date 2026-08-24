@@ -897,6 +897,27 @@ static int cap_dump_rt_ppm(rsx_nr_d3d12* sink, const char* dir,
     return ok ? 0 : -1;
 }
 
+static int cap_dump_depth_raw(rsx_nr_d3d12* sink, const char* path,
+                              u32 space, u32 offset, u32 format,
+                              u32 width, u32 height)
+{
+    const size_t count = (size_t)width * height;
+    float* const depth = malloc(count * sizeof(*depth));
+    if (!depth || rsx_nr_d3d12_read_depth(
+            sink, space, offset, format, width, height, depth) != 0) {
+        free(depth);
+        return -1;
+    }
+    FILE* const fp = fopen(path, "wb");
+    int ok = fp != NULL;
+    if (ok)
+        ok = fwrite(depth, sizeof(*depth), count, fp) == count;
+    if (fp && fclose(fp) != 0)
+        ok = 0;
+    free(depth);
+    return ok ? 0 : -1;
+}
+
 static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                         size_t stats_size, int dump_outputs,
                         cap_manifest* manifest)
@@ -1267,6 +1288,31 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         if (dump_dir && dump_dir[0] && !dumped) {
             fprintf(stderr, "capture: failed to dump oracle render targets\n");
             ring_fault = 1;
+        }
+    }
+    {
+        const char* const path = getenv("YZ_NR_CAPTURE_DEPTH_DUMP");
+        if (path && path[0]) {
+            const char* const offset_text =
+                getenv("YZ_NR_CAPTURE_DEPTH_OFFSET");
+            const char* const width_text =
+                getenv("YZ_NR_CAPTURE_DEPTH_WIDTH");
+            const char* const height_text =
+                getenv("YZ_NR_CAPTURE_DEPTH_HEIGHT");
+            const u32 offset = offset_text
+                ? (u32)strtoul(offset_text, NULL, 0) : 0x00B40000u;
+            const u32 width = width_text
+                ? (u32)strtoul(width_text, NULL, 0) : 1024u;
+            const u32 height = height_text
+                ? (u32)strtoul(height_text, NULL, 0) : 768u;
+            if (cap_dump_depth_raw(
+                    sink, path, RSX_NIR_LOCATION_LOCAL, offset, 2u,
+                    width, height) != 0) {
+                fprintf(stderr,
+                        "capture: failed to dump depth %u:%08X %ux%u\n",
+                        RSX_NIR_LOCATION_LOCAL, offset, width, height);
+                ring_fault = 1;
+            }
         }
     }
 

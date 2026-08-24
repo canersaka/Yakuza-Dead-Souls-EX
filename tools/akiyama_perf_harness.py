@@ -910,6 +910,8 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "full-native"
         if args.nr_scanout_provenance:
             yz["YZ_NR_SCANOUT_PROVENANCE"] = "1"
+        if args.nr_hana_input_oracle:
+            yz["YZ_NR_HANA_INPUT_ORACLE"] = "1"
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -1403,6 +1405,8 @@ def run(args):
         yz["YZ_NR_VERTICAL"] = "full-native"
         if args.nr_scanout_provenance:
             yz["YZ_NR_SCANOUT_PROVENANCE"] = "1"
+        if args.nr_hana_input_oracle:
+            yz["YZ_NR_HANA_INPUT_ORACLE"] = "1"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1859,6 +1863,7 @@ def main():
     parser.add_argument("--nr-vertical-active-graphics", action="store_true")
     parser.add_argument("--nr-vertical-full-native", action="store_true")
     parser.add_argument("--nr-scanout-provenance", action="store_true")
+    parser.add_argument("--nr-hana-input-oracle", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
@@ -1919,6 +1924,10 @@ def main():
     if args.nr_scanout_provenance and not args.nr_vertical_full_native:
         parser.error(
             "--nr-scanout-provenance requires --nr-vertical-full-native"
+        )
+    if args.nr_hana_input_oracle and not args.nr_vertical_full_native:
+        parser.error(
+            "--nr-hana-input-oracle requires --nr-vertical-full-native"
         )
 
     root = Path(__file__).resolve().parents[3]

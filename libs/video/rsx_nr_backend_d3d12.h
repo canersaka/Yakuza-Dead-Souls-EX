@@ -311,6 +311,12 @@ void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out);
 
+/* Offline validation readback for one exact depth target. Writes w*h
+ * float32 depth values in row-major order and flushes first. The lookup is
+ * exact, so diagnostics cannot accidentally create or substitute a target. */
+int rsx_nr_d3d12_read_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
+                            u32 format, u32 w, u32 h, float* out);
+
 /* Enumerate live render targets for deterministic offline capture validation.
  * Ordinals are dense over the currently live target table.
  * Returns 0 on success or -1 when ordinal is past the last live target. */
