@@ -26,6 +26,7 @@
 #include "rsx_nir_adapter.h"
 #include "rsx_nr_producer_contract.h"
 #include "rsx_nr_span_router.h"
+#include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,13 @@ extern "C" void cellSpursSetGuestWriteObserver(
 extern "C" void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size);
 extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
 extern "C" void yz_drain_trampolines(ppu_context* ctx);
+extern "C" uint32_t yz_nr_vertical_io_to_ea(uint32_t io_offset);
+extern "C" int yz_nr_vertical_mirror_legacy_method(
+    uint32_t method, uint32_t arg, int suppress_action);
+extern "C" int yz_nr_vertical_report_can(uint32_t kind, uint32_t arg,
+                                           uint32_t dma);
+extern "C" int yz_nr_vertical_render_condition_read(
+    uint32_t dma, uint32_t offset, uint32_t* value);
 
 namespace {
 
@@ -202,6 +210,29 @@ enum : uint32_t {
     YZ_NR_ACTIVE_ACTION_OP_BOUND = 512,
     YZ_NR_ACTIVE_ACTION_SIDE_BOUND = 16384,
     YZ_NR_ACTIVE_GUEST_PAGE_COUNT = 1u << 20,
+    YZ_NR_SECTION_METHOD_CAPACITY = 262144,
+    YZ_NR_SECTION_OP_CAPACITY = 65536,
+    YZ_NR_SECTION_SIDE_CAPACITY = 1u << 20,
+    YZ_NR_SECTION_STEP_CAPACITY = 0x40000,
+};
+
+enum : uint32_t {
+    YZ_NR_SECTION_FB_NONE = 0,
+    YZ_NR_SECTION_FB_NOT_READY,
+    YZ_NR_SECTION_FB_WINDOW,
+    YZ_NR_SECTION_FB_UNMAPPED,
+    YZ_NR_SECTION_FB_FLOW,
+    YZ_NR_SECTION_FB_CAPACITY,
+    YZ_NR_SECTION_FB_UNKNOWN_METHOD,
+    YZ_NR_SECTION_FB_INCOMPLETE_ACTION,
+    YZ_NR_SECTION_FB_NO_GPU_ACTION,
+    YZ_NR_SECTION_FB_PREFLIGHT_CLEAR,
+    YZ_NR_SECTION_FB_PREFLIGHT_DRAW,
+    YZ_NR_SECTION_FB_PREFLIGHT_TRANSFER,
+    YZ_NR_SECTION_FB_PREFLIGHT_SYNC,
+    YZ_NR_SECTION_FB_PREFLIGHT_REPORT,
+    YZ_NR_SECTION_FB_PREFLIGHT_PRESENT,
+    YZ_NR_SECTION_FB_REASON_COUNT,
 };
 
 enum : uint32_t {
@@ -213,9 +244,83 @@ enum : uint32_t {
     YZ_NR_GRAPHICS_ALL = (1u << 5) - 1u,
 };
 
+enum : uint32_t {
+    YZ_NR_CLEAR_ALL = 0,
+    YZ_NR_CLEAR_COLOR_ONLY = 1,
+    YZ_NR_CLEAR_DEPTH_ONLY = 2,
+    YZ_NR_CLEAR_COMBINED = 3,
+};
+
 struct yz_nr_vertical_display {
     uint32_t location, offset, width, height;
     uint32_t valid;
+};
+
+struct yz_nr_section_method {
+    uint32_t method;
+    uint32_t arg;
+    uint32_t suppress_action;
+};
+
+struct yz_nr_section_unknown_key {
+    uint32_t method, arg;
+    unsigned long long count;
+};
+
+struct yz_nr_section_report_key {
+    uint32_t kind, arg, dma;
+    unsigned long long count;
+};
+
+struct yz_nr_section_draw_preflight_key {
+    uint32_t reason, primitive, color_target, fp_location, fp_offset;
+    uint32_t vp_start, vp_inputs;
+    uint32_t color_location, color_offset, color_format, color_pitch;
+    uint32_t viewport_x, viewport_y, viewport_w, viewport_h;
+    uint32_t scissor_x, scissor_y, scissor_w, scissor_h;
+    uint32_t color_mask, depth_test, depth_write, texture_mask;
+    uint32_t stencil_two_sided;
+    uint32_t stencil_ref, back_stencil_ref;
+    uint32_t stencil_mask, back_stencil_mask;
+    uint32_t stencil_write_mask, back_stencil_write_mask;
+    unsigned long long vp_hash;
+    uint32_t vp_words, vp_bad_vec, vp_bad_sca, vp_missing_vtex;
+    uint32_t vp_conditional, vp_terminated;
+    unsigned long long count;
+};
+
+struct yz_nr_section_sync_preflight_key {
+    uint32_t kind, dma, offset, value, release_kind;
+    int32_t result;
+    unsigned long long count;
+};
+
+struct yz_nr_section_transfer_preflight_key {
+    uint32_t kind, src_location, dst_location;
+    uint32_t src_format, dst_format;
+    uint32_t line_length, line_count, word_count;
+    uint32_t in_w, in_h, out_w, out_h;
+    unsigned long long count;
+};
+
+struct yz_nr_section_window_key {
+    uint32_t pc, ret, size, command, stage;
+    uint32_t first_put, last_put, min_available, max_available;
+    unsigned long long count, error;
+};
+
+enum { YZ_NR_FLOW_VP_DIAG_COUNT = 8 };
+
+struct yz_nr_flow_vp_diag {
+    unsigned long long hash;
+    unsigned long long draws;
+    uint32_t start_slot;
+    uint32_t word_count;
+    uint32_t branch_first;
+    uint32_t branch_last;
+    uint32_t branch_or;
+    uint32_t branch_and;
+    uint32_t words[RSX_NIR_VP_MAX_WORDS];
 };
 
 struct yz_nr_vertical_active_state {
@@ -232,6 +337,71 @@ struct yz_nr_vertical_active_state {
     yz_nr_vertical_display displays[8];
     volatile LONG graphics_ready;
     uint32_t graphics_families;
+    uint32_t clear_scope;
+    uint32_t frame_islands;
+    rsx_nir_stream section_stream;
+    rsx_nir_op* section_ops;
+    uint32_t* section_side;
+    yz_nr_section_method* section_methods;
+    rsx_nir_adapter* section_adapter;
+    uint32_t section_method_count;
+    uint32_t section_packet_count;
+    uint32_t section_start_get;
+    uint32_t section_exec_pos;
+    uint32_t section_next_get;
+    uint32_t section_next_ret;
+    uint32_t section_pending;
+    uint32_t section_fatal;
+    uint32_t section_gpu_actions;
+    uint32_t section_draws;
+    uint32_t section_clears;
+    uint32_t section_transfers;
+    uint32_t section_presents;
+    unsigned long long section_attempts;
+    unsigned long long section_owned;
+    unsigned long long section_methods_owned;
+    unsigned long long section_ops_owned;
+    unsigned long long section_fallback[YZ_NR_SECTION_FB_REASON_COUNT];
+    uint32_t section_fallback_active;
+    uint32_t section_fallback_until_get;
+    unsigned long long section_fallback_fast_skips;
+    uint32_t section_repeat_valid;
+    uint32_t section_repeat_get;
+    uint32_t section_repeat_put;
+    uint32_t section_repeat_ret;
+    uint32_t section_repeat_word;
+    uint32_t section_scan_cacheable;
+    uint32_t section_scan_get;
+    uint32_t section_scan_put;
+    uint32_t section_scan_ret;
+    uint32_t section_scan_word;
+    uint32_t section_blocked_sem_get;
+    uint32_t section_blocked_sem_dma;
+    uint32_t section_blocked_sem_offset;
+    uint32_t section_blocked_sem_value;
+    uint32_t section_blocked_sem_valid;
+    uint32_t section_preflight_sem_dma;
+    uint32_t section_preflight_sem_offset;
+    uint32_t section_preflight_sem_value;
+    uint32_t section_preflight_sem_valid;
+    uint32_t section_diag_enabled;
+    uint32_t draw_primitive_filter;
+    unsigned long long section_render_passes_owned;
+    unsigned long long section_dependency_islands_owned;
+    yz_nr_section_unknown_key section_unknown[64];
+    yz_nr_section_report_key section_reports[64];
+    yz_nr_section_draw_preflight_key section_draw_preflight[64];
+    yz_nr_section_sync_preflight_key section_sync_preflight[64];
+    yz_nr_section_transfer_preflight_key section_transfer_preflight[64];
+    yz_nr_section_window_key section_window[32];
+    yz_nr_flow_vp_diag section_flow_vp[YZ_NR_FLOW_VP_DIAG_COUNT];
+    unsigned long long section_unknown_overflow;
+    unsigned long long section_report_overflow;
+    unsigned long long section_draw_preflight_overflow;
+    unsigned long long section_sync_preflight_overflow;
+    unsigned long long section_transfer_preflight_overflow;
+    unsigned long long section_flow_vp_overflow;
+    unsigned long long section_exec_errors;
     volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
     volatile LONG* guest_page_route;
     unsigned long long owned[YZ_NR_VERT_FAMILY_COUNT];
@@ -247,6 +417,7 @@ struct yz_nr_vertical_active_state {
     unsigned long long consumer_draw_fallback;
     unsigned long long consumer_clear_owned;
     unsigned long long consumer_clear_fallback;
+    unsigned long long consumer_clear_contract[3];
     unsigned long long consumer_transfer_owned;
     unsigned long long consumer_transfer_fallback;
     unsigned long long consumer_sync_owned;
@@ -267,6 +438,8 @@ static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 static uint32_t yz_nr_graphics_family_mask(const char* text)
 {
     if (!text || !*text)
+        return YZ_NR_GRAPHICS_ALL;
+    if (strcmp(text, "all") == 0)
         return YZ_NR_GRAPHICS_ALL;
     uint32_t mask = 0;
     const char* cursor = text;
@@ -291,6 +464,19 @@ static uint32_t yz_nr_graphics_family_mask(const char* text)
         cursor = comma + 1;
     }
     return mask;
+}
+
+static uint32_t yz_nr_clear_scope(const char* text)
+{
+    if (!text || !*text || strcmp(text, "all") == 0)
+        return YZ_NR_CLEAR_ALL;
+    if (strcmp(text, "color-only") == 0)
+        return YZ_NR_CLEAR_COLOR_ONLY;
+    if (strcmp(text, "depth-only") == 0)
+        return YZ_NR_CLEAR_DEPTH_ONLY;
+    if (strcmp(text, "combined") == 0)
+        return YZ_NR_CLEAR_COMBINED;
+    return UINT32_MAX;
 }
 
 extern "C" void yz_nr_vertical_exec_set_reference(uint32_t value);
@@ -325,11 +511,19 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                              uint32_t width, uint32_t height,
                              uint32_t buffer_id)
 {
-    const int result = rsx_live_draw_present_external(
-        texture, format, width, height, buffer_id);
-    if (!result)
-        yz_nr_vertical_exec_present_complete(buffer_id);
-    return result;
+    (void)texture;
+    (void)format;
+    (void)width;
+    (void)height;
+    /* nrb_present has already retired the native queue and every live render
+     * target is an exact resource borrowed from the legacy surface registry.
+     * Present that shared scanout through the typed semantic boundary so the
+     * movie handoff, QPC ring and sparse renderer-owned visual/state gates all
+     * observe the frame.  This calls sink_flip directly; it does not decode
+     * or replay an RSX packet. */
+    rsx_live_draw_typed_present(buffer_id);
+    yz_nr_vertical_exec_present_complete(buffer_id);
+    return 0;
 }
 
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
@@ -366,16 +560,20 @@ static uint8_t* yz_nr_d3d_guest_writable_ptr(void*, uint32_t space,
 
 static int yz_nr_d3d_watch_page(void*, uint32_t space, uint32_t page_offset)
 {
-    if (!g_active.guest_page_route || space > 1u ||
-        (page_offset & 0xFFFu))
+    if (!g_active.guest_page_route || space > 1u)
         return -1;
+    /* The persistent mirror tracks 1 KiB subpages to avoid dynamic-buffer
+     * false sharing. VM write rejection remains one sparse bit/route per host
+     * 4 KiB page, so four adjacent mirror registrations intentionally map to
+     * the same exact external route. */
+    const uint32_t watch_offset = page_offset & ~0xFFFu;
     uint32_t ea = 0;
-    if (yz_nr_vertical_space_page_to_ea(space, page_offset, &ea) != 0 ||
+    if (yz_nr_vertical_space_page_to_ea(space, watch_offset, &ea) != 0 ||
         (ea & 0xFFFu))
         return -1;
     const uint32_t ea_page = ea >> 12;
     const LONG encoded = (LONG)(((space + 1u) << 28) |
-                                (page_offset >> 12));
+                                (watch_offset >> 12));
     const LONG prior = InterlockedCompareExchange(
         &g_active.guest_page_route[ea_page], encoded, 0);
     if (prior && prior != encoded)
@@ -400,12 +598,22 @@ static void yz_nr_d3d_publish_write(void*, uint32_t space, uint32_t offset,
 static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
                            const rsx_nir_clear* clear)
 {
+    const uint32_t mismatch = g_active.frame_islands ? 0u :
+        rsx_live_draw_native_clear_contract_mismatch(st, clear);
+    if (mismatch) {
+        for (uint32_t bit = 0; bit < 3u; ++bit)
+            if (mismatch & (1u << bit))
+                g_active.consumer_clear_contract[bit]++;
+        return -1;
+    }
     if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.clear
         ? g_active.gpu_ops.clear(g_active.gpu_ops.user, st, clear) : -1;
-    if (result)
+    if (result) {
         InterlockedExchange(&g_active.renderer_owner, 0);
+    } else
+        rsx_live_draw_native_clear_commit(st, clear);
     return result;
 }
 
@@ -458,14 +666,35 @@ static int yz_nr_borrow_color(void*, uint32_t space, uint32_t offset,
 }
 
 static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
-                              uint32_t depth_format, uint32_t width,
-                              uint32_t height, void** resource,
-                              uint32_t* resource_format,
-                              uint32_t* dsv_format, uint32_t* srv_format)
+                               uint32_t depth_format, uint32_t width,
+                               uint32_t height, void** resource,
+                               uint32_t* resource_format,
+                               uint32_t* dsv_format, uint32_t* srv_format,
+                               int* publication_required)
 {
-    return rsx_live_draw_borrow_depth(
+    const int result = rsx_live_draw_borrow_depth(
         space, offset, depth_format, width, height, resource,
-        resource_format, dsv_format, srv_format);
+        resource_format, dsv_format, srv_format, publication_required);
+    if (!result && *publication_required) {
+        /* zdepth_get may have created this borrowed resource and recorded its
+         * initialization clear on the legacy queue.  The native backend uses
+         * a separate queue, so returning the resource before that list is
+         * submitted is a cross-queue race.  A backend cache miss invokes this
+         * broker only once per exact zeta identity; make that publication a
+         * fenced handoff before the native list can reference the resource.
+         * Existing legacy work was already flushed when renderer_owner moved
+         * to native, so this retires only a newly created resource's
+         * initialization. Re-resolving an unchanged cache entry is free of
+         * queue handoffs. */
+        rsx_live_draw_flush();
+    }
+    return result;
+}
+
+static int yz_nr_render_condition_read(void*, uint32_t dma,
+                                        uint32_t offset, uint32_t* value)
+{
+    return yz_nr_vertical_render_condition_read(dma, offset, value);
 }
 
 static void yz_nr_active_ensure_graphics(void)
@@ -492,6 +721,8 @@ static void yz_nr_active_ensure_graphics(void)
         d3d12, yz_nr_borrow_color, yz_nr_borrow_depth, nullptr);
     rsx_nr_d3d12_set_publish_write(
         d3d12, yz_nr_d3d_publish_write, nullptr);
+    rsx_nr_d3d12_set_render_condition_reader(
+        d3d12, yz_nr_render_condition_read, nullptr);
     for (uint32_t i = 0; i < 8u; ++i) {
         const yz_nr_vertical_display* const display = &g_active.displays[i];
         if (display->valid)
@@ -545,6 +776,39 @@ static int yz_nr_active_init(int graphics)
             rsx_nr_span_router_destroy(&g_active.router);
             return 0;
         }
+        if (g_active.frame_islands) {
+            g_active.section_ops = static_cast<rsx_nir_op*>(calloc(
+                YZ_NR_SECTION_OP_CAPACITY, sizeof(rsx_nir_op)));
+            g_active.section_side = static_cast<uint32_t*>(calloc(
+                YZ_NR_SECTION_SIDE_CAPACITY, sizeof(uint32_t)));
+            g_active.section_methods =
+                static_cast<yz_nr_section_method*>(calloc(
+                    YZ_NR_SECTION_METHOD_CAPACITY,
+                    sizeof(yz_nr_section_method)));
+            g_active.section_adapter =
+                static_cast<rsx_nir_adapter*>(calloc(
+                    1, sizeof(rsx_nir_adapter)));
+            if (!g_active.section_ops || !g_active.section_side ||
+                !g_active.section_methods || !g_active.section_adapter) {
+                free(g_active.section_ops);
+                free(g_active.section_side);
+                free(g_active.section_methods);
+                free(g_active.section_adapter);
+                free(const_cast<LONG*>(g_active.guest_page_route));
+                g_active.section_ops = nullptr;
+                g_active.section_side = nullptr;
+                g_active.section_methods = nullptr;
+                g_active.section_adapter = nullptr;
+                g_active.guest_page_route = nullptr;
+                rsx_nr_ring_destroy(&g_active.ring);
+                rsx_nr_span_router_destroy(&g_active.router);
+                return 0;
+            }
+            rsx_nir_stream_init_fixed(
+                &g_active.section_stream, g_active.section_ops,
+                YZ_NR_SECTION_OP_CAPACITY, g_active.section_side,
+                YZ_NR_SECTION_SIDE_CAPACITY);
+        }
     }
     rsx_nr_exec_ops ops = {};
     ops.set_reference = yz_nr_exec_reference;
@@ -561,6 +825,8 @@ static int yz_nr_active_publish(ppu_context* ctx, uint32_t family,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0))
         return 0;
+    if (g_active.frame_islands)
+        return 0; /* raw packet belongs to the transactional section gate */
     const uint32_t context = (uint32_t)ctx->gpr[3];
     if (context != YZ_GCM_CTX_ADDR) {
         g_active.wrong_context++;
@@ -623,6 +889,8 @@ static int yz_nr_active_publish_flip(uint32_t context,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_active_present, 0, 0))
         return 0;
+    if (g_active.frame_islands)
+        return 0;
     if (context != YZ_GCM_CTX_ADDR) {
         g_active.wrong_context++;
         g_active.fallback[YZ_NR_VERT_FLIP]++;
@@ -678,7 +946,10 @@ static int yz_nr_active_publish_draw_arrays(ppu_context* ctx)
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0) ||
         !(g_active.graphics_families & YZ_NR_GRAPHICS_DRAW) ||
-        !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
+        !rsx_live_draw_native_actions_allowed())
+        return 0;
+    if (g_active.frame_islands)
         return 0;
     const uint32_t context = static_cast<uint32_t>(ctx->gpr[3]);
     if (context != YZ_GCM_CTX_ADDR) {
@@ -1424,10 +1695,32 @@ extern "C" void yz_nr_vertical_init(void)
         g_active.graphics_families = graphics
             ? yz_nr_graphics_family_mask(getenv("YZ_NR_GRAPHICS_FAMILIES"))
             : 0u;
-        if (graphics && !g_active.graphics_families) {
+        g_active.clear_scope = graphics
+            ? yz_nr_clear_scope(getenv("YZ_NR_CLEAR_SCOPE"))
+            : YZ_NR_CLEAR_ALL;
+        g_active.frame_islands = graphics &&
+            getenv("YZ_NR_FRAME_ISLANDS") != nullptr;
+        g_active.section_diag_enabled = graphics &&
+            getenv("YZ_NR_PASS_DIAG") != nullptr;
+        g_active.draw_primitive_filter = UINT32_MAX;
+        if (graphics) {
+            const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
+            if (primitive && *primitive) {
+                char* end = nullptr;
+                const unsigned long parsed = strtoul(primitive, &end, 0);
+                if (!end || *end || parsed > 10u)
+                    g_active.draw_primitive_filter = UINT32_MAX - 1u;
+                else
+                    g_active.draw_primitive_filter =
+                        static_cast<uint32_t>(parsed);
+            }
+        }
+        if (graphics && (!g_active.graphics_families ||
+                         g_active.clear_scope == UINT32_MAX ||
+                         g_active.draw_primitive_filter == UINT32_MAX - 1u)) {
             fprintf(stderr,
-                    "[nr-vertical-active init=failed; invalid empty "
-                    "YZ_NR_GRAPHICS_FAMILIES]\n");
+                    "[nr-vertical-active init=failed; invalid graphics "
+                    "family/clear scope]\n");
             fflush(stderr);
         } else if (yz_nr_active_init(graphics))
             InterlockedExchange(&g_vertical.mode_active_basic, 1);
@@ -1525,6 +1818,13 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0))
         return 0;
+    if (g_active.frame_islands)
+        return 0;
+    /* The host movie is the sole renderer/queue owner while armed. Falling
+     * through preserves the mature legacy movie suppression and prevents a
+     * native clear/draw/transfer from racing the host movie command list. */
+    if (!rsx_live_draw_native_actions_allowed())
+        return 0;
     yz_nr_active_ensure_graphics();
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
         g_active.pending_valid || rsx_nr_ring_depth(&g_active.ring))
@@ -1550,6 +1850,19 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         is_sync ? YZ_NR_GRAPHICS_SYNC : YZ_NR_GRAPHICS_REPORT;
     if (!(g_active.graphics_families & family))
         return 0;
+    if (is_clear && g_active.clear_scope != YZ_NR_CLEAR_ALL) {
+        const bool color = (arg & 0xF0u) != 0;
+        const bool depth = (arg & 0x03u) != 0;
+        const bool selected =
+            (g_active.clear_scope == YZ_NR_CLEAR_COLOR_ONLY &&
+             color && !depth) ||
+            (g_active.clear_scope == YZ_NR_CLEAR_DEPTH_ONLY &&
+             depth && !color) ||
+            (g_active.clear_scope == YZ_NR_CLEAR_COMBINED &&
+             color && depth);
+        if (!selected)
+            return 0;
+    }
     const auto note_fallback = [&]() {
         if (is_draw)
             g_active.consumer_draw_fallback++;
@@ -1615,13 +1928,11 @@ extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0))
         return;
-    const bool action =
-        (method == 0x1808u && arg == 0u) || method == 0x1D94u ||
-        method == 0x2328u || method == 0xC40Cu ||
-        method == 0x0050u || method == 0x006Cu || method == 0x0110u ||
-        method == 0x17C8u || method == 0x1800u ||
-        method == 0x1D70u || method == 0x1D74u ||
-        (method >= 0xE920u && method <= 0xE95Cu);
+    /* The A010-path inline transfer window publishes guest/shared-resource
+     * writes directly in yz_rsx_method. It must not overtake an open native
+     * clear/draw list. observe_method also recognizes this range, but
+     * resetting the owner after dispatch is too late to preserve order. */
+    const bool action = rsx_nr_legacy_gpu_action(method, arg) != 0;
     if (!action)
         return;
     if (InterlockedExchange(&g_active.renderer_owner, 0) == 1 &&
@@ -1632,6 +1943,12 @@ extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                                 uint32_t packet_ea)
 {
+    /* Host movies own execution and presentation, not the guest RSX register
+     * file. The guest continues publishing state while movie frames suppress
+     * its visible actions. Keep the shadow adapter current through that
+     * interval so the first post-movie pass starts from the exact live state;
+     * shadow_mode guarantees that clears/draws/transfers/presents emit no
+     * native operation and therefore cannot race the movie renderer. */
     if (InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0))
         rsx_nir_adapter_method(&g_active.adapter, method, arg);
@@ -1979,6 +2296,1074 @@ observe_single_method:
     ReleaseSRWLockExclusive(&g_vertical.lock);
 }
 
+static int yz_nr_section_gpu_action(uint32_t kind)
+{
+    return kind == RSX_NIR_OP_CLEAR || kind == RSX_NIR_OP_DRAW ||
+        kind == RSX_NIR_OP_TRANSFER || kind == RSX_NIR_OP_PRESENT;
+}
+
+/* A native render-pass island may contain arbitrary folded graphics state and
+ * any number of draws, but it must not straddle an operation that publishes
+ * memory, changes framebuffer identity, transfers ownership, or presents.
+ * These are semantic boundaries, not packet-count heuristics: the complete
+ * island is preflighted before any legacy action is suppressed. */
+static int yz_nr_section_dependency_method(uint32_t method)
+{
+    switch (method) {
+    case 0x0050u: /* NV406E SET_REFERENCE */
+    case 0x0068u: /* NV406E SEMAPHORE_ACQUIRE */
+    case 0x006Cu: /* NV406E SEMAPHORE_RELEASE */
+    case 0x0110u: /* WAIT_FOR_IDLE */
+    case 0x17C8u: /* CLEAR_REPORT_VALUE */
+    case 0x1800u: /* GET_REPORT */
+    case 0x1D70u: /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+    case 0x1D74u: /* TEXTURE_READ_SEMAPHORE_RELEASE */
+    case 0x2328u: /* NV0039 BUFFER_NOTIFY */
+    case 0xC40Cu: /* NV3089 IMAGE_IN */
+    case 0xE924u: /* typed PRESENT */
+    case 0xE944u: /* legacy driver flip */
+    case 0xEB00u: /* user command cause */
+    case 0xEB04u: /* user command fire */
+        return 1;
+    default:
+        return method >= 0xA400u && method <= 0xAAFCu;
+    }
+}
+
+static int yz_nr_section_surface_method(uint32_t method)
+{
+    switch (method) {
+    case 0x018Cu: /* DMA_COLOR1 */
+    case 0x0194u: /* DMA_COLOR0 */
+    case 0x0198u: /* DMA_ZETA */
+    case 0x01B4u: /* DMA_COLOR2 */
+    case 0x01B8u: /* DMA_COLOR3 */
+    case 0x0200u: /* RT_HORIZ */
+    case 0x0204u: /* RT_VERT */
+    case 0x0208u: /* RT_FORMAT */
+    case 0x020Cu: /* COLOR0_PITCH */
+    case 0x0210u: /* COLOR0_OFFSET */
+    case 0x0214u: /* ZETA_OFFSET */
+    case 0x0218u: /* COLOR1_OFFSET */
+    case 0x021Cu: /* COLOR1_PITCH */
+    case 0x0220u: /* RT_ENABLE */
+    case 0x022Cu: /* ZETA_PITCH */
+    case 0x0280u: /* COLOR2_PITCH */
+    case 0x0284u: /* COLOR3_PITCH */
+    case 0x0288u: /* COLOR2_OFFSET */
+    case 0x028Cu: /* COLOR3_OFFSET */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int yz_nr_section_starts_new_pass(uint32_t method)
+{
+    return method == 0x1D94u || yz_nr_section_surface_method(method);
+}
+
+static int yz_nr_section_op_side(const rsx_nir_op* op,
+                                 uint32_t* offset, uint32_t* count)
+{
+    *offset = 0;
+    *count = 0;
+    switch (op->kind) {
+    case RSX_NIR_OP_DRAW:
+        *offset = op->u.draw.batches_ofs;
+        *count = op->u.draw.batch_count * 2u;
+        break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM:
+        *offset = op->u.vertex_program.words_ofs;
+        *count = op->u.vertex_program.word_count;
+        break;
+    case RSX_NIR_OP_SET_CONSTANTS:
+        *offset = op->u.constants.words_ofs;
+        *count = op->u.constants.slot_count * 4u;
+        break;
+    case RSX_NIR_OP_TRANSFER:
+        *offset = op->u.transfer.words_ofs;
+        *count = op->u.transfer.word_count;
+        break;
+    default:
+        break;
+    }
+    return *count != 0;
+}
+
+static void yz_nr_section_set_side(rsx_nir_op* op, uint32_t offset)
+{
+    switch (op->kind) {
+    case RSX_NIR_OP_DRAW:
+        op->u.draw.batches_ofs = offset;
+        break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM:
+        op->u.vertex_program.words_ofs = offset;
+        break;
+    case RSX_NIR_OP_SET_CONSTANTS:
+        op->u.constants.words_ofs = offset;
+        break;
+    case RSX_NIR_OP_TRANSFER:
+        op->u.transfer.words_ofs = offset;
+        break;
+    default:
+        break;
+    }
+}
+
+static yz_nr_vertical_section_result yz_nr_section_fallback(uint32_t reason)
+{
+    if (reason >= YZ_NR_SECTION_FB_REASON_COUNT)
+        reason = YZ_NR_SECTION_FB_FLOW;
+    g_active.section_fallback[reason]++;
+    /* A rejected, still-published FIFO head is immutable until GET, PUT, the
+     * return cursor, or its command word changes. Cache only that exact
+     * identity. This suppresses repeated whole-section decoding/preflight on
+     * a legacy semaphore retry or self-stopper without broad address scans. */
+    if (g_active.section_scan_cacheable) {
+        g_active.section_repeat_get = g_active.section_scan_get;
+        g_active.section_repeat_put = g_active.section_scan_put;
+        g_active.section_repeat_ret = g_active.section_scan_ret;
+        g_active.section_repeat_word = g_active.section_scan_word;
+        g_active.section_repeat_valid = 1;
+        g_active.section_scan_cacheable = 0;
+    }
+    return YZ_NR_VERTICAL_SECTION_FALLBACK;
+}
+
+static yz_nr_vertical_section_result yz_nr_section_defer_fallback(
+    uint32_t reason, uint32_t until_get, uint32_t budget)
+{
+    (void)budget;
+    /* The scanner has already followed every control-flow edge to this exact
+     * semantic boundary. Legacy execution of the rejected section follows
+     * the same FIFO path, so keep it wholly legacy until GET reaches that
+     * boundary. A retry at an acquire can remain here indefinitely without
+     * causing another scan. */
+    g_active.section_fallback_active = 1;
+    g_active.section_fallback_until_get = until_get;
+    return yz_nr_section_fallback(reason);
+}
+
+static void yz_nr_section_note_unknown(uint32_t method, uint32_t arg)
+{
+    for (uint32_t i = 0; i < 64u; ++i) {
+        yz_nr_section_unknown_key* const entry =
+            &g_active.section_unknown[i];
+        if (!entry->count) {
+            entry->method = method;
+            entry->arg = arg;
+            entry->count = 1;
+            return;
+        }
+        if (entry->method == method && entry->arg == arg) {
+            entry->count++;
+            return;
+        }
+    }
+    g_active.section_unknown_overflow++;
+}
+
+static void yz_nr_section_note_window(
+    uint32_t pc, uint32_t put, uint32_t ret, uint32_t size,
+    uint32_t command, uint32_t stage)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t available = pc < ring
+        ? (put - pc + ring) & (ring - 1u) : UINT32_MAX;
+    yz_nr_section_window_key* empty = nullptr;
+    yz_nr_section_window_key* least = &g_active.section_window[0];
+    for (uint32_t i = 0; i < 32u; ++i) {
+        yz_nr_section_window_key* const entry =
+            &g_active.section_window[i];
+        if (entry->count && entry->pc == pc && entry->ret == ret &&
+            entry->size == size && entry->command == command &&
+            entry->stage == stage) {
+            entry->last_put = put;
+            if (available < entry->min_available)
+                entry->min_available = available;
+            if (available > entry->max_available)
+                entry->max_available = available;
+            entry->count++;
+            return;
+        }
+        if (!entry->count && !empty)
+            empty = entry;
+        if (entry->count < least->count)
+            least = entry;
+    }
+    yz_nr_section_window_key* const entry = empty ? empty : least;
+    const unsigned long long inherited = empty ? 0u : entry->count;
+    *entry = {pc, ret, size, command, stage, put, put,
+              available, available, inherited + 1u, inherited};
+}
+
+static void yz_nr_section_note_report(
+    uint32_t kind, uint32_t arg, uint32_t dma)
+{
+    for (uint32_t i = 0; i < 64u; ++i) {
+        yz_nr_section_report_key* const entry =
+            &g_active.section_reports[i];
+        if (!entry->count) {
+            entry->kind = kind;
+            entry->arg = arg;
+            entry->dma = dma;
+            entry->count = 1;
+            return;
+        }
+        if (entry->kind == kind && entry->arg == arg &&
+            entry->dma == dma) {
+            entry->count++;
+            return;
+        }
+    }
+    g_active.section_report_overflow++;
+}
+
+static void yz_nr_section_note_draw_preflight(
+    uint32_t reason, const rsx_nir_pipeline* state,
+    const rsx_nir_draw* draw, const uint32_t* vp_words,
+    uint32_t vp_word_count)
+{
+    uint32_t texture_mask = 0;
+    uint32_t vertex_texture_mask = 0;
+    if (state)
+        for (uint32_t i = 0; i < RSX_NIR_NUM_TEXTURES; ++i)
+            if (state->textures[i].enabled)
+                texture_mask |= 1u << i;
+    if (state)
+        for (uint32_t i = 0; i < RSX_NIR_NUM_VERTEX_TEXTURES; ++i)
+            if (state->vertex_textures[i].enabled)
+                vertex_texture_mask |= 1u << i;
+    rsx_vp_native_support_analysis vp_support = {};
+    if (vp_words && vp_word_count)
+        rsx_vp_analyze_native_support_control(
+            reinterpret_cast<const uint8_t*>(vp_words),
+            vp_word_count * sizeof(uint32_t), vertex_texture_mask,
+            state ? state->vertex_program.start_slot : 0u,
+            &vp_support);
+    const yz_nr_section_draw_preflight_key key = {
+        reason, draw ? draw->primitive : 0u,
+        state ? state->surface.color_target : 0u,
+        state ? state->fragment_program.location : 0u,
+        state ? state->fragment_program.offset : 0u,
+        state ? state->vertex_program.start_slot : 0u,
+        state ? state->vertex_program.attrib_input_mask : 0u,
+        state ? state->surface.color_location[0] : 0u,
+        state ? state->surface.color_offset[0] : 0u,
+        state ? state->surface.color_format : 0u,
+        state ? state->surface.color_pitch[0] : 0u,
+        state ? state->viewport.x : 0u,
+        state ? state->viewport.y : 0u,
+        state ? state->viewport.w : 0u,
+        state ? state->viewport.h : 0u,
+        state ? state->scissor.x : 0u,
+        state ? state->scissor.y : 0u,
+        state ? state->scissor.w : 0u,
+        state ? state->scissor.h : 0u,
+        state ? state->raster.color_mask : 0u,
+        state ? state->depth_stencil.depth_test_enable : 0u,
+        state ? state->depth_stencil.depth_write_enable : 0u,
+        texture_mask,
+        state ? state->depth_stencil.two_sided_stencil_enable : 0u,
+        state ? state->depth_stencil.stencil_ref : 0u,
+        state ? state->depth_stencil.back_stencil_ref : 0u,
+        state ? state->depth_stencil.stencil_mask : 0u,
+        state ? state->depth_stencil.back_stencil_mask : 0u,
+        state ? state->depth_stencil.stencil_write_mask : 0u,
+        state ? state->depth_stencil.back_stencil_write_mask : 0u,
+        state ? state->vertex_program.hash : 0u,
+        vp_word_count,
+        vp_support.unsupported_vec_mask,
+        vp_support.unsupported_sca_mask,
+        vp_support.missing_vtex_mask,
+        vp_support.conditional_tests,
+        vp_support.terminated,
+        1u
+    };
+    for (uint32_t i = 0; i < 64u; ++i) {
+        yz_nr_section_draw_preflight_key* const entry =
+            &g_active.section_draw_preflight[i];
+        if (!entry->count) {
+            *entry = key;
+            return;
+        }
+        if (entry->reason == key.reason &&
+            entry->primitive == key.primitive &&
+            entry->color_target == key.color_target &&
+            entry->fp_location == key.fp_location &&
+            entry->fp_offset == key.fp_offset &&
+            entry->vp_start == key.vp_start &&
+            entry->vp_inputs == key.vp_inputs &&
+            entry->color_location == key.color_location &&
+            entry->color_offset == key.color_offset &&
+            entry->color_format == key.color_format &&
+            entry->color_pitch == key.color_pitch &&
+            entry->viewport_x == key.viewport_x &&
+            entry->viewport_y == key.viewport_y &&
+            entry->viewport_w == key.viewport_w &&
+            entry->viewport_h == key.viewport_h &&
+            entry->scissor_x == key.scissor_x &&
+            entry->scissor_y == key.scissor_y &&
+            entry->scissor_w == key.scissor_w &&
+            entry->scissor_h == key.scissor_h &&
+            entry->color_mask == key.color_mask &&
+            entry->depth_test == key.depth_test &&
+            entry->depth_write == key.depth_write &&
+            entry->texture_mask == key.texture_mask &&
+            entry->stencil_two_sided == key.stencil_two_sided &&
+            entry->stencil_ref == key.stencil_ref &&
+            entry->back_stencil_ref == key.back_stencil_ref &&
+            entry->stencil_mask == key.stencil_mask &&
+            entry->back_stencil_mask == key.back_stencil_mask &&
+            entry->stencil_write_mask == key.stencil_write_mask &&
+            entry->back_stencil_write_mask == key.back_stencil_write_mask &&
+            entry->vp_hash == key.vp_hash &&
+            entry->vp_words == key.vp_words &&
+            entry->vp_bad_vec == key.vp_bad_vec &&
+            entry->vp_bad_sca == key.vp_bad_sca &&
+            entry->vp_missing_vtex == key.vp_missing_vtex &&
+            entry->vp_conditional == key.vp_conditional &&
+            entry->vp_terminated == key.vp_terminated) {
+            entry->count++;
+            return;
+        }
+    }
+    g_active.section_draw_preflight_overflow++;
+}
+
+static void yz_nr_section_note_flow_vp(
+    const rsx_nir_pipeline* state, const uint32_t* vp_words,
+    uint32_t vp_word_count)
+{
+    if (!g_active.section_diag_enabled || !state || !vp_words ||
+        !vp_word_count || vp_word_count > RSX_NIR_VP_MAX_WORDS)
+        return;
+    uint32_t vertex_texture_mask = 0;
+    for (uint32_t i = 0; i < RSX_NIR_NUM_VERTEX_TEXTURES; ++i)
+        if (state->vertex_textures[i].enabled)
+            vertex_texture_mask |= 1u << i;
+    rsx_vp_native_support_analysis support = {};
+    rsx_vp_analyze_native_support_control(
+        reinterpret_cast<const uint8_t*>(vp_words),
+        vp_word_count * sizeof(uint32_t), vertex_texture_mask,
+        state->vertex_program.start_slot, &support);
+    if (!support.flow_instructions)
+        return;
+
+    yz_nr_flow_vp_diag* empty = nullptr;
+    for (uint32_t i = 0; i < YZ_NR_FLOW_VP_DIAG_COUNT; ++i) {
+        yz_nr_flow_vp_diag* const entry = &g_active.section_flow_vp[i];
+        if (!entry->draws) {
+            if (!empty)
+                empty = entry;
+            continue;
+        }
+        if (entry->hash != state->vertex_program.hash ||
+            entry->start_slot != state->vertex_program.start_slot ||
+            entry->word_count != vp_word_count)
+            continue;
+        const uint32_t branch_bits = state->vertex_program.branch_bits;
+        entry->draws++;
+        entry->branch_last = branch_bits;
+        entry->branch_or |= branch_bits;
+        entry->branch_and &= branch_bits;
+        return;
+    }
+    if (!empty) {
+        g_active.section_flow_vp_overflow++;
+        return;
+    }
+    empty->hash = state->vertex_program.hash;
+    empty->draws = 1;
+    empty->start_slot = state->vertex_program.start_slot;
+    empty->word_count = vp_word_count;
+    empty->branch_first = state->vertex_program.branch_bits;
+    empty->branch_last = state->vertex_program.branch_bits;
+    empty->branch_or = state->vertex_program.branch_bits;
+    empty->branch_and = state->vertex_program.branch_bits;
+    memcpy(empty->words, vp_words,
+           static_cast<size_t>(vp_word_count) * sizeof(uint32_t));
+}
+
+static void yz_nr_section_note_sync_preflight(
+    const rsx_nir_op* op, int32_t result)
+{
+    const yz_nr_section_sync_preflight_key key = {
+        op ? op->kind : 0u,
+        op ? op->u.semaphore.dma_context : 0u,
+        op ? op->u.semaphore.offset : 0u,
+        op ? op->u.semaphore.value : 0u,
+        op ? op->u.semaphore.texture_read : 0u,
+        result, 1u
+    };
+    for (uint32_t i = 0; i < 64u; ++i) {
+        yz_nr_section_sync_preflight_key* const entry =
+            &g_active.section_sync_preflight[i];
+        if (!entry->count) {
+            *entry = key;
+            return;
+        }
+        if (entry->kind == key.kind && entry->dma == key.dma &&
+            entry->offset == key.offset && entry->value == key.value &&
+            entry->release_kind == key.release_kind &&
+            entry->result == key.result) {
+            entry->count++;
+            return;
+        }
+    }
+    g_active.section_sync_preflight_overflow++;
+}
+
+static void yz_nr_section_note_transfer_preflight(
+    const rsx_nir_transfer* transfer)
+{
+    const yz_nr_section_transfer_preflight_key key = {
+        transfer ? transfer->kind : 0u,
+        transfer ? transfer->src_location : 0u,
+        transfer ? transfer->dst_location : 0u,
+        transfer ? transfer->src_format : 0u,
+        transfer ? transfer->dst_format : 0u,
+        transfer ? transfer->line_length : 0u,
+        transfer ? transfer->line_count : 0u,
+        transfer ? transfer->word_count : 0u,
+        transfer ? transfer->in_w : 0u,
+        transfer ? transfer->in_h : 0u,
+        transfer ? transfer->out_w : 0u,
+        transfer ? transfer->out_h : 0u,
+        1u
+    };
+    for (uint32_t i = 0; i < 64u; ++i) {
+        yz_nr_section_transfer_preflight_key* const entry =
+            &g_active.section_transfer_preflight[i];
+        if (!entry->count) {
+            *entry = key;
+            return;
+        }
+        if (entry->kind == key.kind &&
+            entry->src_location == key.src_location &&
+            entry->dst_location == key.dst_location &&
+            entry->src_format == key.src_format &&
+            entry->dst_format == key.dst_format &&
+            entry->line_length == key.line_length &&
+            entry->line_count == key.line_count &&
+            entry->word_count == key.word_count &&
+            entry->in_w == key.in_w && entry->in_h == key.in_h &&
+            entry->out_w == key.out_w && entry->out_h == key.out_h) {
+            entry->count++;
+            return;
+        }
+    }
+    g_active.section_transfer_preflight_overflow++;
+}
+
+static uint32_t yz_nr_section_preflight(void)
+{
+    rsx_nir_pipeline state = g_active.backend.st;
+    uint32_t vp_words[RSX_NIR_VP_MAX_WORDS] = {};
+    uint32_t vp_word_count = g_active.backend.vp_word_count;
+    if (vp_word_count > RSX_NIR_VP_MAX_WORDS)
+        return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+    if (vp_word_count)
+        memcpy(vp_words, g_active.backend.vp_words,
+               static_cast<size_t>(vp_word_count) * sizeof(uint32_t));
+
+    g_active.section_gpu_actions = 0;
+    g_active.section_draws = 0;
+    g_active.section_clears = 0;
+    g_active.section_transfers = 0;
+    g_active.section_presents = 0;
+    g_active.section_preflight_sem_valid = 0;
+    for (uint32_t i = 0; i < g_active.section_stream.op_count; ++i) {
+        const rsx_nir_op* const op = &g_active.section_stream.ops[i];
+        if (!rsx_nir_op_is_action(op->kind)) {
+            rsx_nir_pipeline_apply_op(
+                &state, &g_active.section_stream, op);
+            if (op->kind == RSX_NIR_OP_SET_VERTEX_PROGRAM) {
+                vp_word_count = op->u.vertex_program.word_count;
+                const uint32_t* const words = rsx_nir_side(
+                    &g_active.section_stream,
+                    op->u.vertex_program.words_ofs, vp_word_count);
+                if (vp_word_count > RSX_NIR_VP_MAX_WORDS ||
+                    (vp_word_count && !words))
+                    return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+                if (vp_word_count)
+                    memcpy(vp_words, words,
+                           static_cast<size_t>(vp_word_count) *
+                               sizeof(uint32_t));
+            }
+            continue;
+        }
+
+        if (yz_nr_section_gpu_action(op->kind))
+            g_active.section_gpu_actions++;
+        switch (op->kind) {
+        case RSX_NIR_OP_CLEAR:
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_CLEAR))
+                return YZ_NR_SECTION_FB_PREFLIGHT_CLEAR;
+            if (g_active.clear_scope != YZ_NR_CLEAR_ALL) {
+                const bool color = (op->u.clear.mask & 0xF0u) != 0;
+                const bool depth = (op->u.clear.mask & 0x03u) != 0;
+                const bool selected =
+                    (g_active.clear_scope == YZ_NR_CLEAR_COLOR_ONLY &&
+                     color && !depth) ||
+                    (g_active.clear_scope == YZ_NR_CLEAR_DEPTH_ONLY &&
+                     depth && !color) ||
+                    (g_active.clear_scope == YZ_NR_CLEAR_COMBINED &&
+                     color && depth);
+                if (!selected)
+                    return YZ_NR_SECTION_FB_PREFLIGHT_CLEAR;
+            }
+            if (rsx_nr_d3d12_preflight_clear(
+                    g_active.d3d12, &state, &op->u.clear) != 0)
+                return YZ_NR_SECTION_FB_PREFLIGHT_CLEAR;
+            g_active.section_clears++;
+            break;
+        case RSX_NIR_OP_DRAW: {
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_DRAW))
+                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            if (g_active.draw_primitive_filter != UINT32_MAX &&
+                op->u.draw.primitive != g_active.draw_primitive_filter)
+                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            const uint32_t* const batches = rsx_nir_side(
+                &g_active.section_stream, op->u.draw.batches_ofs,
+                op->u.draw.batch_count * 2u);
+            yz_nr_section_note_flow_vp(&state, vp_words, vp_word_count);
+            const int draw_preflight = batches
+                ? rsx_nr_d3d12_preflight_draw(
+                    g_active.d3d12, &state, vp_words, vp_word_count,
+                    &op->u.draw, batches)
+                : -RSX_NR_DRAW_PF_BAD_ARGUMENT;
+            if (draw_preflight != 0) {
+                yz_nr_section_note_draw_preflight(
+                    (uint32_t)-draw_preflight, &state, &op->u.draw,
+                    vp_words, vp_word_count);
+                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            }
+            g_active.section_draws++;
+            break;
+        }
+        case RSX_NIR_OP_TRANSFER: {
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_TRANSFER))
+                return YZ_NR_SECTION_FB_PREFLIGHT_TRANSFER;
+            const uint32_t* words = nullptr;
+            if (op->u.transfer.word_count)
+                words = rsx_nir_side(
+                    &g_active.section_stream, op->u.transfer.words_ofs,
+                    op->u.transfer.word_count);
+            if (rsx_nr_d3d12_preflight_transfer(
+                    g_active.d3d12, &state, &op->u.transfer, words) != 0) {
+                yz_nr_section_note_transfer_preflight(&op->u.transfer);
+                return YZ_NR_SECTION_FB_PREFLIGHT_TRANSFER;
+            }
+            g_active.section_transfers++;
+            break;
+        }
+        case RSX_NIR_OP_SEMAPHORE_ACQUIRE:
+        case RSX_NIR_OP_SEMAPHORE_RELEASE: {
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_SYNC))
+                return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+            uint32_t value = 0;
+            const int32_t read_result = yz_nr_vertical_sem_read(
+                    op->u.semaphore.dma_context,
+                    op->u.semaphore.offset, &value);
+            if (read_result != 0 ||
+                (op->kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE &&
+                 value != op->u.semaphore.value)) {
+                yz_nr_section_note_sync_preflight(op, read_result);
+                if (read_result == 0 &&
+                    op->kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE) {
+                    g_active.section_preflight_sem_dma =
+                        op->u.semaphore.dma_context;
+                    g_active.section_preflight_sem_offset =
+                        op->u.semaphore.offset;
+                    g_active.section_preflight_sem_value =
+                        op->u.semaphore.value;
+                    g_active.section_preflight_sem_valid = 1;
+                }
+                return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+            }
+            break;
+        }
+        case RSX_NIR_OP_REPORT:
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_REPORT))
+                return YZ_NR_SECTION_FB_PREFLIGHT_REPORT;
+            if (yz_nr_vertical_report_can(
+                    op->u.report.kind, op->u.report.arg,
+                    op->u.report.dma_report) != 0) {
+                yz_nr_section_note_report(
+                    op->u.report.kind, op->u.report.arg,
+                    op->u.report.dma_report);
+                return YZ_NR_SECTION_FB_PREFLIGHT_REPORT;
+            }
+            break;
+        case RSX_NIR_OP_PRESENT:
+            if (rsx_nr_d3d12_preflight_present(
+                    g_active.d3d12, op->u.present.buffer) != 0)
+                return YZ_NR_SECTION_FB_PREFLIGHT_PRESENT;
+            g_active.section_presents++;
+            break;
+        case RSX_NIR_OP_BARRIER:
+        case RSX_NIR_OP_SET_REFERENCE:
+        case RSX_NIR_OP_USER_COMMAND:
+            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_SYNC))
+                return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+            break;
+        default:
+            return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+        }
+    }
+    return g_active.section_gpu_actions ? YZ_NR_SECTION_FB_NONE :
+        YZ_NR_SECTION_FB_NO_GPU_ACTION;
+}
+
+static int yz_nr_section_push_op(uint32_t index)
+{
+    if (index >= g_active.section_stream.op_count ||
+        rsx_nr_ring_depth(&g_active.ring))
+        return -1;
+    rsx_nir_op op = g_active.section_stream.ops[index];
+    uint32_t offset = 0, count = 0;
+    yz_nr_section_op_side(&op, &offset, &count);
+    if (!rsx_nr_ring_can_accept(&g_active.ring, 1u, count))
+        return -1;
+    if (count) {
+        const uint32_t* const source = rsx_nir_side(
+            &g_active.section_stream, offset, count);
+        uint32_t* destination = nullptr;
+        const uint32_t ring_offset = rsx_nr_ring_side_reserve(
+            &g_active.ring, count, &destination);
+        if (!source || ring_offset == ~0u || !destination)
+            return -1;
+        memcpy(destination, source,
+               static_cast<size_t>(count) * sizeof(uint32_t));
+        yz_nr_section_set_side(&op, ring_offset);
+    }
+    return rsx_nr_ring_push(&g_active.ring, &op);
+}
+
+static void yz_nr_section_report_fatal(
+    const char* phase, uint32_t index, rsx_nr_step_result step,
+    unsigned long long errors_before)
+{
+    static LONG reported = 0;
+    if (InterlockedExchange(&reported, 1))
+        return;
+    const rsx_nir_op* const op =
+        index < g_active.section_stream.op_count
+            ? &g_active.section_stream.ops[index] : nullptr;
+    rsx_nr_d3d12_stats stats = {};
+    if (g_active.d3d12)
+        rsx_nr_d3d12_get_stats(g_active.d3d12, &stats);
+    fprintf(stderr,
+            "[nr-vertical-section-fatal phase=%s index=%u/%u kind=%u "
+            "step=%u errors=%llu->%llu surface=%u:%08X target=%u "
+            "fp=%u:%08X draw=%u/%u/%u clear=%08X transfer=%u "
+            "present=%u d3d{draw=%llu clear=%llu xfer=%llu present=%llu "
+            "fallback=%llu resident-fail=%llu}]\n",
+            phase ? phase : "unknown", index,
+            g_active.section_stream.op_count,
+            op ? (uint32_t)op->kind : UINT32_MAX, (uint32_t)step,
+            errors_before, g_active.backend.stats.exec_errors,
+            g_active.backend.st.surface.color_location[0],
+            g_active.backend.st.surface.color_offset[0],
+            g_active.backend.st.surface.color_target,
+            g_active.backend.st.fragment_program.location,
+            g_active.backend.st.fragment_program.offset,
+            op && op->kind == RSX_NIR_OP_DRAW ? op->u.draw.primitive : 0u,
+            op && op->kind == RSX_NIR_OP_DRAW ? op->u.draw.batch_count : 0u,
+            op && op->kind == RSX_NIR_OP_DRAW ? op->u.draw.total_count : 0u,
+            op && op->kind == RSX_NIR_OP_CLEAR ? op->u.clear.mask : 0u,
+            op && op->kind == RSX_NIR_OP_TRANSFER
+                ? op->u.transfer.kind : 0u,
+            op && op->kind == RSX_NIR_OP_PRESENT
+                ? op->u.present.buffer : UINT32_MAX,
+            stats.draws, stats.clears, stats.transfers, stats.presents,
+            stats.unsupported_draws, stats.residency_failures);
+    fflush(stderr);
+}
+
+static yz_nr_vertical_section_result yz_nr_section_execute(
+    uint32_t* next_get, uint32_t* next_ret)
+{
+    while (g_active.section_exec_pos <
+           g_active.section_stream.op_count) {
+        if (!rsx_nr_ring_depth(&g_active.ring) &&
+            yz_nr_section_push_op(g_active.section_exec_pos) != 0) {
+            g_active.section_exec_errors++;
+            g_active.section_fatal = 1;
+            yz_nr_section_report_fatal(
+                "push", g_active.section_exec_pos,
+                RSX_NR_STEP_EMPTY, g_active.backend.stats.exec_errors);
+            return YZ_NR_VERTICAL_SECTION_FATAL;
+        }
+        const unsigned long long errors_before =
+            g_active.backend.stats.exec_errors;
+        const rsx_nr_step_result step =
+            rsx_nr_backend_step(&g_active.backend);
+        if (step == RSX_NR_STEP_BLOCKED_TOKEN ||
+            step == RSX_NR_STEP_BLOCKED_SEMAPHORE)
+            return YZ_NR_VERTICAL_SECTION_WAIT;
+        if (step != RSX_NR_STEP_EXECUTED ||
+            g_active.backend.stats.exec_errors != errors_before) {
+            g_active.section_exec_errors++;
+            g_active.section_fatal = 1;
+            yz_nr_section_report_fatal(
+                "execute", g_active.section_exec_pos, step,
+                errors_before);
+            return YZ_NR_VERTICAL_SECTION_FATAL;
+        }
+        g_active.section_exec_pos++;
+    }
+    if (rsx_nr_ring_depth(&g_active.ring)) {
+        g_active.section_exec_errors++;
+        g_active.section_fatal = 1;
+        yz_nr_section_report_fatal(
+            "trailing", g_active.section_exec_pos,
+            RSX_NR_STEP_EMPTY, g_active.backend.stats.exec_errors);
+        return YZ_NR_VERTICAL_SECTION_FATAL;
+    }
+    if (next_get)
+        *next_get = g_active.section_next_get;
+    if (next_ret)
+        *next_ret = g_active.section_next_ret;
+    g_active.section_owned++;
+    g_active.section_methods_owned += g_active.section_method_count;
+    g_active.section_ops_owned += g_active.section_stream.op_count;
+    if (g_active.section_draws || g_active.section_clears)
+        g_active.section_render_passes_owned++;
+    else
+        g_active.section_dependency_islands_owned++;
+    g_active.consumer_draw_owned += g_active.section_draws;
+    g_active.consumer_clear_owned += g_active.section_clears;
+    g_active.consumer_transfer_owned += g_active.section_transfers;
+    g_active.executed[YZ_NR_VERT_DRAW_ARRAYS] += g_active.section_draws;
+    g_active.section_pending = 0;
+    g_active.section_exec_pos = 0;
+    return YZ_NR_VERTICAL_SECTION_EXECUTED;
+}
+
+static yz_nr_vertical_section_result yz_nr_section_commit(
+    uint32_t pc, uint32_t ret, uint32_t* next_get, uint32_t* next_ret)
+{
+    rsx_nir_adapter_finish(g_active.section_adapter);
+    if (g_active.section_adapter->rsx.in_begin_end ||
+        g_active.section_adapter->batch_count ||
+        g_active.section_adapter->inline_count)
+        return yz_nr_section_fallback(
+            YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
+
+    const uint32_t preflight = yz_nr_section_preflight();
+    if (preflight == YZ_NR_SECTION_FB_NO_GPU_ACTION) {
+        /* A producer may publish a long state prefix before its terminal
+         * draw/clear/transfer. Owning that prefix buys no GPU work and risks
+         * suppressing legacy-only register side effects before the complete
+         * pass exists. Keep it wholly legacy and reconsider only at the exact
+         * next publication boundary. */
+        return yz_nr_section_defer_fallback(
+            preflight, pc, g_active.section_packet_count);
+    }
+    if (preflight == YZ_NR_SECTION_FB_PREFLIGHT_SYNC &&
+        g_active.section_preflight_sem_valid) {
+        g_active.section_blocked_sem_get = g_active.section_start_get;
+        g_active.section_blocked_sem_dma =
+            g_active.section_preflight_sem_dma;
+        g_active.section_blocked_sem_offset =
+            g_active.section_preflight_sem_offset;
+        g_active.section_blocked_sem_value =
+            g_active.section_preflight_sem_value;
+        g_active.section_blocked_sem_valid = 1;
+        /* The exact semaphore-value gate below is the cache. It must observe
+         * satisfaction even when GET/PUT and the command word are unchanged. */
+        g_active.section_scan_cacheable = 0;
+        return yz_nr_section_fallback(preflight);
+    }
+    if (preflight != YZ_NR_SECTION_FB_NONE) {
+        const uint32_t packet_budget =
+            g_active.section_packet_count < 0x7FFFu
+                ? g_active.section_packet_count * 2u + 16u
+                : 0xFFFFu;
+        return yz_nr_section_defer_fallback(
+            preflight, pc, packet_budget);
+    }
+
+    /* The complete command-list section is now admitted. Keep the dormant
+     * legacy register/resource model current before suppressing its terminal
+     * actions. An executor failure after this point is fatal: legacy can
+     * never repeat a partially executed section. */
+    for (uint32_t m = 0; m < g_active.section_method_count; ++m) {
+        const yz_nr_section_method* const retained =
+            &g_active.section_methods[m];
+        if (yz_nr_vertical_mirror_legacy_method(
+                retained->method, retained->arg,
+                retained->suppress_action) != 0)
+            return yz_nr_section_fallback(
+                YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
+    }
+    const rsx_nir_sink ring_sink = rsx_nr_ring_sink(&g_active.ring);
+    g_active.adapter = *g_active.section_adapter;
+    rsx_nir_adapter_rebind(&g_active.adapter);
+    g_active.adapter.em.out = ring_sink;
+    g_active.adapter.shadow_mode = 1;
+    g_active.section_next_get = pc;
+    g_active.section_next_ret = ret;
+    g_active.section_exec_pos = 0;
+    g_active.section_fatal = 0;
+    g_active.section_pending = 1;
+    return yz_nr_section_execute(next_get, next_ret);
+}
+
+extern "C" yz_nr_vertical_section_result
+yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
+                               uint32_t fifo_ret, uint32_t* next_get,
+                               uint32_t* next_ret)
+{
+    if (next_get)
+        *next_get = get;
+    if (next_ret)
+        *next_ret = fifo_ret;
+    if (!g_active.frame_islands ||
+        !InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0) ||
+        !rsx_live_draw_native_actions_allowed())
+        return YZ_NR_VERTICAL_SECTION_MISS;
+    yz_nr_active_ensure_graphics();
+    if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return YZ_NR_VERTICAL_SECTION_MISS;
+    if (g_active.section_pending)
+        if (g_active.section_fatal)
+            return YZ_NR_VERTICAL_SECTION_FATAL;
+    if (g_active.section_pending)
+        return yz_nr_section_execute(next_get, next_ret);
+    if (get == put)
+        return YZ_NR_VERTICAL_SECTION_WAIT;
+    if (g_active.section_blocked_sem_valid) {
+        if (get != g_active.section_blocked_sem_get) {
+            g_active.section_blocked_sem_valid = 0;
+        } else {
+            uint32_t observed = 0;
+            const int32_t result = yz_nr_vertical_sem_read(
+                g_active.section_blocked_sem_dma,
+                g_active.section_blocked_sem_offset, &observed);
+            if (result != 0 ||
+                observed != g_active.section_blocked_sem_value) {
+                g_active.section_fallback_fast_skips++;
+                return YZ_NR_VERTICAL_SECTION_FALLBACK;
+            }
+            g_active.section_blocked_sem_valid = 0;
+            g_active.section_repeat_valid = 0;
+        }
+    }
+    if (g_active.section_fallback_active) {
+        if (get == g_active.section_fallback_until_get) {
+            g_active.section_fallback_active = 0;
+            g_active.section_repeat_valid = 0;
+        } else {
+            g_active.section_fallback_fast_skips++;
+            return YZ_NR_VERTICAL_SECTION_FALLBACK;
+        }
+    }
+
+    if (g_active.section_repeat_valid) {
+        const uint32_t repeat_ea = yz_nr_vertical_io_to_ea(get);
+        if (get == g_active.section_repeat_get &&
+            put == g_active.section_repeat_put &&
+            fifo_ret == g_active.section_repeat_ret && repeat_ea &&
+            vm_read32(repeat_ea) == g_active.section_repeat_word) {
+            g_active.section_fallback_fast_skips++;
+            return YZ_NR_VERTICAL_SECTION_FALLBACK;
+        }
+        g_active.section_repeat_valid = 0;
+    }
+
+    g_active.section_attempts++;
+    g_active.section_scan_get = get;
+    g_active.section_scan_put = put;
+    g_active.section_scan_ret = fifo_ret;
+    const uint32_t scan_ea = yz_nr_vertical_io_to_ea(get);
+    g_active.section_scan_word = scan_ea ? vm_read32(scan_ea) : 0u;
+    g_active.section_scan_cacheable = scan_ea != 0;
+    rsx_nir_stream_reset(&g_active.section_stream);
+    g_active.section_method_count = 0;
+    g_active.section_packet_count = 0;
+    g_active.section_start_get = get;
+    *g_active.section_adapter = g_active.adapter;
+    rsx_nir_adapter_rebind(g_active.section_adapter);
+    const rsx_nir_sink stream_sink =
+        rsx_nir_stream_sink(&g_active.section_stream);
+    g_active.section_adapter->em.out = stream_sink;
+    g_active.section_adapter->shadow_mode = 0;
+
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    uint32_t pc = get;
+    uint32_t ret = fifo_ret;
+    uint32_t gpu_actions_seen = 0;
+
+    for (uint32_t step = 0; step < YZ_NR_SECTION_STEP_CAPACITY; ++step) {
+        const rsx_nr_fifo_range_status header_status =
+            rsx_nr_fifo_section_range_status(pc, 4u, put, ret, ring);
+        if (header_status == RSX_NR_FIFO_RANGE_NOT_READY) {
+            /* PUT is a publication boundary. A state-only prefix is safe to
+             * claim too: it is mirrored into both register models and has no
+             * externally visible GPU action. This avoids rescanning a long
+             * state prefix one packet at a time. */
+            if (pc != get && ret == fifo_ret)
+                return yz_nr_section_commit(
+                    pc, ret, next_get, next_ret);
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_NOT_READY);
+        }
+        if (header_status == RSX_NR_FIFO_RANGE_WINDOW) {
+            yz_nr_section_note_window(pc, put, ret, 4u, 0u, 0u);
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_WINDOW);
+        }
+        const uint32_t ea = yz_nr_vertical_io_to_ea(pc);
+        if (!ea)
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_UNMAPPED);
+        const uint32_t command = vm_read32(ea);
+        if (command == 0u) {
+            pc = ret == ~0u ? ((pc + 4u) & mask) : pc + 4u;
+            continue;
+        }
+        if ((command & 0xE0000003u) == 0x20000000u ||
+            (command & 3u) == 1u) {
+            const uint32_t target = (command & 3u) == 1u
+                ? (command & 0xFFFFFFFCu) : (command & 0x1FFFFFFCu);
+            if (target == pc && gpu_actions_seen)
+                return yz_nr_section_commit(
+                    pc, ret, next_get, next_ret);
+            if (target == pc || !yz_nr_vertical_io_to_ea(target))
+                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+            pc = target;
+            continue;
+        }
+        if ((command & 3u) == 2u) {
+            const uint32_t target = command & 0x1FFFFFFCu;
+            if (ret != ~0u || !yz_nr_vertical_io_to_ea(target))
+                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+            ret = pc < ring ? ((pc + 4u) & mask) : pc + 4u;
+            pc = target;
+            continue;
+        }
+        if ((command & 0xFFFF0003u) == 0x00020000u) {
+            if (ret == ~0u)
+                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+            pc = ret;
+            ret = ~0u;
+            continue;
+        }
+        if (command & 0xA0030003u)
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_NOT_READY);
+
+        const uint32_t count = (command >> 18) & 0x7FFu;
+        const uint32_t non_incrementing = command & 0x40000000u;
+        const uint32_t method = command & 0x3FFFCu;
+        if (!count)
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+        const uint32_t packet_size = 4u + count * 4u;
+        const rsx_nr_fifo_range_status packet_status =
+            rsx_nr_fifo_section_range_status(
+                pc, packet_size, put, ret, ring);
+        if (packet_status == RSX_NR_FIFO_RANGE_NOT_READY)
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_NOT_READY);
+        if (packet_status == RSX_NR_FIFO_RANGE_WINDOW) {
+            yz_nr_section_note_window(
+                pc, put, ret, packet_size, command, 1u);
+            return yz_nr_section_fallback(YZ_NR_SECTION_FB_WINDOW);
+        }
+        /* Do not let a render pass absorb the first packet of the following
+         * dependency or pass. This check happens before mutating the shadow
+         * adapter, so fallback can never require a rollback. A FIFO packet is
+         * indivisible; if it combines the boundary with preceding state it is
+         * admitted as part of the next island. */
+        if (gpu_actions_seen) {
+            int boundary_before = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t effective = non_incrementing
+                    ? method : method + i * 4u;
+                if (yz_nr_section_dependency_method(effective) ||
+                    yz_nr_section_starts_new_pass(effective)) {
+                    boundary_before = 1;
+                    break;
+                }
+            }
+            if (boundary_before)
+                return yz_nr_section_commit(
+                    pc, ret, next_get, next_ret);
+        }
+        const uint32_t packet_ops_before =
+            g_active.section_stream.op_count;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t argument_pc = pc + 4u + i * 4u;
+            const uint32_t argument_ea =
+                yz_nr_vertical_io_to_ea(argument_pc);
+            if (!argument_ea)
+                return yz_nr_section_fallback(
+                    YZ_NR_SECTION_FB_UNMAPPED);
+            const uint32_t effective = non_incrementing
+                ? method : method + i * 4u;
+            const uint32_t value = vm_read32(argument_ea);
+            if (!rsx_nir_adapter_method_supported(
+                    g_active.section_adapter, effective, value)) {
+                yz_nr_section_note_unknown(effective, value);
+                return yz_nr_section_fallback(
+                    YZ_NR_SECTION_FB_UNKNOWN_METHOD);
+            }
+            if (g_active.section_method_count >=
+                YZ_NR_SECTION_METHOD_CAPACITY)
+                return yz_nr_section_fallback(
+                    YZ_NR_SECTION_FB_CAPACITY);
+            const uint32_t actions_before =
+                g_active.section_adapter->actions_seen;
+            rsx_nir_adapter_method(
+                g_active.section_adapter, effective, value);
+            const uint32_t action =
+                g_active.section_adapter->actions_seen != actions_before;
+            yz_nr_section_method* const retained =
+                &g_active.section_methods[g_active.section_method_count++];
+            retained->method = effective;
+            retained->arg = value;
+            retained->suppress_action = action ||
+                rsx_nr_legacy_gpu_action(effective, value) ||
+                effective == 0x1808u || effective == 0x1814u ||
+                effective == 0x1824u;
+            if (g_active.section_stream.overflow ||
+                g_active.section_stream.oom ||
+                g_active.section_adapter->batch_overflow ||
+                g_active.section_adapter->inline_overflow)
+                return yz_nr_section_fallback(
+                    YZ_NR_SECTION_FB_CAPACITY);
+        }
+        pc = ret == ~0u ? ((pc + packet_size) & mask)
+                        : pc + packet_size;
+        g_active.section_packet_count++;
+
+        int dependency_action = 0;
+        for (uint32_t i = packet_ops_before;
+             i < g_active.section_stream.op_count; ++i) {
+            const uint32_t kind = g_active.section_stream.ops[i].kind;
+            if (yz_nr_section_gpu_action(kind))
+                gpu_actions_seen++;
+            if (kind == RSX_NIR_OP_TRANSFER ||
+                kind == RSX_NIR_OP_PRESENT ||
+                kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE ||
+                kind == RSX_NIR_OP_SEMAPHORE_RELEASE ||
+                kind == RSX_NIR_OP_REPORT ||
+                kind == RSX_NIR_OP_BARRIER ||
+                kind == RSX_NIR_OP_SET_REFERENCE ||
+                kind == RSX_NIR_OP_USER_COMMAND)
+                dependency_action = 1;
+        }
+        /* Draws remain grouped until the next semantic pass boundary. A
+         * transfer/sync/report/present island is complete at its action and
+         * is admitted independently, never mixed into a render pass. */
+        if (dependency_action)
+            return yz_nr_section_commit(
+                pc, ret, next_get, next_ret);
+    }
+    return yz_nr_section_fallback(YZ_NR_SECTION_FB_CAPACITY);
+}
+
 extern "C" yz_nr_vertical_consume_result
 yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
 {
@@ -2165,19 +3550,23 @@ extern "C" void yz_nr_vertical_shutdown(void)
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
-                "[nr-vertical-active families=0x%02X "
+                "[nr-vertical-active families=0x%02X clear-scope=%u "
+                "frame-islands=%u "
                 "ref=%llu/%llu user=%llu/%llu draw=%llu/%llu "
                 "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
                 "fallback-draw=%llu fallback-flip=%llu "
                 "wrong-context=%llu no-room=%llu publish-fail=%llu "
                 "consumer-draw=%llu/%llu "
                 "consumer-clear=%llu/%llu "
+                "clear-contract=%llu/%llu/%llu "
                 "consumer-transfer=%llu/%llu "
                 "consumer-sync=%llu/%llu "
                 "consumer-report=%llu/%llu "
                 "wait=%llu late-fallback=%llu fatal=%llu "
                 "depth=%u errors=%llu]\n",
                 g_active.graphics_families,
+                g_active.clear_scope,
+                g_active.frame_islands,
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],
@@ -2196,6 +3585,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.consumer_draw_fallback,
                 g_active.consumer_clear_owned,
                 g_active.consumer_clear_fallback,
+                g_active.consumer_clear_contract[0],
+                g_active.consumer_clear_contract[1],
+                g_active.consumer_clear_contract[2],
                 g_active.consumer_transfer_owned,
                 g_active.consumer_transfer_fallback,
                 g_active.consumer_sync_owned,
@@ -2212,27 +3604,236 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 stats.published, stats.claimed, stats.fast_misses,
                 stats.exact_misses, stats.not_ready, stats.duplicates,
                 stats.busy, stats.full, stats.corrupt);
+        if (g_active.frame_islands) {
+            fprintf(stderr,
+                    "[nr-vertical-sections attempts=%llu owned=%llu "
+                    "render-passes=%llu dependency-islands=%llu "
+                    "methods=%llu ops=%llu exec-errors=%llu fast-skip=%llu "
+                    "fallback="
+                    "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                    "%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+                    g_active.section_attempts, g_active.section_owned,
+                    g_active.section_render_passes_owned,
+                    g_active.section_dependency_islands_owned,
+                    g_active.section_methods_owned,
+                    g_active.section_ops_owned,
+                    g_active.section_exec_errors,
+                    g_active.section_fallback_fast_skips,
+                    g_active.section_fallback[0],
+                    g_active.section_fallback[1],
+                    g_active.section_fallback[2],
+                    g_active.section_fallback[3],
+                    g_active.section_fallback[4],
+                    g_active.section_fallback[5],
+                    g_active.section_fallback[6],
+                    g_active.section_fallback[7],
+                    g_active.section_fallback[8],
+                    g_active.section_fallback[9],
+                    g_active.section_fallback[10],
+                    g_active.section_fallback[11],
+                    g_active.section_fallback[12],
+                    g_active.section_fallback[13],
+                    g_active.section_fallback[14]);
+            for (uint32_t i = 0; i < 64u; ++i) {
+                const yz_nr_section_unknown_key* const entry =
+                    &g_active.section_unknown[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-unknown "
+                            "method=0x%05X arg=0x%08X count=%llu]\n",
+                            entry->method, entry->arg, entry->count);
+            }
+            if (g_active.section_unknown_overflow)
+                fprintf(stderr,
+                        "[nr-vertical-section-unknown-overflow=%llu]\n",
+                        g_active.section_unknown_overflow);
+            for (uint32_t i = 0; i < 32u; ++i) {
+                const yz_nr_section_window_key* const entry =
+                    &g_active.section_window[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-window stage=%u "
+                            "pc=0x%08X ret=0x%08X size=%u cmd=0x%08X "
+                            "put=0x%08X..0x%08X available=0x%08X..0x%08X "
+                            "count=%llu error=%llu]\n",
+                            entry->stage, entry->pc, entry->ret,
+                            entry->size, entry->command,
+                            entry->first_put, entry->last_put,
+                            entry->min_available, entry->max_available,
+                            entry->count, entry->error);
+            }
+            for (uint32_t i = 0; i < 64u; ++i) {
+                const yz_nr_section_report_key* const entry =
+                    &g_active.section_reports[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-report kind=%u "
+                            "arg=0x%08X dma=0x%08X count=%llu]\n",
+                            entry->kind, entry->arg, entry->dma,
+                            entry->count);
+            }
+            if (g_active.section_report_overflow)
+                fprintf(stderr,
+                        "[nr-vertical-section-report-overflow=%llu]\n",
+                        g_active.section_report_overflow);
+            if (g_active.section_diag_enabled) {
+                for (uint32_t i = 0; i < YZ_NR_FLOW_VP_DIAG_COUNT; ++i) {
+                    const yz_nr_flow_vp_diag* const entry =
+                        &g_active.section_flow_vp[i];
+                    if (!entry->draws)
+                        continue;
+                    fprintf(stderr,
+                            "[nr-vertical-flow-vp slot=%u hash=%016llX "
+                            "start=%u words=%u draws=%llu "
+                            "branch=%08X..%08X or=%08X and=%08X]\n",
+                            i, entry->hash, entry->start_slot,
+                            entry->word_count, entry->draws,
+                            entry->branch_first, entry->branch_last,
+                            entry->branch_or, entry->branch_and);
+                    for (uint32_t word = 0;
+                         word + 3u < entry->word_count; word += 4u)
+                        fprintf(stderr,
+                                "[nr-vertical-flow-vp-word slot=%u i=%u "
+                                "%08X %08X %08X %08X]\n",
+                                i, word / 4u, entry->words[word],
+                                entry->words[word + 1u],
+                                entry->words[word + 2u],
+                                entry->words[word + 3u]);
+                }
+                if (g_active.section_flow_vp_overflow)
+                    fprintf(stderr,
+                            "[nr-vertical-flow-vp-overflow=%llu]\n",
+                            g_active.section_flow_vp_overflow);
+            }
+            for (uint32_t i = 0; i < 64u; ++i) {
+                const yz_nr_section_draw_preflight_key* const entry =
+                    &g_active.section_draw_preflight[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-draw-preflight reason=%u "
+                            "prim=%u target=0x%X fp=%u:0x%08X "
+                            "vp=%u/in=%04X rt=%u:0x%08X/fmt=%u/pitch=%u "
+                            "view=%u,%u+%ux%u sc=%u,%u+%ux%u "
+                            "color-mask=%08X depth=%u/%u tex=%04X "
+                            "stencil=%u ref=%02X/%02X mask=%02X/%02X "
+                            "write=%02X/%02X vp-hash=%016llX words=%u "
+                            "bad-vec=%08X bad-sca=%08X missing-vtex=%X "
+                            "cond=%u term=%u "
+                            "count=%llu]\n",
+                            entry->reason, entry->primitive,
+                            entry->color_target, entry->fp_location,
+                            entry->fp_offset, entry->vp_start,
+                            entry->vp_inputs & 0xFFFFu,
+                            entry->color_location, entry->color_offset,
+                            entry->color_format, entry->color_pitch,
+                            entry->viewport_x, entry->viewport_y,
+                            entry->viewport_w, entry->viewport_h,
+                            entry->scissor_x, entry->scissor_y,
+                            entry->scissor_w, entry->scissor_h,
+                            entry->color_mask, entry->depth_test,
+                            entry->depth_write,
+                            entry->texture_mask & 0xFFFFu,
+                            entry->stencil_two_sided,
+                            entry->stencil_ref & 0xFFu,
+                            entry->back_stencil_ref & 0xFFu,
+                            entry->stencil_mask & 0xFFu,
+                            entry->back_stencil_mask & 0xFFu,
+                            entry->stencil_write_mask & 0xFFu,
+                            entry->back_stencil_write_mask & 0xFFu,
+                            entry->vp_hash, entry->vp_words,
+                            entry->vp_bad_vec, entry->vp_bad_sca,
+                            entry->vp_missing_vtex,
+                            entry->vp_conditional, entry->vp_terminated,
+                            entry->count);
+            }
+            if (g_active.section_draw_preflight_overflow)
+                fprintf(stderr,
+                        "[nr-vertical-section-draw-preflight-overflow=%llu]\n",
+                        g_active.section_draw_preflight_overflow);
+            for (uint32_t i = 0; i < 64u; ++i) {
+                const yz_nr_section_sync_preflight_key* const entry =
+                    &g_active.section_sync_preflight[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-sync-preflight kind=%u "
+                            "dma=0x%08X offset=0x%08X value=0x%08X "
+                            "release-kind=%u result=%d count=%llu]\n",
+                            entry->kind, entry->dma, entry->offset,
+                            entry->value, entry->release_kind,
+                            entry->result, entry->count);
+            }
+            if (g_active.section_sync_preflight_overflow)
+                fprintf(stderr,
+                        "[nr-vertical-section-sync-preflight-overflow=%llu]\n",
+                        g_active.section_sync_preflight_overflow);
+            for (uint32_t i = 0; i < 64u; ++i) {
+                const yz_nr_section_transfer_preflight_key* const entry =
+                    &g_active.section_transfer_preflight[i];
+                if (entry->count)
+                    fprintf(stderr,
+                            "[nr-vertical-section-transfer-preflight kind=%u "
+                            "src=%u dst=%u fmt=%u/%u line=%u/%u words=%u "
+                            "in=%ux%u out=%ux%u count=%llu]\n",
+                            entry->kind, entry->src_location,
+                            entry->dst_location, entry->src_format,
+                            entry->dst_format, entry->line_length,
+                            entry->line_count, entry->word_count,
+                            entry->in_w, entry->in_h, entry->out_w,
+                            entry->out_h, entry->count);
+            }
+            if (g_active.section_transfer_preflight_overflow)
+                fprintf(stderr,
+                        "[nr-vertical-section-transfer-preflight-overflow=%llu]\n",
+                        g_active.section_transfer_preflight_overflow);
+        }
         fflush(stderr);
         if (g_active.d3d12) {
             rsx_nr_d3d12_stats d3d_stats = {};
             rsx_nr_d3d12_get_stats(g_active.d3d12, &d3d_stats);
+            const unsigned long long legacy_draw_groups =
+                rsx_live_draw_get_completed_draws();
+            const unsigned long long all_draw_groups =
+                d3d_stats.draw_batches + legacy_draw_groups;
+            const unsigned long long native_draw_coverage_ppm =
+                all_draw_groups
+                    ? d3d_stats.draw_batches * 1000000ull / all_draw_groups
+                    : 0ull;
             fprintf(stderr,
-                    "[nr-vertical-d3d draws=%llu batches=%llu clears=%llu "
+                    "[nr-vertical-d3d draws=%llu conditional-skip=%llu "
+                    "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
+                    "clears=%llu "
                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
-                    "residency-fail=%llu pso=%llu/%llu]\n",
-                    d3d_stats.draws, d3d_stats.draw_batches,
+                    "residency-fail=%llu mirror=%llu/%llu pso=%llu/%llu "
+                    "rt=%llu/%llu depth=%llu/%llu]\n",
+                    d3d_stats.draws,
+                    d3d_stats.conditional_draws_skipped,
+                    d3d_stats.draw_batches,
+                    legacy_draw_groups,
+                    native_draw_coverage_ppm,
                     d3d_stats.clears, d3d_stats.presents,
                     d3d_stats.queue_submissions,
                     d3d_stats.unsupported_draws,
                     d3d_stats.resident_pages[0],
                     d3d_stats.resident_pages[1],
                     d3d_stats.residency_failures,
-                    d3d_stats.pso_hits, d3d_stats.pso_builds);
+                    d3d_stats.mirror_resyncs,
+                    d3d_stats.mirror_rollovers,
+                    d3d_stats.pso_hits, d3d_stats.pso_builds,
+                    d3d_stats.rt_builds, d3d_stats.rt_refreshes,
+                    d3d_stats.depth_builds, d3d_stats.depth_refreshes);
             rsx_nr_d3d12_destroy(g_active.d3d12);
             g_active.d3d12 = nullptr;
         }
         free(const_cast<LONG*>(g_active.guest_page_route));
         g_active.guest_page_route = nullptr;
+        free(g_active.section_ops);
+        free(g_active.section_side);
+        free(g_active.section_methods);
+        free(g_active.section_adapter);
+        g_active.section_ops = nullptr;
+        g_active.section_side = nullptr;
+        g_active.section_methods = nullptr;
+        g_active.section_adapter = nullptr;
         rsx_nr_ring_destroy(&g_active.ring);
         rsx_nr_span_router_destroy(&g_active.router);
     }

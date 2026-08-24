@@ -123,6 +123,19 @@ u64 rsx_fp_literal_source_hash(
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
 
+/* Apply NV4097_SET_TEX_COORD_CONTROL to the generated fragment inputs.
+ * A controlled coordinate is 2D: Z is zero and W is the interpolated
+ * reciprocal clip-W exposed as pixel SV_Position.w. Units 8/9 remain
+ * unsupported because the current PSInput surface carries TC0..TC7. */
+int rsx_fp_apply_texcoord_control(
+    char* hlsl, u32 out_size, u32 texcoord_2d_mask);
+
+/* Apply NV4097_SET_SHADER_WINDOW to WPOS/SV_Position. D3D exposes
+ * half-centered, top-origin coordinates; this reproduces the RSX origin and
+ * pixel-center convention before the program reads input.position. */
+int rsx_fp_apply_shader_window(
+    char* hlsl, u32 out_size, u32 shader_window);
+
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
  * -1 when one allocation can never fit. */

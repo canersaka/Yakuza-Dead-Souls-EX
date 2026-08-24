@@ -71,6 +71,11 @@ typedef struct rsx_nir_adapter {
     u32 fifo_semaphore_dma;
     u32 fifo_semaphore_offset;
 
+    /* Resolved when NV4097 SET_RENDER_ENABLE is processed. Keeping the DMA
+     * selector here, rather than deriving it during a later draw, preserves
+     * the method-time report binding across section boundaries. */
+    rsx_nir_render_condition render_condition;
+
     /* NV0039 buffer-copy staging (trigger: BUFFER_NOTIFY) */
     u32 m2mf_dma_in, m2mf_dma_out;
     u32 m2mf_offset_in, m2mf_offset_out;
@@ -86,6 +91,8 @@ typedef struct rsx_nir_adapter {
 
     /* NV3089 scaled-image staging (trigger: IMAGE_IN 0xC40C) */
     u32 sif_dma_src;
+    u32 sif_context_surface;
+    u32 sif_color_conversion;
     u32 sif_color_format;
     u32 sif_operation;
     u32 sif_clip_point, sif_clip_size;
@@ -114,6 +121,11 @@ typedef struct rsx_nir_adapter {
 void rsx_nir_adapter_init(rsx_nir_adapter* ad, rsx_nir_stream* out);
 void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out);
 
+/* rsx_dispatch embeds callbacks whose user pointer targets the containing
+ * adapter. A bytewise adapter snapshot therefore must be rebound after every
+ * copy before dispatch-based clear/draw/present methods are consumed. */
+void rsx_nir_adapter_rebind(rsx_nir_adapter* ad);
+
 /* Seed the underlying register file (captured initial state). */
 void rsx_nir_adapter_seed(rsx_nir_adapter* ad, const u32* regs, u32 reg_words,
                           const u32* vp, u32 vp_words,
@@ -121,6 +133,13 @@ void rsx_nir_adapter_seed(rsx_nir_adapter* ad, const u32* regs, u32 reg_words,
 
 /* Feed one already-expanded method write (e.g. an .rxs record). */
 void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg);
+
+/* Whether a flattened method is represented completely by this adapter.
+ * The transactional live path uses this before owning a whole FIFO section:
+ * a stored-only/TODO register makes the complete section fall back before
+ * any native action begins.  This query has no side effects. */
+int rsx_nir_adapter_method_supported(
+    const rsx_nir_adapter* ad, u32 method, u32 arg);
 
 /* Emit one terminal action from an otherwise shadow-only adapter. State and
  * draw batches must already have been mirrored through the method path. The

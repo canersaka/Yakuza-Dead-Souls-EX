@@ -146,6 +146,9 @@ void rsx_vertex_pull_fill_constants(const rsx_vertex_pull_plan* plan,
 int rsx_vertex_pull_decompile(const rsx_vertex_pull_plan* plan,
                               const u8* ucode, u32 max_bytes, u32 vtex_mask,
                               char* out, u32 out_size);
+int rsx_vertex_pull_decompile_control(
+    const rsx_vertex_pull_plan* plan, const u8* ucode, u32 max_bytes,
+    u32 vtex_mask, u32 start_slot, char* out, u32 out_size);
 
 /* Feature flag YZ_RSX_GPU_PULL (default OFF, read once).  Integration
  * gates every live consumer of this module and of the GPU mirror on it. */

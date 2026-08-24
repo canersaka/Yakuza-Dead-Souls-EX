@@ -74,6 +74,22 @@ typedef enum yz_nr_vertical_consume_result {
 yz_nr_vertical_consume_result
 yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count);
 
+typedef enum yz_nr_vertical_section_result {
+    YZ_NR_VERTICAL_SECTION_MISS = 0,
+    YZ_NR_VERTICAL_SECTION_EXECUTED,
+    YZ_NR_VERTICAL_SECTION_WAIT,
+    YZ_NR_VERTICAL_SECTION_FALLBACK,
+    YZ_NR_VERTICAL_SECTION_FATAL,
+} yz_nr_vertical_section_result;
+
+/* Transactional consumer-side island. Called at the exact serialized FIFO
+ * GET after producer-span lookup misses. On EXECUTED, the caller atomically
+ * publishes next_get/next_ret; on WAIT both remain unchanged. FALLBACK means
+ * the complete section was refused before native execution began. */
+yz_nr_vertical_section_result yz_nr_vertical_consume_section(
+    uint32_t get, uint32_t put, uint32_t fifo_ret,
+    uint32_t* next_get, uint32_t* next_ret);
+
 void yz_nr_vertical_shutdown(void);
 
 #ifdef __cplusplus

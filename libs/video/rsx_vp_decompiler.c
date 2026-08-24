@@ -120,15 +120,84 @@ static void mask_str(int mx,int my,int mz,int mw, char* m)
     m[i]='\0';
 }
 
-/* Emit "    dst.mask = _v.mask;" (skips when mask empty). */
-static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
+static const char* cc_operator(u32 cond)
+{
+    switch (cond & 7u) {
+    case 1u: return "<";
+    case 2u: return "==";
+    case 3u: return "<=";
+    case 4u: return ">";
+    case 5u: return "!=";
+    case 6u: return ">=";
+    default: return NULL;
+    }
+}
+
+static u32 cc_swizzle_for_component(u32 d0, u32 component)
+{
+    static const u32 shift[4] = {8u, 6u, 4u, 2u};
+    return (d0 >> shift[component & 3u]) & 3u;
+}
+
+/* Emit an NV40 destination write. Conditional writes are component-wise:
+ * each destination lane selects its own CC lane through D0.mask_x/y/z/w.
+ * cond==0 suppresses the write even when cond_test_enable is clear, matching
+ * the hardware decompiler's destination semantics. */
+static void emit_store_value(Out* b, const char* dst_fmt, u32 idx,
+                             const char* m, u32 d0, const char* value)
 {
     if (!m[0]) return;
-    char line[96];
+    const u32 cond = (d0 >> 10) & 7u;
+    const int cond_test = (d0 >> 13) & 1u;
+    if (!cond)
+        return;
+    char line[160];
     char dst[32];
     snprintf(dst, sizeof(dst), dst_fmt, idx);
-    snprintf(line, sizeof(line), "        %s.%s = _v.%s;\n", dst, m, m);
-    emit(b, line);
+    if (!cond_test || cond == 7u) {
+        snprintf(line, sizeof(line), "        %s.%s = %s.%s;\n",
+                 dst, m, value, m);
+        emit(b, line);
+        return;
+    }
+    const char* op = cc_operator(cond);
+    if (!op)
+        return;
+    const u32 cc = (d0 >> 25) & 1u;
+    for (const char* component = m; *component; ++component) {
+        const u32 lane = (u32)(strchr(SWZ, *component) - SWZ);
+        const char cc_lane = SWZ[cc_swizzle_for_component(d0, lane)];
+        snprintf(line, sizeof(line),
+                 "        if (cc[%u].%c %s 0.0) %s.%c = %s.%c;\n",
+                 cc, cc_lane, op, dst, *component, value, *component);
+        emit(b, line);
+    }
+}
+
+static void emit_store(Out* b, const char* dst_fmt, u32 idx,
+                       const char* m, u32 d0)
+{
+    emit_store_value(b, dst_fmt, idx, m, d0, "_v");
+}
+
+static void vp_branch_condition(u32 d0, char* out, u32 out_size)
+{
+    const u32 cond = (d0 >> 10) & 7u;
+    if (!cond) {
+        snprintf(out, out_size, "false");
+        return;
+    }
+    if (cond == 7u) {
+        snprintf(out, out_size, "true");
+        return;
+    }
+    const u32 cc = (d0 >> 25) & 1u;
+    char swizzle[5];
+    for (u32 lane = 0; lane < 4; ++lane)
+        swizzle[lane] = SWZ[cc_swizzle_for_component(d0, lane)];
+    swizzle[4] = '\0';
+    snprintf(out, out_size, "any(cc[%u].%s %s 0.0)",
+             cc, swizzle, cc_operator(cond));
 }
 
 static u32 vec_source_use(u32 op, int* exact)
@@ -219,8 +288,116 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
     return instrs;
 }
 
+int rsx_vp_program_is_native_supported(const u8* ucode, u32 max_bytes)
+{
+    return rsx_vp_program_is_native_supported_ex(ucode, max_bytes, 0u);
+}
+
+int rsx_vp_program_is_native_supported_ex(const u8* ucode, u32 max_bytes,
+                                          u32 vtex_mask)
+{
+    return rsx_vp_program_is_native_supported_control_ex(
+        ucode, max_bytes, vtex_mask, 0u);
+}
+
+int rsx_vp_program_is_native_supported_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot)
+{
+    rsx_vp_native_support_analysis analysis;
+    return rsx_vp_analyze_native_support_control(
+        ucode, max_bytes, vtex_mask, start_slot, &analysis);
+}
+
+int rsx_vp_analyze_native_support(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask,
+    rsx_vp_native_support_analysis* analysis)
+{
+    return rsx_vp_analyze_native_support_control(
+        ucode, max_bytes, vtex_mask, 0u, analysis);
+}
+
+static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
+{
+    return (((d0 >> 23) & 1u) << 9) |
+           ((d2 & 0x3Fu) << 3) |
+           ((d3 >> 29) & 7u);
+}
+
+int rsx_vp_analyze_native_support_control(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    rsx_vp_native_support_analysis* analysis)
+{
+    if (!analysis)
+        return 0;
+    memset(analysis, 0, sizeof(*analysis));
+    if (!ucode)
+        return 0;
+    const u32 instruction_count = rsx_vp_program_size_instrs(
+        ucode, max_bytes);
+    if (!instruction_count)
+        return 0;
+    analysis->instruction_count = instruction_count;
+    analysis->terminated = 1u;
+    int has_flow = 0;
+    int has_vertex_texture = 0;
+    for (u32 instruction = 0; instruction < instruction_count;
+         ++instruction) {
+        const u32 off = instruction * 16u;
+        const u32 d0 = rd_le(ucode + off);
+        const u32 d1 = rd_le(ucode + off + 4u);
+        const u32 d2 = rd_le(ucode + off + 8u);
+        const u32 d3 = rd_le(ucode + off + 12u);
+        const u32 vec_op = (d1 >> 22) & 0x1Fu;
+        const u32 sca_op = (d1 >> 27) & 0x1Fu;
+        const u32 cond = (d0 >> 10) & 7u;
+        const int cond_test = (d0 >> 13) & 1u;
+
+        /* Vector 0..22 are implemented exactly. TXL(25) is exact only when
+         * its encoded unit has a live descriptor; 23/24 remain unsupported.
+         * The scalar ALU owns 0..7 and 13..16. BRI/BRB are accepted only as
+         * exact forward in-program transfers; every other flow family keeps
+         * the complete owning section on legacy. */
+        const u32 txl_unit = (d2 >> 8) & 3u;
+        if (vec_op == 25u)
+            has_vertex_texture = 1;
+        const int vec_supported = vec_op <= 22u ||
+            (vec_op == 25u && (vtex_mask & (1u << txl_unit)) != 0);
+        if (!vec_supported) {
+            analysis->unsupported_vec_mask |= 1u << vec_op;
+            if (vec_op == 25u)
+                analysis->missing_vtex_mask |= 1u << txl_unit;
+        }
+        if (sca_op == 9u || sca_op == 17u) {
+            has_flow = 1;
+            const u32 target = vp_branch_target(d0, d2, d3);
+            const u32 absolute_instruction = start_slot + instruction;
+            const u32 program_end = start_slot + instruction_count;
+            analysis->flow_instructions++;
+            if (target <= absolute_instruction || target >= program_end)
+                analysis->invalid_branch_targets++;
+        } else if (sca_op > 7u && (sca_op < 13u || sca_op > 16u)) {
+            analysis->unsupported_sca_mask |= 1u << sca_op;
+        }
+        if (cond_test && cond != 7u)
+            analysis->conditional_tests++;
+    }
+    /* The title's large skinned-character ubershaders combine BRI/BRB with
+     * twelve dependent vertex-texture fetches.  Straight-line TXL and exact
+     * flow are independently covered by WARP, but their combined live data
+     * path produced black character silhouettes in the captured Hana frame.
+     * Until a captured-program execution oracle proves the interaction, keep
+     * the complete owning pass on legacy.  This is a semantic admission gate,
+     * not a hash/title exception. */
+    if (has_flow && has_vertex_texture)
+        analysis->unsupported_vec_mask |= 1u << 25;
+    return analysis->terminated && !analysis->unsupported_vec_mask &&
+        !analysis->unsupported_sca_mask && !analysis->missing_vtex_mask &&
+        !analysis->invalid_branch_targets;
+}
+
 static int rsx_vp_decompile_impl(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    int compact_inputs,
     u32 input_mask, const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size);
 
@@ -233,7 +410,8 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, NULL, NULL, out, out_size);
+        ucode, max_bytes, vtex_mask, 0u, 0, 0xFFFFu,
+        NULL, NULL, out, out_size);
 }
 
 int rsx_vp_decompile_compact_ex(
@@ -248,7 +426,7 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 1, input_mask, NULL, NULL,
+        ucode, max_bytes, vtex_mask, 0u, 1, input_mask, NULL, NULL,
         out, out_size);
 }
 
@@ -257,15 +435,26 @@ int rsx_vp_decompile_pull_ex(
     const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size)
 {
-    if (!pull_globals || !pull_loads)
-        return -1;
-    return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, pull_globals, pull_loads,
+    return rsx_vp_decompile_pull_control_ex(
+        ucode, max_bytes, vtex_mask, 0u, pull_globals, pull_loads,
         out, out_size);
 }
 
+int rsx_vp_decompile_pull_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size)
+{
+    if (!pull_globals || !pull_loads)
+        return -1;
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, vtex_mask, start_slot, 0, 0xFFFFu,
+        pull_globals, pull_loads, out, out_size);
+}
+
 static int rsx_vp_decompile_impl(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    int compact_inputs,
     u32 input_mask, const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size)
 {
@@ -276,13 +465,43 @@ static int rsx_vp_decompile_impl(
     Out b = { body, sizeof(body), 0, 0 };
     body[0] = '\0';
 
-    int n_cond_skipped = 0, n_flow_skipped = 0;
+    const u32 instruction_count = rsx_vp_program_size_instrs(
+        ucode, max_bytes);
+    if (!instruction_count)
+        return -1;
+    int has_flow = 0;
+    for (u32 instruction = 0; instruction < instruction_count;
+         ++instruction) {
+        const u32 d1 = rd_le(ucode + instruction * 16u + 4u);
+        const u32 sca_op = (d1 >> 27) & 0x1Fu;
+        if (sca_op == 9u || sca_op == 17u) {
+            has_flow = 1;
+            break;
+        }
+    }
+    if (has_flow) {
+        rsx_vp_native_support_analysis support;
+        if (!rsx_vp_analyze_native_support_control(
+                ucode, max_bytes, vtex_mask, start_slot, &support))
+            return -1;
+        emit(&b, "    uint _vp_pc = 0u;\n");
+    }
+
+    int n_flow_skipped = 0;
 
     u32 off = 0; int instrs = 0;
     while (off + 16 <= max_bytes) {
+        const u32 instruction = (u32)instrs;
         u32 d0 = rd_le(ucode+off+0), d1 = rd_le(ucode+off+4);
         u32 d2 = rd_le(ucode+off+8), d3 = rd_le(ucode+off+12);
         off += 16; instrs++;
+
+        if (has_flow) {
+            char flow_header[64];
+            snprintf(flow_header, sizeof(flow_header),
+                     "    if (_vp_pc == %uu) {\n", instruction);
+            emit(&b, flow_header);
+        }
 
         u32 vec_op = (d1 >> 22) & 0x1F;
         u32 sca_op = (d1 >> 27) & 0x1F;
@@ -314,13 +533,8 @@ static int rsx_vp_decompile_impl(
         int vmx=(d3>>16)&1, vmy=(d3>>15)&1, vmz=(d3>>14)&1, vmw=(d3>>13)&1;
         int smx=(d3>>20)&1, smy=(d3>>19)&1, smz=(d3>>18)&1, smw=(d3>>17)&1;
 
-        /* Condition-code tests are not modeled (no CC register file yet):
-         * cond==7 (always) and cond_test disabled execute normally, anything
-         * else is emitted unconditionally with a marker. */
-        if (cond_test && cond != 7) {
-            n_cond_skipped++;
-            emit(&b, "    /* WARNING: cond-test on next op not modeled */\n");
-        }
+        (void)cond_test;
+        (void)cond;
 
         /* ---- vector ALU ---- */
         if ((vmx|vmy|vmz|vmw) && vec_op != 0x00) {
@@ -363,9 +577,10 @@ static int rsx_vp_decompile_impl(
                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
                     char line[256];
                     snprintf(line,sizeof line,
-                        "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
-                        A, addr_sel, m, m);
+                        "    { int4 _a = (int4)floor(%s);\n", A);
                     emit(&b, line);
+                    emit_store_value(&b, "a%u", addr_sel, m, d0, "_a");
+                    emit(&b, "    }\n");
                 }
                 handled = 0;
                 break;
@@ -383,11 +598,12 @@ static int rsx_vp_decompile_impl(
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 if (vec_result && dst_out != 0x1F)
-                    emit_store(&b, "o[%u]", dst_out & 15, m);
+                    emit_store(&b, "o[%u]", dst_out & 15, m, d0);
                 if (dst_tmp != 0x3F)
-                    emit_store(&b, "r[%u]", dst_tmp & 31, m);
-                if (!vec_result && dst_tmp == 0x3F)
-                    emit(&b, "        /* TODO: CC-only write not modeled */\n");
+                    emit_store(&b, "r[%u]", dst_tmp & 31, m, d0);
+                if (!vec_result && dst_tmp == 0x3F &&
+                    (((d0 >> 14) & 1u) || ((d0 >> 29) & 1u)))
+                    emit_store(&b, "cc[%u]", (d0 >> 25) & 1u, m, d0);
                 emit(&b, "    }\n");
             }
         }
@@ -397,20 +613,29 @@ static int rsx_vp_decompile_impl(
             char rhs[256];
             switch (sca_op) {
             case 0x01: snprintf(rhs,sizeof rhs,"%s",C); break;                /* MOV */
-            case 0x02: snprintf(rhs,sizeof rhs,"(1.0/(%s).x)",C); break;      /* RCP */
-            case 0x03: snprintf(rhs,sizeof rhs,"clamp(1.0/(%s).x, 5.42101e-20, 1.884467e19)",C); break; /* RCC */
-            case 0x04: snprintf(rhs,sizeof rhs,"rsqrt(max(abs((%s).x), 1e-10))",C); break; /* RSQ */
-            case 0x05: snprintf(rhs,sizeof rhs,"exp2((%s).x)",C); break;      /* EXP */
-            case 0x06: snprintf(rhs,sizeof rhs,"log2(max(abs((%s).x), 1e-10))",C); break; /* LOG */
-            case 0x0D: snprintf(rhs,sizeof rhs,"log2(max(abs((%s).x), 1e-10))",C); break; /* LG2 */
-            case 0x0E: snprintf(rhs,sizeof rhs,"exp2((%s).x)",C); break;      /* EX2 */
-            case 0x0F: snprintf(rhs,sizeof rhs,"sin((%s).x)",C); break;       /* SIN */
-            case 0x10: snprintf(rhs,sizeof rhs,"cos((%s).x)",C); break;       /* COS */
+            /* NV40's scalar pipe names describe its issue slot, not a forced
+             * source-x broadcast. Except for RSQ, these instructions operate
+             * component-wise on SRC2 and the destination mask selects the
+             * lanes. Collapsing them to .x corrupts the title's large
+             * lighting/skinning ubershaders (notably their SIN/COS paths). */
+            case 0x02: snprintf(rhs,sizeof rhs,"(1.0/(%s))",C); break;        /* RCP */
+            case 0x03: snprintf(rhs,sizeof rhs,"clamp(1.0/(%s), 5.42101e-20, 1.884467e19)",C); break; /* RCC */
+            case 0x04: snprintf(rhs,sizeof rhs,"rsqrt(max((%s).x, 1e-10))",C); break; /* RSQ */
+            case 0x05: snprintf(rhs,sizeof rhs,"exp(%s)",C); break;          /* EXP */
+            case 0x06: snprintf(rhs,sizeof rhs,"log(%s)",C); break;          /* LOG */
+            case 0x0D: snprintf(rhs,sizeof rhs,"log2(max(%s, 1e-10))",C); break; /* LG2 */
+            case 0x0E: snprintf(rhs,sizeof rhs,"exp2(%s)",C); break;         /* EX2 */
+            case 0x0F: snprintf(rhs,sizeof rhs,"sin(%s)",C); break;          /* SIN */
+            case 0x10: snprintf(rhs,sizeof rhs,"cos(%s)",C); break;          /* COS */
             case 0x07: /* LIT: (1, max(s.x,0), s.x>0 ? 2^(s.w*log2(max(s.y,eps))) : 0, 1) */
                 snprintf(rhs,sizeof rhs,
                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0) ? "
                     "exp2(clamp((%s).w, -127.996, 127.996) * log2(max((%s).y, 1e-10))) : 0.0, 1.0)",
                     C, C, C, C);
+                break;
+            case 0x09: /* BRI: emitted after the co-issued vector op */
+            case 0x11: /* BRB: emitted after the co-issued vector op */
+                rhs[0] = '\0';
                 break;
             default:
                 n_flow_skipped++;
@@ -427,11 +652,40 @@ static int rsx_vp_decompile_impl(
                 /* SCA writes the output register when the VEC unit does not
                  * own it; otherwise it targets its own temp. */
                 if (!vec_result && dst_out != 0x1F)
-                    emit_store(&b, "o[%u]", dst_out & 15, m);
+                    emit_store(&b, "o[%u]", dst_out & 15, m, d0);
                 if (sca_dst_tmp != 0x3F)
-                    emit_store(&b, "r[%u]", sca_dst_tmp & 31, m);
+                    emit_store(&b, "r[%u]", sca_dst_tmp & 31, m, d0);
+                if (vec_result && sca_dst_tmp == 0x3F &&
+                    (((d0 >> 14) & 1u) || ((d0 >> 29) & 1u)))
+                    emit_store(&b, "cc[%u]", (d0 >> 25) & 1u, m, d0);
                 emit(&b, "    }\n");
             }
+        }
+
+        if (has_flow) {
+            const u32 next = (d3 & 1u) ? 0xFFFFFFFFu : instruction + 1u;
+            char line[256];
+            if (sca_op == 0x09u) {
+                char branch_cond[96];
+                const u32 target = vp_branch_target(d0, d2, d3) - start_slot;
+                vp_branch_condition(d0, branch_cond, sizeof(branch_cond));
+                snprintf(line, sizeof(line),
+                         "        _vp_pc = (%s) ? %uu : %uu;\n",
+                         branch_cond, target, next);
+            } else if (sca_op == 0x11u) {
+                const u32 target = vp_branch_target(d0, d2, d3) - start_slot;
+                const u32 branch_index = (d3 >> 23) & 31u;
+                const int branch_true = (d3 >> 28) & 1u;
+                snprintf(line, sizeof(line),
+                         "        _vp_pc = ((vp_branch_bits & (1u << %uu)) %s 0u) ? %uu : %uu;\n",
+                         branch_index, branch_true ? "!=" : "==",
+                         target, next);
+            } else {
+                snprintf(line, sizeof(line),
+                         "        _vp_pc = %uu;\n", next);
+            }
+            emit(&b, line);
+            emit(&b, "    }\n");
         }
 
         if (d3 & 1u) break; /* end */
@@ -481,6 +735,8 @@ static int rsx_vp_decompile_impl(
         "    float4 vp_c[512];\n"
         "    float4 vp_posscale;\n"
         "    float4 vp_posoffset;\n"
+        "    uint vp_branch_bits;\n"
+        "    uint3 vp_branch_pad;\n"
         "};\n");
 
     for (u32 vtu = 0; vtu < 4; vtu++) {
@@ -528,7 +784,8 @@ static int rsx_vp_decompile_impl(
         "    float4 r[32]; float4 o[16];\n"
         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
-        "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n");
+        "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
+        "    float4 cc[2]; cc[0]=(float4)0; cc[1]=(float4)0;\n");
 
     emit(&o, body);
 
@@ -544,7 +801,6 @@ static int rsx_vp_decompile_impl(
         "    return Out;\n"
         "}\n");
 
-    (void)n_cond_skipped;
     (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;

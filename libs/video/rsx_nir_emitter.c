@@ -52,6 +52,12 @@ void rsx_nir_em_blend(rsx_nir_emitter* em, const rsx_nir_blend* b)
     em->pending.blend = *b;
 }
 
+void rsx_nir_em_render_condition(rsx_nir_emitter* em,
+                                 const rsx_nir_render_condition* c)
+{
+    em->pending.render_condition = *c;
+}
+
 void rsx_nir_em_fragment_program(rsx_nir_emitter* em, const rsx_nir_fragment_program* f)
 {
     em->pending.fragment_program = *f;
@@ -94,7 +100,8 @@ void rsx_nir_em_constants(rsx_nir_emitter* em, u32 first_slot, u32 slot_count,
 
 void rsx_nir_em_vertex_program(rsx_nir_emitter* em, u32 start_slot,
                                const u32* words, u32 word_count,
-                               u32 attrib_input_mask, u32 attrib_output_mask)
+                               u32 attrib_input_mask, u32 attrib_output_mask,
+                               u32 branch_bits)
 {
     if (word_count > RSX_NIR_VP_MAX_WORDS)
         word_count = RSX_NIR_VP_MAX_WORDS;
@@ -104,6 +111,7 @@ void rsx_nir_em_vertex_program(rsx_nir_emitter* em, u32 start_slot,
     vp->hash = rsx_nir_hash_words(words, word_count);
     vp->attrib_input_mask = attrib_input_mask;
     vp->attrib_output_mask = attrib_output_mask;
+    vp->branch_bits = branch_bits;
     vp->words_ofs = 0;   /* assigned at flush when the op is emitted */
     if (word_count)
         memcpy(em->vp_words, words, (size_t)word_count * 4);
@@ -143,6 +151,17 @@ static void flush_state(rsx_nir_emitter* em)
     FLUSH_GROUP(raster, RSX_NIR_OP_SET_RASTER);
     FLUSH_GROUP(depth_stencil, RSX_NIR_OP_SET_DEPTH_STENCIL);
     FLUSH_GROUP(blend, RSX_NIR_OP_SET_BLEND);
+    /* Disabled is the architectural reset default, so an all-default first
+     * action need not spend an op on it. Any enabled condition (including one
+     * staged before the first action) still emits before that action. */
+    if (memcmp(&em->pending.render_condition,
+               &em->shadow.render_condition,
+               sizeof(em->pending.render_condition))) {
+        push_group(em, RSX_NIR_OP_SET_RENDER_CONDITION, 0,
+                   &em->pending.render_condition,
+                   sizeof(em->pending.render_condition));
+        em->shadow.render_condition = em->pending.render_condition;
+    }
     FLUSH_GROUP(fragment_program, RSX_NIR_OP_SET_FRAGMENT_PROGRAM);
     FLUSH_GROUP(vertex_bindings, RSX_NIR_OP_SET_VERTEX_BINDINGS);
     FLUSH_GROUP(index_binding, RSX_NIR_OP_SET_INDEX_BINDING);
@@ -171,7 +190,8 @@ static void flush_state(rsx_nir_emitter* em)
         em->pending.vertex_program.word_count != em->shadow.vertex_program.word_count ||
         em->pending.vertex_program.start_slot != em->shadow.vertex_program.start_slot ||
         em->pending.vertex_program.attrib_input_mask != em->shadow.vertex_program.attrib_input_mask ||
-        em->pending.vertex_program.attrib_output_mask != em->shadow.vertex_program.attrib_output_mask) {
+        em->pending.vertex_program.attrib_output_mask != em->shadow.vertex_program.attrib_output_mask ||
+        em->pending.vertex_program.branch_bits != em->shadow.vertex_program.branch_bits) {
         rsx_nir_vertex_program vp = em->pending.vertex_program;
         vp.words_ofs = em->out.side_push(em->out.user, em->vp_words,
                                          vp.word_count);

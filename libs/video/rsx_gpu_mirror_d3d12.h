@@ -54,6 +54,12 @@ void rsx_gpu_mirror_d3d12_get_ops(rsx_gpu_mirror_d3d12* b,
                                   rsx_gpu_mirror_ops* out);
 
 int  rsx_gpu_mirror_d3d12_begin(rsx_gpu_mirror_d3d12* b, void* command_list);
+/* Begin or resume the upload slice owned by one not-yet-submitted command
+ * list. Repeated calls with the same list/submission fence append staging
+ * bytes instead of rotating onto another fence-gated slice. */
+int  rsx_gpu_mirror_d3d12_begin_fenced(rsx_gpu_mirror_d3d12* b,
+                                       void* command_list,
+                                       u64 submission_fence);
 void rsx_gpu_mirror_d3d12_end(rsx_gpu_mirror_d3d12* b, u64 fence_value);
 void rsx_gpu_mirror_d3d12_retire(rsx_gpu_mirror_d3d12* b,
                                  u64 completed_fence_value);

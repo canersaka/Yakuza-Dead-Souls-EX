@@ -27,12 +27,21 @@ int main(void) { return 2; }
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+
 static int g_failures;
 static u32 g_present_handoffs;
 static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
 static u32 g_published_writes;
 static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
+static u32 g_render_condition_value;
+static int g_render_condition_fail;
 
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
@@ -55,6 +64,7 @@ static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 #define IDX_OFFSET 0x4000u
 #define FP_OFFSET  0x6000u
 #define TEX_OFFSET 0x8000u
+#define VTEX_OFFSET 0xA000u
 
 static int test_present_handoff(void* user, void* texture, u32 format,
                                 u32 width, u32 height, u32 buffer_id)
@@ -85,6 +95,17 @@ static void test_publish_write(void* user, u32 space, u32 offset, u32 size)
     }
     g_published_writes++;
     rsx_nr_d3d12_note_guest_write((rsx_nr_d3d12*)user, space, offset, size);
+}
+
+static int test_render_condition_read(void* user, u32 dma, u32 offset,
+                                      u32* value)
+{
+    (void)user;
+    if (g_render_condition_fail || !value || dma != 0x66626660u ||
+        offset != 0x45A0u)
+        return -1;
+    *value = g_render_condition_value;
+    return 0;
 }
 
 static u8 g_local[LOCAL_SIZE];
@@ -197,6 +218,38 @@ static void stage_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
+static void write_vertex_texture0(rsx_guest_pages* pages,
+                                  float x, float y, float z, float w)
+{
+    const float value[4] = {x, y, z, w};
+    for (u32 component = 0; component < 4u; ++component)
+        put_be32(g_local + VTEX_OFFSET + component * 4u,
+                 fbits(value[component]));
+    rsx_guest_pages_note_write(pages, 0, VTEX_OFFSET, 16u);
+}
+
+static rsx_nir_texture vertex_texture0_descriptor(void)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1u;
+    texture.offset = VTEX_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xBBu;          /* LINEAR | W32Z32Y32X32_FLOAT       */
+    texture.dimension = 2u;
+    texture.mipmaps = 1u;
+    texture.width = 1u;
+    texture.height = 1u;
+    texture.pitch = 16u;
+    return texture;
+}
+
+static void stage_vertex_texture0(rsx_nir_emitter* em)
+{
+    const rsx_nir_texture texture = vertex_texture0_descriptor();
+    rsx_nir_em_vertex_texture(em, 0, &texture);
+}
+
 static void stage_rt565_texture0(rsx_nir_emitter* em)
 {
     rsx_nir_texture texture;
@@ -243,16 +296,23 @@ static u32 fbits(float f)
 }
 
 /* three float4 clip-space vertices, big-endian, at VTX_OFFSET */
-static void write_triangle(rsx_guest_pages* pages, float x0, float y0,
-                           float x1, float y1, float x2, float y2)
+static void write_triangle_z(rsx_guest_pages* pages, float x0, float y0,
+                             float x1, float y1, float x2, float y2,
+                             float z)
 {
     u8* p = g_local + VTX_OFFSET;
-    const float v[12] = { x0, y0, 0.5f, 1.0f,
-                          x1, y1, 0.5f, 1.0f,
-                          x2, y2, 0.5f, 1.0f };
+    const float v[12] = { x0, y0, z, 1.0f,
+                          x1, y1, z, 1.0f,
+                          x2, y2, z, 1.0f };
     for (int i = 0; i < 12; i++)
         put_be32(p + i * 4, fbits(v[i]));
     rsx_guest_pages_note_write(pages, 0, VTX_OFFSET, 48);
+}
+
+static void write_triangle(rsx_guest_pages* pages, float x0, float y0,
+                           float x1, float y1, float x2, float y2)
+{
+    write_triangle_z(pages, x0, y0, x1, y1, x2, y2, 0.5f);
 }
 
 static void write_quad(rsx_guest_pages* pages)
@@ -267,6 +327,21 @@ static void write_quad(rsx_guest_pages* pages)
     for (int i = 0; i < 16; i++)
         put_be32(p + i * 4, fbits(v[i]));
     rsx_guest_pages_note_write(pages, 0, VTX_OFFSET, 64);
+}
+
+static void stage_vertex_bindings(rsx_nir_emitter* em, u32 base_index)
+{
+    rsx_nir_vertex_bindings vb;
+    memset(&vb, 0, sizeof(vb));
+    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++)
+        vb.attr[i].def[3] = 1.0f;
+    vb.attr[0].type = 2;             /* FLOAT                              */
+    vb.attr[0].size = 4;
+    vb.attr[0].stride = 16;
+    vb.attr[0].offset = VTX_OFFSET;
+    vb.attr[0].location = RSX_NIR_LOCATION_LOCAL;
+    vb.base_index = base_index;
+    rsx_nir_em_vertex_bindings(em, &vb);
 }
 
 static void stage_frame_state(rsx_nir_emitter* em)
@@ -289,8 +364,13 @@ static void stage_frame_state(rsx_nir_emitter* em)
 
     rsx_nir_viewport v;
     memset(&v, 0, sizeof(v));
-    v.w = RT_W;
-    v.h = RT_H;
+    /* The VP epilogue owns guest viewport mapping. Keep a deliberately
+     * narrowed raster declaration so the pixel oracle catches any backend
+     * that applies x/y/w/h a second time as a D3D viewport. */
+    v.x = 7;
+    v.y = 5;
+    v.w = RT_W - 14;
+    v.h = RT_H - 10;
     rsx_nir_em_viewport(em, &v);
 
     rsx_nir_raster r;
@@ -305,16 +385,7 @@ static void stage_frame_state(rsx_nir_emitter* em)
     fp.control = 0x40u;              /* r0 is the color export             */
     rsx_nir_em_fragment_program(em, &fp);
 
-    rsx_nir_vertex_bindings vb;
-    memset(&vb, 0, sizeof(vb));
-    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++)
-        vb.attr[i].def[3] = 1.0f;
-    vb.attr[0].type = 2;             /* FLOAT                              */
-    vb.attr[0].size = 4;
-    vb.attr[0].stride = 16;
-    vb.attr[0].offset = VTX_OFFSET;
-    vb.attr[0].location = RSX_NIR_LOCATION_LOCAL;
-    rsx_nir_em_vertex_bindings(em, &vb);
+    stage_vertex_bindings(em, 0u);
 }
 
 static u8 g_pix[RT_W * RT_H * 4];
@@ -619,6 +690,150 @@ static void run_capture_backend(const char* path)
     cap_free(&c);
 }
 
+typedef struct broker_color_test {
+    ID3D12Resource* resource;
+    u32 calls;
+} broker_color_test;
+
+static int borrow_rgba_for_logical_565(
+    void* user, u32 space, u32 offset, u32 width, u32 height,
+    void** resource, u32* dxgi_format)
+{
+    broker_color_test* broker = (broker_color_test*)user;
+    if (!broker || !broker->resource || !resource || !dxgi_format || space ||
+        offset != RT565_OFFSET || width != RT_W || height != RT_H)
+        return -1;
+    broker->resource->lpVtbl->AddRef(broker->resource);
+    *resource = broker->resource;
+    *dxgi_format = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
+    broker->calls++;
+    return 0;
+}
+
+/* The live surface broker canonicalizes logical Cell GCM color format 3 to
+ * an RGBA8 D3D resource.  Exercise that exact mismatch through a real WARP
+ * draw: resource identity remains keyed by the guest format, while the RTV
+ * and PSO must use the broker resource's actual format. */
+static void test_broker_actual_color_format(void)
+{
+    IDXGIFactory4* factory = NULL;
+    IDXGIAdapter* adapter = NULL;
+    ID3D12Device* device = NULL;
+    ID3D12Resource* resource = NULL;
+    rsx_nr_d3d12* sink = NULL;
+    rsx_nr_ring ring;
+    memset(&ring, 0, sizeof(ring));
+    int ring_live = 0;
+
+    HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
+    if (SUCCEEDED(hr))
+        hr = factory->lpVtbl->EnumWarpAdapter(
+            factory, &IID_IDXGIAdapter, (void**)&adapter);
+    if (SUCCEEDED(hr))
+        hr = D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0,
+                               &IID_ID3D12Device, (void**)&device);
+    CHECK(SUCCEEDED(hr) && device,
+          "could not create explicit WARP device for broker-format test");
+    if (FAILED(hr) || !device)
+        goto done;
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = RT_W;
+    rd.Height = RT_H;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    hr = device->lpVtbl->CreateCommittedResource(
+        device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource,
+        (void**)&resource);
+    CHECK(SUCCEEDED(hr) && resource,
+          "could not create broker RGBA8 render target");
+    if (FAILED(hr) || !resource)
+        goto done;
+
+    sink = rsx_nr_d3d12_create(
+        device, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "could not create broker-format native sink");
+    if (!sink)
+        goto done;
+
+    broker_color_test broker = { resource, 0u };
+    rsx_nr_d3d12_set_resource_broker(
+        sink, borrow_rgba_for_logical_565, NULL, &broker);
+    const int ring_result = rsx_nr_ring_init(&ring, 128u, 4096u);
+    CHECK(ring_result == 0,
+          "broker-format ring init failed");
+    if (ring_result != 0)
+        goto done;
+    ring_live = 1;
+
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init(&em, &k);
+
+    write_test_fp();
+    stage_frame_state(&em);
+    rsx_nir_surface s565;
+    memset(&s565, 0, sizeof(s565));
+    s565.color_format = 3;
+    s565.depth_format = 2;
+    s565.raster_type = 1;
+    s565.clip_w = RT_W;
+    s565.clip_h = RT_H;
+    s565.color_offset[0] = RT565_OFFSET;
+    s565.color_pitch[0] = RT_W * 2u;
+    s565.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    s565.color_target = 1;
+    rsx_nir_em_surface(&em, &s565);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    rsx_nir_em_clear(&em, 0xF3u, 0xFF0000FFu, 0xFFFFFFu, 0u);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "logical-565/actual-RGBA draw had %llu execution errors",
+          be.stats.exec_errors);
+    CHECK(broker.calls >= 2u,
+          "logical-565/actual-RGBA broker was not exercised (%u calls)",
+          broker.calls);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, 0u, RT565_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "broker RGBA target readback failed");
+    CHECK(pix_is(2u, 61u, 0xFFu, 0x00u, 0xFFu),
+          "broker RGBA target did not execute the logical-565 draw");
+
+done:
+    if (ring_live)
+        rsx_nr_ring_destroy(&ring);
+    if (sink)
+        rsx_nr_d3d12_destroy(sink);
+    if (resource)
+        resource->lpVtbl->Release(resource);
+    if (device)
+        device->lpVtbl->Release(device);
+    if (adapter)
+        adapter->lpVtbl->Release(adapter);
+    if (factory)
+        factory->lpVtbl->Release(factory);
+}
+
 int main(int argc, char** argv)
 {
     write_test_fp();
@@ -666,10 +881,264 @@ int main(int argc, char** argv)
           pix(1, 1)[0], pix(1, 1)[1], pix(1, 1)[2]);
     CHECK(pix_is(62, 62, 0xFF, 0x00, 0x00), "clear pixel far corner");
 
-    /* ---- leg 2: bottom-left half triangle ------------------------------ */
+    /* ---- transactional preflight is execution-free --------------------
+     * A complete section is eligible only after every action passes these
+     * checks.  Cache/resource preparation is allowed, but the preflight
+     * phase must not submit, draw, clear, transfer, publish, or present. */
     write_triangle(rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
                    -1.0f, 1.0f);
     u32 batch[2] = { 0, 3 };
+    rsx_nir_clear preflight_clear = {
+        0xF3u, 0xFF0000FFu, 0xFFFFFFu, 0u
+    };
+    rsx_nir_draw preflight_draw = { 5u, 0u, 1u, 0u, 3u };
+    const u32 native_vp[4] = {
+        0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF81u
+    }; /* MOV o0, v0; END */
+    const u32 vertex_texture_vp[8] = {
+        0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF80u,
+        0x401F9C00u, 0x0640000Du, 0x81000000u, 0x0001FF85u
+    }; /* MOV o0,v0; TXL o1,v0,unit0; END */
+    rsx_nr_d3d12_stats before_preflight, after_preflight;
+    rsx_nr_d3d12_get_stats(sink, &before_preflight);
+    const u32 handoffs_before = g_present_handoffs;
+    const u32 publishes_before = g_published_writes;
+    CHECK(rsx_nr_d3d12_preflight_clear(
+              sink, &be.st, &preflight_clear) == 0,
+          "valid clear preflight refused");
+    CHECK(rsx_nr_d3d12_preflight_draw(
+              sink, &be.st, native_vp, 4u,
+              &preflight_draw, batch) == 0,
+          "valid draw preflight refused");
+    {
+        rsx_nir_pipeline conditional = be.st;
+        conditional.render_condition.enabled = 1u;
+        conditional.render_condition.dma_report = 0x66626660u;
+        conditional.render_condition.offset = 0x45A0u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &conditional, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_RENDER_CONDITION,
+              "conditional draw was accepted without an exact report reader");
+        rsx_nr_d3d12_set_render_condition_reader(
+            sink, test_render_condition_read, NULL);
+        g_render_condition_value = 0u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &conditional, native_vp, 4u,
+                  &preflight_draw, batch) == 0,
+              "false but resolvable conditional draw was refused");
+        g_render_condition_fail = 1;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &conditional, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_RENDER_CONDITION,
+              "unresolvable conditional draw escaped preflight");
+        g_render_condition_fail = 0;
+    }
+    {
+        rsx_nir_pipeline polygon_offset = be.st;
+        rsx_nr_d3d12_stats before_offset, after_offset;
+        polygon_offset.raster.polygon_offset_fill_enable = 1u;
+        polygon_offset.raster.polygon_offset_scale = 0x3FC00000u; /* 1.5 */
+        polygon_offset.raster.polygon_offset_bias = 0xC0000000u;  /* -2 */
+        rsx_nr_d3d12_get_stats(sink, &before_offset);
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &polygon_offset, native_vp, 4u,
+                  &preflight_draw, batch) == 0,
+              "polygon-offset draw preflight refused");
+        rsx_nr_d3d12_get_stats(sink, &after_offset);
+        CHECK(after_offset.pso_builds == before_offset.pso_builds + 1u,
+              "polygon-offset raster state did not produce a distinct PSO");
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &polygon_offset, native_vp, 4u,
+                  &preflight_draw, batch) == 0,
+              "repeated polygon-offset draw preflight refused");
+        rsx_nr_d3d12_get_stats(sink, &after_offset);
+        CHECK(after_offset.pso_hits > before_offset.pso_hits,
+              "polygon-offset PSO was not reused");
+    }
+    {
+        rsx_nir_pipeline two_sided = be.st;
+        two_sided.depth_stencil.stencil_test_enable = 1u;
+        two_sided.depth_stencil.stencil_func = 0x0203u;
+        two_sided.depth_stencil.stencil_ref = 0x12u;
+        two_sided.depth_stencil.stencil_mask = 0xFFu;
+        two_sided.depth_stencil.stencil_write_mask = 0xFFu;
+        two_sided.depth_stencil.stencil_op_fail = 0x1E00u;
+        two_sided.depth_stencil.stencil_op_zfail = 0x1E01u;
+        two_sided.depth_stencil.stencil_op_zpass = 0x1E02u;
+        two_sided.depth_stencil.two_sided_stencil_enable = 1u;
+        two_sided.depth_stencil.back_stencil_func = 0x0204u;
+        two_sided.depth_stencil.back_stencil_ref = 0x12u;
+        two_sided.depth_stencil.back_stencil_mask = 0xFFu;
+        two_sided.depth_stencil.back_stencil_write_mask = 0xFFu;
+        two_sided.depth_stencil.back_stencil_op_fail = 0x1E02u;
+        two_sided.depth_stencil.back_stencil_op_zfail = 0x1E01u;
+        two_sided.depth_stencil.back_stencil_op_zpass = 0x1E00u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &two_sided, native_vp, 4u,
+                  &preflight_draw, batch) == 0,
+              "representable two-sided stencil draw preflight refused");
+        {
+            rsx_nr_d3d12_stats before_ref, after_ref;
+            rsx_nr_d3d12_get_stats(sink, &before_ref);
+            two_sided.depth_stencil.stencil_ref = 0x34u;
+            two_sided.depth_stencil.back_stencil_ref = 0x34u;
+            CHECK(rsx_nr_d3d12_preflight_draw(
+                      sink, &two_sided, native_vp, 4u,
+                      &preflight_draw, batch) == 0,
+                  "dynamic stencil-reference draw preflight refused");
+            rsx_nr_d3d12_get_stats(sink, &after_ref);
+            CHECK(after_ref.pso_builds == before_ref.pso_builds &&
+                      after_ref.pso_hits == before_ref.pso_hits + 1u,
+                  "dynamic stencil reference rebuilt a PSO");
+        }
+        two_sided.depth_stencil.back_stencil_ref = 0x13u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &two_sided, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_STENCIL_STATE,
+              "unequal front/back stencil reference escaped preflight");
+    }
+    {
+        rsx_nir_pipeline depth_bounds = be.st;
+        depth_bounds.depth_stencil.depth_bounds_test_enable = 1u;
+        depth_bounds.depth_stencil.depth_bounds_min = 0x3E800000u; /* .25 */
+        depth_bounds.depth_stencil.depth_bounds_max = 0x3F400000u; /* .75 */
+        const int depth_bounds_result = rsx_nr_d3d12_preflight_draw(
+            sink, &depth_bounds, native_vp, 4u, &preflight_draw, batch);
+        CHECK(depth_bounds_result ==
+                  (rsx_nr_d3d12_depth_bounds_supported(sink)
+                       ? 0 : -RSX_NR_DRAW_PF_DEPTH_BOUNDS),
+              "depth-bounds feature gate mismatch result=%d support=%d",
+              depth_bounds_result,
+              rsx_nr_d3d12_depth_bounds_supported(sink));
+        if (rsx_nr_d3d12_depth_bounds_supported(sink)) {
+            rsx_nr_d3d12_stats before_bounds, after_bounds;
+            rsx_nr_d3d12_get_stats(sink, &before_bounds);
+            depth_bounds.depth_stencil.depth_bounds_min = 0x3E000000u; /* .125 */
+            depth_bounds.depth_stencil.depth_bounds_max = 0x3F200000u; /* .625 */
+            CHECK(rsx_nr_d3d12_preflight_draw(
+                      sink, &depth_bounds, native_vp, 4u,
+                      &preflight_draw, batch) == 0,
+                  "second dynamic depth-bounds draw preflight refused");
+            rsx_nr_d3d12_get_stats(sink, &after_bounds);
+            CHECK(after_bounds.pso_builds == before_bounds.pso_builds &&
+                      after_bounds.pso_hits == before_bounds.pso_hits + 1u,
+                  "dynamic depth bounds rebuilt a PSO");
+        }
+        depth_bounds.depth_stencil.depth_bounds_min = 0x3F600000u; /* .875 */
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &depth_bounds, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_DEPTH_BOUNDS,
+              "reversed depth bounds escaped preflight");
+    }
+    {
+        rsx_nir_pipeline unsupported = be.st;
+        unsupported.surface.color_target = 0x13u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &unsupported, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_SURFACE_TARGET,
+              "draw preflight did not preserve exact refusal reason");
+    }
+    {
+        const u32 flow_vp[4] = {
+            0u, 0x08u << 27, 0u, 1u
+        };
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &be.st, flow_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_VERTEX_PROGRAM,
+              "flow-control VP escaped transactional draw preflight");
+    }
+    {
+        rsx_nir_pipeline vertex_texture = be.st;
+        vertex_texture.vertex_textures[0].enabled = 1u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &vertex_texture, native_vp, 4u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_VERTEX_TEXTURE,
+              "enabled vertex texture escaped draw preflight");
+    }
+    {
+        rsx_nir_pipeline vertex_texture = be.st;
+        write_vertex_texture0(rsx_nr_d3d12_pages(sink),
+                              0.0f, 1.0f, 0.0f, 1.0f);
+        vertex_texture.vertex_textures[0] = vertex_texture0_descriptor();
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &vertex_texture, vertex_texture_vp, 8u,
+                  &preflight_draw, batch) == 0,
+              "valid TXL vertex texture preflight refused");
+        vertex_texture.vertex_textures[0].format = 0xA5u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &vertex_texture, vertex_texture_vp, 8u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_VERTEX_TEXTURE,
+              "ordinary color format escaped vertex-texture preflight");
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &be.st, vertex_texture_vp, 8u,
+                  &preflight_draw, batch) ==
+                  -RSX_NR_DRAW_PF_VERTEX_PROGRAM,
+              "TXL program escaped preflight without its bound unit");
+    }
+    CHECK(rsx_nr_d3d12_preflight_present(sink, 0) == 0,
+          "valid present preflight refused");
+    preflight_clear.mask = 0x10u;
+    CHECK(rsx_nr_d3d12_preflight_clear(
+              sink, &be.st, &preflight_clear) != 0,
+          "partial-channel clear preflight accepted");
+    rsx_nir_transfer invalid_transfer;
+    memset(&invalid_transfer, 0, sizeof(invalid_transfer));
+    CHECK(rsx_nr_d3d12_preflight_transfer(
+              sink, &be.st, &invalid_transfer, NULL) != 0,
+          "empty transfer preflight accepted");
+    rsx_nr_d3d12_get_stats(sink, &after_preflight);
+    CHECK(after_preflight.queue_submissions ==
+              before_preflight.queue_submissions &&
+          after_preflight.clears == before_preflight.clears &&
+          after_preflight.draws == before_preflight.draws &&
+          after_preflight.transfers == before_preflight.transfers &&
+          after_preflight.presents == before_preflight.presents &&
+          g_present_handoffs == handoffs_before &&
+          g_published_writes == publishes_before,
+          "preflight executed work submit=%llu/%llu clear=%llu/%llu "
+          "draw=%llu/%llu xfer=%llu/%llu present=%llu/%llu",
+          after_preflight.queue_submissions,
+          before_preflight.queue_submissions,
+          after_preflight.clears, before_preflight.clears,
+          after_preflight.draws, before_preflight.draws,
+          after_preflight.transfers, before_preflight.transfers,
+          after_preflight.presents, before_preflight.presents);
+
+    /* ---- conditional draw: false consumes without recording ---------- */
+    rsx_nir_render_condition condition;
+    memset(&condition, 0, sizeof(condition));
+    condition.enabled = 1u;
+    condition.dma_report = 0x66626660u;
+    condition.offset = 0x45A0u;
+    rsx_nir_em_render_condition(&em, &condition);
+    g_render_condition_value = 0u;
+    rsx_nr_d3d12_stats before_conditional, after_conditional;
+    rsx_nr_d3d12_get_stats(sink, &before_conditional);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nr_backend_run(&be, 0);
+    rsx_nr_d3d12_get_stats(sink, &after_conditional);
+    CHECK(be.stats.exec_errors == 0 &&
+              after_conditional.draws == before_conditional.draws &&
+              after_conditional.conditional_draws_skipped ==
+                  before_conditional.conditional_draws_skipped + 1u,
+          "false condition rendered or faulted draws=%llu/%llu skip=%llu/%llu",
+          before_conditional.draws, after_conditional.draws,
+          before_conditional.conditional_draws_skipped,
+          after_conditional.conditional_draws_skipped);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0 &&
+              pix_is(2, 61, 0xFF, 0x00, 0x00),
+          "false conditional draw changed the target");
+
+    /* ---- leg 2: bottom-left half triangle; true condition executes ---- */
+    g_render_condition_value = 1u;
     rsx_nir_em_draw(&em, 5, 0, batch, 1);
     rsx_nir_em_present(&em, 0);
     rsx_nr_backend_run(&be, 0);
@@ -683,6 +1152,23 @@ int main(int argc, char** argv)
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     CHECK(pix_is(61, 2, 0xFF, 0x00, 0x00), "outside pixel %02X %02X %02X",
           pix(61, 2)[0], pix(61, 2)[1], pix(61, 2)[2]);
+
+    /* A stale nonzero INDEX_BASE may remain while the producer switches to
+     * DRAW_ARRAYS.  Array fetches must ignore it exactly as the legacy
+     * decoder does; indexed fetches below continue to apply it. */
+    stage_frame_state(&em);
+    stage_vertex_bindings(&em, 0x40u);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "array draw with stale base index faulted");
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "stale-base array RT readback failed");
+    CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF) &&
+              pix_is(61, 2, 0xFF, 0x00, 0x00),
+          "array draw incorrectly applied stale index base");
     {
         rsx_nr_d3d12_stats resident;
         rsx_nr_d3d12_get_stats(sink, &resident);
@@ -695,6 +1181,29 @@ int main(int argc, char** argv)
               resident.resident_pages[0], resident.resident_pages[1],
               g_watched_pages[0], g_last_watched_offset[0]);
     }
+
+    /* The legacy renderer deliberately leaves D3D depth clipping disabled.
+     * Fullscreen and post-process programs can therefore write clip-space Z
+     * outside [0,w] when depth testing is disabled.  Native rendering must
+     * not silently discard those pixels. */
+    stage_frame_state(&em);
+    stage_vertex_bindings(&em, 0u);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    write_triangle_z(rsx_nr_d3d12_pages(sink),
+                     -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 2.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "unclipped out-of-range Z draw faulted");
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "unclipped out-of-range Z readback failed");
+    CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF) &&
+              pix_is(61, 2, 0xFF, 0x00, 0x00),
+          "native depth clipping discarded legacy-visible pixels");
+
+    memset(&condition, 0, sizeof(condition));
+    rsx_nir_em_render_condition(&em, &condition);
 
     /* ---- leg 3: dirty-page re-upload flips the covered half ------------ */
     stage_frame_state(&em);
@@ -712,6 +1221,44 @@ int main(int argc, char** argv)
           pix(61, 2)[0], pix(61, 2)[1], pix(61, 2)[2]);
     CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "old-half pixel %02X %02X %02X",
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
+    /* ---- one command-list generation reuses one mirror slice ----------
+     * Six dirty draws deliberately exceed the backend's three physical
+     * staging slices while remaining in one unsubmitted command list. The
+     * mirror must append within that submission fence rather than rotate a
+     * slice per draw and reject the fourth upload. */
+    {
+        rsx_nr_d3d12_stats before_append, after_append;
+        rsx_nr_d3d12_get_stats(sink, &before_append);
+        stage_frame_state(&em);
+        rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+        for (u32 i = 0; i < 6u; ++i) {
+            const float edge = i & 1u ? 0.875f : 1.0f;
+            write_triangle(rsx_nr_d3d12_pages(sink),
+                           -1.0f, -1.0f, edge, -1.0f, -1.0f, edge);
+            rsx_nir_em_draw(&em, 5, 0, batch, 1);
+            rsx_nr_backend_run(&be, 0);
+            CHECK(be.stats.exec_errors == 0,
+                  "same-list mirror append failed at dirty draw %u", i);
+        }
+        rsx_nr_d3d12_get_stats(sink, &after_append);
+        CHECK(after_append.draws == before_append.draws + 6u &&
+                  after_append.residency_failures ==
+                      before_append.residency_failures &&
+                  after_append.mirror_rollovers ==
+                      before_append.mirror_rollovers,
+              "same-list mirror append rotated or failed draws=%llu/%llu "
+              "residency=%llu/%llu rollover=%llu/%llu",
+              before_append.draws, after_append.draws,
+              before_append.residency_failures,
+              after_append.residency_failures,
+              before_append.mirror_rollovers,
+              after_append.mirror_rollovers);
+        rsx_nir_em_present(&em, 0);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(be.stats.exec_errors == 0,
+              "same-list mirror append present failed");
+    }
 
     /* ---- leg 4: indexed draw through BE u16 in-shader index fetch ------ */
     {
@@ -840,6 +1387,37 @@ int main(int argc, char** argv)
           before_texture_change.pso_builds, after_texture_change.pso_builds,
           before_texture_change.pso_hits, after_texture_change.pso_hits);
 
+    /* ---- immutable descriptors + fence-retired texture resources -----
+     * Record two differently textured draws into the same open command
+     * list, refreshing the same guest texture key between them.  The first
+     * draw must keep both its descriptor contents and old resource alive
+     * until submission instead of observing the second draw's replacement. */
+    stage_frame_state(&em);
+    stage_texture0(&em);             /* cached red texture from above      */
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nr_backend_run(&be, 0);      /* record, deliberately do not submit */
+
+    write_solid_texture(rsx_nr_d3d12_pages(sink), 0, 255, 0, 255);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f);
+    stage_frame_state(&em);
+    stage_texture0(&em);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "same-list texture replacement exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "same-list texture replacement readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0x00, 0xFF),
+          "first same-list draw lost its red descriptor/resource");
+    CHECK(pix_is(61, 2, 0x00, 0xFF, 0x00),
+          "second same-list draw did not use refreshed green texture");
+
     /* ---- R5G6B5 target sampled as an exact native alias --------------
      * The capture's only remaining surface format is GCM color format 3.
      * Clear a real B5G6R5 target, then sample its GPU contents into the
@@ -866,6 +1444,8 @@ int main(int argc, char** argv)
     stage_frame_state(&em);
     stage_rt565_texture0(&em);
     rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
     rsx_nir_em_draw(&em, 5, 0, batch, 1);
     rsx_nir_em_present(&em, 0);
     rsx_nr_backend_run(&be, 0);
@@ -945,6 +1525,7 @@ int main(int argc, char** argv)
           pix(2, 2)[0], pix(2, 2)[1], pix(2, 2)[2]);
     CHECK(pix_is(40, 40, 0xFF, 0x00, 0x00), "outside-scissor pixel "
           "%02X %02X %02X", pix(40, 40)[0], pix(40, 40)[1], pix(40, 40)[2]);
+
     scz.w = RT_W;                    /* restore full scissor for later legs */
     scz.h = RT_H;
     rsx_nir_em_scissor(&em, &scz);
@@ -1024,14 +1605,93 @@ int main(int argc, char** argv)
               g_published_offset[1], g_published_size[1]);
     }
 
+    /* ---- vertex TXL: exact float format + big-endian conversion -------
+     * A two-instruction guest VP preserves clip position and samples a
+     * one-texel W32Z32Y32X32 vertex texture into COL0. The ordinary FP
+     * exports COL0, so the green oracle covers shader declaration, root
+     * binding, fixed vertex sampler, cache resolution and byte conversion. */
+    write_test_fp();
+    stage_frame_state(&em);
+    stage_vertex_texture0(&em);
+    rsx_nir_em_vertex_program(
+        &em, 0u, vertex_texture_vp, 8u, 1u, 3u, 0u);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFFu, 0);
+    write_vertex_texture0(rsx_nr_d3d12_pages(sink),
+                          0.0f, 1.0f, 0.0f, 1.0f);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 2,
+          "vertex-texture draw exec errors %llu", be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "vertex-texture RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00),
+          "vertex TXL pixel %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
+    /* ---- exact forward BRI/BRB + dynamic branch bits ------------------
+     * BRB b0 selects white; the fallthrough writes black then an always BRI
+     * skips the white instruction. Position is still pulled from ATTR0.
+     * Reusing one PSO while changing only branch_bits proves that the live
+     * register is draw data in b0 rather than shader/PSO identity. */
+    {
+        const u32 branch_vp[24] = {
+            0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF80u,
+            0x001F9C00u, 0x88000000u, 0x00000000u, 0x90000000u,
+            0x401F9C00u, 0x04400000u, 0x00000000u, 0x0001E004u,
+            0x001F9C00u, 0x48000000u, 0x00000000u, 0xA0000000u,
+            0x401F9C00u, 0x05400000u, 0x00000000u, 0x0001E004u,
+            0x001F9C00u, 0x00000000u, 0x00000000u, 0x00000001u
+        };
+        rsx_nir_texture disabled_vertex_texture;
+        memset(&disabled_vertex_texture, 0, sizeof(disabled_vertex_texture));
+        rsx_nir_em_vertex_texture(&em, 0u, &disabled_vertex_texture);
+        rsx_nir_em_vertex_program(
+            &em, 0u, branch_vp, 24u, 1u, 3u, 0u);
+        rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFFu, 0);
+        rsx_nir_em_draw(&em, 5, 0, batch, 1);
+        rsx_nir_em_present(&em, 0);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "BRB false RT readback failed");
+        CHECK(pix_is(2, 61, 0x00, 0x00, 0x00),
+              "BRB false pixel %02X %02X %02X",
+              pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
+        rsx_nr_d3d12_stats before_branch_change, after_branch_change;
+        rsx_nr_d3d12_get_stats(sink, &before_branch_change);
+        rsx_nir_em_vertex_program(
+            &em, 0u, branch_vp, 24u, 1u, 3u, 1u);
+        rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFFu, 0);
+        rsx_nir_em_draw(&em, 5, 0, batch, 1);
+        rsx_nir_em_present(&em, 0);
+        rsx_nr_backend_run(&be, 0);
+        rsx_nr_d3d12_get_stats(sink, &after_branch_change);
+        CHECK(after_branch_change.pso_builds == before_branch_change.pso_builds &&
+              after_branch_change.pso_hits == before_branch_change.pso_hits + 1u,
+              "dynamic branch bits rebuilt the PSO");
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "BRB true RT readback failed");
+        CHECK(pix_is(2, 61, 0xFF, 0xFF, 0xFF),
+              "BRB true pixel %02X %02X %02X",
+              pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    }
+
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 15 && st.draws == 10 && st.presents == 13,
+    CHECK(st.clears == 22 && st.draws == 23 && st.presents == 20,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
+    CHECK(st.conditional_draws_skipped == 1u,
+          "conditional skips=%llu expected=1",
+          st.conditional_draws_skipped);
     CHECK(st.queue_submissions < st.clears + st.draws + st.presents,
           "draw/clear actions were not submission-batched (%llu submissions "
           "for %llu actions)", st.queue_submissions,
@@ -1045,17 +1705,19 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 4 && st.texture_builds == 1 &&
-              st.texture_refreshes == 1 && st.texture_failures == 0,
+    CHECK(st.texture_draws == 7 && st.texture_builds == 2 &&
+              st.texture_refreshes == 2 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
     CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
-    CHECK(g_present_handoffs == 13,
-          "native scanout handoffs=%u expected=13", g_present_handoffs);
+    CHECK(g_present_handoffs == 20,
+          "native scanout handoffs=%u expected=20", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
+
+    test_broker_actual_color_format();
 
     /* optional real-capture execution leg (large local untracked oracle:
      * absent capture = SKIP so CTest stays hermetic) */

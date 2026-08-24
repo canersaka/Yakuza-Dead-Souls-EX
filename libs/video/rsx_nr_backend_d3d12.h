@@ -59,15 +59,21 @@ typedef int (*rsx_nr_d3d12_borrow_color_fn)(
 typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
     void* user, u32 space, u32 offset, u32 depth_format,
     u32 width, u32 height, void** resource, u32* resource_format,
-    u32* dsv_format, u32* srv_format);
+    u32* dsv_format, u32* srv_format, int* publication_required);
 typedef void (*rsx_nr_d3d12_publish_write_fn)(
     void* user, u32 space, u32 offset, u32 size);
+/* Resolve and read CellGcmReportData.value for a condition captured by
+ * NV4097 SET_RENDER_ENABLE. Return zero with *value filled, or nonzero when
+ * the exact report mapping is unavailable. */
+typedef int (*rsx_nr_d3d12_render_condition_fn)(
+    void* user, u32 dma_report, u32 offset, u32* value);
 
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long pso_hits, pso_builds;
     unsigned long long unsupported_draws;    /* refused to the core (sum)  */
+    unsigned long long conditional_draws_skipped;
     unsigned long long unsup_draw_topology;  /* fan/loop/quads/polygon     */
     unsigned long long unsup_draw_rt;        /* surface format/target      */
     unsigned long long unsup_draw_plan;      /* pull plan unsupported      */
@@ -89,8 +95,13 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long rt_alias_binds;       /* current native RT sampled  */
     unsigned long long compile_failures;
     unsigned long long rt_builds;
+    unsigned long long rt_refreshes;     /* broker replaced same identity */
+    unsigned long long depth_builds;
+    unsigned long long depth_refreshes;  /* broker replaced same identity */
     unsigned long long resident_pages[2];
     unsigned long long residency_failures;
+    unsigned long long mirror_resyncs;
+    unsigned long long mirror_rollovers;
 } rsx_nr_d3d12_stats;
 
 /* guest_ptr resolves (space, offset, min_bytes) like rsx_live_guest_ptr_fn;
@@ -110,10 +121,49 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b);
 /* The guest-write tracker feeding the mirror; the embedder publishes guest
  * writes here (tests call note_write after touching arenas). */
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b);
+int rsx_nr_d3d12_depth_bounds_supported(const rsx_nr_d3d12* b);
 
 /* Fill the GPU half of the exec ops (clear/draw/transfer/present/flush).
  * The embedder fills the host half before rsx_nr_backend_init. */
 void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out);
+
+/* Transactional section preflight. These routines may populate persistent
+ * resource/PSO/page-watch caches, but never open/submit a command list,
+ * modify guest memory, publish a report/label, or present. A live section is
+ * eligible only when every action passes these checks before execution. */
+enum rsx_nr_d3d12_draw_preflight_reason {
+    RSX_NR_DRAW_PF_BAD_ARGUMENT = 1,
+    RSX_NR_DRAW_PF_SURFACE_TARGET,
+    RSX_NR_DRAW_PF_TOPOLOGY,
+    RSX_NR_DRAW_PF_COLOR_TARGET,
+    RSX_NR_DRAW_PF_DEPTH_TARGET,
+    RSX_NR_DRAW_PF_FRAGMENT_RESOLVE,
+    RSX_NR_DRAW_PF_FRAGMENT_UNSUPPORTED,
+    RSX_NR_DRAW_PF_TEXTURE_DISABLED,
+    RSX_NR_DRAW_PF_TEXTURE_INVALID,
+    RSX_NR_DRAW_PF_VERTEX_PLAN,
+    RSX_NR_DRAW_PF_PSO,
+    RSX_NR_DRAW_PF_RESIDENCY,
+    RSX_NR_DRAW_PF_UPLOAD_SCRATCH,
+    RSX_NR_DRAW_PF_VERTEX_PROGRAM,
+    RSX_NR_DRAW_PF_VERTEX_TEXTURE,
+    RSX_NR_DRAW_PF_STENCIL_STATE,
+    RSX_NR_DRAW_PF_DEPTH_BOUNDS,
+    RSX_NR_DRAW_PF_RENDER_CONDITION,
+};
+int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
+                                 const rsx_nir_pipeline* st,
+                                 const rsx_nir_clear* clear);
+int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
+                                const rsx_nir_pipeline* st,
+                                const u32* vp_words, u32 vp_word_count,
+                                const rsx_nir_draw* draw,
+                                const u32* batches);
+int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
+                                    const rsx_nir_pipeline* st,
+                                    const rsx_nir_transfer* transfer,
+                                    const u32* words);
+int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer_id);
 
 /* Configure live scanout before the first native render target is created.
  * rgba_targets selects R8G8B8A8 for direct compatibility with the title's
@@ -141,6 +191,11 @@ void rsx_nr_d3d12_set_resource_broker(
  * installed (the offline default). */
 void rsx_nr_d3d12_set_publish_write(
     rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user);
+
+/* Install the exact guest-report reader used by conditional draws. NULL
+ * keeps such draws transactionally unsupported. */
+void rsx_nr_d3d12_set_render_condition_reader(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_render_condition_fn read, void* user);
 
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,

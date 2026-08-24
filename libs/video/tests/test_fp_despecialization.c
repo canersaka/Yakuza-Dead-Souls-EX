@@ -229,6 +229,33 @@ int main(void)
         return 10;
     }
 
+    char texcoord_hlsl[16384];
+    memcpy(texcoord_hlsl, hlsl_first, sizeof(texcoord_hlsl));
+    if (rsx_fp_apply_texcoord_control(
+            texcoord_hlsl, sizeof(texcoord_hlsl), 0x05u) != 1 ||
+        !strstr(texcoord_hlsl,
+                "input.tc0 = float4(input.tc0.xy, 0.0, input.position.w)") ||
+        !strstr(texcoord_hlsl,
+                "input.tc2 = float4(input.tc2.xy, 0.0, input.position.w)") ||
+        strstr(texcoord_hlsl,
+               "input.tc1 = float4(input.tc1.xy, 0.0, input.position.w)") ||
+        rsx_fp_apply_texcoord_control(
+            texcoord_hlsl, sizeof(texcoord_hlsl), 1u << 8) != -1) {
+        printf("[FAIL] texcoord-control structural input transform\n");
+        return 11;
+    }
+    if (rsx_fp_apply_shader_window(
+            texcoord_hlsl, sizeof(texcoord_hlsl), 0x000102D0u) != 1 ||
+        !strstr(texcoord_hlsl,
+                "input.position.x = input.position.x - 0.5") ||
+        !strstr(texcoord_hlsl,
+                "input.position.y = input.position.y - 0.5") ||
+        rsx_fp_apply_shader_window(
+            texcoord_hlsl, sizeof(texcoord_hlsl), 0x00200000u) != -1) {
+        printf("[FAIL] shader-window WPOS transform\n");
+        return 11;
+    }
+
     /* Aligned allocation, wrap request, reset/retry, and oversize. */
     u32 ring_offset = 99, ring_allocation = 99;
     if (rsx_fp_constant_ring_plan(
@@ -273,7 +300,7 @@ int main(void)
     ID3DBlob* shader = NULL;
     ID3DBlob* errors = NULL;
     const HRESULT compile_result = D3DCompile(
-        alpha_first, strlen(alpha_first), "fp-buffered-test",
+            texcoord_hlsl, strlen(texcoord_hlsl), "fp-buffered-test",
         NULL, NULL, "main", "ps_5_0", 0, 0, &shader, &errors);
     if (FAILED(compile_result)) {
         printf(

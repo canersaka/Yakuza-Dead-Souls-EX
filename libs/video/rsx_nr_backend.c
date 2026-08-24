@@ -27,6 +27,7 @@ static void apply_state_op(rsx_nr_backend* be, const rsx_nir_op* op)
     case RSX_NIR_OP_SET_RASTER:           p->raster = op->u.raster; break;
     case RSX_NIR_OP_SET_DEPTH_STENCIL:    p->depth_stencil = op->u.depth_stencil; break;
     case RSX_NIR_OP_SET_BLEND:            p->blend = op->u.blend; break;
+    case RSX_NIR_OP_SET_RENDER_CONDITION: p->render_condition = op->u.render_condition; break;
     case RSX_NIR_OP_SET_FRAGMENT_PROGRAM: p->fragment_program = op->u.fragment_program; break;
     case RSX_NIR_OP_SET_VERTEX_BINDINGS:  p->vertex_bindings = op->u.vertex_bindings; break;
     case RSX_NIR_OP_SET_INDEX_BINDING:    p->index_binding = op->u.index_binding; break;
@@ -110,7 +111,7 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
          * final memory value (SDK SetWriteBackEndLabel "swap byte 0 and
          * 2" vs SetWriteTextureLabel). */
         u32 v = op->u.semaphore.value;
-        if (!op->u.semaphore.texture_read)
+        if (op->u.semaphore.texture_read == 0u)
             v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) |
                 ((v >> 16) & 0xFFu);
         /* Both back-end and texture-pipe releases publish completion of all

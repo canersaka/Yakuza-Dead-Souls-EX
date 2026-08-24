@@ -30,12 +30,54 @@ typedef struct rsx_vp_input_analysis {
     int exact;
 } rsx_vp_input_analysis;
 
+typedef struct rsx_vp_native_support_analysis {
+    u32 unsupported_vec_mask;
+    u32 unsupported_sca_mask;
+    u32 missing_vtex_mask;
+    u32 conditional_tests;
+    u32 flow_instructions;
+    u32 invalid_branch_targets;
+    u32 instruction_count;
+    u32 terminated;
+} rsx_vp_native_support_analysis;
+
 /* Report the guest input registers statically read by the program.  `exact`
  * is zero and input_mask is 0xFFFF when an unsupported opcode/control-flow
  * construct makes the result unsafe to narrow.  Returns the instruction
  * count, or -1 for invalid/non-terminated input. */
 int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
                           rsx_vp_input_analysis* analysis);
+
+/* Conservative eligibility gate for native execution.  Returns one only
+ * when the terminated program uses instruction and condition semantics the
+ * current HLSL decompiler models exactly.  In particular, this rejects all
+ * branch/call/return opcodes and non-trivial condition-code tests even when
+ * they carry no ordinary scalar write mask. */
+int rsx_vp_program_is_native_supported(const u8* ucode, u32 max_bytes);
+
+/* Binding-aware eligibility gate. TXL is accepted only when its exact
+ * vertex-texture unit is present in vtex_mask; all other semantics match the
+ * conservative gate above. */
+int rsx_vp_program_is_native_supported_ex(const u8* ucode, u32 max_bytes,
+                                          u32 vtex_mask);
+
+/* Start-slot-aware form used by live programs. It additionally accepts
+ * exact forward BRI/BRB control flow whose absolute targets remain inside
+ * the captured program. Other flow opcodes and cyclic/backward targets stay
+ * on the ordered legacy fallback. */
+int rsx_vp_program_is_native_supported_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot);
+
+/* Detailed form of the same conservative eligibility gate. It is intended
+ * for bounded aggregate diagnostics and offline coverage analysis: no
+ * allocation or output occurs here. Returns one iff every reported failure
+ * field is zero and the program terminated within max_bytes. */
+int rsx_vp_analyze_native_support(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask,
+    rsx_vp_native_support_analysis* analysis);
+int rsx_vp_analyze_native_support_control(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    rsx_vp_native_support_analysis* analysis);
 
 /* Decompile an NV40 vertex program into an HLSL vertex shader.
  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
@@ -48,8 +90,10 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
  * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
  * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
- * Not modeled: condition-code tests and flow control (BRA/CAL/...). TXL is
- * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
+ * Exact condition-code tests and forward in-program BRI/BRB are modeled by
+ * the start-slot-aware live form. BRA/call/return and cyclic flow remain
+ * unsupported. TXL is stubbed to zero unless rsx_vp_decompile_ex receives a
+ * bound-unit mask. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
 
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
@@ -76,6 +120,13 @@ int rsx_vp_decompile_compact_ex(
  * vertex textures and varyings are identical to rsx_vp_decompile_ex. */
 int rsx_vp_decompile_pull_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask,
+    const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size);
+
+/* Live start-slot-aware vertex-pulling form. The generated cbuffer includes
+ * the dynamic TRANSFORM_BRANCH_BITS word, so BRB does not alter PSO identity. */
+int rsx_vp_decompile_pull_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size);
 

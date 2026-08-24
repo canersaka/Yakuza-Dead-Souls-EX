@@ -258,6 +258,58 @@ int main(void)
     CHECK(!rsx_nr_main_report_io_range(0u, 0u, &report_io));
     CHECK(!rsx_nr_main_report_io_range(0u, 16u, 0));
 
+    /* Primary packets are bounded by the exact modulo GET-to-PUT span,
+     * including partial publication and packet crossing. A backlog larger
+     * than half the ring remains valid; the half-ring heuristic belongs to
+     * recovery proofs, not normal consumption. A called display list is
+     * already published by its CALL and must not be compared to caller PUT. */
+    const u32 fifo_ring = 0x800000u;
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x1000u, 8u, 0x1008u, 0xFFFFFFFFu, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_READY);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x1000u, 12u, 0x1008u, 0xFFFFFFFFu, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_NOT_READY);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x1000u, 4u, 0x700000u, 0xFFFFFFFFu, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_READY);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x7FFFFCu, 8u, 0x1000u, 0xFFFFFFFFu, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_WINDOW);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x2000u, 16u, 0x1000u, 0x700100u, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_READY);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x1104D00u, 16u, 0x1000u, 0x700100u, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_READY);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0xFFFFFFFCu, 8u, 0x1000u, 0x700100u, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_WINDOW);
+    CHECK(rsx_nr_fifo_section_range_status(
+              0x1000u, 0u, 0x1008u, 0xFFFFFFFFu, fifo_ring) ==
+          RSX_NR_FIFO_RANGE_WINDOW);
+
+    /* Per-action ownership is forbidden: only the complete queue/head flip
+     * pair closes a transactional native frame. */
+    CHECK(!rsx_nr_fifo_frame_boundary(0x1808u, 0u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0x1D94u, 0xF3u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0x2328u, 0u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0x0110u, 0u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0x17C8u, 0u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0xEB00u, 1u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0xE944u, 3u));
+    CHECK(!rsx_nr_fifo_frame_boundary(0xE924u, 0u));
+    CHECK(rsx_nr_fifo_frame_boundary(0xE924u, 0x8000010Fu));
+
+    CHECK(rsx_nr_legacy_gpu_action(0x1808u, 0u));
+    CHECK(!rsx_nr_legacy_gpu_action(0x1808u, 1u));
+    CHECK(rsx_nr_legacy_gpu_action(0x1D94u, 0xF3u));
+    CHECK(rsx_nr_legacy_gpu_action(0xA400u, 0u));
+    CHECK(rsx_nr_legacy_gpu_action(0xAAFCu, 0u));
+    CHECK(!rsx_nr_legacy_gpu_action(0xA3FCu, 0u));
+    CHECK(!rsx_nr_legacy_gpu_action(0xAB00u, 0u));
+    CHECK(!rsx_nr_legacy_gpu_action(0x1D90u, 0u));
+
     if (failures) {
         fprintf(stderr, "nr producer contract: %d failure(s)\n", failures);
         return 1;

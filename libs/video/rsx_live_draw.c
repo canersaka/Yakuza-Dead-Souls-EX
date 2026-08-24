@@ -37,15 +37,16 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_mirror_state_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_typed_present(u32 b) { (void)b; }
 void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
 int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, void** r, u32* f)
 { (void)l; (void)o; (void)w; (void)h; (void)r; (void)f; return -1; }
 int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
-                               void** r, u32* rf, u32* d, u32* s)
+                               void** r, u32* rf, u32* d, u32* s, int* p)
 { (void)l; (void)o; (void)df; (void)w; (void)h; (void)r; (void)rf; (void)d;
-  (void)s; return -1; }
+  (void)s; if (p) *p = 0; return -1; }
 int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
@@ -56,6 +57,14 @@ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
+int rsx_live_draw_native_actions_allowed(void) { return 0; }
+int rsx_live_draw_guest_graphics_suppressed(void) { return 1; }
+u32 rsx_live_draw_native_clear_contract_mismatch(
+    const struct rsx_nir_pipeline* s, const struct rsx_nir_clear* c)
+{ (void)s; (void)c; return 7u; }
+void rsx_live_draw_native_clear_commit(
+    const struct rsx_nir_pipeline* s, const struct rsx_nir_clear* c)
+{ (void)s; (void)c; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
 u32  rsx_live_draw_get_frames(void) { return 0; }
 u64  rsx_live_draw_get_completed_draws(void) { return 0; }
@@ -76,6 +85,7 @@ void rsx_live_draw_shutdown(void) {}
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "rsx_dispatch.h"
+#include "rsx_nir.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
@@ -4889,7 +4899,22 @@ static void ld_trace_target(const char* event, u32 target, u32 mask)
  * CRI/movie handoff scheduling and regressed the proven title/menu path.
  * YZ_MOVIE_TRACK_RSX keeps the state-tracking experiment available for a
  * focused post-movie A/B once the transition itself is deterministic. */
+static int ld_movie_composite_ui_enabled(void);
 static volatile int g_ld_movie_mode = 0;
+
+int rsx_live_draw_native_actions_allowed(void)
+{
+    return g.ready &&
+        InterlockedCompareExchange(
+            (volatile LONG*)&g_ld_movie_mode, 0, 0) == 0;
+}
+
+int rsx_live_draw_guest_graphics_suppressed(void)
+{
+    return InterlockedCompareExchange(
+               (volatile LONG*)&g_ld_movie_mode, 0, 0) != 0 &&
+        !ld_movie_composite_ui_enabled();
+}
 static int g_ld_movie_track_rsx = -1;
 static int g_ld_movie_composite_ui = -1;
 
@@ -7134,6 +7159,49 @@ void rsx_live_draw_method(u32 method, u32 arg)
     rsx_dispatch_method(&g.rsx, method, arg);
 }
 
+static void ld_dispatch_state_only(u32 method, u32 arg)
+{
+    rsx_dispatch_sink saved = g.rsx.sink;
+    g.rsx.sink.clear = NULL;
+    g.rsx.sink.begin = NULL;
+    g.rsx.sink.end = NULL;
+    g.rsx.sink.draw_arrays = NULL;
+    g.rsx.sink.draw_index_array = NULL;
+    g.rsx.sink.flip = NULL;
+    rsx_dispatch_method(&g.rsx, method, arg);
+    g.rsx.sink = saved;
+}
+
+void rsx_live_draw_mirror_state_method(u32 method, u32 arg)
+{
+    const int composite = ld_movie_composite_ui_enabled();
+    const int serialized = composite || g_ld_debug_layer_enabled;
+    if (serialized) {
+        for (;;) {
+            if (g_ld_movie_mode || g_ld_host_waiting) {
+                while (g_ld_host_waiting)
+                    SwitchToThread();
+                AcquireSRWLockExclusive(&g_ld_access_lock);
+                if (g.ready)
+                    ld_dispatch_state_only(method, arg);
+                ReleaseSRWLockExclusive(&g_ld_access_lock);
+                return;
+            }
+            InterlockedIncrement(&g_ld_guest_active);
+            MemoryBarrier();
+            if (!g_ld_movie_mode && !g_ld_host_waiting) {
+                if (g.ready)
+                    ld_dispatch_state_only(method, arg);
+                InterlockedDecrement(&g_ld_guest_active);
+                return;
+            }
+            InterlockedDecrement(&g_ld_guest_active);
+        }
+    }
+    if (g.ready)
+        ld_dispatch_state_only(method, arg);
+}
+
 void rsx_live_draw_native_present(u32 buffer_id)
 {
     /* Keep this bridge semantically identical to a FIFO E944 dispatch.  In
@@ -7195,6 +7263,64 @@ void rsx_live_draw_typed_present(u32 buffer_id)
 void rsx_live_draw_native_clear(u32 mask)
 {
     rsx_live_draw_method(0x1D94u, mask);
+}
+
+u32 rsx_live_draw_native_clear_contract_mismatch(
+    const rsx_nir_pipeline* state, const rsx_nir_clear* clear)
+{
+    if (!state || !clear || !g.ready)
+        return 7u;
+    u32 mismatch = 0;
+    rsx_dsp_surface surface;
+    rsx_dsp_get_surface(&g.rsx, &surface);
+    if (memcmp(&surface, &state->surface, sizeof(surface)) != 0)
+        mismatch |= 1u;
+    const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+    const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+    if (state->scissor.x != (sh & 0xFFFFu) ||
+        state->scissor.w != (sh >> 16) ||
+        state->scissor.y != (sv & 0xFFFFu) ||
+        state->scissor.h != (sv >> 16))
+        mismatch |= 2u;
+    const u32 zs = rsx_dsp_clear_zstencil(&g.rsx);
+    if (clear->color_value != rsx_dsp_clear_color(&g.rsx) ||
+        clear->depth_value != (zs >> 8) ||
+        clear->stencil_value != (zs & 0xFFu))
+        mismatch |= 4u;
+    return mismatch;
+}
+
+void rsx_live_draw_native_clear_commit(
+    const rsx_nir_pipeline* state, const rsx_nir_clear* clear)
+{
+    (void)state;
+    if (!clear || !g.ready)
+        return;
+    const u32 color_bits = clear->mask &
+        (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
+         RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A);
+    if (color_bits) {
+        const u32 target = current_surface();
+        if (target != LD_INVALID_SURFACE)
+            ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+    }
+    if ((clear->mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+        rsx_dsp_surface surface;
+        rsx_dsp_get_surface(&g.rsx, &surface);
+        const u32 zslot = zdepth_get(
+            surface.zeta_location, surface.zeta_offset,
+            surface.clip_w, surface.clip_h);
+        if (zslot) {
+            zdepth_t* const z = &g.zdepths[zslot - 1u];
+            z->cleared = 1;
+            if (clear->mask & RSX_CLEAR_DEPTH) {
+                z->had_write = 0;
+                z->snapshot_valid = 0;
+            }
+        } else if (clear->mask & RSX_CLEAR_DEPTH) {
+            g.depth_cleared = 1;
+        }
+    }
 }
 
 void rsx_live_draw_native_end(void)
@@ -7302,16 +7428,26 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
                                u32 width, u32 height, void** resource,
                                u32* resource_format, u32* dsv_format,
-                               u32* srv_format)
+                               u32* srv_format,
+                               int* publication_required)
 {
     if (!resource || !resource_format || !dsv_format || !srv_format ||
-        depth_format != 2u)
+        !publication_required || depth_format != 2u)
         return -1; /* live shared cache is D32S8; Z16 remains legacy */
     *resource = NULL;
+    *publication_required = 0;
     AcquireSRWLockExclusive(&g_ld_access_lock);
     if (!g.ready) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         return -1;
+    }
+    ID3D12Resource* prior = NULL;
+    for (u32 i = 0; i < g.n_zdepths; ++i) {
+        if (g.zdepths[i].location == location &&
+            g.zdepths[i].offset == offset) {
+            prior = g.zdepths[i].tex;
+            break;
+        }
     }
     const u32 slot = zdepth_get(location, offset, width, height);
     if (!slot || slot > g.n_zdepths || !g.zdepths[slot - 1u].tex) {
@@ -7319,6 +7455,7 @@ int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
         return -1;
     }
     ID3D12Resource* const texture = g.zdepths[slot - 1u].tex;
+    *publication_required = texture != prior;
     texture->lpVtbl->AddRef(texture);
     *resource = texture;
     *resource_format = DXGI_FORMAT_R32G8X24_TYPELESS;
@@ -8762,10 +8899,12 @@ void rsx_live_draw_present(u32 buffer_id)
             const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
             const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
             const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
-            const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+            akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
+            const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE");
+            if ((!stop || !*stop) && akiyama_route)
+                stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
             const char* movement_stop =
                 getenv("YZ_MOVEMENT_PROOF_STOP_FILE");
-            akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
             probe_enabled = ((enabled && *enabled) || akiyama_route) &&
                 directory && *directory;
             if (probe_enabled) {

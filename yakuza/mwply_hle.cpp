@@ -35,6 +35,7 @@ extern "C" void     yz_host_movie_stop(long serial);
 extern "C" int      yz_host_movie_status(long serial);
 extern "C" void     yz_host_movie_time(long serial, uint32_t* count,
                                         uint32_t* scale);
+extern "C" void     yz_host_movie_graphics_session_closed(long serial);
 
 /* ------------------------------------------------------------------ flag -- */
 
@@ -581,10 +582,12 @@ void func_00F4A9AC(ppu_context* ctx)   /* Destroy */
     func_00F4A9AC_lifted(ctx);
     if (yz_movie_hle_armed() && session_active(g_sess) &&
         handle == g_sess.handle) {
+        const long direct_serial = g_sess.direct_serial;
         fprintf(stderr, "[mwhle] session CLOSE handle=%08llX frames_served=%u\n",
                 g_sess.handle, g_sess.frame_id);
         fflush(stderr);
         session_close(g_sess);
+        yz_host_movie_graphics_session_closed(direct_serial);
         g_retired_clock.handle = handle;
         QueryPerformanceFrequency(&g_retired_clock.freq);
         fprintf(stderr,
