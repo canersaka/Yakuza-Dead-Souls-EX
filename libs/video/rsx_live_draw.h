@@ -179,6 +179,11 @@ u32 rsx_live_draw_native_clear_contract_mismatch(
 void rsx_live_draw_native_clear_commit(
     const struct rsx_nir_pipeline* state,
     const struct rsx_nir_clear* clear);
+/* Publish the depth-resource side effect of one successfully recorded native
+ * draw to the shared legacy resource registry. This is metadata only: it
+ * neither decodes nor executes a legacy draw. */
+void rsx_live_draw_native_draw_commit(
+    const struct rsx_nir_pipeline* state);
 
 /* Present a host-decoded RGBA8 frame (w*h*4, row pitch w*4) straight to the
  * swap-chain backbuffer. Call from one thread with movie mode on. */

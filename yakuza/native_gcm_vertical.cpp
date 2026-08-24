@@ -657,6 +657,8 @@ static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
                                 draw, batches) : -1;
     if (result)
         InterlockedExchange(&g_active.renderer_owner, 0);
+    else
+        rsx_live_draw_native_draw_commit(st);
     return result;
 }
 
