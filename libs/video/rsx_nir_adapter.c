@@ -22,7 +22,7 @@
  *   OFFSET_IN/OUT, 0x2314/0x2318 PITCH_IN/OUT, 0x231C LINE_LENGTH_IN,
  *   0x2320 LINE_COUNT, 0x2324 FORMAT, 0x2328 BUFFER_NOTIFY (trigger)
  *   NV3062 (sub 3, 0x6000+): 0x6184/0x6188 DMA src/dst, 0x6300 COLOR_FORMAT,
- *   0x6304 PITCH (src<<16|dst), 0x6308/0x630C OFFSET_SOURCE/DESTIN
+ *   0x6304 PITCH (pitch<<16|alignment), 0x6308/0x630C OFFSET_SOURCE/DESTIN
  *   NV308A (sub 5, 0xA000+): 0xA304 POINT (y<<16|x), 0xA308 SIZE_OUT,
  *   0xA30C SIZE_IN, 0xA400..0xAAFC COLOR data window
  *   NV3089 (sub 6, 0xC000+): 0xC184 DMA_IMAGE, 0xC300 COLOR_FORMAT,
@@ -448,7 +448,7 @@ static void flush_inline(rsx_nir_adapter* ad)
     t.kind         = RSX_NIR_XFER_INLINE;
     t.dst_location = dma_location(ad->s2d_dma_dst);
     t.dst_offset   = ad->s2d_offset_dst;
-    t.dst_pitch    = ad->s2d_pitch & 0xFFFFu;
+    t.dst_pitch    = ad->s2d_pitch >> 16;
     t.dst_format   = ad->s2d_color_format;
     t.point_x      = (ad->inline_point & 0xFFFFu) + ad->inline_first_index;
     t.point_y      = ad->inline_point >> 16;
@@ -457,6 +457,7 @@ static void flush_inline(rsx_nir_adapter* ad)
     t.word_count   = ad->inline_count;
     rsx_nir_em_transfer(&ad->em, &t, ad->inline_words);
     ad->actions_seen++;
+    ad->context_image_open = 0;
     ad->inline_count = 0;
 }
 
@@ -491,6 +492,8 @@ static void sink_clear(void* user, const rsx_dispatch* rsx, u32 mask)
     rsx_nir_em_clear(&ad->em, mask, rsx_dsp_clear_color(rsx),
                      zs >> 8, zs & 0xFF);
     ad->actions_seen++;
+    if (mask)
+        ad->context_image_open = 0;
 }
 
 static void sink_begin(void* user, const rsx_dispatch* rsx, u32 primitive)
@@ -543,6 +546,7 @@ static void sink_end(void* user, const rsx_dispatch* rsx)
     rsx_nir_em_draw(&ad->em, rsx->current_primitive, ad->draw_indexed,
                     ad->batches, ad->batch_count);
     ad->actions_seen++;
+    ad->context_image_open = 0;
     ad->batch_count = 0;
 }
 
@@ -555,6 +559,7 @@ static void sink_flip(void* user, const rsx_dispatch* rsx, u32 arg)
     stage_state(ad);
     rsx_nir_em_present(&ad->em, arg);
     ad->actions_seen++;
+    ad->context_image_open = 0;
 }
 
 /* ---- public ------------------------------------------------------------ */
@@ -586,7 +591,7 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
      * 0xB = CELL_GCM_TRANSFER_SURFACE_FORMAT_Y32, the SDK inline-
      * transfer default (the live consumer's "a8r8g8b8" comment for 0xB
      * is mislabeled; A8R8G8B8 is 0xA — both are 4-byte raw copies). */
-    ad->s2d_pitch = 64;
+    ad->s2d_pitch = (64u << 16) | 64u;
     ad->s2d_color_format = 0xB;
     ad->inline_size_out = 0x00010001;
     ad->sif_context_surface = GCM_CONTEXT_SURFACE2D;
@@ -595,6 +600,7 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
      * memset-zero made a section beginning with OFFSET/ACQUIRE unresolvable
      * until the title happened to issue SET_CONTEXT_DMA_SEMAPHORE. */
     ad->fifo_semaphore_dma = 0x66616661u;
+    ad->context_image_open = 1;
 }
 
 void rsx_nir_adapter_init(rsx_nir_adapter* ad, rsx_nir_stream* out)
@@ -659,12 +665,99 @@ static int fifo_engine_method(rsx_nir_adapter* ad, u32 m, u32 arg)
     }
 }
 
+typedef struct rsx_nir_exact_method {
+    u32 method;
+    u32 argument;
+} rsx_nir_exact_method;
+
+/* The title installs one deterministic NV4097 context image before issuing
+ * its first rendering action.  These writes are not independent render
+ * operations: they populate hardware state which is either folded into a
+ * later typed action or overwritten before first use.  Mixed section
+ * admission used to reject the stored-only portion of this image even though
+ * the adapter retained every word and action preflight validated the state
+ * when it became observable.  Validate the encountered context image exactly
+ * here.  An altered value remains unsupported and becomes the full-native
+ * development failure instead of being silently ignored. */
+static int title_context_image_method_supported(u32 method, u32 arg)
+{
+    static const rsx_nir_exact_method exact[] = {
+        {0x00000u, 0x31337000u},
+        {0x00180u, 0x66604200u}, {0x00184u, 0xFEED0000u},
+        {0x00188u, 0xFEED0001u}, {0x00190u, 0x00000000u},
+        {0x0019Cu, 0xFEED0000u}, {0x001A0u, 0xFEED0001u},
+        {0x001ACu, 0x00000000u}, {0x001B0u, 0x00000000u},
+        {0x00230u, 0x00000000u}, {0x00238u, 0x00000000u},
+        {0x00240u, 0x0000FFFFu}, {0x00244u, 0x00000000u},
+        {0x00248u, 0x00000000u}, {0x0024Cu, 0x00000000u},
+        {0x002BCu, 0x00000000u}, {0x00300u, 0x00000001u},
+        {0x00368u, 0x00001D01u}, {0x00374u, 0x00000000u},
+        {0x00378u, 0x00001503u}, {0x0037Cu, 0x00000000u},
+        {0x003B8u, 0x00000008u}, {0x003BCu, 0x00000000u},
+        {0x008CCu, 0x00000800u}, {0x008D0u, 0x00000000u},
+        {0x008D4u, 0x00000000u}, {0x008D8u, 0x00000000u},
+        {0x00A0Cu, 0x00000000u},
+        {0x01428u, 0x00000001u}, {0x0142Cu, 0x00000000u},
+        {0x01450u, 0x00080003u}, {0x01454u, 0x00000000u},
+        {0x0145Cu, 0x00000001u}, {0x01478u, 0x00000000u},
+        {0x0147Cu, 0x00000000u}, {0x01838u, 0x00000000u},
+        {0x01D64u, 0x02000000u}, {0x01D80u, 0x00000003u},
+        {0x01D98u, 0x0FFF0000u}, {0x01D9Cu, 0x0FFF0000u},
+        {0x01DA4u, 0x00000000u}, {0x01DB4u, 0x00000000u},
+        {0x01E94u, 0x00000011u}, {0x01EE0u, 0x3F800000u},
+        {0x01FC4u, 0x06144321u}, {0x01FC8u, 0xEDCBA987u},
+        {0x01FCCu, 0x0000006Fu}, {0x01FD0u, 0x00171615u},
+        {0x01FD4u, 0x001B1A19u}, {0x01FE0u, 0x00000001u},
+        {0x01FE8u, 0x00000000u}, {0x01FECu, 0x00000000u},
+        {0x02000u, 0x31337303u}, {0x02180u, 0x66604200u},
+        {0x06000u, 0x313371C3u}, {0x06180u, 0x66604200u},
+        {0x08000u, 0x31337A73u}, {0x08180u, 0x66604200u},
+        {0x08184u, 0xFEED0000u}, {0x0A000u, 0x31337808u},
+        {0x0A180u, 0x66604200u}, {0x0A184u, 0x00000000u},
+        {0x0A188u, 0x00000000u}, {0x0A18Cu, 0x00000000u},
+        {0x0A190u, 0x00000000u}, {0x0A194u, 0x00000000u},
+        {0x0A198u, 0x00000000u}, {0x0A19Cu, 0x313371C3u},
+        {0x0A2FCu, 0x00000003u}, {0x0A300u, 0x00000004u},
+        {0x0C000u, 0x3137AF00u}, {0x0C180u, 0x66604200u},
+        {0x0E000u, 0xCAFEBABEu},
+    };
+    static const u32 texture_control[16] = {
+        0x9AABAA98u, 0x66666789u, 0x98766666u, 0x89AABAA9u,
+        0x99999999u, 0x88888889u, 0x98888888u, 0x99999999u,
+        0x56676654u, 0x33333345u, 0x54333333u, 0x45667665u,
+        0xAABBBA99u, 0x66667899u, 0x99876666u, 0x99ABBBAAu,
+    };
+
+    if (method >= 0x002C0u && method <= 0x002FCu &&
+        !(method & 3u) && arg == 0x0FFF0000u)
+        return 1;
+    if (method >= 0x003C0u && method <= 0x003FCu &&
+        !(method & 3u) && arg == 0x00010101u)
+        return 1;
+    if (method >= 0x00400u && method <= 0x0043Cu &&
+        !(method & 3u) && arg == 0x00007421u)
+        return 1;
+    if (method >= 0x00440u && method <= 0x0047Cu && !(method & 3u) &&
+        arg == texture_control[(method - 0x00440u) >> 2])
+        return 1;
+    if (method >= 0x00B00u && method <= 0x00B3Cu &&
+        !(method & 3u) && arg == 0x00002DC8u)
+        return 1;
+    for (u32 i = 0; i < sizeof(exact) / sizeof(exact[0]); ++i)
+        if (method == exact[i].method && arg == exact[i].argument)
+            return 1;
+    return 0;
+}
+
 int rsx_nir_adapter_method_supported(
     const rsx_nir_adapter* ad, u32 method, u32 arg)
 {
     if (!ad)
         return 0;
     method &= 0xFFFFCu;
+    if (ad->context_image_open &&
+        title_context_image_method_supported(method, arg))
+        return 1;
     if (method < 0x100u) {
         switch (method) {
         case M406E_SET_REFERENCE:
@@ -956,6 +1049,7 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         t.line_count   = ad->m2mf_line_count;
         rsx_nir_em_transfer(&ad->em, &t, NULL);
         ad->actions_seen++;
+        ad->context_image_open = 0;
         break;
     }
 
@@ -1004,7 +1098,7 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         t.src_format   = ad->sif_color_format;
         t.dst_location = dma_location(ad->s2d_dma_dst);
         t.dst_offset   = ad->s2d_offset_dst;
-        t.dst_pitch    = ad->s2d_pitch & 0xFFFFu;
+        t.dst_pitch    = ad->s2d_pitch >> 16;
         t.dst_format   = ad->s2d_color_format;
         t.in_x  = arg & 0xFFFFu;             /* raw 12.4 via IN_POINT   */
         t.in_y  = arg >> 16;
@@ -1024,6 +1118,7 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         t.interpolator = (ad->sif_in_format >> 24) & 0xFFu;
         rsx_nir_em_transfer(&ad->em, &t, NULL);
         ad->actions_seen++;
+        ad->context_image_open = 0;
         break;
     }
 

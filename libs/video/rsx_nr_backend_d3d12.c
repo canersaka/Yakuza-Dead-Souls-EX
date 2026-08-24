@@ -1027,6 +1027,12 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
                      const rsx_nir_clear* c)
 {
     rsx_nr_d3d12* b = user;
+    /* CLEAR_SURFACE with no color/depth/stencil bits is an ordered no-op.
+     * Do not require a valid target merely to consume it. */
+    if (!(c->mask & 0xF3u)) {
+        b->stats.clears++;
+        return 0;
+    }
     const u32 color_bits = c->mask & 0xF0u;
     if (color_bits && color_bits != 0xF0u) {
         b->stats.unsupported_clears++;   /* partial-channel clear          */
@@ -3308,7 +3314,11 @@ int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
                                  const rsx_nir_pipeline* st,
                                  const rsx_nir_clear* c)
 {
-    if (!b || !st || !c || st->surface.color_target != 1u)
+    if (!b || !st || !c)
+        return -1;
+    if (!(c->mask & 0xF3u))
+        return 0;
+    if (st->surface.color_target != 1u)
         return -1;
     const u32 color_bits = c->mask & 0xF0u;
     if (color_bits && color_bits != 0xF0u)
@@ -3502,6 +3512,29 @@ int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
     return 0;
 }
 
+static int nrb_scaled_copy_layout(const rsx_nir_transfer* t, u32* bpp)
+{
+    if (!t || t->ds_dx != 0x00100000u ||
+        t->dt_dy != 0x00100000u || !t->in_w || !t->in_h ||
+        t->in_w != t->out_w || t->in_h != t->out_h ||
+        t->in_x || t->in_y || t->out_x || t->out_y ||
+        t->clip_x || t->clip_y || t->clip_w != t->out_w ||
+        t->clip_h != t->out_h)
+        return -1;
+
+    /* NV3089 source and NV3062 destination use different enum domains.
+     * These pairs are representation-identical and need no conversion. */
+    if ((t->src_format == 3u || t->src_format == 4u) &&
+        t->dst_format == 10u)
+        *bpp = 4u; /* A/X8R8G8B8 -> A8R8G8B8 */
+    else if (t->src_format == 7u && t->dst_format == 4u)
+        *bpp = 2u; /* R5G6B5 -> R5G6B5 */
+    else
+        return -1;
+    return t->src_pitch >= t->in_w * *bpp &&
+           t->dst_pitch >= t->out_w * *bpp ? 0 : -1;
+}
+
 int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
                                     const rsx_nir_pipeline* st,
                                     const rsx_nir_transfer* t,
@@ -3535,11 +3568,13 @@ int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
                                t->dst_offset, (u32)bytes) ? 0 : -1;
     }
     case RSX_NIR_XFER_SCALED: {
-        if (t->ds_dx != 0x00100000u || t->dt_dy != 0x00100000u ||
-            t->src_format != t->dst_format || !t->out_w || !t->out_h)
+        u32 bpp = 0;
+        if (nrb_scaled_copy_layout(t, &bpp) != 0)
             return -1;
-        const u64 src_size = (u64)t->in_h * t->src_pitch;
-        const u64 dst_size = (u64)(t->out_y + t->out_h) * t->dst_pitch;
+        const u64 row_bytes = (u64)t->out_w * bpp;
+        const u64 src_size = (u64)(t->in_h - 1u) * t->src_pitch + row_bytes;
+        const u64 dst_size =
+            (u64)(t->out_h - 1u) * t->dst_pitch + row_bytes;
         if (src_size > UINT32_MAX || dst_size > UINT32_MAX ||
             !b->guest_ptr(b->guest_user, t->src_location, t->src_offset,
                           (u32)src_size) ||
@@ -4168,35 +4203,34 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
         break;
     }
     case RSX_NIR_XFER_SCALED: {
-        /* 1:1 raw copy only (ds_dx/dt_dy == 1.0 in 11.20); real scaling
-         * and format conversion stay on the fallback path for now */
-        if (t->ds_dx != 0x00100000u || t->dt_dy != 0x00100000u ||
-            t->src_format != t->dst_format) {
+        /* Exact 1:1 representation-compatible copy. Scaling, clipping and
+         * true format conversion remain explicit refusals. */
+        u32 bpp = 0;
+        if (nrb_scaled_copy_layout(t, &bpp) != 0) {
             b->stats.unsupported_transfers++;
             return -1;
         }
-        const u32 bpp = 4;
+        const u32 row_bytes = t->out_w * bpp;
+        const u32 src_size = (t->in_h - 1u) * t->src_pitch + row_bytes;
+        const u32 dst_size = (t->out_h - 1u) * t->dst_pitch + row_bytes;
         const u8* src = b->guest_ptr(b->guest_user, t->src_location,
-                                     t->src_offset,
-                                     t->in_h * t->src_pitch);
+                                     t->src_offset, src_size);
         u8* dst = b->writable_ptr(b->guest_user, t->dst_location,
-                                  t->dst_offset,
-                                  (t->out_y + t->out_h) * t->dst_pitch);
-        if (!src || !dst || !t->out_w || !t->out_h) {
+                                  t->dst_offset, dst_size);
+        if (!src || !dst) {
             b->stats.unsupported_transfers++;
             return -1;
         }
-        const u32 copy_w = t->out_w < t->in_w ? t->out_w : t->in_w;
-        for (u32 y = 0; y < t->out_h && y < t->in_h; y++) {
-            memmove(dst + (size_t)(t->out_y + y) * t->dst_pitch +
-                        (size_t)t->out_x * bpp,
-                    src + (size_t)y * t->src_pitch,
-                    (size_t)copy_w * bpp);
+        const int reverse = t->src_location == t->dst_location &&
+            t->dst_offset > t->src_offset &&
+            t->dst_offset < t->src_offset + src_size;
+        for (u32 row = 0; row < t->out_h; ++row) {
+            const u32 y = reverse ? t->out_h - 1u - row : row;
+            memmove(dst + (size_t)y * t->dst_pitch,
+                    src + (size_t)y * t->src_pitch, row_bytes);
             nrb_publish_guest_write(
                 b, t->dst_location,
-                t->dst_offset + (t->out_y + y) * t->dst_pitch +
-                    t->out_x * bpp,
-                copy_w * bpp);
+                t->dst_offset + y * t->dst_pitch, row_bytes);
         }
         break;
     }
@@ -4903,6 +4937,35 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     return 0;
 }
 
+int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
+                         u32* space, u32* offset, u32* format,
+                         u32* width, u32* height)
+{
+    if (!b)
+        return -1;
+    for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+        const nrb_rt* const rt = &b->rts[i];
+        if (!rt->live)
+            continue;
+        if (ordinal) {
+            --ordinal;
+            continue;
+        }
+        if (space)
+            *space = rt->space;
+        if (offset)
+            *offset = rt->offset;
+        if (format)
+            *format = rt->fmt;
+        if (width)
+            *width = rt->w;
+        if (height)
+            *height = rt->h;
+        return 0;
+    }
+    return -1;
+}
+
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out)
 {
     *out = b->stats;
@@ -5009,6 +5072,14 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)
 {
     (void)b; (void)space; (void)offset; (void)w; (void)h; (void)out;
+    return -1;
+}
+int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
+                         u32* space, u32* offset, u32* format,
+                         u32* width, u32* height)
+{
+    (void)b; (void)ordinal; (void)space; (void)offset; (void)format;
+    (void)width; (void)height;
     return -1;
 }
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out)
