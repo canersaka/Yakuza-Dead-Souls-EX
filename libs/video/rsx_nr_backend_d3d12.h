@@ -55,7 +55,8 @@ typedef int (*rsx_nr_d3d12_watch_page_fn)(void* user, u32 space,
                                           u32 page_offset);
 typedef int (*rsx_nr_d3d12_borrow_color_fn)(
     void* user, u32 space, u32 offset, u32 width, u32 height,
-    void** resource, u32* dxgi_format);
+    int create, void** resource, u32* dxgi_format,
+    u32* resource_width, u32* resource_height);
 typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
     void* user, u32 space, u32 offset, u32 depth_format,
     u32 width, u32 height, int create, void** resource, u32* resource_format,
@@ -123,6 +124,7 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long residency_failures;
     unsigned long long mirror_resyncs;
     unsigned long long mirror_rollovers;
+    unsigned long long upload_rollovers;  /* safe pre-draw arena retires   */
     unsigned long long shared_timeline_acquires;
     unsigned long long shared_timeline_generations;
     unsigned long long shared_timeline_forced_submissions;

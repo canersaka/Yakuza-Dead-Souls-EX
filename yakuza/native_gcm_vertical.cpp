@@ -693,10 +693,13 @@ static void yz_nr_gpu_flush(void*)
 
 static int yz_nr_borrow_color(void*, uint32_t space, uint32_t offset,
                               uint32_t width, uint32_t height,
-                              void** resource, uint32_t* format)
+                              int create, void** resource, uint32_t* format,
+                              uint32_t* resource_width,
+                              uint32_t* resource_height)
 {
     return rsx_live_draw_borrow_color(
-        space, offset, width, height, resource, format);
+        space, offset, width, height, create, resource, format,
+        resource_width, resource_height);
 }
 
 static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
@@ -2892,9 +2895,7 @@ static uint32_t yz_nr_section_program_preflight(void)
             const rsx_nir_texture* const texture = &state.textures[unit];
             if (rsx_nr_yz_unproven_shadow_depth_consumer(
                     texture->enabled, texture->location, texture->offset,
-                    texture->format) &&
-                rsx_nr_d3d12_validate_depth_sample_alias(
-                    g_active.d3d12, texture) != 0) {
+                    texture->format)) {
                 g_active.section_shadow_consumer_fallback++;
                 return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             }
@@ -2998,9 +2999,7 @@ static uint32_t yz_nr_section_preflight(void)
                 const rsx_nir_texture* const texture = &state.textures[unit];
                 if (rsx_nr_yz_unproven_shadow_depth_consumer(
                         texture->enabled, texture->location, texture->offset,
-                        texture->format) &&
-                    rsx_nr_d3d12_validate_depth_sample_alias(
-                        g_active.d3d12, texture) != 0)
+                        texture->format))
                     return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             }
             const uint32_t* const batches = rsx_nir_side(
@@ -4016,7 +4015,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
                     "clears=%llu "
                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
-                    "residency-fail=%llu mirror=%llu/%llu pso=%llu/%llu "
+                    "residency-fail=%llu mirror=%llu/%llu upload-rollover=%llu "
+                    "pso=%llu/%llu "
                     "rt=%llu/%llu depth=%llu/%llu "
                     "timeline=%d/%llu/%llu/%llu]\n",
                     d3d_stats.draws,
@@ -4032,6 +4032,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.residency_failures,
                     d3d_stats.mirror_resyncs,
                     d3d_stats.mirror_rollovers,
+                    d3d_stats.upload_rollovers,
                     d3d_stats.pso_hits, d3d_stats.pso_builds,
                     d3d_stats.rt_builds, d3d_stats.rt_refreshes,
                     d3d_stats.depth_builds, d3d_stats.depth_refreshes,

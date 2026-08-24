@@ -59,6 +59,7 @@ static int g_render_condition_fail;
 #define RT_OFFSET  0x00300000u   /* outside the arena on purpose: the RT  */
 #define RT565_OFFSET 0x00310000u
 #define ZETA_OFFSET  0x00320000u
+#define COLOR_ALIAS_OFFSET 0x00410000u /* outside the guest arena          */
 #define RT_W 64u                 /* is a GPU object keyed by (space,ofs)  */
 #define RT_H 64u
 #define VTX_OFFSET 0x2000u
@@ -266,6 +267,25 @@ static void stage_rt565_texture0(rsx_nir_emitter* em)
     texture.width = RT_W;
     texture.height = RT_H;
     texture.pitch = RT_W * 2u;
+    texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
+static void stage_external_color_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = COLOR_ALIAS_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xA5u;          /* LINEAR | A8R8G8B8                */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = RT_W;
+    texture.height = RT_H;
+    texture.pitch = RT_W * 4u;
     texture.wrap = 0x00030303u;
     texture.remap = 0xAAE4u;
     texture.filter = (1u << 16) | (1u << 24);
@@ -648,6 +668,13 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                          c->consts, c->const_words);
 
     u32 rt_space = 0, rt_offset = 0, rt_w = 0, rt_h = 0;
+    u32 completed_draws = 0;
+    u32 stop_after_draw = 0;
+    {
+        const char* const stop = getenv("YZ_NR_CAPTURE_STOP_AFTER_DRAW");
+        if (stop && stop[0])
+            stop_after_draw = (u32)strtoul(stop, NULL, 0);
+    }
     int ring_fault = 0;
     for (u32 i = 0; i < c->n_records; i++) {
         u32 m = c->records[i * 2];
@@ -660,6 +687,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             continue;
         }
         rsx_nir_adapter_method(ad, m, a);
+        if (m == 0x1808u && a == 0u)
+            completed_draws++;
         if (rsx_nr_ring_reject_sticky(&ring)) {
             ring_fault = 1;
             break;
@@ -677,6 +706,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             rt_w = be.st.surface.clip_w;
             rt_h = be.st.surface.clip_h;
         }
+        if (stop_after_draw && completed_draws >= stop_after_draw)
+            break;
     }
     rsx_nir_adapter_finish(ad);
     while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
@@ -772,8 +803,11 @@ static void run_capture_backend(const char* path)
 
 typedef struct broker_color_test {
     ID3D12Resource* resource;
+    ID3D12Resource* color_alias;
     ID3D12Resource* depth;
     u32 calls;
+    u32 color_lookup_calls;
+    u32 color_create_calls;
     u32 depth_calls;
     u32 depth_lookup_calls;
     u32 depth_create_calls;
@@ -783,15 +817,28 @@ typedef struct broker_color_test {
 
 static int borrow_rgba_for_logical_565(
     void* user, u32 space, u32 offset, u32 width, u32 height,
-    void** resource, u32* dxgi_format)
+    int create, void** resource, u32* dxgi_format,
+    u32* resource_width, u32* resource_height)
 {
     broker_color_test* broker = (broker_color_test*)user;
-    if (!broker || !broker->resource || !resource || !dxgi_format || space ||
-        offset != RT565_OFFSET || width != RT_W || height != RT_H)
+    if (!broker || !resource || !dxgi_format || !resource_width ||
+        !resource_height || space || width != RT_W || height != RT_H)
         return -1;
-    broker->resource->lpVtbl->AddRef(broker->resource);
-    *resource = broker->resource;
+    ID3D12Resource* selected = NULL;
+    if (offset == RT565_OFFSET && create) {
+        selected = broker->resource;
+        broker->color_create_calls++;
+    } else if (offset == COLOR_ALIAS_OFFSET && !create) {
+        selected = broker->color_alias;
+        broker->color_lookup_calls++;
+    }
+    if (!selected)
+        return -1;
+    selected->lpVtbl->AddRef(selected);
+    *resource = selected;
     *dxgi_format = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
+    *resource_width = RT_W;
+    *resource_height = RT_H;
     broker->calls++;
     return 0;
 }
@@ -847,6 +894,7 @@ static void test_broker_actual_color_format(void)
     IDXGIAdapter* adapter = NULL;
     ID3D12Device* device = NULL;
     ID3D12Resource* resource = NULL;
+    ID3D12Resource* color_alias_resource = NULL;
     ID3D12Resource* depth_resource = NULL;
     rsx_nr_d3d12* sink = NULL;
     rsx_nr_ring ring;
@@ -886,6 +934,15 @@ static void test_broker_actual_color_format(void)
     if (FAILED(hr) || !resource)
         goto done;
 
+    hr = device->lpVtbl->CreateCommittedResource(
+        device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource,
+        (void**)&color_alias_resource);
+    CHECK(SUCCEEDED(hr) && color_alias_resource,
+          "could not create established-only color alias resource");
+    if (FAILED(hr) || !color_alias_resource)
+        goto done;
+
     rd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE depth_clear = {0};
@@ -906,9 +963,11 @@ static void test_broker_actual_color_format(void)
     if (!sink)
         goto done;
 
-    broker_color_test broker = {
-        resource, depth_resource, 0u, 0u, 0u, 0u, 0u, 0
-    };
+    broker_color_test broker;
+    memset(&broker, 0, sizeof(broker));
+    broker.resource = resource;
+    broker.color_alias = color_alias_resource;
+    broker.depth = depth_resource;
     rsx_nr_d3d12_set_resource_broker(
         sink, borrow_rgba_for_logical_565, borrow_depth_for_alias_test,
         resolve_depth_for_alias_test, &broker);
@@ -1012,6 +1071,32 @@ static void test_broker_actual_color_format(void)
     CHECK(pix_is(2u, 61u, 0xFFu, 0x00u, 0xFFu),
           "broker RGBA target did not execute the logical-565 draw");
 
+    /* An established-only color producer may first appear to native code as
+     * a sampled dependency. COLOR_ALIAS_OFFSET is outside guest memory and
+     * has never been a native target, so successful preflight/execution
+     * proves an exact lookup-only broker import rather than stale guest
+     * decoding or target creation. Pixel content is intentionally not an
+     * oracle here; the resource is opaque established-renderer output. */
+    write_tex_fp();
+    stage_frame_state(&em);
+    rsx_nir_em_surface(&em, &s565);
+    stage_external_color_texture0(&em);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "established-only color alias draw had %llu execution errors",
+          be.stats.exec_errors);
+    CHECK(broker.color_lookup_calls == 1u,
+          "color dependency import lookup count=%u",
+          broker.color_lookup_calls);
+    CHECK(broker.color_create_calls >= 1u,
+          "native target broker create was not exercised");
+
     /* The live renderer keeps depth maps as shared typeless D3D resources.
      * A later color pass may sample a non-current one directly on the shared
      * ordered list. This must not fall back to stale guest bytes merely
@@ -1108,6 +1193,8 @@ done:
         rsx_nr_d3d12_destroy(sink);
     if (resource)
         resource->lpVtbl->Release(resource);
+    if (color_alias_resource)
+        color_alias_resource->lpVtbl->Release(color_alias_resource);
     if (depth_resource)
         depth_resource->lpVtbl->Release(depth_resource);
     if (device)
@@ -1729,6 +1816,45 @@ int main(int argc, char** argv)
               g_watched_pages[0], g_last_watched_offset[0]);
     }
 
+    /* One RSX BEGIN/END can contain several DRAW_INDEX_ARRAY methods. A
+     * triangle strip continues across those batch boundaries; only an
+     * explicit restart index cuts it. The first two indices are deliberately
+     * in batch 0 and their completing third index is in batch 1, followed by
+     * a restart and a second triangle. Issuing one host draw per batch loses
+     * the first triangle and was the live multi-batch shadow-pass defect. */
+    {
+        u8* indices = g_main + IDX_OFFSET;
+        const u16 values[7] = {0u, 1u, 2u, 0xFFFFu, 0u, 2u, 3u};
+        for (u32 i = 0; i < 7u; ++i) {
+            indices[i * 2u] = (u8)(values[i] >> 8);
+            indices[i * 2u + 1u] = (u8)values[i];
+        }
+        rsx_guest_pages_note_write(
+            rsx_nr_d3d12_pages(sink), 1, IDX_OFFSET, 14u);
+        stage_frame_state(&em);
+        stage_vertex_bindings(&em, 0u);
+        rsx_nir_index_binding split_ib;
+        memset(&split_ib, 0, sizeof(split_ib));
+        split_ib.offset = IDX_OFFSET;
+        split_ib.location = RSX_NIR_LOCATION_MAIN;
+        split_ib.restart_enable = 1u;
+        split_ib.restart_index = 0xFFFFu;
+        rsx_nir_em_index_binding(&em, &split_ib);
+        rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+        write_quad(rsx_nr_d3d12_pages(sink));
+        const u32 split_strip_batches[4] = {0u, 2u, 2u, 5u};
+        rsx_nir_em_draw(&em, 6, 1, split_strip_batches, 2);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(be.stats.exec_errors == 0,
+              "split triangle-strip draw faulted");
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "split triangle-strip RT readback failed");
+        CHECK(pix_is(61u, 61u, 0xFF, 0x00, 0xFF) &&
+                  pix_is(2u, 2u, 0xFF, 0x00, 0xFF),
+              "split triangle-strip did not preserve batch/restart semantics");
+    }
+
     /* The legacy renderer deliberately leaves D3D depth clipping disabled.
      * Fullscreen and post-process programs can therefore write clip-space Z
      * outside [0,w] when depth testing is disabled.  Native rendering must
@@ -2307,12 +2433,37 @@ int main(int argc, char** argv)
               pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     }
 
+    /* ---- bounded upload-arena rollover -------------------------------
+     * One admitted live section can exceed the 32-MiB upload arena even
+     * though every draw fits individually.  Retire an ordered prefix before
+     * the first draw that would overflow, then continue without fallback. */
+    {
+        rsx_nr_d3d12_stats before_rollover, after_rollover;
+        rsx_nr_d3d12_get_stats(sink, &before_rollover);
+        for (u32 i = 0; i < 4096u; ++i) {
+            rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+            rsx_nr_backend_run(&be, 0);
+        }
+        rsx_nr_d3d12_get_stats(sink, &after_rollover);
+        CHECK(be.stats.exec_errors == 2,
+              "upload rollover introduced exec error (%llu)",
+              be.stats.exec_errors);
+        CHECK(after_rollover.draws == before_rollover.draws + 4096u,
+              "upload rollover lost draws (%llu/%llu)",
+              after_rollover.draws, before_rollover.draws);
+        CHECK(after_rollover.upload_rollovers >
+                  before_rollover.upload_rollovers &&
+              after_rollover.queue_submissions >
+                  before_rollover.queue_submissions,
+              "long section did not retire its full upload arena");
+    }
+
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 23 && st.draws == 538 && st.presents == 21,
+    CHECK(st.clears == 24 && st.draws == 4635 && st.presents == 21,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,

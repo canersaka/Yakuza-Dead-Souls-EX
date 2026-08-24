@@ -377,6 +377,27 @@ static u8* nrb_upload_alloc(rsx_nr_d3d12* b, u32 size, u64* gpu_va)
     return p;
 }
 
+static u64 nrb_upload_aligned_size(u64 size)
+{
+    return (size + 255u) & ~255ull;
+}
+
+/* A transactionally admitted section may contain thousands of draws.  The
+ * upload arena is fence-gated, so retire only the already-recorded ordered
+ * prefix before starting a draw that cannot fit.  At this point the current
+ * draw has recorded no render, descriptor, or target side effects. */
+static int nrb_ensure_draw_upload_capacity(rsx_nr_d3d12* b, u64 budget)
+{
+    if (budget > NRB_UPLOAD_BYTES)
+        return -1;
+    if ((u64)b->upload_used + budget <= NRB_UPLOAD_BYTES)
+        return 0;
+    if (nrb_exec_wait(b) || nrb_open_list(b))
+        return -1;
+    b->stats.upload_rollovers++;
+    return (u64)b->upload_used + budget <= NRB_UPLOAD_BYTES ? 0 : -1;
+}
+
 static ID3D12Resource* nrb_make_buffer(ID3D12Device* dev, u64 size,
                                        D3D12_HEAP_TYPE heap,
                                        D3D12_RESOURCE_STATES state)
@@ -426,7 +447,7 @@ static int nrb_color_rtv_dxgi_ok(DXGI_FORMAT fmt)
 }
 
 static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
-                          u32 w, u32 h, int create)
+                          u32 w, u32 h, int create, int broker_create)
 {
     const DXGI_FORMAT logical_dxgi = nrb_color_dxgi(b, fmt);
     DXGI_FORMAT color_dxgi = logical_dxgi;
@@ -436,9 +457,13 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
     ID3D12Resource* borrowed = NULL;
     if (create && b->borrow_color) {
         u32 borrowed_format = 0;
+        u32 borrowed_width = 0;
+        u32 borrowed_height = 0;
         if (b->borrow_color(
-                b->broker_user, space, offset, w, h, (void**)&borrowed,
-                &borrowed_format) != 0 || !borrowed ||
+                b->broker_user, space, offset, w, h, broker_create,
+                (void**)&borrowed, &borrowed_format,
+                &borrowed_width, &borrowed_height) != 0 || !borrowed ||
+            !borrowed_width || !borrowed_height ||
             !nrb_color_rtv_dxgi_ok((DXGI_FORMAT)borrowed_format)) {
             if (borrowed)
                 borrowed->lpVtbl->Release(borrowed);
@@ -452,17 +477,25 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
          * than silently trusting a stale registry entry. */
         D3D12_RESOURCE_DESC borrowed_desc;
         borrowed->lpVtbl->GetDesc(borrowed, &borrowed_desc);
-        if ((u32)borrowed_desc.Format != borrowed_format) {
+        if ((u32)borrowed_desc.Format != borrowed_format ||
+            borrowed_desc.Width != borrowed_width ||
+            borrowed_desc.Height != borrowed_height) {
             borrowed->lpVtbl->Release(borrowed);
             return NULL;
         }
         color_dxgi = (DXGI_FORMAT)borrowed_format;
+        w = borrowed_width;
+        h = borrowed_height;
     }
 
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
         nrb_rt* rt = &b->rts[i];
+        const int exact_private_identity =
+            rt->fmt == fmt && rt->w == w && rt->h == h;
+        const int exact_live_identity =
+            borrowed && rt->external;
         if (rt->live && rt->space == space && rt->offset == offset &&
-            rt->fmt == fmt && rt->w == w && rt->h == h) {
+            (exact_private_identity || exact_live_identity)) {
             if (borrowed) {
                 if (borrowed == rt->tex) {
                     if (color_dxgi != rt->dxgi) {
@@ -493,6 +526,15 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
                         b->dev, rt->tex, NULL, rtv);
                     b->stats.rt_refreshes++;
                 }
+            }
+            if (rt->external) {
+                /* The established registry owns color identity by guest
+                 * address. Keep one native state tracker for that resource,
+                 * even when later texture/target declarations use a
+                 * different logical format or view size. */
+                rt->fmt = fmt;
+                rt->w = w;
+                rt->h = h;
             }
             return rt;
         }
@@ -582,7 +624,7 @@ static nrb_rt* nrb_rt_from_state(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
     u32 w = s->clip_w ? s->clip_w : 1280;
     u32 h = s->clip_h ? s->clip_h : 720;
     return nrb_get_rt(b, s->color_location[0], s->color_offset[0],
-                      s->color_format, w, h, create);
+                      s->color_format, w, h, create, create);
 }
 
 static int nrb_depth_formats(u32 fmt, DXGI_FORMAT* resource,
@@ -1057,7 +1099,8 @@ static int nrb_topology(u32 prim, D3D12_PRIMITIVE_TOPOLOGY* topo,
 
 static int nrb_needs_expansion(u32 primitive)
 {
-    return primitive == 3u || primitive == 7u || primitive == 8u ||
+    return primitive == 3u || primitive == 6u || primitive == 7u ||
+           primitive == 8u ||
            primitive == 9u || primitive == 10u;
 }
 
@@ -1069,6 +1112,46 @@ typedef struct nrb_fp_info {
     u64 structural_hash;
     rsx_fp_constant_block constants;
 } nrb_fp_info;
+
+/* Complete worst-case bump-arena footprint of one draw.  Constants are per
+ * action, pull constants are per emitted D3D draw, and host-expanded indices
+ * conservatively reserve three output indices per source element. */
+static u64 nrb_draw_upload_budget(const rsx_nir_pipeline* st,
+                                  const nrb_fp_info* fp,
+                                  const rsx_nir_draw* draw,
+                                  const u32* batches)
+{
+    const int expand = nrb_needs_expansion(draw->primitive);
+    const int host_indices = expand ||
+        (draw->indexed && st->index_binding.restart_enable);
+    const int combine_strip = draw->primitive == 6u;
+    const u32 output_batches = combine_strip ? 1u : draw->batch_count;
+    u64 bytes = nrb_upload_aligned_size(
+        sizeof(st->constants) + 12u * sizeof(float));
+    const u32 fp_slots = fp->constants.count ? fp->constants.count : 1u;
+    bytes += nrb_upload_aligned_size((u64)(fp_slots + 1u) * 16u);
+    bytes += (u64)output_batches *
+             nrb_upload_aligned_size(sizeof(rsx_vertex_pull_constants));
+
+    if (host_indices) {
+        if (combine_strip) {
+            u64 source_count = 0;
+            for (u32 bi = 0; bi < draw->batch_count; ++bi)
+                source_count += batches[bi * 2u + 1u];
+            if (source_count > 0x55555555u)
+                return UINT64_MAX;
+            bytes += nrb_upload_aligned_size(
+                (source_count * 3u + 2u) * sizeof(u32));
+        } else {
+            for (u32 bi = 0; bi < draw->batch_count; ++bi) {
+                const u64 count = batches[bi * 2u + 1u];
+                const u64 worst = expand ? count * 3u + 2u : count;
+                bytes += nrb_upload_aligned_size(worst * sizeof(u32));
+            }
+        }
+    }
+    return bytes;
+}
 
 /* Validate the exact subset translated by rsx_fp_decompiler before a draw
  * can become native-owned.  The decompiler deliberately emits comments for
@@ -1940,10 +2023,11 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
         (!live_identity && (texture->mipmaps > 1u ||
          (format != NRB_TEX_A8R8G8B8 && format != NRB_TEX_R5G6B5))))
         return NULL;
+    nrb_rt* rt = NULL;
     for (u32 i = 0; i < NRB_MAX_RTS; i++) {
-        nrb_rt* rt = &b->rts[i];
-        if (!rt->live || rt->space != texture->location ||
-            rt->offset != texture->offset)
+        nrb_rt* const candidate = &b->rts[i];
+        if (!candidate->live || candidate->space != texture->location ||
+            candidate->offset != texture->offset)
             continue;
         /* Live RSX surfaces are persistent GPU memory identities. The title
          * routinely samples one through a differently declared texture view;
@@ -1951,34 +2035,49 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
          * repeating the producer's dimensions. Offline/private resources keep
          * the stricter byte-layout equivalence rule. */
         if (!live_identity &&
-            (rt->w != texture->width || rt->h != texture->height))
+            (candidate->w != texture->width ||
+             candidate->h != texture->height))
             continue;
         if (!live_identity &&
-            ((format == NRB_TEX_R5G6B5 && rt->fmt != 3u) ||
+            ((format == NRB_TEX_R5G6B5 && candidate->fmt != 3u) ||
             (format == NRB_TEX_A8R8G8B8 &&
-             rt->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM)))
+             candidate->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM)))
             continue;
-        if (rt == draw_rt)
-            return rt;              /* input/output alias: must refuse    */
-        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
-        desc.Format = rt->dxgi;
-        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        /* The live renderer's SRV_SURFACE table exposes rendered targets in
-         * their native component order; texture remap applies when decoding
-         * guest texels, not when rebinding that already-rendered GPU image.
-         * Reapplying it here turned post-process RGB into forced/alpha
-         * channels (dark scene with an exaggerated bright border). */
-        desc.Shader4ComponentMapping =
-            live_identity || (texture->remap & 0xFFFFu) == 0xAAE4u
-            ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-            : nrb_component_mapping(texture->remap & 0xFFFFu);
-        desc.Texture2D.MipLevels = 1;
-        b->dev->lpVtbl->CreateShaderResourceView(
-            b->dev, rt->tex, &desc,
-            nrb_texture_cpu_handle(b, NRB_TEX_CAP + 1u + unit));
-        return rt;
+        rt = candidate;
+        break;
     }
-    return NULL;
+    if (!rt && live_identity) {
+        /* A complete producer pass may have stayed wholly established. Its
+         * first native appearance is then a sampled color dependency, not a
+         * native target. Import the existing address identity lookup-only;
+         * the broker is forbidden from creating or resizing it. */
+        const u32 surface_format =
+            format == NRB_TEX_R5G6B5 ? 3u : 8u;
+        rt = nrb_get_rt(
+            b, texture->location, texture->offset, surface_format,
+            texture->width, texture->height, 1, 0);
+    }
+    if (!rt)
+        return NULL;
+    if (rt == draw_rt)
+        return rt;                  /* input/output alias: must refuse    */
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+    desc.Format = rt->dxgi;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    /* The live renderer's SRV_SURFACE table exposes rendered targets in
+     * their native component order; texture remap applies when decoding
+     * guest texels, not when rebinding that already-rendered GPU image.
+     * Reapplying it here turned post-process RGB into forced/alpha
+     * channels (dark scene with an exaggerated bright border). */
+    desc.Shader4ComponentMapping =
+        live_identity || (texture->remap & 0xFFFFu) == 0xAAE4u
+        ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        : nrb_component_mapping(texture->remap & 0xFFFFu);
+    desc.Texture2D.MipLevels = 1;
+    b->dev->lpVtbl->CreateShaderResourceView(
+        b->dev, rt->tex, &desc,
+        nrb_texture_cpu_handle(b, NRB_TEX_CAP + 1u + unit));
+    return rt;
 }
 
 static nrb_depth* nrb_texture_depth_alias(
@@ -3019,6 +3118,88 @@ static u32 nrb_expand_primitives(rsx_nr_d3d12* b,
     return out_count;
 }
 
+/* A BEGIN/END may contain many DRAW_INDEX_ARRAY/DRAW_ARRAYS methods.  RSX
+ * triangle strips continue across those method boundaries; only an explicit
+ * restart index cuts the strip.  The established renderer concatenates the
+ * batches before expanding them.  Recording one D3D draw per batch silently
+ * restarted the strip and corrupted the high-batch shadow-consumer passes.
+ * Expand the complete action into one triangle list with the established
+ * alternating winding so native and legacy ownership are interchangeable. */
+static u32 nrb_expand_triangle_strip_batches(
+    rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+    const rsx_nir_draw* draw, const u32* batches)
+{
+    u64 source_count = 0;
+    for (u32 batch = 0; batch < draw->batch_count; ++batch)
+        source_count += batches[batch * 2u + 1u];
+    if (source_count > 0x55555555u ||
+        nrb_ensure_index_scratch(b, (u32)source_count * 3u + 2u) != 0)
+        return ~0u;
+
+    const u32 element_size = st->index_binding.is_u32 ? 4u : 2u;
+    const int restart_enabled =
+        draw->indexed && st->index_binding.restart_enable;
+    const u32 restart = st->index_binding.restart_index;
+    u32 previous2 = 0, previous1 = 0;
+    u32 group_count = 0, out_count = 0;
+
+    for (u32 batch = 0; batch < draw->batch_count; ++batch) {
+        const u32 first = batches[batch * 2u];
+        const u32 count = batches[batch * 2u + 1u];
+        const u8* source = NULL;
+        if (draw->indexed && count) {
+            const u64 byte_offset =
+                (u64)st->index_binding.offset + (u64)first * element_size;
+            const u64 byte_count = (u64)count * element_size;
+            if (byte_offset > UINT32_MAX || byte_count > UINT32_MAX ||
+                byte_offset + byte_count > 0x100000000ull)
+                return ~0u;
+            source = b->guest_ptr(
+                b->guest_user, st->index_binding.location,
+                (u32)byte_offset, (u32)byte_count);
+            if (!source)
+                return ~0u;
+        }
+
+        for (u32 i = 0; i < count; ++i) {
+            u32 value = first + i;
+            if (source) {
+                if (element_size == 4u)
+                    value = ((u32)source[i * 4u] << 24) |
+                            ((u32)source[i * 4u + 1u] << 16) |
+                            ((u32)source[i * 4u + 2u] << 8) |
+                            (u32)source[i * 4u + 3u];
+                else
+                    value = ((u32)source[i * 2u] << 8) |
+                            (u32)source[i * 2u + 1u];
+            }
+            if (restart_enabled && value == restart) {
+                group_count = 0;
+                continue;
+            }
+            if (group_count == 0u) {
+                previous2 = value;
+            } else if (group_count == 1u) {
+                previous1 = value;
+            } else {
+                const u32 triangle = group_count - 2u;
+                if (triangle & 1u) {
+                    b->idx_scratch[out_count++] = previous1;
+                    b->idx_scratch[out_count++] = previous2;
+                } else {
+                    b->idx_scratch[out_count++] = previous2;
+                    b->idx_scratch[out_count++] = previous1;
+                }
+                b->idx_scratch[out_count++] = value;
+                previous2 = previous1;
+                previous1 = value;
+            }
+            group_count++;
+        }
+    }
+    return out_count;
+}
+
 static int nrb_guest_texture_preflight(rsx_nr_d3d12* b,
                                        const rsx_nir_texture* texture)
 {
@@ -3268,13 +3449,10 @@ int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
     if (nrb_stabilize_required_spans(
             b, required, required_count) != 0)
         return -RSX_NR_DRAW_PF_RESIDENCY;
-    for (u32 bi = 0; bi < d->batch_count; ++bi) {
-        const u32 count = batches[bi * 2u + 1u];
-        const u64 worst_indices = expand ? (u64)count * 3u + 2u : count;
-        if ((expand || filter_restart) &&
-            worst_indices * sizeof(u32) > NRB_UPLOAD_BYTES)
-            return -RSX_NR_DRAW_PF_UPLOAD_SCRATCH;
-    }
+    (void)expand;
+    (void)filter_restart;
+    if (nrb_draw_upload_budget(st, &fp, d, batches) > NRB_UPLOAD_BYTES)
+        return -RSX_NR_DRAW_PF_UPLOAD_SCRATCH;
     return 0;
 }
 
@@ -3389,6 +3567,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     }
     const int strips = d->primitive == 4 || d->primitive == 6;
     const int expand_primitive = nrb_needs_expansion(d->primitive);
+    const int combine_triangle_strip = d->primitive == 6u;
     const int filter_restart =
         d->indexed && st->index_binding.restart_enable;
     const int use_host_ib = expand_primitive || filter_restart;
@@ -3397,6 +3576,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b->stats.unsup_draw_index++;
         return -1;
     }
+    if (combine_triangle_strip)
+        topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     nrb_rt* rt = nrb_rt_from_state(b, st, 1);
     if (!rt) {
         b->stats.unsupported_draws++;
@@ -3494,6 +3675,13 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    const u64 upload_budget = nrb_draw_upload_budget(st, &fp, d, batches);
+    if (nrb_ensure_draw_upload_capacity(b, upload_budget) != 0) {
+        b->stats.unsupported_draws++;
+        b->stats.unsup_draw_index++;
+        return -1;
+    }
+
     nrb_required_span required[NRB_MAX_REQUIRED_SPANS];
     u32 required_count = 0;
     const int residency = nrb_prepare_draw_residency(
@@ -3538,6 +3726,44 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    /* A newly uploaded texture can consume the headroom reserved above.
+     * Retire its side-effect-free preparation, then rebuild the now-cached
+     * descriptor table on a fresh list before allocating this draw. */
+    if ((u64)b->upload_used + upload_budget > NRB_UPLOAD_BYTES) {
+        nrb_restore_texture_aliases(
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
+        if (nrb_exec_wait(b) || nrb_open_list(b)) {
+            b->stats.unsupported_draws++;
+            b->stats.unsup_draw_texture++;
+            b->stats.texture_failures++;
+            return -1;
+        }
+        b->stats.upload_rollovers++;
+        memset(texture_aliases, 0, sizeof(texture_aliases));
+        memset(texture_depth_aliases, 0, sizeof(texture_depth_aliases));
+        memset(vtex_aliases, 0, sizeof(vtex_aliases));
+        memset(vtex_depth_aliases, 0, sizeof(vtex_depth_aliases));
+        resolved_cube_mask = 0;
+        descriptor_table_index = 0;
+        if (nrb_prepare_textures(
+                b, st, fp.texture_mask, vtex_mask, rt, depth,
+                texture_aliases, texture_depth_aliases,
+                vtex_aliases, vtex_depth_aliases,
+                &resolved_cube_mask, &descriptor_table_index) != 0 ||
+            resolved_cube_mask != cube_mask ||
+            (u64)b->upload_used + upload_budget > NRB_UPLOAD_BYTES) {
+            nrb_restore_texture_aliases(
+                b, texture_aliases, texture_depth_aliases,
+                vtex_aliases, vtex_depth_aliases);
+            nrb_exec_wait(b);
+            b->stats.unsupported_draws++;
+            b->stats.unsup_draw_texture++;
+            b->stats.texture_failures++;
+            return -1;
+        }
+    }
+
     /* Refusal-safe reservation: finish every host index read/expansion and
      * every upload-ring allocation before binding a target or recording the
      * first draw. In particular, an unreadable later batch can no longer
@@ -3549,16 +3775,20 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                            : RSX_PULL_SOURCE_ARRAYS;
     int prepare_failed = 0;
     int prepare_index_failed = 0;
+    const u32 prepared_batch_count = combine_triangle_strip
+        ? 1u : d->batch_count;
     memset(b->prepared_batches, 0,
-           d->batch_count * sizeof(b->prepared_batches[0]));
-    for (u32 bi = 0; bi < d->batch_count; ++bi) {
+           prepared_batch_count * sizeof(b->prepared_batches[0]));
+    for (u32 bi = 0; bi < prepared_batch_count; ++bi) {
         const u32 first = batches[bi * 2u];
         const u32 count = batches[bi * 2u + 1u];
         nrb_prepared_batch* prepared = &b->prepared_batches[bi];
         prepared->draw_count = count;
 
         if (use_host_ib) {
-            const u32 n = expand_primitive
+            const u32 n = combine_triangle_strip
+                ? nrb_expand_triangle_strip_batches(b, st, d, batches)
+                : expand_primitive
                 ? nrb_expand_primitives(b, st, d, first, count)
                 : nrb_read_indices(b, st, first, count, strips);
             if (n == ~0u) {
@@ -3752,13 +3982,12 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             b->list, 3, rm->lpVtbl->GetGPUVirtualAddress(rm));
 
     /* Restart draws and non-native RSX primitive shapes go through a
-     * host-built u32 index buffer. Restart strips use D3D12's cut sentinel;
-     * list shapes drop cuts, while loops/fans/quads are expanded exactly. The
-     * shader then runs the ARRAYS source with first = 0, so SV_VertexID
-     * IS the fetched index and base_index still applies in-shader —
-     * exactly the pull module's documented host-index integration. All
-     * other draws use the in-shader guest index fetch. */
-    for (u32 bi = 0; bi < d->batch_count; bi++) {
+     * host-built u32 index buffer. Triangle strips are expanded across the
+     * complete BEGIN/END action so DRAW_* batch boundaries do not introduce
+     * false cuts; loops/fans/quads are expanded exactly as well. The shader
+     * then runs the ARRAYS source with first = 0, so SV_VertexID is the
+     * fetched index and base_index still applies in-shader. */
+    for (u32 bi = 0; bi < prepared_batch_count; bi++) {
         const nrb_prepared_batch* prepared = &b->prepared_batches[bi];
         if (prepared->skip) {
             b->stats.draw_batches++;

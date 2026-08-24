@@ -117,8 +117,9 @@ int rsx_live_draw_present_shared(void* texture, u32 dxgi_format,
  * DEPTH_WRITE state. This preserves framebuffer history when ordered native
  * and legacy actions alternate; it does not invoke the legacy decoder. */
 int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
-                               u32 height, void** resource,
-                               u32* dxgi_format);
+                               u32 height, int create, void** resource,
+                               u32* dxgi_format, u32* resource_width,
+                               u32* resource_height);
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
                                u32 width, u32 height, int create,
                                void** resource,

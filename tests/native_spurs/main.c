@@ -1,6 +1,7 @@
 #include "cellSpurs.h"
 #include "cellSync.h"
 #include "spu_workload.h"
+#include "ppu/ppu_guest_write.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +68,11 @@ static uint32_t call_tail_publication_hook_ea;
 static _Atomic int pending_ticket_claim_hook_armed;
 static uint32_t pending_ticket_claim_hook_slot;
 static uint32_t pending_ticket_claim_hook_descriptor;
+static _Atomic uint32_t sparse_write_observer_calls;
+static uint32_t sparse_write_observer_ea;
+static uint32_t sparse_write_observer_size;
+static uint8_t sparse_write_expected_first;
+static uint8_t sparse_write_expected_last;
 static volatile int call_tail_job_runs;
 extern volatile uint32_t g_native_spurs_ppu_watch_hi;
 extern int cellSpursTestProductionMainStorageRange(uint32_t ea, uint64_t size);
@@ -77,6 +83,17 @@ extern int cellSpursTestCaptureUnknownJob(
 extern int yz_spurs_test_pending_snapshot_count(CellSpursJobChain* object);
 extern void cellSpursTestTaskBit(
     void* taskset, uint32_t offset, uint32_t id, int value);
+
+static void sparse_write_observer(uint32_t ea, uint32_t size)
+{
+    sparse_write_observer_ea = ea;
+    sparse_write_observer_size = size;
+    if (ea < MEM_SIZE && size && (uint64_t)ea + size <= MEM_SIZE &&
+        guest[ea] == sparse_write_expected_first &&
+        guest[ea + size - 1u] == sparse_write_expected_last)
+        atomic_fetch_add_explicit(
+            &sparse_write_observer_calls, 1u, memory_order_relaxed);
+}
 
 typedef struct EventWaitArgs {
     CellSpursEventFlag* flag;
@@ -2625,6 +2642,58 @@ static int test_unknown_job_inventory_capture(void)
     return 0;
 }
 
+static int test_sparse_bulk_write_notification(void)
+{
+    const uint32_t unrelated = 0x1d0000u;
+    const uint32_t cross_page = 0x1e0fffu;
+    const uint32_t unrelated_page = unrelated >> 12;
+    const uint32_t first_page = cross_page >> 12;
+    const uint32_t second_page = (cross_page + 1u) >> 12;
+    _Atomic uint64_t* bits =
+        (_Atomic uint64_t*)g_native_spurs_watch_page_bits;
+
+    atomic_fetch_and_explicit(
+        &bits[unrelated_page >> 6],
+        ~(1ull << (unrelated_page & 63u)), memory_order_relaxed);
+    atomic_fetch_and_explicit(
+        &bits[first_page >> 6],
+        ~(1ull << (first_page & 63u)), memory_order_relaxed);
+    atomic_fetch_or_explicit(
+        &bits[second_page >> 6],
+        1ull << (second_page & 63u), memory_order_release);
+
+    guest[cross_page] = 0x5au;
+    guest[cross_page + 1u] = 0xa5u;
+    sparse_write_expected_first = 0x5au;
+    sparse_write_expected_last = 0xa5u;
+    sparse_write_observer_ea = 0;
+    sparse_write_observer_size = 0;
+    atomic_store_explicit(
+        &sparse_write_observer_calls, 0u, memory_order_relaxed);
+    cellSpursSetGuestWriteObserver(sparse_write_observer);
+
+    /* An unrelated HLE bulk write is rejected by one sparse page-bit load. */
+    vm_native_spurs_notify_write(unrelated, 32u);
+    CHECK(atomic_load_explicit(
+              &sparse_write_observer_calls, memory_order_relaxed) == 0u);
+    /* A write beginning on an unwatched page must still find the watched
+     * second page, and the callback must observe already-published bytes. */
+    vm_native_spurs_notify_write(cross_page, 2u);
+    CHECK(atomic_load_explicit(
+              &sparse_write_observer_calls, memory_order_relaxed) == 1u);
+    CHECK(sparse_write_observer_ea == cross_page);
+    CHECK(sparse_write_observer_size == 2u);
+    vm_native_spurs_notify_write(cross_page, 0u);
+    CHECK(atomic_load_explicit(
+              &sparse_write_observer_calls, memory_order_relaxed) == 1u);
+
+    cellSpursSetGuestWriteObserver(NULL);
+    atomic_fetch_and_explicit(
+        &bits[second_page >> 6],
+        ~(1ull << (second_page & 63u)), memory_order_relaxed);
+    return 0;
+}
+
 int main(void)
 {
     if (test_task_bit_reservation_coherence()) return 1;
@@ -2646,7 +2715,8 @@ int main(void)
         test_repeated_barrier_publications() ||
         test_long_lived_job_chain() || test_far_command_wakeup() ||
         test_job_guest_range_validation() || test_joblist_late_publication() ||
-        test_ticket_mutex() || test_unknown_job_inventory_capture()) return 1;
+        test_ticket_mutex() || test_unknown_job_inventory_capture() ||
+        test_sparse_bulk_write_notification()) return 1;
     puts("native_spurs_tests: PASS");
     return 0;
 }

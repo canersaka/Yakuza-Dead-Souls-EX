@@ -41,8 +41,10 @@ void rsx_live_draw_mirror_state_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_typed_present(u32 b) { (void)b; }
 void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
-int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, void** r, u32* f)
-{ (void)l; (void)o; (void)w; (void)h; (void)r; (void)f; return -1; }
+int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, int c,
+                               void** r, u32* f, u32* rw, u32* rh)
+{ (void)l; (void)o; (void)w; (void)h; (void)c; (void)r; (void)f;
+  (void)rw; (void)rh; return -1; }
 int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
                                int create, void** r, u32* rf, u32* d, u32* s,
                                void** sr, u32* sf, int* p)
@@ -7514,18 +7516,36 @@ int rsx_live_draw_timeline_flush(void)
 }
 
 int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
-                               u32 height, void** resource,
-                               u32* dxgi_format)
+                               u32 height, int create, void** resource,
+                               u32* dxgi_format, u32* resource_width,
+                               u32* resource_height)
 {
-    if (!resource || !dxgi_format)
+    if (!resource || !dxgi_format || !resource_width || !resource_height)
         return -1;
     *resource = NULL;
+    *resource_width = 0;
+    *resource_height = 0;
     AcquireSRWLockExclusive(&g_ld_access_lock);
     if (!g.ready) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         return -1;
     }
-    const u32 slot = surface_get(location, offset, width, height);
+    u32 slot = LD_INVALID_SURFACE;
+    if (create) {
+        slot = surface_get(location, offset, width, height);
+    } else {
+        /* Texture preflight may discover a color surface produced wholly by
+         * the established renderer. Lookup is deliberately address-exact and
+         * side-effect-free: it must not create, resize, clear, or submit a
+         * target merely because native code is considering a pass. */
+        for (u32 i = 0; i < g.n_surfaces; ++i) {
+            if (g.surfaces[i].location == location &&
+                g.surfaces[i].offset == offset) {
+                slot = i;
+                break;
+            }
+        }
+    }
     if (slot == LD_INVALID_SURFACE || !g.surfaces[slot].tex) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         return -1;
@@ -7534,6 +7554,8 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
     texture->lpVtbl->AddRef(texture);
     *resource = texture;
     *dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    *resource_width = g.surfaces[slot].w;
+    *resource_height = g.surfaces[slot].h;
     ReleaseSRWLockExclusive(&g_ld_access_lock);
     return 0;
 }

@@ -4882,6 +4882,7 @@ int main(int argc, char** argv)
     const char* outdir = ".";
     int use_hw = 0;
     int dump_surfaces = 0;
+    u32 stop_after_draw = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--hw")) use_hw = 1;
         else if (!strcmp(argv[i], "--surfaces")) dump_surfaces = 1;
@@ -4893,6 +4894,11 @@ int main(int argc, char** argv)
         printf("usage: %s <stream.rxs> [--hw] [--surfaces] [--out dir]"
                " [--dump-shaders dir]\n", argv[0]);
         return 2;
+    }
+    {
+        const char* const stop = getenv("RSX_STOP_AFTER_DRAW");
+        if (stop && stop[0])
+            stop_after_draw = (u32)strtoul(stop, NULL, 0);
     }
     b1_read_env();
     printf("[b1] state: blend=%d depth=%d cull=%d samp=%d\n",
@@ -5031,6 +5037,8 @@ int main(int argc, char** argv)
             apply_block(&s, b);
         else
             rsx_dispatch_method(&rsx, a, b);
+        if (stop_after_draw && ctx.draw_count >= stop_after_draw)
+            break;
     }
 
     if (ctx.frame_no == 0) {
@@ -5038,6 +5046,14 @@ int main(int argc, char** argv)
         char fpath[MAX_PATH];
         snprintf(fpath, sizeof(fpath), "%s\\frame_000.ppm", outdir);
         gpu_readback_surface(current_surface(&rsx), fpath);
+        if (dump_surfaces) {
+            for (u32 i = 0; i < g.n_surfaces; ++i) {
+                snprintf(fpath, sizeof(fpath),
+                         "%s\\frame_000_s%07X.ppm", outdir,
+                         g.surfaces[i].offset);
+                gpu_readback_surface(i, fpath);
+            }
+        }
     }
 
     for (u32 p = 0; p < 16; p++)
