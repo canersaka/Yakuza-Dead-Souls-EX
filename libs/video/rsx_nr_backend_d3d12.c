@@ -35,8 +35,14 @@
 #include "rsx_vertex_pull.h"
 #include "rsx_vp_decompiler.h"
 
-#define NRB_MAX_RTS      32
-#define NRB_MAX_DEPTHS   32
+/* The union of the archived orphanage/Hana/Frontier/gun captures contains
+ * 33 exact color-target identities (32 guest addresses).  Keep every native
+ * target alive by identity: evicting an offscreen producer would discard GPU
+ * content that a later pass can sample without republishing guest bytes.
+ * The live descriptor heap already reserved 64 RTV slots, so use that
+ * bounded capacity rather than failing on the 33rd encountered target. */
+#define NRB_MAX_RTS      64u
+#define NRB_MAX_DEPTHS   32u
 #define NRB_UPLOAD_BYTES (32u << 20)
 #define NRB_VS_TEXT      (256 * 1024)
 #define NRB_PS_TEXT      (256 * 1024)
@@ -73,6 +79,11 @@ typedef struct nrb_required_span {
 typedef struct nrb_rt {
     ID3D12Resource* tex;
     u32 space, offset, w, h, fmt;
+    /* Strict-native mode may legitimately retain more than one RSX surface
+     * identity at one display address (for example the title and world use
+     * different logical color formats).  Presentation must choose the
+     * identity most recently written, not the oldest table slot. */
+    u64 last_write_serial;
     DXGI_FORMAT dxgi;
     u32 rtv_slot;
     D3D12_RESOURCE_STATES color_state;
@@ -175,6 +186,7 @@ struct rsx_nr_d3d12 {
     nrb_rt rts[NRB_MAX_RTS];
     nrb_depth depths[NRB_MAX_DEPTHS];
     nrb_rt* last_rt;
+    u64 rt_write_serial;
     nrb_display displays[8];
     rsx_nr_d3d12_present_fn present_cb;
     void* present_user;
@@ -207,14 +219,18 @@ struct rsx_nr_d3d12 {
 
 /* ---- device plumbing --------------------------------------------------- */
 
-static void nrb_wait_idle(rsx_nr_d3d12* b)
+static int nrb_wait_idle(rsx_nr_d3d12* b)
 {
     const u64 v = ++b->fence_value;
-    b->queue->lpVtbl->Signal(b->queue, b->fence, v);
+    if (FAILED(b->queue->lpVtbl->Signal(b->queue, b->fence, v)))
+        return -1;
     if (b->fence->lpVtbl->GetCompletedValue(b->fence) < v) {
-        b->fence->lpVtbl->SetEventOnCompletion(b->fence, v, b->fence_event);
-        WaitForSingleObject(b->fence_event, 10000);
+        if (FAILED(b->fence->lpVtbl->SetEventOnCompletion(
+                b->fence, v, b->fence_event)) ||
+            WaitForSingleObject(b->fence_event, 60000) != WAIT_OBJECT_0)
+            return -1;
     }
+    return b->fence->lpVtbl->GetCompletedValue(b->fence) >= v ? 0 : -1;
 }
 
 static void nrb_release_timeline_lease(rsx_nr_d3d12* b)
@@ -340,7 +356,10 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
     b->list->lpVtbl->Close(b->list);
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)b->list };
     b->queue->lpVtbl->ExecuteCommandLists(b->queue, 1, lists);
-    nrb_wait_idle(b);
+    if (nrb_wait_idle(b)) {
+        b->list_open = 0;
+        return -1;
+    }
     b->list_open = 0;
     nrb_release_retired_textures(b);
     b->stats.queue_submissions++;
@@ -386,6 +405,26 @@ static u8* nrb_upload_alloc(rsx_nr_d3d12* b, u32 size, u64* gpu_va)
 static u64 nrb_upload_aligned_size(u64 size)
 {
     return (size + 255u) & ~255ull;
+}
+
+static void nrb_note_draw_upload_failure(rsx_nr_d3d12* b, u32 stage,
+                                         u64 budget, u32 request,
+                                         u32 batches)
+{
+    switch (stage) {
+    case 1u: b->stats.unsup_upload_index++; break;
+    case 2u: b->stats.unsup_upload_pull++; break;
+    case 3u: b->stats.unsup_upload_vp++; break;
+    case 4u: b->stats.unsup_upload_fp++; break;
+    default: break;
+    }
+    if (!b->stats.first_upload_stage) {
+        b->stats.first_upload_used = b->upload_used;
+        b->stats.first_upload_budget = budget;
+        b->stats.first_upload_request = request;
+        b->stats.first_upload_batches = batches;
+        b->stats.first_upload_stage = stage;
+    }
 }
 
 /* A transactionally admitted section may contain thousands of draws.  The
@@ -559,7 +598,7 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
             break;
         }
     }
-    if (!rt || b->rtv_used >= 64) {
+    if (!rt || b->rtv_used >= NRB_MAX_RTS) {
         if (borrowed)
             borrowed->lpVtbl->Release(borrowed);
         return NULL;
@@ -614,6 +653,45 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_rt_handle(rsx_nr_d3d12* b,
                                                             &rtv);
     rtv.ptr += (SIZE_T)rt->rtv_slot * b->rtv_size;
     return rtv;
+}
+
+static void nrb_note_rt_write(rsx_nr_d3d12* b, nrb_rt* rt)
+{
+    /* Zero means "allocated/preflighted but never written".  A practical
+     * process cannot wrap this counter, but preserve the invariant anyway. */
+    if (++b->rt_write_serial == 0u)
+        b->rt_write_serial = 1u;
+    rt->last_write_serial = b->rt_write_serial;
+    b->last_rt = rt;
+}
+
+static nrb_rt* nrb_latest_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
+                             u32 w, u32 h, int rgba_only)
+{
+    nrb_rt* selected = NULL;
+    for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+        nrb_rt* const candidate = &b->rts[i];
+        if (!candidate->live || candidate->space != space ||
+            candidate->offset != offset || (w && candidate->w != w) ||
+            (h && candidate->h != h) ||
+            (rgba_only &&
+             candidate->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM &&
+             candidate->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM))
+            continue;
+        if (!selected || candidate->last_write_serial >
+                             selected->last_write_serial)
+            selected = candidate;
+    }
+    return selected;
+}
+
+static nrb_rt* nrb_display_rt(rsx_nr_d3d12* b, u32 buffer)
+{
+    if (buffer >= 8u || !b->displays[buffer].valid)
+        return NULL;
+    const nrb_display* const display = &b->displays[buffer];
+    return nrb_latest_rt(b, display->location, display->offset,
+                         display->width, display->height, 0);
 }
 
 /* Capture-observed pitch-linear color formats with an exact D3D12 RTV.
@@ -769,7 +847,7 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
             break;
         }
     }
-    if (!depth || b->dsv_used >= 64u) {
+    if (!depth || b->dsv_used >= NRB_MAX_DEPTHS) {
         if (borrowed)
             borrowed->lpVtbl->Release(borrowed);
         if (borrowed_sample)
@@ -1102,7 +1180,7 @@ static int nrb_clear(void* user, const rsx_nir_pipeline* st,
             (float)c->depth_value / 16777215.0f,
             (UINT8)c->stencil_value, nrects, rects);
     }
-    b->last_rt = rt;
+    nrb_note_rt_write(b, rt);
     b->stats.clears++;
     return 0;
 }
@@ -3594,21 +3672,7 @@ int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer)
 {
     if (!b)
         return -1;
-    nrb_rt* scanout = NULL;
-    if (buffer < 8u && b->displays[buffer].valid) {
-        const nrb_display* display = &b->displays[buffer];
-        for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
-            nrb_rt* candidate = &b->rts[i];
-            if (candidate->live &&
-                candidate->space == display->location &&
-                candidate->offset == display->offset &&
-                (!display->width || candidate->w == display->width) &&
-                (!display->height || candidate->h == display->height)) {
-                scanout = candidate;
-                break;
-            }
-        }
-    }
+    nrb_rt* scanout = nrb_display_rt(b, buffer);
     if (!scanout)
         scanout = b->last_rt;
     return b->present_cb && !scanout ? -1 : 0;
@@ -3878,6 +3942,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                            : RSX_PULL_SOURCE_ARRAYS;
     int prepare_failed = 0;
     int prepare_index_failed = 0;
+    u32 prepare_upload_stage = 0;
+    u32 prepare_upload_request = 0;
     const u32 prepared_batch_count = combine_triangle_strip
         ? 1u : d->batch_count;
     memset(b->prepared_batches, 0,
@@ -3907,6 +3973,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                 b, n * sizeof(u32), &prepared->index_va);
             if (!index_bytes) {
                 prepare_failed = 1;
+                prepare_upload_stage = 1u;
+                prepare_upload_request = n * sizeof(u32);
                 break;
             }
             memcpy(index_bytes, b->idx_scratch, (size_t)n * sizeof(u32));
@@ -3930,6 +3998,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             b, sizeof(pull), &prepared->pull_va);
         if (!pull_bytes) {
             prepare_failed = 1;
+            prepare_upload_stage = 2u;
+            prepare_upload_request = sizeof(pull);
             break;
         }
         memcpy(pull_bytes, &pull, sizeof(pull));
@@ -3937,6 +4007,10 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     if (prepare_failed) {
         if (prepare_index_failed)
             b->stats.unsup_draw_index++;
+        if (prepare_upload_stage)
+            nrb_note_draw_upload_failure(
+                b, prepare_upload_stage, upload_budget,
+                prepare_upload_request, prepared_batch_count);
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
@@ -4012,6 +4086,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     const u32 vp_cb_bytes = sizeof(st->constants) + 12u * sizeof(float);
     u8* cp = nrb_upload_alloc(b, vp_cb_bytes, &const_va);
     if (!cp) {
+        nrb_note_draw_upload_failure(
+            b, 3u, upload_budget, vp_cb_bytes, prepared_batch_count);
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
@@ -4048,6 +4124,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     u64 fp_va = 0;
     u8* fp_cp = nrb_upload_alloc(b, fp_cb_bytes, &fp_va);
     if (!fp_cp) {
+        nrb_note_draw_upload_failure(
+            b, 4u, upload_budget, fp_cb_bytes, prepared_batch_count);
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
@@ -4122,7 +4200,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     b->stats.real_fp_draws++;
     if (fp.texture_mask || vtex_mask)
         b->stats.texture_draws++;
-    b->last_rt = rt;
+    nrb_note_rt_write(b, rt);
     b->stats.draws++;
     return 0;
 }
@@ -4249,21 +4327,7 @@ static int nrb_present(void* user, u32 buffer)
     rsx_nr_d3d12* b = user;
     if (!b->shared_timeline && nrb_exec_wait(b))
         return -1;                   /* offscreen: complete the frame      */
-    nrb_rt* scanout = NULL;
-    if (buffer < 8u && b->displays[buffer].valid) {
-        const nrb_display* display = &b->displays[buffer];
-        for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
-            nrb_rt* candidate = &b->rts[i];
-            if (candidate->live &&
-                candidate->space == display->location &&
-                candidate->offset == display->offset &&
-                (!display->width || candidate->w == display->width) &&
-                (!display->height || candidate->h == display->height)) {
-                scanout = candidate;
-                break;
-            }
-        }
-    }
+    nrb_rt* scanout = nrb_display_rt(b, buffer);
     if (!scanout)
         scanout = b->last_rt;
     if (b->present_cb && (!scanout || b->present_cb(
@@ -4576,11 +4640,12 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 64;
+    hd.NumDescriptors = NRB_MAX_RTS;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
             b->dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&b->rtv_heap)))
         goto fail;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hd.NumDescriptors = NRB_MAX_DEPTHS;
     if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
             b->dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&b->dsv_heap)))
         goto fail;
@@ -4879,17 +4944,7 @@ int rsx_nr_d3d12_depth_bounds_supported(const rsx_nr_d3d12* b)
 int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
                          u32 w, u32 h, u8* out)
 {
-    nrb_rt* rt = NULL;
-    for (u32 i = 0; i < NRB_MAX_RTS; i++) {
-        if (b->rts[i].live && b->rts[i].space == space &&
-            b->rts[i].offset == offset && b->rts[i].w == w &&
-            b->rts[i].h == h &&
-            (b->rts[i].dxgi == DXGI_FORMAT_B8G8R8A8_UNORM ||
-             b->rts[i].dxgi == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-            rt = &b->rts[i];
-            break;
-        }
-    }
+    nrb_rt* rt = nrb_latest_rt(b, space, offset, w, h, 1);
     if (!rt)
         return -1;
 

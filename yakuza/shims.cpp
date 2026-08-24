@@ -216,7 +216,7 @@ extern "C" void yz_watch_arm(uint32_t guest_addr);
 extern "C" void yz_a010_reltrace_ppu_store(
     uint32_t addr, uint32_t val, uint32_t guest_pc);
 extern "C" void yz_a010_data_island_register(
-    uint32_t stopper_ea, uint32_t data_end_ea);
+    uint32_t source_ea, uint32_t command, uint32_t data_end_ea);
 extern "C" volatile long g_yz_a010_release_scene_active;
 
 /* YZ_A010_HANDOFF: name the last camera handoff gate without modifying the
@@ -1224,30 +1224,56 @@ extern "C" void vm_write16(uint64_t addr, uint16_t val)
 
 extern "C" void vm_write32(uint64_t addr, uint32_t val)
 {
-    static thread_local uint32_t data_island_stopper = 0;
+    static thread_local uint32_t data_island_source = 0;
+    static thread_local uint32_t data_island_command = 0;
+    static thread_local uint32_t data_island_start = 0;
+    static int track_full_native_islands = -1;
+    if (track_full_native_islands < 0) {
+        const char* const mode = getenv("YZ_NR_VERTICAL");
+        track_full_native_islands =
+            mode && strcmp(mode, "full-native") == 0 ? 1 : 0;
+    }
     yz_ea_trap((uint32_t)addr, 4, val, _ReturnAddress());
     uint32_t guest_pc = 0;
     /* Opt-in compact FIFO lifecycle catcher.  Generated PPU code calls this
      * exported shim directly; runtime/ppu/ppu_memory.h does not cover it. */
-    if (g_yz_a010_release_scene_active &&
+    if ((g_yz_a010_release_scene_active || track_full_native_islands) &&
         (uint32_t)addr >= 0x40400000u &&
         (uint32_t)addr < 0x40C00000u) {
         guest_pc = yz_guest_addr_from_host(_ReturnAddress());
-        yz_a010_reltrace_ppu_store(
-            (uint32_t)addr, val, guest_pc);
-        const uint32_t self = 0x20000000u |
-            (((uint32_t)addr - 0x40400000u) & 0x1FFFFFFCu);
-        if (guest_pc == 0x00EAB3DCu && val == self)
-            data_island_stopper = (uint32_t)addr;
-    } else if (data_island_stopper) {
-        guest_pc = yz_guest_addr_from_host(_ReturnAddress());
-        if (guest_pc == 0x00EAB3DCu &&
-            val > data_island_stopper && val <= 0x40C00000u) {
-            /* The allocator's very next store publishes ctx->current, which
-             * is the exact forward jump after its reserved data island. */
-            yz_a010_data_island_register(data_island_stopper, val);
+        if (g_yz_a010_release_scene_active)
+            yz_a010_reltrace_ppu_store(
+                (uint32_t)addr, val, guest_pc);
+        const uint32_t source =
+            ((uint32_t)addr - 0x40400000u) & 0x7FFFFFu;
+        const uint32_t target = val & 0x1FFFFFFCu;
+        /* func_00EAB3DC's first FIFO store is a forward old-JUMP to
+         * 4..16 bytes of alignment immediately before its raw payload.
+         * Its slow allocation branch resumes in the lifted continuation
+         * func_00EAB44C, which executes the same stores with the original
+         * frame still live. */
+        const bool inline_allocator =
+            guest_pc == 0x00EAB3DCu || guest_pc == 0x00EAB44Cu;
+        if (track_full_native_islands && inline_allocator &&
+            (val & 0xE0000003u) == 0x20000000u &&
+            target > source && target - source <= 0x10u) {
+            data_island_source = (uint32_t)addr;
+            data_island_command = val;
+            data_island_start = 0x40400000u + target;
         }
-        data_island_stopper = 0;
+    } else if (data_island_source) {
+        guest_pc = yz_guest_addr_from_host(_ReturnAddress());
+        if ((guest_pc == 0x00EAB3DCu || guest_pc == 0x00EAB44Cu) &&
+            val > data_island_start && val < 0x40C00000u &&
+            val - data_island_source <= 0x10000u) {
+            /* The allocator's next non-FIFO store publishes ctx->current,
+             * which is the exact cursor after the reserved payload. */
+            yz_a010_data_island_register(
+                data_island_source, data_island_command, val);
+        }
+        data_island_source = 0;
+        data_island_command = 0;
+        data_island_start = 0;
     }
     const uint32_t value = ps3_bswap32(val);
     VM_WRITE_COH(addr, &value, sizeof(value));

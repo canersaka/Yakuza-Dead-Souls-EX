@@ -10,6 +10,7 @@
  *
  *   0x0110 WAIT_FOR_IDLE          0x17C8 CLEAR_REPORT_VALUE
  *   0x01A8 CONTEXT_DMA_REPORT     0x1800 GET_REPORT
+ *   0x1804 ZCULL_STATS_ENABLE
  *   0x1D6C SET_SEMAPHORE_OFFSET   0x1D70 BACK_END_WRITE_SEMAPHORE_RELEASE
  *   0x1D74 TEXTURE_READ_SEMAPHORE_RELEASE
  *   0x0394 CLIP_MIN               0x0398 CLIP_MAX
@@ -82,6 +83,7 @@
 #define M_ZCULL_CONTROL1        0x1EA8
 #define M_SCULL_CONTROL         0x1EAC
 #define M_GET_REPORT            0x1800
+#define M_ZCULL_STATS_ENABLE    0x1804
 #define M_RENDER_ENABLE         0x1E98
 #define M_CULL_FACE             0x1830
 #define M_FRONT_FACE            0x1834
@@ -872,6 +874,13 @@ int rsx_nir_adapter_method_supported(
      * captured title state explicitly disables it; admit only that exact
      * mode and retain legacy ownership for the enabled hardware feature. */
     if (method == M_POINT_PARAMS_ENABLE)
+        return arg == 0u;
+    /* The production startup stream explicitly disables hardware ZCULL
+     * statistic accumulation. Reports already retain their separate ordered
+     * typed semantics; disabling the optional counters has no render or
+     * publication side effect. Do not admit the enabled mode until its
+     * accumulation/reset behavior is represented. */
+    if (method == M_ZCULL_STATS_ENABLE)
         return arg == 0u;
     /* Bit 0 is the actual point-sprite enable; bits 8..17 are texcoord
      * replacement masks and are inert while disabled.  Admit the hardware

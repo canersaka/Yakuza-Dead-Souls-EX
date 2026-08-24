@@ -386,35 +386,89 @@ struct yz_a010_stoplife {
 };
 static yz_a010_stoplife g_yz_a010_stoplife[YZ_A010_STOPLIFE_CAP] = {};
 
-/* func_00EAB3DC publishes a temporary self-stop before an inline data island,
- * then stores the exact cursor after that island.  Retain that producer-owned
- * edge outside guest memory so a hard-freeze autopsy can prove the intended
- * transition instead of guessing through data.  Direct FIFO-word indexing
- * prevents a producer several MiB ahead of GET from aliasing the record. */
-static volatile LONG
-    g_yz_a010_data_island_end[0x800000u / 4u] = {};
+/* func_00EAB3DC writes a forward JUMP from the command cursor to an aligned
+ * inline data payload, then stores the exact cursor after that payload.  The
+ * payload can contain vertex-program words which are also syntactically valid
+ * RSX flow words.  Retain the producer's complete source/command/end triple so
+ * the strict native owner never guesses through those bytes.  Each word has a
+ * tiny seqlock: writers are rare, while the read side remains allocation-free
+ * and touches only the exact GET slot. */
+struct yz_a010_data_island_record {
+    volatile LONG sequence;
+    volatile LONG command;
+    volatile LONG end_ea;
+};
+static yz_a010_data_island_record
+    g_yz_a010_data_island[0x800000u / 4u] = {};
 
 extern "C" void yz_a010_data_island_register(
-    uint32_t stopper_ea, uint32_t data_end_ea)
+    uint32_t source_ea, uint32_t command, uint32_t data_end_ea)
 {
-    if (stopper_ea < 0x40400000u || stopper_ea >= 0x40C00000u ||
-        (stopper_ea & 3u) || data_end_ea <= stopper_ea ||
-        data_end_ea > 0x40C00000u)
+    if (source_ea < 0x40400000u || source_ea >= 0x40C00000u ||
+        (source_ea & 3u) || (command & 0xE0000003u) != 0x20000000u ||
+        data_end_ea <= source_ea || data_end_ea >= 0x40C00000u)
         return;
-    InterlockedExchange(
-        &g_yz_a010_data_island_end[
-            (stopper_ea - 0x40400000u) >> 2],
-        (LONG)data_end_ea);
+    yz_a010_data_island_record* const record =
+        &g_yz_a010_data_island[(source_ea - 0x40400000u) >> 2];
+    for (;;) {
+        const LONG sequence = InterlockedCompareExchange(
+            &record->sequence, 0, 0);
+        if (sequence & 1) {
+            YieldProcessor();
+            continue;
+        }
+        if (InterlockedCompareExchange(
+                &record->sequence, sequence + 1, sequence) != sequence)
+            continue;
+        InterlockedExchange(&record->command, (LONG)command);
+        InterlockedExchange(&record->end_ea, (LONG)data_end_ea);
+        MemoryBarrier();
+        InterlockedExchange(&record->sequence, sequence + 2);
+        return;
+    }
 }
 
-static uint32_t yz_a010_data_island_end(uint32_t stopper_ea)
+static int yz_a010_data_island_snapshot(
+    uint32_t source_ea, uint32_t* command, uint32_t* data_end_ea,
+    uint32_t* generation)
 {
-    if (stopper_ea < 0x40400000u || stopper_ea >= 0x40C00000u ||
-        (stopper_ea & 3u))
-        return 0u;
-    return (uint32_t)InterlockedCompareExchange(
-        &g_yz_a010_data_island_end[
-            (stopper_ea - 0x40400000u) >> 2], 0, 0);
+    if (!command || !data_end_ea ||
+        source_ea < 0x40400000u || source_ea >= 0x40C00000u ||
+        (source_ea & 3u))
+        return 0;
+    yz_a010_data_island_record* const record =
+        &g_yz_a010_data_island[(source_ea - 0x40400000u) >> 2];
+    for (unsigned attempt = 0; attempt < 4u; ++attempt) {
+        const LONG before = InterlockedCompareExchange(
+            &record->sequence, 0, 0);
+        if (!before || (before & 1))
+            return 0;
+        const uint32_t saved_command = (uint32_t)InterlockedCompareExchange(
+            &record->command, 0, 0);
+        const uint32_t saved_end = (uint32_t)InterlockedCompareExchange(
+            &record->end_ea, 0, 0);
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(
+            &record->sequence, 0, 0);
+        if (before != after || (after & 1))
+            continue;
+        *command = saved_command;
+        *data_end_ea = saved_end;
+        if (generation)
+            *generation = (uint32_t)after >> 1;
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t yz_a010_data_island_end(uint32_t source_ea)
+{
+    uint32_t command = 0u;
+    uint32_t data_end_ea = 0u;
+    return yz_a010_data_island_snapshot(
+               source_ea, &command, &data_end_ea, nullptr) &&
+           vm_read32(source_ea) == command
+        ? data_end_ea : 0u;
 }
 
 static yz_a010_stoplife* yz_a010_stoplife_find(uint32_t ea, int create)
@@ -5160,19 +5214,53 @@ static int yz_a010_probe_is_safe_prefix(
            (probe->arrays != 0u || probe->indices != 0u);
 }
 
+static int yz_a010_balanced_generated_prefix_at(
+    uint32_t candidate, uint32_t window_start, uint32_t window_end)
+{
+    if (!yz_a010_generated_prologue_at(candidate))
+        return 0;
+    struct yz_a010_chain_probe probe;
+    yz_a010_probe_chain(
+        candidate, window_end, window_start, window_end, &probe);
+    return yz_a010_probe_is_safe_prefix(
+        &probe, candidate, window_start, window_end);
+}
+
+/* Sequential generated-data gaps do not need the later FE0 completion packet
+ * to be present. Their cursor already orders them after the preceding method,
+ * so the earliest exact prologue is safe once its local chain is draw-balanced
+ * and terminates at its own forward self-stopper. */
+static uint32_t yz_a010_find_balanced_generated_prefix(
+    uint32_t start, uint32_t end)
+{
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    const uint32_t ahead = (end - start + ring) & mask;
+    if (ahead == 0u || ahead >= (ring >> 1))
+        return 0u;
+    for (uint32_t delta = 0u; delta + 0x30u <= ahead; delta += 4u) {
+        const uint32_t candidate = (start + delta) & mask;
+        if (yz_a010_balanced_generated_prefix_at(
+                candidate, start, end))
+            return candidate;
+    }
+    return 0u;
+}
+
 /* Find the next user-interrupt packet the guest is waiting to consume, then
  * find the earliest exact generated block that is safe to execute.  A complete
  * chain may reach the interrupt directly; otherwise a balanced prefix can run
  * up to its own self-stop and recovery resumes from there.  Never jump over a
  * validated prefix merely because a later tail already reaches completion. */
-static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
+static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put,
+                                           int emit_summary)
 {
     static int trace_enabled = -1;
     static int trace_done = 0;
     static uint32_t trace_label_min = 0u;
     if (trace_enabled < 0) {
         trace_enabled = getenv("YZ_A010_MISSING_REL_TRACE") ? 1 : 0;
-        if (trace_enabled) {
+        if (trace_enabled && emit_summary) {
             const char* const label_env =
                 getenv("YZ_A010_MISSING_REL_TRACE_LABEL");
             if (label_env && *label_env)
@@ -5194,7 +5282,7 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
 
     const uint32_t have = vm_read32(RSX_REPORTS + 0xFE0u);
     const uint32_t want = have + 1u;
-    const int trace =
+    const int trace = emit_summary &&
         trace_enabled && !trace_done && have >= trace_label_min;
     uint32_t ucmd = 0u;
     for (uint32_t delta = 0u; delta + 8u <= ahead; delta += 4u) {
@@ -5243,12 +5331,14 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
             trace_done = 1;
             fflush(stderr);
         }
-        fprintf(stderr,
-                "[a010-pending-chain] label=0x%08X next=0x%08X "
-                "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
-                "chain-end=0x%06X PUT=0x%06X complete-steps=%u direct\n",
-                have, want, ucmd, start, start, chain_end, put, steps);
-        fflush(stderr);
+        if (emit_summary) {
+            fprintf(stderr,
+                    "[a010-pending-chain] label=0x%08X next=0x%08X "
+                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                    "chain-end=0x%06X PUT=0x%06X complete-steps=%u direct\n",
+                    have, want, ucmd, start, start, chain_end, put, steps);
+            fflush(stderr);
+        }
         return start;
     }
 
@@ -5269,12 +5359,14 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
             trace_done = 1;
             fflush(stderr);
         }
-        fprintf(stderr,
-                "[a010-pending-chain] label=0x%08X next=0x%08X "
-                "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
-                "PUT=0x%06X prefix-steps=%u staged-direct\n",
-                have, want, ucmd, start, start, put, steps);
-        fflush(stderr);
+        if (emit_summary) {
+            fprintf(stderr,
+                    "[a010-pending-chain] label=0x%08X next=0x%08X "
+                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                    "PUT=0x%06X prefix-steps=%u staged-direct\n",
+                    have, want, ucmd, start, start, put, steps);
+            fflush(stderr);
+        }
         return start;
     }
 
@@ -5307,16 +5399,18 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
                 trace_done = 1;
                 fflush(stderr);
             }
-            fprintf(stderr,
-                    "[a010-pending-chain] label=0x%08X next=0x%08X "
-                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
-                    "segment-stop=0x%06X PUT=0x%06X "
-                    "draw=%u/%u/%u/%u ordered-prefix\n",
-                    have, want, ucmd, candidate, start,
-                    prefix_probe.stop_pc, put, prefix_probe.begin,
-                    prefix_probe.end, prefix_probe.arrays,
-                    prefix_probe.indices);
-            fflush(stderr);
+            if (emit_summary) {
+                fprintf(stderr,
+                        "[a010-pending-chain] label=0x%08X next=0x%08X "
+                        "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                        "segment-stop=0x%06X PUT=0x%06X "
+                        "draw=%u/%u/%u/%u ordered-prefix\n",
+                        have, want, ucmd, candidate, start,
+                        prefix_probe.stop_pc, put, prefix_probe.begin,
+                        prefix_probe.end, prefix_probe.arrays,
+                        prefix_probe.indices);
+                fflush(stderr);
+            }
             return candidate;
         }
         steps = 0u;
@@ -5340,13 +5434,15 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
                 trace_done = 1;
                 fflush(stderr);
             }
-            fprintf(stderr,
-                    "[a010-pending-chain] label=0x%08X next=0x%08X "
-                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
-                    "chain-end=0x%06X PUT=0x%06X complete-steps=%u\n",
-                    have, want, ucmd, candidate, start,
-                    chain_end, put, steps);
-            fflush(stderr);
+            if (emit_summary) {
+                fprintf(stderr,
+                        "[a010-pending-chain] label=0x%08X next=0x%08X "
+                        "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                        "chain-end=0x%06X PUT=0x%06X complete-steps=%u\n",
+                        have, want, ucmd, candidate, start,
+                        chain_end, put, steps);
+                fflush(stderr);
+            }
             return candidate;
         }
         steps = 0u;
@@ -5369,12 +5465,14 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
                 trace_done = 1;
                 fflush(stderr);
             }
-            fprintf(stderr,
-                    "[a010-pending-chain] label=0x%08X next=0x%08X "
-                    "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
-                    "PUT=0x%06X prefix-steps=%u staged\n",
-                    have, want, ucmd, candidate, start, put, steps);
-            fflush(stderr);
+            if (emit_summary) {
+                fprintf(stderr,
+                        "[a010-pending-chain] label=0x%08X next=0x%08X "
+                        "ucmd=0x%06X entry=0x%06X scan-start=0x%06X "
+                        "PUT=0x%06X prefix-steps=%u staged\n",
+                        have, want, ucmd, candidate, start, put, steps);
+                fflush(stderr);
+            }
             return candidate;
         }
         if (trace && trace_logged < 128u) {
@@ -5402,12 +5500,14 @@ static uint32_t yz_a010_find_pending_chain(uint32_t start, uint32_t put)
         trace_done = 1;
         fflush(stderr);
     }
-    fprintf(stderr,
-            "[a010-pending-chain] REFUSED label=0x%08X next=0x%08X "
-            "ucmd=0x%06X scan-start=0x%06X PUT=0x%06X "
-            "incomplete-prologues=%u\n",
-            have, want, ucmd, start, put, rejected);
-    fflush(stderr);
+    if (emit_summary) {
+        fprintf(stderr,
+                "[a010-pending-chain] REFUSED label=0x%08X next=0x%08X "
+                "ucmd=0x%06X scan-start=0x%06X PUT=0x%06X "
+                "incomplete-prologues=%u\n",
+                have, want, ucmd, start, put, rejected);
+        fflush(stderr);
+    }
     return 0u;
 }
 
@@ -5419,7 +5519,7 @@ static uint32_t yz_a010_missing_release_resume(uint32_t get, uint32_t put)
     const uint32_t sequential = (get + 4u) & mask;
 
     const uint32_t pending_chain =
-        yz_a010_find_pending_chain(sequential, put);
+        yz_a010_find_pending_chain(sequential, put, 1);
     if (pending_chain)
         return pending_chain;
 
@@ -5706,7 +5806,8 @@ static int yz_a010_missing_release_try(uint32_t stopper_ea,
     uint32_t island_word = 0u;
     if (deep_lag) {
         resume = yz_a010_find_pending_chain((get + 4u) & (ring - 1u),
-                                            (get + 0x8000u) & (ring - 1u));
+                                            (get + 0x8000u) & (ring - 1u),
+                                            1);
         if (!resume) {
             const uint32_t next_io = (get + 4u) & (ring - 1u);
             const uint32_t nea = yz_rsx_io_to_ea(next_io);
@@ -6584,6 +6685,315 @@ extern "C" volatile long g_yz_t1_sample_seq;
 extern "C" volatile void* g_yz_t1_last_tf;   /* s25 spin-witness feed (dispatch.cpp) */
 extern "C" volatile uint32_t g_yz_jrnl_cur_ea;  /* s34 live journal-consumer cursor EA (spu_channels.c / spu_dma.h) */
 
+/* The default FIFO buffer starts behind one deliberately published
+ * jump-to-self guard.  It is the only self-stopper the consumer may release
+ * from PUT alone: segment zero, its reserved 0x1000 head, and a stable PUT
+ * snapshot proving a later command boundary.  All recycled/in-stream
+ * stoppers retain their journal/SPU publication lifecycle.  The caller owns
+ * the final GET write so this same exact rule is usable by both FIFO owners. */
+extern "C" int yz_rsx_try_release_published_segment_head(
+    void*, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t* resume_get)
+{
+    if (!resume_get || !g_yz_gcm_segment_bytes)
+        return 0;
+    const uint32_t ring = 0x800000u;
+    const uint32_t segment = get / g_yz_gcm_segment_bytes;
+    const uint32_t segment_head =
+        segment * g_yz_gcm_segment_bytes +
+        (segment == 0u ? 0x1000u : 0u);
+    const uint32_t ahead = (put - get + ring) & (ring - 1u);
+    if (segment != 0u || get != segment_head || ahead <= 4u ||
+        ahead >= (ring >> 1))
+        return 0;
+    const uint32_t ea = yz_rsx_io_to_ea(get);
+    if (!ea)
+        return 0;
+    MemoryBarrier();
+    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+        vm_read32(ea) != command)
+        return 0;
+    const uint32_t resume = (get + 4u) & (ring - 1u);
+    vm_write32(ea, 0x20000000u | resume);
+    *resume_get = resume;
+    return 1;
+}
+
+/* Read-only strict-native query for an edge recorded by the title's exact
+ * inline-data allocator. It never scans or repairs FIFO contents. */
+extern "C" int yz_rsx_registered_data_island_edge(
+    void*, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t* resume_get)
+{
+    if (!resume_get)
+        return 0;
+    const uint32_t source_ea = yz_rsx_io_to_ea(get);
+    uint32_t saved_command = 0u;
+    uint32_t data_end_ea = 0u;
+    uint32_t generation = 0u;
+    if (!yz_a010_data_island_snapshot(
+            source_ea, &saved_command, &data_end_ea, &generation) ||
+        saved_command != command)
+        return 0;
+    const uint32_t resume = yz_fifo_registered_inline_island_resume(
+        source_ea, saved_command, data_end_ea, get, put,
+        0x40400000u, 0x800000u);
+    if (!resume)
+        return 0;
+    MemoryBarrier();
+    uint32_t recheck_command = 0u;
+    uint32_t recheck_end = 0u;
+    uint32_t recheck_generation = 0u;
+    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+        vm_read32(source_ea) != command ||
+        !yz_a010_data_island_snapshot(
+            source_ea, &recheck_command, &recheck_end,
+            &recheck_generation) ||
+        recheck_command != saved_command || recheck_end != data_end_ea ||
+        recheck_generation != generation)
+        return 0;
+    *resume_get = resume;
+    return 1;
+}
+
+/* Strict-native counterpart of the retained a010 generated-link repair.
+ * This is reached only after the frame owner has observed one unchanged bad
+ * target for a bounded publication interval.  It performs one fail-closed
+ * structural proof in a fixed 1 MiB generated-list window, anchored to the
+ * exact next FE0 user-command value, then revalidates every source witness
+ * before publishing a replacement JUMP.  It neither renders nor falls back
+ * to the legacy consumer and emits no per-event output. */
+extern "C" int yz_rsx_resolve_published_generated_link(
+    void*, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t target, uint32_t target_word, uint32_t* resume_get)
+{
+    if (!resume_get || !yz_a010_fifo_publication_repair_enabled())
+        return 0;
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    if (get >= ring || target >= ring)
+        return 0;
+    const int old_jump =
+        (command & 0xE0000003u) == 0x20000000u;
+    const int new_jump = (command & 3u) == 1u;
+    if (!old_jump && !new_jump)
+        return 0;
+    const uint32_t encoded_target = new_jump
+        ? (command & 0xFFFFFFFCu) : (command & 0x1FFFFFFCu);
+    if (encoded_target != target)
+        return 0;
+    const int target_flow =
+        ((target_word & 0xE0000003u) == 0x20000000u) ||
+        ((target_word & 3u) == 1u) || ((target_word & 3u) == 2u) ||
+        ((target_word & 0xFFFF0003u) == 0x00020000u);
+    const int target_method =
+        (target_word & 0xA0030003u) == 0u &&
+        ((target_word >> 18) & 0x7FFu) != 0u;
+    if (target_flow || target_method)
+        return 0;
+
+    const uint32_t source_ea = yz_rsx_io_to_ea(get);
+    const uint32_t target_ea = yz_rsx_io_to_ea(target);
+    if (!source_ea || !target_ea)
+        return 0;
+
+    /* EDGE's generated command arena is divided into 128 KiB blocks.  A
+     * primary FIFO JUMP initially targets the final word of one block; that
+     * word is producer-owned link storage and can still hold recycled
+     * vertex/constant payload when the source edge becomes visible.  This
+     * occurs before the a010 scene root is active as well as during gameplay,
+     * so use a protocol proof rather than a scene gate: the following word
+     * must be the exact generated prologue and its complete 128 KiB window
+     * must form one draw-balanced prefix ending at its own self-stopper. */
+    const uint32_t generated_block = 0x20000u;
+    const uint32_t local_resume = (target + 4u) & mask;
+    const uint32_t local_end = (local_resume + generated_block) & mask;
+    const int local_boundary =
+        ((target + 4u) & (generated_block - 1u)) == 0u;
+    const int local_prologue = local_boundary &&
+        yz_a010_generated_prologue_at(local_resume);
+    const int local_balanced = local_prologue &&
+        yz_a010_balanced_generated_prefix_at(
+            local_resume, local_resume, local_end);
+    const uint32_t exact_resume = yz_fifo_generated_block_tail_resume(
+        target, target_word, ring, generated_block,
+        local_prologue, local_balanced);
+    if (exact_resume) {
+        MemoryBarrier();
+        if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+            vm_read32(source_ea) != command ||
+            vm_read32(target_ea) != target_word ||
+            yz_fifo_generated_block_tail_resume(
+                target, vm_read32(target_ea), ring, generated_block,
+                yz_a010_generated_prologue_at(exact_resume),
+                yz_a010_balanced_generated_prefix_at(
+                    exact_resume, exact_resume,
+                    (exact_resume + generated_block) & mask)) !=
+                exact_resume)
+            return 0;
+        const uint32_t repaired = new_jump
+            ? (exact_resume | 1u)
+            : (0x20000000u | (exact_resume & 0x1FFFFFFCu));
+        vm_write32(source_ea, repaired);
+        MemoryBarrier();
+        if (vm_read32(source_ea) != repaired)
+            return 0;
+        *resume_get = exact_resume;
+        return 1;
+    }
+
+    /* The older FE0-anchored search is specifically an a010 generated-chain
+     * recovery.  Keep that broader proof scene-gated; only the exact block
+     * boundary contract above is valid protocol-wide. */
+#if defined(YZ_PERF_CLEAN)
+    if (ReadAcquire(&g_yz_a010_root_active) == 0)
+        return 0;
+#else
+    if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) == 0)
+        return 0;
+#endif
+
+    const uint32_t fe0_before = vm_read32(RSX_REPORTS + 0xFE0u);
+    const uint32_t scan_start = (target + 4u) & mask;
+    const uint32_t scan_end =
+        (scan_start + 0x100000u) & mask;
+    const uint32_t resume =
+        yz_a010_find_pending_chain(scan_start, scan_end, 0);
+    if (!resume || !yz_a010_generated_prologue_at(resume))
+        return 0;
+
+    MemoryBarrier();
+    if (vm_read32(RSX_REPORTS + 0xFE0u) != fe0_before ||
+        vm_read32(source_ea) != command ||
+        vm_read32(target_ea) != target_word ||
+        !yz_a010_generated_prologue_at(resume))
+        return 0;
+    const uint32_t repaired = new_jump
+        ? (resume | 1u)
+        : (0x20000000u | (resume & 0x1FFFFFFCu));
+    vm_write32(source_ea, repaired);
+    MemoryBarrier();
+    if (vm_read32(source_ea) != repaired)
+        return 0;
+    *resume_get = resume;
+    return 1;
+}
+
+/* A primary cursor can land immediately after a complete method packet but
+ * before the generated draw prologue, with a short inline data tail in
+ * between (the stable a010 example is 0x1278: 3A2AAAAB 04000000, followed by
+ * the exact prologue at 0x1280). Prove the same complete generated chain as
+ * the link repair before advancing; never search on every poll and never
+ * treat a merely command-shaped word as sufficient. */
+extern "C" int yz_rsx_resolve_published_generated_hole(
+    void*, uint32_t get, uint32_t put, uint32_t word,
+    uint32_t* resume_get)
+{
+    if (!resume_get || !yz_a010_fifo_publication_repair_enabled())
+        return 0;
+    const uint32_t ring = 0x800000u;
+    const uint32_t mask = ring - 1u;
+    if (get >= ring)
+        return 0;
+    const uint32_t hole_ea = yz_rsx_io_to_ea(get);
+    if (!hole_ea || vm_read32(hole_ea) != word)
+        return 0;
+
+    /* Protocol-wide EDGE generated-block boundary.  Do this only from the
+     * owner's unsupported/malformed-word path: supported methods which happen
+     * to occupy the same 128 KiB alignment are ordinary commands and never
+     * enter this proof. */
+    const uint32_t generated_block = 0x20000u;
+    const uint32_t block_resume = (get + 4u) & mask;
+    const uint32_t block_end =
+        (block_resume + generated_block) & mask;
+    const int block_boundary =
+        ((get + 4u) & (generated_block - 1u)) == 0u;
+    const int block_prologue = block_boundary &&
+        yz_a010_generated_prologue_at(block_resume);
+    const int block_balanced = block_prologue &&
+        yz_a010_balanced_generated_prefix_at(
+            block_resume, block_resume, block_end);
+    const uint32_t block_exact = yz_fifo_generated_block_tail_resume(
+        get, word, ring, generated_block,
+        block_prologue, block_balanced);
+    if (block_exact) {
+        MemoryBarrier();
+        if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(hole_ea) == word &&
+            yz_fifo_generated_block_tail_resume(
+                get, vm_read32(hole_ea), ring, generated_block,
+                yz_a010_generated_prologue_at(block_exact),
+                yz_a010_balanced_generated_prefix_at(
+                    block_exact, block_exact,
+                    (block_exact + generated_block) & mask)) ==
+                block_exact) {
+            *resume_get = block_exact;
+            return 1;
+        }
+        return 0;
+    }
+
+    /* The captured 0x1278 family is the eight-byte alignment tail after one
+     * exact 17-argument SET_TRANSFORM_CONSTANT_LOAD packet.  Prove that local
+     * producer boundary directly; the previous broad generated-chain scan was
+     * both unnecessarily expensive and too strict for a sequential prologue
+     * whose later completion packet has not been published yet. */
+    const uint32_t previous = (get - 0x48u) & mask;
+    const uint32_t tail = (get + 4u) & mask;
+    const uint32_t local_resume = (get + 8u) & mask;
+    const uint32_t previous_ea = yz_rsx_io_to_ea(previous);
+    const uint32_t tail_ea = yz_rsx_io_to_ea(tail);
+    const uint32_t previous_command = previous_ea
+        ? vm_read32(previous_ea) : 0u;
+    const uint32_t tail_word = tail_ea ? vm_read32(tail_ea) : 0u;
+    const uint32_t exact_resume =
+        yz_fifo_generated_vp_constant_tail_resume(
+            previous_command, word, get, put, ring,
+            yz_a010_generated_prologue_at(local_resume));
+    if (exact_resume) {
+        MemoryBarrier();
+        if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(previous_ea) == previous_command &&
+            vm_read32(hole_ea) == word &&
+            vm_read32(tail_ea) == tail_word &&
+            yz_fifo_generated_vp_constant_tail_resume(
+                vm_read32(previous_ea), vm_read32(hole_ea), get, put,
+                ring, yz_a010_generated_prologue_at(exact_resume)) ==
+                exact_resume) {
+            *resume_get = exact_resume;
+            return 1;
+        }
+        return 0;
+    }
+
+    /* Only the older broad search depends on the a010 FE0 scene root.  The
+     * two exact local producer-boundary proofs above are valid throughout the
+     * run and deliberately do not inherit this scene gate. */
+#if defined(YZ_PERF_CLEAN)
+    if (ReadAcquire(&g_yz_a010_root_active) == 0)
+        return 0;
+#else
+    if (InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) == 0)
+        return 0;
+#endif
+
+    const uint32_t scan_start = (get + 4u) & mask;
+    const uint32_t scan_end = (scan_start + 0x100000u) & mask;
+    const uint32_t resume =
+        yz_a010_find_balanced_generated_prefix(scan_start, scan_end);
+    if (!resume)
+        return 0;
+    MemoryBarrier();
+    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+        vm_read32(hole_ea) != word ||
+        !yz_a010_balanced_generated_prefix_at(
+            resume, scan_start, scan_end))
+        return 0;
+    *resume_get = resume;
+    return 1;
+}
+
 /* Process exactly ONE FIFO command at GET (self-locked). Returns an observation
  * category: ADVANCING if GET advanced / a method dispatched, otherwise the
  * precise reason it remained idle or stalled. The RPCS3 run_FIFO step, factored
@@ -6845,32 +7255,20 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
              * self-jump.  Release only that startup guard from the consumer
              * side, after PUT proves a later command boundary was published.
              * Recycled and in-stream stoppers keep their journal lifecycle. */
-            if (g_yz_gcm_segment_bytes) {
-                const uint32_t ring = 0x800000u;
-                const uint32_t segment = get / g_yz_gcm_segment_bytes;
-                const uint32_t segment_head =
-                    segment * g_yz_gcm_segment_bytes +
-                    (segment == 0u ? 0x1000u : 0u);
-                const uint32_t ahead = (put - get + ring) & (ring - 1u);
-                if (segment == 0u && get == segment_head && ahead > 4u &&
-                    ahead < (ring >> 1)) {
-                    MemoryBarrier();
-                    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
-                        vm_read32(ea) == cmd) {
-                        const uint32_t resume = (get + 4u) & (ring - 1u);
-                        vm_write32(ea, 0x20000000u | resume);
-                        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, resume);
-                        static unsigned released_heads = 0;
-                        if (++released_heads <= 16u) {
-                            fprintf(stderr,
-                                    "[gcm] released published segment head "
-                                    "io=0x%06X PUT=0x%06X\n",
-                                    get, put);
-                            fflush(stderr);
-                        }
-                        return finish(YZ_RSX_WAIT_ADVANCING);
-                    }
+            uint32_t published_resume = get;
+            if (yz_rsx_try_release_published_segment_head(
+                    nullptr, get, put, cmd, &published_resume)) {
+                vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET,
+                           published_resume);
+                static unsigned released_heads = 0;
+                if (++released_heads <= 16u) {
+                    fprintf(stderr,
+                            "[gcm] released published segment head "
+                            "io=0x%06X PUT=0x%06X\n",
+                            get, put);
+                    fflush(stderr);
                 }
+                return finish(YZ_RSX_WAIT_ADVANCING);
             }
             /* Jump-to-self stopper. DEFERRED-RELEASE APPLY -- RETIRED (default
              * OFF 2026-07-02, layer-1 root-cause session; opt back in with
@@ -7237,7 +7635,7 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
             if (te && !target_flow && !target_method) {
                 const uint32_t resume =
                     yz_a010_find_pending_chain((tgt + 4u) & 0x7FFFFFu,
-                                               put);
+                                               put, 1);
                 if (resume) {
                     const uint32_t repaired =
                         (cmd & 3u) == 1u

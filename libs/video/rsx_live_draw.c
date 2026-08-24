@@ -1480,6 +1480,7 @@ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 }
 static u64 fnv1a(const void* data, u32 n, u64 h);
 static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface);
+static void ld_clean_frontier_visual_probe(const surface_t* surface);
 static void ld_vertex_diag_emit(const char* reason, int dump_surface);
 
 /* ---------------------------------------------------------------------------
@@ -8236,6 +8237,19 @@ static int ld_present_external_impl(ID3D12Resource* source, u32 format,
 #if defined(YZ_PERF_PROFILE)
     ld_profile_present(g_ld_frames);
 #endif
+#if defined(YZ_PERF_CLEAN) && defined(YZ_FRONTIER_VISUAL_PROBE)
+    /* Full-native scanout bypasses rsx_live_draw_present(), but the sparse
+     * acceptance readback belongs to the presentation boundary rather than
+     * to the legacy renderer.  Wrap the exact native source without adding it
+     * to the legacy surface registry or rendering it a second time. */
+    {
+        surface_t presented = {0};
+        presented.tex = source;
+        presented.w = width;
+        presented.h = height;
+        ld_clean_frontier_visual_probe(&presented);
+    }
+#endif
     g_ld_flip_consumed++;
     g_ld_last_consumed_buffer = buffer_id & 7u;
     return 0;
@@ -8948,6 +8962,199 @@ static u64 ld_movement_proof_hold_ms_for_leg(u32 leg)
     return result < 1000ull ? 1000ull : result;
 }
 
+/* Sparse acceptance capture shared by legacy and strict full-native scanout.
+ * It is compiled only into the explicit visual-probe lane and remains inert
+ * unless the route supplies its bounded directory/stop-file contract. */
+static void ld_clean_frontier_visual_probe(const surface_t* surface)
+{
+#if defined(YZ_PERF_CLEAN) && defined(YZ_FRONTIER_VISUAL_PROBE)
+    static int probe_enabled = -1;
+    static char probe_dir[MAX_PATH * 2];
+    static char route_stop_file[MAX_PATH * 2];
+    static char movement_stop_file[MAX_PATH * 2];
+    static int akiyama_route;
+    static u64 probe_delay_ms;
+    static u64 probe_interval_ms;
+    static u64 next_probe_tick;
+    static u64 next_movement_stop_poll;
+    static u32 probe_serial;
+    if (probe_enabled < 0) {
+        const char* enabled = getenv("YZ_MOVEMENT_PROOF");
+        const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
+        const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
+        const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
+        akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
+        const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE");
+        if ((!stop || !*stop) && akiyama_route)
+            stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
+        const char* movement_stop = getenv("YZ_MOVEMENT_PROOF_STOP_FILE");
+        probe_enabled = ((enabled && *enabled) || akiyama_route) &&
+            directory && *directory;
+        if (probe_enabled) {
+            strncpy(probe_dir, directory, sizeof(probe_dir) - 1u);
+            probe_dir[sizeof(probe_dir) - 1u] = '\0';
+            if (akiyama_route && stop && *stop) {
+                strncpy(route_stop_file, stop,
+                        sizeof(route_stop_file) - 1u);
+                route_stop_file[sizeof(route_stop_file) - 1u] = '\0';
+            } else if (akiyama_route) {
+                probe_enabled = 0;
+                fprintf(stderr,
+                        "[akiyama-route] visual probe disabled: "
+                        "stop file is required\n");
+                fflush(stderr);
+            }
+            if (!akiyama_route && movement_stop && *movement_stop) {
+                strncpy(movement_stop_file, movement_stop,
+                        sizeof(movement_stop_file) - 1u);
+                movement_stop_file[sizeof(movement_stop_file) - 1u] = '\0';
+            }
+            probe_delay_ms = delay && *delay
+                ? _strtoui64(delay, NULL, 10) :
+                (akiyama_route ? 120000ull : 780000ull);
+            probe_interval_ms = interval && *interval
+                ? _strtoui64(interval, NULL, 10) : 30000ull;
+            if (probe_interval_ms < (akiyama_route ? 2000ull : 30000ull))
+                probe_interval_ms = akiyama_route ? 2000ull : 30000ull;
+        }
+    }
+    if (probe_enabled && !akiyama_route && movement_stop_file[0]) {
+        const u64 now = GetTickCount64();
+        if (now >= next_movement_stop_poll) {
+            next_movement_stop_poll = now + 250ull;
+            if (GetFileAttributesA(movement_stop_file) !=
+                    INVALID_FILE_ATTRIBUTES) {
+                probe_enabled = 0;
+                fprintf(stderr,
+                        "[movement-proof] visual probe stopped at "
+                        "confirmed route checkpoint present_id=%llu\n",
+                        (unsigned long long)g_ld_present_total);
+                fflush(stderr);
+            }
+        }
+    }
+    if (probe_enabled && surface && surface->tex &&
+        g_yz_auto_start_tick) {
+        const u64 now = GetTickCount64();
+        const u64 elapsed = now - g_yz_auto_start_tick;
+        if (elapsed >= probe_delay_ms &&
+            (!next_probe_tick || now >= next_probe_tick)) {
+            if (akiyama_route &&
+                GetFileAttributesA(route_stop_file) !=
+                    INVALID_FILE_ATTRIBUTES) {
+                probe_enabled = 0;
+                YZ_WKL4_CYCLE_BEGIN_INTERVAL();
+                fprintf(stderr,
+                        "[akiyama-route] visual probe stopped at "
+                        "confirmed checkpoint present_id=%llu\n",
+                        (unsigned long long)g_ld_present_total);
+                fflush(stderr);
+            }
+        }
+        if (probe_enabled && elapsed >= probe_delay_ms &&
+            (!next_probe_tick || now >= next_probe_tick)) {
+            char path[MAX_PATH * 2];
+            const u32 serial = ++probe_serial;
+            snprintf(path, sizeof(path), "%s\\frontier_probe_%03u.ppm",
+                     probe_dir, serial);
+            {
+                const u64 nonblack = ld_dump_surface_ppm(path, surface);
+                if (!akiyama_route)
+                    ld_movement_probe_mark_ready(
+                        probe_dir, serial, nonblack);
+                fprintf(stderr,
+                        "[%s] clean-frontier-probe serial=%u "
+                        "elapsed_ms=%llu frame=%u present_id=%llu "
+                        "nonblack=%s%llu hud_pale_ppm=%llu path=%s\n",
+                        akiyama_route ? "akiyama-route" :
+                            "movement-proof",
+                        serial, (unsigned long long)elapsed, g_ld_frames,
+                        (unsigned long long)g_ld_present_total,
+                        nonblack == UINT64_MAX ? "unknown:" : "",
+                        (unsigned long long)(
+                            nonblack == UINT64_MAX ? 0 : nonblack),
+                        (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                        path);
+                fflush(stderr);
+            }
+            next_probe_tick = now + probe_interval_ms;
+        }
+
+        /* The extended route shares the same native source for its three
+         * before/after movement handshakes. */
+        {
+            const LONG phase = InterlockedCompareExchange(
+                &g_yz_movement_proof_phase, 0, 0);
+            if (phase == 1 || phase == 3 || phase == 5) {
+                static u64 before_fingerprint;
+                const LONG capture_leg = InterlockedCompareExchange(
+                    &g_yz_movement_proof_leg, 0, 0);
+                const char* suffix = phase == 1 ? "before" :
+                    (phase == 3 ? "after_camera" : "after_hold");
+                char name[96];
+                snprintf(name, sizeof(name),
+                         "movement_leg_%ld_%s.ppm", capture_leg, suffix);
+                char path[MAX_PATH * 2];
+                snprintf(path, sizeof(path), "%s\\%s", probe_dir, name);
+                const u64 nonblack = ld_dump_surface_ppm(path, surface);
+                const u64 fingerprint = g_ld_last_dump_fingerprint;
+                if (phase == 1)
+                    before_fingerprint = fingerprint;
+                const char* final_hud_text = getenv(
+                    "YZ_MOVEMENT_PROOF_FINAL_HUD_PPM");
+                const u64 final_hud_ppm = final_hud_text && *final_hud_text
+                    ? _strtoui64(final_hud_text, NULL, 10) : 0ull;
+                const int final_hud_ready = !final_hud_ppm ||
+                    g_ld_last_dump_hud_pale_ppm >= final_hud_ppm;
+                if (phase == 5 && nonblack != UINT64_MAX &&
+                    fingerprint != before_fingerprint && final_hud_ready) {
+                    char proof_path[MAX_PATH * 2];
+                    snprintf(proof_path, sizeof(proof_path),
+                             "%s\\movement_proof_leg_%ld.txt",
+                             probe_dir, capture_leg);
+                    FILE* proof = fopen(proof_path, "wb");
+                    if (proof) {
+                        fprintf(proof,
+                                "leg=%ld before=%016llX after=%016llX "
+                                "nonblack=%llu hold_ms=%llu "
+                                "hud_pale_ppm=%llu bridge_successes=%ld\n",
+                                capture_leg,
+                                (unsigned long long)before_fingerprint,
+                                (unsigned long long)fingerprint,
+                                (unsigned long long)nonblack,
+                                (unsigned long long)
+                                    ld_movement_proof_hold_ms_for_leg(
+                                        (u32)capture_leg),
+                                (unsigned long long)
+                                    g_ld_last_dump_hud_pale_ppm,
+                                InterlockedCompareExchange(
+                                    &g_yz_frontier_bridge_success_count,
+                                    0, 0));
+                        fclose(proof);
+                    }
+                }
+                fprintf(stderr,
+                        "[movement-proof] clean-capture phase=%ld "
+                        "frame=%u nonblack=%s%llu fingerprint=%016llX "
+                        "hud_pale_ppm=%llu path=%s\n",
+                        phase, g_ld_frames,
+                        nonblack == UINT64_MAX ? "unknown:" : "",
+                        (unsigned long long)(nonblack == UINT64_MAX ?
+                            0 : nonblack),
+                        (unsigned long long)fingerprint,
+                        (unsigned long long)g_ld_last_dump_hud_pale_ppm,
+                        path);
+                fflush(stderr);
+                InterlockedCompareExchange(
+                    &g_yz_movement_proof_phase, phase + 1, phase);
+            }
+        }
+    }
+#else
+    (void)surface;
+#endif
+}
+
 #if !defined(YZ_PERF_CLEAN)
 static void ld_parity_capture_surface(
     const char* directory, const char* phase, u32 serial,
@@ -9602,199 +9809,7 @@ void rsx_live_draw_present(u32 buffer_id)
      * boundary, so an explicitly compiled diagnostic lane may take one sparse
      * renderer-owned image at the requested interval.  The option is OFF by
      * default, leaving ordinary clean builds with no extra per-frame branch. */
-    {
-        static int probe_enabled = -1;
-        static char probe_dir[MAX_PATH * 2];
-        static char route_stop_file[MAX_PATH * 2];
-        static char movement_stop_file[MAX_PATH * 2];
-        static int akiyama_route;
-        static u64 probe_delay_ms;
-        static u64 probe_interval_ms;
-        static u64 next_probe_tick;
-        static u64 next_movement_stop_poll;
-        static u32 probe_serial;
-        if (probe_enabled < 0) {
-            const char* enabled = getenv("YZ_MOVEMENT_PROOF");
-            const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
-            const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
-            const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
-            akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
-            const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE");
-            if ((!stop || !*stop) && akiyama_route)
-                stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
-            const char* movement_stop =
-                getenv("YZ_MOVEMENT_PROOF_STOP_FILE");
-            probe_enabled = ((enabled && *enabled) || akiyama_route) &&
-                directory && *directory;
-            if (probe_enabled) {
-                strncpy(probe_dir, directory, sizeof(probe_dir) - 1u);
-                probe_dir[sizeof(probe_dir) - 1u] = '\0';
-                if (akiyama_route && stop && *stop) {
-                    strncpy(route_stop_file, stop,
-                            sizeof(route_stop_file) - 1u);
-                    route_stop_file[sizeof(route_stop_file) - 1u] = '\0';
-                } else if (akiyama_route) {
-                    probe_enabled = 0;
-                    fprintf(stderr,
-                            "[akiyama-route] visual probe disabled: "
-                            "stop file is required\n");
-                    fflush(stderr);
-                }
-                if (!akiyama_route && movement_stop && *movement_stop) {
-                    strncpy(movement_stop_file, movement_stop,
-                            sizeof(movement_stop_file) - 1u);
-                    movement_stop_file[
-                        sizeof(movement_stop_file) - 1u] = '\0';
-                }
-                probe_delay_ms = delay && *delay
-                    ? _strtoui64(delay, NULL, 10) :
-                    (akiyama_route ? 120000ull : 780000ull);
-                probe_interval_ms = interval && *interval
-                    ? _strtoui64(interval, NULL, 10) : 30000ull;
-                if (probe_interval_ms < (akiyama_route ? 2000ull : 30000ull))
-                    probe_interval_ms =
-                        akiyama_route ? 2000ull : 30000ull;
-            }
-        }
-        if (probe_enabled && !akiyama_route && movement_stop_file[0]) {
-            const u64 now = GetTickCount64();
-            if (now >= next_movement_stop_poll) {
-                next_movement_stop_poll = now + 250ull;
-                if (GetFileAttributesA(movement_stop_file) !=
-                        INVALID_FILE_ATTRIBUTES) {
-                    probe_enabled = 0;
-                    fprintf(stderr,
-                            "[movement-proof] visual probe stopped at "
-                            "confirmed route checkpoint present_id=%llu\n",
-                            (unsigned long long)g_ld_present_total);
-                    fflush(stderr);
-                }
-            }
-        }
-        if (probe_enabled && g_yz_auto_start_tick) {
-            const u64 now = GetTickCount64();
-            const u64 elapsed = now - g_yz_auto_start_tick;
-            if (elapsed >= probe_delay_ms &&
-                (!next_probe_tick || now >= next_probe_tick)) {
-                if (akiyama_route &&
-                    GetFileAttributesA(route_stop_file) !=
-                        INVALID_FILE_ATTRIBUTES) {
-                    probe_enabled = 0;
-                    YZ_WKL4_CYCLE_BEGIN_INTERVAL();
-                    fprintf(stderr,
-                            "[akiyama-route] visual probe stopped at "
-                            "confirmed checkpoint present_id=%llu\n",
-                            (unsigned long long)g_ld_present_total);
-                    fflush(stderr);
-                }
-            }
-            if (probe_enabled && elapsed >= probe_delay_ms &&
-                (!next_probe_tick || now >= next_probe_tick)) {
-                char path[MAX_PATH * 2];
-                const u32 serial = ++probe_serial;
-                snprintf(path, sizeof(path), "%s\\frontier_probe_%03u.ppm",
-                         probe_dir, serial);
-                {
-                    const u64 nonblack =
-                        ld_dump_surface_ppm(path, &g.surfaces[target]);
-                    if (!akiyama_route)
-                        ld_movement_probe_mark_ready(
-                            probe_dir, serial, nonblack);
-                    fprintf(stderr,
-                            "[%s] clean-frontier-probe serial=%u "
-                            "elapsed_ms=%llu frame=%u present_id=%llu "
-                            "nonblack=%s%llu "
-                            "hud_pale_ppm=%llu path=%s\n",
-                            akiyama_route ? "akiyama-route" :
-                                "movement-proof",
-                            serial, (unsigned long long)elapsed, g_ld_frames,
-                            (unsigned long long)(g_ld_present_total + 1u),
-                            nonblack == UINT64_MAX ? "unknown:" : "",
-                            (unsigned long long)(
-                                nonblack == UINT64_MAX ? 0 : nonblack),
-                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
-                            path);
-                    fflush(stderr);
-                }
-                next_probe_tick = now + probe_interval_ms;
-            }
-
-            /* PERF_CLEAN omits the broad promotion capture controller, but
-             * this explicitly compiled acceptance lane still owns the three
-             * movement handshakes. Preserve before/after surfaces and require
-             * a changed presented fingerprint before writing proof. */
-            {
-                const LONG phase = InterlockedCompareExchange(
-                    &g_yz_movement_proof_phase, 0, 0);
-                if (phase == 1 || phase == 3 || phase == 5) {
-                    static u64 before_fingerprint;
-                    const LONG capture_leg = InterlockedCompareExchange(
-                        &g_yz_movement_proof_leg, 0, 0);
-                    const char* suffix = phase == 1 ? "before" :
-                        (phase == 3 ? "after_camera" : "after_hold");
-                    char name[96];
-                    snprintf(name, sizeof(name),
-                             "movement_leg_%ld_%s.ppm", capture_leg, suffix);
-                    char path[MAX_PATH * 2];
-                    snprintf(path, sizeof(path), "%s\\%s", probe_dir, name);
-                    const u64 nonblack =
-                        ld_dump_surface_ppm(path, &g.surfaces[target]);
-                    const u64 fingerprint = g_ld_last_dump_fingerprint;
-                    if (phase == 1)
-                        before_fingerprint = fingerprint;
-                    const char* final_hud_text = getenv(
-                        "YZ_MOVEMENT_PROOF_FINAL_HUD_PPM");
-                    const u64 final_hud_ppm = final_hud_text &&
-                        *final_hud_text
-                            ? _strtoui64(final_hud_text, NULL, 10) : 0ull;
-                    const int final_hud_ready = !final_hud_ppm ||
-                        g_ld_last_dump_hud_pale_ppm >= final_hud_ppm;
-                    if (phase == 5 && nonblack != UINT64_MAX &&
-                        fingerprint != before_fingerprint &&
-                        final_hud_ready) {
-                        char proof_path[MAX_PATH * 2];
-                        snprintf(proof_path, sizeof(proof_path),
-                                 "%s\\movement_proof_leg_%ld.txt",
-                                 probe_dir, capture_leg);
-                        FILE* proof = fopen(proof_path, "wb");
-                        if (proof) {
-                            fprintf(proof,
-                                    "leg=%ld before=%016llX after=%016llX "
-                                    "nonblack=%llu hold_ms=%llu "
-                                    "hud_pale_ppm=%llu bridge_successes=%ld\n",
-                                    capture_leg,
-                                    (unsigned long long)before_fingerprint,
-                                    (unsigned long long)fingerprint,
-                                    (unsigned long long)nonblack,
-                                    (unsigned long long)
-                                        ld_movement_proof_hold_ms_for_leg(
-                                            (u32)capture_leg),
-                                    (unsigned long long)
-                                        g_ld_last_dump_hud_pale_ppm,
-                                    InterlockedCompareExchange(
-                                        &g_yz_frontier_bridge_success_count,
-                                        0, 0));
-                            fclose(proof);
-                        }
-                    }
-                    fprintf(stderr,
-                            "[movement-proof] clean-capture phase=%ld "
-                            "frame=%u nonblack=%s%llu fingerprint=%016llX "
-                            "hud_pale_ppm=%llu path=%s\n",
-                            phase, g_ld_frames,
-                            nonblack == UINT64_MAX ? "unknown:" : "",
-                            (unsigned long long)(nonblack == UINT64_MAX ?
-                                0 : nonblack),
-                            (unsigned long long)fingerprint,
-                            (unsigned long long)g_ld_last_dump_hud_pale_ppm,
-                            path);
-                    fflush(stderr);
-                    InterlockedCompareExchange(
-                        &g_yz_movement_proof_phase, phase + 1, phase);
-                }
-            }
-        }
-    }
+    ld_clean_frontier_visual_probe(presented_surface);
 #endif
 #if defined(YZ_PERF_PROFILE)
     /* Explicit YZ_RSX_PERF_LOG output only: buffered and rate-limited, never

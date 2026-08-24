@@ -103,6 +103,15 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long unsup_draw_index;     /* index list unreadable      */
     unsigned long long unsup_draw_fp;        /* FP unreadable/unsupported  */
     unsigned long long unsup_draw_texture;   /* FP texture lane pending    */
+    unsigned long long unsup_upload_index;   /* host IB arena reservation   */
+    unsigned long long unsup_upload_pull;    /* vertex-pull CB reservation  */
+    unsigned long long unsup_upload_vp;      /* vertex constants reservation */
+    unsigned long long unsup_upload_fp;      /* fragment constants reserve  */
+    unsigned long long first_upload_used;
+    unsigned long long first_upload_budget;
+    unsigned long long first_upload_request;
+    unsigned int first_upload_batches;
+    unsigned int first_upload_stage;         /* 1=index 2=pull 3=VP 4=FP   */
     unsigned long long unsup_topology_id[16];/* exact primitive census     */
     unsigned long long unsup_rt_format[32];  /* exact surface-format census */
     unsigned long long restart_draws;        /* executed via strip-cut IB  */

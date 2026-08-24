@@ -132,7 +132,9 @@ def main() -> int:
     # known.  Failed retries register their exact key before finish records the
     # unchanged WAIT_SEMAPHORE phase.
     dispatch = step[step.index("int stalled = 0;"):step.index("if (stalled)")]
-    method_call = dispatch.index("stalled = yz_rsx_method")
+    # The call may be the right arm of the native-method ternary; anchor on
+    # the exact dispatch function rather than one formatting of its assignment.
+    method_call = dispatch.index("yz_rsx_method")
     if "transition(YZ_RSX_WAIT_ADVANCING)" in dispatch[:method_call]:
         raise AssertionError("ADVANCING is entered before yz_rsx_method succeeds")
     sem_attempt = dispatch.find("yz_rsx_wait_classifier_semaphore_attempt")

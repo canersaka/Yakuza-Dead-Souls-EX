@@ -38,6 +38,7 @@ int main(void) { return 2; }
 
 static int g_failures;
 static u32 g_present_handoffs;
+static void* g_last_present_texture;
 static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
 static u8 g_watched_host_page[2][1024]; /* LOCAL_SIZE / host page */
@@ -77,6 +78,7 @@ static int test_present_handoff(void* user, void* texture, u32 format,
     (void)user;
     if (!texture || !format || width != RT_W || height != RT_H || buffer_id)
         return -1;
+    g_last_present_texture = texture;
     g_present_handoffs++;
     return 0;
 }
@@ -966,7 +968,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         if (!frame_fifo.words)
             return -1;
         rsx_nr_frame_owner_init(
-            &frame_owner, ad, &be, &ring, cap_frame_read32, &frame_fifo);
+            &frame_owner, ad, &be, &ring, cap_frame_read32, &frame_fifo,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
     u32 completed_draws = 0;
@@ -1944,6 +1947,118 @@ done:
         adapter->lpVtbl->Release(adapter);
     if (factory)
         factory->lpVtbl->Release(factory);
+}
+
+static void test_private_rt_registry_capacity(void)
+{
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    if (!sink) {
+        CHECK(0, "private RT capacity sink creation failed");
+        return;
+    }
+
+    rsx_nir_pipeline state;
+    memset(&state, 0, sizeof(state));
+    state.surface.color_format = 8u;
+    state.surface.color_target = 1u;
+    state.surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    state.surface.color_pitch[0] = 16u;
+    state.surface.clip_w = 4u;
+    state.surface.clip_h = 4u;
+    rsx_nir_clear clear = {0xF0u, 0u, 0u, 0u};
+
+    for (u32 i = 0; i < 64u; ++i) {
+        state.surface.color_offset[0] = i * 0x1000u;
+        CHECK(rsx_nr_d3d12_preflight_clear(sink, &state, &clear) == 0,
+              "private RT identity %u was refused", i);
+    }
+    rsx_nr_d3d12_stats before, after;
+    rsx_nr_d3d12_get_stats(sink, &before);
+    CHECK(before.rt_builds == 64u,
+          "private RT registry built %llu/64 targets", before.rt_builds);
+
+    state.surface.color_offset[0] = 64u * 0x1000u;
+    CHECK(rsx_nr_d3d12_preflight_clear(sink, &state, &clear) != 0,
+          "private RT registry did not refuse its bounded 65th identity");
+    rsx_nr_d3d12_get_stats(sink, &after);
+    CHECK(after.rt_builds == before.rt_builds,
+          "bounded RT refusal partially allocated a target");
+    rsx_nr_d3d12_destroy(sink);
+}
+
+static void test_display_chooses_latest_surface_identity(void)
+{
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    if (!sink) {
+        CHECK(0, "display alias sink creation failed");
+        return;
+    }
+    CHECK(rsx_nr_d3d12_set_live_output(
+              sink, 0, test_present_handoff, NULL) == 0,
+          "display alias live-output setup failed");
+    rsx_nr_d3d12_set_display_buffer(
+        sink, 0, RSX_NIR_LOCATION_LOCAL, RT_OFFSET, RT_W, RT_H);
+
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nir_pipeline state;
+    memset(&state, 0, sizeof(state));
+    state.surface.color_target = 1u;
+    state.surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    state.surface.color_offset[0] = RT_OFFSET;
+    state.surface.color_pitch[0] = RT_W * 4u;
+    state.surface.clip_w = RT_W;
+    state.surface.clip_h = RT_H;
+    rsx_nir_clear clear = {0xF0u, 0xFFFF0000u, 0u, 0u};
+
+    /* The title's format-8 identity is allocated first. */
+    state.surface.color_format = 8u;
+    CHECK(rsx_nr_d3d12_preflight_clear(sink, &state, &clear) == 0 &&
+              ops.clear(ops.user, &state, &clear) == 0 &&
+              ops.present(ops.user, 0u) == 0,
+          "first display identity failed");
+    void* const title_texture = g_last_present_texture;
+
+    /* The world reuses the display address and dimensions with format 5.
+     * It must win scanout even though its target occupies a later slot. */
+    state.surface.color_format = 5u;
+    clear.color_value = 0xFF0000FFu;
+    CHECK(rsx_nr_d3d12_preflight_clear(sink, &state, &clear) == 0 &&
+              ops.clear(ops.user, &state, &clear) == 0 &&
+              ops.present(ops.user, 0u) == 0,
+          "second display identity failed");
+    void* const world_texture = g_last_present_texture;
+    CHECK(title_texture && world_texture && title_texture != world_texture,
+          "display alias did not create two exact surface identities");
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0 &&
+              pix_is(1u, 1u, 0xFFu, 0x00u, 0x00u),
+          "latest display identity did not provide world pixels");
+
+    /* Recency follows successful writes, not allocation/table order. */
+    state.surface.color_format = 8u;
+    clear.color_value = 0xFF00FF00u;
+    CHECK(ops.clear(ops.user, &state, &clear) == 0 &&
+              ops.present(ops.user, 0u) == 0,
+          "rewritten first display identity failed");
+    CHECK(g_last_present_texture == title_texture,
+          "scanout did not return to the newly written older identity");
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0 &&
+              pix_is(1u, 1u, 0x00u, 0xFFu, 0x00u),
+          "display recency did not follow the successful rewrite");
+
+    rsx_nr_d3d12_stats stats;
+    rsx_nr_d3d12_get_stats(sink, &stats);
+    CHECK(stats.rt_builds == 2u,
+          "display alias test built %llu identities instead of two",
+          stats.rt_builds);
+    rsx_nr_d3d12_destroy(sink);
 }
 
 int main(int argc, char** argv)
@@ -3162,6 +3277,8 @@ int main(int argc, char** argv)
 
     test_broker_actual_color_format();
     test_shared_timeline();
+    test_private_rt_registry_capacity();
+    test_display_chooses_latest_surface_identity();
 
     /* optional real-capture execution leg (large local untracked oracle:
      * absent capture = SKIP so CTest stays hermetic) */

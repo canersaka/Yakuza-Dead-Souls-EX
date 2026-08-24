@@ -24,6 +24,29 @@ extern "C" {
 #endif
 
 typedef int (*rsx_nr_frame_read32_fn)(void* user, u32 io, u32* value);
+/* A producer-publication hook for an exact jump-to-self stopper. Returning
+ * one means the hook atomically proved and published a forward resume cursor;
+ * zero leaves the stopper parked. This is not a generic skip facility. */
+typedef int (*rsx_nr_frame_release_stopper_fn)(
+    void* user, u32 get, u32 put, u32 command, u32* resume_get);
+/* Exact producer record for an inline data island rooted at this command.
+ * A nonzero return supplies the only safe cursor after the island.  The
+ * command target is the data start and must not itself be executed. */
+typedef int (*rsx_nr_frame_island_edge_fn)(
+    void* user, u32 get, u32 put, u32 command, u32* resume_get);
+/* Fail-closed repair for one exact published JUMP whose target still starts
+ * with non-command payload.  The hook may return a replacement cursor only
+ * after proving the complete producer chain and atomically replacing the
+ * source JUMP.  It is called at most once for an unchanged
+ * source/command/target/word content generation. */
+typedef int (*rsx_nr_frame_resolve_jump_fn)(
+    void* user, u32 get, u32 put, u32 command, u32 target,
+    u32 target_word, u32* resume_get);
+/* Equivalent fail-closed proof for a primary-ring cursor parked on an inline
+ * generated-data gap. The hook may return only the first structurally proven
+ * command prologue following that exact unchanged word. */
+typedef int (*rsx_nr_frame_resolve_hole_fn)(
+    void* user, u32 get, u32 put, u32 word, u32* resume_get);
 
 typedef enum rsx_nr_frame_step_result {
     RSX_NR_FRAME_ADVANCED = 0,
@@ -42,11 +65,13 @@ typedef enum rsx_nr_frame_failure_kind {
     RSX_NR_FRAME_FAILURE_RING_CAPACITY,
     RSX_NR_FRAME_FAILURE_EXECUTION,
     RSX_NR_FRAME_FAILURE_CURSOR_CHANGED,
+    RSX_NR_FRAME_FAILURE_ISLAND_EDGE,
 } rsx_nr_frame_failure_kind;
 
 typedef struct rsx_nr_frame_failure {
     u32 kind;
     u32 get;
+    u32 put;
     u32 call_return;
     u32 command;
     u32 method;
@@ -54,6 +79,23 @@ typedef struct rsx_nr_frame_failure {
     u32 argument_index;
     unsigned long long frame;
 } rsx_nr_frame_failure;
+
+#define RSX_NR_FRAME_BREADCRUMB_COUNT 8u
+typedef struct rsx_nr_frame_breadcrumb {
+    u32 get;
+    u32 put;
+    u32 call_return;
+    u32 command;
+} rsx_nr_frame_breadcrumb;
+
+typedef struct rsx_nr_frame_flow_origin {
+    u32 get;
+    u32 command;
+    u32 target;
+    u32 return_before;
+    u32 return_after;
+    unsigned long long sequence;
+} rsx_nr_frame_flow_origin;
 
 typedef struct rsx_nr_frame_owner_stats {
     unsigned long long steps;
@@ -63,6 +105,11 @@ typedef struct rsx_nr_frame_owner_stats {
     unsigned long long waits_empty;
     unsigned long long waits_partial;
     unsigned long long waits_stopper;
+    unsigned long long released_stoppers;
+    unsigned long long skipped_data_islands;
+    unsigned long long repaired_generated_links;
+    unsigned long long repaired_generated_holes;
+    unsigned long long generated_link_attempts;
     unsigned long long waits_semaphore;
     unsigned long long frames;
     unsigned long long backend_ops;
@@ -74,11 +121,20 @@ typedef struct rsx_nr_frame_owner {
     rsx_nr_ring* ring;
     rsx_nr_frame_read32_fn read32;
     void* read_user;
+    rsx_nr_frame_release_stopper_fn release_stopper;
+    void* release_stopper_user;
+    rsx_nr_frame_island_edge_fn island_edge;
+    void* island_edge_user;
+    rsx_nr_frame_resolve_jump_fn resolve_jump;
+    void* resolve_jump_user;
+    rsx_nr_frame_resolve_hole_fn resolve_hole;
+    void* resolve_hole_user;
 
     u32 fatal;
     u32 packet_active;
     u32 method_inflight;
     u32 packet_get;
+    u32 packet_put;
     u32 packet_ret;
     u32 packet_command;
     u32 packet_count;
@@ -89,9 +145,31 @@ typedef struct rsx_nr_frame_owner {
     u32 packet_next_get;
     u32 packet_next_ret;
     u32 control_streak;
+    u32 breadcrumb_head;
+    u32 breadcrumb_count;
+    u32 breadcrumb_last_get;
+    u32 breadcrumb_last_return;
+    u32 breadcrumb_last_command;
+    u32 flow_wait_source;
+    u32 flow_wait_target;
+    u32 flow_wait_word;
+    u32 flow_wait_polls;
+    u32 flow_wait_put;
+    u32 flow_wait_put_polls;
+    u32 flow_wait_limit;
+    u32 repair_attempt_valid;
+    u32 repair_attempt_kind;
+    u32 repair_attempt_source;
+    u32 repair_attempt_put;
+    u32 repair_attempt_command;
+    u32 repair_attempt_target;
+    u32 repair_attempt_word;
+    u32 primary_segment_bytes;
     unsigned long long method_errors_before;
 
     rsx_nr_frame_failure failure;
+    rsx_nr_frame_flow_origin flow_origin;
+    rsx_nr_frame_breadcrumb breadcrumbs[RSX_NR_FRAME_BREADCRUMB_COUNT];
     rsx_nr_frame_owner_stats stats;
 } rsx_nr_frame_owner;
 
@@ -100,7 +178,15 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* owner,
                              rsx_nr_backend* backend,
                              rsx_nr_ring* ring,
                              rsx_nr_frame_read32_fn read32,
-                             void* read_user);
+                             void* read_user,
+                             rsx_nr_frame_release_stopper_fn release_stopper,
+                             void* release_stopper_user,
+                             rsx_nr_frame_island_edge_fn island_edge,
+                             void* island_edge_user,
+                             rsx_nr_frame_resolve_jump_fn resolve_jump,
+                             void* resolve_jump_user,
+                             rsx_nr_frame_resolve_hole_fn resolve_hole,
+                             void* resolve_hole_user);
 
 rsx_nr_frame_step_result rsx_nr_frame_owner_step(
     rsx_nr_frame_owner* owner, u32 get, u32 put, u32 call_return,

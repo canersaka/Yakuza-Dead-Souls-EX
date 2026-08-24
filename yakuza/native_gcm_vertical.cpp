@@ -55,6 +55,18 @@ extern "C" void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size);
 extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
 extern "C" void yz_drain_trampolines(ppu_context* ctx);
 extern "C" uint32_t yz_nr_vertical_io_to_ea(uint32_t io_offset);
+extern "C" int yz_rsx_try_release_published_segment_head(
+    void* user, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t* resume_get);
+extern "C" int yz_rsx_registered_data_island_edge(
+    void* user, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t* resume_get);
+extern "C" int yz_rsx_resolve_published_generated_link(
+    void* user, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t target, uint32_t target_word, uint32_t* resume_get);
+extern "C" int yz_rsx_resolve_published_generated_hole(
+    void* user, uint32_t get, uint32_t put, uint32_t word,
+    uint32_t* resume_get);
 extern "C" int yz_nr_vertical_mirror_legacy_method(
     uint32_t method, uint32_t arg, int suppress_action);
 extern "C" int yz_nr_vertical_report_can(uint32_t kind, uint32_t arg,
@@ -373,6 +385,7 @@ struct yz_nr_vertical_active_state {
     yz_nr_vertical_display displays[8];
     volatile LONG graphics_ready;
     volatile LONG graphics_init_failed;
+    volatile LONG strict_fatal_reported;
     uint32_t graphics_families;
     uint32_t clear_scope;
     uint32_t frame_islands;
@@ -985,7 +998,11 @@ static int yz_nr_active_init(int graphics)
                         &g_active.tokens, &ops);
     rsx_nr_frame_owner_init(
         &g_active.frame_owner, &g_active.adapter, &g_active.backend,
-        &g_active.ring, yz_nr_frame_read32, nullptr);
+        &g_active.ring, yz_nr_frame_read32, nullptr,
+        yz_rsx_try_release_published_segment_head, nullptr,
+        yz_rsx_registered_data_island_edge, nullptr,
+        yz_rsx_resolve_published_generated_link, nullptr,
+        yz_rsx_resolve_published_generated_hole, nullptr);
     return 1;
 }
 
@@ -3738,12 +3755,30 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
     if (!g_active.strict_full_native)
         return YZ_NR_VERTICAL_FRAME_DISABLED;
     if (!InterlockedCompareExchange(
-            &g_vertical.mode_active_graphics, 0, 0))
+            &g_vertical.mode_active_graphics, 0, 0)) {
+        if (!InterlockedExchange(&g_active.strict_fatal_reported, 1)) {
+            fprintf(stderr,
+                    "[nr-full-native-fatal init=1 kind=0 frame=0 "
+                    "get=%08X ret=%08X command=00000000 method=00000 "
+                    "arg=00000000 index=0]\n",
+                    get, fifo_ret);
+            fflush(stderr);
+        }
         return YZ_NR_VERTICAL_FRAME_FATAL;
+    }
     yz_nr_active_ensure_graphics();
     if (InterlockedCompareExchange(
-            &g_active.graphics_init_failed, 0, 0))
+            &g_active.graphics_init_failed, 0, 0)) {
+        if (!InterlockedExchange(&g_active.strict_fatal_reported, 1)) {
+            fprintf(stderr,
+                    "[nr-full-native-fatal init=1 kind=0 frame=0 "
+                    "get=%08X ret=%08X command=00000000 method=00000 "
+                    "arg=00000000 index=0]\n",
+                    get, fifo_ret);
+            fflush(stderr);
+        }
         return YZ_NR_VERTICAL_FRAME_FATAL;
+    }
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
         return YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL;
 
@@ -3767,8 +3802,44 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
         return YZ_NR_VERTICAL_FRAME_WAIT_STOPPER;
     case RSX_NR_FRAME_WAIT_SEMAPHORE:
         return YZ_NR_VERTICAL_FRAME_WAIT_SEMAPHORE;
-    default:
+    default: {
+        if (!InterlockedExchange(&g_active.strict_fatal_reported, 1)) {
+            const rsx_nr_frame_failure* const failure =
+                &g_active.frame_owner.failure;
+            fprintf(stderr,
+                    "[nr-full-native-fatal init=0 kind=%u frame=%llu "
+                    "get=%08X put=%08X ret=%08X command=%08X method=%05X "
+                    "arg=%08X index=%u]\n",
+                    failure->kind, failure->frame, failure->get,
+                    failure->put, failure->call_return, failure->command,
+                    failure->method, failure->argument,
+                    failure->argument_index);
+            const rsx_nr_frame_owner* const owner = &g_active.frame_owner;
+            fprintf(stderr,
+                    "[nr-full-native-origin seq=%llu get=%08X "
+                    "command=%08X target=%08X ret-before=%08X "
+                    "ret-after=%08X]\n",
+                    owner->flow_origin.sequence, owner->flow_origin.get,
+                    owner->flow_origin.command, owner->flow_origin.target,
+                    owner->flow_origin.return_before,
+                    owner->flow_origin.return_after);
+            for (uint32_t i = 0; i < owner->breadcrumb_count; ++i) {
+                const uint32_t index =
+                    (owner->breadcrumb_head + RSX_NR_FRAME_BREADCRUMB_COUNT -
+                     owner->breadcrumb_count + i) %
+                    RSX_NR_FRAME_BREADCRUMB_COUNT;
+                const rsx_nr_frame_breadcrumb* const crumb =
+                    &owner->breadcrumbs[index];
+                fprintf(stderr,
+                        "[nr-full-native-flow n=%u get=%08X put=%08X "
+                        "ret=%08X command=%08X]\n",
+                        i, crumb->get, crumb->put, crumb->call_return,
+                        crumb->command);
+            }
+            fflush(stderr);
+        }
         return YZ_NR_VERTICAL_FRAME_FATAL;
+    }
     }
 }
 
@@ -4301,16 +4372,23 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 &g_active.frame_owner.failure;
             fprintf(stderr,
                     "[nr-full-native steps=%llu packets=%llu methods=%llu "
-                    "ops=%llu frames=%llu controls=%llu "
-                    "wait=%llu/%llu/%llu/%llu "
-                    "fatal=%u kind=%u frame=%llu get=%08X ret=%08X "
+                     "ops=%llu frames=%llu controls=%llu "
+                     "wait=%llu/%llu/%llu/%llu "
+                     "stopper-release=%llu island-skip=%llu "
+                     "link-repair=%llu hole-repair=%llu attempts=%llu "
+                     "fatal=%u kind=%u frame=%llu get=%08X put=%08X ret=%08X "
                     "command=%08X method=%05X arg=%08X index=%u]\n",
                     fs->steps, fs->packets, fs->methods,
                     fs->backend_ops, fs->frames, fs->control_words,
-                    fs->waits_empty, fs->waits_partial,
-                    fs->waits_stopper, fs->waits_semaphore,
-                    g_active.frame_owner.fatal, failure->kind,
-                    failure->frame, failure->get, failure->call_return,
+                     fs->waits_empty, fs->waits_partial,
+                     fs->waits_stopper, fs->waits_semaphore,
+                     fs->released_stoppers, fs->skipped_data_islands,
+                     fs->repaired_generated_links,
+                     fs->repaired_generated_holes,
+                     fs->generated_link_attempts,
+                     g_active.frame_owner.fatal, failure->kind,
+                    failure->frame, failure->get, failure->put,
+                    failure->call_return,
                     failure->command, failure->method,
                     failure->argument, failure->argument_index);
             if (g_active.frame_owner.fatal) {
@@ -4704,8 +4782,12 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-vertical-d3d draws=%llu conditional-skip=%llu "
                     "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
                     "clears=%llu "
-                    "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
-                    "watched=%llu/%llu "
+                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
+                     "fallback-reason=%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                     "upload-fail=%llu/%llu/%llu/%llu "
+                     "upload-first=%u/%llu/%llu/%llu/%u "
+                     "compile-fail=%llu texture-fail=%llu "
+                     "watched=%llu/%llu "
                     "residency-fail=%llu mirror=%llu/%llu force-refresh=%llu "
                     "upload-rollover=%llu "
                     "pso=%llu/%llu "
@@ -4717,11 +4799,29 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     legacy_draw_groups,
                     native_draw_coverage_ppm,
                     d3d_stats.clears, d3d_stats.presents,
-                    d3d_stats.queue_submissions,
-                    d3d_stats.unsupported_draws,
-                    d3d_stats.resident_pages[0],
-                    d3d_stats.resident_pages[1],
-                    d3d_stats.watched_guest_pages[0],
+                     d3d_stats.queue_submissions,
+                     d3d_stats.unsupported_draws,
+                     d3d_stats.resident_pages[0],
+                     d3d_stats.resident_pages[1],
+                     d3d_stats.unsup_draw_topology,
+                     d3d_stats.unsup_draw_rt,
+                     d3d_stats.unsup_draw_plan,
+                     d3d_stats.unsup_draw_pso,
+                     d3d_stats.unsup_draw_index,
+                     d3d_stats.unsup_draw_fp,
+                     d3d_stats.unsup_draw_texture,
+                     d3d_stats.unsup_upload_index,
+                     d3d_stats.unsup_upload_pull,
+                     d3d_stats.unsup_upload_vp,
+                     d3d_stats.unsup_upload_fp,
+                     d3d_stats.first_upload_stage,
+                     d3d_stats.first_upload_used,
+                     d3d_stats.first_upload_budget,
+                     d3d_stats.first_upload_request,
+                     d3d_stats.first_upload_batches,
+                     d3d_stats.compile_failures,
+                     d3d_stats.texture_failures,
+                     d3d_stats.watched_guest_pages[0],
                     d3d_stats.watched_guest_pages[1],
                     d3d_stats.residency_failures,
                     d3d_stats.mirror_resyncs,
