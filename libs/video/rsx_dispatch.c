@@ -282,6 +282,18 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     memcpy(rsx->constants, words, count * sizeof(u32));
 }
 
+void rsx_dispatch_copy_architectural_state(
+    rsx_dispatch* dst, const rsx_dispatch* src)
+{
+    if (!dst || !src || dst == src)
+        return;
+    memcpy(dst->regs, src->regs, sizeof(dst->regs));
+    memcpy(dst->vp, src->vp, sizeof(dst->vp));
+    memcpy(dst->constants, src->constants, sizeof(dst->constants));
+    dst->in_begin_end = src->in_begin_end;
+    dst->current_primitive = src->current_primitive;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;

@@ -12,6 +12,10 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "../rsx_live_draw.h"
+#include "../rsx_nir_adapter.h"
+#include "../rsx_nr_backend.h"
+#include "../rsx_nr_backend_d3d12.h"
+#include "../rsx_nr_ring.h"
 #include "ps3emu/yz_runtime_config.h"
 
 #include <stdio.h>
@@ -50,7 +54,42 @@ typedef struct {
 
 volatile LONG g_yz_a010_reference_camera_active = 0;
 volatile LONG g_yz_a010_root_active = 0;
+volatile LONG g_yz_a010_release_scene_active = 0;
+volatile LONG g_yz_a010_stage_generation = 0;
+volatile LONG g_yz_auto_new_game_complete = 0;
+volatile unsigned long long g_yz_auto_start_tick = 0;
+u32 g_yz_codec_taskset = 0;
+u32 g_yz_parked_pub_ea = 0;
+u8* vm_base = NULL;
+void (*g_yz_usleep_pump)(void) = NULL;
 const yz_runtime_config g_yz_runtime_config = {0};
+
+/* The production runtime library contains optional boot/SPU diagnostics whose
+ * owners live in the game executable.  Replay never exercises those paths,
+ * but keeping inert definitions here lets this differential harness link
+ * against the exact current renderer instead of a stale standalone binary. */
+u32 yz_thread_current_id(void) { return 0; }
+u32 yz_guest_addr_from_host(const void* rip) { (void)rip; return 0; }
+void yz_movement_frontier_snapshot(const char* reason) { (void)reason; }
+int yz_ea_trap_range(u32 ea, unsigned size, u32* lo, u32* hi)
+{
+    (void)ea; (void)size; (void)lo; (void)hi;
+    return 0;
+}
+void yz_a010_reltrace_spu(
+    u32 spu_id, u32 image_id, u32 pc, u32 ea,
+    const u8* payload, u32 size, const u32* context)
+{
+    (void)spu_id; (void)image_id; (void)pc; (void)ea;
+    (void)payload; (void)size; (void)context;
+}
+void yz_a010_reltrace_spu_commit(
+    u32 spu_id, u32 image_id, u32 pc, u32 ea,
+    const u8* payload, u32 size)
+{
+    (void)spu_id; (void)image_id; (void)pc; (void)ea;
+    (void)payload; (void)size;
+}
 
 void spu_perf_window_begin(u32 frame) { (void)frame; }
 void spu_perf_window_dump(u32 frame) { (void)frame; }
@@ -190,8 +229,158 @@ static void apply_block_to(
            stream->data + block->data_off, block->size);
 }
 
-static void feed_stream(rxs_stream* memory, const rxs_stream* frame)
+typedef struct mixed_renderer {
+    rsx_nr_d3d12* d3d12;
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_backend backend;
+    rsx_nir_adapter* adapter;
+    u32 target_draw;
+    u32 last_draw;
+    u32 completed_draws;
+    int executed;
+} mixed_renderer;
+
+static u8* mixed_guest_wptr(
+    void* user, u32 location, u32 offset, u32 min_bytes)
 {
+    return (u8*)live_guest_ptr(user, location, offset, min_bytes);
+}
+
+static int mixed_borrow_color(
+    void* user, u32 location, u32 offset, u32 width, u32 height, int create,
+    void** resource, u32* format, u32* resource_width, u32* resource_height)
+{
+    (void)user;
+    return rsx_live_draw_borrow_color(
+        location, offset, width, height, create, resource, format,
+        resource_width, resource_height);
+}
+
+static int mixed_borrow_depth(
+    void* user, u32 location, u32 offset, u32 depth_format,
+    u32 width, u32 height, int create, void** resource,
+    u32* resource_format, u32* dsv_format, u32* srv_format,
+    void** sample_resource, u32* sample_srv_format,
+    int* publication_required)
+{
+    (void)user;
+    return rsx_live_draw_borrow_depth(
+        location, offset, depth_format, width, height, create, resource,
+        resource_format, dsv_format, srv_format, sample_resource,
+        sample_srv_format, publication_required);
+}
+
+static int mixed_resolve_depth(
+    void* user, u32 location, u32 offset, u32 width, u32 height)
+{
+    (void)user;
+    return rsx_live_draw_resolve_depth_sample(
+        location, offset, width, height);
+}
+
+static int mixed_timeline_acquire(
+    void* user, void** list, u64* generation, u64* recording,
+    u64* completed)
+{
+    (void)user;
+    return rsx_live_draw_timeline_acquire(
+        list, generation, recording, completed);
+}
+
+static void mixed_timeline_release(void* user)
+{
+    (void)user;
+    rsx_live_draw_timeline_release();
+}
+
+static int mixed_timeline_flush(void* user)
+{
+    (void)user;
+    return rsx_live_draw_timeline_flush();
+}
+
+static int mixed_init(mixed_renderer* mixed, rxs_stream* memory,
+                      const rxs_stream* frame, u32 target_draw,
+                      u32 draw_count)
+{
+    memset(mixed, 0, sizeof(*mixed));
+    mixed->target_draw = target_draw;
+    mixed->last_draw = target_draw + draw_count - 1u;
+    mixed->d3d12 = rsx_nr_d3d12_create(
+        rsx_live_draw_get_d3d12_device(), ARENA_SIZE, ARENA_SIZE,
+        live_guest_ptr, mixed_guest_wptr, memory);
+    if (!mixed->d3d12 ||
+        rsx_nr_d3d12_set_coherent_section_mode(mixed->d3d12, 1) != 0)
+        return -1;
+    rsx_nr_d3d12_set_resource_broker(
+        mixed->d3d12, mixed_borrow_color, mixed_borrow_depth,
+        mixed_resolve_depth, NULL);
+    if (rsx_nr_d3d12_set_shared_timeline(
+            mixed->d3d12, mixed_timeline_acquire,
+            mixed_timeline_release, mixed_timeline_flush, NULL) != 0)
+        return -1;
+    if (rsx_nr_ring_init(&mixed->ring, 4096u, 1u << 19))
+        return -1;
+    rsx_nr_tokens_init(&mixed->tokens);
+    rsx_nr_exec_ops ops = {0};
+    rsx_nr_d3d12_get_exec_ops(mixed->d3d12, &ops);
+    rsx_nr_backend_init(
+        &mixed->backend, &mixed->ring, &mixed->tokens, &ops);
+    mixed->adapter = malloc(sizeof(*mixed->adapter));
+    if (!mixed->adapter)
+        return -1;
+    const rsx_nir_sink sink = rsx_nr_ring_sink(&mixed->ring);
+    rsx_nir_adapter_init_sink(mixed->adapter, &sink);
+    rsx_nir_adapter_seed(
+        mixed->adapter, frame->regs, frame->reg_words,
+        frame->vp, frame->vp_words, frame->constants, frame->const_words);
+    mixed->adapter->shadow_mode = 1;
+    return 0;
+}
+
+static void mixed_destroy(mixed_renderer* mixed)
+{
+    if (!mixed) return;
+    free(mixed->adapter);
+    rsx_nr_ring_destroy(&mixed->ring);
+    rsx_nr_d3d12_destroy(mixed->d3d12);
+    memset(mixed, 0, sizeof(*mixed));
+}
+
+static int mixed_method(mixed_renderer* mixed, u32 method, u32 argument)
+{
+    const int terminal = method == 0x1808u && argument == 0u;
+    const u32 next_draw = mixed->completed_draws + 1u;
+    if (!terminal || next_draw < mixed->target_draw ||
+        next_draw > mixed->last_draw) {
+        rsx_nir_adapter_method(mixed->adapter, method, argument);
+        rsx_live_draw_method(method, argument);
+        if (terminal)
+            mixed->completed_draws++;
+        return 0;
+    }
+
+    mixed->completed_draws = next_draw;
+    rsx_live_draw_mirror_state_method(method, argument);
+    if (!rsx_nir_adapter_shadow_action(
+            mixed->adapter, method, argument))
+        return -1;
+    while (rsx_nr_ring_depth(&mixed->ring)) {
+        const rsx_nr_step_result step = rsx_nr_backend_step(&mixed->backend);
+        if (step != RSX_NR_STEP_EXECUTED)
+            return -1;
+    }
+    rsx_live_draw_native_draw_commit(&mixed->backend.st);
+    mixed->executed++;
+    return next_draw == mixed->last_draw ? 1 : 0;
+}
+
+static int feed_stream(rxs_stream* memory, const rxs_stream* frame,
+                       mixed_renderer* mixed)
+{
+    if (mixed)
+        mixed->completed_draws = 0;
     rsx_live_draw_seed_registers(frame->regs, frame->reg_words);
     rsx_live_draw_seed_transform_program(frame->vp, frame->vp_words);
     rsx_live_draw_seed_transform_constants(
@@ -202,14 +391,40 @@ static void feed_stream(rxs_stream* memory, const rxs_stream* frame)
             i, 0, display->offset, display->pitch,
             display->w, display->h);
     }
+    u32 completed_draws = 0;
+    u32 stop_after_draw = 0;
+    const char* const stop = getenv("YZ_NR_CAPTURE_STOP_AFTER_DRAW");
+    if (stop && stop[0])
+        stop_after_draw = (u32)strtoul(stop, NULL, 0);
     for (u32 i = 0; i < frame->n_records; i++) {
         const u32 method = frame->records[i * 2u];
         const u32 argument = frame->records[i * 2u + 1u];
         if (method & 0x80000000u)
+        {
             apply_block_to(frame, memory->arena, argument);
-        else
-            rsx_live_draw_method(method, argument);
+            if (mixed && argument < frame->n_blocks) {
+                const rxs_block* const block = &frame->blocks[argument];
+                rsx_nr_d3d12_note_guest_write(
+                    mixed->d3d12, block->location, block->offset,
+                    block->size);
+            }
+        }
+        else {
+            if (mixed) {
+                const int result = mixed_method(mixed, method, argument);
+                if (result < 0)
+                    return -1;
+                if (result > 0 && !getenv("YZ_NR_MIXED_CONTINUE"))
+                    break;
+            } else {
+                rsx_live_draw_method(method, argument);
+            }
+            if (method == 0x1808u && argument == 0u &&
+                ++completed_draws == stop_after_draw)
+                break;
+        }
     }
+    return 0;
 }
 
 static LRESULT CALLBACK live_replay_window_proc(
@@ -252,6 +467,7 @@ int main(int argc, char** argv)
     }
     rxs_stream stream = {0};
     if (rxs_load(argv[1], &stream, 1)) return 1;
+    vm_base = stream.arena[0];
     CreateDirectoryA(argv[2], NULL);
     _putenv_s("YZ_RSX_DRAW", "1");
     if (!getenv("YZ_RSX_VERTEX_MODE"))
@@ -275,10 +491,38 @@ int main(int argc, char** argv)
         rxs_free(&stream);
         return 1;
     }
+    mixed_renderer mixed = {0};
+    mixed_renderer* mixed_ptr = NULL;
+    const char* const mixed_draw_text = getenv("YZ_NR_MIXED_DRAW");
+    if (mixed_draw_text && mixed_draw_text[0]) {
+        const u32 mixed_draw = (u32)strtoul(mixed_draw_text, NULL, 0);
+        const char* const count_text = getenv("YZ_NR_MIXED_DRAW_COUNT");
+        u32 mixed_draw_count = count_text && count_text[0]
+            ? (u32)strtoul(count_text, NULL, 0) : 1u;
+        if (!mixed_draw || !mixed_draw_count ||
+            mixed_draw_count - 1u > UINT32_MAX - mixed_draw ||
+            mixed_init(&mixed, &stream, &stream, mixed_draw,
+                       mixed_draw_count)) {
+            fprintf(stderr, "mixed renderer initialization failed\n");
+            rsx_live_draw_shutdown();
+            DestroyWindow(window);
+            rxs_free(&stream);
+            return 1;
+        }
+        mixed_ptr = &mixed;
+    }
     u32 repeats = argc >= 4 ? (u32)strtoul(argv[3], NULL, 10) : 1u;
     if (!repeats || repeats > 64u) repeats = 1u;
-    for (u32 repeat = 0; repeat < repeats; repeat++)
-        feed_stream(&stream, &stream);
+    for (u32 repeat = 0; repeat < repeats; repeat++) {
+        if (feed_stream(&stream, &stream, mixed_ptr)) {
+            fprintf(stderr, "mixed renderer execution failed\n");
+            mixed_destroy(&mixed);
+            rsx_live_draw_shutdown();
+            DestroyWindow(window);
+            rxs_free(&stream);
+            return 1;
+        }
+    }
     for (int argument = 4; argument < argc; argument++) {
         rxs_stream later = {0};
         if (rxs_load(argv[argument], &later, 0)) {
@@ -288,9 +532,14 @@ int main(int argc, char** argv)
             return 1;
         }
         fprintf(stderr, "[live-replay-sequence] feed %s\n", argv[argument]);
-        feed_stream(&stream, &later);
+        feed_stream(&stream, &later, mixed_ptr);
         rxs_free(&later);
     }
+    if (mixed_ptr)
+        fprintf(stderr,
+                "[mixed-replay] target=%u..%u completed=%u executed=%d\n",
+                mixed.target_draw, mixed.last_draw,
+                mixed.completed_draws, mixed.executed);
     rsx_live_draw_flush();
     const int world = dump_boundary(argv[2], 0x01800000u, "world");
     const int final = dump_boundary(argv[2], 0x00E40000u, "final");
@@ -300,8 +549,10 @@ int main(int argc, char** argv)
             "frames=%u draws=%u\n",
             world, final, scanout, rsx_live_draw_get_frames(),
             rsx_live_draw_get_last_draws());
+    mixed_destroy(&mixed);
     rsx_live_draw_shutdown();
     DestroyWindow(window);
     rxs_free(&stream);
+    vm_base = NULL;
     return world == 0 ? 0 : 1;
 }

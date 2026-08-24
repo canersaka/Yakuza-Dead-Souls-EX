@@ -121,9 +121,11 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long depth_builds;
     unsigned long long depth_refreshes;  /* broker replaced same identity */
     unsigned long long resident_pages[2];
+    unsigned long long watched_guest_pages[2];
     unsigned long long residency_failures;
     unsigned long long mirror_resyncs;
     unsigned long long mirror_rollovers;
+    unsigned long long forced_draw_input_refreshes;
     unsigned long long upload_rollovers;  /* safe pre-draw arena retires   */
     unsigned long long shared_timeline_acquires;
     unsigned long long shared_timeline_generations;
@@ -258,6 +260,18 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b);
  * depth work with later legacy draws. Default is disabled. It must be set
  * before any preflight/draw/PSO build; returns nonzero if too late. */
 int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled);
+
+/* Diagnostic-only exact draw-input refresh. When enabled, execution marks
+ * only the already-preflighted vertex/index spans dirty immediately before
+ * their mirror synchronization. This distinguishes a missed guest-writer
+ * notification from shader/raster defects without broad memory scanning.
+ * Default is disabled and the disabled path is one predictable branch. */
+int rsx_nr_d3d12_set_force_draw_input_refresh(rsx_nr_d3d12* b,
+                                              int enabled);
+/* Advance the diagnostic's fixed-memory page-deduplication epoch at one
+ * complete ownership boundary. Repeated draws of the same page inside that
+ * section then produce one refresh, not one upload per draw. */
+void rsx_nr_d3d12_begin_draw_input_refresh_section(rsx_nr_d3d12* b);
 
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,

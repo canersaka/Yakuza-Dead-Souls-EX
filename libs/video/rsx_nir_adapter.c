@@ -842,7 +842,11 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg)
         (method < M308A_COLOR_FIRST || method > M308A_COLOR_LAST))
         flush_inline(ad);
 
-    if (method < 0x100) {
+    if (method < 0x80u) {
+        /* NV406E methods still occupy the shared hardware register file.
+         * Keep that architectural state identical to rsx_dispatch even when
+         * the typed adapter handles their synchronization semantics itself. */
+        rsx_dispatch_method(&ad->rsx, method, arg);
         if (fifo_engine_method(ad, method, arg))
             return;
     }

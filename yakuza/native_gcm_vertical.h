@@ -28,7 +28,8 @@ extern "C" {
 
 void yz_nr_vertical_init(void);
 void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
-                                   uint32_t packet_ea);
+                                   uint32_t packet_ea,
+                                   int legacy_graphics_suppressed);
 
 /* Called before legacy method dispatch. Returns 1 only when the complete
  * terminal action executed through the ordered native path, in which case

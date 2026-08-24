@@ -45,6 +45,38 @@ typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
                                            u32 min_bytes);
 struct rsx_nir_pipeline;
 struct rsx_nir_clear;
+struct rsx_dispatch;
+
+typedef struct rsx_live_draw_dispatch_diff {
+    u32 mask;
+    u32 first_reg;
+    u32 first_vp_word;
+    u32 first_constant_word;
+} rsx_live_draw_dispatch_diff;
+
+/* Default-off Hana shadow-resource oracle context.  The vertical section
+ * scanner supplies this only for the exact two-map consumer family.  The live
+ * renderer owns the bounded GPU readback and emits the first occurrence once
+ * at shutdown, so ordinary draws pay no diagnostic work. */
+typedef struct rsx_live_draw_shadow_oracle_context {
+    u64 section_identity;
+    u64 section_generation;
+    u32 native_owner;
+    u32 fragment_location;
+    u32 fragment_offset;
+    u32 texture_unit[2];
+    u32 texture_location[2];
+    u32 texture_offset[2];
+    u32 texture_format[2];
+    u32 texture_width[2];
+    u32 texture_height[2];
+    u32 texture_pitch[2];
+    u32 texture_wrap[2];
+    u32 texture_remap[2];
+    u32 texture_filter[2];
+    u32 texture_control0[2];
+    u32 texture_border_color[2];
+} rsx_live_draw_shadow_oracle_context;
 
 /* Whether the live draw path is enabled this run (reads YZ_RSX_DRAW once).
  * Cheap; safe to call from the hot method hook. */
@@ -62,6 +94,11 @@ int  rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 void rsx_live_draw_seed_registers(const u32* regs, u32 count);
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
 void rsx_live_draw_seed_transform_constants(const u32* words, u32 count);
+
+/* Join a late-starting shadow decoder to the exact architectural state of
+ * the established live renderer.  The destination retains its own callbacks,
+ * classifications, and coverage counters. Returns zero on success. */
+int rsx_live_draw_sync_dispatch_state(struct rsx_dispatch* shadow);
 
 /* Register a scanout buffer from sys_rsx_context_attribute(0x104). A flip's
  * argument indexes this table; it is not necessarily the current render
@@ -130,6 +167,11 @@ int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
 int rsx_live_draw_resolve_depth_sample(u32 location, u32 offset,
                                        u32 width, u32 height);
 
+/* Publish the exact Hana shadow consumer that owns the next resolve. The
+ * function is a no-op unless YZ_NR_HANA_DEPTH_ORACLE was selected at startup. */
+void rsx_live_draw_set_shadow_oracle_context(
+    const rsx_live_draw_shadow_oracle_context* context);
+
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the
  * ordered CLEAR action. */
@@ -173,6 +215,15 @@ int rsx_live_draw_native_actions_allowed(void);
  * or their first post-movie terminal action will target stale, divergent
  * state. */
 int rsx_live_draw_guest_graphics_suppressed(void);
+
+/* Compare a shadow dispatcher's architectural state with the dormant/live
+ * legacy renderer at a transactional section boundary.  The mismatch mask is
+ * 1=register file, 2=vertex program, 4=transform constants, 8=BEGIN/control.
+ * This is a read-only, allocation-free diagnostic; callers gate it behind a
+ * default-off aggregate flag and never invoke it per draw or method. */
+u32 rsx_live_draw_dispatch_contract_mismatch(
+    const struct rsx_dispatch* shadow,
+    rsx_live_draw_dispatch_diff* diff);
 
 /* Validate and publish one typed CLEAR against the exact state owned by the
  * live fallback renderer. The mismatch mask is 1=surface, 2=scissor,

@@ -154,6 +154,8 @@ struct rsx_nr_d3d12 {
     rsx_gpu_mirror_d3d12* mirror_be;
     rsx_gpu_mirror_range* resident_page[RSX_GUEST_NUM_SPACES];
     u32 resident_page_count[RSX_GUEST_NUM_SPACES];
+    u64* watched_host_page_bits[RSX_GUEST_NUM_SPACES];
+    u32 watched_host_page_count[RSX_GUEST_NUM_SPACES];
     rsx_nr_d3d12_watch_page_fn watch_page;
     void* watch_page_user;
     rsx_nr_d3d12_borrow_color_fn borrow_color;
@@ -178,6 +180,10 @@ struct rsx_nr_d3d12 {
     void* present_user;
     int rgba_targets;
     u32 coherent_vp_options;
+    int force_draw_input_refresh;
+    int force_draw_input_allocated;
+    u32 force_draw_input_epoch;
+    u32* force_draw_input_page_epoch[RSX_GUEST_NUM_SPACES];
 
     const u8* (*guest_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
     u8* (*writable_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
@@ -843,6 +849,43 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_depth_handle(
 
 /* ---- mirror session helper --------------------------------------------- */
 
+/* Arm the embedder's sparse exact-write route for every 4 KiB host page
+ * touched by a persistent guest resource. The page tracker itself remains
+ * 1 KiB granular, but the VM-write hook rejects at host-page granularity.
+ * A fixed bitset makes registration idempotent without allocation or a scan
+ * on later draws. This is shared by vertex/index mirror spans and decoded
+ * texture resources; previously only the former armed live notifications. */
+static int nrb_watch_guest_span(rsx_nr_d3d12* b, u32 space,
+                                u32 offset, u32 size)
+{
+    if (!size || space >= RSX_GUEST_NUM_SPACES ||
+        (u64)offset + size > b->pages.space[space].size)
+        return -1;
+    if (!b->watch_page)
+        return 0;
+    const u32 first = offset >> 12;
+    const u32 last = (u32)(((u64)offset + size - 1u) >> 12);
+    if (last >= b->watched_host_page_count[space])
+        return -1;
+    for (u32 page = first; page <= last; ++page) {
+        const u64 mask = 1ull << (page & 63u);
+        if (b->watched_host_page_bits[space][page >> 6] & mask)
+            continue;
+        const u32 page_offset = page << 12;
+        u32 page_size = 4096u;
+        if ((u64)page_offset + page_size > b->pages.space[space].size)
+            page_size = b->pages.space[space].size - page_offset;
+        if (!b->guest_ptr(
+                b->guest_user, space, page_offset, page_size) ||
+            b->watch_page(
+                b->watch_page_user, space, page_offset) != 0)
+            return -1;
+        b->watched_host_page_bits[space][page >> 6] |= mask;
+        b->stats.watched_guest_pages[space]++;
+    }
+    return 0;
+}
+
 /* Permanently arm each exact mirror subpage a native shader can read.
  * Registrations are deliberately subpage-sized and deduplicated in a fixed
  * array: the first use pays a bounded loop, subsequent draws only test
@@ -872,8 +915,7 @@ static int nrb_require_span(rsx_nr_d3d12* b, u32 space, u32 offset, u32 size)
             b->mirror, space, page_offset, page_size);
         if (!range)
             return -1;
-        if (b->watch_page && b->watch_page(
-                b->watch_page_user, space, page_offset) != 0) {
+        if (nrb_watch_guest_span(b, space, page_offset, page_size) != 0) {
             rsx_gpu_mirror_unregister(b->mirror, range);
             b->stats.residency_failures++;
             return -1;
@@ -1854,7 +1896,8 @@ static int nrb_resolve_guest_texture(rsx_nr_d3d12* b,
                                      u32* slot_out)
 {
     const u32 span = nrb_texture_span(texture);
-    if (!span)
+    if (!span || nrb_watch_guest_span(
+            b, texture->location, texture->offset, span) != 0)
         return -1;
     rsx_nr_res_key key = {0};
     key.kind = 1;
@@ -1915,7 +1958,8 @@ static int nrb_resolve_guest_vertex_texture(
     rsx_nr_d3d12* b, const rsx_nir_texture* texture, u32* slot_out)
 {
     const u32 span = nrb_vertex_texture_span(texture, NULL, NULL);
-    if (!span)
+    if (!span || nrb_watch_guest_span(
+            b, texture->location, texture->offset, span) != 0)
         return -1;
     rsx_nr_res_key key = {0};
     key.kind = 2;                    /* distinct from fragment textures   */
@@ -3215,7 +3259,8 @@ static int nrb_guest_texture_preflight(rsx_nr_d3d12* b,
         return -1;
     if (format == NRB_TEX_DEPTH24_D8 && texture->cubemap)
         return -1;
-    return 0;
+    return nrb_watch_guest_span(
+        b, texture->location, texture->offset, span);
 }
 
 static int nrb_texture_preflight(rsx_nr_d3d12* b,
@@ -3255,7 +3300,8 @@ static int nrb_vertex_texture_preflight(
     if (!span || !b->guest_ptr(
             b->guest_user, texture->location, texture->offset, span))
         return -1;
-    return 0;
+    return nrb_watch_guest_span(
+        b, texture->location, texture->offset, span);
 }
 
 int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
@@ -3695,6 +3741,26 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             b->stats.unsup_draw_plan++;
         b->stats.residency_failures++;
         return -1;
+    }
+    if (b->force_draw_input_refresh) {
+        for (u32 i = 0; i < required_count; ++i) {
+            const u32 space = required[i].space;
+            const u32 first = required[i].offset >> RSX_GUEST_PAGE_SHIFT;
+            const u32 last = (u32)(((u64)required[i].offset +
+                                    required[i].size - 1u) >>
+                                   RSX_GUEST_PAGE_SHIFT);
+            for (u32 page = first; page <= last; ++page) {
+                if (b->force_draw_input_page_epoch[space][page] ==
+                    b->force_draw_input_epoch)
+                    continue;
+                b->force_draw_input_page_epoch[space][page] =
+                    b->force_draw_input_epoch;
+                rsx_guest_pages_note_write(
+                    &b->pages, space, page << RSX_GUEST_PAGE_SHIFT,
+                    RSX_GUEST_PAGE_SIZE);
+                b->stats.forced_draw_input_refreshes++;
+            }
+        }
     }
     if (nrb_stabilize_required_spans(
             b, required, required_count) != 0) {
@@ -4350,6 +4416,45 @@ int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
         ? RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL : 0u;
     return 0;
 }
+int rsx_nr_d3d12_set_force_draw_input_refresh(rsx_nr_d3d12* b,
+                                              int enabled)
+{
+    if (!b)
+        return -1;
+    if (enabled && !b->force_draw_input_allocated) {
+        for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space) {
+            if (!b->resident_page_count[space])
+                continue;
+            b->force_draw_input_page_epoch[space] = calloc(
+                b->resident_page_count[space],
+                sizeof(b->force_draw_input_page_epoch[space][0]));
+            if (!b->force_draw_input_page_epoch[space]) {
+                for (u32 undo = 0; undo < RSX_GUEST_NUM_SPACES; ++undo) {
+                    free(b->force_draw_input_page_epoch[undo]);
+                    b->force_draw_input_page_epoch[undo] = NULL;
+                }
+                return -1;
+            }
+        }
+        b->force_draw_input_allocated = 1;
+        b->force_draw_input_epoch = 1u;
+    }
+    b->force_draw_input_refresh = enabled != 0;
+    return 0;
+}
+
+void rsx_nr_d3d12_begin_draw_input_refresh_section(rsx_nr_d3d12* b)
+{
+    if (!b || !b->force_draw_input_refresh)
+        return;
+    if (++b->force_draw_input_epoch == 0u) {
+        for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space)
+            if (b->force_draw_input_page_epoch[space])
+                memset(b->force_draw_input_page_epoch[space], 0,
+                       (size_t)b->resident_page_count[space] * sizeof(u32));
+        b->force_draw_input_epoch = 1u;
+    }
+}
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
 {
@@ -4607,11 +4712,21 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space) {
             const u32 count = b->pages.space[space].npages;
             b->resident_page_count[space] = count;
+            b->watched_host_page_count[space] =
+                (b->pages.space[space].size + 4095u) >> 12;
             total_pages += count;
             if (count) {
                 b->resident_page[space] = calloc(
                     count, sizeof(b->resident_page[space][0]));
                 if (!b->resident_page[space])
+                    goto fail;
+            }
+            if (b->watched_host_page_count[space]) {
+                const u32 words =
+                    (b->watched_host_page_count[space] + 63u) >> 6;
+                b->watched_host_page_bits[space] = calloc(
+                    words, sizeof(b->watched_host_page_bits[space][0]));
+                if (!b->watched_host_page_bits[space])
                     goto fail;
             }
         }
@@ -4671,8 +4786,11 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (b->pages.space[0].page_gen || b->pages.space[1].page_gen)
         rsx_guest_pages_destroy(&b->pages);
     free(b->idx_scratch);
-    for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space)
+    for (u32 space = 0; space < RSX_GUEST_NUM_SPACES; ++space) {
         free(b->resident_page[space]);
+        free(b->watched_host_page_bits[space]);
+        free(b->force_draw_input_page_epoch[space]);
+    }
     if (b->readback)
         b->readback->lpVtbl->Release(b->readback);
     if (b->upload)
@@ -4871,6 +4989,16 @@ int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
 {
     (void)b; (void)enabled;
     return -1;
+}
+int rsx_nr_d3d12_set_force_draw_input_refresh(rsx_nr_d3d12* b,
+                                              int enabled)
+{
+    (void)b; (void)enabled;
+    return -1;
+}
+void rsx_nr_d3d12_begin_draw_input_refresh_section(rsx_nr_d3d12* b)
+{
+    (void)b;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)

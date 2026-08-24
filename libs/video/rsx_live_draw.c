@@ -33,6 +33,8 @@ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void*
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
 void rsx_live_draw_seed_transform_program(const u32* w, u32 n) { (void)w; (void)n; }
 void rsx_live_draw_seed_transform_constants(const u32* w, u32 n) { (void)w; (void)n; }
+int rsx_live_draw_sync_dispatch_state(struct rsx_dispatch* s)
+{ (void)s; return -1; }
 void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -53,6 +55,8 @@ int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
   (void)s; (void)sr; (void)sf; if (p) *p = 0; return -1; }
 int rsx_live_draw_resolve_depth_sample(u32 l, u32 o, u32 w, u32 h)
 { (void)l; (void)o; (void)w; (void)h; return -1; }
+void rsx_live_draw_set_shadow_oracle_context(
+    const rsx_live_draw_shadow_oracle_context* c) { (void)c; }
 int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 int rsx_live_draw_timeline_acquire(void** l, u64* g, u64* r, u64* c)
@@ -71,6 +75,10 @@ void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 int rsx_live_draw_native_actions_allowed(void) { return 0; }
 int rsx_live_draw_guest_graphics_suppressed(void) { return 1; }
+u32 rsx_live_draw_dispatch_contract_mismatch(
+    const struct rsx_dispatch* s, rsx_live_draw_dispatch_diff* d)
+{ (void)s; if (d) { d->mask = 15u; d->first_reg = d->first_vp_word =
+  d->first_constant_word = ~0u; } return 15u; }
 u32 rsx_live_draw_native_clear_contract_mismatch(
     const struct rsx_nir_pipeline* s, const struct rsx_nir_clear* c)
 { (void)s; (void)c; return 7u; }
@@ -184,7 +192,8 @@ extern volatile LONG g_yz_frontier_bridge_success_count;
 #define SRV_HEAP_SLOTS   (SRV_VTEX_BASE + MAX_VTEX)
 #define SRV_DEPTH_SOURCE_BASE SRV_HEAP_SLOTS
 #define UAV_ZDEPTH_BASE   (SRV_DEPTH_SOURCE_BASE + MAX_SURFACES)
-#define SRV_CPU_HEAP_SLOTS (UAV_ZDEPTH_BASE + MAX_SURFACES)
+#define UAV_SHADOW_ORACLE_BASE (UAV_ZDEPTH_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (UAV_SHADOW_ORACLE_BASE + 2u)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -260,6 +269,10 @@ typedef struct {
     u64 depth_test_draws;
     u64 depth_write_draws;
     u64 depth_both_draws;
+    u64 resource_generation;
+    u64 last_depth_write_generation;
+    u64 last_resolve_generation;
+    u32 last_depth_write_owner;
     int reject_logged;
 } zdepth_t;
 typedef struct {
@@ -410,6 +423,68 @@ typedef struct {
 } ld_state;
 
 static ld_state g;
+
+#define LD_SHADOW_ORACLE_MAPS 2u
+#define LD_SHADOW_ORACLE_GRID 16u
+#define LD_SHADOW_ORACLE_LOCAL_BASE 0xC0000000u
+
+typedef struct {
+    int attempted;
+    int recorded;
+    u32 location;
+    u32 offset;
+    u32 guest_address;
+    u32 producer_owner;
+    u64 resource_generation;
+    u64 last_depth_write_generation;
+    u64 last_resolve_generation;
+    u64 command_list_generation;
+    u64 recording_fence;
+    u64 completed_fence_at_resolve;
+    u64 completed_fence_at_shutdown;
+    u32 source_state_at_resolve;
+    u32 snapshot_state_at_resolve;
+    u32 source_state_at_consume;
+    u32 snapshot_state_at_consume;
+    u32 source_srv_format;
+    u32 snapshot_srv_format;
+    u64 source_resource_identity;
+    u64 snapshot_resource_identity;
+    u64 section_identity;
+    u64 section_generation;
+    u32 consumer_owner;
+    u32 texture_unit;
+    u32 texture_format;
+    u32 texture_width;
+    u32 texture_height;
+    u32 texture_pitch;
+    u32 texture_wrap;
+    u32 texture_remap;
+    u32 texture_filter;
+    u32 texture_control0;
+    u32 texture_border_color;
+    u32 sampler_filter;
+    u32 sampler_address_u;
+    u32 sampler_address_v;
+    u32 sampler_address_w;
+    u32 sampler_comparison;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT source_footprint;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT snapshot_footprint;
+    u64 readback_bytes;
+    ID3D12Resource* producer_sample;
+    ID3D12Resource* readback;
+} ld_shadow_oracle_map;
+
+typedef struct {
+    int enabled;
+    int dumped;
+    u64 semantic_generation;
+    rsx_live_draw_shadow_oracle_context context;
+    int context_valid;
+    ld_shadow_oracle_map map[LD_SHADOW_ORACLE_MAPS];
+} ld_shadow_oracle_state;
+
+static ld_shadow_oracle_state g_ld_shadow_oracle;
 
 /* Default-off, production-safe draw phase classifier.  The hot path uses one
  * QPC read to select a fixed one-second bucket and RDTSC at semantic phase
@@ -1682,6 +1757,27 @@ static u32 sampler_key(const rsx_dsp_texture* t)
     return minf | (magf << 3) | (wrap << 6) | (lod << 18);
 }
 
+void rsx_live_draw_set_shadow_oracle_context(
+    const rsx_live_draw_shadow_oracle_context* context)
+{
+    if (!g_ld_shadow_oracle.enabled || !context ||
+        context->fragment_location != 1u ||
+        context->fragment_offset != 0x01143600u ||
+        context->texture_unit[0] != 14u ||
+        context->texture_unit[1] != 15u ||
+        context->texture_location[0] != 0u ||
+        context->texture_location[1] != 0u ||
+        context->texture_offset[0] != 0x02310000u ||
+        context->texture_offset[1] != 0x02910000u ||
+        context->texture_width[0] != 1024u ||
+        context->texture_height[0] != 1024u ||
+        context->texture_width[1] != 1024u ||
+        context->texture_height[1] != 1024u)
+        return;
+    g_ld_shadow_oracle.context = *context;
+    g_ld_shadow_oracle.context_valid = 1;
+}
+
 /* ---------------------------------------------------------------------------
  * descriptor heap helpers
  * -----------------------------------------------------------------------*/
@@ -1760,8 +1856,10 @@ static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
     return h;
 }
 static int depth_snapshot_descriptors(
-    u32 zindex, D3D12_GPU_DESCRIPTOR_HANDLE* out_source,
-    D3D12_GPU_DESCRIPTOR_HANDLE* out_destination)
+    u32 zindex, int oracle_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE* out_source,
+    D3D12_GPU_DESCRIPTOR_HANDLE* out_destination,
+    D3D12_GPU_DESCRIPTOR_HANDLE* out_oracle_destination)
 {
     if (zindex >= MAX_SURFACES || g.srv_ring_used >= SRV_RING_TABLES)
         return 0;
@@ -1777,6 +1875,13 @@ static int depth_snapshot_descriptors(
     g.dev->lpVtbl->CopyDescriptorsSimple(
         g.dev, 1, cpu, srv_cpu(UAV_ZDEPTH_BASE + zindex),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (oracle_index >= 0 && out_oracle_destination) {
+        cpu.ptr += g.srv_step;
+        g.dev->lpVtbl->CopyDescriptorsSimple(
+            g.dev, 1, cpu,
+            srv_cpu(UAV_SHADOW_ORACLE_BASE + (u32)oracle_index),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
 
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
     g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
@@ -1785,6 +1890,10 @@ static int depth_snapshot_descriptors(
     *out_source = gpu;
     gpu.ptr += g.srv_step;
     *out_destination = gpu;
+    if (out_oracle_destination) {
+        gpu.ptr += g.srv_step;
+        *out_oracle_destination = gpu;
+    }
     return 1;
 }
 static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
@@ -1840,6 +1949,8 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
     h.ptr += (u64)base * g.smp_step;
     return h;
 }
+
+static void ld_shadow_oracle_dump(void);
 
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
@@ -1903,6 +2014,16 @@ static void ld_flush(ld_flush_reason reason)
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
     }
+    /* The game window is allowed to terminate the process directly, so a
+     * destructor-only diagnostic can lose its only record.  Once both fixed
+     * first-occurrence copies are fence-retired, they are immutable and safe
+     * to map.  Emit the single bounded record here without forcing an extra
+     * submission; shutdown remains the fallback when no ordinary retirement
+     * followed the capture. */
+    if (g_ld_shadow_oracle.enabled && !g_ld_shadow_oracle.dumped &&
+        g_ld_shadow_oracle.map[0].recorded &&
+        g_ld_shadow_oracle.map[1].recorded)
+        ld_shadow_oracle_dump();
     ld_drain_info_queue("flush");
     /* Dynamic guest textures can replace a cached D3D resource while an
      * earlier draw in this command list still references the old one.  The
@@ -2964,6 +3085,13 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->offset = offset;
     z->w = want_w;
     z->h = want_h;
+    if (g_ld_shadow_oracle.enabled) {
+        z->resource_generation =
+            ++g_ld_shadow_oracle.semantic_generation;
+        z->last_depth_write_generation = 0;
+        z->last_resolve_generation = 0;
+        z->last_depth_write_owner = 0;
+    }
     z->had_write = 0;
     z->snapshot_valid = 0;
     z->snapshot_w = rt_w ? rt_w : want_w;
@@ -3020,6 +3148,207 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     return 1 + slot;
 }
 
+static int ld_shadow_oracle_map_index(u32 location, u32 offset)
+{
+    if (location != 0u)
+        return -1;
+    if (offset == 0x02310000u)
+        return 0;
+    if (offset == 0x02910000u)
+        return 1;
+    return -1;
+}
+
+static int ld_shadow_oracle_prepare(zdepth_t* z)
+{
+    if (!g_ld_shadow_oracle.enabled ||
+        !g_ld_shadow_oracle.context_valid || !z || !z->tex ||
+        !z->snapshot || z->snapshot_w != 1024u ||
+        z->snapshot_h != 1024u)
+        return 0;
+    const int index = ld_shadow_oracle_map_index(z->location, z->offset);
+    if (index < 0)
+        return 0;
+    ld_shadow_oracle_map* const map =
+        &g_ld_shadow_oracle.map[(u32)index];
+    if (map->attempted)
+        return 0;
+    map->attempted = 1;
+
+    const rsx_live_draw_shadow_oracle_context* const context =
+        &g_ld_shadow_oracle.context;
+    if (context->texture_location[index] != z->location ||
+        context->texture_offset[index] != z->offset)
+        return 0;
+
+    D3D12_HEAP_PROPERTIES producer_heap = {0};
+    producer_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC producer_desc = {0};
+    producer_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    producer_desc.Width = 1024u;
+    producer_desc.Height = 1024u;
+    producer_desc.DepthOrArraySize = 1;
+    producer_desc.MipLevels = 1;
+    producer_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    producer_desc.SampleDesc.Count = 1;
+    producer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &producer_heap, D3D12_HEAP_FLAG_NONE,
+            &producer_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            NULL, &IID_ID3D12Resource,
+            (void**)&map->producer_sample)))
+        return 0;
+    uav_write_zdepth(
+        UAV_SHADOW_ORACLE_BASE + (u32)index,
+        map->producer_sample);
+
+    D3D12_RESOURCE_DESC source_desc, snapshot_desc;
+    map->producer_sample->lpVtbl->GetDesc(
+        map->producer_sample, &source_desc);
+    z->snapshot->lpVtbl->GetDesc(z->snapshot, &snapshot_desc);
+    UINT source_rows = 0, snapshot_rows = 0;
+    UINT64 source_row_bytes = 0, snapshot_row_bytes = 0;
+    UINT64 source_bytes = 0, snapshot_bytes = 0;
+    g.dev->lpVtbl->GetCopyableFootprints(
+        g.dev, &source_desc, 0, 1, 0,
+        &map->source_footprint, &source_rows,
+        &source_row_bytes, &source_bytes);
+    const UINT64 snapshot_base = (source_bytes + 511u) & ~511ull;
+    g.dev->lpVtbl->GetCopyableFootprints(
+        g.dev, &snapshot_desc, 0, 1, snapshot_base,
+        &map->snapshot_footprint, &snapshot_rows,
+        &snapshot_row_bytes, &snapshot_bytes);
+    (void)source_rows;
+    (void)snapshot_rows;
+    (void)source_row_bytes;
+    (void)snapshot_row_bytes;
+    const UINT64 readback_bytes = snapshot_base + snapshot_bytes;
+    if (!snapshot_bytes || readback_bytes > 64ull * 1024ull * 1024ull)
+        goto fail;
+
+    D3D12_HEAP_PROPERTIES heap = {0};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer = {0};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = readback_bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.Format = DXGI_FORMAT_UNKNOWN;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&map->readback)))
+        goto fail;
+
+    map->readback_bytes = readback_bytes;
+    map->location = z->location;
+    map->offset = z->offset;
+    map->guest_address = z->location
+        ? z->offset : LD_SHADOW_ORACLE_LOCAL_BASE + z->offset;
+    map->producer_owner = z->last_depth_write_owner;
+    map->resource_generation = z->resource_generation;
+    map->last_depth_write_generation =
+        z->last_depth_write_generation;
+    map->last_resolve_generation = z->last_resolve_generation;
+    map->command_list_generation = g.list_generation;
+    map->recording_fence = g.fence_value + 1u;
+    map->completed_fence_at_resolve =
+        g.fence->lpVtbl->GetCompletedValue(g.fence);
+    map->source_state_at_resolve = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    map->snapshot_state_at_resolve = z->snapshot_state;
+    map->source_srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    map->snapshot_srv_format = DXGI_FORMAT_R32_FLOAT;
+    map->source_resource_identity = (u64)(uintptr_t)z->tex;
+    map->snapshot_resource_identity = (u64)(uintptr_t)z->snapshot;
+    map->section_identity = context->section_identity;
+    map->section_generation = context->section_generation;
+    map->consumer_owner = context->native_owner;
+    map->texture_unit = context->texture_unit[index];
+    map->texture_format = context->texture_format[index];
+    map->texture_width = context->texture_width[index];
+    map->texture_height = context->texture_height[index];
+    map->texture_pitch = context->texture_pitch[index];
+    map->texture_wrap = context->texture_wrap[index];
+    map->texture_remap = context->texture_remap[index];
+    map->texture_filter = context->texture_filter[index];
+    map->texture_control0 = context->texture_control0[index];
+    map->texture_border_color = context->texture_border_color[index];
+    rsx_dsp_texture texture = {0};
+    texture.wrap = map->texture_wrap;
+    texture.filter = map->texture_filter;
+    texture.control0 = map->texture_control0;
+    texture.border_color = map->texture_border_color;
+    const D3D12_SAMPLER_DESC sampler = decode_sampler(&texture);
+    map->sampler_filter = sampler.Filter;
+    map->sampler_address_u = sampler.AddressU;
+    map->sampler_address_v = sampler.AddressV;
+    map->sampler_address_w = sampler.AddressW;
+    map->sampler_comparison = sampler.ComparisonFunc;
+    return 1;
+
+fail:
+    map->producer_sample->lpVtbl->Release(map->producer_sample);
+    map->producer_sample = NULL;
+    return 0;
+}
+
+static void ld_shadow_oracle_record_copy(
+    zdepth_t* z, D3D12_RESOURCE_STATES producer_before,
+    D3D12_RESOURCE_STATES snapshot_before)
+{
+    const int index = z
+        ? ld_shadow_oracle_map_index(z->location, z->offset) : -1;
+    if (index < 0)
+        return;
+    ld_shadow_oracle_map* const map =
+        &g_ld_shadow_oracle.map[(u32)index];
+    if (!map->producer_sample || !map->readback)
+        return;
+
+    D3D12_RESOURCE_BARRIER barriers[2] = {0};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = map->producer_sample;
+    barriers[0].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[0].Transition.StateBefore = producer_before;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = z->snapshot;
+    barriers[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore = snapshot_before;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+
+    D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
+    source.pResource = map->producer_sample;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = 0;
+    destination.pResource = map->readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = map->source_footprint;
+    g.list->lpVtbl->CopyTextureRegion(
+        g.list, &destination, 0, 0, 0, &source, NULL);
+    source.pResource = z->snapshot;
+    destination.PlacedFootprint = map->snapshot_footprint;
+    g.list->lpVtbl->CopyTextureRegion(
+        g.list, &destination, 0, 0, 0, &source, NULL);
+
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    map->source_state_at_consume = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    map->snapshot_state_at_consume =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    map->recorded = 1;
+}
+
 /* Preserve the last completed depth-writing pass before the guest clears or
  * reuses its live zeta.  The replay renderer gets these bytes from its
  * captured cross-frame memory image; live rendering must explicitly retain
@@ -3032,11 +3361,72 @@ static int zdepth_snapshot(u32 slot)
     if (!z->snapshot || !g.depth_snapshot_rootsig ||
         !g.depth_snapshot_pso)
         return 0;
-    if (!z->had_write) return z->snapshot_valid;
+    if (!z->had_write) {
+        if (z->snapshot_valid && ld_shadow_oracle_prepare(z)) {
+            D3D12_GPU_DESCRIPTOR_HANDLE source_table = {0};
+            D3D12_GPU_DESCRIPTOR_HANDLE unused_destination = {0};
+            D3D12_GPU_DESCRIPTOR_HANDLE oracle_destination = {0};
+            const int oracle_index =
+                ld_shadow_oracle_map_index(z->location, z->offset);
+            if (depth_snapshot_descriptors(
+                    slot - 1u, oracle_index, &source_table,
+                    &unused_destination, &oracle_destination)) {
+                D3D12_RESOURCE_BARRIER source_barrier = {0};
+                source_barrier.Type =
+                    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                source_barrier.Transition.pResource = z->tex;
+                source_barrier.Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                source_barrier.Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                source_barrier.Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                g.list->lpVtbl->ResourceBarrier(
+                    g.list, 1, &source_barrier);
+                ID3D12DescriptorHeap* heaps[] = {
+                    g.srv_heap, g.smp_heap};
+                g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+                g.list->lpVtbl->SetPipelineState(
+                    g.list, g.depth_snapshot_pso);
+                g.list->lpVtbl->SetComputeRootSignature(
+                    g.list, g.depth_snapshot_rootsig);
+                g.list->lpVtbl->SetComputeRootDescriptorTable(
+                    g.list, 0, source_table);
+                g.list->lpVtbl->SetComputeRootDescriptorTable(
+                    g.list, 1, oracle_destination);
+                g.list->lpVtbl->Dispatch(g.list, 128u, 128u, 1u);
+                D3D12_RESOURCE_BARRIER producer_done = {0};
+                producer_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                producer_done.UAV.pResource =
+                    g_ld_shadow_oracle.map[(u32)oracle_index]
+                        .producer_sample;
+                g.list->lpVtbl->ResourceBarrier(
+                    g.list, 1, &producer_done);
+                source_barrier.Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                source_barrier.Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                g.list->lpVtbl->ResourceBarrier(
+                    g.list, 1, &source_barrier);
+                ld_shadow_oracle_record_copy(
+                    z, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    z->snapshot_state);
+            }
+        }
+        return z->snapshot_valid;
+    }
 
-    D3D12_GPU_DESCRIPTOR_HANDLE source_table, destination_table;
+    z->last_resolve_generation = g_ld_shadow_oracle.enabled
+        ? ++g_ld_shadow_oracle.semantic_generation : 0;
+    const int oracle_capture = ld_shadow_oracle_prepare(z);
+    const int oracle_index = oracle_capture
+        ? ld_shadow_oracle_map_index(z->location, z->offset) : -1;
+    D3D12_GPU_DESCRIPTOR_HANDLE source_table = {0};
+    D3D12_GPU_DESCRIPTOR_HANDLE destination_table = {0};
+    D3D12_GPU_DESCRIPTOR_HANDLE oracle_destination = {0};
     if (!depth_snapshot_descriptors(
-            slot - 1u, &source_table, &destination_table)) {
+            slot - 1u, oracle_index, &source_table,
+            &destination_table, &oracle_destination)) {
         fprintf(stderr,
                 "[zetatrack] depth snapshot descriptor ring exhausted "
                 "at frame %u\n",
@@ -3077,29 +3467,55 @@ static int zdepth_snapshot(u32 slot)
     g.list->lpVtbl->Dispatch(
         g.list, (z->snapshot_w + 7u) / 8u,
         (z->snapshot_h + 7u) / 8u, 1);
+    if (oracle_capture) {
+        g.list->lpVtbl->SetComputeRootDescriptorTable(
+            g.list, 1, oracle_destination);
+        g.list->lpVtbl->Dispatch(g.list, 128u, 128u, 1u);
+    }
 
-    D3D12_RESOURCE_BARRIER uav_done = {0};
-    uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uav_done.UAV.pResource = z->snapshot;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
+    D3D12_RESOURCE_BARRIER uav_done[2] = {0};
+    uav_done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_done[0].UAV.pResource = z->snapshot;
+    u32 uav_count = 1u;
+    if (oracle_capture) {
+        uav_done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav_done[1].UAV.pResource =
+            g_ld_shadow_oracle.map[(u32)oracle_index].producer_sample;
+        uav_count++;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, uav_count, uav_done);
 
     D3D12_RESOURCE_BARRIER done[2] = {0};
-    done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    done[0].Transition.pResource = z->tex;
-    done[0].Transition.Subresource =
-        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    done[0].Transition.StateBefore =
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    done[1].Transition.pResource = z->snapshot;
-    done[1].Transition.Subresource =
-        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    done[1].Transition.StateBefore =
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    done[1].Transition.StateAfter =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
+    if (oracle_capture) {
+        done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        done[0].Transition.pResource = z->tex;
+        done[0].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        done[0].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, done);
+        ld_shadow_oracle_record_copy(
+            z, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        done[0].Transition.pResource = z->tex;
+        done[0].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        done[0].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        done[1].Transition.pResource = z->snapshot;
+        done[1].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        done[1].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        done[1].Transition.StateAfter =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
+    }
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     z->snapshot_valid = 1;
     z->had_write = 0;
@@ -3114,6 +3530,53 @@ static u64 fnv1a(const void* data, u32 n, u64 h)
     const u8* p = (const u8*)data;
     for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
+}
+
+static void ld_shadow_oracle_bind_legacy_context(void)
+{
+    if (!g_ld_shadow_oracle.enabled ||
+        g_ld_shadow_oracle.context_valid)
+        return;
+    u32 fragment_location = 0;
+    const u32 fragment_offset =
+        rsx_dsp_fragment_program(&g.rsx, &fragment_location);
+    if (fragment_location != 1u || fragment_offset != 0x01143600u)
+        return;
+    rsx_dsp_texture texture[2];
+    rsx_dsp_get_texture(&g.rsx, 14u, &texture[0]);
+    rsx_dsp_get_texture(&g.rsx, 15u, &texture[1]);
+    if (!texture[0].enabled || !texture[1].enabled ||
+        texture[0].location != 0u || texture[1].location != 0u ||
+        texture[0].offset != 0x02310000u ||
+        texture[1].offset != 0x02910000u ||
+        texture[0].width != 1024u || texture[0].height != 1024u ||
+        texture[1].width != 1024u || texture[1].height != 1024u)
+        return;
+    rsx_live_draw_shadow_oracle_context context = {0};
+    u64 identity = fnv1a(
+        &fragment_offset, sizeof(fragment_offset),
+        1469598103934665603ull);
+    identity = fnv1a(texture, sizeof(texture), identity);
+    context.section_identity = identity ? identity : 1u;
+    context.section_generation = g_ld_recent_draw_total + 1u;
+    context.native_owner = 0u;
+    context.fragment_location = fragment_location;
+    context.fragment_offset = fragment_offset;
+    for (u32 index = 0; index < 2u; ++index) {
+        context.texture_unit[index] = 14u + index;
+        context.texture_location[index] = texture[index].location;
+        context.texture_offset[index] = texture[index].offset;
+        context.texture_format[index] = texture[index].format;
+        context.texture_width[index] = texture[index].width;
+        context.texture_height[index] = texture[index].height;
+        context.texture_pitch[index] = texture[index].pitch;
+        context.texture_wrap[index] = texture[index].wrap;
+        context.texture_remap[index] = texture[index].remap;
+        context.texture_filter[index] = texture[index].filter;
+        context.texture_control0[index] = texture[index].control0;
+        context.texture_border_color[index] = texture[index].border_color;
+    }
+    rsx_live_draw_set_shadow_oracle_context(&context);
 }
 
 static int sampler_table_needs_flush(const u32 slots[SMP_TABLE_SIZE])
@@ -6160,6 +6623,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 current_zslot = g.depth
         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
         : 0;
+    ld_shadow_oracle_bind_legacy_context();
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
@@ -6436,8 +6900,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         /* A write-enable bit alone does not prove that this draw produced a
          * usable depth map.  With depth testing disabled RSX does not execute
          * the depth pass represented by this tracked zeta. */
-        if (depth_state.depth_test && depth_state.depth_write)
+        if (depth_state.depth_test && depth_state.depth_write) {
             z->had_write = 1;
+            if (g_ld_shadow_oracle.enabled) {
+                z->last_depth_write_generation =
+                    ++g_ld_shadow_oracle.semantic_generation;
+                z->last_depth_write_owner = 0u;
+            }
+        }
     }
     g_ld_stats.groups_executed++;
     ld_draw_phase_mark(&phase_sample, LD_DRAW_PHASE_POST);
@@ -6760,6 +7230,13 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    memset(&g_ld_shadow_oracle, 0, sizeof(g_ld_shadow_oracle));
+    g_ld_shadow_oracle.enabled =
+        getenv("YZ_NR_HANA_DEPTH_ORACLE") != NULL;
+    if (g_ld_shadow_oracle.enabled)
+        fprintf(stderr,
+                "[hana-depth-oracle] enabled: two fixed first-occurrence "
+                "depth maps, shutdown-only output\n");
     ld_present_measure_init();
     ld_draw_phases_init();
 #if defined(YZ_PERF_PROFILE)
@@ -7090,6 +7567,16 @@ void rsx_live_draw_seed_transform_constants(const u32* words, u32 count)
     if (g.ready) rsx_dispatch_seed_transform_constants(&g.rsx, words, count);
 }
 
+int rsx_live_draw_sync_dispatch_state(rsx_dispatch* shadow)
+{
+    if (!shadow || !g.ready)
+        return -1;
+    /* Called by the sole FIFO consumer while host-movie ownership is off;
+     * that is the same serialization contract as ordinary method dispatch. */
+    rsx_dispatch_copy_architectural_state(shadow, &g.rsx);
+    return 0;
+}
+
 void rsx_live_draw_set_display_buffer(
     u32 buffer_id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
 {
@@ -7287,6 +7774,45 @@ void rsx_live_draw_native_clear(u32 mask)
     rsx_live_draw_method(0x1D94u, mask);
 }
 
+u32 rsx_live_draw_dispatch_contract_mismatch(
+    const rsx_dispatch* shadow, rsx_live_draw_dispatch_diff* diff)
+{
+    rsx_live_draw_dispatch_diff local = {0, ~0u, ~0u, ~0u};
+    if (!shadow || !g.ready) {
+        local.mask = 15u;
+        if (diff) *diff = local;
+        return local.mask;
+    }
+    for (u32 i = 0; i < RSX_DSP_NUM_REGS; ++i) {
+        if (shadow->regs[i] == g.rsx.regs[i])
+            continue;
+        local.mask |= 1u;
+        local.first_reg = i;
+        break;
+    }
+    for (u32 i = 0; i < RSX_DSP_VP_WORDS; ++i) {
+        if (shadow->vp[i] == g.rsx.vp[i])
+            continue;
+        local.mask |= 2u;
+        local.first_vp_word = i;
+        break;
+    }
+    const u32* const shadow_constants = &shadow->constants[0][0];
+    const u32* const legacy_constants = &g.rsx.constants[0][0];
+    for (u32 i = 0; i < RSX_DSP_NUM_CONSTANTS * 4u; ++i) {
+        if (shadow_constants[i] == legacy_constants[i])
+            continue;
+        local.mask |= 4u;
+        local.first_constant_word = i;
+        break;
+    }
+    if (shadow->in_begin_end != g.rsx.in_begin_end ||
+        shadow->current_primitive != g.rsx.current_primitive)
+        local.mask |= 8u;
+    if (diff) *diff = local;
+    return local.mask;
+}
+
 u32 rsx_live_draw_native_clear_contract_mismatch(
     const rsx_nir_pipeline* state, const rsx_nir_clear* clear)
 {
@@ -7370,6 +7896,11 @@ void rsx_live_draw_native_draw_commit(const rsx_nir_pipeline* state)
          * pass must resolve the depth image written by this native draw,
          * rather than reusing the previous snapshot generation. */
         z->had_write = 1;
+        if (g_ld_shadow_oracle.enabled) {
+            z->last_depth_write_generation =
+                ++g_ld_shadow_oracle.semantic_generation;
+            z->last_depth_write_owner = 1u;
+        }
     }
 }
 
@@ -9447,6 +9978,140 @@ void rsx_live_draw_present(u32 buffer_id)
      * clear/demote a tracked zeta (sink_clear does that above). */
 }
 
+static u32 ld_shadow_oracle_bytes_per_texel(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        return 8u;
+    default:
+        return 4u;
+    }
+}
+
+static const char* ld_shadow_oracle_owner(u32 owner)
+{
+    return owner ? "native" : "legacy";
+}
+
+static void ld_shadow_oracle_dump(void)
+{
+    if (!g_ld_shadow_oracle.enabled || g_ld_shadow_oracle.dumped)
+        return;
+    g_ld_shadow_oracle.dumped = 1;
+    for (u32 index = 0; index < LD_SHADOW_ORACLE_MAPS; ++index) {
+        ld_shadow_oracle_map* const map =
+            &g_ld_shadow_oracle.map[index];
+        if (!map->recorded || !map->readback) {
+            fprintf(stderr,
+                    "[hana-depth-oracle map=%u captured=0 attempted=%d]\n",
+                    index, map->attempted);
+            continue;
+        }
+        map->completed_fence_at_shutdown =
+            g.fence->lpVtbl->GetCompletedValue(g.fence);
+        const u32 source_bpp = ld_shadow_oracle_bytes_per_texel(
+            map->source_footprint.Footprint.Format);
+        const u32 snapshot_bpp = ld_shadow_oracle_bytes_per_texel(
+            map->snapshot_footprint.Footprint.Format);
+        u64 source_hash = 1469598103934665603ull;
+        u64 snapshot_hash = 1469598103934665603ull;
+        u32 mismatch = 0, source_zero = 0, snapshot_zero = 0;
+        u32 source_one = 0, snapshot_one = 0;
+        u8* bytes = NULL;
+        D3D12_RANGE read_range = {0, (SIZE_T)map->readback_bytes};
+        const HRESULT map_hr = map->readback->lpVtbl->Map(
+            map->readback, 0, &read_range, (void**)&bytes);
+        if (SUCCEEDED(map_hr) && bytes) {
+            for (u32 gy = 0; gy < LD_SHADOW_ORACLE_GRID; ++gy) {
+                const u32 y = (gy * 1024u + 512u) /
+                    LD_SHADOW_ORACLE_GRID;
+                for (u32 gx = 0; gx < LD_SHADOW_ORACLE_GRID; ++gx) {
+                    const u32 x = (gx * 1024u + 512u) /
+                        LD_SHADOW_ORACLE_GRID;
+                    const u8* const source = bytes +
+                        map->source_footprint.Offset +
+                        (size_t)y *
+                            map->source_footprint.Footprint.RowPitch +
+                        (size_t)x * source_bpp;
+                    const u8* const snapshot = bytes +
+                        map->snapshot_footprint.Offset +
+                        (size_t)y *
+                            map->snapshot_footprint.Footprint.RowPitch +
+                        (size_t)x * snapshot_bpp;
+                    u32 source_bits = 0, snapshot_bits = 0;
+                    memcpy(&source_bits, source, sizeof(source_bits));
+                    memcpy(&snapshot_bits, snapshot, sizeof(snapshot_bits));
+                    source_hash = fnv1a(
+                        &source_bits, sizeof(source_bits), source_hash);
+                    snapshot_hash = fnv1a(
+                        &snapshot_bits, sizeof(snapshot_bits), snapshot_hash);
+                    mismatch += source_bits != snapshot_bits;
+                    source_zero += source_bits == 0u;
+                    snapshot_zero += snapshot_bits == 0u;
+                    source_one += source_bits == 0x3F800000u;
+                    snapshot_one += snapshot_bits == 0x3F800000u;
+                }
+            }
+            D3D12_RANGE no_write = {0, 0};
+            map->readback->lpVtbl->Unmap(
+                map->readback, 0, &no_write);
+        }
+        fprintf(stderr,
+                "[hana-depth-oracle map=%u captured=%d map-hr=0x%08lX "
+                "guest=%u:0x%08X/ea=0x%08X "
+                "producer=%s resource=0x%016llX/gen=%llu "
+                "write-gen=%llu resolve-gen=%llu "
+                "snapshot=0x%016llX "
+                "list-gen=%llu fence=%llu/%llu/%llu "
+                "state-resolve=0x%X/0x%X state-consume=0x%X/0x%X "
+                "srv=%u/%u "
+                "texture=u%u/fmt=0x%02X/%ux%u/pitch=%u/"
+                "wrap=%08X/remap=%08X/filter=%08X/control=%08X/"
+                "border=%08X "
+                "sampler=filter:%u/address:%u,%u,%u/compare:%u "
+                "consumer=%s/section=%016llX/gen=%llu "
+                "grid=%ux%u/source=%016llX/snapshot=%016llX/"
+                "mismatch=%u/zero=%u,%u/one=%u,%u]\n",
+                index, map->recorded, (unsigned long)map_hr,
+                map->location, map->offset, map->guest_address,
+                ld_shadow_oracle_owner(map->producer_owner),
+                (unsigned long long)map->source_resource_identity,
+                (unsigned long long)map->resource_generation,
+                (unsigned long long)map->last_depth_write_generation,
+                (unsigned long long)map->last_resolve_generation,
+                (unsigned long long)map->snapshot_resource_identity,
+                (unsigned long long)map->command_list_generation,
+                (unsigned long long)map->recording_fence,
+                (unsigned long long)map->completed_fence_at_resolve,
+                (unsigned long long)map->completed_fence_at_shutdown,
+                map->source_state_at_resolve,
+                map->snapshot_state_at_resolve,
+                map->source_state_at_consume,
+                map->snapshot_state_at_consume,
+                map->source_srv_format, map->snapshot_srv_format,
+                map->texture_unit, map->texture_format,
+                map->texture_width, map->texture_height,
+                map->texture_pitch, map->texture_wrap,
+                map->texture_remap, map->texture_filter,
+                map->texture_control0, map->texture_border_color,
+                map->sampler_filter, map->sampler_address_u,
+                map->sampler_address_v, map->sampler_address_w,
+                map->sampler_comparison,
+                ld_shadow_oracle_owner(map->consumer_owner),
+                (unsigned long long)map->section_identity,
+                (unsigned long long)map->section_generation,
+                LD_SHADOW_ORACLE_GRID, LD_SHADOW_ORACLE_GRID,
+                (unsigned long long)source_hash,
+                (unsigned long long)snapshot_hash,
+                mismatch, source_zero, snapshot_zero,
+                source_one, snapshot_one);
+    }
+    fflush(stderr);
+}
+
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
@@ -9456,6 +10121,7 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    ld_shadow_oracle_dump();
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.output) {
         FILE* const output = g_ld_profile.output;
@@ -9675,6 +10341,15 @@ void rsx_live_draw_shutdown(void)
             g.zdepths[i].snapshot->lpVtbl->Release(
                 g.zdepths[i].snapshot);
     }
+    for (u32 i = 0; i < LD_SHADOW_ORACLE_MAPS; ++i)
+    {
+        if (g_ld_shadow_oracle.map[i].producer_sample)
+            g_ld_shadow_oracle.map[i].producer_sample->lpVtbl->Release(
+                g_ld_shadow_oracle.map[i].producer_sample);
+        if (g_ld_shadow_oracle.map[i].readback)
+            g_ld_shadow_oracle.map[i].readback->lpVtbl->Release(
+                g_ld_shadow_oracle.map[i].readback);
+    }
     if (g.movie_upload) g.movie_upload->lpVtbl->Release(g.movie_upload);
     if (g.movie_overlay_readback) g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
     if (g.movie_overlay_rgba) free(g.movie_overlay_rgba);
@@ -9701,6 +10376,7 @@ void rsx_live_draw_shutdown(void)
 #endif
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
+    memset(&g_ld_shadow_oracle, 0, sizeof(g_ld_shadow_oracle));
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
     if (dc.refs) { free(dc.refs); dc.refs = NULL; dc.cap_refs = 0; }
     if (dc.compact_verts) {
