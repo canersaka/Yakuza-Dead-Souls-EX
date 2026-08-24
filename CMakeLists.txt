@@ -477,6 +477,33 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        add_executable(rsx_nr_frame_owner_tests
+            libs/video/tests/test_nr_frame_owner.c
+            libs/video/rsx_nr_frame_owner.c
+            libs/video/rsx_nr_producer_contract.c
+            libs/video/rsx_nir.c
+            libs/video/rsx_nir_emitter.c
+            libs/video/rsx_nir_adapter.c
+            libs/video/rsx_nr_ring.c
+            libs/video/rsx_nr_backend.c
+            libs/video/rsx_dispatch.c
+        )
+        target_include_directories(rsx_nr_frame_owner_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nr_frame_owner_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_nr_frame_owner
+            COMMAND rsx_nr_frame_owner_tests
+        )
+        set_tests_properties(
+            rsx_nr_frame_owner
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
         add_executable(rsx_nr_span_router_tests
             libs/video/tests/test_nr_span_router.c
             libs/video/rsx_nr_span_router.c
@@ -552,6 +579,8 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_nir.c
             libs/video/rsx_nir_emitter.c
             libs/video/rsx_nir_adapter.c
+            libs/video/rsx_nr_frame_owner.c
+            libs/video/rsx_nr_producer_contract.c
             libs/video/rsx_nr_ring.c
             libs/video/rsx_nr_backend.c
             libs/video/rsx_nr_backend_d3d12.c

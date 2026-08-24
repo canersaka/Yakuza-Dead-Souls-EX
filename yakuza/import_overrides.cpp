@@ -6708,6 +6708,36 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
     if (get == put)
         return finish(YZ_RSX_WAIT_EMPTY);
 
+    /* Strict full-native mode owns the FIFO at the actual serialized GET.
+     * It translates and executes each method once and has no in-frame legacy
+     * fallback. This precedes the legacy off-ring recovery deliberately: a
+     * malformed native cursor is an exact bounded failure, never a silent
+     * resync that discards published work. The ordinary producer-span,
+     * section-scanner, and legacy decoder paths below are unreachable while
+     * this owner is enabled. */
+    uint32_t frame_get = get;
+    uint32_t frame_ret = g_fifo_ret;
+    const yz_nr_vertical_frame_result frame_result =
+        yz_nr_vertical_consume_frame(
+            get, put, g_fifo_ret, &frame_get, &frame_ret);
+    if (frame_result == YZ_NR_VERTICAL_FRAME_ADVANCED) {
+        if (frame_get == get || !yz_rsx_io_to_ea(frame_get))
+            return finish(YZ_RSX_WAIT_BAD_FLOW);
+        g_fifo_ret = frame_ret;
+        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, frame_get);
+        return finish(YZ_RSX_WAIT_ADVANCING);
+    }
+    if (frame_result == YZ_NR_VERTICAL_FRAME_WAIT_EMPTY)
+        return finish(YZ_RSX_WAIT_EMPTY);
+    if (frame_result == YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL)
+        return finish(YZ_RSX_WAIT_UNFINALIZED_HOLE);
+    if (frame_result == YZ_NR_VERTICAL_FRAME_WAIT_STOPPER)
+        return finish(YZ_RSX_WAIT_SELF_STOPPER);
+    if (frame_result == YZ_NR_VERTICAL_FRAME_WAIT_SEMAPHORE)
+        return finish(YZ_RSX_WAIT_SEMAPHORE);
+    if (frame_result == YZ_NR_VERTICAL_FRAME_FATAL)
+        return finish(YZ_RSX_WAIT_BAD_FLOW);
+
     const uint32_t ea = yz_rsx_io_to_ea(get);
     if (!ea) {
         const uint32_t pea = yz_rsx_io_to_ea(put);

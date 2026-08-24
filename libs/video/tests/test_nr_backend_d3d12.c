@@ -21,6 +21,7 @@ int main(void) { return 2; }
 #else
 
 #include "../rsx_nr_backend_d3d12.h"
+#include "../rsx_nr_frame_owner.h"
 #include "../rsx_nir_emitter.h"
 #include "../rsx_vp_decompiler.h"
 
@@ -521,6 +522,20 @@ typedef struct cap_data {
     u32* records;
 } cap_data;
 
+typedef struct cap_frame_fifo {
+    u32* words;
+    u32 word_count;
+} cap_frame_fifo;
+
+static int cap_frame_read32(void* user, u32 io, u32* value)
+{
+    cap_frame_fifo* const fifo = user;
+    if (!fifo || !value || (io & 3u) || (io >> 2) >= fifo->word_count)
+        return -1;
+    *value = fifo->words[io >> 2];
+    return 0;
+}
+
 enum {
     CAP_METHOD_COUNT = 0x40000,
     CAP_FAILURE_COUNT = 64,
@@ -873,6 +888,14 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         g_cap.size[s] = (need[s] + 0xFFFFu) & ~0xFFFFu;
         if (!g_cap.size[s])
             g_cap.size[s] = 0x10000;
+        /* The earliest SDK-context capture predates memory-block export but
+         * contains a real inline transfer to offset 0x00800000. Give that
+         * incomplete archive a bounded 16 MiB window in both RSX spaces;
+         * zero initialization is sufficient to validate ordered transfer
+         * execution, while any access beyond the window remains an explicit
+         * failure. Complete captures continue to size from their snapshots. */
+        if (!c->n_blocks && g_cap.size[s] < 0x01000000u)
+            g_cap.size[s] = 0x01000000u;
         g_cap.arena[s] = calloc(1, g_cap.size[s]);
         if (!g_cap.arena[s])
             return -1;
@@ -895,8 +918,11 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     rsx_nr_d3d12_set_render_condition_reader(
         sink, cap_render_condition_read, NULL);
     const char* allow_flow_txl = getenv("YZ_NR_CAPTURE_FLOW_TXL_ORACLE");
-    if (allow_flow_txl && allow_flow_txl[0] &&
-        strcmp(allow_flow_txl, "0") != 0)
+    const char* const strict_text = getenv("YZ_NR_CAPTURE_STRICT_FRAME");
+    const int strict_frame = strict_text && strict_text[0] &&
+        strcmp(strict_text, "0") != 0;
+    if (strict_frame || (allow_flow_txl && allow_flow_txl[0] &&
+        strcmp(allow_flow_txl, "0") != 0))
         CHECK(rsx_nr_d3d12_set_coherent_section_mode(sink, 1) == 0,
               "capture coherent-section mode refused before execution");
 
@@ -928,6 +954,20 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     rsx_nir_adapter_init_sink(ad, &k);
     rsx_nir_adapter_seed(ad, c->regs, c->reg_words, c->vp, c->vp_words,
                          c->consts, c->const_words);
+
+    cap_frame_fifo frame_fifo;
+    memset(&frame_fifo, 0, sizeof(frame_fifo));
+    rsx_nr_frame_owner frame_owner;
+    memset(&frame_owner, 0, sizeof(frame_owner));
+    u32 frame_get = 0x1000u;
+    if (strict_frame) {
+        frame_fifo.word_count = 0x800000u / 4u;
+        frame_fifo.words = calloc(frame_fifo.word_count, sizeof(u32));
+        if (!frame_fifo.words)
+            return -1;
+        rsx_nr_frame_owner_init(
+            &frame_owner, ad, &be, &ring, cap_frame_read32, &frame_fifo);
+    }
 
     u32 completed_draws = 0;
     u32 stop_after_draw = 0;
@@ -970,7 +1010,83 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             else
                 method->unsupported++;
         }
-        rsx_nir_adapter_method(ad, m, a);
+        if (strict_frame) {
+            if (frame_get > 0x7FFFF8u)
+                frame_get = 0x1000u;
+            frame_fifo.words[frame_get >> 2] = (1u << 18) | m;
+            frame_fifo.words[(frame_get + 4u) >> 2] = a;
+            u32 next_get = frame_get;
+            u32 next_ret = ~0u;
+            const rsx_nr_frame_step_result result =
+                rsx_nr_frame_owner_step(
+                    &frame_owner, frame_get, frame_get + 8u, ~0u,
+                    &next_get, &next_ret);
+            if (result != RSX_NR_FRAME_ADVANCED ||
+                next_get != frame_get + 8u || next_ret != ~0u) {
+                fprintf(stderr,
+                        "strict-frame fault result=%u record=%u "
+                        "owner-kind=%u get=%08X method=%05X arg=%08X "
+                        "index=%u backend-errors=%llu\n",
+                        result, i, frame_owner.failure.kind,
+                        frame_owner.failure.get,
+                        frame_owner.failure.method,
+                        frame_owner.failure.argument,
+                        frame_owner.failure.argument_index,
+                        be.stats.exec_errors);
+                if (manifest->failure_count) {
+                    const cap_action_failure* const failure =
+                        &manifest->failures[manifest->failure_count - 1u];
+                    fprintf(stderr,
+                            "strict-frame action kind=%u rc=%d ordinal=%llu "
+                            "rt=%u:%08X/fmt=%u/target=%u/%ux%u "
+                            "z=%u:%08X/fmt=%u fp=%u:%08X/%08X "
+                            "vp=%u draw=%u/%u/%u/%u\n",
+                            failure->kind, failure->rc, failure->ordinal,
+                            failure->color_location,
+                            failure->color_offset,
+                            failure->color_format,
+                            failure->color_target,
+                            failure->clip_w, failure->clip_h,
+                            failure->depth_location,
+                            failure->depth_offset,
+                            failure->depth_format,
+                            failure->fp_location,
+                            failure->fp_offset,
+                            failure->fp_control,
+                            failure->vp_start, failure->primitive,
+                            failure->indexed, failure->batch_count,
+                            failure->total_count);
+                    if (failure->kind == RSX_NIR_OP_TRANSFER) {
+                        const rsx_nir_transfer* const transfer =
+                            &failure->transfer;
+                        fprintf(stderr,
+                                "strict-frame transfer kind=%u "
+                                "src=%u:%08X pitch=%u fmt=%u "
+                                "dst=%u:%08X pitch=%u fmt=%u "
+                                "point=%u,%u size=%ux%u words=%u\n",
+                                transfer->kind,
+                                transfer->src_location,
+                                transfer->src_offset,
+                                transfer->src_pitch,
+                                transfer->src_format,
+                                transfer->dst_location,
+                                transfer->dst_offset,
+                                transfer->dst_pitch,
+                                transfer->dst_format,
+                                transfer->point_x,
+                                transfer->point_y,
+                                transfer->size_w,
+                                transfer->size_h,
+                                transfer->word_count);
+                    }
+                }
+                ring_fault = 1;
+                break;
+            }
+            frame_get = next_get;
+        } else {
+            rsx_nir_adapter_method(ad, m, a);
+        }
         if (m == 0x1808u && a == 0u)
             completed_draws++;
         if (rsx_nr_ring_reject_sticky(&ring)) {
@@ -1064,6 +1180,7 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         }
     }
 
+    free(frame_fifo.words);
     free(ad);
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
@@ -1193,6 +1310,12 @@ static void run_capture_backend(const char* path)
         return;
     }
     CHECK(r1 == 0, "capture backend run 1 faulted");
+    if (r1 != 0) {
+        cap_manifest_free(&manifest1);
+        cap_manifest_free(&manifest2);
+        cap_free(&c);
+        return;
+    }
     int r2 = cap_run_once(&c, &h2, line2, sizeof(line2), 0, &manifest2);
     CHECK(r2 == 0, "capture backend run 2 faulted");
     CHECK(strcmp(line1, line2) == 0, "capture stats nondeterministic:\n  %s\n  %s",
