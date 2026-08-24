@@ -185,6 +185,23 @@ typedef enum rsx_nr_fifo_range_status {
 rsx_nr_fifo_range_status rsx_nr_fifo_section_range_status(
     u32 pc, u32 size, u32 put, u32 call_return, u32 ring_size);
 
+/* Fixed-memory exact control-flow visit set for transactional FIFO section
+ * discovery. A generation reset is O(1); revisiting the same (PC,return)
+ * pair proves a cycle and prevents an otherwise valid multi-packet loop from
+ * consuming the section scanner's entire step budget. Hash collisions are
+ * resolved by exact comparison, never treated as a cycle. */
+#define RSX_NR_FIFO_VISIT_CAPACITY 8192u
+typedef struct rsx_nr_fifo_visit_set {
+    u32 pc[RSX_NR_FIFO_VISIT_CAPACITY];
+    u32 ret[RSX_NR_FIFO_VISIT_CAPACITY];
+    u32 stamp[RSX_NR_FIFO_VISIT_CAPACITY];
+    u32 generation;
+} rsx_nr_fifo_visit_set;
+
+void rsx_nr_fifo_visit_reset(rsx_nr_fifo_visit_set* set);
+/* 1 = first visit, 0 = exact revisit, -1 = invalid/full. */
+int rsx_nr_fifo_visit_note(rsx_nr_fifo_visit_set* set, u32 pc, u32 ret);
+
 /* The imported flip contract is not complete at E944 (queue buffer).  Its
  * E924 head command is the first boundary after which a renderer may claim
  * the preceding command-list frame without mixing clears/draws/presentation

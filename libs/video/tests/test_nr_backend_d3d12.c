@@ -903,6 +903,29 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &before_preflight);
     const u32 handoffs_before = g_present_handoffs;
     const u32 publishes_before = g_published_writes;
+    {
+        rsx_nr_d3d12_stats before_program, after_program;
+        rsx_nr_d3d12_get_stats(sink, &before_program);
+        CHECK(rsx_nr_d3d12_validate_draw_program(
+                  sink, &be.st, native_vp, 4u) == 0,
+              "valid side-effect-free program preflight refused");
+        {
+            const u32 invalid_flow_vp[4] = {
+                0u, 0x08u << 27, 0u, 1u
+            };
+            CHECK(rsx_nr_d3d12_validate_draw_program(
+                      sink, &be.st, invalid_flow_vp, 4u) ==
+                      -RSX_NR_DRAW_PF_VERTEX_PROGRAM,
+                  "unsupported program escaped side-effect-free preflight");
+        }
+        rsx_nr_d3d12_get_stats(sink, &after_program);
+        CHECK(memcmp(&before_program, &after_program,
+                     sizeof(before_program)) == 0,
+              "program preflight changed backend statistics");
+        CHECK(g_present_handoffs == handoffs_before &&
+                  g_published_writes == publishes_before,
+              "program preflight caused an external side effect");
+    }
     CHECK(rsx_nr_d3d12_preflight_clear(
               sink, &be.st, &preflight_clear) == 0,
           "valid clear preflight refused");
@@ -1681,12 +1704,46 @@ int main(int argc, char** argv)
               pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     }
 
+    /* ---- exact descriptor-table reuse --------------------------------
+     * The sampler heap contains 128 immutable tables. More than 128 draws
+     * with identical resource/view/sampler identity must reuse one table and
+     * must not synchronously submit merely to recycle descriptor capacity. */
+    {
+        rsx_nr_d3d12_stats before_reuse, after_reuse;
+        rsx_nr_d3d12_get_stats(sink, &before_reuse);
+        for (u32 i = 0; i < 512u; ++i) {
+            rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+            rsx_nr_backend_run(&be, 0);
+        }
+        rsx_nr_d3d12_get_stats(sink, &after_reuse);
+        CHECK(after_reuse.queue_submissions ==
+                  before_reuse.queue_submissions,
+              "descriptor reuse forced %llu submissions",
+              after_reuse.queue_submissions -
+                  before_reuse.queue_submissions);
+        CHECK(after_reuse.descriptor_table_builds ==
+                  before_reuse.descriptor_table_builds + 1u &&
+              after_reuse.descriptor_table_hits >=
+                  before_reuse.descriptor_table_hits + 511u,
+              "descriptor reuse builds=%llu hits=%llu",
+              after_reuse.descriptor_table_builds -
+                  before_reuse.descriptor_table_builds,
+              after_reuse.descriptor_table_hits -
+                  before_reuse.descriptor_table_hits);
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "descriptor-reuse RT readback failed");
+        CHECK(pix_is(2, 61, 0xFF, 0xFF, 0xFF),
+              "descriptor-reuse pixel %02X %02X %02X",
+              pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    }
+
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 22 && st.draws == 23 && st.presents == 20,
+    CHECK(st.clears == 22 && st.draws == 535 && st.presents == 20,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,

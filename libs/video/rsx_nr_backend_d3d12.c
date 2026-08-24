@@ -90,6 +90,14 @@ typedef struct nrb_depth {
     int external;
 } nrb_depth;
 
+typedef struct nrb_descriptor_table_key {
+    u64 resource[NRB_SRV_TABLE_STRIDE];
+    u64 view[NRB_SRV_TABLE_STRIDE];
+    D3D12_SAMPLER_DESC sampler[NRB_TEX_UNITS];
+    u32 texture_mask;
+    u32 vtex_mask;
+} nrb_descriptor_table_key;
+
 typedef struct nrb_display {
     u32 location, offset, width, height;
     int valid;
@@ -115,6 +123,7 @@ struct rsx_nr_d3d12 {
     ID3D12DescriptorHeap* sampler_gpu_heap;
     u32 texture_desc_size, sampler_desc_size;
     u32 descriptor_tables_used;
+    nrb_descriptor_table_key descriptor_table_keys[NRB_DRAW_TABLES];
 
     ID3D12RootSignature* rootsig;
 
@@ -1846,6 +1855,10 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
     u32 source_slots[NRB_TEX_UNITS];
     u32 vtex_source_slots[NRB_VTEX_UNITS];
     D3D12_SAMPLER_DESC samplers[NRB_TEX_UNITS];
+    nrb_descriptor_table_key table_key;
+    memset(&table_key, 0, sizeof(table_key));
+    table_key.texture_mask = texture_mask;
+    table_key.vtex_mask = vtex_mask;
     for (u32 unit = 0; unit < NRB_TEX_UNITS; unit++) {
         const rsx_nir_texture* texture = &st->textures[unit];
         u32 source_slot = null_slot;
@@ -1887,6 +1900,17 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
         }
         source_slots[unit] = source_slot;
         samplers[unit] = nrb_sampler(texture);
+        table_key.sampler[unit] = samplers[unit];
+        table_key.view[unit] = nrb_texture_key(texture);
+        if (aliases[unit])
+            table_key.resource[unit] = (u64)(uintptr_t)aliases[unit]->tex;
+        else if (depth_aliases[unit])
+            table_key.resource[unit] =
+                (u64)(uintptr_t)depth_aliases[unit]->tex;
+        else if (source_slot < b->textures.cap &&
+                 b->textures.slots[source_slot].live)
+            table_key.resource[unit] =
+                b->textures.slots[source_slot].backend_id;
     }
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
         const rsx_nir_texture* texture = &st->vertex_textures[unit];
@@ -1899,6 +1923,25 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                 return -1;
         }
         vtex_source_slots[unit] = source_slot;
+        table_key.view[NRB_TEX_UNITS + unit] = nrb_texture_key(texture);
+        if (source_slot < b->textures.cap &&
+            b->textures.slots[source_slot].live)
+            table_key.resource[NRB_TEX_UNITS + unit] =
+                b->textures.slots[source_slot].backend_id;
+    }
+    /* Descriptor tables are immutable for the lifetime of an open command
+     * list. Exact resource/view/sampler reuse is therefore safe and avoids
+     * consuming one of D3D12's 128 sampler tables for every draw. A refreshed
+     * texture receives a different resource pointer while the old resource is
+     * fence-retired, so it cannot alias an earlier key in this generation. */
+    for (u32 i = 0; i < b->descriptor_tables_used; ++i) {
+        if (memcmp(&b->descriptor_table_keys[i], &table_key,
+                   sizeof(table_key)) == 0) {
+            *cube_mask_out = cube_mask;
+            *table_index_out = i;
+            b->stats.descriptor_table_hits++;
+            return 0;
+        }
     }
     /* Resolve/upload may have submitted a full upload ring and therefore
      * reset this fence generation. Allocate the immutable descriptor table
@@ -1907,6 +1950,8 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
     if (nrb_ensure_descriptor_capacity(b) != 0)
         return -1;
     const u32 table_index = b->descriptor_tables_used++;
+    b->descriptor_table_keys[table_index] = table_key;
+    b->stats.descriptor_table_builds++;
     const u32 srv_base = table_index * NRB_SRV_TABLE_STRIDE;
     const u32 sampler_base = table_index * NRB_SAMPLER_TABLE_STRIDE;
     for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit) {
@@ -2809,6 +2854,40 @@ int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
     return 0;
 }
 
+int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
+                                       const rsx_nir_pipeline* st,
+                                       const u32* vp_words,
+                                       u32 vp_word_count)
+{
+    if (!b || !st)
+        return -RSX_NR_DRAW_PF_BAD_ARGUMENT;
+    nrb_fp_info fp;
+    if (nrb_resolve_fp(b, st, &fp) != 0)
+        return -RSX_NR_DRAW_PF_FRAGMENT_RESOLVE;
+    if (fp.unsupported)
+        return -RSX_NR_DRAW_PF_FRAGMENT_UNSUPPORTED;
+    for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit)
+        if ((fp.texture_mask & (1u << unit)) &&
+            !st->textures[unit].enabled)
+            return -RSX_NR_DRAW_PF_TEXTURE_DISABLED;
+
+    u32 vtex_mask = 0;
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        if (st->vertex_textures[unit].enabled)
+            vtex_mask |= 1u << unit;
+    if (!vp_words || !vp_word_count ||
+        !rsx_vp_program_is_native_supported_control_ex(
+            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+            st->vertex_program.start_slot))
+        return -RSX_NR_DRAW_PF_VERTEX_PROGRAM;
+    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+        if ((vtex_mask & (1u << unit)) &&
+            nrb_vertex_texture_preflight(
+                b, &st->vertex_textures[unit]) != 0)
+            return -RSX_NR_DRAW_PF_VERTEX_TEXTURE;
+    return 0;
+}
+
 int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
                                 const rsx_nir_pipeline* st,
                                 const u32* vp_words, u32 vp_word_count,
@@ -3182,11 +3261,6 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS] = {0};
     u32 resolved_cube_mask = 0;
     u32 descriptor_table_index = 0;
-    if (nrb_ensure_descriptor_capacity(b) != 0) {
-        b->stats.unsupported_draws++;
-        b->stats.unsup_draw_texture++;
-        return -1;
-    }
     if (nrb_prepare_textures(b, st, fp.texture_mask, vtex_mask, rt, depth,
                              texture_aliases, texture_depth_aliases,
                              vtex_aliases, vtex_depth_aliases,

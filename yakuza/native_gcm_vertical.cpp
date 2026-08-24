@@ -395,6 +395,7 @@ struct yz_nr_vertical_active_state {
     yz_nr_section_transfer_preflight_key section_transfer_preflight[64];
     yz_nr_section_window_key section_window[32];
     yz_nr_flow_vp_diag section_flow_vp[YZ_NR_FLOW_VP_DIAG_COUNT];
+    rsx_nr_fifo_visit_set section_visits;
     unsigned long long section_unknown_overflow;
     unsigned long long section_report_overflow;
     unsigned long long section_draw_preflight_overflow;
@@ -2757,6 +2758,56 @@ static void yz_nr_section_note_transfer_preflight(
     g_active.section_transfer_preflight_overflow++;
 }
 
+/* Reject unsupported shader/program families before the heavyweight D3D12
+ * admission pass can create targets, compile PSOs, register mirror pages, or
+ * record uploads for earlier draws in a section that must ultimately remain
+ * legacy. This pass only folds the already-decoded fixed-memory op stream and
+ * reads the referenced program bytes. */
+static uint32_t yz_nr_section_program_preflight(void)
+{
+    rsx_nir_pipeline state = g_active.backend.st;
+    uint32_t vp_words[RSX_NIR_VP_MAX_WORDS] = {};
+    uint32_t vp_word_count = g_active.backend.vp_word_count;
+    if (vp_word_count > RSX_NIR_VP_MAX_WORDS)
+        return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+    if (vp_word_count)
+        memcpy(vp_words, g_active.backend.vp_words,
+               static_cast<size_t>(vp_word_count) * sizeof(uint32_t));
+
+    for (uint32_t i = 0; i < g_active.section_stream.op_count; ++i) {
+        const rsx_nir_op* const op = &g_active.section_stream.ops[i];
+        if (!rsx_nir_op_is_action(op->kind)) {
+            rsx_nir_pipeline_apply_op(
+                &state, &g_active.section_stream, op);
+            if (op->kind == RSX_NIR_OP_SET_VERTEX_PROGRAM) {
+                vp_word_count = op->u.vertex_program.word_count;
+                const uint32_t* const words = rsx_nir_side(
+                    &g_active.section_stream,
+                    op->u.vertex_program.words_ofs, vp_word_count);
+                if (vp_word_count > RSX_NIR_VP_MAX_WORDS ||
+                    (vp_word_count && !words))
+                    return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+                if (vp_word_count)
+                    memcpy(vp_words, words,
+                           static_cast<size_t>(vp_word_count) *
+                               sizeof(uint32_t));
+            }
+            continue;
+        }
+        if (op->kind != RSX_NIR_OP_DRAW)
+            continue;
+        const int result = rsx_nr_d3d12_validate_draw_program(
+            g_active.d3d12, &state, vp_words, vp_word_count);
+        if (result != 0) {
+            yz_nr_section_note_draw_preflight(
+                (uint32_t)-result, &state, &op->u.draw,
+                vp_words, vp_word_count);
+            return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+        }
+    }
+    return YZ_NR_SECTION_FB_NONE;
+}
+
 static uint32_t yz_nr_section_preflight(void)
 {
     rsx_nir_pipeline state = g_active.backend.st;
@@ -3053,7 +3104,9 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
         return yz_nr_section_fallback(
             YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
 
-    const uint32_t preflight = yz_nr_section_preflight();
+    uint32_t preflight = yz_nr_section_program_preflight();
+    if (preflight == YZ_NR_SECTION_FB_NONE)
+        preflight = yz_nr_section_preflight();
     if (preflight == YZ_NR_SECTION_FB_NO_GPU_ACTION) {
         /* A producer may publish a long state prefix before its terminal
          * draw/clear/transfer. Owning that prefix buys no GPU work and risks
@@ -3199,8 +3252,22 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
     uint32_t pc = get;
     uint32_t ret = fifo_ret;
     uint32_t gpu_actions_seen = 0;
+    rsx_nr_fifo_visit_reset(&g_active.section_visits);
 
     for (uint32_t step = 0; step < YZ_NR_SECTION_STEP_CAPACITY; ++step) {
+        const int visit = rsx_nr_fifo_visit_note(
+            &g_active.section_visits, pc, ret);
+        if (visit <= 0) {
+            /* A general control-flow cycle has no proven transactional end.
+             * Keep the entire cycle legacy even when it contains GPU actions;
+             * committing a prefix would suppress one iteration and resume GET
+             * in the middle of the loop. The explicit self-stopper case below
+             * remains the only cyclic boundary eligible for native ownership.
+             * Hash-table exhaustion is likewise a bounded refusal. */
+            return yz_nr_section_fallback(
+                visit == 0 ? YZ_NR_SECTION_FB_FLOW
+                           : YZ_NR_SECTION_FB_CAPACITY);
+        }
         const rsx_nr_fifo_range_status header_status =
             rsx_nr_fifo_section_range_status(pc, 4u, put, ret, ring);
         if (header_status == RSX_NR_FIFO_RANGE_NOT_READY) {
