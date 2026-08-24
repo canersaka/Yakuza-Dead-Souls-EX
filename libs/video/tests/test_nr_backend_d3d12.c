@@ -2011,6 +2011,11 @@ static void test_display_chooses_latest_surface_identity(void)
     CHECK(rsx_nr_d3d12_set_live_output(
               sink, 0, test_present_handoff, NULL) == 0,
           "display alias live-output setup failed");
+    rsx_nr_d3d12_rt_provenance provenance = {0};
+    CHECK(rsx_nr_d3d12_get_rt_provenance(sink, 0, &provenance) != 0,
+          "scanout provenance was not default-off");
+    CHECK(rsx_nr_d3d12_set_scanout_provenance(sink, 1) == 0,
+          "scanout provenance setup failed");
     rsx_nr_d3d12_set_display_buffer(
         sink, 0, RSX_NIR_LOCATION_LOCAL, RT_OFFSET, RT_W, RT_H);
 
@@ -2066,11 +2071,52 @@ static void test_display_chooses_latest_surface_identity(void)
               pix_is(1u, 1u, 0x00u, 0xFFu, 0x00u),
           "display recency did not follow the successful rewrite");
 
+    /* A depth-only clear still carries a color-surface declaration and may
+     * allocate its exact format identity during preflight.  It writes no
+     * color bytes, so it must neither supersede the last genuine color writer
+     * nor make a never-written alias eligible for presentation. */
+    state.surface.color_format = 5u;
+    state.surface.depth_format = 2u;
+    state.surface.zeta_location = RSX_NIR_LOCATION_LOCAL;
+    state.surface.zeta_offset = ZETA_OFFSET;
+    state.surface.zeta_pitch = RT_W * 4u;
+    clear.mask = 0x01u;
+    clear.depth_value = 0x7FFFFFu;
+    CHECK(rsx_nr_d3d12_preflight_clear(sink, &state, &clear) == 0 &&
+              ops.clear(ops.user, &state, &clear) == 0 &&
+              ops.present(ops.user, 0u) == 0,
+          "depth-only display-alias clear failed");
+    CHECK(g_last_present_texture == title_texture,
+          "depth-only clear incorrectly replaced the color scanout writer");
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0 &&
+              pix_is(1u, 1u, 0x00u, 0xFFu, 0x00u),
+          "depth-only clear changed the selected color scanout");
+
     rsx_nr_d3d12_stats stats;
     rsx_nr_d3d12_get_stats(sink, &stats);
     CHECK(stats.rt_builds == 2u,
           "display alias test built %llu identities instead of two",
           stats.rt_builds);
+    CHECK(rsx_nr_d3d12_get_rt_provenance(sink, 0, &provenance) == 0 &&
+              provenance.format == 8u &&
+              provenance.color_clear_writes == 2u &&
+              provenance.draw_writes == 0u &&
+              provenance.present_count == 3u,
+          "title provenance mismatch fmt=%u clear=%llu draw=%llu present=%llu",
+          provenance.format, provenance.color_clear_writes,
+          provenance.draw_writes, provenance.present_count);
+    CHECK(rsx_nr_d3d12_get_rt_provenance(sink, 1, &provenance) == 0 &&
+              provenance.format == 5u &&
+              provenance.color_clear_writes == 1u &&
+              provenance.draw_writes == 0u &&
+              provenance.present_count == 1u,
+          "world provenance mismatch fmt=%u clear=%llu draw=%llu present=%llu",
+          provenance.format, provenance.color_clear_writes,
+          provenance.draw_writes, provenance.present_count);
+    CHECK(rsx_nr_d3d12_get_rt_provenance(sink, 2, &provenance) != 0,
+          "scanout provenance exceeded the live RT table");
     rsx_nr_d3d12_destroy(sink);
 }
 

@@ -6889,6 +6889,7 @@ extern "C" int yz_rsx_resolve_published_generated_link(
  * treat a merely command-shaped word as sufficient. */
 extern "C" int yz_rsx_resolve_published_generated_hole(
     void*, uint32_t get, uint32_t put, uint32_t word,
+    uint32_t previous_get, uint32_t previous_command,
     uint32_t* resume_get)
 {
     if (!resume_get || !yz_a010_fifo_publication_repair_enabled())
@@ -6946,25 +6947,24 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     const uint32_t previous = (get - 0x48u) & mask;
     const uint32_t tail = (get + 4u) & mask;
     const uint32_t local_resume = (get + 8u) & mask;
-    const uint32_t previous_ea = yz_rsx_io_to_ea(previous);
     const uint32_t tail_ea = yz_rsx_io_to_ea(tail);
-    const uint32_t previous_command = previous_ea
-        ? vm_read32(previous_ea) : 0u;
     const uint32_t tail_word = tail_ea ? vm_read32(tail_ea) : 0u;
+    const int exact_predecessor =
+        previous_get == previous && previous_command == 0x00441EFCu;
     const int local_prologue_ready =
         yz_a010_generated_prologue_at(local_resume);
     const uint32_t exact_resume =
         yz_fifo_generated_vp_constant_tail_resume(
-            previous_command, word, get, put, ring,
+            exact_predecessor ? previous_command : 0u,
+            word, get, put, ring,
             local_prologue_ready);
-    if (exact_resume) {
+    if (exact_resume && tail_word == 0x04000000u) {
         MemoryBarrier();
         if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
-            vm_read32(previous_ea) == previous_command &&
             vm_read32(hole_ea) == word &&
-            vm_read32(tail_ea) == tail_word &&
+            vm_read32(tail_ea) == 0x04000000u &&
             yz_fifo_generated_vp_constant_tail_resume(
-                vm_read32(previous_ea), vm_read32(hole_ea), get, put,
+                previous_command, vm_read32(hole_ea), get, put,
                 ring, yz_a010_generated_prologue_at(exact_resume)) ==
                 exact_resume) {
             *resume_get = exact_resume;
@@ -6975,7 +6975,8 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     /* Recognize the exact packet/tail shape independently of the following
      * prologue so an early proof cannot permanently latch out bytes which
      * the generated-list producer publishes later without another PUT. */
-    if (!local_prologue_ready &&
+    if (exact_predecessor && tail_word == 0x04000000u &&
+        !local_prologue_ready &&
         yz_fifo_generated_vp_constant_tail_resume(
             previous_command, word, get, put, ring, 1))
         return -1;

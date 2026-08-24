@@ -141,6 +141,20 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long shared_timeline_forced_submissions;
 } rsx_nr_d3d12_stats;
 
+/* Fixed-memory, default-off scanout provenance.  This deliberately exposes
+ * only stable identities and aggregate write/present counts; it never reads
+ * a render target back or emits output from the backend. */
+typedef struct rsx_nr_d3d12_rt_provenance {
+    unsigned long long resource_identity;
+    unsigned long long write_serial;
+    unsigned long long color_clear_writes;
+    unsigned long long draw_writes;
+    unsigned long long present_count;
+    unsigned int space, offset, format, width, height;
+    unsigned int resource_state;
+    unsigned int external;
+} rsx_nr_d3d12_rt_provenance;
+
 /* guest_ptr resolves (space, offset, min_bytes) like rsx_live_guest_ptr_fn;
  * writable_ptr resolves the same bytes writable (transfers write guest
  * memory). `device` = existing ID3D12Device* or NULL to create a WARP
@@ -226,6 +240,10 @@ int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer_id);
 int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
                                  rsx_nr_d3d12_present_fn present,
                                  void* present_user);
+/* Enable the shutdown-only scanout provenance counters before the first GPU
+ * operation. The default-off path is one predictable branch at successful
+ * color clears, draws, and presents, with no clocks, allocation, or I/O. */
+int rsx_nr_d3d12_set_scanout_provenance(rsx_nr_d3d12* b, int enabled);
 void rsx_nr_d3d12_set_display_buffer(rsx_nr_d3d12* b, u32 buffer_id,
                                      u32 location, u32 offset,
                                      u32 width, u32 height);
@@ -297,6 +315,9 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
 int rsx_nr_d3d12_rt_info(const rsx_nr_d3d12* b, u32 ordinal,
                          u32* space, u32* offset, u32* format,
                          u32* width, u32* height);
+int rsx_nr_d3d12_get_rt_provenance(
+    const rsx_nr_d3d12* b, u32 ordinal,
+    rsx_nr_d3d12_rt_provenance* out);
 
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out);
 

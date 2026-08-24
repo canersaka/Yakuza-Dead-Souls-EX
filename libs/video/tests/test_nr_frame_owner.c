@@ -35,6 +35,8 @@ typedef struct fixture {
     u32 hole_resume;
     u32 hole_pending;
     u32 hole_calls;
+    u32 hole_previous_get;
+    u32 hole_previous_command;
     rsx_nr_slot slots[TEST_RING_OPS];
     u32 side[TEST_RING_SIDE];
     rsx_nr_ring ring;
@@ -122,9 +124,12 @@ static int resolve_generated_jump(void* user, u32 get, u32 put,
 }
 
 static int resolve_generated_hole(void* user, u32 get, u32 put,
-                                  u32 word, u32* resume_get)
+                                  u32 word, u32 previous_get,
+                                  u32 previous_command, u32* resume_get)
 {
     fixture* f = user;
+    f->hole_previous_get = previous_get;
+    f->hole_previous_command = previous_command;
     f->hole_calls++;
     if (!resume_get || get != f->hole_get || put != f->hole_put ||
         word != f->hole_word)
@@ -618,6 +623,178 @@ static int test_pending_generated_hole_rechecks_without_put_change(void)
     return 0;
 }
 
+static int test_generated_hole_postproof_reread_retries(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 hole = 0x1278u;
+    const u32 resume = 0x1280u;
+    const u32 put = 0x3000u;
+    const u32 raw = 0x3A2AAAABu;
+    u32 next = hole, ret = ~0u;
+    f.words[hole >> 2] = raw;
+    f.hole_get = hole;
+    f.hole_put = put;
+    f.hole_word = raw;
+    f.hole_resume = resume;
+    f.words[resume >> 2] = 0x3A2AAAABu;
+
+    /* The callback proves the producer identity, but the independent owner
+     * reread still sees an unready resume word.  This is a pending
+     * publication race, not a permanent refusal for this unchanged PUT. */
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "post-proof hole was tested before delay at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && f.hole_calls == 1u,
+          "failed post-proof reread did not remain pending");
+
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0x89ABCDEFu;
+    for (u32 i = 0; i < (1u << 16) - 1u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "post-proof hole retried too early at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume &&
+              f.hole_calls == 2u &&
+              f.owner.stats.repaired_generated_holes == 1u,
+          "ready post-proof hole was not retried under unchanged PUT");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, resume, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && f.references == 0x89ABCDEFu,
+          "post-proof retry did not execute the resume exactly once");
+    return 0;
+}
+
+static int test_generated_hole_put_progress_resets_failure_bound(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 hole = 0x1278u;
+    const u32 raw = 0x3A2AAAABu;
+    u32 next = hole, ret = ~0u;
+    f.words[hole >> 2] = raw;
+    f.hole_get = hole;
+    f.hole_word = raw;
+    f.owner.flow_wait_limit = 3u;
+
+    /* Every PUT value is a new publication generation.  More total polls
+     * than the unchanged-generation bound must remain a wait while the
+     * producer is demonstrably advancing. */
+    for (u32 i = 0; i < 64u; ++i) {
+        const u32 put = 0x2000u + i * 4u;
+        f.hole_put = put;
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole && !f.owner.fatal,
+              "advancing PUT consumed the failure bound at generation %u", i);
+    }
+    CHECK(f.owner.flow_wait_polls == 1u,
+          "new PUT generation retained %u stale failure polls",
+          f.owner.flow_wait_polls);
+
+    /* Once publication stops changing, the ordinary bounded failure remains
+     * intact; this is not an unbounded malformed-command escape. */
+    const u32 stable_put = f.hole_put;
+    for (u32 i = 0; i < 2u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, stable_put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "stable PUT failed before its unchanged bound at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, stable_put, ret, &next, &ret) ==
+              RSX_NR_FRAME_FATAL && f.owner.fatal,
+          "stable malformed generation did not retain the bounded failure");
+    return 0;
+}
+
+static int test_generated_hole_receives_owner_predecessor(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1200u;
+    const u32 command = packet(1u, 0x0050u);
+    const u32 hole = base + 8u;
+    const u32 resume = hole + 8u;
+    const u32 put = 0x3000u;
+    u32 next = base, ret = ~0u;
+    f.words[base >> 2] = command;
+    f.words[(base + 4u) >> 2] = 0x01020304u;
+    f.words[hole >> 2] = 0x3A2AAAABu;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0x05060708u;
+    f.hole_get = hole;
+    f.hole_put = put;
+    f.hole_word = f.words[hole >> 2];
+    f.hole_resume = resume;
+
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == hole,
+          "predecessor packet did not advance to generated gap");
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "predecessor-proven gap escaped before delay at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume &&
+              f.hole_previous_get == base &&
+              f.hole_previous_command == command,
+          "hole resolver received predecessor %08X/%08X expected %08X/%08X",
+          f.hole_previous_get, f.hole_previous_command, base, command);
+    return 0;
+}
+
+static int test_primary_unmapped_flow_waits_for_in_place_publication(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 get = 0x1158u;
+    const u32 put = 0x3000u;
+    const u32 raw_jump = 0xBF820821u;
+    u32 next = get, ret = ~0u;
+    f.words[get >> 2] = raw_jump;
+    f.owner.flow_wait_limit = 3u;
+
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, get, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && next == get && !f.owner.fatal,
+          "unmapped flow-shaped publication word failed immediately");
+    f.words[get >> 2] = packet(1u, 0x0050u);
+    f.words[(get + 4u) >> 2] = 0x13572468u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, get, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == get + 8u &&
+              f.references == 0x13572468u && !f.owner.fatal,
+          "in-place published method did not execute exactly once");
+
+    /* Reuse the fixed fixture rather than placing two full command arenas on
+     * the Windows test stack at once. */
+    fixture_init(&f);
+    f.words[get >> 2] = raw_jump;
+    f.owner.flow_wait_limit = 3u;
+    next = get;
+    ret = ~0u;
+    for (u32 i = 0; i < 3u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, get, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "stable unmapped flow failed before bound at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, get, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_FATAL && f.owner.fatal,
+          "stable unmapped flow escaped bounded failure");
+    return 0;
+}
+
 static int test_packet_shaped_generated_hole_executes_no_arguments(void)
 {
     fixture f;
@@ -830,6 +1007,10 @@ int main(void)
         test_invalid_jump_repair_is_exact_and_latched() ||
         test_primary_generated_hole_proof_is_exact_and_latched() ||
         test_pending_generated_hole_rechecks_without_put_change() ||
+        test_generated_hole_postproof_reread_retries() ||
+        test_generated_hole_put_progress_resets_failure_bound() ||
+        test_generated_hole_receives_owner_predecessor() ||
+        test_primary_unmapped_flow_waits_for_in_place_publication() ||
         test_packet_shaped_generated_hole_executes_no_arguments() ||
         test_primary_hole_waits_but_called_list_fails() ||
         test_registered_island_edge_skips_payload_exactly() ||
