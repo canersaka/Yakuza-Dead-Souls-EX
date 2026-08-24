@@ -221,6 +221,17 @@ int rsx_nr_fifo_visit_contains(
 int rsx_nr_complete_section_family_allowed(
     u32 enabled_families, u32 action_family, u32 section_draw_count);
 
+/* The title's two local-memory depth-only shadow producers are a proven
+ * cross-section dependency: later world passes sample these zetas. Until the
+ * native depth producer is bit-equivalent to the established renderer, the
+ * complete containing FIFO section must remain legacy. This predicate is
+ * deliberately exact so ordinary depth/color passes stay native-eligible. */
+#define RSX_NR_YZ_SHADOW_ZETA0 0x02310000u
+#define RSX_NR_YZ_SHADOW_ZETA1 0x02910000u
+int rsx_nr_yz_unproven_shadow_depth_producer(
+    u32 zeta_location, u32 zeta_offset, u32 color_mask,
+    u32 depth_write_enable);
+
 /* The imported flip contract is not complete at E944 (queue buffer).  Its
  * E924 head command is the first boundary after which a renderer may claim
  * the preceding command-list frame without mixing clears/draws/presentation

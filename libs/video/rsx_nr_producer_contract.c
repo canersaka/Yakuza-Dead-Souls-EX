@@ -431,6 +431,16 @@ int rsx_nr_complete_section_family_allowed(
         (enabled_families & RSX_NR_GRAPHICS_FAMILY_DRAW) != 0u;
 }
 
+int rsx_nr_yz_unproven_shadow_depth_producer(
+    u32 zeta_location, u32 zeta_offset, u32 color_mask,
+    u32 depth_write_enable)
+{
+    return zeta_location == 0u && color_mask == 0u &&
+        depth_write_enable != 0u &&
+        (zeta_offset == RSX_NR_YZ_SHADOW_ZETA0 ||
+         zeta_offset == RSX_NR_YZ_SHADOW_ZETA1);
+}
+
 int rsx_nr_fifo_frame_boundary(u32 method, u32 arg)
 {
     return method == 0xE924u && arg == 0x8000010Fu;
