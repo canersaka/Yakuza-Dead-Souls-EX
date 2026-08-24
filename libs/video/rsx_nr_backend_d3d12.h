@@ -71,6 +71,8 @@ typedef int (*rsx_nr_d3d12_render_condition_fn)(
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long queue_submissions;   /* fence-retired command lists */
+    unsigned long long descriptor_table_hits;
+    unsigned long long descriptor_table_builds;
     unsigned long long pso_hits, pso_builds;
     unsigned long long unsupported_draws;    /* refused to the core (sum)  */
     unsigned long long conditional_draws_skipped;
@@ -157,8 +159,15 @@ int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
 int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
                                 const rsx_nir_pipeline* st,
                                 const u32* vp_words, u32 vp_word_count,
-                                const rsx_nir_draw* draw,
-                                const u32* batches);
+                                 const rsx_nir_draw* draw,
+                                 const u32* batches);
+/* Side-effect-free first gate for shader/program compatibility. It performs
+ * no resource creation, page registration, command-list recording, PSO build,
+ * allocation, submission, or guest write. */
+int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
+                                       const rsx_nir_pipeline* st,
+                                       const u32* vp_words,
+                                       u32 vp_word_count);
 int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
                                     const rsx_nir_pipeline* st,
                                     const rsx_nir_transfer* transfer,

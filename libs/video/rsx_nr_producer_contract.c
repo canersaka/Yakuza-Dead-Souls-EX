@@ -373,6 +373,37 @@ rsx_nr_fifo_range_status rsx_nr_fifo_section_range_status(
     return RSX_NR_FIFO_RANGE_READY;
 }
 
+void rsx_nr_fifo_visit_reset(rsx_nr_fifo_visit_set* set)
+{
+    if (!set)
+        return;
+    set->generation++;
+    if (!set->generation) {
+        memset(set->stamp, 0, sizeof(set->stamp));
+        set->generation = 1u;
+    }
+}
+
+int rsx_nr_fifo_visit_note(rsx_nr_fifo_visit_set* set, u32 pc, u32 ret)
+{
+    if (!set || !set->generation)
+        return -1;
+    const u32 mask = RSX_NR_FIFO_VISIT_CAPACITY - 1u;
+    u32 index = ((pc >> 2) ^ (ret * 0x9E3779B9u)) & mask;
+    for (u32 probe = 0; probe < RSX_NR_FIFO_VISIT_CAPACITY; ++probe) {
+        if (set->stamp[index] != set->generation) {
+            set->pc[index] = pc;
+            set->ret[index] = ret;
+            set->stamp[index] = set->generation;
+            return 1;
+        }
+        if (set->pc[index] == pc && set->ret[index] == ret)
+            return 0;
+        index = (index + 1u) & mask;
+    }
+    return -1;
+}
+
 int rsx_nr_fifo_frame_boundary(u32 method, u32 arg)
 {
     return method == 0xE924u && arg == 0x8000010Fu;

@@ -289,6 +289,26 @@ int main(void)
               0x1000u, 0u, 0x1008u, 0xFFFFFFFFu, fifo_ring) ==
           RSX_NR_FIFO_RANGE_WINDOW);
 
+    /* Multi-packet cycles are detected by exact PC+return identity in O(1)
+     * generations. A million retries cannot burn the scanner step budget. */
+    {
+        static rsx_nr_fifo_visit_set visits;
+        rsx_nr_fifo_visit_reset(&visits);
+        CHECK(rsx_nr_fifo_visit_note(&visits, 0x1000u, 0xFFFFFFFFu) == 1);
+        CHECK(rsx_nr_fifo_visit_note(&visits, 0x1004u, 0xFFFFFFFFu) == 1);
+        CHECK(rsx_nr_fifo_visit_note(&visits, 0x1000u, 0x2000u) == 1);
+        for (u32 i = 0; i < 1000000u; ++i)
+            CHECK(rsx_nr_fifo_visit_note(
+                      &visits, 0x1000u, 0xFFFFFFFFu) == 0);
+        rsx_nr_fifo_visit_reset(&visits);
+        CHECK(rsx_nr_fifo_visit_note(&visits, 0x1000u, 0xFFFFFFFFu) == 1);
+        visits.generation = 0xFFFFFFFFu;
+        rsx_nr_fifo_visit_reset(&visits);
+        CHECK(visits.generation == 1u &&
+              rsx_nr_fifo_visit_note(
+                  &visits, 0x1000u, 0xFFFFFFFFu) == 1);
+    }
+
     /* Per-action ownership is forbidden: only the complete queue/head flip
      * pair closes a transactional native frame. */
     CHECK(!rsx_nr_fifo_frame_boundary(0x1808u, 0u));
