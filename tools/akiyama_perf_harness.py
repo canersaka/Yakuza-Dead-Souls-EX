@@ -908,6 +908,8 @@ def run_gun(args):
             yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
     if args.nr_vertical_full_native:
         yz["YZ_NR_VERTICAL"] = "full-native"
+        if args.nr_scanout_provenance:
+            yz["YZ_NR_SCANOUT_PROVENANCE"] = "1"
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -932,8 +934,11 @@ def run_gun(args):
             )
         },
         "active_yz": yz,
-        "active_diagnostics": ({"RSX_D3D_DEBUG": "1"}
-                               if args.d3d_debug else {}),
+        "active_diagnostics": (
+            ({"RSX_D3D_DEBUG": "1"} if args.d3d_debug else {}) |
+            ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
+             if args.nr_scanout_provenance else {})
+        ),
         "gun_reference_dir": str(reference_dir),
         "captures": [],
         "route_markers": {},
@@ -1396,6 +1401,8 @@ def run(args):
             yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
     if args.nr_vertical_full_native:
         yz["YZ_NR_VERTICAL"] = "full-native"
+        if args.nr_scanout_provenance:
+            yz["YZ_NR_SCANOUT_PROVENANCE"] = "1"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1422,8 +1429,11 @@ def run(args):
             )
         },
         "active_yz": yz,
-        "active_diagnostics": ({"RSX_D3D_DEBUG": "1"}
-                               if args.d3d_debug else {}),
+        "active_diagnostics": (
+            ({"RSX_D3D_DEBUG": "1"} if args.d3d_debug else {}) |
+            ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
+             if args.nr_scanout_provenance else {})
+        ),
         "reference": str(reference_path),
         "captures": [],
     }
@@ -1848,6 +1858,7 @@ def main():
     parser.add_argument("--nr-vertical-active-present", action="store_true")
     parser.add_argument("--nr-vertical-active-graphics", action="store_true")
     parser.add_argument("--nr-vertical-full-native", action="store_true")
+    parser.add_argument("--nr-scanout-provenance", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
@@ -1905,6 +1916,10 @@ def main():
         parser.error("--nr-draw-primitive requires --nr-frame-islands")
     if args.nr_hana_depth_oracle and not args.nr_frame_islands:
         parser.error("--nr-hana-depth-oracle requires --nr-frame-islands")
+    if args.nr_scanout_provenance and not args.nr_vertical_full_native:
+        parser.error(
+            "--nr-scanout-provenance requires --nr-vertical-full-native"
+        )
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]
