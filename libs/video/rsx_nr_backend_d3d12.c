@@ -1883,6 +1883,8 @@ static D3D12_TEXTURE_ADDRESS_MODE nrb_wrap(u32 wrap)
 static D3D12_SAMPLER_DESC nrb_sampler(const rsx_nir_texture* texture)
 {
     D3D12_SAMPLER_DESC desc = {0};
+    const u32 format = texture->format & NRB_TEX_BASE_MASK &
+                       ~NRB_TEX_UNNORM;
     const u32 minf = (texture->filter >> 16) & 7u;
     const u32 magf = (texture->filter >> 24) & 7u;
     const D3D12_FILTER_TYPE min_type =
@@ -1903,14 +1905,22 @@ static D3D12_SAMPLER_DESC nrb_sampler(const rsx_nir_texture* texture)
     if (desc.MaxLOD < desc.MinLOD)
         desc.MaxLOD = desc.MinLOD;
     desc.MaxAnisotropy = 1;
-    desc.BorderColor[0] =
-        (float)((texture->border_color >> 16) & 0xFFu) / 255.0f;
-    desc.BorderColor[1] =
-        (float)((texture->border_color >> 8) & 0xFFu) / 255.0f;
-    desc.BorderColor[2] =
-        (float)(texture->border_color & 0xFFu) / 255.0f;
-    desc.BorderColor[3] =
-        (float)((texture->border_color >> 24) & 0xFFu) / 255.0f;
+    /* The established renderer has always left the D3D border color at
+     * zero for sampled depth snapshots.  Yakuza writes opaque white into
+     * the guest border register for its character-shadow maps, so honoring
+     * that value here changes out-of-range depth comparisons and produces
+     * black silhouettes.  Preserve ordinary texture border colors while
+     * keeping DEPTH24_D8 sampling bit-for-bit compatible with legacy. */
+    if (format != NRB_TEX_DEPTH24_D8) {
+        desc.BorderColor[0] =
+            (float)((texture->border_color >> 16) & 0xFFu) / 255.0f;
+        desc.BorderColor[1] =
+            (float)((texture->border_color >> 8) & 0xFFu) / 255.0f;
+        desc.BorderColor[2] =
+            (float)(texture->border_color & 0xFFu) / 255.0f;
+        desc.BorderColor[3] =
+            (float)((texture->border_color >> 24) & 0xFFu) / 255.0f;
+    }
     return desc;
 }
 
@@ -2569,7 +2579,7 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                      "        v[i] = float4(0.0, 0.0, 0.0, 1.0);\n"
                      "%s"
                      "    VSOutput o; o.pos=v[0]; o.col0=float4(1,0,1,1);\n"
-                     "    o.col1=0; o.fog=0; o.t0=0; o.t1=0; o.t2=0; o.t3=0;\n"
+                     "    o.col1=0; o.fog=0; o.t0=float4(-1,-1,0,0); o.t1=0; o.t2=0; o.t3=0;\n"
                      "    o.t4=0; o.t5=0; o.t6=0; o.t7=0; return o;\n"
                      "}\n",
                      b->pull_globals, b->pull_loads);
