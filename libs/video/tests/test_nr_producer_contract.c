@@ -372,6 +372,23 @@ int main(void)
     CHECK(!rsx_nr_yz_unproven_shadow_depth_producer(
                0u, RSX_NR_YZ_SHADOW_ZETA0 + 0x1000u, 0u, 1u));
 
+    /* Consumer quarantine is equally exact and format-aware. The captured
+     * linear DEPTH24_D8 byte is 0xB0; LINEAR and UNNORMALIZED modifiers are
+     * intentionally ignored, while disabled/color/main-memory/unrelated
+     * bindings remain eligible. */
+    CHECK(rsx_nr_yz_unproven_shadow_depth_consumer(
+              1u, 0u, RSX_NR_YZ_SHADOW_ZETA0, 0xB0u));
+    CHECK(rsx_nr_yz_unproven_shadow_depth_consumer(
+              1u, 0u, RSX_NR_YZ_SHADOW_ZETA1, 0xF0u));
+    CHECK(!rsx_nr_yz_unproven_shadow_depth_consumer(
+               0u, 0u, RSX_NR_YZ_SHADOW_ZETA0, 0xB0u));
+    CHECK(!rsx_nr_yz_unproven_shadow_depth_consumer(
+               1u, 1u, RSX_NR_YZ_SHADOW_ZETA0, 0xB0u));
+    CHECK(!rsx_nr_yz_unproven_shadow_depth_consumer(
+               1u, 0u, RSX_NR_YZ_SHADOW_ZETA0, 0xA5u));
+    CHECK(!rsx_nr_yz_unproven_shadow_depth_consumer(
+               1u, 0u, RSX_NR_YZ_SHADOW_ZETA0 + 0x1000u, 0xB0u));
+
     /* Per-action ownership is forbidden: only the complete queue/head flip
      * pair closes a transactional native frame. */
     CHECK(!rsx_nr_fifo_frame_boundary(0x1808u, 0u));

@@ -441,6 +441,17 @@ int rsx_nr_yz_unproven_shadow_depth_producer(
          zeta_offset == RSX_NR_YZ_SHADOW_ZETA1);
 }
 
+int rsx_nr_yz_unproven_shadow_depth_consumer(
+    u32 enabled, u32 texture_location, u32 texture_offset,
+    u32 texture_format)
+{
+    const u32 base_format = (texture_format & 0x9Fu) & ~0x40u;
+    return enabled != 0u && texture_location == 0u &&
+        base_format == 0x90u &&
+        (texture_offset == RSX_NR_YZ_SHADOW_ZETA0 ||
+         texture_offset == RSX_NR_YZ_SHADOW_ZETA1);
+}
+
 int rsx_nr_fifo_frame_boundary(u32 method, u32 arg)
 {
     return method == 0xE924u && arg == 0x8000010Fu;
