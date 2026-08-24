@@ -747,11 +747,6 @@ static void yz_nr_active_ensure_graphics(void)
         rsx_nr_d3d12_destroy(d3d12);
         return;
     }
-    if (g_active.frame_islands &&
-        rsx_nr_d3d12_set_coherent_section_mode(d3d12, 1) != 0) {
-        rsx_nr_d3d12_destroy(d3d12);
-        return;
-    }
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
     rsx_nr_d3d12_set_resource_broker(
         d3d12, yz_nr_borrow_color, yz_nr_borrow_depth, nullptr);

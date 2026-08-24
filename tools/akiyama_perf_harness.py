@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -138,6 +139,28 @@ def prompt_blue_pixels(width: int, height: int, pixels: bytes):
     return count
 
 
+def region_black_fraction(width: int, height: int, pixels: bytes, box):
+    """Fraction of near-black pixels in a normalized RGB image box."""
+    x0, y0, x1, y1 = box
+    left = max(0, min(width, int(width * x0)))
+    right = max(left, min(width, int(width * x1)))
+    top = max(0, min(height, int(height * y0)))
+    bottom = max(top, min(height, int(height * y1)))
+    black = 0
+    total = 0
+    for y in range(top, bottom):
+        row = y * width * 3
+        for x in range(left, right):
+            offset = row + x * 3
+            r, g, b = pixels[offset : offset + 3]
+            # Integer Rec.709 luma < 12. This catches the known solid-black
+            # character fill while tolerating dark fabric and background.
+            if 2126 * r + 7152 * g + 722 * b < 120000:
+                black += 1
+            total += 1
+    return black / total if total else 1.0
+
+
 def gun_hud_mask(width: int, height: int, pixels: bytes):
     """Fixed-screen pale-glyph mask for the post-Frontier gun HUD.
 
@@ -190,6 +213,17 @@ def scene_features(path: Path):
         "mean_rgb": sum(rgb) / (len(rgb) * 255.0),
         "dialogue": dialogue_mask(width, height, pixels),
         "prompt_blue_pixels": prompt_blue_pixels(width, height, pixels),
+        # Stable torso boxes shared by the first Hana X-prompt cameras. The
+        # previous coarse whole-frame gate missed black characters because the
+        # bright city background dominated its mean and sampled distance.
+        "character_black": {
+            "akiyama": region_black_fraction(
+                width, height, pixels, (0.27, 0.31, 0.40, 0.66)
+            ),
+            "hana": region_black_fraction(
+                width, height, pixels, (0.58, 0.35, 0.70, 0.69)
+            ),
+        },
         "gun_hud": gun_hud_mask(width, height, pixels),
     }
 
@@ -212,6 +246,11 @@ def compare_scene(reference, candidate):
     reference_mean = reference["mean_rgb"]
     scene_mean_ratio = (candidate["mean_rgb"] / reference_mean
                         if reference_mean else 0.0)
+    character_black = candidate["character_black"]
+    characters_intact = (
+        character_black["akiyama"] <= 0.45 and
+        character_black["hana"] <= 0.45
+    )
     # The requested checkpoint is semantic: the first Akiyama/Hana city
     # dialogue that displays an X-to-continue prompt.  The archived subtitle
     # frame used as the scene anchor is transient and has no prompt itself.
@@ -223,7 +262,7 @@ def compare_scene(reference, candidate):
     # never a visual pass. The lower bound remains tolerant of camera/exposure
     # variation in the archived healthy prompt corpus.
     arrival = (coarse_mae <= 0.18 and mask_difference <= 0.05 and
-               0.65 <= scene_mean_ratio <= 1.5)
+               0.65 <= scene_mean_ratio <= 1.5 and characters_intact)
     match = (arrival and prompt_blue >= 20)
     return {
         "match": match,
@@ -233,6 +272,10 @@ def compare_scene(reference, candidate):
         "dialogue_text_iou": round(text_iou, 6),
         "prompt_blue_pixels": prompt_blue,
         "scene_mean_ratio": round(scene_mean_ratio, 6),
+        "character_black_fraction": {
+            key: round(value, 6) for key, value in character_black.items()
+        },
+        "characters_intact": characters_intact,
     }
 
 
@@ -429,7 +472,7 @@ def game_processes():
     }
 
 
-def post_close(pid: int):
+def visible_windows_for_pid(pid: int):
     user32 = ctypes.windll.user32
     windows = []
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -443,8 +486,62 @@ def post_close(pid: int):
         return True
 
     user32.EnumWindows(callback, 0)
+    return windows
+
+
+def capture_process_window(pid: int, path: Path):
+    """Capture the largest visible window owned by exactly *pid*.
+
+    This is a route-health discriminator only. Scene acceptance still uses the
+    renderer-owned framebuffer PPMs, which are independent of desktop state.
+    """
+    if os.name != "nt":
+        return None
+    user32 = ctypes.windll.user32
+    rect_type = wintypes.RECT
+    candidates = []
+    for hwnd in visible_windows_for_pid(pid):
+        rect = rect_type()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+        width = max(0, rect.right - rect.left)
+        height = max(0, rect.bottom - rect.top)
+        if width and height:
+            candidates.append((width * height, hwnd))
+    if not candidates:
+        return None
+    _, hwnd = max(candidates)
+    try:
+        from PIL import ImageGrab
+
+        image = ImageGrab.grab(window=int(hwnd), include_layered_windows=True)
+        if image.width <= 0 or image.height <= 0:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(path)
+        sample = image.convert("RGB").resize((64, 36)).tobytes()
+        return {
+            "path": str(path),
+            "width": image.width,
+            "height": image.height,
+            "sample_sha256": hashlib.sha256(sample).hexdigest(),
+            "mean_channel": round(sum(sample) / len(sample), 3),
+            "sample": sample,
+        }
+    except (OSError, ImportError):
+        return None
+
+
+def sample_mae(first: bytes, second: bytes):
+    if not first or len(first) != len(second):
+        return float("inf")
+    return sum(abs(a - b) for a, b in zip(first, second)) / len(first)
+
+
+def post_close(pid: int):
+    windows = visible_windows_for_pid(pid)
     for hwnd in windows:
-        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
     return len(windows)
 
 
@@ -555,7 +652,10 @@ def self_test(root: Path, reference_path: Path):
     ]
     expected_first = {
         str(runs[0].resolve()): None,
-        str(runs[1].resolve()): "frontier_probe_002.ppm",
+        # The older accept20 camera is outside the intentionally tighter
+        # whole-scene distance bound. It remains a healthy character sample,
+        # but is no longer the checkpoint reference.
+        str(runs[1].resolve()): None,
     }
     first_matches = {}
     total = 0
@@ -572,6 +672,27 @@ def self_test(root: Path, reference_path: Path):
         raise AssertionError(
             f"scene corpus mismatch: expected {expected_first}, got {first_matches}"
         )
+    healthy_prompt = (
+        root / "scratch" / "native-coherent-pass-566febd-hana-20260824-capture"
+        / "frontier_probe_006.ppm"
+    )
+    rejected_prompt = (
+        root / "scratch"
+        / "native-coherent-flow-txl-72a0463-hana-r2-20260824-capture"
+        / "frontier_probe_006.ppm"
+    )
+    if healthy_prompt.is_file():
+        healthy_result = compare_scene(reference, scene_features(healthy_prompt))
+        if not healthy_result["match"] or not healthy_result["characters_intact"]:
+            raise AssertionError(
+                f"healthy Hana prompt rejected: {healthy_result}"
+            )
+    if rejected_prompt.is_file():
+        rejected_result = compare_scene(reference, scene_features(rejected_prompt))
+        if rejected_result["match"] or rejected_result["characters_intact"]:
+            raise AssertionError(
+                f"black-character Hana prompt escaped gate: {rejected_result}"
+            )
     repaired = (
         root / "scratch" / "akiyama-auto-fe0-lane-fix4-20260821-1450-capture"
     )
@@ -1257,6 +1378,8 @@ def run(args):
         consecutive = 0
         arrival_consecutive = 0
         last_capture_progress = time.monotonic()
+        startup_idle_visual = []
+        next_startup_idle_visual = 0.0
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during route: {process.returncode}")
@@ -1330,13 +1453,56 @@ def run(args):
                 )
                 if (len(idle_states) >= 3 and
                         len(set(idle_states[-3:])) == 1):
-                    result["route_failure_class"] = (
-                        "startup-fifo-no-progress"
-                    )
-                    result["route_failure_state"] = idle_states[-1]
-                    raise RuntimeError(
-                        "startup FIFO repeated one no-progress state three times"
-                    )
+                    now = time.monotonic()
+                    if now >= next_startup_idle_visual:
+                        serial = len(startup_idle_visual) + 1
+                        capture = capture_process_window(
+                            process.pid,
+                            scratch / f"startup_idle_{serial:03d}.png",
+                        )
+                        next_startup_idle_visual = now + 10.0
+                        if capture:
+                            capture["fifo_state"] = idle_states[-1]
+                            capture["seconds_without_route_capture"] = round(
+                                no_capture_for, 3
+                            )
+                            startup_idle_visual.append(capture)
+                            result["startup_idle_visual_probes"] = [
+                                {key: value for key, value in item.items()
+                                 if key != "sample"}
+                                for item in startup_idle_visual
+                            ]
+                            print(
+                                "[akiyama-harness] startup idle visual "
+                                f"{serial}: mean={capture['mean_channel']}",
+                                flush=True,
+                            )
+                    if len(startup_idle_visual) >= 3:
+                        recent = startup_idle_visual[-3:]
+                        visual_mae = max(
+                            sample_mae(recent[0]["sample"], recent[1]["sample"]),
+                            sample_mae(recent[1]["sample"], recent[2]["sample"]),
+                        )
+                        result["startup_idle_visual_mae"] = round(visual_mae, 3)
+                        if (len({item["fifo_state"] for item in recent}) == 1 and
+                                visual_mae <= 2.5):
+                            result["route_failure_class"] = (
+                                "startup-fifo-and-visual-no-progress"
+                            )
+                            result["route_failure_state"] = idle_states[-1]
+                            raise RuntimeError(
+                                "startup FIFO and game image both stopped "
+                                "progressing"
+                            )
+                    if no_capture_for >= 150.0:
+                        result["route_failure_class"] = (
+                            "startup-route-no-progress-timeout"
+                        )
+                        result["route_failure_state"] = idle_states[-1]
+                        raise RuntimeError(
+                            "startup route made no framebuffer progress for "
+                            "150 seconds"
+                        )
             if (not captured_this_poll and seen and no_capture_for >= 15.0 and
                     stderr_path.exists()):
                 tail = stderr_path.read_text(
