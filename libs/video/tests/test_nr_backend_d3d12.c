@@ -1351,10 +1351,25 @@ int main(int argc, char** argv)
     {
         rsx_nr_d3d12_stats before_program, after_program;
         u32 native_sections = 0u, legacy_sections = 0u;
+        u32 fragment_texture_mask = ~0u;
         rsx_nr_d3d12_get_stats(sink, &before_program);
-        CHECK(rsx_nr_d3d12_validate_draw_program(
-                  sink, &be.st, native_vp, 4u) == 0,
+        CHECK(rsx_nr_d3d12_validate_draw_program_usage(
+                  sink, &be.st, native_vp, 4u,
+                  &fragment_texture_mask) == 0,
               "valid side-effect-free program preflight refused");
+        CHECK(fragment_texture_mask == 0u,
+              "MOV fragment program reported texture mask %04X",
+              fragment_texture_mask);
+        write_tex_fp();
+        rsx_nir_pipeline texture_usage_state = be.st;
+        texture_usage_state.textures[0].enabled = 1u;
+        CHECK(rsx_nr_d3d12_validate_draw_program_usage(
+                  sink, &texture_usage_state, native_vp, 4u,
+                  &fragment_texture_mask) == 0 &&
+              fragment_texture_mask == 1u,
+              "TEX fragment program usage mask=%04X",
+              fragment_texture_mask);
+        write_test_fp();
         {
             const u32 invalid_flow_vp[4] = {
                 0u, 0x08u << 27, 0u, 1u

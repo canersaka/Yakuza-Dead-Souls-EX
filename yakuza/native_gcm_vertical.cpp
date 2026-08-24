@@ -2876,7 +2876,19 @@ static uint32_t yz_nr_section_program_preflight(void)
             g_active.section_shadow_depth_fallback++;
             return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
         }
+        uint32_t texture_mask = 0;
+        const int result = rsx_nr_d3d12_validate_draw_program_usage(
+            g_active.d3d12, &state, vp_words, vp_word_count,
+            &texture_mask);
+        if (result != 0) {
+            yz_nr_section_note_draw_preflight(
+                (uint32_t)-result, &state, &op->u.draw,
+                vp_words, vp_word_count);
+            return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+        }
         for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
+            if (!(texture_mask & (1u << unit)))
+                continue;
             const rsx_nir_texture* const texture = &state.textures[unit];
             if (rsx_nr_yz_unproven_shadow_depth_consumer(
                     texture->enabled, texture->location, texture->offset,
@@ -2884,14 +2896,6 @@ static uint32_t yz_nr_section_program_preflight(void)
                 g_active.section_shadow_consumer_fallback++;
                 return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             }
-        }
-        const int result = rsx_nr_d3d12_validate_draw_program(
-            g_active.d3d12, &state, vp_words, vp_word_count);
-        if (result != 0) {
-            yz_nr_section_note_draw_preflight(
-                (uint32_t)-result, &state, &op->u.draw,
-                vp_words, vp_word_count);
-            return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
         }
     }
     return YZ_NR_SECTION_FB_NONE;
@@ -2981,7 +2985,14 @@ static uint32_t yz_nr_section_preflight(void)
                     state.raster.color_mask,
                     state.depth_stencil.depth_write_enable))
                 return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            uint32_t texture_mask = 0;
+            if (rsx_nr_d3d12_validate_draw_program_usage(
+                    g_active.d3d12, &state, vp_words, vp_word_count,
+                    &texture_mask) != 0)
+                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
             for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
+                if (!(texture_mask & (1u << unit)))
+                    continue;
                 const rsx_nir_texture* const texture = &state.textures[unit];
                 if (rsx_nr_yz_unproven_shadow_depth_consumer(
                         texture->enabled, texture->location, texture->offset,

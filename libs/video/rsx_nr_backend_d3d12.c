@@ -3081,10 +3081,9 @@ static int nrb_vp_program_supported(rsx_nr_d3d12* b,
             start_slot, b->coherent_vp_options, &analysis);
 }
 
-int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
-                                       const rsx_nir_pipeline* st,
-                                       const u32* vp_words,
-                                       u32 vp_word_count)
+int rsx_nr_d3d12_validate_draw_program_usage(
+    rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+    const u32* vp_words, u32 vp_word_count, u32* texture_mask)
 {
     if (!b || !st)
         return -RSX_NR_DRAW_PF_BAD_ARGUMENT;
@@ -3111,7 +3110,18 @@ int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
             nrb_vertex_texture_preflight(
                 b, &st->vertex_textures[unit]) != 0)
             return -RSX_NR_DRAW_PF_VERTEX_TEXTURE;
+    if (texture_mask)
+        *texture_mask = fp.texture_mask;
     return 0;
+}
+
+int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
+                                       const rsx_nir_pipeline* st,
+                                       const u32* vp_words,
+                                       u32 vp_word_count)
+{
+    return rsx_nr_d3d12_validate_draw_program_usage(
+        b, st, vp_words, vp_word_count, NULL);
 }
 
 int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,

@@ -190,6 +190,12 @@ int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
                                        const rsx_nir_pipeline* st,
                                        const u32* vp_words,
                                        u32 vp_word_count);
+/* Same side-effect-free gate, additionally returning the exact fragment
+ * texture-unit usage decoded from TEX/TXP instructions. The output is valid
+ * only on success. */
+int rsx_nr_d3d12_validate_draw_program_usage(
+    rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+    const u32* vp_words, u32 vp_word_count, u32* texture_mask);
 int rsx_nr_d3d12_preflight_transfer(rsx_nr_d3d12* b,
                                     const rsx_nir_pipeline* st,
                                     const rsx_nir_transfer* transfer,
