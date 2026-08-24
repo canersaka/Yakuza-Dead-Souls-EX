@@ -43,6 +43,7 @@ static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
 static u8 g_watched_host_page[2][1024]; /* LOCAL_SIZE / host page */
 static u32 g_published_writes;
+
 static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 static u32 g_render_condition_value;
 static int g_render_condition_fail;
@@ -1105,6 +1106,24 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                                 transfer->word_count);
                     }
                 }
+                {
+                    rsx_nr_d3d12_stats failure_stats;
+                    rsx_nr_d3d12_get_stats(sink, &failure_stats);
+                    fprintf(stderr,
+                            "strict-frame backend failure topo=%llu rt=%llu "
+                            "plan=%llu pso=%llu idx=%llu fp=%llu tex=%llu "
+                            "compile=%llu residency=%llu texfail=%llu\n",
+                            failure_stats.unsup_draw_topology,
+                            failure_stats.unsup_draw_rt,
+                            failure_stats.unsup_draw_plan,
+                            failure_stats.unsup_draw_pso,
+                            failure_stats.unsup_draw_index,
+                            failure_stats.unsup_draw_fp,
+                            failure_stats.unsup_draw_texture,
+                            failure_stats.compile_failures,
+                            failure_stats.residency_failures,
+                            failure_stats.texture_failures);
+                }
                 ring_fault = 1;
                 break;
             }
@@ -1138,6 +1157,7 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu fp=%llu "
              "tex=%llu] real_fp=%llu tex_draw=%llu "
              "tex_cache=%llu(+%lluh,%llur) tex_fail=%llu alias=%llu "
+             "depth_snap=%llu/%llu "
              "unsup_clear=%llu unsup_xfer=%llu compile_fail=%llu "
              "exec_err=%llu submits=%llu "
              "topo_id=[3:%llu 7:%llu 8:%llu 9:%llu 10:%llu] "
@@ -1154,6 +1174,7 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.unsup_draw_fp, st.unsup_draw_texture, st.real_fp_draws,
              st.texture_draws, st.texture_builds, st.texture_hits,
              st.texture_refreshes, st.texture_failures, st.rt_alias_binds,
+             st.depth_snapshot_builds, st.depth_snapshot_resolves,
              st.unsupported_clears, st.unsupported_transfers,
              st.compile_failures, be.stats.exec_errors,
              st.queue_submissions,
@@ -1171,7 +1192,37 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
 
     *rt_hash = 0;
     int presented_readback = -2;
-    if (manifest->saw_present &&
+    u32 oracle_offset = 0;
+    int have_oracle_offset = 0;
+    {
+        const char* const oracle = getenv("YZ_NR_CAPTURE_ORACLE_RT_OFFSET");
+        if (oracle && oracle[0]) {
+            oracle_offset = (u32)strtoul(oracle, NULL, 0);
+            have_oracle_offset = 1;
+        }
+    }
+    if (have_oracle_offset) {
+        for (u32 i = 0;; ++i) {
+            cap_target_manifest target = {0};
+            if (rsx_nr_d3d12_rt_info(
+                    sink, i, &target.location, &target.offset,
+                    &target.format, &target.width, &target.height) != 0)
+                break;
+            if (target.offset != oracle_offset)
+                continue;
+            const size_t bytes =
+                (size_t)target.width * target.height * 4u;
+            u8* px = malloc(bytes);
+            if (px)
+                presented_readback = rsx_nr_d3d12_read_rt(
+                    sink, target.location, target.offset,
+                    target.width, target.height, px);
+            if (px && presented_readback == 0)
+                *rt_hash = fnv64(px, bytes);
+            free(px);
+            break;
+        }
+    } else if (manifest->saw_present &&
         manifest->last_present_buffer < c->disp_count) {
         const u32* const display = c->disp[manifest->last_present_buffer];
         const size_t bytes = (size_t)display[0] * display[1] * 4u;
@@ -1201,6 +1252,9 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                         sink, i, &target.location, &target.offset,
                         &target.format, &target.width, &target.height) != 0)
                     break;
+                if (have_oracle_offset &&
+                    target.offset != oracle_offset)
+                    continue;
                 char name[160];
                 snprintf(name, sizeof(name),
                          "native_rt_%02u_%u_%08X_%ux%u_f%u.ppm",
@@ -2228,6 +2282,29 @@ static void test_private_rgba_rt_alias(void)
 
 int main(int argc, char** argv)
 {
+    /* Large archived-frame gates run in their own fresh WARP process. This
+     * avoids carrying thousands of unrelated unit-test submissions and
+     * resources into the deterministic two-pass capture comparison. */
+    const char* const capture_only = getenv("YZ_NR_CAPTURE_ONLY");
+    if (capture_only && capture_only[0] &&
+        strcmp(capture_only, "0") != 0) {
+        const char* const capture_path =
+            argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
+        if (!capture_path || !capture_path[0]) {
+            fprintf(stderr,
+                    "capture-only requires argv[1] or YZ_NIR_RXS\n");
+            return 2;
+        }
+        run_capture_backend(capture_path);
+        if (g_failures) {
+            fprintf(stderr, "rsx_nr_backend_d3d12: %d FAILURE(S)\n",
+                    g_failures);
+            return 1;
+        }
+        printf("rsx_nr_backend_d3d12: PASS\n");
+        return 0;
+    }
+
     write_test_fp();
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(NULL, LOCAL_SIZE, MAIN_SIZE,
                                              arena_ptr, arena_wptr, NULL);
@@ -3048,7 +3125,11 @@ int main(int argc, char** argv)
     /* ---- guest-identity zeta + GPU depth sampling ---------------------
      * Clear the distinct ZETA_OFFSET resource to 0.25, then sample it in a
      * depth-disabled pass. The address is outside guest memory, proving the
-     * sampled value comes from the prior GPU depth resource. */
+     * sampled value comes from the prior GPU depth resource. Strict native
+     * sampling resolves the private D24 resource to the established R32
+     * representation exactly once per depth-writing generation. */
+    rsx_nr_d3d12_stats depth_snapshot_before;
+    rsx_nr_d3d12_get_stats(sink, &depth_snapshot_before);
     stage_frame_state(&em);
     rsx_nir_em_clear(&em, 0x01, 0, 0x400000u, 0);
     rsx_nr_backend_run(&be, 0);
@@ -3071,6 +3152,74 @@ int main(int argc, char** argv)
     CHECK(pix_is(2, 61, 0x40, 0x40, 0x40),
           "zeta sample pixel %02X %02X %02X",
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    rsx_nr_d3d12_stats depth_snapshot_first;
+    rsx_nr_d3d12_get_stats(sink, &depth_snapshot_first);
+    CHECK(depth_snapshot_first.depth_snapshot_builds ==
+              depth_snapshot_before.depth_snapshot_builds + 1u &&
+          depth_snapshot_first.depth_snapshot_resolves ==
+              depth_snapshot_before.depth_snapshot_resolves + 1u,
+          "first zeta snapshot builds=%llu/%llu resolves=%llu/%llu",
+          depth_snapshot_before.depth_snapshot_builds,
+          depth_snapshot_first.depth_snapshot_builds,
+          depth_snapshot_before.depth_snapshot_resolves,
+          depth_snapshot_first.depth_snapshot_resolves);
+
+    /* Sampling again without a producer write must reuse the same resolved
+     * generation rather than adding a second compute dispatch. */
+    stage_frame_state(&em);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0, 0xFF0000FFu, 0, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+                   -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    rsx_nr_d3d12_stats depth_snapshot_reused;
+    rsx_nr_d3d12_get_stats(sink, &depth_snapshot_reused);
+    CHECK(be.stats.exec_errors == 0 &&
+              depth_snapshot_reused.depth_snapshot_builds ==
+                  depth_snapshot_first.depth_snapshot_builds &&
+              depth_snapshot_reused.depth_snapshot_resolves ==
+                  depth_snapshot_first.depth_snapshot_resolves,
+          "unchanged zeta snapshot was rebuilt/resolved builds=%llu/%llu "
+          "resolves=%llu/%llu",
+          depth_snapshot_first.depth_snapshot_builds,
+          depth_snapshot_reused.depth_snapshot_builds,
+          depth_snapshot_first.depth_snapshot_resolves,
+          depth_snapshot_reused.depth_snapshot_resolves);
+
+    /* A subsequent depth clear creates a new producer generation. The R32
+     * resource is retained, but its contents must be resolved exactly once. */
+    stage_frame_state(&em);
+    rsx_nir_em_clear(&em, 0x01, 0, 0x800000u, 0);
+    rsx_nr_backend_run(&be, 0);
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0, 0xFF0000FFu, 0, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+                   -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0, "second zeta sample exec errors %llu",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "second zeta RT readback failed");
+    CHECK(pix_is(2, 61, 0x80, 0x80, 0x80),
+          "second zeta sample pixel %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    rsx_nr_d3d12_stats depth_snapshot_second;
+    rsx_nr_d3d12_get_stats(sink, &depth_snapshot_second);
+    CHECK(depth_snapshot_second.depth_snapshot_builds ==
+              depth_snapshot_first.depth_snapshot_builds &&
+          depth_snapshot_second.depth_snapshot_resolves ==
+              depth_snapshot_first.depth_snapshot_resolves + 1u,
+          "changed zeta snapshot builds=%llu/%llu resolves=%llu/%llu",
+          depth_snapshot_first.depth_snapshot_builds,
+          depth_snapshot_second.depth_snapshot_builds,
+          depth_snapshot_first.depth_snapshot_resolves,
+          depth_snapshot_second.depth_snapshot_resolves);
 
     /* ---- depth BORDER parity with the established renderer -----------
      * Yakuza's shadow textures request BORDER and write opaque white into
@@ -3409,7 +3558,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 26 && st.draws == 4638 && st.presents == 22,
+    CHECK(st.clears == 29 && st.draws == 4640 && st.presents == 24,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -3428,14 +3577,18 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 8 && st.texture_builds == 2 &&
+    CHECK(st.texture_draws == 10 && st.texture_builds == 2 &&
               st.texture_refreshes == 2 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
     CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
-    CHECK(g_present_handoffs == 22,
-          "native scanout handoffs=%u expected=22", g_present_handoffs);
+    CHECK(st.depth_snapshot_builds == 1u &&
+              st.depth_snapshot_resolves == 2u,
+          "depth snapshots builds=%llu resolves=%llu",
+          st.depth_snapshot_builds, st.depth_snapshot_resolves);
+    CHECK(g_present_handoffs == 24,
+          "native scanout handoffs=%u expected=24", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
