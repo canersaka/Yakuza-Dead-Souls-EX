@@ -39,6 +39,7 @@ static int g_failures;
 static u32 g_present_handoffs;
 static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
+static u8 g_watched_host_page[2][1024]; /* LOCAL_SIZE / host page */
 static u32 g_published_writes;
 static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 static u32 g_render_condition_value;
@@ -85,6 +86,7 @@ static int test_watch_page(void* user, u32 space, u32 page_offset)
         return -1;
     g_watched_pages[space]++;
     g_last_watched_offset[space] = page_offset;
+    g_watched_host_page[space][page_offset >> 12] = 1u;
     return 0;
 }
 
@@ -190,8 +192,7 @@ static void write_tex_fp(void)
     put_fp_word(p + 12, 0);
 }
 
-static void write_solid_texture(rsx_guest_pages* pages,
-                                u8 r, u8 g, u8 b, u8 a)
+static void write_solid_texture_bytes(u8 r, u8 g, u8 b, u8 a)
 {
     u8* p = g_local + TEX_OFFSET;
     for (u32 i = 0; i < 4; i++) {
@@ -200,6 +201,12 @@ static void write_solid_texture(rsx_guest_pages* pages,
         p[i * 4 + 2] = g;
         p[i * 4 + 3] = b;
     }
+}
+
+static void write_solid_texture(rsx_guest_pages* pages,
+                                u8 r, u8 g, u8 b, u8 a)
+{
+    write_solid_texture_bytes(r, g, b, a);
     rsx_guest_pages_note_write(pages, 0, TEX_OFFSET, 16);
 }
 
@@ -339,9 +346,8 @@ static u32 fbits(float f)
 }
 
 /* three float4 clip-space vertices, big-endian, at VTX_OFFSET */
-static void write_triangle_z(rsx_guest_pages* pages, float x0, float y0,
-                             float x1, float y1, float x2, float y2,
-                             float z)
+static void write_triangle_z_bytes(float x0, float y0, float x1, float y1,
+                                   float x2, float y2, float z)
 {
     u8* p = g_local + VTX_OFFSET;
     const float v[12] = { x0, y0, z, 1.0f,
@@ -349,6 +355,13 @@ static void write_triangle_z(rsx_guest_pages* pages, float x0, float y0,
                           x2, y2, z, 1.0f };
     for (int i = 0; i < 12; i++)
         put_be32(p + i * 4, fbits(v[i]));
+}
+
+static void write_triangle_z(rsx_guest_pages* pages, float x0, float y0,
+                             float x1, float y1, float x2, float y2,
+                             float z)
+{
+    write_triangle_z_bytes(x0, y0, x1, y1, x2, y2, z);
     rsx_guest_pages_note_write(pages, 0, VTX_OFFSET, 48);
 }
 
@@ -576,12 +589,35 @@ static u64 fnv64(const u8* p, size_t n)
 static int cap_dump_rt_ppm(rsx_nr_d3d12* sink, const char* dir,
                            u32 offset, const char* name)
 {
-    const u32 width = 1024u, height = 768u;
-    u8* pixels = malloc((size_t)width * height * 4u);
-    if (!pixels)
-        return -1;
-    if (rsx_nr_d3d12_read_rt(
-            sink, 0u, offset, width, height, pixels) != 0) {
+    /* Local capture oracles span the original 1280-wide captures and the
+     * current 1024x768 render configuration. The backend lookup is exact by
+     * design, so probe only these audited canvas shapes instead of creating
+     * or resizing a resource merely to dump it. */
+    static const u32 dimensions[][2] = {
+        {1024u, 720u}, {1024u, 768u}, {1280u, 720u},
+        {1280u, 768u}, {1280u, 1024u}
+    };
+    u32 width = 0, height = 0;
+    u8* pixels = NULL;
+    for (u32 i = 0; i < (u32)(sizeof(dimensions) / sizeof(dimensions[0]));
+         ++i) {
+        const size_t bytes =
+            (size_t)dimensions[i][0] * dimensions[i][1] * 4u;
+        u8* const candidate = realloc(pixels, bytes);
+        if (!candidate) {
+            free(pixels);
+            return -1;
+        }
+        pixels = candidate;
+        if (rsx_nr_d3d12_read_rt(
+                sink, 0u, offset, dimensions[i][0], dimensions[i][1],
+                pixels) == 0) {
+            width = dimensions[i][0];
+            height = dimensions[i][1];
+            break;
+        }
+    }
+    if (!width) {
         free(pixels);
         return -1;
     }
@@ -755,11 +791,16 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
 
     if (dump_outputs) {
         const char* dump_dir = getenv("YZ_NR_CAPTURE_DUMP_DIR");
-        if (dump_dir && dump_dir[0] &&
-            (cap_dump_rt_ppm(sink, dump_dir, 0x01800000u,
-                             "native_world_01800000.ppm") != 0 ||
-             cap_dump_rt_ppm(sink, dump_dir, 0x00E40000u,
-                             "native_final_00E40000.ppm") != 0)) {
+        int dumped = 0;
+        if (dump_dir && dump_dir[0]) {
+            dumped |= cap_dump_rt_ppm(
+                sink, dump_dir, 0x01800000u,
+                "native_world_01800000.ppm") == 0;
+            dumped |= cap_dump_rt_ppm(
+                sink, dump_dir, 0x00E40000u,
+                "native_final_00E40000.ppm") == 0;
+        }
+        if (dump_dir && dump_dir[0] && !dumped) {
             fprintf(stderr, "capture: failed to dump oracle render targets\n");
             ring_fault = 1;
         }
@@ -1808,8 +1849,7 @@ int main(int argc, char** argv)
         rsx_nr_d3d12_get_stats(sink, &resident);
         CHECK(resident.resident_pages[0] == 1u &&
                   resident.resident_pages[1] == 0u &&
-                  g_watched_pages[0] == 1u &&
-                  g_last_watched_offset[0] == VTX_OFFSET,
+                  g_watched_host_page[0][VTX_OFFSET >> 12],
               "array draw did not register only its exact vertex page "
               "local=%llu main=%llu watch=%u offset=%X",
               resident.resident_pages[0], resident.resident_pages[1],
@@ -1894,6 +1934,41 @@ int main(int argc, char** argv)
           pix(61, 2)[0], pix(61, 2)[1], pix(61, 2)[2]);
     CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "old-half pixel %02X %02X %02X",
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
+    /* A deliberately silent writer models a live publication route that
+     * bypassed generation notification. The default mirror would retain the
+     * previous top-right triangle. The narrow diagnostic must refresh only
+     * the draw's already-derived vertex span and recover the new geometry. */
+    {
+        rsx_nr_d3d12_stats before_force, after_force;
+        write_triangle_z_bytes(-1.0f, -1.0f, 1.0f, -1.0f,
+                               -1.0f, 1.0f, 0.5f);
+        CHECK(rsx_nr_d3d12_set_force_draw_input_refresh(sink, 1) == 0,
+              "failed to enable forced exact-span refresh");
+        rsx_nr_d3d12_begin_draw_input_refresh_section(sink);
+        rsx_nr_d3d12_get_stats(sink, &before_force);
+        stage_frame_state(&em);
+        rsx_nir_em_clear(&em, 0xF3, 0xFF00FF00u, 0xFFFFFF, 0);
+        rsx_nir_em_draw(&em, 5, 0, batch, 1);
+        rsx_nir_em_present(&em, 0);
+        rsx_nr_backend_run(&be, 0);
+        rsx_nir_em_draw(&em, 5, 0, batch, 1);
+        rsx_nr_backend_run(&be, 0);
+        CHECK(rsx_nr_d3d12_set_force_draw_input_refresh(sink, 0) == 0,
+              "failed to disable forced exact-span refresh");
+        rsx_nr_d3d12_get_stats(sink, &after_force);
+        CHECK(be.stats.exec_errors == 0,
+              "forced exact-span refresh draw faulted");
+        CHECK(after_force.forced_draw_input_refreshes ==
+                  before_force.forced_draw_input_refreshes + 1u,
+              "same-section exact page was not refreshed exactly once");
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "forced exact-span refresh readback failed");
+        CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF) &&
+                  pix_is(61, 2, 0x00, 0xFF, 0x00),
+              "forced exact-span refresh did not recover silent write");
+    }
 
     /* ---- one command-list generation reuses one mirror slice ----------
      * Six dirty draws deliberately exceed the backend's three physical
@@ -2029,8 +2104,16 @@ int main(int argc, char** argv)
     CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "green texture pixel");
     rsx_nr_d3d12_stats before_texture_change;
     rsx_nr_d3d12_get_stats(sink, &before_texture_change);
+        CHECK(g_watched_host_page[0][TEX_OFFSET >> 12],
+          "guest texture did not arm its exact host write page "
+          "watches=%u last=%X", g_watched_pages[0],
+          g_last_watched_offset[0]);
 
-    write_solid_texture(rsx_nr_d3d12_pages(sink), 255, 0, 0, 255);
+    write_solid_texture_bytes(255, 0, 0, 255);
+    /* Model the host VM-write hook: only an exact page armed by the backend
+     * is forwarded to its generation tracker after the bytes publish. */
+    if (g_watched_host_page[0][TEX_OFFSET >> 12])
+        rsx_nr_d3d12_note_guest_write(sink, 0, TEX_OFFSET, 16u);
     stage_frame_state(&em);
     stage_texture0(&em);
     rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
@@ -2463,7 +2546,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 24 && st.draws == 4635 && st.presents == 21,
+    CHECK(st.clears == 25 && st.draws == 4637 && st.presents == 22,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -2488,8 +2571,8 @@ int main(int argc, char** argv)
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
     CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
-    CHECK(g_present_handoffs == 21,
-          "native scanout handoffs=%u expected=21", g_present_handoffs);
+    CHECK(g_present_handoffs == 22,
+          "native scanout handoffs=%u expected=22", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);

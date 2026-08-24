@@ -323,6 +323,40 @@ struct yz_nr_flow_vp_diag {
     uint32_t words[RSX_NIR_VP_MAX_WORDS];
 };
 
+enum { YZ_NR_SHADOW_CONSUMER_DIAG_COUNT = 64 };
+
+struct yz_nr_shadow_consumer_diag {
+    unsigned long long signature;
+    unsigned long long count;
+    unsigned long long vp_hash;
+    unsigned long long fp_content_hash;
+    unsigned long long fp_structural_hash;
+    uint32_t fp_bytes;
+    uint32_t fp_location, fp_offset, fp_control;
+    uint32_t fp_texcoord_2d_mask, fp_shader_window;
+    uint32_t vp_start, vp_words, vp_inputs, vp_outputs, vp_branch_bits;
+    uint32_t texture_mask;
+    uint32_t texture_unit[2];
+    rsx_nir_texture texture[2];
+    rsx_nir_surface surface;
+    rsx_nir_viewport viewport;
+    rsx_nir_scissor scissor;
+    rsx_nir_raster raster;
+    rsx_nir_depth_stencil depth_stencil;
+    rsx_nir_blend blend;
+    rsx_nir_vertex_bindings vertex_bindings;
+    rsx_nir_index_binding index_binding;
+    uint32_t attr_offset_first[RSX_NIR_NUM_VERTEX_ATTR];
+    uint32_t attr_offset_last[RSX_NIR_NUM_VERTEX_ATTR];
+    uint32_t attr_offset_min[RSX_NIR_NUM_VERTEX_ATTR];
+    uint32_t attr_offset_max[RSX_NIR_NUM_VERTEX_ATTR];
+    uint32_t index_offset_first, index_offset_last;
+    uint32_t index_offset_min, index_offset_max;
+    uint32_t primitive, indexed;
+    uint32_t batch_count_min, batch_count_max;
+    uint32_t total_count_min, total_count_max;
+};
+
 struct yz_nr_vertical_active_state {
     SRWLOCK producer_lock;
     rsx_nr_span_router router;
@@ -358,6 +392,7 @@ struct yz_nr_vertical_active_state {
     uint32_t section_transfers;
     uint32_t section_presents;
     unsigned long long section_attempts;
+    unsigned long long section_generation;
     unsigned long long section_owned;
     unsigned long long section_methods_owned;
     unsigned long long section_ops_owned;
@@ -389,11 +424,23 @@ struct yz_nr_vertical_active_state {
     uint32_t section_preflight_sem_value;
     uint32_t section_preflight_sem_valid;
     uint32_t section_diag_enabled;
+    uint32_t section_shadow_consumer_admit;
+    uint32_t force_draw_input_refresh;
+    volatile LONG section_state_resync_pending;
+    unsigned long long section_state_resyncs;
+    unsigned long long section_state_resync_failures;
+    unsigned long long section_dispatch_contract_checks;
+    unsigned long long section_dispatch_contract_mismatches;
+    uint32_t section_dispatch_contract_mask;
+    uint32_t section_dispatch_contract_first_reg;
+    uint32_t section_dispatch_contract_first_vp;
+    uint32_t section_dispatch_contract_first_constant;
     uint32_t draw_primitive_filter;
     unsigned long long section_render_passes_owned;
     unsigned long long section_dependency_islands_owned;
     unsigned long long section_shadow_depth_fallback;
     unsigned long long section_shadow_consumer_fallback;
+    unsigned long long section_shadow_consumer_admitted;
     yz_nr_section_unknown_key section_unknown[64];
     yz_nr_section_report_key section_reports[64];
     yz_nr_section_draw_preflight_key section_draw_preflight[64];
@@ -401,6 +448,8 @@ struct yz_nr_vertical_active_state {
     yz_nr_section_transfer_preflight_key section_transfer_preflight[64];
     yz_nr_section_window_key section_window[32];
     yz_nr_flow_vp_diag section_flow_vp[YZ_NR_FLOW_VP_DIAG_COUNT];
+    yz_nr_shadow_consumer_diag
+        section_shadow_consumer_diag[YZ_NR_SHADOW_CONSUMER_DIAG_COUNT];
     rsx_nr_fifo_visit_set section_visits;
     unsigned long long section_unknown_overflow;
     unsigned long long section_report_overflow;
@@ -408,6 +457,7 @@ struct yz_nr_vertical_active_state {
     unsigned long long section_sync_preflight_overflow;
     unsigned long long section_transfer_preflight_overflow;
     unsigned long long section_flow_vp_overflow;
+    unsigned long long section_shadow_consumer_diag_overflow;
     unsigned long long section_exec_errors;
     volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
     volatile LONG shared_timeline;
@@ -772,6 +822,11 @@ static void yz_nr_active_ensure_graphics(void)
         d3d12, yz_nr_d3d_publish_write, nullptr);
     rsx_nr_d3d12_set_render_condition_reader(
         d3d12, yz_nr_render_condition_read, nullptr);
+    if (rsx_nr_d3d12_set_force_draw_input_refresh(
+            d3d12, g_active.force_draw_input_refresh) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        return;
+    }
     if (rsx_nr_d3d12_set_shared_timeline(
             d3d12, yz_nr_d3d_timeline_acquire,
             yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
@@ -790,6 +845,19 @@ static void yz_nr_active_ensure_graphics(void)
 
     memset(&g_active.gpu_ops, 0, sizeof(g_active.gpu_ops));
     rsx_nr_d3d12_get_exec_ops(d3d12, &g_active.gpu_ops);
+    /* Vertical decoding begins before the window thread necessarily finishes
+     * constructing the established renderer.  Guest movie traffic is also
+     * intentionally discarded by that renderer.  Join its exact state at
+     * the first safe post-movie ownership boundary instead of carrying an
+     * older/extra register, program, or constant history into native draws. */
+    if (rsx_live_draw_sync_dispatch_state(&g_active.adapter.rsx) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        memset(&g_active.gpu_ops, 0, sizeof(g_active.gpu_ops));
+        InterlockedExchange(&g_active.shared_timeline, 0);
+        return;
+    }
+    InterlockedExchange(&g_active.section_state_resync_pending, 0);
+    g_active.section_state_resyncs++;
     rsx_nr_exec_ops combined = {};
     combined.clear = yz_nr_gpu_clear;
     combined.draw = yz_nr_gpu_draw;
@@ -875,6 +943,21 @@ static int yz_nr_active_init(int graphics)
     rsx_nr_backend_init(&g_active.backend, &g_active.ring,
                         &g_active.tokens, &ops);
     return 1;
+}
+
+static bool yz_nr_active_resync_dispatch_state(void)
+{
+    if (!InterlockedCompareExchange(
+            &g_active.section_state_resync_pending, 0, 0))
+        return true;
+    if (!rsx_live_draw_native_actions_allowed() ||
+        rsx_live_draw_sync_dispatch_state(&g_active.adapter.rsx) != 0) {
+        g_active.section_state_resync_failures++;
+        return false;
+    }
+    InterlockedExchange(&g_active.section_state_resync_pending, 0);
+    g_active.section_state_resyncs++;
+    return true;
 }
 
 static int yz_nr_active_publish(ppu_context* ctx, uint32_t family,
@@ -1445,6 +1528,257 @@ static bool yz_nr_fragment_identity_from_binding(
     return true;
 }
 
+static unsigned long long yz_nr_diag_hash_bytes(
+    const void* bytes, size_t size, unsigned long long hash)
+{
+    const uint8_t* const p = static_cast<const uint8_t*>(bytes);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= p[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static void yz_nr_note_shadow_consumer_diag(
+    const rsx_nir_pipeline* state, const rsx_nir_draw* draw,
+    uint32_t texture_mask)
+{
+    if (!g_active.section_diag_enabled || !state || !draw ||
+        !texture_mask)
+        return;
+    yz_nr_fragment_identity fp = {};
+    const uint32_t program_word = state->fragment_program.offset |
+        (state->fragment_program.location ? 2u : 0u);
+    if (!yz_nr_fragment_identity_from_binding(program_word, &fp))
+        return;
+    unsigned long long signature = 1469598103934665603ull;
+#define YZ_NR_DIAG_HASH(value)                                               \
+    signature = yz_nr_diag_hash_bytes(                                      \
+        &(value), sizeof(value), signature)
+    YZ_NR_DIAG_HASH(state->vertex_program.hash);
+    YZ_NR_DIAG_HASH(state->vertex_program.start_slot);
+    YZ_NR_DIAG_HASH(state->vertex_program.word_count);
+    YZ_NR_DIAG_HASH(state->vertex_program.attrib_input_mask);
+    YZ_NR_DIAG_HASH(state->vertex_program.attrib_output_mask);
+    YZ_NR_DIAG_HASH(state->vertex_program.branch_bits);
+    YZ_NR_DIAG_HASH(fp.content_hash);
+    YZ_NR_DIAG_HASH(fp.structural_hash);
+    YZ_NR_DIAG_HASH(fp.byte_count);
+    YZ_NR_DIAG_HASH(state->fragment_program.control);
+    YZ_NR_DIAG_HASH(state->fragment_program.texcoord_2d_mask);
+    YZ_NR_DIAG_HASH(state->fragment_program.shader_window);
+    YZ_NR_DIAG_HASH(texture_mask);
+    for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
+        if (!(texture_mask & (1u << unit)))
+            continue;
+        YZ_NR_DIAG_HASH(unit);
+        YZ_NR_DIAG_HASH(state->textures[unit]);
+    }
+    YZ_NR_DIAG_HASH(state->surface);
+    YZ_NR_DIAG_HASH(state->viewport);
+    YZ_NR_DIAG_HASH(state->scissor);
+    YZ_NR_DIAG_HASH(state->raster);
+    YZ_NR_DIAG_HASH(state->depth_stencil);
+    YZ_NR_DIAG_HASH(state->blend);
+    YZ_NR_DIAG_HASH(state->vertex_bindings.base_offset);
+    YZ_NR_DIAG_HASH(state->vertex_bindings.base_index);
+    YZ_NR_DIAG_HASH(state->vertex_bindings.freq_divider_op);
+    for (uint32_t attr = 0; attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+        if (!(state->vertex_program.attrib_input_mask & (1u << attr)))
+            continue;
+        const rsx_nir_vertex_attr* const binding =
+            &state->vertex_bindings.attr[attr];
+        YZ_NR_DIAG_HASH(attr);
+        YZ_NR_DIAG_HASH(binding->type);
+        YZ_NR_DIAG_HASH(binding->size);
+        YZ_NR_DIAG_HASH(binding->stride);
+        YZ_NR_DIAG_HASH(binding->frequency);
+        YZ_NR_DIAG_HASH(binding->location);
+        YZ_NR_DIAG_HASH(binding->def);
+    }
+    YZ_NR_DIAG_HASH(state->index_binding.location);
+    YZ_NR_DIAG_HASH(state->index_binding.is_u32);
+    YZ_NR_DIAG_HASH(state->index_binding.restart_enable);
+    YZ_NR_DIAG_HASH(state->index_binding.restart_index);
+    YZ_NR_DIAG_HASH(draw->primitive);
+    YZ_NR_DIAG_HASH(draw->indexed);
+#undef YZ_NR_DIAG_HASH
+    if (!signature)
+        signature = 1u;
+    const uint32_t mask = YZ_NR_SHADOW_CONSUMER_DIAG_COUNT - 1u;
+    uint32_t slot = static_cast<uint32_t>(signature) & mask;
+    for (uint32_t probe = 0; probe < YZ_NR_SHADOW_CONSUMER_DIAG_COUNT;
+         ++probe) {
+        yz_nr_shadow_consumer_diag* const entry =
+            &g_active.section_shadow_consumer_diag[slot];
+        if (!entry->count) {
+            entry->signature = signature;
+            entry->count = 1;
+            entry->vp_hash = state->vertex_program.hash;
+            entry->fp_content_hash = fp.content_hash;
+            entry->fp_structural_hash = fp.structural_hash;
+            entry->fp_bytes = fp.byte_count;
+            entry->fp_location = state->fragment_program.location;
+            entry->fp_offset = state->fragment_program.offset;
+            entry->fp_control = state->fragment_program.control;
+            entry->fp_texcoord_2d_mask =
+                state->fragment_program.texcoord_2d_mask;
+            entry->fp_shader_window =
+                state->fragment_program.shader_window;
+            entry->vp_start = state->vertex_program.start_slot;
+            entry->vp_words = state->vertex_program.word_count;
+            entry->vp_inputs = state->vertex_program.attrib_input_mask;
+            entry->vp_outputs = state->vertex_program.attrib_output_mask;
+            entry->vp_branch_bits = state->vertex_program.branch_bits;
+            entry->texture_mask = texture_mask;
+            uint32_t texture_index = 0;
+            for (uint32_t unit = 0;
+                 unit < RSX_NIR_NUM_TEXTURES && texture_index < 2u; ++unit) {
+                if (!(texture_mask & (1u << unit)))
+                    continue;
+                entry->texture_unit[texture_index] = unit;
+                entry->texture[texture_index++] = state->textures[unit];
+            }
+            entry->surface = state->surface;
+            entry->viewport = state->viewport;
+            entry->scissor = state->scissor;
+            entry->raster = state->raster;
+            entry->depth_stencil = state->depth_stencil;
+            entry->blend = state->blend;
+            entry->vertex_bindings = state->vertex_bindings;
+            entry->index_binding = state->index_binding;
+            for (uint32_t attr = 0; attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+                const uint32_t offset =
+                    state->vertex_bindings.attr[attr].offset;
+                entry->attr_offset_first[attr] = offset;
+                entry->attr_offset_last[attr] = offset;
+                entry->attr_offset_min[attr] = offset;
+                entry->attr_offset_max[attr] = offset;
+            }
+            entry->index_offset_first = state->index_binding.offset;
+            entry->index_offset_last = state->index_binding.offset;
+            entry->index_offset_min = state->index_binding.offset;
+            entry->index_offset_max = state->index_binding.offset;
+            entry->primitive = draw->primitive;
+            entry->indexed = draw->indexed;
+            entry->batch_count_min = draw->batch_count;
+            entry->batch_count_max = draw->batch_count;
+            entry->total_count_min = draw->total_count;
+            entry->total_count_max = draw->total_count;
+            return;
+        }
+        if (entry->signature == signature) {
+            entry->count++;
+            for (uint32_t attr = 0; attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+                const uint32_t offset =
+                    state->vertex_bindings.attr[attr].offset;
+                entry->attr_offset_last[attr] = offset;
+                if (offset < entry->attr_offset_min[attr])
+                    entry->attr_offset_min[attr] = offset;
+                if (offset > entry->attr_offset_max[attr])
+                    entry->attr_offset_max[attr] = offset;
+            }
+            entry->index_offset_last = state->index_binding.offset;
+            if (state->index_binding.offset < entry->index_offset_min)
+                entry->index_offset_min = state->index_binding.offset;
+            if (state->index_binding.offset > entry->index_offset_max)
+                entry->index_offset_max = state->index_binding.offset;
+            if (draw->batch_count < entry->batch_count_min)
+                entry->batch_count_min = draw->batch_count;
+            if (draw->batch_count > entry->batch_count_max)
+                entry->batch_count_max = draw->batch_count;
+            if (draw->total_count < entry->total_count_min)
+                entry->total_count_min = draw->total_count;
+            if (draw->total_count > entry->total_count_max)
+                entry->total_count_max = draw->total_count;
+            return;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    g_active.section_shadow_consumer_diag_overflow++;
+}
+
+static void yz_nr_bind_hana_shadow_oracle(
+    const rsx_nir_pipeline* state, const rsx_nir_draw* draw,
+    uint32_t shadow_texture_mask)
+{
+    if (!state || !draw || state->fragment_program.location != 1u ||
+        state->fragment_program.offset != 0x01143600u ||
+        (shadow_texture_mask & 0xC000u) != 0xC000u)
+        return;
+    const rsx_nir_texture* const first = &state->textures[14];
+    const rsx_nir_texture* const second = &state->textures[15];
+    if (!first->enabled || !second->enabled ||
+        first->location != 0u || second->location != 0u ||
+        first->offset != RSX_NR_YZ_SHADOW_ZETA0 ||
+        second->offset != RSX_NR_YZ_SHADOW_ZETA1 ||
+        first->width != 1024u || first->height != 1024u ||
+        second->width != 1024u || second->height != 1024u)
+        return;
+
+    rsx_live_draw_shadow_oracle_context context = {};
+    unsigned long long identity = 1469598103934665603ull;
+#define YZ_NR_ORACLE_HASH(value)                                             \
+    identity = yz_nr_diag_hash_bytes(&(value), sizeof(value), identity)
+    YZ_NR_ORACLE_HASH(g_active.section_start_get);
+    YZ_NR_ORACLE_HASH(state->fragment_program.location);
+    YZ_NR_ORACLE_HASH(state->fragment_program.offset);
+    YZ_NR_ORACLE_HASH(state->vertex_program.hash);
+    YZ_NR_ORACLE_HASH(state->surface);
+    YZ_NR_ORACLE_HASH(draw->primitive);
+    YZ_NR_ORACLE_HASH(draw->indexed);
+#undef YZ_NR_ORACLE_HASH
+    context.section_identity = identity ? identity : 1u;
+    context.section_generation = g_active.section_generation;
+    context.native_owner = g_active.section_shadow_consumer_admit ? 1u : 0u;
+    context.fragment_location = state->fragment_program.location;
+    context.fragment_offset = state->fragment_program.offset;
+    const rsx_nir_texture* textures[2] = {first, second};
+    for (uint32_t i = 0; i < 2u; ++i) {
+        const rsx_nir_texture* const texture = textures[i];
+        context.texture_unit[i] = 14u + i;
+        context.texture_location[i] = texture->location;
+        context.texture_offset[i] = texture->offset;
+        context.texture_format[i] = texture->format;
+        context.texture_width[i] = texture->width;
+        context.texture_height[i] = texture->height;
+        context.texture_pitch[i] = texture->pitch;
+        context.texture_wrap[i] = texture->wrap;
+        context.texture_remap[i] = texture->remap;
+        context.texture_filter[i] = texture->filter;
+        context.texture_control0[i] = texture->control0;
+        context.texture_border_color[i] = texture->border_color;
+    }
+    rsx_live_draw_set_shadow_oracle_context(&context);
+}
+
+static void yz_nr_note_dispatch_contract(void)
+{
+    if (!g_active.section_diag_enabled)
+        return;
+    rsx_live_draw_dispatch_diff diff = {};
+    g_active.section_dispatch_contract_checks++;
+    /* Program preflight runs after the temporary section adapter has folded
+     * all retained methods, while the established renderer is intentionally
+     * still at the section entry. Compare that established state with the
+     * persistent adapter snapshot, not with the temporary end state. The
+     * admitted methods themselves are covered by adapter/dispatcher parity
+     * tests and are mirrored atomically only after admission succeeds. */
+    const uint32_t mismatch =
+        rsx_live_draw_dispatch_contract_mismatch(
+            &g_active.adapter.rsx, &diff);
+    if (!mismatch)
+        return;
+    if (!g_active.section_dispatch_contract_mismatches) {
+        g_active.section_dispatch_contract_first_reg = diff.first_reg;
+        g_active.section_dispatch_contract_first_vp = diff.first_vp_word;
+        g_active.section_dispatch_contract_first_constant =
+            diff.first_constant_word;
+    }
+    g_active.section_dispatch_contract_mismatches++;
+    g_active.section_dispatch_contract_mask |= mismatch;
+}
+
 /* Fixed-memory open addressing keeps the default-off shadow census bounded
  * without turning every draw into a linear scan of all built programs.  The
  * tables never delete entries, so an empty slot terminates a miss. */
@@ -1759,6 +2093,10 @@ extern "C" void yz_nr_vertical_init(void)
             getenv("YZ_NR_FRAME_ISLANDS") != nullptr;
         g_active.section_diag_enabled = graphics &&
             getenv("YZ_NR_PASS_DIAG") != nullptr;
+        g_active.section_shadow_consumer_admit = graphics &&
+            getenv("YZ_NR_SHADOW_CONSUMER_ADMIT") != nullptr;
+        g_active.force_draw_input_refresh = graphics &&
+            getenv("YZ_NR_FORCE_DRAW_INPUT_REFRESH") != nullptr;
         g_active.draw_primitive_filter = UINT32_MAX;
         if (graphics) {
             const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
@@ -1884,6 +2222,7 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
         return 0;
     yz_nr_active_ensure_graphics();
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0) ||
+        !yz_nr_active_resync_dispatch_state() ||
         g_active.pending_valid || rsx_nr_ring_depth(&g_active.ring))
         return 0;
 
@@ -1999,17 +2338,26 @@ extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
 }
 
 extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
-                                                uint32_t packet_ea)
+                                                uint32_t packet_ea,
+                                                int legacy_graphics_suppressed)
 {
-    /* Host movies own execution and presentation, not the guest RSX register
-     * file. The guest continues publishing state while movie frames suppress
-     * its visible actions. Keep the shadow adapter current through that
-     * interval so the first post-movie pass starts from the exact live state;
-     * shadow_mode guarantees that clears/draws/transfers/presents emit no
-     * native operation and therefore cannot race the movie renderer. */
+    /* Match the established renderer's movie contract exactly. Non-composite
+     * host movies discard guest graphics methods wholesale; retaining those
+     * methods only in the native adapter makes its persistent programs and
+     * constants diverge before the next ownership boundary. */
     if (InterlockedCompareExchange(
-            &g_vertical.mode_active_graphics, 0, 0))
-        rsx_nir_adapter_method(&g_active.adapter, method, arg);
+            &g_vertical.mode_active_graphics, 0, 0)) {
+        if (legacy_graphics_suppressed) {
+            /* The caller samples this while holding the FIFO serialization
+             * lock, immediately before legacy dispatch. Movie ownership uses
+             * that same lock, so this records what the legacy renderer
+             * actually did rather than a racy post-dispatch observation. */
+            InterlockedExchange(
+                &g_active.section_state_resync_pending, 1);
+        } else if (yz_nr_active_resync_dispatch_state()) {
+            rsx_nir_adapter_method(&g_active.adapter, method, arg);
+        }
+    }
     if (InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0) &&
         ((method == 0x1808u && arg == 0u) || method == 0x1D94u ||
@@ -2889,16 +3237,35 @@ static uint32_t yz_nr_section_program_preflight(void)
                 vp_words, vp_word_count);
             return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
         }
+        uint32_t shadow_texture_mask = 0;
         for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
             if (!(texture_mask & (1u << unit)))
                 continue;
             const rsx_nir_texture* const texture = &state.textures[unit];
             if (rsx_nr_yz_unproven_shadow_depth_consumer(
                     texture->enabled, texture->location, texture->offset,
-                    texture->format)) {
-                g_active.section_shadow_consumer_fallback++;
-                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
-            }
+                    texture->format))
+                shadow_texture_mask |= 1u << unit;
+        }
+        if (shadow_texture_mask &&
+            !g_active.section_shadow_consumer_admit) {
+            /* The legacy dispatcher has not consumed this transactional
+             * section yet.  Compare its entry state with the adapter snapshot
+             * only for the exact Hana shadow-family sections under study;
+             * this keeps the otherwise large state comparison off every
+             * ordinary section attempt. */
+            yz_nr_note_dispatch_contract();
+            yz_nr_note_shadow_consumer_diag(
+                &state, &op->u.draw, shadow_texture_mask);
+            yz_nr_bind_hana_shadow_oracle(
+                &state, &op->u.draw, shadow_texture_mask);
+            g_active.section_shadow_consumer_fallback++;
+            return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+        }
+        if (shadow_texture_mask) {
+            yz_nr_bind_hana_shadow_oracle(
+                &state, &op->u.draw, shadow_texture_mask);
+            g_active.section_shadow_consumer_admitted++;
         }
     }
     return YZ_NR_SECTION_FB_NONE;
@@ -2997,7 +3364,8 @@ static uint32_t yz_nr_section_preflight(void)
                 if (!(texture_mask & (1u << unit)))
                     continue;
                 const rsx_nir_texture* const texture = &state.textures[unit];
-                if (rsx_nr_yz_unproven_shadow_depth_consumer(
+                if (!g_active.section_shadow_consumer_admit &&
+                    rsx_nr_yz_unproven_shadow_depth_consumer(
                         texture->enabled, texture->location, texture->offset,
                         texture->format))
                     return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
@@ -3266,6 +3634,8 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
             preflight, pc, packet_budget);
     }
 
+    rsx_nr_d3d12_begin_draw_input_refresh_section(g_active.d3d12);
+
     /* The complete command-list section is now admitted. Keep the dormant
      * legacy register/resource model current before suppressing its terminal
      * actions. An executor failure after this point is fatal: legacy can
@@ -3308,6 +3678,8 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
         return YZ_NR_VERTICAL_SECTION_MISS;
     yz_nr_active_ensure_graphics();
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return YZ_NR_VERTICAL_SECTION_MISS;
+    if (!yz_nr_active_resync_dispatch_state())
         return YZ_NR_VERTICAL_SECTION_MISS;
     if (g_active.section_pending)
         if (g_active.section_fatal)
@@ -3367,6 +3739,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
     }
 
     g_active.section_attempts++;
+    g_active.section_generation++;
     g_active.section_scan_get = get;
     g_active.section_scan_put = put;
     g_active.section_scan_ret = fifo_ret;
@@ -3814,7 +4187,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "render-passes=%llu dependency-islands=%llu "
                     "methods=%llu ops=%llu exec-errors=%llu fast-skip=%llu "
                     "legacy-path=%u:%u/%llu/%llu shadow-depth=%llu "
-                    "shadow-consumer=%llu "
+                    "shadow-consumer=%llu/%llu "
                     "fallback="
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
@@ -3831,6 +4204,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     g_active.section_legacy_path_exits,
                     g_active.section_shadow_depth_fallback,
                     g_active.section_shadow_consumer_fallback,
+                    g_active.section_shadow_consumer_admitted,
                     g_active.section_fallback[0],
                     g_active.section_fallback[1],
                     g_active.section_fallback[2],
@@ -3889,6 +4263,21 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         "[nr-vertical-section-report-overflow=%llu]\n",
                         g_active.section_report_overflow);
             if (g_active.section_diag_enabled) {
+                fprintf(stderr,
+                        "[nr-vertical-dispatch-contract checks=%llu "
+                        "mismatches=%llu mask=%u first-reg=%08X "
+                        "first-vp=%08X first-constant=%08X "
+                        "resync=%llu/%llu pending=%ld]\n",
+                        g_active.section_dispatch_contract_checks,
+                        g_active.section_dispatch_contract_mismatches,
+                        g_active.section_dispatch_contract_mask,
+                        g_active.section_dispatch_contract_first_reg,
+                        g_active.section_dispatch_contract_first_vp,
+                        g_active.section_dispatch_contract_first_constant,
+                        g_active.section_state_resyncs,
+                        g_active.section_state_resync_failures,
+                        InterlockedCompareExchange(
+                            &g_active.section_state_resync_pending, 0, 0));
                 for (uint32_t i = 0; i < YZ_NR_FLOW_VP_DIAG_COUNT; ++i) {
                     const yz_nr_flow_vp_diag* const entry =
                         &g_active.section_flow_vp[i];
@@ -3916,6 +4305,141 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     fprintf(stderr,
                             "[nr-vertical-flow-vp-overflow=%llu]\n",
                             g_active.section_flow_vp_overflow);
+                for (uint32_t i = 0;
+                     i < YZ_NR_SHADOW_CONSUMER_DIAG_COUNT; ++i) {
+                    const yz_nr_shadow_consumer_diag* const entry =
+                        &g_active.section_shadow_consumer_diag[i];
+                    if (!entry->count)
+                        continue;
+                    fprintf(stderr,
+                            "[nr-vertical-shadow-consumer slot=%u "
+                            "sig=%016llX count=%llu "
+                            "vp=%016llX/%u+%u/in=%04X/out=%04X/br=%08X "
+                            "fp=%u:0x%08X+%u/ctrl=%08X/"
+                            "%016llX/%016llX/tc2d=%08X/win=%08X "
+                            "draw=%u/%u/batches=%u..%u/count=%u..%u "
+                            "rt=%u:0x%08X/fmt=%u/pitch=%u/"
+                            "clip=%u,%u+%ux%u "
+                            "z=%u:0x%08X/fmt=%u/pitch=%u "
+                            "view=%u,%u+%ux%u sc=%u,%u+%ux%u "
+                            "raster=%u/%u/%u/mask=%08X "
+                            "depth=%u/%03X/%u bounds=%u "
+                            "blend=%u/%08X/%08X/%08X/%08X "
+                            "alpha=%u/%03X/%08X "
+                            "texmask=%04X "
+                            "tex%u=%u:0x%08X/fmt=%02X/%ux%u/pitch=%u/"
+                            "wrap=%08X/remap=%08X/filter=%08X/ctl=%08X "
+                            "tex%u=%u:0x%08X/fmt=%02X/%ux%u/pitch=%u/"
+                            "wrap=%08X/remap=%08X/filter=%08X/ctl=%08X "
+                            "index=%u:0x%08X[first=%08X,last=%08X,"
+                            "range=%08X..%08X]/u32=%u/restart=%u:%08X "
+                            "base=%08X/%08X/freqop=%08X]\n",
+                            i, entry->signature, entry->count,
+                            entry->vp_hash, entry->vp_start,
+                            entry->vp_words, entry->vp_inputs & 0xFFFFu,
+                            entry->vp_outputs & 0xFFFFu,
+                            entry->vp_branch_bits,
+                            entry->fp_location, entry->fp_offset,
+                            entry->fp_bytes, entry->fp_control,
+                            entry->fp_content_hash,
+                            entry->fp_structural_hash,
+                            entry->fp_texcoord_2d_mask,
+                            entry->fp_shader_window,
+                            entry->primitive, entry->indexed,
+                            entry->batch_count_min,
+                            entry->batch_count_max,
+                            entry->total_count_min,
+                            entry->total_count_max,
+                            entry->surface.color_location[0],
+                            entry->surface.color_offset[0],
+                            entry->surface.color_format,
+                            entry->surface.color_pitch[0],
+                            entry->surface.clip_x, entry->surface.clip_y,
+                            entry->surface.clip_w, entry->surface.clip_h,
+                            entry->surface.zeta_location,
+                            entry->surface.zeta_offset,
+                            entry->surface.depth_format,
+                            entry->surface.zeta_pitch,
+                            entry->viewport.x, entry->viewport.y,
+                            entry->viewport.w, entry->viewport.h,
+                            entry->scissor.x, entry->scissor.y,
+                            entry->scissor.w, entry->scissor.h,
+                            entry->raster.cull_face_enable,
+                            entry->raster.cull_face,
+                            entry->raster.front_face,
+                            entry->raster.color_mask,
+                            entry->depth_stencil.depth_test_enable,
+                            entry->depth_stencil.depth_func,
+                            entry->depth_stencil.depth_write_enable,
+                            entry->depth_stencil.depth_bounds_test_enable,
+                            entry->blend.blend_enable,
+                            entry->blend.sfactor, entry->blend.dfactor,
+                            entry->blend.equation,
+                            entry->blend.blend_color,
+                            entry->blend.alpha_test_enable,
+                            entry->blend.alpha_func,
+                            entry->blend.alpha_ref,
+                            entry->texture_mask,
+                            entry->texture_unit[0],
+                            entry->texture[0].location,
+                            entry->texture[0].offset,
+                            entry->texture[0].format,
+                            entry->texture[0].width,
+                            entry->texture[0].height,
+                            entry->texture[0].pitch,
+                            entry->texture[0].wrap,
+                            entry->texture[0].remap,
+                            entry->texture[0].filter,
+                            entry->texture[0].control0,
+                            entry->texture_unit[1],
+                            entry->texture[1].location,
+                            entry->texture[1].offset,
+                            entry->texture[1].format,
+                            entry->texture[1].width,
+                            entry->texture[1].height,
+                            entry->texture[1].pitch,
+                            entry->texture[1].wrap,
+                            entry->texture[1].remap,
+                            entry->texture[1].filter,
+                            entry->texture[1].control0,
+                            entry->index_binding.location,
+                            entry->index_binding.offset,
+                            entry->index_offset_first,
+                            entry->index_offset_last,
+                            entry->index_offset_min,
+                            entry->index_offset_max,
+                            entry->index_binding.is_u32,
+                            entry->index_binding.restart_enable,
+                            entry->index_binding.restart_index,
+                            entry->vertex_bindings.base_offset,
+                            entry->vertex_bindings.base_index,
+                            entry->vertex_bindings.freq_divider_op);
+                    for (uint32_t attr = 0;
+                         attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+                        const rsx_nir_vertex_attr* const binding =
+                            &entry->vertex_bindings.attr[attr];
+                        if (!(entry->vp_inputs & (1u << attr)))
+                            continue;
+                        fprintf(stderr,
+                                "[nr-vertical-shadow-consumer-attr "
+                                "slot=%u attr=%u used=%u type=%u size=%u "
+                                "stride=%u freq=%u src=%u:0x%08X "
+                                "first=%08X last=%08X range=%08X..%08X]\n",
+                                i, attr,
+                                (entry->vp_inputs >> attr) & 1u,
+                                binding->type, binding->size,
+                                binding->stride, binding->frequency,
+                                binding->location, binding->offset,
+                                entry->attr_offset_first[attr],
+                                entry->attr_offset_last[attr],
+                                entry->attr_offset_min[attr],
+                                entry->attr_offset_max[attr]);
+                    }
+                }
+                if (g_active.section_shadow_consumer_diag_overflow)
+                    fprintf(stderr,
+                            "[nr-vertical-shadow-consumer-overflow=%llu]\n",
+                            g_active.section_shadow_consumer_diag_overflow);
             }
             for (uint32_t i = 0; i < 64u; ++i) {
                 const yz_nr_section_draw_preflight_key* const entry =
@@ -4015,7 +4539,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
                     "clears=%llu "
                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
-                    "residency-fail=%llu mirror=%llu/%llu upload-rollover=%llu "
+                    "watched=%llu/%llu "
+                    "residency-fail=%llu mirror=%llu/%llu force-refresh=%llu "
+                    "upload-rollover=%llu "
                     "pso=%llu/%llu "
                     "rt=%llu/%llu depth=%llu/%llu "
                     "timeline=%d/%llu/%llu/%llu]\n",
@@ -4029,9 +4555,12 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.unsupported_draws,
                     d3d_stats.resident_pages[0],
                     d3d_stats.resident_pages[1],
+                    d3d_stats.watched_guest_pages[0],
+                    d3d_stats.watched_guest_pages[1],
                     d3d_stats.residency_failures,
                     d3d_stats.mirror_resyncs,
                     d3d_stats.mirror_rollovers,
+                    d3d_stats.forced_draw_input_refreshes,
                     d3d_stats.upload_rollovers,
                     d3d_stats.pso_hits, d3d_stats.pso_builds,
                     d3d_stats.rt_builds, d3d_stats.rt_refreshes,

@@ -898,8 +898,14 @@ def run_gun(args):
             yz["YZ_NR_FRAME_ISLANDS"] = "1"
         if args.nr_pass_diag:
             yz["YZ_NR_PASS_DIAG"] = "1"
+        if args.nr_shadow_consumer_admit:
+            yz["YZ_NR_SHADOW_CONSUMER_ADMIT"] = "1"
+        if args.nr_force_draw_input_refresh:
+            yz["YZ_NR_FORCE_DRAW_INPUT_REFRESH"] = "1"
         if args.nr_draw_primitive is not None:
             yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
+        if args.nr_hana_depth_oracle:
+            yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -1340,8 +1346,14 @@ def run(args):
             yz["YZ_NR_FRAME_ISLANDS"] = "1"
         if args.nr_pass_diag:
             yz["YZ_NR_PASS_DIAG"] = "1"
+        if args.nr_shadow_consumer_admit:
+            yz["YZ_NR_SHADOW_CONSUMER_ADMIT"] = "1"
+        if args.nr_force_draw_input_refresh:
+            yz["YZ_NR_FORCE_DRAW_INPUT_REFRESH"] = "1"
         if args.nr_draw_primitive is not None:
             yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
+        if args.nr_hana_depth_oracle:
+            yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1783,6 +1795,9 @@ def main():
         help="transactionally own only complete preflighted FIFO sections",
     )
     parser.add_argument("--nr-pass-diag", action="store_true")
+    parser.add_argument("--nr-shadow-consumer-admit", action="store_true")
+    parser.add_argument("--nr-hana-depth-oracle", action="store_true")
+    parser.add_argument("--nr-force-draw-input-refresh", action="store_true")
     parser.add_argument("--nr-draw-primitive", type=int, choices=range(0, 11))
     parser.add_argument("--draw-phases", action="store_true")
     parser.add_argument("--wkl4-cycle", action="store_true")
@@ -1811,8 +1826,16 @@ def main():
         parser.error("--nr-frame-islands requires --nr-vertical-active-graphics")
     if args.nr_pass_diag and not args.nr_frame_islands:
         parser.error("--nr-pass-diag requires --nr-frame-islands")
+    if args.nr_shadow_consumer_admit and not args.nr_frame_islands:
+        parser.error("--nr-shadow-consumer-admit requires --nr-frame-islands")
+    if args.nr_force_draw_input_refresh and not args.nr_shadow_consumer_admit:
+        parser.error(
+            "--nr-force-draw-input-refresh requires --nr-shadow-consumer-admit"
+        )
     if args.nr_draw_primitive is not None and not args.nr_frame_islands:
         parser.error("--nr-draw-primitive requires --nr-frame-islands")
+    if args.nr_hana_depth_oracle and not args.nr_frame_islands:
+        parser.error("--nr-hana-depth-oracle requires --nr-frame-islands")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

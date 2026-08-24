@@ -120,6 +120,13 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count);
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count);
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count);
 
+/* Replace only the architectural RSX state.  Sink bindings, coverage tables,
+ * and method classifications belong to the destination instance and remain
+ * intact.  This lets a late-starting transactional decoder join the exact
+ * state of an established decoder without replaying already-consumed work. */
+void rsx_dispatch_copy_architectural_state(
+    rsx_dispatch* dst, const rsx_dispatch* src);
+
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 

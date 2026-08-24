@@ -7709,12 +7709,16 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
             yz_nr_vertical_try_method(eff, val, yz_rsx_io_to_ea(get)) : 0;
         if (!native_method)
             yz_nr_vertical_prepare_legacy_method(eff, val);
+        const int legacy_graphics_suppressed = !native_method &&
+            rsx_live_draw_guest_graphics_suppressed();
         stalled = native_method ? 0 :
             yz_rsx_method(eff, val);   /* 1 => semaphore ACQUIRE not satisfied */
         if (!stalled && !native_method) {
             if (g_yz_nr_shadow_enabled)
                 rsx_nr_intercept_shadow_method(&g_yz_nr_shadow, eff, val);
-            yz_nr_vertical_observe_method(eff, val, yz_rsx_io_to_ea(get));
+            yz_nr_vertical_observe_method(
+                eff, val, yz_rsx_io_to_ea(get),
+                legacy_graphics_suppressed);
         }
         if (g_yz_fe0_timeline_enabled && eff == 0x068u) {
             const uint32_t sem_addr =

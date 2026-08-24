@@ -2404,6 +2404,52 @@ static void test_adapter_copy_rebind(void)
     rsx_nir_stream_free(&source_stream);
 }
 
+static void test_dispatch_state_sync_and_fifo_registers(void)
+{
+    rsx_dispatch source, destination;
+    rsx_dispatch_sink source_sink = {0}, destination_sink = {0};
+    static int source_owner, destination_owner;
+    source_sink.user = &source_owner;
+    destination_sink.user = &destination_owner;
+    rsx_dispatch_init(&source, &source_sink);
+    rsx_dispatch_init(&destination, &destination_sink);
+    rsx_dispatch_method(&source, M_CLEAR_COLOR, 0xAABBCCDDu);
+    rsx_dispatch_method(&source, M_BEGIN_END, 6u);
+    source.vp[17] = 0x11223344u;
+    source.constants[91][2] = 0x55667788u;
+    const u8 destination_class = destination.klass[M_CLEAR_COLOR >> 2];
+    rsx_dispatch_copy_architectural_state(&destination, &source);
+    CHECK(destination.regs[M_CLEAR_COLOR >> 2] == 0xAABBCCDDu &&
+              destination.vp[17] == 0x11223344u &&
+              destination.constants[91][2] == 0x55667788u &&
+              destination.in_begin_end == 1 &&
+              destination.current_primitive == 6u,
+          "architectural state copy omitted live render state");
+    CHECK(destination.sink.user == &destination_owner &&
+              destination.klass[M_CLEAR_COLOR >> 2] == destination_class,
+          "architectural state copy replaced destination metadata");
+
+    rsx_nir_stream stream;
+    rsx_nir_stream_init(&stream);
+    rsx_nir_adapter adapter;
+    rsx_nir_adapter_init(&adapter, &stream);
+    rsx_dispatch legacy;
+    rsx_dispatch_init(&legacy, 0);
+    static const u32 fifo_methods[] = {0x0050u, 0x0060u, 0x0064u,
+                                       0x0068u, 0x006Cu};
+    for (u32 i = 0; i < (u32)(sizeof(fifo_methods) /
+                              sizeof(fifo_methods[0])); ++i) {
+        const u32 value = 0xCAFE0000u | i;
+        rsx_dispatch_method(&legacy, fifo_methods[i], value);
+        rsx_nir_adapter_method(&adapter, fifo_methods[i], value);
+        CHECK(adapter.rsx.regs[fifo_methods[i] >> 2] ==
+                  legacy.regs[fifo_methods[i] >> 2],
+              "FIFO method 0x%X diverged in architectural register state",
+              fifo_methods[i]);
+    }
+    rsx_nir_stream_free(&stream);
+}
+
 int main(int argc, char** argv)
 {
     test_fifo_vs_typed();
@@ -2428,6 +2474,7 @@ int main(int argc, char** argv)
     test_shadow_terminal_action();
     test_section_method_support();
     test_adapter_copy_rebind();
+    test_dispatch_state_sync_and_fifo_registers();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");
     if (rxs && rxs[0])
