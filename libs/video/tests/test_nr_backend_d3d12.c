@@ -750,7 +750,9 @@ static void run_capture_backend(const char* path)
 
 typedef struct broker_color_test {
     ID3D12Resource* resource;
+    ID3D12Resource* depth;
     u32 calls;
+    u32 depth_calls;
 } broker_color_test;
 
 static int borrow_rgba_for_logical_565(
@@ -768,6 +770,27 @@ static int borrow_rgba_for_logical_565(
     return 0;
 }
 
+static int borrow_depth_for_alias_test(
+    void* user, u32 space, u32 offset, u32 depth_format,
+    u32 width, u32 height, void** resource, u32* resource_format,
+    u32* dsv_format, u32* srv_format, int* publication_required)
+{
+    broker_color_test* broker = (broker_color_test*)user;
+    if (!broker || !broker->depth || !resource || !resource_format ||
+        !dsv_format || !srv_format || !publication_required || space ||
+        offset != ZETA_OFFSET || depth_format != 2u ||
+        width != RT_W || height != RT_H)
+        return -1;
+    broker->depth->lpVtbl->AddRef(broker->depth);
+    *resource = broker->depth;
+    *resource_format = (u32)DXGI_FORMAT_R32G8X24_TYPELESS;
+    *dsv_format = (u32)DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    *srv_format = (u32)DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    *publication_required = 0;
+    broker->depth_calls++;
+    return 0;
+}
+
 /* The live surface broker canonicalizes logical Cell GCM color format 3 to
  * an RGBA8 D3D resource.  Exercise that exact mismatch through a real WARP
  * draw: resource identity remains keyed by the guest format, while the RTV
@@ -778,6 +801,7 @@ static void test_broker_actual_color_format(void)
     IDXGIAdapter* adapter = NULL;
     ID3D12Device* device = NULL;
     ID3D12Resource* resource = NULL;
+    ID3D12Resource* depth_resource = NULL;
     rsx_nr_d3d12* sink = NULL;
     rsx_nr_ring ring;
     memset(&ring, 0, sizeof(ring));
@@ -816,15 +840,30 @@ static void test_broker_actual_color_format(void)
     if (FAILED(hr) || !resource)
         goto done;
 
+    rd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE depth_clear = {0};
+    depth_clear.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    depth_clear.DepthStencil.Depth = 1.0f;
+    hr = device->lpVtbl->CreateCommittedResource(
+        device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
+        &IID_ID3D12Resource, (void**)&depth_resource);
+    CHECK(SUCCEEDED(hr) && depth_resource,
+          "could not create broker depth resource");
+    if (FAILED(hr) || !depth_resource)
+        goto done;
+
     sink = rsx_nr_d3d12_create(
         device, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
     CHECK(sink != NULL, "could not create broker-format native sink");
     if (!sink)
         goto done;
 
-    broker_color_test broker = { resource, 0u };
+    broker_color_test broker = { resource, depth_resource, 0u, 0u };
     rsx_nr_d3d12_set_resource_broker(
-        sink, borrow_rgba_for_logical_565, NULL, &broker);
+        sink, borrow_rgba_for_logical_565, borrow_depth_for_alias_test,
+        &broker);
     const int ring_result = rsx_nr_ring_init(&ring, 128u, 4096u);
     CHECK(ring_result == 0,
           "broker-format ring init failed");
@@ -856,6 +895,9 @@ static void test_broker_actual_color_format(void)
     s565.color_pitch[0] = RT_W * 2u;
     s565.color_location[0] = RSX_NIR_LOCATION_LOCAL;
     s565.color_target = 1;
+    s565.zeta_offset = ZETA_OFFSET;
+    s565.zeta_pitch = RT_W * 4u;
+    s565.zeta_location = RSX_NIR_LOCATION_LOCAL;
     rsx_nir_em_surface(&em, &s565);
     write_triangle(rsx_nr_d3d12_pages(sink),
                    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
@@ -877,6 +919,53 @@ static void test_broker_actual_color_format(void)
     CHECK(pix_is(2u, 61u, 0xFFu, 0x00u, 0xFFu),
           "broker RGBA target did not execute the logical-565 draw");
 
+    /* The live renderer keeps depth maps as shared typeless D3D resources.
+     * A later color pass may sample a non-current one directly on the shared
+     * ordered list. This must not fall back to stale guest bytes merely
+     * because the resource came through the broker. */
+    rsx_nir_em_surface(&em, &s565);
+    rsx_nir_em_clear(&em, 0x01u, 0u, 0x400000u, 0u);
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u && broker.depth_calls >= 1u,
+          "borrowed zeta clear failed errors=%llu calls=%u",
+          be.stats.exec_errors, broker.depth_calls);
+
+    write_tex_fp();
+    stage_frame_state(&em);
+    rsx_nir_em_surface(&em, &s565);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF0000FFu, 0u, 0u);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "borrowed zeta sample had %llu execution errors",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, 0u, RT565_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "borrowed zeta target readback failed");
+    CHECK(pix_is(2u, 61u, 0x40u, 0x40u, 0x40u),
+          "borrowed zeta sample pixel %02X %02X %02X",
+          pix(2u, 61u)[0], pix(2u, 61u)[1], pix(2u, 61u)[2]);
+    {
+        const u32 native_vp[4] = {
+            0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF81u
+        };
+        const u32 batch[2] = {0u, 3u};
+        const rsx_nir_draw draw = {5u, 0u, 1u, 0u, 3u};
+        rsx_nir_pipeline self_alias = be.st;
+        self_alias.depth_stencil.depth_test_enable = 1u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &self_alias, native_vp, 4u, &draw, batch) ==
+                  -RSX_NR_DRAW_PF_TEXTURE_INVALID,
+              "active borrowed DSV/SRV self-alias escaped preflight");
+    }
+    write_test_fp();
+
 done:
     if (ring_live)
         rsx_nr_ring_destroy(&ring);
@@ -884,6 +973,8 @@ done:
         rsx_nr_d3d12_destroy(sink);
     if (resource)
         resource->lpVtbl->Release(resource);
+    if (depth_resource)
+        depth_resource->lpVtbl->Release(depth_resource);
     if (device)
         device->lpVtbl->Release(device);
     if (adapter)

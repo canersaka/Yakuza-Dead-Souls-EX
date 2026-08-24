@@ -71,6 +71,8 @@ u32 rsx_live_draw_native_clear_contract_mismatch(
 void rsx_live_draw_native_clear_commit(
     const struct rsx_nir_pipeline* s, const struct rsx_nir_clear* c)
 { (void)s; (void)c; }
+void rsx_live_draw_native_draw_commit(const struct rsx_nir_pipeline* s)
+{ (void)s; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
 u32  rsx_live_draw_get_frames(void) { return 0; }
 u64  rsx_live_draw_get_completed_draws(void) { return 0; }
@@ -7334,6 +7336,34 @@ void rsx_live_draw_native_clear_commit(
         } else if (clear->mask & RSX_CLEAR_DEPTH) {
             g.depth_cleared = 1;
         }
+    }
+}
+
+void rsx_live_draw_native_draw_commit(const rsx_nir_pipeline* state)
+{
+    if (!state || !g.ready)
+        return;
+    const rsx_nir_depth_stencil* const ds = &state->depth_stencil;
+    if (!ds->depth_test_enable && !ds->stencil_test_enable)
+        return;
+    const rsx_nir_surface* const surface = &state->surface;
+    const u32 zslot = zdepth_get(
+        surface->zeta_location, surface->zeta_offset,
+        surface->clip_w, surface->clip_h);
+    if (!zslot)
+        return;
+    zdepth_t* const z = &g.zdepths[zslot - 1u];
+    z->draws++;
+    if (ds->depth_test_enable)
+        z->depth_test_draws++;
+    if (ds->depth_write_enable)
+        z->depth_write_draws++;
+    if (ds->depth_test_enable && ds->depth_write_enable) {
+        z->depth_both_draws++;
+        /* Match sink_end_impl's publication contract. A later legacy color
+         * pass must resolve the depth image written by this native draw,
+         * rather than reusing the previous snapshot generation. */
+        z->had_write = 1;
     }
 }
 

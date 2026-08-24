@@ -2933,8 +2933,6 @@ static int nrb_texture_preflight(rsx_nr_d3d12* b,
         return rt_alias == draw_rt ? -1 : 0;
     nrb_depth* depth_alias = nrb_texture_depth_alias(
         b, texture, draw_depth, unit);
-    if (depth_alias && b->borrow_depth)
-        return -1;
     if (depth_alias)
         return depth_alias == draw_depth ? -1 : 0;
 
