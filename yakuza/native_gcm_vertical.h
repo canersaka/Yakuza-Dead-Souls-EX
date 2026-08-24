@@ -14,7 +14,9 @@
  * guest FIFO address, and lets the FIFO consumer execute that payload at
  * that address without decoding the retained byte-exact packet. The packet
  * remains valid fallback if a display list copies it to another address.
- * No operation is skipped in shadow mode.
+ * No operation is skipped in shadow mode. "full-native" is a separate
+ * strict whole-run lane: the serialized FIFO is translated once into typed
+ * operations and never enters the legacy RSX decoder.
  */
 
 #ifndef YAKUZA_NATIVE_GCM_VERTICAL_H
@@ -88,6 +90,24 @@ typedef enum yz_nr_vertical_section_result {
  * publishes next_get/next_ret; on WAIT both remain unchanged. FALLBACK means
  * the complete section was refused before native execution began. */
 yz_nr_vertical_section_result yz_nr_vertical_consume_section(
+    uint32_t get, uint32_t put, uint32_t fifo_ret,
+    uint32_t* next_get, uint32_t* next_ret);
+
+typedef enum yz_nr_vertical_frame_result {
+    YZ_NR_VERTICAL_FRAME_DISABLED = 0,
+    YZ_NR_VERTICAL_FRAME_ADVANCED,
+    YZ_NR_VERTICAL_FRAME_WAIT_EMPTY,
+    YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL,
+    YZ_NR_VERTICAL_FRAME_WAIT_STOPPER,
+    YZ_NR_VERTICAL_FRAME_WAIT_SEMAPHORE,
+    YZ_NR_VERTICAL_FRAME_FATAL,
+} yz_nr_vertical_frame_result;
+
+/* Strict full-native FIFO owner. When enabled this is the only RSX graphics
+ * consumer: it translates the current method once, executes it through the
+ * typed backend, and advances GET only after completion. It never falls back
+ * to the legacy renderer inside a native frame. */
+yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
     uint32_t get, uint32_t put, uint32_t fifo_ret,
     uint32_t* next_get, uint32_t* next_ret);
 

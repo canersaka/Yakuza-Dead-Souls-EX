@@ -21,6 +21,7 @@
 #include "yakuza_runner.h"
 #include "rsx_nr_backend.h"
 #include "rsx_nr_backend_d3d12.h"
+#include "rsx_nr_frame_owner.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_live_draw.h"
 #include "rsx_nir_adapter.h"
@@ -364,15 +365,18 @@ struct yz_nr_vertical_active_state {
     rsx_nr_tokens tokens;
     rsx_nr_backend backend;
     rsx_nir_adapter adapter;
+    rsx_nr_frame_owner frame_owner;
     rsx_nr_d3d12* d3d12;
     rsx_nr_exec_ops gpu_ops;
     rsx_nr_slot slots[YZ_NR_ACTIVE_RING_CAPACITY];
     uint32_t side[YZ_NR_ACTIVE_SIDE_CAPACITY];
     yz_nr_vertical_display displays[8];
     volatile LONG graphics_ready;
+    volatile LONG graphics_init_failed;
     uint32_t graphics_families;
     uint32_t clear_scope;
     uint32_t frame_islands;
+    uint32_t strict_full_native;
     rsx_nir_stream section_stream;
     rsx_nir_op* section_ops;
     uint32_t* section_side;
@@ -569,10 +573,13 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                              uint32_t width, uint32_t height,
                              uint32_t buffer_id)
 {
-    (void)texture;
-    (void)format;
-    (void)width;
-    (void)height;
+    if (g_active.strict_full_native) {
+        const int result = rsx_live_draw_present_external(
+            texture, format, width, height, buffer_id);
+        if (!result)
+            yz_nr_vertical_exec_present_complete(buffer_id);
+        return result;
+    }
     /* Every live render target is an exact resource borrowed from the legacy
      * surface registry. In shared-timeline mode the preceding native commands
      * are still on the live list; sink_flip appends the scanout copy and
@@ -677,7 +684,8 @@ static void yz_nr_d3d_publish_write(void*, uint32_t space, uint32_t offset,
 static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
                            const rsx_nir_clear* clear)
 {
-    const uint32_t mismatch = g_active.frame_islands ? 0u :
+    const uint32_t mismatch =
+        (g_active.frame_islands || g_active.strict_full_native) ? 0u :
         rsx_live_draw_native_clear_contract_mismatch(st, clear);
     if (mismatch) {
         for (uint32_t bit = 0; bit < 3u; ++bit)
@@ -685,14 +693,15 @@ static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
                 g_active.consumer_clear_contract[bit]++;
         return -1;
     }
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+    if (!g_active.strict_full_native &&
+        InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.clear
         ? g_active.gpu_ops.clear(g_active.gpu_ops.user, st, clear) : -1;
     if (result) {
         InterlockedExchange(&g_active.renderer_owner, 0);
-    } else
+    } else if (!g_active.strict_full_native)
         rsx_live_draw_native_clear_commit(st, clear);
     return result;
 }
@@ -701,7 +710,8 @@ static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
                           const uint32_t* vp, uint32_t vp_words,
                           const rsx_nir_draw* draw, const uint32_t* batches)
 {
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+    if (!g_active.strict_full_native &&
+        InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.draw
@@ -709,7 +719,7 @@ static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
                                 draw, batches) : -1;
     if (result)
         InterlockedExchange(&g_active.renderer_owner, 0);
-    else
+    else if (!g_active.strict_full_native)
         rsx_live_draw_native_draw_commit(st);
     return result;
 }
@@ -718,7 +728,8 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
                               const rsx_nir_transfer* transfer,
                               const uint32_t* words)
 {
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+    if (!g_active.strict_full_native &&
+        InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.transfer
@@ -795,6 +806,17 @@ static int yz_nr_render_condition_read(void*, uint32_t dma,
     return yz_nr_vertical_render_condition_read(dma, offset, value);
 }
 
+static int yz_nr_frame_read32(void*, uint32_t io, uint32_t* value)
+{
+    if (!value)
+        return -1;
+    const uint32_t ea = yz_nr_vertical_io_to_ea(io);
+    if (!ea)
+        return -1;
+    *value = vm_read32(ea);
+    return 0;
+}
+
 static void yz_nr_active_ensure_graphics(void)
 {
     if (!InterlockedCompareExchange(
@@ -807,17 +829,29 @@ static void yz_nr_active_ensure_graphics(void)
     rsx_nr_d3d12* const d3d12 = rsx_nr_d3d12_create(
         device, YZ_GCM_LOCAL_SIZE, 0x10000000u,
         yz_nr_d3d_guest_ptr, yz_nr_d3d_guest_writable_ptr, nullptr);
-    if (!d3d12)
+    if (!d3d12) {
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
+    }
     if (rsx_nr_d3d12_set_live_output(
             d3d12, 1, yz_nr_d3d_present, nullptr) != 0) {
         rsx_nr_d3d12_destroy(d3d12);
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
+    if (g_active.strict_full_native &&
+        rsx_nr_d3d12_set_coherent_section_mode(d3d12, 1) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
-    rsx_nr_d3d12_set_resource_broker(
-        d3d12, yz_nr_borrow_color, yz_nr_borrow_depth,
-        yz_nr_resolve_depth_sample, nullptr);
+    if (!g_active.strict_full_native)
+        rsx_nr_d3d12_set_resource_broker(
+            d3d12, yz_nr_borrow_color, yz_nr_borrow_depth,
+            yz_nr_resolve_depth_sample, nullptr);
     rsx_nr_d3d12_set_publish_write(
         d3d12, yz_nr_d3d_publish_write, nullptr);
     rsx_nr_d3d12_set_render_condition_reader(
@@ -825,16 +859,20 @@ static void yz_nr_active_ensure_graphics(void)
     if (rsx_nr_d3d12_set_force_draw_input_refresh(
             d3d12, g_active.force_draw_input_refresh) != 0) {
         rsx_nr_d3d12_destroy(d3d12);
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
-    if (rsx_nr_d3d12_set_shared_timeline(
-            d3d12, yz_nr_d3d_timeline_acquire,
-            yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
-            nullptr) != 0) {
-        rsx_nr_d3d12_destroy(d3d12);
-        return;
+    if (!g_active.strict_full_native) {
+        if (rsx_nr_d3d12_set_shared_timeline(
+                d3d12, yz_nr_d3d_timeline_acquire,
+                yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
+                nullptr) != 0) {
+            rsx_nr_d3d12_destroy(d3d12);
+            return;
+        }
+        InterlockedExchange(&g_active.shared_timeline, 1);
     }
-    InterlockedExchange(&g_active.shared_timeline, 1);
     for (uint32_t i = 0; i < 8u; ++i) {
         const yz_nr_vertical_display* const display = &g_active.displays[i];
         if (display->valid)
@@ -850,14 +888,17 @@ static void yz_nr_active_ensure_graphics(void)
      * intentionally discarded by that renderer.  Join its exact state at
      * the first safe post-movie ownership boundary instead of carrying an
      * older/extra register, program, or constant history into native draws. */
-    if (rsx_live_draw_sync_dispatch_state(&g_active.adapter.rsx) != 0) {
+    if (!g_active.strict_full_native &&
+        rsx_live_draw_sync_dispatch_state(&g_active.adapter.rsx) != 0) {
         rsx_nr_d3d12_destroy(d3d12);
         memset(&g_active.gpu_ops, 0, sizeof(g_active.gpu_ops));
         InterlockedExchange(&g_active.shared_timeline, 0);
         return;
     }
-    InterlockedExchange(&g_active.section_state_resync_pending, 0);
-    g_active.section_state_resyncs++;
+    if (!g_active.strict_full_native) {
+        InterlockedExchange(&g_active.section_state_resync_pending, 0);
+        g_active.section_state_resyncs++;
+    }
     rsx_nr_exec_ops combined = {};
     combined.clear = yz_nr_gpu_clear;
     combined.draw = yz_nr_gpu_draw;
@@ -892,7 +933,7 @@ static int yz_nr_active_init(int graphics)
     }
     const rsx_nir_sink sink = rsx_nr_ring_sink(&g_active.ring);
     rsx_nir_adapter_init_sink(&g_active.adapter, &sink);
-    g_active.adapter.shadow_mode = 1;
+    g_active.adapter.shadow_mode = g_active.strict_full_native ? 0 : 1;
     if (graphics) {
         g_active.guest_page_route = (volatile LONG*)calloc(
             YZ_NR_ACTIVE_GUEST_PAGE_COUNT, sizeof(LONG));
@@ -942,6 +983,9 @@ static int yz_nr_active_init(int graphics)
     ops.sem_read = yz_nr_exec_sem_read;
     rsx_nr_backend_init(&g_active.backend, &g_active.ring,
                         &g_active.tokens, &ops);
+    rsx_nr_frame_owner_init(
+        &g_active.frame_owner, &g_active.adapter, &g_active.backend,
+        &g_active.ring, yz_nr_frame_read32, nullptr);
     return 1;
 }
 
@@ -965,6 +1009,8 @@ static int yz_nr_active_publish(ppu_context* ctx, uint32_t family,
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0))
         return 0;
+    if (g_active.strict_full_native)
+        return 0; /* raw packet belongs to the single strict frame owner */
     if (g_active.frame_islands)
         return 0; /* raw packet belongs to the transactional section gate */
     const uint32_t context = (uint32_t)ctx->gpr[3];
@@ -1028,6 +1074,8 @@ static int yz_nr_active_publish_flip(uint32_t context,
                                      const rsx_nr_flip_contract* flip)
 {
     if (!InterlockedCompareExchange(&g_vertical.mode_active_present, 0, 0))
+        return 0;
+    if (g_active.strict_full_native)
         return 0;
     if (g_active.frame_islands)
         return 0;
@@ -2081,24 +2129,27 @@ extern "C" void yz_nr_vertical_init(void)
         InterlockedExchange(&g_vertical.mode_shadow, 1);
     else if (mode && (strcmp(mode, "active-basic") == 0 ||
                       strcmp(mode, "active-present") == 0 ||
-                      strcmp(mode, "active-graphics") == 0)) {
-        const int graphics = strcmp(mode, "active-graphics") == 0;
-        g_active.graphics_families = graphics
+                      strcmp(mode, "active-graphics") == 0 ||
+                      strcmp(mode, "full-native") == 0)) {
+        const int strict = strcmp(mode, "full-native") == 0;
+        const int graphics = strict || strcmp(mode, "active-graphics") == 0;
+        g_active.strict_full_native = strict;
+        g_active.graphics_families = strict ? YZ_NR_GRAPHICS_ALL : graphics
             ? yz_nr_graphics_family_mask(getenv("YZ_NR_GRAPHICS_FAMILIES"))
             : 0u;
-        g_active.clear_scope = graphics
+        g_active.clear_scope = strict ? YZ_NR_CLEAR_ALL : graphics
             ? yz_nr_clear_scope(getenv("YZ_NR_CLEAR_SCOPE"))
             : YZ_NR_CLEAR_ALL;
-        g_active.frame_islands = graphics &&
+        g_active.frame_islands = graphics && !strict &&
             getenv("YZ_NR_FRAME_ISLANDS") != nullptr;
-        g_active.section_diag_enabled = graphics &&
+        g_active.section_diag_enabled = graphics && !strict &&
             getenv("YZ_NR_PASS_DIAG") != nullptr;
-        g_active.section_shadow_consumer_admit = graphics &&
+        g_active.section_shadow_consumer_admit = graphics && !strict &&
             getenv("YZ_NR_SHADOW_CONSUMER_ADMIT") != nullptr;
-        g_active.force_draw_input_refresh = graphics &&
+        g_active.force_draw_input_refresh = graphics && !strict &&
             getenv("YZ_NR_FORCE_DRAW_INPUT_REFRESH") != nullptr;
         g_active.draw_primitive_filter = UINT32_MAX;
-        if (graphics) {
+        if (graphics && !strict) {
             const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
             if (primitive && *primitive) {
                 char* end = nullptr;
@@ -2120,8 +2171,14 @@ extern "C" void yz_nr_vertical_init(void)
         } else if (yz_nr_active_init(graphics))
             InterlockedExchange(&g_vertical.mode_active_basic, 1);
         else {
-            fprintf(stderr,
-                    "[nr-vertical-active init=failed; legacy fallback only]\n");
+            if (strict)
+                fprintf(stderr,
+                        "[nr-full-native init=failed; strict consumer will "
+                        "stop without legacy fallback]\n");
+            else
+                fprintf(stderr,
+                        "[nr-vertical-active init=failed; legacy fallback "
+                        "only]\n");
             fflush(stderr);
         }
         if (InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0) &&
@@ -2194,6 +2251,8 @@ extern "C" int yz_nr_vertical_try_flip(uint32_t context,
                                          uint32_t label_value,
                                          int32_t* result)
 {
+    if (g_active.strict_full_native)
+        return 0;
     rsx_nr_flip_contract flip = {};
     if (!rsx_nr_flip_contract_init(&flip, buffer_id, wait_for_label,
                                    label_index, label_value))
@@ -2212,6 +2271,8 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
     (void)packet_ea;
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0))
+        return 0;
+    if (g_active.strict_full_native)
         return 0;
     if (g_active.frame_islands)
         return 0;
@@ -2321,6 +2382,8 @@ extern "C" int yz_nr_vertical_try_method(uint32_t method, uint32_t arg,
 extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
                                                         uint32_t arg)
 {
+    if (g_active.strict_full_native)
+        return;
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0))
         return;
@@ -2341,6 +2404,8 @@ extern "C" void yz_nr_vertical_observe_method(uint32_t method, uint32_t arg,
                                                 uint32_t packet_ea,
                                                 int legacy_graphics_suppressed)
 {
+    if (g_active.strict_full_native)
+        return;
     /* Match the established renderer's movie contract exactly. Non-composite
      * host movies discard guest graphics methods wholesale; retaining those
      * methods only in the native adapter makes its persistent programs and
@@ -3662,6 +3727,51 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
     return yz_nr_section_execute(next_get, next_ret);
 }
 
+extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
+    uint32_t get, uint32_t put, uint32_t fifo_ret,
+    uint32_t* next_get, uint32_t* next_ret)
+{
+    if (next_get)
+        *next_get = get;
+    if (next_ret)
+        *next_ret = fifo_ret;
+    if (!g_active.strict_full_native)
+        return YZ_NR_VERTICAL_FRAME_DISABLED;
+    if (!InterlockedCompareExchange(
+            &g_vertical.mode_active_graphics, 0, 0))
+        return YZ_NR_VERTICAL_FRAME_FATAL;
+    yz_nr_active_ensure_graphics();
+    if (InterlockedCompareExchange(
+            &g_active.graphics_init_failed, 0, 0))
+        return YZ_NR_VERTICAL_FRAME_FATAL;
+    if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL;
+
+    uint32_t owned_get = get;
+    uint32_t owned_ret = fifo_ret;
+    const rsx_nr_frame_step_result result = rsx_nr_frame_owner_step(
+        &g_active.frame_owner, get, put, fifo_ret,
+        &owned_get, &owned_ret);
+    if (next_get)
+        *next_get = owned_get;
+    if (next_ret)
+        *next_ret = owned_ret;
+    switch (result) {
+    case RSX_NR_FRAME_ADVANCED:
+        return YZ_NR_VERTICAL_FRAME_ADVANCED;
+    case RSX_NR_FRAME_WAIT_EMPTY:
+        return YZ_NR_VERTICAL_FRAME_WAIT_EMPTY;
+    case RSX_NR_FRAME_WAIT_PARTIAL:
+        return YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL;
+    case RSX_NR_FRAME_WAIT_STOPPER:
+        return YZ_NR_VERTICAL_FRAME_WAIT_STOPPER;
+    case RSX_NR_FRAME_WAIT_SEMAPHORE:
+        return YZ_NR_VERTICAL_FRAME_WAIT_SEMAPHORE;
+    default:
+        return YZ_NR_VERTICAL_FRAME_FATAL;
+    }
+}
+
 extern "C" yz_nr_vertical_section_result
 yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
                                uint32_t fifo_ret, uint32_t* next_get,
@@ -3948,6 +4058,8 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
         *word_count = 0;
     if (!InterlockedCompareExchange(&g_vertical.mode_active_basic, 0, 0))
         return YZ_NR_VERTICAL_CONSUME_MISS;
+    if (g_active.strict_full_native)
+        return YZ_NR_VERTICAL_CONSUME_MISS;
     yz_nr_active_ensure_graphics();
 
     /* A retained claim owns GET until every typed op has completed. In
@@ -4128,7 +4240,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
                 "[nr-vertical-active families=0x%02X clear-scope=%u "
-                "frame-islands=%u "
+                "frame-islands=%u strict-full-native=%u "
                 "ref=%llu/%llu user=%llu/%llu draw=%llu/%llu "
                 "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
                 "fallback-draw=%llu fallback-flip=%llu "
@@ -4144,6 +4256,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.graphics_families,
                 g_active.clear_scope,
                 g_active.frame_islands,
+                g_active.strict_full_native,
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
                 g_active.owned[YZ_NR_VERT_USER],
@@ -4181,6 +4294,59 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 stats.published, stats.claimed, stats.fast_misses,
                 stats.exact_misses, stats.not_ready, stats.duplicates,
                 stats.busy, stats.full, stats.corrupt);
+        if (g_active.strict_full_native) {
+            const rsx_nr_frame_owner_stats* const fs =
+                &g_active.frame_owner.stats;
+            const rsx_nr_frame_failure* const failure =
+                &g_active.frame_owner.failure;
+            fprintf(stderr,
+                    "[nr-full-native steps=%llu packets=%llu methods=%llu "
+                    "ops=%llu frames=%llu controls=%llu "
+                    "wait=%llu/%llu/%llu/%llu "
+                    "fatal=%u kind=%u frame=%llu get=%08X ret=%08X "
+                    "command=%08X method=%05X arg=%08X index=%u]\n",
+                    fs->steps, fs->packets, fs->methods,
+                    fs->backend_ops, fs->frames, fs->control_words,
+                    fs->waits_empty, fs->waits_partial,
+                    fs->waits_stopper, fs->waits_semaphore,
+                    g_active.frame_owner.fatal, failure->kind,
+                    failure->frame, failure->get, failure->call_return,
+                    failure->command, failure->method,
+                    failure->argument, failure->argument_index);
+            if (g_active.frame_owner.fatal) {
+                const rsx_nr_slot* const blocked =
+                    rsx_nr_ring_peek(&g_active.ring);
+                const rsx_nir_op* const op = blocked ? &blocked->op : nullptr;
+                const bool semaphore = op &&
+                    (op->kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE ||
+                     op->kind == RSX_NIR_OP_SEMAPHORE_RELEASE);
+                fprintf(stderr,
+                        "[nr-full-native-state op=%u sem=%08X:%08X:%08X "
+                        "rt=%u:%08X/fmt=%u/target=%u/%ux%u "
+                        "z=%u:%08X/fmt=%u fp=%u:%08X/%08X "
+                        "vp=%u begin=%d batches=%u inline=%u]\n",
+                        op ? op->kind : UINT32_MAX,
+                        semaphore ? op->u.semaphore.dma_context : 0u,
+                        semaphore ? op->u.semaphore.offset : 0u,
+                        semaphore ? op->u.semaphore.value : 0u,
+                        g_active.backend.st.surface.color_location[0],
+                        g_active.backend.st.surface.color_offset[0],
+                        g_active.backend.st.surface.color_format,
+                        g_active.backend.st.surface.color_target,
+                        g_active.backend.st.surface.clip_w,
+                        g_active.backend.st.surface.clip_h,
+                        g_active.backend.st.surface.zeta_location,
+                        g_active.backend.st.surface.zeta_offset,
+                        g_active.backend.st.surface.depth_format,
+                        g_active.backend.st.fragment_program.location,
+                        g_active.backend.st.fragment_program.offset,
+                        g_active.backend.st.fragment_program.control,
+                        g_active.backend.st.vertex_program.start_slot,
+                        g_active.adapter.rsx.in_begin_end,
+                        g_active.adapter.batch_count,
+                        g_active.adapter.inline_count);
+            }
+        }
         if (g_active.frame_islands) {
             fprintf(stderr,
                     "[nr-vertical-sections attempts=%llu owned=%llu "
