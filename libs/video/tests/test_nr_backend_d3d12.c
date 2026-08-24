@@ -59,6 +59,7 @@ static int g_render_condition_fail;
 #define MAIN_SIZE  (1u << 16)
 #define RT_OFFSET  0x00300000u   /* outside the arena on purpose: the RT  */
 #define RT565_OFFSET 0x00310000u
+#define RTF32_OFFSET 0x00330000u
 #define ZETA_OFFSET  0x00320000u
 #define COLOR_ALIAS_OFFSET 0x00410000u /* outside the guest arena          */
 #define RT_W 64u                 /* is a GPU object keyed by (space,ofs)  */
@@ -491,6 +492,22 @@ static u8* cap_wptr(void* user, u32 space, u32 offset, u32 min_bytes)
     return (u8*)cap_ptr(user, space, offset, min_bytes);
 }
 
+/* The production semantic report bridge publishes zero for the modeled
+ * ZPASS/ZCULL counters. Archived captures do not contain the separate report
+ * aperture, so resolve valid conditional-render addresses to that same
+ * deterministic value instead of turning every conditional draw into a
+ * missing-callback execution error. */
+static int cap_render_condition_read(void* user, u32 dma, u32 offset,
+                                     u32* value)
+{
+    (void)user;
+    if (!value || (dma != 0x66626660u && dma != 0xBAD68000u) ||
+        offset > 0x00FFFFF0u)
+        return -1;
+    *value = 0u;
+    return 0;
+}
+
 typedef struct cap_data {
     u32 n_blocks, n_records, reg_words, vp_words, const_words;
     u32 disp_count;
@@ -875,6 +892,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             sink, i, RSX_NIR_LOCATION_LOCAL, c->disp[i][3],
             c->disp[i][0], c->disp[i][1]);
     }
+    rsx_nr_d3d12_set_render_condition_reader(
+        sink, cap_render_condition_read, NULL);
     const char* allow_flow_txl = getenv("YZ_NR_CAPTURE_FLOW_TXL_ORACLE");
     if (allow_flow_txl && allow_flow_txl[0] &&
         strcmp(allow_flow_txl, "0") != 0)
@@ -2572,6 +2591,38 @@ int main(int argc, char** argv)
           "RT readback failed");
     CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00), "R5G6B5 alias pixel");
 
+    /* ---- F_X32 render target -----------------------------------------
+     * The earlier world archive contains one float-only color pass. D3D12's
+     * R32_FLOAT RTV is an exact representation; the pixel shader's x output
+     * is the sole stored component. Execute and submit the draw without
+     * converting it through an RGBA target. */
+    rsx_nr_d3d12_stats f32_before, f32_after;
+    rsx_nr_d3d12_get_stats(sink, &f32_before);
+    write_test_fp();
+    stage_frame_state(&em);
+    rsx_nir_surface sf32;
+    memset(&sf32, 0, sizeof(sf32));
+    sf32.color_format = 13u;
+    sf32.depth_format = 2u;
+    sf32.raster_type = 1u;
+    sf32.clip_w = RT_W;
+    sf32.clip_h = RT_H;
+    sf32.color_offset[0] = RTF32_OFFSET;
+    sf32.color_pitch[0] = RT_W * 4u;
+    sf32.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    sf32.color_target = 1u;
+    rsx_nir_em_surface(&em, &sf32);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    rsx_nr_backend_run(&be, 0);
+    ops.flush(ops.user);
+    rsx_nr_d3d12_get_stats(sink, &f32_after);
+    CHECK(be.stats.exec_errors == 0u &&
+              f32_after.draws == f32_before.draws + 1u,
+          "F_X32 draw failed errors=%llu draws=%llu/%llu",
+          be.stats.exec_errors, f32_before.draws, f32_after.draws);
+
     /* ---- exact QUADS host-index expansion -----------------------------
      * Primitive 8 is the only non-native topology present in the archived
      * world captures. Two native triangles must cover the same full quad. */
@@ -2955,7 +3006,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 26 && st.draws == 4637 && st.presents == 22,
+    CHECK(st.clears == 26 && st.draws == 4638 && st.presents == 22,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
