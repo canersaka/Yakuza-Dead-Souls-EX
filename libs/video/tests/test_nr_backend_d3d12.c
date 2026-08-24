@@ -284,6 +284,28 @@ static void stage_rt565_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
+static void stage_private_rgba_rt_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = RT565_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xA5u;          /* LINEAR | A8R8G8B8                */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = RT_W;
+    texture.height = RT_H;
+    texture.pitch = RT_W * 4u;
+    texture.wrap = 0x00030303u;
+    /* Deliberately not the guest identity remap.  A GPU render-target alias
+     * is already in native component order and must not be remapped as if it
+     * were freshly decoded guest texels. */
+    texture.remap = 0u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
 static void stage_external_color_texture0(rsx_nir_emitter* em)
 {
     rsx_nir_texture texture;
@@ -2120,6 +2142,90 @@ static void test_display_chooses_latest_surface_identity(void)
     rsx_nr_d3d12_destroy(sink);
 }
 
+/* Strict live native rendering uses private RGBA targets without the legacy
+ * resource broker.  Prove that a format-8 target written by one pass is
+ * rebound by GPU identity in the following pass.  Guest bytes at the source
+ * address deliberately remain zero, so a missed alias produces black. */
+static void test_private_rgba_rt_alias(void)
+{
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    if (!sink) {
+        CHECK(0, "private RGBA alias sink creation failed");
+        return;
+    }
+    CHECK(rsx_nr_d3d12_set_live_output(
+              sink, 1, test_present_handoff, NULL) == 0,
+          "private RGBA live-output setup failed");
+
+    rsx_nr_ring ring;
+    memset(&ring, 0, sizeof(ring));
+    if (rsx_nr_ring_init(&ring, 128u, 4096u)) {
+        CHECK(0, "private RGBA alias ring init failed");
+        rsx_nr_d3d12_destroy(sink);
+        return;
+    }
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init(&em, &k);
+
+    memset(g_local + RT565_OFFSET, 0, RT_W * RT_H * 4u);
+    rsx_nir_surface source;
+    memset(&source, 0, sizeof(source));
+    source.color_format = 8u;
+    source.depth_format = 2u;
+    source.raster_type = 1u;
+    source.clip_w = RT_W;
+    source.clip_h = RT_H;
+    source.color_offset[0] = RT565_OFFSET;
+    source.color_pitch[0] = RT_W * 4u;
+    source.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    source.color_target = 1u;
+    rsx_nir_em_surface(&em, &source);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF00FF00u, 0u, 0u);
+
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_private_rgba_rt_texture0(&em);
+    {
+        const u32 native_vp[4] = {
+            0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF81u
+        };
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_vertex_program(
+            &em, 0u, native_vp, 4u, 1u, 3u, 0u);
+        rsx_nir_em_clear(&em, 0xF3u, 0xFF000000u, 0xFFFFFFu, 0u);
+        write_triangle(rsx_nr_d3d12_pages(sink),
+                       -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "private RGBA alias execution faulted (%llu)",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0,
+          "private RGBA alias destination readback failed");
+    CHECK(pix_is(2u, 61u, 0x00u, 0xFFu, 0x00u),
+          "private RGBA alias sampled guest black (%02X %02X %02X)",
+          pix(2u, 61u)[0], pix(2u, 61u)[1], pix(2u, 61u)[2]);
+    rsx_nr_d3d12_stats stats;
+    rsx_nr_d3d12_get_stats(sink, &stats);
+    CHECK(stats.rt_alias_binds >= 1u,
+          "private RGBA target was not rebound as a GPU alias");
+
+    rsx_nr_ring_destroy(&ring);
+    rsx_nr_d3d12_destroy(sink);
+}
+
 int main(int argc, char** argv)
 {
     write_test_fp();
@@ -3338,6 +3444,7 @@ int main(int argc, char** argv)
     test_shared_timeline();
     test_private_rt_registry_capacity();
     test_display_chooses_latest_surface_identity();
+    test_private_rgba_rt_alias();
 
     /* optional real-capture execution leg (large local untracked oracle:
      * absent capture = SKIP so CTest stays hermetic) */

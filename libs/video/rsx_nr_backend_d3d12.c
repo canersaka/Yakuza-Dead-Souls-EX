@@ -2270,7 +2270,7 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
         if (!live_identity &&
             ((format == NRB_TEX_R5G6B5 && candidate->fmt != 3u) ||
             (format == NRB_TEX_A8R8G8B8 &&
-             candidate->dxgi != DXGI_FORMAT_B8G8R8A8_UNORM)))
+             candidate->dxgi != nrb_color_dxgi(b, 8u))))
             continue;
         rt = candidate;
         break;
@@ -2299,9 +2299,7 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
      * Reapplying it here turned post-process RGB into forced/alpha
      * channels (dark scene with an exaggerated bright border). */
     desc.Shader4ComponentMapping =
-        live_identity || (texture->remap & 0xFFFFu) == 0xAAE4u
-        ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-        : nrb_component_mapping(texture->remap & 0xFFFFu);
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     desc.Texture2D.MipLevels = 1;
     b->dev->lpVtbl->CreateShaderResourceView(
         b->dev, rt->tex, &desc,
