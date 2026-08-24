@@ -96,6 +96,13 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_
 if(YZ_PERF_DEFINITIONS)
     target_compile_definitions(ps3recomp_runtime PRIVATE ${YZ_PERF_DEFINITIONS})
 endif()
+if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
+    # Runtime/HLE bulk writers must use the same sparse watched-page route as
+    # generated PPU stores.  Without this, memcpy/memset/file reads can mutate
+    # resident native graphics resources without advancing their generations.
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
+endif()
 if(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
         $<$<CONFIG:Release>:/O2>

@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/ppu/ppu_guest_write.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -339,7 +340,11 @@ void* _sys_memset(void* dst, s32 val, u32 size)
         host >= base && host - base <= UINT32_MAX)
         yz_a010_reltrace_ppu_bulk(
             (u32)(host - base), NULL, size, 0u, 2u, (u8)val);
-    return memset(dst, val, size);
+    void* result = memset(dst, val, size);
+    if (dst && vm_base && host >= base && host - base <= UINT32_MAX &&
+        (uint64_t)(host - base) + size <= 0x100000000ull)
+        vm_native_spurs_notify_write((u32)(host - base), size);
+    return result;
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
@@ -363,7 +368,11 @@ void* _sys_memcpy(void* dst, const void* src, u32 size)
             yz_ea_trap_c((u32)(host - base), size,
                          size >= 4 ? *(const u32*)src : 0, _ReturnAddress());
     }
-    return memcpy(dst, src, size);
+    void* result = memcpy(dst, src, size);
+    if (dst && vm_base && host >= base && host - base <= UINT32_MAX &&
+        (uint64_t)(host - base) + size <= 0x100000000ull)
+        vm_native_spurs_notify_write((u32)(host - base), size);
+    return result;
 }
 
 s32 _sys_memcmp(const void* s1, const void* s2, u32 size)

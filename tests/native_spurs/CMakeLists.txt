@@ -17,6 +17,7 @@ add_executable(native_spurs_tests
     "${PS3RECOMP_ROOT}/runtime/diag/yz_frontier_trace.c"
     "${PS3RECOMP_ROOT}/runtime/diag/yz_fe0_timeline.c")
 target_compile_definitions(native_spurs_tests PRIVATE
+    PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1
     YZ_SPURS_LOCK_ORDER_TEST=1
     YZ_SPURS_DESCRIPTOR_SNAPSHOT_TEST=1
     YZ_SPURS_TEST_GUEST_SIZE=2097152

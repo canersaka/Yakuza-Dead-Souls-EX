@@ -579,6 +579,18 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     if (s_files[fd].host_fp) {
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
     }
+    /* fread publishes directly through the translated guest pointer rather
+     * than vm_memcpy_to().  Invalidate only an already-watched native resource
+     * page, after the bytes are visible; ordinary file reads stay on the sparse
+     * page-bit fast-rejection path. */
+    if (bytes_read && vm_base && (u8*)buf >= vm_base) {
+        const uintptr_t guest_offset = (uintptr_t)((u8*)buf - vm_base);
+        if (guest_offset <= UINT32_MAX &&
+            bytes_read <= UINT32_MAX &&
+            (uint64_t)guest_offset + bytes_read <= 0x100000000ull)
+            vm_native_spurs_notify_write(
+                (u32)guest_offset, (u32)bytes_read);
+    }
     /* Boot-14 frontier diag: name any file read whose destination overlaps the
      * watched motion-bank HEADER (0x62B40880..+0x20) — the fatal reload writes
      * raw offsets into +0x14/+0x18 of the LIVE block; if that write is a
