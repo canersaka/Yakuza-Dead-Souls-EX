@@ -113,6 +113,78 @@ def main():
               f"{100*kn/max(1,kn+kw):.1f}% |")
         W("")
 
+    # ---- whole-job lane (stage 2) --------------------------------------
+    wj_metrics = {}
+    for p in sorted(glob.glob(os.path.join(ROOT, "scratch", "wjgen",
+                                           "metrics", "*.json"))):
+        m = load(p)
+        if m:
+            wj_metrics[os.path.basename(p)[:-5]] = m
+    if wj_metrics:
+        t = Counter()
+        for m in wj_metrics.values():
+            for k in ("n_insns", "n_insns_compiled", "n_blocks",
+                      "n_blocks_compiled", "n_blocks_helper_free",
+                      "wj_units", "wj_groups", "wj_entries",
+                      "wj_interior_blocks", "wj_intra_gotos",
+                      "wj_entry_loads", "wj_publish_stores",
+                      "kernel_native", "kernel_wrapped"):
+                t[k] += m.get(k, 0)
+        W("## Whole-job lane (stage 2)")
+        W("")
+        W(f"- {len(wj_metrics)} placements compiled into "
+          f"**{t['wj_units']:,} units / {t['wj_groups']:,} group functions** "
+          f"with **{t['wj_entries']:,} entry pcs** — "
+          f"**{t['wj_interior_blocks']:,} of {t['n_blocks_compiled']:,} "
+          f"compiled blocks ({100*t['wj_interior_blocks']/max(1,t['n_blocks_compiled']):.1f}%)"
+          f" are interior**: no entry-switch case, registers carried across "
+          f"them in host locals.")
+        W(f"- Intra-group transfers converted to plain gotos: "
+          f"{t['wj_intra_gotos']:,} (each was a dispatch-visible hop or a "
+          f"per-block reload boundary in earlier lanes).")
+        W(f"- Publication traffic: {t['wj_publish_stores']:,} barrier stores "
+          f"for {t['n_insns_compiled']:,} instructions "
+          f"({t['wj_publish_stores']/max(1,t['n_insns_compiled']):.3f} per "
+          f"instruction).")
+        W("")
+    wj_diffs = []
+    for p in sorted(glob.glob(os.path.join(ROOT, "scratch", "wjdiff",
+                                           "report*.json"))):
+        d = load(p)
+        if d:
+            wj_diffs.extend(d)
+    if wj_diffs:
+        v = Counter(e.get("verdict") for e in wj_diffs)
+        st_ok = sum(1 for e in wj_diffs if e.get("static_table", {}).get("ok"))
+        tm = sum(e.get("match", 0) for e in wj_diffs)
+        tx = sum(e.get("mismatch", 0) for e in wj_diffs)
+        ti = sum(e.get("inconclusive", 0) for e in wj_diffs)
+        W(f"### WJ differential: {len(wj_diffs)} placements — "
+          + ", ".join(f"{k} = {n}" for k, n in v.most_common())
+          + f"; windows {tm} MATCH / {tx} MISMATCH / {ti} inconclusive; "
+          f"static every-pc proofs {st_ok}/{len(wj_diffs)} exact.")
+        W("")
+    wj_audits = {}
+    for p in sorted(glob.glob(os.path.join(ROOT, "scratch", "wjaudit",
+                                           "*.json"))):
+        a = load(p)
+        if a and "wb" in a:
+            wj_audits[a.get("stem", os.path.basename(p)[:-5])] = a
+    if wj_audits:
+        W("### WJ assembly audit")
+        W("")
+        W("| placement | WJ insns | FAST insns | ratio | WJ gpr L/S | violations |")
+        W("|---|---:|---:|---:|---|---|")
+        for stem, a in sorted(wj_audits.items()):
+            wjs, fs = a["wb"], a.get("fast")
+            ratio = (f"{wjs['insns']/fs['insns']:.3f}"
+                     if fs and fs.get("insns") else "-")
+            W(f"| {stem} | {wjs['insns']:,} | "
+              f"{fs['insns'] if fs else 0:,} | {ratio} | "
+              f"{wjs['gpr_loads']}/{wjs['gpr_stores']} | "
+              f"{len(wjs.get('violations', {})) or 'none'} |")
+        W("")
+
     # ---- differential -------------------------------------------------
     diffs = []
     for p in sorted(glob.glob(os.path.join(ROOT, "scratch", "wbdiff",
@@ -196,11 +268,12 @@ def main():
     if bench:
         W("## Microbenchmarks (identical architectural windows)")
         W("")
-        W("| placement | timed windows | geomean FAST/WB speedup |")
-        W("|---|---:|---:|")
+        W("| placement | timed windows | geomean FAST/WB | geomean FAST/WJ |")
+        W("|---|---:|---:|---:|")
         for e in bench:
             W(f"| {e['stem']} | {e.get('n_timed_windows', 0)} | "
-              f"{e.get('geomean_fast_wb', '-')} |")
+              f"{e.get('geomean_fast_wb', '-')} | "
+              f"{e.get('geomean_fast_wj', '-')} |")
         W("")
         W("Per-window details live in scratch/wbbench/report.json "
           "(diag/fast/wb microseconds, dispatch counts).")
