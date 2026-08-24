@@ -190,7 +190,11 @@ rsx_nr_fifo_range_status rsx_nr_fifo_section_range_status(
  * pair proves a cycle and prevents an otherwise valid multi-packet loop from
  * consuming the section scanner's entire step budget. Hash collisions are
  * resolved by exact comparison, never treated as a cycle. */
-#define RSX_NR_FIFO_VISIT_CAPACITY 8192u
+/* Match the live section step/method ceiling. The exact visit set must detect
+ * cycles without introducing a smaller artificial refusal boundary for a
+ * valid long linear command section. Reset remains O(1), so this larger
+ * fixed table has no per-section clearing cost. */
+#define RSX_NR_FIFO_VISIT_CAPACITY 262144u
 typedef struct rsx_nr_fifo_visit_set {
     u32 pc[RSX_NR_FIFO_VISIT_CAPACITY];
     u32 ret[RSX_NR_FIFO_VISIT_CAPACITY];
