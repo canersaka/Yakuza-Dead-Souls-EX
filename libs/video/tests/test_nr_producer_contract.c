@@ -297,6 +297,10 @@ int main(void)
         CHECK(rsx_nr_fifo_visit_note(&visits, 0x1000u, 0xFFFFFFFFu) == 1);
         CHECK(rsx_nr_fifo_visit_note(&visits, 0x1004u, 0xFFFFFFFFu) == 1);
         CHECK(rsx_nr_fifo_visit_note(&visits, 0x1000u, 0x2000u) == 1);
+        for (u32 i = 0; i < 16384u; ++i)
+            CHECK(rsx_nr_fifo_visit_note(
+                      &visits, 0x10000u + i * 4u,
+                      0x80000000u + i * 4u) == 1);
         for (u32 i = 0; i < 1000000u; ++i)
             CHECK(rsx_nr_fifo_visit_note(
                       &visits, 0x1000u, 0xFFFFFFFFu) == 0);
