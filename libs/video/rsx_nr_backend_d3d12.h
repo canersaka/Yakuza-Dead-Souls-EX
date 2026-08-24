@@ -230,6 +230,13 @@ int rsx_nr_d3d12_set_shared_timeline(
     rsx_nr_d3d12_timeline_flush_fn flush, void* user);
 int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b);
 
+/* Declare that every draw submitted to this backend is owned as part of a
+ * completely preflighted render section. This admits the captured combined
+ * flow+vertex-texture family whose old failure came from mixing its native
+ * depth work with later legacy draws. Default is disabled. It must be set
+ * before any preflight/draw/PSO build; returns nonzero if too late. */
+int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled);
+
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size);

@@ -175,6 +175,7 @@ struct rsx_nr_d3d12 {
     rsx_nr_d3d12_present_fn present_cb;
     void* present_user;
     int rgba_targets;
+    u32 coherent_vp_options;
 
     const u8* (*guest_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
     u8* (*writable_ptr)(void* user, u32 space, u32 offset, u32 min_bytes);
@@ -2428,6 +2429,8 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                            sizeof(fp->structural_hash));
     key = rsx_nr_hash_fold(key, &cube_mask, sizeof(cube_mask));
     key = rsx_nr_hash_fold(key, &vtex_mask, sizeof(vtex_mask));
+    key = rsx_nr_hash_fold(key, &b->coherent_vp_options,
+                           sizeof(b->coherent_vp_options));
     const u32 fp_ctrl = st->fragment_program.control & 0x40u;
     key = rsx_nr_hash_fold(key, &fp_ctrl, sizeof(fp_ctrl));
     key = rsx_nr_hash_fold(
@@ -2479,9 +2482,9 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
 
     int n;
     if (vp_word_count) {
-        n = rsx_vertex_pull_decompile_control(
+        n = rsx_vertex_pull_decompile_control_options(
             plan, (const u8*)vp_words, vp_word_count * 4, vtex_mask,
-            st->vertex_program.start_slot,
+            st->vertex_program.start_slot, b->coherent_vp_options,
             b->vs_text, sizeof(b->vs_text));
         if (n < 0)
             return NULL;
@@ -2979,6 +2982,18 @@ int rsx_nr_d3d12_preflight_clear(rsx_nr_d3d12* b,
     return 0;
 }
 
+static int nrb_vp_program_supported(rsx_nr_d3d12* b,
+                                    const u32* vp_words,
+                                    u32 vp_word_count, u32 vtex_mask,
+                                    u32 start_slot)
+{
+    rsx_vp_native_support_analysis analysis;
+    return vp_words && vp_word_count &&
+        rsx_vp_analyze_native_support_control_options(
+            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+            start_slot, b->coherent_vp_options, &analysis);
+}
+
 int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
                                        const rsx_nir_pipeline* st,
                                        const u32* vp_words,
@@ -3000,9 +3015,8 @@ int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
         if (st->vertex_textures[unit].enabled)
             vtex_mask |= 1u << unit;
-    if (!vp_words || !vp_word_count ||
-        !rsx_vp_program_is_native_supported_control_ex(
-            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+    if (!nrb_vp_program_supported(
+            b, vp_words, vp_word_count, vtex_mask,
             st->vertex_program.start_slot))
         return -RSX_NR_DRAW_PF_VERTEX_PROGRAM;
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
@@ -3061,9 +3075,8 @@ int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
         if (st->vertex_textures[unit].enabled)
             vtex_mask |= 1u << unit;
-    if (!vp_words || !vp_word_count ||
-        !rsx_vp_program_is_native_supported_control_ex(
-            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
+    if (!nrb_vp_program_supported(
+            b, vp_words, vp_word_count, vtex_mask,
             st->vertex_program.start_slot))
         return -RSX_NR_DRAW_PF_VERTEX_PROGRAM;
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
@@ -3310,10 +3323,9 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
         if (st->vertex_textures[unit].enabled)
             vtex_mask |= 1u << unit;
-    if ((vp_word_count && !vp_words) ||
-        (vp_word_count && !rsx_vp_program_is_native_supported_control_ex(
-            (const u8*)vp_words, vp_word_count * sizeof(u32), vtex_mask,
-            st->vertex_program.start_slot))) {
+    if (vp_word_count && !nrb_vp_program_supported(
+            b, vp_words, vp_word_count, vtex_mask,
+            st->vertex_program.start_slot)) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_pso++;
         return -1;
@@ -3974,6 +3986,15 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
     return b && b->shared_timeline && !b->timeline_fault;
 }
 
+int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
+{
+    if (!b || b->stats.pso_builds || b->stats.draws)
+        return -1;
+    b->coherent_vp_options = enabled
+        ? RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL : 0u;
+    return 0;
+}
+
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
 {
@@ -4478,6 +4499,11 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
 {
     (void)b;
     return 0;
+}
+int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
+{
+    (void)b; (void)enabled;
+    return -1;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)

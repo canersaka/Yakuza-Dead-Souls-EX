@@ -327,6 +327,14 @@ int rsx_vp_analyze_native_support_control(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     rsx_vp_native_support_analysis* analysis)
 {
+    return rsx_vp_analyze_native_support_control_options(
+        ucode, max_bytes, vtex_mask, start_slot, 0u, analysis);
+}
+
+int rsx_vp_analyze_native_support_control_options(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options, rsx_vp_native_support_analysis* analysis)
+{
     if (!analysis)
         return 0;
     memset(analysis, 0, sizeof(*analysis));
@@ -388,7 +396,8 @@ int rsx_vp_analyze_native_support_control(
      * Until a captured-program execution oracle proves the interaction, keep
      * the complete owning pass on legacy.  This is a semantic admission gate,
      * not a hash/title exception. */
-    if (has_flow && has_vertex_texture)
+    if (has_flow && has_vertex_texture &&
+        !(options & RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL))
         analysis->unsupported_vec_mask |= 1u << 25;
     return analysis->terminated && !analysis->unsupported_vec_mask &&
         !analysis->unsupported_sca_mask && !analysis->missing_vtex_mask &&
@@ -397,6 +406,7 @@ int rsx_vp_analyze_native_support_control(
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options,
     int compact_inputs,
     u32 input_mask, const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size);
@@ -410,7 +420,7 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0u, 0, 0xFFFFu,
+        ucode, max_bytes, vtex_mask, 0u, 0u, 0, 0xFFFFu,
         NULL, NULL, out, out_size);
 }
 
@@ -426,7 +436,7 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0u, 1, input_mask, NULL, NULL,
+        ucode, max_bytes, vtex_mask, 0u, 0u, 1, input_mask, NULL, NULL,
         out, out_size);
 }
 
@@ -445,15 +455,26 @@ int rsx_vp_decompile_pull_control_ex(
     const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size)
 {
+    return rsx_vp_decompile_pull_control_options_ex(
+        ucode, max_bytes, vtex_mask, start_slot, 0u,
+        pull_globals, pull_loads, out, out_size);
+}
+
+int rsx_vp_decompile_pull_control_options_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options, const char* pull_globals, const char* pull_loads,
+    char* out, u32 out_size)
+{
     if (!pull_globals || !pull_loads)
         return -1;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, start_slot, 0, 0xFFFFu,
+        ucode, max_bytes, vtex_mask, start_slot, options, 0, 0xFFFFu,
         pull_globals, pull_loads, out, out_size);
 }
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    u32 options,
     int compact_inputs,
     u32 input_mask, const char* pull_globals, const char* pull_loads,
     char* out, u32 out_size)
@@ -481,8 +502,8 @@ static int rsx_vp_decompile_impl(
     }
     if (has_flow) {
         rsx_vp_native_support_analysis support;
-        if (!rsx_vp_analyze_native_support_control(
-                ucode, max_bytes, vtex_mask, start_slot, &support))
+        if (!rsx_vp_analyze_native_support_control_options(
+                ucode, max_bytes, vtex_mask, start_slot, options, &support))
             return -1;
         emit(&b, "    uint _vp_pc = 0u;\n");
     }

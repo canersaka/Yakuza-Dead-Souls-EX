@@ -375,6 +375,14 @@ int rsx_vertex_pull_decompile_control(
     const rsx_vertex_pull_plan* plan, const u8* ucode, u32 max_bytes,
     u32 vtex_mask, u32 start_slot, char* out, u32 out_size)
 {
+    return rsx_vertex_pull_decompile_control_options(
+        plan, ucode, max_bytes, vtex_mask, start_slot, 0u, out, out_size);
+}
+
+int rsx_vertex_pull_decompile_control_options(
+    const rsx_vertex_pull_plan* plan, const u8* ucode, u32 max_bytes,
+    u32 vtex_mask, u32 start_slot, u32 options, char* out, u32 out_size)
+{
     /* Single render-thread shader-build path, same convention as the
      * decompiler's static body buffer. */
     static char globals[48 * 1024];
@@ -384,9 +392,9 @@ int rsx_vertex_pull_decompile_control(
     if (rsx_vertex_pull_emit_loads(plan, "yz_sysvid", loads,
                                    sizeof(loads)) < 0)
         return -1;
-    return rsx_vp_decompile_pull_control_ex(
-        ucode, max_bytes, vtex_mask, start_slot, globals, loads,
-        out, out_size);
+    return rsx_vp_decompile_pull_control_options_ex(
+        ucode, max_bytes, vtex_mask, start_slot, options,
+        globals, loads, out, out_size);
 }
 
 int rsx_vertex_pull_flag_enabled(void)

@@ -484,6 +484,23 @@ static void test_vp_masks(void)
                       support.unsupported_vec_mask == (1u << 25) &&
                       support.missing_vtex_mask == 0u,
                   "flow+TXL interaction escaped conservative admission");
+            CHECK(rsx_vp_analyze_native_support_control_options(
+                      flow, sizeof(flow), 1u, 4u,
+                      RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL, &support) &&
+                      support.flow_instructions == 1u &&
+                      support.unsupported_vec_mask == 0u,
+                  "offline flow+TXL execution oracle stayed gated");
+            {
+                static char hlsl[256 * 1024];
+                CHECK(rsx_vp_decompile_pull_control_options_ex(
+                          flow, sizeof(flow), 1u, 4u,
+                          RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL, "", "",
+                          hlsl, sizeof(hlsl)) == 3,
+                      "offline flow+TXL execution oracle did not decompile");
+                CHECK(strstr(hlsl, "rsx_vtex0.SampleLevel") != NULL &&
+                          strstr(hlsl, "_vp_pc") != NULL,
+                      "offline flow+TXL HLSL lost texture or control flow");
+            }
         }
         vp_instruction(flow + 16, 0x11, 0, 0,
                        vp_src(1), vp_src(1), vp_src(1), 1, 0, 0);

@@ -22,6 +22,7 @@ int main(void) { return 2; }
 
 #include "../rsx_nr_backend_d3d12.h"
 #include "../rsx_nir_emitter.h"
+#include "../rsx_vp_decompiler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -530,8 +531,48 @@ static u64 fnv64(const u8* p, size_t n)
     return h;
 }
 
+static int cap_dump_rt_ppm(rsx_nr_d3d12* sink, const char* dir,
+                           u32 offset, const char* name)
+{
+    const u32 width = 1024u, height = 768u;
+    u8* pixels = malloc((size_t)width * height * 4u);
+    if (!pixels)
+        return -1;
+    if (rsx_nr_d3d12_read_rt(
+            sink, 0u, offset, width, height, pixels) != 0) {
+        free(pixels);
+        return -1;
+    }
+    char path[1024];
+    const int length = snprintf(path, sizeof(path), "%s\\%s", dir, name);
+    if (length <= 0 || length >= (int)sizeof(path)) {
+        free(pixels);
+        return -1;
+    }
+    FILE* fp = fopen(path, "wb");
+    if (!fp) {
+        free(pixels);
+        return -1;
+    }
+    int ok = fprintf(fp, "P6\n%u %u\n255\n", width, height) > 0;
+    for (u32 y = 0; ok && y < height; ++y) {
+        for (u32 x = 0; x < width; ++x) {
+            const u8* bgra = pixels + ((size_t)y * width + x) * 4u;
+            const u8 rgb[3] = { bgra[2], bgra[1], bgra[0] };
+            if (fwrite(rgb, 1, sizeof(rgb), fp) != sizeof(rgb)) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    if (fclose(fp) != 0)
+        ok = 0;
+    free(pixels);
+    return ok ? 0 : -1;
+}
+
 static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
-                        size_t stats_size)
+                        size_t stats_size, int dump_outputs)
 {
     /* arena sizes: max block end per location, 64K aligned */
     u32 need[2] = { 0, 0 };
@@ -559,6 +600,11 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         memset(&g_cap, 0, sizeof(g_cap));
         return -2;                   /* no device                          */
     }
+    const char* allow_flow_txl = getenv("YZ_NR_CAPTURE_FLOW_TXL_ORACLE");
+    if (allow_flow_txl && allow_flow_txl[0] &&
+        strcmp(allow_flow_txl, "0") != 0)
+        CHECK(rsx_nr_d3d12_set_coherent_section_mode(sink, 1) == 0,
+              "capture coherent-section mode refused before execution");
 
     rsx_nr_ring ring;
     rsx_nr_tokens tokens;
@@ -654,6 +700,18 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         free(px);
     }
 
+    if (dump_outputs) {
+        const char* dump_dir = getenv("YZ_NR_CAPTURE_DUMP_DIR");
+        if (dump_dir && dump_dir[0] &&
+            (cap_dump_rt_ppm(sink, dump_dir, 0x01800000u,
+                             "native_world_01800000.ppm") != 0 ||
+             cap_dump_rt_ppm(sink, dump_dir, 0x00E40000u,
+                             "native_final_00E40000.ppm") != 0)) {
+            fprintf(stderr, "capture: failed to dump oracle render targets\n");
+            ring_fault = 1;
+        }
+    }
+
     free(ad);
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
@@ -672,14 +730,14 @@ static void run_capture_backend(const char* path)
     }
     char line1[512], line2[512];
     u64 h1 = 0, h2 = 0;
-    int r1 = cap_run_once(&c, &h1, line1, sizeof(line1));
+    int r1 = cap_run_once(&c, &h1, line1, sizeof(line1), 1);
     if (r1 == -2) {
         printf("capture backend leg: SKIP (no WARP device)\n");
         cap_free(&c);
         return;
     }
     CHECK(r1 == 0, "capture backend run 1 faulted");
-    int r2 = cap_run_once(&c, &h2, line2, sizeof(line2));
+    int r2 = cap_run_once(&c, &h2, line2, sizeof(line2), 0);
     CHECK(r2 == 0, "capture backend run 2 faulted");
     CHECK(strcmp(line1, line2) == 0, "capture stats nondeterministic:\n  %s\n  %s",
           line1, line2);
