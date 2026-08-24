@@ -432,6 +432,7 @@ static DXGI_FORMAT nrb_color_dxgi(const rsx_nr_d3d12* b, u32 fmt)
 {
     switch (fmt) {
     case 3: return DXGI_FORMAT_B5G6R5_UNORM;
+    case 13: return DXGI_FORMAT_R32_FLOAT;
     case 4:
     case 5:
     case 8: return b->rgba_targets ? DXGI_FORMAT_R8G8B8A8_UNORM
@@ -444,6 +445,7 @@ static int nrb_color_rtv_dxgi_ok(DXGI_FORMAT fmt)
 {
     switch (fmt) {
     case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_R32_FLOAT:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
         return 1;
@@ -615,7 +617,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE nrb_rt_handle(rsx_nr_d3d12* b,
 }
 
 /* Capture-observed pitch-linear color formats with an exact D3D12 RTV.
- * 3 = R5G6B5; 4/5 = X8R8G8B8; 8 = A8R8G8B8. */
+ * 3 = R5G6B5; 4/5 = X8R8G8B8; 8 = A8R8G8B8; 13 = F_X32. */
 static int nrb_color_format_ok(const rsx_nr_d3d12* b, u32 fmt)
 {
     return nrb_color_dxgi(b, fmt) != DXGI_FORMAT_UNKNOWN;
