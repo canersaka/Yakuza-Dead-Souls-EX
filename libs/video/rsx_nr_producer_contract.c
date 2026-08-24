@@ -404,6 +404,33 @@ int rsx_nr_fifo_visit_note(rsx_nr_fifo_visit_set* set, u32 pc, u32 ret)
     return -1;
 }
 
+int rsx_nr_fifo_visit_contains(
+    const rsx_nr_fifo_visit_set* set, u32 pc, u32 ret)
+{
+    if (!set || !set->generation)
+        return 0;
+    const u32 mask = RSX_NR_FIFO_VISIT_CAPACITY - 1u;
+    u32 index = ((pc >> 2) ^ (ret * 0x9E3779B9u)) & mask;
+    for (u32 probe = 0; probe < RSX_NR_FIFO_VISIT_CAPACITY; ++probe) {
+        if (set->stamp[index] != set->generation)
+            return 0;
+        if (set->pc[index] == pc && set->ret[index] == ret)
+            return 1;
+        index = (index + 1u) & mask;
+    }
+    return 0;
+}
+
+int rsx_nr_complete_section_family_allowed(
+    u32 enabled_families, u32 action_family, u32 section_draw_count)
+{
+    if (enabled_families & action_family)
+        return 1;
+    return action_family == RSX_NR_GRAPHICS_FAMILY_CLEAR &&
+        section_draw_count != 0u &&
+        (enabled_families & RSX_NR_GRAPHICS_FAMILY_DRAW) != 0u;
+}
+
 int rsx_nr_fifo_frame_boundary(u32 method, u32 arg)
 {
     return method == 0xE924u && arg == 0x8000010Fu;

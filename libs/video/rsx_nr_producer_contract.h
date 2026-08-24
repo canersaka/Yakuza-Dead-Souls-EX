@@ -205,6 +205,21 @@ typedef struct rsx_nr_fifo_visit_set {
 void rsx_nr_fifo_visit_reset(rsx_nr_fifo_visit_set* set);
 /* 1 = first visit, 0 = exact revisit, -1 = invalid/full. */
 int rsx_nr_fifo_visit_note(rsx_nr_fifo_visit_set* set, u32 pc, u32 ret);
+/* Exact membership in the current generation. This is deliberately read-only:
+ * a rejected scanner path can remain legacy while GET walks that path without
+ * clearing or rebuilding the visit table at every command. */
+int rsx_nr_fifo_visit_contains(
+    const rsx_nr_fifo_visit_set* set, u32 pc, u32 ret);
+
+/* Complete-section graphics-family contract. A clear may accompany the draw
+ * family only when the same already-decoded section contains a draw. This
+ * admits an indivisible clear+draw render pass without reviving independently
+ * mixed per-clear ownership. Clear-only sections still require the explicit
+ * clear family. */
+#define RSX_NR_GRAPHICS_FAMILY_DRAW  (1u << 0)
+#define RSX_NR_GRAPHICS_FAMILY_CLEAR (1u << 1)
+int rsx_nr_complete_section_family_allowed(
+    u32 enabled_families, u32 action_family, u32 section_draw_count);
 
 /* The imported flip contract is not complete at E944 (queue buffer).  Its
  * E924 head command is the first boundary after which a renderer may claim
