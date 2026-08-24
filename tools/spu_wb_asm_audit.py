@@ -75,7 +75,8 @@ _FLAGS_NOBIGOBJ = [f for f in D.CLFLAGS if f != "/bigobj"]
 def compile_for_audit(src, out_obj, extra):
     inc = ["/I", os.path.join(ROOT, "include"),
            "/I", os.path.join(ROOT, "runtime", "spu"),
-           "/I", WB, "/I", FAST]
+           "/I", WB, "/I", FAST,
+           "/I", os.path.join(ROOT, "yakuza", "generated", "wj")]
     cmd = [D.CL_EXE] + _FLAGS_NOBIGOBJ + extra + inc + \
         ["/c", src, f"/Fo{out_obj}"]
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
@@ -138,7 +139,7 @@ def audit_obj(obj, func_prefix):
                 cats["memory"] += n
             elif FLOAT_RE.match(tgt) or WRAPPED_WBK.match(tgt):
                 cats["float"] += n
-            elif tgt.startswith(("spu_region_", "spu_wb_", "spu_func_")):
+            elif tgt.startswith(("spu_region_", "spu_wb_", "spu_wj_", "spu_func_")):
                 cats["twin"] += n
             elif _INDIRECT_RE.match(tgt):
                 cats["dispatch-indirect"] += n
@@ -168,20 +169,27 @@ def summarize(audit):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stem", required=True)
+    ap.add_argument("--lane", choices=("wb", "wj"), default="wb")
     ap.add_argument("--no-fast", action="store_true")
     ap.add_argument("--json", default=None)
     ap.add_argument("--workdir", default=None)
     args = ap.parse_args()
     if not D.CL_EXE:
         raise SystemExit("cl not found; run from a vcvars64 shell")
-    wd = args.workdir or os.path.join(ROOT, "scratch", "wbaudit", args.stem)
+    lane_dir = WB if args.lane == "wb" else os.path.join(
+        ROOT, "yakuza", "generated", "wj")
+    lane_sfx = "_wb" if args.lane == "wb" else "_wj"
+    lane_pfx = "spu_wb_" if args.lane == "wb" else "spu_wj_"
+    wd = args.workdir or os.path.join(ROOT, "scratch",
+                                      "wbaudit" if args.lane == "wb" else "wjaudit",
+                                      args.stem)
     os.makedirs(wd, exist_ok=True)
 
     wb_obj = os.path.join(wd, "wb_audit.obj")
-    compile_for_audit(os.path.join(WB, f"{args.stem}_wb.c"), wb_obj,
+    compile_for_audit(os.path.join(lane_dir, f"{args.stem}{lane_sfx}.c"), wb_obj,
                       ["/arch:AVX2", "/DYZ_SPU_SIMD_LS128=1",
                        "/DYZ_SPU_SIMD_SHUFB=1"])
-    wb = audit_obj(wb_obj, "spu_wb_")
+    wb = audit_obj(wb_obj, lane_pfx)
     wb_sum = summarize(wb)
     report = {"stem": args.stem, "wb": wb_sum, "wb_funcs": wb}
     print(f"WB   {wb_sum['funcs']} fn(s): {wb_sum['insns']} insns, "
