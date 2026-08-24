@@ -37,14 +37,17 @@ typedef int (*rsx_nr_frame_island_edge_fn)(
 /* Fail-closed repair for one exact published JUMP whose target still starts
  * with non-command payload.  The hook may return a replacement cursor only
  * after proving the complete producer chain and atomically replacing the
- * source JUMP.  It is called at most once for an unchanged
- * source/command/target/word content generation. */
+ * source JUMP.  Return 1 for a proven repair, 0 for a definitive mismatch in
+ * this unchanged source/command/target/word generation, or -1 when an exact
+ * producer shape is present but its dependent bytes are still publishing.
+ * Pending results are reconsidered only after another bounded proof delay. */
 typedef int (*rsx_nr_frame_resolve_jump_fn)(
     void* user, u32 get, u32 put, u32 command, u32 target,
     u32 target_word, u32* resume_get);
 /* Equivalent fail-closed proof for a primary-ring cursor parked on an inline
- * generated-data gap. The hook may return only the first structurally proven
- * command prologue following that exact unchanged word. */
+ * generated-data gap, with the same 1/0/-1 result contract. The hook may
+ * return a cursor only for the first structurally proven command prologue
+ * following that exact unchanged word. */
 typedef int (*rsx_nr_frame_resolve_hole_fn)(
     void* user, u32 get, u32 put, u32 word, u32* resume_get);
 

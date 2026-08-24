@@ -6841,6 +6841,8 @@ extern "C" int yz_rsx_resolve_published_generated_link(
         *resume_get = exact_resume;
         return 1;
     }
+    if (local_boundary && (!local_prologue || !local_balanced))
+        return -1; /* exact EDGE block; producer has not finalized it yet */
 
     /* The older FE0-anchored search is specifically an a010 generated-chain
      * recovery.  Keep that broader proof scene-gated; only the exact block
@@ -6931,8 +6933,10 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
             *resume_get = block_exact;
             return 1;
         }
-        return 0;
+        return -1;
     }
+    if (block_boundary && (!block_prologue || !block_balanced))
+        return -1;
 
     /* The captured 0x1278 family is the eight-byte alignment tail after one
      * exact 17-argument SET_TRANSFORM_CONSTANT_LOAD packet.  Prove that local
@@ -6947,10 +6951,12 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     const uint32_t previous_command = previous_ea
         ? vm_read32(previous_ea) : 0u;
     const uint32_t tail_word = tail_ea ? vm_read32(tail_ea) : 0u;
+    const int local_prologue_ready =
+        yz_a010_generated_prologue_at(local_resume);
     const uint32_t exact_resume =
         yz_fifo_generated_vp_constant_tail_resume(
             previous_command, word, get, put, ring,
-            yz_a010_generated_prologue_at(local_resume));
+            local_prologue_ready);
     if (exact_resume) {
         MemoryBarrier();
         if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
@@ -6964,8 +6970,15 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
             *resume_get = exact_resume;
             return 1;
         }
-        return 0;
+        return -1;
     }
+    /* Recognize the exact packet/tail shape independently of the following
+     * prologue so an early proof cannot permanently latch out bytes which
+     * the generated-list producer publishes later without another PUT. */
+    if (!local_prologue_ready &&
+        yz_fifo_generated_vp_constant_tail_resume(
+            previous_command, word, get, put, ring, 1))
+        return -1;
 
     /* Only the older broad search depends on the a010 FE0 scene root.  The
      * two exact local producer-boundary proofs above are valid throughout the

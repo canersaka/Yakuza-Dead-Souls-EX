@@ -35,6 +35,36 @@
 #include "rsx_vertex_pull.h"
 #include "rsx_vp_decompiler.h"
 
+/* Offline-only device-removal oracle. It must be enabled before device
+ * creation, remains completely absent unless the narrow environment flag is
+ * set, and emits only after an actual failure. */
+static int g_nrb_dred_enabled;
+
+static void nrb_enable_device_oracle(void)
+{
+    if (!getenv("YZ_NR_D3D12_DRED"))
+        return;
+    ID3D12DeviceRemovedExtendedDataSettings* settings = NULL;
+    if (SUCCEEDED(D3D12GetDebugInterface(
+            &IID_ID3D12DeviceRemovedExtendedDataSettings,
+            (void**)&settings)) && settings) {
+        settings->lpVtbl->SetAutoBreadcrumbsEnablement(
+            settings, D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->lpVtbl->SetPageFaultEnablement(
+            settings, D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->lpVtbl->Release(settings);
+        g_nrb_dred_enabled = 1;
+    }
+    if (getenv("YZ_NR_D3D12_DEBUG")) {
+        ID3D12Debug* debug = NULL;
+        if (SUCCEEDED(D3D12GetDebugInterface(
+                &IID_ID3D12Debug, (void**)&debug)) && debug) {
+            debug->lpVtbl->EnableDebugLayer(debug);
+            debug->lpVtbl->Release(debug);
+        }
+    }
+}
+
 /* The union of the archived orphanage/Hana/Frontier/gun captures contains
  * 33 exact color-target identities (32 guest addresses).  Keep every native
  * target alive by identity: evicting an offscreen producer would discard GPU
@@ -217,6 +247,58 @@ struct rsx_nr_d3d12 {
     char pull_loads[8 * 1024];
 };
 
+static void nrb_dump_device_oracle(ID3D12Device* dev, const char* where,
+                                   HRESULT trigger)
+{
+    if (!g_nrb_dred_enabled || !dev)
+        return;
+    fprintf(stderr, "[nrb-dred] %s trigger=0x%08lX removed=0x%08lX\n",
+            where, (unsigned long)trigger,
+            (unsigned long)dev->lpVtbl->GetDeviceRemovedReason(dev));
+    ID3D12DeviceRemovedExtendedData1* dred = NULL;
+    HRESULT hr = dev->lpVtbl->QueryInterface(
+        dev, &IID_ID3D12DeviceRemovedExtendedData1, (void**)&dred);
+    if (FAILED(hr) || !dred) {
+        fprintf(stderr, "[nrb-dred] query=0x%08lX\n", (unsigned long)hr);
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {0};
+    hr = dred->lpVtbl->GetAutoBreadcrumbsOutput1(dred, &breadcrumbs);
+    fprintf(stderr, "[nrb-dred] breadcrumbs=0x%08lX\n",
+            (unsigned long)hr);
+    if (SUCCEEDED(hr)) {
+        const D3D12_AUTO_BREADCRUMB_NODE1* node =
+            breadcrumbs.pHeadAutoBreadcrumbNode;
+        for (u32 n = 0; node && n < 12u; ++n, node = node->pNext) {
+            const u32 last = node->pLastBreadcrumbValue
+                ? *node->pLastBreadcrumbValue : 0u;
+            fprintf(stderr,
+                    "[nrb-dred] node=%u count=%u last=%u list=%s queue=%s\n",
+                    n, node->BreadcrumbCount, last,
+                    node->pCommandListDebugNameA
+                        ? node->pCommandListDebugNameA : "<unnamed>",
+                    node->pCommandQueueDebugNameA
+                        ? node->pCommandQueueDebugNameA : "<unnamed>");
+            if (!node->pCommandHistory || !node->BreadcrumbCount)
+                continue;
+            const u32 begin = last > 6u ? last - 6u : 0u;
+            u32 end = last + 6u;
+            if (end >= node->BreadcrumbCount)
+                end = node->BreadcrumbCount - 1u;
+            for (u32 i = begin; i <= end; ++i)
+                fprintf(stderr, "[nrb-dred] op[%u]%s=%u\n", i,
+                        i == last ? "*" : "",
+                        (unsigned)node->pCommandHistory[i]);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 fault = {0};
+    hr = dred->lpVtbl->GetPageFaultAllocationOutput1(dred, &fault);
+    fprintf(stderr, "[nrb-dred] page-fault=0x%08lX va=0x%016llX\n",
+            (unsigned long)hr, (unsigned long long)fault.PageFaultVA);
+    dred->lpVtbl->Release(dred);
+    fflush(stderr);
+}
+
 /* ---- device plumbing --------------------------------------------------- */
 
 static int nrb_wait_idle(rsx_nr_d3d12* b)
@@ -224,13 +306,19 @@ static int nrb_wait_idle(rsx_nr_d3d12* b)
     const u64 v = ++b->fence_value;
     if (FAILED(b->queue->lpVtbl->Signal(b->queue, b->fence, v)))
         return -1;
-    if (b->fence->lpVtbl->GetCompletedValue(b->fence) < v) {
+    u64 completed = b->fence->lpVtbl->GetCompletedValue(b->fence);
+    /* D3D12 returns UINT64_MAX when the device was removed. It must never be
+     * mistaken for a fence value newer than the requested submission. */
+    if (completed == UINT64_MAX)
+        return -1;
+    if (completed < v) {
         if (FAILED(b->fence->lpVtbl->SetEventOnCompletion(
                 b->fence, v, b->fence_event)) ||
             WaitForSingleObject(b->fence_event, 60000) != WAIT_OBJECT_0)
             return -1;
     }
-    return b->fence->lpVtbl->GetCompletedValue(b->fence) >= v ? 0 : -1;
+    completed = b->fence->lpVtbl->GetCompletedValue(b->fence);
+    return completed != UINT64_MAX && completed >= v ? 0 : -1;
 }
 
 static void nrb_release_timeline_lease(rsx_nr_d3d12* b)
@@ -4578,6 +4666,7 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
 {
     if (!guest_ptr)
         return NULL;
+    nrb_enable_device_oracle();
     rsx_nr_d3d12* b = calloc(1, sizeof(*b));
     if (!b)
         return NULL;
@@ -4610,6 +4699,13 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     }
 
     D3D12_COMMAND_QUEUE_DESC qd = {0};
+    /* A complete archived gameplay frame intentionally executes thousands
+     * of software-rasterized shader invocations.  The private WARP oracle is
+     * deterministic work, not an interactive GPU queue; exempt only that
+     * owned test queue from the OS GPU timeout. Live hardware queues are
+     * supplied by the host and never receive this flag. */
+    if (!device)
+        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
     if (FAILED(b->dev->lpVtbl->CreateCommandQueue(
             b->dev, &qd, &IID_ID3D12CommandQueue, (void**)&b->queue)) ||
         FAILED(b->dev->lpVtbl->CreateCommandAllocator(
@@ -4984,9 +5080,16 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
 
     u8* mapped = NULL;
     D3D12_RANGE rr = {0, need};
-    if (FAILED(b->readback->lpVtbl->Map(b->readback, 0, &rr,
-                                        (void**)&mapped)))
+    const HRESULT map_result = b->readback->lpVtbl->Map(
+        b->readback, 0, &rr, (void**)&mapped);
+    if (FAILED(map_result)) {
+        fprintf(stderr,
+                "[nrb-readback] Map failed hr=0x%08lX removed=0x%08lX\n",
+                (unsigned long)map_result,
+                (unsigned long)b->dev->lpVtbl->GetDeviceRemovedReason(b->dev));
+        nrb_dump_device_oracle(b->dev, "readback Map", map_result);
         return -1;
+    }
     for (u32 y = 0; y < h; y++)
         memcpy(out + (size_t)y * w * 4, mapped + (size_t)y * row, w * 4);
     D3D12_RANGE nw = {0, 0};
