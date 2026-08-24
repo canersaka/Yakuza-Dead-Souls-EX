@@ -175,8 +175,10 @@ static void write_const_fp(float r, float g, float b, float a)
 
 static void write_tex_fp(void)
 {
-    /* TEX r0, TC0, unit 0; END.  The passthrough test VS emits TC0=(0,0),
-     * and the texture is deliberately solid so interpolation is irrelevant. */
+    /* TEX r0, TC0, unit 0; END.  The passthrough test VS emits an
+     * out-of-range TC0=(-1,-1), while ordinary texture tests use CLAMP and
+     * solid data.  This also lets the depth-border leg exercise the real
+     * D3D12 sampler instead of only inspecting a decoded descriptor. */
     u8* p = g_local + FP_OFFSET;
     put_fp_word(p + 0, (0x17u << 24) | (0xFu << 9) |
                          (0x4u << 13) | 1u);
@@ -284,6 +286,26 @@ static void stage_depth_texture0(rsx_nir_emitter* em)
     texture.height = RT_H;
     texture.pitch = RT_W * 4u;
     texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
+static void stage_depth_border_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = ZETA_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xB0u;          /* LINEAR | DEPTH24_D8               */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = RT_W;
+    texture.height = RT_H;
+    texture.pitch = RT_W * 4u;
+    texture.wrap = 0x00040404u;      /* BORDER on every coordinate        */
+    texture.border_color = 0xFFFFFFFFu;
     texture.remap = 0xAAE4u;
     texture.filter = (1u << 16) | (1u << 24);
     rsx_nir_em_texture(em, 0, &texture);
@@ -1959,6 +1981,28 @@ int main(int argc, char** argv)
     CHECK(pix_is(2, 61, 0x40, 0x40, 0x40),
           "zeta sample pixel %02X %02X %02X",
           pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+
+    /* ---- depth BORDER parity with the established renderer -----------
+     * Yakuza's shadow textures request BORDER and write opaque white into
+     * the guest border register.  Legacy leaves the D3D depth-sampler border
+     * at zero.  The offline passthrough VS supplies TC0=(-1,-1), proving the
+     * native GPU path observes the same zero border instead of white. */
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_depth_border_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0, 0xFF0000FFu, 0, 0);
+    write_triangle(rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+                   -1.0f, 1.0f);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "zeta border sample exec errors %llu", be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0x00, 0x00),
+          "zeta border sample was not legacy-zero %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     write_test_fp();
 
     /* ---- scissored clear ------------------------------------------------
@@ -2202,7 +2246,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 22 && st.draws == 537 && st.presents == 20,
+    CHECK(st.clears == 23 && st.draws == 538 && st.presents == 21,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -2221,14 +2265,14 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 7 && st.texture_builds == 2 &&
+    CHECK(st.texture_draws == 8 && st.texture_builds == 2 &&
               st.texture_refreshes == 2 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
     CHECK(st.rt_alias_binds >= 1, "R5G6B5 alias not counted");
-    CHECK(g_present_handoffs == 20,
-          "native scanout handoffs=%u expected=20", g_present_handoffs);
+    CHECK(g_present_handoffs == 21,
+          "native scanout handoffs=%u expected=21", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
