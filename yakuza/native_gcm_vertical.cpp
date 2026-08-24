@@ -375,6 +375,10 @@ struct yz_nr_vertical_active_state {
     uint32_t section_scan_put;
     uint32_t section_scan_ret;
     uint32_t section_scan_word;
+    uint32_t section_legacy_path_active;
+    uint32_t section_legacy_path_reason;
+    unsigned long long section_legacy_path_skips;
+    unsigned long long section_legacy_path_exits;
     uint32_t section_blocked_sem_get;
     uint32_t section_blocked_sem_dma;
     uint32_t section_blocked_sem_offset;
@@ -2467,6 +2471,19 @@ static yz_nr_vertical_section_result yz_nr_section_fallback(uint32_t reason)
     return YZ_NR_VERTICAL_SECTION_FALLBACK;
 }
 
+static yz_nr_vertical_section_result yz_nr_section_path_fallback(
+    uint32_t reason)
+{
+    /* FLOW and CAPACITY refusals have no proven transactional endpoint. Keep
+     * every exact (PC,return) node already visited by this scan wholly legacy.
+     * This is one-way safe: a patched word may make legacy leave the cached
+     * path, but stale membership can never cause native execution. */
+    g_active.section_legacy_path_active = 1;
+    g_active.section_legacy_path_reason = reason;
+    g_active.section_scan_cacheable = 0;
+    return yz_nr_section_fallback(reason);
+}
+
 static yz_nr_vertical_section_result yz_nr_section_defer_fallback(
     uint32_t reason, uint32_t until_get, uint32_t budget)
 {
@@ -2860,6 +2877,13 @@ static uint32_t yz_nr_section_preflight(void)
     g_active.section_transfers = 0;
     g_active.section_presents = 0;
     g_active.section_preflight_sem_valid = 0;
+    /* The whole op stream is already fixed and side-effect-free. Count draws
+     * before family admission so a leading clear can be recognized as part of
+     * the same indivisible render pass. */
+    uint32_t section_draw_count = 0;
+    for (uint32_t i = 0; i < g_active.section_stream.op_count; ++i)
+        if (g_active.section_stream.ops[i].kind == RSX_NIR_OP_DRAW)
+            section_draw_count++;
     for (uint32_t i = 0; i < g_active.section_stream.op_count; ++i) {
         const rsx_nir_op* const op = &g_active.section_stream.ops[i];
         if (!rsx_nir_op_is_action(op->kind)) {
@@ -2885,7 +2909,10 @@ static uint32_t yz_nr_section_preflight(void)
             g_active.section_gpu_actions++;
         switch (op->kind) {
         case RSX_NIR_OP_CLEAR:
-            if (!(g_active.graphics_families & YZ_NR_GRAPHICS_CLEAR))
+            if (!rsx_nr_complete_section_family_allowed(
+                    g_active.graphics_families,
+                    RSX_NR_GRAPHICS_FAMILY_CLEAR,
+                    section_draw_count))
                 return YZ_NR_SECTION_FB_PREFLIGHT_CLEAR;
             if (g_active.clear_scope != YZ_NR_CLEAR_ALL) {
                 const bool color = (op->u.clear.mask & 0xF0u) != 0;
@@ -3252,6 +3279,17 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
         }
     }
 
+    if (g_active.section_legacy_path_active) {
+        if (rsx_nr_fifo_visit_contains(
+                &g_active.section_visits, get, fifo_ret)) {
+            g_active.section_fallback_fast_skips++;
+            g_active.section_legacy_path_skips++;
+            return YZ_NR_VERTICAL_SECTION_FALLBACK;
+        }
+        g_active.section_legacy_path_active = 0;
+        g_active.section_legacy_path_exits++;
+    }
+
     if (g_active.section_repeat_valid) {
         const uint32_t repeat_ea = yz_nr_vertical_io_to_ea(get);
         if (get == g_active.section_repeat_get &&
@@ -3299,7 +3337,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
              * in the middle of the loop. The explicit self-stopper case below
              * remains the only cyclic boundary eligible for native ownership.
              * Hash-table exhaustion is likewise a bounded refusal. */
-            return yz_nr_section_fallback(
+            return yz_nr_section_path_fallback(
                 visit == 0 ? YZ_NR_SECTION_FB_FLOW
                            : YZ_NR_SECTION_FB_CAPACITY);
         }
@@ -3335,21 +3373,21 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
                 return yz_nr_section_commit(
                     pc, ret, next_get, next_ret);
             if (target == pc || !yz_nr_vertical_io_to_ea(target))
-                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+                return yz_nr_section_path_fallback(YZ_NR_SECTION_FB_FLOW);
             pc = target;
             continue;
         }
         if ((command & 3u) == 2u) {
             const uint32_t target = command & 0x1FFFFFFCu;
             if (ret != ~0u || !yz_nr_vertical_io_to_ea(target))
-                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+                return yz_nr_section_path_fallback(YZ_NR_SECTION_FB_FLOW);
             ret = pc < ring ? ((pc + 4u) & mask) : pc + 4u;
             pc = target;
             continue;
         }
         if ((command & 0xFFFF0003u) == 0x00020000u) {
             if (ret == ~0u)
-                return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+                return yz_nr_section_path_fallback(YZ_NR_SECTION_FB_FLOW);
             pc = ret;
             ret = ~0u;
             continue;
@@ -3361,7 +3399,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
         const uint32_t non_incrementing = command & 0x40000000u;
         const uint32_t method = command & 0x3FFFCu;
         if (!count)
-            return yz_nr_section_fallback(YZ_NR_SECTION_FB_FLOW);
+            return yz_nr_section_path_fallback(YZ_NR_SECTION_FB_FLOW);
         const uint32_t packet_size = 4u + count * 4u;
         const rsx_nr_fifo_range_status packet_status =
             rsx_nr_fifo_section_range_status(
@@ -3413,7 +3451,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
             }
             if (g_active.section_method_count >=
                 YZ_NR_SECTION_METHOD_CAPACITY)
-                return yz_nr_section_fallback(
+                return yz_nr_section_path_fallback(
                     YZ_NR_SECTION_FB_CAPACITY);
             const uint32_t actions_before =
                 g_active.section_adapter->actions_seen;
@@ -3433,7 +3471,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
                 g_active.section_stream.oom ||
                 g_active.section_adapter->batch_overflow ||
                 g_active.section_adapter->inline_overflow)
-                return yz_nr_section_fallback(
+                return yz_nr_section_path_fallback(
                     YZ_NR_SECTION_FB_CAPACITY);
         }
         pc = ret == ~0u ? ((pc + packet_size) & mask)
@@ -3463,7 +3501,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
             return yz_nr_section_commit(
                 pc, ret, next_get, next_ret);
     }
-    return yz_nr_section_fallback(YZ_NR_SECTION_FB_CAPACITY);
+    return yz_nr_section_path_fallback(YZ_NR_SECTION_FB_CAPACITY);
 }
 
 extern "C" yz_nr_vertical_consume_result
@@ -3711,6 +3749,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-vertical-sections attempts=%llu owned=%llu "
                     "render-passes=%llu dependency-islands=%llu "
                     "methods=%llu ops=%llu exec-errors=%llu fast-skip=%llu "
+                    "legacy-path=%u:%u/%llu/%llu "
                     "fallback="
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
@@ -3721,6 +3760,10 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     g_active.section_ops_owned,
                     g_active.section_exec_errors,
                     g_active.section_fallback_fast_skips,
+                    g_active.section_legacy_path_active,
+                    g_active.section_legacy_path_reason,
+                    g_active.section_legacy_path_skips,
+                    g_active.section_legacy_path_exits,
                     g_active.section_fallback[0],
                     g_active.section_fallback[1],
                     g_active.section_fallback[2],

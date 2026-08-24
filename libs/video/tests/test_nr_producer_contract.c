@@ -313,6 +313,48 @@ int main(void)
                   &visits, 0x1000u, 0xFFFFFFFFu) == 1);
     }
 
+    /* A rejected flow/capacity path is a conservative legacy-only cache.
+     * A million retries through its exact nodes require no reinsertion or
+     * scanner reset; leaving the path is detected exactly. */
+    {
+        static rsx_nr_fifo_visit_set rejected;
+        const u32 pc[4] = {0x2000u, 0x2100u, 0x2200u, 0x2300u};
+        const u32 ret[4] = {
+            0xFFFFFFFFu, 0x3000u, 0x3000u, 0xFFFFFFFFu
+        };
+        rsx_nr_fifo_visit_reset(&rejected);
+        for (u32 i = 0; i < 4u; ++i)
+            CHECK(rsx_nr_fifo_visit_note(&rejected, pc[i], ret[i]) == 1);
+        for (u32 i = 0; i < 1000000u; ++i)
+            CHECK(rsx_nr_fifo_visit_contains(
+                      &rejected, pc[i & 3u], ret[i & 3u]));
+        CHECK(!rsx_nr_fifo_visit_contains(
+                  &rejected, 0x2400u, 0xFFFFFFFFu));
+        CHECK(!rsx_nr_fifo_visit_contains(
+                  &rejected, 0x2000u, 0x3000u));
+        rsx_nr_fifo_visit_reset(&rejected);
+        CHECK(!rsx_nr_fifo_visit_contains(
+                  &rejected, 0x2000u, 0xFFFFFFFFu));
+    }
+
+    /* Draw-only mode can own a complete clear+draw render pass, but never a
+     * standalone clear. Explicit clear-only and ordinary draw admission keep
+     * their direct family behavior. */
+    CHECK(rsx_nr_complete_section_family_allowed(
+              RSX_NR_GRAPHICS_FAMILY_DRAW,
+              RSX_NR_GRAPHICS_FAMILY_CLEAR, 1u));
+    CHECK(!rsx_nr_complete_section_family_allowed(
+              RSX_NR_GRAPHICS_FAMILY_DRAW,
+              RSX_NR_GRAPHICS_FAMILY_CLEAR, 0u));
+    CHECK(rsx_nr_complete_section_family_allowed(
+              RSX_NR_GRAPHICS_FAMILY_CLEAR,
+              RSX_NR_GRAPHICS_FAMILY_CLEAR, 0u));
+    CHECK(rsx_nr_complete_section_family_allowed(
+              RSX_NR_GRAPHICS_FAMILY_DRAW,
+              RSX_NR_GRAPHICS_FAMILY_DRAW, 0u));
+    CHECK(!rsx_nr_complete_section_family_allowed(
+              0u, RSX_NR_GRAPHICS_FAMILY_DRAW, 1u));
+
     /* Per-action ownership is forbidden: only the complete queue/head flip
      * pair closes a transactional native frame. */
     CHECK(!rsx_nr_fifo_frame_boundary(0x1808u, 0u));
