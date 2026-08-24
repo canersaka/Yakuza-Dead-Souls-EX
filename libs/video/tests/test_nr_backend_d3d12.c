@@ -54,7 +54,7 @@ static int g_render_condition_fail;
         }                                                                    \
     } while (0)
 
-#define LOCAL_SIZE (1u << 20)
+#define LOCAL_SIZE (4u << 20) /* includes the live-style 0x00320000 zeta */
 #define MAIN_SIZE  (1u << 16)
 #define RT_OFFSET  0x00300000u   /* outside the arena on purpose: the RT  */
 #define RT565_OFFSET 0x00310000u
@@ -753,6 +753,8 @@ typedef struct broker_color_test {
     ID3D12Resource* depth;
     u32 calls;
     u32 depth_calls;
+    u32 depth_resolve_calls;
+    int depth_resolve_fail;
 } broker_color_test;
 
 static int borrow_rgba_for_logical_565(
@@ -773,22 +775,38 @@ static int borrow_rgba_for_logical_565(
 static int borrow_depth_for_alias_test(
     void* user, u32 space, u32 offset, u32 depth_format,
     u32 width, u32 height, void** resource, u32* resource_format,
-    u32* dsv_format, u32* srv_format, int* publication_required)
+    u32* dsv_format, u32* srv_format, void** sample_resource,
+    u32* sample_srv_format, int* publication_required)
 {
     broker_color_test* broker = (broker_color_test*)user;
     if (!broker || !broker->depth || !resource || !resource_format ||
-        !dsv_format || !srv_format || !publication_required || space ||
+        !dsv_format || !srv_format || !sample_resource ||
+        !sample_srv_format || !publication_required || space ||
         offset != ZETA_OFFSET || depth_format != 2u ||
         width != RT_W || height != RT_H)
         return -1;
     broker->depth->lpVtbl->AddRef(broker->depth);
+    broker->depth->lpVtbl->AddRef(broker->depth);
     *resource = broker->depth;
+    *sample_resource = broker->depth;
     *resource_format = (u32)DXGI_FORMAT_R32G8X24_TYPELESS;
     *dsv_format = (u32)DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     *srv_format = (u32)DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    *sample_srv_format = (u32)DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     *publication_required = 0;
     broker->depth_calls++;
     return 0;
+}
+
+static int resolve_depth_for_alias_test(
+    void* user, u32 space, u32 offset, u32 width, u32 height)
+{
+    broker_color_test* broker = (broker_color_test*)user;
+    if (!broker || space || offset != ZETA_OFFSET ||
+        width != RT_W || height != RT_H)
+        return -1;
+    broker->depth_resolve_calls++;
+    return broker->depth_resolve_fail ? -1 : 0;
 }
 
 /* The live surface broker canonicalizes logical Cell GCM color format 3 to
@@ -860,10 +878,12 @@ static void test_broker_actual_color_format(void)
     if (!sink)
         goto done;
 
-    broker_color_test broker = { resource, depth_resource, 0u, 0u };
+    broker_color_test broker = {
+        resource, depth_resource, 0u, 0u, 0u, 0
+    };
     rsx_nr_d3d12_set_resource_broker(
         sink, borrow_rgba_for_logical_565, borrow_depth_for_alias_test,
-        &broker);
+        resolve_depth_for_alias_test, &broker);
     const int ring_result = rsx_nr_ring_init(&ring, 128u, 4096u);
     CHECK(ring_result == 0,
           "broker-format ring init failed");
@@ -945,11 +965,53 @@ static void test_broker_actual_color_format(void)
     CHECK(be.stats.exec_errors == 0u,
           "borrowed zeta sample had %llu execution errors",
           be.stats.exec_errors);
+    CHECK(broker.depth_resolve_calls >= 1u,
+          "borrowed zeta bypassed the resolved-sample contract");
     CHECK(rsx_nr_d3d12_read_rt(
               sink, 0u, RT565_OFFSET, RT_W, RT_H, g_pix) == 0,
           "borrowed zeta target readback failed");
     CHECK(pix_is(2u, 61u, 0x40u, 0x40u, 0x40u),
           "borrowed zeta sample pixel %02X %02X %02X",
+          pix(2u, 61u)[0], pix(2u, 61u)[1], pix(2u, 61u)[2]);
+
+    /* A clear-only/no-write live zeta has no resolved snapshot. Preflight
+     * already proved guest depth decoding, so resolver refusal must stay a
+     * successful native draw and bind that deterministic legacy fallback. */
+    for (u32 y = 0; y < RT_H; ++y) {
+        u8* const row = g_local + ZETA_OFFSET + y * RT_W * 4u;
+        for (u32 x = 0; x < RT_W; ++x) {
+            row[x * 4u + 0u] = 0xBFu;
+            row[x * 4u + 1u] = 0xFFu;
+            row[x * 4u + 2u] = 0xFFu;
+            row[x * 4u + 3u] = 0u;
+        }
+    }
+    rsx_guest_pages_note_write(
+        rsx_nr_d3d12_pages(sink), 0u, ZETA_OFFSET,
+        RT_W * RT_H * 4u);
+    broker.depth_resolve_fail = 1;
+    write_tex_fp();
+    stage_frame_state(&em);
+    rsx_nir_em_surface(&em, &s565);
+    stage_depth_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF0000FFu, 0u, 0u);
+    write_triangle(rsx_nr_d3d12_pages(sink),
+                   -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "borrowed zeta guest fallback had %llu execution errors",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, 0u, RT565_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "borrowed zeta fallback target readback failed");
+    CHECK(pix(2u, 61u)[0] >= 0xBEu && pix(2u, 61u)[0] <= 0xC0u &&
+              pix(2u, 61u)[1] == pix(2u, 61u)[0] &&
+              pix(2u, 61u)[2] == pix(2u, 61u)[0],
+          "borrowed zeta fallback pixel %02X %02X %02X",
           pix(2u, 61u)[0], pix(2u, 61u)[1], pix(2u, 61u)[2]);
     {
         const u32 native_vp[4] = {

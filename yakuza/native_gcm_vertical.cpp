@@ -702,11 +702,14 @@ static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
                                uint32_t height, void** resource,
                                uint32_t* resource_format,
                                uint32_t* dsv_format, uint32_t* srv_format,
+                               void** sample_resource,
+                               uint32_t* sample_srv_format,
                                int* publication_required)
 {
     const int result = rsx_live_draw_borrow_depth(
         space, offset, depth_format, width, height, resource,
-        resource_format, dsv_format, srv_format, publication_required);
+        resource_format, dsv_format, srv_format, sample_resource,
+        sample_srv_format, publication_required);
     if (!result && *publication_required &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0)) {
         /* zdepth_get may have created this borrowed resource and recorded its
@@ -722,6 +725,13 @@ static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
         rsx_live_draw_flush();
     }
     return result;
+}
+
+static int yz_nr_resolve_depth_sample(void*, uint32_t space, uint32_t offset,
+                                      uint32_t width, uint32_t height)
+{
+    return rsx_live_draw_resolve_depth_sample(
+        space, offset, width, height);
 }
 
 static int yz_nr_render_condition_read(void*, uint32_t dma,
@@ -751,7 +761,8 @@ static void yz_nr_active_ensure_graphics(void)
     }
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
     rsx_nr_d3d12_set_resource_broker(
-        d3d12, yz_nr_borrow_color, yz_nr_borrow_depth, nullptr);
+        d3d12, yz_nr_borrow_color, yz_nr_borrow_depth,
+        yz_nr_resolve_depth_sample, nullptr);
     rsx_nr_d3d12_set_publish_write(
         d3d12, yz_nr_d3d_publish_write, nullptr);
     rsx_nr_d3d12_set_render_condition_reader(

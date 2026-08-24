@@ -82,9 +82,10 @@ typedef struct nrb_rt {
 
 typedef struct nrb_depth {
     ID3D12Resource* tex;
+    ID3D12Resource* sample_tex;
     u32 space, offset, w, h, fmt;
     u32 dsv_slot;
-    DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi;
+    DXGI_FORMAT resource_dxgi, dsv_dxgi, srv_dxgi, sample_srv_dxgi;
     D3D12_RESOURCE_STATES state;
     int live;
     int external;
@@ -157,6 +158,7 @@ struct rsx_nr_d3d12 {
     void* watch_page_user;
     rsx_nr_d3d12_borrow_color_fn borrow_color;
     rsx_nr_d3d12_borrow_depth_fn borrow_depth;
+    rsx_nr_d3d12_resolve_depth_sample_fn resolve_depth_sample;
     void* broker_user;
     rsx_nr_d3d12_publish_write_fn publish_write;
     void* publish_write_user;
@@ -618,21 +620,34 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
         return NULL;
 
     ID3D12Resource* borrowed = NULL;
+    ID3D12Resource* borrowed_sample = NULL;
+    DXGI_FORMAT sample_srv_dxgi = DXGI_FORMAT_UNKNOWN;
     if (create && b->borrow_depth) {
-        u32 rf = 0, df = 0, sf = 0;
+        u32 rf = 0, df = 0, sf = 0, ssf = 0;
         int publication_required = 0;
         if (b->borrow_depth(
                 b->broker_user, space, offset, fmt, w, h,
                 (void**)&borrowed, &rf, &df, &sf,
+                (void**)&borrowed_sample, &ssf,
                 &publication_required) != 0 || !borrowed) {
             if (borrowed)
                 borrowed->lpVtbl->Release(borrowed);
+            if (borrowed_sample)
+                borrowed_sample->lpVtbl->Release(borrowed_sample);
             return NULL;
         }
         (void)publication_required; /* live wrapper completes this handoff */
         resource_dxgi = (DXGI_FORMAT)rf;
         dsv_dxgi = (DXGI_FORMAT)df;
         srv_dxgi = (DXGI_FORMAT)sf;
+        sample_srv_dxgi = (DXGI_FORMAT)ssf;
+        if (borrowed_sample &&
+            sample_srv_dxgi != DXGI_FORMAT_R32_FLOAT &&
+            sample_srv_dxgi != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) {
+            borrowed->lpVtbl->Release(borrowed);
+            borrowed_sample->lpVtbl->Release(borrowed_sample);
+            return NULL;
+        }
     }
 
     for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
@@ -640,20 +655,35 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
         if (depth->live && depth->space == space && depth->offset == offset &&
             depth->fmt == fmt && depth->w == w && depth->h == h) {
             if (borrowed) {
-                if (borrowed == depth->tex) {
-                    borrowed->lpVtbl->Release(borrowed);
-                } else {
+                const int raw_changed = borrowed != depth->tex;
+                const int sample_changed = borrowed_sample != depth->sample_tex;
+                if (raw_changed || sample_changed) {
                     if (nrb_exec_wait(b)) {
                         borrowed->lpVtbl->Release(borrowed);
+                        if (borrowed_sample)
+                            borrowed_sample->lpVtbl->Release(borrowed_sample);
                         return NULL;
                     }
-                    if (depth->tex)
-                        depth->tex->lpVtbl->Release(depth->tex);
+                }
+                if (raw_changed) {
+                    if (depth->tex) depth->tex->lpVtbl->Release(depth->tex);
                     depth->tex = borrowed;
+                } else {
+                    borrowed->lpVtbl->Release(borrowed);
+                }
+                if (sample_changed) {
+                    if (depth->sample_tex)
+                        depth->sample_tex->lpVtbl->Release(depth->sample_tex);
+                    depth->sample_tex = borrowed_sample;
+                } else if (borrowed_sample) {
+                    borrowed_sample->lpVtbl->Release(borrowed_sample);
+                }
+                if (raw_changed || sample_changed) {
                     depth->external = 1;
                     depth->resource_dxgi = resource_dxgi;
                     depth->dsv_dxgi = dsv_dxgi;
                     depth->srv_dxgi = srv_dxgi;
+                    depth->sample_srv_dxgi = sample_srv_dxgi;
                     depth->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
                     D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
                     dsv.Format = dsv_dxgi;
@@ -673,6 +703,8 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     if (!create) {
         if (borrowed)
             borrowed->lpVtbl->Release(borrowed);
+        if (borrowed_sample)
+            borrowed_sample->lpVtbl->Release(borrowed_sample);
         return NULL;
     }
     nrb_depth* depth = NULL;
@@ -685,11 +717,14 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     if (!depth || b->dsv_used >= 64u) {
         if (borrowed)
             borrowed->lpVtbl->Release(borrowed);
+        if (borrowed_sample)
+            borrowed_sample->lpVtbl->Release(borrowed_sample);
         return NULL;
     }
 
     if (borrowed) {
         depth->tex = borrowed;
+        depth->sample_tex = borrowed_sample;
         depth->external = 1;
     } else {
         D3D12_HEAP_PROPERTIES heap = {0};
@@ -721,6 +756,7 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     depth->resource_dxgi = resource_dxgi;
     depth->dsv_dxgi = dsv_dxgi;
     depth->srv_dxgi = srv_dxgi;
+    depth->sample_srv_dxgi = sample_srv_dxgi;
     depth->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     depth->dsv_slot = b->dsv_used++;
     depth->live = 1;
@@ -1934,6 +1970,7 @@ static nrb_depth* nrb_texture_depth_alias(
     rsx_nr_d3d12* b, const rsx_nir_texture* texture,
     const nrb_depth* draw_depth, u32 unit)
 {
+    (void)unit;
     const u32 format = texture->format & NRB_TEX_BASE_MASK &
                        ~NRB_TEX_UNNORM;
     if (format != NRB_TEX_DEPTH24_D8 || texture->cubemap ||
@@ -1947,22 +1984,28 @@ static nrb_depth* nrb_texture_depth_alias(
             continue;
         if (depth == draw_depth)
             return depth;           /* active DSV/SRV alias: refuse       */
-        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
-        desc.Format = depth->srv_dxgi;
-        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        desc.Shader4ComponentMapping =
-            D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
-                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
-                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
-                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
-                D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
-        desc.Texture2D.MipLevels = 1;
-        b->dev->lpVtbl->CreateShaderResourceView(
-            b->dev, depth->tex, &desc,
-            nrb_texture_cpu_handle(b, NRB_TEX_CAP + 1u + unit));
         return depth;
     }
     return NULL;
+}
+
+static void nrb_write_depth_sample_srv(rsx_nr_d3d12* b,
+                                       ID3D12Resource* resource,
+                                       DXGI_FORMAT format, u32 unit)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping =
+        D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+    desc.Texture2D.MipLevels = 1;
+    b->dev->lpVtbl->CreateShaderResourceView(
+        b->dev, resource, &desc,
+        nrb_texture_cpu_handle(b, NRB_TEX_CAP + 1u + unit));
 }
 
 static int nrb_prepare_textures(rsx_nr_d3d12* b,
@@ -1988,6 +2031,7 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
     for (u32 unit = 0; unit < NRB_TEX_UNITS; unit++) {
         const rsx_nir_texture* texture = &st->textures[unit];
         u32 source_slot = null_slot;
+        u64 alias_resource = 0;
         aliases[unit] = NULL;
         depth_aliases[unit] = NULL;
         if (texture_mask & (1u << unit)) {
@@ -2004,23 +2048,46 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 source_slot = NRB_TEX_CAP + 1u + unit;
+                alias_resource = (u64)(uintptr_t)aliases[unit]->tex;
                 b->stats.rt_alias_binds++;
             } else {
-                depth_aliases[unit] = nrb_texture_depth_alias(
+                nrb_depth* const depth_alias = nrb_texture_depth_alias(
                     b, texture, draw_depth, unit);
-                if (depth_aliases[unit] &&
-                    depth_aliases[unit] == draw_depth)
+                if (depth_alias && depth_alias == draw_depth)
                     return -1;
+                if (depth_alias && !depth_alias->external) {
+                    nrb_write_depth_sample_srv(
+                        b, depth_alias->tex, depth_alias->srv_dxgi, unit);
+                    nrb_depth_transition(
+                        b, depth_alias,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    depth_aliases[unit] = depth_alias;
+                    source_slot = NRB_TEX_CAP + 1u + unit;
+                    alias_resource = (u64)(uintptr_t)depth_alias->tex;
+                    b->stats.rt_alias_binds++;
+                } else if (depth_alias && depth_alias->sample_tex &&
+                           b->resolve_depth_sample &&
+                           b->resolve_depth_sample(
+                               b->broker_user, depth_alias->space,
+                               depth_alias->offset, texture->width,
+                               texture->height) == 0) {
+                    /* Live D32S8 is not the guest's sampled depth image. The
+                     * established renderer resolves it to R32_FLOAT first;
+                     * bind that exact snapshot and leave the source DSV in
+                     * DEPTH_WRITE state. */
+                    nrb_write_depth_sample_srv(
+                        b, depth_alias->sample_tex,
+                        depth_alias->sample_srv_dxgi, unit);
+                    source_slot = NRB_TEX_CAP + 1u + unit;
+                    alias_resource =
+                        (u64)(uintptr_t)depth_alias->sample_tex;
+                    b->stats.rt_alias_binds++;
+                }
             }
-            if (depth_aliases[unit]) {
-                nrb_depth_transition(
-                    b, depth_aliases[unit],
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                source_slot = NRB_TEX_CAP + 1u + unit;
-                b->stats.rt_alias_binds++;
-            } else if (!aliases[unit] && nrb_resolve_guest_texture(
-                           b, texture, &source_slot) != 0) {
+            if (source_slot == null_slot && !aliases[unit] &&
+                !depth_aliases[unit] && !alias_resource &&
+                nrb_resolve_guest_texture(b, texture, &source_slot) != 0) {
                 return -1;
             }
         }
@@ -2028,11 +2095,8 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
         samplers[unit] = nrb_sampler(texture);
         table_key.sampler[unit] = samplers[unit];
         table_key.view[unit] = nrb_texture_key(texture);
-        if (aliases[unit])
-            table_key.resource[unit] = (u64)(uintptr_t)aliases[unit]->tex;
-        else if (depth_aliases[unit])
-            table_key.resource[unit] =
-                (u64)(uintptr_t)depth_aliases[unit]->tex;
+        if (alias_resource)
+            table_key.resource[unit] = alias_resource;
         else if (source_slot < b->textures.cap &&
                  b->textures.slots[source_slot].live)
             table_key.resource[unit] =
@@ -2918,6 +2982,24 @@ static u32 nrb_expand_primitives(rsx_nr_d3d12* b,
     return out_count;
 }
 
+static int nrb_guest_texture_preflight(rsx_nr_d3d12* b,
+                                       const rsx_nir_texture* texture)
+{
+    const u32 span = nrb_texture_span(texture);
+    if (!span || !b->guest_ptr(
+            b->guest_user, texture->location, texture->offset, span))
+        return -1;
+    const u32 format = texture->format & NRB_TEX_BASE_MASK &
+                       ~NRB_TEX_UNNORM;
+    const int linear = (texture->format & NRB_TEX_LINEAR) != 0;
+    if (!linear && ((texture->width & (texture->width - 1u)) ||
+                    (texture->height & (texture->height - 1u))))
+        return -1;
+    if (format == NRB_TEX_DEPTH24_D8 && texture->cubemap)
+        return -1;
+    return 0;
+}
+
 static int nrb_texture_preflight(rsx_nr_d3d12* b,
                                  const rsx_nir_texture* texture,
                                  nrb_rt* draw_rt, nrb_depth* draw_depth,
@@ -2933,22 +3015,19 @@ static int nrb_texture_preflight(rsx_nr_d3d12* b,
         return rt_alias == draw_rt ? -1 : 0;
     nrb_depth* depth_alias = nrb_texture_depth_alias(
         b, texture, draw_depth, unit);
-    if (depth_alias)
-        return depth_alias == draw_depth ? -1 : 0;
-
-    const u32 span = nrb_texture_span(texture);
-    if (!span || !b->guest_ptr(
-            b->guest_user, texture->location, texture->offset, span))
-        return -1;
-    const u32 format = texture->format & NRB_TEX_BASE_MASK &
-                       ~NRB_TEX_UNNORM;
-    const int linear = (texture->format & NRB_TEX_LINEAR) != 0;
-    if (!linear && ((texture->width & (texture->width - 1u)) ||
-                    (texture->height & (texture->height - 1u))))
-        return -1;
-    if (format == NRB_TEX_DEPTH24_D8 && texture->cubemap)
-        return -1;
-    return 0;
+    if (depth_alias) {
+        if (depth_alias == draw_depth)
+            return -1;
+        if (!depth_alias->external)
+            return 0;
+        /* The live D32S8 resource is not sample-equivalent. Require the
+         * established R32 snapshot plus a same-list resolver, and also prove
+         * the guest fallback up front so a clear-only/no-write zeta remains a
+         * wholly supported atomic section. */
+        if (!depth_alias->sample_tex || !b->resolve_depth_sample)
+            return -1;
+    }
+    return nrb_guest_texture_preflight(b, texture);
 }
 
 static int nrb_vertex_texture_preflight(
@@ -3918,12 +3997,15 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
 
 void rsx_nr_d3d12_set_resource_broker(
     rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
-    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user)
+    rsx_nr_d3d12_borrow_depth_fn depth,
+    rsx_nr_d3d12_resolve_depth_sample_fn resolve_depth_sample,
+    void* broker_user)
 {
     if (!b || b->rtv_used || b->dsv_used)
         return;
     b->borrow_color = color;
     b->borrow_depth = depth;
+    b->resolve_depth_sample = resolve_depth_sample;
     b->broker_user = broker_user;
 }
 
@@ -4303,6 +4385,9 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     for (u32 i = 0; i < NRB_MAX_DEPTHS; i++) {
         if (b->depths[i].tex)
             b->depths[i].tex->lpVtbl->Release(b->depths[i].tex);
+        if (b->depths[i].sample_tex)
+            b->depths[i].sample_tex->lpVtbl->Release(
+                b->depths[i].sample_tex);
     }
     if (b->mirror)
         rsx_gpu_mirror_destroy(b->mirror);
@@ -4471,9 +4556,12 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
 }
 void rsx_nr_d3d12_set_resource_broker(
     rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
-    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user)
+    rsx_nr_d3d12_borrow_depth_fn depth,
+    rsx_nr_d3d12_resolve_depth_sample_fn resolve_depth_sample,
+    void* broker_user)
 {
-    (void)b; (void)color; (void)depth; (void)broker_user;
+    (void)b; (void)color; (void)depth; (void)resolve_depth_sample;
+    (void)broker_user;
 }
 void rsx_nr_d3d12_set_publish_write(
     rsx_nr_d3d12* b, rsx_nr_d3d12_publish_write_fn publish, void* user)
