@@ -21,6 +21,7 @@ typedef struct fixture {
     u32 island_get;
     u32 island_put;
     u32 island_resume;
+    u32 island_late_entry;
     u32 repair_source;
     u32 repair_put;
     u32 repair_command;
@@ -99,7 +100,7 @@ static int registered_island_edge(void* user, u32 get, u32 put,
         put != f->island_put || !f->island_resume)
         return 0;
     *resume_get = f->island_resume;
-    return 1;
+    return f->island_late_entry ? 2 : 1;
 }
 
 static int resolve_generated_jump(void* user, u32 get, u32 put,
@@ -542,6 +543,46 @@ static int test_invalid_jump_repair_is_exact_and_latched(void)
               &f.owner, resume, new_put, ret, &next, &ret) ==
               RSX_NR_FRAME_ADVANCED && f.references == 0xAABBCCDDu,
           "repaired command stream did not execute exactly once");
+    return 0;
+}
+
+static int test_late_published_island_entry_preserves_payload(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 payload = 0x1050u;
+    const u32 false_target = 0x2060u;
+    const u32 resume = 0x2200u;
+    const u32 put = 0x3000u;
+    const u32 vp_word = 0x20000000u | false_target;
+    u32 next = payload, ret = ~0u;
+    f.words[payload >> 2] = vp_word;
+    /* Raw payload can target bytes which themselves look executable. The
+     * producer record must win before normal flow-target admission. */
+    f.words[false_target >> 2] = packet(1u, 0x0050u);
+    f.words[(false_target + 4u) >> 2] = 0xDEADBEEFu;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0x12345678u;
+    f.island_get = payload;
+    f.island_put = put;
+    f.island_resume = resume;
+    f.island_late_entry = 1u;
+
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, payload, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume,
+          "recorded late island entry did not advance to its exact end");
+    CHECK(f.words[payload >> 2] == vp_word &&
+              f.owner.stats.skipped_data_islands == 1u &&
+              f.owner.stats.recovered_late_island_entries == 1u &&
+              f.owner.stats.repaired_generated_links == 0u &&
+              f.repair_calls == 0u &&
+              f.owner.stats.methods == 0u,
+          "late island recovery rewrote/dispatched payload or miscounted");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, resume, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && f.references == 0x12345678u,
+          "late island resume command did not execute exactly once");
     return 0;
 }
 
@@ -1028,6 +1069,7 @@ int main(void)
         test_called_list_entry_waits_for_final_publication() ||
         test_jump_waits_for_exact_target_publication() ||
         test_invalid_jump_repair_is_exact_and_latched() ||
+        test_late_published_island_entry_preserves_payload() ||
         test_primary_generated_hole_proof_is_exact_and_latched() ||
         test_pending_generated_hole_rechecks_without_put_change() ||
         test_generated_hole_postproof_reread_retries() ||

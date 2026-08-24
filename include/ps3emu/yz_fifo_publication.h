@@ -72,6 +72,40 @@ static inline uint32_t yz_fifo_registered_inline_island_resume(
     return resume;
 }
 
+/* Recover when the consumer observed the allocator's source word while it was
+ * still zero padding, advanced once, and only then saw the producer publish
+ * the exact jump-over-payload edge.  member_get must be the recorded payload
+ * start itself: this is not an interval search and cannot skip an arbitrary
+ * word found inside a data allocation.  The caller obtains the source/end
+ * triple from the producer record and revalidates that record, the source
+ * word, the current member word, and PUT after a barrier. */
+static inline uint32_t yz_fifo_registered_inline_island_member_resume(
+    uint32_t source_ea, uint32_t expected_command, uint32_t data_end_ea,
+    uint32_t member_get, uint32_t put,
+    uint32_t fifo_base, uint32_t fifo_size)
+{
+    if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
+        source_ea < fifo_base || source_ea >= fifo_base + fifo_size)
+        return 0u;
+
+    const uint32_t source_get = source_ea - fifo_base;
+    const uint32_t resume = yz_fifo_registered_inline_island_resume(
+        source_ea, expected_command, data_end_ea, source_get, put,
+        fifo_base, fifo_size);
+    if (!resume)
+        return 0u;
+
+    const uint32_t target = expected_command & 0x1FFFFFFCu;
+    if (member_get != target || member_get <= source_get ||
+        member_get >= resume)
+        return 0u;
+
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t remaining = (resume - member_get) & mask;
+    const uint32_t ahead = (put - member_get) & mask;
+    return remaining && ahead && remaining < ahead ? resume : 0u;
+}
+
 /* Validate the title's exact generated VP-constant packet boundary.  The
  * producer emits one incrementing SET_TRANSFORM_CONSTANT_LOAD packet with a
  * load slot plus four float4 constants (17 arguments total), aligns the next

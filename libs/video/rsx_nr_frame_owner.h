@@ -30,14 +30,16 @@ typedef int (*rsx_nr_frame_read32_fn)(void* user, u32 io, u32* value);
 typedef int (*rsx_nr_frame_release_stopper_fn)(
     void* user, u32 get, u32 put, u32 command, u32* resume_get);
 /* Exact producer record for an inline data island rooted at this command.
- * A nonzero return supplies the only safe cursor after the island.  The
- * command target is the data start and must not itself be executed. */
+ * Return 1 for the recorded source edge or 2 when this command is the exact
+ * payload start reached before that preceding edge became visible. Both
+ * results supply the only safe cursor after the island; payload must never be
+ * executed. */
 typedef int (*rsx_nr_frame_island_edge_fn)(
     void* user, u32 get, u32 put, u32 command, u32* resume_get);
 /* Fail-closed repair for one exact published JUMP whose target still starts
  * with non-command payload.  The hook may return a replacement cursor only
  * after proving the complete producer chain and atomically replacing the
- * source JUMP.  Return 1 for a proven repair, 0 for a definitive mismatch in
+ * source JUMP. Return 1 for a proven patched-link repair, 0 for a definitive mismatch in
  * this unchanged source/command/target/word generation, or -1 when an exact
  * producer shape is present but its dependent bytes are still publishing.
  * Pending results are reconsidered only after another bounded proof delay. */
@@ -113,6 +115,7 @@ typedef struct rsx_nr_frame_owner_stats {
     unsigned long long waits_stopper;
     unsigned long long released_stoppers;
     unsigned long long skipped_data_islands;
+    unsigned long long recovered_late_island_entries;
     unsigned long long repaired_generated_links;
     unsigned long long repaired_generated_holes;
     unsigned long long generated_link_attempts;

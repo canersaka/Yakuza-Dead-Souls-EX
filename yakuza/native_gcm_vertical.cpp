@@ -4416,7 +4416,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-full-native steps=%llu packets=%llu methods=%llu "
                      "ops=%llu frames=%llu controls=%llu "
                      "wait=%llu/%llu/%llu/%llu "
-                     "stopper-release=%llu island-skip=%llu "
+                     "stopper-release=%llu island-skip=%llu late-island=%llu "
                      "link-repair=%llu hole-repair=%llu attempts=%llu "
                      "fatal=%u kind=%u frame=%llu get=%08X put=%08X ret=%08X "
                     "command=%08X method=%05X arg=%08X index=%u]\n",
@@ -4425,6 +4425,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      fs->waits_empty, fs->waits_partial,
                      fs->waits_stopper, fs->waits_semaphore,
                      fs->released_stoppers, fs->skipped_data_islands,
+                     fs->recovered_late_island_entries,
                      fs->repaired_generated_links,
                      fs->repaired_generated_holes,
                      fs->generated_link_attempts,

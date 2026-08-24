@@ -70,6 +70,27 @@ int main(void)
             0x40401000u, 0x20001010u, 0x40401930u,
             0x00001000u, 0x00001900u, base, size), 0u);
 
+    /* If the source zero was consumed before the exact edge became visible,
+     * only the recorded payload start may recover to the same allocation end.
+     * Interior words and incomplete publication remain fail-closed. */
+    failed |= expect("late inline payload entry",
+        yz_fifo_registered_inline_island_member_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001010u, 0x00002000u, base, size),
+        0x00001930u);
+    failed |= expect("late inline interior word",
+        yz_fifo_registered_inline_island_member_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001014u, 0x00002000u, base, size), 0u);
+    failed |= expect("late inline wrong recorded target",
+        yz_fifo_registered_inline_island_member_resume(
+            0x40401000u, 0x2000100Cu, 0x40401930u,
+            0x00001010u, 0x00002000u, base, size), 0u);
+    failed |= expect("late inline not yet published",
+        yz_fifo_registered_inline_island_member_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001010u, 0x00001900u, base, size), 0u);
+
     /* Captured generated-list boundary: 17-argument VP constant packet at
      * 0x1230, two padding/data words at 0x1278, exact prologue at 0x1280. */
     failed |= expect("generated VP constant tail",
