@@ -98,6 +98,20 @@ void* rsx_live_draw_get_d3d12_device(void);
 int rsx_live_draw_present_external(void* texture, u32 dxgi_format,
                                    u32 width, u32 height, u32 buffer_id);
 
+/* Ordered native/legacy recording broker.  acquire() excludes the host movie
+ * producer until release() and returns the live DIRECT list plus the exact
+ * generation/fence values governing native upload and mirror lifetimes.
+ * timeline_flush() is the only operation which may retire that borrowed
+ * generation.  present_shared() records the scanout copy on the same list and
+ * performs the ordinary synchronous present retirement. */
+int rsx_live_draw_timeline_acquire(
+    void** command_list, u64* generation, u64* recording_fence,
+    u64* completed_fence);
+void rsx_live_draw_timeline_release(void);
+int rsx_live_draw_timeline_flush(void);
+int rsx_live_draw_present_shared(void* texture, u32 dxgi_format,
+                                 u32 width, u32 height, u32 buffer_id);
+
 /* Shared-resource broker for the vertical renderer. Returned resources carry
  * one COM reference owned by the caller and are left in RENDER_TARGET or
  * DEPTH_WRITE state. This preserves framebuffer history when ordered native

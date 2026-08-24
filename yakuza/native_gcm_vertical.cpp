@@ -404,6 +404,7 @@ struct yz_nr_vertical_active_state {
     unsigned long long section_flow_vp_overflow;
     unsigned long long section_exec_errors;
     volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
+    volatile LONG shared_timeline;
     volatile LONG* guest_page_route;
     unsigned long long owned[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long fallback[YZ_NR_VERT_FAMILY_COUNT];
@@ -516,15 +517,36 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
     (void)format;
     (void)width;
     (void)height;
-    /* nrb_present has already retired the native queue and every live render
-     * target is an exact resource borrowed from the legacy surface registry.
-     * Present that shared scanout through the typed semantic boundary so the
+    /* Every live render target is an exact resource borrowed from the legacy
+     * surface registry. In shared-timeline mode the preceding native commands
+     * are still on the live list; sink_flip appends the scanout copy and
+     * retires the complete ordered frame once. Present through the typed
+     * semantic boundary so the
      * movie handoff, QPC ring and sparse renderer-owned visual/state gates all
      * observe the frame.  This calls sink_flip directly; it does not decode
      * or replay an RSX packet. */
     rsx_live_draw_typed_present(buffer_id);
     yz_nr_vertical_exec_present_complete(buffer_id);
     return 0;
+}
+
+static int yz_nr_d3d_timeline_acquire(
+    void*, void** command_list, unsigned long long* generation,
+    unsigned long long* recording_fence,
+    unsigned long long* completed_fence)
+{
+    return rsx_live_draw_timeline_acquire(
+        command_list, generation, recording_fence, completed_fence);
+}
+
+static void yz_nr_d3d_timeline_release(void*)
+{
+    rsx_live_draw_timeline_release();
+}
+
+static int yz_nr_d3d_timeline_flush(void*)
+{
+    return rsx_live_draw_timeline_flush();
 }
 
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
@@ -607,7 +629,8 @@ static int yz_nr_gpu_clear(void*, const rsx_nir_pipeline* st,
                 g_active.consumer_clear_contract[bit]++;
         return -1;
     }
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+        !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.clear
         ? g_active.gpu_ops.clear(g_active.gpu_ops.user, st, clear) : -1;
@@ -622,7 +645,8 @@ static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
                           const uint32_t* vp, uint32_t vp_words,
                           const rsx_nir_draw* draw, const uint32_t* batches)
 {
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+        !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.draw
         ? g_active.gpu_ops.draw(g_active.gpu_ops.user, st, vp, vp_words,
@@ -636,7 +660,8 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
                               const rsx_nir_transfer* transfer,
                               const uint32_t* words)
 {
-    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0)
+    if (InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
+        !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
     const int result = g_active.gpu_ops.transfer
         ? g_active.gpu_ops.transfer(g_active.gpu_ops.user, st, transfer,
@@ -676,7 +701,8 @@ static int yz_nr_borrow_depth(void*, uint32_t space, uint32_t offset,
     const int result = rsx_live_draw_borrow_depth(
         space, offset, depth_format, width, height, resource,
         resource_format, dsv_format, srv_format, publication_required);
-    if (!result && *publication_required) {
+    if (!result && *publication_required &&
+        !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0)) {
         /* zdepth_get may have created this borrowed resource and recorded its
          * initialization clear on the legacy queue.  The native backend uses
          * a separate queue, so returning the resource before that list is
@@ -724,6 +750,14 @@ static void yz_nr_active_ensure_graphics(void)
         d3d12, yz_nr_d3d_publish_write, nullptr);
     rsx_nr_d3d12_set_render_condition_reader(
         d3d12, yz_nr_render_condition_read, nullptr);
+    if (rsx_nr_d3d12_set_shared_timeline(
+            d3d12, yz_nr_d3d_timeline_acquire,
+            yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
+            nullptr) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        return;
+    }
+    InterlockedExchange(&g_active.shared_timeline, 1);
     for (uint32_t i = 0; i < 8u; ++i) {
         const yz_nr_vertical_display* const display = &g_active.displays[i];
         if (display->valid)
@@ -1937,6 +1971,7 @@ extern "C" void yz_nr_vertical_prepare_legacy_method(uint32_t method,
     if (!action)
         return;
     if (InterlockedExchange(&g_active.renderer_owner, 0) == 1 &&
+        !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0) &&
         g_active.gpu_ops.flush)
         g_active.gpu_ops.flush(g_active.gpu_ops.user);
 }
@@ -3871,7 +3906,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "clears=%llu "
                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
                     "residency-fail=%llu mirror=%llu/%llu pso=%llu/%llu "
-                    "rt=%llu/%llu depth=%llu/%llu]\n",
+                    "rt=%llu/%llu depth=%llu/%llu "
+                    "timeline=%d/%llu/%llu/%llu]\n",
                     d3d_stats.draws,
                     d3d_stats.conditional_draws_skipped,
                     d3d_stats.draw_batches,
@@ -3887,9 +3923,14 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.mirror_rollovers,
                     d3d_stats.pso_hits, d3d_stats.pso_builds,
                     d3d_stats.rt_builds, d3d_stats.rt_refreshes,
-                    d3d_stats.depth_builds, d3d_stats.depth_refreshes);
+                    d3d_stats.depth_builds, d3d_stats.depth_refreshes,
+                    rsx_nr_d3d12_shared_timeline_enabled(g_active.d3d12),
+                    d3d_stats.shared_timeline_acquires,
+                    d3d_stats.shared_timeline_generations,
+                    d3d_stats.shared_timeline_forced_submissions);
             rsx_nr_d3d12_destroy(g_active.d3d12);
             g_active.d3d12 = nullptr;
+            InterlockedExchange(&g_active.shared_timeline, 0);
         }
         free(const_cast<LONG*>(g_active.guest_page_route));
         g_active.guest_page_route = nullptr;

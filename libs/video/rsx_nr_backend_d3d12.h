@@ -68,6 +68,18 @@ typedef void (*rsx_nr_d3d12_publish_write_fn)(
 typedef int (*rsx_nr_d3d12_render_condition_fn)(
     void* user, u32 dma_report, u32 offset, u32* value);
 
+/* Optional live command-timeline broker.  acquire() leases the application's
+ * currently open DIRECT list until release() and reports the fence value that
+ * will retire that list generation.  flush() closes, submits, waits, and
+ * resets that same list.  The backend never closes or resets a borrowed list
+ * itself.  Offline/WARP users leave this unset and retain the private queue. */
+typedef int (*rsx_nr_d3d12_timeline_acquire_fn)(
+    void* user, void** command_list, unsigned long long* generation,
+    unsigned long long* recording_fence,
+    unsigned long long* completed_fence);
+typedef void (*rsx_nr_d3d12_timeline_release_fn)(void* user);
+typedef int (*rsx_nr_d3d12_timeline_flush_fn)(void* user);
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long queue_submissions;   /* fence-retired command lists */
@@ -104,6 +116,9 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long residency_failures;
     unsigned long long mirror_resyncs;
     unsigned long long mirror_rollovers;
+    unsigned long long shared_timeline_acquires;
+    unsigned long long shared_timeline_generations;
+    unsigned long long shared_timeline_forced_submissions;
 } rsx_nr_d3d12_stats;
 
 /* guest_ptr resolves (space, offset, min_bytes) like rsx_live_guest_ptr_fn;
@@ -205,6 +220,15 @@ void rsx_nr_d3d12_set_publish_write(
  * keeps such draws transactionally unsupported. */
 void rsx_nr_d3d12_set_render_condition_reader(
     rsx_nr_d3d12* b, rsx_nr_d3d12_render_condition_fn read, void* user);
+
+/* Move recording from the backend's private queue to one ordered host list.
+ * Must be installed before the first GPU operation.  Returns nonzero if the
+ * broker cannot provide a valid open list/fence generation. */
+int rsx_nr_d3d12_set_shared_timeline(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_timeline_acquire_fn acquire,
+    rsx_nr_d3d12_timeline_release_fn release,
+    rsx_nr_d3d12_timeline_flush_fn flush, void* user);
+int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b);
 
 /* Publish a completed guest write to the lock-free generation tracker. */
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,

@@ -109,11 +109,25 @@ struct rsx_nr_d3d12 {
     ID3D12CommandAllocator* alloc;
     ID3D12GraphicsCommandList* list;
     ID3D12GraphicsCommandList1* list1;
+    ID3D12GraphicsCommandList* owned_list;
+    ID3D12GraphicsCommandList1* owned_list1;
+    ID3D12GraphicsCommandList1* shared_list1;
     ID3D12Fence* fence;
     HANDLE fence_event;
     u64 fence_value;
     int list_open;
     int depth_bounds_supported;
+    int shared_timeline;
+    int timeline_leased;
+    int timeline_fault;
+    rsx_nr_d3d12_timeline_acquire_fn timeline_acquire;
+    rsx_nr_d3d12_timeline_release_fn timeline_release;
+    rsx_nr_d3d12_timeline_flush_fn timeline_flush;
+    void* timeline_user;
+    ID3D12GraphicsCommandList* shared_list;
+    u64 shared_generation;
+    u64 shared_recording_fence;
+    u64 shared_completed_fence;
 
     ID3D12DescriptorHeap* rtv_heap;
     ID3D12DescriptorHeap* dsv_heap;
@@ -194,8 +208,97 @@ static void nrb_wait_idle(rsx_nr_d3d12* b)
     }
 }
 
+static void nrb_release_timeline_lease(rsx_nr_d3d12* b)
+{
+    if (b->timeline_leased) {
+        b->timeline_release(b->timeline_user);
+        b->timeline_leased = 0;
+    }
+}
+
+static void nrb_release_retired_textures(rsx_nr_d3d12* b)
+{
+    for (u32 i = 0; i < b->retired_texture_count; ++i)
+        b->retired_textures[i]->lpVtbl->Release(b->retired_textures[i]);
+    b->retired_texture_count = 0;
+}
+
+static int nrb_acquire_shared_list(rsx_nr_d3d12* b)
+{
+    if (!b->shared_timeline)
+        return 0;
+    if (b->timeline_fault || b->timeline_leased)
+        return b->timeline_fault ? -1 : 0;
+
+    void* opaque_list = NULL;
+    u64 generation = 0, recording_fence = 0, completed_fence = 0;
+    if (b->timeline_acquire(
+            b->timeline_user, &opaque_list, &generation,
+            &recording_fence, &completed_fence) != 0)
+        return -1; /* host movie ownership is a transient safe fallback */
+    b->timeline_leased = 1;
+    if (!opaque_list || !recording_fence) {
+        nrb_release_timeline_lease(b);
+        b->timeline_fault = 1;
+        return -1;
+    }
+    b->stats.shared_timeline_acquires++;
+
+    ID3D12GraphicsCommandList* const list =
+        (ID3D12GraphicsCommandList*)opaque_list;
+    if (list != b->shared_list) {
+        ID3D12GraphicsCommandList1* list1 = NULL;
+        if (SUCCEEDED(list->lpVtbl->QueryInterface(
+                list, &IID_ID3D12GraphicsCommandList1, (void**)&list1))) {
+            if (b->shared_list1)
+                b->shared_list1->lpVtbl->Release(b->shared_list1);
+            b->shared_list1 = list1;
+        } else {
+            if (b->shared_list1) {
+                b->shared_list1->lpVtbl->Release(b->shared_list1);
+                b->shared_list1 = NULL;
+            }
+            if (b->depth_bounds_supported) {
+                nrb_release_timeline_lease(b);
+                b->timeline_fault = 1;
+                return -1;
+            }
+        }
+        b->shared_list = list;
+    }
+
+    if (b->shared_generation && generation != b->shared_generation) {
+        /* A generation may change only after the host synchronously retired
+         * the fence promised for the old borrowed list.  Refuse a broker
+         * which resets an allocator while native uploads are still live. */
+        if (completed_fence < b->shared_recording_fence) {
+            nrb_release_timeline_lease(b);
+            b->timeline_fault = 1;
+            return -1;
+        }
+        nrb_release_retired_textures(b);
+        b->upload_used = 0;
+        b->descriptor_tables_used = 0;
+        b->list_open = 0;
+        b->stats.shared_timeline_generations++;
+    }
+    b->shared_generation = generation;
+    b->shared_recording_fence = recording_fence;
+    b->shared_completed_fence = completed_fence;
+    b->list = list;
+    b->list1 = b->shared_list1;
+    return 0;
+}
+
 static int nrb_open_list(rsx_nr_d3d12* b)
 {
+    if (b->shared_timeline) {
+        if (nrb_acquire_shared_list(b))
+            return -1;
+        if (!b->list_open)
+            b->list_open = 1;
+        return 0;
+    }
     if (b->list_open)
         return 0;
     if (FAILED(b->alloc->lpVtbl->Reset(b->alloc)) ||
@@ -207,26 +310,38 @@ static int nrb_open_list(rsx_nr_d3d12* b)
     return 0;
 }
 
-static void nrb_exec_wait(rsx_nr_d3d12* b)
+static int nrb_exec_wait(rsx_nr_d3d12* b)
 {
     if (!b->list_open)
-        return;
+        return 0;
+    if (b->shared_timeline) {
+        nrb_release_timeline_lease(b);
+        if (b->timeline_flush(b->timeline_user) != 0) {
+            b->timeline_fault = 1;
+            return -1;
+        }
+        b->list_open = 0;
+        nrb_release_retired_textures(b);
+        b->upload_used = 0;
+        b->descriptor_tables_used = 0;
+        b->stats.queue_submissions++;
+        b->stats.shared_timeline_forced_submissions++;
+        return 0;
+    }
     b->list->lpVtbl->Close(b->list);
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)b->list };
     b->queue->lpVtbl->ExecuteCommandLists(b->queue, 1, lists);
     nrb_wait_idle(b);
     b->list_open = 0;
-    for (u32 i = 0; i < b->retired_texture_count; ++i)
-        b->retired_textures[i]->lpVtbl->Release(b->retired_textures[i]);
-    b->retired_texture_count = 0;
+    nrb_release_retired_textures(b);
     b->stats.queue_submissions++;
+    return 0;
 }
 
 static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b)
 {
     if (b->descriptor_tables_used >= NRB_DRAW_TABLES) {
-        nrb_exec_wait(b);
-        if (nrb_open_list(b))
+        if (nrb_exec_wait(b) || nrb_open_list(b))
             return -1;
     }
     return b->retired_texture_count + NRB_TEX_UNITS <=
@@ -357,7 +472,10 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
                      * guest identity stayed constant. Retire every native
                      * reference to the old generation before rebinding its
                      * stable descriptor slot. */
-                    nrb_exec_wait(b);
+                    if (nrb_exec_wait(b)) {
+                        borrowed->lpVtbl->Release(borrowed);
+                        return NULL;
+                    }
                     if (rt->tex)
                         rt->tex->lpVtbl->Release(rt->tex);
                     rt->tex = borrowed;
@@ -524,7 +642,10 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
                 if (borrowed == depth->tex) {
                     borrowed->lpVtbl->Release(borrowed);
                 } else {
-                    nrb_exec_wait(b);
+                    if (nrb_exec_wait(b)) {
+                        borrowed->lpVtbl->Release(borrowed);
+                        return NULL;
+                    }
                     if (depth->tex)
                         depth->tex->lpVtbl->Release(depth->tex);
                     depth->tex = borrowed;
@@ -713,13 +834,17 @@ static int nrb_add_required_span(nrb_required_span* spans, u32* count,
 
 static int nrb_mirror_sync(rsx_nr_d3d12* b)
 {
-    rsx_gpu_mirror_d3d12_retire(
-        b->mirror_be, b->fence->lpVtbl->GetCompletedValue(b->fence));
+    const u64 completed = b->shared_timeline
+        ? b->shared_completed_fence
+        : b->fence->lpVtbl->GetCompletedValue(b->fence);
+    const u64 recording = b->shared_timeline
+        ? b->shared_recording_fence : b->fence_value + 1u;
+    rsx_gpu_mirror_d3d12_retire(b->mirror_be, completed);
     if (rsx_gpu_mirror_d3d12_begin_fenced(
-            b->mirror_be, b->list, b->fence_value + 1) != 0)
+            b->mirror_be, b->list, recording) != 0)
         return -1;
     rsx_gpu_mirror_sync(b->mirror, 0);
-    rsx_gpu_mirror_d3d12_end(b->mirror_be, b->fence_value + 1);
+    rsx_gpu_mirror_d3d12_end(b->mirror_be, recording);
     return 0;
 }
 
@@ -757,7 +882,8 @@ static int nrb_stabilize_required_spans(
          * or the producer is actively republishing the page; retire the
          * ordered prefix before retrying with fresh bounded storage. */
         if (attempt & 1u) {
-            nrb_exec_wait(b);
+            if (nrb_exec_wait(b))
+                return -1;
             b->stats.mirror_rollovers++;
         }
     }
@@ -1138,8 +1264,7 @@ static u8* nrb_texture_upload_slice(rsx_nr_d3d12* b, u32 size, u64* offset)
 {
     u32 start = (b->upload_used + 511u) & ~511u;
     if ((u64)start + size > NRB_UPLOAD_BYTES) {
-        nrb_exec_wait(b);
-        if (nrb_open_list(b))
+        if (nrb_exec_wait(b) || nrb_open_list(b))
             return NULL;
         start = 0;
     }
@@ -3655,7 +3780,8 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
 static int nrb_present(void* user, u32 buffer)
 {
     rsx_nr_d3d12* b = user;
-    nrb_exec_wait(b);                /* offscreen: complete the frame      */
+    if (!b->shared_timeline && nrb_exec_wait(b))
+        return -1;                   /* offscreen: complete the frame      */
     nrb_rt* scanout = NULL;
     if (buffer < 8u && b->displays[buffer].valid) {
         const nrb_display* display = &b->displays[buffer];
@@ -3677,6 +3803,14 @@ static int nrb_present(void* user, u32 buffer)
             b->present_user, scanout->tex, (u32)scanout->dxgi,
             scanout->w, scanout->h, buffer) != 0))
         return -1;
+    if (b->shared_timeline) {
+        /* The shared presenter appended its copy to this exact list and
+         * synchronously retired/reset the generation. */
+        b->list_open = 0;
+        nrb_release_retired_textures(b);
+        b->upload_used = 0;
+        b->descriptor_tables_used = 0;
+    }
     rsx_nr_res_next_frame(&b->textures);
     if ((b->textures.frame & 127u) == 0u)
         rsx_nr_res_sweep(&b->textures, 600u, nrb_release_texture, b);
@@ -3689,13 +3823,50 @@ static void nrb_flush(void* user)
     nrb_exec_wait((rsx_nr_d3d12*)user);
 }
 
+static int nrb_clear_op(void* user, const rsx_nir_pipeline* st,
+                        const rsx_nir_clear* clear)
+{
+    rsx_nr_d3d12* b = user;
+    const int result = nrb_clear(user, st, clear);
+    nrb_release_timeline_lease(b);
+    return result;
+}
+
+static int nrb_draw_op(void* user, const rsx_nir_pipeline* st,
+                       const u32* vp, u32 vp_words,
+                       const rsx_nir_draw* draw, const u32* batches)
+{
+    rsx_nr_d3d12* b = user;
+    const int result = nrb_draw(user, st, vp, vp_words, draw, batches);
+    nrb_release_timeline_lease(b);
+    return result;
+}
+
+static int nrb_transfer_op(void* user, const rsx_nir_pipeline* st,
+                           const rsx_nir_transfer* transfer,
+                           const u32* words)
+{
+    rsx_nr_d3d12* b = user;
+    const int result = nrb_transfer(user, st, transfer, words);
+    nrb_release_timeline_lease(b);
+    return result;
+}
+
+static int nrb_present_op(void* user, u32 buffer)
+{
+    rsx_nr_d3d12* b = user;
+    const int result = nrb_present(user, buffer);
+    nrb_release_timeline_lease(b);
+    return result;
+}
+
 void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
 {
     out->user = b;
-    out->clear = nrb_clear;
-    out->draw = nrb_draw;
-    out->transfer = nrb_transfer;
-    out->present = nrb_present;
+    out->clear = nrb_clear_op;
+    out->draw = nrb_draw_op;
+    out->transfer = nrb_transfer_op;
+    out->present = nrb_present_op;
     out->flush = nrb_flush;
 }
 
@@ -3762,6 +3933,45 @@ void rsx_nr_d3d12_set_render_condition_reader(
         return;
     b->render_condition_read = read;
     b->render_condition_user = user;
+}
+
+int rsx_nr_d3d12_set_shared_timeline(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_timeline_acquire_fn acquire,
+    rsx_nr_d3d12_timeline_release_fn release,
+    rsx_nr_d3d12_timeline_flush_fn flush, void* user)
+{
+    if (!b || !acquire || !release || !flush || b->list_open ||
+        b->rtv_used || b->dsv_used || b->last_rt || b->shared_timeline)
+        return -1;
+    b->timeline_acquire = acquire;
+    b->timeline_release = release;
+    b->timeline_flush = flush;
+    b->timeline_user = user;
+    b->shared_timeline = 1;
+    if (nrb_acquire_shared_list(b) != 0) {
+        nrb_release_timeline_lease(b);
+        if (b->shared_list1) {
+            b->shared_list1->lpVtbl->Release(b->shared_list1);
+            b->shared_list1 = NULL;
+        }
+        b->shared_list = NULL;
+        b->shared_timeline = 0;
+        b->timeline_fault = 0;
+        b->timeline_acquire = NULL;
+        b->timeline_release = NULL;
+        b->timeline_flush = NULL;
+        b->timeline_user = NULL;
+        b->list = b->owned_list;
+        b->list1 = b->owned_list1;
+        return -1;
+    }
+    nrb_release_timeline_lease(b);
+    return 0;
+}
+
+int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
+{
+    return b && b->shared_timeline && !b->timeline_fault;
 }
 
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
@@ -3831,12 +4041,14 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
                                            &IID_ID3D12Fence,
                                            (void**)&b->fence)))
         goto fail;
+    b->owned_list = b->list;
     b->list->lpVtbl->Close(b->list);
     b->fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!b->fence_event)
         goto fail;
     if (SUCCEEDED(b->list->lpVtbl->QueryInterface(
             b->list, &IID_ID3D12GraphicsCommandList1, (void**)&b->list1))) {
+        b->owned_list1 = b->list1;
         D3D12_FEATURE_DATA_D3D12_OPTIONS2 options2 = {0};
         if (SUCCEEDED(b->dev->lpVtbl->CheckFeatureSupport(
                 b->dev, D3D12_FEATURE_D3D12_OPTIONS2,
@@ -4047,6 +4259,9 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
 {
     if (!b)
         return;
+    if (b->list_open)
+        nrb_exec_wait(b);
+    nrb_release_timeline_lease(b);
     if (b->queue && b->fence)
         nrb_wait_idle(b);
     for (u32 i = 0; i < b->psos.cap && b->psos.keys; i++) {
@@ -4099,9 +4314,15 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         CloseHandle(b->fence_event);
     if (b->fence)
         b->fence->lpVtbl->Release(b->fence);
-    if (b->list1)
+    if (b->shared_list1)
+        b->shared_list1->lpVtbl->Release(b->shared_list1);
+    if (b->owned_list1)
+        b->owned_list1->lpVtbl->Release(b->owned_list1);
+    else if (b->list1 && !b->shared_timeline)
         b->list1->lpVtbl->Release(b->list1);
-    if (b->list)
+    if (b->owned_list)
+        b->owned_list->lpVtbl->Release(b->owned_list);
+    else if (b->list && !b->shared_timeline)
         b->list->lpVtbl->Release(b->list);
     if (b->alloc)
         b->alloc->lpVtbl->Release(b->alloc);
@@ -4170,7 +4391,8 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     b->list->lpVtbl->CopyTextureRegion(b->list, &dstl, 0, 0, 0, &srcl, NULL);
 
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    nrb_exec_wait(b);
+    if (nrb_exec_wait(b))
+        return -1;
 
     u8* mapped = NULL;
     D3D12_RANGE rr = {0, need};
@@ -4243,6 +4465,19 @@ void rsx_nr_d3d12_set_render_condition_reader(
     rsx_nr_d3d12* b, rsx_nr_d3d12_render_condition_fn read, void* user)
 {
     (void)b; (void)read; (void)user;
+}
+int rsx_nr_d3d12_set_shared_timeline(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_timeline_acquire_fn acquire,
+    rsx_nr_d3d12_timeline_release_fn release,
+    rsx_nr_d3d12_timeline_flush_fn flush, void* user)
+{
+    (void)b; (void)acquire; (void)release; (void)flush; (void)user;
+    return -1;
+}
+int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
+{
+    (void)b;
+    return 0;
 }
 void rsx_nr_d3d12_note_guest_write(rsx_nr_d3d12* b, u32 space,
                                    u32 offset, u32 size)
