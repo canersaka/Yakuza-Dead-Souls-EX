@@ -834,6 +834,218 @@ done:
         factory->lpVtbl->Release(factory);
 }
 
+typedef struct shared_timeline_test {
+    ID3D12CommandQueue* queue;
+    ID3D12CommandAllocator* alloc;
+    ID3D12GraphicsCommandList* list;
+    ID3D12Fence* fence;
+    HANDLE event;
+    u64 fence_value;
+    u64 generation;
+    u32 acquires;
+    u32 releases;
+    u32 flushes;
+    int leased;
+    int fail_acquire_once;
+} shared_timeline_test;
+
+static int shared_test_acquire(
+    void* user, void** command_list, unsigned long long* generation,
+    unsigned long long* recording_fence,
+    unsigned long long* completed_fence)
+{
+    shared_timeline_test* host = (shared_timeline_test*)user;
+    if (!host || host->leased || !command_list || !generation ||
+        !recording_fence || !completed_fence)
+        return -1;
+    if (host->fail_acquire_once) {
+        host->fail_acquire_once = 0;
+        return -1;
+    }
+    host->leased = 1;
+    host->acquires++;
+    *command_list = host->list;
+    *generation = host->generation;
+    *recording_fence = host->fence_value + 1u;
+    *completed_fence =
+        host->fence->lpVtbl->GetCompletedValue(host->fence);
+    return 0;
+}
+
+static void shared_test_release(void* user)
+{
+    shared_timeline_test* host = (shared_timeline_test*)user;
+    if (!host || !host->leased) {
+        g_failures++;
+        return;
+    }
+    host->leased = 0;
+    host->releases++;
+}
+
+static int shared_test_flush(void* user)
+{
+    shared_timeline_test* host = (shared_timeline_test*)user;
+    if (!host || host->leased ||
+        FAILED(host->list->lpVtbl->Close(host->list)))
+        return -1;
+    ID3D12CommandList* lists[1] = {(ID3D12CommandList*)host->list};
+    host->queue->lpVtbl->ExecuteCommandLists(host->queue, 1, lists);
+    const u64 value = ++host->fence_value;
+    if (FAILED(host->queue->lpVtbl->Signal(
+            host->queue, host->fence, value)))
+        return -1;
+    if (host->fence->lpVtbl->GetCompletedValue(host->fence) < value) {
+        if (FAILED(host->fence->lpVtbl->SetEventOnCompletion(
+                host->fence, value, host->event)) ||
+            WaitForSingleObject(host->event, 10000u) != WAIT_OBJECT_0)
+            return -1;
+    }
+    if (FAILED(host->alloc->lpVtbl->Reset(host->alloc)) ||
+        FAILED(host->list->lpVtbl->Reset(
+            host->list, host->alloc, NULL)))
+        return -1;
+    host->generation++;
+    host->flushes++;
+    return 0;
+}
+
+/* Two independently admitted native sections may append to one established
+ * host command-list generation with no native queue submission between them.
+ * A legacy boundary then advances the generation; the next native section
+ * must observe the retired fence before reusing uploads/descriptors. */
+static void test_shared_timeline(void)
+{
+    IDXGIFactory4* factory = NULL;
+    IDXGIAdapter* adapter = NULL;
+    ID3D12Device* device = NULL;
+    shared_timeline_test host;
+    memset(&host, 0, sizeof(host));
+    rsx_nr_d3d12* sink = NULL;
+
+    HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
+    if (SUCCEEDED(hr))
+        hr = factory->lpVtbl->EnumWarpAdapter(
+            factory, &IID_IDXGIAdapter, (void**)&adapter);
+    if (SUCCEEDED(hr))
+        hr = D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0,
+                               &IID_ID3D12Device, (void**)&device);
+    D3D12_COMMAND_QUEUE_DESC qd = {0};
+    if (SUCCEEDED(hr))
+        hr = device->lpVtbl->CreateCommandQueue(
+            device, &qd, &IID_ID3D12CommandQueue, (void**)&host.queue);
+    if (SUCCEEDED(hr))
+        hr = device->lpVtbl->CreateCommandAllocator(
+            device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void**)&host.alloc);
+    if (SUCCEEDED(hr))
+        hr = device->lpVtbl->CreateCommandList(
+            device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, host.alloc, NULL,
+            &IID_ID3D12GraphicsCommandList, (void**)&host.list);
+    if (SUCCEEDED(hr))
+        hr = device->lpVtbl->CreateFence(
+            device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+            (void**)&host.fence);
+    host.event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    host.generation = 1u;
+    CHECK(SUCCEEDED(hr) && host.event,
+          "could not create shared-timeline WARP host");
+    if (FAILED(hr) || !host.event)
+        goto done;
+
+    sink = rsx_nr_d3d12_create(
+        device, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "could not create shared-timeline sink");
+    if (!sink)
+        goto done;
+    CHECK(rsx_nr_d3d12_set_shared_timeline(
+              sink, shared_test_acquire, shared_test_release,
+              shared_test_flush, &host) == 0,
+          "shared timeline configuration failed");
+    CHECK(rsx_nr_d3d12_shared_timeline_enabled(sink),
+          "shared timeline was not enabled");
+
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nir_pipeline state;
+    memset(&state, 0, sizeof(state));
+    state.surface.color_format = 5u;
+    state.surface.depth_format = 2u;
+    state.surface.raster_type = 1u;
+    state.surface.clip_w = RT_W;
+    state.surface.clip_h = RT_H;
+    state.surface.color_offset[0] = RT_OFFSET;
+    state.surface.color_pitch[0] = RT_W * 4u;
+    state.surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    state.surface.color_target = 1u;
+    state.scissor.w = RT_W;
+    state.scissor.h = RT_H;
+    rsx_nir_clear clear = {0xF0u, 0xFFFF0000u, 0xFFFFFFu, 0u};
+
+    host.fail_acquire_once = 1;
+    CHECK(ops.clear(ops.user, &state, &clear) != 0 &&
+              rsx_nr_d3d12_shared_timeline_enabled(sink),
+          "transient host ownership permanently faulted shared timeline");
+    CHECK(ops.clear(ops.user, &state, &clear) == 0,
+          "first shared clear failed");
+    clear.color_value = 0xFF00FF00u;
+    CHECK(ops.clear(ops.user, &state, &clear) == 0,
+          "second shared clear failed");
+    rsx_nr_d3d12_stats stats;
+    rsx_nr_d3d12_get_stats(sink, &stats);
+    CHECK(host.flushes == 0u && stats.queue_submissions == 0u &&
+              stats.shared_timeline_forced_submissions == 0u,
+          "consecutive shared sections submitted host=%u native=%llu",
+          host.flushes, stats.queue_submissions);
+
+    CHECK(shared_test_flush(&host) == 0,
+          "simulated legacy boundary failed");
+    clear.color_value = 0xFF0000FFu;
+    CHECK(ops.clear(ops.user, &state, &clear) == 0,
+          "post-generation shared clear failed");
+    rsx_nr_d3d12_get_stats(sink, &stats);
+    CHECK(stats.shared_timeline_generations == 1u,
+          "generation changes=%llu expected=1",
+          stats.shared_timeline_generations);
+
+    ops.flush(ops.user);
+    rsx_nr_d3d12_get_stats(sink, &stats);
+    CHECK(host.flushes == 2u && stats.queue_submissions == 1u &&
+              stats.shared_timeline_forced_submissions == 1u,
+          "forced shared retirement host=%u submissions=%llu forced=%llu",
+          host.flushes, stats.queue_submissions,
+          stats.shared_timeline_forced_submissions);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, 0u, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "shared timeline readback failed");
+    CHECK(pix_is(1u, 1u, 0xFFu, 0x00u, 0x00u),
+          "shared timeline lost command order");
+    CHECK(host.acquires == host.releases && !host.leased,
+          "timeline lease imbalance %u/%u leased=%d",
+          host.acquires, host.releases, host.leased);
+
+done:
+    if (sink)
+        rsx_nr_d3d12_destroy(sink);
+    if (host.event)
+        CloseHandle(host.event);
+    if (host.fence)
+        host.fence->lpVtbl->Release(host.fence);
+    if (host.list)
+        host.list->lpVtbl->Release(host.list);
+    if (host.alloc)
+        host.alloc->lpVtbl->Release(host.alloc);
+    if (host.queue)
+        host.queue->lpVtbl->Release(host.queue);
+    if (device)
+        device->lpVtbl->Release(device);
+    if (adapter)
+        adapter->lpVtbl->Release(adapter);
+    if (factory)
+        factory->lpVtbl->Release(factory);
+}
+
 int main(int argc, char** argv)
 {
     write_test_fp();
@@ -905,6 +1117,7 @@ int main(int argc, char** argv)
     const u32 publishes_before = g_published_writes;
     {
         rsx_nr_d3d12_stats before_program, after_program;
+        u32 native_sections = 0u, legacy_sections = 0u;
         rsx_nr_d3d12_get_stats(sink, &before_program);
         CHECK(rsx_nr_d3d12_validate_draw_program(
                   sink, &be.st, native_vp, 4u) == 0,
@@ -917,8 +1130,20 @@ int main(int argc, char** argv)
                       sink, &be.st, invalid_flow_vp, 4u) ==
                       -RSX_NR_DRAW_PF_VERTEX_PROGRAM,
                   "unsupported program escaped side-effect-free preflight");
+            /* Model one complete two-draw section: the first program is
+             * supported but the later one is not. Admission is all-or-none,
+             * so neither draw may enter the native backend. */
+            if (rsx_nr_d3d12_validate_draw_program(
+                    sink, &be.st, native_vp, 4u) == 0 &&
+                rsx_nr_d3d12_validate_draw_program(
+                    sink, &be.st, invalid_flow_vp, 4u) == 0)
+                native_sections++;
+            else
+                legacy_sections++;
         }
         rsx_nr_d3d12_get_stats(sink, &after_program);
+        CHECK(native_sections == 0u && legacy_sections == 1u,
+              "unsupported section was not wholly legacy");
         CHECK(memcmp(&before_program, &after_program,
                      sizeof(before_program)) == 0,
               "program preflight changed backend statistics");
@@ -1704,6 +1929,29 @@ int main(int argc, char** argv)
               pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     }
 
+    /* ---- consecutive supported sections share one submission ---------
+     * Separate backend drains model separate transactionally admitted
+     * sections. No dependency or legacy boundary occurs between them, so
+     * both must remain on one open native command list. */
+    {
+        rsx_nr_d3d12_stats before_sections, after_sections;
+        rsx_nr_d3d12_get_stats(sink, &before_sections);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+        rsx_nr_backend_run(&be, 0);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+        rsx_nr_backend_run(&be, 0);
+        rsx_nr_d3d12_get_stats(sink, &after_sections);
+        CHECK(after_sections.draws == before_sections.draws + 2u &&
+                  after_sections.queue_submissions ==
+                      before_sections.queue_submissions,
+              "consecutive native sections did not share a submission");
+        CHECK(after_sections.descriptor_table_builds ==
+                  before_sections.descriptor_table_builds + 1u &&
+              after_sections.descriptor_table_hits >=
+                  before_sections.descriptor_table_hits + 1u,
+              "consecutive section descriptor reuse failed");
+    }
+
     /* ---- exact descriptor-table reuse --------------------------------
      * The sampler heap contains 128 immutable tables. More than 128 draws
      * with identical resource/view/sampler identity must reuse one table and
@@ -1722,9 +1970,9 @@ int main(int argc, char** argv)
               after_reuse.queue_submissions -
                   before_reuse.queue_submissions);
         CHECK(after_reuse.descriptor_table_builds ==
-                  before_reuse.descriptor_table_builds + 1u &&
+                  before_reuse.descriptor_table_builds &&
               after_reuse.descriptor_table_hits >=
-                  before_reuse.descriptor_table_hits + 511u,
+                  before_reuse.descriptor_table_hits + 512u,
               "descriptor reuse builds=%llu hits=%llu",
               after_reuse.descriptor_table_builds -
                   before_reuse.descriptor_table_builds,
@@ -1743,7 +1991,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 22 && st.draws == 535 && st.presents == 20,
+    CHECK(st.clears == 22 && st.draws == 537 && st.presents == 20,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -1775,6 +2023,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_destroy(sink);
 
     test_broker_actual_color_format();
+    test_shared_timeline();
 
     /* optional real-capture execution leg (large local untracked oracle:
      * absent capture = SKIP so CTest stays hermetic) */

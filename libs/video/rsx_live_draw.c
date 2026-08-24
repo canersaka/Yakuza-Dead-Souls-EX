@@ -49,6 +49,12 @@ int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
   (void)s; if (p) *p = 0; return -1; }
 int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
+int rsx_live_draw_timeline_acquire(void** l, u64* g, u64* r, u64* c)
+{ (void)l; (void)g; (void)r; (void)c; return -1; }
+void rsx_live_draw_timeline_release(void) {}
+int rsx_live_draw_timeline_flush(void) { return -1; }
+int rsx_live_draw_present_shared(void* t, u32 f, u32 w, u32 h, u32 b)
+{ (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
@@ -296,6 +302,7 @@ typedef struct {
     ID3D12Fence*               fence;
     HANDLE                     fence_event;
     u64                        fence_value;
+    u64                        list_generation;
 
     IDXGISwapChain3*           swap;
     ID3D12Resource*            backbuf[LD_SWAP_BUFFERS];
@@ -1377,6 +1384,11 @@ static void ld_movement_camera_snapshot(LONG phase)
 static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
 static volatile LONG g_ld_guest_active = 0;
 static volatile LONG g_ld_host_waiting = 0;
+/* A native backend leases the same list only while it is actively recording
+ * one typed operation.  1 = active-reader handshake, 2 = exclusive movie
+ * lock.  TLS makes accidental nesting fail closed instead of corrupting the
+ * guest-active count or unlocking another producer's lease. */
+static __declspec(thread) int g_ld_timeline_lease = 0;
 
 static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 {
@@ -1893,6 +1905,7 @@ static void ld_flush(ld_flush_reason reason)
     g.n_retired_textures = 0;
     g.alloc->lpVtbl->Reset(g.alloc);
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    g.list_generation++;
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
@@ -6904,6 +6917,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                                           &IID_ID3D12CommandAllocator, (void**)&g.alloc);
     g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc, NULL,
                                      &IID_ID3D12GraphicsCommandList, (void**)&g.list);
+    g.list_generation = 1u;
     if (g.queue) g.queue->lpVtbl->SetName(g.queue, L"rsx-live-queue");
     if (g.list) g.list->lpVtbl->SetName(g.list, L"rsx-live-list");
     g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&g.fence);
@@ -7400,6 +7414,71 @@ void* rsx_live_draw_get_d3d12_device(void)
     return g.ready ? g.dev : NULL;
 }
 
+int rsx_live_draw_timeline_acquire(void** command_list, u64* generation,
+                                   u64* recording_fence,
+                                   u64* completed_fence)
+{
+    if (!command_list || !generation || !recording_fence ||
+        !completed_fence || g_ld_timeline_lease)
+        return -1;
+    *command_list = NULL;
+    for (;;) {
+        if (g_ld_movie_mode || g_ld_host_waiting) {
+            while (g_ld_host_waiting)
+                SwitchToThread();
+            AcquireSRWLockExclusive(&g_ld_access_lock);
+            if (!g.ready || g_ld_movie_mode) {
+                ReleaseSRWLockExclusive(&g_ld_access_lock);
+                return -1;
+            }
+            g_ld_timeline_lease = 2;
+            break;
+        }
+        InterlockedIncrement(&g_ld_guest_active);
+        MemoryBarrier();
+        if (!g_ld_movie_mode && !g_ld_host_waiting) {
+            if (!g.ready) {
+                InterlockedDecrement(&g_ld_guest_active);
+                return -1;
+            }
+            g_ld_timeline_lease = 1;
+            break;
+        }
+        InterlockedDecrement(&g_ld_guest_active);
+    }
+    *command_list = g.list;
+    *generation = g.list_generation;
+    *recording_fence = g.fence_value + 1u;
+    *completed_fence = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    return 0;
+}
+
+void rsx_live_draw_timeline_release(void)
+{
+    const int lease = g_ld_timeline_lease;
+    g_ld_timeline_lease = 0;
+    if (lease == 1)
+        InterlockedDecrement(&g_ld_guest_active);
+    else if (lease == 2)
+        ReleaseSRWLockExclusive(&g_ld_access_lock);
+}
+
+int rsx_live_draw_timeline_flush(void)
+{
+    void* list = NULL;
+    u64 generation = 0, recording = 0, completed = 0;
+    if (rsx_live_draw_timeline_acquire(
+            &list, &generation, &recording, &completed) != 0)
+        return -1;
+    (void)list;
+    (void)recording;
+    (void)completed;
+    ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    const int result = g.ready && g.list_generation != generation ? 0 : -1;
+    rsx_live_draw_timeline_release();
+    return result;
+}
+
 int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
                                u32 height, void** resource,
                                u32* dxgi_format)
@@ -7466,7 +7545,8 @@ int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
 }
 
 static int ld_present_external_impl(ID3D12Resource* source, u32 format,
-                                    u32 width, u32 height, u32 buffer_id)
+                                    u32 width, u32 height, u32 buffer_id,
+                                    int source_on_current_list)
 {
     if (!g.ready || !source || format != DXGI_FORMAT_R8G8B8A8_UNORM ||
         width != g.width || height != g.height)
@@ -7490,12 +7570,13 @@ static int ld_present_external_impl(ID3D12Resource* source, u32 format,
         return 0;
     }
 
-    /* Retire any preceding legacy fallback work before the native resource
-     * crosses queues. The native backend has already retired its own queue.
-     * Both queues belong to this exact device. */
-    ld_flush(LD_FLUSH_PRESENT);
-    if (!g.ready)
-        return -1;
+    if (!source_on_current_list) {
+        /* Separate-queue compatibility path: retire preceding legacy work
+         * before the already-retired native resource crosses queues. */
+        ld_flush(LD_FLUSH_PRESENT);
+        if (!g.ready)
+            return -1;
+    }
 
     const u32 back_index = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* back = g.backbuf[back_index];
@@ -7548,8 +7629,26 @@ int rsx_live_draw_present_external(void* texture, u32 format,
      * chain. Native gameplay takes it once per present, never per draw. */
     AcquireSRWLockExclusive(&g_ld_access_lock);
     result = ld_present_external_impl(
-        (ID3D12Resource*)texture, format, width, height, buffer_id);
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 0);
     ReleaseSRWLockExclusive(&g_ld_access_lock);
+    return result;
+}
+
+int rsx_live_draw_present_shared(void* texture, u32 format,
+                                 u32 width, u32 height, u32 buffer_id)
+{
+    void* list = NULL;
+    u64 generation = 0, recording = 0, completed = 0;
+    if (rsx_live_draw_timeline_acquire(
+            &list, &generation, &recording, &completed) != 0)
+        return -1;
+    (void)list;
+    (void)generation;
+    (void)recording;
+    (void)completed;
+    const int result = ld_present_external_impl(
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 1);
+    rsx_live_draw_timeline_release();
     return result;
 }
 
