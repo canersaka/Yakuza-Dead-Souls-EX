@@ -2252,6 +2252,9 @@ static void test_section_method_support(void)
     CHECK(!rsx_nir_adapter_method_supported(&ad, 0x0004u, 0u) &&
               !rsx_nir_adapter_method_supported(&ad, 0xFFFFCu, 0u),
           "unknown methods incorrectly section-supported");
+    CHECK(rsx_nir_adapter_method_supported(&ad, 0x1804u, 0u) &&
+              !rsx_nir_adapter_method_supported(&ad, 0x1804u, 1u),
+          "ZCULL statistics enable was not fenced to the inert disabled mode");
     CHECK(rsx_nir_adapter_method_supported(&ad, 0x1D78u, 1u) &&
               !rsx_nir_adapter_method_supported(&ad, 0x1D78u, 0u),
           "ZMIN/MAX non-default mode was not fenced");

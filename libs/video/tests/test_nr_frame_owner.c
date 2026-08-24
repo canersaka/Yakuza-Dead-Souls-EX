@@ -16,6 +16,23 @@ typedef struct fixture {
     u32 semaphore;
     u32 references;
     u32 presents;
+    u32 published_put;
+    u32 stopper_release_calls;
+    u32 island_get;
+    u32 island_put;
+    u32 island_resume;
+    u32 repair_source;
+    u32 repair_put;
+    u32 repair_command;
+    u32 repair_target;
+    u32 repair_word;
+    u32 repair_resume;
+    u32 repair_calls;
+    u32 hole_get;
+    u32 hole_put;
+    u32 hole_word;
+    u32 hole_resume;
+    u32 hole_calls;
     rsx_nr_slot slots[TEST_RING_OPS];
     u32 side[TEST_RING_SIDE];
     rsx_nr_ring ring;
@@ -56,6 +73,58 @@ static int present(void* user, u32 buffer)
     return buffer < 8u ? 0 : -1;
 }
 
+static int release_initial_stopper(void* user, u32 get, u32 put,
+                                   u32 command, u32* resume_get)
+{
+    fixture* f = user;
+    f->stopper_release_calls++;
+    if (!resume_get || get != 0x1000u || f->published_put != put ||
+        put <= get + 4u || f->words[get >> 2] != command)
+        return 0;
+    *resume_get = get + 4u;
+    f->words[get >> 2] = 0x20000000u | *resume_get;
+    return 1;
+}
+
+static int registered_island_edge(void* user, u32 get, u32 put,
+                                  u32 command, u32* resume_get)
+{
+    fixture* f = user;
+    (void)command;
+    if (!resume_get || !f->island_get || get != f->island_get ||
+        put != f->island_put || !f->island_resume)
+        return 0;
+    *resume_get = f->island_resume;
+    return 1;
+}
+
+static int resolve_generated_jump(void* user, u32 get, u32 put,
+                                  u32 command, u32 target,
+                                  u32 target_word, u32* resume_get)
+{
+    fixture* f = user;
+    f->repair_calls++;
+    if (!resume_get || get != f->repair_source || put != f->repair_put ||
+        command != f->repair_command || target != f->repair_target ||
+        target_word != f->repair_word || !f->repair_resume)
+        return 0;
+    f->words[get >> 2] = 0x20000000u | f->repair_resume;
+    *resume_get = f->repair_resume;
+    return 1;
+}
+
+static int resolve_generated_hole(void* user, u32 get, u32 put,
+                                  u32 word, u32* resume_get)
+{
+    fixture* f = user;
+    f->hole_calls++;
+    if (!resume_get || get != f->hole_get || put != f->hole_put ||
+        word != f->hole_word || !f->hole_resume)
+        return 0;
+    *resume_get = f->hole_resume;
+    return 1;
+}
+
 static void fixture_init(fixture* f)
 {
     memset(f, 0, sizeof(*f));
@@ -73,7 +142,11 @@ static void fixture_init(fixture* f)
     ops.present = present;
     rsx_nr_backend_init(&f->backend, &f->ring, &f->tokens, &ops);
     rsx_nr_frame_owner_init(&f->owner, &f->adapter, &f->backend,
-                            &f->ring, read_word, f);
+                             &f->ring, read_word, f,
+                             release_initial_stopper, f,
+                             registered_island_edge, f,
+                             resolve_generated_jump, f,
+                             resolve_generated_hole, f);
 }
 
 static u32 packet(u32 count, u32 method)
@@ -172,6 +245,51 @@ static int test_partial_stopper_and_flow(void)
     return 0;
 }
 
+static int test_exact_published_head_stopper_release(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1000u;
+    const u32 put = base + 12u;
+    u32 next = 0, ret = ~0u;
+    f.words[base >> 2] = 0x20000000u | base;
+    f.words[(base + 4u) >> 2] = 0u;
+    f.published_put = put;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 4u,
+          "stable published head stopper did not advance exactly once");
+    CHECK(f.stopper_release_calls == 1u &&
+              f.words[base >> 2] == (0x20000000u | (base + 4u)) &&
+              f.owner.stats.released_stoppers == 1u,
+          "published head release did not retain exact accounting");
+
+    fixture_init(&f);
+    f.words[base >> 2] = 0x20000000u | base;
+    f.words[(base + 4u) >> 2] = 0u;
+    f.published_put = put + 4u; /* publication changed before recheck */
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, put, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_STOPPER && next == base,
+          "unstable publication snapshot skipped the stopper");
+    CHECK(f.words[base >> 2] == (0x20000000u | base) &&
+              f.owner.stats.released_stoppers == 0u,
+          "unstable publication mutated the stopper");
+
+    fixture_init(&f);
+    const u32 ordinary = 0x2000u;
+    f.words[ordinary >> 2] = 0x20000000u | ordinary;
+    f.published_put = ordinary + 12u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, ordinary, f.published_put, ~0u,
+              &next, &ret) == RSX_NR_FRAME_WAIT_STOPPER,
+          "ordinary in-stream stopper was released as a startup guard");
+    CHECK(next == ordinary &&
+              f.words[ordinary >> 2] == (0x20000000u | ordinary),
+          "ordinary stopper was changed or skipped");
+    return 0;
+}
+
 static int test_call_return_and_exact_unmapped_failure(void)
 {
     fixture f;
@@ -200,6 +318,359 @@ static int test_call_return_and_exact_unmapped_failure(void)
     CHECK(f.owner.failure.kind == RSX_NR_FRAME_FAILURE_UNMAPPED &&
               f.owner.failure.get == unmapped,
           "unmapped strict cursor was not recorded exactly");
+    return 0;
+}
+
+static int test_called_list_entry_waits_for_final_publication(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1000u;
+    const u32 target = 0x1800u;
+    const u32 transient_nested_call = 0x8E021702u;
+    u32 next = 0, ret = ~0u;
+    f.words[base >> 2] = target | 2u;
+    f.words[target >> 2] = transient_nested_call;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 4u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == target &&
+              ret == base + 4u,
+          "CALL did not enter the target publication boundary");
+    CHECK(f.owner.flow_origin.get == base &&
+              f.owner.flow_origin.command == (target | 2u) &&
+              f.owner.flow_origin.target == target &&
+              f.owner.flow_origin.return_before == ~0u &&
+              f.owner.flow_origin.return_after == base + 4u,
+          "CALL origin was not retained exactly");
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, target, base + 4u, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == target &&
+                  ret == base + 4u,
+              "transient called-list word escaped at retry %u", i);
+    CHECK(!f.owner.fatal && f.owner.flow_wait_polls == 1000000u &&
+              f.owner.stats.control_words == 1u,
+          "transient called-list word did not remain one wait episode");
+    f.words[target >> 2] = 0x00020000u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, target, base + 4u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 4u && ret == ~0u,
+          "finalized called list did not return exactly once");
+    return 0;
+}
+
+static int test_jump_waits_for_exact_target_publication(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1000u;
+    const u32 target = 0x2000u;
+    const u32 stale = 0x43260000u;
+    u32 next = 0, ret = ~0u;
+    f.words[base >> 2] = 0x20000000u | target;
+    f.words[target >> 2] = stale;
+    for (u32 i = 0; i < 1000000u; ++i) {
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, base, base + 8u, ~0u, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == base && ret == ~0u,
+              "unfinalized jump target escaped at retry %u", i);
+    }
+    CHECK(!f.owner.fatal && f.owner.flow_wait_polls == 1000000u &&
+              f.owner.stats.control_words == 0u,
+          "unfinalized jump was executed, skipped, or failed early");
+
+    f.words[target >> 2] = packet(1u, 0x0050u);
+    f.words[(target + 4u) >> 2] = 0x11223344u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 8u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == target,
+          "published jump target did not advance from the source");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, target, base + 8u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == target + 8u &&
+              f.references == 0x11223344u,
+          "published target packet did not execute exactly once");
+
+    fixture_init(&f);
+    f.words[base >> 2] = 0x20000000u | target;
+    f.words[target >> 2] = stale;
+    f.owner.flow_wait_limit = 3u;
+    for (u32 i = 0; i < 3u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, base, base + 8u, ~0u, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "bounded target wait failed before limit at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 8u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_FATAL &&
+              f.owner.failure.kind == RSX_NR_FRAME_FAILURE_BAD_FLOW &&
+              f.owner.failure.get == base &&
+              f.owner.failure.put == base + 8u &&
+              f.owner.failure.command == (0x20000000u | target) &&
+              f.owner.failure.method == target &&
+              f.owner.failure.argument == stale &&
+              f.owner.failure.argument_index == 4u,
+          "bounded target wait did not retain the exact dependency");
+
+    /* A recycled segment tail can contain data which happens to decode as a
+     * supported packet. The producer reserves that exact word for its link,
+     * so no packet-shaped value may release the dependency. */
+    fixture_init(&f);
+    const u32 segment_tail = 0x1FFCu;
+    const u32 segment_next = 0x2000u;
+    f.owner.primary_segment_bytes = 0x2000u;
+    f.words[base >> 2] = 0x20000000u | segment_tail;
+    f.words[segment_tail >> 2] = packet(1u, 0x0050u);
+    f.words[(segment_tail + 4u) >> 2] = 0xAABBCCDDu;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, 0x3000u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && next == base,
+          "packet-shaped segment-tail data was consumed as a command");
+    f.words[segment_tail >> 2] =
+        0x20000000u | segment_next;
+    f.words[segment_next >> 2] = 0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, 0x3000u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == segment_tail,
+          "published segment-tail link did not release its incoming jump");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, 0x3000u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == segment_next,
+          "published segment-tail link did not execute");
+
+    return 0;
+}
+
+static int test_invalid_jump_repair_is_exact_and_latched(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 source = 0x1000u;
+    const u32 raw_target = 0x2000u;
+    const u32 resume = 0x2100u;
+    const u32 put = 0x3000u;
+    const u32 raw = 0x43260000u;
+    u32 next = source, ret = ~0u;
+    f.words[source >> 2] = 0x20000000u | raw_target;
+    f.words[raw_target >> 2] = raw;
+    f.repair_source = source;
+    f.repair_put = put;
+    f.repair_command = f.words[source >> 2];
+    f.repair_target = raw_target;
+    f.repair_word = raw;
+
+    /* A refused proof is attempted once for an unchanged dependency, even
+     * across a million consumer polls. */
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, source, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == source,
+              "refused generated-link proof escaped at retry %u", i);
+    CHECK(f.repair_calls == 1u &&
+              f.owner.stats.generated_link_attempts == 1u &&
+              f.owner.stats.repaired_generated_links == 0u,
+          "unchanged invalid target was rescanned (%u/%llu)",
+          f.repair_calls, f.owner.stats.generated_link_attempts);
+
+    /* A genuinely newer PUT generation permits one new proof only after that
+     * snapshot is stable for the same bounded interval. The callback must
+     * patch the source, and the owner revalidates both the patched jump and
+     * resume command before advancing. Raw target bytes are never dispatched. */
+    const u32 new_put = put + 0x100u;
+    f.repair_put = new_put;
+    f.repair_resume = resume;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0xAABBCCDDu;
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, source, new_put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == source,
+              "new PUT generation was scanned before stable at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, source, new_put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume,
+          "proven generated-link repair did not advance exactly");
+    CHECK(f.repair_calls == 2u &&
+              f.owner.stats.generated_link_attempts == 2u &&
+              f.owner.stats.repaired_generated_links == 1u &&
+              f.owner.stats.methods == 0u &&
+              f.words[source >> 2] == (0x20000000u | resume),
+          "generated-link repair accounting or source patch was wrong");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, resume, new_put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && f.references == 0xAABBCCDDu,
+          "repaired command stream did not execute exactly once");
+    return 0;
+}
+
+static int test_primary_generated_hole_proof_is_exact_and_latched(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 hole = 0x1278u;
+    const u32 resume = 0x1280u;
+    const u32 put = 0x3000u;
+    const u32 raw = 0x3A2AAAABu;
+    u32 next = hole, ret = ~0u;
+    f.words[hole >> 2] = raw;
+    f.words[(hole + 4u) >> 2] = 0x04000000u;
+    f.hole_get = hole;
+    f.hole_put = put;
+    f.hole_word = raw;
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "refused generated hole escaped at retry %u", i);
+    CHECK(f.hole_calls == 1u &&
+              f.owner.stats.repaired_generated_holes == 0u,
+          "unchanged generated hole was rescanned (%u)", f.hole_calls);
+
+    const u32 new_put = put + 0x100u;
+    f.hole_put = new_put;
+    f.hole_resume = resume;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0x12345678u;
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, new_put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "new hole PUT generation was scanned before stable at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, new_put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume,
+          "proven generated hole did not advance to its exact prologue");
+    CHECK(f.hole_calls == 2u &&
+              f.owner.stats.repaired_generated_holes == 1u &&
+              f.owner.stats.methods == 0u,
+          "generated hole proof dispatched raw bytes or counted wrongly");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, resume, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && f.references == 0x12345678u,
+          "generated hole resume did not execute exactly once");
+    return 0;
+}
+
+static int test_packet_shaped_generated_hole_executes_no_arguments(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 hole = 0x1230u;
+    const u32 resume = 0x1280u;
+    const u32 put = 0x3000u;
+    const u32 packet_shaped_raw = 0x43C04000u;
+    u32 next = hole, ret = ~0u;
+    f.words[hole >> 2] = packet_shaped_raw;
+    f.words[(hole + 4u) >> 2] = 0u;
+    f.hole_get = hole;
+    f.hole_put = put;
+    f.hole_word = packet_shaped_raw;
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "packet-shaped raw data escaped at retry %u", i);
+    CHECK(f.hole_calls == 1u && f.adapter.methods_seen == 0u &&
+              f.owner.stats.methods == 0u && !f.owner.packet_active,
+          "packet-shaped raw data was scanned/executed calls=%u seen=%u "
+          "methods=%llu active=%u polls=%u",
+          f.hole_calls, f.adapter.methods_seen, f.owner.stats.methods,
+          f.owner.packet_active, f.owner.flow_wait_polls);
+
+    f.hole_word = packet_shaped_raw + 4u;
+    f.words[hole >> 2] = f.hole_word;
+    f.hole_resume = resume;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0xCAFEBABEu;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume &&
+              f.adapter.methods_seen == 0u,
+          "proven packet-shaped data gap did not skip to the exact prologue");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, resume, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && f.references == 0xCAFEBABEu,
+          "packet-shaped gap resume did not execute once");
+    return 0;
+}
+
+static int test_primary_hole_waits_but_called_list_fails(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1000u;
+    const u32 hole = base + 8u;
+    const u32 stale = 0x3A2AAAABu;
+    u32 next = 0, ret = ~0u;
+    f.words[base >> 2] = packet(1u, 0x0050u);
+    f.words[(base + 4u) >> 2] = 1u;
+    f.words[hole >> 2] = stale;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 16u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == hole,
+          "packet before the primary hole did not retire");
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, hole, base + 16u, ~0u, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && next == hole,
+              "primary unfinalized hole escaped at retry %u", i);
+    CHECK(!f.owner.fatal && f.owner.flow_wait_polls == 1000000u,
+          "primary unfinalized hole did not remain one bounded episode");
+    f.words[hole >> 2] = packet(1u, 0x0050u);
+    f.words[(hole + 4u) >> 2] = 2u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, base + 16u, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == hole + 8u &&
+              f.references == 2u,
+          "published primary hole did not execute exactly once");
+
+    fixture_init(&f);
+    f.words[hole >> 2] = stale;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, hole, base + 16u, base + 4u, &next, &ret) ==
+              RSX_NR_FRAME_FATAL &&
+              f.owner.failure.kind == RSX_NR_FRAME_FAILURE_BAD_FLOW &&
+              f.owner.failure.get == hole &&
+              f.owner.failure.command == stale,
+          "complete called-list corruption was mistaken for publication");
+    return 0;
+}
+
+static int test_registered_island_edge_skips_payload_exactly(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 base = 0x1000u;
+    const u32 payload = 0x1800u;
+    const u32 resume = 0x2000u;
+    const u32 put = 0x3000u;
+    u32 next = 0, ret = ~0u;
+    f.island_get = base;
+    f.island_put = put;
+    f.island_resume = resume;
+    f.words[base >> 2] = 0x20000000u | payload;
+    f.words[payload >> 2] = 0x2041FFFCu; /* valid VP word, ambiguous JUMP */
+    f.words[resume >> 2] = 0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, put, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume &&
+              f.owner.stats.skipped_data_islands == 1u &&
+              f.owner.stats.methods == 0u,
+          "registered island payload was decoded instead of skipped");
+
+    fixture_init(&f);
+    f.island_get = base;
+    f.island_put = put;
+    f.island_resume = 0x9000u; /* callback supplied an unmapped bad edge */
+    f.words[base >> 2] = 0x20000000u | payload;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, put, ~0u, &next, &ret) ==
+              RSX_NR_FRAME_FATAL &&
+              f.owner.failure.kind == RSX_NR_FRAME_FAILURE_ISLAND_EDGE &&
+              f.owner.failure.get == base &&
+              f.owner.failure.method == 0x9000u &&
+              f.owner.failure.argument == payload,
+          "invalid producer island edge was not bounded exactly");
     return 0;
 }
 
@@ -235,6 +706,7 @@ static int test_first_unsupported_is_sticky(void)
 {
     fixture f;
     fixture_init(&f);
+    f.owner.resolve_hole = NULL;
     const u32 base = 0x1000u;
     f.words[(base + 0u) >> 2] = packet(1u, 0x0004u);
     f.words[(base + 4u) >> 2] = 0xCAFEBABEu;
@@ -284,7 +756,15 @@ int main(void)
     if (test_consume_once_and_present() ||
         test_semaphore_retry_is_not_retranslated() ||
         test_partial_stopper_and_flow() ||
+        test_exact_published_head_stopper_release() ||
         test_call_return_and_exact_unmapped_failure() ||
+        test_called_list_entry_waits_for_final_publication() ||
+        test_jump_waits_for_exact_target_publication() ||
+        test_invalid_jump_repair_is_exact_and_latched() ||
+        test_primary_generated_hole_proof_is_exact_and_latched() ||
+        test_packet_shaped_generated_hole_executes_no_arguments() ||
+        test_primary_hole_waits_but_called_list_fails() ||
+        test_registered_island_edge_skips_payload_exactly() ||
         test_control_cycle_is_bounded() ||
         test_first_unsupported_is_sticky() ||
         test_execution_failure_retains_exact_argument())

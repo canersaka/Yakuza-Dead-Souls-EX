@@ -17,8 +17,7 @@ int main(void)
     const uint32_t base = 0x40400000u;
     const uint32_t size = 0x00800000u;
 
-    /* Live hard-freeze witness: GET 0x34F180 was a producer-owned self-stop;
-     * func_00EAB3DC published the immutable post-island cursor 0x4074FAA0. */
+    /* Keep the established stopper helper covered independently. */
     failed |= expect("captured island edge",
         yz_fifo_registered_island_resume(
             0x4074F180u, 0x4074FAA0u,
@@ -45,6 +44,80 @@ int main(void)
         yz_fifo_registered_island_resume(
             0x4074F180u, 0x4074FAA0u,
             0x0034F180u, 0x0034F900u, base, size), 0u);
+
+    /* func_00EAB3DC writes a forward jump to the aligned payload and then
+     * publishes the allocation end.  The payload is data, never a command
+     * target for the strict native consumer. */
+    failed |= expect("inline allocator edge",
+        yz_fifo_registered_inline_island_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001000u, 0x00002000u, base, size),
+        0x00001930u);
+    failed |= expect("inline wrong command family",
+        yz_fifo_registered_inline_island_resume(
+            0x40401000u, 0x00041010u, 0x40401930u,
+            0x00001000u, 0x00002000u, base, size), 0u);
+    failed |= expect("inline distant target",
+        yz_fifo_registered_inline_island_resume(
+            0x40401000u, 0x20001100u, 0x40401930u,
+            0x00001000u, 0x00002000u, base, size), 0u);
+    failed |= expect("inline target past end",
+        yz_fifo_registered_inline_island_resume(
+            0x40401000u, 0x20001010u, 0x40401010u,
+            0x00001000u, 0x00002000u, base, size), 0u);
+    failed |= expect("inline not yet published",
+        yz_fifo_registered_inline_island_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001000u, 0x00001900u, base, size), 0u);
+
+    /* Captured generated-list boundary: 17-argument VP constant packet at
+     * 0x1230, two padding/data words at 0x1278, exact prologue at 0x1280. */
+    failed |= expect("generated VP constant tail",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00441EFCu, 0x3A2AAAABu,
+            0x00001278u, 0x007FFFA0u, size, 1),
+        0x00001280u);
+    failed |= expect("generated VP wrong producer packet",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00401EFCu, 0x3A2AAAABu,
+            0x00001278u, 0x007FFFA0u, size, 1), 0u);
+    failed |= expect("generated VP command-shaped tail",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00441EFCu, 0x00041710u,
+            0x00001278u, 0x007FFFA0u, size, 1), 0u);
+    failed |= expect("generated VP flow-shaped tail",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00441EFCu, 0x20001280u,
+            0x00001278u, 0x007FFFA0u, size, 1), 0u);
+    failed |= expect("generated VP missing prologue",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00441EFCu, 0x3A2AAAABu,
+            0x00001278u, 0x007FFFA0u, size, 0), 0u);
+    failed |= expect("generated VP incomplete publication",
+        yz_fifo_generated_vp_constant_tail_resume(
+            0x00441EFCu, 0x3A2AAAABu,
+            0x00001278u, 0x000012A8u, size, 1), 0u);
+
+    /* Captured EDGE block boundary: a primary JUMP targets 0x41FFFC, the
+     * producer-owned final word of a 128 KiB generated block.  Recycled float
+     * data there may look like a packet; only the exact prologue and balanced
+     * prefix at 0x420000 permit resumption. */
+    failed |= expect("generated block tail",
+        yz_fifo_generated_block_tail_resume(
+            0x0041FFFCu, 0x43AC0000u, size, 0x00020000u, 1, 1),
+        0x00420000u);
+    failed |= expect("generated block real flow",
+        yz_fifo_generated_block_tail_resume(
+            0x0041FFFCu, 0x20420000u, size, 0x00020000u, 1, 1), 0u);
+    failed |= expect("generated block wrong boundary",
+        yz_fifo_generated_block_tail_resume(
+            0x0041FFF8u, 0x43AC0000u, size, 0x00020000u, 1, 1), 0u);
+    failed |= expect("generated block missing prologue",
+        yz_fifo_generated_block_tail_resume(
+            0x0041FFFCu, 0x43AC0000u, size, 0x00020000u, 0, 1), 0u);
+    failed |= expect("generated block unbalanced",
+        yz_fifo_generated_block_tail_resume(
+            0x0041FFFCu, 0x43AC0000u, size, 0x00020000u, 1, 0), 0u);
 
     if (!failed)
         puts("fifo publication island-edge regression: PASS");

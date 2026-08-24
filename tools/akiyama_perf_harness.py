@@ -906,6 +906,8 @@ def run_gun(args):
             yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
         if args.nr_hana_depth_oracle:
             yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
+    if args.nr_vertical_full_native:
+        yz["YZ_NR_VERTICAL"] = "full-native"
     if args.nr_vertical_shadow:
         # Shutdown-only fixed-memory producer/FIFO equivalence census.  This
         # is safe on the extended route: it neither owns commands nor emits
@@ -975,6 +977,21 @@ def run_gun(args):
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during gun route: {process.returncode}")
+            if stderr_path.exists():
+                stderr_tail = stderr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-262144:]
+                fatal = re.findall(
+                    r"\[(?:nr-vertical-section-fatal|nr-full-native-fatal)"
+                    r"[^\r\n]*",
+                    stderr_tail,
+                )
+                if fatal:
+                    result["route_failure_class"] = (
+                        "native-section-execution-fatal"
+                    )
+                    result["route_failure_state"] = fatal[-1]
+                    raise RuntimeError(fatal[-1])
             for path in sorted(capture_dir.glob("frontier_probe_*.ppm")):
                 if path in seen:
                     continue
@@ -1161,6 +1178,29 @@ def run_gun(args):
             stderr_text, re.MULTILINE,
         )
         result["nr_vertical_shadow"] = vertical_shadow
+        full_native_lines = re.findall(
+            r"^\[nr-full-native .*\]$", stderr_text, re.MULTILINE
+        )
+        full_native_d3d = re.findall(
+            r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_full_native"] = full_native_lines
+        result["nr_full_native_d3d"] = full_native_d3d
+        if args.nr_vertical_full_native:
+            if len(full_native_lines) != 1 or "fatal=0" not in full_native_lines[0]:
+                raise RuntimeError(
+                    "strict full-native gun run did not close with one clean "
+                    f"summary: {full_native_lines}"
+                )
+            if (len(full_native_d3d) != 1 or
+                    "legacy-groups=0" not in full_native_d3d[0] or
+                    "fallback=0" not in full_native_d3d[0]):
+                raise RuntimeError(
+                    "strict full-native gun run reached legacy work or a "
+                    f"native refusal: {full_native_d3d}"
+                )
+        elif full_native_lines:
+            raise RuntimeError("strict full-native owner was active in another lane")
         if args.nr_vertical_shadow:
             summaries = [line for line in vertical_shadow
                          if line.startswith("[nr-vertical-shadow ")]
@@ -1354,6 +1394,8 @@ def run(args):
             yz["YZ_NR_DRAW_PRIMITIVE"] = str(args.nr_draw_primitive)
         if args.nr_hana_depth_oracle:
             yz["YZ_NR_HANA_DEPTH_ORACLE"] = "1"
+    if args.nr_vertical_full_native:
+        yz["YZ_NR_VERTICAL"] = "full-native"
     if args.draw_phases:
         yz["YZ_RSX_DRAW_PHASES"] = "1"
     if args.wkl4_cycle:
@@ -1434,7 +1476,9 @@ def run(args):
                     encoding="utf-8", errors="replace"
                 )[-262144:]
                 fatal = re.findall(
-                    r"\[nr-vertical-section-fatal[^\r\n]*", stderr_tail
+                    r"\[(?:nr-vertical-section-fatal|nr-full-native-fatal)"
+                    r"[^\r\n]*",
+                    stderr_tail,
                 )
                 if fatal:
                     result["route_failure_class"] = (
@@ -1648,6 +1692,29 @@ def run(args):
         result["nr_live_census"] = live_lines
         result["draw_phase_aggregate"] = draw_phase_lines
         result["wkl4_cycle_aggregate"] = wkl4_cycle_lines
+        full_native_lines = re.findall(
+            r"^\[nr-full-native .*\]$", stderr_text, re.MULTILINE
+        )
+        full_native_d3d = re.findall(
+            r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_full_native"] = full_native_lines
+        result["nr_full_native_d3d"] = full_native_d3d
+        if args.nr_vertical_full_native:
+            if len(full_native_lines) != 1 or "fatal=0" not in full_native_lines[0]:
+                raise RuntimeError(
+                    "strict full-native run did not close with one clean "
+                    f"summary: {full_native_lines}"
+                )
+            if (len(full_native_d3d) != 1 or
+                    "legacy-groups=0" not in full_native_d3d[0] or
+                    "fallback=0" not in full_native_d3d[0]):
+                raise RuntimeError(
+                    "strict full-native run reached legacy work or a native "
+                    f"refusal: {full_native_d3d}"
+                )
+        elif full_native_lines:
+            raise RuntimeError("strict full-native owner was active in another lane")
         if ((args.nr_shadow_census or args.nr_flip or args.nr_clear or
              args.nr_draw) and
                 len(shadow_lines) != 1):
@@ -1780,6 +1847,7 @@ def main():
     parser.add_argument("--nr-vertical-active-basic", action="store_true")
     parser.add_argument("--nr-vertical-active-present", action="store_true")
     parser.add_argument("--nr-vertical-active-graphics", action="store_true")
+    parser.add_argument("--nr-vertical-full-native", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
@@ -1813,6 +1881,7 @@ def main():
             args.nr_draw, args.nr_vertical_shadow,
             args.nr_vertical_active_basic, args.nr_vertical_active_present,
             args.nr_vertical_active_graphics,
+            args.nr_vertical_full_native,
             args.draw_phases,
             args.wkl4_cycle)) > 1:
         parser.error("select only one diagnostic/family lane")
