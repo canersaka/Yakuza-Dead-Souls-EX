@@ -44,9 +44,12 @@ void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
 int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, void** r, u32* f)
 { (void)l; (void)o; (void)w; (void)h; (void)r; (void)f; return -1; }
 int rsx_live_draw_borrow_depth(u32 l, u32 o, u32 df, u32 w, u32 h,
-                               void** r, u32* rf, u32* d, u32* s, int* p)
+                               void** r, u32* rf, u32* d, u32* s,
+                               void** sr, u32* sf, int* p)
 { (void)l; (void)o; (void)df; (void)w; (void)h; (void)r; (void)rf; (void)d;
-  (void)s; if (p) *p = 0; return -1; }
+  (void)s; (void)sr; (void)sf; if (p) *p = 0; return -1; }
+int rsx_live_draw_resolve_depth_sample(u32 l, u32 o, u32 w, u32 h)
+{ (void)l; (void)o; (void)w; (void)h; return -1; }
 int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 int rsx_live_draw_timeline_acquire(void** l, u64* g, u64* r, u64* c)
@@ -7537,13 +7540,16 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
                                u32 width, u32 height, void** resource,
                                u32* resource_format, u32* dsv_format,
-                               u32* srv_format,
+                               u32* srv_format, void** sample_resource,
+                               u32* sample_srv_format,
                                int* publication_required)
 {
     if (!resource || !resource_format || !dsv_format || !srv_format ||
-        !publication_required || depth_format != 2u)
+        !sample_resource || !sample_srv_format || !publication_required ||
+        depth_format != 2u)
         return -1; /* live shared cache is D32S8; Z16 remains legacy */
     *resource = NULL;
+    *sample_resource = NULL;
     *publication_required = 0;
     AcquireSRWLockExclusive(&g_ld_access_lock);
     if (!g.ready) {
@@ -7563,15 +7569,40 @@ int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         return -1;
     }
-    ID3D12Resource* const texture = g.zdepths[slot - 1u].tex;
+    zdepth_t* const z = &g.zdepths[slot - 1u];
+    ID3D12Resource* const texture = z->tex;
     *publication_required = texture != prior;
     texture->lpVtbl->AddRef(texture);
     *resource = texture;
     *resource_format = DXGI_FORMAT_R32G8X24_TYPELESS;
     *dsv_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     *srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    if (z->snapshot) {
+        z->snapshot->lpVtbl->AddRef(z->snapshot);
+        *sample_resource = z->snapshot;
+        *sample_srv_format = DXGI_FORMAT_R32_FLOAT;
+    }
     ReleaseSRWLockExclusive(&g_ld_access_lock);
     return 0;
+}
+
+int rsx_live_draw_resolve_depth_sample(u32 location, u32 offset,
+                                       u32 width, u32 height)
+{
+    int result = -1;
+    AcquireSRWLockExclusive(&g_ld_access_lock);
+    if (g.ready) {
+        for (u32 i = 0; i < g.n_zdepths; ++i) {
+            zdepth_t* const z = &g.zdepths[i];
+            if (z->location != location || z->offset != offset ||
+                z->snapshot_w != width || z->snapshot_h != height)
+                continue;
+            result = zdepth_snapshot(1u + i) ? 0 : -1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_ld_access_lock);
+    return result;
 }
 
 static int ld_present_external_impl(ID3D12Resource* source, u32 format,

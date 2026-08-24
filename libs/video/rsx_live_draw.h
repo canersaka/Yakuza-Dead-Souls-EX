@@ -122,8 +122,11 @@ int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
 int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
                                u32 width, u32 height, void** resource,
                                u32* resource_format, u32* dsv_format,
-                               u32* srv_format,
+                               u32* srv_format, void** sample_resource,
+                               u32* sample_srv_format,
                                int* publication_required);
+int rsx_live_draw_resolve_depth_sample(u32 location, u32 offset,
+                                       u32 width, u32 height);
 
 /* Native-render clear-family bridge, preserving the original live renderer's
  * state/register ownership and serialization while the typed backend owns the

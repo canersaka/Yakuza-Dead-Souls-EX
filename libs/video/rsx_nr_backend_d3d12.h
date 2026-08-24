@@ -59,7 +59,14 @@ typedef int (*rsx_nr_d3d12_borrow_color_fn)(
 typedef int (*rsx_nr_d3d12_borrow_depth_fn)(
     void* user, u32 space, u32 offset, u32 depth_format,
     u32 width, u32 height, void** resource, u32* resource_format,
-    u32* dsv_format, u32* srv_format, int* publication_required);
+    u32* dsv_format, u32* srv_format, void** sample_resource,
+    u32* sample_srv_format, int* publication_required);
+/* Record the established renderer's depth-to-color snapshot on the same
+ * ordered command list. A zero result guarantees sample_resource contains the
+ * representation legacy rendering would bind; nonzero makes the backend use
+ * its already-preflighted guest-memory fallback for that draw. */
+typedef int (*rsx_nr_d3d12_resolve_depth_sample_fn)(
+    void* user, u32 space, u32 offset, u32 width, u32 height);
 typedef void (*rsx_nr_d3d12_publish_write_fn)(
     void* user, u32 space, u32 offset, u32 size);
 /* Resolve and read CellGcmReportData.value for a condition captured by
@@ -207,7 +214,9 @@ void rsx_nr_d3d12_set_watch_page(rsx_nr_d3d12* b,
                                  void* watch_user);
 void rsx_nr_d3d12_set_resource_broker(
     rsx_nr_d3d12* b, rsx_nr_d3d12_borrow_color_fn color,
-    rsx_nr_d3d12_borrow_depth_fn depth, void* broker_user);
+    rsx_nr_d3d12_borrow_depth_fn depth,
+    rsx_nr_d3d12_resolve_depth_sample_fn resolve_depth_sample,
+    void* broker_user);
 
 /* Optional post-publication route for host-memory transfer writes. When set,
  * the callback owns generation notification after the bytes are visible; the
