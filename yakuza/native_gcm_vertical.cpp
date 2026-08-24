@@ -393,6 +393,7 @@ struct yz_nr_vertical_active_state {
     unsigned long long section_render_passes_owned;
     unsigned long long section_dependency_islands_owned;
     unsigned long long section_shadow_depth_fallback;
+    unsigned long long section_shadow_consumer_fallback;
     yz_nr_section_unknown_key section_unknown[64];
     yz_nr_section_report_key section_reports[64];
     yz_nr_section_draw_preflight_key section_draw_preflight[64];
@@ -2875,6 +2876,15 @@ static uint32_t yz_nr_section_program_preflight(void)
             g_active.section_shadow_depth_fallback++;
             return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
         }
+        for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
+            const rsx_nir_texture* const texture = &state.textures[unit];
+            if (rsx_nr_yz_unproven_shadow_depth_consumer(
+                    texture->enabled, texture->location, texture->offset,
+                    texture->format)) {
+                g_active.section_shadow_consumer_fallback++;
+                return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            }
+        }
         const int result = rsx_nr_d3d12_validate_draw_program(
             g_active.d3d12, &state, vp_words, vp_word_count);
         if (result != 0) {
@@ -2971,6 +2981,13 @@ static uint32_t yz_nr_section_preflight(void)
                     state.raster.color_mask,
                     state.depth_stencil.depth_write_enable))
                 return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            for (uint32_t unit = 0; unit < RSX_NIR_NUM_TEXTURES; ++unit) {
+                const rsx_nir_texture* const texture = &state.textures[unit];
+                if (rsx_nr_yz_unproven_shadow_depth_consumer(
+                        texture->enabled, texture->location, texture->offset,
+                        texture->format))
+                    return YZ_NR_SECTION_FB_PREFLIGHT_DRAW;
+            }
             const uint32_t* const batches = rsx_nir_side(
                 &g_active.section_stream, op->u.draw.batches_ofs,
                 op->u.draw.batch_count * 2u);
@@ -3783,6 +3800,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "render-passes=%llu dependency-islands=%llu "
                     "methods=%llu ops=%llu exec-errors=%llu fast-skip=%llu "
                     "legacy-path=%u:%u/%llu/%llu shadow-depth=%llu "
+                    "shadow-consumer=%llu "
                     "fallback="
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
@@ -3798,6 +3816,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     g_active.section_legacy_path_skips,
                     g_active.section_legacy_path_exits,
                     g_active.section_shadow_depth_fallback,
+                    g_active.section_shadow_consumer_fallback,
                     g_active.section_fallback[0],
                     g_active.section_fallback[1],
                     g_active.section_fallback[2],

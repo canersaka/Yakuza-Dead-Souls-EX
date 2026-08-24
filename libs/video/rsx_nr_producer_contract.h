@@ -232,6 +232,15 @@ int rsx_nr_yz_unproven_shadow_depth_producer(
     u32 zeta_location, u32 zeta_offset, u32 color_mask,
     u32 depth_write_enable);
 
+/* These same two depth identities feed the title's character/world shadow
+ * factor pass through DEPTH24_D8 fragment textures. Until the native
+ * consumer is visually equivalent, keep its complete containing section on
+ * the established renderer. Modifiers such as LINEAR/UNNORMALIZED do not
+ * change the underlying depth format identity. */
+int rsx_nr_yz_unproven_shadow_depth_consumer(
+    u32 enabled, u32 texture_location, u32 texture_offset,
+    u32 texture_format);
+
 /* The imported flip contract is not complete at E944 (queue buffer).  Its
  * E924 head command is the first boundary after which a renderer may claim
  * the preceding command-list frame without mixing clears/draws/presentation
