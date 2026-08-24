@@ -438,6 +438,17 @@ static int yz_a010_data_island_snapshot(
         return 0;
     yz_a010_data_island_record* const record =
         &g_yz_a010_data_island[(source_ea - 0x40400000u) >> 2];
+    /* Empty slots dominate the strict-owner flow path. Reject them with one
+     * acquire load before entering the seqlock retry, avoiding a locked RMW
+     * for each of the four late-edge candidates on ordinary JUMPs. */
+#if defined(YZ_PERF_CLEAN)
+    const LONG visible = ReadAcquire(&record->sequence);
+#else
+    const LONG visible = InterlockedCompareExchange(
+        &record->sequence, 0, 0);
+#endif
+    if (!visible || (visible & 1))
+        return 0;
     for (unsigned attempt = 0; attempt < 4u; ++attempt) {
         const LONG before = InterlockedCompareExchange(
             &record->sequence, 0, 0);
@@ -6731,13 +6742,39 @@ extern "C" int yz_rsx_registered_data_island_edge(
     uint32_t saved_command = 0u;
     uint32_t data_end_ea = 0u;
     uint32_t generation = 0u;
-    if (!yz_a010_data_island_snapshot(
-            source_ea, &saved_command, &data_end_ea, &generation) ||
-        saved_command != command)
-        return 0;
-    const uint32_t resume = yz_fifo_registered_inline_island_resume(
-        source_ea, saved_command, data_end_ea, get, put,
-        0x40400000u, 0x800000u);
+    uint32_t record_source_ea = source_ea;
+    uint32_t resume = 0u;
+    int result = 1;
+    if (yz_a010_data_island_snapshot(
+            source_ea, &saved_command, &data_end_ea, &generation) &&
+        saved_command == command) {
+        resume = yz_fifo_registered_inline_island_resume(
+            source_ea, saved_command, data_end_ea, get, put,
+            0x40400000u, 0x800000u);
+    }
+
+    /* The allocator writes up to four alignment zeros before its edge. If the
+     * consumer observes one transient zero, GET reaches the exact payload
+     * start before the edge becomes visible. Probe only those four possible
+     * source slots in the producer-record table; never scan FIFO contents or
+     * admit an interior payload word. */
+    if (!resume) {
+        result = 2;
+        for (uint32_t delta = 4u; delta <= 0x10u && get >= delta;
+             delta += 4u) {
+            record_source_ea = yz_rsx_io_to_ea(get - delta);
+            if (!record_source_ea ||
+                !yz_a010_data_island_snapshot(
+                    record_source_ea, &saved_command, &data_end_ea,
+                    &generation))
+                continue;
+            resume = yz_fifo_registered_inline_island_member_resume(
+                record_source_ea, saved_command, data_end_ea,
+                get, put, 0x40400000u, 0x800000u);
+            if (resume)
+                break;
+        }
+    }
     if (!resume)
         return 0;
     MemoryBarrier();
@@ -6746,14 +6783,15 @@ extern "C" int yz_rsx_registered_data_island_edge(
     uint32_t recheck_generation = 0u;
     if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
         vm_read32(source_ea) != command ||
+        vm_read32(record_source_ea) != saved_command ||
         !yz_a010_data_island_snapshot(
-            source_ea, &recheck_command, &recheck_end,
+            record_source_ea, &recheck_command, &recheck_end,
             &recheck_generation) ||
         recheck_command != saved_command || recheck_end != data_end_ea ||
         recheck_generation != generation)
         return 0;
     *resume_get = resume;
-    return 1;
+    return result;
 }
 
 /* Strict-native counterpart of the retained a010 generated-link repair.

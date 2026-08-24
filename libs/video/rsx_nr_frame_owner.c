@@ -509,9 +509,11 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
             ? (command & 0xFFFFFFFCu) : (command & 0x1FFFFFFCu);
         u32 target_word = 0;
         u32 island_resume = 0;
-        if (o->island_edge && o->island_edge(
-                o->island_edge_user, get, put, command,
-                &island_resume)) {
+        const int island_result = o->island_edge
+            ? o->island_edge(o->island_edge_user, get, put, command,
+                             &island_resume)
+            : 0;
+        if (island_result) {
             if (island_resume == get ||
                 !frame_read(o, island_resume, &target_word))
                 return frame_fail(
@@ -522,6 +524,8 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
             o->flow_wait_polls = 0u;
             *next_get = island_resume;
             o->stats.skipped_data_islands++;
+            if (island_result == 2)
+                o->stats.recovered_late_island_entries++;
             frame_record_flow(
                 o, get, command, island_resume, call_return,
                 call_return);
