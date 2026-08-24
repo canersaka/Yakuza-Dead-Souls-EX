@@ -6789,7 +6789,15 @@ extern "C" int yz_rsx_resolve_published_generated_link(
     const int target_method =
         (target_word & 0xA0030003u) == 0u &&
         ((target_word >> 18) & 0x7FFu) != 0u;
-    if (target_flow || target_method)
+    const uint32_t generated_block = 0x20000u;
+    const uint32_t local_resume = (target + 4u) & mask;
+    const uint32_t local_end = (local_resume + generated_block) & mask;
+    const int local_boundary =
+        ((target + 4u) & (generated_block - 1u)) == 0u;
+    /* A generated-block tail is producer-owned link storage.  Recycled
+     * float/constant bytes can syntactically resemble a valid packet, so the
+     * exact boundary proof below—not packet shape—owns admission there. */
+    if (target_flow || (target_method && !local_boundary))
         return 0;
 
     const uint32_t source_ea = yz_rsx_io_to_ea(get);
@@ -6802,33 +6810,37 @@ extern "C" int yz_rsx_resolve_published_generated_link(
      * word is producer-owned link storage and can still hold recycled
      * vertex/constant payload when the source edge becomes visible.  This
      * occurs before the a010 scene root is active as well as during gameplay,
-     * so use a protocol proof rather than a scene gate: the following word
-     * must be the exact generated prologue and its complete 128 KiB window
-     * must form one draw-balanced prefix ending at its own self-stopper. */
-    const uint32_t generated_block = 0x20000u;
-    const uint32_t local_resume = (target + 4u) & mask;
-    const uint32_t local_end = (local_resume + generated_block) & mask;
-    const int local_boundary =
-        ((target + 4u) & (generated_block - 1u)) == 0u;
-    const int local_prologue = local_boundary &&
-        yz_a010_generated_prologue_at(local_resume);
+     * so use a protocol proof rather than a scene gate: the following block
+     * must contain an exact generated prologue whose prefix is draw-balanced
+     * and ends at its own self-stopper.  Recycled payload may precede that
+     * first finalized prologue. */
+    const uint32_t local_candidate = local_boundary
+        ? yz_a010_find_balanced_generated_prefix(local_resume, local_end)
+        : 0u;
+    const int local_prologue = local_candidate &&
+        yz_a010_generated_prologue_at(local_candidate);
     const int local_balanced = local_prologue &&
         yz_a010_balanced_generated_prefix_at(
-            local_resume, local_resume, local_end);
-    const uint32_t exact_resume = yz_fifo_generated_block_tail_resume(
-        target, target_word, ring, generated_block,
+            local_candidate, local_resume, local_end);
+    const uint32_t exact_resume =
+        yz_fifo_generated_block_candidate_resume(
+        target, target_word, local_candidate, ring, generated_block,
         local_prologue, local_balanced);
     if (exact_resume) {
         MemoryBarrier();
+        const uint32_t recheck_candidate =
+            yz_a010_find_balanced_generated_prefix(
+                local_resume, local_end);
         if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
             vm_read32(source_ea) != command ||
             vm_read32(target_ea) != target_word ||
-            yz_fifo_generated_block_tail_resume(
-                target, vm_read32(target_ea), ring, generated_block,
+            recheck_candidate != exact_resume ||
+            yz_fifo_generated_block_candidate_resume(
+                target, vm_read32(target_ea), exact_resume,
+                ring, generated_block,
                 yz_a010_generated_prologue_at(exact_resume),
                 yz_a010_balanced_generated_prefix_at(
-                    exact_resume, exact_resume,
-                    (exact_resume + generated_block) & mask)) !=
+                    exact_resume, local_resume, local_end)) !=
                 exact_resume)
             return 0;
         const uint32_t repaired = new_jump
@@ -6841,7 +6853,7 @@ extern "C" int yz_rsx_resolve_published_generated_link(
         *resume_get = exact_resume;
         return 1;
     }
-    if (local_boundary && (!local_prologue || !local_balanced))
+    if (local_boundary && !exact_resume)
         return -1; /* exact EDGE block; producer has not finalized it yet */
 
     /* The older FE0-anchored search is specifically an a010 generated-chain
@@ -6912,31 +6924,39 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
         (block_resume + generated_block) & mask;
     const int block_boundary =
         ((get + 4u) & (generated_block - 1u)) == 0u;
-    const int block_prologue = block_boundary &&
-        yz_a010_generated_prologue_at(block_resume);
+    const uint32_t block_candidate = block_boundary
+        ? yz_a010_find_balanced_generated_prefix(block_resume, block_end)
+        : 0u;
+    const int block_prologue = block_candidate &&
+        yz_a010_generated_prologue_at(block_candidate);
     const int block_balanced = block_prologue &&
         yz_a010_balanced_generated_prefix_at(
-            block_resume, block_resume, block_end);
-    const uint32_t block_exact = yz_fifo_generated_block_tail_resume(
-        get, word, ring, generated_block,
+            block_candidate, block_resume, block_end);
+    const uint32_t block_exact =
+        yz_fifo_generated_block_candidate_resume(
+        get, word, block_candidate, ring, generated_block,
         block_prologue, block_balanced);
     if (block_exact) {
         MemoryBarrier();
+        const uint32_t recheck_candidate =
+            yz_a010_find_balanced_generated_prefix(
+                block_resume, block_end);
         if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
             vm_read32(hole_ea) == word &&
-            yz_fifo_generated_block_tail_resume(
-                get, vm_read32(hole_ea), ring, generated_block,
+            recheck_candidate == block_exact &&
+            yz_fifo_generated_block_candidate_resume(
+                get, vm_read32(hole_ea), block_exact,
+                ring, generated_block,
                 yz_a010_generated_prologue_at(block_exact),
                 yz_a010_balanced_generated_prefix_at(
-                    block_exact, block_exact,
-                    (block_exact + generated_block) & mask)) ==
+                    block_exact, block_resume, block_end)) ==
                 block_exact) {
             *resume_get = block_exact;
             return 1;
         }
         return -1;
     }
-    if (block_boundary && (!block_prologue || !block_balanced))
+    if (block_boundary && !block_exact)
         return -1;
 
     /* The captured 0x1278 family is the eight-byte alignment tail after one

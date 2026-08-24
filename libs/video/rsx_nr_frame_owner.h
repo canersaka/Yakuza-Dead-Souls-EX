@@ -171,6 +171,7 @@ typedef struct rsx_nr_frame_owner {
     u32 repair_attempt_target;
     u32 repair_attempt_word;
     u32 primary_segment_bytes;
+    u32 generated_block_bytes;
     unsigned long long method_errors_before;
 
     rsx_nr_frame_failure failure;

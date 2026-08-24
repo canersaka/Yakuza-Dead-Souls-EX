@@ -118,6 +118,26 @@ int main(void)
     failed |= expect("generated block unbalanced",
         yz_fifo_generated_block_tail_resume(
             0x0041FFFCu, 0x43AC0000u, size, 0x00020000u, 1, 0), 0u);
+    failed |= expect("generated block later exact candidate",
+        yz_fifo_generated_block_candidate_resume(
+            0x0041FFFCu, 0x43AC0000u, 0x00420180u,
+            size, 0x00020000u, 1, 1), 0x00420180u);
+    failed |= expect("generated block candidate outside next block",
+        yz_fifo_generated_block_candidate_resume(
+            0x0041FFFCu, 0x43AC0000u, 0x00440000u,
+            size, 0x00020000u, 1, 1), 0u);
+    failed |= expect("generated block later candidate with real flow tail",
+        yz_fifo_generated_block_candidate_resume(
+            0x0041FFFCu, 0x20420000u, 0x00420180u,
+            size, 0x00020000u, 1, 1), 0u);
+    failed |= expect("generated block later candidate missing prologue",
+        yz_fifo_generated_block_candidate_resume(
+            0x0041FFFCu, 0x43AC0000u, 0x00420180u,
+            size, 0x00020000u, 0, 1), 0u);
+    failed |= expect("generated block later candidate unbalanced",
+        yz_fifo_generated_block_candidate_resume(
+            0x0041FFFCu, 0x43AC0000u, 0x00420180u,
+            size, 0x00020000u, 1, 0), 0u);
 
     if (!failed)
         puts("fifo publication island-edge regression: PASS");
