@@ -65,6 +65,8 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* o,
                              void* release_stopper_user,
                              rsx_nr_frame_island_edge_fn island_edge,
                              void* island_edge_user,
+                             rsx_nr_frame_released_edge_fn released_edge,
+                             void* released_edge_user,
                              rsx_nr_frame_resolve_jump_fn resolve_jump,
                              void* resolve_jump_user,
                              rsx_nr_frame_resolve_hole_fn resolve_hole,
@@ -80,6 +82,8 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* o,
     o->release_stopper_user = release_stopper_user;
     o->island_edge = island_edge;
     o->island_edge_user = island_edge_user;
+    o->released_edge = released_edge;
+    o->released_edge_user = released_edge_user;
     o->resolve_jump = resolve_jump;
     o->resolve_jump_user = resolve_jump_user;
     o->resolve_hole = resolve_hole;
@@ -564,8 +568,21 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
                 o, RSX_NR_FRAME_FAILURE_BAD_FLOW, get, put, call_return,
                 command, 0u, target, 0u);
         }
-        if (!frame_flow_target_ready(
-                o, target, call_return, target_word)) {
+        int target_ready = frame_flow_target_ready(
+            o, target, call_return, target_word);
+        if (!target_ready &&
+            frame_is_generated_block_tail(o, target, call_return) &&
+            frame_command_syntactically_ready(target_word) &&
+            o->released_edge && o->released_edge(
+                o->released_edge_user, get, put, command,
+                target, target_word)) {
+            /* The exact fenced producer edge distinguishes a real packet
+             * beginning at this address from recycled command-shaped data.
+             * The target itself is consumed normally on the next step. */
+            target_ready = 1;
+            o->stats.admitted_released_boundaries++;
+        }
+        if (!target_ready) {
             if (call_return == ~0u && target < NR_FRAME_RING_SIZE &&
                 frame_try_resolve_generated_jump(
                     o, get, put, call_return, command, target,

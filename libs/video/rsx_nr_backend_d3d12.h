@@ -138,6 +138,25 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long residency_failures;
     unsigned long long mirror_resyncs;
     unsigned long long mirror_rollovers;
+    unsigned long long mirror_syncs;
+    unsigned long long mirror_uploads;
+    unsigned long long mirror_upload_bytes;
+    unsigned long long mirror_upload_rejects;
+    unsigned long long mirror_deferred_syncs;
+    unsigned long long mirror_resolver_failures;
+    unsigned long long mirror_exact_patches;
+    unsigned long long mirror_exact_patch_bytes;
+    unsigned long long mirror_exact_patch_retries;
+    unsigned int first_residency_failure_stage; /* 1=plan 2=span 3=stabilize */
+    unsigned int first_residency_failure_result;
+    unsigned int first_residency_required_count;
+    unsigned int first_residency_space;
+    unsigned int first_residency_offset;
+    unsigned int first_residency_size;
+    unsigned int first_residency_first_page;
+    unsigned int first_residency_last_page;
+    unsigned int first_residency_first_gen;
+    unsigned int first_residency_last_gen;
     unsigned long long forced_draw_input_refreshes;
     unsigned long long upload_rollovers;  /* safe pre-draw arena retires   */
     unsigned long long shared_timeline_acquires;

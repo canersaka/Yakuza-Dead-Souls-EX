@@ -1470,6 +1470,87 @@ static int nrb_required_spans_current(
     return 1;
 }
 
+/* Repair only shader-visible bytes when a producer is continuously updating
+ * another part of the same coarse generation page.  The ordinary mirror sync
+ * remains the fast persistent path.  An exact patch is ordered after that
+ * page copy and before the draw on the same command list, but deliberately
+ * does not acknowledge the page generation: a later draw that consumes a
+ * different span must independently prove or upload its own bytes. */
+static int nrb_patch_stale_required_spans(
+    rsx_nr_d3d12* b, const nrb_required_span* required, u32 count)
+{
+    const u64 completed = b->shared_timeline
+        ? b->shared_completed_fence
+        : b->fence->lpVtbl->GetCompletedValue(b->fence);
+    const u64 recording = b->shared_timeline
+        ? b->shared_recording_fence : b->fence_value + 1u;
+    rsx_gpu_mirror_d3d12_retire(b->mirror_be, completed);
+    if (rsx_gpu_mirror_d3d12_begin_fenced(
+            b->mirror_be, b->list, recording) != 0)
+        return -1;
+
+    int result = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const nrb_required_span* const span = &required[i];
+        if (nrb_span_current(b, span->space, span->offset, span->size))
+            continue;
+        const u8* const src = b->guest_ptr(
+            b->guest_user, span->space, span->offset, span->size);
+        if (!src) {
+            result = -1;
+            break;
+        }
+        result = rsx_gpu_mirror_d3d12_patch_exact(
+            b->mirror_be, span->space, span->offset, src, span->size);
+        if (result != 0) {
+            b->stats.mirror_exact_patch_retries++;
+            break;
+        }
+        b->stats.mirror_exact_patches++;
+        b->stats.mirror_exact_patch_bytes += span->size;
+    }
+    rsx_gpu_mirror_d3d12_end(b->mirror_be, recording);
+    return result;
+}
+
+/* A strict-native refusal is a bounded development failure. Preserve the
+ * first exact residency dependency in fixed stats so a live-only failure can
+ * be corrected from one run without per-draw logging or a profiler. */
+static void nrb_note_first_residency_failure(
+    rsx_nr_d3d12* b, u32 stage, u32 result,
+    const nrb_required_span* required, u32 count)
+{
+    if (b->stats.first_residency_failure_stage)
+        return;
+    b->stats.first_residency_failure_stage = stage;
+    b->stats.first_residency_failure_result = result;
+    b->stats.first_residency_required_count = count;
+    if (!required || !count)
+        return;
+    const nrb_required_span* selected = &required[0];
+    for (u32 i = 0; i < count; ++i) {
+        if (!nrb_span_current(b, required[i].space, required[i].offset,
+                              required[i].size)) {
+            selected = &required[i];
+            break;
+        }
+    }
+    b->stats.first_residency_space = selected->space;
+    b->stats.first_residency_offset = selected->offset;
+    b->stats.first_residency_size = selected->size;
+    if (!selected->size || selected->space >= RSX_GUEST_NUM_SPACES)
+        return;
+    const u32 first = selected->offset >> RSX_GUEST_PAGE_SHIFT;
+    const u32 last = (u32)(((u64)selected->offset + selected->size - 1u) >>
+                           RSX_GUEST_PAGE_SHIFT);
+    b->stats.first_residency_first_page = first;
+    b->stats.first_residency_last_page = last;
+    b->stats.first_residency_first_gen =
+        rsx_guest_pages_page_gen(&b->pages, selected->space, first);
+    b->stats.first_residency_last_gen =
+        rsx_guest_pages_page_gen(&b->pages, selected->space, last);
+}
+
 /* Establish one immutable GPU-visible point for every byte this draw pulls.
  * A write published while a page is copied leaves its generation stale; in
  * that case append a repair copy before recording the draw. If the bounded
@@ -1489,6 +1570,14 @@ static int nrb_stabilize_required_spans(
             return 0;
         b->stats.mirror_resyncs++;
 
+        /* A busy dynamic arena can republish one 1 KiB tracking page for the
+         * next draw forever even though this draw's exact 52-byte (or similar)
+         * span is stable.  Snapshot and patch only every still-stale required
+         * span; successful patches are later commands in this same list, so
+         * they supersede the coarse page copy without weakening cache state. */
+        if (nrb_patch_stale_required_spans(b, required, count) == 0)
+            return 0;
+
         /* One append retry repairs an ordinary generation race without a
          * submission. If it is still stale, the fixed slice is either full
          * or the producer is actively republishing the page; retire the
@@ -1499,6 +1588,7 @@ static int nrb_stabilize_required_spans(
             b->stats.mirror_rollovers++;
         }
     }
+    nrb_note_first_residency_failure(b, 3u, 0u, required, count);
     return -1;
 }
 
@@ -2555,8 +2645,6 @@ static D3D12_TEXTURE_ADDRESS_MODE nrb_wrap(u32 wrap)
 static D3D12_SAMPLER_DESC nrb_sampler(const rsx_nir_texture* texture)
 {
     D3D12_SAMPLER_DESC desc = {0};
-    const u32 format = texture->format & NRB_TEX_BASE_MASK &
-                       ~NRB_TEX_UNNORM;
     const u32 minf = (texture->filter >> 16) & 7u;
     const u32 magf = (texture->filter >> 24) & 7u;
     const D3D12_FILTER_TYPE min_type =
@@ -2577,22 +2665,11 @@ static D3D12_SAMPLER_DESC nrb_sampler(const rsx_nir_texture* texture)
     if (desc.MaxLOD < desc.MinLOD)
         desc.MaxLOD = desc.MinLOD;
     desc.MaxAnisotropy = 1;
-    /* The established renderer has always left the D3D border color at
-     * zero for sampled depth snapshots.  Yakuza writes opaque white into
-     * the guest border register for its character-shadow maps, so honoring
-     * that value here changes out-of-range depth comparisons and produces
-     * black silhouettes.  Preserve ordinary texture border colors while
-     * keeping DEPTH24_D8 sampling bit-for-bit compatible with legacy. */
-    if (format != NRB_TEX_DEPTH24_D8) {
-        desc.BorderColor[0] =
-            (float)((texture->border_color >> 16) & 0xFFu) / 255.0f;
-        desc.BorderColor[1] =
-            (float)((texture->border_color >> 8) & 0xFFu) / 255.0f;
-        desc.BorderColor[2] =
-            (float)(texture->border_color & 0xFFu) / 255.0f;
-        desc.BorderColor[3] =
-            (float)((texture->border_color >> 24) & 0xFFu) / 255.0f;
-    }
+    /* Match the established renderer's sampler contract exactly.  It
+     * zero-initializes D3D12_SAMPLER_DESC and never copies the guest border
+     * register.  Honoring Yakuza's opaque-white value here made fullscreen
+     * BORDER-sampled post effects feather white in from every image edge;
+     * it also changed out-of-range character-shadow depth comparisons. */
     return desc;
 }
 
@@ -4506,6 +4583,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             &plan, attrs, defaults, st->vertex_bindings.base_offset,
             st->vertex_bindings.freq_divider_op, &layout,
             RSX_PULL_TYPES_ALL)) {
+        nrb_note_first_residency_failure(b, 1u, 0u, NULL, 0u);
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_plan++;
         return -1;
@@ -4534,6 +4612,9 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         b, st, &plan, d, batches, d->indexed && !use_host_ib,
         required, &required_count);
     if (residency != 0) {
+        nrb_note_first_residency_failure(
+            b, 2u, (u32)(residency < 0 ? -residency : residency),
+            required, required_count);
         b->stats.unsupported_draws++;
         if (residency == -2)
             b->stats.unsup_draw_index++;
@@ -4564,6 +4645,8 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     }
     if (nrb_stabilize_required_spans(
             b, required, required_count) != 0) {
+        nrb_note_first_residency_failure(
+            b, 3u, 0u, required, required_count);
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_plan++;
         b->stats.residency_failures++;
@@ -6263,6 +6346,16 @@ int rsx_nr_d3d12_get_rt_provenance(
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out)
 {
     *out = b->stats;
+    if (b->mirror) {
+        rsx_gpu_mirror_stats mirror = {0};
+        rsx_gpu_mirror_get_stats(b->mirror, &mirror);
+        out->mirror_syncs = mirror.syncs;
+        out->mirror_uploads = mirror.uploads;
+        out->mirror_upload_bytes = mirror.upload_bytes;
+        out->mirror_upload_rejects = mirror.upload_rejects;
+        out->mirror_deferred_syncs = mirror.deferred_syncs;
+        out->mirror_resolver_failures = mirror.resolver_failures;
+    }
 }
 
 #else /* !_WIN32 */

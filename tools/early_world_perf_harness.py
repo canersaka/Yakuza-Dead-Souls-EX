@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Matched diagnostics-off orphanage/world performance gate.
+"""Matched diagnostics-off early-world performance gate.
 
-Stops both legacy and strict-native lanes at the same archived visual anchor,
+Measures the authored orphanage sequence from its first stable world walkway
+anchor to the sink,
+then stops both legacy and strict-native lanes at the same archived visual
+anchor.  Route START injection is deliberately delayed until after this
+window so renderer speed cannot make one lane skip draws the other executes.
 then combines the built-in Present QPC ring with process-scoped RSX thread
 times and Windows' cumulative per-process GPU-engine counter.  It launches
 and closes only its exact child PID.
@@ -23,6 +27,28 @@ import akiyama_perf_harness as base
 
 
 THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+PDH_MORE_DATA = 0x800007D2
+
+
+# The beach shot is only a few rendered frames long and strict-native can pass
+# through it between two bounded framebuffer samples.  The following walkway
+# is the first repeatable world-rendering anchor shared by both lanes.  It is
+# still before any synthetic route input and is followed by the same authored
+# lion/sign/sink sequence in each lane.
+EARLY_WORLD_ANCHORS = {
+    "orphanage_walkway": {"serials": (14, 15, 16, 17)},
+    "sink": {"serials": (23, 24)},
+}
+
+
+class PDH_RAW_COUNTER(ctypes.Structure):
+    _fields_ = [
+        ("CStatus", wintypes.DWORD),
+        ("TimeStamp", wintypes.FILETIME),
+        ("FirstValue", ctypes.c_longlong),
+        ("SecondValue", ctypes.c_longlong),
+        ("MultiCount", wintypes.DWORD),
+    ]
 
 
 def filetime_value(value):
@@ -66,25 +92,75 @@ def thread_cpu_100ns(thread_id):
 
 def gpu_running_time_100ns(process_id):
     # Running Time is a cumulative KMT process-engine counter.  Sum all
-    # engines owned by the exact child PID; this is a pair of point reads, not
-    # a trace or profiler session.
-    script = (
-        "$s=(Get-Counter '\\GPU Engine(*)\\Running Time' -MaxSamples 1)"
-        ".CounterSamples;"
-        "$v=($s|Where-Object {$_.InstanceName -like "
-        f"'pid_{process_id}_*'"
-        "}|Measure-Object -Property RawValue -Sum).Sum;"
-        "if($null -eq $v){$v=0};[Console]::Write([uint64]$v)"
+    # engines owned by the exact child PID.  Read PDH directly: launching
+    # PowerShell/Get-Counter here cost over two seconds and visibly distorted
+    # the QPC frame window it was intended to accompany.
+    pdh = ctypes.WinDLL("pdh", use_last_error=True)
+    pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t,
+                                  ctypes.POINTER(wintypes.HANDLE)]
+    pdh.PdhOpenQueryW.restype = wintypes.LONG
+    pdh.PdhExpandWildCardPathW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+    ]
+    pdh.PdhExpandWildCardPathW.restype = wintypes.LONG
+    pdh.PdhAddEnglishCounterW.argtypes = [
+        wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    pdh.PdhAddEnglishCounterW.restype = wintypes.LONG
+    pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+    pdh.PdhCollectQueryData.restype = wintypes.LONG
+    pdh.PdhGetRawCounterValue.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(PDH_RAW_COUNTER),
+    ]
+    pdh.PdhGetRawCounterValue.restype = wintypes.LONG
+    pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+    pdh.PdhCloseQuery.restype = wintypes.LONG
+
+    wildcard = rf"\GPU Engine(pid_{process_id}_*)\Running Time"
+    size = wintypes.DWORD()
+    status = pdh.PdhExpandWildCardPathW(
+        None, wildcard, None, ctypes.byref(size), 0
     )
-    try:
-        completed = subprocess.run(
-            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-             "-Command", script],
-            text=True, capture_output=True, timeout=10, check=True,
-        )
-        return int(completed.stdout.strip() or "0")
-    except (OSError, ValueError, subprocess.SubprocessError):
+    if (status & 0xFFFFFFFF) != PDH_MORE_DATA or size.value == 0:
+        return 0 if status == 0 else None
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if pdh.PdhExpandWildCardPathW(
+        None, wildcard, buffer, ctypes.byref(size), 0
+    ) != 0:
         return None
+    paths = [path for path in buffer[:size.value].split("\0") if path]
+    if not paths:
+        return 0
+
+    query = wintypes.HANDLE()
+    if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+        return None
+    try:
+        counters = []
+        for path in paths:
+            counter = wintypes.HANDLE()
+            if pdh.PdhAddEnglishCounterW(
+                query, path, 0, ctypes.byref(counter)
+            ) == 0:
+                counters.append(counter)
+        if not counters or pdh.PdhCollectQueryData(query) != 0:
+            return None
+        total = 0
+        valid = 0
+        for counter in counters:
+            value = PDH_RAW_COUNTER()
+            counter_type = wintypes.DWORD()
+            if pdh.PdhGetRawCounterValue(
+                counter, ctypes.byref(counter_type), ctypes.byref(value)
+            ) == 0 and value.CStatus == 0:
+                total += value.FirstValue
+                valid += 1
+        return total if valid else None
+    finally:
+        pdh.PdhCloseQuery(query)
 
 
 def make_sample(process_id, thread_id):
@@ -103,7 +179,7 @@ def make_sample(process_id, thread_id):
 def refs_for(reference_dir, name):
     return [
         base.scene_features(reference_dir / f"frontier_probe_{serial:03d}.ppm")
-        for serial in base.MULTI_SCENE_ANCHORS[name]["serials"]
+        for serial in EARLY_WORLD_ANCHORS[name]["serials"]
     ]
 
 
@@ -152,7 +228,7 @@ def run(args):
         "YZ_AKIYAMA_DIALOGUE_ROUTE": "1",
         "YZ_AKIYAMA_DIALOGUE_STOP_FILE": str(input_stop),
         "YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE": str(capture_stop),
-        "YZ_AKIYAMA_ROUTE_START_DELAY_MS": "0",
+        "YZ_AKIYAMA_ROUTE_START_DELAY_MS": str(args.route_start_delay_ms),
         "YZ_MOVEMENT_PROOF_DELAY_MS": str(args.capture_delay_ms),
         "YZ_MOVEMENT_PROBE_INTERVAL_MS": "2000",
         "YZ_RSX_VALIDATION_DIR": str(capture_dir),
@@ -174,9 +250,9 @@ def run(args):
     }
     references = {
         name: refs_for(args.reference_dir.resolve(), name)
-        for name in ("beach", "orphanage_sign", "sink")
+        for name in ("orphanage_walkway", "sink")
     }
-    expected = ["beach", "orphanage_sign", "sink"]
+    expected = ["orphanage_walkway", "sink"]
     anchor_index = 0
     seen = set()
     process = None
@@ -243,29 +319,45 @@ def run(args):
                 name = expected[anchor_index]
                 maximum = min(
                     args.anchor_mae,
-                    base.MULTI_SCENE_ANCHORS[name].get(
+                    EARLY_WORLD_ANCHORS[name].get(
                         "maximum_mae", args.anchor_mae
                     ),
                 )
                 if maes[name] <= maximum:
+                    # The point GPU counter query is intentionally outside
+                    # the QPC frame window.  Take it at the first walkway
+                    # match, then require a second positive walkway frame as
+                    # the actual measured start anchor.
+                    if (name == "orphanage_walkway" and
+                            "resource_sample_start" not in result):
+                        result["resource_start_visual"] = {
+                            "serial": serial, "path": str(path),
+                            "coarse_mae": round(maes[name], 6),
+                        }
+                        print(
+                            f"[early-world] resource start at walkway probe "
+                            f"{serial}", flush=True,
+                        )
+                        result["resource_sample_start"] = make_sample(
+                            process.pid, rsx_tid
+                        )
+                        continue
                     result.setdefault("anchors", {})[name] = {
                         "serial": serial, "path": str(path),
                         "coarse_mae": round(maes[name], 6),
                     }
                     print(f"[early-world] anchor {name} at probe {serial}",
                           flush=True)
-                    if name == "beach":
-                        result["resource_sample_start"] = make_sample(
-                            process.pid, rsx_tid
-                        )
-                    elif name == "sink":
+                    if name == "sink":
                         result["resource_sample_end"] = make_sample(
                             process.pid, rsx_tid
                         )
                     anchor_index += 1
             time.sleep(0.25)
         if anchor_index != len(expected):
-            raise TimeoutError(f"early world anchors incomplete: {anchor_index}/3")
+            raise TimeoutError(
+                f"early world anchors incomplete: {anchor_index}/2"
+            )
 
         input_stop.write_text("early world endpoint reached\n", encoding="ascii")
         capture_stop.write_text("early world endpoint reached\n", encoding="ascii")
@@ -295,7 +387,7 @@ def run(args):
         }
         for name, anchor in result["anchors"].items():
             anchor["present_id"] = present_ids.get(anchor["serial"])
-        start_id = result["anchors"]["beach"].get("present_id")
+        start_id = result["anchors"]["orphanage_walkway"].get("present_id")
         end_id = result["anchors"]["sink"].get("present_id")
         if start_id is None or end_id is None or end_id <= start_id + 1:
             raise RuntimeError(f"invalid present anchor IDs: {start_id}/{end_id}")
@@ -377,6 +469,7 @@ def main():
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--route-timeout", type=float, default=420)
     parser.add_argument("--capture-delay-ms", type=int, default=30000)
+    parser.add_argument("--route-start-delay-ms", type=int, default=120000)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     args = parser.parse_args()
     return run(args)

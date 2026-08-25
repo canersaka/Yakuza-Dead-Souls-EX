@@ -815,6 +815,7 @@ static ld_present_sample g_ld_present_ring[LD_PRESENT_RING_CAP];
 static u64 g_ld_present_total = 0;
 static LONGLONG g_ld_qpc_frequency = 0;
 static int g_ld_present_dumped = 0;
+static int g_ld_clean_stats_dumped = 0;
 static int g_ld_schedule_diag = 0;
 #if defined(YZ_PPU_SAMPLE)
 static HANDLE g_ld_present_thread_handle = NULL;
@@ -838,6 +839,7 @@ static void ld_present_measure_init(void)
     memset(g_ld_present_ring, 0, sizeof(g_ld_present_ring));
     g_ld_present_total = 0;
     g_ld_present_dumped = 0;
+    g_ld_clean_stats_dumped = 0;
     g_ld_schedule_diag = getenv("YZ_SCHEDULE_DIAG") != NULL;
     if (QueryPerformanceFrequency(&frequency))
         g_ld_qpc_frequency = frequency.QuadPart;
@@ -8389,6 +8391,17 @@ double rsx_live_draw_get_present_fps(void)
 
 void rsx_live_draw_dump_present_samples(void)
 {
+    if (!g_ld_clean_stats_dumped) {
+        g_ld_clean_stats_dumped = 1;
+        fprintf(stderr,
+                "[live-draw-clean frames=%u groups=%llu clears=%llu "
+                "submits=%llu]\n",
+                g_ld_frames,
+                (unsigned long long)g_ld_stats.groups_executed,
+                (unsigned long long)g_ld_stats.clears,
+                (unsigned long long)g.fence_value);
+        fflush(stderr);
+    }
     ld_present_measure_dump();
     /* WM_CLOSE terminates this runtime with ExitProcess rather than normal
      * renderer destruction. Preserve shutdown-only diagnostic aggregates at
@@ -10130,22 +10143,28 @@ static void ld_shadow_oracle_dump(void)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    /* Production-fast A/B accounting only.  These counters already advance
+     * in the ordinary renderer; reporting them once at shutdown adds no hot-
+     * path clock, allocation, branch, or I/O.  Emit before the final drain so
+     * an ordinary WM_CLOSE cannot end process teardown between the QPC dump
+     * and this aggregate. */
+    if (!g_ld_clean_stats_dumped) {
+        g_ld_clean_stats_dumped = 1;
+        fprintf(stderr,
+                "[live-draw-clean frames=%u groups=%llu clears=%llu "
+                "submits=%llu]\n",
+                g_ld_frames,
+                (unsigned long long)g_ld_stats.groups_executed,
+                (unsigned long long)g_ld_stats.clears,
+                (unsigned long long)g.fence_value);
+        fflush(stderr);
+    }
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
     ld_draw_phases_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
-    /* Production-fast A/B accounting only.  These counters already advance
-     * in the ordinary renderer; reporting them once at shutdown adds no hot-
-     * path clock, allocation, branch, or I/O. */
-    fprintf(stderr,
-            "[live-draw-clean frames=%u groups=%llu clears=%llu "
-            "submits=%llu]\n",
-            g_ld_frames,
-            (unsigned long long)g_ld_stats.groups_executed,
-            (unsigned long long)g_ld_stats.clears,
-            (unsigned long long)g.fence_value);
     ld_shadow_oracle_dump();
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.output) {

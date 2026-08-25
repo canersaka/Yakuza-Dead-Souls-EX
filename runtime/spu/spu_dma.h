@@ -73,6 +73,19 @@ void yz_a010_reltrace_spu_commit(
 void yz_a010_reltrace_spu_atomic(
     uint32_t spu_id, uint32_t image_id, uint32_t pc,
     uint32_t line_ea, const uint8_t* new_line, uint32_t cmd);
+/* Exact gs_task publication contract for a generated-block boundary.  The
+ * bulk publisher clears an older lifecycle before overwriting the block;
+ * the fenced four-byte release publishes it only after the guest bytes are
+ * visible.  The strict RSX owner consults this record only for the otherwise
+ * ambiguous final word of a 128 KiB generated block. */
+void yz_rsx_generated_boundary_group_begin(
+    uint32_t image_id, uint32_t pc, uint32_t ea,
+    const uint8_t* payload, uint32_t size);
+void yz_rsx_generated_boundary_release_commit(
+    uint32_t image_id, uint32_t pc, uint32_t cmd,
+    uint32_t ea, const uint8_t* payload, uint32_t size);
+int yz_rsx_generated_boundary_release_snapshot(
+    uint32_t source_ea, uint32_t command);
 
 /* ---------------------------------------------------------------------------
  * MFC command entry
@@ -1586,6 +1599,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     spu->fe0_timeline_epoch, fe0_put_ea,
                     fe0_timeline_value, spu->pc & SPU_LS_MASK);
             }
+            /* gs_task owns the only protocol-wide generated-block release
+             * contract used by the strict native FIFO owner.  Clear a reused
+             * boundary before the group copy; a later MFC_PUTF publishes the
+             * matching forward edge after all dependent bytes are visible.
+             * Both helpers reject every unrelated DMA in constant time. */
+            yz_rsx_generated_boundary_group_begin(
+                (uint32_t)spu->image_id, spu->pc & SPU_LS_MASK,
+                (uint32_t)(ea & ~0x80000000ull), ls_ptr, size);
             /* YZ_EA_TRAP SPU leg (2026-08-05 frontier): the PPU-side trap
              * proved the fatal motion-descriptor write is NOT any PPU store
              * path (boot 19: header flipped to file-relative pointers with
@@ -1785,6 +1806,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             yz_a010_reltrace_spu_commit(
                 spu->spu_id, (uint32_t)spu->image_id,
                 spu->pc & SPU_LS_MASK,
+                (uint32_t)(ea & ~0x80000000ull), ls_ptr, size);
+            yz_rsx_generated_boundary_release_commit(
+                (uint32_t)spu->image_id, spu->pc & SPU_LS_MASK, cmd,
                 (uint32_t)(ea & ~0x80000000ull), ls_ptr, size);
 #if !defined(YZ_PERF_CLEAN)
             /* The a010-specific 0x01252680 job was previously executed as

@@ -171,6 +171,33 @@ static int gmb_ops_upload(void* user, u32 space, u32 offset, const u8* src,
     return 0;
 }
 
+int rsx_gpu_mirror_d3d12_patch_exact(rsx_gpu_mirror_d3d12* b, u32 space,
+                                     u32 offset, const u8* src, u32 size)
+{
+    if (!b || !src || !size || !b->in_session || !b->slice_available ||
+        !b->list || space >= RSX_GUEST_NUM_SPACES)
+        return -1;
+    gmb_space* s = &b->space[space];
+    if (!s->buffer || (u64)offset + size > s->size ||
+        b->slice_used + (u64)size > b->slice_size)
+        return -1;
+
+    const u32 pos = b->slice_index * b->slice_size + b->slice_used;
+    u8* const snapshot = b->staging_mapped + pos;
+    memcpy(snapshot, src, size);
+    MemoryBarrier();
+    /* A post-copy equality check proves that the recorded bytes represent
+     * one complete observed value of the exact shader-visible span.  Writes
+     * elsewhere on its coarse tracking page do not invalidate that proof. */
+    if (memcmp(snapshot, src, size) != 0)
+        return -2;
+    b->list->lpVtbl->CopyBufferRegion(b->list, s->buffer, offset,
+                                      b->staging, pos, size);
+    b->slice_used += size;
+    s->touched = 1;
+    return 0;
+}
+
 void rsx_gpu_mirror_d3d12_get_ops(rsx_gpu_mirror_d3d12* b,
                                   rsx_gpu_mirror_ops* out)
 {
@@ -313,6 +340,9 @@ void rsx_gpu_mirror_d3d12_end(rsx_gpu_mirror_d3d12* b, u64 fence_value)
 void rsx_gpu_mirror_d3d12_retire(rsx_gpu_mirror_d3d12* b,
                                  u64 completed_fence_value)
 { (void)b; (void)completed_fence_value; }
+int rsx_gpu_mirror_d3d12_patch_exact(rsx_gpu_mirror_d3d12* b, u32 space,
+                                     u32 offset, const u8* src, u32 size)
+{ (void)b; (void)space; (void)offset; (void)src; (void)size; return -1; }
 void* rsx_gpu_mirror_d3d12_buffer(rsx_gpu_mirror_d3d12* b, u32 space)
 { (void)b; (void)space; return 0; }
 u32 rsx_gpu_mirror_d3d12_buffer_size(rsx_gpu_mirror_d3d12* b, u32 space)

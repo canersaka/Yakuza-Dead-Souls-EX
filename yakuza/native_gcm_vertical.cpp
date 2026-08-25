@@ -61,6 +61,9 @@ extern "C" int yz_rsx_try_release_published_segment_head(
 extern "C" int yz_rsx_registered_data_island_edge(
     void* user, uint32_t get, uint32_t put, uint32_t command,
     uint32_t* resume_get);
+extern "C" int yz_rsx_released_generated_boundary_edge(
+    void* user, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t target, uint32_t target_word);
 extern "C" int yz_rsx_resolve_published_generated_link(
     void* user, uint32_t get, uint32_t put, uint32_t command,
     uint32_t target, uint32_t target_word, uint32_t* resume_get);
@@ -1052,6 +1055,7 @@ static int yz_nr_active_init(int graphics)
         &g_active.ring, yz_nr_frame_read32, nullptr,
         yz_rsx_try_release_published_segment_head, nullptr,
         yz_rsx_registered_data_island_edge, nullptr,
+        yz_rsx_released_generated_boundary_edge, nullptr,
         yz_rsx_resolve_published_generated_link, nullptr,
         yz_rsx_resolve_published_generated_hole, nullptr);
     return 1;
@@ -4498,6 +4502,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      "ops=%llu frames=%llu controls=%llu "
                      "wait=%llu/%llu/%llu/%llu "
                      "stopper-release=%llu island-skip=%llu late-island=%llu "
+                     "released-boundary=%llu "
                      "link-repair=%llu hole-repair=%llu attempts=%llu "
                      "fatal=%u kind=%u frame=%llu get=%08X put=%08X ret=%08X "
                     "command=%08X method=%05X arg=%08X index=%u]\n",
@@ -4507,6 +4512,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      fs->waits_stopper, fs->waits_semaphore,
                      fs->released_stoppers, fs->skipped_data_islands,
                      fs->recovered_late_island_entries,
+                     fs->admitted_released_boundaries,
                      fs->repaired_generated_links,
                      fs->repaired_generated_holes,
                      fs->generated_link_attempts,
@@ -4925,7 +4931,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      "upload-first=%u/%llu/%llu/%llu/%u "
                      "compile-fail=%llu texture-fail=%llu "
                      "watched=%llu/%llu "
-                    "residency-fail=%llu mirror=%llu/%llu force-refresh=%llu "
+                    "residency-fail=%llu mirror=%llu/%llu "
+                    "exact=%llu/%llu/%llu force-refresh=%llu "
                     "upload-rollover=%llu "
                     "pso=%llu/%llu "
                     "rt=%llu/%llu depth=%llu/%llu "
@@ -4965,6 +4972,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.residency_failures,
                     d3d_stats.mirror_resyncs,
                     d3d_stats.mirror_rollovers,
+                    d3d_stats.mirror_exact_patches,
+                    d3d_stats.mirror_exact_patch_bytes,
+                    d3d_stats.mirror_exact_patch_retries,
                     d3d_stats.forced_draw_input_refreshes,
                     d3d_stats.upload_rollovers,
                     d3d_stats.pso_hits, d3d_stats.pso_builds,
@@ -4974,6 +4984,28 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.shared_timeline_acquires,
                     d3d_stats.shared_timeline_generations,
                     d3d_stats.shared_timeline_forced_submissions);
+            if (d3d_stats.first_residency_failure_stage) {
+                fprintf(stderr,
+                        "[nr-vertical-d3d-residency stage=%u result=%u "
+                        "required=%u span=%u:%08X+%u pages=%u-%u "
+                        "gen=%u/%u mirror=%llu/%llu/%llu/%llu/%llu/%llu]\n",
+                        d3d_stats.first_residency_failure_stage,
+                        d3d_stats.first_residency_failure_result,
+                        d3d_stats.first_residency_required_count,
+                        d3d_stats.first_residency_space,
+                        d3d_stats.first_residency_offset,
+                        d3d_stats.first_residency_size,
+                        d3d_stats.first_residency_first_page,
+                        d3d_stats.first_residency_last_page,
+                        d3d_stats.first_residency_first_gen,
+                        d3d_stats.first_residency_last_gen,
+                        d3d_stats.mirror_syncs,
+                        d3d_stats.mirror_uploads,
+                        d3d_stats.mirror_upload_bytes,
+                        d3d_stats.mirror_upload_rejects,
+                        d3d_stats.mirror_deferred_syncs,
+                        d3d_stats.mirror_resolver_failures);
+            }
             if (g_active.scanout_provenance) {
                 for (uint32_t i = 0; i < 8u; ++i) {
                     const yz_nr_vertical_display* const display =
@@ -5007,22 +5039,22 @@ extern "C" void yz_nr_vertical_shutdown(void)
                             provenance.present_count);
                 }
             }
-            rsx_nr_d3d12_destroy(g_active.d3d12);
-            g_active.d3d12 = nullptr;
-            InterlockedExchange(&g_active.shared_timeline, 0);
+            /* This shutdown entry is the final host-process boundary: both
+             * callers either invoke ExitProcess immediately or return from
+             * main.  Guest PPU/SPU and RSX workers are still live while the
+             * window thread emits these aggregates.  Destroying the native
+             * command queue/resources here can therefore race an already-
+             * entered producer/consumer call and, more importantly, keeps
+             * the window thread inside teardown long enough for the guest to
+             * run after its host window has disappeared.  The legacy renderer
+             * deliberately leaves its D3D objects to ExitProcess for exactly
+             * this reason.  Disable admission above, retain every object until
+             * process reclamation, and keep an explicit in-process destroy API
+             * only in the backend's focused tests.
+             */
         }
-        free(const_cast<LONG*>(g_active.guest_page_route));
-        g_active.guest_page_route = nullptr;
-        free(g_active.section_ops);
-        free(g_active.section_side);
-        free(g_active.section_methods);
-        free(g_active.section_adapter);
-        g_active.section_ops = nullptr;
-        g_active.section_side = nullptr;
-        g_active.section_methods = nullptr;
-        g_active.section_adapter = nullptr;
-        rsx_nr_ring_destroy(&g_active.ring);
-        rsx_nr_span_router_destroy(&g_active.router);
+        /* Producer/router storage is shared by the same live workers.  It is
+         * intentionally process-lifetime storage for production runs. */
     }
 
     if (!InterlockedExchange(&g_vertical.mode_shadow, 0))

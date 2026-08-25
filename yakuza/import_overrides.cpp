@@ -6798,6 +6798,36 @@ extern "C" int yz_rsx_registered_data_island_edge(
     return result;
 }
 
+/* A generated-block tail is ambiguous from bytes alone: the captured
+ * 0x41FFFC case is recycled float data, while 0x45FFFC is a real one-argument
+ * method packet released by the immediately preceding stopper.  Admit the
+ * latter only when gs_task's exact 0x5F00 MFC_PUTF publication record matches
+ * this source/command generation.  The SPU helper publishes that record only
+ * after the dependent bytes are visible and clears it when 0x5F70 recycles
+ * the source slot. */
+extern "C" int yz_rsx_generated_boundary_release_snapshot(
+    uint32_t source_ea, uint32_t command);
+
+extern "C" int yz_rsx_released_generated_boundary_edge(
+    void*, uint32_t get, uint32_t put, uint32_t command,
+    uint32_t target, uint32_t target_word)
+{
+    (void)put;
+    const uint32_t ring = 0x800000u;
+    const uint32_t block = 0x20000u;
+    if (get >= ring || target != get + 4u ||
+        ((target + 4u) & (block - 1u)) != 0u)
+        return 0;
+    const uint32_t source_ea = yz_rsx_io_to_ea(get);
+    const uint32_t target_ea = yz_rsx_io_to_ea(target);
+    if (!source_ea || !target_ea ||
+        !yz_rsx_generated_boundary_release_snapshot(source_ea, command))
+        return 0;
+    MemoryBarrier();
+    return vm_read32(source_ea) == command &&
+           vm_read32(target_ea) == target_word;
+}
+
 /* Strict-native counterpart of the retained a010 generated-link repair.
  * This is reached only after the frame owner has observed one unchanged bad
  * target for a bounded publication interval.  It performs one fail-closed

@@ -36,6 +36,13 @@ typedef int (*rsx_nr_frame_release_stopper_fn)(
  * executed. */
 typedef int (*rsx_nr_frame_island_edge_fn)(
     void* user, u32 get, u32 put, u32 command, u32* resume_get);
+/* Exact producer proof for a forward stopper release whose target happens to
+ * be a generated-block boundary word.  This is the only exception to the
+ * conservative rule that packet-shaped data at such a boundary is not ready.
+ * The producer record must have been published after the dependent bytes. */
+typedef int (*rsx_nr_frame_released_edge_fn)(
+    void* user, u32 get, u32 put, u32 command,
+    u32 target, u32 target_word);
 /* Fail-closed repair for one exact published JUMP whose target still starts
  * with non-command payload.  The hook may return a replacement cursor only
  * after proving the complete producer chain and atomically replacing the
@@ -116,6 +123,7 @@ typedef struct rsx_nr_frame_owner_stats {
     unsigned long long released_stoppers;
     unsigned long long skipped_data_islands;
     unsigned long long recovered_late_island_entries;
+    unsigned long long admitted_released_boundaries;
     unsigned long long repaired_generated_links;
     unsigned long long repaired_generated_holes;
     unsigned long long generated_link_attempts;
@@ -134,6 +142,8 @@ typedef struct rsx_nr_frame_owner {
     void* release_stopper_user;
     rsx_nr_frame_island_edge_fn island_edge;
     void* island_edge_user;
+    rsx_nr_frame_released_edge_fn released_edge;
+    void* released_edge_user;
     rsx_nr_frame_resolve_jump_fn resolve_jump;
     void* resolve_jump_user;
     rsx_nr_frame_resolve_hole_fn resolve_hole;
@@ -193,6 +203,8 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* owner,
                              void* release_stopper_user,
                              rsx_nr_frame_island_edge_fn island_edge,
                              void* island_edge_user,
+                             rsx_nr_frame_released_edge_fn released_edge,
+                             void* released_edge_user,
                              rsx_nr_frame_resolve_jump_fn resolve_jump,
                              void* resolve_jump_user,
                              rsx_nr_frame_resolve_hole_fn resolve_hole,
