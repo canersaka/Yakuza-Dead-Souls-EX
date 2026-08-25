@@ -2627,8 +2627,14 @@ static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
             (format == NRB_TEX_A8R8G8B8 &&
              candidate->dxgi != nrb_color_dxgi(b, 8u))))
             continue;
-        rt = candidate;
-        break;
+        /* Private strict-native rendering can retain multiple logical RSX
+         * surfaces at one guest address.  Sampling that address must observe
+         * the most recent GPU writer, just like scanout does; table order is
+         * allocation history and is not an ownership rule.  The previous
+         * first-match lookup could therefore rebind a stale, still-black
+         * format sibling after a newer pass had populated the address. */
+        if (!rt || candidate->last_write_serial > rt->last_write_serial)
+            rt = candidate;
     }
     if (!rt && live_identity) {
         /* A complete producer pass may have stayed wholly established. Its
