@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -889,6 +890,35 @@ static int yz_nr_frame_read32(void*, uint32_t io, uint32_t* value)
     return 0;
 }
 
+static void* yz_nr_compile_cached_shader(
+    void*, uint32_t stage, const char* source, uint32_t source_length,
+    uint32_t compiler_flags, int* cache_hit, int* compiled)
+{
+    return rsx_live_draw_compile_cached_shader(
+        stage, source, source_length, compiler_flags, cache_hit, compiled);
+}
+
+static int yz_nr_load_cached_pso(
+    void*, uint64_t pso_key, uint64_t vertex_bytecode_hash,
+    uint64_t pixel_bytecode_hash, void** data, uint32_t* size)
+{
+    return rsx_live_draw_load_cached_pso(
+        pso_key, vertex_bytecode_hash, pixel_bytecode_hash, data, size);
+}
+
+static int yz_nr_store_cached_pso(
+    void*, uint64_t pso_key, uint64_t vertex_bytecode_hash,
+    uint64_t pixel_bytecode_hash, const void* data, uint32_t size)
+{
+    return rsx_live_draw_store_cached_pso(
+        pso_key, vertex_bytecode_hash, pixel_bytecode_hash, data, size);
+}
+
+static void yz_nr_free_cached_pso(void*, void* data)
+{
+    rsx_live_draw_free_cached_pso(data);
+}
+
 static void yz_nr_active_ensure_graphics(void)
 {
     if (!InterlockedCompareExchange(
@@ -902,6 +932,14 @@ static void yz_nr_active_ensure_graphics(void)
         device, YZ_GCM_LOCAL_SIZE, 0x10000000u,
         yz_nr_d3d_guest_ptr, yz_nr_d3d_guest_writable_ptr, nullptr);
     if (!d3d12) {
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
+    if (rsx_nr_d3d12_set_content_cache(
+            d3d12, yz_nr_compile_cached_shader, yz_nr_load_cached_pso,
+            yz_nr_store_cached_pso, yz_nr_free_cached_pso, nullptr) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
         if (g_active.strict_full_native)
             InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
@@ -4934,7 +4972,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "residency-fail=%llu mirror=%llu/%llu "
                     "exact=%llu/%llu/%llu force-refresh=%llu "
                     "upload-rollover=%llu "
-                    "pso=%llu/%llu "
+                    "pso=%llu/%llu pso-disk=%llu/%llu/%llu "
+                    "shader-builds=%llu/%llu shader-cache=%llu/%llu "
+                    "pso-creates=%llu "
                     "rt=%llu/%llu depth=%llu/%llu "
                     "timeline=%d/%llu/%llu/%llu]\n",
                     d3d_stats.draws,
@@ -4978,12 +5018,123 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.forced_draw_input_refreshes,
                     d3d_stats.upload_rollovers,
                     d3d_stats.pso_hits, d3d_stats.pso_builds,
+                    d3d_stats.driver_pso_cache_hits,
+                    d3d_stats.driver_pso_cache_writes,
+                    d3d_stats.driver_pso_cache_rejects,
+                    d3d_stats.vertex_shader_builds,
+                    d3d_stats.pixel_shader_builds,
+                    d3d_stats.vertex_shader_cache_hits,
+                    d3d_stats.pixel_shader_cache_hits,
+                    d3d_stats.driver_pso_creates,
                     d3d_stats.rt_builds, d3d_stats.rt_refreshes,
                     d3d_stats.depth_builds, d3d_stats.depth_refreshes,
                     rsx_nr_d3d12_shared_timeline_enabled(g_active.d3d12),
                     d3d_stats.shared_timeline_acquires,
                     d3d_stats.shared_timeline_generations,
                     d3d_stats.shared_timeline_forced_submissions);
+            if (d3d_stats.stall_qpc_frequency) {
+                const unsigned long long frequency =
+                    d3d_stats.stall_qpc_frequency;
+                const auto to_us = [frequency](unsigned long long ticks) {
+                    return ticks <= ULLONG_MAX / 1000000ull
+                        ? ticks * 1000000ull / frequency
+                        : ticks / frequency * 1000000ull;
+                };
+                fprintf(stderr,
+                        "[nr-stall-aggregate qpc=%llu "
+                        "fence=%llu/%llu/%lluus "
+                        "flush=%llu/%llu/%lluus "
+                        "readback=%llu/%llu/%llu/%lluus "
+                        "upload=%llu/%llu/%llu/%lluus "
+                        "residency-prepare=%llu/%llu/%lluus "
+                        "residency-stabilize=%llu/%llu/%lluus "
+                        "preflight-draw=%llu/%llu/%lluus "
+                        "draw=%llu/%llu/%lluus "
+                        "fp-resolve=%llu/%llu/%lluus "
+                        "pso-total=%llu/%llu/%lluus "
+                        "pso-key-lookup=%llu/%llu/%lluus "
+                        "vertex-compile=%llu/%llu/%lluus "
+                        "vertex-cache=%llu/%llu/%lluus "
+                        "pixel-compile=%llu/%llu/%lluus "
+                        "pixel-cache=%llu/%llu/%lluus "
+                        "driver-pso-create=%llu/%llu/%lluus "
+                        "texture-prepare=%llu/%llu/%lluus "
+                        "batch-prepare=%llu/%llu/%lluus "
+                        "command-record=%llu/%llu/%lluus "
+                        "sync-ops=%llu/%llu/%llu/%llu/%llu "
+                        "residency-retries=%llu/%llu/%llu]\n",
+                        frequency,
+                        d3d_stats.stall_fence_drain_count,
+                        d3d_stats.stall_fence_drain_ticks,
+                        to_us(d3d_stats.stall_fence_drain_ticks),
+                        d3d_stats.stall_flush_count,
+                        d3d_stats.stall_flush_ticks,
+                        to_us(d3d_stats.stall_flush_ticks),
+                        d3d_stats.stall_transfer_readback_count,
+                        d3d_stats.stall_transfer_readback_bytes,
+                        d3d_stats.stall_transfer_readback_ticks,
+                        to_us(d3d_stats.stall_transfer_readback_ticks),
+                        d3d_stats.stall_transfer_upload_count,
+                        d3d_stats.stall_transfer_upload_bytes,
+                        d3d_stats.stall_transfer_upload_ticks,
+                        to_us(d3d_stats.stall_transfer_upload_ticks),
+                        d3d_stats.stall_residency_prepare_count,
+                        d3d_stats.stall_residency_prepare_ticks,
+                        to_us(d3d_stats.stall_residency_prepare_ticks),
+                        d3d_stats.stall_residency_stabilize_count,
+                        d3d_stats.stall_residency_stabilize_ticks,
+                        to_us(d3d_stats.stall_residency_stabilize_ticks),
+                        d3d_stats.stall_preflight_draw_count,
+                        d3d_stats.stall_preflight_draw_ticks,
+                        to_us(d3d_stats.stall_preflight_draw_ticks),
+                        d3d_stats.stall_draw_count,
+                        d3d_stats.stall_draw_ticks,
+                        to_us(d3d_stats.stall_draw_ticks),
+                        d3d_stats.stall_fp_resolve_count,
+                        d3d_stats.stall_fp_resolve_ticks,
+                        to_us(d3d_stats.stall_fp_resolve_ticks),
+                        d3d_stats.stall_pso_lookup_count,
+                        d3d_stats.stall_pso_lookup_ticks,
+                        to_us(d3d_stats.stall_pso_lookup_ticks),
+                        d3d_stats.stall_pso_key_lookup_count,
+                        d3d_stats.stall_pso_key_lookup_ticks,
+                        to_us(d3d_stats.stall_pso_key_lookup_ticks),
+                        d3d_stats.stall_vertex_compile_count,
+                        d3d_stats.stall_vertex_compile_ticks,
+                        to_us(d3d_stats.stall_vertex_compile_ticks),
+                        d3d_stats.stall_vertex_cache_count,
+                        d3d_stats.stall_vertex_cache_ticks,
+                        to_us(d3d_stats.stall_vertex_cache_ticks),
+                        d3d_stats.stall_pixel_compile_count,
+                        d3d_stats.stall_pixel_compile_ticks,
+                        to_us(d3d_stats.stall_pixel_compile_ticks),
+                        d3d_stats.stall_pixel_cache_count,
+                        d3d_stats.stall_pixel_cache_ticks,
+                        to_us(d3d_stats.stall_pixel_cache_ticks),
+                        d3d_stats.stall_driver_pso_create_count,
+                        d3d_stats.stall_driver_pso_create_ticks,
+                        to_us(d3d_stats.stall_driver_pso_create_ticks),
+                        d3d_stats.stall_texture_prepare_count,
+                        d3d_stats.stall_texture_prepare_ticks,
+                        to_us(d3d_stats.stall_texture_prepare_ticks),
+                        d3d_stats.stall_batch_prepare_count,
+                        d3d_stats.stall_batch_prepare_ticks,
+                        to_us(d3d_stats.stall_batch_prepare_ticks),
+                        d3d_stats.stall_command_record_count,
+                        d3d_stats.stall_command_record_ticks,
+                        to_us(d3d_stats.stall_command_record_ticks),
+                        g_active.backend.stats.executed[
+                            RSX_NIR_OP_SEMAPHORE_ACQUIRE],
+                        g_active.backend.stats.executed[
+                            RSX_NIR_OP_SEMAPHORE_RELEASE],
+                        g_active.backend.stats.executed[RSX_NIR_OP_BARRIER],
+                        g_active.backend.stats.executed[
+                            RSX_NIR_OP_SET_REFERENCE],
+                        g_active.backend.stats.executed[RSX_NIR_OP_REPORT],
+                        d3d_stats.mirror_resyncs,
+                        d3d_stats.mirror_rollovers,
+                        d3d_stats.mirror_exact_patch_retries);
+            }
             if (d3d_stats.first_residency_failure_stage) {
                 fprintf(stderr,
                         "[nr-vertical-d3d-residency stage=%u result=%u "

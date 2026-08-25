@@ -43,6 +43,17 @@ void rsx_live_draw_mirror_state_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_native_present(u32 b) { (void)b; }
 void rsx_live_draw_typed_present(u32 b) { (void)b; }
 void* rsx_live_draw_get_d3d12_device(void) { return NULL; }
+void* rsx_live_draw_compile_cached_shader(
+    u32 s, const char* p, u32 n, u32 f, int* h, int* c)
+{ (void)s; (void)p; (void)n; (void)f; if (h) *h = 0; if (c) *c = 0;
+  return NULL; }
+int rsx_live_draw_load_cached_pso(
+    u64 k, u64 v, u64 p, void** d, u32* n)
+{ (void)k; (void)v; (void)p; if (d) *d = NULL; if (n) *n = 0; return -1; }
+int rsx_live_draw_store_cached_pso(
+    u64 k, u64 v, u64 p, const void* d, u32 n)
+{ (void)k; (void)v; (void)p; (void)d; (void)n; return -1; }
+void rsx_live_draw_free_cached_pso(void* d) { (void)d; }
 int rsx_live_draw_borrow_color(u32 l, u32 o, u32 w, u32 h, int c,
                                void** r, u32* f, u32* rw, u32* rh)
 { (void)l; (void)o; (void)w; (void)h; (void)c; (void)r; (void)f;
@@ -183,6 +194,9 @@ extern volatile LONG g_yz_frontier_bridge_success_count;
  * shaders would silently keep the old no-discard codegen. */
 #define SHADER_DISK_CACHE_VERSION 2u
 #define SHADER_DISK_CACHE_MAX_BLOB (4u * 1024u * 1024u)
+#define NATIVE_PSO_DISK_MAGIC       0x505A5959u /* "YYZP" */
+#define NATIVE_PSO_DISK_VERSION     1u
+#define NATIVE_PSO_DISK_MAX_BLOB    (16u * 1024u * 1024u)
 
 #define SRV_WHITE        0
 #define SRV_SURFACE_BASE 1
@@ -311,6 +325,15 @@ typedef struct {
     u32 reserved;
     u64 source_hash;
 } shader_disk_cache_header;
+typedef struct {
+    u32 magic;
+    u32 version;
+    u32 blob_length;
+    u32 reserved;
+    u64 pso_key;
+    u64 vertex_bytecode_hash;
+    u64 pixel_bytecode_hash;
+} native_pso_disk_cache_header;
 
 typedef struct {
     int              enabled;    /* YZ_RSX_DRAW resolved                     */
@@ -3599,6 +3622,10 @@ static u32 shader_disk_cache_stage_index(u32 stage)
 
 static void shader_disk_cache_progress(u64 value)
 {
+#if defined(YZ_PERF_CLEAN)
+    (void)value;
+    return;
+#else
     if (value > 4u && (value & (value - 1u)) != 0u)
         return;
     fprintf(stderr,
@@ -3612,6 +3639,7 @@ static void shader_disk_cache_progress(u64 value)
             (unsigned long long)g_ld_shader_disk_writes[0],
             (unsigned long long)g_ld_shader_disk_writes[1],
             (unsigned long long)g_ld_shader_disk_rejects);
+#endif
 }
 
 static int shader_disk_cache_prepare(void)
@@ -3769,6 +3797,166 @@ static void shader_disk_cache_store(
     const u32 stage_index = shader_disk_cache_stage_index(stage);
     const u64 value = ++g_ld_shader_disk_writes[stage_index];
     shader_disk_cache_progress(value);
+}
+
+static ID3DBlob* shader_blob_cache_find(
+    shader_blob_cache_t* cache, const char* source, u32 source_length,
+    u64 hash, int* post_boundary_hit, int* hash_seen);
+static void shader_blob_cache_insert_accounted(
+    shader_blob_cache_t* cache, const char* source, u32 source_length,
+    u64 hash, ID3DBlob* blob, u32 stage, int hash_seen);
+
+void* rsx_live_draw_compile_cached_shader(
+    u32 stage, const char* source, u32 source_length, u32 compiler_flags,
+    int* cache_hit, int* compiled)
+{
+    if (cache_hit)
+        *cache_hit = 0;
+    if (compiled)
+        *compiled = 0;
+    if ((stage != 'V' && stage != 'P') || !source || !source_length ||
+        source_length > 256u * 1024u)
+        return NULL;
+
+    const char* const target = stage == 'V' ? "vs_5_0" : "ps_5_0";
+    shader_blob_cache_t* const cache =
+        stage == 'V' ? &g.vs_blobs : &g.ps_blobs;
+    u64 hash = fnv1a(source, source_length, 1469598103934665603ull);
+    hash = fnv1a(&compiler_flags, sizeof(compiler_flags), hash);
+    int hash_seen = 0;
+    ID3DBlob* blob = shader_blob_cache_find(
+        cache, source, source_length, hash, NULL, &hash_seen);
+    if (blob) {
+        if (cache_hit)
+            *cache_hit = 1;
+        return blob;
+    }
+
+    blob = shader_disk_cache_load(stage, source, source_length, hash);
+    if (blob) {
+        shader_blob_cache_insert_accounted(
+            cache, source, source_length, hash, blob, stage, hash_seen);
+        if (cache_hit)
+            *cache_hit = 1;
+        return blob;
+    }
+
+    ID3DBlob* error = NULL;
+    const HRESULT hr = D3DCompile(
+        source, source_length, stage == 'V' ? "nrb-vs" : "nrb-ps",
+        NULL, NULL, "main", target, compiler_flags, 0, &blob, &error);
+    if (error)
+        error->lpVtbl->Release(error);
+    if (FAILED(hr) || !blob)
+        return NULL;
+    shader_disk_cache_store(stage, source, source_length, hash, blob);
+    shader_blob_cache_insert_accounted(
+        cache, source, source_length, hash, blob, stage, hash_seen);
+    if (compiled)
+        *compiled = 1;
+    return blob;
+}
+
+static int native_pso_disk_cache_path(
+    char path[MAX_PATH], u64 pso_key, u64 vertex_bytecode_hash,
+    u64 pixel_bytecode_hash)
+{
+    if (!shader_disk_cache_prepare())
+        return 0;
+    const int length = snprintf(
+        path, MAX_PATH, "%s\\N_%016llX_%016llX_%016llX.pso",
+        g_ld_shader_disk_dir, (unsigned long long)pso_key,
+        (unsigned long long)vertex_bytecode_hash,
+        (unsigned long long)pixel_bytecode_hash);
+    return length > 0 && length < MAX_PATH;
+}
+
+int rsx_live_draw_load_cached_pso(
+    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
+    void** data, u32* size)
+{
+    if (data)
+        *data = NULL;
+    if (size)
+        *size = 0;
+    if (!data || !size)
+        return -1;
+    char path[MAX_PATH];
+    if (!native_pso_disk_cache_path(
+            path, pso_key, vertex_bytecode_hash, pixel_bytecode_hash))
+        return -1;
+    FILE* file = fopen(path, "rb");
+    if (!file)
+        return -1;
+    native_pso_disk_cache_header header;
+    memset(&header, 0, sizeof(header));
+    int valid = fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == NATIVE_PSO_DISK_MAGIC &&
+        header.version == NATIVE_PSO_DISK_VERSION &&
+        header.pso_key == pso_key &&
+        header.vertex_bytecode_hash == vertex_bytecode_hash &&
+        header.pixel_bytecode_hash == pixel_bytecode_hash &&
+        header.blob_length > 0 &&
+        header.blob_length <= NATIVE_PSO_DISK_MAX_BLOB;
+    void* bytes = NULL;
+    if (valid) {
+        bytes = malloc(header.blob_length);
+        valid = bytes != NULL &&
+            fread(bytes, 1, header.blob_length, file) == header.blob_length &&
+            fgetc(file) == EOF;
+    }
+    fclose(file);
+    if (!valid) {
+        free(bytes);
+        DeleteFileA(path);
+        return -1;
+    }
+    *data = bytes;
+    *size = header.blob_length;
+    return 0;
+}
+
+int rsx_live_draw_store_cached_pso(
+    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
+    const void* data, u32 size)
+{
+    if (!data || !size || size > NATIVE_PSO_DISK_MAX_BLOB)
+        return -1;
+    char path[MAX_PATH], temporary[MAX_PATH];
+    if (!native_pso_disk_cache_path(
+            path, pso_key, vertex_bytecode_hash, pixel_bytecode_hash))
+        return -1;
+    const int temporary_length = snprintf(
+        temporary, sizeof(temporary), "%s.tmp.%lu", path,
+        (unsigned long)GetCurrentProcessId());
+    if (temporary_length <= 0 || temporary_length >= sizeof(temporary))
+        return -1;
+    native_pso_disk_cache_header header;
+    memset(&header, 0, sizeof(header));
+    header.magic = NATIVE_PSO_DISK_MAGIC;
+    header.version = NATIVE_PSO_DISK_VERSION;
+    header.blob_length = size;
+    header.pso_key = pso_key;
+    header.vertex_bytecode_hash = vertex_bytecode_hash;
+    header.pixel_bytecode_hash = pixel_bytecode_hash;
+    FILE* file = fopen(temporary, "wb");
+    if (!file)
+        return -1;
+    const int wrote = fwrite(&header, sizeof(header), 1, file) == 1 &&
+        fwrite(data, 1, size, file) == size && fflush(file) == 0;
+    fclose(file);
+    if (!wrote || !MoveFileExA(
+            temporary, path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary);
+        return -1;
+    }
+    return 0;
+}
+
+void rsx_live_draw_free_cached_pso(void* data)
+{
+    free(data);
 }
 
 static u64 ld_hash_structural_render_state(

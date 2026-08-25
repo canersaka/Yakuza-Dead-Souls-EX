@@ -183,6 +183,26 @@ def refs_for(reference_dir, name):
     ]
 
 
+def show_process_window(process, timeout=30.0):
+    """Require and foreground a visible top-level window for the exact PID."""
+    user32 = ctypes.windll.user32
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"game exited before creating a visible window: "
+                f"{process.returncode}"
+            )
+        windows = base.visible_windows_for_pid(process.pid)
+        if windows:
+            hwnd = windows[0]
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            return int(hwnd)
+        time.sleep(0.1)
+    raise RuntimeError("exact game PID created no visible window")
+
+
 def run(args):
     executable = args.exe.resolve()
     game_dir = args.game_dir.resolve()
@@ -235,6 +255,14 @@ def run(args):
     }
     if args.native:
         yz["YZ_NR_VERTICAL"] = "full-native"
+    if args.rsx_wait_classifier:
+        yz["YZ_RSX_WAIT_CLASSIFIER"] = "1"
+    if args.nr_stall_aggregate:
+        yz["YZ_NR_STALL_AGGREGATE"] = "1"
+    if args.shader_cache_dir:
+        shader_cache_dir = args.shader_cache_dir.resolve()
+        shader_cache_dir.mkdir(parents=True, exist_ok=True)
+        yz["YZ_RSX_SHADER_CACHE_DIR"] = str(shader_cache_dir)
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -244,7 +272,10 @@ def run(args):
         "executable_sha256": base.sha256_file(executable),
         "configuration": {key: cache.get(key) for key in base.EXPECTED_CACHE},
         "active_yz": yz,
-        "active_diagnostics": {},
+        "active_diagnostics": {
+            key: value for key, value in yz.items()
+            if key in ("YZ_RSX_WAIT_CLASSIFIER", "YZ_NR_STALL_AGGREGATE")
+        },
         "reference_dir": str(args.reference_dir.resolve()),
         "captures": [],
     }
@@ -267,7 +298,9 @@ def run(args):
         result["pid"] = process.pid
         result["status"] = "routing"
         print(f"[early-world] launched exact PID {process.pid}", flush=True)
-        time.sleep(1.0)
+        result["visible_window"] = show_process_window(process)
+        print("[early-world] exact-PID window visible and foregrounded",
+              flush=True)
         if list(base.game_processes()) != [process.pid]:
             raise RuntimeError(
                 f"single-game-process invariant failed: {base.game_processes()}"
@@ -341,7 +374,13 @@ def run(args):
                         result["resource_sample_start"] = make_sample(
                             process.pid, rsx_tid
                         )
-                        continue
+                        # This is a moving-scene start anchor, not a held
+                        # stationary scene.  Some production runs expose the
+                        # walkway for only one 2-second probe interval.  The
+                        # point resource query finishes before this visual's
+                        # present id becomes the QPC start boundary, so one
+                        # positive start visual plus the later positive sink
+                        # visual is the reproducible clean A/B contract.
                     result.setdefault("anchors", {})[name] = {
                         "serial": serial, "path": str(path),
                         "coarse_mae": round(maes[name], 6),
@@ -467,6 +506,9 @@ def main():
     parser.add_argument("--tag", required=True)
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--native", action="store_true")
+    parser.add_argument("--rsx-wait-classifier", action="store_true")
+    parser.add_argument("--nr-stall-aggregate", action="store_true")
+    parser.add_argument("--shader-cache-dir", type=Path)
     parser.add_argument("--route-timeout", type=float, default=420)
     parser.add_argument("--capture-delay-ms", type=int, default=30000)
     parser.add_argument("--route-start-delay-ms", type=int, default=120000)

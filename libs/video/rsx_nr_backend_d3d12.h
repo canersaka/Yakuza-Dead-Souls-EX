@@ -88,6 +88,21 @@ typedef int (*rsx_nr_d3d12_timeline_acquire_fn)(
 typedef void (*rsx_nr_d3d12_timeline_release_fn)(void* user);
 typedef int (*rsx_nr_d3d12_timeline_flush_fn)(void* user);
 
+/* Optional live content cache. Shader blobs are opaque ID3DBlob pointers with
+ * one caller-owned reference. Driver PSO blobs are malloc-like byte arrays
+ * released through pso_free. Offline/WARP callers may leave all callbacks
+ * unset and retain direct D3D compilation/creation. */
+typedef void* (*rsx_nr_d3d12_compile_shader_fn)(
+    void* user, u32 stage, const char* source, u32 source_length,
+    u32 compiler_flags, int* cache_hit, int* compiled);
+typedef int (*rsx_nr_d3d12_pso_load_fn)(
+    void* user, u64 pso_key, u64 vertex_bytecode_hash,
+    u64 pixel_bytecode_hash, void** data, u32* size);
+typedef int (*rsx_nr_d3d12_pso_store_fn)(
+    void* user, u64 pso_key, u64 vertex_bytecode_hash,
+    u64 pixel_bytecode_hash, const void* data, u32 size);
+typedef void (*rsx_nr_d3d12_pso_free_fn)(void* user, void* data);
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long transfer_gpu_readbacks;
@@ -96,6 +111,14 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long descriptor_table_hits;
     unsigned long long descriptor_table_builds;
     unsigned long long pso_hits, pso_builds;
+    unsigned long long vertex_shader_builds;
+    unsigned long long pixel_shader_builds;
+    unsigned long long vertex_shader_cache_hits;
+    unsigned long long pixel_shader_cache_hits;
+    unsigned long long driver_pso_creates;
+    unsigned long long driver_pso_cache_hits;
+    unsigned long long driver_pso_cache_writes;
+    unsigned long long driver_pso_cache_rejects;
     unsigned long long unsupported_draws;    /* refused to the core (sum)  */
     unsigned long long conditional_draws_skipped;
     unsigned long long unsup_draw_topology;  /* fan/loop/quads/polygon     */
@@ -162,6 +185,50 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long shared_timeline_acquires;
     unsigned long long shared_timeline_generations;
     unsigned long long shared_timeline_forced_submissions;
+    /* Default-off shutdown aggregate. Ticks use stall_qpc_frequency and
+     * overlap intentionally: a transfer readback includes its fence drain,
+     * while explicit flush calls identify synchronization boundaries. */
+    unsigned long long stall_qpc_frequency;
+    unsigned long long stall_fence_drain_count;
+    unsigned long long stall_fence_drain_ticks;
+    unsigned long long stall_flush_count;
+    unsigned long long stall_flush_ticks;
+    unsigned long long stall_transfer_readback_count;
+    unsigned long long stall_transfer_readback_ticks;
+    unsigned long long stall_transfer_readback_bytes;
+    unsigned long long stall_transfer_upload_count;
+    unsigned long long stall_transfer_upload_ticks;
+    unsigned long long stall_transfer_upload_bytes;
+    unsigned long long stall_residency_prepare_count;
+    unsigned long long stall_residency_prepare_ticks;
+    unsigned long long stall_residency_stabilize_count;
+    unsigned long long stall_residency_stabilize_ticks;
+    unsigned long long stall_preflight_draw_count;
+    unsigned long long stall_preflight_draw_ticks;
+    unsigned long long stall_draw_count;
+    unsigned long long stall_draw_ticks;
+    unsigned long long stall_fp_resolve_count;
+    unsigned long long stall_fp_resolve_ticks;
+    unsigned long long stall_pso_lookup_count;
+    unsigned long long stall_pso_lookup_ticks;
+    unsigned long long stall_pso_key_lookup_count;
+    unsigned long long stall_pso_key_lookup_ticks;
+    unsigned long long stall_vertex_compile_count;
+    unsigned long long stall_vertex_compile_ticks;
+    unsigned long long stall_vertex_cache_count;
+    unsigned long long stall_vertex_cache_ticks;
+    unsigned long long stall_pixel_compile_count;
+    unsigned long long stall_pixel_compile_ticks;
+    unsigned long long stall_pixel_cache_count;
+    unsigned long long stall_pixel_cache_ticks;
+    unsigned long long stall_driver_pso_create_count;
+    unsigned long long stall_driver_pso_create_ticks;
+    unsigned long long stall_texture_prepare_count;
+    unsigned long long stall_texture_prepare_ticks;
+    unsigned long long stall_batch_prepare_count;
+    unsigned long long stall_batch_prepare_ticks;
+    unsigned long long stall_command_record_count;
+    unsigned long long stall_command_record_ticks;
 } rsx_nr_d3d12_stats;
 
 /* Fixed-memory, default-off scanout provenance.  This deliberately exposes
@@ -196,6 +263,13 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b);
  * writes here (tests call note_write after touching arenas). */
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b);
 int rsx_nr_d3d12_depth_bounds_supported(const rsx_nr_d3d12* b);
+
+/* Install the live process-wide content cache before the first PSO request. */
+int rsx_nr_d3d12_set_content_cache(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn compile_shader,
+    rsx_nr_d3d12_pso_load_fn pso_load,
+    rsx_nr_d3d12_pso_store_fn pso_store,
+    rsx_nr_d3d12_pso_free_fn pso_free, void* user);
 
 /* Fill the GPU half of the exec ops (clear/draw/transfer/present/flush).
  * The embedder fills the host half before rsx_nr_backend_init. */
