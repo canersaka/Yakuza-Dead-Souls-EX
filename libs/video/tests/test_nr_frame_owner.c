@@ -41,6 +41,7 @@ typedef struct fixture {
     u32 hole_calls;
     u32 hole_previous_get;
     u32 hole_previous_command;
+    unsigned long long now_ms;
     rsx_nr_slot slots[TEST_RING_OPS];
     u32 side[TEST_RING_SIDE];
     rsx_nr_ring ring;
@@ -57,6 +58,11 @@ static int read_word(void* user, u32 io, u32* value)
         return -1;
     *value = f->words[io >> 2];
     return 0;
+}
+
+static unsigned long long test_now_ms(void* user)
+{
+    return ((fixture*)user)->now_ms;
 }
 
 static int sem_read(void* user, u32 dma, u32 offset, u32* value)
@@ -594,6 +600,62 @@ static int test_invalid_jump_repair_is_exact_and_latched(void)
     return 0;
 }
 
+static int test_publication_timeout_uses_wall_time_not_poll_rate(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 source = 0x1000u;
+    const u32 target = 0x2000u;
+    u32 put = 0x3000u;
+    u32 next = source, ret = ~0u;
+    f.words[source >> 2] = 0x20000000u | target;
+    f.words[target >> 2] = 0x43260000u;
+    f.repair_source = source;
+    f.repair_command = f.words[source >> 2];
+    f.repair_target = target;
+    f.repair_word = f.words[target >> 2];
+    f.now_ms = 1000u;
+    rsx_nr_frame_owner_set_publication_clock(
+        &f.owner, test_now_ms, &f, 2u, 100u);
+
+    for (u32 i = 0; i < 1000000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, source, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL && !f.owner.fatal,
+              "wall-time publication wait failed from poll rate at %u", i);
+    CHECK(f.repair_calls == 0u,
+          "proof ran before the wall-time delay (%u)", f.repair_calls);
+
+    f.now_ms = 1003u;
+    f.owner.flow_wait_clock_next_poll = 0u;
+    f.repair_put = put;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, source, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && f.repair_calls == 1u,
+          "wall-time proof did not run once after its delay");
+
+    /* Unrelated producer progress changes PUT but not this dependency. It may
+     * permit a new bounded proof, but it must not restart the failure clock. */
+    put += 0x100u;
+    f.repair_put = put;
+    f.now_ms = 1099u;
+    f.owner.flow_wait_clock_next_poll = 0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, source, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_WAIT_PARTIAL && !f.owner.fatal,
+          "publication wait failed before wall-time bound");
+    put += 0x100u;
+    f.repair_put = put;
+    f.now_ms = 1100u;
+    f.owner.flow_wait_clock_next_poll = 0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, source, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_FATAL && f.owner.fatal &&
+              f.owner.failure.kind == RSX_NR_FRAME_FAILURE_BAD_FLOW,
+          "changing PUT incorrectly reset the wall-time failure bound");
+    return 0;
+}
+
 static int test_late_published_island_entry_preserves_payload(void)
 {
     fixture f;
@@ -950,6 +1012,42 @@ static int test_packet_shaped_generated_hole_executes_no_arguments(void)
     return 0;
 }
 
+static int test_noop_preserves_sequential_gap_provenance(void)
+{
+    fixture f;
+    fixture_init(&f);
+    const u32 noop = 0x1254u;
+    const u32 gap = 0x1258u;
+    const u32 resume = 0x1280u;
+    const u32 put = 0x3000u;
+    u32 next = noop, ret = ~0u;
+    f.words[noop >> 2] = 0u;
+    f.words[gap >> 2] = 0x44C00000u;
+    f.hole_get = gap;
+    f.hole_put = put;
+    f.hole_word = f.words[gap >> 2];
+    f.hole_resume = resume;
+    f.words[resume >> 2] = packet(1u, 0x0050u);
+    f.words[(resume + 4u) >> 2] = 0x12345678u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, noop, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == gap,
+          "NOOP before generated gap did not advance exactly");
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, gap, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "generated gap escaped before proof delay at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, gap, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == resume &&
+              f.hole_previous_get == noop &&
+              f.hole_previous_command == 0u &&
+              f.owner.stats.methods == 0u,
+          "NOOP sequential provenance was not delivered to exact gap proof");
+    return 0;
+}
+
 static int test_primary_hole_waits_but_called_list_fails(void)
 {
     fixture f;
@@ -1117,6 +1215,7 @@ int main(void)
         test_called_list_entry_waits_for_final_publication() ||
         test_jump_waits_for_exact_target_publication() ||
         test_invalid_jump_repair_is_exact_and_latched() ||
+        test_publication_timeout_uses_wall_time_not_poll_rate() ||
         test_late_published_island_entry_preserves_payload() ||
         test_primary_generated_hole_proof_is_exact_and_latched() ||
         test_pending_generated_hole_rechecks_without_put_change() ||
@@ -1125,6 +1224,7 @@ int main(void)
         test_generated_hole_receives_owner_predecessor() ||
         test_primary_unmapped_flow_waits_for_in_place_publication() ||
         test_packet_shaped_generated_hole_executes_no_arguments() ||
+        test_noop_preserves_sequential_gap_provenance() ||
         test_primary_hole_waits_but_called_list_fails() ||
         test_registered_island_edge_skips_payload_exactly() ||
         test_control_cycle_is_bounded() ||

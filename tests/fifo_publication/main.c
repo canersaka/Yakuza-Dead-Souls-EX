@@ -117,7 +117,31 @@ int main(void)
     failed |= expect("generated VP incomplete publication",
         yz_fifo_generated_vp_constant_tail_resume(
             0x00441EFCu, 0x3A2AAAABu,
-            0x00001278u, 0x000012A8u, size, 1), 0u);
+        0x00001278u, 0x000012A8u, size, 1), 0u);
+
+    /* Complete captured gap: NOOP at 0x1254, ten raw words at 0x1258,
+     * generated draw prologue at 0x1280. */
+    failed |= expect("generated VP complete inline gap",
+        yz_fifo_generated_vp_inline_gap_resume(
+            0x00001254u, 0u, 0x44C00000u,
+            0x00001258u, 0x007FFFA0u, size, 1, 1),
+        0x00001280u);
+    failed |= expect("generated VP inline gap wrong predecessor",
+        yz_fifo_generated_vp_inline_gap_resume(
+            0x00001250u, 0u, 0x44C00000u,
+            0x00001258u, 0x007FFFA0u, size, 1, 1), 0u);
+    failed |= expect("generated VP inline gap real flow",
+        yz_fifo_generated_vp_inline_gap_resume(
+            0x00001254u, 0u, 0x20001280u,
+            0x00001258u, 0x007FFFA0u, size, 1, 1), 0u);
+    failed |= expect("generated VP inline gap missing prologue",
+        yz_fifo_generated_vp_inline_gap_resume(
+            0x00001254u, 0u, 0x44C00000u,
+            0x00001258u, 0x007FFFA0u, size, 0, 1), 0u);
+    failed |= expect("generated VP inline gap unbalanced",
+        yz_fifo_generated_vp_inline_gap_resume(
+            0x00001254u, 0u, 0x44C00000u,
+            0x00001258u, 0x007FFFA0u, size, 1, 0), 0u);
 
     /* Captured EDGE block boundary: a primary JUMP targets 0x41FFFC, the
      * producer-owned final word of a 128 KiB generated block.  Recycled float

@@ -7031,6 +7031,49 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     if (block_boundary && !block_exact)
         return -1;
 
+    /* Protocol-wide complete inline generated-VP gap.  The owner must have
+     * consumed the exact preceding NOOP, and the fixed 0x28-byte data extent
+     * must end at a complete draw-balanced generated prologue.  This covers
+     * the packet-shaped 0x1258 entry without scanning or executing any raw
+     * constants. */
+    const uint32_t inline_resume = (get + 0x28u) & mask;
+    const uint32_t inline_end =
+        (inline_resume + generated_block) & mask;
+    const int inline_prologue =
+        yz_a010_generated_prologue_at(inline_resume);
+    const int inline_balanced = inline_prologue &&
+        yz_a010_balanced_generated_prefix_at(
+            inline_resume, inline_resume, inline_end);
+    const uint32_t inline_exact =
+        yz_fifo_generated_vp_inline_gap_resume(
+            previous_get, previous_command, word, get, put, ring,
+            inline_prologue, inline_balanced);
+    if (inline_exact) {
+        const uint32_t previous_ea = yz_rsx_io_to_ea(previous_get);
+        MemoryBarrier();
+        if (previous_ea &&
+            vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(previous_ea) == previous_command &&
+            vm_read32(hole_ea) == word &&
+            yz_fifo_generated_vp_inline_gap_resume(
+                previous_get, vm_read32(previous_ea), vm_read32(hole_ea),
+                get, put, ring,
+                yz_a010_generated_prologue_at(inline_exact),
+                yz_a010_balanced_generated_prefix_at(
+                    inline_exact, inline_exact, inline_end)) ==
+                inline_exact) {
+            *resume_get = inline_exact;
+            return 1;
+        }
+        return -1;
+    }
+    /* Preserve one pending dependency when the exact NOOP/gap layout is
+     * present but its prologue or terminal stopper is still publishing. */
+    if (yz_fifo_generated_vp_inline_gap_resume(
+            previous_get, previous_command, word, get, put, ring, 1, 1) &&
+        (!inline_prologue || !inline_balanced))
+        return -1;
+
     /* The captured 0x1278 family is the eight-byte alignment tail after one
      * exact 17-argument SET_TRANSFORM_CONSTANT_LOAD packet.  Prove that local
      * producer boundary directly; the previous broad generated-chain scan was

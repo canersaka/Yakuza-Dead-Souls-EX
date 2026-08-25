@@ -11,6 +11,9 @@
 #define NR_FRAME_CONTROL_BOUND 4096u
 #define NR_FRAME_FLOW_WAIT_BOUND (1u << 24)
 #define NR_FRAME_GENERATED_LINK_PROOF_DELAY (1u << 16)
+#define NR_FRAME_PUBLICATION_CLOCK_POLL_INTERVAL (1u << 16)
+#define NR_FRAME_PUBLICATION_PROOF_DELAY_MS 2u
+#define NR_FRAME_PUBLICATION_FAILURE_DELAY_MS 30000u
 #define NR_FRAME_PRIMARY_SEGMENT_BYTES 0x100000u
 #define NR_FRAME_GENERATED_BLOCK_BYTES 0x20000u
 
@@ -99,6 +102,81 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* o,
     o->generated_block_bytes = NR_FRAME_GENERATED_BLOCK_BYTES;
 }
 
+void rsx_nr_frame_owner_set_publication_clock(
+    rsx_nr_frame_owner* o, rsx_nr_frame_now_ms_fn now_ms,
+    void* user, u32 proof_delay_ms, u32 failure_delay_ms)
+{
+    if (!o)
+        return;
+    o->publication_now_ms = now_ms;
+    o->publication_clock_user = user;
+    o->publication_proof_delay_ms = proof_delay_ms
+        ? proof_delay_ms : NR_FRAME_PUBLICATION_PROOF_DELAY_MS;
+    o->publication_failure_delay_ms = failure_delay_ms
+        ? failure_delay_ms : NR_FRAME_PUBLICATION_FAILURE_DELAY_MS;
+    o->flow_wait_clock_next_poll = 0u;
+}
+
+static void frame_publication_wait_start(rsx_nr_frame_owner* o)
+{
+    o->flow_wait_clock_next_poll = 0u;
+    o->flow_wait_started_ms = 0u;
+    o->flow_wait_cached_ms = 0u;
+    o->flow_wait_next_proof_ms = 0u;
+    if (o->publication_now_ms) {
+        const unsigned long long now =
+            o->publication_now_ms(o->publication_clock_user);
+        o->flow_wait_started_ms = now;
+        o->flow_wait_cached_ms = now;
+        o->flow_wait_next_proof_ms = now +
+            (o->publication_proof_delay_ms
+                ? o->publication_proof_delay_ms
+                : NR_FRAME_PUBLICATION_PROOF_DELAY_MS);
+        o->flow_wait_clock_next_poll =
+            NR_FRAME_PUBLICATION_CLOCK_POLL_INTERVAL;
+    }
+}
+
+static void frame_publication_clock_refresh(rsx_nr_frame_owner* o)
+{
+    if (!o->publication_now_ms ||
+        o->flow_wait_polls < o->flow_wait_clock_next_poll)
+        return;
+    o->flow_wait_cached_ms =
+        o->publication_now_ms(o->publication_clock_user);
+    o->flow_wait_clock_next_poll = o->flow_wait_polls +
+        NR_FRAME_PUBLICATION_CLOCK_POLL_INTERVAL;
+}
+
+static int frame_publication_timed_out(const rsx_nr_frame_owner* o)
+{
+    if (!o->publication_now_ms)
+        return o->flow_wait_polls > o->flow_wait_limit;
+    const unsigned long long delay = o->publication_failure_delay_ms
+        ? o->publication_failure_delay_ms
+        : NR_FRAME_PUBLICATION_FAILURE_DELAY_MS;
+    return o->flow_wait_cached_ms - o->flow_wait_started_ms >= delay;
+}
+
+static int frame_publication_proof_due(const rsx_nr_frame_owner* o)
+{
+    return o->publication_now_ms
+        ? o->flow_wait_cached_ms >= o->flow_wait_next_proof_ms
+        : o->flow_wait_put_polls >= NR_FRAME_GENERATED_LINK_PROOF_DELAY;
+}
+
+static void frame_publication_defer_proof(rsx_nr_frame_owner* o)
+{
+    if (o->publication_now_ms) {
+        const unsigned long long delay = o->publication_proof_delay_ms
+            ? o->publication_proof_delay_ms
+            : NR_FRAME_PUBLICATION_PROOF_DELAY_MS;
+        o->flow_wait_next_proof_ms = o->flow_wait_cached_ms + delay;
+    } else {
+        o->flow_wait_put_polls = 0u;
+    }
+}
+
 static void frame_breadcrumb(rsx_nr_frame_owner* o, u32 get, u32 put,
                              u32 ret, u32 command)
 {
@@ -119,6 +197,41 @@ static void frame_breadcrumb(rsx_nr_frame_owner* o, u32 get, u32 put,
     o->breadcrumb_last_get = get;
     o->breadcrumb_last_return = ret;
     o->breadcrumb_last_command = command;
+}
+
+static int frame_previous_sequential_breadcrumb(
+    const rsx_nr_frame_owner* o, u32 get, u32 ret,
+    u32* previous_get, u32* previous_command)
+{
+    if (!o->breadcrumb_count || !previous_get || !previous_command)
+        return 0;
+    /* The newest breadcrumb is this unchanged wait cursor.  Walk backward to
+     * the last distinct owner-observed command and accept only a complete
+     * linear command ending exactly at GET. */
+    for (u32 back = 2u; back <= o->breadcrumb_count; ++back) {
+        const u32 index = (o->breadcrumb_head +
+            RSX_NR_FRAME_BREADCRUMB_COUNT - back) %
+            RSX_NR_FRAME_BREADCRUMB_COUNT;
+        const rsx_nr_frame_breadcrumb* const crumb =
+            &o->breadcrumbs[index];
+        if (crumb->call_return != ret || crumb->get == get)
+            continue;
+        u32 bytes = 0u;
+        if (crumb->command == 0u) {
+            bytes = 4u;
+        } else if ((crumb->command & 0xA0030003u) == 0u) {
+            const u32 count = (crumb->command >> 18) & 0x7FFu;
+            if (count)
+                bytes = 4u + count * 4u;
+        }
+        if (bytes && frame_linear_next(crumb->get, bytes, ret) == get) {
+            *previous_get = crumb->get;
+            *previous_command = crumb->command;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 static void frame_record_flow(rsx_nr_frame_owner* o, u32 get,
@@ -191,21 +304,24 @@ static rsx_nr_frame_step_result frame_wait_for_flow_target(
         o->flow_wait_polls = 0u;
         o->flow_wait_put = put;
         o->flow_wait_put_polls = 0u;
+        frame_publication_wait_start(o);
     } else if (o->flow_wait_put != put) {
-        /* PUT is the producer publication generation for this dependency.
-         * A proof made against an earlier snapshot cannot permanently latch
-         * out data published later.  Require the new generation itself to
-         * remain stable for the full proof delay before rescanning it.  A
-         * moving PUT is also concrete producer progress, so the fatal bound
-         * belongs to the new unchanged generation rather than accumulating
-         * across every publication made while this target is being built. */
+        /* PUT is part of each proof snapshot, but unrelated command
+         * publication is not progress on this exact dependency.  With the
+         * production wall clock, retain the episode's original deadline and
+         * rate-limit a new proof against the latest PUT.  Clockless offline
+         * callers retain the older deterministic per-generation poll bound. */
         o->flow_wait_put = put;
-        o->flow_wait_put_polls = 0u;
-        o->flow_wait_polls = 0u;
+        if (!o->publication_now_ms) {
+            o->flow_wait_put_polls = 0u;
+            o->flow_wait_polls = 0u;
+        }
     }
     o->flow_wait_word = target_word;
     o->flow_wait_put_polls++;
-    if (++o->flow_wait_polls > o->flow_wait_limit)
+    ++o->flow_wait_polls;
+    frame_publication_clock_refresh(o);
+    if (frame_publication_timed_out(o))
         return frame_fail(
             o, RSX_NR_FRAME_FAILURE_BAD_FLOW, get, put, ret, command,
             target, target_word, o->flow_wait_polls);
@@ -223,14 +339,19 @@ static rsx_nr_frame_step_result frame_wait_for_unsupported_candidate(
         o->flow_wait_polls = 0u;
         o->flow_wait_put = put;
         o->flow_wait_put_polls = 0u;
+        frame_publication_wait_start(o);
     } else if (o->flow_wait_put != put) {
         o->flow_wait_put = put;
-        o->flow_wait_put_polls = 0u;
-        o->flow_wait_polls = 0u;
+        if (!o->publication_now_ms) {
+            o->flow_wait_put_polls = 0u;
+            o->flow_wait_polls = 0u;
+        }
     }
     o->flow_wait_word = command;
     o->flow_wait_put_polls++;
-    if (++o->flow_wait_polls > o->flow_wait_limit)
+    ++o->flow_wait_polls;
+    frame_publication_clock_refresh(o);
+    if (frame_publication_timed_out(o))
         return frame_fail(
             o, RSX_NR_FRAME_FAILURE_UNSUPPORTED_METHOD, get, put, ret,
             command, method, argument, o->flow_wait_polls);
@@ -245,6 +366,7 @@ static int frame_try_resolve_generated_jump(
     u32 resume = 0u;
     u32 repaired = 0u;
     u32 resume_word = 0u;
+    frame_publication_clock_refresh(o);
     const int same_attempt =
         o->repair_attempt_valid &&
         o->repair_attempt_kind == 1u &&
@@ -255,8 +377,7 @@ static int frame_try_resolve_generated_jump(
         o->repair_attempt_put == put;
     if (!o->resolve_jump || same_attempt ||
         o->flow_wait_source != get || o->flow_wait_target != target ||
-        o->flow_wait_put != put ||
-        o->flow_wait_put_polls < NR_FRAME_GENERATED_LINK_PROOF_DELAY)
+        o->flow_wait_put != put || !frame_publication_proof_due(o))
         return 0;
 
     o->repair_attempt_valid = 1u;
@@ -267,6 +388,7 @@ static int frame_try_resolve_generated_jump(
     o->repair_attempt_target = target;
     o->repair_attempt_word = target_word;
     o->stats.generated_link_attempts++;
+    frame_publication_defer_proof(o);
     const int resolved = o->resolve_jump(
         o->resolve_jump_user, get, put, command, target,
         target_word, &resume);
@@ -277,7 +399,7 @@ static int frame_try_resolve_generated_jump(
              * filled behind an already-published source edge. Do not rescan
              * on every poll: begin one new fixed proof-delay interval. */
             o->repair_attempt_valid = 0u;
-            o->flow_wait_put_polls = 0u;
+            frame_publication_defer_proof(o);
         }
         return 0;
     }
@@ -296,7 +418,7 @@ static int frame_try_resolve_generated_jump(
          * pending rather than definitively refused.  Do not latch it forever
          * under an unchanged PUT; require another complete proof interval. */
         o->repair_attempt_valid = 0u;
-        o->flow_wait_put_polls = 0u;
+        frame_publication_defer_proof(o);
         return 0;
     }
 
@@ -317,6 +439,7 @@ static int frame_try_resolve_generated_hole(
     u32 resume = 0u;
     u32 current = 0u;
     u32 resume_word = 0u;
+    frame_publication_clock_refresh(o);
     const int same_attempt =
         o->repair_attempt_valid &&
         o->repair_attempt_kind == 2u &&
@@ -325,8 +448,7 @@ static int frame_try_resolve_generated_hole(
         o->repair_attempt_put == put;
     if (!o->resolve_hole || same_attempt || ret != ~0u ||
         o->flow_wait_source != get || o->flow_wait_target != get ||
-        o->flow_wait_put != put ||
-        o->flow_wait_put_polls < NR_FRAME_GENERATED_LINK_PROOF_DELAY)
+        o->flow_wait_put != put || !frame_publication_proof_due(o))
         return 0;
 
     o->repair_attempt_valid = 1u;
@@ -337,21 +459,26 @@ static int frame_try_resolve_generated_hole(
     o->repair_attempt_target = get;
     o->repair_attempt_word = word;
     o->stats.generated_link_attempts++;
+    frame_publication_defer_proof(o);
     const int sequential_previous =
         !o->packet_active && o->packet_count &&
         o->packet_next_get == get && o->packet_next_ret == ret &&
         o->packet_get != get;
     const u32 previous_get = sequential_previous
         ? o->packet_get : ~0u;
-    const u32 previous_command = sequential_previous
+    u32 previous_command = sequential_previous
         ? o->packet_command : 0u;
+    u32 exact_previous_get = previous_get;
+    if (!sequential_previous)
+        frame_previous_sequential_breadcrumb(
+            o, get, ret, &exact_previous_get, &previous_command);
     const int resolved = o->resolve_hole(
         o->resolve_hole_user, get, put, word,
-        previous_get, previous_command, &resume);
+        exact_previous_get, previous_command, &resume);
     if (resolved <= 0) {
         if (resolved < 0) {
             o->repair_attempt_valid = 0u;
-            o->flow_wait_put_polls = 0u;
+            frame_publication_defer_proof(o);
         }
         return 0;
     }
@@ -359,7 +486,7 @@ static int frame_try_resolve_generated_hole(
         !frame_read(o, resume, &resume_word) ||
         !frame_flow_target_ready(o, resume, ret, resume_word)) {
         o->repair_attempt_valid = 0u;
-        o->flow_wait_put_polls = 0u;
+        frame_publication_defer_proof(o);
         return 0;
     }
 
