@@ -129,6 +129,14 @@ void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out);
  * copy before dispatch-based clear/draw/present methods are consumed. */
 void rsx_nir_adapter_rebind(rsx_nir_adapter* ad);
 
+/* Copy only persistent graphics/render state.  Transport bindings, FIFO
+ * semaphore state, transfer staging, counters, and the destination sink are
+ * deliberately preserved.  The strict live owner uses this at host-movie
+ * ownership boundaries: movie-hidden graphics state is discarded while
+ * synchronization and data-move semantics continue to advance normally. */
+void rsx_nir_adapter_copy_render_state(rsx_nir_adapter* dst,
+                                       const rsx_nir_adapter* src);
+
 /* Seed the underlying register file (captured initial state). */
 void rsx_nir_adapter_seed(rsx_nir_adapter* ad, const u32* regs, u32 reg_words,
                           const u32* vp, u32 vp_words,

@@ -3093,6 +3093,7 @@ static void yz_movie_set_live_draw_mode(int on)
 {
     yz_rsx_fifo_acquire();
     rsx_live_draw_set_movie_mode(on);
+    yz_nr_vertical_set_movie_mode(on);
     yz_rsx_fifo_release();
 }
 
@@ -3108,6 +3109,7 @@ static void yz_movie_begin_live_draw_mode(LONG serial)
 {
     yz_rsx_fifo_acquire();
     rsx_live_draw_set_movie_mode(1);
+    yz_nr_vertical_set_movie_mode(1);
     InterlockedExchange(&g_movie_live_draw_serial, serial);
     yz_rsx_fifo_release();
 }
@@ -3116,8 +3118,10 @@ static void yz_movie_end_live_draw_mode(LONG serial)
 {
     yz_rsx_fifo_acquire();
     if (InterlockedCompareExchange(
-            &g_movie_live_draw_serial, 0, serial) == serial)
+            &g_movie_live_draw_serial, 0, serial) == serial) {
         rsx_live_draw_set_movie_mode(0);
+        yz_nr_vertical_set_movie_mode(0);
+    }
     yz_rsx_fifo_release();
 }
 

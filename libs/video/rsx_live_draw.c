@@ -10136,6 +10136,16 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    /* Production-fast A/B accounting only.  These counters already advance
+     * in the ordinary renderer; reporting them once at shutdown adds no hot-
+     * path clock, allocation, branch, or I/O. */
+    fprintf(stderr,
+            "[live-draw-clean frames=%u groups=%llu clears=%llu "
+            "submits=%llu]\n",
+            g_ld_frames,
+            (unsigned long long)g_ld_stats.groups_executed,
+            (unsigned long long)g_ld_stats.clears,
+            (unsigned long long)g.fence_value);
     ld_shadow_oracle_dump();
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.output) {

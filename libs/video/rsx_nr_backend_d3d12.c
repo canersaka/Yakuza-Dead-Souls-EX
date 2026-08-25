@@ -4926,6 +4926,200 @@ static void nrb_publish_guest_write(rsx_nr_d3d12* b, u32 space,
         rsx_guest_pages_note_write(&b->pages, space, offset, size);
 }
 
+static int nrb_transfer_rt_format_ok(const nrb_rt* rt)
+{
+    return rt && (rt->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                  rt->dxgi == DXGI_FORMAT_B8G8R8A8_UNORM);
+}
+
+/* Locate the exact full-surface identity used by the capture-observed 1:1
+ * transfer. Source selection follows the latest GPU writer. Destination
+ * selection also permits an allocated-but-unwritten exact identity because
+ * the transfer itself becomes its first writer. A same-address incompatible
+ * identity is an explicit mismatch rather than a stale guest-memory copy. */
+static nrb_rt* nrb_transfer_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
+                               u32 w, u32 h, int source, int* mismatch)
+{
+    nrb_rt* selected = NULL;
+    int saw_address = 0;
+    if (mismatch)
+        *mismatch = 0;
+    for (u32 i = 0; i < NRB_MAX_RTS; ++i) {
+        nrb_rt* const candidate = &b->rts[i];
+        if (!candidate->live || candidate->space != space ||
+            candidate->offset != offset)
+            continue;
+        saw_address = 1;
+        if (candidate->w != w || candidate->h != h ||
+            !nrb_transfer_rt_format_ok(candidate) ||
+            (source && !candidate->last_write_serial))
+            continue;
+        if (!selected || candidate->last_write_serial >
+                             selected->last_write_serial)
+            selected = candidate;
+    }
+    if (!selected && saw_address && mismatch)
+        *mismatch = 1;
+    return selected;
+}
+
+static void nrb_report_transfer_rt_failure(rsx_nr_d3d12* b,
+                                           const char* stage,
+                                           u32 space, u32 offset,
+                                           u32 width, u32 height)
+{
+    fprintf(stderr,
+            "[nrb-transfer-fatal stage=%s key=%u:%08X/%ux%u "
+            "removed=%08lX candidates=",
+            stage, space, offset, width, height,
+            (unsigned long)b->dev->lpVtbl->GetDeviceRemovedReason(b->dev));
+    u32 emitted = 0u;
+    for (u32 i = 0; i < NRB_MAX_RTS && emitted < 8u; ++i) {
+        const nrb_rt* const rt = &b->rts[i];
+        if (!rt->live || rt->space != space || rt->offset != offset)
+            continue;
+        fprintf(stderr, "%s%u:f%u/%ux%u/dxgi%u/w%llu",
+                emitted ? "," : "", i, rt->fmt, rt->w, rt->h,
+                (u32)rt->dxgi,
+                (unsigned long long)rt->last_write_serial);
+        emitted++;
+    }
+    fprintf(stderr, "]\n");
+}
+
+static void nrb_rt_pixel_to_guest(const nrb_rt* rt, const u8* pixel,
+                                  u8 guest[4])
+{
+    /* Guest A8R8G8B8 is byte-addressed A,R,G,B. */
+    guest[0] = pixel[3];
+    if (rt->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        guest[1] = pixel[0];
+        guest[2] = pixel[1];
+        guest[3] = pixel[2];
+    } else {
+        guest[1] = pixel[2];
+        guest[2] = pixel[1];
+        guest[3] = pixel[0];
+    }
+}
+
+static void nrb_guest_pixel_to_rt(const nrb_rt* rt, const u8 guest[4],
+                                  u8* pixel)
+{
+    if (rt->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        pixel[0] = guest[1];
+        pixel[1] = guest[2];
+        pixel[2] = guest[3];
+    } else {
+        pixel[0] = guest[3];
+        pixel[1] = guest[2];
+        pixel[2] = guest[1];
+    }
+    pixel[3] = guest[0];
+}
+
+static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
+                                u8* dst, u32 dst_pitch)
+{
+    const u32 row_pitch = (rt->w * 4u + 255u) & ~255u;
+    const u64 need64 = (u64)row_pitch * rt->h;
+    if (!dst || dst_pitch < rt->w * 4u || need64 > UINT32_MAX)
+        return -1;
+    const u32 need = (u32)need64;
+    if (!b->readback || b->readback_size < need) {
+        if (b->readback)
+            b->readback->lpVtbl->Release(b->readback);
+        b->readback = nrb_make_buffer(b->dev, need,
+                                      D3D12_HEAP_TYPE_READBACK,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->readback) {
+            b->readback_size = 0u;
+            return -1;
+        }
+        b->readback_size = need;
+    }
+    if (nrb_open_list(b))
+        return -1;
+    nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source = {0};
+    source.pResource = rt->tex;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION target = {0};
+    target.pResource = b->readback;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    target.PlacedFootprint.Footprint.Format = rt->dxgi;
+    target.PlacedFootprint.Footprint.Width = rt->w;
+    target.PlacedFootprint.Footprint.Height = rt->h;
+    target.PlacedFootprint.Footprint.Depth = 1u;
+    target.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    b->list->lpVtbl->CopyTextureRegion(
+        b->list, &target, 0u, 0u, 0u, &source, NULL);
+    nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (nrb_exec_wait(b))
+        return -1;
+
+    u8* mapped = NULL;
+    D3D12_RANGE read_range = {0u, need};
+    if (FAILED(b->readback->lpVtbl->Map(
+            b->readback, 0u, &read_range, (void**)&mapped)))
+        return -1;
+    for (u32 y = 0; y < rt->h; ++y) {
+        const u8* const source_row = mapped + (size_t)y * row_pitch;
+        u8* const target_row = dst + (size_t)y * dst_pitch;
+        for (u32 x = 0; x < rt->w; ++x)
+            nrb_rt_pixel_to_guest(
+                rt, source_row + (size_t)x * 4u,
+                target_row + (size_t)x * 4u);
+    }
+    D3D12_RANGE no_write = {0u, 0u};
+    b->readback->lpVtbl->Unmap(b->readback, 0u, &no_write);
+    b->stats.transfer_gpu_readbacks++;
+    return 0;
+}
+
+static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
+                                    const u8* src, u32 src_pitch)
+{
+    const u32 row_pitch = (rt->w * 4u + 255u) & ~255u;
+    const u64 need64 = (u64)row_pitch * rt->h;
+    if (!src || src_pitch < rt->w * 4u || need64 > UINT32_MAX)
+        return -1;
+    u64 upload_offset = 0u;
+    u8* const upload = nrb_texture_upload_slice(
+        b, (u32)need64, &upload_offset);
+    if (!upload)
+        return -1;
+    for (u32 y = 0; y < rt->h; ++y) {
+        const u8* const source_row = src + (size_t)y * src_pitch;
+        u8* const target_row = upload + (size_t)y * row_pitch;
+        for (u32 x = 0; x < rt->w; ++x)
+            nrb_guest_pixel_to_rt(
+                rt, source_row + (size_t)x * 4u,
+                target_row + (size_t)x * 4u);
+    }
+    if (nrb_open_list(b))
+        return -1;
+    D3D12_TEXTURE_COPY_LOCATION source = {0};
+    source.pResource = b->upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = upload_offset;
+    source.PlacedFootprint.Footprint.Format = rt->dxgi;
+    source.PlacedFootprint.Footprint.Width = rt->w;
+    source.PlacedFootprint.Footprint.Height = rt->h;
+    source.PlacedFootprint.Footprint.Depth = 1u;
+    source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    D3D12_TEXTURE_COPY_LOCATION target = {0};
+    target.pResource = rt->tex;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_COPY_DEST);
+    b->list->lpVtbl->CopyTextureRegion(
+        b->list, &target, 0u, 0u, 0u, &source, NULL);
+    nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    nrb_note_rt_write(b, rt);
+    b->stats.transfer_gpu_uploads++;
+    return 0;
+}
+
 static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
                         const rsx_nir_transfer* t, const u32* words)
 {
@@ -5011,16 +5205,54 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             b->stats.unsupported_transfers++;
             return -1;
         }
-        const int reverse = t->src_location == t->dst_location &&
-            t->dst_offset > t->src_offset &&
-            t->dst_offset < t->src_offset + src_size;
-        for (u32 row = 0; row < t->out_h; ++row) {
-            const u32 y = reverse ? t->out_h - 1u - row : row;
-            memmove(dst + (size_t)y * t->dst_pitch,
-                    src + (size_t)y * t->src_pitch, row_bytes);
+        int src_mismatch = 0, dst_mismatch = 0;
+        nrb_rt* const src_rt = bpp == 4u ? nrb_transfer_rt(
+            b, t->src_location, t->src_offset, t->in_w, t->in_h,
+            1, &src_mismatch) : NULL;
+        nrb_rt* const dst_rt = bpp == 4u ? nrb_transfer_rt(
+            b, t->dst_location, t->dst_offset, t->out_w, t->out_h,
+            0, &dst_mismatch) : NULL;
+        if (src_mismatch || dst_mismatch) {
+            if (src_mismatch)
+                nrb_report_transfer_rt_failure(
+                    b, "source-shape", t->src_location, t->src_offset,
+                    t->in_w, t->in_h);
+            if (dst_mismatch)
+                nrb_report_transfer_rt_failure(
+                    b, "destination-shape", t->dst_location,
+                    t->dst_offset, t->out_w, t->out_h);
+            b->stats.unsupported_transfers++;
+            return -1;
+        }
+        if (src_rt) {
+            if (nrb_rt_read_to_guest(b, src_rt, dst, t->dst_pitch) != 0) {
+                nrb_report_transfer_rt_failure(
+                    b, "source-readback", t->src_location, t->src_offset,
+                    t->in_w, t->in_h);
+                b->stats.unsupported_transfers++;
+                return -1;
+            }
+        } else {
+            const int reverse = t->src_location == t->dst_location &&
+                t->dst_offset > t->src_offset &&
+                t->dst_offset < t->src_offset + src_size;
+            for (u32 row = 0; row < t->out_h; ++row) {
+                const u32 y = reverse ? t->out_h - 1u - row : row;
+                memmove(dst + (size_t)y * t->dst_pitch,
+                        src + (size_t)y * t->src_pitch, row_bytes);
+            }
+        }
+        for (u32 y = 0; y < t->out_h; ++y)
             nrb_publish_guest_write(
                 b, t->dst_location,
                 t->dst_offset + y * t->dst_pitch, row_bytes);
+        if (dst_rt && nrb_rt_upload_from_guest(
+                b, dst_rt, dst, t->dst_pitch) != 0) {
+            nrb_report_transfer_rt_failure(
+                b, "destination-upload", t->dst_location, t->dst_offset,
+                t->out_w, t->out_h);
+            b->stats.unsupported_transfers++;
+            return -1;
         }
         break;
     }

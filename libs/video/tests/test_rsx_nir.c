@@ -2427,6 +2427,62 @@ static void test_adapter_copy_rebind(void)
     rsx_nir_stream_free(&source_stream);
 }
 
+static void test_adapter_render_state_checkpoint(void)
+{
+    rsx_nir_stream live_stream, saved_stream;
+    rsx_nir_stream_init(&live_stream);
+    rsx_nir_stream_init(&saved_stream);
+    rsx_nir_adapter live, saved;
+    rsx_nir_adapter_init(&live, &live_stream);
+    rsx_nir_adapter_init(&saved, &saved_stream);
+
+    rsx_nir_adapter_method(&live, M_CLEAR_COLOR, 0x11223344u);
+    rsx_nir_adapter_method(&live, M_BEGIN_END, 6u);
+    rsx_nir_adapter_method(&live, M_DRAW_ARRAYS, (2u << 24) | 7u);
+    live.fifo_semaphore_dma = 0x66604200u;
+    live.fifo_semaphore_offset = 0x100u;
+    live.m2mf_offset_in = 0x200u;
+    live.methods_seen = 17u;
+    rsx_nir_adapter_copy_render_state(&saved, &live);
+
+    /* Model hidden movie traffic: graphics state must later roll back, while
+     * FIFO synchronization and transfer staging remain at their newest
+     * values. */
+    rsx_nir_adapter_method(&live, M_CLEAR_COLOR, 0xAABBCCDDu);
+    rsx_nir_adapter_method(&live, M_BEGIN_END, 0u);
+    live.fifo_semaphore_dma = 0x66616661u;
+    live.fifo_semaphore_offset = 0xFE0u;
+    live.m2mf_offset_in = 0x300u;
+    live.methods_seen = 29u;
+    const rsx_nir_sink live_sink = live.em.out;
+    rsx_nir_adapter_copy_render_state(&live, &saved);
+
+    CHECK(live.rsx.regs[M_CLEAR_COLOR >> 2] == 0x11223344u &&
+              live.rsx.in_begin_end == 1u &&
+              live.rsx.current_primitive == 6u &&
+              live.batch_count == 1u,
+          "render checkpoint did not restore pre-movie graphics state");
+    CHECK(live.fifo_semaphore_dma == 0x66616661u &&
+              live.fifo_semaphore_offset == 0xFE0u &&
+              live.m2mf_offset_in == 0x300u &&
+              live.methods_seen == 29u,
+          "render checkpoint rolled back synchronization/transfer metadata");
+    CHECK(live.em.out.push == live_sink.push &&
+              live.em.out.user == live_sink.user,
+          "render checkpoint replaced the destination sink");
+
+    rsx_nir_adapter_method(&live, M_BEGIN_END, 0u);
+    CHECK(live_stream.op_count &&
+              live_stream.ops[live_stream.op_count - 1u].kind ==
+                  RSX_NIR_OP_DRAW,
+          "restored pre-movie draw did not remain executable");
+    CHECK(saved_stream.op_count == 0u,
+          "render checkpoint dispatch escaped into the saved adapter");
+
+    rsx_nir_stream_free(&saved_stream);
+    rsx_nir_stream_free(&live_stream);
+}
+
 static void test_dispatch_state_sync_and_fifo_registers(void)
 {
     rsx_dispatch source, destination;
@@ -2497,6 +2553,7 @@ int main(int argc, char** argv)
     test_shadow_terminal_action();
     test_section_method_support();
     test_adapter_copy_rebind();
+    test_adapter_render_state_checkpoint();
     test_dispatch_state_sync_and_fifo_registers();
 
     const char* rxs = argc > 1 ? argv[1] : getenv("YZ_NIR_RXS");

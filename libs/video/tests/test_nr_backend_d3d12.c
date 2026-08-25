@@ -571,6 +571,7 @@ enum {
     CAP_METHOD_COUNT = 0x40000,
     CAP_FAILURE_COUNT = 64,
     CAP_TARGET_COUNT = 64,
+    CAP_TRANSFER_COUNT = 64,
 };
 
 typedef struct cap_method_manifest {
@@ -600,6 +601,13 @@ typedef struct cap_target_manifest {
     u64 writes;
 } cap_target_manifest;
 
+typedef struct cap_transfer_manifest {
+    rsx_nir_transfer transfer;
+    u64 count;
+    u64 first_ordinal;
+    u64 last_ordinal;
+} cap_transfer_manifest;
+
 typedef struct cap_manifest {
     cap_method_manifest* methods;
     u64 method_records;
@@ -612,6 +620,9 @@ typedef struct cap_manifest {
     cap_target_manifest targets[CAP_TARGET_COUNT];
     u32 target_count;
     u64 target_overflow;
+    cap_transfer_manifest transfers[CAP_TRANSFER_COUNT];
+    u32 transfer_count;
+    u64 transfer_overflow;
     u32 last_target;
     u32 last_present_buffer;
     int saw_present;
@@ -651,6 +662,57 @@ static void cap_note_target(cap_manifest* m, const rsx_nir_pipeline* st)
     target->height = st->surface.clip_h;
     target->writes = 1;
     m->last_target = m->target_count++;
+}
+
+static int cap_transfer_equal(const rsx_nir_transfer* a,
+                              const rsx_nir_transfer* b)
+{
+    return a->kind == b->kind &&
+           a->src_location == b->src_location &&
+           a->dst_location == b->dst_location &&
+           a->src_offset == b->src_offset &&
+           a->dst_offset == b->dst_offset &&
+           a->src_pitch == b->src_pitch &&
+           a->dst_pitch == b->dst_pitch &&
+           a->src_format == b->src_format &&
+           a->dst_format == b->dst_format &&
+           a->line_length == b->line_length &&
+           a->line_count == b->line_count &&
+           a->point_x == b->point_x && a->point_y == b->point_y &&
+           a->word_count == b->word_count &&
+           a->in_x == b->in_x && a->in_y == b->in_y &&
+           a->in_w == b->in_w && a->in_h == b->in_h &&
+           a->out_x == b->out_x && a->out_y == b->out_y &&
+           a->out_w == b->out_w && a->out_h == b->out_h &&
+           a->clip_x == b->clip_x && a->clip_y == b->clip_y &&
+           a->clip_w == b->clip_w && a->clip_h == b->clip_h &&
+           a->ds_dx == b->ds_dx && a->dt_dy == b->dt_dy &&
+           a->origin == b->origin &&
+           a->interpolator == b->interpolator;
+}
+
+static void cap_note_transfer(cap_manifest* m,
+                              const rsx_nir_transfer* transfer)
+{
+    if (!m || !transfer)
+        return;
+    for (u32 i = 0; i < m->transfer_count; ++i) {
+        cap_transfer_manifest* const entry = &m->transfers[i];
+        if (!cap_transfer_equal(&entry->transfer, transfer))
+            continue;
+        entry->count++;
+        entry->last_ordinal = m->action_ordinal;
+        return;
+    }
+    if (m->transfer_count >= CAP_TRANSFER_COUNT) {
+        m->transfer_overflow++;
+        return;
+    }
+    cap_transfer_manifest* const entry = &m->transfers[m->transfer_count++];
+    entry->transfer = *transfer;
+    entry->count = 1u;
+    entry->first_ordinal = m->action_ordinal;
+    entry->last_ordinal = m->action_ordinal;
 }
 
 static void cap_note_failure(cap_exec_trace* t, u32 kind, int rc,
@@ -743,6 +805,8 @@ static int cap_trace_transfer(void* user, const rsx_nir_pipeline* st,
     if (rc)
         cap_note_failure(t, RSX_NIR_OP_TRANSFER, rc, st, NULL, NULL,
                          transfer);
+    else
+        cap_note_transfer(t->manifest, transfer);
     return rc;
 }
 
@@ -1180,7 +1244,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     snprintf(stats_line, stats_size,
              "methods=%llu unique=%u unsupported_methods=%u data=%llu "
              "clears=%llu draws=%llu (restart=%llu) batches=%llu "
-             "presents=%llu xfers=%llu pso=%llu(+%lluh) unsup_draw=%llu "
+             "presents=%llu xfers=%llu gpu_xfers=%llu/%llu "
+             "pso=%llu(+%lluh) unsup_draw=%llu "
              "[topo=%llu rt=%llu plan=%llu pso=%llu idx=%llu fp=%llu "
              "tex=%llu] real_fp=%llu tex_draw=%llu "
              "tex_cache=%llu(+%lluh,%llur) tex_fail=%llu alias=%llu "
@@ -1195,7 +1260,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              manifest->method_records, manifest->unique_methods,
              manifest->unique_unsupported_methods, manifest->data_records,
              st.clears, st.draws, st.restart_draws, st.draw_batches,
-             st.presents, st.transfers, st.pso_builds, st.pso_hits,
+             st.presents, st.transfers, st.transfer_gpu_readbacks,
+             st.transfer_gpu_uploads, st.pso_builds, st.pso_hits,
              st.unsupported_draws, st.unsup_draw_topology, st.unsup_draw_rt,
              st.unsup_draw_plan, st.unsup_draw_pso, st.unsup_draw_index,
              st.unsup_draw_fp, st.unsup_draw_texture, st.real_fp_draws,
@@ -1369,11 +1435,11 @@ static void cap_write_manifest(const char* capture_path,
             "first_arg,last_arg,first_unsupported_arg,details\n");
     fprintf(fp,
             "summary,%s,methods,%llu,%u,%u,0x%08X,0x%08X,0x%08X,"
-            "data=%llu;failures=%u;targets=%u\n",
+            "data=%llu;failures=%u;targets=%u;transfers=%u\n",
             base, manifest->method_records, manifest->unique_methods,
             manifest->unique_unsupported_methods, 0u, 0u, 0u,
             manifest->data_records, manifest->failure_count,
-            manifest->target_count);
+            manifest->target_count, manifest->transfer_count);
     for (u32 method = 0; method < CAP_METHOD_COUNT; ++method) {
         const cap_method_manifest* const entry =
             &manifest->methods[method];
@@ -1423,6 +1489,28 @@ static void cap_write_manifest(const char* capture_path,
                 target->height, target->location, target->format,
                 target->width, target->height);
     }
+    for (u32 i = 0; i < manifest->transfer_count; ++i) {
+        const cap_transfer_manifest* const entry = &manifest->transfers[i];
+        const rsx_nir_transfer* const t = &entry->transfer;
+        fprintf(fp,
+                "transfer,%s,%u,%llu,%llu,0,0x%08X,0x%08X,0x%08X,"
+                "ordinal=%llu..%llu;kind=%u;src=%u:0x%08X,p%u,f%u;"
+                "dst=%u:0x%08X,p%u,f%u;line=%ux%u;point=%u,%u;"
+                "words=%u;in=%u,%u+%ux%u;out=%u,%u+%ux%u;"
+                "clip=%u,%u+%ux%u;step=0x%08X/0x%08X;"
+                "origin=%u;interp=%u\n",
+                base, i, entry->count, entry->count,
+                t->src_offset, t->dst_offset, t->kind,
+                entry->first_ordinal, entry->last_ordinal, t->kind,
+                t->src_location, t->src_offset, t->src_pitch,
+                t->src_format, t->dst_location, t->dst_offset,
+                t->dst_pitch, t->dst_format, t->line_length,
+                t->line_count, t->point_x, t->point_y, t->word_count,
+                t->in_x, t->in_y, t->in_w, t->in_h, t->out_x,
+                t->out_y, t->out_w, t->out_h, t->clip_x, t->clip_y,
+                t->clip_w, t->clip_h, t->ds_dx, t->dt_dy,
+                t->origin, t->interpolator);
+    }
     fclose(fp);
 }
 
@@ -1457,6 +1545,20 @@ static void run_capture_backend(const char* path)
         cap_manifest_free(&manifest2);
         cap_free(&c);
         return;
+    }
+    {
+        const char* const single_run = getenv("YZ_NR_CAPTURE_SINGLE_RUN");
+        if (single_run && single_run[0] && strcmp(single_run, "0") != 0) {
+            CHECK(h1 != 0u,
+                  "capture presented target could not be read back");
+            cap_write_manifest(path, &manifest1);
+            printf("capture backend %s:\n  %s\n  rt_hash=%016llX\n",
+                   path, line1, (unsigned long long)h1);
+            cap_manifest_free(&manifest1);
+            cap_manifest_free(&manifest2);
+            cap_free(&c);
+            return;
+        }
     }
     int r2 = cap_run_once(&c, &h2, line2, sizeof(line2), 0, &manifest2);
     CHECK(r2 == 0, "capture backend run 2 faulted");
@@ -3550,6 +3652,67 @@ int main(int argc, char** argv)
                   g_published_offset[1] == scaled_dst + 32u &&
                   g_published_size[1] == sizeof(row1),
               "scaled transfer publication mismatch");
+
+        /* A strict-native surface is authoritative on the GPU. Exercise the
+         * exact Hana round trip: GPU target -> main guest bytes, then main
+         * guest bytes -> the same native target. This must use A,R,G,B guest
+         * order even though the offline target is physically BGRA. */
+        stage_frame_state(&em);
+        rsx_nir_em_clear(&em, 0xF0u, 0x7F123456u, 0u, 0u);
+        rsx_nr_backend_run(&be, 0u);
+        const u32 roundtrip = 0xA000u;
+        memset(g_main + roundtrip, 0, RT_W * RT_H * 4u);
+        memset(&transfer, 0, sizeof(transfer));
+        transfer.kind = RSX_NIR_XFER_SCALED;
+        transfer.src_location = RSX_NIR_LOCATION_LOCAL;
+        transfer.src_offset = RT_OFFSET;
+        transfer.src_pitch = RT_W * 4u;
+        transfer.src_format = 3u;
+        transfer.dst_location = RSX_NIR_LOCATION_MAIN;
+        transfer.dst_offset = roundtrip;
+        transfer.dst_pitch = RT_W * 4u;
+        transfer.dst_format = 10u;
+        transfer.in_w = transfer.out_w = transfer.clip_w = RT_W;
+        transfer.in_h = transfer.out_h = transfer.clip_h = RT_H;
+        transfer.ds_dx = transfer.dt_dy = 0x00100000u;
+        transfer.origin = transfer.interpolator = 1u;
+        rsx_nir_em_transfer(&em, &transfer, NULL);
+        rsx_nr_backend_run(&be, 0u);
+        CHECK(be.stats.exec_errors == 2 &&
+                  g_main[roundtrip + 0u] == 0x7Fu &&
+                  g_main[roundtrip + 1u] == 0x12u &&
+                  g_main[roundtrip + 2u] == 0x34u &&
+                  g_main[roundtrip + 3u] == 0x56u,
+              "native target readback did not publish guest A,R,G,B bytes");
+
+        g_main[roundtrip + 0u] = 0xD4u;
+        g_main[roundtrip + 1u] = 0xA1u;
+        g_main[roundtrip + 2u] = 0xB2u;
+        g_main[roundtrip + 3u] = 0xC3u;
+        transfer.src_location = RSX_NIR_LOCATION_MAIN;
+        transfer.src_offset = roundtrip;
+        transfer.dst_location = RSX_NIR_LOCATION_LOCAL;
+        transfer.dst_offset = RT_OFFSET;
+        rsx_nir_em_transfer(&em, &transfer, NULL);
+        rsx_nr_backend_run(&be, 0u);
+        CHECK(be.stats.exec_errors == 2,
+              "native target upload added exec error (%llu)",
+              be.stats.exec_errors);
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+                  RT_W, RT_H, g_pix) == 0 &&
+                  pix_is(0u, 0u, 0xC3u, 0xB2u, 0xA1u),
+              "guest A,R,G,B upload did not update the native target "
+              "(%02X %02X %02X %02X)",
+              pix(0u, 0u)[0], pix(0u, 0u)[1],
+              pix(0u, 0u)[2], pix(0u, 0u)[3]);
+        rsx_nr_d3d12_stats transfer_stats;
+        rsx_nr_d3d12_get_stats(sink, &transfer_stats);
+        CHECK(transfer_stats.transfer_gpu_readbacks >= 1u &&
+                  transfer_stats.transfer_gpu_uploads >= 1u,
+              "native transfer route was not exercised read=%llu upload=%llu",
+              transfer_stats.transfer_gpu_readbacks,
+              transfer_stats.transfer_gpu_uploads);
     }
 
     /* ---- vertex TXL: exact float format + big-endian conversion -------
@@ -3715,7 +3878,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 29 && st.draws == 4640 && st.presents == 24,
+    CHECK(st.clears == 30 && st.draws == 4640 && st.presents == 24,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,

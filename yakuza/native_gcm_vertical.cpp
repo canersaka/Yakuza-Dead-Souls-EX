@@ -391,6 +391,16 @@ struct yz_nr_vertical_active_state {
     uint32_t clear_scope;
     uint32_t frame_islands;
     uint32_t strict_full_native;
+    uint32_t movie_suppressed;
+    uint32_t movie_snapshot_valid;
+    rsx_nir_adapter movie_render_snapshot;
+    rsx_nir_pipeline movie_backend_snapshot;
+    uint32_t movie_backend_vp[RSX_NIR_VP_MAX_WORDS];
+    uint32_t movie_backend_vp_words;
+    unsigned long long movie_intervals;
+    unsigned long long movie_draws_suppressed;
+    unsigned long long movie_clears_suppressed;
+    unsigned long long movie_presents_completed;
     rsx_nir_stream section_stream;
     rsx_nir_op* section_ops;
     uint32_t* section_side;
@@ -767,6 +777,50 @@ static void yz_nr_gpu_flush(void*)
         g_active.gpu_ops.flush(g_active.gpu_ops.user);
 }
 
+static int yz_nr_movie_clear(void*, const rsx_nir_pipeline*,
+                             const rsx_nir_clear*)
+{
+    g_active.movie_clears_suppressed++;
+    return 0;
+}
+
+static int yz_nr_movie_draw(void*, const rsx_nir_pipeline*,
+                            const uint32_t*, uint32_t,
+                            const rsx_nir_draw*, const uint32_t*)
+{
+    g_active.movie_draws_suppressed++;
+    return 0;
+}
+
+static int yz_nr_movie_present(void*, uint32_t buffer)
+{
+    /* The host movie owns the swap chain, but the guest-visible flip queue
+     * and completion packages must still advance just as they do in the
+     * established movie-suppression path. */
+    yz_nr_vertical_exec_present_complete(buffer);
+    g_active.movie_presents_completed++;
+    return 0;
+}
+
+static void yz_nr_active_bind_graphics_ops(void)
+{
+    rsx_nr_exec_ops combined = {};
+    combined.clear = g_active.movie_suppressed
+        ? yz_nr_movie_clear : yz_nr_gpu_clear;
+    combined.draw = g_active.movie_suppressed
+        ? yz_nr_movie_draw : yz_nr_gpu_draw;
+    combined.transfer = yz_nr_gpu_transfer;
+    combined.present = g_active.movie_suppressed
+        ? yz_nr_movie_present : yz_nr_gpu_present;
+    combined.flush = yz_nr_gpu_flush;
+    combined.set_reference = yz_nr_exec_reference;
+    combined.user_command = yz_nr_exec_user;
+    combined.sem_read = yz_nr_exec_sem_read;
+    combined.sem_write = yz_nr_exec_sem_write;
+    combined.report = yz_nr_exec_report;
+    g_active.backend.ops = combined;
+}
+
 static int yz_nr_borrow_color(void*, uint32_t space, uint32_t offset,
                               uint32_t width, uint32_t height,
                               int create, void** resource, uint32_t* format,
@@ -920,18 +974,7 @@ static void yz_nr_active_ensure_graphics(void)
         InterlockedExchange(&g_active.section_state_resync_pending, 0);
         g_active.section_state_resyncs++;
     }
-    rsx_nr_exec_ops combined = {};
-    combined.clear = yz_nr_gpu_clear;
-    combined.draw = yz_nr_gpu_draw;
-    combined.transfer = yz_nr_gpu_transfer;
-    combined.present = yz_nr_gpu_present;
-    combined.flush = yz_nr_gpu_flush;
-    combined.set_reference = yz_nr_exec_reference;
-    combined.user_command = yz_nr_exec_user;
-    combined.sem_read = yz_nr_exec_sem_read;
-    combined.sem_write = yz_nr_exec_sem_write;
-    combined.report = yz_nr_exec_report;
-    g_active.backend.ops = combined;
+    yz_nr_active_bind_graphics_ops();
     g_active.d3d12 = d3d12;
     MemoryBarrier();
     InterlockedExchange(&g_active.graphics_ready, 1);
@@ -3754,6 +3797,44 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
     return yz_nr_section_execute(next_get, next_ret);
 }
 
+extern "C" void yz_nr_vertical_set_movie_mode(int on)
+{
+    if (!g_active.strict_full_native)
+        return;
+    const uint32_t requested = on ? 1u : 0u;
+    if (requested == g_active.movie_suppressed)
+        return;
+
+    /* The caller holds g_rsx_fifo_lock, so no adapter/backend step can race
+     * this checkpoint. A yielded method can leave only one blocked semantic
+     * wait at the ring head; copying render state cannot affect that wait. */
+    if (requested) {
+        rsx_nir_adapter_copy_render_state(
+            &g_active.movie_render_snapshot, &g_active.adapter);
+        g_active.movie_backend_snapshot = g_active.backend.st;
+        memcpy(g_active.movie_backend_vp, g_active.backend.vp_words,
+               sizeof(g_active.movie_backend_vp));
+        g_active.movie_backend_vp_words = g_active.backend.vp_word_count;
+        g_active.movie_snapshot_valid = 1u;
+        g_active.movie_suppressed = 1u;
+        g_active.movie_intervals++;
+    } else {
+        if (g_active.movie_snapshot_valid) {
+            rsx_nir_adapter_copy_render_state(
+                &g_active.adapter, &g_active.movie_render_snapshot);
+            g_active.backend.st = g_active.movie_backend_snapshot;
+            memcpy(g_active.backend.vp_words, g_active.movie_backend_vp,
+                   sizeof(g_active.backend.vp_words));
+            g_active.backend.vp_word_count =
+                g_active.movie_backend_vp_words;
+            g_active.movie_snapshot_valid = 0u;
+        }
+        g_active.movie_suppressed = 0u;
+    }
+    if (InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        yz_nr_active_bind_graphics_ops();
+}
+
 extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
     uint32_t get, uint32_t put, uint32_t fifo_ret,
     uint32_t* next_get, uint32_t* next_ret)
@@ -4809,6 +4890,18 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         "[nr-vertical-section-transfer-preflight-overflow=%llu]\n",
                         g_active.section_transfer_preflight_overflow);
         }
+        if (g_active.strict_full_native) {
+            fprintf(stderr,
+                    "[nr-full-native-movies intervals=%llu "
+                    "draws-suppressed=%llu clears-suppressed=%llu "
+                    "presents-completed=%llu active=%u snapshot=%u]\n",
+                    g_active.movie_intervals,
+                    g_active.movie_draws_suppressed,
+                    g_active.movie_clears_suppressed,
+                    g_active.movie_presents_completed,
+                    g_active.movie_suppressed,
+                    g_active.movie_snapshot_valid);
+        }
         fflush(stderr);
         if (g_active.d3d12) {
             rsx_nr_d3d12_stats d3d_stats = {};
@@ -4825,7 +4918,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-vertical-d3d draws=%llu conditional-skip=%llu "
                     "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
                     "clears=%llu "
-                     "presents=%llu submits=%llu fallback=%llu resident=%llu/%llu "
+                     "presents=%llu submits=%llu xfer-gpu=%llu/%llu "
+                     "fallback=%llu resident=%llu/%llu "
                      "fallback-reason=%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                      "upload-fail=%llu/%llu/%llu/%llu "
                      "upload-first=%u/%llu/%llu/%llu/%u "
@@ -4843,6 +4937,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     native_draw_coverage_ppm,
                     d3d_stats.clears, d3d_stats.presents,
                      d3d_stats.queue_submissions,
+                     d3d_stats.transfer_gpu_readbacks,
+                     d3d_stats.transfer_gpu_uploads,
                      d3d_stats.unsupported_draws,
                      d3d_stats.resident_pages[0],
                      d3d_stats.resident_pages[1],
