@@ -34,6 +34,7 @@ int main(void) { return 2; }
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
 static int g_failures;
@@ -45,6 +46,9 @@ static u8 g_watched_host_page[2][1024]; /* LOCAL_SIZE / host page */
 static u32 g_published_writes;
 static rsx_nr_d3d12* g_churn_sink;
 static int g_churn_unrelated_vertex_page;
+static u64 g_content_shader_calls;
+static u64 g_content_pso_loads;
+static u64 g_content_pso_stores;
 
 static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 static u32 g_render_condition_value;
@@ -568,6 +572,58 @@ static int cap_render_condition_read(void* user, u32 dma, u32 offset,
         return -1;
     *value = 0u;
     return 0;
+}
+
+static void* test_compile_shader(
+    void* user, u32 stage, const char* source, u32 source_length,
+    u32 compiler_flags, int* cache_hit, int* compiled)
+{
+    (void)user;
+    ID3DBlob* blob = NULL;
+    ID3DBlob* error = NULL;
+    if (cache_hit)
+        *cache_hit = 0;
+    if (compiled)
+        *compiled = 0;
+    g_content_shader_calls++;
+    const HRESULT hr = D3DCompile(
+        source, source_length, "content-cache-test", NULL, NULL, "main",
+        stage == 'V' ? "vs_5_0" : "ps_5_0", compiler_flags, 0,
+        &blob, &error);
+    if (error)
+        error->lpVtbl->Release(error);
+    if (FAILED(hr))
+        return NULL;
+    if (compiled)
+        *compiled = 1;
+    return blob;
+}
+
+static int test_pso_load(
+    void* user, u64 key, u64 vertex_hash, u64 pixel_hash,
+    void** data, u32* size)
+{
+    (void)user; (void)key; (void)vertex_hash; (void)pixel_hash;
+    g_content_pso_loads++;
+    *data = NULL;
+    *size = 0;
+    return -1;
+}
+
+static int test_pso_store(
+    void* user, u64 key, u64 vertex_hash, u64 pixel_hash,
+    const void* data, u32 size)
+{
+    (void)user; (void)key; (void)vertex_hash; (void)pixel_hash;
+    CHECK(data && size, "empty driver PSO cache blob");
+    g_content_pso_stores++;
+    return 0;
+}
+
+static void test_pso_free(void* user, void* data)
+{
+    (void)user;
+    free(data);
 }
 
 typedef struct cap_data {
@@ -2602,6 +2658,10 @@ int main(int argc, char** argv)
         fprintf(stderr, "no WARP D3D12 device: SKIP\n");
         return 2;
     }
+    CHECK(rsx_nr_d3d12_set_content_cache(
+              sink, test_compile_shader, test_pso_load,
+              test_pso_store, test_pso_free, NULL) == 0,
+          "content-cache callback configuration failed");
     CHECK(rsx_nr_d3d12_set_live_output(
               sink, 0, test_present_handoff, NULL) == 0,
           "present handoff configuration failed");
@@ -3980,6 +4040,14 @@ int main(int argc, char** argv)
           st.compile_failures);
     CHECK(st.pso_builds >= 1 && st.pso_hits >= 1,
           "pso cache builds=%llu hits=%llu", st.pso_builds, st.pso_hits);
+    CHECK(g_content_shader_calls ==
+              st.vertex_shader_builds + st.pixel_shader_builds &&
+              g_content_pso_loads == st.pso_builds &&
+              g_content_pso_stores == st.pso_builds,
+          "content cache shader=%llu builds=%llu/%llu pso=%llu/%llu/%llu",
+          g_content_shader_calls, st.vertex_shader_builds,
+          st.pixel_shader_builds, g_content_pso_loads,
+          g_content_pso_stores, st.pso_builds);
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);

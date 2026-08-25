@@ -303,6 +303,11 @@ struct rsx_nr_d3d12 {
     void* publish_write_user;
     rsx_nr_d3d12_render_condition_fn render_condition_read;
     void* render_condition_user;
+    rsx_nr_d3d12_compile_shader_fn compile_shader;
+    rsx_nr_d3d12_pso_load_fn pso_load;
+    rsx_nr_d3d12_pso_store_fn pso_store;
+    rsx_nr_d3d12_pso_free_fn pso_free;
+    void* content_cache_user;
     u32 local_size, main_size;
 
     rsx_nr_pso_cache psos;
@@ -318,6 +323,7 @@ struct rsx_nr_d3d12 {
     void* present_user;
     int rgba_targets;
     int scanout_provenance;
+    int stall_aggregate;
     u32 coherent_vp_options;
     int force_draw_input_refresh;
     int force_draw_input_allocated;
@@ -411,6 +417,25 @@ static void nrb_dump_device_oracle(ID3D12Device* dev, const char* where,
 }
 
 /* ---- device plumbing --------------------------------------------------- */
+
+static u64 nrb_stall_now(const rsx_nr_d3d12* b)
+{
+    LARGE_INTEGER now;
+    if (!b->stall_aggregate || !QueryPerformanceCounter(&now))
+        return 0u;
+    return (u64)now.QuadPart;
+}
+
+static void nrb_stall_finish(const rsx_nr_d3d12* b, u64 start,
+                             u64* count, u64* ticks)
+{
+    LARGE_INTEGER now;
+    if (!start || !b->stall_aggregate ||
+        !QueryPerformanceCounter(&now) || (u64)now.QuadPart < start)
+        return;
+    (*count)++;
+    *ticks += (u64)now.QuadPart - start;
+}
 
 static int nrb_wait_idle(rsx_nr_d3d12* b)
 {
@@ -538,11 +563,14 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
 {
     if (!b->list_open)
         return 0;
+    const u64 stall_start = nrb_stall_now(b);
+    int result = 0;
     if (b->shared_timeline) {
         nrb_release_timeline_lease(b);
         if (b->timeline_flush(b->timeline_user) != 0) {
             b->timeline_fault = 1;
-            return -1;
+            result = -1;
+            goto done;
         }
         b->list_open = 0;
         nrb_release_retired_textures(b);
@@ -550,7 +578,7 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
         b->descriptor_tables_used = 0;
         b->stats.queue_submissions++;
         b->stats.shared_timeline_forced_submissions++;
-        return 0;
+        goto done;
     }
     b->list->lpVtbl->Close(b->list);
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)b->list };
@@ -560,12 +588,17 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
             b->dev, "command submission",
             b->dev->lpVtbl->GetDeviceRemovedReason(b->dev));
         b->list_open = 0;
-        return -1;
+        result = -1;
+        goto done;
     }
     b->list_open = 0;
     nrb_release_retired_textures(b);
     b->stats.queue_submissions++;
-    return 0;
+done:
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_fence_drain_count,
+                     &b->stats.stall_fence_drain_ticks);
+    return result;
 }
 
 static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b)
@@ -3486,10 +3519,23 @@ static void nrb_apply_render_state(
 }
 
 static ID3DBlob* nrb_compile(rsx_nr_d3d12* b, const char* text, size_t len,
-                             const char* target)
+                             u32 stage, int* cache_hit, int* compiled)
 {
+    if (cache_hit)
+        *cache_hit = 0;
+    if (compiled)
+        *compiled = 0;
+    if (b->compile_shader) {
+        ID3DBlob* const cached = (ID3DBlob*)b->compile_shader(
+            b->content_cache_user, stage, text, (u32)len,
+            D3DCOMPILE_OPTIMIZATION_LEVEL1, cache_hit, compiled);
+        if (!cached)
+            b->stats.compile_failures++;
+        return cached;
+    }
     ID3DBlob* blob = NULL;
     ID3DBlob* err = NULL;
+    const char* const target = stage == 'V' ? "vs_5_0" : "ps_5_0";
     if (FAILED(D3DCompile(text, len, "nrb", NULL, NULL, "main", target,
                           D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &blob, &err))) {
         b->stats.compile_failures++;
@@ -3509,6 +3555,8 @@ static ID3DBlob* nrb_compile(rsx_nr_d3d12* b, const char* text, size_t len,
     }
     if (err)
         err->lpVtbl->Release(err);
+    if (compiled)
+        *compiled = 1;
     return blob;
 }
 
@@ -3522,6 +3570,7 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
                                          u32 vtex_mask,
                                          DXGI_FORMAT color_dxgi)
 {
+    const u64 key_lookup_start = nrb_stall_now(b);
     /* Structural shader identity deliberately excludes inline FP constants
      * and alpha-ref: both are uploaded through b1.  Everything that shapes
      * the compiled source or PSO remains in the key. */
@@ -3574,7 +3623,11 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pso_blend.blend_color = 0;
     key = rsx_nr_hash_fold(key, &pso_blend, sizeof(pso_blend));
     u64 cached = 0;
-    if (rsx_nr_pso_lookup(&b->psos, key, &cached)) {
+    const int cache_hit = rsx_nr_pso_lookup(&b->psos, key, &cached);
+    nrb_stall_finish(b, key_lookup_start,
+                     &b->stats.stall_pso_key_lookup_count,
+                     &b->stats.stall_pso_key_lookup_ticks);
+    if (cache_hit) {
         b->stats.pso_hits++;
         return (ID3D12PipelineState*)(uintptr_t)cached;
     }
@@ -3619,7 +3672,22 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
             return NULL;
     }
 
-    ID3DBlob* vs = nrb_compile(b, b->vs_text, strlen(b->vs_text), "vs_5_0");
+    const u64 vertex_compile_start = nrb_stall_now(b);
+    int vertex_cache_hit = 0, vertex_compiled = 0;
+    ID3DBlob* vs = nrb_compile(
+        b, b->vs_text, strlen(b->vs_text), 'V',
+        &vertex_cache_hit, &vertex_compiled);
+    if (vertex_cache_hit) {
+        b->stats.vertex_shader_cache_hits++;
+        nrb_stall_finish(b, vertex_compile_start,
+                         &b->stats.stall_vertex_cache_count,
+                         &b->stats.stall_vertex_cache_ticks);
+    } else {
+        b->stats.vertex_shader_builds += vertex_compiled != 0;
+        nrb_stall_finish(b, vertex_compile_start,
+                         &b->stats.stall_vertex_compile_count,
+                         &b->stats.stall_vertex_compile_ticks);
+    }
     if (!vs)
         return NULL;
     u32 constant_count = 0;
@@ -3638,8 +3706,22 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
         vs->lpVtbl->Release(vs);
         return NULL;
     }
+    const u64 pixel_compile_start = nrb_stall_now(b);
+    int pixel_cache_hit = 0, pixel_compiled = 0;
     ID3DBlob* ps = nrb_compile(
-        b, b->ps_text, strlen(b->ps_text), "ps_5_0");
+        b, b->ps_text, strlen(b->ps_text), 'P',
+        &pixel_cache_hit, &pixel_compiled);
+    if (pixel_cache_hit) {
+        b->stats.pixel_shader_cache_hits++;
+        nrb_stall_finish(b, pixel_compile_start,
+                         &b->stats.stall_pixel_cache_count,
+                         &b->stats.stall_pixel_cache_ticks);
+    } else {
+        b->stats.pixel_shader_builds += pixel_compiled != 0;
+        nrb_stall_finish(b, pixel_compile_start,
+                         &b->stats.stall_pixel_compile_count,
+                         &b->stats.stall_pixel_compile_ticks);
+    }
     if (!ps) {
         vs->lpVtbl->Release(vs);
         return NULL;
@@ -3663,14 +3745,62 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     pd.DSVFormat = nrb_depth_dsv_dxgi(b, st->surface.depth_format);
     pd.SampleDesc.Count = 1;
 
+    const u64 vertex_bytecode_hash = rsx_nr_hash_fold(
+        0x56534844524E5242ull, pd.VS.pShaderBytecode,
+        pd.VS.BytecodeLength);
+    const u64 pixel_bytecode_hash = rsx_nr_hash_fold(
+        0x50534844524E5242ull, pd.PS.pShaderBytecode,
+        pd.PS.BytecodeLength);
+    void* cached_pso = NULL;
+    u32 cached_pso_size = 0;
+    if (b->pso_load && b->pso_load(
+            b->content_cache_user, key, vertex_bytecode_hash,
+            pixel_bytecode_hash, &cached_pso, &cached_pso_size) == 0 &&
+        cached_pso && cached_pso_size) {
+        pd.CachedPSO.pCachedBlob = cached_pso;
+        pd.CachedPSO.CachedBlobSizeInBytes = cached_pso_size;
+    }
+
     ID3D12PipelineState* pso = NULL;
+    const u64 driver_pso_start = nrb_stall_now(b);
+    b->stats.driver_pso_creates++;
     HRESULT hr = b->dev->lpVtbl->CreateGraphicsPipelineState(
         b->dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    if (FAILED(hr) && cached_pso) {
+        b->stats.driver_pso_cache_rejects++;
+        pd.CachedPSO.pCachedBlob = NULL;
+        pd.CachedPSO.CachedBlobSizeInBytes = 0;
+        b->stats.driver_pso_creates++;
+        hr = b->dev->lpVtbl->CreateGraphicsPipelineState(
+            b->dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    } else if (SUCCEEDED(hr) && cached_pso) {
+        b->stats.driver_pso_cache_hits++;
+    }
+    nrb_stall_finish(b, driver_pso_start,
+                     &b->stats.stall_driver_pso_create_count,
+                     &b->stats.stall_driver_pso_create_ticks);
+    if (cached_pso && b->pso_free)
+        b->pso_free(b->content_cache_user, cached_pso);
     vs->lpVtbl->Release(vs);
     ps->lpVtbl->Release(ps);
     if (FAILED(hr)) {
         b->stats.compile_failures++;
         return NULL;
+    }
+    if (!pd.CachedPSO.pCachedBlob && b->pso_store) {
+        ID3DBlob* cached_blob = NULL;
+        if (SUCCEEDED(pso->lpVtbl->GetCachedBlob(pso, &cached_blob)) &&
+            cached_blob) {
+            const size_t cached_size =
+                cached_blob->lpVtbl->GetBufferSize(cached_blob);
+            if (cached_size <= UINT32_MAX && b->pso_store(
+                    b->content_cache_user, key, vertex_bytecode_hash,
+                    pixel_bytecode_hash,
+                    cached_blob->lpVtbl->GetBufferPointer(cached_blob),
+                    (u32)cached_size) == 0)
+                b->stats.driver_pso_cache_writes++;
+            cached_blob->lpVtbl->Release(cached_blob);
+        }
     }
     rsx_nr_pso_insert(&b->psos, key, (u64)(uintptr_t)pso);
     b->stats.pso_builds++;
@@ -4244,11 +4374,11 @@ int rsx_nr_d3d12_validate_draw_program(rsx_nr_d3d12* b,
         b, st, vp_words, vp_word_count, NULL);
 }
 
-int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
-                                const rsx_nir_pipeline* st,
-                                const u32* vp_words, u32 vp_word_count,
-                                const rsx_nir_draw* d,
-                                const u32* batches)
+static int nrb_preflight_draw_impl(rsx_nr_d3d12* b,
+                                   const rsx_nir_pipeline* st,
+                                   const u32* vp_words, u32 vp_word_count,
+                                   const rsx_nir_draw* d,
+                                   const u32* batches)
 {
     if (!b || !st || !d || !batches || !d->batch_count ||
         d->batch_count > NRB_MAX_DRAW_BATCHES)
@@ -4349,23 +4479,50 @@ int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
 
     nrb_required_span required[NRB_MAX_REQUIRED_SPANS];
     u32 required_count = 0;
-    if (nrb_prepare_draw_residency(
-            b, st, &plan, d, batches,
-            d->indexed && !expand && !filter_restart,
-            required, &required_count) != 0)
+    const u64 residency_prepare_start = nrb_stall_now(b);
+    const int residency_prepare = nrb_prepare_draw_residency(
+        b, st, &plan, d, batches,
+        d->indexed && !expand && !filter_restart,
+        required, &required_count);
+    nrb_stall_finish(b, residency_prepare_start,
+                     &b->stats.stall_residency_prepare_count,
+                     &b->stats.stall_residency_prepare_ticks);
+    if (residency_prepare != 0)
         return -RSX_NR_DRAW_PF_RESIDENCY;
     /* Admission must establish the same immutable GPU-visible byte point
      * used by execution. Registering page spans alone is insufficient: a
      * guest producer can publish while the mirror copy is being recorded.
      * Repair that race before the section becomes native-owned. */
-    if (nrb_stabilize_required_spans(
-            b, required, required_count) != 0)
+    const u64 residency_stabilize_start = nrb_stall_now(b);
+    const int residency_stabilize = nrb_stabilize_required_spans(
+        b, required, required_count);
+    nrb_stall_finish(b, residency_stabilize_start,
+                     &b->stats.stall_residency_stabilize_count,
+                     &b->stats.stall_residency_stabilize_ticks);
+    if (residency_stabilize != 0)
         return -RSX_NR_DRAW_PF_RESIDENCY;
     (void)expand;
     (void)filter_restart;
     if (nrb_draw_upload_budget(st, &fp, d, batches) > NRB_UPLOAD_BYTES)
         return -RSX_NR_DRAW_PF_UPLOAD_SCRATCH;
     return 0;
+}
+
+int rsx_nr_d3d12_preflight_draw(rsx_nr_d3d12* b,
+                                const rsx_nir_pipeline* st,
+                                const u32* vp_words, u32 vp_word_count,
+                                const rsx_nir_draw* d,
+                                const u32* batches)
+{
+    if (!b)
+        return -RSX_NR_DRAW_PF_BAD_ARGUMENT;
+    const u64 stall_start = nrb_stall_now(b);
+    const int result = nrb_preflight_draw_impl(
+        b, st, vp_words, vp_word_count, d, batches);
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_preflight_draw_count,
+                     &b->stats.stall_preflight_draw_ticks);
+    return result;
 }
 
 static int nrb_scaled_copy_layout(const rsx_nir_transfer* t, u32* bpp)
@@ -4454,9 +4611,9 @@ int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer)
     return b->present_cb && !scanout ? -1 : 0;
 }
 
-static int nrb_draw(void* user, const rsx_nir_pipeline* st,
-                    const u32* vp_words, u32 vp_word_count,
-                    const rsx_nir_draw* d, const u32* batches)
+static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
+                         const u32* vp_words, u32 vp_word_count,
+                         const rsx_nir_draw* d, const u32* batches)
 {
     rsx_nr_d3d12* b = user;
 
@@ -4529,7 +4686,12 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     }
 
     nrb_fp_info fp;
-    if (nrb_resolve_fp(b, st, &fp) != 0 || fp.unsupported) {
+    const u64 fp_resolve_start = nrb_stall_now(b);
+    const int fp_resolve = nrb_resolve_fp(b, st, &fp);
+    nrb_stall_finish(b, fp_resolve_start,
+                     &b->stats.stall_fp_resolve_count,
+                     &b->stats.stall_fp_resolve_ticks);
+    if (fp_resolve != 0 || fp.unsupported) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_fp++;
         return -1;
@@ -4589,10 +4751,14 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    const u64 pso_lookup_start = nrb_stall_now(b);
     ID3D12PipelineState* pso = nrb_get_pso(
         b, st, vp_words, vp_word_count, &fp, &plan, tt,
         filter_restart && strips && !expand_primitive, cube_mask, vtex_mask,
         rt->dxgi);
+    nrb_stall_finish(b, pso_lookup_start,
+                     &b->stats.stall_pso_lookup_count,
+                     &b->stats.stall_pso_lookup_ticks);
     if (!pso) {
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_pso++;
@@ -4608,9 +4774,13 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
 
     nrb_required_span required[NRB_MAX_REQUIRED_SPANS];
     u32 required_count = 0;
+    const u64 residency_prepare_start = nrb_stall_now(b);
     const int residency = nrb_prepare_draw_residency(
         b, st, &plan, d, batches, d->indexed && !use_host_ib,
         required, &required_count);
+    nrb_stall_finish(b, residency_prepare_start,
+                     &b->stats.stall_residency_prepare_count,
+                     &b->stats.stall_residency_prepare_ticks);
     if (residency != 0) {
         nrb_note_first_residency_failure(
             b, 2u, (u32)(residency < 0 ? -residency : residency),
@@ -4643,8 +4813,13 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
             }
         }
     }
-    if (nrb_stabilize_required_spans(
-            b, required, required_count) != 0) {
+    const u64 residency_stabilize_start = nrb_stall_now(b);
+    const int residency_stabilize = nrb_stabilize_required_spans(
+        b, required, required_count);
+    nrb_stall_finish(b, residency_stabilize_start,
+                     &b->stats.stall_residency_stabilize_count,
+                     &b->stats.stall_residency_stabilize_ticks);
+    if (residency_stabilize != 0) {
         nrb_note_first_residency_failure(
             b, 3u, 0u, required, required_count);
         b->stats.unsupported_draws++;
@@ -4659,11 +4834,16 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS] = {0};
     u32 resolved_cube_mask = 0;
     u32 descriptor_table_index = 0;
-    if (nrb_prepare_textures(b, st, fp.texture_mask, vtex_mask, rt, depth,
-                             texture_aliases, texture_depth_aliases,
-                             vtex_aliases, vtex_depth_aliases,
-                             &resolved_cube_mask,
-                             &descriptor_table_index) != 0 ||
+    const u64 texture_prepare_start = nrb_stall_now(b);
+    const int texture_prepare = nrb_prepare_textures(
+        b, st, fp.texture_mask, vtex_mask, rt, depth,
+        texture_aliases, texture_depth_aliases,
+        vtex_aliases, vtex_depth_aliases,
+        &resolved_cube_mask, &descriptor_table_index);
+    nrb_stall_finish(b, texture_prepare_start,
+                     &b->stats.stall_texture_prepare_count,
+                     &b->stats.stall_texture_prepare_ticks);
+    if (texture_prepare != 0 ||
         resolved_cube_mask != cube_mask) {
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
@@ -4699,11 +4879,16 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         memset(vtex_depth_aliases, 0, sizeof(vtex_depth_aliases));
         resolved_cube_mask = 0;
         descriptor_table_index = 0;
-        if (nrb_prepare_textures(
-                b, st, fp.texture_mask, vtex_mask, rt, depth,
-                texture_aliases, texture_depth_aliases,
-                vtex_aliases, vtex_depth_aliases,
-                &resolved_cube_mask, &descriptor_table_index) != 0 ||
+        const u64 retry_texture_prepare_start = nrb_stall_now(b);
+        const int retry_texture_prepare = nrb_prepare_textures(
+            b, st, fp.texture_mask, vtex_mask, rt, depth,
+            texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases,
+            &resolved_cube_mask, &descriptor_table_index);
+        nrb_stall_finish(b, retry_texture_prepare_start,
+                         &b->stats.stall_texture_prepare_count,
+                         &b->stats.stall_texture_prepare_ticks);
+        if (retry_texture_prepare != 0 ||
             resolved_cube_mask != cube_mask ||
             (u64)b->upload_used + upload_budget > NRB_UPLOAD_BYTES) {
             nrb_restore_texture_aliases(
@@ -4732,6 +4917,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
     u32 prepare_upload_request = 0;
     const u32 prepared_batch_count = combine_triangle_strip
         ? 1u : d->batch_count;
+    const u64 batch_prepare_start = nrb_stall_now(b);
     memset(b->prepared_batches, 0,
            prepared_batch_count * sizeof(b->prepared_batches[0]));
     for (u32 bi = 0; bi < prepared_batch_count; ++bi) {
@@ -4790,6 +4976,9 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         }
         memcpy(pull_bytes, &pull, sizeof(pull));
     }
+    nrb_stall_finish(b, batch_prepare_start,
+                     &b->stats.stall_batch_prepare_count,
+                     &b->stats.stall_batch_prepare_ticks);
     if (prepare_failed) {
         if (prepare_index_failed)
             b->stats.unsup_draw_index++;
@@ -4805,6 +4994,7 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    const u64 command_record_start = nrb_stall_now(b);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrb_rt_handle(b, rt);
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (depth) {
@@ -4995,7 +5185,24 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
         rt->draw_writes++;
     nrb_note_rt_write(b, rt);
     b->stats.draws++;
+    nrb_stall_finish(b, command_record_start,
+                     &b->stats.stall_command_record_count,
+                     &b->stats.stall_command_record_ticks);
     return 0;
+}
+
+static int nrb_draw(void* user, const rsx_nir_pipeline* st,
+                    const u32* vp_words, u32 vp_word_count,
+                    const rsx_nir_draw* d, const u32* batches)
+{
+    rsx_nr_d3d12* const b = (rsx_nr_d3d12*)user;
+    const u64 stall_start = nrb_stall_now(b);
+    const int result = nrb_draw_impl(
+        user, st, vp_words, vp_word_count, d, batches);
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_draw_count,
+                     &b->stats.stall_draw_ticks);
+    return result;
 }
 
 static void nrb_publish_guest_write(rsx_nr_d3d12* b, u32 space,
@@ -5108,6 +5315,7 @@ static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     const u64 need64 = (u64)row_pitch * rt->h;
     if (!dst || dst_pitch < rt->w * 4u || need64 > UINT32_MAX)
         return -1;
+    const u64 stall_start = nrb_stall_now(b);
     const u32 need = (u32)need64;
     if (!b->readback || b->readback_size < need) {
         if (b->readback)
@@ -5157,6 +5365,11 @@ static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     D3D12_RANGE no_write = {0u, 0u};
     b->readback->lpVtbl->Unmap(b->readback, 0u, &no_write);
     b->stats.transfer_gpu_readbacks++;
+    if (b->stall_aggregate)
+        b->stats.stall_transfer_readback_bytes += need64;
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_transfer_readback_count,
+                     &b->stats.stall_transfer_readback_ticks);
     return 0;
 }
 
@@ -5167,6 +5380,7 @@ static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     const u64 need64 = (u64)row_pitch * rt->h;
     if (!src || src_pitch < rt->w * 4u || need64 > UINT32_MAX)
         return -1;
+    const u64 stall_start = nrb_stall_now(b);
     u64 upload_offset = 0u;
     u8* const upload = nrb_texture_upload_slice(
         b, (u32)need64, &upload_offset);
@@ -5200,6 +5414,11 @@ static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     nrb_note_rt_write(b, rt);
     b->stats.transfer_gpu_uploads++;
+    if (b->stall_aggregate)
+        b->stats.stall_transfer_upload_bytes += need64;
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_transfer_upload_count,
+                     &b->stats.stall_transfer_upload_ticks);
     return 0;
 }
 
@@ -5378,7 +5597,12 @@ static int nrb_present(void* user, u32 buffer)
 
 static void nrb_flush(void* user)
 {
-    nrb_exec_wait((rsx_nr_d3d12*)user);
+    rsx_nr_d3d12* const b = (rsx_nr_d3d12*)user;
+    const u64 stall_start = nrb_stall_now(b);
+    nrb_exec_wait(b);
+    nrb_stall_finish(b, stall_start,
+                     &b->stats.stall_flush_count,
+                     &b->stats.stall_flush_ticks);
 }
 
 static int nrb_clear_op(void* user, const rsx_nir_pipeline* st,
@@ -5618,6 +5842,15 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         const char* const oracle = getenv("YZ_NR_HANA_INPUT_ORACLE");
         b->hana_input_oracle = oracle && oracle[0] &&
             strcmp(oracle, "0") != 0;
+    }
+    {
+        const char* const aggregate = getenv("YZ_NR_STALL_AGGREGATE");
+        LARGE_INTEGER frequency;
+        b->stall_aggregate = aggregate && strcmp(aggregate, "1") == 0;
+        if (b->stall_aggregate && QueryPerformanceFrequency(&frequency))
+            b->stats.stall_qpc_frequency = (u64)frequency.QuadPart;
+        else
+            b->stall_aggregate = 0;
     }
 
     if (device) {
@@ -5900,6 +6133,24 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
 fail:
     rsx_nr_d3d12_destroy(b);
     return NULL;
+}
+
+int rsx_nr_d3d12_set_content_cache(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn compile_shader,
+    rsx_nr_d3d12_pso_load_fn pso_load,
+    rsx_nr_d3d12_pso_store_fn pso_store,
+    rsx_nr_d3d12_pso_free_fn pso_free, void* user)
+{
+    if (!b || !compile_shader || !pso_load || !pso_store || !pso_free ||
+        b->stats.pso_hits || b->stats.pso_builds ||
+        b->stats.vertex_shader_builds || b->stats.pixel_shader_builds)
+        return -1;
+    b->compile_shader = compile_shader;
+    b->pso_load = pso_load;
+    b->pso_store = pso_store;
+    b->pso_free = pso_free;
+    b->content_cache_user = user;
+    return 0;
 }
 
 static void nrb_hana_input_dump(rsx_nr_d3d12* b)
@@ -6371,6 +6622,11 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
 }
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b) { (void)b; }
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b) { (void)b; return 0; }
+int rsx_nr_d3d12_set_content_cache(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn c,
+    rsx_nr_d3d12_pso_load_fn l, rsx_nr_d3d12_pso_store_fn s,
+    rsx_nr_d3d12_pso_free_fn f, void* u)
+{ (void)b; (void)c; (void)l; (void)s; (void)f; (void)u; return -1; }
 void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
 {
     (void)b;

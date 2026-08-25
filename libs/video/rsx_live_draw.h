@@ -135,6 +135,23 @@ void* rsx_live_draw_get_d3d12_device(void);
 int rsx_live_draw_present_external(void* texture, u32 dxgi_format,
                                    u32 width, u32 height, u32 buffer_id);
 
+/* Shared content-addressed D3D shader/PSO cache for live renderers.  Shader
+ * identity is the exact generated source, stage, and compiler flags; the
+ * returned ID3DBlob is opaque here and carries one caller-owned COM ref.
+ * Driver PSO blobs are additionally keyed by the complete native PSO key and
+ * both compiled shader bytecode hashes.  A stale/driver-incompatible PSO blob
+ * is safe to reject and rebuild through the caller's ordinary D3D12 path. */
+void* rsx_live_draw_compile_cached_shader(
+    u32 stage, const char* source, u32 source_length, u32 compiler_flags,
+    int* cache_hit, int* compiled);
+int rsx_live_draw_load_cached_pso(
+    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
+    void** data, u32* size);
+int rsx_live_draw_store_cached_pso(
+    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
+    const void* data, u32 size);
+void rsx_live_draw_free_cached_pso(void* data);
+
 /* Ordered native/legacy recording broker.  acquire() excludes the host movie
  * producer until release() and returns the live DIRECT list plus the exact
  * generation/fence values governing native upload and mirror lifetimes.
