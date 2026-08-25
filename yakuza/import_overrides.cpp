@@ -3845,7 +3845,13 @@ extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
     vm_write64(address, timestamp);
     if (type >= RSX_REPORT_TYPE_ZPASS_PIXEL_CNT &&
         type <= RSX_REPORT_TYPE_ZCULL_STATS3) {
-        vm_write32(address + 8u, 0u);
+        /* The strict native sink enforces SET_RENDER_ENABLE, unlike the
+         * established legacy renderer. Until native GPU occlusion queries
+         * exist, conservatively mark an unmodeled ZPASS query visible so its
+         * dependent geometry executes; synthesizing zero made every object
+         * using this SDK culling path disappear. Other ZCULL stats stay zero. */
+        vm_write32(address + 8u,
+                   rsx_report_unmodeled_value(type, 1));
         vm_write32(address + 12u, 0u);
     } else {
         /* Ordinary reports leave value@+8 untouched and clear only pad. */
@@ -6511,17 +6517,13 @@ static void yz_rsx_fifo_lock_ensure(void)
 
 extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
 {
-    /* The producer-boundary shadow has its own enable bit and lock. Disable
-     * it before consulting the older consumer-shadow guard so a vertical-only
-     * run still emits its shutdown aggregate exactly once. */
-    yz_nr_vertical_shutdown();
-    if (!g_yz_rsx_wait_classifier_enabled &&
-        !g_yz_fe0_timeline_enabled &&
-        !g_yz_wkl4_cycle_enabled &&
-        !g_yz_nr_shadow_enabled)
-        return;
+    /* Serialize vertical finalization with the same lock held by every FIFO
+     * adapter/backend step.  Ordinary lanes only emit fixed counters here;
+     * the default-off Hana oracle may additionally retire its pre-recorded
+     * copies before mapping the bounded readback buffer. */
     yz_rsx_fifo_lock_ensure();
     EnterCriticalSection(&g_rsx_fifo_lock);
+    yz_nr_vertical_shutdown();
     if (g_yz_rsx_wait_classifier_enabled)
         yz_rsx_wait_classifier_shutdown();
     if (g_yz_fe0_timeline_enabled)
@@ -7031,22 +7033,35 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     if (block_boundary && !block_exact)
         return -1;
 
-    /* Protocol-wide complete inline generated-VP gap.  The owner must have
-     * consumed the exact preceding NOOP, and the fixed 0x28-byte data extent
-     * must end at a complete draw-balanced generated prologue.  This covers
-     * the packet-shaped 0x1258 entry without scanning or executing any raw
-     * constants. */
-    const uint32_t inline_resume = (get + 0x28u) & mask;
+    /* Protocol-wide complete inline generated-VP gap. The owner must have
+     * consumed the exact preceding NOOP. Find only the first exact prologue
+     * in the producer's bounded 0x100-byte inline window, then prove its
+     * complete draw-balanced chain independently. This covers both captured
+     * legal payload spans (0x28 and 0x38) without executing or interpreting
+     * any raw constants between the NOOP and the prologue. */
+    const uint32_t inline_scan_start = (get + 4u) & mask;
+    const uint32_t inline_scan_end = (get + 0x104u) & mask;
+    const uint32_t inline_resume = yz_a010_find_generated_prologue(
+        inline_scan_start, inline_scan_end);
     const uint32_t inline_end =
         (inline_resume + generated_block) & mask;
-    const int inline_prologue =
+    const int inline_prologue = inline_resume &&
         yz_a010_generated_prologue_at(inline_resume);
     const int inline_balanced = inline_prologue &&
         yz_a010_balanced_generated_prefix_at(
             inline_resume, inline_resume, inline_end);
+    const int inline_flow =
+        ((word & 0xE0000003u) == 0x20000000u) ||
+        ((word & 3u) == 1u) || ((word & 3u) == 2u);
+    const uint32_t inline_flow_target = (word & 3u) == 1u
+        ? (word & 0xFFFFFFFCu) : (word & 0x1FFFFFFCu);
+    const int inline_flow_unmapped =
+        inline_flow && inline_flow_target >= ring;
     const uint32_t inline_exact =
-        yz_fifo_generated_vp_inline_gap_resume(
-            previous_get, previous_command, word, get, put, ring,
+        yz_fifo_generated_vp_inline_candidate_resume(
+            previous_get, previous_command, word, get, put,
+            inline_resume, ring, 0x100u,
+            inline_flow_unmapped,
             inline_prologue, inline_balanced);
     if (inline_exact) {
         const uint32_t previous_ea = yz_rsx_io_to_ea(previous_get);
@@ -7055,9 +7070,12 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
             vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
             vm_read32(previous_ea) == previous_command &&
             vm_read32(hole_ea) == word &&
-            yz_fifo_generated_vp_inline_gap_resume(
+            yz_a010_find_generated_prologue(
+                inline_scan_start, inline_scan_end) == inline_exact &&
+            yz_fifo_generated_vp_inline_candidate_resume(
                 previous_get, vm_read32(previous_ea), vm_read32(hole_ea),
-                get, put, ring,
+                get, put, inline_exact, ring, 0x100u,
+                inline_flow_unmapped,
                 yz_a010_generated_prologue_at(inline_exact),
                 yz_a010_balanced_generated_prefix_at(
                     inline_exact, inline_exact, inline_end)) ==
@@ -7069,8 +7087,10 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     }
     /* Preserve one pending dependency when the exact NOOP/gap layout is
      * present but its prologue or terminal stopper is still publishing. */
-    if (yz_fifo_generated_vp_inline_gap_resume(
-            previous_get, previous_command, word, get, put, ring, 1, 1) &&
+    if (yz_fifo_generated_vp_inline_candidate_resume(
+            previous_get, previous_command, word, get, put,
+            (get + 4u) & mask, ring, 0x100u,
+            inline_flow_unmapped, 1, 1) &&
         (!inline_prologue || !inline_balanced))
         return -1;
 

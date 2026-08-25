@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <limits.h>
+#include <stddef.h>
 
 #ifdef _WIN32
 
@@ -106,6 +107,7 @@ static void nrb_enable_device_oracle(void)
      NRB_HANA_DEPTH_POINT_STRIDE)
 #define NRB_HANA_DEPTH_READBACK_BYTES \
     (NRB_HANA_INPUT_SAMPLES * NRB_HANA_DEPTH_SAMPLE_BYTES)
+#define NRB_HANA_CONDITION_KEYS 512u
 
 typedef struct nrb_prepared_batch {
     u64 index_va;
@@ -191,6 +193,34 @@ typedef struct nrb_hana_input_sample {
     nrb_hana_input_vtex vtex[NRB_VTEX_UNITS];
     nrb_hana_input_depth depth[NRB_HANA_DEPTH_UNITS];
 } nrb_hana_input_sample;
+
+/* Fixed-memory census of conditional-render draw families.  It is armed by
+ * the existing narrow Hana input oracle only, so ordinary production draws
+ * do not pay a key construction or lookup cost.  The key deliberately uses
+ * producer-visible identities rather than host pointers: this makes a live
+ * skipped family comparable with captured NIR and the report stream. */
+typedef struct nrb_hana_condition_key {
+    u32 dma_report;
+    u32 report_offset;
+    u32 observed_value;
+    u32 fp_location;
+    u32 fp_offset;
+    u32 fp_control;
+    u32 vp_start;
+    u32 vp_branch_bits;
+    u32 color_location;
+    u32 color_offset;
+    u32 color_format;
+    u32 depth_location;
+    u32 depth_offset;
+    u32 depth_format;
+    u32 depth_test;
+    u32 depth_write;
+    u32 blend_enable;
+    u32 alpha_test;
+    u64 attempts;
+    u64 skipped;
+} nrb_hana_condition_key;
 
 typedef struct nrb_rt {
     ID3D12Resource* tex;
@@ -336,9 +366,15 @@ struct rsx_nr_d3d12 {
      * ordinary production path performs one cached flag test and nothing
      * else. Per-texture uploaded hashes are populated only while armed. */
     int hana_input_oracle;
+    int hana_input_dumped;
     u64 hana_input_matches;
     u32 hana_input_writes;
     nrb_hana_input_sample hana_input[NRB_HANA_INPUT_SAMPLES];
+    nrb_hana_condition_key hana_condition[NRB_HANA_CONDITION_KEYS];
+    u32 hana_condition_count;
+    u32 hana_condition_replace;
+    u64 hana_condition_total;
+    u64 hana_condition_overflow;
     u64 hana_vtex_uploaded_hash[NRB_TEX_CAP];
     u8 hana_vtex_resolution[NRB_TEX_CAP]; /* 1 hit, 2 build, 3 refresh */
     ID3D12Resource* hana_depth_readback;
@@ -4611,6 +4647,77 @@ int rsx_nr_d3d12_preflight_present(rsx_nr_d3d12* b, u32 buffer)
     return b->present_cb && !scanout ? -1 : 0;
 }
 
+static void nrb_hana_condition_note(rsx_nr_d3d12* b,
+                                    const rsx_nir_pipeline* st,
+                                    u32 value)
+{
+    if (!b->hana_input_oracle)
+        return;
+
+    nrb_hana_condition_key key;
+    memset(&key, 0, sizeof(key));
+    key.dma_report = st->render_condition.dma_report;
+    key.report_offset = st->render_condition.offset;
+    key.observed_value = value;
+    key.fp_location = st->fragment_program.location;
+    key.fp_offset = st->fragment_program.offset;
+    key.fp_control = st->fragment_program.control;
+    key.vp_start = st->vertex_program.start_slot;
+    key.vp_branch_bits = st->vertex_program.branch_bits;
+    key.color_location = st->surface.color_location[0];
+    key.color_offset = st->surface.color_offset[0];
+    key.color_format = st->surface.color_format;
+    key.depth_location = st->surface.zeta_location;
+    key.depth_offset = st->surface.zeta_offset;
+    key.depth_format = st->surface.depth_format;
+    key.depth_test = st->depth_stencil.depth_test_enable;
+    key.depth_write = st->depth_stencil.depth_write_enable;
+    key.blend_enable = st->blend.blend_enable;
+    key.alpha_test = st->blend.alpha_test_enable;
+
+    b->hana_condition_total++;
+    for (u32 i = 0; i < b->hana_condition_count; ++i) {
+        nrb_hana_condition_key* const found = &b->hana_condition[i];
+        /* The report slot identifies the query/object; program offsets vary
+         * across its material passes and would otherwise consume one table
+         * slot per draw. Keep the most recent program identity as evidence,
+         * but aggregate by the condition, target and relevant fixed state. */
+        if (found->dma_report == key.dma_report &&
+            found->report_offset == key.report_offset &&
+            found->observed_value == key.observed_value &&
+            found->vp_start == key.vp_start &&
+            found->vp_branch_bits == key.vp_branch_bits &&
+            found->color_location == key.color_location &&
+            found->color_offset == key.color_offset &&
+            found->color_format == key.color_format &&
+            found->depth_location == key.depth_location &&
+            found->depth_offset == key.depth_offset &&
+            found->depth_format == key.depth_format &&
+            found->depth_test == key.depth_test &&
+            found->depth_write == key.depth_write &&
+            found->blend_enable == key.blend_enable &&
+            found->alpha_test == key.alpha_test) {
+            found->attempts++;
+            found->skipped += value == 0u;
+            found->fp_location = key.fp_location;
+            found->fp_offset = key.fp_offset;
+            found->fp_control = key.fp_control;
+            return;
+        }
+    }
+    nrb_hana_condition_key* added = NULL;
+    if (b->hana_condition_count == NRB_HANA_CONDITION_KEYS) {
+        added = &b->hana_condition[
+            b->hana_condition_replace++ % NRB_HANA_CONDITION_KEYS];
+        b->hana_condition_overflow++;
+    } else {
+        added = &b->hana_condition[b->hana_condition_count++];
+    }
+    *added = key;
+    added->attempts = 1u;
+    added->skipped = value == 0u;
+}
+
 static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                          const u32* vp_words, u32 vp_word_count,
                          const rsx_nir_draw* d, const u32* batches)
@@ -4630,6 +4737,7 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                 st->render_condition.dma_report,
                 st->render_condition.offset, &value) != 0)
             return -1;
+        nrb_hana_condition_note(b, st, value);
         if (!value) {
             b->stats.conditional_draws_skipped++;
             return 0;
@@ -6155,8 +6263,9 @@ int rsx_nr_d3d12_set_content_cache(
 
 static void nrb_hana_input_dump(rsx_nr_d3d12* b)
 {
-    if (!b->hana_input_oracle)
+    if (!b->hana_input_oracle || b->hana_input_dumped)
         return;
+    b->hana_input_dumped = 1;
     u8* depth_bytes = NULL;
     HRESULT depth_map = E_FAIL;
     if (b->hana_depth_readback) {
@@ -6170,10 +6279,34 @@ static void nrb_hana_input_dump(rsx_nr_d3d12* b)
         ? b->hana_input_writes % NRB_HANA_INPUT_SAMPLES : 0u;
     fprintf(stderr,
             "[nr-hana-input matches=%llu samples=%u writes=%u "
-            "depth-copy-fail=%u depth-map=%08lX]\n",
+            "depth-copy-fail=%u depth-map=%08lX condition-total=%llu "
+            "condition-keys=%u condition-replaced=%llu]\n",
             (unsigned long long)b->hana_input_matches, count,
             b->hana_input_writes, b->hana_depth_copy_failures,
-            (unsigned long)depth_map);
+            (unsigned long)depth_map,
+            (unsigned long long)b->hana_condition_total,
+            b->hana_condition_count,
+            (unsigned long long)b->hana_condition_overflow);
+    for (u32 i = 0; i < b->hana_condition_count; ++i) {
+        const nrb_hana_condition_key* const key = &b->hana_condition[i];
+        fprintf(stderr,
+                "[nr-hana-condition i=%u attempts=%llu skipped=%llu "
+                "report=%08X:%08X value=%08X "
+                "fp=%u:%08X/ctl=%08X vp=%u/br=%08X "
+                "color=%u:%08X/fmt=%u depth=%u:%08X/fmt=%u "
+                "ztest=%u/zwrite=%u blend=%u alpha=%u]\n",
+                i, (unsigned long long)key->attempts,
+                (unsigned long long)key->skipped,
+                key->dma_report, key->report_offset,
+                key->observed_value,
+                key->fp_location, key->fp_offset, key->fp_control,
+                key->vp_start, key->vp_branch_bits,
+                key->color_location, key->color_offset,
+                key->color_format, key->depth_location,
+                key->depth_offset, key->depth_format,
+                key->depth_test, key->depth_write,
+                key->blend_enable, key->alpha_test);
+    }
     for (u32 ordinal = 0; ordinal < count; ++ordinal) {
         const u32 slot = (start + ordinal) % NRB_HANA_INPUT_SAMPLES;
         nrb_hana_input_sample* const sample = &b->hana_input[slot];
@@ -6300,6 +6433,20 @@ static void nrb_hana_input_dump(rsx_nr_d3d12* b)
         b->hana_depth_readback->lpVtbl->Unmap(
             b->hana_depth_readback, 0, &written);
     }
+}
+
+int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b)
+{
+    if (!b)
+        return -1;
+    if (!b->hana_input_oracle || b->hana_input_dumped)
+        return 0;
+    if (b->list_open && nrb_exec_wait(b) != 0)
+        return -1;
+    if (b->queue && b->fence && nrb_wait_idle(b) != 0)
+        return -1;
+    nrb_hana_input_dump(b);
+    return 0;
 }
 
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
@@ -6621,6 +6768,8 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     return 0;
 }
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b) { (void)b; }
+int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b)
+{ (void)b; return 0; }
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b) { (void)b; return 0; }
 int rsx_nr_d3d12_set_content_cache(
     rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn c,

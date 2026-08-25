@@ -121,6 +121,19 @@ extern "C" {
 #define RSX_REPORT_TYPE_ZCULL_STATS2             4
 #define RSX_REPORT_TYPE_ZCULL_STATS3             5
 
+/* No host occlusion-query accumulator exists yet. The established legacy
+ * renderer executes conditional geometry unconditionally, so strict native
+ * uses a conservative-visible ZPASS fallback (one visible sample) instead of
+ * synthesizing a zero and then suppressing every dependent draw. Other ZCULL
+ * statistics remain zero. Keeping this policy explicit lets the generic
+ * report model preserve its legacy-shaped zero records. */
+static inline u32 rsx_report_unmodeled_value(u32 type,
+                                             int conservative_visible)
+{
+    return conservative_visible &&
+           type == RSX_REPORT_TYPE_ZPASS_PIXEL_CNT ? 1u : 0u;
+}
+
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814

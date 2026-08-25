@@ -261,12 +261,18 @@ def compare_scene(reference, candidate):
     # lighting were absent (0.10x reference brightness). A prompt alone is
     # never a visual pass. The lower bound remains tolerant of camera/exposure
     # variation in the archived healthy prompt corpus.
+    prompt_scene = (coarse_mae <= 0.21 and mask_difference <= 0.05 and
+                    0.65 <= scene_mean_ratio <= 1.5 and prompt_blue >= 20)
     arrival = (coarse_mae <= 0.18 and mask_difference <= 0.05 and
                0.65 <= scene_mean_ratio <= 1.5 and characters_intact)
     match = (arrival and prompt_blue >= 20)
     return {
         "match": match,
         "arrival": arrival,
+        # This is deliberately not an acceptance result.  It exists only so
+        # a fixed-memory renderer oracle can stop and shut down cleanly at the
+        # exact prompt even when the character-integrity gate rejects it.
+        "prompt_scene": prompt_scene,
         "coarse_mae": round(coarse_mae, 6),
         "dialogue_mask_difference": round(mask_difference, 6),
         "dialogue_text_iou": round(text_iou, 6),
@@ -721,7 +727,8 @@ def self_test(root: Path, reference_path: Path):
             )
     if rejected_prompt.is_file():
         rejected_result = compare_scene(reference, scene_features(rejected_prompt))
-        if rejected_result["match"] or rejected_result["characters_intact"]:
+        if (rejected_result["match"] or rejected_result["characters_intact"] or
+                not rejected_result["prompt_scene"]):
             raise AssertionError(
                 f"black-character Hana prompt escaped gate: {rejected_result}"
             )
@@ -1514,8 +1521,12 @@ def run(args):
                 comparison["path"] = str(path)
                 comparison["serial"] = int(path.stem.rsplit("_", 1)[-1])
                 result["captures"].append(comparison)
+                oracle_prompt = (
+                    args.nr_hana_input_oracle and comparison["prompt_scene"]
+                )
                 arrival_consecutive = (
-                    arrival_consecutive + 1 if comparison["arrival"] else 0
+                    arrival_consecutive + 1
+                    if comparison["arrival"] or oracle_prompt else 0
                 )
                 if arrival_consecutive >= 1 and not input_stop_path.exists():
                     input_stop_path.write_text(
@@ -1523,7 +1534,13 @@ def run(args):
                         encoding="ascii",
                     )
                     result["input_stop_capture"] = str(path)
-                consecutive = consecutive + 1 if comparison["match"] else 0
+                accepted_oracle_prompt = (
+                    args.nr_hana_input_oracle and oracle_prompt
+                )
+                consecutive = (
+                    consecutive + 1
+                    if comparison["match"] or accepted_oracle_prompt else 0
+                )
                 print(
                     f"[akiyama-harness] {path.name}: match={comparison['match']} "
                     f"arrival={comparison['arrival']} "
@@ -1539,6 +1556,9 @@ def run(args):
                     )
                     result["checkpoint_capture"] = str(path)
                     result["checkpoint_match"] = comparison
+                    result["diagnostic_corrupt_checkpoint"] = (
+                        accepted_oracle_prompt and not comparison["match"]
+                    )
                     result["capture_count_at_checkpoint"] = len(seen)
                     break
             if stop_path.exists():
@@ -1800,6 +1820,8 @@ def run(args):
             result["status"] = "forced-close"
         elif process.returncode != 0:
             result["status"] = "nonzero-exit"
+        elif result.get("diagnostic_corrupt_checkpoint"):
+            result["status"] = "diagnostic-visual-failure"
         elif len(fps) < max(3, int(args.hold_seconds // 5) - 1):
             result["status"] = "insufficient-fps-samples"
         else:
