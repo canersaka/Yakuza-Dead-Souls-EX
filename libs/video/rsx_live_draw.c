@@ -118,6 +118,7 @@ int  rsx_live_draw_a010_world_ready(void) { return 1; }
 int  rsx_live_draw_debug_dump_surface(u32 l, u32 o, const char* p)
 { (void)l; (void)o; (void)p; return -1; }
 void rsx_live_draw_set_a010_camera_matrix(const float* m) { (void)m; }
+void rsx_live_draw_dump_submit_attribution(void) {}
 void rsx_live_draw_shutdown(void) {}
 
 #else /* _WIN32 */
@@ -1315,6 +1316,17 @@ typedef enum {
     LD_FLUSH_REASON_COUNT
 } ld_flush_reason;
 
+typedef struct ld_submit_attribution {
+    int enabled;
+    int dumped;
+    u64 qpc_frequency;
+    u64 submissions[LD_FLUSH_REASON_COUNT];
+    u64 cpu_ticks[LD_FLUSH_REASON_COUNT];
+    u64 fence_ticks[LD_FLUSH_REASON_COUNT];
+} ld_submit_attribution;
+
+static ld_submit_attribution g_ld_submit_attribution;
+
 #if defined(YZ_PERF_PROFILE)
 typedef enum {
     LD_REJECT_WORLD = 0,
@@ -1990,6 +2002,11 @@ static void ld_shadow_oracle_dump(void);
  * -----------------------------------------------------------------------*/
 static void ld_flush(ld_flush_reason reason)
 {
+    LARGE_INTEGER attribution_begin = {0};
+    LARGE_INTEGER attribution_fence_begin = {0};
+    u64 attribution_fence_ticks = 0;
+    if (g_ld_submit_attribution.enabled)
+        QueryPerformanceCounter(&attribution_begin);
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -2025,6 +2042,8 @@ static void ld_flush(ld_flush_reason reason)
         return;
     }
     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+        if (g_ld_submit_attribution.enabled)
+            QueryPerformanceCounter(&attribution_fence_begin);
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
 #endif
@@ -2041,6 +2060,15 @@ static void ld_flush(ld_flush_reason reason)
             return;
         }
         WaitForSingleObject(g.fence_event, INFINITE);
+        if (attribution_fence_begin.QuadPart) {
+            LARGE_INTEGER attribution_fence_end;
+            if (QueryPerformanceCounter(&attribution_fence_end) &&
+                attribution_fence_end.QuadPart >=
+                    attribution_fence_begin.QuadPart)
+                attribution_fence_ticks =
+                    (u64)(attribution_fence_end.QuadPart -
+                          attribution_fence_begin.QuadPart);
+        }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
@@ -2074,6 +2102,18 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+    if (g_ld_submit_attribution.enabled &&
+        reason < LD_FLUSH_REASON_COUNT && attribution_begin.QuadPart) {
+        LARGE_INTEGER attribution_end;
+        if (QueryPerformanceCounter(&attribution_end) &&
+            attribution_end.QuadPart >= attribution_begin.QuadPart) {
+            g_ld_submit_attribution.submissions[reason]++;
+            g_ld_submit_attribution.cpu_ticks[reason] +=
+                (u64)(attribution_end.QuadPart - attribution_begin.QuadPart);
+            g_ld_submit_attribution.fence_ticks[reason] +=
+                attribution_fence_ticks;
+        }
+    }
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -7429,6 +7469,18 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
     memset(&g_ld_shadow_oracle, 0, sizeof(g_ld_shadow_oracle));
+    memset(&g_ld_submit_attribution, 0, sizeof(g_ld_submit_attribution));
+    {
+        const char* const requested = getenv("YZ_NR_SUBMIT_ATTRIBUTION");
+        LARGE_INTEGER frequency;
+        g_ld_submit_attribution.enabled = requested &&
+            strcmp(requested, "1") == 0;
+        if (g_ld_submit_attribution.enabled &&
+            QueryPerformanceFrequency(&frequency))
+            g_ld_submit_attribution.qpc_frequency = (u64)frequency.QuadPart;
+        else
+            g_ld_submit_attribution.enabled = 0;
+    }
     g_ld_shadow_oracle.enabled =
         getenv("YZ_NR_HANA_DEPTH_ORACLE") != NULL;
     if (g_ld_shadow_oracle.enabled)
@@ -10385,6 +10437,35 @@ static void ld_shadow_oracle_dump(void)
     fflush(stderr);
 }
 
+static void ld_submit_attribution_dump(void)
+{
+    static const char* const names[LD_FLUSH_REASON_COUNT] = {
+        "present", "guest-reference", "vertex-ring", "vertex-constant-ring",
+        "retire-queue", "movie", "movie-present", "readback",
+        "pixel-constant-ring", "descriptor-ring", "shutdown"
+    };
+    if (!g_ld_submit_attribution.enabled ||
+        g_ld_submit_attribution.dumped)
+        return;
+    g_ld_submit_attribution.dumped = 1;
+    for (u32 i = 0; i < LD_FLUSH_REASON_COUNT; ++i) {
+        fprintf(stderr,
+                "[live-submit-attribution qpc=%llu cause=%s "
+                "submits=%llu cpu-ticks=%llu fence-ticks=%llu]\n",
+                (unsigned long long)g_ld_submit_attribution.qpc_frequency,
+                names[i],
+                (unsigned long long)g_ld_submit_attribution.submissions[i],
+                (unsigned long long)g_ld_submit_attribution.cpu_ticks[i],
+                (unsigned long long)g_ld_submit_attribution.fence_ticks[i]);
+    }
+    fflush(stderr);
+}
+
+void rsx_live_draw_dump_submit_attribution(void)
+{
+    ld_submit_attribution_dump();
+}
+
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
@@ -10410,6 +10491,7 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    rsx_live_draw_dump_submit_attribution();
     ld_shadow_oracle_dump();
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.output) {

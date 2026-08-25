@@ -924,6 +924,8 @@ def run_gun(args):
         # is safe on the extended route: it neither owns commands nor emits
         # per-event output, timing, or synthetic graphics work.
         yz["YZ_NR_VERTICAL"] = "shadow"
+    if args.nr_submit_attribution:
+        yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -1198,8 +1200,34 @@ def run_gun(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        submit_lines = re.findall(
+            r"^\[nr-submit-attribution .*\]$", stderr_text, re.MULTILINE
+        )
+        submit_transfer_lines = re.findall(
+            r"^\[nr-submit-transfer .*\]$", stderr_text, re.MULTILINE
+        )
+        live_submit_lines = re.findall(
+            r"^\[live-submit-attribution .*\]$", stderr_text, re.MULTILINE
+        )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_submit_attribution"] = submit_lines
+        result["nr_submit_transfer"] = submit_transfer_lines
+        result["live_submit_attribution"] = live_submit_lines
+        if args.nr_submit_attribution:
+            if (len(submit_lines) != 14 or
+                    len(submit_transfer_lines) != 1 or
+                    len(live_submit_lines) != 11):
+                raise RuntimeError(
+                    "submission attribution aggregate incomplete: "
+                    f"native={len(submit_lines)} "
+                    f"transfer={len(submit_transfer_lines)} "
+                    f"timeline={len(live_submit_lines)}"
+                )
+        elif submit_lines or submit_transfer_lines or live_submit_lines:
+            raise RuntimeError(
+                "submission attribution was active outside its requested lane"
+            )
         if args.nr_vertical_full_native:
             if len(full_native_lines) != 1 or "fatal=0" not in full_native_lines[0]:
                 raise RuntimeError(
@@ -1420,6 +1448,8 @@ def run(args):
         yz["YZ_WKL4_CYCLE"] = "1"
     if args.xf_ieee:
         yz["YZ_XF_IEEE"] = "1"
+    if args.nr_submit_attribution:
+        yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     environment.update(yz)
 
     result = {
@@ -1732,8 +1762,34 @@ def run(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        submit_lines = re.findall(
+            r"^\[nr-submit-attribution .*\]$", stderr_text, re.MULTILINE
+        )
+        submit_transfer_lines = re.findall(
+            r"^\[nr-submit-transfer .*\]$", stderr_text, re.MULTILINE
+        )
+        live_submit_lines = re.findall(
+            r"^\[live-submit-attribution .*\]$", stderr_text, re.MULTILINE
+        )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_submit_attribution"] = submit_lines
+        result["nr_submit_transfer"] = submit_transfer_lines
+        result["live_submit_attribution"] = live_submit_lines
+        if args.nr_submit_attribution:
+            if (len(submit_lines) != 14 or
+                    len(submit_transfer_lines) != 1 or
+                    len(live_submit_lines) != 11):
+                raise RuntimeError(
+                    "submission attribution aggregate incomplete: "
+                    f"native={len(submit_lines)} "
+                    f"transfer={len(submit_transfer_lines)} "
+                    f"timeline={len(live_submit_lines)}"
+                )
+        elif submit_lines or submit_transfer_lines or live_submit_lines:
+            raise RuntimeError(
+                "submission attribution was active outside its requested lane"
+            )
         if args.nr_vertical_full_native:
             if len(full_native_lines) != 1 or "fatal=0" not in full_native_lines[0]:
                 raise RuntimeError(
@@ -1886,6 +1942,7 @@ def main():
     parser.add_argument("--nr-vertical-full-native", action="store_true")
     parser.add_argument("--nr-scanout-provenance", action="store_true")
     parser.add_argument("--nr-hana-input-oracle", action="store_true")
+    parser.add_argument("--nr-submit-attribution", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",

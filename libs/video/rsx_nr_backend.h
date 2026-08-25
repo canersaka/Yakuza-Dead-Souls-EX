@@ -35,6 +35,17 @@ typedef enum rsx_nr_step_result {
     RSX_NR_STEP_BLOCKED_SEMAPHORE,  /* head is an unsatisfied acquire      */
 } rsx_nr_step_result;
 
+/* Semantic reason for a guest-visible synchronization flush.  Sinks which
+ * need exact submission attribution may implement flush_reason; the ordinary
+ * flush callback remains the compatibility path for offline recorders. */
+typedef enum rsx_nr_flush_reason {
+    RSX_NR_FLUSH_SEMAPHORE = 0,
+    RSX_NR_FLUSH_REFERENCE,
+    RSX_NR_FLUSH_REPORT,
+    RSX_NR_FLUSH_BARRIER,
+    RSX_NR_FLUSH_REASON_COUNT
+} rsx_nr_flush_reason;
+
 /* Every callback may be NULL (treated as success / value 0). */
 typedef struct rsx_nr_exec_ops {
     void* user;
@@ -47,6 +58,7 @@ typedef struct rsx_nr_exec_ops {
                      const rsx_nir_transfer* t, const u32* words);
     int  (*present)(void* u, u32 buffer);
     void (*flush)(void* u);                       /* barrier / pre-REF     */
+    void (*flush_reason)(void* u, u32 reason);    /* exact publication kind */
     /* value is the FINAL memory value: the core has already applied the
      * hardware store transform (back-end releases swizzle bytes 0<->2;
      * texture-pipe/NV406E releases are verbatim — see rsx_nir_semaphore). */

@@ -318,6 +318,11 @@ int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
 
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
+/* Emit the default-off fixed-memory submit/fence attribution once without
+ * draining or releasing the shared renderer.  Strict-native production
+ * teardown uses this because renderer objects intentionally remain alive
+ * until process reclamation. */
+void rsx_live_draw_dump_submit_attribution(void);
 
 #ifdef __cplusplus
 }
