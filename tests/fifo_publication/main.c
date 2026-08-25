@@ -143,6 +143,42 @@ int main(void)
             0x00001254u, 0u, 0x44C00000u,
             0x00001258u, 0x007FFFA0u, size, 1, 0), 0u);
 
+    /* Warm-repeat capture: the same exact NOOP-owned generated-VP payload is
+     * 0x38 bytes long. Its last raw word is itself a plausible one-argument
+     * RT_ENABLE packet, so only the separately proven prologue at 0x1280 may
+     * terminate the data island. */
+    failed |= expect("generated VP variable inline gap",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001244u, 0u, 0x3F000000u,
+            0x00001248u, 0x007FFFA0u, 0x00001280u,
+            size, 0x100u, 1, 1, 1),
+        0x00001280u);
+    failed |= expect("generated VP variable gap wrong predecessor",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001240u, 0u, 0x3F000000u,
+            0x00001248u, 0x007FFFA0u, 0x00001280u,
+            size, 0x100u, 1, 1, 1), 0u);
+    failed |= expect("generated VP variable gap too wide",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001244u, 0u, 0x3F000000u,
+            0x00001248u, 0x007FFFA0u, 0x00001380u,
+            size, 0x100u, 1, 1, 1), 0u);
+    failed |= expect("generated VP variable gap flow word",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001244u, 0u, 0x20001280u,
+            0x00001248u, 0x007FFFA0u, 0x00001280u,
+            size, 0x100u, 0, 1, 1), 0u);
+    failed |= expect("generated VP variable gap incomplete publication",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001244u, 0u, 0x3F000000u,
+            0x00001248u, 0x000012A8u, 0x00001280u,
+            size, 0x100u, 1, 1, 1), 0u);
+    failed |= expect("generated VP variable gap unbalanced",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x00001244u, 0u, 0x3F000000u,
+            0x00001248u, 0x007FFFA0u, 0x00001280u,
+            size, 0x100u, 1, 1, 0), 0u);
+
     /* Captured EDGE block boundary: a primary JUMP targets 0x41FFFC, the
      * producer-owned final word of a 128 KiB generated block.  Recycled float
      * data there may look like a packet; only the exact prologue and balanced

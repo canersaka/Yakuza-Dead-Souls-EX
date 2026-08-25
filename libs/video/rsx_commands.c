@@ -678,7 +678,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                  * 2595-2619, the g_cfg.video.disable_zcull_queries path):
                  * timer + value=0 + pad=0, all 16 bytes. */
                 rsx_report_write64(addr, cellGcmReportTimestampNs());
-                rsx_report_write32(addr + 8, 0);   /* value: not tracked, see above */
+                rsx_report_write32(
+                    addr + 8,
+                    rsx_report_unmodeled_value(type, 0));
                 rsx_report_write32(addr + 12, 0);  /* pad */
             } else {
                 /* Ordinary timestamp report. RPCS3's own default branch

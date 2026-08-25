@@ -1045,6 +1045,41 @@ static int test_noop_preserves_sequential_gap_provenance(void)
               f.hole_previous_command == 0u &&
               f.owner.stats.methods == 0u,
           "NOOP sequential provenance was not delivered to exact gap proof");
+
+    /* The warm-repeat payload begins with 0x3F000000, which aliases an old
+     * JUMP to an address outside the FIFO. It must enter the same delayed,
+     * exact hole proof rather than either following or permanently parking on
+     * that raw word. */
+    fixture_init(&f);
+    const u32 variable_noop = 0x1244u;
+    const u32 variable_gap = 0x1248u;
+    const u32 variable_resume = 0x1280u;
+    next = variable_noop;
+    ret = ~0u;
+    f.words[variable_noop >> 2] = 0u;
+    f.words[variable_gap >> 2] = 0x3F000000u;
+    f.hole_get = variable_gap;
+    f.hole_put = put;
+    f.hole_word = f.words[variable_gap >> 2];
+    f.hole_resume = variable_resume;
+    f.words[variable_resume >> 2] = packet(1u, 0x0050u);
+    f.words[(variable_resume + 4u) >> 2] = 0x89ABCDEFu;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, variable_noop, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == variable_gap,
+          "NOOP before flow-shaped generated gap did not advance");
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, variable_gap, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "flow-shaped generated gap escaped before proof at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, variable_gap, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == variable_resume &&
+              f.hole_previous_get == variable_noop &&
+              f.hole_previous_command == 0u && f.hole_calls == 1u &&
+              f.owner.stats.methods == 0u,
+          "unmapped flow-shaped payload did not use exact NOOP gap proof");
     return 0;
 }
 

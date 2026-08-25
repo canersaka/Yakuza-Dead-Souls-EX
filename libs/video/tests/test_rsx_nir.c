@@ -22,6 +22,7 @@
 #include "../rsx_nr_intercept.h"
 #include "../rsx_nr_ring.h"
 #include "../rsx_nr_backend.h"
+#include "../rsx_commands.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2197,6 +2198,15 @@ static void test_section_method_support(void)
     rsx_nir_stream_init(&stream);
     rsx_nir_adapter ad;
     rsx_nir_adapter_init(&ad, &stream);
+    CHECK(rsx_report_unmodeled_value(
+              RSX_REPORT_TYPE_ZPASS_PIXEL_CNT, 1) == 1u &&
+              rsx_report_unmodeled_value(
+                  RSX_REPORT_TYPE_ZPASS_PIXEL_CNT, 0) == 0u &&
+              rsx_report_unmodeled_value(
+                  RSX_REPORT_TYPE_ZCULL_STATS, 1) == 0u &&
+              rsx_report_unmodeled_value(
+                  RSX_REPORT_TYPE_ZCULL_STATS3, 1) == 0u,
+          "unmodeled report fallback did not remain narrowly ZPASS-visible");
     CHECK(ad.fifo_semaphore_dma == 0x66616661u,
           "NV406E reset semaphore DMA %08X", ad.fifo_semaphore_dma);
     CHECK(rsx_nir_adapter_method_supported(&ad, 0x0300u, 1u) &&

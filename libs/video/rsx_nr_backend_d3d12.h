@@ -258,6 +258,10 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
                                                       u32 min_bytes),
                                   void* user);
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b);
+/* Default-off diagnostic finalization.  When the Hana input oracle was
+ * enabled at creation, retire its already-recorded copies and emit the fixed
+ * shutdown aggregate without destroying process-lifetime renderer objects. */
+int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b);
 
 /* The guest-write tracker feeding the mirror; the embedder publishes guest
  * writes here (tests call note_write after touching arenas). */

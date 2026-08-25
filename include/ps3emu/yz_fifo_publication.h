@@ -151,21 +151,29 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
     return resume;
 }
 
-/* Validate the complete captured generated-VP inline data gap.  After one
- * primary-ring NOOP, EDGE leaves exactly ten producer-owned words (0x28
- * bytes) before the next generated draw prologue.  The first word can satisfy
- * the method-header mask by chance, so packet shape is not an ownership
- * proof.  Admission requires the exact sequential NOOP boundary plus an
- * independently proven, draw-balanced generated prologue at the fixed end.
- * Real flow words are never bypassed. */
-static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
+/* Validate a complete generated-VP inline data gap.  EDGE leaves one primary
+ * ring NOOP immediately before a bounded producer-owned payload, followed by
+ * the next exact generated draw prologue.  The payload length varies with the
+ * vertex program (the captured legal spans are 0x28 and 0x38 bytes), and its
+ * words can satisfy the method-header mask by chance.  Packet shape is never
+ * an ownership proof: admission requires the exact sequential NOOP boundary,
+ * the first independently identified prologue within max_gap, and a complete
+ * draw-balanced prefix at that candidate. Real flow words are never bypassed.
+ *
+ * The caller finds the first exact prologue, proves its command chain, then
+ * re-reads all witnesses and repeats this pure proof after a barrier. */
+static inline uint32_t yz_fifo_generated_vp_inline_candidate_resume(
     uint32_t previous_get, uint32_t previous_command,
-    uint32_t gap_word, uint32_t get, uint32_t put, uint32_t fifo_size,
+    uint32_t gap_word, uint32_t get, uint32_t put, uint32_t candidate,
+    uint32_t fifo_size, uint32_t max_gap,
+    int flow_word_unmapped,
     int generated_prologue_ready, int balanced_prefix_ready)
 {
     if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
         (previous_get & 3u) || previous_get >= fifo_size ||
         (get & 3u) || get >= fifo_size || put >= fifo_size ||
+        (candidate & 3u) || candidate >= fifo_size ||
+        !max_gap || max_gap >= (fifo_size >> 1) ||
         previous_command != 0u ||
         ((previous_get + 4u) & (fifo_size - 1u)) != get ||
         generated_prologue_ready == 0 || balanced_prefix_ready == 0)
@@ -175,16 +183,35 @@ static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
         ((gap_word & 0xE0000003u) == 0x20000000u) ||
         ((gap_word & 3u) == 1u) || ((gap_word & 3u) == 2u) ||
         ((gap_word & 0xFFFF0003u) == 0x00020000u);
-    if (!gap_word || flow)
+    /* A flow-shaped payload is admissible only when the strict owner has
+     * independently established that its encoded target is outside the FIFO
+     * address space. A real mapped JUMP/CALL is never bypassed. */
+    if (!gap_word || (flow && !flow_word_unmapped))
         return 0u;
 
     const uint32_t mask = fifo_size - 1u;
-    const uint32_t resume = (get + 0x28u) & mask;
+    const uint32_t distance = (candidate - get) & mask;
     const uint32_t ahead = (put - get) & mask;
-    /* The exact prologue witness reads through resume+0x28 inclusive. */
-    if (!resume || ahead < 0x54u)
+    /* The exact prologue witness reads through candidate+0x28 inclusive. */
+    if (!candidate || distance < 4u || distance > max_gap ||
+        ahead < distance + 0x2Cu)
         return 0u;
-    return resume;
+    return candidate;
+}
+
+/* Retain the original fixed-shape helper as a source-compatible specialization
+ * for its standalone regressions and any older callers. */
+static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
+    uint32_t previous_get, uint32_t previous_command,
+    uint32_t gap_word, uint32_t get, uint32_t put, uint32_t fifo_size,
+    int generated_prologue_ready, int balanced_prefix_ready)
+{
+    const uint32_t candidate = fifo_size
+        ? (get + 0x28u) & (fifo_size - 1u) : 0u;
+    return yz_fifo_generated_vp_inline_candidate_resume(
+        previous_get, previous_command, gap_word, get, put, candidate,
+        fifo_size, 0x28u, 0, generated_prologue_ready,
+        balanced_prefix_ready);
 }
 
 /* Validate the EDGE generated-list block-boundary publication shape.  The

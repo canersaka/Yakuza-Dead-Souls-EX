@@ -4476,6 +4476,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
         InterlockedExchange(&g_vertical.mode_active_graphics, 0);
         cellSpursSetGuestWriteObserver(nullptr);
         InterlockedExchange(&g_active.graphics_ready, 0);
+        if (g_active.d3d12 &&
+            rsx_nr_d3d12_dump_hana_input(g_active.d3d12) != 0)
+            fprintf(stderr, "[nr-hana-input dump-failed=1]\n");
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,

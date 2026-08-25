@@ -687,7 +687,16 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
              * low bits transiently resemble an absolute JUMP.  An unmapped
              * target from the primary ring is not executable evidence yet;
              * retain the exact source word in the ordinary bounded
-             * publication wait.  Called lists remain strict failures. */
+             * publication wait. Once its proof delay expires, also give the
+             * exact generated-hole oracle the preceding-command breadcrumb:
+             * producer-owned float payload can encode an out-of-range JUMP,
+             * but only a bounded NOOP/prologue/chain proof may bypass it.
+             * Called lists remain strict failures. */
+            if (call_return == ~0u && get < NR_FRAME_RING_SIZE &&
+                frame_try_resolve_generated_hole(
+                    o, get, put, call_return, command, next_get))
+                return frame_control_advance(
+                    o, get, put, call_return, command);
             if (call_return == ~0u && get < NR_FRAME_RING_SIZE)
                 return frame_wait_for_flow_target(
                     o, get, put, call_return, command, get, command);
