@@ -18,6 +18,7 @@
 #include "../../include/ps3emu/error_codes.h"   /* CELL_EBUSY: send_event ack mapping */
 #include "../../include/ps3emu/yz_frontier_trace.h"
 #include "../../include/ps3emu/yz_fe0_timeline.h"
+#include "../../include/ps3emu/yz_fifo_publication.h"
 /* Generated EBOOT SPU image registry (tools/gen_spu_images.py): elf EA ->
  * image id / entry / BSS spans. Generated into recomp_prx like the lifted
  * kernels the build already requires. */
@@ -45,6 +46,114 @@ volatile long g_yz_ucmd_handler_completed = -1;
 volatile long g_yz_ucmd_handler_epoch = 0;
 volatile long g_yz_ucmd_handler_completed_epoch = 0;
 volatile long g_yz_ucmd_handler_active = 0;
+
+/* Strict-native generated-block boundary provenance.  gs_task publishes
+ * command groups at LS 0x5F70 and later releases their terminal stopper with
+ * an ordered MFC_PUTF at LS 0x5F00 (docs/NATIVE_RENDER_PRODUCERS.md).  A
+ * global modulo test alone is insufficient: ordinary command packets can
+ * legitimately start at the same 128 KiB-aligned word.  Keep one exact word
+ * per possible boundary (64 total for the 8 MiB FIFO) and clear it whenever
+ * the producer recycles that source slot.  No allocation, clocks, scanning,
+ * or I/O is involved. */
+#define YZ_RSX_FIFO_BASE 0x40400000u
+#define YZ_RSX_FIFO_SIZE 0x00800000u
+#define YZ_RSX_GENERATED_BLOCK_SIZE 0x00020000u
+#define YZ_RSX_GENERATED_BOUNDARY_COUNT \
+    (YZ_RSX_FIFO_SIZE / YZ_RSX_GENERATED_BLOCK_SIZE)
+static volatile long
+    g_yz_rsx_generated_boundary_release[YZ_RSX_GENERATED_BOUNDARY_COUNT];
+
+static uint32_t yz_be32_bytes(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static int yz_rsx_generated_boundary_slot(
+    uint32_t source_ea, uint32_t command, uint32_t* slot)
+{
+    const uint32_t fifo_end = YZ_RSX_FIFO_BASE + YZ_RSX_FIFO_SIZE;
+    if (!slot || source_ea < YZ_RSX_FIFO_BASE || source_ea >= fifo_end ||
+        (source_ea & 3u))
+        return 0;
+    const uint32_t source_io = source_ea - YZ_RSX_FIFO_BASE;
+    const uint32_t target_io = command & 0x1FFFFFFCu;
+    if ((command & 0xE0000003u) != 0x20000000u ||
+        target_io != source_io + 4u ||
+        ((target_io + 4u) & (YZ_RSX_GENERATED_BLOCK_SIZE - 1u)) != 0u)
+        return 0;
+    *slot = (target_io + 4u) / YZ_RSX_GENERATED_BLOCK_SIZE - 1u;
+    return *slot < YZ_RSX_GENERATED_BOUNDARY_COUNT;
+}
+
+void yz_rsx_generated_boundary_group_begin(
+    uint32_t image_id, uint32_t pc, uint32_t ea,
+    const uint8_t* payload, uint32_t size)
+{
+    (void)payload;
+    if (image_id != 0u || pc != 0x05F70u || !size ||
+        ea >= YZ_RSX_FIFO_BASE + YZ_RSX_FIFO_SIZE ||
+        (uint64_t)ea + size <= YZ_RSX_FIFO_BASE)
+        return;
+    const uint64_t begin = ea < YZ_RSX_FIFO_BASE
+        ? YZ_RSX_FIFO_BASE : (uint64_t)ea;
+    const uint64_t end_raw = (uint64_t)ea + size;
+    const uint64_t end = end_raw >
+            (uint64_t)YZ_RSX_FIFO_BASE + YZ_RSX_FIFO_SIZE
+        ? (uint64_t)YZ_RSX_FIFO_BASE + YZ_RSX_FIFO_SIZE : end_raw;
+    uint32_t block =
+        (uint32_t)((begin - YZ_RSX_FIFO_BASE) /
+                   YZ_RSX_GENERATED_BLOCK_SIZE);
+    for (; block < YZ_RSX_GENERATED_BOUNDARY_COUNT; ++block) {
+        const uint32_t source_ea = YZ_RSX_FIFO_BASE +
+            (block + 1u) * YZ_RSX_GENERATED_BLOCK_SIZE - 8u;
+        if ((uint64_t)source_ea >= end)
+            break;
+        if ((uint64_t)source_ea + 4u > begin) {
+#if defined(_MSC_VER)
+            _InterlockedExchange(
+                &g_yz_rsx_generated_boundary_release[block], 0);
+#else
+            g_yz_rsx_generated_boundary_release[block] = 0;
+#endif
+        }
+    }
+}
+
+void yz_rsx_generated_boundary_release_commit(
+    uint32_t image_id, uint32_t pc, uint32_t cmd,
+    uint32_t ea, const uint8_t* payload, uint32_t size)
+{
+    uint32_t slot = 0;
+    if (image_id != 0u || pc != 0x05F00u || cmd != MFC_PUTF_CMD ||
+        !payload || size != 4u)
+        return;
+    const uint32_t command = yz_be32_bytes(payload);
+    if (!yz_rsx_generated_boundary_slot(ea, command, &slot))
+        return;
+    /* Called after the real DMA copy.  InterlockedExchange is the release
+     * publication for both the command bytes and every earlier fenced PUT. */
+#if defined(_MSC_VER)
+    _InterlockedExchange(
+        &g_yz_rsx_generated_boundary_release[slot], (long)command);
+#else
+    g_yz_rsx_generated_boundary_release[slot] = (long)command;
+#endif
+}
+
+int yz_rsx_generated_boundary_release_snapshot(
+    uint32_t source_ea, uint32_t command)
+{
+    uint32_t slot = 0;
+    if (!yz_rsx_generated_boundary_slot(source_ea, command, &slot))
+        return 0;
+#if defined(_MSC_VER)
+    return (uint32_t)_InterlockedCompareExchange(
+               &g_yz_rsx_generated_boundary_release[slot], 0, 0) == command;
+#else
+    return (uint32_t)g_yz_rsx_generated_boundary_release[slot] == command;
+#endif
+}
 
 #if defined(YZ_PERF_PROFILE)
 #if defined(_MSC_VER)

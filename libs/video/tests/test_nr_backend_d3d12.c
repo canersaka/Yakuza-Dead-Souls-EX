@@ -43,6 +43,8 @@ static u32 g_watched_pages[2];
 static u32 g_last_watched_offset[2];
 static u8 g_watched_host_page[2][1024]; /* LOCAL_SIZE / host page */
 static u32 g_published_writes;
+static rsx_nr_d3d12* g_churn_sink;
+static int g_churn_unrelated_vertex_page;
 
 static u32 g_published_space[4], g_published_offset[4], g_published_size[4];
 static u32 g_render_condition_value;
@@ -127,6 +129,14 @@ static const u8* arena_ptr(void* user, u32 space, u32 offset, u32 min_bytes)
     u32 size = space ? MAIN_SIZE : LOCAL_SIZE;
     if (offset > size || min_bytes > size - offset)
         return NULL;
+    if (g_churn_unrelated_vertex_page && g_churn_sink && !space &&
+        offset == VTX_OFFSET && min_bytes >= RSX_GUEST_PAGE_SIZE) {
+        /* Model a producer continually publishing unrelated scratch bytes in
+         * the same 1 KiB generation page as a stable vertex span. */
+        g_local[VTX_OFFSET + 512u] ^= 1u;
+        rsx_nr_d3d12_note_guest_write(
+            g_churn_sink, 0u, VTX_OFFSET + 512u, 1u);
+    }
     return base + offset;
 }
 
@@ -280,6 +290,26 @@ static void stage_rt565_texture0(rsx_nir_emitter* em)
     texture.height = RT_H;
     texture.pitch = RT_W * 2u;
     texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
+static void stage_color_border_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = TEX_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0xA5u;          /* LINEAR | A8R8G8B8                */
+    texture.dimension = 2;
+    texture.mipmaps = 1;
+    texture.width = 2;
+    texture.height = 2;
+    texture.pitch = 8;
+    texture.wrap = 0x00040404u;      /* BORDER on every coordinate        */
+    texture.border_color = 0xFFFFFFFFu;
     texture.remap = 0xAAE4u;
     texture.filter = (1u << 16) | (1u << 24);
     rsx_nir_em_texture(em, 0, &texture);
@@ -1083,7 +1113,8 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             return -1;
         rsx_nr_frame_owner_init(
             &frame_owner, ad, &be, &ring, cap_frame_read32, &frame_fifo,
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL);
     }
 
     u32 completed_draws = 0;
@@ -3127,6 +3158,40 @@ int main(int argc, char** argv)
               "same-list mirror append present failed");
     }
 
+    /* A dynamic producer may reuse another portion of the same coarse page
+     * for the next draw.  Coarse generation can therefore change on every
+     * mirror upload while this draw's exact vertex bytes remain stable.  The
+     * ordered exact-span patch must execute this draw once without falsely
+     * acknowledging the whole page or exhausting stabilization retries. */
+    {
+        rsx_nr_d3d12_stats before_churn, after_churn;
+        stage_frame_state(&em);
+        stage_vertex_bindings(&em, 0u);
+        write_triangle(rsx_nr_d3d12_pages(sink),
+                       -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+        rsx_nr_d3d12_get_stats(sink, &before_churn);
+        g_churn_sink = sink;
+        g_churn_unrelated_vertex_page = 1;
+        rsx_nir_em_draw(&em, 5, 0, batch, 1);
+        rsx_nr_backend_run(&be, 0);
+        g_churn_unrelated_vertex_page = 0;
+        g_churn_sink = NULL;
+        rsx_nr_d3d12_get_stats(sink, &after_churn);
+        CHECK(be.stats.exec_errors == 0 &&
+                  after_churn.draws == before_churn.draws + 1u,
+              "same-page unrelated churn rejected exact draw");
+        CHECK(after_churn.residency_failures ==
+                  before_churn.residency_failures &&
+                  after_churn.mirror_exact_patches >
+                      before_churn.mirror_exact_patches,
+              "same-page churn did not use exact ordered patch "
+              "residency=%llu/%llu exact=%llu/%llu",
+              before_churn.residency_failures,
+              after_churn.residency_failures,
+              before_churn.mirror_exact_patches,
+              after_churn.mirror_exact_patches);
+    }
+
     /* ---- leg 4: indexed draw through BE u16 in-shader index fetch ------ */
     {
         u8* ip = g_main + IDX_OFFSET;
@@ -3261,6 +3326,27 @@ int main(int argc, char** argv)
           "texture data change rebuilt PSO builds=%llu/%llu hits=%llu/%llu",
           before_texture_change.pso_builds, after_texture_change.pso_builds,
           before_texture_change.pso_hits, after_texture_change.pso_hits);
+
+    /* ---- color BORDER parity with the established renderer -----------
+     * The guest requests an opaque-white border, but the established D3D12
+     * path leaves its sampler border at zero.  The test VS emits an
+     * out-of-range TC0=(-1,-1), so this real TEX draw catches a white edge
+     * leaking into screen-space post effects. */
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_color_border_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "color border sample exec errors %llu", be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "color border RT readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0x00, 0x00),
+          "color border sample was not legacy-zero %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    write_tex_fp();
 
     /* ---- immutable descriptors + fence-retired texture resources -----
      * Record two differently textured draws into the same open command
@@ -3878,7 +3964,7 @@ int main(int argc, char** argv)
     rsx_nr_d3d12_get_stats(sink, &st);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 30 && st.draws == 4640 && st.presents == 24,
+    CHECK(st.clears == 31 && st.draws == 4642 && st.presents == 25,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -3897,7 +3983,7 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 10 && st.texture_builds == 2 &&
+    CHECK(st.texture_draws == 11 && st.texture_builds == 2 &&
               st.texture_refreshes == 2 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
@@ -3907,8 +3993,8 @@ int main(int argc, char** argv)
               st.depth_snapshot_resolves == 2u,
           "depth snapshots builds=%llu resolves=%llu",
           st.depth_snapshot_builds, st.depth_snapshot_resolves);
-    CHECK(g_present_handoffs == 24,
-          "native scanout handoffs=%u expected=24", g_present_handoffs);
+    CHECK(g_present_handoffs == 25,
+          "native scanout handoffs=%u expected=25", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);

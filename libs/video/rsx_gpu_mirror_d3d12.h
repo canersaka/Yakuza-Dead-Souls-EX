@@ -64,6 +64,14 @@ void rsx_gpu_mirror_d3d12_end(rsx_gpu_mirror_d3d12* b, u64 fence_value);
 void rsx_gpu_mirror_d3d12_retire(rsx_gpu_mirror_d3d12* b,
                                  u64 completed_fence_value);
 
+/* Record a later exact-byte patch into the current mirror session.  The
+ * bytes are copied into fence-owned staging and compared once with the guest
+ * source before the GPU copy is recorded.  This is the narrow fallback for
+ * a required draw span whose surrounding 1 KiB tracking page is being
+ * modified for a future draw; it never marks that whole page current. */
+int rsx_gpu_mirror_d3d12_patch_exact(rsx_gpu_mirror_d3d12* b, u32 space,
+                                     u32 offset, const u8* src, u32 size);
+
 /* ID3D12Resource* of a space's mirror buffer (NULL for an empty space),
  * and its byte size (the value to put in the pull cbuffer mem_size). */
 void* rsx_gpu_mirror_d3d12_buffer(rsx_gpu_mirror_d3d12* b, u32 space);

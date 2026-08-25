@@ -22,6 +22,9 @@ typedef struct fixture {
     u32 island_put;
     u32 island_resume;
     u32 island_late_entry;
+    u32 released_source;
+    u32 released_command;
+    u32 released_target_word;
     u32 repair_source;
     u32 repair_put;
     u32 repair_command;
@@ -103,6 +106,17 @@ static int registered_island_edge(void* user, u32 get, u32 put,
     return f->island_late_entry ? 2 : 1;
 }
 
+static int registered_released_edge(void* user, u32 get, u32 put,
+                                    u32 command, u32 target,
+                                    u32 target_word)
+{
+    fixture* f = user;
+    (void)put;
+    return get == f->released_source &&
+           command == f->released_command &&
+           target == get + 4u && target_word == f->released_target_word;
+}
+
 static int resolve_generated_jump(void* user, u32 get, u32 put,
                                   u32 command, u32 target,
                                   u32 target_word, u32* resume_get)
@@ -165,6 +179,7 @@ static void fixture_init(fixture* f)
                              &f->ring, read_word, f,
                              release_initial_stopper, f,
                              registered_island_edge, f,
+                             registered_released_edge, f,
                              resolve_generated_jump, f,
                              resolve_generated_hole, f);
 }
@@ -480,6 +495,39 @@ static int test_jump_waits_for_exact_target_publication(void)
               &f.owner, next, 0x3000u, ret, &next, &ret) ==
               RSX_NR_FRAME_ADVANCED && next == segment_next,
           "generated-block tail link did not execute");
+
+    /* The other live shape is a fenced forward stopper release from the
+     * preceding word into a real packet whose header itself occupies the
+     * generated-block tail.  Byte shape alone remains insufficient: it must
+     * park without the exact producer record, then execute normally once the
+     * matching record is visible. */
+    fixture_init(&f);
+    f.owner.primary_segment_bytes = 0x4000u;
+    f.owner.generated_block_bytes = 0x2000u;
+    const u32 release_source = segment_tail - 4u;
+    const u32 release_command = 0x20000000u | segment_tail;
+    f.words[release_source >> 2] = release_command;
+    f.words[segment_tail >> 2] = packet(1u, 0x0050u);
+    f.words[segment_next >> 2] = 0x55AA33CCu;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, release_source, 0x3000u, ~0u,
+              &next, &ret) == RSX_NR_FRAME_WAIT_PARTIAL &&
+              next == release_source,
+          "unproven packet-shaped boundary did not remain parked");
+    f.released_source = release_source;
+    f.released_command = release_command;
+    f.released_target_word = f.words[segment_tail >> 2];
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, release_source, 0x3000u, ~0u,
+              &next, &ret) == RSX_NR_FRAME_ADVANCED &&
+              next == segment_tail &&
+              f.owner.stats.admitted_released_boundaries == 1u,
+          "exact fenced boundary release was not admitted once");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, 0x3000u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == segment_next + 4u &&
+              f.references == 0x55AA33CCu,
+          "released cross-boundary packet was not executed exactly once");
 
     return 0;
 }

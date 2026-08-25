@@ -48,6 +48,58 @@ void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size)
 #include "spu_dma.h"
 #include "spu_context.h"
 
+/* Standalone harness stubs for optional game-owned diagnostics referenced by
+ * the clean runtime source.  They are deliberately inert here. */
+volatile long g_yz_a010_release_scene_active = 0;
+volatile long g_yz_fe0_timeline_enabled = 0;
+void yz_fe0_timeline_emit(yz_fe0_event_type event, uint32_t cause,
+                          uint32_t actor, uint32_t a0, uint32_t a1,
+                          uint32_t a2, uint32_t a3)
+{
+    (void)event; (void)cause; (void)actor; (void)a0;
+    (void)a1; (void)a2; (void)a3;
+}
+void yz_fe0_timeline_callback_begin(uint32_t cause, uint32_t epoch)
+{
+    (void)cause; (void)epoch;
+}
+void yz_fe0_timeline_callback_end(uint32_t cause, uint32_t epoch)
+{
+    (void)cause; (void)epoch;
+}
+void yz_fe0_timeline_observe_wkl4_atomic(
+    uint32_t image_id, uint32_t spu_id, uint32_t pc,
+    uint32_t cause, uint32_t task, uint32_t line_ea,
+    const uint8_t* before, const uint8_t* after)
+{
+    (void)image_id; (void)spu_id; (void)pc; (void)cause;
+    (void)task; (void)line_ea; (void)before; (void)after;
+}
+void yz_fe0_timeline_observe_wkl4_taskset_attempt(
+    uint32_t image_id, uint32_t spu_id, uint32_t pc,
+    uint32_t cause, uint32_t task, uint32_t line_ea,
+    int success, const uint8_t* current, const uint8_t* candidate)
+{
+    (void)image_id; (void)spu_id; (void)pc; (void)cause;
+    (void)task; (void)line_ea; (void)success;
+    (void)current; (void)candidate;
+}
+void yz_a010_reltrace_spu(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size,
+    const uint32_t* context)
+{
+    (void)spu_id; (void)image_id; (void)pc; (void)ea;
+    (void)payload; (void)size; (void)context;
+}
+void yz_a010_reltrace_spu_commit(
+    uint32_t spu_id, uint32_t image_id, uint32_t pc,
+    uint32_t ea, const uint8_t* payload, uint32_t size)
+{
+    (void)spu_id; (void)image_id; (void)pc; (void)ea;
+    (void)payload; (void)size;
+}
+
 /*
  * The standalone clean-lane harness links the SPU runtime without the Yakuza
  * executable's startup module.  All optional runtime repairs are deliberately
@@ -1356,6 +1408,67 @@ static int test7_nested_callback_epoch(void)
 }
 
 /* =========================================================================
+ * TEST 8 -- EXACT GENERATED-BOUNDARY PUBLICATION LIFECYCLE
+ *
+ * A real command packet may begin at a globally aligned 128 KiB tail.  It is
+ * admissible only after gs_task's exact fenced stopper release, and recycling
+ * the source in a later group must invalidate that record before any bytes
+ * are copied.  This drives the runtime-owned fixed table directly so the
+ * race contract is deterministic.
+ * ========================================================================= */
+static int test8_generated_boundary_publication(void)
+{
+    const char* name = "test8_generated_boundary_publication";
+    LONG before = g_fail_count;
+    const uint32_t source = 0x4085FFF8u;
+    const uint32_t command = 0x2045FFFCu;
+    const uint8_t release[4] = {0x20u, 0x45u, 0xFFu, 0xFCu};
+    const uint8_t group[8] = {
+        0x20u, 0x45u, 0xFFu, 0xF8u, /* self stopper */
+        0x00u, 0x04u, 0x03u, 0x10u  /* real boundary packet */
+    };
+
+    yz_rsx_generated_boundary_group_begin(
+        0u, 0x05F70u, source, group, sizeof(group));
+    if (yz_rsx_generated_boundary_release_snapshot(source, command))
+        fail(name, "fresh/recycled group began released");
+
+    yz_rsx_generated_boundary_release_commit(
+        0u, 0x05F00u, MFC_PUT_CMD,
+        source, release, sizeof(release));
+    if (yz_rsx_generated_boundary_release_snapshot(source, command))
+        fail(name, "unfenced PUT published a release");
+
+    yz_rsx_generated_boundary_release_commit(
+        0u, 0x05F00u, MFC_PUTF_CMD,
+        source, release, sizeof(release));
+    if (!yz_rsx_generated_boundary_release_snapshot(source, command))
+        fail(name, "exact fenced release was not published");
+    if (yz_rsx_generated_boundary_release_snapshot(
+            source, command + 0x20000u))
+        fail(name, "different command generation matched");
+
+    yz_rsx_generated_boundary_group_begin(
+        0u, 0x05F70u, source, group, sizeof(group));
+    if (yz_rsx_generated_boundary_release_snapshot(source, command))
+        fail(name, "source reuse did not invalidate the prior release");
+
+    /* Wrong image/PC/address shapes cannot manufacture provenance. */
+    yz_rsx_generated_boundary_release_commit(
+        1u, 0x05F00u, MFC_PUTF_CMD,
+        source, release, sizeof(release));
+    yz_rsx_generated_boundary_release_commit(
+        0u, 0x05F04u, MFC_PUTF_CMD,
+        source, release, sizeof(release));
+    if (yz_rsx_generated_boundary_release_snapshot(source, command))
+        fail(name, "non-gs_task producer published a release");
+
+    const int ok = g_fail_count == before;
+    printf("[%s] -> %s\n", name, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 int main(int argc, char** argv)
@@ -1380,6 +1493,7 @@ int main(int argc, char** argv)
     int rc5  = test5_cas_retry_liveness();
     int rc6  = test6_many_context_isolation();
     int rc7  = test7_nested_callback_epoch();
+    int rc8  = test8_generated_boundary_publication();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
@@ -1396,8 +1510,9 @@ int main(int argc, char** argv)
     printf("  5 CAS retry liveness          : %s\n", rc5  ? "FAIL" : "PASS");
     printf("  6 many-context MFC isolation  : %s\n", rc6  ? "FAIL" : "PASS");
     printf("  7 nested callback epoch       : %s\n", rc7  ? "FAIL" : "PASS");
+    printf("  8 generated boundary release  : %s\n", rc8  ? "FAIL" : "PASS");
 
-    int failed = rc0 || rc0a || rc0b || rc1 || rc2 || rc3 || rc4 || rc5 || rc6 || rc7;
+    int failed = rc0 || rc0a || rc0b || rc1 || rc2 || rc3 || rc4 || rc5 || rc6 || rc7 || rc8;
     printf("=== RESULT: %s (fail_count=%ld; test1b is informational, excluded) ===\n",
            failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
