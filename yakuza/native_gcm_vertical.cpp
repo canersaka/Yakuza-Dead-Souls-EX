@@ -603,7 +603,7 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                              uint32_t buffer_id)
 {
     if (g_active.strict_full_native) {
-        const int result = rsx_live_draw_present_external(
+        const int result = rsx_live_draw_present_shared_full_native(
             texture, format, width, height, buffer_id);
         if (!result)
             yz_nr_vertical_exec_present_complete(buffer_id);
@@ -627,8 +627,11 @@ static int yz_nr_d3d_timeline_acquire(
     unsigned long long* recording_fence,
     unsigned long long* completed_fence)
 {
-    return rsx_live_draw_timeline_acquire(
-        command_list, generation, recording_fence, completed_fence);
+    return g_active.strict_full_native
+        ? rsx_live_draw_timeline_acquire_full_native(
+              command_list, generation, recording_fence, completed_fence)
+        : rsx_live_draw_timeline_acquire(
+              command_list, generation, recording_fence, completed_fence);
 }
 
 static void yz_nr_d3d_timeline_release(void*)
@@ -638,7 +641,9 @@ static void yz_nr_d3d_timeline_release(void*)
 
 static int yz_nr_d3d_timeline_flush(void*)
 {
-    return rsx_live_draw_timeline_flush();
+    return g_active.strict_full_native
+        ? rsx_live_draw_timeline_flush_full_native()
+        : rsx_live_draw_timeline_flush();
 }
 
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
@@ -979,16 +984,16 @@ static void yz_nr_active_ensure_graphics(void)
             InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
-    if (!g_active.strict_full_native) {
-        if (rsx_nr_d3d12_set_shared_timeline(
-                d3d12, yz_nr_d3d_timeline_acquire,
-                yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
-                nullptr) != 0) {
-            rsx_nr_d3d12_destroy(d3d12);
-            return;
-        }
-        InterlockedExchange(&g_active.shared_timeline, 1);
+    if (rsx_nr_d3d12_set_shared_timeline(
+            d3d12, yz_nr_d3d_timeline_acquire,
+            yz_nr_d3d_timeline_release, yz_nr_d3d_timeline_flush,
+            nullptr) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
     }
+    InterlockedExchange(&g_active.shared_timeline, 1);
     for (uint32_t i = 0; i < 8u; ++i) {
         const yz_nr_vertical_display* const display = &g_active.displays[i];
         if (display->valid)

@@ -161,10 +161,16 @@ void rsx_live_draw_free_cached_pso(void* data);
 int rsx_live_draw_timeline_acquire(
     void** command_list, u64* generation, u64* recording_fence,
     u64* completed_fence);
+int rsx_live_draw_timeline_acquire_full_native(
+    void** command_list, u64* generation, u64* recording_fence,
+    u64* completed_fence);
 void rsx_live_draw_timeline_release(void);
 int rsx_live_draw_timeline_flush(void);
+int rsx_live_draw_timeline_flush_full_native(void);
 int rsx_live_draw_present_shared(void* texture, u32 dxgi_format,
                                  u32 width, u32 height, u32 buffer_id);
+int rsx_live_draw_present_shared_full_native(
+    void* texture, u32 dxgi_format, u32 width, u32 height, u32 buffer_id);
 
 /* Shared-resource broker for the vertical renderer. Returned resources carry
  * one COM reference owned by the caller and are left in RENDER_TARGET or

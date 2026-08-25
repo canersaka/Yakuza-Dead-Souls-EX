@@ -72,9 +72,16 @@ int rsx_live_draw_present_external(void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 int rsx_live_draw_timeline_acquire(void** l, u64* g, u64* r, u64* c)
 { (void)l; (void)g; (void)r; (void)c; return -1; }
+int rsx_live_draw_timeline_acquire_full_native(
+    void** l, u64* g, u64* r, u64* c)
+{ (void)l; (void)g; (void)r; (void)c; return -1; }
 void rsx_live_draw_timeline_release(void) {}
 int rsx_live_draw_timeline_flush(void) { return -1; }
+int rsx_live_draw_timeline_flush_full_native(void) { return -1; }
 int rsx_live_draw_present_shared(void* t, u32 f, u32 w, u32 h, u32 b)
+{ (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
+int rsx_live_draw_present_shared_full_native(
+    void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
@@ -8172,9 +8179,10 @@ void* rsx_live_draw_get_d3d12_device(void)
     return g.ready ? g.dev : NULL;
 }
 
-int rsx_live_draw_timeline_acquire(void** command_list, u64* generation,
-                                   u64* recording_fence,
-                                   u64* completed_fence)
+static int ld_timeline_acquire_impl(void** command_list, u64* generation,
+                                    u64* recording_fence,
+                                    u64* completed_fence,
+                                    int allow_movie)
 {
     if (!command_list || !generation || !recording_fence ||
         !completed_fence || g_ld_timeline_lease)
@@ -8185,7 +8193,7 @@ int rsx_live_draw_timeline_acquire(void** command_list, u64* generation,
             while (g_ld_host_waiting)
                 SwitchToThread();
             AcquireSRWLockExclusive(&g_ld_access_lock);
-            if (!g.ready || g_ld_movie_mode) {
+            if (!g.ready || (g_ld_movie_mode && !allow_movie)) {
                 ReleaseSRWLockExclusive(&g_ld_access_lock);
                 return -1;
             }
@@ -8211,6 +8219,26 @@ int rsx_live_draw_timeline_acquire(void** command_list, u64* generation,
     return 0;
 }
 
+int rsx_live_draw_timeline_acquire(void** command_list, u64* generation,
+                                   u64* recording_fence,
+                                   u64* completed_fence)
+{
+    return ld_timeline_acquire_impl(
+        command_list, generation, recording_fence, completed_fence, 0);
+}
+
+int rsx_live_draw_timeline_acquire_full_native(
+    void** command_list, u64* generation, u64* recording_fence,
+    u64* completed_fence)
+{
+    /* Strict full-native has no legacy fallback for transfers and reports
+     * issued while a host movie owns presentation.  Serialize those commands
+     * with the movie producer through the existing access lock; scanout still
+     * remains movie-owned until the ordinary movie handoff completes. */
+    return ld_timeline_acquire_impl(
+        command_list, generation, recording_fence, completed_fence, 1);
+}
+
 void rsx_live_draw_timeline_release(void)
 {
     const int lease = g_ld_timeline_lease;
@@ -8221,12 +8249,13 @@ void rsx_live_draw_timeline_release(void)
         ReleaseSRWLockExclusive(&g_ld_access_lock);
 }
 
-int rsx_live_draw_timeline_flush(void)
+static int ld_timeline_flush_impl(int allow_movie)
 {
     void* list = NULL;
     u64 generation = 0, recording = 0, completed = 0;
-    if (rsx_live_draw_timeline_acquire(
-            &list, &generation, &recording, &completed) != 0)
+    if (ld_timeline_acquire_impl(
+            &list, &generation, &recording, &completed,
+            allow_movie) != 0)
         return -1;
     (void)list;
     (void)recording;
@@ -8235,6 +8264,16 @@ int rsx_live_draw_timeline_flush(void)
     const int result = g.ready && g.list_generation != generation ? 0 : -1;
     rsx_live_draw_timeline_release();
     return result;
+}
+
+int rsx_live_draw_timeline_flush(void)
+{
+    return ld_timeline_flush_impl(0);
+}
+
+int rsx_live_draw_timeline_flush_full_native(void)
+{
+    return ld_timeline_flush_impl(1);
 }
 
 int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
@@ -8464,6 +8503,24 @@ int rsx_live_draw_present_shared(void* texture, u32 format,
     void* list = NULL;
     u64 generation = 0, recording = 0, completed = 0;
     if (rsx_live_draw_timeline_acquire(
+            &list, &generation, &recording, &completed) != 0)
+        return -1;
+    (void)list;
+    (void)generation;
+    (void)recording;
+    (void)completed;
+    const int result = ld_present_external_impl(
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 1);
+    rsx_live_draw_timeline_release();
+    return result;
+}
+
+int rsx_live_draw_present_shared_full_native(
+    void* texture, u32 format, u32 width, u32 height, u32 buffer_id)
+{
+    void* list = NULL;
+    u64 generation = 0, recording = 0, completed = 0;
+    if (rsx_live_draw_timeline_acquire_full_native(
             &list, &generation, &recording, &completed) != 0)
         return -1;
     (void)list;
