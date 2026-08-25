@@ -24,6 +24,7 @@ extern "C" {
 #endif
 
 typedef int (*rsx_nr_frame_read32_fn)(void* user, u32 io, u32* value);
+typedef unsigned long long (*rsx_nr_frame_now_ms_fn)(void* user);
 /* A producer-publication hook for an exact jump-to-self stopper. Returning
  * one means the hook atomically proved and published a forward resume cursor;
  * zero leaves the stopper parked. This is not a generic skip facility. */
@@ -176,6 +177,14 @@ typedef struct rsx_nr_frame_owner {
     u32 flow_wait_put;
     u32 flow_wait_put_polls;
     u32 flow_wait_limit;
+    rsx_nr_frame_now_ms_fn publication_now_ms;
+    void* publication_clock_user;
+    unsigned long long flow_wait_started_ms;
+    unsigned long long flow_wait_cached_ms;
+    unsigned long long flow_wait_next_proof_ms;
+    u32 flow_wait_clock_next_poll;
+    u32 publication_proof_delay_ms;
+    u32 publication_failure_delay_ms;
     u32 repair_attempt_valid;
     u32 repair_attempt_kind;
     u32 repair_attempt_source;
@@ -209,6 +218,14 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* owner,
                              void* resolve_jump_user,
                              rsx_nr_frame_resolve_hole_fn resolve_hole,
                              void* resolve_hole_user);
+
+/* Give publication waits a host wall clock so their proof and failure bounds
+ * do not depend on how quickly one CPU can spin the consumer.  The clock is
+ * sampled only once per fixed poll batch.  A null clock preserves the
+ * deterministic poll-bounded behavior used by standalone/offline callers. */
+void rsx_nr_frame_owner_set_publication_clock(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_now_ms_fn now_ms,
+    void* user, u32 proof_delay_ms, u32 failure_delay_ms);
 
 rsx_nr_frame_step_result rsx_nr_frame_owner_step(
     rsx_nr_frame_owner* owner, u32 get, u32 put, u32 call_return,

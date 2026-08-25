@@ -151,6 +151,42 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
     return resume;
 }
 
+/* Validate the complete captured generated-VP inline data gap.  After one
+ * primary-ring NOOP, EDGE leaves exactly ten producer-owned words (0x28
+ * bytes) before the next generated draw prologue.  The first word can satisfy
+ * the method-header mask by chance, so packet shape is not an ownership
+ * proof.  Admission requires the exact sequential NOOP boundary plus an
+ * independently proven, draw-balanced generated prologue at the fixed end.
+ * Real flow words are never bypassed. */
+static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
+    uint32_t previous_get, uint32_t previous_command,
+    uint32_t gap_word, uint32_t get, uint32_t put, uint32_t fifo_size,
+    int generated_prologue_ready, int balanced_prefix_ready)
+{
+    if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
+        (previous_get & 3u) || previous_get >= fifo_size ||
+        (get & 3u) || get >= fifo_size || put >= fifo_size ||
+        previous_command != 0u ||
+        ((previous_get + 4u) & (fifo_size - 1u)) != get ||
+        generated_prologue_ready == 0 || balanced_prefix_ready == 0)
+        return 0u;
+
+    const int flow =
+        ((gap_word & 0xE0000003u) == 0x20000000u) ||
+        ((gap_word & 3u) == 1u) || ((gap_word & 3u) == 2u) ||
+        ((gap_word & 0xFFFF0003u) == 0x00020000u);
+    if (!gap_word || flow)
+        return 0u;
+
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t resume = (get + 0x28u) & mask;
+    const uint32_t ahead = (put - get) & mask;
+    /* The exact prologue witness reads through resume+0x28 inclusive. */
+    if (!resume || ahead < 0x54u)
+        return 0u;
+    return resume;
+}
+
 /* Validate the EDGE generated-list block-boundary publication shape.  The
  * title links the primary FIFO to the final word of a fixed-size generated
  * block; that word is producer-owned flow storage and can still contain

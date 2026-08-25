@@ -1096,6 +1096,10 @@ static int yz_nr_active_init(int graphics)
         yz_rsx_released_generated_boundary_edge, nullptr,
         yz_rsx_resolve_published_generated_link, nullptr,
         yz_rsx_resolve_published_generated_hole, nullptr);
+    rsx_nr_frame_owner_set_publication_clock(
+        &g_active.frame_owner,
+        [](void*) -> unsigned long long { return GetTickCount64(); },
+        nullptr, 2u, 30000u);
     return 1;
 }
 
