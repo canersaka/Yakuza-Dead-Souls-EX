@@ -52,6 +52,11 @@ void yz_nr_vertical_set_display_buffer(uint32_t buffer_id, uint32_t location,
                                        uint32_t height);
 void yz_nr_vertical_notify_guest_write(uint32_t ea, uint32_t size);
 
+/* Called under the serialized FIFO lock when the host movie presenter takes
+ * or releases graphics ownership. Strict full-native keeps synchronization
+ * live but discards movie-hidden render state/actions exactly once. */
+void yz_nr_vertical_set_movie_mode(int on);
+
 /* Highest-safe imported flip producer. Shadow mode records the typed
  * queue+present contract and returns 0 so the caller emits the legacy packet.
  * active-present may return 1 after publishing an exact-EA typed span; in

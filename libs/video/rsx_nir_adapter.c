@@ -572,6 +572,32 @@ void rsx_nir_adapter_rebind(rsx_nir_adapter* ad)
         ad->rsx.sink.user = ad;
 }
 
+void rsx_nir_adapter_copy_render_state(rsx_nir_adapter* dst,
+                                       const rsx_nir_adapter* src)
+{
+    if (!dst || !src || dst == src)
+        return;
+
+    rsx_dispatch_copy_architectural_state(&dst->rsx, &src->rsx);
+
+    /* Keep dst->em.out: it belongs to the destination ring/stream. */
+    dst->em.shadow = src->em.shadow;
+    dst->em.pending = src->em.pending;
+    memcpy(dst->em.const_dirty, src->em.const_dirty,
+           sizeof(dst->em.const_dirty));
+    memcpy(dst->em.vp_words, src->em.vp_words,
+           sizeof(dst->em.vp_words));
+    dst->em.primed = src->em.primed;
+
+    memcpy(dst->batches, src->batches, sizeof(dst->batches));
+    dst->batch_count = src->batch_count;
+    dst->batch_overflow = src->batch_overflow;
+    dst->draw_indexed = src->draw_indexed;
+    dst->draw_mixed = src->draw_mixed;
+    dst->render_condition = src->render_condition;
+    dst->context_image_open = src->context_image_open;
+}
+
 void rsx_nir_adapter_init_sink(rsx_nir_adapter* ad, const rsx_nir_sink* out)
 {
     memset(ad, 0, sizeof(*ad));

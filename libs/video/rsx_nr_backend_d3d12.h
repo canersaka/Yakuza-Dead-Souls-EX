@@ -90,6 +90,8 @@ typedef int (*rsx_nr_d3d12_timeline_flush_fn)(void* user);
 
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
+    unsigned long long transfer_gpu_readbacks;
+    unsigned long long transfer_gpu_uploads;
     unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long descriptor_table_hits;
     unsigned long long descriptor_table_builds;
