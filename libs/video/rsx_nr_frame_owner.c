@@ -752,6 +752,15 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
             return frame_wait_for_flow_target(
                 o, get, put, call_return, command, get, command);
         if (!frame_read(o, target, &target_word)) {
+            /* Raw generated-program tail data can alias an absolute CALL to
+             * an unmapped address. As with an unmapped JUMP-shaped payload,
+             * only the delayed exact producer-boundary oracle may advance it;
+             * genuine mapped CALLs and called-list nesting remain strict. */
+            if (get < NR_FRAME_RING_SIZE &&
+                frame_try_resolve_generated_hole(
+                    o, get, put, call_return, command, next_get))
+                return frame_control_advance(
+                    o, get, put, call_return, command);
             if (call_return == ~0u && get < NR_FRAME_RING_SIZE)
                 return frame_wait_for_flow_target(
                     o, get, put, call_return, command, get, command);

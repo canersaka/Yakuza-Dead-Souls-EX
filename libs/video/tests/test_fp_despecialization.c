@@ -278,7 +278,7 @@ int main(void)
         const u32 vertex_block = 8448u;
         const u32 vertex_capacity = vertex_block * 4096u;
         u32 vertex_offset = 99u;
-        if (rsx_vertex_constant_ring_plan(
+    if (rsx_vertex_constant_ring_plan(
                 vertex_block * 4095u, vertex_capacity,
                 vertex_block, &vertex_offset) != 1 ||
             vertex_offset != vertex_block * 4095u ||
@@ -293,6 +293,59 @@ int main(void)
                 &vertex_offset) != -1) {
             printf("[FAIL] vertex constant-ring 4097th-draw recycle\n");
             return 12;
+        }
+    }
+
+    /* Opcode bit 6 lives in SRC1 bit 31. RET is a top-level predicated early
+     * return, not DP3 with a generic "branch" modifier. Flow-control fields
+     * also must not be mistaken for a trailing inline-CONST payload. */
+    {
+        u8 ret_program[48] = {0};
+        put_word(ret_program + 0u,
+                 OPC(0x01) | OUTMASK_ALL | (1u << 7));
+        put_word(ret_program + 4u, T_CONST | SWZ_IDENT | UNCOND);
+        put_float(ret_program + 16u, 0.25f);
+        put_float(ret_program + 20u, 0.5f);
+        put_float(ret_program + 24u, 0.75f);
+        put_float(ret_program + 28u, 1.0f);
+
+        u8 ret_tail[16] = {0};
+        put_word(ret_tail + 0u, OPC(0x05) | (1u << 30) | END);
+        put_word(ret_tail + 4u,
+                 (1u << 18) | (1u << 31)); /* LT against cc1.xxxx */
+        put_word(ret_tail + 8u,
+                 (1u << 31) | T_CONST);    /* opcode_hi plus alias bits */
+        memcpy(ret_program + 32u, ret_tail, sizeof(ret_tail));
+
+        rsx_fp_constant_block ret_constants;
+        u32 ret_slots = 99u;
+        if (rsx_fp_program_size(ret_program, sizeof(ret_program)) != 48u ||
+            rsx_fp_collect_constants(
+                ret_program, sizeof(ret_program), &ret_constants) != 1 ||
+            rsx_fp_decompile_buffered_ex(
+                ret_program, sizeof(ret_program), 0u, 0u,
+                hlsl_first, sizeof(hlsl_first), &ret_slots) != 2 ||
+            ret_slots != 1u ||
+            !strstr(hlsl_first,
+                    "if (any(cc1.xxxx < (float4)0)) return h[0];") ||
+            strstr(hlsl_first, "unsupported flow-control")) {
+            printf("[FAIL] predicated RET lowering/program walk\n");
+            return 13;
+        }
+
+        /* A single RET with source-alias CONST bits is exactly 16 bytes and
+         * has no literal payload. */
+        put_word(ret_tail + 4u, UNCOND | T_CONST);
+        if (rsx_fp_program_size(ret_tail, sizeof(ret_tail)) != 16u ||
+            rsx_fp_collect_constants(
+                ret_tail, sizeof(ret_tail), &ret_constants) != 0 ||
+            rsx_fp_decompile_buffered_ex(
+                ret_tail, sizeof(ret_tail), 0x40u, 0u,
+                hlsl_first, sizeof(hlsl_first), &ret_slots) != 1 ||
+            ret_slots != 0u ||
+            !strstr(hlsl_first, "return r[0];")) {
+            printf("[FAIL] unconditional RET flow fields consumed data\n");
+            return 14;
         }
     }
 

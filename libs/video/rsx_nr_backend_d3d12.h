@@ -148,6 +148,52 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long texture_hits;         /* unchanged cached resources */
     unsigned long long texture_refreshes;    /* dirty guest resource rebuilt */
     unsigned long long texture_failures;     /* exact texture refusal      */
+    /* First exact execution-time texture refusal. Populated only on failure,
+     * so the clean path pays no diagnostic timing or I/O. Stage:
+     * 1=disabled, 2=color self-alias, 3=depth self-alias,
+     * 4=private-depth resolve, 5=guest texture resolve,
+     * 6=vertex texture resolve, 7=descriptor capacity, 8=cube mismatch,
+     * 9=rollover retire/open. */
+    unsigned int first_texture_failure_stage;
+    unsigned int first_texture_failure_unit;
+    int first_texture_failure_result;
+    unsigned int first_texture_failure_mask;
+    unsigned int first_texture_failure_location;
+    unsigned int first_texture_failure_offset;
+    unsigned int first_texture_failure_format;
+    unsigned int first_texture_failure_width;
+    unsigned int first_texture_failure_height;
+    unsigned int first_texture_failure_pitch;
+    unsigned int first_texture_failure_mipmaps;
+    unsigned int first_texture_failure_cubemap;
+    unsigned int first_texture_cache_count;
+    unsigned long long first_texture_cache_table_full;
+    unsigned long long first_texture_cache_arena_exhausted;
+    /* First exact execution-time fragment-program refusal. Populated only
+     * on the failure branch; accepted draws pay no diagnostic clock, copy,
+     * allocation, or I/O. Stage: 1=resolve/read failure, 2=unsupported
+     * instruction/modifier. Reason bits: 1=opcode, 2=source modifier. */
+    unsigned int first_fp_failure_stage;
+    int first_fp_failure_result;
+    unsigned int first_fp_failure_location;
+    unsigned int first_fp_failure_offset;
+    unsigned int first_fp_failure_control;
+    unsigned int first_fp_failure_size;
+    unsigned int first_fp_failure_texture_mask;
+    unsigned int first_fp_failure_unsupported_count;
+    unsigned int first_fp_failure_instruction_offset;
+    unsigned int first_fp_failure_opcode;
+    unsigned int first_fp_failure_reason;
+    unsigned long long first_fp_failure_structural_hash;
+    unsigned long long first_fp_failure_byte_hash;
+    unsigned int first_fp_failure_words[16];
+    unsigned int texture_cache_count;
+    unsigned int texture_cache_capacity;
+    unsigned long long texture_cache_table_full;
+    unsigned long long texture_cache_arena_exhausted;
+    unsigned int pso_cache_count;
+    unsigned int pso_cache_capacity;
+    unsigned long long pso_cache_table_full;
     unsigned long long rt_alias_binds;       /* current native RT sampled  */
     unsigned long long compile_failures;
     unsigned long long rt_builds;

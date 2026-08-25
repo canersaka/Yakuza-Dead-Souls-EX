@@ -180,6 +180,23 @@ static void write_test_fp(void)
     put_fp_word(p + 12, 0);
 }
 
+static void write_ret_fp(void)
+{
+    /* MOV r0, COL0; RET; END. Opcode bit 6 is SRC1 bit 31, so the
+     * second instruction's full opcode is 0x45 rather than DP3. */
+    u8* p = g_local + FP_OFFSET;
+    put_fp_word(p + 0, (0x01u << 24) | (0xFu << 9) | (1u << 13));
+    put_fp_word(p + 4, 1u | ((0u << 9) | (1u << 11) |
+                             (2u << 13) | (3u << 15)) |
+                              (7u << 18));
+    put_fp_word(p + 8, 0);
+    put_fp_word(p + 12, 0);
+    put_fp_word(p + 16, (0x05u << 24) | (1u << 30) | 1u);
+    put_fp_word(p + 20, 7u << 18);
+    put_fp_word(p + 24, 1u << 31);
+    put_fp_word(p + 28, 0);
+}
+
 static void write_const_fp(float r, float g, float b, float a)
 {
     u8* p = g_local + FP_OFFSET;
@@ -4019,12 +4036,72 @@ int main(int argc, char** argv)
               "long section did not retire its full upload arena");
     }
 
+    /* ---- top-level fragment RET ---------------------------------------
+     * The live Frontier shader uses the opcode-hi form 0x45. It must reach
+     * the compiler and execute as an early return, not be refused as a
+     * generic branch bit or decoded as DP3. */
+    {
+        rsx_nr_d3d12_stats before_ret, after_ret;
+        rsx_nr_d3d12_get_stats(sink, &before_ret);
+        write_ret_fp();
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+        rsx_nr_backend_run(&be, 0u);
+        rsx_nr_d3d12_get_stats(sink, &after_ret);
+        CHECK(after_ret.draws == before_ret.draws + 1u &&
+                  after_ret.unsupported_draws ==
+                      before_ret.unsupported_draws &&
+                  after_ret.compile_failures == before_ret.compile_failures,
+              "top-level RET did not execute natively");
+        write_test_fp();
+    }
+
+    /* ---- first exact fragment-program refusal identity ----------------
+     * Failure-only diagnostics must preserve the exact unsupported word and
+     * remain absent from the accepted draw path. */
+    {
+        rsx_nr_d3d12_stats before_fp_failure, after_fp_failure;
+        rsx_nr_d3d12_get_stats(sink, &before_fp_failure);
+        u8* const p = g_local + FP_OFFSET;
+        put_fp_word(p + 0u, (0x07u << 24) | (0xFu << 9) | 1u);
+        put_fp_word(p + 4u, 1u | ((0u << 9) | (1u << 11) |
+                                  (2u << 13) | (3u << 15)) |
+                                   (7u << 18));
+        put_fp_word(p + 8u, 0u);
+        put_fp_word(p + 12u, 0u);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+        rsx_nr_backend_run(&be, 0u);
+        rsx_nr_d3d12_get_stats(sink, &after_fp_failure);
+        CHECK(after_fp_failure.unsupported_draws ==
+                  before_fp_failure.unsupported_draws + 1u &&
+              after_fp_failure.unsup_draw_fp ==
+                  before_fp_failure.unsup_draw_fp + 1u,
+              "unsupported FP was not classified exactly");
+        CHECK(after_fp_failure.first_fp_failure_stage == 2u &&
+                  after_fp_failure.first_fp_failure_result == 0 &&
+                  after_fp_failure.first_fp_failure_location == 0u &&
+                  after_fp_failure.first_fp_failure_offset == FP_OFFSET &&
+                  after_fp_failure.first_fp_failure_size == 16u &&
+                  after_fp_failure.first_fp_failure_unsupported_count == 1u &&
+                  after_fp_failure.first_fp_failure_instruction_offset == 0u &&
+                  after_fp_failure.first_fp_failure_opcode == 0x07u &&
+                  after_fp_failure.first_fp_failure_reason == 1u &&
+                  after_fp_failure.first_fp_failure_words[0] ==
+                      ((0x07u << 24) | (0xFu << 9) | 1u) &&
+                  after_fp_failure.first_fp_failure_byte_hash != 0u,
+              "first FP refusal identity was incomplete");
+        write_test_fp();
+    }
+
     /* ---- sink accounting ----------------------------------------------- */
     rsx_nr_d3d12_stats st;
     rsx_nr_d3d12_get_stats(sink, &st);
+    CHECK(st.texture_cache_capacity == 8192u &&
+              st.pso_cache_capacity == 16384u,
+          "production cache capacities texture=%u pso=%u",
+          st.texture_cache_capacity, st.pso_cache_capacity);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 31 && st.draws == 4642 && st.presents == 25,
+    CHECK(st.clears == 31 && st.draws == 4643 && st.presents == 25,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -4034,8 +4111,8 @@ int main(int argc, char** argv)
           "draw/clear actions were not submission-batched (%llu submissions "
           "for %llu actions)", st.queue_submissions,
           st.clears + st.draws + st.presents);
-    CHECK(st.unsupported_draws == 1 && st.unsup_draw_index == 1 &&
-              st.compile_failures == 0,
+    CHECK(st.unsupported_draws == 2 && st.unsup_draw_index == 1 &&
+              st.unsup_draw_fp == 1 && st.compile_failures == 0,
           "unsupported=%llu compile_failures=%llu", st.unsupported_draws,
           st.compile_failures);
     CHECK(st.pso_builds >= 1 && st.pso_hits >= 1,

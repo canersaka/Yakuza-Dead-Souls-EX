@@ -3,6 +3,32 @@
 
 #include <stdint.h>
 
+/* The default FIFO's reserved segment-zero head has one process-lifetime
+ * startup guard.  PUT may release that guard exactly once; after the ring is
+ * recycled, a self-jump at the same address belongs to the ordinary producer
+ * journal and cannot be advanced from PUT alone. */
+static inline uint32_t yz_fifo_startup_head_release_resume(
+    uint32_t get, uint32_t put, uint32_t command,
+    uint32_t fifo_size, uint32_t segment_size,
+    int already_released)
+{
+    if (already_released || !fifo_size ||
+        (fifo_size & (fifo_size - 1u)) != 0u ||
+        !segment_size || (segment_size & 3u) != 0u ||
+        segment_size > fifo_size || get >= fifo_size || put >= fifo_size)
+        return 0u;
+
+    const uint32_t segment = get / segment_size;
+    const uint32_t segment_head =
+        segment * segment_size + (segment == 0u ? 0x1000u : 0u);
+    const uint32_t ahead = (put - get) & (fifo_size - 1u);
+    if (segment != 0u || get != segment_head ||
+        command != (0x20000000u | get) ||
+        ahead <= 4u || ahead >= (fifo_size >> 1))
+        return 0u;
+    return (get + 4u) & (fifo_size - 1u);
+}
+
 /* Validate a producer-recorded inline data-island edge without inspecting or
  * guessing through the island payload.  A nonzero result is the ring offset
  * of data_end_ea; zero means the record is not safe for publication repair. */
@@ -106,6 +132,39 @@ static inline uint32_t yz_fifo_registered_inline_island_member_resume(
     return remaining && ahead && remaining < ahead ? resume : 0u;
 }
 
+/* Recover an owner that has advanced beyond the exact payload start because
+ * one or more raw payload words happened to decode as supported commands.
+ * This is still producer-record based, not a byte-pattern skip: the complete
+ * source/JUMP/end triple supplies the allocation interval, and the caller
+ * revalidates its generation, source word, current member word, and PUT after
+ * a barrier.  Keep this separate from the fast exact-start query above so
+ * ordinary FIFO traffic never scans for an owning interval. */
+static inline uint32_t yz_fifo_registered_inline_island_interior_resume(
+    uint32_t source_ea, uint32_t expected_command, uint32_t data_end_ea,
+    uint32_t member_get, uint32_t put,
+    uint32_t fifo_base, uint32_t fifo_size)
+{
+    if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
+        source_ea < fifo_base || source_ea >= fifo_base + fifo_size)
+        return 0u;
+
+    const uint32_t source_get = source_ea - fifo_base;
+    const uint32_t resume = yz_fifo_registered_inline_island_resume(
+        source_ea, expected_command, data_end_ea, source_get, put,
+        fifo_base, fifo_size);
+    if (!resume)
+        return 0u;
+
+    const uint32_t target = expected_command & 0x1FFFFFFCu;
+    if (member_get < target || member_get >= resume)
+        return 0u;
+
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t remaining = (resume - member_get) & mask;
+    const uint32_t ahead = (put - member_get) & mask;
+    return remaining && ahead && remaining < ahead ? resume : 0u;
+}
+
 /* Validate the title's exact generated VP-constant packet boundary.  The
  * producer emits one incrementing SET_TRANSFORM_CONSTANT_LOAD packet with a
  * load slot plus four float4 constants (17 arguments total), aligns the next
@@ -151,10 +210,43 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
     return resume;
 }
 
+/* Validate the exact generated vertex-program upload tail seen on the
+ * Frontier transition. The producer emits a run of 32-word incrementing
+ * SET_TRANSFORM_PROGRAM packets (0x00800B80), leaves one final three-word
+ * instruction/data fragment, then publishes SET_BEGIN_END(0). The fragment
+ * is not FIFO: its first word can alias an absolute CALL by chance.
+ *
+ * Admission therefore requires the owner's exact preceding packet boundary,
+ * at least four independently reread consecutive upload packets, an unmapped
+ * CALL-shaped first data word, the exact draw-end pair, and PUT covering the
+ * whole pair. The caller repeats every witness after a barrier. */
+static inline uint32_t yz_fifo_generated_vp_program_tail_resume(
+    uint32_t previous_get, uint32_t previous_command,
+    uint32_t tail_word, uint32_t get, uint32_t put, uint32_t fifo_size,
+    uint32_t consecutive_program_packets,
+    uint32_t end_command, uint32_t end_argument)
+{
+    if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
+        (previous_get & 3u) || previous_get >= fifo_size ||
+        (get & 3u) || get >= fifo_size || put >= fifo_size ||
+        previous_command != 0x00800B80u ||
+        ((previous_get + 0x84u) & (fifo_size - 1u)) != get ||
+        consecutive_program_packets < 4u ||
+        (tail_word & 3u) != 2u ||
+        (tail_word & 0x1FFFFFFCu) < fifo_size ||
+        end_command != 0x00041808u || end_argument != 0u)
+        return 0u;
+
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t resume = (get + 0x0Cu) & mask;
+    const uint32_t ahead = (put - get) & mask;
+    return resume && ahead >= 0x14u ? resume : 0u;
+}
+
 /* Validate a complete generated-VP inline data gap.  EDGE leaves one primary
  * ring NOOP immediately before a bounded producer-owned payload, followed by
  * the next exact generated draw prologue.  The payload length varies with the
- * vertex program (the captured legal spans are 0x28 and 0x38 bytes), and its
+ * vertex program (captured legal spans are 0x28, 0x38, and 0x100 bytes), and its
  * words can satisfy the method-header mask by chance.  Packet shape is never
  * an ownership proof: admission requires the exact sequential NOOP boundary,
  * the first independently identified prologue within max_gap, and a complete
@@ -193,6 +285,50 @@ static inline uint32_t yz_fifo_generated_vp_inline_candidate_resume(
     const uint32_t distance = (candidate - get) & mask;
     const uint32_t ahead = (put - get) & mask;
     /* The exact prologue witness reads through candidate+0x28 inclusive. */
+    if (!candidate || distance < 4u || distance > max_gap ||
+        ahead < distance + 0x2Cu)
+        return 0u;
+    return candidate;
+}
+
+/* Validate the larger generated-VP payload captured immediately after a
+ * complete SET_BEGIN_END(0) packet.  The producer places the program bytes
+ * after the draw-end pair and resumes at the next independently recognizable
+ * generated draw prologue.  Some program words alias unmapped JUMPs/CALLs;
+ * they are data only when the complete producer boundary below agrees.
+ *
+ * This is deliberately distinct from the NOOP-owned inline-gap family.  A
+ * genuine mapped flow target is never bypassed, and the caller must re-read
+ * the end packet, raw word, candidate prologue, balanced prefix and PUT after
+ * a barrier before applying the result. */
+static inline uint32_t yz_fifo_generated_vp_post_draw_candidate_resume(
+    uint32_t previous_get, uint32_t previous_command,
+    uint32_t previous_argument, uint32_t gap_word,
+    uint32_t get, uint32_t put, uint32_t candidate,
+    uint32_t fifo_size, uint32_t max_gap,
+    int flow_word_unmapped,
+    int generated_prologue_ready, int balanced_prefix_ready)
+{
+    if (!fifo_size || (fifo_size & (fifo_size - 1u)) != 0u ||
+        (previous_get & 3u) || previous_get >= fifo_size ||
+        (get & 3u) || get >= fifo_size || put >= fifo_size ||
+        (candidate & 3u) || candidate >= fifo_size ||
+        !max_gap || max_gap >= (fifo_size >> 1) ||
+        previous_command != 0x00041808u || previous_argument != 0u ||
+        ((previous_get + 8u) & (fifo_size - 1u)) != get ||
+        generated_prologue_ready == 0 || balanced_prefix_ready == 0)
+        return 0u;
+
+    const int flow =
+        ((gap_word & 0xE0000003u) == 0x20000000u) ||
+        ((gap_word & 3u) == 1u) || ((gap_word & 3u) == 2u) ||
+        ((gap_word & 0xFFFF0003u) == 0x00020000u);
+    if (!gap_word || (flow && !flow_word_unmapped))
+        return 0u;
+
+    const uint32_t mask = fifo_size - 1u;
+    const uint32_t distance = (candidate - get) & mask;
+    const uint32_t ahead = (put - get) & mask;
     if (!candidate || distance < 4u || distance > max_gap ||
         ahead < distance + 0x2Cu)
         return 0u;

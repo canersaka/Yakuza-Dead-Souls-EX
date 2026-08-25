@@ -482,6 +482,45 @@ static uint32_t yz_a010_data_island_end(uint32_t source_ea)
         ? data_end_ea : 0u;
 }
 
+/* Delayed strict-owner recovery only: locate the exact producer record whose
+ * bounded allocation contains member_get.  Ordinary command consumption uses
+ * the O(1) exact-edge query and never enters this bounded backward lookup. */
+static int yz_a010_data_island_containing_snapshot(
+    uint32_t member_get, uint32_t put,
+    uint32_t* source_ea_out, uint32_t* command_out,
+    uint32_t* data_end_ea_out, uint32_t* generation_out,
+    uint32_t* resume_out)
+{
+    if (!source_ea_out || !command_out || !data_end_ea_out ||
+        !generation_out || !resume_out || member_get >= 0x800000u)
+        return 0;
+    const uint32_t member_ea = 0x40400000u + member_get;
+    const uint32_t max_back = member_get < 0x10000u
+        ? member_get : 0x10000u;
+    for (uint32_t delta = 4u; delta <= max_back; delta += 4u) {
+        const uint32_t source_ea = member_ea - delta;
+        uint32_t command = 0u;
+        uint32_t data_end_ea = 0u;
+        uint32_t generation = 0u;
+        if (!yz_a010_data_island_snapshot(
+                source_ea, &command, &data_end_ea, &generation))
+            continue;
+        const uint32_t resume =
+            yz_fifo_registered_inline_island_interior_resume(
+                source_ea, command, data_end_ea, member_get, put,
+                0x40400000u, 0x800000u);
+        if (!resume)
+            continue;
+        *source_ea_out = source_ea;
+        *command_out = command;
+        *data_end_ea_out = data_end_ea;
+        *generation_out = generation;
+        *resume_out = resume;
+        return 1;
+    }
+    return 0;
+}
+
 static yz_a010_stoplife* yz_a010_stoplife_find(uint32_t ea, int create)
 {
     uint32_t slot = ((ea >> 2) * 2654435761u) &
@@ -6702,6 +6741,8 @@ extern "C" volatile long g_yz_t1_sample_seq;
 extern "C" volatile void* g_yz_t1_last_tf;   /* s25 spin-witness feed (dispatch.cpp) */
 extern "C" volatile uint32_t g_yz_jrnl_cur_ea;  /* s34 live journal-consumer cursor EA (spu_channels.c / spu_dma.h) */
 
+static volatile LONG g_yz_startup_segment_head_released = 0;
+
 /* The default FIFO buffer starts behind one deliberately published
  * jump-to-self guard.  It is the only self-stopper the consumer may release
  * from PUT alone: segment zero, its reserved 0x1000 head, and a stable PUT
@@ -6715,13 +6756,17 @@ extern "C" int yz_rsx_try_release_published_segment_head(
     if (!resume_get || !g_yz_gcm_segment_bytes)
         return 0;
     const uint32_t ring = 0x800000u;
-    const uint32_t segment = get / g_yz_gcm_segment_bytes;
-    const uint32_t segment_head =
-        segment * g_yz_gcm_segment_bytes +
-        (segment == 0u ? 0x1000u : 0u);
-    const uint32_t ahead = (put - get + ring) & (ring - 1u);
-    if (segment != 0u || get != segment_head || ahead <= 4u ||
-        ahead >= (ring >> 1))
+#if defined(YZ_PERF_CLEAN)
+    const int already_released =
+        ReadAcquire(&g_yz_startup_segment_head_released) != 0;
+#else
+    const int already_released = InterlockedCompareExchange(
+        &g_yz_startup_segment_head_released, 0, 0) != 0;
+#endif
+    const uint32_t resume = yz_fifo_startup_head_release_resume(
+        get, put, command, ring, g_yz_gcm_segment_bytes,
+        already_released);
+    if (!resume)
         return 0;
     const uint32_t ea = yz_rsx_io_to_ea(get);
     if (!ea)
@@ -6730,7 +6775,19 @@ extern "C" int yz_rsx_try_release_published_segment_head(
     if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
         vm_read32(ea) != command)
         return 0;
-    const uint32_t resume = (get + 4u) & (ring - 1u);
+    /* Claim the one process-lifetime release before changing the word.  A
+     * failed post-claim recheck gives the claim back; once the startup guard
+     * is patched, every later self-jump at 0x1000 is a recycled producer
+     * stopper and stays under the journal/SPU publication protocol. */
+    if (InterlockedCompareExchange(
+            &g_yz_startup_segment_head_released, 1, 0) != 0)
+        return 0;
+    MemoryBarrier();
+    if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) != put ||
+        vm_read32(ea) != command) {
+        InterlockedExchange(&g_yz_startup_segment_head_released, 0);
+        return 0;
+    }
     vm_write32(ea, 0x20000000u | resume);
     *resume_get = resume;
     return 1;
@@ -6988,6 +7045,41 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     if (!hole_ea || vm_read32(hole_ea) != word)
         return 0;
 
+    /* If a late-published allocator edge let the consumer enter beyond the
+     * payload's first word, recover only from the allocator's exact immutable
+     * source/JUMP/end generation.  This avoids interpreting additional raw
+     * shader/constant words and does not turn the broader structural scanners
+     * below into interval guesses. */
+    uint32_t island_source_ea = 0u;
+    uint32_t island_command = 0u;
+    uint32_t island_end_ea = 0u;
+    uint32_t island_generation = 0u;
+    uint32_t island_resume = 0u;
+    if (yz_a010_data_island_containing_snapshot(
+            get, put, &island_source_ea, &island_command,
+            &island_end_ea, &island_generation, &island_resume)) {
+        MemoryBarrier();
+        uint32_t recheck_command = 0u;
+        uint32_t recheck_end = 0u;
+        uint32_t recheck_generation = 0u;
+        if (vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(hole_ea) == word &&
+            vm_read32(island_source_ea) == island_command &&
+            yz_a010_data_island_snapshot(
+                island_source_ea, &recheck_command, &recheck_end,
+                &recheck_generation) &&
+            recheck_command == island_command &&
+            recheck_end == island_end_ea &&
+            recheck_generation == island_generation &&
+            yz_fifo_registered_inline_island_interior_resume(
+                island_source_ea, island_command, island_end_ea,
+                get, put, 0x40400000u, 0x800000u) == island_resume) {
+            *resume_get = island_resume;
+            return 1;
+        }
+        return -1;
+    }
+
     /* Protocol-wide EDGE generated-block boundary.  Do this only from the
      * owner's unsupported/malformed-word path: supported methods which happen
      * to occupy the same 128 KiB alignment are ordinary commands and never
@@ -7033,14 +7125,84 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     if (block_boundary && !block_exact)
         return -1;
 
+    /* Orphanage/startup generated-VP family: a complete BEGIN_END(0) packet
+     * is followed by a bounded raw program and then the next exact generated
+     * draw prologue.  This was previously handled only by the Akiyama-gated
+     * broad prefix search, making startup success timing-dependent.  Admit it
+     * from the complete local producer boundary instead. */
+    const uint32_t post_draw_max_gap = 0x300u;
+    const uint32_t post_draw_scan_start = (get + 4u) & mask;
+    const uint32_t post_draw_scan_end =
+        (get + post_draw_max_gap + 0x30u) & mask;
+    const uint32_t post_draw_resume = yz_a010_find_generated_prologue(
+        post_draw_scan_start, post_draw_scan_end);
+    const uint32_t post_draw_end =
+        (post_draw_resume + generated_block) & mask;
+    const int post_draw_prologue = post_draw_resume &&
+        yz_a010_generated_prologue_at(post_draw_resume);
+    const int post_draw_balanced = post_draw_prologue &&
+        yz_a010_balanced_generated_prefix_at(
+            post_draw_resume, post_draw_resume, post_draw_end);
+    const int post_draw_flow =
+        ((word & 0xE0000003u) == 0x20000000u) ||
+        ((word & 3u) == 1u) || ((word & 3u) == 2u);
+    const uint32_t post_draw_flow_target = (word & 3u) == 1u
+        ? (word & 0xFFFFFFFCu) : (word & 0x1FFFFFFCu);
+    const int post_draw_flow_unmapped =
+        post_draw_flow && post_draw_flow_target >= ring;
+    const uint32_t previous_argument_ea =
+        previous_get != ~0u ? yz_rsx_io_to_ea((previous_get + 4u) & mask)
+                            : 0u;
+    const uint32_t previous_argument =
+        previous_argument_ea ? vm_read32(previous_argument_ea) : ~0u;
+    const uint32_t post_draw_exact =
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            previous_get, previous_command, previous_argument,
+            word, get, put, post_draw_resume, ring, post_draw_max_gap,
+            post_draw_flow_unmapped,
+            post_draw_prologue, post_draw_balanced);
+    if (post_draw_exact) {
+        const uint32_t previous_ea = yz_rsx_io_to_ea(previous_get);
+        MemoryBarrier();
+        if (previous_ea && previous_argument_ea &&
+            vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(previous_ea) == previous_command &&
+            vm_read32(previous_argument_ea) == previous_argument &&
+            vm_read32(hole_ea) == word &&
+            yz_a010_find_generated_prologue(
+                post_draw_scan_start, post_draw_scan_end) ==
+                post_draw_exact &&
+            yz_fifo_generated_vp_post_draw_candidate_resume(
+                previous_get, vm_read32(previous_ea),
+                vm_read32(previous_argument_ea), vm_read32(hole_ea),
+                get, put, post_draw_exact, ring, post_draw_max_gap,
+                post_draw_flow_unmapped,
+                yz_a010_generated_prologue_at(post_draw_exact),
+                yz_a010_balanced_generated_prefix_at(
+                    post_draw_exact, post_draw_exact, post_draw_end)) ==
+                post_draw_exact) {
+            *resume_get = post_draw_exact;
+            return 1;
+        }
+        return -1;
+    }
+    if (previous_command == 0x00041808u && previous_argument == 0u &&
+        post_draw_flow_unmapped &&
+        (!post_draw_prologue || !post_draw_balanced))
+        return -1;
+
     /* Protocol-wide complete inline generated-VP gap. The owner must have
      * consumed the exact preceding NOOP. Find only the first exact prologue
      * in the producer's bounded 0x100-byte inline window, then prove its
-     * complete draw-balanced chain independently. This covers both captured
-     * legal payload spans (0x28 and 0x38) without executing or interpreting
+     * complete draw-balanced chain independently. This covers all captured
+     * legal payload spans (0x28, 0x38, and 0x100) without executing or interpreting
      * any raw constants between the NOOP and the prologue. */
     const uint32_t inline_scan_start = (get + 4u) & mask;
-    const uint32_t inline_scan_end = (get + 0x104u) & mask;
+    /* Leave the exact 0x2C-byte prologue witness inside the search window
+     * even when the candidate is at the maximum admitted gap. */
+    const uint32_t inline_max_gap = 0x200u;
+    const uint32_t inline_scan_end =
+        (get + inline_max_gap + 0x30u) & mask;
     const uint32_t inline_resume = yz_a010_find_generated_prologue(
         inline_scan_start, inline_scan_end);
     const uint32_t inline_end =
@@ -7060,7 +7222,7 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
     const uint32_t inline_exact =
         yz_fifo_generated_vp_inline_candidate_resume(
             previous_get, previous_command, word, get, put,
-            inline_resume, ring, 0x100u,
+            inline_resume, ring, inline_max_gap,
             inline_flow_unmapped,
             inline_prologue, inline_balanced);
     if (inline_exact) {
@@ -7074,7 +7236,7 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
                 inline_scan_start, inline_scan_end) == inline_exact &&
             yz_fifo_generated_vp_inline_candidate_resume(
                 previous_get, vm_read32(previous_ea), vm_read32(hole_ea),
-                get, put, inline_exact, ring, 0x100u,
+                get, put, inline_exact, ring, inline_max_gap,
                 inline_flow_unmapped,
                 yz_a010_generated_prologue_at(inline_exact),
                 yz_a010_balanced_generated_prefix_at(
@@ -7089,9 +7251,73 @@ extern "C" int yz_rsx_resolve_published_generated_hole(
      * present but its prologue or terminal stopper is still publishing. */
     if (yz_fifo_generated_vp_inline_candidate_resume(
             previous_get, previous_command, word, get, put,
-            (get + 4u) & mask, ring, 0x100u,
+            (get + 4u) & mask, ring, inline_max_gap,
             inline_flow_unmapped, 1, 1) &&
         (!inline_prologue || !inline_balanced))
+        return -1;
+
+    /* Generated vertex-program tail observed at the Frontier transition.
+     * The owner has just consumed the final complete 32-word program packet;
+     * prove a bounded run of identical packet boundaries behind it, then the
+     * exact three-word data fragment and SET_BEGIN_END(0) ahead. This is the
+     * only CALL-shaped payload admission and its encoded target must be
+     * outside the FIFO. */
+    const auto program_packet_run = [&]() -> uint32_t {
+        uint32_t run = 0;
+        uint32_t cursor = previous_get;
+        while (run < 16u) {
+            const uint32_t ea = yz_rsx_io_to_ea(cursor);
+            if (!ea || vm_read32(ea) != 0x00800B80u)
+                break;
+            ++run;
+            cursor = (cursor - 0x84u) & mask;
+        }
+        return run;
+    };
+    const uint32_t program_tail1 = (get + 4u) & mask;
+    const uint32_t program_tail2 = (get + 8u) & mask;
+    const uint32_t program_end = (get + 0x0Cu) & mask;
+    const uint32_t program_end_arg = (get + 0x10u) & mask;
+    const uint32_t program_tail1_ea = yz_rsx_io_to_ea(program_tail1);
+    const uint32_t program_tail2_ea = yz_rsx_io_to_ea(program_tail2);
+    const uint32_t program_end_ea = yz_rsx_io_to_ea(program_end);
+    const uint32_t program_end_arg_ea = yz_rsx_io_to_ea(program_end_arg);
+    const uint32_t program_tail1_word =
+        program_tail1_ea ? vm_read32(program_tail1_ea) : 0u;
+    const uint32_t program_tail2_word =
+        program_tail2_ea ? vm_read32(program_tail2_ea) : 0u;
+    const uint32_t program_end_word =
+        program_end_ea ? vm_read32(program_end_ea) : 0u;
+    const uint32_t program_end_arg_word =
+        program_end_arg_ea ? vm_read32(program_end_arg_ea) : ~0u;
+    const uint32_t program_run = program_packet_run();
+    const uint32_t program_resume =
+        yz_fifo_generated_vp_program_tail_resume(
+            previous_get, previous_command, word, get, put, ring,
+            program_run, program_end_word, program_end_arg_word);
+    if (program_resume) {
+        const uint32_t previous_ea = yz_rsx_io_to_ea(previous_get);
+        MemoryBarrier();
+        if (previous_ea &&
+            vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) == put &&
+            vm_read32(previous_ea) == previous_command &&
+            vm_read32(hole_ea) == word &&
+            vm_read32(program_tail1_ea) == program_tail1_word &&
+            vm_read32(program_tail2_ea) == program_tail2_word &&
+            yz_fifo_generated_vp_program_tail_resume(
+                previous_get, vm_read32(previous_ea), vm_read32(hole_ea),
+                get, put, ring, program_packet_run(),
+                vm_read32(program_end_ea),
+                vm_read32(program_end_arg_ea)) == program_resume) {
+            *resume_get = program_resume;
+            return 1;
+        }
+        return -1;
+    }
+    if (previous_command == 0x00800B80u && program_run >= 4u &&
+        (word & 3u) == 2u && (word & 0x1FFFFFFCu) >= ring &&
+        (!program_end_ea || !program_end_arg_ea ||
+         program_end_word != 0x00041808u || program_end_arg_word != 0u))
         return -1;
 
     /* The captured 0x1278 family is the eight-byte alignment tail after one

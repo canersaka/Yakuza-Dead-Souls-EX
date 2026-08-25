@@ -17,6 +17,27 @@ int main(void)
     const uint32_t base = 0x40400000u;
     const uint32_t size = 0x00800000u;
 
+    failed |= expect("one startup head release",
+        yz_fifo_startup_head_release_resume(
+            0x00001000u, 0x00002000u, 0x20001000u,
+            size, 0x00020000u, 0), 0x00001004u);
+    failed |= expect("recycled startup head remains parked",
+        yz_fifo_startup_head_release_resume(
+            0x00001000u, 0x00002000u, 0x20001000u,
+            size, 0x00020000u, 1), 0u);
+    failed |= expect("startup head wrong command",
+        yz_fifo_startup_head_release_resume(
+            0x00001000u, 0x00002000u, 0x20001004u,
+            size, 0x00020000u, 0), 0u);
+    failed |= expect("startup head unpublished",
+        yz_fifo_startup_head_release_resume(
+            0x00001000u, 0x00001004u, 0x20001000u,
+            size, 0x00020000u, 0), 0u);
+    failed |= expect("nonzero segment head not host-released",
+        yz_fifo_startup_head_release_resume(
+            0x00020000u, 0x00021000u, 0x20020000u,
+            size, 0x00020000u, 0), 0u);
+
     /* Keep the established stopper helper covered independently. */
     failed |= expect("captured island edge",
         yz_fifo_registered_island_resume(
@@ -90,6 +111,22 @@ int main(void)
         yz_fifo_registered_inline_island_member_resume(
             0x40401000u, 0x20001010u, 0x40401930u,
             0x00001010u, 0x00001900u, base, size), 0u);
+    failed |= expect("registered inline interior member",
+        yz_fifo_registered_inline_island_interior_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001480u, 0x00002000u, base, size), 0x00001930u);
+    failed |= expect("registered inline interior before payload",
+        yz_fifo_registered_inline_island_interior_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x0000100Cu, 0x00002000u, base, size), 0u);
+    failed |= expect("registered inline interior at resume",
+        yz_fifo_registered_inline_island_interior_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001930u, 0x00002000u, base, size), 0u);
+    failed |= expect("registered inline interior incomplete PUT",
+        yz_fifo_registered_inline_island_interior_resume(
+            0x40401000u, 0x20001010u, 0x40401930u,
+            0x00001480u, 0x00001800u, base, size), 0u);
 
     /* Captured generated-list boundary: 17-argument VP constant packet at
      * 0x1230, two padding/data words at 0x1278, exact prologue at 0x1280. */
@@ -118,6 +155,32 @@ int main(void)
         yz_fifo_generated_vp_constant_tail_resume(
             0x00441EFCu, 0x3A2AAAABu,
         0x00001278u, 0x000012A8u, size, 1), 0u);
+
+    failed |= expect("generated VP program tail",
+        yz_fifo_generated_vp_program_tail_resume(
+            0x000013B8u, 0x00800B80u, 0xFF00043Eu,
+            0x0000143Cu, 0x00001450u, size, 7u,
+            0x00041808u, 0u), 0x00001448u);
+    failed |= expect("generated VP program tail short run",
+        yz_fifo_generated_vp_program_tail_resume(
+            0x000013B8u, 0x00800B80u, 0xFF00043Eu,
+            0x0000143Cu, 0x00001450u, size, 3u,
+            0x00041808u, 0u), 0u);
+    failed |= expect("generated VP program tail mapped call",
+        yz_fifo_generated_vp_program_tail_resume(
+            0x000013B8u, 0x00800B80u, 0x0001043Eu,
+            0x0000143Cu, 0x00001450u, size, 7u,
+            0x00041808u, 0u), 0u);
+    failed |= expect("generated VP program tail wrong end",
+        yz_fifo_generated_vp_program_tail_resume(
+            0x000013B8u, 0x00800B80u, 0xFF00043Eu,
+            0x0000143Cu, 0x00001450u, size, 7u,
+            0x00041808u, 1u), 0u);
+    failed |= expect("generated VP program tail unpublished end",
+        yz_fifo_generated_vp_program_tail_resume(
+            0x000013B8u, 0x00800B80u, 0xFF00043Eu,
+            0x0000143Cu, 0x0000144Cu, size, 7u,
+            0x00041808u, 0u), 0u);
 
     /* Complete captured gap: NOOP at 0x1254, ten raw words at 0x1258,
      * generated draw prologue at 0x1280. */
@@ -178,6 +241,60 @@ int main(void)
             0x00001244u, 0u, 0x3F000000u,
             0x00001248u, 0x007FFFA0u, 0x00001280u,
             size, 0x100u, 1, 1, 0), 0u);
+
+    /* Frontier leg-2 capture: sequential NOOP at 0x47200C, a full
+     * 0x100-byte producer-owned constant payload, then the exact generated
+     * prologue at 0x472110. The prologue witness itself extends another
+     * 0x2C bytes and must be published. */
+    failed |= expect("generated VP 0x100 inline gap",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x0047200Cu, 0u, 0xBF800347u,
+            0x00472010u, 0x00472180u, 0x00472110u,
+            size, 0x200u, 0, 1, 1), 0x00472110u);
+    failed |= expect("generated VP 0x100 gap incomplete witness",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x0047200Cu, 0u, 0xBF800347u,
+            0x00472010u, 0x00472138u, 0x00472110u,
+            size, 0x200u, 0, 1, 1), 0u);
+    failed |= expect("generated VP 0x100 gap over bounded limit",
+        yz_fifo_generated_vp_inline_candidate_resume(
+            0x0047200Cu, 0u, 0xBF800347u,
+            0x00472010u, 0x00472300u, 0x00472214u,
+            size, 0x200u, 0, 1, 1), 0u);
+
+    /* Orphanage startup capture: complete BEGIN_END(0) at 0x1074/0x1078,
+     * a 0x204-byte vertex-program payload whose first word aliases an
+     * unmapped JUMP, then the exact generated prologue at 0x1280. */
+    failed |= expect("generated VP post-draw payload",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041808u, 0u, 0x2041FFFCu,
+            0x0000107Cu, 0x00001300u, 0x00001280u,
+            size, 0x300u, 1, 1, 1), 0x00001280u);
+    failed |= expect("generated VP post-draw wrong end command",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041814u, 0u, 0x2041FFFCu,
+            0x0000107Cu, 0x00001300u, 0x00001280u,
+            size, 0x300u, 1, 1, 1), 0u);
+    failed |= expect("generated VP post-draw nonzero end argument",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041808u, 5u, 0x2041FFFCu,
+            0x0000107Cu, 0x00001300u, 0x00001280u,
+            size, 0x300u, 1, 1, 1), 0u);
+    failed |= expect("generated VP post-draw mapped flow",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041808u, 0u, 0x20001280u,
+            0x0000107Cu, 0x00001300u, 0x00001280u,
+            size, 0x300u, 0, 1, 1), 0u);
+    failed |= expect("generated VP post-draw missing prologue",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041808u, 0u, 0x2041FFFCu,
+            0x0000107Cu, 0x00001300u, 0x00001280u,
+            size, 0x300u, 1, 0, 1), 0u);
+    failed |= expect("generated VP post-draw incomplete publication",
+        yz_fifo_generated_vp_post_draw_candidate_resume(
+            0x00001074u, 0x00041808u, 0u, 0x2041FFFCu,
+            0x0000107Cu, 0x000012A8u, 0x00001280u,
+            size, 0x300u, 1, 1, 1), 0u);
 
     /* Captured EDGE block boundary: a primary JUMP targets 0x41FFFC, the
      * producer-owned final word of a 128 KiB generated block.  Recycled float
