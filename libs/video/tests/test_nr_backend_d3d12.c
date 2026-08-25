@@ -2296,6 +2296,72 @@ done:
         factory->lpVtbl->Release(factory);
 }
 
+static void test_submit_attribution_gate(void)
+{
+    rsx_nir_pipeline state;
+    memset(&state, 0, sizeof(state));
+    state.surface.color_format = 5u;
+    state.surface.depth_format = 2u;
+    state.surface.raster_type = 1u;
+    state.surface.clip_w = RT_W;
+    state.surface.clip_h = RT_H;
+    state.surface.color_offset[0] = RT_OFFSET;
+    state.surface.color_pitch[0] = RT_W * 4u;
+    state.surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    state.surface.color_target = 1u;
+    state.scissor.w = RT_W;
+    state.scissor.h = RT_H;
+    rsx_nir_clear clear = {0xF0u, 0xFF112233u, 0xFFFFFFu, 0u};
+
+    _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "");
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "default-off attribution sink creation failed");
+    if (sink) {
+        rsx_nr_exec_ops ops;
+        rsx_nr_d3d12_stats stats;
+        memset(&ops, 0, sizeof(ops));
+        rsx_nr_d3d12_get_exec_ops(sink, &ops);
+        CHECK(ops.clear(ops.user, &state, &clear) == 0,
+              "default-off attribution clear failed");
+        ops.flush_reason(ops.user, RSX_NR_FLUSH_REFERENCE);
+        rsx_nr_d3d12_get_stats(sink, &stats);
+        CHECK(stats.submit_attribution_qpc_frequency == 0u &&
+                  stats.submit_cause[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION].submissions ==
+                      0u,
+              "default-off attribution performed clocks/accounting");
+        rsx_nr_d3d12_destroy(sink);
+    }
+
+    _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "1");
+    sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "enabled attribution sink creation failed");
+    if (sink) {
+        rsx_nr_exec_ops ops;
+        rsx_nr_d3d12_stats stats;
+        memset(&ops, 0, sizeof(ops));
+        rsx_nr_d3d12_get_exec_ops(sink, &ops);
+        CHECK(ops.clear(ops.user, &state, &clear) == 0,
+              "enabled attribution clear failed");
+        ops.flush_reason(ops.user, RSX_NR_FLUSH_REFERENCE);
+        rsx_nr_d3d12_get_stats(sink, &stats);
+        CHECK(stats.submit_attribution_qpc_frequency != 0u &&
+                  stats.submit_cause[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION].submissions ==
+                      1u &&
+                  stats.submit_cause[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION].draws == 0u,
+              "enabled reference attribution frequency=%llu submits=%llu",
+              stats.submit_attribution_qpc_frequency,
+              stats.submit_cause[
+                  RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION].submissions);
+        rsx_nr_d3d12_destroy(sink);
+    }
+    _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "");
+}
+
 static void test_private_rt_registry_capacity(void)
 {
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
@@ -4173,6 +4239,7 @@ int main(int argc, char** argv)
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
 
+    test_submit_attribution_gate();
     test_broker_actual_color_format();
     test_shared_timeline();
     test_private_rt_registry_capacity();

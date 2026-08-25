@@ -358,6 +358,9 @@ struct rsx_nr_d3d12 {
     int rgba_targets;
     int scanout_provenance;
     int stall_aggregate;
+    int submit_attribution;
+    u64 submit_retired_draws;
+    u64 submit_retired_batches;
     u32 coherent_vp_options;
     int force_draw_input_refresh;
     int force_draw_input_allocated;
@@ -475,6 +478,56 @@ static void nrb_stall_finish(const rsx_nr_d3d12* b, u64 start,
         return;
     (*count)++;
     *ticks += (u64)now.QuadPart - start;
+}
+
+static u64 nrb_submit_now(const rsx_nr_d3d12* b)
+{
+    LARGE_INTEGER now;
+    if (!b->submit_attribution || !QueryPerformanceCounter(&now))
+        return 0u;
+    return (u64)now.QuadPart;
+}
+
+static void nrb_submit_finish(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_submit_cause cause, u64 start,
+    u32 descriptor_tables, u32 upload_bytes, u64 readback_bytes)
+{
+    LARGE_INTEGER now;
+    if (!b->submit_attribution || cause >= RSX_NR_D3D12_SUBMIT_CAUSE_COUNT ||
+        !start || !QueryPerformanceCounter(&now) ||
+        (u64)now.QuadPart < start)
+        return;
+    rsx_nr_d3d12_submit_cause_stats* const out =
+        &b->stats.submit_cause[cause];
+    out->submissions++;
+    out->cpu_wait_ticks += (u64)now.QuadPart - start;
+    out->draws += b->stats.draws - b->submit_retired_draws;
+    out->draw_batches += b->stats.draw_batches - b->submit_retired_batches;
+    out->descriptor_tables += descriptor_tables;
+    out->upload_bytes += upload_bytes;
+    out->readback_bytes += readback_bytes;
+    b->submit_retired_draws = b->stats.draws;
+    b->submit_retired_batches = b->stats.draw_batches;
+}
+
+static void nrb_submit_transfer_finish(rsx_nr_d3d12* b, u64 start,
+                                       int upload, u64 bytes)
+{
+    LARGE_INTEGER now;
+    if (!b->submit_attribution || !start ||
+        !QueryPerformanceCounter(&now) || (u64)now.QuadPart < start)
+        return;
+    if (upload) {
+        b->stats.submit_transfer_upload_count++;
+        b->stats.submit_transfer_upload_ticks +=
+            (u64)now.QuadPart - start;
+        b->stats.submit_transfer_upload_bytes += bytes;
+    } else {
+        b->stats.submit_transfer_readback_count++;
+        b->stats.submit_transfer_readback_ticks +=
+            (u64)now.QuadPart - start;
+        b->stats.submit_transfer_readback_bytes += bytes;
+    }
 }
 
 static int nrb_wait_idle(rsx_nr_d3d12* b)
@@ -599,10 +652,15 @@ static int nrb_open_list(rsx_nr_d3d12* b)
     return 0;
 }
 
-static int nrb_exec_wait(rsx_nr_d3d12* b)
+static int nrb_exec_wait(rsx_nr_d3d12* b,
+                         rsx_nr_d3d12_submit_cause cause,
+                         u64 readback_bytes)
 {
     if (!b->list_open)
         return 0;
+    const u32 attributed_descriptors = b->descriptor_tables_used;
+    const u32 attributed_upload = b->upload_used;
+    const u64 attribution_start = nrb_submit_now(b);
     const u64 stall_start = nrb_stall_now(b);
     int result = 0;
     if (b->shared_timeline) {
@@ -635,6 +693,8 @@ static int nrb_exec_wait(rsx_nr_d3d12* b)
     nrb_release_retired_textures(b);
     b->stats.queue_submissions++;
 done:
+    nrb_submit_finish(b, cause, attribution_start, attributed_descriptors,
+                      attributed_upload, readback_bytes);
     nrb_stall_finish(b, stall_start,
                      &b->stats.stall_fence_drain_count,
                      &b->stats.stall_fence_drain_ticks);
@@ -644,7 +704,8 @@ done:
 static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b)
 {
     if (b->descriptor_tables_used >= NRB_DRAW_TABLES) {
-        if (nrb_exec_wait(b) || nrb_open_list(b))
+        if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_DESCRIPTOR_RECYCLE, 0u) ||
+            nrb_open_list(b))
             return -1;
     }
     return b->retired_texture_count + NRB_TEX_UNITS <=
@@ -712,7 +773,8 @@ static int nrb_ensure_draw_upload_capacity(rsx_nr_d3d12* b, u64 budget)
         return -1;
     if ((u64)b->upload_used + budget <= NRB_UPLOAD_BYTES)
         return 0;
-    if (nrb_exec_wait(b) || nrb_open_list(b))
+    if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_UPLOAD_ROLLOVER, 0u) ||
+        nrb_open_list(b))
         return -1;
     b->stats.upload_rollovers++;
     return (u64)b->upload_used + budget <= NRB_UPLOAD_BYTES ? 0 : -1;
@@ -830,7 +892,8 @@ static nrb_rt* nrb_get_rt(rsx_nr_d3d12* b, u32 space, u32 offset, u32 fmt,
                      * guest identity stayed constant. Retire every native
                      * reference to the old generation before rebinding its
                      * stable descriptor slot. */
-                    if (nrb_exec_wait(b)) {
+                    if (nrb_exec_wait(
+                            b, RSX_NR_D3D12_SUBMIT_RESOURCE_REFRESH, 0u)) {
                         borrowed->lpVtbl->Release(borrowed);
                         return NULL;
                     }
@@ -1072,7 +1135,8 @@ static nrb_depth* nrb_get_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
                 const int raw_changed = borrowed != depth->tex;
                 const int sample_changed = borrowed_sample != depth->sample_tex;
                 if (raw_changed || sample_changed) {
-                    if (nrb_exec_wait(b)) {
+                    if (nrb_exec_wait(
+                            b, RSX_NR_D3D12_SUBMIT_RESOURCE_REFRESH, 0u)) {
                         borrowed->lpVtbl->Release(borrowed);
                         if (borrowed_sample)
                             borrowed_sample->lpVtbl->Release(borrowed_sample);
@@ -1656,7 +1720,8 @@ static int nrb_stabilize_required_spans(
          * or the producer is actively republishing the page; retire the
          * ordered prefix before retrying with fresh bounded storage. */
         if (attempt & 1u) {
-            if (nrb_exec_wait(b))
+            if (nrb_exec_wait(
+                    b, RSX_NR_D3D12_SUBMIT_RESIDENCY_RETRY, 0u))
                 return -1;
             b->stats.mirror_rollovers++;
         }
@@ -2098,7 +2163,8 @@ static u8* nrb_texture_upload_slice(rsx_nr_d3d12* b, u32 size, u64* offset)
 {
     u32 start = (b->upload_used + 511u) & ~511u;
     if ((u64)start + size > NRB_UPLOAD_BYTES) {
-        if (nrb_exec_wait(b) || nrb_open_list(b))
+        if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_UPLOAD_ROLLOVER, 0u) ||
+            nrb_open_list(b))
             return NULL;
         start = 0;
     }
@@ -5088,7 +5154,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
-        nrb_exec_wait(b);
+        nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_texture++;
         b->stats.texture_failures++;
@@ -5106,7 +5173,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
-        if (nrb_exec_wait(b) || nrb_open_list(b)) {
+        if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_UPLOAD_ROLLOVER, 0u) ||
+            nrb_open_list(b)) {
             nrb_note_first_texture_failure(
                 b, 9u, ~0u, -1, fp.texture_mask, NULL);
             b->stats.unsupported_draws++;
@@ -5136,7 +5204,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
             nrb_restore_texture_aliases(
                 b, texture_aliases, texture_depth_aliases,
                 vtex_aliases, vtex_depth_aliases);
-            nrb_exec_wait(b);
+            nrb_exec_wait(
+                b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
             b->stats.unsupported_draws++;
             b->stats.unsup_draw_texture++;
             b->stats.texture_failures++;
@@ -5231,7 +5300,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
-        nrb_exec_wait(b);
+        nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
         b->stats.unsupported_draws++;
         return -1;
     }
@@ -5309,7 +5379,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
-        nrb_exec_wait(b);
+        nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
         b->stats.unsupported_draws++;
         return -1;
     }
@@ -5347,7 +5418,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
-        nrb_exec_wait(b);
+        nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
         b->stats.unsupported_draws++;
         return -1;
     }
@@ -5551,12 +5623,13 @@ static void nrb_guest_pixel_to_rt(const nrb_rt* rt, const u8 guest[4],
 }
 
 static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
-                                u8* dst, u32 dst_pitch)
+                                 u8* dst, u32 dst_pitch)
 {
     const u32 row_pitch = (rt->w * 4u + 255u) & ~255u;
     const u64 need64 = (u64)row_pitch * rt->h;
     if (!dst || dst_pitch < rt->w * 4u || need64 > UINT32_MAX)
         return -1;
+    const u64 attribution_start = nrb_submit_now(b);
     const u64 stall_start = nrb_stall_now(b);
     const u32 need = (u32)need64;
     if (!b->readback || b->readback_size < need) {
@@ -5588,7 +5661,8 @@ static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     b->list->lpVtbl->CopyTextureRegion(
         b->list, &target, 0u, 0u, 0u, &source, NULL);
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    if (nrb_exec_wait(b))
+    if (nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_TRANSFER_READBACK, need64))
         return -1;
 
     u8* mapped = NULL;
@@ -5612,6 +5686,7 @@ static int nrb_rt_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     nrb_stall_finish(b, stall_start,
                      &b->stats.stall_transfer_readback_count,
                      &b->stats.stall_transfer_readback_ticks);
+    nrb_submit_transfer_finish(b, attribution_start, 0, need64);
     return 0;
 }
 
@@ -5622,6 +5697,7 @@ static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     const u64 need64 = (u64)row_pitch * rt->h;
     if (!src || src_pitch < rt->w * 4u || need64 > UINT32_MAX)
         return -1;
+    const u64 attribution_start = nrb_submit_now(b);
     const u64 stall_start = nrb_stall_now(b);
     u64 upload_offset = 0u;
     u8* const upload = nrb_texture_upload_slice(
@@ -5661,6 +5737,7 @@ static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     nrb_stall_finish(b, stall_start,
                      &b->stats.stall_transfer_upload_count,
                      &b->stats.stall_transfer_upload_ticks);
+    nrb_submit_transfer_finish(b, attribution_start, 1, need64);
     return 0;
 }
 
@@ -5811,15 +5888,27 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
 static int nrb_present(void* user, u32 buffer)
 {
     rsx_nr_d3d12* b = user;
-    if (!b->shared_timeline && nrb_exec_wait(b))
+    if (!b->shared_timeline && nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_PRESENT, 0u))
         return -1;                   /* offscreen: complete the frame      */
     nrb_rt* scanout = nrb_display_rt(b, buffer);
     if (!scanout)
         scanout = b->last_rt;
-    if (b->present_cb && (!scanout || b->present_cb(
-            b->present_user, scanout->tex, (u32)scanout->dxgi,
-            scanout->w, scanout->h, buffer) != 0))
-        return -1;
+    if (b->present_cb) {
+        if (!scanout)
+            return -1;
+        const u32 attributed_descriptors = b->descriptor_tables_used;
+        const u32 attributed_upload = b->upload_used;
+        const u64 attribution_start = nrb_submit_now(b);
+        if (b->present_cb(
+                b->present_user, scanout->tex, (u32)scanout->dxgi,
+                scanout->w, scanout->h, buffer) != 0)
+            return -1;
+        if (b->shared_timeline)
+            nrb_submit_finish(
+                b, RSX_NR_D3D12_SUBMIT_PRESENT, attribution_start,
+                attributed_descriptors, attributed_upload, 0u);
+    }
     if (scanout && b->scanout_provenance)
         scanout->present_count++;
     if (b->shared_timeline) {
@@ -5837,14 +5926,35 @@ static int nrb_present(void* user, u32 buffer)
     return 0;
 }
 
-static void nrb_flush(void* user)
+static rsx_nr_d3d12_submit_cause nrb_publication_cause(u32 reason)
+{
+    switch ((rsx_nr_flush_reason)reason) {
+    case RSX_NR_FLUSH_SEMAPHORE:
+        return RSX_NR_D3D12_SUBMIT_SEMAPHORE_PUBLICATION;
+    case RSX_NR_FLUSH_REFERENCE:
+        return RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION;
+    case RSX_NR_FLUSH_REPORT:
+        return RSX_NR_D3D12_SUBMIT_REPORT_PUBLICATION;
+    case RSX_NR_FLUSH_BARRIER:
+        return RSX_NR_D3D12_SUBMIT_BARRIER_PUBLICATION;
+    default:
+        return RSX_NR_D3D12_SUBMIT_OTHER;
+    }
+}
+
+static void nrb_flush_reason(void* user, u32 reason)
 {
     rsx_nr_d3d12* const b = (rsx_nr_d3d12*)user;
     const u64 stall_start = nrb_stall_now(b);
-    nrb_exec_wait(b);
+    nrb_exec_wait(b, nrb_publication_cause(reason), 0u);
     nrb_stall_finish(b, stall_start,
                      &b->stats.stall_flush_count,
                      &b->stats.stall_flush_ticks);
+}
+
+static void nrb_flush(void* user)
+{
+    nrb_flush_reason(user, (u32)RSX_NR_FLUSH_BARRIER);
 }
 
 static int nrb_clear_op(void* user, const rsx_nir_pipeline* st,
@@ -5892,6 +6002,7 @@ void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
     out->transfer = nrb_transfer_op;
     out->present = nrb_present_op;
     out->flush = nrb_flush;
+    out->flush_reason = nrb_flush_reason;
 }
 
 int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
@@ -6093,6 +6204,18 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
             b->stats.stall_qpc_frequency = (u64)frequency.QuadPart;
         else
             b->stall_aggregate = 0;
+    }
+    {
+        const char* const attribution =
+            getenv("YZ_NR_SUBMIT_ATTRIBUTION");
+        LARGE_INTEGER frequency;
+        b->submit_attribution = attribution &&
+            strcmp(attribution, "1") == 0;
+        if (b->submit_attribution && QueryPerformanceFrequency(&frequency))
+            b->stats.submit_attribution_qpc_frequency =
+                (u64)frequency.QuadPart;
+        else
+            b->submit_attribution = 0;
     }
 
     if (device) {
@@ -6575,7 +6698,8 @@ int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b)
         return -1;
     if (!b->hana_input_oracle || b->hana_input_dumped)
         return 0;
-    if (b->list_open && nrb_exec_wait(b) != 0)
+    if (b->list_open && nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_DIAGNOSTIC_READBACK, 0u) != 0)
         return -1;
     if (b->queue && b->fence && nrb_wait_idle(b) != 0)
         return -1;
@@ -6588,7 +6712,7 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (!b)
         return;
     if (b->list_open)
-        nrb_exec_wait(b);
+        nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET, 0u);
     nrb_release_timeline_lease(b);
     if (b->queue && b->fence)
         nrb_wait_idle(b);
@@ -6726,7 +6850,8 @@ int rsx_nr_d3d12_read_rt(rsx_nr_d3d12* b, u32 space, u32 offset,
     b->list->lpVtbl->CopyTextureRegion(b->list, &dstl, 0, 0, 0, &srcl, NULL);
 
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    if (nrb_exec_wait(b))
+    if (nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_DIAGNOSTIC_READBACK, need))
         return -1;
 
     u8* mapped = NULL;
@@ -6789,7 +6914,8 @@ int rsx_nr_d3d12_read_depth(rsx_nr_d3d12* b, u32 space, u32 offset,
     b->list->lpVtbl->CopyTextureRegion(
         b->list, &destination, 0, 0, 0, &source, NULL);
     nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    if (nrb_exec_wait(b))
+    if (nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_DIAGNOSTIC_READBACK, need))
         return -1;
 
     u8* mapped = NULL;

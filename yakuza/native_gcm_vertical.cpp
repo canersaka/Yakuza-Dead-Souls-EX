@@ -786,6 +786,14 @@ static void yz_nr_gpu_flush(void*)
         g_active.gpu_ops.flush(g_active.gpu_ops.user);
 }
 
+static void yz_nr_gpu_flush_reason(void*, uint32_t reason)
+{
+    if (g_active.gpu_ops.flush_reason)
+        g_active.gpu_ops.flush_reason(g_active.gpu_ops.user, reason);
+    else
+        yz_nr_gpu_flush(nullptr);
+}
+
 static int yz_nr_movie_clear(void*, const rsx_nir_pipeline*,
                              const rsx_nir_clear*)
 {
@@ -822,6 +830,7 @@ static void yz_nr_active_bind_graphics_ops(void)
     combined.present = g_active.movie_suppressed
         ? yz_nr_movie_present : yz_nr_gpu_present;
     combined.flush = yz_nr_gpu_flush;
+    combined.flush_reason = yz_nr_gpu_flush_reason;
     combined.set_reference = yz_nr_exec_reference;
     combined.user_command = yz_nr_exec_user;
     combined.sem_read = yz_nr_exec_sem_read;
@@ -5139,6 +5148,43 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.first_fp_failure_words[14],
                         d3d_stats.first_fp_failure_words[15]);
             }
+            if (d3d_stats.submit_attribution_qpc_frequency) {
+                static const char* const cause_names[
+                    RSX_NR_D3D12_SUBMIT_CAUSE_COUNT] = {
+                    "descriptor-recycle", "upload-rollover",
+                    "semaphore-publication", "reference-publication",
+                    "report-publication", "barrier-publication",
+                    "transfer-readback", "resource-refresh",
+                    "residency-retry", "refusal-retirement", "present",
+                    "diagnostic-readback", "shutdown-reset", "other"
+                };
+                for (unsigned int cause = 0;
+                     cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT; ++cause) {
+                    const rsx_nr_d3d12_submit_cause_stats& entry =
+                        d3d_stats.submit_cause[cause];
+                    fprintf(stderr,
+                            "[nr-submit-attribution qpc=%llu cause=%s "
+                            "submits=%llu cpu-ticks=%llu draws=%llu "
+                            "batches=%llu descriptors=%llu upload-bytes=%llu "
+                            "readback-bytes=%llu]\n",
+                            d3d_stats.submit_attribution_qpc_frequency,
+                            cause_names[cause], entry.submissions,
+                            entry.cpu_wait_ticks, entry.draws,
+                            entry.draw_batches, entry.descriptor_tables,
+                            entry.upload_bytes, entry.readback_bytes);
+                }
+                fprintf(stderr,
+                        "[nr-submit-transfer qpc=%llu "
+                        "readback=%llu/%llu/%llu "
+                        "upload=%llu/%llu/%llu]\n",
+                        d3d_stats.submit_attribution_qpc_frequency,
+                        d3d_stats.submit_transfer_readback_count,
+                        d3d_stats.submit_transfer_readback_bytes,
+                        d3d_stats.submit_transfer_readback_ticks,
+                        d3d_stats.submit_transfer_upload_count,
+                        d3d_stats.submit_transfer_upload_bytes,
+                        d3d_stats.submit_transfer_upload_ticks);
+            }
             if (d3d_stats.stall_qpc_frequency) {
                 const unsigned long long frequency =
                     d3d_stats.stall_qpc_frequency;
@@ -5311,6 +5357,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
              * only in the backend's focused tests.
              */
         }
+        rsx_live_draw_dump_submit_attribution();
         /* Producer/router storage is shared by the same live workers.  It is
          * intentionally process-lifetime storage for production runs. */
     }

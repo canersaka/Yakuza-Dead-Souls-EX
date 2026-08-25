@@ -103,6 +103,34 @@ typedef int (*rsx_nr_d3d12_pso_store_fn)(
     u64 pixel_bytecode_hash, const void* data, u32 size);
 typedef void (*rsx_nr_d3d12_pso_free_fn)(void* user, void* data);
 
+typedef enum rsx_nr_d3d12_submit_cause {
+    RSX_NR_D3D12_SUBMIT_DESCRIPTOR_RECYCLE = 0,
+    RSX_NR_D3D12_SUBMIT_UPLOAD_ROLLOVER,
+    RSX_NR_D3D12_SUBMIT_SEMAPHORE_PUBLICATION,
+    RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION,
+    RSX_NR_D3D12_SUBMIT_REPORT_PUBLICATION,
+    RSX_NR_D3D12_SUBMIT_BARRIER_PUBLICATION,
+    RSX_NR_D3D12_SUBMIT_TRANSFER_READBACK,
+    RSX_NR_D3D12_SUBMIT_RESOURCE_REFRESH,
+    RSX_NR_D3D12_SUBMIT_RESIDENCY_RETRY,
+    RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT,
+    RSX_NR_D3D12_SUBMIT_PRESENT,
+    RSX_NR_D3D12_SUBMIT_DIAGNOSTIC_READBACK,
+    RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET,
+    RSX_NR_D3D12_SUBMIT_OTHER,
+    RSX_NR_D3D12_SUBMIT_CAUSE_COUNT
+} rsx_nr_d3d12_submit_cause;
+
+typedef struct rsx_nr_d3d12_submit_cause_stats {
+    unsigned long long submissions;
+    unsigned long long cpu_wait_ticks;
+    unsigned long long draws;
+    unsigned long long draw_batches;
+    unsigned long long descriptor_tables;
+    unsigned long long upload_bytes;
+    unsigned long long readback_bytes;
+} rsx_nr_d3d12_submit_cause_stats;
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
     unsigned long long transfer_gpu_readbacks;
@@ -275,6 +303,17 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long stall_batch_prepare_ticks;
     unsigned long long stall_command_record_count;
     unsigned long long stall_command_record_ticks;
+    /* Default-off fixed-memory submission attribution.  Enabled only by
+     * YZ_NR_SUBMIT_ATTRIBUTION=1 and emitted once during orderly shutdown. */
+    unsigned long long submit_attribution_qpc_frequency;
+    rsx_nr_d3d12_submit_cause_stats
+        submit_cause[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned long long submit_transfer_readback_count;
+    unsigned long long submit_transfer_readback_ticks;
+    unsigned long long submit_transfer_readback_bytes;
+    unsigned long long submit_transfer_upload_count;
+    unsigned long long submit_transfer_upload_ticks;
+    unsigned long long submit_transfer_upload_bytes;
 } rsx_nr_d3d12_stats;
 
 /* Fixed-memory, default-off scanout provenance.  This deliberately exposes

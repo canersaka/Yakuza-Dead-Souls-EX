@@ -6,6 +6,14 @@
 
 #include <string.h>
 
+static void backend_flush(rsx_nr_exec_ops* x, rsx_nr_flush_reason reason)
+{
+    if (x->flush_reason)
+        x->flush_reason(x->user, (u32)reason);
+    else if (x->flush)
+        x->flush(x->user);
+}
+
 void rsx_nr_backend_init(rsx_nr_backend* be, rsx_nr_ring* ring,
                          rsx_nr_tokens* tokens, const rsx_nr_exec_ops* ops)
 {
@@ -117,8 +125,7 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
         /* Both back-end and texture-pipe releases publish completion of all
          * preceding graphics work. Retire the native list before making the
          * guest-visible label store observable. */
-        if (x->flush)
-            x->flush(x->user);
+        backend_flush(x, RSX_NR_FLUSH_SEMAPHORE);
         if (x->sem_write)
             x->sem_write(x->user, op->u.semaphore.dma_context,
                          op->u.semaphore.offset, v,
@@ -151,18 +158,15 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
             rc = x->present(x->user, op->u.present.buffer);
         break;
     case RSX_NIR_OP_BARRIER:
-        if (x->flush)
-            x->flush(x->user);
+        backend_flush(x, RSX_NR_FLUSH_BARRIER);
         break;
     case RSX_NIR_OP_SET_REFERENCE:
-        if (x->flush)
-            x->flush(x->user);
+        backend_flush(x, RSX_NR_FLUSH_REFERENCE);
         if (x->set_reference)
             x->set_reference(x->user, op->u.reference.value);
         break;
     case RSX_NIR_OP_REPORT:
-        if (x->flush)
-            x->flush(x->user);
+        backend_flush(x, RSX_NR_FLUSH_REPORT);
         if (x->report)
             rc = x->report(x->user, op->u.report.kind, op->u.report.arg,
                            op->u.report.dma_report);

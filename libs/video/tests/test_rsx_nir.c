@@ -1340,6 +1340,8 @@ typedef struct exec_rec {
     int report_result;
     u32 user_cause;
     u32 flushes;
+    u32 flush_reasons[16];
+    u32 flush_reason_count;
     u32 last_sem_kind;
 } exec_rec;
 
@@ -1396,6 +1398,15 @@ static int rec_present(void* u, u32 buffer)
 
 static void rec_flush(void* u) { ((exec_rec*)u)->flushes++; }
 
+static void rec_flush_reason(void* u, u32 reason)
+{
+    exec_rec* r = u;
+    r->flushes++;
+    if (r->flush_reason_count <
+        (u32)(sizeof(r->flush_reasons) / sizeof(r->flush_reasons[0])))
+        r->flush_reasons[r->flush_reason_count++] = reason;
+}
+
 static void rec_sem_write(void* u, u32 dma, u32 offset, u32 value, u32 tex)
 {
     exec_rec* r = u;
@@ -1451,6 +1462,7 @@ static void test_backend_core(void)
     ops.transfer = rec_transfer;
     ops.present = rec_present;
     ops.flush = rec_flush;
+    ops.flush_reason = rec_flush_reason;
     ops.sem_write = rec_sem_write;
     ops.sem_read = rec_sem_read;
     ops.report = rec_report;
@@ -1483,6 +1495,12 @@ static void test_backend_core(void)
     CHECK(rec.flushes >= 2,
           "semaphore release + SET_REFERENCE did not flush (%u)",
           rec.flushes);
+    CHECK(rec.flush_reason_count == 2u &&
+              rec.flush_reasons[0] == RSX_NR_FLUSH_SEMAPHORE &&
+              rec.flush_reasons[1] == RSX_NR_FLUSH_REFERENCE,
+          "semantic flush order count=%u reasons=%u,%u",
+          rec.flush_reason_count, rec.flush_reasons[0],
+          rec.flush_reasons[1]);
     /* SDK-conformance: the scene's release is a BACK-END (0x1D70) write,
      * whose hardware store swizzles bytes 0<->2 — the wire value
      * 0x11223344 must land in memory as 0x11443322, matching both the
@@ -1514,6 +1532,16 @@ static void test_backend_core(void)
     CHECK(rec.reports == 1 && rec.flushes == flushes_before_report + 1,
           "report did not flush/publish reports=%u flushes=%u/%u",
           rec.reports, flushes_before_report, rec.flushes);
+    CHECK(rec.flush_reason_count &&
+              rec.flush_reasons[rec.flush_reason_count - 1u] ==
+                  RSX_NR_FLUSH_REPORT,
+          "report flush reason was not preserved");
+    rsx_nir_em_barrier(&em, 0xA5u);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.flush_reason_count &&
+              rec.flush_reasons[rec.flush_reason_count - 1u] ==
+                  RSX_NR_FLUSH_BARRIER,
+          "barrier flush reason was not preserved");
     const u64 errors_before_report_refusal = be.stats.exec_errors;
     rec.report_result = -1;
     rsx_nir_em_report(&em, 0, 0x01000090u, 0xBAD68000u);
