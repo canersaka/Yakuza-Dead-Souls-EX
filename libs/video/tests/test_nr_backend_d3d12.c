@@ -2860,6 +2860,35 @@ int main(int argc, char** argv)
               "polygon-offset PSO was not reused");
     }
     {
+        /* Retained RSX registers that cannot affect this triangle's D3D12
+         * descriptor must not manufacture another driver pipeline. */
+        rsx_nir_pipeline inert = be.st;
+        rsx_nr_d3d12_stats before_inert, after_inert;
+        rsx_nr_d3d12_get_stats(sink, &before_inert);
+        inert.raster.mrt_color_mask ^= 0xFFFFFFFFu;
+        inert.raster.polygon_offset_point_enable = 1u;
+        inert.raster.polygon_offset_line_enable = 1u;
+        inert.raster.polygon_offset_scale = 0x41200000u;
+        inert.raster.polygon_offset_bias = 0xC0A00000u;
+        inert.blend.sfactor ^= 0x00010001u;
+        inert.blend.dfactor ^= 0x00020002u;
+        inert.blend.equation ^= 0x00030003u;
+        inert.depth_stencil.stencil_func ^= 0x7u;
+        inert.depth_stencil.stencil_mask ^= 0xA5u;
+        inert.depth_stencil.stencil_write_mask ^= 0x5Au;
+        inert.depth_stencil.stencil_op_fail ^= 0x1E01u;
+        CHECK(rsx_nr_d3d12_preflight_draw(
+                  sink, &inert, native_vp, 4u,
+                  &preflight_draw, batch) == 0,
+              "inert-state draw preflight refused");
+        rsx_nr_d3d12_get_stats(sink, &after_inert);
+        CHECK(after_inert.pso_builds == before_inert.pso_builds &&
+                  after_inert.pso_hits == before_inert.pso_hits + 1u,
+              "inert RSX state rebuilt a PSO builds=%llu/%llu hits=%llu/%llu",
+              before_inert.pso_builds, after_inert.pso_builds,
+              before_inert.pso_hits, after_inert.pso_hits);
+    }
+    {
         rsx_nir_pipeline two_sided = be.st;
         two_sided.depth_stencil.stencil_test_enable = 1u;
         two_sided.depth_stencil.stencil_func = 0x0203u;

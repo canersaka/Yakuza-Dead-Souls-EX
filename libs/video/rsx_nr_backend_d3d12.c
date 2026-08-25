@@ -3658,6 +3658,45 @@ static void nrb_apply_render_state(
     }
 }
 
+/* Hash the exact fixed-function descriptor consumed by D3D12. Raw NIR
+ * state includes inert retained registers (unused MRT masks, disabled blend
+ * and stencil fields, and polygon-offset modes for other topologies). Those
+ * values produced thousands of aliases for an identical driver PSO. */
+static u64 nrb_pso_fixed_state_key(
+    u64 seed, const rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, int strip_cut,
+    DXGI_FORMAT color_dxgi)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.SampleMask = 0xFFFFFFFFu;
+    nrb_apply_render_state(&pd, st, topology_type);
+    pd.IBStripCutValue = strip_cut
+        ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    pd.PrimitiveTopologyType = topology_type;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = color_dxgi;
+    pd.DSVFormat = nrb_depth_dsv_dxgi(b, st->surface.depth_format);
+    pd.SampleDesc.Count = 1;
+
+    u64 key = rsx_nr_hash_fold(seed, &pd.BlendState,
+                               sizeof(pd.BlendState));
+    key = rsx_nr_hash_fold(key, &pd.SampleMask, sizeof(pd.SampleMask));
+    key = rsx_nr_hash_fold(key, &pd.RasterizerState,
+                           sizeof(pd.RasterizerState));
+    key = rsx_nr_hash_fold(key, &pd.DepthStencilState,
+                           sizeof(pd.DepthStencilState));
+    key = rsx_nr_hash_fold(key, &pd.IBStripCutValue,
+                           sizeof(pd.IBStripCutValue));
+    key = rsx_nr_hash_fold(key, &pd.PrimitiveTopologyType,
+                           sizeof(pd.PrimitiveTopologyType));
+    key = rsx_nr_hash_fold(key, &pd.NumRenderTargets,
+                           sizeof(pd.NumRenderTargets));
+    key = rsx_nr_hash_fold(key, &pd.RTVFormats, sizeof(pd.RTVFormats));
+    key = rsx_nr_hash_fold(key, &pd.DSVFormat, sizeof(pd.DSVFormat));
+    return rsx_nr_hash_fold(key, &pd.SampleDesc, sizeof(pd.SampleDesc));
+}
+
 static ID3DBlob* nrb_compile(rsx_nr_d3d12* b, const char* text, size_t len,
                              u32 stage, int* cache_hit, int* compiled)
 {
@@ -3739,29 +3778,10 @@ static ID3D12PipelineState* nrb_get_pso(rsx_nr_d3d12* b,
     key = rsx_nr_hash_fold(key, &alpha_enable, sizeof(alpha_enable));
     key = rsx_nr_hash_fold(key, &alpha_func, sizeof(alpha_func));
     /* The live broker may canonicalize a guest R5G6B5 surface into RGBA8.
-     * PSO identity follows the actual RTV format, not the logical guest
-     * encoding, or CreateGraphicsPipelineState/OMSetRenderTargets disagree. */
-    key = rsx_nr_hash_fold(key, &color_dxgi, sizeof(color_dxgi));
-    key = rsx_nr_hash_fold(key, &st->surface.depth_format,
-                           sizeof(st->surface.depth_format));
-    key = rsx_nr_hash_fold(key, &st->raster, sizeof(st->raster));
-    rsx_nir_depth_stencil pso_depth_stencil = st->depth_stencil;
-    /* OMSetDepthBounds and OMSetStencilRef are command-list state. Neither
-     * changes the D3D12 PSO, so animated limits/references must not create a
-     * fresh pair of compiled shaders. Front/back references are already
-     * required equal by preflight because D3D12 exposes one dynamic ref. */
-    pso_depth_stencil.depth_bounds_test_enable = 0;
-    pso_depth_stencil.depth_bounds_min = 0;
-    pso_depth_stencil.depth_bounds_max = 0;
-    pso_depth_stencil.stencil_ref = 0;
-    pso_depth_stencil.back_stencil_ref = 0;
-    key = rsx_nr_hash_fold(key, &pso_depth_stencil,
-                           sizeof(pso_depth_stencil));
-    rsx_nir_blend pso_blend = st->blend;
-    /* These are draw data in buffered/dynamic state, not PSO identity. */
-    pso_blend.alpha_ref = 0;
-    pso_blend.blend_color = 0;
-    key = rsx_nr_hash_fold(key, &pso_blend, sizeof(pso_blend));
+     * PSO identity follows the actual D3D descriptor, including the actual
+     * RTV/DSV formats, and excludes dynamic OM state and inert RSX fields. */
+    key = nrb_pso_fixed_state_key(
+        key, b, st, tt, strip_cut, color_dxgi);
     u64 cached = 0;
     const int cache_hit = rsx_nr_pso_lookup(&b->psos, key, &cached);
     nrb_stall_finish(b, key_lookup_start,
