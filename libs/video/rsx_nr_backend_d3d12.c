@@ -78,12 +78,16 @@ static void nrb_enable_device_oracle(void)
 #define NRB_VS_TEXT      (256 * 1024)
 #define NRB_PS_TEXT      (256 * 1024)
 /* A complete live boot carries menu/movie shader pairs into world rendering.
- * The established live corpus reaches about 2,296 distinct requested PSO
- * keys before Akiyama; the former 1,024-slot table stopped inserting at 75%
- * load and recompiled every later draw. Match the proven live-render cache
- * headroom so native section ownership cannot fall into compile thrash. */
-#define NRB_PSO_CAP      8192
-#define NRB_TEX_CAP      2048
+ * The extended Hana->Frontier route proved 7,391 distinct persisted PSOs and
+ * filled the former 8,192-slot table at its intentional 75% load ceiling;
+ * 185,501 later requests then rebuilt/reloaded instead of staying resident.
+ * Keep the same bounded load rule with enough headroom for the measured route.
+ * The same capture filled the 2,048-slot texture table at exactly 1,536 live
+ * identities and then refused a valid DXT5 gun-transition dependency. These
+ * are storage limits, not unsupported RSX semantics; enlarging the fixed
+ * tables preserves every cache key, invalidation, and resource-lifetime rule. */
+#define NRB_PSO_CAP      16384
+#define NRB_TEX_CAP      8192
 #define NRB_TEX_SNAP_WORDS (1024u * 1024u)
 #define NRB_TEX_UNITS    RSX_NIR_NUM_TEXTURES
 #define NRB_VTEX_UNITS   RSX_NIR_NUM_VERTEX_TEXTURES
@@ -1810,6 +1814,9 @@ typedef struct nrb_fp_info {
     u32 size;
     u32 texture_mask;
     u32 unsupported;
+    u32 first_unsupported_offset;
+    u32 first_unsupported_opcode;
+    u32 first_unsupported_reason;
     u64 structural_hash;
     rsx_fp_constant_block constants;
 } nrb_fp_info;
@@ -1896,6 +1903,7 @@ static int nrb_fp_opcode_supported(u32 opcode)
     case 0x3B: /* DIVSQ */
     case 0x3D: /* FENCT */
     case 0x3E: /* FENCB */
+    case 0x45: /* RET: predicated top-level early return */
         return 1;
     default:
         return 0;
@@ -2742,6 +2750,32 @@ static D3D12_SAMPLER_DESC nrb_sampler(const rsx_nir_texture* texture)
     return desc;
 }
 
+static void nrb_note_first_texture_failure(
+    rsx_nr_d3d12* b, u32 stage, u32 unit, int result, u32 texture_mask,
+    const rsx_nir_texture* texture)
+{
+    if (!b || b->stats.first_texture_failure_stage)
+        return;
+    b->stats.first_texture_failure_stage = stage;
+    b->stats.first_texture_failure_unit = unit;
+    b->stats.first_texture_failure_result = result;
+    b->stats.first_texture_failure_mask = texture_mask;
+    b->stats.first_texture_cache_count = b->textures.count;
+    b->stats.first_texture_cache_table_full = b->textures.stats.table_full;
+    b->stats.first_texture_cache_arena_exhausted =
+        b->textures.stats.arena_exhausted;
+    if (!texture)
+        return;
+    b->stats.first_texture_failure_location = texture->location;
+    b->stats.first_texture_failure_offset = texture->offset;
+    b->stats.first_texture_failure_format = texture->format;
+    b->stats.first_texture_failure_width = texture->width;
+    b->stats.first_texture_failure_height = texture->height;
+    b->stats.first_texture_failure_pitch = texture->pitch;
+    b->stats.first_texture_failure_mipmaps = texture->mipmaps;
+    b->stats.first_texture_failure_cubemap = texture->cubemap;
+}
+
 static nrb_rt* nrb_texture_rt_alias(rsx_nr_d3d12* b,
                                     const rsx_nir_texture* texture,
                                     const nrb_rt* draw_rt, u32 unit)
@@ -2905,14 +2939,20 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
         aliases[unit] = NULL;
         depth_aliases[unit] = NULL;
         if (texture_mask & (1u << unit)) {
-            if (!texture->enabled)
+            if (!texture->enabled) {
+                nrb_note_first_texture_failure(
+                    b, 1u, unit, -1, texture_mask, texture);
                 return -1;
+            }
             if (texture->cubemap)
                 cube_mask |= 1u << unit;
             aliases[unit] = nrb_texture_rt_alias(
                 b, texture, draw_rt, unit);
-            if (aliases[unit] == draw_rt)
+            if (aliases[unit] == draw_rt) {
+                nrb_note_first_texture_failure(
+                    b, 2u, unit, -1, texture_mask, texture);
                 return -1;
+            }
             if (aliases[unit]) {
                 nrb_rt_transition(b, aliases[unit],
                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -2923,12 +2963,18 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
             } else {
                 nrb_depth* const depth_alias = nrb_texture_depth_alias(
                     b, texture, draw_depth, unit);
-                if (depth_alias && depth_alias == draw_depth)
+                if (depth_alias && depth_alias == draw_depth) {
+                    nrb_note_first_texture_failure(
+                        b, 3u, unit, -1, texture_mask, texture);
                     return -1;
+                }
                 if (depth_alias && !depth_alias->external) {
                     if (nrb_resolve_private_depth_sample(
-                            b, depth_alias) != 0)
+                            b, depth_alias) != 0) {
+                        nrb_note_first_texture_failure(
+                            b, 4u, unit, -1, texture_mask, texture);
                         return -1;
+                    }
                     nrb_write_depth_sample_srv(
                         b, depth_alias->sample_tex,
                         depth_alias->sample_srv_dxgi, unit);
@@ -2960,6 +3006,8 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
             if (source_slot == null_slot && !aliases[unit] &&
                 !depth_aliases[unit] && !alias_resource &&
                 nrb_resolve_guest_texture(b, texture, &source_slot) != 0) {
+                nrb_note_first_texture_failure(
+                    b, 5u, unit, -1, texture_mask, texture);
                 return -1;
             }
         }
@@ -2981,8 +3029,12 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
         vtex_depth_aliases[unit] = NULL;
         if (vtex_mask & (1u << unit)) {
             if (!texture->enabled || nrb_resolve_guest_vertex_texture(
-                    b, texture, &source_slot) != 0)
+                    b, texture, &source_slot) != 0) {
+                nrb_note_first_texture_failure(
+                    b, 6u, NRB_TEX_UNITS + unit, -1,
+                    vtex_mask, texture);
                 return -1;
+            }
         }
         vtex_source_slots[unit] = source_slot;
         table_key.view[NRB_TEX_UNITS + unit] = nrb_texture_key(texture);
@@ -3009,8 +3061,11 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
      * reset this fence generation. Allocate the immutable descriptor table
      * only after all such work is complete. Each recorded draw receives a
      * distinct table; descriptors are never rewritten before its fence. */
-    if (nrb_ensure_descriptor_capacity(b) != 0)
+    if (nrb_ensure_descriptor_capacity(b) != 0) {
+        nrb_note_first_texture_failure(
+            b, 7u, ~0u, -1, texture_mask, NULL);
         return -1;
+    }
     const u32 table_index = b->descriptor_tables_used++;
     b->descriptor_table_keys[table_index] = table_key;
     b->stats.descriptor_table_builds++;
@@ -3370,13 +3425,23 @@ static int nrb_resolve_fp(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
         const u32 w1 = rsx_fp_read_word(bytes + off + 4u);
         const u32 w2 = rsx_fp_read_word(bytes + off + 8u);
         const u32 w3 = rsx_fp_read_word(bytes + off + 12u);
-        const u32 opcode = (w0 >> 24) & 0x3Fu;
-        if (!nrb_fp_opcode_supported(opcode) || (w2 & 0x80000000u))
+        const u32 opcode = ((w0 >> 24) & 0x3Fu) |
+                           ((w2 & 0x80000000u) ? 0x40u : 0u);
+        const u32 unsupported_reason =
+            !nrb_fp_opcode_supported(opcode) ? 1u : 0u;
+        if (unsupported_reason) {
+            if (!out->unsupported) {
+                out->first_unsupported_offset = off;
+                out->first_unsupported_opcode = opcode;
+                out->first_unsupported_reason = unsupported_reason;
+            }
             out->unsupported++;
+        }
         if (opcode == 0x17u || opcode == 0x18u)
             out->texture_mask |= 1u << ((w0 >> 17) & 0xFu);
         off += 16u;
-        if ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u)
+        if (opcode < 0x40u &&
+            ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u))
             off += 16u;
         if (w0 & 1u)
             break;
@@ -3390,6 +3455,45 @@ static int nrb_resolve_fp(rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
     out->bytes = bytes;
     out->size = size;
     return 0;
+}
+
+static void nrb_note_first_fp_failure(
+    rsx_nr_d3d12* b, u32 stage, int result,
+    const rsx_nir_pipeline* st, const nrb_fp_info* fp)
+{
+    if (!b || !st || b->stats.first_fp_failure_stage)
+        return;
+
+    b->stats.first_fp_failure_result = result;
+    b->stats.first_fp_failure_location = st->fragment_program.location;
+    b->stats.first_fp_failure_offset = st->fragment_program.offset;
+    b->stats.first_fp_failure_control = st->fragment_program.control;
+    if (fp) {
+        b->stats.first_fp_failure_size = fp->size;
+        b->stats.first_fp_failure_texture_mask = fp->texture_mask;
+        b->stats.first_fp_failure_unsupported_count = fp->unsupported;
+        b->stats.first_fp_failure_instruction_offset =
+            fp->first_unsupported_offset;
+        b->stats.first_fp_failure_opcode = fp->first_unsupported_opcode;
+        b->stats.first_fp_failure_reason = fp->first_unsupported_reason;
+        b->stats.first_fp_failure_structural_hash = fp->structural_hash;
+        if (fp->bytes && fp->size) {
+            const u32 word_count =
+                fp->size / 4u < 16u ? fp->size / 4u : 16u;
+            u64 hash = 1469598103934665603ull;
+            for (u32 i = 0; i < fp->size; ++i) {
+                hash ^= fp->bytes[i];
+                hash *= 1099511628211ull;
+            }
+            b->stats.first_fp_failure_byte_hash = hash;
+            for (u32 i = 0; i < word_count; ++i)
+                b->stats.first_fp_failure_words[i] =
+                    rsx_fp_read_word(fp->bytes + i * 4u);
+        }
+    }
+    /* Publish the discriminator last so a concurrent shutdown snapshot can
+     * never print a partially populated identity. */
+    b->stats.first_fp_failure_stage = stage;
 }
 
 static D3D12_BLEND nrb_blend_factor(u32 f, int alpha)
@@ -4800,6 +4904,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                      &b->stats.stall_fp_resolve_count,
                      &b->stats.stall_fp_resolve_ticks);
     if (fp_resolve != 0 || fp.unsupported) {
+        nrb_note_first_fp_failure(
+            b, fp_resolve != 0 ? 1u : 2u, fp_resolve, st, &fp);
         b->stats.unsupported_draws++;
         b->stats.unsup_draw_fp++;
         return -1;
@@ -4809,6 +4915,9 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         if (!(fp.texture_mask & (1u << unit)))
             continue;
         if (!st->textures[unit].enabled) {
+            nrb_note_first_texture_failure(
+                b, 1u, unit, -1, fp.texture_mask,
+                &st->textures[unit]);
             b->stats.unsupported_draws++;
             b->stats.unsup_draw_texture++;
             b->stats.texture_failures++;
@@ -4953,6 +5062,9 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                      &b->stats.stall_texture_prepare_ticks);
     if (texture_prepare != 0 ||
         resolved_cube_mask != cube_mask) {
+        if (texture_prepare == 0)
+            nrb_note_first_texture_failure(
+                b, 8u, ~0u, -1, fp.texture_mask, NULL);
         nrb_restore_texture_aliases(
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
@@ -4975,6 +5087,8 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
             b, texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases);
         if (nrb_exec_wait(b) || nrb_open_list(b)) {
+            nrb_note_first_texture_failure(
+                b, 9u, ~0u, -1, fp.texture_mask, NULL);
             b->stats.unsupported_draws++;
             b->stats.unsup_draw_texture++;
             b->stats.texture_failures++;
@@ -6744,6 +6858,14 @@ int rsx_nr_d3d12_get_rt_provenance(
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out)
 {
     *out = b->stats;
+    out->texture_cache_count = b->textures.count;
+    out->texture_cache_capacity = b->textures.cap;
+    out->texture_cache_table_full = b->textures.stats.table_full;
+    out->texture_cache_arena_exhausted =
+        b->textures.stats.arena_exhausted;
+    out->pso_cache_count = b->psos.count;
+    out->pso_cache_capacity = b->psos.cap;
+    out->pso_cache_table_full = b->psos.stats.table_full;
     if (b->mirror) {
         rsx_gpu_mirror_stats mirror = {0};
         rsx_gpu_mirror_get_stats(b->mirror, &mirror);

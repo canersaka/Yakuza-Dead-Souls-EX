@@ -1080,6 +1080,40 @@ static int test_noop_preserves_sequential_gap_provenance(void)
               f.hole_previous_command == 0u && f.hole_calls == 1u &&
               f.owner.stats.methods == 0u,
           "unmapped flow-shaped payload did not use exact NOOP gap proof");
+
+    /* Frontier capture: an exact program-tail data word aliases an unmapped
+     * CALL. It must remain one delayed publication episode, then use only the
+     * exact hole oracle; it must never be followed as a real CALL. */
+    fixture_init(&f);
+    const u32 program_packet = 0x13B8u;
+    const u32 program_gap = 0x143Cu;
+    const u32 program_resume = 0x1448u;
+    next = program_packet;
+    ret = ~0u;
+    f.words[program_packet >> 2] = packet(32u, 0x0B80u);
+    for (u32 i = 0; i < 32u; ++i)
+        f.words[(program_packet + 4u + i * 4u) >> 2] = i + 1u;
+    f.words[program_gap >> 2] = 0xFF00043Eu;
+    f.hole_get = program_gap;
+    f.hole_put = put;
+    f.hole_word = f.words[program_gap >> 2];
+    f.hole_resume = program_resume;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, program_packet, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == program_gap,
+          "program packet before CALL-shaped tail did not advance");
+    for (u32 i = 0; i < (1u << 16); ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, program_gap, put, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_PARTIAL,
+              "CALL-shaped program tail escaped before proof at %u", i);
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, program_gap, put, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == program_resume &&
+              ret == ~0u && f.hole_calls == 1u &&
+              f.hole_previous_get == program_packet &&
+              f.hole_previous_command == packet(32u, 0x0B80u),
+          "unmapped CALL-shaped program tail did not use exact hole proof");
     return 0;
 }
 

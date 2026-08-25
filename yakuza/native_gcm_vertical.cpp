@@ -3990,6 +3990,30 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
                 fprintf(stderr, "%s%08X", i ? "," : "", word);
             }
             fprintf(stderr, "]\n");
+            /* Fatal-only producer-boundary oracle. A malformed generated
+             * cursor can be preceded by command-shaped shader/data words, so
+             * the short window above is insufficient to recover the exact
+             * owning edge. Dump one fixed, read-only 0x1200-byte span around
+             * the first failure. This is unreachable on accepted runs and is
+             * removed once the producer contract is made explicit. */
+            {
+                const uint32_t base =
+                    (failure->get - 0x200u) & 0x7FFFFFu;
+                for (uint32_t off = 0; off < 0x1200u; off += 0x40u) {
+                    fprintf(stderr,
+                            "[nr-full-native-oracle-span io=%08X words=",
+                            (base + off) & 0x7FFFFFu);
+                    for (uint32_t i = 0; i < 16u; ++i) {
+                        uint32_t word = 0xDEADDEADu;
+                        (void)yz_nr_frame_read32(
+                            nullptr,
+                            (base + off + i * 4u) & 0x7FFFFFu,
+                            &word);
+                        fprintf(stderr, "%s%08X", i ? "," : "", word);
+                    }
+                    fprintf(stderr, "]\n");
+                }
+            }
             if (failure->kind == RSX_NR_FRAME_FAILURE_BAD_FLOW &&
                 failure->get < 0x800000u &&
                 failure->call_return == UINT32_MAX) {
@@ -5039,6 +5063,77 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.shared_timeline_acquires,
                     d3d_stats.shared_timeline_generations,
                     d3d_stats.shared_timeline_forced_submissions);
+            fprintf(stderr,
+                    "[nr-vertical-d3d-cache textures=%u/%u "
+                    "table-full=%llu arena-full=%llu pso=%u/%u "
+                    "pso-table-full=%llu]\n",
+                    d3d_stats.texture_cache_count,
+                    d3d_stats.texture_cache_capacity,
+                    d3d_stats.texture_cache_table_full,
+                    d3d_stats.texture_cache_arena_exhausted,
+                    d3d_stats.pso_cache_count,
+                    d3d_stats.pso_cache_capacity,
+                    d3d_stats.pso_cache_table_full);
+            if (d3d_stats.first_texture_failure_stage) {
+                fprintf(stderr,
+                        "[nr-vertical-d3d-first-texture stage=%u unit=%u "
+                        "result=%d mask=%08X tex=%u:%08X/fmt=%08X/"
+                        "%ux%u/pitch=%u/mips=%u/cube=%u cache=%u "
+                        "table-full=%llu arena-full=%llu]\n",
+                        d3d_stats.first_texture_failure_stage,
+                        d3d_stats.first_texture_failure_unit,
+                        d3d_stats.first_texture_failure_result,
+                        d3d_stats.first_texture_failure_mask,
+                        d3d_stats.first_texture_failure_location,
+                        d3d_stats.first_texture_failure_offset,
+                        d3d_stats.first_texture_failure_format,
+                        d3d_stats.first_texture_failure_width,
+                        d3d_stats.first_texture_failure_height,
+                        d3d_stats.first_texture_failure_pitch,
+                        d3d_stats.first_texture_failure_mipmaps,
+                        d3d_stats.first_texture_failure_cubemap,
+                        d3d_stats.first_texture_cache_count,
+                        d3d_stats.first_texture_cache_table_full,
+                        d3d_stats.first_texture_cache_arena_exhausted);
+            }
+            if (d3d_stats.first_fp_failure_stage) {
+                fprintf(stderr,
+                        "[nr-vertical-d3d-first-fp stage=%u result=%d "
+                        "program=%u:%08X/control=%08X size=%u mask=%04X "
+                        "unsupported=%u insn=%u/op=%02X/reason=%u "
+                        "hash=%016llX/%016llX "
+                        "words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"
+                        "%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X]\n",
+                        d3d_stats.first_fp_failure_stage,
+                        d3d_stats.first_fp_failure_result,
+                        d3d_stats.first_fp_failure_location,
+                        d3d_stats.first_fp_failure_offset,
+                        d3d_stats.first_fp_failure_control,
+                        d3d_stats.first_fp_failure_size,
+                        d3d_stats.first_fp_failure_texture_mask,
+                        d3d_stats.first_fp_failure_unsupported_count,
+                        d3d_stats.first_fp_failure_instruction_offset,
+                        d3d_stats.first_fp_failure_opcode,
+                        d3d_stats.first_fp_failure_reason,
+                        d3d_stats.first_fp_failure_structural_hash,
+                        d3d_stats.first_fp_failure_byte_hash,
+                        d3d_stats.first_fp_failure_words[0],
+                        d3d_stats.first_fp_failure_words[1],
+                        d3d_stats.first_fp_failure_words[2],
+                        d3d_stats.first_fp_failure_words[3],
+                        d3d_stats.first_fp_failure_words[4],
+                        d3d_stats.first_fp_failure_words[5],
+                        d3d_stats.first_fp_failure_words[6],
+                        d3d_stats.first_fp_failure_words[7],
+                        d3d_stats.first_fp_failure_words[8],
+                        d3d_stats.first_fp_failure_words[9],
+                        d3d_stats.first_fp_failure_words[10],
+                        d3d_stats.first_fp_failure_words[11],
+                        d3d_stats.first_fp_failure_words[12],
+                        d3d_stats.first_fp_failure_words[13],
+                        d3d_stats.first_fp_failure_words[14],
+                        d3d_stats.first_fp_failure_words[15]);
+            }
             if (d3d_stats.stall_qpc_frequency) {
                 const unsigned long long frequency =
                     d3d_stats.stall_qpc_frequency;

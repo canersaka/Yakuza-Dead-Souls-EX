@@ -42,7 +42,7 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
-#define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
+#define FP_OPCODE_HI        (1u << 31) /* DWORD2 bit31: opcode bit 6 */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
  * The NV40 fragment ISA predicates each instruction on a condition register
@@ -74,6 +74,19 @@ enum {
     OP_TXB=0x31, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
     OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
 };
+
+#define OP_RET 0x45u
+
+static u32 fp_full_opcode(u32 w0, u32 w2)
+{
+    return ((w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT) |
+           ((w2 & FP_OPCODE_HI) ? 0x40u : 0u);
+}
+
+static int fp_opcode_is_flow(u32 opcode)
+{
+    return opcode >= 0x40u;
+}
 
 const char* rsx_fp_opcode_name(u32 op)
 {
@@ -117,9 +130,10 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
         /* A CONST source pulls an inline 16-byte constant slot. */
-        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
+        if (!fp_opcode_is_flow(fp_full_opcode(w0, w2)) &&
+            (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+             ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+             ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST)) {
             if (off + 16 <= max_bytes) off += 16;
         }
         if (w0 & FP_END) return off;
@@ -152,7 +166,8 @@ int rsx_fp_collect_constants(
         const u32 w2 = rsx_fp_read_word(ucode + off + 8);
         const u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
-        if (fp_instruction_has_constant(w1, w2, w3)) {
+        if (!fp_opcode_is_flow(fp_full_opcode(w0, w2)) &&
+            fp_instruction_has_constant(w1, w2, w3)) {
             if (off + 16 > max_bytes ||
                 out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
                 return -1;
@@ -195,7 +210,8 @@ u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
         hash = fp_hash_bytes(ucode + off, 16, hash);
         instruction_count++;
         off += 16;
-        if (fp_instruction_has_constant(w1, w2, w3)) {
+        if (!fp_opcode_is_flow(fp_full_opcode(w0, w2)) &&
+            fp_instruction_has_constant(w1, w2, w3)) {
             if (off + 16 > max_bytes ||
                 constant_count >= RSX_FP_MAX_INLINE_CONSTANTS)
                 return 0;
@@ -461,9 +477,9 @@ static int rsx_fp_decompile_internal(
         count++;
 
         u32 opcode    = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        u32 full_opcode = fp_full_opcode(w0, w2);
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
-        int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
          * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
@@ -492,6 +508,43 @@ static int rsx_fp_decompile_internal(
         else if (exec_gr)            cmp_op = ">";
         else if (exec_lt)            cmp_op = "<";
         else                         cmp_op = "==";  /* exec_eq only */
+
+        /* RET is a top-level, optionally predicated early exit on NV40. It
+         * does not consume source operands or an inline constant even when
+         * the overlaid flow-control fields happen to look like CONST source
+         * encodings. RPCS3's CFG oracle deliberately leaves main-block RET
+         * in linear flow and emits AddFlowOp("return") under this same
+         * any-component execution condition. Return the currently selected
+         * RSX color register so writes completed before RET are preserved. */
+        if (full_opcode == OP_RET) {
+            const char* result_reg;
+            if (ctrl == RSX_FP_CTRL_AUTO)
+                result_reg = (wrote_r0 || !wrote_h0) ? "r[0]" : "h[0]";
+            else
+                result_reg = (ctrl & FP_CTRL_32BIT_EXPORTS) ? "r[0]" : "h[0]";
+
+            if (is_never) {
+                out_puts(&o, "    /* RET exec_if=none: return suppressed */\n");
+            } else if (is_uncond) {
+                char line[64];
+                snprintf(line, sizeof(line), "    return %s;\n", result_reg);
+                out_puts(&o, line);
+            } else {
+                char line[160];
+                snprintf(line, sizeof(line),
+                         "    if (any(cc%u.%s %s (float4)0)) return %s;\n",
+                         cc_read, cswz, cmp_op, result_reg);
+                out_puts(&o, line);
+            }
+            if (w0 & FP_END) break;
+            continue;
+        }
+
+        if (fp_opcode_is_flow(full_opcode)) {
+            out_puts(&o, "    /* TODO: unsupported flow-control op */\n");
+            if (w0 & FP_END) break;
+            continue;
+        }
 
         Src s0, s1, s2;
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
@@ -526,12 +579,6 @@ static int rsx_fp_decompile_internal(
             c, sizeof(c));
         if (has_k)
             constant_slot++;
-
-        if (is_branch) {
-            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
-            if (w0 & FP_END) break;
-            continue;
-        }
 
         /* Build the RHS expression for this opcode. */
         char rhs[640];
