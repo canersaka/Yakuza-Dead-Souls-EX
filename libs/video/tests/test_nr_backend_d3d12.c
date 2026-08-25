@@ -285,12 +285,13 @@ static void stage_rt565_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
-static void stage_private_rgba_rt_texture0(rsx_nir_emitter* em)
+static void stage_private_rgba_rt_texture0_at(rsx_nir_emitter* em,
+                                               u32 offset)
 {
     rsx_nir_texture texture;
     memset(&texture, 0, sizeof(texture));
     texture.enabled = 1;
-    texture.offset = RT565_OFFSET;
+    texture.offset = offset;
     texture.location = RSX_NIR_LOCATION_LOCAL;
     texture.format = 0xA5u;          /* LINEAR | A8R8G8B8                */
     texture.dimension = 2;
@@ -305,6 +306,11 @@ static void stage_private_rgba_rt_texture0(rsx_nir_emitter* em)
     texture.remap = 0u;
     texture.filter = (1u << 16) | (1u << 24);
     rsx_nir_em_texture(em, 0, &texture);
+}
+
+static void stage_private_rgba_rt_texture0(rsx_nir_emitter* em)
+{
+    stage_private_rgba_rt_texture0_at(em, RT565_OFFSET);
 }
 
 static void stage_external_color_texture0(rsx_nir_emitter* em)
@@ -2326,6 +2332,111 @@ static void test_private_rgba_rt_alias(void)
     rsx_nr_d3d12_destroy(sink);
 }
 
+/* One guest address can carry successive logical color formats in a live
+ * frame.  Private full-native targets cannot share a D3D12 resource across
+ * incompatible RSX identities, so target-as-texture lookup must follow the
+ * latest successful writer rather than the first allocated table slot. */
+static void test_private_rt_alias_chooses_latest_writer(void)
+{
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    if (!sink) {
+        CHECK(0, "latest private alias sink creation failed");
+        return;
+    }
+    CHECK(rsx_nr_d3d12_set_live_output(
+              sink, 1, test_present_handoff, NULL) == 0,
+          "latest private alias live-output setup failed");
+
+    rsx_nr_ring ring;
+    memset(&ring, 0, sizeof(ring));
+    if (rsx_nr_ring_init(&ring, 128u, 4096u)) {
+        CHECK(0, "latest private alias ring init failed");
+        rsx_nr_d3d12_destroy(sink);
+        return;
+    }
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nr_backend be;
+    rsx_nr_backend_init(&be, &ring, &tokens, &ops);
+    rsx_nir_sink k = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter em;
+    rsx_nir_emitter_init(&em, &k);
+
+    rsx_nir_surface source;
+    memset(&source, 0, sizeof(source));
+    source.depth_format = 2u;
+    source.raster_type = 1u;
+    source.clip_w = RT_W;
+    source.clip_h = RT_H;
+    source.color_offset[0] = RT565_OFFSET;
+    source.color_pitch[0] = RT_W * 4u;
+    source.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    source.color_target = 1u;
+
+    /* Allocate/write format 8 first, then a format-5 sibling at the same
+     * address. The subsequent A8R8G8B8 texture view must see red, not the
+     * older green identity. */
+    source.color_format = 8u;
+    rsx_nir_em_surface(&em, &source);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF00FF00u, 0u, 0u);
+    source.color_format = 5u;
+    rsx_nir_em_surface(&em, &source);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFFFF0000u, 0u, 0u);
+
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_private_rgba_rt_texture0_at(&em, RT565_OFFSET);
+    {
+        const u32 native_vp[4] = {
+            0x401F9C00u, 0x0040000Du, 0x81000000u, 0x0001FF81u
+        };
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_vertex_program(
+            &em, 0u, native_vp, 4u, 1u, 3u, 0u);
+        rsx_nir_em_clear(&em, 0xF3u, 0xFF000000u, 0xFFFFFFu, 0u);
+        write_triangle(rsx_nr_d3d12_pages(sink),
+                       -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "latest private alias first execution faulted (%llu)",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0 &&
+              pix_is(2u, 61u, 0xFFu, 0x00u, 0x00u),
+          "private alias sampled first allocation instead of latest writer");
+
+    /* Recency must move back to the older table slot after a real rewrite. */
+    source.color_format = 8u;
+    rsx_nir_em_surface(&em, &source);
+    rsx_nir_em_clear(&em, 0xF0u, 0xFF0000FFu, 0u, 0u);
+    stage_frame_state(&em);
+    stage_private_rgba_rt_texture0_at(&em, RT565_OFFSET);
+    {
+        const u32 batch[2] = {0u, 3u};
+        rsx_nir_em_clear(&em, 0xF3u, 0xFF000000u, 0xFFFFFFu, 0u);
+        rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+    }
+    rsx_nr_backend_run(&be, 0u);
+    CHECK(be.stats.exec_errors == 0u,
+          "latest private alias rewrite execution faulted (%llu)",
+          be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, RSX_NIR_LOCATION_LOCAL, RT_OFFSET,
+              RT_W, RT_H, g_pix) == 0 &&
+              pix_is(2u, 61u, 0x00u, 0x00u, 0xFFu),
+          "private alias recency did not follow rewritten older slot");
+
+    rsx_nr_ring_destroy(&ring);
+    rsx_nr_d3d12_destroy(sink);
+}
+
 int main(int argc, char** argv)
 {
     /* Large archived-frame gates run in their own fresh WARP process. This
@@ -3644,6 +3755,7 @@ int main(int argc, char** argv)
     test_private_rt_registry_capacity();
     test_display_chooses_latest_surface_identity();
     test_private_rgba_rt_alias();
+    test_private_rt_alias_chooses_latest_writer();
 
     /* optional real-capture execution leg (large local untracked oracle:
      * absent capture = SKIP so CTest stays hermetic) */
