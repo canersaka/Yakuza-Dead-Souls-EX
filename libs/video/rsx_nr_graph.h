@@ -18,7 +18,7 @@ typedef enum rsx_nr_graph_method_boundary {
  * preceding island without consuming any method from the next island. */
 rsx_nr_graph_method_boundary rsx_nr_graph_classify_method(u32 method);
 
-/* Called after typed adaptation.  These guest-visible actions terminate the
+/* Called after typed adaptation. These guest-visible actions terminate the
  * current island after the complete packet containing the action. */
 int rsx_nr_graph_op_ends_island(u32 kind);
 

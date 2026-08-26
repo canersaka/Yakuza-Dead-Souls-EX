@@ -161,6 +161,8 @@ typedef struct rsx_nr_frame_graph_stats {
     unsigned long long passive_equivalent;
     unsigned long long passive_mismatches;
     unsigned long long construction_ticks;
+    unsigned long long execution_ticks;
+    unsigned long long timed_islands;
     unsigned long long fallback[RSX_NR_FRAME_GRAPH_FB_REASON_COUNT];
     unsigned long long max_methods;
     unsigned long long max_ops;

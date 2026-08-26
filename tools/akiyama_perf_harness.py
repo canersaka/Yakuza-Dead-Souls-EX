@@ -884,6 +884,9 @@ def run_gun(args):
         "YZ_MOVEMENT_PROOF_DELAY_MS": "180000",
         "YZ_MOVEMENT_PROOF_ARM_FILE": str(first_arm),
         "YZ_MOVEMENT_PROOF_DIALOGUE_ARM_FILE": str(hana_visual_gate),
+        # Performance A/B may stop while the ordinary three-leg controller is
+        # quiescent waiting for leg 3. Keeping max legs at three is important:
+        # it preserves the full leg-2 hold needed to trigger Frontier.
         "YZ_MOVEMENT_PROOF_MAX_LEGS": "3",
         "YZ_MOVEMENT_PROOF_FRONTIER_LEG": "2",
         "YZ_MOVEMENT_PROOF_READY_MIN_SERIAL": "1",
@@ -952,6 +955,8 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "shadow"
     if args.nr_submit_attribution:
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
+    if args.nr_stall_aggregate:
+        yz["YZ_NR_STALL_AGGREGATE"] = "1"
     if args.nr_defer_reports:
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
@@ -986,7 +991,9 @@ def run_gun(args):
             ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
              if args.nr_scanout_provenance else {}) |
             ({"YZ_NR_REPORT_AUDIT": "1"}
-             if args.nr_report_audit else {})
+             if args.nr_report_audit else {}) |
+            ({"YZ_NR_STALL_AGGREGATE": "1"}
+             if args.nr_stall_aggregate else {})
         ),
         "gun_reference_dir": str(reference_dir),
         "captures": [],
@@ -1132,6 +1139,26 @@ def run_gun(args):
             for leg in (1, 2):
                 stable = sorted(capture_dir.glob(f"stable_gameplay_leg_{leg}_*.txt"))
                 next_arm = capture_dir / f"arm-movement-{leg + 1}.txt"
+                if stable and leg == 2 and args.gun_entry_checkpoint:
+                    candidate = stable[0]
+                    serial = int(candidate.stem.rsplit("_", 1)[-1])
+                    capture = next((
+                        item for item in result["captures"]
+                        if item["serial"] == serial
+                    ), None)
+                    if (capture and
+                            capture["best_gun_mae"] <= args.gun_anchor_mae and
+                            capture["best_gun_hud_iou"] >= args.gun_hud_iou):
+                        stable_three = candidate
+                        result["route_markers"]["stable_gun_entry"] = str(
+                            candidate
+                        )
+                        result["gun_checkpoint_capture"] = capture
+                        stop_path.write_text(
+                            f"stable initial gun checkpoint {candidate.name}\n",
+                            encoding="ascii",
+                        )
+                        break
                 if stable and not next_arm.exists():
                     next_arm.write_text(
                         f"armed after {stable[0].name}\n", encoding="ascii"
@@ -1141,6 +1168,9 @@ def run_gun(args):
                         f"[gun-harness] armed leg {leg + 1} after {stable[0].name}",
                         flush=True,
                     )
+
+            if stable_three is not None and args.gun_entry_checkpoint:
+                break
 
             stable_files = sorted(
                 capture_dir.glob("stable_gameplay_leg_3_*.txt")
@@ -1182,12 +1212,14 @@ def run_gun(args):
         if stable_three is None:
             raise TimeoutError("stable post-Frontier gun tutorial not reached")
 
-        route_match, _ = wait_log(
-            stderr_path,
+        route_pattern = (
+            r"\[movement-proof\] leg=2 complete; waiting for visual "
+            r"dialogue/transition evidence; next arm path=.*arm-movement-3\.txt"
+            if args.gun_entry_checkpoint else
             r"\[movement-proof\] route complete legs=3; stable gameplay "
-            r"confirmed; synthetic input stopped",
-            20, process,
+            r"confirmed; synthetic input stopped"
         )
+        route_match, _ = wait_log(stderr_path, route_pattern, 20, process)
         stop_match, _ = wait_log(
             stderr_path,
             r"\[movement-proof\] visual probe stopped at confirmed route "
@@ -1543,6 +1575,8 @@ def run(args):
         yz["YZ_XF_IEEE"] = "1"
     if args.nr_submit_attribution:
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
+    if args.nr_stall_aggregate:
+        yz["YZ_NR_STALL_AGGREGATE"] = "1"
     if args.nr_defer_reports:
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
@@ -1578,7 +1612,9 @@ def run(args):
             ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
              if args.nr_scanout_provenance else {}) |
             ({"YZ_NR_REPORT_AUDIT": "1"}
-             if args.nr_report_audit else {})
+             if args.nr_report_audit else {}) |
+            ({"YZ_NR_STALL_AGGREGATE": "1"}
+             if args.nr_stall_aggregate else {})
         ),
         "reference": str(reference_path),
         "captures": [],
@@ -2083,6 +2119,13 @@ def main():
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--gun-route", action="store_true")
+    parser.add_argument(
+        "--gun-entry-checkpoint", action="store_true",
+        help=(
+            "measure the deterministic initial post-Frontier gun camera after "
+            "two proven route legs instead of the FPS-dependent timed third leg"
+        ),
+    )
     parser.add_argument("--gun-reference-dir", type=Path)
     parser.add_argument("--gun-anchor-mae", type=float, default=0.22)
     parser.add_argument("--gun-hud-iou", type=float, default=0.20)
@@ -2103,6 +2146,7 @@ def main():
     parser.add_argument("--nr-scanout-provenance", action="store_true")
     parser.add_argument("--nr-hana-input-oracle", action="store_true")
     parser.add_argument("--nr-submit-attribution", action="store_true")
+    parser.add_argument("--nr-stall-aggregate", action="store_true")
     parser.add_argument("--nr-defer-reports", action="store_true")
     parser.add_argument("--nr-report-audit", action="store_true")
     parser.add_argument(
@@ -2264,6 +2308,8 @@ def main():
                 args.draw_phases, args.wkl4_cycle)):
             parser.error("gun route accepts no diagnostic/family lane")
         return run_gun(args)
+    if args.gun_entry_checkpoint:
+        parser.error("--gun-entry-checkpoint requires --gun-route")
     return run(args)
 
 

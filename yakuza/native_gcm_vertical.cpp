@@ -1388,22 +1388,19 @@ static int yz_nr_active_init(int graphics)
         [](void*) -> unsigned long long { return GetTickCount64(); },
         nullptr, 2u, 30000u);
     if (g_active.single_pass_graph) {
-        LARGE_INTEGER frequency = {};
-        QueryPerformanceFrequency(&frequency);
         const bool graph_timing =
             getenv("YZ_NR_SINGLE_PASS_GRAPH_TIMING") != nullptr;
         rsx_nr_frame_now_ticks_fn graph_clock = nullptr;
         if (graph_timing)
             graph_clock = [](void*) -> unsigned long long {
-                LARGE_INTEGER value = {};
-                QueryPerformanceCounter(&value);
-                return static_cast<unsigned long long>(value.QuadPart);
+                ULONG64 cycles = 0;
+                QueryThreadCycleTime(GetCurrentThread(), &cycles);
+                return static_cast<unsigned long long>(cycles);
             };
         rsx_nr_frame_owner_set_single_pass_graph(
             &g_active.frame_owner, g_active.single_pass_graph,
             &g_active.section_stream, graph_clock, nullptr,
-            graph_timing
-                ? static_cast<unsigned long long>(frequency.QuadPart) : 0ull);
+            0ull);
     }
     return 1;
 }
@@ -5040,11 +5037,6 @@ extern "C" void yz_nr_vertical_shutdown(void)
             const rsx_nr_frame_graph_stats* const graph =
                 &g_active.frame_owner.graph_stats;
             const unsigned long long frames = graph->frames;
-            const unsigned long long construction_us =
-                g_active.frame_owner.graph_tick_frequency
-                    ? graph->construction_ticks * 1000000ull /
-                          g_active.frame_owner.graph_tick_frequency
-                    : 0ull;
             const unsigned long long coverage_den =
                 g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE
                     ? graph->methods : g_active.frame_owner.stats.methods;
@@ -5054,8 +5046,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-single-graph mode=%u calls=%llu islands=%llu "
                     "methods=%llu ops=%llu side-words=%llu frames=%llu "
                     "commands-per-frame=%llu ops-per-frame=%llu "
-                    "construction-ticks=%llu qpc=%llu us=%llu "
-                    "us-per-frame=%llu coverage-ppm=%llu "
+                    "construction-ticks=%llu execution-ticks=%llu "
+                    "timed-islands=%llu ticks-per-frame=%llu/%llu "
+                    "coverage-ppm=%llu "
                     "passive=%llu/%llu/%llu "
                     "fallback=%llu,%llu,%llu "
                     "max=%llu/%llu/%llu]\n",
@@ -5065,9 +5058,10 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     frames ? graph->methods / frames : 0ull,
                     frames ? graph->ops / frames : 0ull,
                     graph->construction_ticks,
-                    g_active.frame_owner.graph_tick_frequency,
-                    construction_us,
-                    frames ? construction_us / frames : 0ull,
+                    graph->execution_ticks,
+                    graph->timed_islands,
+                    frames ? graph->construction_ticks / frames : 0ull,
+                    frames ? graph->execution_ticks / frames : 0ull,
                     coverage_ppm,
                     graph->passive_islands,
                     graph->passive_equivalent,

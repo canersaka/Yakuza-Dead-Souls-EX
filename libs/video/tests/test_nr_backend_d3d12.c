@@ -136,10 +136,11 @@ static const u8* arena_ptr(void* user, u32 space, u32 offset, u32 min_bytes)
     if (g_churn_unrelated_vertex_page && g_churn_sink && !space &&
         offset == VTX_OFFSET && min_bytes >= RSX_GUEST_PAGE_SIZE) {
         /* Model a producer continually publishing unrelated scratch bytes in
-         * the same 1 KiB generation page as a stable vertex span. */
-        g_local[VTX_OFFSET + 512u] ^= 1u;
+         * the same generation page as a stable vertex span. */
+        const u32 churn_offset = VTX_OFFSET + RSX_GUEST_PAGE_SIZE / 2u;
+        g_local[churn_offset] ^= 1u;
         rsx_nr_d3d12_note_guest_write(
-            g_churn_sink, 0u, VTX_OFFSET + 512u, 1u);
+            g_churn_sink, 0u, churn_offset, 1u);
     }
     return base + offset;
 }

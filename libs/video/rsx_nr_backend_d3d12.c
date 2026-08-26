@@ -6484,10 +6484,14 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
                     goto fail;
             }
         }
-        /* One permanent mirror handle per exact 1 KiB subpage is the maximum.
-         * Reserving it here proves the render-thread registration path cannot
-         * allocate, reallocate, or lose a page under memory pressure. */
-        if (rsx_gpu_mirror_reserve_ranges(b->mirror, total_pages) != 0)
+        /* Mirror handles encode a 20-bit slot. Reserve the complete handle
+         * namespace (or the smaller tracked address space) up front so
+         * first-use page registration cannot allocate on the render thread.
+         * The fixed cap remains fail-closed if a future tracker layout can
+         * describe more pages than the handle namespace. */
+        const u32 mirror_slots = total_pages < 0xFFFFFu
+            ? total_pages : 0xFFFFFu;
+        if (rsx_gpu_mirror_reserve_ranges(b->mirror, mirror_slots) != 0)
             goto fail;
     }
 

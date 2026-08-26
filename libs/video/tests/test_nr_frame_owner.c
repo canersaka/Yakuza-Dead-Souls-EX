@@ -1368,13 +1368,13 @@ static int test_single_pass_publishes_copied_packet_before_island_execution(void
     fixture_init(&f);
     fixture_graph(&f, RSX_NR_FRAME_GRAPH_EXECUTE);
     const u32 base = 0x1000u;
-    /* CLEAR records an action but does not end its island. PRESENT in the
-     * next packet closes it. The copied first packet may be published to the
-     * producer without executing or rescanning it. */
-    f.words[(base + 0u) >> 2] = packet(1u, 0x1D94u);
-    f.words[(base + 4u) >> 2] = 0x000000F3u;
-    f.words[(base + 8u) >> 2] = packet(1u, 0xE944u);
-    f.words[(base + 12u) >> 2] = 2u;
+    /* A state-only packet may publish immediately without execution. The
+     * following CLEAR action is a resource-consumption boundary and must
+     * execute exactly once before its packet cursor becomes visible. */
+    f.words[(base + 0u) >> 2] = packet(1u, 0x0388u);
+    f.words[(base + 4u) >> 2] = 0x3F800000u;
+    f.words[(base + 8u) >> 2] = packet(1u, 0x1D94u);
+    f.words[(base + 12u) >> 2] = 0x000000F3u;
     u32 next = base, ret = ~0u;
     CHECK(rsx_nr_frame_owner_step(
               &f.owner, next, base + 16u, ret, &next, &ret) ==
@@ -1383,17 +1383,17 @@ static int test_single_pass_publishes_copied_packet_before_island_execution(void
     CHECK(f.adapter.methods_seen == 1u &&
               f.owner.graph_stats.islands == 0u &&
               f.owner.stats.backend_ops == 0u &&
-              f.graph_stream.op_count != 0u,
-          "copied packet executed or was discarded before its boundary");
+              f.graph_stream.op_count == 0u,
+          "state-only packet executed or retained work unexpectedly");
     CHECK(rsx_nr_frame_owner_step(
               &f.owner, next, base + 16u, ret, &next, &ret) ==
               RSX_NR_FRAME_ADVANCED && next == base + 16u,
-          "retained island did not retire at the next packet");
-    CHECK(f.adapter.methods_seen == 2u && f.presents == 1u &&
+          "clear island did not retire at its action boundary");
+    CHECK(f.adapter.methods_seen == 2u && f.presents == 0u &&
               f.owner.graph_stats.methods == 2u &&
-              f.owner.graph_stats.islands == 2u &&
+              f.owner.graph_stats.islands == 1u &&
               f.ring.pushes == 0u && f.ring.pops == 0u,
-          "retained packet was rescanned or executed out of order");
+          "action packet was rescanned or executed out of order");
     return 0;
 }
 
