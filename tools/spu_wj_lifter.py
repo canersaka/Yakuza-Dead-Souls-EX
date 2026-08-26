@@ -15,8 +15,8 @@ What changes vs WB:
   * Each group is ONE C function. Guest registers live in function-scoped
     __m128i locals (R3, R80, ...) that mirror the architectural registers
     at all times inside the group:
-      - every ENTRY (entry switch case) runs a stub that loads every
-        register the group touches, then jumps to its block;
+      - every ENTRY (entry switch case) runs a stub that loads its
+        conservatively-computed live-in registers, then jumps to its block;
       - intra-group control flow is plain `goto` carrying the locals --
         no ctx->gpr traffic on block boundaries or loop back-edges;
       - barriers (channel ops, calls, halts, stops, every transfer that
@@ -89,6 +89,45 @@ def _reads_of(insn):
     return list(regs)
 
 
+def compute_entry_loads(leaders, entries, carry_in, use_before_def,
+                        block_defs, successors, reload_cuts):
+    """Return conservative architectural-register loads for each entry.
+
+    ``reload_cuts`` contains call blocks whose continuation resumes through a
+    fresh entry stub. Carry registers are pseudo-reads: generated publication
+    may mirror-store them even when the path entered from the external switch
+    rather than an internal dirty predecessor.
+
+    The helper is deliberately independent of decoded instructions so its
+    fixed-point and boundary behavior can be tested deterministically.
+    """
+    leaders = tuple(leaders)
+    uses = {
+        leader: set(use_before_def.get(leader, ())) |
+                set(carry_in.get(leader, ()))
+        for leader in leaders
+    }
+    live_in = {leader: set(uses[leader]) for leader in leaders}
+    changed = True
+    while changed:
+        changed = False
+        for leader in reversed(leaders):
+            succ_live = set()
+            if leader not in reload_cuts:
+                for succ in successors.get(leader, ()):
+                    if succ in live_in:
+                        succ_live.update(live_in[succ])
+            new_live = (uses[leader] |
+                        (succ_live - set(block_defs.get(leader, ()))))
+            if new_live != live_in[leader]:
+                live_in[leader] = new_live
+                changed = True
+    return {
+        entry: frozenset(live_in[entry] | set(carry_in.get(entry, ())))
+        for entry in entries
+    }
+
+
 class Group:
     def __init__(self, gid, blocks):
         self.gid = gid
@@ -97,6 +136,7 @@ class Group:
         self.entries = set()              # cased pcs
         self.touched = set()              # guest regs read or written
         self.carry_in = {}                # leader -> frozenset(regs)
+        self.entry_loads = {}             # entry -> frozenset(regs)
         self.name = None
 
 
@@ -109,6 +149,7 @@ class WJLifter(WBLifter):
         self.metrics.update({
             "wj_units": 0, "wj_groups": 0, "wj_entries": 0,
             "wj_interior_blocks": 0, "wj_entry_loads": 0,
+            "wj_entry_loads_all_touched": 0,
             "wj_publish_stores": 0, "wj_intra_gotos": 0,
         })
 
@@ -284,6 +325,39 @@ class WJLifter(WBLifter):
                                 changed = True
             g.carry_in = {l: frozenset(v) for l, v in carry.items()}
 
+            # Backward may-liveness for each externally/call-enterable pc.
+            # A register is needed at an entry when some reachable path reads
+            # it before defining it. Carry sets are pseudo-reads because the
+            # emitter may publish a carried-but-clean local: loading that local
+            # preserves the old value and keeps conservative publication a
+            # semantic no-op. Real calls are reload cuts: their continuation
+            # re-enters through an entry stub after the callee/drain may have
+            # changed every architectural register. Publishing without a call
+            # is not a cut because an in-group fallthrough keeps the locals.
+            use_before_def = {}
+            block_defs = {}
+            for b in g.blocks:
+                defined = set()
+                uses = set(g.carry_in.get(b.leader, ()))
+                for insn in b.insns:
+                    uses.update(set(_reads_of(insn)) - defined)
+                    defined.update(_dest_of(insn))
+                use_before_def[b.leader] = uses
+                block_defs[b.leader] = defined
+
+            successors = {
+                b.leader: tuple(s for s in self.block_edges(b)
+                                if self.leader_group.get(s) is g)
+                for b in g.blocks
+            }
+            reload_cuts = {b.leader for b in g.blocks
+                           if self._term_reloads_successor(b)}
+            g.entry_loads = compute_entry_loads(
+                [b.leader for b in g.blocks], g.entries, g.carry_in,
+                use_before_def, block_defs, successors, reload_cuts)
+            self.metrics["wj_entry_loads_all_touched"] += (
+                len(g.entries) * len(g.touched))
+
     def _term_publishes(self, blk):
         """True when the block's terminator publishes before its outgoing
         intra-group edges run (call/channel-class or any possibly-external
@@ -308,6 +382,18 @@ class WJLifter(WBLifter):
         if mn in ("biz", "binz", "bihz", "bihnz"):
             return True                      # conditional return/indirect
         return True
+
+    def _term_reloads_successor(self, blk):
+        """True only when a successor is re-entered after a real call."""
+        insn = blk.insns[-1]
+        mn = insn.mnemonic
+        if mn == "bisl":
+            return True
+        if mn not in ("brsl", "brasl"):
+            return False
+        tgt = SPULifter()._branch_target(insn)
+        # Self traps and pc-getter idioms do not execute a callee.
+        return tgt not in (insn.addr, insn.addr + 4)
 
     # -- routing ----------------------------------------------------------
     def wj_symbol(self, pc):
@@ -594,7 +680,7 @@ def emit_wj(wl: WJLifter, header_name):
         src.append("}")
         for e in sorted(g.entries):
             src.append(f"entry_{e:08X}: ;")
-            for r in sorted(g.touched):
+            for r in sorted(g.entry_loads[e]):
                 src.append(f"    R{r} = WB_GPR_LOAD(ctx, {r});")
                 wl.metrics["wj_entry_loads"] += 1
             src.append(f"    goto b_{e:08X};")

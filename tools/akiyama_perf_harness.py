@@ -44,10 +44,40 @@ EXPECTED_CACHE = {
     "YZ_SPU_FAST_JOB_E": "ON",
     "YZ_SPU_FAST_ORPHANAGE": "ON",
     "YZ_SPU_FAST_SPURS_EXPERIMENTAL": "OFF",
+    "YZ_SPU_WJ_GSTASK": "OFF",
+    "YZ_SPU_WJ_CRI": "OFF",
+    "YZ_SPU_WJ_WKL4": "OFF",
+    "YZ_SPU_WJ_SPUIMG": "OFF",
+    "YZ_SPU_WJ_JOB_A": "OFF",
+    "YZ_SPU_WJ_JOB_B": "OFF",
+    "YZ_SPU_WJ_JOB_C": "OFF",
+    "YZ_SPU_WJ_JOB_D": "OFF",
+    "YZ_SPU_WJ_JOB_E": "OFF",
+    "YZ_SPU_WJ_ORPHANAGE": "OFF",
     "YZ_SPU_SIMD_ABSDB": "ON",
     "YZ_SPU_SIMD_XFLOAT": "ON",
     "YZ_WKL4_CYCLE_DIAGNOSTIC": "OFF",
 }
+
+WJ_EXPECTATIONS = {
+    "expect_wj_gstask": "YZ_SPU_WJ_GSTASK",
+    "expect_wj_cri": "YZ_SPU_WJ_CRI",
+    "expect_wj_wkl4": "YZ_SPU_WJ_WKL4",
+    "expect_wj_spuimg": "YZ_SPU_WJ_SPUIMG",
+    "expect_wj_job_a": "YZ_SPU_WJ_JOB_A",
+    "expect_wj_job_b": "YZ_SPU_WJ_JOB_B",
+    "expect_wj_job_c": "YZ_SPU_WJ_JOB_C",
+    "expect_wj_job_d": "YZ_SPU_WJ_JOB_D",
+    "expect_wj_job_e": "YZ_SPU_WJ_JOB_E",
+    "expect_wj_orphanage": "YZ_SPU_WJ_ORPHANAGE",
+}
+
+
+def apply_wj_expectations(args, expected_cache):
+    for argument, cache_key in WJ_EXPECTATIONS.items():
+        value = getattr(args, argument)
+        if value:
+            expected_cache[cache_key] = value
 
 
 def process_cpu_seconds(pid: int) -> float:
@@ -844,6 +874,7 @@ def run_gun(args):
         expected_cache["YZ_SPU_EXACT_IMAGE_BYTES"] = (
             args.expect_exact_image_bytes
         )
+    apply_wj_expectations(args, expected_cache)
     mismatches = {
         name: {"expected": expected, "actual": cache.get(name)}
         for name, expected in expected_cache.items()
@@ -1478,6 +1509,7 @@ def run(args):
         expected_cache["YZ_SPU_EXACT_IMAGE_BYTES"] = (
             args.expect_exact_image_bytes
         )
+    apply_wj_expectations(args, expected_cache)
     if args.wkl4_cycle:
         expected_cache["YZ_WKL4_CYCLE_DIAGNOSTIC"] = "ON"
     mismatches = {
@@ -2116,6 +2148,10 @@ def main():
     parser.add_argument(
         "--expect-exact-image-bytes", choices=("ON", "OFF")
     )
+    for argument in WJ_EXPECTATIONS:
+        parser.add_argument(
+            "--" + argument.replace("_", "-"), choices=("ON", "OFF")
+        )
     parser.add_argument("--multi-scene-reference-dir", type=Path)
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--gun-route", action="store_true")

@@ -96,9 +96,17 @@ static void test_parse(void)
           SPU_NJS_E_DESCRIPTOR, "ea > 0xFFFFFFF0 rejected");
 
     make_desc(d, 0x40);
-    d[0x2c] = 2;                          /* BINARY2 jobType */
+    d[0x2c] = 4;                          /* BINARY2 jobType bit */
     CHECK(spu_njs_parse_descriptor(d, 0x40, 0x40000000, &j) ==
           SPU_NJS_E_BINARY2, "BINARY2 refused honestly");
+
+    make_desc(d, 0x40);
+    d[0x2c] = 1;                          /* STALL_SUCCESSOR */
+    CHECK(spu_njs_parse_descriptor(d, 0x40, 0x40000000, &j) == SPU_NJS_OK,
+          "STALL_SUCCESSOR is not BINARY2");
+    d[0x2c] = 2;                          /* MEMORY_CHECK */
+    CHECK(spu_njs_parse_descriptor(d, 0x40, 0x40000000, &j) == SPU_NJS_OK,
+          "MEMORY_CHECK is not BINARY2");
 
     make_desc(d, 0x40);
     w64(d + 0x00, 0);                     /* no binary */
