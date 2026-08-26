@@ -480,6 +480,7 @@ if(PS3RECOMP_BUILD_TESTS)
         add_executable(rsx_nr_frame_owner_tests
             libs/video/tests/test_nr_frame_owner.c
             libs/video/rsx_nr_frame_owner.c
+            libs/video/rsx_nr_graph.c
             libs/video/rsx_nr_producer_contract.c
             libs/video/rsx_nir.c
             libs/video/rsx_nir_emitter.c
@@ -501,6 +502,20 @@ if(PS3RECOMP_BUILD_TESTS)
         )
         set_tests_properties(
             rsx_nr_frame_owner
+            PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
+        )
+
+        add_executable(rsx_nr_graph_tests
+            libs/video/tests/test_nr_graph.c
+            libs/video/rsx_nr_graph.c
+        )
+        target_include_directories(rsx_nr_graph_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        add_test(NAME rsx_nr_graph COMMAND rsx_nr_graph_tests)
+        set_tests_properties(
+            rsx_nr_graph
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
@@ -606,6 +621,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_nir_emitter.c
             libs/video/rsx_nir_adapter.c
             libs/video/rsx_nr_frame_owner.c
+            libs/video/rsx_nr_graph.c
             libs/video/rsx_nr_producer_contract.c
             libs/video/rsx_nr_ring.c
             libs/video/rsx_nr_backend.c

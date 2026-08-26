@@ -50,6 +50,32 @@ EXPECTED_CACHE = {
 }
 
 
+def process_cpu_seconds(pid: int) -> float:
+    """Return aggregate kernel+user CPU for one exact process."""
+    process_query_limited_information = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(
+        process_query_limited_information, False, pid
+    )
+    if not handle:
+        raise ctypes.WinError()
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not ctypes.windll.kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            raise ctypes.WinError()
+        def ticks(value):
+            return (value.dwHighDateTime << 32) | value.dwLowDateTime
+        return (ticks(kernel) + ticks(user)) / 10_000_000.0
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
 def ppm_tokens(handle):
     while True:
         byte = handle.read(1)
@@ -930,6 +956,10 @@ def run_gun(args):
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
         yz["YZ_NR_REPORT_AUDIT"] = "1"
+    if args.nr_graph_execute:
+        yz["YZ_NR_GRAPH"] = "execute"
+    if args.nr_single_pass_graph:
+        yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -1168,6 +1198,7 @@ def run_gun(args):
             list(capture_dir.glob("frontier_probe_*.ppm"))
         )
         result["status"] = "measuring"
+        measurement_cpu_start = process_cpu_seconds(process.pid)
         print(
             f"[gun-harness] stable gun scene; measuring {args.hold_seconds}s",
             flush=True,
@@ -1180,6 +1211,9 @@ def run_gun(args):
                 )
             time.sleep(min(0.5, end - time.monotonic()))
 
+        result["measurement_process_cpu_seconds"] = round(
+            process_cpu_seconds(process.pid) - measurement_cpu_start, 6
+        )
         result["status"] = "closing"
         windows = post_close(process.pid)
         result["wm_close_windows"] = windows
@@ -1206,6 +1240,9 @@ def run_gun(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        single_graph_lines = re.findall(
+            r"^\[nr-single-graph .*\]$", stderr_text, re.MULTILINE
+        )
         submit_lines = re.findall(
             r"^\[nr-submit-attribution .*\]$", stderr_text, re.MULTILINE
         )
@@ -1217,6 +1254,7 @@ def run_gun(args):
         )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_single_graph"] = single_graph_lines
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
@@ -1272,6 +1310,23 @@ def run_gun(args):
                     "strict full-native gun run reached legacy work or a "
                     f"native refusal: {full_native_d3d}"
                 )
+            if args.nr_single_pass_graph and len(single_graph_lines) != 1:
+                raise RuntimeError(
+                    "single-pass graph aggregate incomplete: "
+                    f"{single_graph_lines}"
+                )
+            if (args.nr_single_pass_graph == "passive" and
+                    (not single_graph_lines or
+                     not re.search(r"passive=([0-9]+)/\1/0(?: |\])",
+                                   single_graph_lines[0]))):
+                raise RuntimeError(
+                    "single-pass passive equivalence failed: "
+                    f"{single_graph_lines}"
+                )
+            if not args.nr_single_pass_graph and single_graph_lines:
+                raise RuntimeError(
+                    "single-pass graph was active outside its requested lane"
+                )
         elif full_native_lines:
             raise RuntimeError("strict full-native owner was active in another lane")
         if args.nr_vertical_shadow:
@@ -1316,6 +1371,11 @@ def run_gun(args):
             qpc_path, result["measurement_start_present_id"], bucket_seconds=5.0
         )
         result.update(metrics)
+        if metrics["measurement_presents"] > 1:
+            result["process_cpu_ms_per_present"] = round(
+                result["measurement_process_cpu_seconds"] * 1000.0 /
+                (metrics["measurement_presents"] - 1), 3
+            )
         result["scenes"] = {
             "post_frontier_gun_tutorial": {
                 "kind": "stationary",
@@ -1485,6 +1545,10 @@ def run(args):
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
         yz["YZ_NR_REPORT_AUDIT"] = "1"
+    if args.nr_graph_execute:
+        yz["YZ_NR_GRAPH"] = "execute"
+    if args.nr_single_pass_graph:
+        yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
     environment.update(yz)
 
     result = {
@@ -1745,6 +1809,7 @@ def run(args):
         # no periodic logging or extra measurement clock is needed here.
         result["measurement_start_present_id"] = int(stop_match.group(1))
         result["status"] = "measuring"
+        measurement_cpu_start = process_cpu_seconds(process.pid)
         print(
             f"[akiyama-harness] checkpoint stable; measuring {args.hold_seconds}s",
             flush=True,
@@ -1754,6 +1819,9 @@ def run(args):
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during measurement: {process.returncode}")
             time.sleep(min(0.5, end - time.monotonic()))
+        result["measurement_process_cpu_seconds"] = round(
+            process_cpu_seconds(process.pid) - measurement_cpu_start, 6
+        )
         result["status"] = "closing"
         windows = post_close(process.pid)
         result["wm_close_windows"] = windows
@@ -1799,6 +1867,9 @@ def run(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        single_graph_lines = re.findall(
+            r"^\[nr-single-graph .*\]$", stderr_text, re.MULTILINE
+        )
         submit_lines = re.findall(
             r"^\[nr-submit-attribution .*\]$", stderr_text, re.MULTILINE
         )
@@ -1810,6 +1881,7 @@ def run(args):
         )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_single_graph"] = single_graph_lines
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
@@ -1864,6 +1936,23 @@ def run(args):
                 raise RuntimeError(
                     "strict full-native run reached legacy work or a native "
                     f"refusal: {full_native_d3d}"
+                )
+            if args.nr_single_pass_graph and len(single_graph_lines) != 1:
+                raise RuntimeError(
+                    "single-pass graph aggregate incomplete: "
+                    f"{single_graph_lines}"
+                )
+            if (args.nr_single_pass_graph == "passive" and
+                    (not single_graph_lines or
+                     not re.search(r"passive=([0-9]+)/\1/0(?: |\])",
+                                   single_graph_lines[0]))):
+                raise RuntimeError(
+                    "single-pass passive equivalence failed: "
+                    f"{single_graph_lines}"
+                )
+            if not args.nr_single_pass_graph and single_graph_lines:
+                raise RuntimeError(
+                    "single-pass graph was active outside its requested lane"
                 )
         elif full_native_lines:
             raise RuntimeError("strict full-native owner was active in another lane")
@@ -1926,6 +2015,11 @@ def run(args):
         result.update(qpc_metrics(
             qpc_path, result["measurement_start_present_id"]
         ))
+        if result["measurement_presents"] > 1:
+            result["process_cpu_ms_per_present"] = round(
+                result["measurement_process_cpu_seconds"] * 1000.0 /
+                (result["measurement_presents"] - 1), 3
+            )
         if args.multi_scene_reference_dir:
             multi_scene_metrics(
                 result,
@@ -2008,6 +2102,14 @@ def main():
     parser.add_argument("--nr-defer-reports", action="store_true")
     parser.add_argument("--nr-report-audit", action="store_true")
     parser.add_argument(
+        "--nr-graph-execute", action="store_true",
+        help="execute strict-native FIFO dependency islands through the fixed graph",
+    )
+    parser.add_argument(
+        "--nr-single-pass-graph", choices=("passive", "execute"),
+        help="record strict-owner dependency islands once at decode time",
+    )
+    parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
     )
@@ -2076,6 +2178,14 @@ def main():
         parser.error("--nr-defer-reports requires --nr-vertical-full-native")
     if args.nr_report_audit and not args.nr_defer_reports:
         parser.error("--nr-report-audit requires --nr-defer-reports")
+    if args.nr_graph_execute and not args.nr_vertical_full_native:
+        parser.error("--nr-graph-execute requires --nr-vertical-full-native")
+    if args.nr_single_pass_graph and not args.nr_vertical_full_native:
+        parser.error(
+            "--nr-single-pass-graph requires --nr-vertical-full-native"
+        )
+    if args.nr_single_pass_graph and args.nr_graph_execute:
+        parser.error("scanner graph and single-pass graph are mutually exclusive")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

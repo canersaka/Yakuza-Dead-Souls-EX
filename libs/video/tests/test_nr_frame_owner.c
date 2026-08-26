@@ -10,6 +10,8 @@
 #define TEST_WORDS (0x8000u / 4u)
 #define TEST_RING_OPS 512u
 #define TEST_RING_SIDE 32768u
+#define TEST_GRAPH_OPS 512u
+#define TEST_GRAPH_SIDE 32768u
 
 typedef struct fixture {
     u32 words[TEST_WORDS];
@@ -42,6 +44,7 @@ typedef struct fixture {
     u32 hole_previous_get;
     u32 hole_previous_command;
     unsigned long long now_ms;
+    unsigned long long now_ticks;
     rsx_nr_slot slots[TEST_RING_OPS];
     u32 side[TEST_RING_SIDE];
     rsx_nr_ring ring;
@@ -49,7 +52,11 @@ typedef struct fixture {
     rsx_nir_adapter adapter;
     rsx_nr_backend backend;
     rsx_nr_frame_owner owner;
+    rsx_nir_stream graph_stream;
 } fixture;
+
+static rsx_nir_op g_graph_ops[TEST_GRAPH_OPS];
+static u32 g_graph_side[TEST_GRAPH_SIDE];
 
 static int read_word(void* user, u32 io, u32* value)
 {
@@ -63,6 +70,12 @@ static int read_word(void* user, u32 io, u32* value)
 static unsigned long long test_now_ms(void* user)
 {
     return ((fixture*)user)->now_ms;
+}
+
+static unsigned long long test_now_ticks(void* user)
+{
+    fixture* f = user;
+    return ++f->now_ticks;
 }
 
 static int sem_read(void* user, u32 dma, u32 offset, u32* value)
@@ -188,6 +201,16 @@ static void fixture_init(fixture* f)
                              registered_released_edge, f,
                              resolve_generated_jump, f,
                              resolve_generated_hole, f);
+}
+
+static void fixture_graph(fixture* f, u32 mode)
+{
+    rsx_nir_stream_init_fixed(
+        &f->graph_stream, g_graph_ops, TEST_GRAPH_OPS,
+        g_graph_side, TEST_GRAPH_SIDE);
+    rsx_nr_frame_owner_set_single_pass_graph(
+        &f->owner, mode, &f->graph_stream,
+        test_now_ticks, f, 1000000ull);
 }
 
 static u32 packet(u32 count, u32 method)
@@ -1274,6 +1297,157 @@ static int test_execution_failure_retains_exact_argument(void)
     return 0;
 }
 
+static int test_single_pass_passive_matches_immediate(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_graph(&f, RSX_NR_FRAME_GRAPH_PASSIVE);
+    const u32 base = 0x1000u;
+    f.words[(base + 0u) >> 2] = packet(1u, 0x0050u);
+    f.words[(base + 4u) >> 2] = 0x13579BDFu;
+    f.words[(base + 8u) >> 2] = packet(1u, 0xE944u);
+    f.words[(base + 12u) >> 2] = 3u;
+    u32 next = base, ret = ~0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 8u,
+          "passive reference cursor changed");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 16u,
+          "passive present cursor changed");
+    CHECK(f.references == 0x13579BDFu && f.presents == 1u &&
+              f.adapter.methods_seen == 2u,
+          "passive path changed immediate outputs");
+    CHECK(f.owner.graph_stats.passive_islands == 2u &&
+              f.owner.graph_stats.passive_equivalent == 2u &&
+              f.owner.graph_stats.passive_mismatches == 0u,
+          "passive op/order equivalence was not exact (%llu/%llu/%llu)",
+          f.owner.graph_stats.passive_islands,
+          f.owner.graph_stats.passive_equivalent,
+          f.owner.graph_stats.passive_mismatches);
+    return 0;
+}
+
+static int test_single_pass_execute_decodes_once_without_ring(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_graph(&f, RSX_NR_FRAME_GRAPH_EXECUTE);
+    const u32 base = 0x1000u;
+    f.words[(base + 0u) >> 2] = packet(1u, 0x0050u);
+    f.words[(base + 4u) >> 2] = 0x2468ACE0u;
+    f.words[(base + 8u) >> 2] = packet(1u, 0xE944u);
+    f.words[(base + 12u) >> 2] = 4u;
+    u32 next = base, ret = ~0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 16u,
+          "single-pass execution did not retire through present");
+    CHECK(f.references == 0x2468ACE0u && f.presents == 1u &&
+              f.adapter.methods_seen == 2u,
+          "single-pass commands were not executed exactly once");
+    CHECK(f.ring.pushes == 0 && f.ring.pops == 0 &&
+              f.owner.graph_stats.methods == 2u &&
+              f.owner.graph_stats.islands == 2u &&
+              f.owner.graph_stats.frames == 1u,
+          "single-pass path copied through ring or miscounted");
+    CHECK(f.owner.graph_stats.construction_ticks == 2u,
+          "construction clock was not sampled once per island (%llu)",
+          f.owner.graph_stats.construction_ticks);
+    return 0;
+}
+
+static int test_single_pass_semaphore_retry_is_one_translation(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_graph(&f, RSX_NR_FRAME_GRAPH_EXECUTE);
+    const u32 base = 0x1000u;
+    f.words[(base + 0u) >> 2] = packet(3u, 0x0060u);
+    f.words[(base + 4u) >> 2] = 0x66626660u;
+    f.words[(base + 8u) >> 2] = 0x100u;
+    f.words[(base + 12u) >> 2] = 0xA5A5A5A5u;
+    u32 next = base, ret = ~0u;
+    for (u32 i = 0; i < 10000u; ++i)
+        CHECK(rsx_nr_frame_owner_step(
+                  &f.owner, base, base + 16u, ret, &next, &ret) ==
+                  RSX_NR_FRAME_WAIT_SEMAPHORE && next == base,
+              "single-pass semaphore escaped at retry %u", i);
+    CHECK(f.adapter.methods_seen == 3u &&
+              f.owner.graph_stats.methods == 0u,
+          "blocked island was retranslated or prematurely accounted");
+    f.semaphore = 0xA5A5A5A5u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 16u,
+          "satisfied single-pass semaphore did not retire");
+    CHECK(f.adapter.methods_seen == 3u &&
+              f.owner.graph_stats.methods == 3u &&
+              f.owner.graph_stats.islands == 1u &&
+              f.backend.stats.blocked_semaphore == 10000u,
+          "single-pass semaphore retry was not one retained island");
+    return 0;
+}
+
+static int test_single_pass_unsupported_island_is_atomic(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_graph(&f, RSX_NR_FRAME_GRAPH_EXECUTE);
+    f.owner.resolve_hole = NULL;
+    const u32 base = 0x1000u;
+    /* LINE_WIDTH is state-only; its following incremented method is
+     * deliberately unsupported. No typed action may execute first. */
+    f.words[(base + 0u) >> 2] = packet(2u, 0x0388u);
+    f.words[(base + 4u) >> 2] = 0x3F800000u;
+    f.words[(base + 8u) >> 2] = 0xDEADBEEFu;
+    u32 next = base, ret = ~0u;
+    CHECK(!rsx_nir_adapter_method_supported(&f.adapter, 0x038Cu,
+                                             0xDEADBEEFu),
+          "test unsupported method became supported");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 12u, ret, &next, &ret) ==
+              RSX_NR_FRAME_FATAL,
+          "unsupported single-pass island did not fail closed");
+    CHECK(f.owner.graph_stats.islands == 0u &&
+              f.owner.stats.backend_ops == 0u &&
+              f.backend.stats.executed[RSX_NIR_OP_DRAW] == 0u &&
+              f.backend.stats.executed[RSX_NIR_OP_CLEAR] == 0u &&
+              f.owner.graph_stats.fallback[
+                  RSX_NR_FRAME_GRAPH_FB_UNSUPPORTED_METHOD] == 1u,
+          "unsupported island partially executed");
+    return 0;
+}
+
+static int test_stream_backend_resolves_linear_side_payload(void)
+{
+    fixture f;
+    fixture_init(&f);
+    rsx_nir_stream_init_fixed(
+        &f.graph_stream, g_graph_ops, TEST_GRAPH_OPS,
+        g_graph_side, TEST_GRAPH_SIDE);
+    const u32 words[4] = {
+        0x01020304u, 0x11223344u, 0x55667788u, 0x99AABBCCu
+    };
+    rsx_nir_op op;
+    memset(&op, 0, sizeof(op));
+    op.kind = RSX_NIR_OP_SET_VERTEX_PROGRAM;
+    op.u.vertex_program.word_count = 4u;
+    op.u.vertex_program.words_ofs =
+        rsx_nir_side_push(&f.graph_stream, words, 4u);
+    CHECK(rsx_nir_push(&f.graph_stream, &op) == 0,
+          "stream VP setup overflowed");
+    CHECK(rsx_nr_backend_stream_step(
+              &f.backend, &f.graph_stream, 0u) == RSX_NR_STEP_EXECUTED &&
+              f.backend.vp_word_count == 4u &&
+              memcmp(f.backend.vp_words, words, sizeof(words)) == 0,
+          "stream backend did not resolve linear side payload");
+    CHECK(f.ring.pushes == 0 && f.ring.pops == 0,
+          "stream backend unexpectedly touched the atomic ring");
+    return 0;
+}
+
 int main(void)
 {
     if (test_consume_once_and_present() ||
@@ -1298,7 +1472,12 @@ int main(void)
         test_registered_island_edge_skips_payload_exactly() ||
         test_control_cycle_is_bounded() ||
         test_first_unsupported_is_sticky() ||
-        test_execution_failure_retains_exact_argument())
+        test_execution_failure_retains_exact_argument() ||
+        test_single_pass_passive_matches_immediate() ||
+        test_single_pass_execute_decodes_once_without_ring() ||
+        test_single_pass_semaphore_retry_is_one_translation() ||
+        test_single_pass_unsupported_island_is_atomic() ||
+        test_stream_backend_resolves_linear_side_payload())
         return 1;
     puts("rsx_nr_frame_owner: PASS");
     return 0;
