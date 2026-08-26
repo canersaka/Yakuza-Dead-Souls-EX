@@ -430,7 +430,21 @@ void spu_diff_ctx_init(spu_context* ctx)
      * iterations) bound every pc architecturally in both twins identically.
      * Lanes 1-3 keep full-width entropy either way. */
     {
+        /* SPU_DIFF_PREFMASK widens single-window trips for realistic-width
+         * soak runs (e.g. 0x3FFFF); unset keeps the documented default.
+         * Sweep mode always uses the 8-bit architectural bound. */
+        static uint32_t ovr_mask;
+        static int ovr_init;
         uint32_t pref_mask = g_sweep_cut_on ? 0xFFu : 0xFFFFu;
+        if (!g_sweep_cut_on) {
+            if (!ovr_init) {
+                const char* s = getenv("SPU_DIFF_PREFMASK");
+                ovr_mask = s ? (uint32_t)strtoul(s, 0, 0) : 0;
+                ovr_init = 1;
+            }
+            if (ovr_mask)
+                pref_mask = ovr_mask;
+        }
         for (int r = 2; r < 128; r++)
             ctx->gpr[r]._u32[0] &= pref_mask;
     }
