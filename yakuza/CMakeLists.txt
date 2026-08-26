@@ -305,8 +305,12 @@ function(_yz_spu_pick3 outvar wb fast diag stem)
         set_source_files_properties("${_fast_c}" PROPERTIES
             COMPILE_DEFINITIONS "${_reg}=${_reg}_fastbase")
         if(MSVC)
+            # /d2SSAOptimizer-: MSVC 19.51.36248's SSA optimizer miscompiles
+            # the lane-TU code shape (huge function, many __m128i locals,
+            # goto web); differential evidence in tools/spu_wb_diff.py at
+            # WB_EXTRA. Keep this list identical to WB_EXTRA there.
             set_source_files_properties("${_wb_c}" PROPERTIES
-                COMPILE_OPTIONS "/arch:AVX2"
+                COMPILE_OPTIONS "/arch:AVX2;/d2SSAOptimizer-"
                 COMPILE_DEFINITIONS "YZ_SPU_SIMD_LS128=1;YZ_SPU_SIMD_SHUFB=1")
         endif()
         list(APPEND ${outvar} "${_fast_c}" "${_wb_c}")
