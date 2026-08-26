@@ -285,19 +285,27 @@ function(_yz_spu_pick outvar fast diag stem)
     set(${outvar} "${${outvar}}" PARENT_SCOPE)
 endfunction()
 
-# _yz_spu_pick3(<listvar> <wb_flag> <fast_flag> <diag_path> <stem>): WB lane
-# on top of the DIAG/FAST swap. The register symbol is recovered from the WB
-# header's `<register>_fastbase` declaration (single source of truth: the
-# generator), so no symbol map is duplicated here.
-function(_yz_spu_pick3 outvar wb fast diag stem)
-    if(${wb})
-        set(_wb_c "${PS3RECOMP_DIR}/yakuza/generated/wb/${stem}_wb.c")
-        set(_wb_h "${PS3RECOMP_DIR}/yakuza/generated/wb/${stem}_wb.h")
+# _yz_spu_pick4(<listvar> <wj_flag> <wb_flag> <fast_flag> <diag_path> <stem>):
+# whole-job/whole-block lane on top of the DIAG/FAST swap. The selected lane's
+# header is the single source of truth for the FAST fallback register symbol.
+function(_yz_spu_pick4 outvar wj wb fast diag stem)
+    if(${wj} AND ${wb})
+        message(FATAL_ERROR
+            "${stem}: YZ_SPU_WJ and YZ_SPU_WB lanes cannot both be enabled")
+    endif()
+    if(${wj} OR ${wb})
+        if(${wj})
+            set(_lane "wj")
+        else()
+            set(_lane "wb")
+        endif()
+        set(_wb_c "${PS3RECOMP_DIR}/yakuza/generated/${_lane}/${stem}_${_lane}.c")
+        set(_wb_h "${PS3RECOMP_DIR}/yakuza/generated/${_lane}/${stem}_${_lane}.h")
         set(_fast_c "${PS3RECOMP_DIR}/yakuza/generated/fast/${stem}_fast.c")
         if(NOT EXISTS "${_wb_c}")
             message(FATAL_ERROR
-                "WB lane requested but ${_wb_c} is missing -- run "
-                "tools/gen_spu_wb.py --only ${stem}")
+                "${_lane} lane requested but ${_wb_c} is missing -- run "
+                "tools/gen_spu_wb.py --lane ${_lane} --only ${stem}")
         endif()
         file(STRINGS "${_wb_h}" _fb_line REGEX "_fastbase\\(void\\)")
         string(REGEX REPLACE ".*void ([A-Za-z0-9_]+)_fastbase.*" "\\1"
@@ -334,44 +342,44 @@ if(YZ_SPURS_BACKEND STREQUAL "LLE")
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_JOB_MODULE "${PS3RECOMP_DIR}/yakuza/generated/diag/job_module.c" job_module)
     _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_TS_EXIT "${PS3RECOMP_DIR}/yakuza/generated/diag/ts_exit.c" ts_exit)
 endif()
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_GSTASK YZ_SPU_FAST "${PS3RECOMP_DIR}/yakuza/generated/diag/gs_task.c" gs_task)          # game render task, EBOOT img #3 @0x0127A580, image 0
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_CRI YZ_SPU_FAST_CRI "${PS3RECOMP_DIR}/yakuza/generated/diag/cri_audio.c" cri_audio)  # SOFDEC/ADX codec task, image 3
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_WKL4 YZ_SPU_FAST_WKL4 "${PS3RECOMP_DIR}/yakuza/generated/diag/wkl4_task.c" wkl4_task) # 4-task worker pool, image 4
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_GSTASK YZ_SPU_WB_GSTASK YZ_SPU_FAST "${PS3RECOMP_DIR}/yakuza/generated/diag/gs_task.c" gs_task)          # game render task, EBOOT img #3 @0x0127A580, image 0
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_CRI YZ_SPU_WB_CRI YZ_SPU_FAST_CRI "${PS3RECOMP_DIR}/yakuza/generated/diag/cri_audio.c" cri_audio)  # SOFDEC/ADX codec task, image 3
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_WKL4 YZ_SPU_WB_WKL4 YZ_SPU_FAST_WKL4 "${PS3RECOMP_DIR}/yakuza/generated/diag/wkl4_task.c" wkl4_task) # 4-task worker pool, image 4
 foreach(stem spuimg_00 spuimg_01 spuimg_02 spuimg_04 spuimg_06 spuimg_08 spuimg_09)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_SPUIMG YZ_SPU_FAST_SPUIMG "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_SPUIMG YZ_SPU_WB_SPUIMG YZ_SPU_FAST_SPUIMG "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_a job_bin_a_e400 job_bin_a_c400 job_bin_a_24400 job_bin_a_2a400)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_A YZ_SPU_FAST_JOB_A "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_A YZ_SPU_WB_JOB_A YZ_SPU_FAST_JOB_A "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_b job_bin_b_4c00 job_bin_b_6c00 job_bin_b_15400 job_bin_b_15800
         job_bin_b_1ec00 job_bin_b_37c00 job_bin_b_39c00 job_bin_b_3b000 job_bin_b_3bc00
         job_bin_b_3dc00)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_B YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/job_bin_b_3d000.c" job_bin_b_3d000)
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_B YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/job_bin_b_3d000.c" job_bin_b_3d000)
 foreach(stem job_bin_c_4c00 job_bin_c_e400 job_bin_c_15800 job_bin_c_17800 job_bin_c_1a800
         job_bin_c_1ac00 job_bin_c_1b800 job_bin_c_1d800 job_bin_c_1e800)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_C YZ_SPU_FAST_JOB_C "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_C YZ_SPU_WB_JOB_C YZ_SPU_FAST_JOB_C "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_d_4c00 job_bin_d_5000 job_bin_d_e400 job_bin_d_15800
         job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400
         job_bin_d_2a800 job_bin_d_2b400
         job_bin_d_2c400 job_bin_d_2d400 job_bin_d_2e400 job_bin_d_2e800)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 # These later placement lifts predate the diag/fast directory split.  Their
 # instruction-mode correctness twins remain in generated/ rather than
 # generated/diag; keep both selector positions buildable.
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c" job_bin_d_15c00)
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c" job_bin_d_2b800)
-_yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c" job_bin_d_15c00)
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c" job_bin_d_2b800)
+_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
 foreach(stem job_bin_e_e400 job_bin_e_4c00)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_JOB_E YZ_SPU_FAST_JOB_E "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_E YZ_SPU_WB_JOB_E YZ_SPU_FAST_JOB_E "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
 endforeach()
 foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
         job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
         job_bin_orphanage_3c000 job_bin_orphanage_3cc00)
-    _yz_spu_pick3(SPU_KERNELS YZ_SPU_WB_ORPHANAGE YZ_SPU_FAST_ORPHANAGE "${PS3RECOMP_DIR}/yakuza/generated/${stem}.c" "${stem}")
+    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_ORPHANAGE YZ_SPU_WB_ORPHANAGE YZ_SPU_FAST_ORPHANAGE "${PS3RECOMP_DIR}/yakuza/generated/${stem}.c" "${stem}")
 endforeach()
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
