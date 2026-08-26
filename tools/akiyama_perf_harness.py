@@ -926,6 +926,10 @@ def run_gun(args):
         yz["YZ_NR_VERTICAL"] = "shadow"
     if args.nr_submit_attribution:
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
+    if args.nr_defer_reports:
+        yz["YZ_NR_DEFER_REPORTS"] = "1"
+    if args.nr_report_audit:
+        yz["YZ_NR_REPORT_AUDIT"] = "1"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -948,7 +952,9 @@ def run_gun(args):
         "active_diagnostics": (
             ({"RSX_D3D_DEBUG": "1"} if args.d3d_debug else {}) |
             ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
-             if args.nr_scanout_provenance else {})
+             if args.nr_scanout_provenance else {}) |
+            ({"YZ_NR_REPORT_AUDIT": "1"}
+             if args.nr_report_audit else {})
         ),
         "gun_reference_dir": str(reference_dir),
         "captures": [],
@@ -1214,6 +1220,31 @@ def run_gun(args):
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
+        report_scoreboard_lines = re.findall(
+            r"^\[nr-report-scoreboard .*\]$", stderr_text, re.MULTILINE
+        )
+        report_fallback_lines = re.findall(
+            r"^\[nr-report-fallback .*\]$", stderr_text, re.MULTILINE
+        )
+        report_family_lines = re.findall(
+            r"^\[nr-report-family .*\]$", stderr_text, re.MULTILINE
+        )
+        report_family_fallback_lines = re.findall(
+            r"^\[nr-report-family-fallback .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_report_scoreboard"] = report_scoreboard_lines
+        result["nr_report_fallback"] = report_fallback_lines
+        result["nr_report_family"] = report_family_lines
+        result["nr_report_family_fallback"] = report_family_fallback_lines
+        if args.nr_report_audit:
+            if len(report_scoreboard_lines) != 1:
+                raise RuntimeError(
+                    "report audit aggregate incomplete: expected one scoreboard "
+                    f"summary, found {len(report_scoreboard_lines)}"
+                )
+        elif (report_scoreboard_lines or report_fallback_lines or
+              report_family_lines or report_family_fallback_lines):
+            raise RuntimeError("report audit output was active outside its requested lane")
         if args.nr_submit_attribution:
             if (len(submit_lines) != 14 or
                     len(submit_transfer_lines) != 1 or
@@ -1450,6 +1481,10 @@ def run(args):
         yz["YZ_XF_IEEE"] = "1"
     if args.nr_submit_attribution:
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
+    if args.nr_defer_reports:
+        yz["YZ_NR_DEFER_REPORTS"] = "1"
+    if args.nr_report_audit:
+        yz["YZ_NR_REPORT_AUDIT"] = "1"
     environment.update(yz)
 
     result = {
@@ -1473,7 +1508,9 @@ def run(args):
         "active_diagnostics": (
             ({"RSX_D3D_DEBUG": "1"} if args.d3d_debug else {}) |
             ({"YZ_NR_SCANOUT_PROVENANCE": "1"}
-             if args.nr_scanout_provenance else {})
+             if args.nr_scanout_provenance else {}) |
+            ({"YZ_NR_REPORT_AUDIT": "1"}
+             if args.nr_report_audit else {})
         ),
         "reference": str(reference_path),
         "captures": [],
@@ -1776,6 +1813,31 @@ def run(args):
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
+        report_scoreboard_lines = re.findall(
+            r"^\[nr-report-scoreboard .*\]$", stderr_text, re.MULTILINE
+        )
+        report_fallback_lines = re.findall(
+            r"^\[nr-report-fallback .*\]$", stderr_text, re.MULTILINE
+        )
+        report_family_lines = re.findall(
+            r"^\[nr-report-family .*\]$", stderr_text, re.MULTILINE
+        )
+        report_family_fallback_lines = re.findall(
+            r"^\[nr-report-family-fallback .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_report_scoreboard"] = report_scoreboard_lines
+        result["nr_report_fallback"] = report_fallback_lines
+        result["nr_report_family"] = report_family_lines
+        result["nr_report_family_fallback"] = report_family_fallback_lines
+        if args.nr_report_audit:
+            if len(report_scoreboard_lines) != 1:
+                raise RuntimeError(
+                    "report audit aggregate incomplete: expected one scoreboard "
+                    f"summary, found {len(report_scoreboard_lines)}"
+                )
+        elif (report_scoreboard_lines or report_fallback_lines or
+              report_family_lines or report_family_fallback_lines):
+            raise RuntimeError("report audit output was active outside its requested lane")
         if args.nr_submit_attribution:
             if (len(submit_lines) != 14 or
                     len(submit_transfer_lines) != 1 or
@@ -1943,6 +2005,8 @@ def main():
     parser.add_argument("--nr-scanout-provenance", action="store_true")
     parser.add_argument("--nr-hana-input-oracle", action="store_true")
     parser.add_argument("--nr-submit-attribution", action="store_true")
+    parser.add_argument("--nr-defer-reports", action="store_true")
+    parser.add_argument("--nr-report-audit", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
@@ -2008,6 +2072,10 @@ def main():
         parser.error(
             "--nr-hana-input-oracle requires --nr-vertical-full-native"
         )
+    if args.nr_defer_reports and not args.nr_vertical_full_native:
+        parser.error("--nr-defer-reports requires --nr-vertical-full-native")
+    if args.nr_report_audit and not args.nr_defer_reports:
+        parser.error("--nr-report-audit requires --nr-defer-reports")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

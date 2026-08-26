@@ -51,6 +51,9 @@ void yz_nr_vertical_set_display_buffer(uint32_t buffer_id, uint32_t location,
                                        uint32_t offset, uint32_t width,
                                        uint32_t height);
 void yz_nr_vertical_notify_guest_write(uint32_t ea, uint32_t size);
+/* Serialized FIFO-thread service point for an exact PPU/SPU report reader.
+ * No-op unless deferred reports are explicitly enabled. */
+void yz_nr_vertical_service_report_requests(void);
 
 /* Called under the serialized FIFO lock when the host movie presenter takes
  * or releases graphics ownership. Strict full-native keeps synchronization

@@ -16,6 +16,7 @@
 #include "ppu_guest_write.h"
 
 #include <stdint.h>
+#include "ppu_guest_read.h"
 #include <string.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -93,11 +94,13 @@ static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
  * -----------------------------------------------------------------------*/
 static inline uint8_t vm_read8(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 1u, 0u);
     return *vm_ptr8(addr);
 }
 
 static inline uint16_t vm_read16(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 2u, 0u);
     uint16_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap16(raw);
@@ -105,6 +108,7 @@ static inline uint16_t vm_read16(uint32_t addr)
 
 static inline uint32_t vm_read32(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap32(raw);
@@ -112,6 +116,7 @@ static inline uint32_t vm_read32(uint32_t addr)
 
 static inline uint64_t vm_read64(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap64(raw);
@@ -119,6 +124,7 @@ static inline uint64_t vm_read64(uint32_t addr)
 
 static inline float vm_read_f32(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     raw = ps3_bswap32(raw);
@@ -129,6 +135,7 @@ static inline float vm_read_f32(uint32_t addr)
 
 static inline double vm_read_f64(uint32_t addr)
 {
+    vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     raw = ps3_bswap64(raw);
@@ -335,6 +342,9 @@ static inline void vm_write_f64(uint32_t addr, double val)
  * -----------------------------------------------------------------------*/
 static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len)
 {
+    if (len <= UINT32_MAX)
+        vm_native_report_notify_read(
+            guest_src, (uint32_t)len, 0u);
     memcpy(host_dst, vm_ptr8(guest_src), len);
 }
 

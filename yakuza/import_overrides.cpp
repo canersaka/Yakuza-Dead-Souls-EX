@@ -3754,9 +3754,9 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
 
 extern "C" uint64_t cellGcmReportTimestampNs(void);
 
-static int yz_nr_vertical_report_address(uint32_t dma, uint32_t offset,
-                                         uint32_t size,
-                                         uint32_t* out_address)
+extern "C" int yz_nr_vertical_report_address(uint32_t dma, uint32_t offset,
+                                                uint32_t size,
+                                                uint32_t* out_address)
 {
     if (!out_address || !size || size > 16u)
         return -1;
@@ -3766,7 +3766,11 @@ static int yz_nr_vertical_report_address(uint32_t dma, uint32_t offset,
     case RSX_DMA_MEMORY_FRAME_BUFFER:
         if (offset < RSX_REPORT_AREA_SIZE &&
             offset <= RSX_REPORT_AREA_SIZE - size)
-            address = RSX_REPORTS + offset;
+            /* driver_info.reportsReportOffset is 0x1400: the first 0x1400
+             * bytes of RsxReports are semaphore/label and notify storage,
+             * not CellGcmReportData. SetReport's index*16 offset is relative
+             * to the report array itself. */
+            address = RSX_REPORTS + 0x1400u + offset;
         break;
     case RSX_DMA_REPORT_LOCATION_MAIN:
     case RSX_DMA_MEMORY_HOST_BUFFER:
@@ -3868,8 +3872,8 @@ extern "C" void yz_nr_vertical_sem_write(uint32_t dma, uint32_t offset,
         yz_rsx_w32(address, value);
 }
 
-extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
-                                       uint32_t dma)
+extern "C" int yz_nr_vertical_report_publish(
+    uint32_t kind, uint32_t arg, uint32_t dma, uint64_t timestamp)
 {
     if (kind != 0u)
         return 0; /* CLEAR_REPORT_VALUE: no ZCULL accumulator is modeled. */
@@ -3880,7 +3884,6 @@ extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
     if (yz_nr_vertical_report_address(dma, offset, 16u, &address) != 0)
         return -1;
 
-    const uint64_t timestamp = cellGcmReportTimestampNs();
     vm_write64(address, timestamp);
     if (type >= RSX_REPORT_TYPE_ZPASS_PIXEL_CNT &&
         type <= RSX_REPORT_TYPE_ZCULL_STATS3) {
@@ -3897,6 +3900,13 @@ extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
         vm_write32(address + 12u, 0u);
     }
     return 0;
+}
+
+extern "C" int yz_nr_vertical_report(uint32_t kind, uint32_t arg,
+                                       uint32_t dma)
+{
+    return yz_nr_vertical_report_publish(
+        kind, arg, dma, cellGcmReportTimestampNs());
 }
 
 extern "C" int yz_nr_vertical_report_can(uint32_t kind, uint32_t arg,
@@ -7407,6 +7417,7 @@ static yz_rsx_wait_category yz_rsx_fifo_step_impl(void)
         return YZ_RSX_WAIT_NO_CONTEXT;
     }
     EnterCriticalSection(&g_rsx_fifo_lock);
+    yz_nr_vertical_service_report_requests();
     uint32_t       get = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_GET) & ~3u;
     const uint32_t put = vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT) & ~3u;
     uint32_t wait_dispatched_methods = 0;

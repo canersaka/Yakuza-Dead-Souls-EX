@@ -26,8 +26,10 @@
 #include "rsx_live_draw.h"
 #include "rsx_nir_adapter.h"
 #include "rsx_nr_producer_contract.h"
+#include "rsx_nr_report_scoreboard.h"
 #include "rsx_nr_span_router.h"
 #include "rsx_vp_decompiler.h"
+#include "../runtime/ppu/ppu_guest_read.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,8 +78,13 @@ extern "C" int yz_nr_vertical_mirror_legacy_method(
     uint32_t method, uint32_t arg, int suppress_action);
 extern "C" int yz_nr_vertical_report_can(uint32_t kind, uint32_t arg,
                                            uint32_t dma);
+extern "C" int yz_nr_vertical_report_address(
+    uint32_t dma, uint32_t offset, uint32_t size, uint32_t* out_address);
+extern "C" int yz_nr_vertical_report_publish(
+    uint32_t kind, uint32_t arg, uint32_t dma, uint64_t timestamp);
 extern "C" int yz_nr_vertical_render_condition_read(
     uint32_t dma, uint32_t offset, uint32_t* value);
+extern "C" uint64_t cellGcmReportTimestampNs(void);
 
 namespace {
 
@@ -383,6 +390,7 @@ struct yz_nr_vertical_active_state {
     rsx_nr_backend backend;
     rsx_nir_adapter adapter;
     rsx_nr_frame_owner frame_owner;
+    rsx_nr_report_scoreboard report_scoreboard;
     rsx_nr_d3d12* d3d12;
     rsx_nr_exec_ops gpu_ops;
     rsx_nr_slot slots[YZ_NR_ACTIVE_RING_CAPACITY];
@@ -494,6 +502,15 @@ struct yz_nr_vertical_active_state {
     unsigned long long section_exec_errors;
     volatile LONG renderer_owner; /* 0 legacy/unknown, 1 native/shared */
     volatile LONG shared_timeline;
+    uint32_t report_defer_enabled;
+    uint32_t report_audit_enabled;
+    volatile LONG report_consumer_thread;
+    volatile LONG64 report_request_sequence;
+    volatile LONG64 report_request_completed;
+    volatile LONG64 report_request_fence;
+    volatile LONG64 report_request_completed_fence;
+    volatile LONG report_request_failed;
+    volatile LONG report_shutdown;
     volatile LONG* guest_page_route;
     unsigned long long owned[YZ_NR_VERT_FAMILY_COUNT];
     unsigned long long fallback[YZ_NR_VERT_FAMILY_COUNT];
@@ -598,28 +615,45 @@ static int yz_nr_exec_present(void*, uint32_t buffer_id)
     return 0;
 }
 
+static int yz_nr_d3d_timeline_acquire(
+    void*, void** command_list, unsigned long long* generation,
+    unsigned long long* recording_fence,
+    unsigned long long* completed_fence);
+static void yz_nr_d3d_timeline_release(void*);
+
 static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                              uint32_t width, uint32_t height,
                              uint32_t buffer_id)
 {
+    int result = 0;
     if (g_active.strict_full_native) {
-        const int result = rsx_live_draw_present_shared_full_native(
+        result = rsx_live_draw_present_shared_full_native(
             texture, format, width, height, buffer_id);
         if (!result)
             yz_nr_vertical_exec_present_complete(buffer_id);
-        return result;
+    } else {
+        /* Every live render target is an exact resource borrowed from the legacy
+         * surface registry. In shared-timeline mode the preceding native commands
+         * are still on the live list; sink_flip appends the scanout copy and
+         * retires the complete ordered frame once. Present through the typed
+         * semantic boundary so the
+         * movie handoff, QPC ring and sparse renderer-owned visual/state gates all
+         * observe the frame.  This calls sink_flip directly; it does not decode
+         * or replay an RSX packet. */
+        rsx_live_draw_typed_present(buffer_id);
+        yz_nr_vertical_exec_present_complete(buffer_id);
     }
-    /* Every live render target is an exact resource borrowed from the legacy
-     * surface registry. In shared-timeline mode the preceding native commands
-     * are still on the live list; sink_flip appends the scanout copy and
-     * retires the complete ordered frame once. Present through the typed
-     * semantic boundary so the
-     * movie handoff, QPC ring and sparse renderer-owned visual/state gates all
-     * observe the frame.  This calls sink_flip directly; it does not decode
-     * or replay an RSX packet. */
-    rsx_live_draw_typed_present(buffer_id);
-    yz_nr_vertical_exec_present_complete(buffer_id);
-    return 0;
+    if (!result && g_active.report_defer_enabled) {
+        void* list = nullptr;
+        unsigned long long generation = 0, recording = 0, completed = 0;
+        if (yz_nr_d3d_timeline_acquire(
+                nullptr, &list, &generation, &recording, &completed) == 0) {
+            yz_nr_d3d_timeline_release(nullptr);
+            rsx_nr_report_scoreboard_complete(
+                &g_active.report_scoreboard, completed, completed, 1);
+        }
+    }
+    return result;
 }
 
 static int yz_nr_d3d_timeline_acquire(
@@ -641,9 +675,20 @@ static void yz_nr_d3d_timeline_release(void*)
 
 static int yz_nr_d3d_timeline_flush(void*)
 {
-    return g_active.strict_full_native
+    const int result = g_active.strict_full_native
         ? rsx_live_draw_timeline_flush_full_native()
         : rsx_live_draw_timeline_flush();
+    if (!result && g_active.report_defer_enabled) {
+        void* list = nullptr;
+        unsigned long long generation = 0, recording = 0, completed = 0;
+        if (yz_nr_d3d_timeline_acquire(
+                nullptr, &list, &generation, &recording, &completed) == 0) {
+            yz_nr_d3d_timeline_release(nullptr);
+            rsx_nr_report_scoreboard_complete(
+                &g_active.report_scoreboard, completed, completed, 1);
+        }
+    }
+    return result;
 }
 
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
@@ -662,6 +707,212 @@ static int yz_nr_exec_report(void*, uint32_t kind, uint32_t arg,
                              uint32_t dma)
 {
     return yz_nr_vertical_report(kind, arg, dma);
+}
+
+static int yz_nr_report_timeline_state(
+    unsigned long long* generation, unsigned long long* recording,
+    unsigned long long* completed)
+{
+    void* list = nullptr;
+    if (!generation || !recording || !completed ||
+        yz_nr_d3d_timeline_acquire(
+            nullptr, &list, generation, recording, completed) != 0)
+        return -1;
+    yz_nr_d3d_timeline_release(nullptr);
+    return list ? 0 : -1;
+}
+
+static unsigned long long yz_nr_report_timestamp(void*)
+{
+    return cellGcmReportTimestampNs();
+}
+
+static int yz_nr_report_publish(
+    void*, const rsx_nr_report_record* record, unsigned long long timestamp)
+{
+    if (!record)
+        return -1;
+    const uint32_t arg = (record->desc.type << 24) |
+        (record->desc.offset & 0x00FFFFFFu);
+    return yz_nr_vertical_report_publish(
+        record->desc.kind, arg, record->desc.dma, timestamp);
+}
+
+static void yz_nr_report_atomic_max(volatile LONG64* target, LONG64 value)
+{
+    LONG64 current = InterlockedCompareExchange64(target, 0, 0);
+    while (current < value) {
+        const LONG64 prior = InterlockedCompareExchange64(
+            target, value, current);
+        if (prior == current)
+            return;
+        current = prior;
+    }
+}
+
+static int yz_nr_report_submit_direct(
+    unsigned long long required, unsigned long long* completed)
+{
+    if (!completed)
+        return -1;
+    unsigned long long before_generation = 0, before_recording = 0;
+    unsigned long long before_completed = 0;
+    if (yz_nr_report_timeline_state(
+            &before_generation, &before_recording, &before_completed) != 0)
+        return -1;
+    if (before_completed < required) {
+        const int flush = g_active.strict_full_native
+            ? rsx_live_draw_timeline_flush_full_native()
+            : rsx_live_draw_timeline_flush();
+        if (flush != 0)
+            return -1;
+    }
+    unsigned long long generation = 0, recording = 0;
+    if (yz_nr_report_timeline_state(
+            &generation, &recording, completed) != 0)
+        return -1;
+    return *completed >= required ? 0 : -1;
+}
+
+static int yz_nr_report_retire_all(int natural)
+{
+    if (!g_active.report_defer_enabled ||
+        !rsx_nr_report_scoreboard_pending(&g_active.report_scoreboard))
+        return 0;
+    unsigned long long generation = 0, recording = 0, completed = 0;
+    if (yz_nr_report_timeline_state(
+            &generation, &recording, &completed) != 0)
+        return -1;
+    if (completed < recording &&
+        yz_nr_report_submit_direct(recording, &completed) != 0)
+        return -1;
+    return rsx_nr_report_scoreboard_complete(
+        &g_active.report_scoreboard, recording, completed, natural) < 0
+        ? -1 : 0;
+}
+
+static void yz_nr_report_service_requests(void)
+{
+    if (!g_active.report_defer_enabled)
+        return;
+    const LONG64 request = InterlockedCompareExchange64(
+        &g_active.report_request_sequence, 0, 0);
+    if (InterlockedCompareExchange64(
+            &g_active.report_request_completed, 0, 0) >= request)
+        return;
+    const unsigned long long required = static_cast<unsigned long long>(
+        InterlockedCompareExchange64(&g_active.report_request_fence, 0, 0));
+    unsigned long long completed = 0;
+    const int failed = yz_nr_report_submit_direct(required, &completed) != 0;
+    InterlockedExchange64(
+        &g_active.report_request_completed_fence,
+        static_cast<LONG64>(completed));
+    InterlockedExchange(&g_active.report_request_failed, failed ? 1 : 0);
+    InterlockedExchange64(&g_active.report_request_completed, request);
+    WakeByAddressAll((PVOID)&g_active.report_request_completed);
+}
+
+static int yz_nr_report_submit_wait(
+    void*, unsigned long long required, unsigned long long* completed)
+{
+    if (!completed || ReadAcquire(&g_active.report_shutdown))
+        return -1;
+    const DWORD consumer = static_cast<DWORD>(
+        ReadAcquire(&g_active.report_consumer_thread));
+    if (!consumer || consumer == GetCurrentThreadId())
+        return yz_nr_report_submit_direct(required, completed);
+
+    yz_nr_report_atomic_max(
+        &g_active.report_request_fence, static_cast<LONG64>(required));
+    const LONG64 request = InterlockedIncrement64(
+        &g_active.report_request_sequence);
+    for (;;) {
+        LONG64 done = InterlockedCompareExchange64(
+            &g_active.report_request_completed, 0, 0);
+        if (done >= request)
+            break;
+        if (ReadAcquire(&g_active.report_shutdown))
+            return -1;
+        WaitOnAddress(
+            (volatile VOID*)&g_active.report_request_completed,
+            &done, sizeof(done), 10u);
+    }
+    *completed = static_cast<unsigned long long>(InterlockedCompareExchange64(
+        &g_active.report_request_completed_fence, 0, 0));
+    return ReadAcquire(&g_active.report_request_failed) ||
+        *completed < required ? -1 : 0;
+}
+
+static int yz_nr_exec_report_defer(void*, uint32_t kind, uint32_t arg,
+                                   uint32_t dma)
+{
+    if (!g_active.report_defer_enabled)
+        return RSX_NR_REPORT_FALLBACK_DISABLED;
+
+    rsx_nr_report_desc desc = {};
+    desc.kind = kind;
+    desc.type = kind == 0u ? arg >> 24 : arg;
+    desc.dma = dma;
+    desc.offset = kind == 0u ? arg & 0x00FFFFFFu : 0u;
+    desc.query_slot = desc.offset / 16u;
+    if (kind != 0u) {
+        /* SetClearReport resets the selected hardware accumulator; the
+         * current strict-native lane intentionally has no real ZCULL query.
+         * It therefore has no guest write and no GPU dependency to retire. */
+        rsx_nr_report_scoreboard_note_clear_noop(
+            &g_active.report_scoreboard, &desc);
+        return 0;
+    }
+    if (desc.type < 1u || desc.type > 5u) {
+        rsx_nr_report_scoreboard_note_fallback(
+            &g_active.report_scoreboard, &desc,
+            RSX_NR_REPORT_FALLBACK_UNKNOWN_TYPE);
+        return RSX_NR_REPORT_FALLBACK_UNKNOWN_TYPE;
+    }
+    if (yz_nr_vertical_report_address(
+            dma, desc.offset, 16u, &desc.ea) != 0) {
+        rsx_nr_report_scoreboard_note_fallback(
+            &g_active.report_scoreboard, &desc,
+            RSX_NR_REPORT_FALLBACK_BAD_DMA);
+        return RSX_NR_REPORT_FALLBACK_BAD_DMA;
+    }
+    unsigned long long completed = 0;
+    if (yz_nr_report_timeline_state(
+            &desc.writer_generation, &desc.recording_fence,
+            &completed) != 0) {
+        rsx_nr_report_scoreboard_note_fallback(
+            &g_active.report_scoreboard, &desc,
+            RSX_NR_REPORT_FALLBACK_NO_TIMELINE);
+        return RSX_NR_REPORT_FALLBACK_NO_TIMELINE;
+    }
+    desc.guest_value_valid = 1u;
+    desc.guest_value = desc.type == 1u ? 1u : 0u;
+    const int result = rsx_nr_report_scoreboard_enqueue(
+        &g_active.report_scoreboard, &desc);
+    if (!result)
+        vm_native_report_watch_read_range(desc.ea, 16u);
+    return result;
+}
+
+static void yz_nr_report_guest_read(
+    void*, uint32_t ea, uint32_t size, uint32_t source)
+{
+    if (!g_active.report_defer_enabled)
+        return;
+    const rsx_nr_report_read_source read_source = source == 1u
+        ? RSX_NR_REPORT_READ_SPU : RSX_NR_REPORT_READ_PPU;
+    rsx_nr_report_scoreboard_consume(
+        &g_active.report_scoreboard, ea, size, read_source);
+}
+
+extern "C" void yz_nr_vertical_service_report_requests(void)
+{
+    if (!g_active.report_defer_enabled)
+        return;
+    InterlockedCompareExchange(
+        &g_active.report_consumer_thread,
+        static_cast<LONG>(GetCurrentThreadId()), 0);
+    yz_nr_report_service_requests();
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -835,6 +1086,8 @@ static void yz_nr_active_bind_graphics_ops(void)
     combined.user_command = yz_nr_exec_user;
     combined.sem_read = yz_nr_exec_sem_read;
     combined.sem_write = yz_nr_exec_sem_write;
+    combined.report_defer = g_active.report_defer_enabled
+        ? yz_nr_exec_report_defer : nullptr;
     combined.report = yz_nr_exec_report;
     g_active.backend.ops = combined;
 }
@@ -890,6 +1143,15 @@ static int yz_nr_resolve_depth_sample(void*, uint32_t space, uint32_t offset,
 static int yz_nr_render_condition_read(void*, uint32_t dma,
                                         uint32_t offset, uint32_t* value)
 {
+    if (g_active.report_defer_enabled) {
+        uint32_t address = 0;
+        if (yz_nr_vertical_report_address(
+                dma, offset, 16u, &address) != 0 ||
+            rsx_nr_report_scoreboard_consume(
+                &g_active.report_scoreboard, address + 8u, 4u,
+                RSX_NR_REPORT_READ_RSX_CONDITION) != 0)
+            return -1;
+    }
     return yz_nr_vertical_render_condition_read(dma, offset, value);
 }
 
@@ -1037,6 +1299,13 @@ static void yz_nr_active_ensure_graphics(void)
 
 static int yz_nr_active_init(int graphics)
 {
+    rsx_nr_report_scoreboard_ops report_ops = {};
+    report_ops.timestamp = yz_nr_report_timestamp;
+    report_ops.publish = yz_nr_report_publish;
+    report_ops.submit_wait = yz_nr_report_submit_wait;
+    rsx_nr_report_scoreboard_init(
+        &g_active.report_scoreboard, g_active.report_defer_enabled,
+        &report_ops);
     if (rsx_nr_span_router_init(&g_active.router,
                                 YZ_NR_ACTIVE_ROUTER_CAPACITY) != 0)
         return 0;
@@ -2278,6 +2547,12 @@ extern "C" void yz_nr_vertical_init(void)
             getenv("YZ_NR_FORCE_DRAW_INPUT_REFRESH") != nullptr;
         g_active.scanout_provenance = strict &&
             getenv("YZ_NR_SCANOUT_PROVENANCE") != nullptr;
+        const char* const report_defer = getenv("YZ_NR_DEFER_REPORTS");
+        const char* const report_audit = getenv("YZ_NR_REPORT_AUDIT");
+        g_active.report_defer_enabled = strict && report_defer &&
+            report_defer[0] == '1' && report_defer[1] == '\0';
+        g_active.report_audit_enabled = strict && report_audit &&
+            report_audit[0] == '1' && report_audit[1] == '\0';
         g_active.draw_primitive_filter = UINT32_MAX;
         if (graphics && !strict) {
             const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
@@ -2318,6 +2593,11 @@ extern "C" void yz_nr_vertical_init(void)
             graphics) {
             InterlockedExchange(&g_vertical.mode_active_graphics, 1);
             cellSpursSetGuestWriteObserver(yz_nr_vertical_notify_guest_write);
+            if (g_active.report_defer_enabled) {
+                vm_native_report_clear_read_watches();
+                vm_native_report_set_read_observer(
+                    yz_nr_report_guest_read, nullptr);
+            }
         }
     }
 }
@@ -3865,6 +4145,14 @@ extern "C" void yz_nr_vertical_set_movie_mode(int on)
     if (requested == g_active.movie_suppressed)
         return;
 
+    /* Movie ownership is a whole-timeline handoff. Publish every report whose
+     * GPU dependency precedes the handoff before the host movie can reset or
+     * reuse the shared list generation. */
+    if (g_active.report_defer_enabled && yz_nr_report_retire_all(1) != 0) {
+        InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
+
     /* The caller holds g_rsx_fifo_lock, so no adapter/backend step can race
      * this checkpoint. A yielded method can leave only one blocked semantic
      * wait at the ring head; copying render state cannot affect that wait. */
@@ -3905,6 +4193,7 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
         *next_ret = fifo_ret;
     if (!g_active.strict_full_native)
         return YZ_NR_VERTICAL_FRAME_DISABLED;
+    yz_nr_vertical_service_report_requests();
     if (!InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0)) {
         if (!InterlockedExchange(&g_active.strict_fatal_reported, 1)) {
@@ -4512,6 +4801,15 @@ extern "C" void yz_nr_vertical_shutdown(void)
     if (InterlockedExchange(&g_vertical.mode_active_basic, 0)) {
         InterlockedExchange(&g_vertical.mode_active_present, 0);
         InterlockedExchange(&g_vertical.mode_active_graphics, 0);
+        if (g_active.report_defer_enabled)
+            yz_nr_report_retire_all(1);
+        InterlockedExchange(&g_active.report_shutdown, 1);
+        WakeByAddressAll((PVOID)&g_active.report_request_completed);
+        vm_native_report_set_read_observer(nullptr, nullptr);
+        vm_native_report_clear_read_watches();
+        if (g_active.report_defer_enabled)
+            rsx_nr_report_scoreboard_shutdown(
+                &g_active.report_scoreboard);
         cellSpursSetGuestWriteObserver(nullptr);
         InterlockedExchange(&g_active.graphics_ready, 0);
         if (g_active.d3d12 &&
@@ -4575,6 +4873,81 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 stats.published, stats.claimed, stats.fast_misses,
                 stats.exact_misses, stats.not_ready, stats.duplicates,
                 stats.busy, stats.full, stats.corrupt);
+        if (g_active.report_audit_enabled) {
+            static const char* const fallback_names[
+                RSX_NR_REPORT_FALLBACK_REASON_COUNT] = {
+                "disabled", "clear-unmodeled", "bad-dma", "bad-range",
+                "no-timeline", "capacity", "unknown-type",
+                "submit-failed", "publish-failed"
+            };
+            rsx_nr_report_scoreboard_stats report_stats = {};
+            rsx_nr_report_scoreboard_get_stats(
+                &g_active.report_scoreboard, &report_stats);
+            fprintf(stderr,
+                    "[nr-report-scoreboard produced=%llu deferred=%llu "
+                    "clear-noops=%llu pending-high=%llu "
+                    "natural-submits=%llu early-submits=%llu "
+                    "published=%llu/%llu/%llu reader-checks=%llu "
+                    "early-consumers=%llu reset=%llu shutdown=%llu "
+                    "abandoned=%llu]\n",
+                    report_stats.produced, report_stats.deferred,
+                    report_stats.clear_noops,
+                    report_stats.pending_high_water,
+                    report_stats.natural_submissions,
+                    report_stats.early_submissions,
+                    report_stats.reports_published,
+                    report_stats.reports_published_natural,
+                    report_stats.reports_published_early,
+                    report_stats.reader_checks,
+                    report_stats.early_consumer_hits,
+                    report_stats.reset_count,
+                    report_stats.shutdown_count,
+                    report_stats.abandoned);
+            for (uint32_t reason = 0;
+                 reason < RSX_NR_REPORT_FALLBACK_REASON_COUNT; ++reason) {
+                if (report_stats.fallback[reason])
+                    fprintf(stderr,
+                            "[nr-report-fallback reason=%s count=%llu]\n",
+                            fallback_names[reason],
+                            report_stats.fallback[reason]);
+            }
+            for (uint32_t slot = 0;
+                 slot < RSX_NR_REPORT_FAMILY_CAPACITY; ++slot) {
+                const rsx_nr_report_family_stats& family =
+                    g_active.report_scoreboard.family[slot];
+                if (!family.occupied)
+                    continue;
+                fprintf(stderr,
+                        "[nr-report-family slot=%u kind=%u type=%u "
+                        "dma=%08X offset=%08X ea=%08X query=%u "
+                        "produced=%llu deferred=%llu natural=%llu "
+                        "early=%llu overwritten=%llu first=%llu "
+                        "first-consumer=%llu reads=%llu/%llu/%llu/%llu]\n",
+                        slot, family.kind, family.type, family.dma,
+                        family.offset, family.ea, family.query_slot,
+                        family.produced, family.deferred,
+                        family.published_natural,
+                        family.published_early,
+                        family.overwritten_pending,
+                        family.first_sequence,
+                        family.first_consumer_sequence,
+                        family.read_count[RSX_NR_REPORT_READ_PPU],
+                        family.read_count[RSX_NR_REPORT_READ_SPU],
+                        family.read_count[
+                            RSX_NR_REPORT_READ_RSX_CONDITION],
+                        family.read_count[RSX_NR_REPORT_READ_HLE]);
+                for (uint32_t reason = 0;
+                     reason < RSX_NR_REPORT_FALLBACK_REASON_COUNT;
+                     ++reason) {
+                    if (family.fallback[reason])
+                        fprintf(stderr,
+                                "[nr-report-family-fallback slot=%u "
+                                "reason=%s count=%llu]\n",
+                                slot, fallback_names[reason],
+                                family.fallback[reason]);
+                }
+            }
+        }
         if (g_active.strict_full_native) {
             const rsx_nr_frame_owner_stats* const fs =
                 &g_active.frame_owner.stats;
