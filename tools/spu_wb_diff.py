@@ -49,7 +49,15 @@ HARNESS = os.path.join(TOOLS, "spu_diff_harness.c")
 SUFFIX = "_wb"          # lane suffix (set by --lane)
 SYM_PREFIX = "spu_wb"   # generated-function symbol prefix for the lane
 
-WB_EXTRA = ["/arch:AVX2", "/DYZ_SPU_SIMD_LS128=1", "/DYZ_SPU_SIMD_SHUFB=1"]
+# /d2SSAOptimizer-: MSVC 19.51.36248's SSA optimizer miscompiles the WJ
+# code shape (single huge function, hundreds of __m128i locals, goto web) --
+# MEASURED(scratch/wjfuzz/img047): wbk_ahi consumed a wrong operand constant
+# at /O1 and /O2 regardless of /Ob level, /arch, or /d2Qvec-, and only
+# /d2SSAOptimizer- (or /Od) restores the differential MATCH. Applied to both
+# lane TUs; the FAST/DIAG twins never showed the fault but share the flag on
+# the lane exes only via this list, keeping production and harness aligned.
+WB_EXTRA = ["/arch:AVX2", "/DYZ_SPU_SIMD_LS128=1", "/DYZ_SPU_SIMD_SHUFB=1",
+            "/d2SSAOptimizer-"]
 
 
 def cl_run(args_list, cwd=ROOT):
@@ -257,13 +265,18 @@ def main():
                     help="report path (default scratch/wbdiff/report.json); "
                          "give each parallel family slice its own")
     ap.add_argument("--lane", choices=("wb", "wj"), default="wb")
+    ap.add_argument("--work", default=None,
+                    help="work dir override (fresh dir forces full "
+                         "recompiles, e.g. after a flag change)")
     args = ap.parse_args()
+    global WB, WORK, SUFFIX, SYM_PREFIX
     if args.lane == "wj":
-        global WB, WORK, SUFFIX, SYM_PREFIX
         WB = os.path.join(ROOT, "yakuza", "generated", "wj")
         WORK = os.path.join(ROOT, "scratch", "wjdiff")
         SUFFIX = "_wj"
         SYM_PREFIX = "spu_wj"
+    if args.work:
+        WORK = args.work
     args.only = set(args.only.split(",")) if args.only else None
     fams = set(args.families.split(",")) if args.families else None
     args.roots = (args.input_roots.split(";") if args.input_roots
