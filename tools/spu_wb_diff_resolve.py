@@ -60,11 +60,13 @@ def main():
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--evbudget", type=int, default=384)
     ap.add_argument("--only", default=None)
+    ap.add_argument("--work", default=None,
+                    help="matrix work dir (default scratch/<lane>diff)")
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
     lane_sfx = "wb"                       # window files are named .wb.txt in
-    work = os.path.join(ROOT, "scratch",  # both lanes (runner reuses names)
-                        f"{args.lane}diff")
+    work = args.work or os.path.join(     # both lanes (runner reuses names)
+        ROOT, "scratch", f"{args.lane}diff")
 
     results = []
     n_resolved = n_unbounded = n_still = 0
