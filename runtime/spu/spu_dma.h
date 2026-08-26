@@ -19,6 +19,7 @@
 #include "spu_job_dispatch.h"
 #include "../../include/ps3emu/yz_fe0_timeline.h"
 #include <stdint.h>
+#include "../ppu/ppu_guest_read.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1270,7 +1271,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                      (unsigned long long)ea, "dma-get"); }
 #endif
 #endif
-            /* GET: main memory -> local store */
+            /* GET: main memory -> local store. Deferred report slots use a
+             * sparse exact-page observer; unrelated DMA reads return after
+             * one relaxed bitmap probe. */
+            vm_native_report_notify_read((uint32_t)ea, size, 1u);
             memcpy(ls_ptr, ea_ptr, size);
             yz_tagread_repair_fetch(
                 spu, lsa, (unsigned long long)ea, size);
@@ -3203,6 +3207,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
         int post_unlock_idle_level = -1;
+        /* An atomic GET snapshots the complete aligned reservation line.  A
+         * deferred GCM report reader must force its exact producer fence
+         * before either the fast or locked GETLLAR path copies those bytes. */
+        if (cmd == MFC_GETLLAR_CMD)
+            vm_native_report_notify_read(
+                (uint32_t)(ea & ~127ull), 128u, 1u);
         /* Sony's SPURS kernel/system-service tags lock-line atomic EAs with
          * bit 31 (a memory coherency/cache attribute the Cell MFC strips when
          * resolving the real address). The SPURS management area lives at the

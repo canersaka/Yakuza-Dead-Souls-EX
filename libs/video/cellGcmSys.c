@@ -1139,35 +1139,23 @@ u32 cellGcmGetReport(u32 type, u32 index)
     return cellGcmGetReportDataLocation(index, CELL_GCM_LOCATION_LOCAL);
 }
 
-/* Reference p.331: returns the report timer in NANOSECONDS for the given
- * slot. HLE model (audit-endorsed: "GetTimeStamp ns correct"): the shared
- * host monotonic ns clock -- the same clock rsx_commands.c stamps into
- * report slots via cellGcmReportTimestampNs -- is returned directly, so a
- * timer written through the FIFO and one read here agree by construction
- * and the value advances even before any GET_REPORT lands (guest code that
- * follows p.331's completion-guarantee rule cannot tell the difference). */
+/* Reference p.331: this is a PPU read of the timer the RSX previously wrote
+ * into the report slot, not a request for a fresh host timestamp. Besides
+ * matching the SDK contract, routing the read through vm_read64 lets a
+ * deferred native report retire its exact producing fence first. */
 u64 cellGcmGetTimeStamp(u32 index)
 {
-    if (index >= CELL_GCM_MAX_REPORT_COUNT)
-        return 0;
-    return get_timestamp_ns();
+    const u32 ea = gcm_report_ea(index, CELL_GCM_LOCATION_LOCAL);
+    return ea ? vm_read64(ea) : 0;
 }
 
-/* Reference p.332: same contract with a location-dependent index range.
- * OVERRIDE-delegated from the live core -- behavior identical to the
- * pre-rewrite version for valid indices. */
+/* Reference p.332: same PPU-memory-read contract with a location-dependent
+ * slot address. The caller remains responsible for ordering; the strict
+ * native report scoreboard supplies it when this exact slot is pending. */
 u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 {
-    if (location == CELL_GCM_LOCATION_LOCAL) {
-        if (index >= CELL_GCM_MAX_REPORT_COUNT)
-            return 0;
-    } else if (location == CELL_GCM_LOCATION_MAIN) {
-        if (index >= CELL_GCM_MAX_MAIN_REPORT_COUNT)
-            return 0;
-    } else {
-        return 0;
-    }
-    return get_timestamp_ns();
+    const u32 ea = gcm_report_ea(index, location);
+    return ea ? vm_read64(ea) : 0;
 }
 
 /* Shared monotonic timebase (ns) for report timers (consumer:

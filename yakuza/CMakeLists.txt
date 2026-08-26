@@ -103,6 +103,10 @@ if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
     target_compile_definitions(ps3recomp_runtime PRIVATE
         PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
 endif()
+if(YZ_GCM_BACKEND STREQUAL "NATIVE")
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
+endif()
 if(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
         $<$<CONFIG:Release>:/O2>
@@ -163,6 +167,10 @@ set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)
 if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
     target_compile_definitions(ppu_recomp_objs PRIVATE
         PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
+endif()
+if(YZ_GCM_BACKEND STREQUAL "NATIVE")
+    target_compile_definitions(ppu_recomp_objs PRIVATE
+        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
 endif()
 target_include_directories(ppu_recomp_objs PRIVATE
     "${YZ_RECOMP_DIR}"
@@ -441,7 +449,9 @@ if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
     target_compile_definitions(yakuza_recomp PRIVATE YZ_NATIVE_SPURS=1)
 endif()
 if(YZ_GCM_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(yakuza_recomp PRIVATE YZ_NATIVE_GCM=1)
+    target_compile_definitions(yakuza_recomp PRIVATE
+        YZ_NATIVE_GCM=1
+        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
 endif()
 
 # FFmpeg (host movie decode) creates a load-time DLL dependency on the exe.

@@ -1338,6 +1338,8 @@ typedef struct exec_rec {
     u32 last_present;
     u32 reports;
     int report_result;
+    u32 report_defer_calls;
+    int report_defer_result;
     u32 user_cause;
     u32 flushes;
     u32 flush_reasons[16];
@@ -1434,6 +1436,14 @@ static int rec_report(void* u, u32 kind, u32 arg, u32 dma)
     rec_add(r, 'r');
     r->reports++;
     return r->report_result;
+}
+
+static int rec_report_defer(void* u, u32 kind, u32 arg, u32 dma)
+{
+    exec_rec* r = u;
+    (void)kind; (void)arg; (void)dma;
+    r->report_defer_calls++;
+    return r->report_defer_result;
 }
 
 static void rec_ref(void* u, u32 value) { ((exec_rec*)u)->ref = value; }
@@ -1536,6 +1546,31 @@ static void test_backend_core(void)
               rec.flush_reasons[rec.flush_reason_count - 1u] ==
                   RSX_NR_FLUSH_REPORT,
           "report flush reason was not preserved");
+
+    /* A successful deferred report is retained by the embedder without a
+     * flush or immediate guest publication. A refusal must preserve the
+     * established flush + report callback behavior byte-for-byte. */
+    be.ops.report_defer = rec_report_defer;
+    const u32 reports_before_defer = rec.reports;
+    const u32 flushes_before_defer = rec.flushes;
+    rsx_nir_em_report(&em, 0, 0x01000088u, 0x66626660u);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.report_defer_calls == 1u &&
+              rec.reports == reports_before_defer &&
+              rec.flushes == flushes_before_defer,
+          "deferred report used immediate path defer=%u reports=%u/%u "
+          "flushes=%u/%u", rec.report_defer_calls, rec.reports,
+          reports_before_defer, rec.flushes, flushes_before_defer);
+
+    rec.report_defer_result = 1;
+    rsx_nir_em_report(&em, 0, 0x0100008Cu, 0x66626660u);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(rec.report_defer_calls == 2u &&
+              rec.reports == reports_before_defer + 1u &&
+              rec.flushes == flushes_before_defer + 1u,
+          "defer fallback did not preserve immediate path");
+    be.ops.report_defer = NULL;
+    rec.report_defer_result = 0;
     rsx_nir_em_barrier(&em, 0xA5u);
     rsx_nr_backend_run(&be, 0);
     CHECK(rec.flush_reason_count &&
@@ -1543,10 +1578,11 @@ static void test_backend_core(void)
                   RSX_NR_FLUSH_BARRIER,
           "barrier flush reason was not preserved");
     const u64 errors_before_report_refusal = be.stats.exec_errors;
+    const u32 reports_before_refusal = rec.reports;
     rec.report_result = -1;
     rsx_nir_em_report(&em, 0, 0x01000090u, 0xBAD68000u);
     rsx_nr_backend_run(&be, 0);
-    CHECK(rec.reports == 2 &&
+    CHECK(rec.reports == reports_before_refusal + 1u &&
           be.stats.exec_errors == errors_before_report_refusal + 1u,
           "report refusal was silently claimed reports=%u errors=%llu/%llu",
           rec.reports, be.stats.exec_errors, errors_before_report_refusal);
@@ -2226,6 +2262,9 @@ static void test_section_method_support(void)
     rsx_nir_stream_init(&stream);
     rsx_nir_adapter ad;
     rsx_nir_adapter_init(&ad, &stream);
+    CHECK(RSX_REPORT_LOCAL_BASE == 0x10201400u &&
+              RSX_REPORT_AREA_SIZE == 0x8000u,
+          "local report array does not match reportsReportOffset/slot count");
     CHECK(rsx_report_unmodeled_value(
               RSX_REPORT_TYPE_ZPASS_PIXEL_CNT, 1) == 1u &&
               rsx_report_unmodeled_value(

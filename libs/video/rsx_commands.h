@@ -102,13 +102,11 @@ extern "C" {
  * (ORACLE(SDK cell/gcm/gcm_enum.h:554
  * CELL_GCM_INDEX_RANGE_REPORT_LOCAL_COUNT=2048); the 2026-08-04 audit noted
  * the title already reads at offset 0xFE0, one slot below the old cliff).
- * Pinned to the same numeric base the live Yakuza consumer already uses for
- * this exact region (yakuza/import_overrides.cpp: RSX_CTX_BASE 0x10000000 +
- * 0x200000 == RSX_REPORTS; that consumer zero-initializes 0x9400 bytes
- * there, so the widened window stays inside initialized guest memory) so a
- * report written here lands where the rest of that consumer's
- * label/semaphore code already expects report data to live. */
-#define RSX_REPORT_LOCAL_BASE                   0x10200000u
+ * The RSX context reports allocation contains labels/semaphores first,
+ * notify slots at +0x1000, and the hardware report array at +0x1400.
+ * Therefore a GET_REPORT offset is relative to 0x10201400, not the base of
+ * the whole allocation. This matches CellGcmReportData pointer accessors. */
+#define RSX_REPORT_LOCAL_BASE                   0x10201400u
 #define RSX_REPORT_AREA_SIZE                    0x8000u
 
 /* NV4097_GET_REPORT's arg packs a report "type" into the top byte and a

@@ -166,10 +166,14 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
             x->set_reference(x->user, op->u.reference.value);
         break;
     case RSX_NIR_OP_REPORT:
-        backend_flush(x, RSX_NR_FLUSH_REPORT);
-        if (x->report)
-            rc = x->report(x->user, op->u.report.kind, op->u.report.arg,
-                           op->u.report.dma_report);
+        if (!x->report_defer ||
+            x->report_defer(x->user, op->u.report.kind, op->u.report.arg,
+                            op->u.report.dma_report) != 0) {
+            backend_flush(x, RSX_NR_FLUSH_REPORT);
+            if (x->report)
+                rc = x->report(x->user, op->u.report.kind, op->u.report.arg,
+                               op->u.report.dma_report);
+        }
         break;
     case RSX_NIR_OP_USER_COMMAND:
         if (x->user_command)

@@ -29,6 +29,7 @@
 #include "../include/ps3emu/yz_runtime_config.h"
 #include "../include/ps3emu/yz_frontier_trace.h"
 #include "../runtime/memory/vm.h"
+#include "../runtime/ppu/ppu_guest_read.h"
 #include "yakuza_runner.h"
 
 #include <cstring>
@@ -110,11 +111,13 @@ static inline void yz_stage_checkpoint_after_object(uint32_t address)
 #if defined(YZ_PERF_CLEAN)
 extern "C" uint8_t vm_read8(uint64_t addr)
 {
+    vm_native_report_notify_read((uint32_t)addr, 1u, 0u);
     return *ea(addr);
 }
 
 extern "C" uint16_t vm_read16(uint64_t addr)
 {
+    vm_native_report_notify_read((uint32_t)addr, 2u, 0u);
     uint16_t value;
     memcpy(&value, ea(addr), sizeof(value));
     return ps3_bswap16(value);
@@ -122,6 +125,7 @@ extern "C" uint16_t vm_read16(uint64_t addr)
 
 extern "C" uint32_t vm_read32(uint64_t addr)
 {
+    vm_native_report_notify_read((uint32_t)addr, 4u, 0u);
     uint32_t value;
     memcpy(&value, ea(addr), sizeof(value));
     value = ps3_bswap32(value);
@@ -136,15 +140,16 @@ extern "C" uint32_t vm_read32(uint64_t addr)
 
 extern "C" uint64_t vm_read64(uint64_t addr)
 {
+    vm_native_report_notify_read((uint32_t)addr, 8u, 0u);
     uint64_t value;
     memcpy(&value, ea(addr), sizeof(value));
     return ps3_bswap64(value);
 }
 #else
-extern "C" uint8_t  vm_read8 (uint64_t addr) { yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
-extern "C" uint16_t vm_read16(uint64_t addr) { yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
-extern "C" uint32_t vm_read32(uint64_t addr) { yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
-extern "C" uint64_t vm_read64(uint64_t addr) { yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
+extern "C" uint8_t  vm_read8 (uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,1u,0u); yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
+extern "C" uint16_t vm_read16(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,2u,0u); yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
+extern "C" uint32_t vm_read32(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,4u,0u); yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
+extern "C" uint64_t vm_read64(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,8u,0u); yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
 #endif
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
