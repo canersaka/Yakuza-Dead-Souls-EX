@@ -188,12 +188,18 @@ def process(famname, fam, plc, args, results):
                                       if row["wj"]["avg_us"] > 0 else None)
             row["speedup_wb_wj"] = (row["wb"]["avg_us"] / row["wj"]["avg_us"]
                                     if row["wj"]["avg_us"] > 0 else None)
+            fw = row["speedup_fast_wj"]
+            ww = row["speedup_wb_wj"]
             line += (f" wj={row['wj']['avg_us']:10.1f}us "
-                     f"fast/wj={row['speedup_fast_wj']:.2f}x "
-                     f"wb/wj={row['speedup_wb_wj']:.2f}x")
+                     f"fast/wj={fw:.2f}x " if fw is not None else
+                     f" wj={row['wj']['avg_us']:10.1f}us fast/wj=-- ")
+            line += f"wb/wj={ww:.2f}x" if ww is not None else "wb/wj=--"
         else:
-            line += (f"  fast/wb={row['speedup_fast_wb']:.2f}x "
-                     f"diag/wb={row['speedup_diag_wb']:.2f}x")
+            fb = row["speedup_fast_wb"]
+            db = row["speedup_diag_wb"]
+            line += (f"  fast/wb={fb:.2f}x " if fb is not None
+                     else "  fast/wb=-- ")
+            line += f"diag/wb={db:.2f}x" if db is not None else "diag/wb=--"
         rows.append(row)
         print(line)
     ent = {"family": famname, "stem": stem, "windows": rows}
