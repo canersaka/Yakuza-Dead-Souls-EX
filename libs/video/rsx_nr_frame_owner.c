@@ -16,7 +16,6 @@
 #define NR_FRAME_PUBLICATION_FAILURE_DELAY_MS 30000u
 #define NR_FRAME_PRIMARY_SEGMENT_BYTES 0x100000u
 #define NR_FRAME_GENERATED_BLOCK_BYTES 0x20000u
-
 static rsx_nr_frame_step_result frame_fail(
     rsx_nr_frame_owner* o, u32 kind, u32 get, u32 put, u32 ret, u32 command,
     u32 method, u32 argument, u32 index)
@@ -117,6 +116,23 @@ void rsx_nr_frame_owner_set_publication_clock(
     o->flow_wait_clock_next_poll = 0u;
 }
 
+static int frame_graph_sink_push(void* user, const rsx_nir_op* op)
+{
+    rsx_nr_frame_owner* const o = (rsx_nr_frame_owner*)user;
+    if (!o || !o->graph_stream || rsx_nir_push(o->graph_stream, op) != 0)
+        return -1;
+    if (rsx_nr_graph_op_ends_island(op->kind))
+        o->graph_boundary_after_method = 1u;
+    return 0;
+}
+
+static u32 frame_graph_sink_side_push(void* user, const u32* words, u32 count)
+{
+    rsx_nr_frame_owner* const o = (rsx_nr_frame_owner*)user;
+    return o && o->graph_stream
+        ? rsx_nir_side_push(o->graph_stream, words, count) : ~0u;
+}
+
 void rsx_nr_frame_owner_set_single_pass_graph(
     rsx_nr_frame_owner* o, u32 mode, rsx_nir_stream* stream,
     rsx_nr_frame_now_ticks_fn now_ticks, void* clock_user,
@@ -134,17 +150,20 @@ void rsx_nr_frame_owner_set_single_pass_graph(
     o->graph_tick_frequency = tick_frequency;
     o->graph_exec_pos = 0u;
     o->graph_execution_pending = 0u;
-    o->graph_method_count = 0u;
-    o->graph_packet_count = 0u;
+    o->graph_method_start_seen = o->adapter
+        ? o->adapter->methods_seen : 0u;
     o->graph_boundary_after_method = 0u;
-    o->graph_contains_present = 0u;
     o->graph_internal_active = 0u;
     o->graph_started_ticks = 0u;
     if (stream)
         rsx_nir_stream_reset(stream);
     if (o->adapter) {
-        const rsx_nir_sink sink = mode == RSX_NR_FRAME_GRAPH_EXECUTE
-            ? rsx_nir_stream_sink(stream) : rsx_nr_ring_sink(o->ring);
+        rsx_nir_sink sink = rsx_nr_ring_sink(o->ring);
+        if (mode == RSX_NR_FRAME_GRAPH_EXECUTE) {
+            sink.user = o;
+            sink.push = frame_graph_sink_push;
+            sink.side_push = frame_graph_sink_side_push;
+        }
         o->adapter->em.out = sink;
     }
 }
@@ -631,10 +650,9 @@ static void frame_graph_reset_island(rsx_nr_frame_owner* o)
     rsx_nir_stream_reset(o->graph_stream);
     o->graph_exec_pos = 0u;
     o->graph_execution_pending = 0u;
-    o->graph_method_count = 0u;
-    o->graph_packet_count = 0u;
+    o->graph_method_start_seen = o->adapter
+        ? o->adapter->methods_seen : 0u;
     o->graph_boundary_after_method = 0u;
-    o->graph_contains_present = 0u;
     o->graph_passive_source_ops = 0u;
     o->graph_passive_source_side = 0u;
     o->graph_passive_source_hash = 0u;
@@ -643,7 +661,8 @@ static void frame_graph_reset_island(rsx_nr_frame_owner* o)
 
 static void frame_graph_account_island(rsx_nr_frame_owner* o, int passive)
 {
-    const u32 methods = o->graph_method_count;
+    const u32 methods = o->adapter
+        ? o->adapter->methods_seen - o->graph_method_start_seen : 0u;
     const u32 ops = o->graph_stream->op_count;
     const u32 side = o->graph_stream->side_count;
     o->graph_stats.islands++;
@@ -786,19 +805,20 @@ static rsx_nr_frame_step_result frame_resume_packet(
             *next_return = o->packet_next_ret;
             o->packet_active = 0;
             o->stats.packets++;
-            if (o->graph_mode != RSX_NR_FRAME_GRAPH_DISABLED)
-                o->graph_packet_count++;
+            if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE)
+                o->graph_yield_after_packet = 1u;
             return RSX_NR_FRAME_ADVANCED;
         }
 
         const u32 method = o->packet_non_incrementing
             ? o->packet_method : o->packet_method + o->packet_index * 4u;
         const rsx_nr_graph_method_boundary graph_boundary =
-            o->graph_mode != RSX_NR_FRAME_GRAPH_DISABLED
+            o->graph_mode != RSX_NR_FRAME_GRAPH_DISABLED &&
+                    o->graph_stream->op_count
                 ? rsx_nr_graph_classify_method(method)
                 : RSX_NR_GRAPH_METHOD_CONTINUE;
         if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE &&
-            o->graph_stream->op_count && o->graph_method_count &&
+            o->graph_stream->op_count &&
             graph_boundary != RSX_NR_GRAPH_METHOD_CONTINUE) {
             frame_graph_close_construction(o);
             return RSX_NR_FRAME_GRAPH_BOUNDARY;
@@ -858,12 +878,8 @@ static rsx_nr_frame_step_result frame_resume_packet(
             rsx_nr_ring_clear_reject(o->ring);
         o->method_errors_before = o->backend->stats.exec_errors;
         o->packet_argument = argument;
-        const u32 graph_op_first = o->graph_stream
-            ? o->graph_stream->op_count : 0u;
         rsx_nir_adapter_method(o->adapter, method, argument);
         o->stats.methods++;
-        if (o->graph_mode != RSX_NR_FRAME_GRAPH_DISABLED)
-            o->graph_method_count++;
         if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE &&
             (o->graph_stream->overflow || o->graph_stream->oom))
             return frame_fail(
@@ -879,13 +895,6 @@ static rsx_nr_frame_step_result frame_resume_packet(
                 argument,
                 o->packet_index);
         if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE) {
-            for (u32 i = graph_op_first; i < o->graph_stream->op_count; ++i) {
-                const u32 kind = o->graph_stream->ops[i].kind;
-                if (kind == RSX_NIR_OP_PRESENT)
-                    o->graph_contains_present = 1u;
-                if (rsx_nr_graph_op_ends_island(kind))
-                    o->graph_boundary_after_method = 1u;
-            }
             o->packet_index++;
             if (o->graph_boundary_after_method) {
                 frame_graph_close_construction(o);
@@ -1175,7 +1184,6 @@ static rsx_nr_frame_step_result frame_owner_step_once(
 static rsx_nr_frame_step_result frame_graph_execute_island(
     rsx_nr_frame_owner* o)
 {
-    const u32 contained_present = o->graph_contains_present;
     while (o->graph_exec_pos < o->graph_stream->op_count) {
         const rsx_nir_op* const op =
             &o->graph_stream->ops[o->graph_exec_pos];
@@ -1205,8 +1213,11 @@ static rsx_nr_frame_step_result frame_graph_execute_island(
     }
     frame_graph_account_island(o, 0);
     frame_graph_reset_island(o);
-    if (contained_present)
-        o->graph_yield_after_packet = 1u;
+    /* The island is now atomically committed.  The packet-completion path
+     * also requests a host handoff as soon as each complete packet has been
+     * copied into the fixed graph arena.  Neither handoff forces a D3D
+     * submission. */
+    o->graph_yield_after_packet = 1u;
     return RSX_NR_FRAME_ADVANCED;
 }
 
@@ -1229,7 +1240,8 @@ static rsx_nr_frame_step_result frame_graph_step(
 
     *next_get = get;
     *next_return = call_return;
-    o->graph_stats.calls++;
+    if (o->graph_now_ticks)
+        o->graph_stats.calls++;
 
     for (u32 guard = 0; guard < NR_FRAME_FLOW_WAIT_BOUND; ++guard) {
         if (o->graph_execution_pending) {

@@ -1390,16 +1390,20 @@ static int yz_nr_active_init(int graphics)
     if (g_active.single_pass_graph) {
         LARGE_INTEGER frequency = {};
         QueryPerformanceFrequency(&frequency);
-        rsx_nr_frame_owner_set_single_pass_graph(
-            &g_active.frame_owner, g_active.single_pass_graph,
-            &g_active.section_stream,
-            [](void*) -> unsigned long long {
+        const bool graph_timing =
+            getenv("YZ_NR_SINGLE_PASS_GRAPH_TIMING") != nullptr;
+        rsx_nr_frame_now_ticks_fn graph_clock = nullptr;
+        if (graph_timing)
+            graph_clock = [](void*) -> unsigned long long {
                 LARGE_INTEGER value = {};
                 QueryPerformanceCounter(&value);
                 return static_cast<unsigned long long>(value.QuadPart);
-            },
-            nullptr,
-            static_cast<unsigned long long>(frequency.QuadPart));
+            };
+        rsx_nr_frame_owner_set_single_pass_graph(
+            &g_active.frame_owner, g_active.single_pass_graph,
+            &g_active.section_stream, graph_clock, nullptr,
+            graph_timing
+                ? static_cast<unsigned long long>(frequency.QuadPart) : 0ull);
     }
     return 1;
 }

@@ -237,10 +237,8 @@ typedef struct rsx_nr_frame_owner {
     u32 graph_mode;
     u32 graph_exec_pos;
     u32 graph_execution_pending;
-    u32 graph_method_count;
-    u32 graph_packet_count;
+    u32 graph_method_start_seen;
     u32 graph_boundary_after_method;
-    u32 graph_contains_present;
     u32 graph_internal_active;
     u32 graph_cursor_get;
     u32 graph_cursor_ret;
