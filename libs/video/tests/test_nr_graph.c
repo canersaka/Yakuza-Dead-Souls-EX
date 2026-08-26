@@ -34,8 +34,8 @@ int main(void)
           RSX_NR_GRAPH_METHOD_CONTINUE);
 
     CHECK(!rsx_nr_graph_op_ends_island(RSX_NIR_OP_SET_VIEWPORT));
-    CHECK(!rsx_nr_graph_op_ends_island(RSX_NIR_OP_DRAW));
-    CHECK(!rsx_nr_graph_op_ends_island(RSX_NIR_OP_CLEAR));
+    CHECK(rsx_nr_graph_op_ends_island(RSX_NIR_OP_DRAW));
+    CHECK(rsx_nr_graph_op_ends_island(RSX_NIR_OP_CLEAR));
     CHECK(rsx_nr_graph_op_ends_island(RSX_NIR_OP_TRANSFER));
     CHECK(rsx_nr_graph_op_ends_island(RSX_NIR_OP_PRESENT));
     CHECK(rsx_nr_graph_op_ends_island(RSX_NIR_OP_SEMAPHORE_ACQUIRE));

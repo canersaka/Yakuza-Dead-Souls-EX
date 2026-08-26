@@ -37,7 +37,14 @@ rsx_nr_graph_method_boundary rsx_nr_graph_classify_method(u32 method)
 
 int rsx_nr_graph_op_ends_island(u32 kind)
 {
-    return kind == RSX_NIR_OP_TRANSFER ||
+    /* A draw/clear is the first consumer of the guest resources accumulated
+     * by the island. Execute that fully recorded island before publishing the
+     * action packet's GET, so a producer cannot overwrite vertex, texture, or
+     * target data between preflight and consumption. This is an execution
+     * boundary only; it does not submit the shared D3D command list. */
+    return kind == RSX_NIR_OP_DRAW ||
+           kind == RSX_NIR_OP_CLEAR ||
+           kind == RSX_NIR_OP_TRANSFER ||
            kind == RSX_NIR_OP_PRESENT ||
            kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE ||
            kind == RSX_NIR_OP_SEMAPHORE_RELEASE ||

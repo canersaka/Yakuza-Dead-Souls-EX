@@ -1184,6 +1184,8 @@ static rsx_nr_frame_step_result frame_owner_step_once(
 static rsx_nr_frame_step_result frame_graph_execute_island(
     rsx_nr_frame_owner* o)
 {
+    const unsigned long long started = o->graph_now_ticks
+        ? o->graph_now_ticks(o->graph_clock_user) : 0u;
     while (o->graph_exec_pos < o->graph_stream->op_count) {
         const rsx_nir_op* const op =
             &o->graph_stream->ops[o->graph_exec_pos];
@@ -1193,11 +1195,23 @@ static rsx_nr_frame_step_result frame_graph_execute_island(
             o->backend, o->graph_stream, o->graph_exec_pos);
         if (result == RSX_NR_STEP_BLOCKED_SEMAPHORE ||
             result == RSX_NR_STEP_BLOCKED_TOKEN) {
+            if (started && o->graph_now_ticks) {
+                const unsigned long long ended =
+                    o->graph_now_ticks(o->graph_clock_user);
+                if (ended >= started)
+                    o->graph_stats.execution_ticks += ended - started;
+            }
             o->stats.waits_semaphore++;
             return RSX_NR_FRAME_WAIT_SEMAPHORE;
         }
         if (result != RSX_NR_STEP_EXECUTED ||
             o->backend->stats.exec_errors != errors_before) {
+            if (started && o->graph_now_ticks) {
+                const unsigned long long ended =
+                    o->graph_now_ticks(o->graph_clock_user);
+                if (ended >= started)
+                    o->graph_stats.execution_ticks += ended - started;
+            }
             o->graph_stats.fallback[RSX_NR_FRAME_GRAPH_FB_EXECUTION]++;
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_EXECUTION, o->graph_cursor_get,
@@ -1211,6 +1225,15 @@ static rsx_nr_frame_step_result frame_graph_execute_island(
         }
         o->graph_exec_pos++;
     }
+    if (started && o->graph_now_ticks) {
+        const unsigned long long ended =
+            o->graph_now_ticks(o->graph_clock_user);
+        if (ended >= started) {
+            o->graph_stats.execution_ticks += ended - started;
+        }
+    }
+    if (started)
+        o->graph_stats.timed_islands++;
     frame_graph_account_island(o, 0);
     frame_graph_reset_island(o);
     /* The island is now atomically committed.  The packet-completion path
