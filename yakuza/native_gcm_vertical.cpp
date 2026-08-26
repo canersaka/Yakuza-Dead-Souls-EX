@@ -22,6 +22,7 @@
 #include "rsx_nr_backend.h"
 #include "rsx_nr_backend_d3d12.h"
 #include "rsx_nr_frame_owner.h"
+#include "rsx_nr_graph.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_live_draw.h"
 #include "rsx_nir_adapter.h"
@@ -402,6 +403,8 @@ struct yz_nr_vertical_active_state {
     uint32_t graphics_families;
     uint32_t clear_scope;
     uint32_t frame_islands;
+    uint32_t graph_islands;
+    uint32_t single_pass_graph;
     uint32_t strict_full_native;
     uint32_t movie_suppressed;
     uint32_t movie_snapshot_valid;
@@ -1330,7 +1333,8 @@ static int yz_nr_active_init(int graphics)
             rsx_nr_span_router_destroy(&g_active.router);
             return 0;
         }
-        if (g_active.frame_islands) {
+        if (g_active.frame_islands || g_active.graph_islands ||
+            g_active.single_pass_graph) {
             g_active.section_ops = static_cast<rsx_nir_op*>(calloc(
                 YZ_NR_SECTION_OP_CAPACITY, sizeof(rsx_nir_op)));
             g_active.section_side = static_cast<uint32_t*>(calloc(
@@ -1383,6 +1387,20 @@ static int yz_nr_active_init(int graphics)
         &g_active.frame_owner,
         [](void*) -> unsigned long long { return GetTickCount64(); },
         nullptr, 2u, 30000u);
+    if (g_active.single_pass_graph) {
+        LARGE_INTEGER frequency = {};
+        QueryPerformanceFrequency(&frequency);
+        rsx_nr_frame_owner_set_single_pass_graph(
+            &g_active.frame_owner, g_active.single_pass_graph,
+            &g_active.section_stream,
+            [](void*) -> unsigned long long {
+                LARGE_INTEGER value = {};
+                QueryPerformanceCounter(&value);
+                return static_cast<unsigned long long>(value.QuadPart);
+            },
+            nullptr,
+            static_cast<unsigned long long>(frequency.QuadPart));
+    }
     return 1;
 }
 
@@ -2539,6 +2557,16 @@ extern "C" void yz_nr_vertical_init(void)
             : YZ_NR_CLEAR_ALL;
         g_active.frame_islands = graphics && !strict &&
             getenv("YZ_NR_FRAME_ISLANDS") != nullptr;
+        const char* const graph = getenv("YZ_NR_GRAPH");
+        g_active.graph_islands = strict && graph &&
+            strcmp(graph, "execute") == 0;
+        const char* const single_graph = getenv("YZ_NR_SINGLE_PASS_GRAPH");
+        g_active.single_pass_graph = strict && single_graph &&
+            strcmp(single_graph, "passive") == 0
+                ? RSX_NR_FRAME_GRAPH_PASSIVE
+                : strict && single_graph &&
+                  strcmp(single_graph, "execute") == 0
+                    ? RSX_NR_FRAME_GRAPH_EXECUTE : 0u;
         g_active.section_diag_enabled = graphics && !strict &&
             getenv("YZ_NR_PASS_DIAG") != nullptr;
         g_active.section_shadow_consumer_admit = graphics && !strict &&
@@ -2549,8 +2577,10 @@ extern "C" void yz_nr_vertical_init(void)
             getenv("YZ_NR_SCANOUT_PROVENANCE") != nullptr;
         const char* const report_defer = getenv("YZ_NR_DEFER_REPORTS");
         const char* const report_audit = getenv("YZ_NR_REPORT_AUDIT");
-        g_active.report_defer_enabled = strict && report_defer &&
-            report_defer[0] == '1' && report_defer[1] == '\0';
+        g_active.report_defer_enabled = strict &&
+            ((report_defer && report_defer[0] == '1' &&
+              report_defer[1] == '\0') || g_active.graph_islands ||
+             g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE);
         g_active.report_audit_enabled = strict && report_audit &&
             report_audit[0] == '1' && report_audit[1] == '\0';
         g_active.draw_primitive_filter = UINT32_MAX;
@@ -3188,62 +3218,6 @@ static int yz_nr_section_gpu_action(uint32_t kind)
  * memory, changes framebuffer identity, transfers ownership, or presents.
  * These are semantic boundaries, not packet-count heuristics: the complete
  * island is preflighted before any legacy action is suppressed. */
-static int yz_nr_section_dependency_method(uint32_t method)
-{
-    switch (method) {
-    case 0x0050u: /* NV406E SET_REFERENCE */
-    case 0x0068u: /* NV406E SEMAPHORE_ACQUIRE */
-    case 0x006Cu: /* NV406E SEMAPHORE_RELEASE */
-    case 0x0110u: /* WAIT_FOR_IDLE */
-    case 0x17C8u: /* CLEAR_REPORT_VALUE */
-    case 0x1800u: /* GET_REPORT */
-    case 0x1D70u: /* BACK_END_WRITE_SEMAPHORE_RELEASE */
-    case 0x1D74u: /* TEXTURE_READ_SEMAPHORE_RELEASE */
-    case 0x2328u: /* NV0039 BUFFER_NOTIFY */
-    case 0xC40Cu: /* NV3089 IMAGE_IN */
-    case 0xE924u: /* typed PRESENT */
-    case 0xE944u: /* legacy driver flip */
-    case 0xEB00u: /* user command cause */
-    case 0xEB04u: /* user command fire */
-        return 1;
-    default:
-        return method >= 0xA400u && method <= 0xAAFCu;
-    }
-}
-
-static int yz_nr_section_surface_method(uint32_t method)
-{
-    switch (method) {
-    case 0x018Cu: /* DMA_COLOR1 */
-    case 0x0194u: /* DMA_COLOR0 */
-    case 0x0198u: /* DMA_ZETA */
-    case 0x01B4u: /* DMA_COLOR2 */
-    case 0x01B8u: /* DMA_COLOR3 */
-    case 0x0200u: /* RT_HORIZ */
-    case 0x0204u: /* RT_VERT */
-    case 0x0208u: /* RT_FORMAT */
-    case 0x020Cu: /* COLOR0_PITCH */
-    case 0x0210u: /* COLOR0_OFFSET */
-    case 0x0214u: /* ZETA_OFFSET */
-    case 0x0218u: /* COLOR1_OFFSET */
-    case 0x021Cu: /* COLOR1_PITCH */
-    case 0x0220u: /* RT_ENABLE */
-    case 0x022Cu: /* ZETA_PITCH */
-    case 0x0280u: /* COLOR2_PITCH */
-    case 0x0284u: /* COLOR3_PITCH */
-    case 0x0288u: /* COLOR2_OFFSET */
-    case 0x028Cu: /* COLOR3_OFFSET */
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static int yz_nr_section_starts_new_pass(uint32_t method)
-{
-    return method == 0x1D94u || yz_nr_section_surface_method(method);
-}
-
 static int yz_nr_section_op_side(const rsx_nir_op* op,
                                  uint32_t* offset, uint32_t* count)
 {
@@ -3937,6 +3911,83 @@ static uint32_t yz_nr_section_preflight(void)
         YZ_NR_SECTION_FB_NO_GPU_ACTION;
 }
 
+/* Strict-native graph ownership has no legacy renderer to fall back to after
+ * a draw has been admitted.  Its executor is the same already-validated D3D12
+ * backend as the immediate strict path, so repeating shader, texture,
+ * residency, and batch preparation here would only perform every expensive
+ * draw calculation twice.  Preflight only dependencies which can genuinely
+ * block or publish guest-visible state.  A scanner refusal leaves GET and the
+ * live adapter untouched and is handled by the existing strict frame owner. */
+static uint32_t yz_nr_graph_preflight(void)
+{
+    g_active.section_gpu_actions = 0;
+    g_active.section_draws = 0;
+    g_active.section_clears = 0;
+    g_active.section_transfers = 0;
+    g_active.section_presents = 0;
+    g_active.section_preflight_sem_valid = 0;
+
+    for (uint32_t i = 0; i < g_active.section_stream.op_count; ++i) {
+        const rsx_nir_op* const op = &g_active.section_stream.ops[i];
+        switch (op->kind) {
+        case RSX_NIR_OP_CLEAR:
+            g_active.section_gpu_actions++;
+            g_active.section_clears++;
+            break;
+        case RSX_NIR_OP_DRAW:
+            g_active.section_gpu_actions++;
+            g_active.section_draws++;
+            break;
+        case RSX_NIR_OP_TRANSFER:
+            g_active.section_gpu_actions++;
+            g_active.section_transfers++;
+            break;
+        case RSX_NIR_OP_PRESENT:
+            g_active.section_gpu_actions++;
+            g_active.section_presents++;
+            break;
+        case RSX_NIR_OP_SEMAPHORE_ACQUIRE: {
+            uint32_t observed = 0;
+            const int32_t result = yz_nr_vertical_sem_read(
+                op->u.semaphore.dma_context,
+                op->u.semaphore.offset, &observed);
+            if (result != 0 || observed != op->u.semaphore.value) {
+                yz_nr_section_note_sync_preflight(op, result);
+                if (result == 0) {
+                    g_active.section_preflight_sem_dma =
+                        op->u.semaphore.dma_context;
+                    g_active.section_preflight_sem_offset =
+                        op->u.semaphore.offset;
+                    g_active.section_preflight_sem_value =
+                        op->u.semaphore.value;
+                    g_active.section_preflight_sem_valid = 1;
+                }
+                return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+            }
+            break;
+        }
+        case RSX_NIR_OP_REPORT:
+            if (yz_nr_vertical_report_can(
+                    op->u.report.kind, op->u.report.arg,
+                    op->u.report.dma_report) != 0) {
+                yz_nr_section_note_report(
+                    op->u.report.kind, op->u.report.arg,
+                    op->u.report.dma_report);
+                return YZ_NR_SECTION_FB_PREFLIGHT_REPORT;
+            }
+            break;
+        case RSX_NIR_OP_TOKEN_WAIT:
+            /* The current strict routes do not emit host-token waits.  Keep
+             * the existing immediate backend as the exact fallback until a
+             * token-state query is part of the graph contract. */
+            return YZ_NR_SECTION_FB_PREFLIGHT_SYNC;
+        default:
+            break;
+        }
+    }
+    return YZ_NR_SECTION_FB_NONE;
+}
+
 static int yz_nr_section_push_op(uint32_t index)
 {
     if (index >= g_active.section_stream.op_count ||
@@ -4073,8 +4124,10 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
         return yz_nr_section_fallback(
             YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
 
-    uint32_t preflight = yz_nr_section_program_preflight();
-    if (preflight == YZ_NR_SECTION_FB_NONE)
+    uint32_t preflight = g_active.graph_islands
+        ? yz_nr_graph_preflight()
+        : yz_nr_section_program_preflight();
+    if (!g_active.graph_islands && preflight == YZ_NR_SECTION_FB_NONE)
         preflight = yz_nr_section_preflight();
     if (preflight == YZ_NR_SECTION_FB_NO_GPU_ACTION) {
         /* A producer may publish a long state prefix before its terminal
@@ -4109,26 +4162,29 @@ static yz_nr_vertical_section_result yz_nr_section_commit(
             preflight, pc, packet_budget);
     }
 
-    rsx_nr_d3d12_begin_draw_input_refresh_section(g_active.d3d12);
+    if (!g_active.graph_islands)
+        rsx_nr_d3d12_begin_draw_input_refresh_section(g_active.d3d12);
 
     /* The complete command-list section is now admitted. Keep the dormant
      * legacy register/resource model current before suppressing its terminal
      * actions. An executor failure after this point is fatal: legacy can
      * never repeat a partially executed section. */
-    for (uint32_t m = 0; m < g_active.section_method_count; ++m) {
-        const yz_nr_section_method* const retained =
-            &g_active.section_methods[m];
-        if (yz_nr_vertical_mirror_legacy_method(
-                retained->method, retained->arg,
-                retained->suppress_action) != 0)
-            return yz_nr_section_fallback(
-                YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
+    if (!g_active.graph_islands) {
+        for (uint32_t m = 0; m < g_active.section_method_count; ++m) {
+            const yz_nr_section_method* const retained =
+                &g_active.section_methods[m];
+            if (yz_nr_vertical_mirror_legacy_method(
+                    retained->method, retained->arg,
+                    retained->suppress_action) != 0)
+                return yz_nr_section_fallback(
+                    YZ_NR_SECTION_FB_INCOMPLETE_ACTION);
+        }
     }
     const rsx_nir_sink ring_sink = rsx_nr_ring_sink(&g_active.ring);
     g_active.adapter = *g_active.section_adapter;
     rsx_nir_adapter_rebind(&g_active.adapter);
     g_active.adapter.em.out = ring_sink;
-    g_active.adapter.shadow_mode = 1;
+    g_active.adapter.shadow_mode = g_active.graph_islands ? 0 : 1;
     g_active.section_next_get = pc;
     g_active.section_next_ret = ret;
     g_active.section_exec_pos = 0;
@@ -4221,6 +4277,33 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
     }
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
         return YZ_NR_VERTICAL_FRAME_WAIT_PARTIAL;
+
+    /* Phase-1 graph mode transactionally scans one complete render pass or
+     * dependency island into the fixed typed arena.  A successful scan owns
+     * and executes the whole island; any refusal leaves GET/RET and the live
+     * adapter unchanged and falls through to the established strict owner for
+     * exactly-once immediate execution. */
+    if (g_active.graph_islands && rsx_nr_graph_can_enter(
+            g_active.section_pending,
+            g_active.frame_owner.packet_active,
+            g_active.frame_owner.method_inflight,
+            rsx_nr_ring_depth(&g_active.ring))) {
+        uint32_t graph_get = get;
+        uint32_t graph_ret = fifo_ret;
+        const yz_nr_vertical_section_result graph_result =
+            yz_nr_vertical_consume_section(
+                get, put, fifo_ret, &graph_get, &graph_ret);
+        if (next_get)
+            *next_get = graph_get;
+        if (next_ret)
+            *next_ret = graph_ret;
+        if (graph_result == YZ_NR_VERTICAL_SECTION_EXECUTED)
+            return YZ_NR_VERTICAL_FRAME_ADVANCED;
+        if (graph_result == YZ_NR_VERTICAL_SECTION_WAIT)
+            return YZ_NR_VERTICAL_FRAME_WAIT_SEMAPHORE;
+        if (graph_result == YZ_NR_VERTICAL_SECTION_FATAL)
+            return YZ_NR_VERTICAL_FRAME_FATAL;
+    }
 
     uint32_t owned_get = get;
     uint32_t owned_ret = fifo_ret;
@@ -4348,15 +4431,16 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
         *next_get = get;
     if (next_ret)
         *next_ret = fifo_ret;
-    if (!g_active.frame_islands ||
+    if (!(g_active.frame_islands || g_active.graph_islands) ||
         !InterlockedCompareExchange(
             &g_vertical.mode_active_graphics, 0, 0) ||
-        !rsx_live_draw_native_actions_allowed())
+        (!g_active.graph_islands &&
+         !rsx_live_draw_native_actions_allowed()))
         return YZ_NR_VERTICAL_SECTION_MISS;
     yz_nr_active_ensure_graphics();
     if (!InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
         return YZ_NR_VERTICAL_SECTION_MISS;
-    if (!yz_nr_active_resync_dispatch_state())
+    if (!g_active.graph_islands && !yz_nr_active_resync_dispatch_state())
         return YZ_NR_VERTICAL_SECTION_MISS;
     if (g_active.section_pending)
         if (g_active.section_fatal)
@@ -4535,8 +4619,8 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
             for (uint32_t i = 0; i < count; ++i) {
                 const uint32_t effective = non_incrementing
                     ? method : method + i * 4u;
-                if (yz_nr_section_dependency_method(effective) ||
-                    yz_nr_section_starts_new_pass(effective)) {
+                if (rsx_nr_graph_classify_method(effective) !=
+                    RSX_NR_GRAPH_METHOD_CONTINUE) {
                     boundary_before = 1;
                     break;
                 }
@@ -4573,14 +4657,18 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
                 g_active.section_adapter, effective, value);
             const uint32_t action =
                 g_active.section_adapter->actions_seen != actions_before;
-            yz_nr_section_method* const retained =
-                &g_active.section_methods[g_active.section_method_count++];
-            retained->method = effective;
-            retained->arg = value;
-            retained->suppress_action = action ||
-                rsx_nr_legacy_gpu_action(effective, value) ||
-                effective == 0x1808u || effective == 0x1814u ||
-                effective == 0x1824u;
+            if (g_active.graph_islands) {
+                g_active.section_method_count++;
+            } else {
+                yz_nr_section_method* const retained =
+                    &g_active.section_methods[g_active.section_method_count++];
+                retained->method = effective;
+                retained->arg = value;
+                retained->suppress_action = action ||
+                    rsx_nr_legacy_gpu_action(effective, value) ||
+                    effective == 0x1808u || effective == 0x1814u ||
+                    effective == 0x1824u;
+            }
             if (g_active.section_stream.overflow ||
                 g_active.section_stream.oom ||
                 g_active.section_adapter->batch_overflow ||
@@ -4598,14 +4686,7 @@ yz_nr_vertical_consume_section(uint32_t get, uint32_t put,
             const uint32_t kind = g_active.section_stream.ops[i].kind;
             if (yz_nr_section_gpu_action(kind))
                 gpu_actions_seen++;
-            if (kind == RSX_NIR_OP_TRANSFER ||
-                kind == RSX_NIR_OP_PRESENT ||
-                kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE ||
-                kind == RSX_NIR_OP_SEMAPHORE_RELEASE ||
-                kind == RSX_NIR_OP_REPORT ||
-                kind == RSX_NIR_OP_BARRIER ||
-                kind == RSX_NIR_OP_SET_REFERENCE ||
-                kind == RSX_NIR_OP_USER_COMMAND)
+            if (rsx_nr_graph_op_ends_island(kind))
                 dependency_action = 1;
         }
         /* Draws remain grouped until the next semantic pass boundary. A
@@ -4819,7 +4900,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
                 "[nr-vertical-active families=0x%02X clear-scope=%u "
-                "frame-islands=%u strict-full-native=%u "
+                "frame-islands=%u graph-islands=%u single-graph=%u "
+                "strict-full-native=%u "
                 "ref=%llu/%llu user=%llu/%llu draw=%llu/%llu "
                 "flip=%llu/%llu fallback-ref=%llu fallback-user=%llu "
                 "fallback-draw=%llu fallback-flip=%llu "
@@ -4835,6 +4917,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 g_active.graphics_families,
                 g_active.clear_scope,
                 g_active.frame_islands,
+                g_active.graph_islands,
+                g_active.single_pass_graph,
                 g_active.strict_full_native,
                 g_active.owned[YZ_NR_VERT_REFERENCE],
                 g_active.executed[YZ_NR_VERT_REFERENCE],
@@ -4948,6 +5032,49 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 }
             }
         }
+        if (g_active.single_pass_graph) {
+            const rsx_nr_frame_graph_stats* const graph =
+                &g_active.frame_owner.graph_stats;
+            const unsigned long long frames = graph->frames;
+            const unsigned long long construction_us =
+                g_active.frame_owner.graph_tick_frequency
+                    ? graph->construction_ticks * 1000000ull /
+                          g_active.frame_owner.graph_tick_frequency
+                    : 0ull;
+            const unsigned long long coverage_den =
+                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE
+                    ? graph->methods : g_active.frame_owner.stats.methods;
+            const unsigned long long coverage_ppm = coverage_den
+                ? graph->methods * 1000000ull / coverage_den : 0ull;
+            fprintf(stderr,
+                    "[nr-single-graph mode=%u calls=%llu islands=%llu "
+                    "methods=%llu ops=%llu side-words=%llu frames=%llu "
+                    "commands-per-frame=%llu ops-per-frame=%llu "
+                    "construction-ticks=%llu qpc=%llu us=%llu "
+                    "us-per-frame=%llu coverage-ppm=%llu "
+                    "passive=%llu/%llu/%llu "
+                    "fallback=%llu,%llu,%llu "
+                    "max=%llu/%llu/%llu]\n",
+                    g_active.single_pass_graph,
+                    graph->calls, graph->islands, graph->methods,
+                    graph->ops, graph->side_words, graph->frames,
+                    frames ? graph->methods / frames : 0ull,
+                    frames ? graph->ops / frames : 0ull,
+                    graph->construction_ticks,
+                    g_active.frame_owner.graph_tick_frequency,
+                    construction_us,
+                    frames ? construction_us / frames : 0ull,
+                    coverage_ppm,
+                    graph->passive_islands,
+                    graph->passive_equivalent,
+                    graph->passive_mismatches,
+                    graph->fallback[RSX_NR_FRAME_GRAPH_FB_CAPACITY],
+                    graph->fallback[
+                        RSX_NR_FRAME_GRAPH_FB_UNSUPPORTED_METHOD],
+                    graph->fallback[RSX_NR_FRAME_GRAPH_FB_EXECUTION],
+                    graph->max_methods, graph->max_ops,
+                    graph->max_side_words);
+        }
         if (g_active.strict_full_native) {
             const rsx_nr_frame_owner_stats* const fs =
                 &g_active.frame_owner.stats;
@@ -5011,20 +5138,32 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         g_active.adapter.inline_count);
             }
         }
-        if (g_active.frame_islands) {
+        if (g_active.frame_islands || g_active.graph_islands) {
+            const unsigned long long graph_total_methods =
+                g_active.section_methods_owned +
+                g_active.frame_owner.stats.methods;
+            const unsigned long long graph_method_coverage_ppm =
+                graph_total_methods
+                    ? g_active.section_methods_owned * 1000000ull /
+                          graph_total_methods
+                    : 0ull;
             fprintf(stderr,
-                    "[nr-vertical-sections attempts=%llu owned=%llu "
+                    "[nr-vertical-graph enabled=%u attempts=%llu owned=%llu "
                     "render-passes=%llu dependency-islands=%llu "
-                    "methods=%llu ops=%llu exec-errors=%llu fast-skip=%llu "
+                    "methods=%llu immediate-methods=%llu coverage-ppm=%llu "
+                    "ops=%llu exec-errors=%llu fast-skip=%llu "
                     "legacy-path=%u:%u/%llu/%llu shadow-depth=%llu "
                     "shadow-consumer=%llu/%llu "
                     "fallback="
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                     "%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+                    g_active.graph_islands,
                     g_active.section_attempts, g_active.section_owned,
                     g_active.section_render_passes_owned,
                     g_active.section_dependency_islands_owned,
                     g_active.section_methods_owned,
+                    g_active.frame_owner.stats.methods,
+                    graph_method_coverage_ppm,
                     g_active.section_ops_owned,
                     g_active.section_exec_errors,
                     g_active.section_fallback_fast_skips,
@@ -5264,8 +5403,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                                 entry->attr_offset_last[attr],
                                 entry->attr_offset_min[attr],
                                 entry->attr_offset_max[attr]);
-                    }
-                }
+            }
+        }
                 if (g_active.section_shadow_consumer_diag_overflow)
                     fprintf(stderr,
                             "[nr-vertical-shadow-consumer-overflow=%llu]\n",
@@ -5447,9 +5586,34 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     d3d_stats.rt_builds, d3d_stats.rt_refreshes,
                     d3d_stats.depth_builds, d3d_stats.depth_refreshes,
                     rsx_nr_d3d12_shared_timeline_enabled(g_active.d3d12),
-                    d3d_stats.shared_timeline_acquires,
-                    d3d_stats.shared_timeline_generations,
-                    d3d_stats.shared_timeline_forced_submissions);
+                     d3d_stats.shared_timeline_acquires,
+                     d3d_stats.shared_timeline_generations,
+                     d3d_stats.shared_timeline_forced_submissions);
+            if (g_active.graph_islands ||
+                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE) {
+                const unsigned long long graph_draw_coverage_ppm =
+                    d3d_stats.draws
+                        ? (g_active.graph_islands
+                            ? g_active.consumer_draw_owned
+                            : d3d_stats.draws) * 1000000ull /
+                              d3d_stats.draws : 0ull;
+                fprintf(stderr,
+                        "[nr-graph-coverage draws=%llu/%llu ppm=%llu "
+                        "clears=%llu transfers=%llu submissions=%llu "
+                        "readbacks=%llu uploads=%llu]\n",
+                        g_active.graph_islands
+                            ? g_active.consumer_draw_owned : d3d_stats.draws,
+                        d3d_stats.draws,
+                        graph_draw_coverage_ppm,
+                        g_active.graph_islands
+                            ? g_active.consumer_clear_owned : d3d_stats.clears,
+                        g_active.graph_islands
+                            ? g_active.consumer_transfer_owned
+                            : d3d_stats.transfers,
+                        d3d_stats.queue_submissions,
+                        d3d_stats.transfer_gpu_readbacks,
+                        d3d_stats.transfer_gpu_uploads);
+            }
             fprintf(stderr,
                     "[nr-vertical-d3d-cache textures=%u/%u "
                     "table-full=%llu arena-full=%llu pso=%u/%u "

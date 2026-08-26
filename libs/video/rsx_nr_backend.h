@@ -101,6 +101,13 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be);
  * number of ops executed. */
 u32 rsx_nr_backend_run(rsx_nr_backend* be, u32 max_ops);
 
+/* Execute one op already retained in a fixed rsx_nir_stream.  This is the
+ * single-pass graph consumer: it shares the exact state/action interpreter
+ * above, but avoids copying an island back through the live atomic ring.
+ * A blocked wait leaves the caller's stream index unchanged. */
+rsx_nr_step_result rsx_nr_backend_stream_step(
+    rsx_nr_backend* be, const rsx_nir_stream* stream, u32 index);
+
 #ifdef __cplusplus
 }
 #endif

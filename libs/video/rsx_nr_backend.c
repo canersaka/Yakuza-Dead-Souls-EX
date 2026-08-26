@@ -25,7 +25,18 @@ void rsx_nr_backend_init(rsx_nr_backend* be, rsx_nr_ring* ring,
     rsx_nir_pipeline_init(&be->st);
 }
 
-static void apply_state_op(rsx_nr_backend* be, const rsx_nir_op* op)
+static const u32* backend_side_ptr(const u32* side, u32 side_count,
+                                   u32 offset, u32 count)
+{
+    if (!count)
+        return NULL;
+    if (!side || offset > side_count || count > side_count - offset)
+        return NULL;
+    return side + offset;
+}
+
+static int apply_state_op(rsx_nr_backend* be, const rsx_nir_op* op,
+                          const u32* side, u32 side_count)
 {
     rsx_nir_pipeline* p = &be->st;
     switch (op->kind) {
@@ -52,17 +63,23 @@ static void apply_state_op(rsx_nr_backend* be, const rsx_nir_op* op)
         u32 n = op->u.vertex_program.word_count;
         if (n > RSX_NIR_VP_MAX_WORDS)
             n = RSX_NIR_VP_MAX_WORDS;
-        if (n)
-            memcpy(be->vp_words,
-                   rsx_nr_ring_side_ptr(be->ring,
-                                        op->u.vertex_program.words_ofs),
-                   (size_t)n * 4);
+        if (n) {
+            const u32* w = backend_side_ptr(
+                side, side_count, op->u.vertex_program.words_ofs, n);
+            if (!w)
+                return -1;
+            memcpy(be->vp_words, w, (size_t)n * 4);
+        }
         be->vp_word_count = n;
         break;
     }
     case RSX_NIR_OP_SET_CONSTANTS: {
         const rsx_nir_constants* c = &op->u.constants;
-        const u32* w = rsx_nr_ring_side_ptr(be->ring, c->words_ofs);
+        const u32 count = c->slot_count * 4u;
+        const u32* w = backend_side_ptr(
+            side, side_count, c->words_ofs, count);
+        if (count && !w)
+            return -1;
         for (u32 i = 0; i < c->slot_count; i++) {
             u32 slot = c->first_slot + i;
             if (slot >= RSX_NIR_NUM_CONSTANTS)
@@ -75,15 +92,14 @@ static void apply_state_op(rsx_nr_backend* be, const rsx_nir_op* op)
     default:
         break;
     }
+    return 0;
 }
 
-rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
+static rsx_nr_step_result backend_execute_op(
+    rsx_nr_backend* be, const rsx_nir_op* op,
+    const u32* side, u32 side_count)
 {
-    const rsx_nr_slot* slot = rsx_nr_ring_peek(be->ring);
-    if (!slot)
-        return RSX_NR_STEP_EMPTY;
-    const rsx_nir_op* op = &slot->op;
-    const rsx_nr_exec_ops* x = &be->ops;
+    rsx_nr_exec_ops* x = &be->ops;
     int rc = 0;
 
     switch (op->kind) {
@@ -137,21 +153,30 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
             rc = x->clear(x->user, &be->st, &op->u.clear);
         break;
     case RSX_NIR_OP_DRAW:
-        if (x->draw)
+        if (x->draw) {
+            const u32* batches = backend_side_ptr(
+                side, side_count, op->u.draw.batches_ofs,
+                op->u.draw.batch_count * 2u);
+            if (op->u.draw.batch_count && !batches) {
+                rc = -1;
+                break;
+            }
             rc = x->draw(x->user, &be->st, be->vp_words, be->vp_word_count,
-                         &op->u.draw,
-                         op->u.draw.batch_count
-                             ? rsx_nr_ring_side_ptr(be->ring,
-                                                    op->u.draw.batches_ofs)
-                             : NULL);
+                         &op->u.draw, batches);
+        }
         break;
     case RSX_NIR_OP_TRANSFER:
-        if (x->transfer)
+        if (x->transfer) {
+            const u32* words = backend_side_ptr(
+                side, side_count, op->u.transfer.words_ofs,
+                op->u.transfer.word_count);
+            if (op->u.transfer.word_count && !words) {
+                rc = -1;
+                break;
+            }
             rc = x->transfer(x->user, &be->st, &op->u.transfer,
-                             op->u.transfer.word_count
-                                 ? rsx_nr_ring_side_ptr(
-                                       be->ring, op->u.transfer.words_ofs)
-                                 : NULL);
+                             words);
+        }
         break;
     case RSX_NIR_OP_PRESENT:
         if (x->present)
@@ -186,7 +211,7 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
             be->stats.fallback_exits++;
         break;
     default:
-        apply_state_op(be, op);
+        rc = apply_state_op(be, op, side, side_count);
         break;
     }
 
@@ -194,8 +219,28 @@ rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
         be->stats.executed[op->kind]++;
     if (rc != 0)
         be->stats.exec_errors++;
-    rsx_nr_ring_pop(be->ring);
     return RSX_NR_STEP_EXECUTED;
+}
+
+rsx_nr_step_result rsx_nr_backend_step(rsx_nr_backend* be)
+{
+    const rsx_nr_slot* slot = rsx_nr_ring_peek(be->ring);
+    if (!slot)
+        return RSX_NR_STEP_EMPTY;
+    const rsx_nr_step_result result = backend_execute_op(
+        be, &slot->op, be->ring->side, be->ring->side_cap);
+    if (result == RSX_NR_STEP_EXECUTED)
+        rsx_nr_ring_pop(be->ring);
+    return result;
+}
+
+rsx_nr_step_result rsx_nr_backend_stream_step(
+    rsx_nr_backend* be, const rsx_nir_stream* stream, u32 index)
+{
+    if (!be || !stream || index >= stream->op_count)
+        return RSX_NR_STEP_EMPTY;
+    return backend_execute_op(
+        be, &stream->ops[index], stream->side, stream->side_count);
 }
 
 u32 rsx_nr_backend_run(rsx_nr_backend* be, u32 max_ops)

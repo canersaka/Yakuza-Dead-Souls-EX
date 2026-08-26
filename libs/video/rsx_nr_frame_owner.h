@@ -17,6 +17,7 @@
 
 #include "rsx_nir_adapter.h"
 #include "rsx_nr_backend.h"
+#include "rsx_nr_graph.h"
 #include "rsx_nr_producer_contract.h"
 
 #ifdef __cplusplus
@@ -25,6 +26,7 @@ extern "C" {
 
 typedef int (*rsx_nr_frame_read32_fn)(void* user, u32 io, u32* value);
 typedef unsigned long long (*rsx_nr_frame_now_ms_fn)(void* user);
+typedef unsigned long long (*rsx_nr_frame_now_ticks_fn)(void* user);
 /* A producer-publication hook for an exact jump-to-self stopper. Returning
  * one means the hook atomically proved and published a forward resume cursor;
  * zero leaves the stopper parked. This is not a generic skip facility. */
@@ -71,7 +73,22 @@ typedef enum rsx_nr_frame_step_result {
     RSX_NR_FRAME_WAIT_STOPPER,
     RSX_NR_FRAME_WAIT_SEMAPHORE,
     RSX_NR_FRAME_FATAL,
+    /* Internal boundary consumed by the single-pass wrapper. */
+    RSX_NR_FRAME_GRAPH_BOUNDARY,
 } rsx_nr_frame_step_result;
+
+typedef enum rsx_nr_frame_graph_mode {
+    RSX_NR_FRAME_GRAPH_DISABLED = 0,
+    RSX_NR_FRAME_GRAPH_PASSIVE,
+    RSX_NR_FRAME_GRAPH_EXECUTE,
+} rsx_nr_frame_graph_mode;
+
+typedef enum rsx_nr_frame_graph_fallback_reason {
+    RSX_NR_FRAME_GRAPH_FB_CAPACITY = 0,
+    RSX_NR_FRAME_GRAPH_FB_UNSUPPORTED_METHOD,
+    RSX_NR_FRAME_GRAPH_FB_EXECUTION,
+    RSX_NR_FRAME_GRAPH_FB_REASON_COUNT,
+} rsx_nr_frame_graph_fallback_reason;
 
 typedef enum rsx_nr_frame_failure_kind {
     RSX_NR_FRAME_FAILURE_NONE = 0,
@@ -132,6 +149,23 @@ typedef struct rsx_nr_frame_owner_stats {
     unsigned long long frames;
     unsigned long long backend_ops;
 } rsx_nr_frame_owner_stats;
+
+typedef struct rsx_nr_frame_graph_stats {
+    unsigned long long calls;
+    unsigned long long islands;
+    unsigned long long methods;
+    unsigned long long ops;
+    unsigned long long side_words;
+    unsigned long long frames;
+    unsigned long long passive_islands;
+    unsigned long long passive_equivalent;
+    unsigned long long passive_mismatches;
+    unsigned long long construction_ticks;
+    unsigned long long fallback[RSX_NR_FRAME_GRAPH_FB_REASON_COUNT];
+    unsigned long long max_methods;
+    unsigned long long max_ops;
+    unsigned long long max_side_words;
+} rsx_nr_frame_graph_stats;
 
 typedef struct rsx_nr_frame_owner {
     rsx_nir_adapter* adapter;
@@ -196,6 +230,32 @@ typedef struct rsx_nr_frame_owner {
     u32 generated_block_bytes;
     unsigned long long method_errors_before;
 
+    /* Optional fixed-memory single-pass dependency-island recorder.  In
+     * execute mode the adapter emits directly into graph_stream; GET is not
+     * exposed until the retained island has executed or failed closed. */
+    rsx_nir_stream* graph_stream;
+    u32 graph_mode;
+    u32 graph_exec_pos;
+    u32 graph_execution_pending;
+    u32 graph_method_count;
+    u32 graph_packet_count;
+    u32 graph_boundary_after_method;
+    u32 graph_contains_present;
+    u32 graph_internal_active;
+    u32 graph_cursor_get;
+    u32 graph_cursor_ret;
+    u32 graph_external_get;
+    u32 graph_external_ret;
+    u32 graph_yield_after_packet;
+    u32 graph_passive_source_ops;
+    u32 graph_passive_source_side;
+    unsigned long long graph_passive_source_hash;
+    unsigned long long graph_started_ticks;
+    rsx_nr_frame_now_ticks_fn graph_now_ticks;
+    void* graph_clock_user;
+    unsigned long long graph_tick_frequency;
+    rsx_nr_frame_graph_stats graph_stats;
+
     rsx_nr_frame_failure failure;
     rsx_nr_frame_flow_origin flow_origin;
     rsx_nr_frame_breadcrumb breadcrumbs[RSX_NR_FRAME_BREADCRUMB_COUNT];
@@ -226,6 +286,15 @@ void rsx_nr_frame_owner_init(rsx_nr_frame_owner* owner,
 void rsx_nr_frame_owner_set_publication_clock(
     rsx_nr_frame_owner* owner, rsx_nr_frame_now_ms_fn now_ms,
     void* user, u32 proof_delay_ms, u32 failure_delay_ms);
+
+/* Bind a caller-owned fixed stream as the consume-once graph arena.  The
+ * scanner graph is unrelated and remains disabled.  PASSIVE preserves the
+ * established immediate ring path while proving byte/order equivalence;
+ * EXECUTE records once and executes complete islands directly from stream. */
+void rsx_nr_frame_owner_set_single_pass_graph(
+    rsx_nr_frame_owner* owner, u32 mode, rsx_nir_stream* stream,
+    rsx_nr_frame_now_ticks_fn now_ticks, void* clock_user,
+    unsigned long long tick_frequency);
 
 rsx_nr_frame_step_result rsx_nr_frame_owner_step(
     rsx_nr_frame_owner* owner, u32 get, u32 put, u32 call_return,
