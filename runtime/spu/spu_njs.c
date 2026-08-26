@@ -67,8 +67,15 @@ spu_njs_status spu_njs_parse_descriptor(const uint8_t* d,
     memcpy(out->descriptor, d, descriptor_size);
     out->descriptor_ea = descriptor_ea;
     out->descriptor_size = descriptor_size;
-    /* run_job:5163: jobType at d[0x2C]; nonzero = BINARY2, format unknown */
-    if (descriptor_size > 0x2C && d[0x2C] != 0)
+    /* jobType at d[0x2C] is a BITFIELD (SDK job_descriptor.h:20-22):
+     * STALL_SUCCESSOR=1, MEMORY_CHECK=2, BINARY2=4. Only the BINARY2 bit
+     * selects the undocumented jobbin2 descriptor format; STALL_SUCCESSOR
+     * is a pipelining hint (host acquisition is synchronous, so it is
+     * satisfied trivially) and MEMORY_CHECK adds a streamer-owned debug
+     * canary jobs never read. NOTE: the live run_job (cellSpurs.c:5163)
+     * refuses ANY nonzero jobType -- an over-broad pre-existing narrowing
+     * this typed parser does not inherit. */
+    if (descriptor_size > 0x2C && (d[0x2C] & 0x04) != 0)
         return SPU_NJS_E_BINARY2;
     /* run_job:5177-5195 */
     out->bin_ea = (uint32_t)(rd64be(d + 0x00) & ~1ull);
