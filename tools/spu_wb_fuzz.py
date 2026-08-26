@@ -457,6 +457,9 @@ def main():
     ap.add_argument("--shape", choices=("flat", "cfg"), default=None,
                     help="image shape (default: cfg for --lane wj, else flat)")
     ap.add_argument("--images", type=int, default=24)
+    ap.add_argument("--entries", type=int, default=1,
+                    help="entries per image: the root plus N-1 random "
+                         "word-aligned interior pcs (entry-stub coverage)")
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--insns", type=int, default=120)
     ap.add_argument("--rng-seed", type=int, default=1)
@@ -489,27 +492,33 @@ def main():
             print(f"img{idx:03d}: BUILD-FAIL ({err})", flush=True)
             continue
         codebin = os.path.join(outdir, "code.bin")
+        n_words = len(code) // 4
+        entries = [BASE] + sorted(
+            BASE + 4 * rng.randrange(1, n_words)
+            for _ in range(args.entries - 1))
         img_ok = True
-        for seed in range(1, args.seeds + 1):
-            od = os.path.join(outdir, f"s{seed}.diag.txt")
-            ow = os.path.join(outdir, f"s{seed}.{args.lane}.txt")
-            st_d = D.run_one(diag_exe, codebin, BASE, BASE, seed,
-                             args.evbudget, args.hopmax, od, args.timeout)
-            st_w = D.run_one(lane_exe, codebin, BASE, BASE, seed,
-                             args.evbudget, args.hopmax, ow, args.timeout)
-            if st_d or st_w:
-                n_inc += 1
-                continue
-            v, detail = D.cmp_runs(D.parse_out(od), D.parse_out(ow))
-            if v == "MATCH":
-                n_match += 1
-            elif v == "MISMATCH":
-                n_mis += 1
-                img_ok = False
-                fails.append((idx, f"seed {seed}: {detail}"))
-                print(f"img{idx:03d} seed{seed}: MISMATCH {detail}", flush=True)
-            else:
-                n_inc += 1
+        for e in entries:
+            for seed in range(1, args.seeds + 1):
+                od = os.path.join(outdir, f"e{e:05X}_s{seed}.diag.txt")
+                ow = os.path.join(outdir, f"e{e:05X}_s{seed}.{args.lane}.txt")
+                st_d = D.run_one(diag_exe, codebin, BASE, e, seed,
+                                 args.evbudget, args.hopmax, od, args.timeout)
+                st_w = D.run_one(lane_exe, codebin, BASE, e, seed,
+                                 args.evbudget, args.hopmax, ow, args.timeout)
+                if st_d or st_w:
+                    n_inc += 1
+                    continue
+                v, detail = D.cmp_runs(D.parse_out(od), D.parse_out(ow))
+                if v == "MATCH":
+                    n_match += 1
+                elif v == "MISMATCH":
+                    n_mis += 1
+                    img_ok = False
+                    fails.append((idx, f"e{e:05X} seed {seed}: {detail}"))
+                    print(f"img{idx:03d} e{e:05X} seed{seed}: MISMATCH "
+                          f"{detail}", flush=True)
+                else:
+                    n_inc += 1
         if img_ok:
             print(f"img{idx:03d}: ok", flush=True)
             if not args.keep:
