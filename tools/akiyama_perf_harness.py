@@ -960,6 +960,8 @@ def run_gun(args):
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
         yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
+    if args.nr_single_pass_graph_timing:
+        yz["YZ_NR_SINGLE_PASS_GRAPH_TIMING"] = "1"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -1549,6 +1551,8 @@ def run(args):
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
         yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
+    if args.nr_single_pass_graph_timing:
+        yz["YZ_NR_SINGLE_PASS_GRAPH_TIMING"] = "1"
     environment.update(yz)
 
     result = {
@@ -2109,6 +2113,7 @@ def main():
         "--nr-single-pass-graph", choices=("passive", "execute"),
         help="record strict-owner dependency islands once at decode time",
     )
+    parser.add_argument("--nr-single-pass-graph-timing", action="store_true")
     parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
@@ -2186,6 +2191,10 @@ def main():
         )
     if args.nr_single_pass_graph and args.nr_graph_execute:
         parser.error("scanner graph and single-pass graph are mutually exclusive")
+    if args.nr_single_pass_graph_timing and not args.nr_single_pass_graph:
+        parser.error(
+            "--nr-single-pass-graph-timing requires --nr-single-pass-graph"
+        )
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

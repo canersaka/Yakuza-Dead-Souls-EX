@@ -1342,8 +1342,12 @@ static int test_single_pass_execute_decodes_once_without_ring(void)
     u32 next = base, ret = ~0u;
     CHECK(rsx_nr_frame_owner_step(
               &f.owner, base, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 8u,
+          "single-pass execution did not publish the first island cursor");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, base + 16u, ret, &next, &ret) ==
               RSX_NR_FRAME_ADVANCED && next == base + 16u,
-          "single-pass execution did not retire through present");
+          "single-pass execution did not retire the present island");
     CHECK(f.references == 0x2468ACE0u && f.presents == 1u &&
               f.adapter.methods_seen == 2u,
           "single-pass commands were not executed exactly once");
@@ -1355,6 +1359,41 @@ static int test_single_pass_execute_decodes_once_without_ring(void)
     CHECK(f.owner.graph_stats.construction_ticks == 2u,
           "construction clock was not sampled once per island (%llu)",
           f.owner.graph_stats.construction_ticks);
+    return 0;
+}
+
+static int test_single_pass_publishes_copied_packet_before_island_execution(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_graph(&f, RSX_NR_FRAME_GRAPH_EXECUTE);
+    const u32 base = 0x1000u;
+    /* CLEAR records an action but does not end its island. PRESENT in the
+     * next packet closes it. The copied first packet may be published to the
+     * producer without executing or rescanning it. */
+    f.words[(base + 0u) >> 2] = packet(1u, 0x1D94u);
+    f.words[(base + 4u) >> 2] = 0x000000F3u;
+    f.words[(base + 8u) >> 2] = packet(1u, 0xE944u);
+    f.words[(base + 12u) >> 2] = 2u;
+    u32 next = base, ret = ~0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 8u,
+          "copied packet did not publish its exact cursor");
+    CHECK(f.adapter.methods_seen == 1u &&
+              f.owner.graph_stats.islands == 0u &&
+              f.owner.stats.backend_ops == 0u &&
+              f.graph_stream.op_count != 0u,
+          "copied packet executed or was discarded before its boundary");
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, next, base + 16u, ret, &next, &ret) ==
+              RSX_NR_FRAME_ADVANCED && next == base + 16u,
+          "retained island did not retire at the next packet");
+    CHECK(f.adapter.methods_seen == 2u && f.presents == 1u &&
+              f.owner.graph_stats.methods == 2u &&
+              f.owner.graph_stats.islands == 2u &&
+              f.ring.pushes == 0u && f.ring.pops == 0u,
+          "retained packet was rescanned or executed out of order");
     return 0;
 }
 
@@ -1475,6 +1514,7 @@ int main(void)
         test_execution_failure_retains_exact_argument() ||
         test_single_pass_passive_matches_immediate() ||
         test_single_pass_execute_decodes_once_without_ring() ||
+        test_single_pass_publishes_copied_packet_before_island_execution() ||
         test_single_pass_semaphore_retry_is_one_translation() ||
         test_single_pass_unsupported_island_is_atomic() ||
         test_stream_backend_resolves_linear_side_payload())
