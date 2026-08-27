@@ -18,6 +18,20 @@ import sys
 import time
 
 
+ALL_WJ_TOGGLES = (
+    ("YZ_SPU_WJ_GSTASK", "--expect-wj-gstask"),
+    ("YZ_SPU_WJ_CRI", "--expect-wj-cri"),
+    ("YZ_SPU_WJ_WKL4", "--expect-wj-wkl4"),
+    ("YZ_SPU_WJ_SPUIMG", "--expect-wj-spuimg"),
+    ("YZ_SPU_WJ_JOB_A", "--expect-wj-job-a"),
+    ("YZ_SPU_WJ_JOB_B", "--expect-wj-job-b"),
+    ("YZ_SPU_WJ_JOB_C", "--expect-wj-job-c"),
+    ("YZ_SPU_WJ_JOB_D", "--expect-wj-job-d"),
+    ("YZ_SPU_WJ_JOB_E", "--expect-wj-job-e"),
+    ("YZ_SPU_WJ_ORPHANAGE", "--expect-wj-orphanage"),
+)
+
+
 def mean(values):
     return sum(values) / len(values) if values else None
 
@@ -86,11 +100,16 @@ def execute_one(args, lane_name, lane, repeat, suite, scratch, harness, worktree
             "--expect-absdb", "ON",
             "--expect-xfloat", "ON",
             "--expect-exact-image-bytes", "ON",
-            args.harness_toggle_arg, lane["toggle"],
             "--nr-vertical-full-native",
             "--tag", tag,
             "--hold-seconds", str(args.hold_seconds),
         ]
+        toggle_args = (
+            ALL_WJ_TOGGLES if args.all_wj
+            else ((args.toggle_key, args.harness_toggle_arg),)
+        )
+        for _, harness_arg in toggle_args:
+            command += [harness_arg, lane["toggle"]]
         if suite == "multiscene":
             command += [
                 "--capture-delay-ms", "0",
@@ -159,15 +178,28 @@ def summarize_scene(off_runs, on_runs, scene):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--family", required=True)
-    parser.add_argument("--toggle-key", required=True)
-    parser.add_argument("--harness-toggle-arg", required=True)
+    parser.add_argument("--toggle-key")
+    parser.add_argument("--harness-toggle-arg")
+    parser.add_argument(
+        "--all-wj", action="store_true",
+        help="Toggle every offline-clean WJ family together.",
+    )
     parser.add_argument("--off-exe", type=Path, required=True)
     parser.add_argument("--on-exe", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--hold-seconds", type=int, default=30)
+    parser.add_argument(
+        "--suite", choices=("all", "multiscene", "gun"), default="all",
+        help="Run both route suites or one bounded suite in isolation.",
+    )
     parser.add_argument("--date", default=time.strftime("%Y%m%d-%H%M%S"))
     args = parser.parse_args()
+    if not args.all_wj and not (args.toggle_key and args.harness_toggle_arg):
+        parser.error(
+            "--toggle-key and --harness-toggle-arg are required unless "
+            "--all-wj is used"
+        )
 
     worktree = Path(__file__).resolve().parents[1]
     root = Path(__file__).resolve().parents[3]
@@ -181,12 +213,15 @@ def main():
         if not lane["exe"].is_file():
             raise FileNotFoundError(lane["exe"])
 
+    suites = (
+        ("multiscene", "gun") if args.suite == "all" else (args.suite,)
+    )
     completed = {
         suite: {lane: [] for lane in lanes}
-        for suite in ("multiscene", "gun")
+        for suite in suites
     }
     failures = []
-    for suite in ("multiscene", "gun"):
+    for suite in suites:
         for repeat in range(1, args.runs + 1):
             for lane_name in ("off", "on"):
                 result, rejected = execute_one(
@@ -196,55 +231,69 @@ def main():
                 completed[suite][lane_name].append(result)
                 failures.extend(rejected)
 
-    off_config = dict(completed["multiscene"]["off"][0]["configuration"])
-    on_config = dict(completed["multiscene"]["on"][0]["configuration"])
-    off_toggle = off_config.pop(args.toggle_key)
-    on_toggle = on_config.pop(args.toggle_key)
-    if off_config != on_config or off_toggle != "OFF" or on_toggle != "ON":
+    config_suite = suites[0]
+    off_config = dict(completed[config_suite]["off"][0]["configuration"])
+    on_config = dict(completed[config_suite]["on"][0]["configuration"])
+    toggle_keys = (
+        [key for key, _ in ALL_WJ_TOGGLES]
+        if args.all_wj else [args.toggle_key]
+    )
+    off_toggles = {key: off_config.pop(key) for key in toggle_keys}
+    on_toggles = {key: on_config.pop(key) for key in toggle_keys}
+    if (
+            off_config != on_config or
+            any(value != "OFF" for value in off_toggles.values()) or
+            any(value != "ON" for value in on_toggles.values())):
         raise AssertionError(
-            f"lane configuration differs beyond {args.toggle_key}: "
-            f"off={off_toggle} on={on_toggle}"
+            f"lane configuration differs beyond {toggle_keys}: "
+            f"off={off_toggles} on={on_toggles}"
         )
     for suite in completed.values():
         for lane_name, runs in suite.items():
-            expected = off_config | {args.toggle_key: lanes[lane_name]["toggle"]}
+            expected = off_config | {
+                key: lanes[lane_name]["toggle"] for key in toggle_keys
+            }
             for run in runs:
                 if run["configuration"] != expected:
                     raise AssertionError("configuration changed across matched runs")
 
     comparisons = {}
-    for scene in completed["multiscene"]["off"][0]["scenes"]:
-        comparisons[scene] = summarize_scene(
-            completed["multiscene"]["off"],
-            completed["multiscene"]["on"],
-            scene,
+    if "multiscene" in completed:
+        for scene in completed["multiscene"]["off"][0]["scenes"]:
+            comparisons[scene] = summarize_scene(
+                completed["multiscene"]["off"],
+                completed["multiscene"]["on"],
+                scene,
+            )
+    if "gun" in completed:
+        gun_scene = "post_frontier_gun_tutorial"
+        comparisons[gun_scene] = summarize_scene(
+            completed["gun"]["off"], completed["gun"]["on"], gun_scene
         )
-    gun_scene = "post_frontier_gun_tutorial"
-    comparisons[gun_scene] = summarize_scene(
-        completed["gun"]["off"], completed["gun"]["on"], gun_scene
-    )
 
     output_dir = scratch / f"wj-{args.family}-ab-{args.date}"
     output_dir.mkdir(exist_ok=False)
     summary = {
         "status": "passed",
         "family": args.family,
-        "toggle_key": args.toggle_key,
+        "toggle_keys": toggle_keys,
         "runs_per_lane_per_suite": args.runs,
         "hold_seconds": args.hold_seconds,
         "graph_execution": "default-off",
         "common_configuration": off_config,
-        "lane_toggle": {"off": off_toggle, "on": on_toggle},
+        "lane_toggle": {"off": off_toggles, "on": on_toggles},
         "executables": {
             lane: {
                 "path": str(values["exe"]),
-                "sha256": completed["multiscene"][lane][0]["executable_sha256"],
+                "sha256": completed[config_suite][lane][0]["executable_sha256"],
             }
             for lane, values in lanes.items()
         },
         "route_status": {
-            "orphanage_hana_transition": "passed",
-            "frontier_gun": "passed",
+            "orphanage_hana_transition": (
+                "passed" if "multiscene" in completed else "not-run"
+            ),
+            "frontier_gun": "passed" if "gun" in completed else "not-run",
             "full_native_coverage": "100%",
             "native_errors_or_fallback": 0,
         },
