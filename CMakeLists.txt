@@ -600,6 +600,26 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        add_executable(rsx_nr_residency_tests
+            libs/video/tests/test_nr_residency.c
+            libs/video/rsx_nr_residency.c
+            runtime/ppu/ppu_guest_read.c
+        )
+        target_include_directories(rsx_nr_residency_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+        )
+        target_compile_definitions(rsx_nr_residency_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            PS3RECOMP_NATIVE_REPORT_READ_WATCH=1
+        )
+        target_compile_options(rsx_nr_residency_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(NAME rsx_nr_residency COMMAND rsx_nr_residency_tests)
+        set_tests_properties(rsx_nr_residency PROPERTIES
+            TIMEOUT 30 LABELS "regression;renderer;native-render")
+
         add_executable(rsx_nr_span_router_tests
             libs/video/tests/test_nr_span_router.c
             libs/video/rsx_nr_span_router.c

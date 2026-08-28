@@ -186,6 +186,9 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long first_present_failure_completed_fence;
     unsigned long long transfer_gpu_readbacks;
     unsigned long long transfer_gpu_uploads;
+    unsigned long long residency_deferred_copies;
+    unsigned long long residency_materializations;
+    unsigned long long residency_materialized_bytes;
     unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long descriptor_table_hits;
     unsigned long long descriptor_table_builds;
@@ -557,6 +560,17 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b);
  * it releases the backend's shared-timeline lease before invoking the host
  * flush and attributes the forced submission as report publication. */
 int rsx_nr_d3d12_flush_report_dependency(rsx_nr_d3d12* b);
+
+/* Default-off exact transfer residency. The capture-proven 1024x768 ARGB
+ * save records its GPU copy without waiting. A proven guest reader/writer
+ * calls materialize from the RSX owner thread; restore remains fail-closed
+ * and materializes itself if no hook arrived. */
+int rsx_nr_d3d12_set_native_residency(rsx_nr_d3d12* b, int enabled);
+int rsx_nr_d3d12_residency_pending(const rsx_nr_d3d12* b,
+                                   unsigned int* generation,
+                                   unsigned long long* writer_fence);
+int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b,
+                                       unsigned int generation);
 
 /* Declare that every draw submitted to this backend is owned as part of a
  * completely preflighted render section. This admits the captured combined

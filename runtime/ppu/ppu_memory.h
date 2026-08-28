@@ -79,6 +79,10 @@ void spu_coh_notify_write(uint32_t ea);
 #endif
 static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
 {
+    if (n <= UINT32_MAX)
+        vm_native_residency_notify(
+            addr, (uint32_t)n, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+            0u, 0u, 0u, 0u);
     if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
         memcpy(vm_ptr8(addr), src, n);
@@ -87,6 +91,10 @@ static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
     } else {
         memcpy(vm_ptr8(addr), src, n);
     }
+    if (n <= UINT32_MAX)
+        vm_native_residency_notify(
+            addr, (uint32_t)n, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
+            0u, 0u, 0u, 0u);
 }
 
 /* ---------------------------------------------------------------------------
@@ -94,12 +102,14 @@ static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
  * -----------------------------------------------------------------------*/
 static inline uint8_t vm_read8(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 1u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 1u, 0u);
     return *vm_ptr8(addr);
 }
 
 static inline uint16_t vm_read16(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 2u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 2u, 0u);
     uint16_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
@@ -108,6 +118,7 @@ static inline uint16_t vm_read16(uint32_t addr)
 
 static inline uint32_t vm_read32(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
@@ -116,6 +127,7 @@ static inline uint32_t vm_read32(uint32_t addr)
 
 static inline uint64_t vm_read64(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
@@ -124,6 +136,7 @@ static inline uint64_t vm_read64(uint32_t addr)
 
 static inline float vm_read_f32(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
@@ -135,6 +148,7 @@ static inline float vm_read_f32(uint32_t addr)
 
 static inline double vm_read_f64(uint32_t addr)
 {
+    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
@@ -342,9 +356,12 @@ static inline void vm_write_f64(uint32_t addr, double val)
  * -----------------------------------------------------------------------*/
 static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len)
 {
-    if (len <= UINT32_MAX)
+    if (len <= UINT32_MAX) {
+        vm_native_residency_notify(
+            guest_src, (uint32_t)len, 0u, 0u, 0u, 0u, 0u, 0u);
         vm_native_report_notify_read(
             guest_src, (uint32_t)len, 0u);
+    }
     memcpy(host_dst, vm_ptr8(guest_src), len);
 }
 
@@ -451,6 +468,10 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
             yz_slotstore_log(guest_dst, (unsigned long long)(unsigned)val, 98, _ReturnAddress());
         }
     }
+    if (len <= UINT32_MAX)
+        vm_native_residency_notify(
+            guest_dst, (uint32_t)len, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u);
     if (spu_coh_is_reserved(guest_dst)) {
         spu_lockline_lock();
         memset(vm_ptr8(guest_dst), val, len);
@@ -459,6 +480,10 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
     } else {
         memset(vm_ptr8(guest_dst), val, len);
     }
+    if (len <= UINT32_MAX)
+        vm_native_residency_notify(
+            guest_dst, (uint32_t)len, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u);
     if (len <= UINT32_MAX)
         vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
 }
@@ -486,6 +511,7 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 static inline uint32_t ppu_lwarx(ppu_context* ctx, uint32_t addr)
 {
     /* Read the current value from memory (big-endian, so swap). */
+    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
     uint32_t raw;
     _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
     raw = atomic_load_explicit(atom, memory_order_acquire);
@@ -506,6 +532,9 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
         return 0;
     }
 
+    vm_native_residency_notify(
+        addr, 4u, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+        0u, 0u, 0u, 0u);
     uint32_t expected = (uint32_t)ctx->reserve_value;
     uint32_t desired  = ps3_bswap32(val);
     _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
@@ -518,6 +547,9 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
 
     if (ok) {
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
+        vm_native_residency_notify(
+            addr, 4u, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
+            0u, 0u, 0u, 0u);
         vm_native_spurs_notify_write(addr, 4);
     } else
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
@@ -528,6 +560,7 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
 /* 64-bit variants: ldarx / stdcx. */
 static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
 {
+    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
     _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
     uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
 
@@ -546,6 +579,9 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
         return 0;
     }
 
+    vm_native_residency_notify(
+        addr, 8u, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+        0u, 0u, 0u, 0u);
     uint64_t expected = ctx->reserve_value;
     uint64_t desired  = ps3_bswap64(val);
     _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
@@ -558,6 +594,9 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
 
     if (ok) {
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
+        vm_native_residency_notify(
+            addr, 8u, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
+            0u, 0u, 0u, 0u);
         vm_native_spurs_notify_write(addr, 8);
     } else
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));

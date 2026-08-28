@@ -1081,6 +1081,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
+    if (mfc_is_get(cmd))
+        vm_native_residency_notify(
+            (uint32_t)ea, size, 1u, 0u, (uint32_t)spu->image_id,
+            spu->fe0_timeline_task,
+            spu->pc & SPU_LS_MASK, cmd);
+    else if (mfc_is_put(cmd))
+        vm_native_residency_notify(
+            (uint32_t)ea, size, 1u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+            (uint32_t)spu->image_id,
+            spu->fe0_timeline_task,
+            spu->pc & SPU_LS_MASK, cmd);
     const uint32_t fe0_put_ea =
         (uint32_t)(ea & ~0x80000000ull);
     const int fe0_timeline_put =
@@ -1800,6 +1811,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         }
                 }
             }
+            /* Publish the dirty generation only after the DMA bytes are
+             * visible.  The paired BEGIN above first materializes any
+             * GPU-owned generation, so a writer racing registration cannot
+             * be overwritten by a late readback. */
+            vm_native_residency_notify(
+                (uint32_t)ea, size, 1u, VM_NATIVE_RESIDENCY_WRITE_END,
+                (uint32_t)spu->image_id, spu->fe0_timeline_task,
+                spu->pc & SPU_LS_MASK, cmd);
             /*
              * Observation-only completion witness for the focused a010
              * stopper-release trace.  The pre-copy recorder proves what the
@@ -3223,6 +3242,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * keep bit 31. Verified live: base reads 0x40197C80, masked EA hits the
          * real instance and the SPURS CAS handshake then advances. */
         ea &= ~0x80000000ull;
+        vm_native_residency_notify(
+            (uint32_t)(ea & ~127ull), 128u, 1u,
+            cmd == MFC_GETLLAR_CMD ? VM_NATIVE_RESIDENCY_READ :
+                                     VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+            (uint32_t)spu->image_id, spu->fe0_timeline_task,
+            spu->pc & SPU_LS_MASK, cmd);
         /* DIAG (2026-07-03, the post-gate crash): a lock-line atomic against the
          * NULL page is a fatal host AV in the unguarded 128-byte copies below.
          * Print the issuer's identity BEFORE the fault so the crash names its
@@ -4394,6 +4419,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * which forces a queue-mutex/lockline collision. */
         spu_lockline_unlock_then_notify_guest_write(
             notify_spurs_after_unlock, (uint32_t)(ea & ~127ull), 128);
+        if (notify_spurs_after_unlock)
+            vm_native_residency_notify(
+                (uint32_t)(ea & ~127ull), 128u, 1u,
+                VM_NATIVE_RESIDENCY_WRITE_END,
+                (uint32_t)spu->image_id, spu->fe0_timeline_task,
+                spu->pc & SPU_LS_MASK, cmd);
         if (post_unlock_idle_level >= 0)
             spu_idle_yield(post_unlock_idle_level);
         if (tagged) mfc_tag_finish(mfc, spu, tag);
