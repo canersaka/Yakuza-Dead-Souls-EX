@@ -243,6 +243,17 @@ rsx_nr_step_result rsx_nr_backend_stream_step(
         be, &stream->ops[index], stream->side, stream->side_count);
 }
 
+int rsx_nr_backend_stream_apply_state(
+    rsx_nr_backend* be, const rsx_nir_stream* stream, u32 index)
+{
+    if (!be || !stream || index >= stream->op_count)
+        return -1;
+    if (rsx_nir_op_is_action(stream->ops[index].kind))
+        return 0;
+    return apply_state_op(
+        be, &stream->ops[index], stream->side, stream->side_count);
+}
+
 u32 rsx_nr_backend_run(rsx_nr_backend* be, u32 max_ops)
 {
     u32 n = 0;

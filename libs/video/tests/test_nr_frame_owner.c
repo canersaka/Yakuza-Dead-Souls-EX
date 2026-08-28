@@ -10,7 +10,7 @@
 #define TEST_WORDS (0x8000u / 4u)
 #define TEST_RING_OPS 512u
 #define TEST_RING_SIDE 32768u
-#define TEST_GRAPH_OPS 512u
+#define TEST_GRAPH_OPS 2048u
 #define TEST_GRAPH_SIDE 32768u
 
 typedef struct fixture {
@@ -18,6 +18,12 @@ typedef struct fixture {
     u32 semaphore;
     u32 references;
     u32 presents;
+    u32 snapshot_prepare_calls;
+    u32 snapshot_prepare_draws;
+    u32 snapshot_leave_draw_unprepared;
+    u32 snapshot_prepare_fail;
+    u32 snapshot_finish_calls;
+    u32 snapshot_finish_committed;
     u32 published_put;
     u32 stopper_release_calls;
     u32 island_get;
@@ -211,6 +217,54 @@ static void fixture_graph(fixture* f, u32 mode)
     rsx_nr_frame_owner_set_single_pass_graph(
         &f->owner, mode, &f->graph_stream,
         test_now_ticks, f, 1000000ull);
+}
+
+static int snapshot_record_draw(void* user,
+                                const rsx_nr_backend* recorded,
+                                rsx_nir_stream* stream, u32 op_index)
+{
+    fixture* f = user;
+    CHECK(recorded != NULL && recorded != &f->backend,
+          "snapshot recording did not use isolated decoder state");
+    CHECK(stream && op_index < stream->op_count &&
+              stream->ops[op_index].kind == RSX_NIR_OP_DRAW,
+          "snapshot recording did not identify the exact draw");
+    f->snapshot_prepare_draws++;
+    if (!f->snapshot_leave_draw_unprepared)
+        stream->ops[op_index].u.draw.snapshot_id =
+            f->snapshot_prepare_draws;
+    return 0;
+}
+
+static int snapshot_prepare(void* user, const rsx_nr_backend* initial,
+                            rsx_nir_stream* stream)
+{
+    fixture* f = user;
+    CHECK(initial == &f->backend, "snapshot initial state was not exact");
+    CHECK(stream && stream->op_count,
+          "snapshot commit gate received an empty island");
+    f->snapshot_prepare_calls++;
+    return f->snapshot_prepare_fail ? -1 : 0;
+}
+
+static void snapshot_finish(void* user, rsx_nr_backend* backend,
+                            int committed)
+{
+    fixture* f = user;
+    if (backend != &f->backend)
+        f->snapshot_finish_committed = ~0u;
+    f->snapshot_finish_calls++;
+    if (committed)
+        f->snapshot_finish_committed++;
+}
+
+static void fixture_snapshot_graph(fixture* f)
+{
+    fixture_graph(f, RSX_NR_FRAME_GRAPH_SNAPSHOT);
+    rsx_nr_frame_owner_set_snapshot_callbacks(
+        &f->owner, snapshot_prepare, snapshot_finish, f);
+    rsx_nr_frame_owner_set_snapshot_record_draw(
+        &f->owner, snapshot_record_draw);
 }
 
 static u32 packet(u32 count, u32 method)
@@ -1459,6 +1513,120 @@ static int test_single_pass_unsupported_island_is_atomic(void)
     return 0;
 }
 
+static int test_snapshot_island_withholds_get_and_prepares_draws_once(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_snapshot_graph(&f);
+    const u32 base = 0x1000u;
+    u32 cursor = base;
+#define EMIT_ONE(m, a) do { \
+    f.words[(cursor + 0u) >> 2] = packet(1u, (m)); \
+    f.words[(cursor + 4u) >> 2] = (a); \
+    cursor += 8u; \
+} while (0)
+    EMIT_ONE(0x1808u, 5u);
+    EMIT_ONE(0x1814u, (2u << 24));
+    EMIT_ONE(0x1808u, 0u);
+    EMIT_ONE(0x1808u, 5u);
+    EMIT_ONE(0x1814u, (2u << 24) | 3u);
+    EMIT_ONE(0x1808u, 0u);
+    EMIT_ONE(0xE944u, 1u);
+#undef EMIT_ONE
+    u32 next = base, ret = ~0u;
+    rsx_nr_frame_step_result result = RSX_NR_FRAME_ADVANCED;
+    for (u32 guard = 0u;
+         guard < 16u && result == RSX_NR_FRAME_ADVANCED && next != cursor;
+         ++guard) {
+        const u32 get = next;
+        result = rsx_nr_frame_owner_step(
+            &f.owner, get, cursor, ret, &next, &ret);
+    }
+    CHECK(result == RSX_NR_FRAME_ADVANCED && next == cursor,
+          "snapshot path result/cursor=%u/%08X expected=0/%08X failure=%u/%04X",
+          result, next, cursor, f.owner.failure.kind,
+          f.owner.failure.method);
+    CHECK(f.adapter.methods_seen == 7u && f.presents == 1u,
+          "snapshot route was not decoded/executed once");
+    CHECK(f.snapshot_prepare_draws == 2u &&
+              f.backend.stats.executed[RSX_NIR_OP_DRAW] == 2u,
+          "snapshot draws were not prepared/executed exactly once");
+    CHECK(f.snapshot_prepare_calls == 3u &&
+              f.snapshot_finish_calls == 3u &&
+              f.snapshot_finish_committed == 3u,
+          "snapshot island lifecycle was not exact (%u/%u/%u)",
+          f.snapshot_prepare_calls, f.snapshot_finish_calls,
+          f.snapshot_finish_committed);
+    CHECK(f.owner.graph_stats.islands == 3u &&
+              f.ring.pushes == 0u && f.ring.pops == 0u,
+          "snapshot dependency consumers did not close exact islands");
+    return 0;
+}
+
+static int test_unprepared_snapshot_draw_executes_recorded_state(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_snapshot_graph(&f);
+    f.snapshot_leave_draw_unprepared = 1u;
+    const u32 base = 0x1000u;
+    u32 cursor = base;
+#define EMIT_UNPREPARED(m, a) do { \
+    f.words[(cursor + 0u) >> 2] = packet(1u, (m)); \
+    f.words[(cursor + 4u) >> 2] = (a); \
+    cursor += 8u; \
+} while (0)
+    EMIT_UNPREPARED(0x1808u, 5u);
+    EMIT_UNPREPARED(0x1814u, (2u << 24));
+    EMIT_UNPREPARED(0x1808u, 0u);
+    EMIT_UNPREPARED(0xE944u, 0u);
+#undef EMIT_UNPREPARED
+    u32 next = base, ret = ~0u;
+    rsx_nr_frame_step_result result = RSX_NR_FRAME_ADVANCED;
+    for (u32 guard = 0u;
+         guard < 12u && result == RSX_NR_FRAME_ADVANCED && next != cursor;
+         ++guard) {
+        const u32 get = next;
+        result = rsx_nr_frame_owner_step(
+            &f.owner, get, cursor, ret, &next, &ret);
+    }
+    CHECK(result == RSX_NR_FRAME_ADVANCED && next == cursor,
+          "unprepared snapshot route failed result=%u cursor=%08X/%08X",
+          result, next, cursor);
+    CHECK(f.snapshot_prepare_draws == 1u &&
+              f.backend.stats.executed[RSX_NIR_OP_DRAW] == 1u &&
+              f.backend.stats.executed[RSX_NIR_OP_SET_SURFACE] != 0u &&
+              f.presents == 1u,
+          "unprepared draw skipped decoder state draw=%llu surface=%llu",
+          f.backend.stats.executed[RSX_NIR_OP_DRAW],
+          f.backend.stats.executed[RSX_NIR_OP_SET_SURFACE]);
+    return 0;
+}
+
+static int test_snapshot_prepare_failure_is_atomic(void)
+{
+    fixture f;
+    fixture_init(&f);
+    fixture_snapshot_graph(&f);
+    f.snapshot_prepare_fail = 1u;
+    const u32 base = 0x1000u;
+    f.words[(base + 0u) >> 2] = packet(1u, 0x1D94u);
+    f.words[(base + 4u) >> 2] = 0x000000F3u;
+    u32 next = base, ret = ~0u;
+    CHECK(rsx_nr_frame_owner_step(
+              &f.owner, base, base + 8u, ret, &next, &ret) ==
+              RSX_NR_FRAME_FATAL && next == base,
+          "failed snapshot preparation exposed GET");
+    CHECK(f.snapshot_prepare_calls == 1u &&
+              f.snapshot_finish_calls == 1u &&
+              f.snapshot_finish_committed == 0u &&
+              f.backend.stats.executed[RSX_NIR_OP_CLEAR] == 0u,
+          "failed snapshot island partially executed");
+    CHECK(f.owner.failure.kind == RSX_NR_FRAME_FAILURE_EXECUTION,
+          "failed snapshot preparation lost its exact failure class");
+    return 0;
+}
+
 static int test_stream_backend_resolves_linear_side_payload(void)
 {
     fixture f;
@@ -1517,6 +1685,9 @@ int main(void)
         test_single_pass_publishes_copied_packet_before_island_execution() ||
         test_single_pass_semaphore_retry_is_one_translation() ||
         test_single_pass_unsupported_island_is_atomic() ||
+        test_snapshot_island_withholds_get_and_prepares_draws_once() ||
+        test_unprepared_snapshot_draw_executes_recorded_state() ||
+        test_snapshot_prepare_failure_is_atomic() ||
         test_stream_backend_resolves_linear_side_payload())
         return 1;
     puts("rsx_nr_frame_owner: PASS");

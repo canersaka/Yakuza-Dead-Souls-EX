@@ -269,6 +269,12 @@ typedef struct rsx_nir_draw {
     u32 batch_count;
     u32 batches_ofs;                             /* side buffer: 2 words ea */
     u32 total_count;                             /* sum of batch counts     */
+    /* Runtime-only prepared-resource identity. Capture/producers leave this
+     * zero. The fixed single-pass owner may assign a one-based immutable
+     * snapshot after the complete dependency island has been recorded and
+     * before GET is published. It is deliberately part of the typed draw,
+     * not a second command stream or a raw FIFO cache. */
+    u32 snapshot_id;
 } rsx_nir_draw;
 
 /* Data-move classes. Field meanings by kind:

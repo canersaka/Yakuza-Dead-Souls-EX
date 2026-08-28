@@ -124,6 +124,8 @@ typedef enum rsx_nr_d3d12_submit_cause {
 typedef struct rsx_nr_d3d12_submit_cause_stats {
     unsigned long long submissions;
     unsigned long long cpu_wait_ticks;
+    unsigned long long gpu_ticks;
+    unsigned long long gpu_intervals;
     unsigned long long draws;
     unsigned long long draw_batches;
     unsigned long long descriptor_tables;
@@ -131,13 +133,79 @@ typedef struct rsx_nr_d3d12_submit_cause_stats {
     unsigned long long readback_bytes;
 } rsx_nr_d3d12_submit_cause_stats;
 
+#define RSX_NR_D3D12_TAIL_BUCKET_CAP 512u
+
+/* One diagnostics-only, per-present delta. The ring is fixed at creation and
+ * is copied only during orderly shutdown. GPU ticks are folded into the same
+ * bucket after the final asynchronous query resolve. */
+typedef struct rsx_nr_d3d12_tail_bucket {
+    unsigned long long present_sequence;
+    unsigned long long end_qpc;
+    unsigned long long adaptation_calls;
+    unsigned long long adaptation_ticks;
+    unsigned long long draws;
+    unsigned long long fence_ticks;
+    unsigned long long flush_ticks;
+    unsigned long long transfer_readback_ticks;
+    unsigned long long transfer_readback_bytes;
+    unsigned long long transfer_upload_ticks;
+    unsigned long long transfer_upload_bytes;
+    unsigned long long residency_prepare_ticks;
+    unsigned long long residency_stabilize_ticks;
+    unsigned long long preflight_draw_ticks;
+    unsigned long long draw_ticks;
+    unsigned long long fp_resolve_ticks;
+    unsigned long long pso_lookup_ticks;
+    unsigned long long pso_key_lookup_ticks;
+    unsigned long long shader_compile_ticks;
+    unsigned long long shader_cache_ticks;
+    unsigned long long driver_pso_ticks;
+    unsigned long long texture_prepare_ticks;
+    unsigned long long batch_prepare_ticks;
+    unsigned long long command_record_ticks;
+    unsigned long long submit_count[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned long long submit_cpu_ticks[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned long long submit_gpu_ticks[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned long long submit_gpu_intervals[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+} rsx_nr_d3d12_tail_bucket;
+
 typedef struct rsx_nr_d3d12_stats {
     unsigned long long clears, draws, draw_batches, presents, transfers;
+    unsigned long long present_failures;
+    unsigned int first_present_failure_stage; /* 1=no RT, 2=handoff */
+    unsigned int first_present_failure_buffer;
+    unsigned int first_present_failure_display_valid;
+    unsigned int first_present_failure_space;
+    unsigned int first_present_failure_offset;
+    unsigned int first_present_failure_width;
+    unsigned int first_present_failure_height;
+    unsigned int first_present_failure_format;
+    unsigned int first_present_failure_dxgi;
+    unsigned long long first_present_failure_generation;
+    unsigned long long first_present_failure_recording_fence;
+    unsigned long long first_present_failure_completed_fence;
     unsigned long long transfer_gpu_readbacks;
     unsigned long long transfer_gpu_uploads;
     unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long descriptor_table_hits;
     unsigned long long descriptor_table_builds;
+    unsigned long long snapshot_islands;
+    unsigned long long snapshot_draws_prepared;
+    unsigned long long snapshot_draws_executed;
+    unsigned long long snapshot_prepare_restarts;
+    unsigned long long snapshot_prepare_failures;
+    unsigned long long
+        snapshot_prepare_submissions[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned int first_snapshot_prepare_failure_cause;
+    unsigned int first_snapshot_prepare_failure_prior_draws;
+    unsigned int first_snapshot_prepare_failure_attempt;
+    unsigned long long snapshot_execute_failures;
+    unsigned int first_snapshot_execute_failure_stage;
+    unsigned int first_snapshot_execute_id;
+    unsigned int first_snapshot_execute_count;
+    unsigned int first_snapshot_execute_valid;
+    unsigned int first_snapshot_execute_condition_dma;
+    unsigned int first_snapshot_execute_condition_offset;
     unsigned long long pso_hits, pso_builds;
     unsigned long long vertex_shader_builds;
     unsigned long long pixel_shader_builds;
@@ -314,6 +382,12 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long submit_transfer_upload_count;
     unsigned long long submit_transfer_upload_ticks;
     unsigned long long submit_transfer_upload_bytes;
+    /* Unified default-off RSX-tail diagnostic. GPU timestamps are resolved
+     * into a fixed readback buffer on the command list which they measure;
+     * the CPU maps that buffer only during orderly shutdown. */
+    unsigned long long tail_gpu_frequency;
+    unsigned long long tail_gpu_intervals_recorded;
+    unsigned long long tail_gpu_intervals_dropped;
 } rsx_nr_d3d12_stats;
 
 /* Fixed-memory, default-off scanout provenance.  This deliberately exposes
@@ -363,6 +437,18 @@ int rsx_nr_d3d12_set_content_cache(
 /* Fill the GPU half of the exec ops (clear/draw/transfer/present/flush).
  * The embedder fills the host half before rsx_nr_backend_init. */
 void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out);
+
+/* Capture one draw's immutable resources at decoder/recording time while its
+ * FIFO GET remains withheld. Island prepare is then a constant-time commit
+ * gate; neither path decodes a FIFO method or executes a draw. */
+int rsx_nr_d3d12_record_snapshot_draw(
+    rsx_nr_d3d12* b, const rsx_nr_backend* recorded_state,
+    rsx_nir_stream* stream, u32 op_index);
+int rsx_nr_d3d12_prepare_snapshot_island(
+    rsx_nr_d3d12* b, const rsx_nr_backend* initial_state,
+    rsx_nir_stream* stream);
+void rsx_nr_d3d12_finish_snapshot_island(
+    rsx_nr_d3d12* b, rsx_nr_backend* backend, int committed);
 
 /* Transactional section preflight. These routines may populate persistent
  * resource/PSO/page-watch caches, but never open/submit a command list,
@@ -466,6 +552,11 @@ int rsx_nr_d3d12_set_shared_timeline(
     rsx_nr_d3d12_timeline_release_fn release,
     rsx_nr_d3d12_timeline_flush_fn flush, void* user);
 int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b);
+/* Retire the currently leased native list for an exact pending GPU-report
+ * consumer. This is the only safe way to flush from inside draw execution:
+ * it releases the backend's shared-timeline lease before invoking the host
+ * flush and attributes the forced submission as report publication. */
+int rsx_nr_d3d12_flush_report_dependency(rsx_nr_d3d12* b);
 
 /* Declare that every draw submitted to this backend is owned as part of a
  * completely preflighted render section. This admits the captured combined
@@ -512,6 +603,17 @@ int rsx_nr_d3d12_get_rt_provenance(
     rsx_nr_d3d12_rt_provenance* out);
 
 void rsx_nr_d3d12_get_stats(const rsx_nr_d3d12* b, rsx_nr_d3d12_stats* out);
+
+/* Retire and fold the optional asynchronous GPU timestamp ring.  This is a
+ * shutdown-only operation; ordinary execution and disabled diagnostics never
+ * map a readback resource or wait for a diagnostic query. */
+int rsx_nr_d3d12_finalize_tail_breakdown(rsx_nr_d3d12* b);
+u32 rsx_nr_d3d12_tail_bucket_count(const rsx_nr_d3d12* b);
+int rsx_nr_d3d12_get_tail_bucket(
+    const rsx_nr_d3d12* b, u32 chronological_index,
+    rsx_nr_d3d12_tail_bucket* out);
+void rsx_nr_d3d12_tail_note_adaptation(
+    rsx_nr_d3d12* b, unsigned long long ticks);
 
 #ifdef __cplusplus
 }
