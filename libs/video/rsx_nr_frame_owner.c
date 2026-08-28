@@ -4,6 +4,12 @@
 
 #include <string.h>
 
+static int frame_graph_exec_mode(const rsx_nr_frame_owner* o)
+{
+    return o && (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE ||
+                 o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT);
+}
+
 #define NR_FRAME_RING_SIZE 0x800000u
 #define NR_FRAME_RING_MASK (NR_FRAME_RING_SIZE - 1u)
 #define NR_FRAME_METHOD_OP_BOUND 512u
@@ -121,7 +127,30 @@ static int frame_graph_sink_push(void* user, const rsx_nir_op* op)
     rsx_nr_frame_owner* const o = (rsx_nr_frame_owner*)user;
     if (!o || !o->graph_stream || rsx_nir_push(o->graph_stream, op) != 0)
         return -1;
-    if (rsx_nr_graph_op_ends_island(op->kind))
+    if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT) {
+        if (!o->graph_record_initialized) {
+            o->graph_record_backend = *o->backend;
+            o->graph_record_initialized = 1u;
+        }
+        const u32 op_index = o->graph_stream->op_count - 1u;
+        if (rsx_nr_backend_stream_apply_state(
+                &o->graph_record_backend, o->graph_stream, op_index) != 0)
+            return -1;
+        if (op->kind == RSX_NIR_OP_DRAW &&
+            (!o->graph_record_draw || o->graph_record_draw(
+                 o->graph_prepare_user, &o->graph_record_backend,
+                 o->graph_stream, op_index) != 0))
+            return -1;
+    }
+    if (op->kind == RSX_NIR_OP_DRAW)
+        o->graph_draws++;
+    else if (rsx_nir_op_is_action(op->kind))
+        o->graph_nondraw_actions++;
+    if ((o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT
+             ? rsx_nr_graph_op_ends_snapshot_island(op->kind)
+             : rsx_nr_graph_op_ends_island(op->kind)) ||
+        (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+         o->graph_draws >= 64u))
         o->graph_boundary_after_method = 1u;
     return 0;
 }
@@ -140,7 +169,7 @@ void rsx_nr_frame_owner_set_single_pass_graph(
 {
     if (!o)
         return;
-    if (mode > RSX_NR_FRAME_GRAPH_EXECUTE ||
+    if (mode > RSX_NR_FRAME_GRAPH_SNAPSHOT ||
         (mode != RSX_NR_FRAME_GRAPH_DISABLED && !stream))
         mode = RSX_NR_FRAME_GRAPH_DISABLED;
     o->graph_mode = mode;
@@ -159,13 +188,53 @@ void rsx_nr_frame_owner_set_single_pass_graph(
         rsx_nir_stream_reset(stream);
     if (o->adapter) {
         rsx_nir_sink sink = rsx_nr_ring_sink(o->ring);
-        if (mode == RSX_NR_FRAME_GRAPH_EXECUTE) {
+        if (mode == RSX_NR_FRAME_GRAPH_EXECUTE ||
+            mode == RSX_NR_FRAME_GRAPH_SNAPSHOT) {
             sink.user = o;
             sink.push = frame_graph_sink_push;
             sink.side_push = frame_graph_sink_side_push;
         }
         o->adapter->em.out = sink;
     }
+}
+
+void rsx_nr_frame_owner_set_snapshot_callbacks(
+    rsx_nr_frame_owner* o, rsx_nr_frame_prepare_island_fn prepare,
+    rsx_nr_frame_finish_island_fn finish, void* user)
+{
+    if (!o)
+        return;
+    o->graph_prepare_island = prepare;
+    o->graph_finish_island = finish;
+    o->graph_prepare_user = user;
+}
+
+void rsx_nr_frame_owner_set_snapshot_record_draw(
+    rsx_nr_frame_owner* o, rsx_nr_frame_record_draw_fn record_draw)
+{
+    if (o)
+        o->graph_record_draw = record_draw;
+}
+
+void rsx_nr_frame_owner_set_tail_clock(
+    rsx_nr_frame_owner* o, rsx_nr_frame_now_ticks_fn now_ticks,
+    void* clock_user, unsigned long long tick_frequency)
+{
+    if (!o)
+        return;
+    o->tail_now_ticks = now_ticks;
+    o->tail_clock_user = clock_user;
+    o->tail_tick_frequency = now_ticks ? tick_frequency : 0u;
+}
+
+void rsx_nr_frame_owner_set_tail_account(
+    rsx_nr_frame_owner* o, rsx_nr_frame_tail_account_fn account,
+    void* account_user)
+{
+    if (!o)
+        return;
+    o->tail_account = account;
+    o->tail_account_user = account_user;
 }
 
 static void frame_publication_wait_start(rsx_nr_frame_owner* o)
@@ -655,6 +724,10 @@ static void frame_graph_reset_island(rsx_nr_frame_owner* o)
     o->graph_boundary_after_method = 0u;
     o->graph_passive_source_ops = 0u;
     o->graph_passive_source_side = 0u;
+    o->graph_draws = 0u;
+    o->graph_nondraw_actions = 0u;
+    o->graph_prepared = 0u;
+    o->graph_record_initialized = 0u;
     o->graph_passive_source_hash = 0u;
     o->graph_started_ticks = 0u;
 }
@@ -817,7 +890,7 @@ static rsx_nr_frame_step_result frame_resume_packet(
                     o->graph_stream->op_count
                 ? rsx_nr_graph_classify_method(method)
                 : RSX_NR_GRAPH_METHOD_CONTINUE;
-        if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE &&
+        if (frame_graph_exec_mode(o) &&
             o->graph_stream->op_count &&
             graph_boundary != RSX_NR_GRAPH_METHOD_CONTINUE) {
             frame_graph_close_construction(o);
@@ -845,7 +918,7 @@ static rsx_nr_frame_step_result frame_resume_packet(
                 argument,
                 o->packet_index);
         }
-        if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE &&
+        if (frame_graph_exec_mode(o) &&
             (o->graph_stream->op_count + NR_FRAME_METHOD_OP_BOUND >
                  o->graph_stream->op_cap ||
              o->graph_stream->side_count + NR_FRAME_METHOD_SIDE_BOUND >
@@ -862,7 +935,7 @@ static rsx_nr_frame_step_result frame_resume_packet(
                 argument,
                 o->packet_index);
         }
-        if (o->graph_mode != RSX_NR_FRAME_GRAPH_EXECUTE &&
+        if (!frame_graph_exec_mode(o) &&
             !rsx_nr_ring_can_accept(
                 o->ring, NR_FRAME_METHOD_OP_BOUND,
                 NR_FRAME_METHOD_SIDE_BOUND))
@@ -872,29 +945,43 @@ static rsx_nr_frame_step_result frame_resume_packet(
                 argument,
                 o->packet_index);
 
-        if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE)
+        if (frame_graph_exec_mode(o))
             frame_graph_start(o);
         else
             rsx_nr_ring_clear_reject(o->ring);
         o->method_errors_before = o->backend->stats.exec_errors;
         o->packet_argument = argument;
+        const unsigned long long adaptation_started = o->tail_now_ticks
+            ? o->tail_now_ticks(o->tail_clock_user) : 0u;
         rsx_nir_adapter_method(o->adapter, method, argument);
+        if (adaptation_started && o->tail_now_ticks) {
+            const unsigned long long adaptation_ended =
+                o->tail_now_ticks(o->tail_clock_user);
+            if (adaptation_ended >= adaptation_started) {
+                const unsigned long long elapsed =
+                    adaptation_ended - adaptation_started;
+                o->stats.adaptation_calls++;
+                o->stats.adaptation_ticks += elapsed;
+                if (o->tail_account)
+                    o->tail_account(o->tail_account_user, elapsed);
+            }
+        }
         o->stats.methods++;
-        if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE &&
+        if (frame_graph_exec_mode(o) &&
             (o->graph_stream->overflow || o->graph_stream->oom))
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_RING_CAPACITY, o->packet_get,
                 o->packet_put, o->packet_ret, o->packet_command, method,
                 argument,
                 o->packet_index);
-        if (o->graph_mode != RSX_NR_FRAME_GRAPH_EXECUTE &&
+        if (!frame_graph_exec_mode(o) &&
             rsx_nr_ring_reject_sticky(o->ring))
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_RING_CAPACITY, o->packet_get,
                 o->packet_put, o->packet_ret, o->packet_command, method,
                 argument,
                 o->packet_index);
-        if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE) {
+        if (frame_graph_exec_mode(o)) {
             o->packet_index++;
             if (o->graph_boundary_after_method) {
                 frame_graph_close_construction(o);
@@ -1181,14 +1268,57 @@ static rsx_nr_frame_step_result frame_owner_step_once(
     return frame_resume_packet(o, get, call_return, next_get, next_return);
 }
 
+static int frame_graph_all_draws_snapshotted(const rsx_nir_stream* stream)
+{
+    if (!stream)
+        return 0;
+    for (u32 i = 0; i < stream->op_count; ++i) {
+        const rsx_nir_op* const op = &stream->ops[i];
+        if (op->kind == RSX_NIR_OP_DRAW && !op->u.draw.snapshot_id)
+            return 0;
+    }
+    return 1;
+}
+
 static rsx_nr_frame_step_result frame_graph_execute_island(
     rsx_nr_frame_owner* o)
 {
+    if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+        !o->graph_prepared) {
+        const int prepared = o->graph_prepare_island
+            ? o->graph_prepare_island(
+                  o->graph_prepare_user, o->backend,
+                  o->graph_stream)
+            : -1;
+        if (prepared < 0) {
+            o->graph_stats.fallback[RSX_NR_FRAME_GRAPH_FB_EXECUTION]++;
+            if (o->graph_finish_island)
+                o->graph_finish_island(
+                    o->graph_prepare_user, o->backend, 0);
+            return frame_fail(
+                o, RSX_NR_FRAME_FAILURE_EXECUTION, o->graph_cursor_get,
+                o->packet_put, o->graph_cursor_ret, o->packet_command,
+                o->packet_method, o->packet_argument, o->packet_index);
+        }
+        o->graph_prepared = prepared >= 0 && o->graph_draws &&
+                !o->graph_nondraw_actions &&
+                frame_graph_all_draws_snapshotted(o->graph_stream)
+            ? 2u : 1u;
+    }
     const unsigned long long started = o->graph_now_ticks
         ? o->graph_now_ticks(o->graph_clock_user) : 0u;
     while (o->graph_exec_pos < o->graph_stream->op_count) {
         const rsx_nir_op* const op =
             &o->graph_stream->ops[o->graph_exec_pos];
+        if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+            o->graph_prepared == 2u &&
+            !rsx_nir_op_is_action(op->kind)) {
+            if (op->kind < RSX_NIR_OP_KIND_COUNT)
+                o->backend->stats.executed[op->kind]++;
+            o->stats.backend_ops++;
+            o->graph_exec_pos++;
+            continue;
+        }
         const unsigned long long errors_before =
             o->backend->stats.exec_errors;
         const rsx_nr_step_result result = rsx_nr_backend_stream_step(
@@ -1213,6 +1343,10 @@ static rsx_nr_frame_step_result frame_graph_execute_island(
                     o->graph_stats.execution_ticks += ended - started;
             }
             o->graph_stats.fallback[RSX_NR_FRAME_GRAPH_FB_EXECUTION]++;
+            if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+                o->graph_finish_island)
+                o->graph_finish_island(
+                    o->graph_prepare_user, o->backend, 0);
             return frame_fail(
                 o, RSX_NR_FRAME_FAILURE_EXECUTION, o->graph_cursor_get,
                 o->packet_put, o->graph_cursor_ret, o->packet_command,
@@ -1234,6 +1368,18 @@ static rsx_nr_frame_step_result frame_graph_execute_island(
     }
     if (started)
         o->graph_stats.timed_islands++;
+    if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+        o->graph_finish_island)
+        o->graph_finish_island(
+            o->graph_prepare_user, o->backend, 1);
+    if (o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT &&
+        o->graph_prepared == 2u && o->graph_record_initialized) {
+        o->backend->st = o->graph_record_backend.st;
+        o->backend->vp_word_count = o->graph_record_backend.vp_word_count;
+        if (o->backend->vp_word_count)
+            memcpy(o->backend->vp_words, o->graph_record_backend.vp_words,
+                   (size_t)o->backend->vp_word_count * sizeof(u32));
+    }
     frame_graph_account_island(o, 0);
     frame_graph_reset_island(o);
     /* The island is now atomically committed.  The packet-completion path
@@ -1329,7 +1475,8 @@ rsx_nr_frame_step_result rsx_nr_frame_owner_step(
 {
     if (!o || !next_get || !next_return)
         return RSX_NR_FRAME_FATAL;
-    if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE)
+    if (o->graph_mode == RSX_NR_FRAME_GRAPH_EXECUTE ||
+        o->graph_mode == RSX_NR_FRAME_GRAPH_SNAPSHOT)
         return frame_graph_step(
             o, get, put, call_return, next_get, next_return);
     const rsx_nr_frame_step_result result = frame_owner_step_once(

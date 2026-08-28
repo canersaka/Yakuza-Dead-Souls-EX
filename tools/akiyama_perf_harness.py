@@ -920,7 +920,7 @@ def run_gun(args):
         "YZ_A010_ACCEPT_FAST": "1",
         "YZ_FRONTIER_ACCEPT_FAST": "1",
         "YZ_MOVEMENT_PROOF": "1",
-        "YZ_MOVEMENT_PROOF_DELAY_MS": "180000",
+        "YZ_MOVEMENT_PROOF_DELAY_MS": str(args.gun_hana_delay_ms),
         "YZ_MOVEMENT_PROOF_ARM_FILE": str(first_arm),
         "YZ_MOVEMENT_PROOF_DIALOGUE_ARM_FILE": str(hana_visual_gate),
         # Performance A/B may stop while the ordinary three-leg controller is
@@ -996,6 +996,9 @@ def run_gun(args):
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     if args.nr_stall_aggregate:
         yz["YZ_NR_STALL_AGGREGATE"] = "1"
+    if args.nr_rsx_tail_breakdown:
+        yz["YZ_NR_RSX_TAIL_BREAKDOWN"] = "1"
+        yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     if args.nr_defer_reports:
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
@@ -1331,6 +1334,17 @@ def run_gun(args):
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
+        tail_lines = re.findall(
+            r"^\[nr-rsx-tail .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_rsx_tail_breakdown"] = tail_lines
+        result["nr_rsx_tail_frames"] = re.findall(
+            r"^\[nr-rsx-tail-frame .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_rsx_tail_frame_submissions"] = re.findall(
+            r"^\[nr-rsx-tail-frame-submit .*\]$", stderr_text,
+            re.MULTILINE,
+        )
         report_scoreboard_lines = re.findall(
             r"^\[nr-report-scoreboard .*\]$", stderr_text, re.MULTILINE
         )
@@ -1356,7 +1370,7 @@ def run_gun(args):
         elif (report_scoreboard_lines or report_fallback_lines or
               report_family_lines or report_family_fallback_lines):
             raise RuntimeError("report audit output was active outside its requested lane")
-        if args.nr_submit_attribution:
+        if args.nr_submit_attribution or args.nr_rsx_tail_breakdown:
             if (len(submit_lines) != 14 or
                     len(submit_transfer_lines) != 1 or
                     len(live_submit_lines) != 11):
@@ -1365,6 +1379,14 @@ def run_gun(args):
                     f"native={len(submit_lines)} "
                     f"transfer={len(submit_transfer_lines)} "
                     f"timeline={len(live_submit_lines)}"
+                )
+            if args.nr_rsx_tail_breakdown and (
+                    len(tail_lines) != 1 or
+                    not result["nr_rsx_tail_frames"]):
+                raise RuntimeError(
+                    "RSX tail aggregate incomplete: expected one summary and "
+                    "per-present buckets, found "
+                    f"{len(tail_lines)}/{len(result['nr_rsx_tail_frames'])}"
                 )
         elif submit_lines or submit_transfer_lines or live_submit_lines:
             raise RuntimeError(
@@ -1617,6 +1639,9 @@ def run(args):
         yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     if args.nr_stall_aggregate:
         yz["YZ_NR_STALL_AGGREGATE"] = "1"
+    if args.nr_rsx_tail_breakdown:
+        yz["YZ_NR_RSX_TAIL_BREAKDOWN"] = "1"
+        yz["YZ_NR_SUBMIT_ATTRIBUTION"] = "1"
     if args.nr_defer_reports:
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
@@ -1965,6 +1990,17 @@ def run(args):
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
         result["live_submit_attribution"] = live_submit_lines
+        tail_lines = re.findall(
+            r"^\[nr-rsx-tail .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_rsx_tail_breakdown"] = tail_lines
+        result["nr_rsx_tail_frames"] = re.findall(
+            r"^\[nr-rsx-tail-frame .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_rsx_tail_frame_submissions"] = re.findall(
+            r"^\[nr-rsx-tail-frame-submit .*\]$", stderr_text,
+            re.MULTILINE,
+        )
         report_scoreboard_lines = re.findall(
             r"^\[nr-report-scoreboard .*\]$", stderr_text, re.MULTILINE
         )
@@ -1990,7 +2026,7 @@ def run(args):
         elif (report_scoreboard_lines or report_fallback_lines or
               report_family_lines or report_family_fallback_lines):
             raise RuntimeError("report audit output was active outside its requested lane")
-        if args.nr_submit_attribution:
+        if args.nr_submit_attribution or args.nr_rsx_tail_breakdown:
             if (len(submit_lines) != 14 or
                     len(submit_transfer_lines) != 1 or
                     len(live_submit_lines) != 11):
@@ -1999,6 +2035,14 @@ def run(args):
                     f"native={len(submit_lines)} "
                     f"transfer={len(submit_transfer_lines)} "
                     f"timeline={len(live_submit_lines)}"
+                )
+            if args.nr_rsx_tail_breakdown and (
+                    len(tail_lines) != 1 or
+                    not result["nr_rsx_tail_frames"]):
+                raise RuntimeError(
+                    "RSX tail aggregate incomplete: expected one summary and "
+                    "per-present buckets, found "
+                    f"{len(tail_lines)}/{len(result['nr_rsx_tail_frames'])}"
                 )
         elif submit_lines or submit_transfer_lines or live_submit_lines:
             raise RuntimeError(
@@ -2164,6 +2208,10 @@ def main():
     parser.add_argument("--anchor-mae", type=float, default=0.10)
     parser.add_argument("--gun-route", action="store_true")
     parser.add_argument(
+        "--gun-hana-delay-ms", type=int, default=180000,
+        help="gun route: delay before the first Hana visual probe",
+    )
+    parser.add_argument(
         "--gun-entry-checkpoint", action="store_true",
         help=(
             "measure the deterministic initial post-Frontier gun camera after "
@@ -2191,6 +2239,7 @@ def main():
     parser.add_argument("--nr-hana-input-oracle", action="store_true")
     parser.add_argument("--nr-submit-attribution", action="store_true")
     parser.add_argument("--nr-stall-aggregate", action="store_true")
+    parser.add_argument("--nr-rsx-tail-breakdown", action="store_true")
     parser.add_argument("--nr-defer-reports", action="store_true")
     parser.add_argument("--nr-report-audit", action="store_true")
     parser.add_argument(
@@ -2198,7 +2247,7 @@ def main():
         help="execute strict-native FIFO dependency islands through the fixed graph",
     )
     parser.add_argument(
-        "--nr-single-pass-graph", choices=("passive", "execute"),
+        "--nr-single-pass-graph", choices=("passive", "execute", "snapshot"),
         help="record strict-owner dependency islands once at decode time",
     )
     parser.add_argument("--nr-single-pass-graph-timing", action="store_true")

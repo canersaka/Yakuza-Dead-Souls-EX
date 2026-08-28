@@ -266,6 +266,25 @@ static void stage_texture0(rsx_nir_emitter* em)
     rsx_nir_em_texture(em, 0, &texture);
 }
 
+static void stage_d8r8g8b8_cube_texture0(rsx_nir_emitter* em)
+{
+    rsx_nir_texture texture;
+    memset(&texture, 0, sizeof(texture));
+    texture.enabled = 1;
+    texture.offset = TEX_OFFSET;
+    texture.location = RSX_NIR_LOCATION_LOCAL;
+    texture.format = 0x9Eu;          /* swizzled D8R8G8B8                 */
+    texture.dimension = 2;
+    texture.cubemap = 1;
+    texture.mipmaps = 1;
+    texture.width = 2;
+    texture.height = 2;
+    texture.wrap = 0x00030303u;
+    texture.remap = 0xAAE4u;
+    texture.filter = (1u << 16) | (1u << 24);
+    rsx_nir_em_texture(em, 0, &texture);
+}
+
 static void write_vertex_texture0(rsx_guest_pages* pages,
                                   float x, float y, float z, float w)
 {
@@ -2260,7 +2279,8 @@ static void test_shared_timeline(void)
           "generation changes=%llu expected=1",
           stats.shared_timeline_generations);
 
-    ops.flush(ops.user);
+    CHECK(rsx_nr_d3d12_flush_report_dependency(sink) == 0,
+          "report dependency did not retire the leased shared list");
     rsx_nr_d3d12_get_stats(sink, &stats);
     CHECK(host.flushes == 2u && stats.queue_submissions == 1u &&
               stats.shared_timeline_forced_submissions == 1u,
@@ -2315,6 +2335,7 @@ static void test_submit_attribution_gate(void)
     rsx_nir_clear clear = {0xF0u, 0xFF112233u, 0xFFFFFFu, 0u};
 
     _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "");
+    _putenv_s("YZ_NR_RSX_TAIL_BREAKDOWN", "");
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
         NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
     CHECK(sink != NULL, "default-off attribution sink creation failed");
@@ -2334,6 +2355,48 @@ static void test_submit_attribution_gate(void)
               "default-off attribution performed clocks/accounting");
         rsx_nr_d3d12_destroy(sink);
     }
+
+    _putenv_s("YZ_NR_RSX_TAIL_BREAKDOWN", "1");
+    sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "enabled tail-breakdown sink creation failed");
+    if (sink) {
+        rsx_nr_exec_ops ops;
+        rsx_nr_d3d12_stats stats;
+        memset(&ops, 0, sizeof(ops));
+        rsx_nr_d3d12_get_exec_ops(sink, &ops);
+        CHECK(ops.clear(ops.user, &state, &clear) == 0,
+              "enabled tail-breakdown clear failed");
+        ops.flush_reason(ops.user, RSX_NR_FLUSH_REFERENCE);
+        CHECK(ops.present(ops.user, 0u) == 0,
+              "enabled tail-breakdown present failed");
+        CHECK(rsx_nr_d3d12_finalize_tail_breakdown(sink) == 0,
+              "tail-breakdown shutdown resolve failed");
+        rsx_nr_d3d12_get_stats(sink, &stats);
+        rsx_nr_d3d12_tail_bucket bucket;
+        memset(&bucket, 0, sizeof(bucket));
+        CHECK(stats.submit_attribution_qpc_frequency != 0u &&
+                  stats.tail_gpu_frequency != 0u &&
+                  stats.tail_gpu_intervals_recorded == 1u &&
+                  stats.tail_gpu_intervals_dropped == 0u &&
+                  rsx_nr_d3d12_tail_bucket_count(sink) == 1u &&
+                  rsx_nr_d3d12_get_tail_bucket(sink, 0u, &bucket) == 0 &&
+                  bucket.present_sequence == 1u &&
+                  bucket.submit_count[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION] == 1u &&
+                  bucket.submit_gpu_intervals[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION] == 1u &&
+                  stats.submit_cause[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION]
+                          .gpu_intervals == 1u,
+              "tail-breakdown gate qpc=%llu gpu=%llu intervals=%llu/%llu",
+              stats.submit_attribution_qpc_frequency,
+              stats.tail_gpu_frequency,
+              stats.tail_gpu_intervals_recorded,
+              stats.tail_gpu_intervals_dropped);
+        rsx_nr_d3d12_destroy(sink);
+    }
+    _putenv_s("YZ_NR_RSX_TAIL_BREAKDOWN", "");
 
     _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "1");
     sink = rsx_nr_d3d12_create(
@@ -3110,6 +3173,69 @@ int main(int argc, char** argv)
           after_preflight.transfers, before_preflight.transfers,
           after_preflight.presents, before_preflight.presents);
 
+    /* Producer-time immutable snapshot: preparation must consume the exact
+     * vertex generation visible while GET is withheld.  A producer rewrite
+     * after preparation but before command execution must affect only the
+     * next island, never this already admitted draw. */
+    {
+        rsx_nir_op snapshot_ops[1];
+        u32 snapshot_side[2];
+        rsx_nir_stream snapshot_stream;
+        rsx_nir_stream_init_fixed(
+            &snapshot_stream, snapshot_ops, 1u, snapshot_side, 2u);
+        rsx_nir_op op;
+        memset(&op, 0, sizeof(op));
+        op.kind = RSX_NIR_OP_DRAW;
+        op.u.draw = preflight_draw;
+        op.u.draw.batches_ofs =
+            rsx_nir_side_push(&snapshot_stream, batch, 2u);
+        CHECK(rsx_nir_push(&snapshot_stream, &op) == 0,
+              "snapshot test stream overflowed");
+        write_triangle(
+            rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+            -1.0f, 1.0f);
+        rsx_nir_em_clear(&em, 0xF3u, 0xFF0000FFu, 0xFFFFFFu, 0u);
+        rsx_nr_backend_run(&be, 0u);
+        rsx_nr_d3d12_stats snapshot_before, snapshot_after;
+        rsx_nr_d3d12_get_stats(sink, &snapshot_before);
+        CHECK(rsx_nr_d3d12_record_snapshot_draw(
+                  sink, &be, &snapshot_stream, 0u) == 0 &&
+                  rsx_nr_d3d12_prepare_snapshot_island(
+                      sink, &be, &snapshot_stream) == 0 &&
+                  snapshot_stream.ops[0].u.draw.snapshot_id == 1u,
+              "immutable draw snapshot preparation failed");
+        write_triangle(
+            rsx_nr_d3d12_pages(sink), 1.0f, 1.0f, -1.0f, 1.0f,
+            1.0f, -1.0f);
+        CHECK(rsx_nr_backend_stream_step(
+                  &be, &snapshot_stream, 0u) == RSX_NR_STEP_EXECUTED,
+              "prepared draw did not execute");
+        rsx_nr_d3d12_finish_snapshot_island(sink, &be, 1);
+        CHECK(rsx_nr_d3d12_read_rt(
+                  sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+              "snapshot RT readback failed");
+        CHECK(pix_is(2, 61, 0xFF, 0x00, 0xFF) &&
+                  pix_is(61, 2, 0xFF, 0x00, 0x00),
+              "prepared draw observed post-preparation guest bytes");
+        rsx_nr_d3d12_get_stats(sink, &snapshot_after);
+        CHECK(snapshot_after.snapshot_islands ==
+                  snapshot_before.snapshot_islands + 1u &&
+              snapshot_after.snapshot_draws_prepared ==
+                  snapshot_before.snapshot_draws_prepared + 1u &&
+              snapshot_after.snapshot_draws_executed ==
+                  snapshot_before.snapshot_draws_executed + 1u &&
+              snapshot_after.snapshot_prepare_failures ==
+                  snapshot_before.snapshot_prepare_failures,
+              "snapshot lifecycle accounting was not exact");
+        /* Restore the ordinary bottom-left source generation used by the
+         * following legacy-reference legs. */
+        write_triangle(
+            rsx_nr_d3d12_pages(sink), -1.0f, -1.0f, 1.0f, -1.0f,
+            -1.0f, 1.0f);
+        rsx_nir_em_clear(&em, 0xF3u, 0xFF0000FFu, 0xFFFFFFu, 0u);
+        rsx_nr_backend_run(&be, 0u);
+    }
+
     /* ---- conditional draw: false consumes without recording ---------- */
     rsx_nir_render_condition condition;
     memset(&condition, 0, sizeof(condition));
@@ -3134,6 +3260,33 @@ int main(int argc, char** argv)
     CHECK(rsx_nr_d3d12_read_rt(sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0 &&
               pix_is(2, 61, 0xFF, 0x00, 0x00),
           "false conditional draw changed the target");
+    {
+        rsx_nir_op conditional_ops[1];
+        u32 conditional_side[2];
+        rsx_nir_stream conditional_stream;
+        rsx_nir_stream_init_fixed(
+            &conditional_stream, conditional_ops, 1u,
+            conditional_side, 2u);
+        rsx_nir_op conditional_op;
+        memset(&conditional_op, 0, sizeof(conditional_op));
+        conditional_op.kind = RSX_NIR_OP_DRAW;
+        conditional_op.u.draw = preflight_draw;
+        conditional_op.u.draw.batches_ofs =
+            rsx_nir_side_push(&conditional_stream, batch, 2u);
+        CHECK(rsx_nir_push(&conditional_stream, &conditional_op) == 0,
+              "conditional snapshot stream overflowed");
+        rsx_nr_d3d12_stats before_dependency, after_dependency;
+        rsx_nr_d3d12_get_stats(sink, &before_dependency);
+        CHECK(rsx_nr_d3d12_record_snapshot_draw(
+                  sink, &be, &conditional_stream, 0u) == 0 &&
+                  conditional_stream.ops[0].u.draw.snapshot_id == 0u,
+              "report-dependent draw captured pre-fence resources");
+        rsx_nr_d3d12_get_stats(sink, &after_dependency);
+        CHECK(after_dependency.snapshot_draws_prepared ==
+                  before_dependency.snapshot_draws_prepared,
+              "conditional draw changed snapshot preparation state");
+        rsx_nr_d3d12_finish_snapshot_island(sink, &be, 0);
+    }
 
     /* ---- leg 2: bottom-left half triangle; true condition executes ---- */
     g_render_condition_value = 1u;
@@ -3499,6 +3652,34 @@ int main(int argc, char** argv)
           "texture data change rebuilt PSO builds=%llu/%llu hits=%llu/%llu",
           before_texture_change.pso_builds, after_texture_change.pso_builds,
           before_texture_change.pso_hits, after_texture_change.pso_hits);
+
+    /* D8R8G8B8 is a four-byte color texture with a discard byte in place of
+     * alpha.  The gun route uses it for a cubemap; admit the exact RSX family
+     * instead of failing an otherwise fully native dependency island. */
+    for (u32 pixel = 0; pixel < 6u * 4u; ++pixel) {
+        g_local[TEX_OFFSET + pixel * 4u + 0u] = 0xFFu;
+        g_local[TEX_OFFSET + pixel * 4u + 1u] = 0x00u;
+        g_local[TEX_OFFSET + pixel * 4u + 2u] = 0xFFu;
+        g_local[TEX_OFFSET + pixel * 4u + 3u] = 0x00u;
+    }
+    rsx_guest_pages_note_write(
+        rsx_nr_d3d12_pages(sink), 0, TEX_OFFSET, 6u * 4u * 4u);
+    write_tex_fp();
+    stage_frame_state(&em);
+    stage_d8r8g8b8_cube_texture0(&em);
+    rsx_nir_em_clear(&em, 0xF3, 0xFF0000FFu, 0xFFFFFF, 0);
+    rsx_nir_em_draw(&em, 5, 0, batch, 1);
+    rsx_nir_em_present(&em, 0);
+    rsx_nr_backend_run(&be, 0);
+    CHECK(be.stats.exec_errors == 0,
+          "D8R8G8B8 cubemap exec errors %llu", be.stats.exec_errors);
+    CHECK(rsx_nr_d3d12_read_rt(
+              sink, 0, RT_OFFSET, RT_W, RT_H, g_pix) == 0,
+          "D8R8G8B8 cubemap readback failed");
+    CHECK(pix_is(2, 61, 0x00, 0xFF, 0x00),
+          "D8R8G8B8 cubemap pixel %02X %02X %02X",
+          pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
+    write_solid_texture(rsx_nr_d3d12_pages(sink), 255, 0, 0, 255);
 
     /* ---- color BORDER parity with the established renderer -----------
      * The guest requests an opaque-white border, but the established D3D12
@@ -4107,6 +4288,50 @@ int main(int argc, char** argv)
               pix(2, 61)[0], pix(2, 61)[1], pix(2, 61)[2]);
     }
 
+    /* ---- shader-unused descriptor state is canonical -----------------
+     * Titles freely mutate dormant texture units. Those registers cannot
+     * consume sampler-table identities when the current fragment program
+     * does not reference the unit; otherwise unrelated state exhausts the
+     * bounded D3D12 sampler heap and forces an ordered mid-frame retirement. */
+    {
+        rsx_nr_d3d12_stats before_unused, after_unused;
+        rsx_nr_d3d12_get_stats(sink, &before_unused);
+        rsx_nir_texture unused;
+        memset(&unused, 0, sizeof(unused));
+        unused.enabled = 1u;
+        unused.location = RSX_NIR_LOCATION_LOCAL;
+        unused.dimension = 2u;
+        unused.mipmaps = 1u;
+        unused.width = 2u;
+        unused.height = 2u;
+        unused.pitch = 8u;
+        for (u32 i = 0; i < 256u; ++i) {
+            unused.offset = TEX_OFFSET + (i & 15u) * 16u;
+            unused.wrap = (i & 7u) | ((i & 7u) << 8) |
+                          ((i & 7u) << 16);
+            unused.filter = ((i & 7u) << 16) |
+                            (((i + 1u) & 7u) << 24);
+            unused.control0 = i * 0x10101u;
+            rsx_nir_em_texture(&em, 15u, &unused);
+            rsx_nir_em_draw(&em, 5u, 0u, batch, 1u);
+            rsx_nr_backend_run(&be, 0);
+        }
+        rsx_nr_d3d12_get_stats(sink, &after_unused);
+        CHECK(after_unused.queue_submissions ==
+                  before_unused.queue_submissions,
+              "unused texture state forced %llu submissions",
+              after_unused.queue_submissions -
+                  before_unused.queue_submissions);
+        CHECK(after_unused.descriptor_table_builds <=
+                  before_unused.descriptor_table_builds + 1u &&
+              after_unused.descriptor_table_hits >=
+                  before_unused.descriptor_table_hits + 255u,
+              "unused texture state escaped descriptor canonicalization");
+        memset(&unused, 0, sizeof(unused));
+        rsx_nir_em_texture(&em, 15u, &unused);
+        rsx_nr_backend_run(&be, 0);
+    }
+
     /* ---- bounded upload-arena rollover -------------------------------
      * One admitted live section can exceed the 32-MiB upload arena even
      * though every draw fits individually.  Retire an ordered prefix before
@@ -4197,7 +4422,7 @@ int main(int argc, char** argv)
           st.texture_cache_capacity, st.pso_cache_capacity);
     CHECK(st.unsupported_clears == 1, "partial clear not counted (%llu)",
           st.unsupported_clears);
-    CHECK(st.clears == 31 && st.draws == 4643 && st.presents == 25,
+    CHECK(st.clears == 34 && st.draws == 4901 && st.presents == 26,
           "sink counts clears=%llu draws=%llu presents=%llu", st.clears,
           st.draws, st.presents);
     CHECK(st.conditional_draws_skipped == 1u,
@@ -4224,8 +4449,8 @@ int main(int argc, char** argv)
     CHECK(st.real_fp_draws == st.draws,
           "real fragment programs=%llu draws=%llu", st.real_fp_draws,
           st.draws);
-    CHECK(st.texture_draws == 11 && st.texture_builds == 2 &&
-              st.texture_refreshes == 2 && st.texture_failures == 0,
+    CHECK(st.texture_draws == 12 && st.texture_builds == 3 &&
+              st.texture_refreshes == 3 && st.texture_failures == 0,
           "textures draws=%llu builds=%llu refresh=%llu failures=%llu",
           st.texture_draws, st.texture_builds, st.texture_refreshes,
           st.texture_failures);
@@ -4234,8 +4459,8 @@ int main(int argc, char** argv)
               st.depth_snapshot_resolves == 2u,
           "depth snapshots builds=%llu resolves=%llu",
           st.depth_snapshot_builds, st.depth_snapshot_resolves);
-    CHECK(g_present_handoffs == 25,
-          "native scanout handoffs=%u expected=25", g_present_handoffs);
+    CHECK(g_present_handoffs == 26,
+          "native scanout handoffs=%u expected=26", g_present_handoffs);
 
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);

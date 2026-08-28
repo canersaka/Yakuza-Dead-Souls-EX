@@ -758,6 +758,14 @@ static int yz_nr_report_submit_direct(
 {
     if (!completed)
         return -1;
+    /* A render-condition consumer executes while the D3D backend owns the
+     * shared command-list lease. Calling the host timeline flush directly
+     * would recursively acquire that lease and can never retire the report.
+     * Let the backend close its own exact list first; its flush callback
+     * completes and publishes every covered scoreboard record in order. */
+    if (g_active.d3d12 &&
+        rsx_nr_d3d12_flush_report_dependency(g_active.d3d12) != 0)
+        return -1;
     unsigned long long before_generation = 0, before_recording = 0;
     unsigned long long before_completed = 0;
     if (yz_nr_report_timeline_state(
@@ -912,9 +920,17 @@ extern "C" void yz_nr_vertical_service_report_requests(void)
 {
     if (!g_active.report_defer_enabled)
         return;
-    InterlockedCompareExchange(
+    /* This entry is called only from the two actual RSX consumer boundaries:
+     * strict-owner frame consumption and the legacy FIFO step. The owner can
+     * move between those workers across startup/movie handoffs, so retaining
+     * the first thread forever can send an early report-consumer request to a
+     * worker which no longer services the queue. Publish the current owner on
+     * every boundary; a render-condition read on this same thread can then
+     * retire its exact pending report directly, while PPU/SPU readers still
+     * use the address-based request/wake path. */
+    InterlockedExchange(
         &g_active.report_consumer_thread,
-        static_cast<LONG>(GetCurrentThreadId()), 0);
+        static_cast<LONG>(GetCurrentThreadId()));
     yz_nr_report_service_requests();
 }
 
@@ -1296,6 +1312,45 @@ static void yz_nr_active_ensure_graphics(void)
     }
     yz_nr_active_bind_graphics_ops();
     g_active.d3d12 = d3d12;
+    if (g_active.frame_owner.tail_tick_frequency)
+        rsx_nr_frame_owner_set_tail_account(
+            &g_active.frame_owner,
+            [](void* user, unsigned long long ticks) {
+                rsx_nr_d3d12_tail_note_adaptation(
+                    static_cast<rsx_nr_d3d12*>(user), ticks);
+            },
+            d3d12);
+    if (g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT)
+        rsx_nr_frame_owner_set_snapshot_callbacks(
+            &g_active.frame_owner,
+            [](void* user, const rsx_nr_backend* initial,
+               rsx_nir_stream* stream) -> int {
+                return rsx_nr_d3d12_prepare_snapshot_island(
+                    static_cast<rsx_nr_d3d12*>(user), initial, stream);
+            },
+            [](void* user, rsx_nr_backend* backend, int committed) {
+                rsx_nr_d3d12_finish_snapshot_island(
+                    static_cast<rsx_nr_d3d12*>(user), backend, committed);
+            },
+            d3d12);
+    if (g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT)
+        rsx_nr_frame_owner_set_snapshot_record_draw(
+            &g_active.frame_owner,
+            [](void* user, const rsx_nr_backend* recorded,
+               rsx_nir_stream* stream, u32 op_index) -> int {
+                /* Host movies deliberately suppress guest clear/draw/present
+                 * work while retaining transfers and synchronization.  Do
+                 * not prepare GPU resources for a draw which the bound movie
+                 * backend will discard: doing so can modify/retire the shared
+                 * list immediately before a movie transfer consumes it.  The
+                 * caller holds the FIFO lock used by the movie handoff, so
+                 * this samples the exact ownership generation. */
+                if (g_active.movie_suppressed)
+                    return 0;
+                return rsx_nr_d3d12_record_snapshot_draw(
+                    static_cast<rsx_nr_d3d12*>(user), recorded,
+                    stream, op_index);
+            });
     MemoryBarrier();
     InterlockedExchange(&g_active.graphics_ready, 1);
 }
@@ -1387,6 +1442,23 @@ static int yz_nr_active_init(int graphics)
         &g_active.frame_owner,
         [](void*) -> unsigned long long { return GetTickCount64(); },
         nullptr, 2u, 30000u);
+    {
+        const char* const tail = getenv("YZ_NR_RSX_TAIL_BREAKDOWN");
+        if (tail && tail[0] == '1' && tail[1] == '\0') {
+            LARGE_INTEGER frequency = {};
+            if (QueryPerformanceFrequency(&frequency))
+                rsx_nr_frame_owner_set_tail_clock(
+                    &g_active.frame_owner,
+                    [](void*) -> unsigned long long {
+                        LARGE_INTEGER now = {};
+                        QueryPerformanceCounter(&now);
+                        return static_cast<unsigned long long>(
+                            now.QuadPart);
+                    },
+                    nullptr,
+                    static_cast<unsigned long long>(frequency.QuadPart));
+        }
+    }
     if (g_active.single_pass_graph) {
         const bool graph_timing =
             getenv("YZ_NR_SINGLE_PASS_GRAPH_TIMING") != nullptr;
@@ -2567,7 +2639,10 @@ extern "C" void yz_nr_vertical_init(void)
                 ? RSX_NR_FRAME_GRAPH_PASSIVE
                 : strict && single_graph &&
                   strcmp(single_graph, "execute") == 0
-                    ? RSX_NR_FRAME_GRAPH_EXECUTE : 0u;
+                    ? RSX_NR_FRAME_GRAPH_EXECUTE
+                    : strict && single_graph &&
+                      strcmp(single_graph, "snapshot") == 0
+                        ? RSX_NR_FRAME_GRAPH_SNAPSHOT : 0u;
         g_active.section_diag_enabled = graphics && !strict &&
             getenv("YZ_NR_PASS_DIAG") != nullptr;
         g_active.section_shadow_consumer_admit = graphics && !strict &&
@@ -2581,7 +2656,8 @@ extern "C" void yz_nr_vertical_init(void)
         g_active.report_defer_enabled = strict &&
             ((report_defer && report_defer[0] == '1' &&
               report_defer[1] == '\0') || g_active.graph_islands ||
-             g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE);
+             g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE ||
+             g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT);
         g_active.report_audit_enabled = strict && report_audit &&
             report_audit[0] == '1' && report_audit[1] == '\0';
         g_active.draw_primitive_filter = UINT32_MAX;
@@ -4897,6 +4973,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
         if (g_active.d3d12 &&
             rsx_nr_d3d12_dump_hana_input(g_active.d3d12) != 0)
             fprintf(stderr, "[nr-hana-input dump-failed=1]\n");
+        if (g_active.d3d12 &&
+            rsx_nr_d3d12_finalize_tail_breakdown(g_active.d3d12) != 0)
+            fprintf(stderr, "[nr-rsx-tail finalize-failed=1]\n");
         rsx_nr_span_router_stats stats = {};
         rsx_nr_span_router_get_stats(&g_active.router, &stats);
         fprintf(stderr,
@@ -5038,7 +5117,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 &g_active.frame_owner.graph_stats;
             const unsigned long long frames = graph->frames;
             const unsigned long long coverage_den =
-                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE
+                (g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE ||
+                 g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT)
                     ? graph->methods : g_active.frame_owner.stats.methods;
             const unsigned long long coverage_ppm = coverage_den
                 ? graph->methods * 1000000ull / coverage_den : 0ull;
@@ -5588,7 +5668,8 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      d3d_stats.shared_timeline_generations,
                      d3d_stats.shared_timeline_forced_submissions);
             if (g_active.graph_islands ||
-                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE) {
+                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_EXECUTE ||
+                g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT) {
                 const unsigned long long graph_draw_coverage_ppm =
                     d3d_stats.draws
                         ? (g_active.graph_islands
@@ -5612,6 +5693,64 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.transfer_gpu_readbacks,
                         d3d_stats.transfer_gpu_uploads);
             }
+            if (g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT)
+                fprintf(stderr,
+                        "[nr-resource-snapshots islands=%llu "
+                        "prepared=%llu executed=%llu restarts=%llu "
+                        "failures=%llu prep-first=%u/%u/%u "
+                        "prep-submits=%llu/%llu/%llu/%llu/%llu/%llu/"
+                        "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                        "execute-failures=%llu "
+                        "first=%u/id=%u/count=%u/valid=%u/"
+                        "condition=%08X:%08X]\n",
+                        d3d_stats.snapshot_islands,
+                        d3d_stats.snapshot_draws_prepared,
+                        d3d_stats.snapshot_draws_executed,
+                        d3d_stats.snapshot_prepare_restarts,
+                        d3d_stats.snapshot_prepare_failures,
+                        d3d_stats.first_snapshot_prepare_failure_cause,
+                        d3d_stats.first_snapshot_prepare_failure_prior_draws,
+                        d3d_stats.first_snapshot_prepare_failure_attempt,
+                        d3d_stats.snapshot_prepare_submissions[0],
+                        d3d_stats.snapshot_prepare_submissions[1],
+                        d3d_stats.snapshot_prepare_submissions[2],
+                        d3d_stats.snapshot_prepare_submissions[3],
+                        d3d_stats.snapshot_prepare_submissions[4],
+                        d3d_stats.snapshot_prepare_submissions[5],
+                        d3d_stats.snapshot_prepare_submissions[6],
+                        d3d_stats.snapshot_prepare_submissions[7],
+                        d3d_stats.snapshot_prepare_submissions[8],
+                        d3d_stats.snapshot_prepare_submissions[9],
+                        d3d_stats.snapshot_prepare_submissions[10],
+                        d3d_stats.snapshot_prepare_submissions[11],
+                        d3d_stats.snapshot_prepare_submissions[12],
+                        d3d_stats.snapshot_prepare_submissions[13],
+                        d3d_stats.snapshot_execute_failures,
+                        d3d_stats.first_snapshot_execute_failure_stage,
+                        d3d_stats.first_snapshot_execute_id,
+                        d3d_stats.first_snapshot_execute_count,
+                        d3d_stats.first_snapshot_execute_valid,
+                        d3d_stats.first_snapshot_execute_condition_dma,
+                        d3d_stats.first_snapshot_execute_condition_offset);
+            if (d3d_stats.first_present_failure_stage)
+                fprintf(stderr,
+                        "[nr-rsx-tail-present-failure count=%llu "
+                        "stage=%u buffer=%u display=%u "
+                        "rt=%u:%08X/%ux%u/fmt=%u/dxgi=%u "
+                        "timeline=%llu/%llu/%llu]\n",
+                        d3d_stats.present_failures,
+                        d3d_stats.first_present_failure_stage,
+                        d3d_stats.first_present_failure_buffer,
+                        d3d_stats.first_present_failure_display_valid,
+                        d3d_stats.first_present_failure_space,
+                        d3d_stats.first_present_failure_offset,
+                        d3d_stats.first_present_failure_width,
+                        d3d_stats.first_present_failure_height,
+                        d3d_stats.first_present_failure_format,
+                        d3d_stats.first_present_failure_dxgi,
+                        d3d_stats.first_present_failure_generation,
+                        d3d_stats.first_present_failure_recording_fence,
+                        d3d_stats.first_present_failure_completed_fence);
             fprintf(stderr,
                     "[nr-vertical-d3d-cache textures=%u/%u "
                     "table-full=%llu arena-full=%llu pso=%u/%u "
@@ -5699,12 +5838,14 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.submit_cause[cause];
                     fprintf(stderr,
                             "[nr-submit-attribution qpc=%llu cause=%s "
-                            "submits=%llu cpu-ticks=%llu draws=%llu "
+                            "submits=%llu cpu-ticks=%llu gpu=%llu/%llu "
+                            "draws=%llu "
                             "batches=%llu descriptors=%llu upload-bytes=%llu "
                             "readback-bytes=%llu]\n",
                             d3d_stats.submit_attribution_qpc_frequency,
                             cause_names[cause], entry.submissions,
-                            entry.cpu_wait_ticks, entry.draws,
+                            entry.cpu_wait_ticks, entry.gpu_intervals,
+                            entry.gpu_ticks, entry.draws,
                             entry.draw_batches, entry.descriptor_tables,
                             entry.upload_bytes, entry.readback_bytes);
                 }
@@ -5822,6 +5963,84 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.mirror_resyncs,
                         d3d_stats.mirror_rollovers,
                         d3d_stats.mirror_exact_patch_retries);
+                if (g_active.frame_owner.tail_tick_frequency) {
+                    fprintf(stderr,
+                            "[nr-rsx-tail qpc=%llu adaptation=%llu/%llu "
+                            "gpu-frequency=%llu gpu-recorded=%llu "
+                            "gpu-dropped=%llu]\n",
+                            g_active.frame_owner.tail_tick_frequency,
+                            g_active.frame_owner.stats.adaptation_calls,
+                            g_active.frame_owner.stats.adaptation_ticks,
+                            d3d_stats.tail_gpu_frequency,
+                            d3d_stats.tail_gpu_intervals_recorded,
+                            d3d_stats.tail_gpu_intervals_dropped);
+                    static const char* const tail_cause_names[
+                        RSX_NR_D3D12_SUBMIT_CAUSE_COUNT] = {
+                        "descriptor-recycle", "upload-rollover",
+                        "semaphore-publication", "reference-publication",
+                        "report-publication", "barrier-publication",
+                        "transfer-readback", "resource-refresh",
+                        "residency-retry", "refusal-retirement", "present",
+                        "diagnostic-readback", "shutdown-reset", "other"
+                    };
+                    const uint32_t buckets =
+                        rsx_nr_d3d12_tail_bucket_count(g_active.d3d12);
+                    for (uint32_t i = 0; i < buckets; ++i) {
+                        rsx_nr_d3d12_tail_bucket bucket = {};
+                        if (rsx_nr_d3d12_get_tail_bucket(
+                                g_active.d3d12, i, &bucket) != 0)
+                            continue;
+                        fprintf(stderr,
+                                "[nr-rsx-tail-frame qpc=%llu gpu-frequency=%llu "
+                                "present=%llu end=%llu adaptation=%llu/%llu "
+                                "draws=%llu "
+                                "fence=%llu flush=%llu readback=%llu/%llu "
+                                "upload=%llu/%llu residency=%llu/%llu "
+                                "preflight=%llu draw=%llu fp=%llu "
+                                "pso=%llu/%llu/%llu/%llu/%llu "
+                                "texture=%llu batch=%llu record=%llu]\n",
+                                g_active.frame_owner.tail_tick_frequency,
+                                d3d_stats.tail_gpu_frequency,
+                                bucket.present_sequence, bucket.end_qpc,
+                                bucket.adaptation_calls,
+                                bucket.adaptation_ticks, bucket.draws,
+                                bucket.fence_ticks,
+                                bucket.flush_ticks,
+                                bucket.transfer_readback_ticks,
+                                bucket.transfer_readback_bytes,
+                                bucket.transfer_upload_ticks,
+                                bucket.transfer_upload_bytes,
+                                bucket.residency_prepare_ticks,
+                                bucket.residency_stabilize_ticks,
+                                bucket.preflight_draw_ticks,
+                                bucket.draw_ticks, bucket.fp_resolve_ticks,
+                                bucket.pso_lookup_ticks,
+                                bucket.pso_key_lookup_ticks,
+                                bucket.shader_compile_ticks,
+                                bucket.shader_cache_ticks,
+                                bucket.driver_pso_ticks,
+                                bucket.texture_prepare_ticks,
+                                bucket.batch_prepare_ticks,
+                                bucket.command_record_ticks);
+                        for (uint32_t cause = 0;
+                             cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT;
+                             ++cause) {
+                            if (!bucket.submit_count[cause] &&
+                                !bucket.submit_gpu_intervals[cause])
+                                continue;
+                            fprintf(stderr,
+                                    "[nr-rsx-tail-frame-submit present=%llu "
+                                    "cause=%s submits=%llu cpu=%llu "
+                                    "gpu=%llu/%llu]\n",
+                                    bucket.present_sequence,
+                                    tail_cause_names[cause],
+                                    bucket.submit_count[cause],
+                                    bucket.submit_cpu_ticks[cause],
+                                    bucket.submit_gpu_intervals[cause],
+                                    bucket.submit_gpu_ticks[cause]);
+                        }
+                    }
+                }
             }
             if (d3d_stats.first_residency_failure_stage) {
                 fprintf(stderr,

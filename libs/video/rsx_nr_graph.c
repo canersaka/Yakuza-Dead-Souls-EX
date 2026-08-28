@@ -56,6 +56,29 @@ int rsx_nr_graph_op_ends_island(u32 kind)
            kind == RSX_NIR_OP_TOKEN_SIGNAL;
 }
 
+int rsx_nr_graph_op_ends_snapshot_island(u32 kind)
+{
+    /* Draw preparation records texture/depth resolves and resource-state
+     * transitions on the live shared list.  A later draw therefore cannot be
+     * prepared before this draw is recorded without moving those side effects
+     * ahead of their guest consumer.  Close at the first draw consumer just
+     * like the ordinary dependency graph.  This is an execution boundary,
+     * not a submission boundary: consecutive accepted draws still share the
+     * same D3D12 list and fence. */
+    return kind == RSX_NIR_OP_DRAW ||
+           kind == RSX_NIR_OP_CLEAR ||
+           kind == RSX_NIR_OP_TRANSFER ||
+           kind == RSX_NIR_OP_PRESENT ||
+           kind == RSX_NIR_OP_SEMAPHORE_ACQUIRE ||
+           kind == RSX_NIR_OP_SEMAPHORE_RELEASE ||
+           kind == RSX_NIR_OP_REPORT ||
+           kind == RSX_NIR_OP_BARRIER ||
+           kind == RSX_NIR_OP_SET_REFERENCE ||
+           kind == RSX_NIR_OP_USER_COMMAND ||
+           kind == RSX_NIR_OP_TOKEN_WAIT ||
+           kind == RSX_NIR_OP_TOKEN_SIGNAL;
+}
+
 int rsx_nr_graph_can_enter(int section_pending, int packet_active,
                            int method_inflight, u32 ring_depth)
 {

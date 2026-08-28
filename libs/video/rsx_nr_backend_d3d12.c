@@ -91,14 +91,23 @@ static void nrb_enable_device_oracle(void)
 #define NRB_TEX_SNAP_WORDS (1024u * 1024u)
 #define NRB_TEX_UNITS    RSX_NIR_NUM_TEXTURES
 #define NRB_VTEX_UNITS   RSX_NIR_NUM_VERTEX_TEXTURES
-#define NRB_DRAW_TABLES  128u       /* D3D12 sampler heap limit / 16      */
+#define NRB_SRV_DRAW_TABLES 8192u
+#define NRB_SAMPLER_DRAW_TABLES 128u /* D3D12 sampler heap limit / 16     */
+#define NRB_SRV_TABLE_INDEX_CAP 16384u
+#define NRB_SAMPLER_TABLE_INDEX_CAP 256u
 #define NRB_SRV_TABLE_STRIDE (NRB_TEX_UNITS + NRB_VTEX_UNITS)
 #define NRB_SAMPLER_TABLE_STRIDE NRB_TEX_UNITS
-#define NRB_SHADER_DESCRIPTORS (NRB_DRAW_TABLES * NRB_SRV_TABLE_STRIDE)
-#define NRB_SHADER_SAMPLERS (NRB_DRAW_TABLES * NRB_SAMPLER_TABLE_STRIDE)
-#define NRB_MAX_RETIRED_TEXTURES NRB_SHADER_DESCRIPTORS
+#define NRB_SHADER_DESCRIPTORS \
+    (NRB_SRV_DRAW_TABLES * NRB_SRV_TABLE_STRIDE)
+#define NRB_SHADER_SAMPLERS \
+    (NRB_SAMPLER_DRAW_TABLES * NRB_SAMPLER_TABLE_STRIDE)
+#define NRB_MAX_RETIRED_TEXTURES 4096u
 #define NRB_MAX_DRAW_BATCHES 4096u
+#define NRB_TAIL_GPU_INTERVALS 131072u
 #define NRB_MAX_REQUIRED_SPANS (RSX_NIR_NUM_VERTEX_ATTR * 2u + 2u)
+#define NRB_SNAPSHOT_DRAW_CAP  64u
+#define NRB_SNAPSHOT_BATCH_CAP (64u * NRB_MAX_DRAW_BATCHES)
+#define NRB_SNAPSHOT_VERTEX_BYTES (64u << 20)
 #define NRB_HANA_INPUT_SAMPLES 16u
 #define NRB_HANA_INPUT_SPANS   8u
 #define NRB_HANA_DEPTH_UNITS   2u
@@ -122,7 +131,33 @@ typedef struct nrb_prepared_batch {
 
 typedef struct nrb_required_span {
     u32 space, offset, size;
+    u32 source;                    /* attr 0..15, or 16 for index data */
+    u32 first_element;
 } nrb_required_span;
+
+typedef struct nrb_snapshot_vertex_binding {
+    u32 attr_mask;
+    u32 attr_offset[RSX_NIR_NUM_VERTEX_ATTR];
+    u32 attr_first[RSX_NIR_NUM_VERTEX_ATTR];
+    u32 index_valid;
+    u32 index_offset;
+    u32 index_first;
+} nrb_snapshot_vertex_binding;
+
+static int nrb_capture_snapshot_vertex_spans(
+    struct rsx_nr_d3d12* b, const nrb_required_span* required, u32 count);
+
+typedef struct nrb_fp_info {
+    const u8* bytes;
+    u32 size;
+    u32 texture_mask;
+    u32 unsupported;
+    u32 first_unsupported_offset;
+    u32 first_unsupported_opcode;
+    u32 first_unsupported_reason;
+    u64 structural_hash;
+    rsx_fp_constant_block constants;
+} nrb_fp_info;
 
 typedef struct nrb_hana_input_vtex {
     rsx_nir_texture texture;
@@ -259,13 +294,48 @@ typedef struct nrb_depth {
     int sample_valid;
 } nrb_depth;
 
-typedef struct nrb_descriptor_table_key {
+typedef struct nrb_draw_snapshot {
+    u32 valid;
+    u32 prepared_batch_offset;
+    u32 prepared_batch_count;
+    u32 srv_table_index;
+    u32 sampler_table_index;
+    u32 fp_texture_mask;
+    u32 vtex_mask;
+    u32 use_host_ib;
+    u32 filter_restart;
+    u32 immutable_vertex;
+    D3D12_PRIMITIVE_TOPOLOGY topology;
+    nrb_rt* rt;
+    nrb_depth* depth;
+    ID3D12PipelineState* pso;
+    u64 upload_budget;
+    u64 vp_constants_va;
+    u64 fp_constants_va;
+    rsx_nir_scissor scissor;
+    rsx_nir_render_condition render_condition;
+    u32 depth_bounds_test_enable;
+    u32 depth_bounds_min;
+    u32 depth_bounds_max;
+    u32 depth_write_enable;
+    u32 stencil_ref;
+    float blend_factor[4];
+    nrb_rt* texture_aliases[NRB_TEX_UNITS];
+    nrb_depth* texture_depth_aliases[NRB_TEX_UNITS];
+    nrb_rt* vtex_aliases[NRB_VTEX_UNITS];
+    nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS];
+} nrb_draw_snapshot;
+
+typedef struct nrb_srv_table_key {
     u64 resource[NRB_SRV_TABLE_STRIDE];
     u64 view[NRB_SRV_TABLE_STRIDE];
-    D3D12_SAMPLER_DESC sampler[NRB_TEX_UNITS];
     u32 texture_mask;
     u32 vtex_mask;
-} nrb_descriptor_table_key;
+} nrb_srv_table_key;
+
+typedef struct nrb_sampler_table_key {
+    D3D12_SAMPLER_DESC sampler[NRB_TEX_UNITS];
+} nrb_sampler_table_key;
 
 typedef struct nrb_display {
     u32 location, offset, width, height;
@@ -306,8 +376,30 @@ struct rsx_nr_d3d12 {
     ID3D12DescriptorHeap* sampler_gpu_heap;
     ID3D12DescriptorHeap* depth_snapshot_heap;
     u32 texture_desc_size, sampler_desc_size;
-    u32 descriptor_tables_used;
-    nrb_descriptor_table_key descriptor_table_keys[NRB_DRAW_TABLES];
+    u32 srv_tables_used;
+    u32 sampler_tables_used;
+    nrb_srv_table_key srv_table_keys[NRB_SRV_DRAW_TABLES];
+    nrb_sampler_table_key sampler_table_keys[NRB_SAMPLER_DRAW_TABLES];
+    u32 srv_table_index[NRB_SRV_TABLE_INDEX_CAP];
+    u32 sampler_table_index[NRB_SAMPLER_TABLE_INDEX_CAP];
+    nrb_draw_snapshot draw_snapshots[NRB_SNAPSHOT_DRAW_CAP];
+    nrb_prepared_batch snapshot_batches[NRB_SNAPSHOT_BATCH_CAP];
+    nrb_snapshot_vertex_binding snapshot_vertex[NRB_SNAPSHOT_DRAW_CAP];
+    ID3D12Resource* snapshot_vertex_upload;
+    ID3D12Resource* snapshot_vertex_gpu;
+    u8* snapshot_vertex_mapped;
+    u32 snapshot_vertex_used;
+    u32 snapshot_compact_vertex;
+    D3D12_RESOURCE_STATES snapshot_vertex_state;
+    u32 snapshot_count;
+    u32 snapshot_batch_count;
+    u32 snapshot_prepare_id;
+    u32 snapshot_prepare_submitted;
+    u32 snapshot_prepare_submit_cause;
+    u32 snapshot_state_skip;
+    rsx_nir_pipeline snapshot_final_state;
+    u32 snapshot_final_vp[RSX_NIR_VP_MAX_WORDS];
+    u32 snapshot_final_vp_count;
 
     ID3D12RootSignature* rootsig;
     ID3D12RootSignature* depth_snapshot_rootsig;
@@ -359,6 +451,19 @@ struct rsx_nr_d3d12 {
     int scanout_provenance;
     int stall_aggregate;
     int submit_attribution;
+    int tail_breakdown;
+    int tail_finalized;
+    ID3D12QueryHeap* tail_query_heap;
+    ID3D12Resource* tail_query_readback;
+    u32 tail_query_count;
+    u32 tail_query_open;
+    u8 tail_query_cause[NRB_TAIL_GPU_INTERVALS];
+    u32 tail_query_frame[NRB_TAIL_GPU_INTERVALS];
+    rsx_nr_d3d12_tail_bucket tail_bucket[RSX_NR_D3D12_TAIL_BUCKET_CAP];
+    rsx_nr_d3d12_tail_bucket tail_previous;
+    u64 tail_bucket_count;
+    u64 tail_adaptation_calls;
+    u64 tail_adaptation_ticks;
     u64 submit_retired_draws;
     u64 submit_retired_batches;
     u32 coherent_vp_options;
@@ -620,7 +725,11 @@ static int nrb_acquire_shared_list(rsx_nr_d3d12* b)
         }
         nrb_release_retired_textures(b);
         b->upload_used = 0;
-        b->descriptor_tables_used = 0;
+        b->snapshot_vertex_used = 0;
+        b->srv_tables_used = 0;
+        b->sampler_tables_used = 0;
+        memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
+        memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
         b->list_open = 0;
         b->stats.shared_timeline_generations++;
     }
@@ -639,7 +748,7 @@ static int nrb_open_list(rsx_nr_d3d12* b)
             return -1;
         if (!b->list_open)
             b->list_open = 1;
-        return 0;
+        goto opened;
     }
     if (b->list_open)
         return 0;
@@ -648,8 +757,46 @@ static int nrb_open_list(rsx_nr_d3d12* b)
         return -1;
     b->list_open = 1;
     b->upload_used = 0;              /* previous exec was waited on        */
-    b->descriptor_tables_used = 0;   /* shader-visible tables fence-retired */
+    b->snapshot_vertex_used = 0;
+    b->srv_tables_used = 0;         /* shader-visible tables fence-retired */
+    b->sampler_tables_used = 0;
+    memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
+    memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
+opened:
+    if (b->tail_breakdown && !b->tail_query_open &&
+        b->tail_query_count < NRB_TAIL_GPU_INTERVALS) {
+        const u32 query = b->tail_query_count * 2u;
+        b->list->lpVtbl->EndQuery(
+            b->list, b->tail_query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP, query);
+        b->tail_query_open = 1;
+    }
     return 0;
+}
+
+static void nrb_tail_close_gpu_interval(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_submit_cause cause)
+{
+    if (!b->tail_breakdown || !b->tail_query_open)
+        return;
+    if (b->tail_query_count >= NRB_TAIL_GPU_INTERVALS) {
+        b->stats.tail_gpu_intervals_dropped++;
+        b->tail_query_open = 0;
+        return;
+    }
+    const u32 slot = b->tail_query_count;
+    const u32 query = slot * 2u;
+    b->list->lpVtbl->EndQuery(
+        b->list, b->tail_query_heap,
+        D3D12_QUERY_TYPE_TIMESTAMP, query + 1u);
+    b->list->lpVtbl->ResolveQueryData(
+        b->list, b->tail_query_heap,
+        D3D12_QUERY_TYPE_TIMESTAMP, query, 2u,
+        b->tail_query_readback, (u64)slot * 2u * sizeof(u64));
+    b->tail_query_cause[slot] = (u8)cause;
+    b->tail_query_frame[slot] = (u32)(b->stats.presents + 1u);
+    b->tail_query_count++;
+    b->tail_query_open = 0;
 }
 
 static int nrb_exec_wait(rsx_nr_d3d12* b,
@@ -658,10 +805,18 @@ static int nrb_exec_wait(rsx_nr_d3d12* b,
 {
     if (!b->list_open)
         return 0;
-    const u32 attributed_descriptors = b->descriptor_tables_used;
+    if (b->snapshot_prepare_id) {
+        b->snapshot_prepare_submitted = 1u;
+        b->snapshot_prepare_submit_cause = (u32)cause;
+        if ((u32)cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT)
+            b->stats.snapshot_prepare_submissions[cause]++;
+    }
+    const u32 attributed_descriptors =
+        b->srv_tables_used + b->sampler_tables_used;
     const u32 attributed_upload = b->upload_used;
     const u64 attribution_start = nrb_submit_now(b);
     const u64 stall_start = nrb_stall_now(b);
+    nrb_tail_close_gpu_interval(b, cause);
     int result = 0;
     if (b->shared_timeline) {
         nrb_release_timeline_lease(b);
@@ -673,7 +828,11 @@ static int nrb_exec_wait(rsx_nr_d3d12* b,
         b->list_open = 0;
         nrb_release_retired_textures(b);
         b->upload_used = 0;
-        b->descriptor_tables_used = 0;
+        b->snapshot_vertex_used = 0;
+        b->srv_tables_used = 0;
+        b->sampler_tables_used = 0;
+        memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
+        memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
         b->stats.queue_submissions++;
         b->stats.shared_timeline_forced_submissions++;
         goto done;
@@ -701,15 +860,21 @@ done:
     return result;
 }
 
-static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b)
+static int nrb_ensure_descriptor_capacity(rsx_nr_d3d12* b,
+                                          int need_srv,
+                                          int need_sampler)
 {
-    if (b->descriptor_tables_used >= NRB_DRAW_TABLES) {
+    const int recycle =
+        (need_srv && b->srv_tables_used >= NRB_SRV_DRAW_TABLES) ||
+        (need_sampler &&
+         b->sampler_tables_used >= NRB_SAMPLER_DRAW_TABLES);
+    if (recycle) {
         if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_DESCRIPTOR_RECYCLE, 0u) ||
             nrb_open_list(b))
             return -1;
     }
     return b->retired_texture_count + NRB_TEX_UNITS <=
-        NRB_MAX_RETIRED_TEXTURES ? 0 : -1;
+        NRB_MAX_RETIRED_TEXTURES ? recycle : -1;
 }
 
 static void nrb_retire_texture(rsx_nr_d3d12* b, ID3D12Resource* resource)
@@ -800,6 +965,67 @@ static ID3D12Resource* nrb_make_buffer(ID3D12Device* dev, u64 size,
             &IID_ID3D12Resource, (void**)&res)))
         return NULL;
     return res;
+}
+
+/* The public snapshot-recording entry point is also exercised directly by
+ * the offline D3D12 equivalence suite, without selecting the runtime graph
+ * mode through the environment.  Allocate this fixed arena on first explicit
+ * use so the API has identical semantics in tests and production.  This is a
+ * one-time setup operation, never a per-draw allocation. */
+static int nrb_ensure_snapshot_vertex_upload(rsx_nr_d3d12* b)
+{
+    if (b->snapshot_vertex_upload && b->snapshot_vertex_gpu &&
+        b->snapshot_vertex_mapped)
+        return 0;
+    if (b->snapshot_vertex_upload || b->snapshot_vertex_gpu ||
+        b->snapshot_vertex_mapped)
+        return -1;
+    b->snapshot_vertex_upload = nrb_make_buffer(
+        b->dev, NRB_SNAPSHOT_VERTEX_BYTES, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!b->snapshot_vertex_upload)
+        return -1;
+    b->snapshot_vertex_gpu = nrb_make_buffer(
+        b->dev, NRB_SNAPSHOT_VERTEX_BYTES, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!b->snapshot_vertex_gpu) {
+        b->snapshot_vertex_upload->lpVtbl->Release(
+            b->snapshot_vertex_upload);
+        b->snapshot_vertex_upload = NULL;
+        return -1;
+    }
+    D3D12_RANGE none = {0, 0};
+    if (FAILED(b->snapshot_vertex_upload->lpVtbl->Map(
+            b->snapshot_vertex_upload, 0, &none,
+            (void**)&b->snapshot_vertex_mapped))) {
+        b->snapshot_vertex_upload->lpVtbl->Release(
+            b->snapshot_vertex_upload);
+        b->snapshot_vertex_upload = NULL;
+        b->snapshot_vertex_gpu->lpVtbl->Release(b->snapshot_vertex_gpu);
+        b->snapshot_vertex_gpu = NULL;
+        return -1;
+    }
+    b->snapshot_vertex_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    return 0;
+}
+
+static int nrb_snapshot_vertex_transition(
+    rsx_nr_d3d12* b, D3D12_RESOURCE_STATES state)
+{
+    if (!b->snapshot_vertex_gpu || nrb_open_list(b) != 0)
+        return -1;
+    if (b->snapshot_vertex_state == state)
+        return 0;
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = b->snapshot_vertex_gpu;
+    barrier.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = b->snapshot_vertex_state;
+    barrier.Transition.StateAfter = state;
+    b->list->lpVtbl->ResourceBarrier(b->list, 1u, &barrier);
+    b->snapshot_vertex_state = state;
+    return 0;
 }
 
 /* ---- render targets ---------------------------------------------------- */
@@ -1568,7 +1794,8 @@ static int nrb_span_current(const rsx_nr_d3d12* b, u32 space, u32 offset,
 }
 
 static int nrb_add_required_span(nrb_required_span* spans, u32* count,
-                                 u32 space, u64 offset, u64 size)
+                                 u32 space, u64 offset, u64 size,
+                                 u32 source, u32 first_element)
 {
     if (!size || offset > UINT32_MAX || size > UINT32_MAX ||
         offset + size > 0x100000000ull ||
@@ -1577,6 +1804,8 @@ static int nrb_add_required_span(nrb_required_span* spans, u32* count,
     spans[*count].space = space;
     spans[*count].offset = (u32)offset;
     spans[*count].size = (u32)size;
+    spans[*count].source = source;
+    spans[*count].first_element = first_element;
     (*count)++;
     return 0;
 }
@@ -1874,18 +2103,6 @@ static int nrb_needs_expansion(u32 primitive)
            primitive == 9u || primitive == 10u;
 }
 
-typedef struct nrb_fp_info {
-    const u8* bytes;
-    u32 size;
-    u32 texture_mask;
-    u32 unsupported;
-    u32 first_unsupported_offset;
-    u32 first_unsupported_opcode;
-    u32 first_unsupported_reason;
-    u64 structural_hash;
-    rsx_fp_constant_block constants;
-} nrb_fp_info;
-
 /* Complete worst-case bump-arena footprint of one draw.  Constants are per
  * action, pull constants are per emitted D3D draw, and host-expanded indices
  * conservatively reserve three output indices per source element. */
@@ -1987,6 +2204,7 @@ static int nrb_fp_opcode_supported(u32 opcode)
 #define NRB_TEX_DXT45       0x88u
 #define NRB_TEX_G8B8        0x8Bu
 #define NRB_TEX_DEPTH24_D8  0x90u
+#define NRB_TEX_D8R8G8B8    0x9Eu
 #define NRB_VTEX_W16Z16Y16X16_FLOAT 0x9Au
 #define NRB_VTEX_W32Z32Y32X32_FLOAT 0x9Bu
 #define NRB_VTEX_X32_FLOAT          0x9Cu
@@ -2132,6 +2350,7 @@ static u32 nrb_texture_span(const rsx_nir_texture* texture)
     case NRB_TEX_R5G6B5:
     case NRB_TEX_G8B8: texel = 2; break;
     case NRB_TEX_A8R8G8B8:
+    case NRB_TEX_D8R8G8B8:
     case NRB_TEX_DEPTH24_D8: texel = 4; break;
     default: return 0;
     }
@@ -2345,7 +2564,8 @@ fail_depth:
     case NRB_TEX_A4R4G4B4:
     case NRB_TEX_R5G6B5:
     case NRB_TEX_G8B8: texel = 2; break;
-    case NRB_TEX_A8R8G8B8: texel = 4; break;
+    case NRB_TEX_A8R8G8B8:
+    case NRB_TEX_D8R8G8B8: texel = 4; break;
     default: return NULL;
     }
     if (!linear && ((texture->width & (texture->width - 1u)) ||
@@ -2477,6 +2697,75 @@ static u64 nrb_hana_hash(const void* data, size_t size)
         hash *= 0x100000001B3ull;
     }
     return hash;
+}
+
+static u32 nrb_find_srv_table(rsx_nr_d3d12* b,
+                              const nrb_srv_table_key* key)
+{
+    const u64 hash = nrb_hana_hash(key, sizeof(*key));
+    for (u32 probe = 0; probe < NRB_SRV_TABLE_INDEX_CAP; ++probe) {
+        const u32 slot = (u32)(hash + probe) &
+            (NRB_SRV_TABLE_INDEX_CAP - 1u);
+        const u32 packed = b->srv_table_index[slot];
+        if (!packed)
+            return UINT32_MAX;
+        const u32 index = packed - 1u;
+        if (index < b->srv_tables_used &&
+            memcmp(&b->srv_table_keys[index], key, sizeof(*key)) == 0)
+            return index;
+    }
+    return UINT32_MAX;
+}
+
+static int nrb_insert_srv_table(rsx_nr_d3d12* b,
+                                const nrb_srv_table_key* key,
+                                u32 index)
+{
+    const u64 hash = nrb_hana_hash(key, sizeof(*key));
+    for (u32 probe = 0; probe < NRB_SRV_TABLE_INDEX_CAP; ++probe) {
+        const u32 slot = (u32)(hash + probe) &
+            (NRB_SRV_TABLE_INDEX_CAP - 1u);
+        if (!b->srv_table_index[slot]) {
+            b->srv_table_index[slot] = index + 1u;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static u32 nrb_find_sampler_table(rsx_nr_d3d12* b,
+                                  const nrb_sampler_table_key* key)
+{
+    const u64 hash = nrb_hana_hash(key, sizeof(*key));
+    for (u32 probe = 0; probe < NRB_SAMPLER_TABLE_INDEX_CAP; ++probe) {
+        const u32 slot = (u32)(hash + probe) &
+            (NRB_SAMPLER_TABLE_INDEX_CAP - 1u);
+        const u32 packed = b->sampler_table_index[slot];
+        if (!packed)
+            return UINT32_MAX;
+        const u32 index = packed - 1u;
+        if (index < b->sampler_tables_used &&
+            memcmp(&b->sampler_table_keys[index], key,
+                   sizeof(*key)) == 0)
+            return index;
+    }
+    return UINT32_MAX;
+}
+
+static int nrb_insert_sampler_table(rsx_nr_d3d12* b,
+                                    const nrb_sampler_table_key* key,
+                                    u32 index)
+{
+    const u64 hash = nrb_hana_hash(key, sizeof(*key));
+    for (u32 probe = 0; probe < NRB_SAMPLER_TABLE_INDEX_CAP; ++probe) {
+        const u32 slot = (u32)(hash + probe) &
+            (NRB_SAMPLER_TABLE_INDEX_CAP - 1u);
+        if (!b->sampler_table_index[slot]) {
+            b->sampler_table_index[slot] = index + 1u;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static u64 nrb_hana_fp_hash(const void* data, size_t size)
@@ -2987,17 +3276,24 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
                                 nrb_depth* depth_aliases[NRB_TEX_UNITS],
                                 nrb_rt* vtex_aliases[NRB_VTEX_UNITS],
                                 nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS],
-                                u32* cube_mask_out, u32* table_index_out)
+                                u32* cube_mask_out,
+                                u32* srv_table_index_out,
+                                u32* sampler_table_index_out)
 {
     const u32 null_slot = NRB_TEX_CAP;
     u32 cube_mask = 0;
     u32 source_slots[NRB_TEX_UNITS];
     u32 vtex_source_slots[NRB_VTEX_UNITS];
     D3D12_SAMPLER_DESC samplers[NRB_TEX_UNITS];
-    nrb_descriptor_table_key table_key;
-    memset(&table_key, 0, sizeof(table_key));
-    table_key.texture_mask = texture_mask;
-    table_key.vtex_mask = vtex_mask;
+    const rsx_nir_texture inactive_texture = {0};
+    const D3D12_SAMPLER_DESC inactive_sampler =
+        nrb_sampler(&inactive_texture);
+    nrb_srv_table_key srv_key;
+    nrb_sampler_table_key sampler_key;
+    memset(&srv_key, 0, sizeof(srv_key));
+    memset(&sampler_key, 0, sizeof(sampler_key));
+    srv_key.texture_mask = texture_mask;
+    srv_key.vtex_mask = vtex_mask;
     for (u32 unit = 0; unit < NRB_TEX_UNITS; unit++) {
         const rsx_nir_texture* texture = &st->textures[unit];
         u32 source_slot = null_slot;
@@ -3078,14 +3374,16 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
             }
         }
         source_slots[unit] = source_slot;
-        samplers[unit] = nrb_sampler(texture);
-        table_key.sampler[unit] = samplers[unit];
-        table_key.view[unit] = nrb_texture_key(texture);
+        samplers[unit] = texture_mask & (1u << unit)
+            ? nrb_sampler(texture) : inactive_sampler;
+        sampler_key.sampler[unit] = samplers[unit];
+        srv_key.view[unit] = texture_mask & (1u << unit)
+            ? nrb_texture_key(texture) : 0u;
         if (alias_resource)
-            table_key.resource[unit] = alias_resource;
+            srv_key.resource[unit] = alias_resource;
         else if (source_slot < b->textures.cap &&
                  b->textures.slots[source_slot].live)
-            table_key.resource[unit] =
+            srv_key.resource[unit] =
                 b->textures.slots[source_slot].backend_id;
     }
     for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit) {
@@ -3103,58 +3401,76 @@ static int nrb_prepare_textures(rsx_nr_d3d12* b,
             }
         }
         vtex_source_slots[unit] = source_slot;
-        table_key.view[NRB_TEX_UNITS + unit] = nrb_texture_key(texture);
+        srv_key.view[NRB_TEX_UNITS + unit] = vtex_mask & (1u << unit)
+            ? nrb_texture_key(texture) : 0u;
         if (source_slot < b->textures.cap &&
             b->textures.slots[source_slot].live)
-            table_key.resource[NRB_TEX_UNITS + unit] =
+            srv_key.resource[NRB_TEX_UNITS + unit] =
                 b->textures.slots[source_slot].backend_id;
     }
-    /* Descriptor tables are immutable for the lifetime of an open command
-     * list. Exact resource/view/sampler reuse is therefore safe and avoids
-     * consuming one of D3D12's 128 sampler tables for every draw. A refreshed
-     * texture receives a different resource pointer while the old resource is
-     * fence-retired, so it cannot alias an earlier key in this generation. */
-    for (u32 i = 0; i < b->descriptor_tables_used; ++i) {
-        if (memcmp(&b->descriptor_table_keys[i], &table_key,
-                   sizeof(table_key)) == 0) {
-            *cube_mask_out = cube_mask;
-            *table_index_out = i;
-            b->stats.descriptor_table_hits++;
-            return 0;
-        }
-    }
-    /* Resolve/upload may have submitted a full upload ring and therefore
-     * reset this fence generation. Allocate the immutable descriptor table
-     * only after all such work is complete. Each recorded draw receives a
-     * distinct table; descriptors are never rewritten before its fence. */
-    if (nrb_ensure_descriptor_capacity(b) != 0) {
+    /* SRV identities and sampler state have independent lifetimes. Keeping
+     * them in one key consumed one complete 16-sampler table whenever a
+     * texture resource generation changed, hitting D3D12's 2,048-sampler
+     * heap limit many times per frame. Cache the two immutable tables
+     * independently: resource churn now consumes only the much larger SRV
+     * heap, while structural sampler states reuse the bounded sampler heap. */
+    u32 srv_index = nrb_find_srv_table(b, &srv_key);
+    u32 sampler_index = nrb_find_sampler_table(b, &sampler_key);
+    int need_srv = srv_index == UINT32_MAX;
+    int need_sampler = sampler_index == UINT32_MAX;
+    const int capacity = nrb_ensure_descriptor_capacity(
+        b, need_srv, need_sampler);
+    if (capacity < 0) {
         nrb_note_first_texture_failure(
             b, 7u, ~0u, -1, texture_mask, NULL);
         return -1;
     }
-    const u32 table_index = b->descriptor_tables_used++;
-    b->descriptor_table_keys[table_index] = table_key;
-    b->stats.descriptor_table_builds++;
-    const u32 srv_base = table_index * NRB_SRV_TABLE_STRIDE;
-    const u32 sampler_base = table_index * NRB_SAMPLER_TABLE_STRIDE;
-    for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit) {
-        b->dev->lpVtbl->CopyDescriptorsSimple(
-            b->dev, 1, nrb_texture_gpu_cpu_handle(b, srv_base + unit),
-            nrb_texture_cpu_handle(b, source_slots[unit]),
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        b->dev->lpVtbl->CreateSampler(
-            b->dev, &samplers[unit],
-            nrb_sampler_cpu_handle(b, sampler_base + unit));
+    if (capacity) {
+        srv_index = 0u;
+        sampler_index = 0u;
+        need_srv = 1;
+        need_sampler = 1;
     }
-    for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
-        b->dev->lpVtbl->CopyDescriptorsSimple(
-            b->dev, 1,
-            nrb_texture_gpu_cpu_handle(
-                b, srv_base + NRB_TEX_UNITS + unit),
-            nrb_texture_cpu_handle(b, vtex_source_slots[unit]),
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (need_srv) {
+        srv_index = b->srv_tables_used++;
+        b->srv_table_keys[srv_index] = srv_key;
+        if (nrb_insert_srv_table(b, &srv_key, srv_index) != 0)
+            return -1;
+        const u32 srv_base = srv_index * NRB_SRV_TABLE_STRIDE;
+        for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit)
+            b->dev->lpVtbl->CopyDescriptorsSimple(
+                b->dev, 1,
+                nrb_texture_gpu_cpu_handle(b, srv_base + unit),
+                nrb_texture_cpu_handle(b, source_slots[unit]),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (u32 unit = 0; unit < NRB_VTEX_UNITS; ++unit)
+            b->dev->lpVtbl->CopyDescriptorsSimple(
+                b->dev, 1,
+                nrb_texture_gpu_cpu_handle(
+                    b, srv_base + NRB_TEX_UNITS + unit),
+                nrb_texture_cpu_handle(b, vtex_source_slots[unit]),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    if (need_sampler) {
+        sampler_index = b->sampler_tables_used++;
+        b->sampler_table_keys[sampler_index] = sampler_key;
+        if (nrb_insert_sampler_table(
+                b, &sampler_key, sampler_index) != 0)
+            return -1;
+        const u32 sampler_base =
+            sampler_index * NRB_SAMPLER_TABLE_STRIDE;
+        for (u32 unit = 0; unit < NRB_TEX_UNITS; ++unit)
+            b->dev->lpVtbl->CreateSampler(
+                b->dev, &samplers[unit],
+                nrb_sampler_cpu_handle(b, sampler_base + unit));
+    }
+    if (!need_srv && !need_sampler)
+        b->stats.descriptor_table_hits++;
+    else
+        b->stats.descriptor_table_builds++;
     *cube_mask_out = cube_mask;
-    *table_index_out = table_index;
+    *srv_table_index_out = srv_index;
+    *sampler_table_index_out = sampler_index;
     return 0;
 }
 
@@ -3398,8 +3714,8 @@ static void nrb_hana_input_capture(
 }
 
 static void nrb_restore_texture_alias_set(
-    rsx_nr_d3d12* b, nrb_rt** aliases,
-    nrb_depth** depth_aliases, u32 count)
+    rsx_nr_d3d12* b, nrb_rt* const* aliases,
+    nrb_depth* const* depth_aliases, u32 count)
 {
     for (u32 unit = 0; unit < count; unit++) {
         if (aliases[unit])
@@ -3412,10 +3728,10 @@ static void nrb_restore_texture_alias_set(
 }
 
 static void nrb_restore_texture_aliases(
-    rsx_nr_d3d12* b, nrb_rt* aliases[NRB_TEX_UNITS],
-    nrb_depth* depth_aliases[NRB_TEX_UNITS],
-    nrb_rt* vtex_aliases[NRB_VTEX_UNITS],
-    nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS])
+    rsx_nr_d3d12* b, nrb_rt* const aliases[NRB_TEX_UNITS],
+    nrb_depth* const depth_aliases[NRB_TEX_UNITS],
+    nrb_rt* const vtex_aliases[NRB_VTEX_UNITS],
+    nrb_depth* const vtex_depth_aliases[NRB_VTEX_UNITS])
 {
     nrb_restore_texture_alias_set(
         b, aliases, depth_aliases, NRB_TEX_UNITS);
@@ -4146,7 +4462,10 @@ static int nrb_index_bounds(rsx_nr_d3d12* b,
     if (mirror_indices && min_byte != UINT64_MAX &&
         nrb_add_required_span(spans, span_count,
                               st->index_binding.location, min_byte,
-                              max_byte - min_byte) != 0)
+                              max_byte - min_byte,
+                              RSX_NIR_NUM_VERTEX_ATTR,
+                              (u32)((min_byte -
+                                  st->index_binding.offset) / esize)) != 0)
         return -1;
     if (!have_value)
         return 1;                   /* restart-only draw: no vertex fetch */
@@ -4178,7 +4497,7 @@ static int nrb_add_attr_element_span(rsx_nr_d3d12* b,
         return 0;                   /* shader returns the RSX default */
     const u64 clipped_last = last < limit ? last : limit;
     return nrb_add_required_span(spans, span_count, space, first,
-                                 clipped_last - first);
+                                 clipped_last - first, attr, elem_min);
 }
 
 static int nrb_prepare_draw_residency(rsx_nr_d3d12* b,
@@ -4720,8 +5039,11 @@ static int nrb_preflight_draw_impl(rsx_nr_d3d12* b,
      * guest producer can publish while the mirror copy is being recorded.
      * Repair that race before the section becomes native-owned. */
     const u64 residency_stabilize_start = nrb_stall_now(b);
-    const int residency_stabilize = nrb_stabilize_required_spans(
-        b, required, required_count);
+    const int residency_stabilize = b->snapshot_prepare_id &&
+            b->snapshot_compact_vertex
+        ? nrb_capture_snapshot_vertex_spans(
+              b, required, required_count)
+        : nrb_stabilize_required_spans(b, required, required_count);
     nrb_stall_finish(b, residency_stabilize_start,
                      &b->stats.stall_residency_stabilize_count,
                      &b->stats.stall_residency_stabilize_ticks);
@@ -4908,18 +5230,281 @@ static void nrb_hana_condition_note(rsx_nr_d3d12* b,
     added->skipped = value == 0u;
 }
 
+static int nrb_prepare_draw_constants(
+    rsx_nr_d3d12* b, const rsx_nir_pipeline* st,
+    const nrb_fp_info* fp, const nrb_rt* rt, u64 upload_budget,
+    u32 prepared_batch_count, nrb_draw_snapshot* snapshot)
+{
+    const u32 vp_cb_bytes = sizeof(st->constants) + 12u * sizeof(float);
+    u8* cp = nrb_upload_alloc(
+        b, vp_cb_bytes, &snapshot->vp_constants_va);
+    if (!cp) {
+        nrb_note_draw_upload_failure(
+            b, 3u, upload_budget, vp_cb_bytes, prepared_batch_count);
+        return -1;
+    }
+    memcpy(cp, st->constants, sizeof(st->constants));
+    float* xf = (float*)(cp + sizeof(st->constants));
+    const float w = (float)(st->surface.clip_w
+        ? st->surface.clip_w : rt->w);
+    const float h = (float)(st->surface.clip_h
+        ? st->surface.clip_h : rt->h);
+    xf[0] = 1.0f; xf[1] = 1.0f; xf[2] = 1.0f; xf[3] = 0.0f;
+    xf[4] = 0.0f; xf[5] = 0.0f; xf[6] = 0.0f; xf[7] = 0.0f;
+    if (st->viewport.scale[0] != 0.0f ||
+        st->viewport.translate[0] != 0.0f) {
+        xf[0] = st->viewport.scale[0] / (w * 0.5f);
+        xf[1] = -(st->viewport.scale[1] / (h * 0.5f));
+        xf[2] = st->viewport.scale[2];
+        xf[4] = (st->viewport.translate[0] - w * 0.5f) / (w * 0.5f);
+        xf[5] = -((st->viewport.translate[1] - h * 0.5f) / (h * 0.5f));
+        xf[6] = st->viewport.translate[2];
+    }
+    u32* branch_words = (u32*)(xf + 8u);
+    branch_words[0] = st->vertex_program.branch_bits;
+    branch_words[1] = 0u;
+    branch_words[2] = 0u;
+    branch_words[3] = 0u;
+
+    const u32 fp_slots = fp->constants.count ? fp->constants.count : 1u;
+    const u32 fp_cb_bytes = (fp_slots + 1u) * 16u;
+    u8* fp_cp = nrb_upload_alloc(
+        b, fp_cb_bytes, &snapshot->fp_constants_va);
+    if (!fp_cp) {
+        nrb_note_draw_upload_failure(
+            b, 4u, upload_budget, fp_cb_bytes, prepared_batch_count);
+        return -1;
+    }
+    memset(fp_cp, 0, fp_cb_bytes);
+    if (fp->constants.count)
+        memcpy(fp_cp, fp->constants.values, fp->constants.count * 16u);
+    const float alpha_ref = rsx_fp_alpha_ref(
+        st->blend.alpha_ref, st->surface.color_format);
+    memcpy(fp_cp + fp_slots * 16u, &alpha_ref, sizeof(alpha_ref));
+
+    snapshot->scissor = st->scissor;
+    snapshot->render_condition = st->render_condition;
+    snapshot->depth_bounds_test_enable =
+        st->depth_stencil.depth_bounds_test_enable;
+    snapshot->depth_bounds_min = st->depth_stencil.depth_bounds_min;
+    snapshot->depth_bounds_max = st->depth_stencil.depth_bounds_max;
+    snapshot->depth_write_enable = st->depth_stencil.depth_write_enable;
+    snapshot->stencil_ref = st->depth_stencil.stencil_ref & 0xFFu;
+    snapshot->blend_factor[0] =
+        (float)((st->blend.blend_color >> 16) & 0xFFu) / 255.0f;
+    snapshot->blend_factor[1] =
+        (float)((st->blend.blend_color >> 8) & 0xFFu) / 255.0f;
+    snapshot->blend_factor[2] =
+        (float)(st->blend.blend_color & 0xFFu) / 255.0f;
+    snapshot->blend_factor[3] =
+        (float)((st->blend.blend_color >> 24) & 0xFFu) / 255.0f;
+    return 0;
+}
+
+static int nrb_record_prepared_draw(
+    rsx_nr_d3d12* b, const nrb_draw_snapshot* snapshot,
+    const nrb_prepared_batch* prepared_batches)
+{
+    nrb_rt* const rt = snapshot->rt;
+    nrb_depth* const depth = snapshot->depth;
+    const u32 prepared_batch_count = snapshot->prepared_batch_count;
+    const u64 command_record_start = nrb_stall_now(b);
+    const int immutable_vertex = snapshot->immutable_vertex != 0u;
+    if (immutable_vertex && nrb_snapshot_vertex_transition(
+            b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) != 0)
+        return -1;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrb_rt_handle(b, rt);
+    nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (depth) {
+        nrb_depth_transition(b, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = nrb_depth_handle(b, depth);
+        b->list->lpVtbl->OMSetRenderTargets(b->list, 1, &rtv, FALSE, &dsv);
+    } else {
+        b->list->lpVtbl->OMSetRenderTargets(b->list, 1, &rtv, FALSE, NULL);
+    }
+
+    D3D12_VIEWPORT vp = {0};
+    vp.Width = (float)rt->w;
+    vp.Height = (float)rt->h;
+    vp.MaxDepth = 1.0f;
+    b->list->lpVtbl->RSSetViewports(b->list, 1, &vp);
+    D3D12_RECT sc;
+    sc.left = (LONG)snapshot->scissor.x;
+    sc.top = (LONG)snapshot->scissor.y;
+    sc.right = (LONG)(snapshot->scissor.w
+        ? snapshot->scissor.x + snapshot->scissor.w : rt->w);
+    sc.bottom = (LONG)(snapshot->scissor.h
+        ? snapshot->scissor.y + snapshot->scissor.h : rt->h);
+    if (sc.left < 0) sc.left = 0;
+    if (sc.top < 0) sc.top = 0;
+    if (sc.right > (LONG)rt->w) sc.right = (LONG)rt->w;
+    if (sc.bottom > (LONG)rt->h) sc.bottom = (LONG)rt->h;
+    if (sc.right < sc.left) sc.right = sc.left;
+    if (sc.bottom < sc.top) sc.bottom = sc.top;
+    b->list->lpVtbl->RSSetScissorRects(b->list, 1, &sc);
+    if (b->depth_bounds_supported && b->list1) {
+        float zmin = 0.0f;
+        float zmax = 1.0f;
+        if (snapshot->depth_bounds_test_enable) {
+            memcpy(&zmin, &snapshot->depth_bounds_min, sizeof(zmin));
+            memcpy(&zmax, &snapshot->depth_bounds_max, sizeof(zmax));
+        }
+        b->list1->lpVtbl->OMSetDepthBounds(b->list1, zmin, zmax);
+    }
+
+    ID3D12DescriptorHeap* descriptor_heaps[2] = {
+        b->texture_gpu_heap, b->sampler_gpu_heap
+    };
+    b->list->lpVtbl->SetDescriptorHeaps(b->list, 2, descriptor_heaps);
+    b->list->lpVtbl->SetGraphicsRootSignature(b->list, b->rootsig);
+    const u32 srv_table_base =
+        snapshot->srv_table_index * NRB_SRV_TABLE_STRIDE;
+    const u32 sampler_table_base =
+        snapshot->sampler_table_index * NRB_SAMPLER_TABLE_STRIDE;
+    b->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        b->list, 5, nrb_texture_gpu_handle(b, srv_table_base));
+    b->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        b->list, 6, nrb_sampler_gpu_handle(b, sampler_table_base));
+    b->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        b->list, 7,
+        nrb_texture_gpu_handle(b, srv_table_base + NRB_TEX_UNITS));
+    b->list->lpVtbl->SetPipelineState(b->list, snapshot->pso);
+    b->list->lpVtbl->IASetPrimitiveTopology(
+        b->list, snapshot->topology);
+
+    b->list->lpVtbl->SetGraphicsRootConstantBufferView(
+        b->list, 0, snapshot->vp_constants_va);
+    b->list->lpVtbl->SetGraphicsRootConstantBufferView(
+        b->list, 4, snapshot->fp_constants_va);
+    b->list->lpVtbl->OMSetBlendFactor(
+        b->list, snapshot->blend_factor);
+    b->list->lpVtbl->OMSetStencilRef(
+        b->list, snapshot->stencil_ref);
+
+    ID3D12Resource* rl = immutable_vertex
+        ? b->snapshot_vertex_gpu
+        : (ID3D12Resource*)rsx_gpu_mirror_d3d12_buffer(b->mirror_be, 0);
+    ID3D12Resource* rm = immutable_vertex
+        ? b->snapshot_vertex_gpu
+        : (ID3D12Resource*)rsx_gpu_mirror_d3d12_buffer(b->mirror_be, 1);
+    if (rl)
+        b->list->lpVtbl->SetGraphicsRootShaderResourceView(
+            b->list, 2, rl->lpVtbl->GetGPUVirtualAddress(rl));
+    if (rm)
+        b->list->lpVtbl->SetGraphicsRootShaderResourceView(
+            b->list, 3, rm->lpVtbl->GetGPUVirtualAddress(rm));
+
+    for (u32 bi = 0; bi < prepared_batch_count; bi++) {
+        const nrb_prepared_batch* prepared = &prepared_batches[bi];
+        if (prepared->skip) {
+            b->stats.draw_batches++;
+            continue;
+        }
+        if (snapshot->use_host_ib) {
+            D3D12_INDEX_BUFFER_VIEW ibv;
+            ibv.BufferLocation = prepared->index_va;
+            ibv.SizeInBytes = prepared->draw_count * sizeof(u32);
+            ibv.Format = DXGI_FORMAT_R32_UINT;
+            b->list->lpVtbl->IASetIndexBuffer(b->list, &ibv);
+        }
+        b->list->lpVtbl->SetGraphicsRootConstantBufferView(
+            b->list, 1, prepared->pull_va);
+        if (snapshot->use_host_ib)
+            b->list->lpVtbl->DrawIndexedInstanced(
+                b->list, prepared->draw_count, 1, 0, 0, 0);
+        else
+            b->list->lpVtbl->DrawInstanced(
+                b->list, prepared->draw_count, 1, 0, 0);
+        b->stats.draw_batches++;
+    }
+
+    if (depth && snapshot->depth_write_enable) {
+        depth->sample_valid = 0;
+        depth->write_generation++;
+    }
+    nrb_restore_texture_aliases(
+        b, snapshot->texture_aliases,
+        snapshot->texture_depth_aliases,
+        snapshot->vtex_aliases,
+        snapshot->vtex_depth_aliases);
+    if (snapshot->filter_restart)
+        b->stats.restart_draws++;
+    b->stats.real_fp_draws++;
+    if (snapshot->fp_texture_mask || snapshot->vtex_mask)
+        b->stats.texture_draws++;
+    if (b->scanout_provenance)
+        rt->draw_writes++;
+    nrb_note_rt_write(b, rt);
+    b->stats.draws++;
+    if (snapshot >= b->draw_snapshots &&
+        snapshot < b->draw_snapshots + NRB_SNAPSHOT_DRAW_CAP)
+        b->stats.snapshot_draws_executed++;
+    nrb_stall_finish(b, command_record_start,
+                     &b->stats.stall_command_record_count,
+                     &b->stats.stall_command_record_ticks);
+    return 0;
+}
+
 static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                          const u32* vp_words, u32 vp_word_count,
                          const rsx_nir_draw* d, const u32* batches)
 {
     rsx_nr_d3d12* b = user;
 
+    if (d->snapshot_id) {
+        const u32 slot = d->snapshot_id - 1u;
+        if (b->snapshot_prepare_id || slot >= b->snapshot_count ||
+            !b->draw_snapshots[slot].valid) {
+            b->stats.snapshot_execute_failures++;
+            if (!b->stats.first_snapshot_execute_failure_stage) {
+                b->stats.first_snapshot_execute_failure_stage = 1u;
+                b->stats.first_snapshot_execute_id = d->snapshot_id;
+                b->stats.first_snapshot_execute_count = b->snapshot_count;
+                b->stats.first_snapshot_execute_valid =
+                    slot < NRB_SNAPSHOT_DRAW_CAP
+                        ? b->draw_snapshots[slot].valid : 0u;
+            }
+            return -1;
+        }
+        const nrb_draw_snapshot* const snapshot =
+            &b->draw_snapshots[slot];
+        if (snapshot->render_condition.enabled) {
+            u32 value = 0;
+            if (!b->render_condition_read ||
+                b->render_condition_read(
+                    b->render_condition_user,
+                    snapshot->render_condition.dma_report,
+                    snapshot->render_condition.offset, &value) != 0) {
+                b->stats.snapshot_execute_failures++;
+                if (!b->stats.first_snapshot_execute_failure_stage) {
+                    b->stats.first_snapshot_execute_failure_stage = 2u;
+                    b->stats.first_snapshot_execute_id = d->snapshot_id;
+                    b->stats.first_snapshot_execute_count = b->snapshot_count;
+                    b->stats.first_snapshot_execute_valid = snapshot->valid;
+                    b->stats.first_snapshot_execute_condition_dma =
+                        snapshot->render_condition.dma_report;
+                    b->stats.first_snapshot_execute_condition_offset =
+                        snapshot->render_condition.offset;
+                }
+                return -1;
+            }
+            nrb_hana_condition_note(b, st, value);
+            if (!value) {
+                b->stats.conditional_draws_skipped++;
+                return 0;
+            }
+        }
+        return nrb_record_prepared_draw(
+            b, snapshot,
+            b->snapshot_batches + snapshot->prepared_batch_offset);
+    }
+
     /* Evaluate as late as possible, before allocating/opening/recording any
      * draw work. Preflight proved only that the exact report address is
      * resolvable; a preceding report action or guest writer may have changed
      * its value since then. A false condition consumes this draw without
      * side effects, exactly as NV4097 conditional rendering does. */
-    if (st->render_condition.enabled) {
+    if (!b->snapshot_prepare_id && st->render_condition.enabled) {
         u32 value = 0;
         if (!b->render_condition_read ||
             b->render_condition_read(
@@ -5117,8 +5702,11 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         }
     }
     const u64 residency_stabilize_start = nrb_stall_now(b);
-    const int residency_stabilize = nrb_stabilize_required_spans(
-        b, required, required_count);
+    const int residency_stabilize = b->snapshot_prepare_id &&
+            b->snapshot_compact_vertex
+        ? nrb_capture_snapshot_vertex_spans(
+              b, required, required_count)
+        : nrb_stabilize_required_spans(b, required, required_count);
     nrb_stall_finish(b, residency_stabilize_start,
                      &b->stats.stall_residency_stabilize_count,
                      &b->stats.stall_residency_stabilize_ticks);
@@ -5136,13 +5724,15 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
     nrb_rt* vtex_aliases[NRB_VTEX_UNITS] = {0};
     nrb_depth* vtex_depth_aliases[NRB_VTEX_UNITS] = {0};
     u32 resolved_cube_mask = 0;
-    u32 descriptor_table_index = 0;
+    u32 srv_table_index = 0;
+    u32 sampler_table_index = 0;
     const u64 texture_prepare_start = nrb_stall_now(b);
     const int texture_prepare = nrb_prepare_textures(
         b, st, fp.texture_mask, vtex_mask, rt, depth,
         texture_aliases, texture_depth_aliases,
         vtex_aliases, vtex_depth_aliases,
-        &resolved_cube_mask, &descriptor_table_index);
+        &resolved_cube_mask, &srv_table_index,
+        &sampler_table_index);
     nrb_stall_finish(b, texture_prepare_start,
                      &b->stats.stall_texture_prepare_count,
                      &b->stats.stall_texture_prepare_ticks);
@@ -5188,13 +5778,15 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         memset(vtex_aliases, 0, sizeof(vtex_aliases));
         memset(vtex_depth_aliases, 0, sizeof(vtex_depth_aliases));
         resolved_cube_mask = 0;
-        descriptor_table_index = 0;
+        srv_table_index = 0;
+        sampler_table_index = 0;
         const u64 retry_texture_prepare_start = nrb_stall_now(b);
         const int retry_texture_prepare = nrb_prepare_textures(
             b, st, fp.texture_mask, vtex_mask, rt, depth,
             texture_aliases, texture_depth_aliases,
             vtex_aliases, vtex_depth_aliases,
-            &resolved_cube_mask, &descriptor_table_index);
+            &resolved_cube_mask, &srv_table_index,
+            &sampler_table_index);
         nrb_stall_finish(b, retry_texture_prepare_start,
                          &b->stats.stall_texture_prepare_count,
                          &b->stats.stall_texture_prepare_ticks);
@@ -5277,6 +5869,47 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
             st->index_binding.offset, st->index_binding.location,
             rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 0),
             rsx_gpu_mirror_d3d12_buffer_size(b->mirror_be, 1), &pull);
+        if (b->snapshot_prepare_id && b->snapshot_compact_vertex) {
+            const nrb_snapshot_vertex_binding* const binding =
+                &b->snapshot_vertex[b->snapshot_prepare_id - 1u];
+            pull.base_offset = 0u;
+            pull.mem_size[0] = NRB_SNAPSHOT_VERTEX_BYTES;
+            pull.mem_size[1] = NRB_SNAPSHOT_VERTEX_BYTES;
+            for (u32 attr = 0; attr < RSX_NIR_NUM_VERTEX_ATTR; ++attr) {
+                if (!plan.attr[attr].pulled)
+                    continue;
+                if (binding->attr_mask & (1u << attr)) {
+                    /* The ordinary pull ABI leaves cfg.w bits 2..31 empty.
+                     * Carry the compact snapshot's first element there and
+                     * subtract it in shader before multiplying by stride.
+                     * This avoids relying on uint underflow to rebase a high
+                     * guest element into a low compact-buffer address, which
+                     * is mathematically valid but can make a driver treat the
+                     * raw-buffer access as unbounded. */
+                    pull.attr_cfg[attr][0] =
+                        binding->attr_offset[attr];
+                    pull.attr_cfg[attr][3] =
+                        (pull.attr_cfg[attr][3] & 3u) |
+                        (binding->attr_first[attr] << 2u);
+                } else {
+                    /* This attribute's guest address was outside the mapped
+                     * space and the ordinary shader would return its default.
+                     * Keep that behavior against the compact resource. */
+                    pull.attr_cfg[attr][0] = NRB_SNAPSHOT_VERTEX_BYTES;
+                }
+            }
+            if (source != RSX_PULL_SOURCE_ARRAYS) {
+                if (!binding->index_valid) {
+                    prepare_failed = 1;
+                    prepare_index_failed = 1;
+                    break;
+                }
+                pull.index_offset = binding->index_offset;
+                /* misc1.y bit zero remains the memory location; upper bits
+                 * carry the compact index span's first guest slot. */
+                pull.index_location = binding->index_first << 1u;
+            }
+        }
         u8* pull_bytes = nrb_upload_alloc(
             b, sizeof(pull), &prepared->pull_va);
         if (!pull_bytes) {
@@ -5306,6 +5939,69 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
         return -1;
     }
 
+    nrb_draw_snapshot prepared_snapshot;
+    memset(&prepared_snapshot, 0, sizeof(prepared_snapshot));
+    prepared_snapshot.valid = 1u;
+    prepared_snapshot.prepared_batch_count = prepared_batch_count;
+    prepared_snapshot.srv_table_index = srv_table_index;
+    prepared_snapshot.sampler_table_index = sampler_table_index;
+    prepared_snapshot.fp_texture_mask = fp.texture_mask;
+    prepared_snapshot.vtex_mask = vtex_mask;
+    prepared_snapshot.use_host_ib = use_host_ib != 0;
+    prepared_snapshot.filter_restart = filter_restart != 0;
+    prepared_snapshot.immutable_vertex =
+        b->snapshot_prepare_id && b->snapshot_compact_vertex;
+    prepared_snapshot.topology = topo;
+    prepared_snapshot.rt = rt;
+    prepared_snapshot.depth = depth;
+    prepared_snapshot.pso = pso;
+    prepared_snapshot.upload_budget = upload_budget;
+    if (nrb_prepare_draw_constants(
+            b, st, &fp, rt, upload_budget, prepared_batch_count,
+            &prepared_snapshot) != 0) {
+        nrb_restore_texture_aliases(
+            b, texture_aliases, texture_depth_aliases,
+            vtex_aliases, vtex_depth_aliases);
+        nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_REFUSAL_RETIREMENT, 0u);
+        b->stats.unsupported_draws++;
+        return -1;
+    }
+    memcpy(prepared_snapshot.texture_aliases, texture_aliases,
+           sizeof(texture_aliases));
+    memcpy(prepared_snapshot.texture_depth_aliases, texture_depth_aliases,
+           sizeof(texture_depth_aliases));
+    memcpy(prepared_snapshot.vtex_aliases, vtex_aliases,
+           sizeof(vtex_aliases));
+    memcpy(prepared_snapshot.vtex_depth_aliases, vtex_depth_aliases,
+           sizeof(vtex_depth_aliases));
+
+    if (b->snapshot_prepare_id) {
+        const u32 slot = b->snapshot_prepare_id - 1u;
+        if (slot >= NRB_SNAPSHOT_DRAW_CAP || slot != b->snapshot_count ||
+            prepared_batch_count >
+                NRB_SNAPSHOT_BATCH_CAP - b->snapshot_batch_count) {
+            nrb_restore_texture_aliases(
+                b, texture_aliases, texture_depth_aliases,
+                vtex_aliases, vtex_depth_aliases);
+            b->stats.snapshot_prepare_failures++;
+            return -1;
+        }
+        prepared_snapshot.prepared_batch_offset = b->snapshot_batch_count;
+        memcpy(b->snapshot_batches + b->snapshot_batch_count,
+               b->prepared_batches,
+               (size_t)prepared_batch_count * sizeof(b->prepared_batches[0]));
+        b->snapshot_batch_count += prepared_batch_count;
+        b->draw_snapshots[slot] = prepared_snapshot;
+        b->snapshot_count++;
+        b->stats.snapshot_draws_prepared++;
+        return 0;
+    }
+
+    return nrb_record_prepared_draw(
+        b, &prepared_snapshot, b->prepared_batches);
+
+#if 0 /* Pre-snapshot draw tail retained as the default-off audit oracle. */
     const u64 command_record_start = nrb_stall_now(b);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrb_rt_handle(b, rt);
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -5355,9 +6051,9 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
     b->list->lpVtbl->SetDescriptorHeaps(b->list, 2, descriptor_heaps);
     b->list->lpVtbl->SetGraphicsRootSignature(b->list, b->rootsig);
     const u32 srv_table_base =
-        descriptor_table_index * NRB_SRV_TABLE_STRIDE;
+        srv_table_index * NRB_SRV_TABLE_STRIDE;
     const u32 sampler_table_base =
-        descriptor_table_index * NRB_SAMPLER_TABLE_STRIDE;
+        sampler_table_index * NRB_SAMPLER_TABLE_STRIDE;
     b->list->lpVtbl->SetGraphicsRootDescriptorTable(
         b->list, 5, nrb_texture_gpu_handle(b, srv_table_base));
     b->list->lpVtbl->SetGraphicsRootDescriptorTable(
@@ -5503,6 +6199,7 @@ static int nrb_draw_impl(void* user, const rsx_nir_pipeline* st,
                      &b->stats.stall_command_record_count,
                      &b->stats.stall_command_record_ticks);
     return 0;
+#endif
 }
 
 static int nrb_draw(void* user, const rsx_nir_pipeline* st,
@@ -5517,6 +6214,194 @@ static int nrb_draw(void* user, const rsx_nir_pipeline* st,
                      &b->stats.stall_draw_count,
                      &b->stats.stall_draw_ticks);
     return result;
+}
+
+static void nrb_snapshot_reset(rsx_nr_d3d12* b)
+{
+    if (!b)
+        return;
+    for (u32 i = 0; i < b->snapshot_count; ++i) {
+        b->draw_snapshots[i].valid = 0u;
+        memset(&b->snapshot_vertex[i], 0,
+               sizeof(b->snapshot_vertex[i]));
+    }
+    b->snapshot_count = 0u;
+    b->snapshot_batch_count = 0u;
+    b->snapshot_prepare_id = 0u;
+    b->snapshot_prepare_submitted = 0u;
+    b->snapshot_prepare_submit_cause = RSX_NR_D3D12_SUBMIT_CAUSE_COUNT;
+    b->snapshot_state_skip = 0u;
+    b->snapshot_final_vp_count = 0u;
+}
+
+int rsx_nr_d3d12_record_snapshot_draw(
+    rsx_nr_d3d12* b, const rsx_nr_backend* recorded_state,
+    rsx_nir_stream* stream, u32 op_index)
+{
+    if (!b || !recorded_state || !stream || op_index >= stream->op_count ||
+        stream->ops[op_index].kind != RSX_NIR_OP_DRAW ||
+        b->snapshot_prepare_id || b->snapshot_count >= NRB_SNAPSHOT_DRAW_CAP)
+        return -1;
+    rsx_nir_op* const op = &stream->ops[op_index];
+    /* A conditional draw's exact report may be produced by an earlier op in
+     * this same island. Its first legal read can therefore retire the shared
+     * list. Preparing descriptor/upload identities before that dependency is
+     * satisfied would leave the draw pointing into the retired generation.
+     * Keep only this dependency-bearing family on the established execution-
+     * time preparation path; ordinary draws remain immutable snapshots. */
+    if (recorded_state->st.render_condition.enabled) {
+        op->u.draw.snapshot_id = 0u;
+        return 0;
+    }
+    const u32* const batches = rsx_nir_side(
+        stream, op->u.draw.batches_ofs, op->u.draw.batch_count * 2u);
+    if (!batches)
+        return -1;
+    if (b->snapshot_compact_vertex &&
+        nrb_ensure_snapshot_vertex_upload(b) != 0)
+        return -1;
+
+    const u32 prior_count = b->snapshot_count;
+    for (u32 attempt = 0; attempt < 2u; ++attempt) {
+        b->snapshot_prepare_submitted = 0u;
+        b->snapshot_prepare_submit_cause =
+            RSX_NR_D3D12_SUBMIT_CAUSE_COUNT;
+        b->snapshot_prepare_id = b->snapshot_count + 1u;
+        rsx_nir_draw draw = op->u.draw;
+        draw.snapshot_id = 0u;
+        const int result = nrb_draw_impl(
+            b, &recorded_state->st, recorded_state->vp_words,
+            recorded_state->vp_word_count, &draw, batches);
+        b->snapshot_prepare_id = 0u;
+        if (result != 0) {
+            b->stats.snapshot_prepare_failures++;
+            return -1;
+        }
+        if (!b->snapshot_prepare_submitted) {
+            op->u.draw.snapshot_id = b->snapshot_count;
+            return 0;
+        }
+
+        /* Resource preparation may retire a cold upload generation before it
+         * allocates this draw. With no earlier draw in the island, retry once
+         * against the now-warm caches and fresh generation. Never invalidate
+         * an earlier immutable draw merely to extend an island. */
+        if (prior_count || attempt) {
+            if (!b->stats.first_snapshot_prepare_failure_cause) {
+                b->stats.first_snapshot_prepare_failure_cause =
+                    b->snapshot_prepare_submit_cause + 1u;
+                b->stats.first_snapshot_prepare_failure_prior_draws =
+                    prior_count;
+                b->stats.first_snapshot_prepare_failure_attempt = attempt;
+            }
+            b->stats.snapshot_prepare_failures++;
+            return -1;
+        }
+        b->stats.snapshot_prepare_restarts++;
+        nrb_snapshot_reset(b);
+    }
+    return -1;
+}
+
+/* Snapshot mode must not let a later producer reuse the persistent mirror
+ * address before this island records its earlier draw. Copy every exact
+ * shader-visible vertex/index span into a monotonically allocated, mapped
+ * upload resource at decoder time. Pull constants are rebased to these
+ * immutable offsets below, so no GPU copy or late guest read is required. */
+static int nrb_capture_snapshot_vertex_spans(
+    rsx_nr_d3d12* b, const nrb_required_span* required, u32 count)
+{
+    if (!b->snapshot_prepare_id ||
+        b->snapshot_prepare_id > NRB_SNAPSHOT_DRAW_CAP ||
+        !b->snapshot_vertex_mapped || !b->snapshot_vertex_upload ||
+        !b->snapshot_vertex_gpu ||
+        nrb_snapshot_vertex_transition(
+            b, D3D12_RESOURCE_STATE_COPY_DEST) != 0)
+        return -1;
+    const u32 slot = b->snapshot_prepare_id - 1u;
+    nrb_snapshot_vertex_binding binding;
+    memset(&binding, 0, sizeof(binding));
+    const u32 allocation_start = b->snapshot_vertex_used;
+
+    for (u32 i = 0; i < count; ++i) {
+        const nrb_required_span* const span = &required[i];
+        if (!span->size || span->source > RSX_NIR_NUM_VERTEX_ATTR)
+            goto fail;
+        if (span->source < RSX_NIR_NUM_VERTEX_ATTR) {
+            const u32 bit = 1u << span->source;
+            /* A 20-bit wrap produces two affine regions for one attribute.
+             * One pull descriptor cannot represent both; retain fail-closed
+             * behavior instead of joining unrelated guest bytes. */
+            if (binding.attr_mask & bit)
+                goto fail;
+            binding.attr_mask |= bit;
+        } else if (binding.index_valid) {
+            goto fail;
+        }
+
+        const u32 aligned = (b->snapshot_vertex_used + 3u) & ~3u;
+        const u32 data_offset = aligned + (span->offset & 3u);
+        const u64 end = (u64)data_offset + span->size + 4u;
+        if (end > NRB_SNAPSHOT_VERTEX_BYTES)
+            goto fail;
+        const u8* const src = b->guest_ptr(
+            b->guest_user, span->space, span->offset, span->size);
+        if (!src)
+            goto fail;
+        u8* const dst = b->snapshot_vertex_mapped + data_offset;
+        memset(b->snapshot_vertex_mapped + aligned, 0,
+               (size_t)(end - aligned));
+        int stable = 0;
+        for (u32 attempt = 0; attempt < 8u; ++attempt) {
+            memcpy(dst, src, span->size);
+            MemoryBarrier();
+            if (memcmp(dst, src, span->size) == 0) {
+                stable = 1;
+                break;
+            }
+        }
+        if (!stable)
+            goto fail;
+        b->list->lpVtbl->CopyBufferRegion(
+            b->list, b->snapshot_vertex_gpu, aligned,
+            b->snapshot_vertex_upload, aligned, end - aligned);
+        b->snapshot_vertex_used = ((u32)end + 3u) & ~3u;
+        if (span->source < RSX_NIR_NUM_VERTEX_ATTR) {
+            binding.attr_offset[span->source] = data_offset;
+            binding.attr_first[span->source] = span->first_element;
+        } else {
+            binding.index_valid = 1u;
+            binding.index_offset = data_offset;
+            binding.index_first = span->first_element;
+        }
+    }
+    b->snapshot_vertex[slot] = binding;
+    return 0;
+
+fail:
+    b->snapshot_vertex_used = allocation_start;
+    memset(&b->snapshot_vertex[slot], 0,
+           sizeof(b->snapshot_vertex[slot]));
+    return -1;
+}
+
+int rsx_nr_d3d12_prepare_snapshot_island(
+    rsx_nr_d3d12* b, const rsx_nr_backend* initial_state,
+    rsx_nir_stream* stream)
+{
+    (void)initial_state;
+    if (!b || !stream || !stream->op_count || b->snapshot_prepare_id)
+        return -1;
+    b->stats.snapshot_islands++;
+    return 0;
+}
+
+void rsx_nr_d3d12_finish_snapshot_island(
+    rsx_nr_d3d12* b, rsx_nr_backend* backend, int committed)
+{
+    (void)backend;
+    (void)committed;
+    nrb_snapshot_reset(b);
 }
 
 static void nrb_publish_guest_write(rsx_nr_d3d12* b, u32 space,
@@ -5885,6 +6770,122 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
     return 0;
 }
 
+static void nrb_tail_capture_cumulative(
+    const rsx_nr_d3d12* b, rsx_nr_d3d12_tail_bucket* out)
+{
+    memset(out, 0, sizeof(*out));
+    out->adaptation_calls = b->tail_adaptation_calls;
+    out->adaptation_ticks = b->tail_adaptation_ticks;
+    out->draws = b->stats.draws;
+    out->fence_ticks = b->stats.stall_fence_drain_ticks;
+    out->flush_ticks = b->stats.stall_flush_ticks;
+    out->transfer_readback_ticks =
+        b->stats.stall_transfer_readback_ticks;
+    out->transfer_readback_bytes =
+        b->stats.stall_transfer_readback_bytes;
+    out->transfer_upload_ticks = b->stats.stall_transfer_upload_ticks;
+    out->transfer_upload_bytes = b->stats.stall_transfer_upload_bytes;
+    out->residency_prepare_ticks = b->stats.stall_residency_prepare_ticks;
+    out->residency_stabilize_ticks =
+        b->stats.stall_residency_stabilize_ticks;
+    out->preflight_draw_ticks = b->stats.stall_preflight_draw_ticks;
+    out->draw_ticks = b->stats.stall_draw_ticks;
+    out->fp_resolve_ticks = b->stats.stall_fp_resolve_ticks;
+    out->pso_lookup_ticks = b->stats.stall_pso_lookup_ticks;
+    out->pso_key_lookup_ticks = b->stats.stall_pso_key_lookup_ticks;
+    out->shader_compile_ticks = b->stats.stall_vertex_compile_ticks +
+        b->stats.stall_pixel_compile_ticks;
+    out->shader_cache_ticks = b->stats.stall_vertex_cache_ticks +
+        b->stats.stall_pixel_cache_ticks;
+    out->driver_pso_ticks = b->stats.stall_driver_pso_create_ticks;
+    out->texture_prepare_ticks = b->stats.stall_texture_prepare_ticks;
+    out->batch_prepare_ticks = b->stats.stall_batch_prepare_ticks;
+    out->command_record_ticks = b->stats.stall_command_record_ticks;
+    for (u32 cause = 0; cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT; ++cause) {
+        out->submit_count[cause] =
+            b->stats.submit_cause[cause].submissions;
+        out->submit_cpu_ticks[cause] =
+            b->stats.submit_cause[cause].cpu_wait_ticks;
+    }
+}
+
+static void nrb_tail_record_present(rsx_nr_d3d12* b)
+{
+    if (!b->tail_breakdown)
+        return;
+    rsx_nr_d3d12_tail_bucket now;
+    nrb_tail_capture_cumulative(b, &now);
+    LARGE_INTEGER qpc;
+    now.end_qpc = QueryPerformanceCounter(&qpc) ? (u64)qpc.QuadPart : 0u;
+    now.present_sequence = b->stats.presents;
+    rsx_nr_d3d12_tail_bucket delta = now;
+#define NRB_TAIL_DELTA(field) \
+    delta.field -= b->tail_previous.field
+    NRB_TAIL_DELTA(draws);
+    NRB_TAIL_DELTA(adaptation_calls);
+    NRB_TAIL_DELTA(adaptation_ticks);
+    NRB_TAIL_DELTA(fence_ticks);
+    NRB_TAIL_DELTA(flush_ticks);
+    NRB_TAIL_DELTA(transfer_readback_ticks);
+    NRB_TAIL_DELTA(transfer_readback_bytes);
+    NRB_TAIL_DELTA(transfer_upload_ticks);
+    NRB_TAIL_DELTA(transfer_upload_bytes);
+    NRB_TAIL_DELTA(residency_prepare_ticks);
+    NRB_TAIL_DELTA(residency_stabilize_ticks);
+    NRB_TAIL_DELTA(preflight_draw_ticks);
+    NRB_TAIL_DELTA(draw_ticks);
+    NRB_TAIL_DELTA(fp_resolve_ticks);
+    NRB_TAIL_DELTA(pso_lookup_ticks);
+    NRB_TAIL_DELTA(pso_key_lookup_ticks);
+    NRB_TAIL_DELTA(shader_compile_ticks);
+    NRB_TAIL_DELTA(shader_cache_ticks);
+    NRB_TAIL_DELTA(driver_pso_ticks);
+    NRB_TAIL_DELTA(texture_prepare_ticks);
+    NRB_TAIL_DELTA(batch_prepare_ticks);
+    NRB_TAIL_DELTA(command_record_ticks);
+    for (u32 cause = 0; cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT; ++cause) {
+        delta.submit_count[cause] -=
+            b->tail_previous.submit_count[cause];
+        delta.submit_cpu_ticks[cause] -=
+            b->tail_previous.submit_cpu_ticks[cause];
+    }
+#undef NRB_TAIL_DELTA
+    const u32 slot = (u32)(b->tail_bucket_count %
+        RSX_NR_D3D12_TAIL_BUCKET_CAP);
+    b->tail_bucket[slot] = delta;
+    b->tail_previous = now;
+    b->tail_bucket_count++;
+}
+
+static void nrb_note_present_failure(rsx_nr_d3d12* b, u32 stage,
+                                     u32 buffer, const nrb_rt* scanout)
+{
+    if (!b || !b->tail_breakdown)
+        return;
+    b->stats.present_failures++;
+    if (b->stats.first_present_failure_stage)
+        return;
+    b->stats.first_present_failure_stage = stage;
+    b->stats.first_present_failure_buffer = buffer;
+    b->stats.first_present_failure_display_valid =
+        buffer < 8u && b->displays[buffer].valid;
+    if (scanout) {
+        b->stats.first_present_failure_space = scanout->space;
+        b->stats.first_present_failure_offset = scanout->offset;
+        b->stats.first_present_failure_width = scanout->w;
+        b->stats.first_present_failure_height = scanout->h;
+        b->stats.first_present_failure_format = scanout->fmt;
+        b->stats.first_present_failure_dxgi = (u32)scanout->dxgi;
+    }
+    b->stats.first_present_failure_generation = b->shared_generation;
+    b->stats.first_present_failure_recording_fence =
+        b->shared_timeline ? b->shared_recording_fence
+                           : b->fence_value + 1u;
+    b->stats.first_present_failure_completed_fence = b->shared_timeline
+        ? b->shared_completed_fence
+        : b->fence->lpVtbl->GetCompletedValue(b->fence);
+}
+
 static int nrb_present(void* user, u32 buffer)
 {
     rsx_nr_d3d12* b = user;
@@ -5895,15 +6896,26 @@ static int nrb_present(void* user, u32 buffer)
     if (!scanout)
         scanout = b->last_rt;
     if (b->present_cb) {
-        if (!scanout)
+        if (!scanout) {
+            nrb_note_present_failure(b, 1u, buffer, NULL);
             return -1;
-        const u32 attributed_descriptors = b->descriptor_tables_used;
+        }
+        const u32 attributed_descriptors =
+            b->srv_tables_used + b->sampler_tables_used;
         const u32 attributed_upload = b->upload_used;
         const u64 attribution_start = nrb_submit_now(b);
+        /* The shared presenter retires and resets this borrowed list inside
+         * the callback. Close/resolve the asynchronous native GPU interval
+         * first so a timestamp pair never straddles timeline generations. */
+        if (b->shared_timeline)
+            nrb_tail_close_gpu_interval(
+                b, RSX_NR_D3D12_SUBMIT_PRESENT);
         if (b->present_cb(
                 b->present_user, scanout->tex, (u32)scanout->dxgi,
-                scanout->w, scanout->h, buffer) != 0)
+                scanout->w, scanout->h, buffer) != 0) {
+            nrb_note_present_failure(b, 2u, buffer, scanout);
             return -1;
+        }
         if (b->shared_timeline)
             nrb_submit_finish(
                 b, RSX_NR_D3D12_SUBMIT_PRESENT, attribution_start,
@@ -5917,12 +6929,16 @@ static int nrb_present(void* user, u32 buffer)
         b->list_open = 0;
         nrb_release_retired_textures(b);
         b->upload_used = 0;
-        b->descriptor_tables_used = 0;
+        b->srv_tables_used = 0;
+        b->sampler_tables_used = 0;
+        memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
+        memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
     }
     rsx_nr_res_next_frame(&b->textures);
     if ((b->textures.frame & 127u) == 0u)
         rsx_nr_res_sweep(&b->textures, 600u, nrb_release_texture, b);
     b->stats.presents++;
+    nrb_tail_record_present(b);
     return 0;
 }
 
@@ -6112,6 +7128,14 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
     return b && b->shared_timeline && !b->timeline_fault;
 }
 
+int rsx_nr_d3d12_flush_report_dependency(rsx_nr_d3d12* b)
+{
+    if (!b)
+        return -1;
+    return nrb_exec_wait(
+        b, RSX_NR_D3D12_SUBMIT_REPORT_PUBLICATION, 0u);
+}
+
 int rsx_nr_d3d12_set_coherent_section_mode(rsx_nr_d3d12* b, int enabled)
 {
     if (!b || b->stats.pso_builds || b->stats.draws)
@@ -6197,9 +7221,14 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
             strcmp(oracle, "0") != 0;
     }
     {
+        const char* const tail = getenv("YZ_NR_RSX_TAIL_BREAKDOWN");
+        b->tail_breakdown = tail && strcmp(tail, "1") == 0;
+    }
+    {
         const char* const aggregate = getenv("YZ_NR_STALL_AGGREGATE");
         LARGE_INTEGER frequency;
-        b->stall_aggregate = aggregate && strcmp(aggregate, "1") == 0;
+        b->stall_aggregate = b->tail_breakdown ||
+            (aggregate && strcmp(aggregate, "1") == 0);
         if (b->stall_aggregate && QueryPerformanceFrequency(&frequency))
             b->stats.stall_qpc_frequency = (u64)frequency.QuadPart;
         else
@@ -6209,8 +7238,8 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
         const char* const attribution =
             getenv("YZ_NR_SUBMIT_ATTRIBUTION");
         LARGE_INTEGER frequency;
-        b->submit_attribution = attribution &&
-            strcmp(attribution, "1") == 0;
+        b->submit_attribution = b->tail_breakdown ||
+            (attribution && strcmp(attribution, "1") == 0);
         if (b->submit_attribution && QueryPerformanceFrequency(&frequency))
             b->stats.submit_attribution_qpc_frequency =
                 (u64)frequency.QuadPart;
@@ -6265,6 +7294,25 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     b->fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!b->fence_event)
         goto fail;
+    if (b->tail_breakdown) {
+        D3D12_QUERY_HEAP_DESC qd = {0};
+        qd.Count = NRB_TAIL_GPU_INTERVALS * 2u;
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        if (FAILED(b->dev->lpVtbl->CreateQueryHeap(
+                b->dev, &qd, &IID_ID3D12QueryHeap,
+                (void**)&b->tail_query_heap)))
+            goto fail;
+        b->tail_query_readback = nrb_make_buffer(
+            b->dev,
+            (u64)NRB_TAIL_GPU_INTERVALS * 2u * sizeof(u64),
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->tail_query_readback ||
+            FAILED(b->queue->lpVtbl->GetTimestampFrequency(
+                b->queue, &b->stats.tail_gpu_frequency)) ||
+            !b->stats.tail_gpu_frequency)
+            goto fail;
+    }
     if (SUCCEEDED(b->list->lpVtbl->QueryInterface(
             b->list, &IID_ID3D12GraphicsCommandList1, (void**)&b->list1))) {
         b->owned_list1 = b->list1;
@@ -6451,8 +7499,35 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     if (rsx_nr_res_cache_init(&b->textures, NRB_TEX_CAP,
                               NRB_TEX_SNAP_WORDS, &b->pages, NULL))
         goto fail;
-    b->mirror_be = rsx_gpu_mirror_d3d12_create(b->dev, local_size, main_size,
-                                               4u << 20);
+    /* A withheld dependency island may snapshot several megabytes of newly
+     * published dynamic pages before any draw is exposed.  Give that
+     * explicitly selected mode a fixed, fence-retired arena large enough to
+     * keep preparation submission-free; the default renderer retains the
+     * established 4 MiB footprint.  This environment setting is immutable
+     * and read once during backend construction, never on a draw path. */
+    u32 mirror_staging_bytes = 4u << 20;
+    const char* const snapshot_mode = getenv("YZ_NR_SINGLE_PASS_GRAPH");
+    if (snapshot_mode && strcmp(snapshot_mode, "snapshot") == 0) {
+        mirror_staging_bytes = 32u << 20;
+        /* Multi-draw compact snapshots remain available only as a focused
+         * diagnostic.  The production snapshot graph closes at each draw
+         * dependency, so the proven exact mirror is consumed before another
+         * producer generation can be prepared.  Direct raw snapshot reads
+         * caused live hardware TDRs/corrupt clothing despite WARP parity. */
+        const char* const compact =
+            getenv("YZ_NR_SNAPSHOT_COMPACT_VERTEX");
+        b->snapshot_compact_vertex =
+            compact && strcmp(compact, "1") == 0;
+        if (b->snapshot_compact_vertex &&
+            nrb_ensure_snapshot_vertex_upload(b) != 0)
+                goto fail;
+    } else {
+        /* Explicit offline snapshot API calls preserve their immutable
+         * generation test without altering ordinary runtime construction. */
+        b->snapshot_compact_vertex = 1u;
+    }
+    b->mirror_be = rsx_gpu_mirror_d3d12_create(
+        b->dev, local_size, main_size, mirror_staging_bytes);
     if (!b->mirror_be)
         goto fail;
     rsx_gpu_mirror_d3d12_set_guest(b->mirror_be, nrb_mirror_guest, b);
@@ -6711,6 +7786,87 @@ int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b)
     return 0;
 }
 
+int rsx_nr_d3d12_finalize_tail_breakdown(rsx_nr_d3d12* b)
+{
+    if (!b || !b->tail_breakdown)
+        return 0;
+    if (b->tail_finalized)
+        return 0;
+    if (b->list_open && nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET, 0u) != 0)
+        return -1;
+    if (!b->tail_query_count || !b->tail_query_readback) {
+        b->tail_finalized = 1;
+        return 0;
+    }
+    u64* values = NULL;
+    D3D12_RANGE read = {
+        0, (SIZE_T)b->tail_query_count * 2u * sizeof(u64)
+    };
+    if (FAILED(b->tail_query_readback->lpVtbl->Map(
+            b->tail_query_readback, 0, &read, (void**)&values)) || !values)
+        return -1;
+    for (u32 i = 0; i < b->tail_query_count; ++i) {
+        const u64 begin = values[i * 2u];
+        const u64 end = values[i * 2u + 1u];
+        const u32 cause = b->tail_query_cause[i];
+        if (cause >= RSX_NR_D3D12_SUBMIT_CAUSE_COUNT || end < begin)
+            continue;
+        b->stats.submit_cause[cause].gpu_ticks += end - begin;
+        b->stats.submit_cause[cause].gpu_intervals++;
+        b->stats.tail_gpu_intervals_recorded++;
+        const u64 frame = b->tail_query_frame[i];
+        const u32 retained = (u32)(b->tail_bucket_count <
+            RSX_NR_D3D12_TAIL_BUCKET_CAP ? b->tail_bucket_count :
+            RSX_NR_D3D12_TAIL_BUCKET_CAP);
+        for (u32 j = 0; j < retained; ++j) {
+            rsx_nr_d3d12_tail_bucket* const bucket =
+                &b->tail_bucket[j];
+            if (bucket->present_sequence != frame)
+                continue;
+            bucket->submit_gpu_ticks[cause] += end - begin;
+            bucket->submit_gpu_intervals[cause]++;
+            break;
+        }
+    }
+    D3D12_RANGE written = {0, 0};
+    b->tail_query_readback->lpVtbl->Unmap(
+        b->tail_query_readback, 0, &written);
+    b->tail_finalized = 1;
+    return 0;
+}
+
+u32 rsx_nr_d3d12_tail_bucket_count(const rsx_nr_d3d12* b)
+{
+    if (!b || !b->tail_breakdown)
+        return 0u;
+    return (u32)(b->tail_bucket_count < RSX_NR_D3D12_TAIL_BUCKET_CAP
+        ? b->tail_bucket_count : RSX_NR_D3D12_TAIL_BUCKET_CAP);
+}
+
+int rsx_nr_d3d12_get_tail_bucket(
+    const rsx_nr_d3d12* b, u32 chronological_index,
+    rsx_nr_d3d12_tail_bucket* out)
+{
+    const u32 count = rsx_nr_d3d12_tail_bucket_count(b);
+    if (!b || !out || chronological_index >= count)
+        return -1;
+    const u32 start = b->tail_bucket_count > RSX_NR_D3D12_TAIL_BUCKET_CAP
+        ? (u32)(b->tail_bucket_count % RSX_NR_D3D12_TAIL_BUCKET_CAP) : 0u;
+    *out = b->tail_bucket[(start + chronological_index) %
+        RSX_NR_D3D12_TAIL_BUCKET_CAP];
+    return 0;
+}
+
+void rsx_nr_d3d12_tail_note_adaptation(
+    rsx_nr_d3d12* b, unsigned long long ticks)
+{
+    if (!b || !b->tail_breakdown)
+        return;
+    b->tail_adaptation_calls++;
+    b->tail_adaptation_ticks += ticks;
+}
+
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
 {
     if (!b)
@@ -6721,6 +7877,7 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (b->queue && b->fence)
         nrb_wait_idle(b);
     nrb_hana_input_dump(b);
+    (void)rsx_nr_d3d12_finalize_tail_breakdown(b);
     for (u32 i = 0; i < b->psos.cap && b->psos.keys; i++) {
         if (b->psos.keys[i]) {
             ID3D12PipelineState* p =
@@ -6762,8 +7919,19 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (b->hana_depth_readback)
         b->hana_depth_readback->lpVtbl->Release(
             b->hana_depth_readback);
+    if (b->tail_query_readback)
+        b->tail_query_readback->lpVtbl->Release(
+            b->tail_query_readback);
+    if (b->tail_query_heap)
+        b->tail_query_heap->lpVtbl->Release(b->tail_query_heap);
     if (b->upload)
         b->upload->lpVtbl->Release(b->upload);
+    if (b->snapshot_vertex_upload)
+        b->snapshot_vertex_upload->lpVtbl->Release(
+            b->snapshot_vertex_upload);
+    if (b->snapshot_vertex_gpu)
+        b->snapshot_vertex_gpu->lpVtbl->Release(
+            b->snapshot_vertex_gpu);
     if (b->rootsig)
         b->rootsig->lpVtbl->Release(b->rootsig);
     if (b->depth_snapshot_pso)
@@ -7042,6 +8210,16 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b) { (void)b; }
 int rsx_nr_d3d12_dump_hana_input(rsx_nr_d3d12* b)
 { (void)b; return 0; }
+int rsx_nr_d3d12_finalize_tail_breakdown(rsx_nr_d3d12* b)
+{ (void)b; return 0; }
+u32 rsx_nr_d3d12_tail_bucket_count(const rsx_nr_d3d12* b)
+{ (void)b; return 0u; }
+int rsx_nr_d3d12_get_tail_bucket(
+    const rsx_nr_d3d12* b, u32 index, rsx_nr_d3d12_tail_bucket* out)
+{ (void)b; (void)index; (void)out; return -1; }
+void rsx_nr_d3d12_tail_note_adaptation(
+    rsx_nr_d3d12* b, unsigned long long ticks)
+{ (void)b; (void)ticks; }
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b) { (void)b; return 0; }
 int rsx_nr_d3d12_set_content_cache(
     rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn c,
@@ -7053,6 +8231,18 @@ void rsx_nr_d3d12_get_exec_ops(rsx_nr_d3d12* b, rsx_nr_exec_ops* out)
     (void)b;
     if (out)
         memset(out, 0, sizeof(*out));
+}
+int rsx_nr_d3d12_prepare_snapshot_island(
+    rsx_nr_d3d12* b, const rsx_nr_backend* initial_state,
+    rsx_nir_stream* stream)
+{
+    (void)b; (void)initial_state; (void)stream;
+    return -1;
+}
+void rsx_nr_d3d12_finish_snapshot_island(
+    rsx_nr_d3d12* b, rsx_nr_backend* backend, int committed)
+{
+    (void)b; (void)backend; (void)committed;
 }
 int rsx_nr_d3d12_set_live_output(rsx_nr_d3d12* b, int rgba_targets,
                                  rsx_nr_d3d12_present_fn present,
@@ -7105,6 +8295,11 @@ int rsx_nr_d3d12_shared_timeline_enabled(const rsx_nr_d3d12* b)
 {
     (void)b;
     return 0;
+}
+int rsx_nr_d3d12_flush_report_dependency(rsx_nr_d3d12* b)
+{
+    (void)b;
+    return -1;
 }
 int rsx_nr_d3d12_validate_depth_sample_alias(
     rsx_nr_d3d12* b, const rsx_nir_texture* texture)

@@ -27,6 +27,18 @@ extern "C" {
 typedef int (*rsx_nr_frame_read32_fn)(void* user, u32 io, u32* value);
 typedef unsigned long long (*rsx_nr_frame_now_ms_fn)(void* user);
 typedef unsigned long long (*rsx_nr_frame_now_ticks_fn)(void* user);
+typedef void (*rsx_nr_frame_tail_account_fn)(
+    void* user, unsigned long long ticks);
+typedef int (*rsx_nr_frame_prepare_island_fn)(
+    void* user, const rsx_nr_backend* initial_state, rsx_nir_stream* stream);
+typedef int (*rsx_nr_frame_record_draw_fn)(
+    void* user, const rsx_nr_backend* recorded_state,
+    rsx_nir_stream* stream, u32 op_index);
+/* The recorder captures each draw while its command is decoded and GET is
+ * still withheld. prepare is a constant-time whole-island commit gate and
+ * returns a negative value for fail-closed rejection. */
+typedef void (*rsx_nr_frame_finish_island_fn)(
+    void* user, rsx_nr_backend* backend, int committed);
 /* A producer-publication hook for an exact jump-to-self stopper. Returning
  * one means the hook atomically proved and published a forward resume cursor;
  * zero leaves the stopper parked. This is not a generic skip facility. */
@@ -81,6 +93,7 @@ typedef enum rsx_nr_frame_graph_mode {
     RSX_NR_FRAME_GRAPH_DISABLED = 0,
     RSX_NR_FRAME_GRAPH_PASSIVE,
     RSX_NR_FRAME_GRAPH_EXECUTE,
+    RSX_NR_FRAME_GRAPH_SNAPSHOT,
 } rsx_nr_frame_graph_mode;
 
 typedef enum rsx_nr_frame_graph_fallback_reason {
@@ -148,6 +161,8 @@ typedef struct rsx_nr_frame_owner_stats {
     unsigned long long waits_semaphore;
     unsigned long long frames;
     unsigned long long backend_ops;
+    unsigned long long adaptation_calls;
+    unsigned long long adaptation_ticks;
 } rsx_nr_frame_owner_stats;
 
 typedef struct rsx_nr_frame_graph_stats {
@@ -249,11 +264,25 @@ typedef struct rsx_nr_frame_owner {
     u32 graph_yield_after_packet;
     u32 graph_passive_source_ops;
     u32 graph_passive_source_side;
+    u32 graph_draws;
+    u32 graph_nondraw_actions;
+    u32 graph_prepared;
     unsigned long long graph_passive_source_hash;
     unsigned long long graph_started_ticks;
     rsx_nr_frame_now_ticks_fn graph_now_ticks;
     void* graph_clock_user;
     unsigned long long graph_tick_frequency;
+    rsx_nr_frame_now_ticks_fn tail_now_ticks;
+    void* tail_clock_user;
+    rsx_nr_frame_tail_account_fn tail_account;
+    void* tail_account_user;
+    rsx_nr_frame_prepare_island_fn graph_prepare_island;
+    rsx_nr_frame_record_draw_fn graph_record_draw;
+    rsx_nr_frame_finish_island_fn graph_finish_island;
+    void* graph_prepare_user;
+    rsx_nr_backend graph_record_backend;
+    u32 graph_record_initialized;
+    unsigned long long tail_tick_frequency;
     rsx_nr_frame_graph_stats graph_stats;
 
     rsx_nr_frame_failure failure;
@@ -295,6 +324,25 @@ void rsx_nr_frame_owner_set_single_pass_graph(
     rsx_nr_frame_owner* owner, u32 mode, rsx_nir_stream* stream,
     rsx_nr_frame_now_ticks_fn now_ticks, void* clock_user,
     unsigned long long tick_frequency);
+
+/* Default-off decoder/adaptation accounting used by the unified RSX-tail
+ * diagnostic. A null clock is the production default and performs no reads. */
+void rsx_nr_frame_owner_set_tail_clock(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_now_ticks_fn now_ticks,
+    void* clock_user, unsigned long long tick_frequency);
+void rsx_nr_frame_owner_set_tail_account(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_tail_account_fn account,
+    void* account_user);
+
+/* SNAPSHOT mode records immutable draw resources once at the decoder
+ * boundary, retains a bounded dependency island, calls the constant-time
+ * commit gate once while GET is withheld, and releases fixed resources only
+ * after commit or fail-closed refusal. */
+void rsx_nr_frame_owner_set_snapshot_callbacks(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_prepare_island_fn prepare,
+    rsx_nr_frame_finish_island_fn finish, void* user);
+void rsx_nr_frame_owner_set_snapshot_record_draw(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_record_draw_fn record_draw);
 
 rsx_nr_frame_step_result rsx_nr_frame_owner_step(
     rsx_nr_frame_owner* owner, u32 get, u32 put, u32 call_return,
