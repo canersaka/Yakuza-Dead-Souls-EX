@@ -21,6 +21,7 @@
 #include "rsx_nr_backend.h"
 #include "rsx_nr_producer_contract.h"
 #include "native_gcm_vertical.h"
+#include "../runtime/ppu/ppu_guest_read.h"
 
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
@@ -6052,7 +6053,14 @@ static bool yz_jrnl_hle_copy(void*, uint32_t destination, uint32_t source,
 {
     if (!vm_base || source + size < source || destination + size < destination)
         return false;
+    vm_native_residency_notify(source, size, 0u, 0u, 0u, 0u, 0u, 0u);
+    vm_native_residency_notify(
+        destination, size, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+        0u, 0u, 0u, 0u);
     memmove(vm_base + destination, vm_base + source, size);
+    vm_native_residency_notify(
+        destination, size, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
+        0u, 0u, 0u, 0u);
     return true;
 }
 

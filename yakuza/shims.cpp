@@ -111,12 +111,14 @@ static inline void yz_stage_checkpoint_after_object(uint32_t address)
 #if defined(YZ_PERF_CLEAN)
 extern "C" uint8_t vm_read8(uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 1u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read((uint32_t)addr, 1u, 0u);
     return *ea(addr);
 }
 
 extern "C" uint16_t vm_read16(uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 2u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read((uint32_t)addr, 2u, 0u);
     uint16_t value;
     memcpy(&value, ea(addr), sizeof(value));
@@ -125,6 +127,7 @@ extern "C" uint16_t vm_read16(uint64_t addr)
 
 extern "C" uint32_t vm_read32(uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read((uint32_t)addr, 4u, 0u);
     uint32_t value;
     memcpy(&value, ea(addr), sizeof(value));
@@ -140,16 +143,17 @@ extern "C" uint32_t vm_read32(uint64_t addr)
 
 extern "C" uint64_t vm_read64(uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
     vm_native_report_notify_read((uint32_t)addr, 8u, 0u);
     uint64_t value;
     memcpy(&value, ea(addr), sizeof(value));
     return ps3_bswap64(value);
 }
 #else
-extern "C" uint8_t  vm_read8 (uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,1u,0u); yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
-extern "C" uint16_t vm_read16(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,2u,0u); yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
-extern "C" uint32_t vm_read32(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,4u,0u); yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
-extern "C" uint64_t vm_read64(uint64_t addr) { vm_native_report_notify_read((uint32_t)addr,8u,0u); yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
+extern "C" uint8_t  vm_read8 (uint64_t addr) { vm_native_residency_notify((uint32_t)addr,1u,0u,0u,0u,0u,0u,0u); vm_native_report_notify_read((uint32_t)addr,1u,0u); yz_mem_guard((uint32_t)addr,1,0); if (yz_vmguard_check((uint32_t)addr,1,0)) return 0; return *ea(addr); }
+extern "C" uint16_t vm_read16(uint64_t addr) { vm_native_residency_notify((uint32_t)addr,2u,0u,0u,0u,0u,0u,0u); vm_native_report_notify_read((uint32_t)addr,2u,0u); yz_stage_checkpoint_before_b0((uint32_t)addr); yz_mem_guard((uint32_t)addr,2,0); if (yz_vmguard_check((uint32_t)addr,2,0)) return 0; uint16_t v; memcpy(&v, ea(addr), 2); return ps3_bswap16(v); }
+extern "C" uint32_t vm_read32(uint64_t addr) { vm_native_residency_notify((uint32_t)addr,4u,0u,0u,0u,0u,0u,0u); vm_native_report_notify_read((uint32_t)addr,4u,0u); yz_mem_guard((uint32_t)addr,4,0); if (yz_vmguard_check((uint32_t)addr,4,0)) return 0; uint32_t v; memcpy(&v, ea(addr), 4); v = ps3_bswap32(v); if (v == 0x434D5450u) yz_a010_cmt_capture((uint32_t)addr, vm_read32((uint32_t)addr + 0xCu)); yz_a010_camera_read32((uint32_t)addr, v, _ReturnAddress()); return v; }
+extern "C" uint64_t vm_read64(uint64_t addr) { vm_native_residency_notify((uint32_t)addr,8u,0u,0u,0u,0u,0u,0u); vm_native_report_notify_read((uint32_t)addr,8u,0u); yz_mem_guard((uint32_t)addr,8,0); if (yz_vmguard_check((uint32_t)addr,8,0)) return 0; uint64_t v; memcpy(&v, ea(addr), 8); v = ps3_bswap64(v); yz_a010_constsrc_read64((uint32_t)addr, v, _ReturnAddress()); yz_stage_checkpoint_after_object((uint32_t)addr); return v; }
 #endif
 
 /* PPU<->SPU lock-line coherence (1f, spu_channels.c): a PPU write to a 128-byte
@@ -203,18 +207,26 @@ static inline void yz_native_spurs_notify_write(uint32_t, uint32_t) {}
 #endif
 #if defined(YZ_PERF_CLEAN)
 #define VM_WRITE_COH(addr, src, n) do { \
+        vm_native_residency_notify((uint32_t)(addr), (uint32_t)(n), \
+            0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
         } else memcpy(ea(addr), (src), (n)); \
+        vm_native_residency_notify((uint32_t)(addr), (uint32_t)(n), \
+            0u, VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u); \
         yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
 #else
 #define VM_WRITE_COH(addr, src, n) do { \
+        vm_native_residency_notify((uint32_t)(addr), (uint32_t)(n), \
+            0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u); \
         yz_watch_bd((uint32_t)(addr), (src), (n)); \
         if (spu_coh_is_reserved((uint32_t)(addr))) { \
             spu_lockline_lock(); memcpy(ea(addr), (src), (n)); \
             spu_coh_notify_write((uint32_t)(addr)); spu_lockline_unlock(); \
         } else memcpy(ea(addr), (src), (n)); \
+        vm_native_residency_notify((uint32_t)(addr), (uint32_t)(n), \
+            0u, VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u); \
         yz_native_spurs_notify_write((uint32_t)(addr), (uint32_t)(n)); } while (0)
 #endif
 extern "C" void yz_watch_arm(uint32_t guest_addr);
@@ -502,6 +514,7 @@ extern "C" void ppu_trace_pc(void* ctxv, uint32_t pc) {
  * emission's convention and the generated ppu_context mirror. */
 extern "C" uint64_t ppu_res_lwarx(ppu_context* ctx, uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
     uint32_t raw;
     memcpy(&raw, ea(addr), 4);            /* x86 aligned load = acquire */
     ctx->reserve_addr  = (uint32_t)addr;
@@ -511,6 +524,7 @@ extern "C" uint64_t ppu_res_lwarx(ppu_context* ctx, uint64_t addr)
 
 extern "C" uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t addr)
 {
+    vm_native_residency_notify((uint32_t)addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
     uint64_t raw;
     memcpy(&raw, ea(addr), 8);
     ctx->reserve_addr  = (uint32_t)addr;
@@ -531,6 +545,9 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
     }
     int ok = 0;
     if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
+        vm_native_residency_notify(
+            (uint32_t)addr, 4u, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u);
         uint32_t expected = (uint32_t)ctx->reserve_value;   /* raw BE */
         uint32_t desired  = ps3_bswap32(val);
         volatile long* p  = (volatile long*)ea(addr);
@@ -700,6 +717,10 @@ extern "C" void ppu_res_stwcx(ppu_context* ctx, uint64_t addr, uint32_t val)
                   fflush(stderr); } } }
     }
     if (ok)
+        vm_native_residency_notify(
+            (uint32_t)addr, 4u, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u);
+    if (ok)
         yz_native_spurs_notify_write((uint32_t)addr, 4);
 #if !defined(YZ_PERF_CLEAN)
     if (ok && (uint32_t)addr >= 0x40400000u &&
@@ -723,6 +744,9 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
     }
     int ok = 0;
     if (ctx->reserve_addr && ctx->reserve_addr == (uint32_t)addr) {
+        vm_native_residency_notify(
+            (uint32_t)addr, 8u, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u);
         uint64_t expected = ctx->reserve_value;
         uint64_t desired  = ps3_bswap64(val);
         volatile long long* p = (volatile long long*)ea(addr);
@@ -781,6 +805,10 @@ extern "C" void ppu_res_stdcx(ppu_context* ctx, uint64_t addr, uint64_t val)
                   fflush(stderr);
               } } }
     }
+    if (ok)
+        vm_native_residency_notify(
+            (uint32_t)addr, 8u, 0u,
+            VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u);
     if (ok)
         yz_native_spurs_notify_write((uint32_t)addr, 8);
 #if !defined(YZ_PERF_CLEAN)

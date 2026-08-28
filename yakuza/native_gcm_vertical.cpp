@@ -21,6 +21,7 @@
 #include "yakuza_runner.h"
 #include "rsx_nr_backend.h"
 #include "rsx_nr_backend_d3d12.h"
+#include "rsx_nr_residency.h"
 #include "rsx_nr_frame_owner.h"
 #include "rsx_nr_graph.h"
 #include "rsx_fp_decompiler.h"
@@ -240,6 +241,15 @@ enum : uint32_t {
     YZ_NR_SECTION_OP_CAPACITY = 65536,
     YZ_NR_SECTION_SIDE_CAPACITY = 1u << 20,
     YZ_NR_SECTION_STEP_CAPACITY = 0x40000,
+    YZ_NR_RESIDENCY_AUDIT_KEYS = 64,
+};
+
+struct yz_nr_residency_audit_key {
+    volatile LONG64 identity;
+    volatile LONG64 count;
+    volatile LONG64 bytes;
+    volatile LONG min_offset;
+    volatile LONG max_offset;
 };
 
 enum : uint32_t {
@@ -507,6 +517,43 @@ struct yz_nr_vertical_active_state {
     volatile LONG shared_timeline;
     uint32_t report_defer_enabled;
     uint32_t report_audit_enabled;
+    /* Default-off exact-range audit for the capture-proven 3 MiB
+     * local-RT -> MAIN -> local-RT save/restore pair.  The access callbacks
+     * are reached only after sparse page rejection.  They keep fixed atomic
+     * totals and never allocate, take a clock, or emit per-event output. */
+    uint32_t residency_audit_enabled;
+    uint32_t residency_enabled;
+    rsx_nr_residency_slot residency_slot;
+    volatile LONG residency_generation;
+    volatile LONG64 residency_request_sequence;
+    volatile LONG64 residency_request_completed;
+    volatile LONG residency_request_failed;
+    volatile LONG residency_shutdown;
+    volatile LONG residency_audit_active;
+    volatile LONG residency_audit_guest_ea;
+    volatile LONG residency_audit_guest_size;
+    volatile LONG64 residency_audit_generation;
+    volatile LONG64 residency_audit_save_count;
+    volatile LONG64 residency_audit_restore_count;
+    volatile LONG64 residency_audit_complete_pairs;
+    volatile LONG64 residency_audit_unpaired_save;
+    volatile LONG64 residency_audit_ppu_reads;
+    volatile LONG64 residency_audit_ppu_read_bytes;
+    volatile LONG64 residency_audit_spu_reads;
+    volatile LONG64 residency_audit_spu_read_bytes;
+    volatile LONG64 residency_audit_writes;
+    volatile LONG64 residency_audit_write_bytes;
+    volatile LONG64 residency_audit_pairs_with_read;
+    volatile LONG64 residency_audit_pairs_with_write;
+    volatile LONG64 residency_audit_pair_ppu_reads;
+    volatile LONG64 residency_audit_pair_spu_reads;
+    volatile LONG64 residency_audit_pair_writes;
+    volatile LONG64 residency_audit_pair_start_qpc;
+    volatile LONG64 residency_audit_pair_ticks;
+    volatile LONG64 residency_audit_max_pair_ticks;
+    yz_nr_residency_audit_key
+        residency_audit_keys[YZ_NR_RESIDENCY_AUDIT_KEYS];
+    volatile LONG64 residency_audit_key_overflow;
     volatile LONG report_consumer_thread;
     volatile LONG64 report_request_sequence;
     volatile LONG64 report_request_completed;
@@ -545,6 +592,337 @@ struct yz_nr_vertical_active_state {
 };
 
 static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
+
+static void yz_nr_report_guest_read(
+    void*, uint32_t ea, uint32_t size, uint32_t source);
+
+static bool yz_nr_residency_audit_save(
+    const rsx_nir_transfer* t)
+{
+    return t && t->kind == RSX_NIR_XFER_SCALED &&
+        t->src_location == 0u && t->src_offset == 0x01140000u &&
+        t->dst_location == 1u && t->dst_offset == 0x01772D00u &&
+        t->src_pitch == 4096u && t->dst_pitch == 4096u &&
+        t->src_format == 3u && t->dst_format == 10u &&
+        t->in_w == 1024u && t->in_h == 768u &&
+        t->out_w == 1024u && t->out_h == 768u &&
+        t->clip_w == 1024u && t->clip_h == 768u &&
+        t->ds_dx == 0x00100000u && t->dt_dy == 0x00100000u;
+}
+
+static bool yz_nr_residency_audit_restore(
+    const rsx_nir_transfer* t)
+{
+    return t && t->kind == RSX_NIR_XFER_SCALED &&
+        t->src_location == 1u && t->src_offset == 0x01772D00u &&
+        t->dst_location == 0u && t->dst_offset == 0x01140000u &&
+        t->src_pitch == 4096u && t->dst_pitch == 4096u &&
+        t->src_format == 3u && t->dst_format == 10u &&
+        t->in_w == 1024u && t->in_h == 768u &&
+        t->out_w == 1024u && t->out_h == 768u &&
+        t->clip_w == 1024u && t->clip_h == 768u &&
+        t->ds_dx == 0x00100000u && t->dt_dy == 0x00100000u;
+}
+
+static bool yz_nr_residency_audit_overlap(uint32_t ea, uint32_t size)
+{
+    if (!size || !ReadAcquire(&g_active.residency_audit_active))
+        return false;
+    const uint32_t base = static_cast<uint32_t>(ReadAcquire(
+        &g_active.residency_audit_guest_ea));
+    const uint32_t span = static_cast<uint32_t>(ReadAcquire(
+        &g_active.residency_audit_guest_size));
+    const uint64_t end = static_cast<uint64_t>(ea) + size;
+    const uint64_t range_end = static_cast<uint64_t>(base) + span;
+    return span && static_cast<uint64_t>(ea) < range_end && end > base;
+}
+
+static void yz_nr_residency_audit_atomic_max(
+    volatile LONG64* target, LONG64 value)
+{
+    LONG64 current = InterlockedCompareExchange64(target, 0, 0);
+    while (current < value) {
+        const LONG64 prior = InterlockedCompareExchange64(
+            target, value, current);
+        if (prior == current)
+            return;
+        current = prior;
+    }
+}
+
+static void yz_nr_residency_audit_read(
+    uint32_t ea, uint32_t size, uint32_t source)
+{
+    if (!g_active.residency_audit_enabled ||
+        !yz_nr_residency_audit_overlap(ea, size))
+        return;
+    if (source == 1u) {
+        InterlockedIncrement64(&g_active.residency_audit_spu_reads);
+        InterlockedAdd64(&g_active.residency_audit_spu_read_bytes, size);
+        InterlockedIncrement64(&g_active.residency_audit_pair_spu_reads);
+    } else {
+        InterlockedIncrement64(&g_active.residency_audit_ppu_reads);
+        InterlockedAdd64(&g_active.residency_audit_ppu_read_bytes, size);
+        InterlockedIncrement64(&g_active.residency_audit_pair_ppu_reads);
+    }
+}
+
+static void yz_nr_residency_access(
+    void* user, uint32_t ea, uint32_t size, uint32_t source,
+    uint32_t write, uint32_t image_id, uint32_t task_id,
+    uint32_t pc, uint32_t command);
+
+static void yz_nr_combined_guest_read(
+    void*, uint32_t ea, uint32_t size, uint32_t source)
+{
+    yz_nr_report_guest_read(nullptr, ea, size, source);
+}
+
+static void yz_nr_residency_audit_atomic_min(
+    volatile LONG* target, LONG value)
+{
+    LONG current = InterlockedCompareExchange(target, 0, 0);
+    while (current > value) {
+        const LONG prior = InterlockedCompareExchange(target, value, current);
+        if (prior == current)
+            return;
+        current = prior;
+    }
+}
+
+static void yz_nr_residency_audit_atomic_max32(
+    volatile LONG* target, LONG value)
+{
+    LONG current = InterlockedCompareExchange(target, 0, 0);
+    while (current < value) {
+        const LONG prior = InterlockedCompareExchange(target, value, current);
+        if (prior == current)
+            return;
+        current = prior;
+    }
+}
+
+static void yz_nr_residency_audit_access(
+    void*, uint32_t ea, uint32_t size, uint32_t source,
+    uint32_t write, uint32_t image_id, uint32_t task_id,
+    uint32_t pc, uint32_t command)
+{
+    if (!g_active.residency_audit_enabled ||
+        !yz_nr_residency_audit_overlap(ea, size))
+        return;
+    const uint32_t base = static_cast<uint32_t>(ReadAcquire(
+        &g_active.residency_audit_guest_ea));
+    const uint32_t span = static_cast<uint32_t>(ReadAcquire(
+        &g_active.residency_audit_guest_size));
+    const uint64_t access_end = static_cast<uint64_t>(ea) + size;
+    const uint64_t range_end = static_cast<uint64_t>(base) + span;
+    const uint32_t begin = ea > base ? ea : base;
+    const uint32_t finish = static_cast<uint32_t>(
+        access_end < range_end ? access_end : range_end);
+    if (finish <= begin)
+        return;
+    const uint32_t overlap = finish - begin;
+    if (write) {
+        InterlockedIncrement64(&g_active.residency_audit_writes);
+        InterlockedAdd64(&g_active.residency_audit_write_bytes, overlap);
+        InterlockedIncrement64(&g_active.residency_audit_pair_writes);
+    } else if (source == 1u) {
+        InterlockedIncrement64(&g_active.residency_audit_spu_reads);
+        InterlockedAdd64(&g_active.residency_audit_spu_read_bytes, overlap);
+        InterlockedIncrement64(&g_active.residency_audit_pair_spu_reads);
+    } else {
+        InterlockedIncrement64(&g_active.residency_audit_ppu_reads);
+        InterlockedAdd64(&g_active.residency_audit_ppu_read_bytes, overlap);
+        InterlockedIncrement64(&g_active.residency_audit_pair_ppu_reads);
+    }
+
+    const LONG64 identity = 1ll |
+        (static_cast<LONG64>(write & 1u) << 1) |
+        (static_cast<LONG64>(source & 3u) << 2) |
+        (static_cast<LONG64>(command & 0xFFu) << 4) |
+        (static_cast<LONG64>(image_id & 0xFFFFu) << 12) |
+        (static_cast<LONG64>(pc & 0x3FFFFu) << 28) |
+        (static_cast<LONG64>(task_id & 0xFFu) << 46);
+    uint32_t slot = static_cast<uint32_t>(
+        (identity ^ (identity >> 17) ^ (identity >> 37)) &
+        (YZ_NR_RESIDENCY_AUDIT_KEYS - 1u));
+    for (uint32_t probe = 0; probe < YZ_NR_RESIDENCY_AUDIT_KEYS;
+         ++probe, slot = (slot + 1u) &
+             (YZ_NR_RESIDENCY_AUDIT_KEYS - 1u)) {
+        yz_nr_residency_audit_key* const key =
+            &g_active.residency_audit_keys[slot];
+        LONG64 observed = InterlockedCompareExchange64(
+            &key->identity, 0, 0);
+        if (!observed)
+            observed = InterlockedCompareExchange64(
+                &key->identity, identity, 0);
+        if (observed && observed != identity)
+            continue;
+        InterlockedIncrement64(&key->count);
+        InterlockedAdd64(&key->bytes, overlap);
+        yz_nr_residency_audit_atomic_min(
+            &key->min_offset, static_cast<LONG>(begin - base));
+        yz_nr_residency_audit_atomic_max32(
+            &key->max_offset, static_cast<LONG>(finish - base));
+        return;
+    }
+    InterlockedIncrement64(&g_active.residency_audit_key_overflow);
+}
+
+static int yz_nr_residency_materialize_direct(uint32_t generation)
+{
+    if (!g_active.residency_enabled || !g_active.d3d12 || !generation ||
+        ReadAcquire(&g_active.residency_shutdown))
+        return -1;
+    if (rsx_nr_d3d12_materialize_residency(
+            g_active.d3d12, generation) != 0)
+        return -1;
+    return rsx_nr_residency_mark_coherent(
+        &g_active.residency_slot, generation);
+}
+
+static void yz_nr_residency_service_requests(void)
+{
+    if (!g_active.residency_enabled)
+        return;
+    const LONG64 request = InterlockedCompareExchange64(
+        &g_active.residency_request_sequence, 0, 0);
+    if (InterlockedCompareExchange64(
+            &g_active.residency_request_completed, 0, 0) >= request)
+        return;
+    const uint32_t generation = static_cast<uint32_t>(ReadAcquire(
+        &g_active.residency_generation));
+    const int failed = yz_nr_residency_materialize_direct(generation) != 0;
+    InterlockedExchange(
+        &g_active.residency_request_failed, failed ? 1 : 0);
+    InterlockedExchange64(&g_active.residency_request_completed, request);
+    WakeByAddressAll((PVOID)&g_active.residency_request_completed);
+}
+
+static int yz_nr_residency_materialize_wait(uint32_t generation)
+{
+    if (!g_active.residency_enabled || !generation ||
+        ReadAcquire(&g_active.residency_shutdown))
+        return -1;
+    const DWORD consumer = static_cast<DWORD>(
+        ReadAcquire(&g_active.report_consumer_thread));
+    if (!consumer || consumer == GetCurrentThreadId())
+        return yz_nr_residency_materialize_direct(generation);
+    InterlockedExchange(
+        &g_active.residency_generation, static_cast<LONG>(generation));
+    const LONG64 request = InterlockedIncrement64(
+        &g_active.residency_request_sequence);
+    for (;;) {
+        LONG64 done = InterlockedCompareExchange64(
+            &g_active.residency_request_completed, 0, 0);
+        if (done >= request)
+            break;
+        if (ReadAcquire(&g_active.residency_shutdown))
+            return -1;
+        WaitOnAddress(
+            (volatile VOID*)&g_active.residency_request_completed,
+            &done, sizeof(done), 10u);
+    }
+    return ReadAcquire(&g_active.residency_request_failed) ? -1 : 0;
+}
+
+static void yz_nr_residency_access(
+    void* user, uint32_t ea, uint32_t size, uint32_t source,
+    uint32_t write, uint32_t image_id, uint32_t task_id,
+    uint32_t pc, uint32_t command)
+{
+    if (write != VM_NATIVE_RESIDENCY_WRITE_END)
+        yz_nr_residency_audit_access(
+            user, ea, size, source,
+            write == VM_NATIVE_RESIDENCY_WRITE_BEGIN,
+            image_id, task_id, pc, command);
+    if (!g_active.residency_enabled)
+        return;
+    int need_materialize = 0;
+    const uint32_t generation = rsx_nr_residency_access(
+        &g_active.residency_slot, ea, size,
+        write == VM_NATIVE_RESIDENCY_WRITE_END,
+        &need_materialize);
+    if (!generation)
+        return;
+    if (need_materialize &&
+        yz_nr_residency_materialize_wait(generation) != 0) {
+        InterlockedExchange(&g_active.residency_request_failed, 1);
+        return;
+    }
+    if (write == VM_NATIVE_RESIDENCY_WRITE_END)
+        rsx_nr_residency_mark_dirty(
+            &g_active.residency_slot, generation, ea, size);
+}
+
+static void yz_nr_residency_audit_arm(void)
+{
+    if (!g_active.residency_audit_enabled)
+        return;
+    constexpr uint32_t size = 1024u * 768u * 4u;
+    uint32_t ea = 0u;
+    if (yz_nr_vertical_space_range_to_ea(
+            1u, 0x01772D00u, size, &ea) != 0)
+        return;
+
+    if (InterlockedExchange(&g_active.residency_audit_active, 0))
+        InterlockedIncrement64(&g_active.residency_audit_unpaired_save);
+    InterlockedExchange(&g_active.residency_audit_guest_ea,
+                        static_cast<LONG>(ea));
+    InterlockedExchange(&g_active.residency_audit_guest_size,
+                        static_cast<LONG>(size));
+    InterlockedExchange64(&g_active.residency_audit_pair_ppu_reads, 0);
+    InterlockedExchange64(&g_active.residency_audit_pair_spu_reads, 0);
+    InterlockedExchange64(&g_active.residency_audit_pair_writes, 0);
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now); /* one timestamp per semantic boundary */
+    InterlockedExchange64(
+        &g_active.residency_audit_pair_start_qpc, now.QuadPart);
+    InterlockedIncrement64(&g_active.residency_audit_generation);
+    InterlockedIncrement64(&g_active.residency_audit_save_count);
+    vm_native_residency_watch_range(ea, size);
+    const uint64_t end = static_cast<uint64_t>(ea) + size - 1u;
+    const uint32_t first_page = ea >> 12;
+    const uint32_t last_page = static_cast<uint32_t>(end >> 12);
+    for (uint32_t page = first_page; ; ++page) {
+        InterlockedOr64(
+            reinterpret_cast<volatile LONG64*>(
+                const_cast<uint64_t*>(&g_native_spurs_watch_page_bits[
+                    page >> 6])),
+            static_cast<LONG64>(1ull << (page & 63u)));
+        if (page == last_page)
+            break;
+    }
+    MemoryBarrier();
+    InterlockedExchange(&g_active.residency_audit_active, 1);
+}
+
+static void yz_nr_residency_audit_disarm(void)
+{
+    if (!g_active.residency_audit_enabled ||
+        !InterlockedExchange(&g_active.residency_audit_active, 0))
+        return;
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now); /* one timestamp per semantic boundary */
+    const LONG64 start = InterlockedExchange64(
+        &g_active.residency_audit_pair_start_qpc, 0);
+    if (start > 0 && now.QuadPart >= start) {
+        const LONG64 ticks = now.QuadPart - start;
+        InterlockedAdd64(&g_active.residency_audit_pair_ticks, ticks);
+        yz_nr_residency_audit_atomic_max(
+            &g_active.residency_audit_max_pair_ticks, ticks);
+    }
+    if (InterlockedCompareExchange64(
+            &g_active.residency_audit_pair_ppu_reads, 0, 0) ||
+        InterlockedCompareExchange64(
+            &g_active.residency_audit_pair_spu_reads, 0, 0))
+        InterlockedIncrement64(&g_active.residency_audit_pairs_with_read);
+    if (InterlockedCompareExchange64(
+            &g_active.residency_audit_pair_writes, 0, 0))
+        InterlockedIncrement64(&g_active.residency_audit_pairs_with_write);
+    InterlockedIncrement64(&g_active.residency_audit_complete_pairs);
+    InterlockedIncrement64(&g_active.residency_audit_restore_count);
+}
 
 static uint32_t yz_nr_graphics_family_mask(const char* text)
 {
@@ -918,7 +1296,7 @@ static void yz_nr_report_guest_read(
 
 extern "C" void yz_nr_vertical_service_report_requests(void)
 {
-    if (!g_active.report_defer_enabled)
+    if (!g_active.report_defer_enabled && !g_active.residency_enabled)
         return;
     /* This entry is called only from the two actual RSX consumer boundaries:
      * strict-owner frame consumption and the legacy FIFO step. The owner can
@@ -932,6 +1310,7 @@ extern "C" void yz_nr_vertical_service_report_requests(void)
         &g_active.report_consumer_thread,
         static_cast<LONG>(GetCurrentThreadId()));
     yz_nr_report_service_requests();
+    yz_nr_residency_service_requests();
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -1036,9 +1415,46 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
         InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
-    const int result = g_active.gpu_ops.transfer
+    int result = g_active.gpu_ops.transfer
         ? g_active.gpu_ops.transfer(g_active.gpu_ops.user, st, transfer,
                                     words) : -1;
+    if (!result && yz_nr_residency_audit_restore(transfer)) {
+        yz_nr_residency_audit_disarm();
+        if (g_active.residency_enabled) {
+            const uint32_t generation = static_cast<uint32_t>(ReadAcquire(
+                &g_active.residency_generation));
+            if (rsx_nr_residency_finish(
+                    &g_active.residency_slot, generation) != 0)
+                result = -1;
+            InterlockedExchange(&g_active.residency_generation, 0);
+            vm_native_residency_clear_watches();
+        }
+    } else if (!result && yz_nr_residency_audit_save(transfer)) {
+        yz_nr_residency_audit_arm();
+        if (g_active.residency_enabled) {
+            uint32_t generation = 0u;
+            unsigned long long writer_fence = 0u;
+            constexpr uint32_t size = 1024u * 768u * 4u;
+            uint32_t ea = 0u;
+            const int pending = g_active.d3d12
+                ? rsx_nr_d3d12_residency_pending(
+                      g_active.d3d12, &generation, &writer_fence)
+                : 0;
+            if (pending == 1 &&
+                (yz_nr_vertical_space_range_to_ea(
+                     1u, 0x01772D00u, size, &ea) != 0 ||
+                 rsx_nr_residency_begin(
+                     &g_active.residency_slot, ea, size,
+                     writer_fence, &generation) != 0)) {
+                result = -1;
+            } else if (pending == 1) {
+                InterlockedExchange(
+                    &g_active.residency_generation,
+                    static_cast<LONG>(generation));
+                vm_native_residency_watch_range(ea, size);
+            }
+        }
+    }
     if (result)
         InterlockedExchange(&g_active.renderer_owner, 0);
     return result;
@@ -1256,6 +1672,13 @@ static void yz_nr_active_ensure_graphics(void)
         rsx_nr_d3d12_set_coherent_section_mode(d3d12, 1) != 0) {
         rsx_nr_d3d12_destroy(d3d12);
         InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
+    if (rsx_nr_d3d12_set_native_residency(
+            d3d12, g_active.residency_enabled) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
@@ -2653,6 +3076,9 @@ extern "C" void yz_nr_vertical_init(void)
             getenv("YZ_NR_SCANOUT_PROVENANCE") != nullptr;
         const char* const report_defer = getenv("YZ_NR_DEFER_REPORTS");
         const char* const report_audit = getenv("YZ_NR_REPORT_AUDIT");
+        const char* const residency_audit =
+            getenv("YZ_NR_NATIVE_RESIDENCY_AUDIT");
+        const char* const residency = getenv("YZ_NR_NATIVE_RESIDENCY");
         g_active.report_defer_enabled = strict &&
             ((report_defer && report_defer[0] == '1' &&
               report_defer[1] == '\0') || g_active.graph_islands ||
@@ -2660,6 +3086,11 @@ extern "C" void yz_nr_vertical_init(void)
              g_active.single_pass_graph == RSX_NR_FRAME_GRAPH_SNAPSHOT);
         g_active.report_audit_enabled = strict && report_audit &&
             report_audit[0] == '1' && report_audit[1] == '\0';
+        g_active.residency_audit_enabled = strict && residency_audit &&
+            residency_audit[0] == '1' && residency_audit[1] == '\0';
+        g_active.residency_enabled = strict && residency &&
+            residency[0] == '1' && residency[1] == '\0';
+        rsx_nr_residency_init(&g_active.residency_slot);
         g_active.draw_primitive_filter = UINT32_MAX;
         if (graphics && !strict) {
             const char* const primitive = getenv("YZ_NR_DRAW_PRIMITIVE");
@@ -2700,10 +3131,22 @@ extern "C" void yz_nr_vertical_init(void)
             graphics) {
             InterlockedExchange(&g_vertical.mode_active_graphics, 1);
             cellSpursSetGuestWriteObserver(yz_nr_vertical_notify_guest_write);
+            if (g_active.residency_audit_enabled) {
+                for (uint32_t i = 0; i < YZ_NR_RESIDENCY_AUDIT_KEYS; ++i)
+                    InterlockedExchange(
+                        &g_active.residency_audit_keys[i].min_offset,
+                        LONG_MAX);
+            }
+            if (g_active.residency_audit_enabled ||
+                g_active.residency_enabled) {
+                vm_native_residency_clear_watches();
+                vm_native_residency_set_observer(
+                    yz_nr_residency_access, nullptr);
+            }
             if (g_active.report_defer_enabled) {
                 vm_native_report_clear_read_watches();
                 vm_native_report_set_read_observer(
-                    yz_nr_report_guest_read, nullptr);
+                    yz_nr_combined_guest_read, nullptr);
             }
         }
     }
@@ -4963,6 +5406,90 @@ extern "C" void yz_nr_vertical_shutdown(void)
             yz_nr_report_retire_all(1);
         InterlockedExchange(&g_active.report_shutdown, 1);
         WakeByAddressAll((PVOID)&g_active.report_request_completed);
+        InterlockedExchange(&g_active.residency_shutdown, 1);
+        WakeByAddressAll((PVOID)&g_active.residency_request_completed);
+        rsx_nr_residency_reset(&g_active.residency_slot);
+        if (g_active.residency_audit_enabled) {
+            if (InterlockedExchange(
+                    &g_active.residency_audit_active, 0))
+                InterlockedIncrement64(
+                    &g_active.residency_audit_unpaired_save);
+            LARGE_INTEGER frequency = {};
+            QueryPerformanceFrequency(&frequency);
+            fprintf(stderr,
+                    "[nr-residency-audit saves=%lld restores=%lld "
+                    "pairs=%lld unpaired=%lld ppu-reads=%lld/%lld "
+                    "spu-reads=%lld/%lld writes=%lld/%lld "
+                    "pairs-read=%lld pairs-write=%lld "
+                    "pair-ticks=%lld max-pair-ticks=%lld qpc=%lld "
+                    "guest=%08lX size=%08lX generation=%lld]\n",
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_save_count, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_restore_count, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_complete_pairs, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_unpaired_save, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_ppu_reads, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_ppu_read_bytes, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_spu_reads, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_spu_read_bytes, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_writes, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_write_bytes, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_pairs_with_read, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_pairs_with_write, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_pair_ticks, 0, 0),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_max_pair_ticks, 0, 0),
+                    frequency.QuadPart,
+                    ReadAcquire(&g_active.residency_audit_guest_ea),
+                    ReadAcquire(&g_active.residency_audit_guest_size),
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_generation, 0, 0));
+            for (uint32_t i = 0; i < YZ_NR_RESIDENCY_AUDIT_KEYS; ++i) {
+                const yz_nr_residency_audit_key* const key =
+                    &g_active.residency_audit_keys[i];
+                const LONG64 identity = InterlockedCompareExchange64(
+                    const_cast<volatile LONG64*>(&key->identity), 0, 0);
+                if (!identity)
+                    continue;
+                fprintf(stderr,
+                        "[nr-residency-access slot=%u source=%llu write=%llu "
+                        "cmd=%02llX image=%llu task=%llu pc=%05llX count=%lld "
+                        "bytes=%lld range=%08lX-%08lX]\n",
+                        i,
+                        static_cast<unsigned long long>((identity >> 2) & 3),
+                        static_cast<unsigned long long>((identity >> 1) & 1),
+                        static_cast<unsigned long long>((identity >> 4) & 0xFF),
+                        static_cast<unsigned long long>((identity >> 12) & 0xFFFF),
+                        static_cast<unsigned long long>((identity >> 46) & 0xFF),
+                        static_cast<unsigned long long>((identity >> 28) & 0x3FFFF),
+                        InterlockedCompareExchange64(
+                            const_cast<volatile LONG64*>(&key->count), 0, 0),
+                        InterlockedCompareExchange64(
+                            const_cast<volatile LONG64*>(&key->bytes), 0, 0),
+                        ReadAcquire(const_cast<volatile LONG*>(
+                            &key->min_offset)),
+                        ReadAcquire(const_cast<volatile LONG*>(
+                            &key->max_offset)));
+            }
+            fprintf(stderr,
+                    "[nr-residency-access-overflow count=%lld]\n",
+                    InterlockedCompareExchange64(
+                        &g_active.residency_audit_key_overflow, 0, 0));
+        }
+        vm_native_residency_set_observer(nullptr, nullptr);
+        vm_native_residency_clear_watches();
         vm_native_report_set_read_observer(nullptr, nullptr);
         vm_native_report_clear_read_watches();
         if (g_active.report_defer_enabled)
@@ -5598,6 +6125,7 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "batches=%llu legacy-groups=%llu coverage-ppm=%llu "
                     "clears=%llu "
                      "presents=%llu submits=%llu xfer-gpu=%llu/%llu "
+                     "deferred=%llu/%llu/%llu "
                      "fallback=%llu resident=%llu/%llu "
                      "fallback-reason=%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                      "upload-fail=%llu/%llu/%llu/%llu "
@@ -5621,6 +6149,9 @@ extern "C" void yz_nr_vertical_shutdown(void)
                      d3d_stats.queue_submissions,
                      d3d_stats.transfer_gpu_readbacks,
                      d3d_stats.transfer_gpu_uploads,
+                     d3d_stats.residency_deferred_copies,
+                     d3d_stats.residency_materializations,
+                     d3d_stats.residency_materialized_bytes,
                      d3d_stats.unsupported_draws,
                      d3d_stats.resident_pages[0],
                      d3d_stats.resident_pages[1],

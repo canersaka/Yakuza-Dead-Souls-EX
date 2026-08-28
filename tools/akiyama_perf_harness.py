@@ -1003,6 +1003,10 @@ def run_gun(args):
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
         yz["YZ_NR_REPORT_AUDIT"] = "1"
+    if args.nr_native_residency_audit:
+        yz["YZ_NR_NATIVE_RESIDENCY_AUDIT"] = "1"
+    if args.nr_native_residency:
+        yz["YZ_NR_NATIVE_RESIDENCY"] = "1"
     if args.nr_graph_execute:
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
@@ -1034,6 +1038,8 @@ def run_gun(args):
              if args.nr_scanout_provenance else {}) |
             ({"YZ_NR_REPORT_AUDIT": "1"}
              if args.nr_report_audit else {}) |
+            ({"YZ_NR_NATIVE_RESIDENCY_AUDIT": "1"}
+             if args.nr_native_residency_audit else {}) |
             ({"YZ_NR_STALL_AGGREGATE": "1"}
              if args.nr_stall_aggregate else {})
         ),
@@ -1361,6 +1367,37 @@ def run_gun(args):
         result["nr_report_fallback"] = report_fallback_lines
         result["nr_report_family"] = report_family_lines
         result["nr_report_family_fallback"] = report_family_fallback_lines
+        residency_audit_lines = re.findall(
+            r"^\[nr-residency-audit .*\]$", stderr_text, re.MULTILINE
+        )
+        residency_access_lines = re.findall(
+            r"^\[nr-residency-access .*\]$", stderr_text, re.MULTILINE
+        )
+        residency_overflow_lines = re.findall(
+            r"^\[nr-residency-access-overflow .*\]$",
+            stderr_text, re.MULTILINE
+        )
+        result["nr_native_residency_audit"] = residency_audit_lines
+        result["nr_native_residency_access"] = residency_access_lines
+        result["nr_native_residency_access_overflow"] = residency_overflow_lines
+        if args.nr_native_residency_audit:
+            if len(residency_audit_lines) != 1:
+                raise RuntimeError(
+                    "native residency audit aggregate incomplete: expected "
+                    f"one summary, found {len(residency_audit_lines)}"
+                )
+            if not residency_access_lines or len(residency_overflow_lines) != 1:
+                raise RuntimeError(
+                    "native residency access map incomplete: "
+                    f"keys={len(residency_access_lines)} "
+                    f"overflow={len(residency_overflow_lines)}"
+                )
+        elif (residency_audit_lines or residency_access_lines or
+              residency_overflow_lines):
+            raise RuntimeError(
+                "native residency audit output was active outside its "
+                "requested lane"
+            )
         if args.nr_report_audit:
             if len(report_scoreboard_lines) != 1:
                 raise RuntimeError(
@@ -1646,6 +1683,10 @@ def run(args):
         yz["YZ_NR_DEFER_REPORTS"] = "1"
     if args.nr_report_audit:
         yz["YZ_NR_REPORT_AUDIT"] = "1"
+    if args.nr_native_residency_audit:
+        yz["YZ_NR_NATIVE_RESIDENCY_AUDIT"] = "1"
+    if args.nr_native_residency:
+        yz["YZ_NR_NATIVE_RESIDENCY"] = "1"
     if args.nr_graph_execute:
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
@@ -1678,6 +1719,8 @@ def run(args):
              if args.nr_scanout_provenance else {}) |
             ({"YZ_NR_REPORT_AUDIT": "1"}
              if args.nr_report_audit else {}) |
+            ({"YZ_NR_NATIVE_RESIDENCY_AUDIT": "1"}
+             if args.nr_native_residency_audit else {}) |
             ({"YZ_NR_STALL_AGGREGATE": "1"}
              if args.nr_stall_aggregate else {})
         ),
@@ -2017,6 +2060,37 @@ def run(args):
         result["nr_report_fallback"] = report_fallback_lines
         result["nr_report_family"] = report_family_lines
         result["nr_report_family_fallback"] = report_family_fallback_lines
+        residency_audit_lines = re.findall(
+            r"^\[nr-residency-audit .*\]$", stderr_text, re.MULTILINE
+        )
+        residency_access_lines = re.findall(
+            r"^\[nr-residency-access .*\]$", stderr_text, re.MULTILINE
+        )
+        residency_overflow_lines = re.findall(
+            r"^\[nr-residency-access-overflow .*\]$",
+            stderr_text, re.MULTILINE
+        )
+        result["nr_native_residency_audit"] = residency_audit_lines
+        result["nr_native_residency_access"] = residency_access_lines
+        result["nr_native_residency_access_overflow"] = residency_overflow_lines
+        if args.nr_native_residency_audit:
+            if len(residency_audit_lines) != 1:
+                raise RuntimeError(
+                    "native residency audit aggregate incomplete: expected "
+                    f"one summary, found {len(residency_audit_lines)}"
+                )
+            if not residency_access_lines or len(residency_overflow_lines) != 1:
+                raise RuntimeError(
+                    "native residency access map incomplete: "
+                    f"keys={len(residency_access_lines)} "
+                    f"overflow={len(residency_overflow_lines)}"
+                )
+        elif (residency_audit_lines or residency_access_lines or
+              residency_overflow_lines):
+            raise RuntimeError(
+                "native residency audit output was active outside its "
+                "requested lane"
+            )
         if args.nr_report_audit:
             if len(report_scoreboard_lines) != 1:
                 raise RuntimeError(
@@ -2242,6 +2316,8 @@ def main():
     parser.add_argument("--nr-rsx-tail-breakdown", action="store_true")
     parser.add_argument("--nr-defer-reports", action="store_true")
     parser.add_argument("--nr-report-audit", action="store_true")
+    parser.add_argument("--nr-native-residency-audit", action="store_true")
+    parser.add_argument("--nr-native-residency", action="store_true")
     parser.add_argument(
         "--nr-graph-execute", action="store_true",
         help="execute strict-native FIFO dependency islands through the fixed graph",
@@ -2320,6 +2396,15 @@ def main():
         parser.error("--nr-defer-reports requires --nr-vertical-full-native")
     if args.nr_report_audit and not args.nr_defer_reports:
         parser.error("--nr-report-audit requires --nr-defer-reports")
+    if (args.nr_native_residency_audit and
+            not args.nr_vertical_full_native):
+        parser.error(
+            "--nr-native-residency-audit requires --nr-vertical-full-native"
+        )
+    if args.nr_native_residency and not args.nr_vertical_full_native:
+        parser.error(
+            "--nr-native-residency requires --nr-vertical-full-native"
+        )
     if args.nr_graph_execute and not args.nr_vertical_full_native:
         parser.error("--nr-graph-execute requires --nr-vertical-full-native")
     if args.nr_single_pass_graph and not args.nr_vertical_full_native:

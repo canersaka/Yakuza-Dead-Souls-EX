@@ -1992,11 +1992,27 @@ static int run_capture(const char* path)
             rsx_nir_adapter_finish(ad);          /* flush pending inline run */
             if (!pass) {
                 u32 draws = 0, clears = 0, sems = 0, presents = 0, reports = 0;
+                u32 transfers = 0;
+                const char* const dump_transfers =
+                    getenv("YZ_NIR_DUMP_TRANSFERS");
+                const char* const dump_transfer_window =
+                    getenv("YZ_NIR_DUMP_TRANSFER_WINDOW");
                 rsx_nir_cursor c;
                 rsx_nir_action act;
                 rsx_nir_cursor_init(&c, &sa);
                 u32 bad_draw = 0;
+                u32 action_index = 0;
                 while (rsx_nir_cursor_next(&c, &act)) {
+                    if (dump_transfer_window && dump_transfer_window[0] &&
+                        strcmp(dump_transfer_window, "0") != 0 &&
+                        action_index >= 1695u && action_index <= 1745u) {
+                        printf("  action[%u] op=%u kind=%u rt=%u:%08X/%ux%u\n",
+                               action_index, act.op_index, act.kind,
+                               act.state.surface.color_location[0],
+                               act.state.surface.color_offset[0],
+                               act.state.surface.clip_w,
+                               act.state.surface.clip_h);
+                    }
                     switch (act.kind) {
                     case RSX_NIR_OP_DRAW:
                         draws++;
@@ -2010,13 +2026,40 @@ static int run_capture(const char* path)
                     case RSX_NIR_OP_SEMAPHORE_ACQUIRE: sems++; break;
                     case RSX_NIR_OP_PRESENT: presents++; break;
                     case RSX_NIR_OP_REPORT: reports++; break;
+                    case RSX_NIR_OP_TRANSFER:
+                        transfers++;
+                        if (dump_transfers && dump_transfers[0] &&
+                            strcmp(dump_transfers, "0") != 0) {
+                            const rsx_nir_transfer* const t = &act.u.transfer;
+                            printf("  transfer[%u] action=%u kind=%u "
+                                   "src=%u:%08X pitch=%u fmt=%u "
+                                   "dst=%u:%08X pitch=%u fmt=%u "
+                                   "line=%ux%u in=%u,%u+%ux%u "
+                                   "out=%u,%u+%ux%u clip=%u,%u+%ux%u "
+                                   "step=%08X/%08X origin=%u interp=%u\n",
+                                   transfers - 1u, action_index, t->kind,
+                                   t->src_location, t->src_offset,
+                                   t->src_pitch, t->src_format,
+                                   t->dst_location, t->dst_offset,
+                                   t->dst_pitch, t->dst_format,
+                                   t->line_length, t->line_count,
+                                   t->in_x, t->in_y, t->in_w, t->in_h,
+                                   t->out_x, t->out_y, t->out_w, t->out_h,
+                                   t->clip_x, t->clip_y,
+                                   t->clip_w, t->clip_h,
+                                   t->ds_dx, t->dt_dy,
+                                   t->origin, t->interpolator);
+                        }
+                        break;
                     default: break;
                     }
+                    action_index++;
                 }
                 printf("capture %s: methods=%u actions=%u draws=%u clears=%u "
-                       "sems=%u reports=%u presents=%u ops=%u side=%u\n",
+                       "sems=%u reports=%u transfers=%u presents=%u "
+                       "ops=%u side=%u\n",
                        path, ad->methods_seen, ad->actions_seen, draws,
-                       clears, sems, reports, presents, sa.op_count,
+                       clears, sems, reports, transfers, presents, sa.op_count,
                        sa.side_count);
                 /* method-write census by decoder class: how much of the
                  * real stream the register-file model actively decodes
