@@ -199,6 +199,24 @@ typedef void (*CellSpursGuestWriteObserver)(u32 ea, u32 size);
 /* Optional post-publication observer. The pointer is read atomically on the
  * existing write chokepoint; NULL is the default and adds no callback work. */
 void cellSpursSetGuestWriteObserver(CellSpursGuestWriteObserver observer);
+/* Default-off exact image-4 semantic replacement. The interceptor is called
+ * only for the five persistent image-4 tasks and receives every task's
+ * parameter EA before the signal is latched. Returning nonzero consumes the
+ * current signal; returning zero preserves the ordinary SPURS path exactly. */
+typedef int (*CellSpursImage4SignalInterceptor)(
+    void* user, u32 wid, u32 current_task_id, u32 task_count,
+    const u32* task_ids, const u32* parameter_eas,
+    u64 image_fingerprint, u32 image_size, u32 entry_pc, s32 image_id);
+void cellSpursSetImage4SignalInterceptor(
+    CellSpursImage4SignalInterceptor interceptor, void* user);
+/* Snapshot the five persistent image-4 task identities without changing any
+ * taskset state.  This is used only by the default-off native graphics route
+ * to prove that a complete EDGE MLAA parameter set is already published
+ * before suppressing its producer readback.  Returns one on an exact live
+ * five-task snapshot and zero otherwise. */
+int cellSpursSnapshotImage4Taskset(
+    u32 wid, u32 task_ids[5], u32 parameter_eas[5],
+    u64* image_fingerprint, u32* image_size, u32* entry_pc, s32* image_id);
 /* Complete staged PPU descriptor publications after the lifted guest barrier
  * that orders their body before the SPURS-visible readiness state. */
 void cellSpursNotifyPpuFence(void);

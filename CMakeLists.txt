@@ -620,6 +620,17 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(rsx_nr_residency PROPERTIES
             TIMEOUT 30 LABELS "regression;renderer;native-render")
 
+        add_executable(rsx_image4_mlaa_tests
+            libs/video/tests/test_image4_mlaa.c
+            libs/video/rsx_image4_mlaa.c
+        )
+        target_include_directories(rsx_image4_mlaa_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        add_test(NAME rsx_image4_mlaa COMMAND rsx_image4_mlaa_tests)
+        set_tests_properties(rsx_image4_mlaa PROPERTIES
+            TIMEOUT 30 LABELS "regression;renderer;native-render;image4")
+
         add_executable(rsx_nr_span_router_tests
             libs/video/tests/test_nr_span_router.c
             libs/video/rsx_nr_span_router.c

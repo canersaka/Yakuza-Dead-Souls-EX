@@ -189,6 +189,18 @@ typedef struct rsx_nr_d3d12_stats {
     unsigned long long residency_deferred_copies;
     unsigned long long residency_materializations;
     unsigned long long residency_materialized_bytes;
+    unsigned long long image4_mlaa_holds;
+    unsigned long long image4_mlaa_dispatches;
+    unsigned long long image4_mlaa_failures;
+    unsigned long long image4_mlaa_fallback_materializations;
+    unsigned long long image4_mlaa_avoided_readbacks;
+    unsigned long long image4_mlaa_avoided_uploads;
+    unsigned long long image4_mlaa_avoided_bytes;
+    unsigned long long image4_mlaa_gpu_samples;
+    unsigned long long image4_mlaa_gpu_ticks;
+    unsigned long long image4_mlaa_gpu_frequency;
+    unsigned long long image4_mlaa_fence_wait_ticks;
+    unsigned long long image4_mlaa_qpc_frequency;
     unsigned long long queue_submissions;   /* fence-retired command lists */
     unsigned long long descriptor_table_hits;
     unsigned long long descriptor_table_builds;
@@ -571,6 +583,24 @@ int rsx_nr_d3d12_residency_pending(const rsx_nr_d3d12* b,
                                    unsigned long long* writer_fence);
 int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b,
                                        unsigned int generation);
+
+/* Default-off exact EDGE 1.2 MLAA replacement. The capture-proven forward
+ * transfer retains the 1024x768 RGBA render target on the shared GPU timeline
+ * without recording a readback. The recognized five-task route dispatches
+ * native MLAA and the matching restore consumes the resident result without
+ * an upload. Any guest access materializes the exact target and therefore
+ * makes the semantic interceptor decline the round. */
+int rsx_nr_d3d12_set_image4_gpu_mlaa(rsx_nr_d3d12* b, int enabled);
+/* Arm only the immediately following transfer after the producer wrapper has
+ * proven a complete, current EDGE MLAA task contract.  Enabling the feature
+ * alone never suppresses a transfer based on shape. */
+int rsx_nr_d3d12_arm_image4_gpu_mlaa(rsx_nr_d3d12* b, int armed);
+int rsx_nr_d3d12_image4_gpu_mlaa_pending(
+    const rsx_nr_d3d12* b, unsigned int* generation,
+    unsigned long long* writer_fence, int* materialized);
+int rsx_nr_d3d12_execute_image4_gpu_mlaa(
+    rsx_nr_d3d12* b, unsigned int generation,
+    unsigned int threshold_base, unsigned int threshold_scale);
 
 /* Declare that every draw submitted to this backend is owned as part of a
  * completely preflighted render section. This admits the captured combined

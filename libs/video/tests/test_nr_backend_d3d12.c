@@ -2773,8 +2773,227 @@ static void test_private_rt_alias_chooses_latest_writer(void)
     rsx_nr_d3d12_destroy(sink);
 }
 
+typedef struct image4_test_arena {
+    u8* local;
+    u8* main;
+    u32 size;
+} image4_test_arena;
+
+static const u8* image4_arena_ptr(
+    void* user, u32 space, u32 offset, u32 min_bytes)
+{
+    image4_test_arena* arena = (image4_test_arena*)user;
+    if (!arena || offset > arena->size || min_bytes > arena->size - offset)
+        return NULL;
+    return (space ? arena->main : arena->local) + offset;
+}
+
+static u8* image4_arena_wptr(
+    void* user, u32 space, u32 offset, u32 min_bytes)
+{
+    return (u8*)image4_arena_ptr(user, space, offset, min_bytes);
+}
+
+static void test_image4_gpu_mlaa_path(void)
+{
+    enum {
+        IMAGE4_LOCAL = 0x01140000u,
+        IMAGE4_MAIN = 0x01772D00u,
+        IMAGE4_W = 1024u,
+        IMAGE4_H = 768u,
+        IMAGE4_PITCH = 4096u,
+        IMAGE4_BYTES = IMAGE4_PITCH * IMAGE4_H
+    };
+    image4_test_arena arena;
+    arena.size = 32u << 20;
+    fprintf(stderr, "[image4-test] allocating-arena\n");
+    arena.local = (u8*)calloc(1u, arena.size);
+    arena.main = (u8*)calloc(1u, arena.size);
+    fprintf(stderr, "[image4-test] arena-ready\n");
+    CHECK(arena.local != NULL && arena.main != NULL,
+          "image4 guest arena allocation failed");
+    if (!arena.local || !arena.main) {
+        free(arena.local);
+        free(arena.main);
+        return;
+    }
+    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE,
+        image4_arena_ptr, image4_arena_wptr, &arena);
+    CHECK(sink != NULL, "image4 WARP sink creation failed");
+    if (!sink) {
+        free(arena.local);
+        free(arena.main);
+        return;
+    }
+    fprintf(stderr, "[image4-test] sink-ready\n");
+    CHECK(rsx_nr_d3d12_set_live_output(sink, 1, NULL, NULL) == 0,
+          "image4 RGBA target configuration failed");
+    CHECK(rsx_nr_d3d12_set_image4_gpu_mlaa(sink, 1) == 0,
+          "image4 compute enable failed");
+
+    rsx_nr_ring ring;
+    rsx_nr_tokens tokens;
+    rsx_nr_tokens_init(&tokens);
+    CHECK(rsx_nr_ring_init(&ring, 128u, 256u) == 0,
+          "image4 ring init failed");
+    rsx_nr_exec_ops ops;
+    memset(&ops, 0, sizeof(ops));
+    rsx_nr_d3d12_get_exec_ops(sink, &ops);
+    rsx_nr_backend backend;
+    rsx_nr_backend_init(&backend, &ring, &tokens, &ops);
+    rsx_nir_sink ring_sink = rsx_nr_ring_sink(&ring);
+    rsx_nir_emitter emitter;
+    rsx_nir_emitter_init(&emitter, &ring_sink);
+
+    rsx_nir_surface surface;
+    memset(&surface, 0, sizeof(surface));
+    surface.color_format = 5u;
+    surface.raster_type = 1u;
+    surface.clip_w = IMAGE4_W;
+    surface.clip_h = IMAGE4_H;
+    surface.color_offset[0] = IMAGE4_LOCAL;
+    surface.color_pitch[0] = IMAGE4_PITCH;
+    surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
+    surface.color_target = 1u;
+    rsx_nir_em_surface(&emitter, &surface);
+    rsx_nir_scissor scissor = {0u, 0u, IMAGE4_W, IMAGE4_H};
+    rsx_nir_em_scissor(&emitter, &scissor);
+    rsx_nir_raster raster;
+    memset(&raster, 0, sizeof(raster));
+    raster.color_mask = 0x01010101u;
+    rsx_nir_em_raster(&emitter, &raster);
+    rsx_nir_em_clear(&emitter, 0xF0u, 0xFF000000u, 0u, 0u);
+    rsx_nr_backend_run(&backend, 0u);
+    fprintf(stderr, "[image4-test] target-ready\n");
+    CHECK(backend.stats.exec_errors == 0u,
+          "image4 target creation failed (%llu)",
+          backend.stats.exec_errors);
+
+    /* Deterministic hard edge in guest A,R,G,B order. The normal reverse
+     * transfer seeds the native RT; only the following recognized round is
+     * eligible to avoid its readback and matching upload. */
+    for (u32 y = 0; y < IMAGE4_H; ++y) {
+        u8* row = arena.main + IMAGE4_MAIN + (size_t)y * IMAGE4_PITCH;
+        for (u32 x = 0; x < IMAGE4_W; ++x) {
+            const u8 value = x < IMAGE4_W / 2u ? 0u : 255u;
+            row[x * 4u + 0u] = 255u;
+            row[x * 4u + 1u] = value;
+            row[x * 4u + 2u] = value;
+            row[x * 4u + 3u] = value;
+        }
+    }
+    rsx_nir_transfer transfer;
+    memset(&transfer, 0, sizeof(transfer));
+    transfer.kind = RSX_NIR_XFER_SCALED;
+    transfer.src_location = RSX_NIR_LOCATION_MAIN;
+    transfer.src_offset = IMAGE4_MAIN;
+    transfer.src_pitch = IMAGE4_PITCH;
+    transfer.src_format = 3u;
+    transfer.dst_location = RSX_NIR_LOCATION_LOCAL;
+    transfer.dst_offset = IMAGE4_LOCAL;
+    transfer.dst_pitch = IMAGE4_PITCH;
+    transfer.dst_format = 10u;
+    transfer.in_w = transfer.out_w = transfer.clip_w = IMAGE4_W;
+    transfer.in_h = transfer.out_h = transfer.clip_h = IMAGE4_H;
+    transfer.ds_dx = transfer.dt_dy = 0x00100000u;
+    transfer.origin = transfer.interpolator = 1u;
+    rsx_nir_em_transfer(&emitter, &transfer, NULL);
+    rsx_nr_backend_run(&backend, 0u);
+    fprintf(stderr, "[image4-test] seed-uploaded\n");
+
+    rsx_nr_d3d12_stats before, after;
+    rsx_nr_d3d12_get_stats(sink, &before);
+    transfer.src_location = RSX_NIR_LOCATION_LOCAL;
+    transfer.src_offset = IMAGE4_LOCAL;
+    transfer.dst_location = RSX_NIR_LOCATION_MAIN;
+    transfer.dst_offset = IMAGE4_MAIN;
+    CHECK(rsx_nr_d3d12_arm_image4_gpu_mlaa(sink, 1) == 0,
+          "exact image4 producer admission failed");
+    rsx_nir_em_transfer(&emitter, &transfer, NULL);
+    rsx_nr_backend_run(&backend, 0u);
+    fprintf(stderr, "[image4-test] forward-held\n");
+    u32 generation = 0u;
+    u64 writer_fence = 0u;
+    int materialized = 1;
+    CHECK(rsx_nr_d3d12_image4_gpu_mlaa_pending(
+              sink, &generation, &writer_fence, &materialized) == 1 &&
+              generation != 0u && !materialized,
+          "exact forward transfer did not retain the GPU target");
+    CHECK(rsx_nr_d3d12_execute_image4_gpu_mlaa(
+              sink, generation, 10u, 89u) == 0,
+          "image4 compute dispatch failed");
+    fprintf(stderr, "[image4-test] compute-complete\n");
+    transfer.src_location = RSX_NIR_LOCATION_MAIN;
+    transfer.src_offset = IMAGE4_MAIN;
+    transfer.dst_location = RSX_NIR_LOCATION_LOCAL;
+    transfer.dst_offset = IMAGE4_LOCAL;
+    rsx_nir_em_transfer(&emitter, &transfer, NULL);
+    rsx_nr_backend_run(&backend, 0u);
+    fprintf(stderr, "[image4-test] restore-consumed\n");
+    rsx_nr_d3d12_get_stats(sink, &after);
+    CHECK(after.transfer_gpu_readbacks == before.transfer_gpu_readbacks &&
+              after.transfer_gpu_uploads == before.transfer_gpu_uploads,
+          "accepted image4 round performed readback/upload (%llu/%llu)",
+          after.transfer_gpu_readbacks - before.transfer_gpu_readbacks,
+          after.transfer_gpu_uploads - before.transfer_gpu_uploads);
+    CHECK(after.image4_mlaa_dispatches ==
+              before.image4_mlaa_dispatches + 1u &&
+              after.image4_mlaa_avoided_readbacks ==
+              before.image4_mlaa_avoided_readbacks + 1u &&
+              after.image4_mlaa_avoided_uploads ==
+              before.image4_mlaa_avoided_uploads + 1u &&
+              after.image4_mlaa_avoided_bytes ==
+              before.image4_mlaa_avoided_bytes + 2ull * IMAGE4_BYTES,
+          "image4 avoided-transfer accounting mismatch");
+    CHECK(after.image4_mlaa_gpu_samples ==
+              before.image4_mlaa_gpu_samples + 1u &&
+              after.image4_mlaa_gpu_ticks >= before.image4_mlaa_gpu_ticks &&
+              after.image4_mlaa_gpu_frequency != 0u &&
+              after.image4_mlaa_qpc_frequency != 0u &&
+              after.image4_mlaa_fence_wait_ticks >=
+                  before.image4_mlaa_fence_wait_ticks,
+          "image4 bounded GPU/fence timing aggregate missing");
+
+    u8* pixels = (u8*)malloc(IMAGE4_BYTES);
+    CHECK(pixels != NULL, "image4 output allocation failed");
+    if (pixels && rsx_nr_d3d12_read_rt(
+            sink, RSX_NIR_LOCATION_LOCAL, IMAGE4_LOCAL,
+            IMAGE4_W, IMAGE4_H, pixels) == 0) {
+        const u8* left = pixels + ((size_t)384u * IMAGE4_W + 100u) * 4u;
+        const u8* edge_l = pixels +
+            ((size_t)384u * IMAGE4_W + 511u) * 4u;
+        const u8* edge_r = pixels +
+            ((size_t)384u * IMAGE4_W + 512u) * 4u;
+        const u8* right = pixels +
+            ((size_t)384u * IMAGE4_W + 900u) * 4u;
+        CHECK(left[0] == 0u && left[1] == 0u && left[2] == 0u &&
+                  right[0] == 255u && right[1] == 255u && right[2] == 255u,
+              "image4 changed pixels away from the edge");
+        CHECK(edge_l[0] >= 63u && edge_l[0] <= 64u &&
+                  edge_r[0] >= 191u && edge_r[0] <= 192u,
+              "image4 edge blend mismatch left=%u right=%u",
+              edge_l[0], edge_r[0]);
+    } else {
+        CHECK(0, "image4 output readback failed");
+    }
+    free(pixels);
+    rsx_nr_ring_destroy(&ring);
+    rsx_nr_d3d12_destroy(sink);
+    free(arena.local);
+    free(arena.main);
+}
+
 int main(int argc, char** argv)
 {
+    const char* const image4_only = getenv("YZ_NR_IMAGE4_ONLY");
+    if (image4_only && image4_only[0] == '1' && image4_only[1] == '\0') {
+        test_image4_gpu_mlaa_path();
+        if (g_failures)
+            return 1;
+        printf("rsx_nr_backend_d3d12 image4: PASS\n");
+        return 0;
+    }
     /* Large archived-frame gates run in their own fresh WARP process. This
      * avoids carrying thousands of unrelated unit-test submissions and
      * resources into the deterministic two-pass capture comparison. */
@@ -4465,6 +4684,7 @@ int main(int argc, char** argv)
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
 
+    test_image4_gpu_mlaa_path();
     test_submit_attribution_gate();
     test_broker_actual_color_format();
     test_shared_timeline();

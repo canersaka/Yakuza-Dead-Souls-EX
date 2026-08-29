@@ -2014,6 +2014,113 @@ static __declspec(thread) int g_yz_sendsig_origin;
 #else
 static _Thread_local int g_yz_sendsig_origin;
 #endif
+static _Atomic(uintptr_t) g_image4_signal_interceptor;
+static _Atomic(void*) g_image4_signal_user;
+
+void cellSpursSetImage4SignalInterceptor(
+    CellSpursImage4SignalInterceptor interceptor, void* user)
+{
+    if (!interceptor) {
+        atomic_store_explicit(
+            &g_image4_signal_interceptor, (uintptr_t)0,
+            memory_order_release);
+        atomic_store_explicit(
+            &g_image4_signal_user, (void*)0, memory_order_relaxed);
+        return;
+    }
+    atomic_store_explicit(&g_image4_signal_user, user,
+                          memory_order_relaxed);
+    atomic_store_explicit(
+        &g_image4_signal_interceptor, (uintptr_t)interceptor,
+        memory_order_release);
+}
+
+int cellSpursSnapshotImage4Taskset(
+    u32 wid, u32 task_ids[5], u32 parameter_eas[5],
+    u64* image_fingerprint, u32* image_size, u32* entry_pc, s32* image_id)
+{
+    if (!task_ids || !parameter_eas || !image_fingerprint || !image_size ||
+        !entry_pc || !image_id)
+        return 0;
+    for (u32 slot = 0; slot < MAX_TASKSETS; ++slot) {
+        TasksetState* ts = &g_tasksets[slot];
+        if (!ts->sync.live || !ts->wid_registered || ts->wid != wid)
+            continue;
+        mx_lock(&ts->sync.mutex);
+        if (!ts->sync.live || !ts->wid_registered || ts->wid != wid) {
+            mx_unlock(&ts->sync.mutex);
+            continue;
+        }
+        u32 count = 0;
+        int overflow = 0;
+        spu_workload_image identity = {0};
+        for (u32 candidate = 0; candidate < CELL_SPURS_MAX_TASK; ++candidate) {
+            const TaskState* task = &ts->tasks[candidate];
+            if (!task->thread_valid || task->complete)
+                continue;
+            if (count >= 5u) {
+                overflow = 1;
+                break;
+            }
+            if (!count)
+                identity = task->image;
+            else if (task->image.fingerprint != identity.fingerprint ||
+                     task->image.image_size != identity.image_size ||
+                     task->image.entry_pc != identity.entry_pc ||
+                     task->image.image_id != identity.image_id) {
+                overflow = 1;
+                break;
+            }
+            task_ids[count] = candidate;
+            parameter_eas[count] = rd32(task->argument);
+            ++count;
+        }
+        if (!overflow && count == 5u) {
+            *image_fingerprint = identity.fingerprint;
+            *image_size = identity.image_size;
+            *entry_pc = identity.entry_pc;
+            *image_id = identity.image_id;
+            mx_unlock(&ts->sync.mutex);
+            return 1;
+        }
+        mx_unlock(&ts->sync.mutex);
+    }
+    return 0;
+}
+
+/* Caller holds ts->sync.mutex. */
+static int image4_intercept_signal_locked(TasksetState* ts, u32 id)
+{
+    if (!ts || id >= CELL_SPURS_MAX_TASK ||
+        ts->wid != 4u)
+        return 0;
+    const uintptr_t interceptor_bits = atomic_load_explicit(
+        &g_image4_signal_interceptor, memory_order_acquire);
+    if (!interceptor_bits)
+        return 0;
+    u32 task_ids[5];
+    u32 parameter_eas[5];
+    u32 count = 0;
+    for (u32 candidate = 0;
+         candidate < CELL_SPURS_MAX_TASK && count < 5u; ++candidate) {
+        const TaskState* task = &ts->tasks[candidate];
+        if (!task->thread_valid || task->complete)
+            continue;
+        task_ids[count] = candidate;
+        parameter_eas[count] = rd32(task->argument);
+        ++count;
+    }
+    return count == 5u &&
+        ((CellSpursImage4SignalInterceptor)interceptor_bits)(
+            atomic_load_explicit(
+                &g_image4_signal_user, memory_order_relaxed),
+            ts->wid, id, count, task_ids, parameter_eas,
+            ts->tasks[id].image.fingerprint,
+            ts->tasks[id].image.image_size,
+            ts->tasks[id].image.entry_pc,
+            ts->tasks[id].image.image_id);
+}
+
 s32 _cellSpursSendSignal(CellSpursTaskset* object, CellSpursTaskId id)
 {
     TasksetState* ts = taskset_find(object);
@@ -2063,6 +2170,16 @@ s32 _cellSpursSendSignal(CellSpursTaskset* object, CellSpursTaskId id)
                 return CELL_SPURS_TASK_ERROR_SRCH;
             }
         }
+    }
+    /* EDGE MLAA prepares all five records before it begins the SendSignal
+     * loop. That lets a semantic replacement validate the complete round on
+     * the first signal and either consume every exact task or leave every
+     * unknown variant on the existing SPURS path. No partial task execution
+     * is exposed. The callback performs no scheduler mutation and runs while
+     * this taskset is stable under its existing mutex. */
+    if (image4_intercept_signal_locked(ts, id)) {
+        mx_unlock(&ts->sync.mutex);
+        return CELL_OK;
     }
     yz_frontier_trace_emit(YZ_FT_TASK_SIGNAL, ts->wid, id,
                            guest_ea(object),
@@ -2248,9 +2365,18 @@ static void taskset_notify_guest_write(u32 ea, u32 size, u64 mask)
             const u8 signals = object[0x40u + byte];
             for (u32 lane = 0; lane < 8u; ++lane) {
                 if (!(signals & (0x80u >> lane))) continue;
-                TaskState* task = &ts->tasks[byte * 8u + lane];
+                const u32 task_id = byte * 8u + lane;
+                TaskState* task = &ts->tasks[task_id];
                 if (!task->thread_valid || task->complete || task->signalled)
                     continue;
+                if (image4_intercept_signal_locked(ts, task_id)) {
+                    /* The guest latch was already published before this
+                     * observer ran.  Native completion consumes the same
+                     * depth-one signal, so clear its guest bit exactly as the
+                     * task-start path would; never leave a replayable wake. */
+                    task_bit(ts->sync.key, 0x40, task_id, 0);
+                    continue;
+                }
                 task->signalled = 1;
                 task->signal_origin = 5u;
                 wake = 1;
