@@ -3742,7 +3742,7 @@ static void yz_ucmd_retry_pending(void)
  * enter yz_rsx_method. A retained typed span rechecks this value while GET
  * remains on the owned packet. */
 extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
-                                        uint32_t* value)
+                                         uint32_t* value)
 {
     if (!value)
         return -1;
@@ -3751,6 +3751,12 @@ extern "C" int yz_nr_vertical_sem_read(uint32_t dma, uint32_t offset,
         return -1;
     *value = vm_read32(address);
     return 0;
+}
+
+extern "C" uint32_t yz_nr_vertical_sem_address(
+    uint32_t dma, uint32_t offset)
+{
+    return yz_rsx_sem_addr(dma, offset);
 }
 
 extern "C" uint64_t cellGcmReportTimestampNs(void);

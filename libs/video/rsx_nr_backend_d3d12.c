@@ -375,6 +375,7 @@ struct rsx_nr_d3d12 {
     ID3D12DescriptorHeap* texture_gpu_heap;
     ID3D12DescriptorHeap* sampler_gpu_heap;
     ID3D12DescriptorHeap* depth_snapshot_heap;
+    ID3D12DescriptorHeap* image4_mlaa_heap;
     u32 texture_desc_size, sampler_desc_size;
     u32 srv_tables_used;
     u32 sampler_tables_used;
@@ -404,6 +405,10 @@ struct rsx_nr_d3d12 {
     ID3D12RootSignature* rootsig;
     ID3D12RootSignature* depth_snapshot_rootsig;
     ID3D12PipelineState* depth_snapshot_pso;
+    ID3D12RootSignature* image4_mlaa_rootsig;
+    ID3D12PipelineState* image4_mlaa_pso;
+    ID3D12QueryHeap* image4_mlaa_query;
+    ID3D12Resource* image4_mlaa_query_readback;
 
     ID3D12Resource* upload;          /* fence-gated per-exec bump ring     */
     u8* upload_mapped;
@@ -412,8 +417,13 @@ struct rsx_nr_d3d12 {
     ID3D12Resource* readback;
     u32 readback_size;
     int native_residency;
+    int image4_mlaa_armed;
     int residency_pending;
     int residency_materialized;
+    int residency_copy_recorded;
+    int residency_image4;
+    int image4_gpu_mlaa;
+    int image4_mlaa_processed;
     u32 residency_generation;
     u64 residency_writer_fence;
     u32 residency_dst_space;
@@ -423,6 +433,10 @@ struct rsx_nr_d3d12 {
     u32 residency_need;
     u8* residency_dst;
     nrb_rt* residency_rt;
+    ID3D12Resource* image4_mlaa_temp[2];
+    D3D12_RESOURCE_STATES image4_mlaa_temp_state[2];
+    u32 image4_mlaa_width;
+    u32 image4_mlaa_height;
 
     rsx_guest_pages pages;
     rsx_gpu_mirror* mirror;
@@ -1612,6 +1626,130 @@ static int nrb_make_depth_snapshot_pipeline(rsx_nr_d3d12* b)
         (void**)&b->depth_snapshot_pso);
     shader->lpVtbl->Release(shader);
     return SUCCEEDED(hr) ? 0 : -1;
+}
+
+/* The title's image-4 task is Sony EDGE 1.2 MLAA. On PS3 it transposes the
+ * 1024x768 A8R8G8B8 image, runs the same morphological pass in both axes,
+ * and transposes back solely to make the vertical pass SPU-friendly. Native
+ * D3D12 has no reason to reproduce those layout/DMA steps. This separable
+ * compute implementation operates on the already resident render target and
+ * preserves the task's relative per-pixel threshold contract:
+ *
+ *     threshold = max(base, max(r,g,b) * scale >> 8)
+ *
+ * Pixel equivalence is intentionally evaluated as render output (the title
+ * never consumes these bytes on PPU/SPU); completion label/counter semantics
+ * remain bit exact in the vertical owner. */
+static int nrb_make_image4_mlaa_pipeline(rsx_nr_d3d12* b)
+{
+    static const char source[] =
+        "Texture2D<float4> source_image : register(t0);\n"
+        "RWTexture2D<float4> destination_image : register(u0);\n"
+        "cbuffer Parameters : register(b0) {\n"
+        "  uint width; uint height; int step_x; int step_y;\n"
+        "  uint threshold_base; uint threshold_scale;\n"
+        "};\n"
+        "float threshold(float3 c) {\n"
+        "  float peak = max(c.r, max(c.g, c.b)) * 255.0;\n"
+        "  return max((float)threshold_base, "
+        "floor(peak * (float)threshold_scale / 256.0));\n"
+        "}\n"
+        "float delta(float3 a, float3 b) {\n"
+        "  float3 d = abs(a - b) * 255.0;\n"
+        "  return max(d.r, max(d.g, d.b));\n"
+        "}\n"
+        "float edge(float4 a, float4 b) {\n"
+        "  return delta(a.rgb, b.rgb) >= "
+        "min(threshold(a.rgb), threshold(b.rgb)) ? 1.0 : 0.0;\n"
+        "}\n"
+        "float4 load_clamped(int2 p) {\n"
+        "  p = clamp(p, int2(0, 0), int2((int)width-1, (int)height-1));\n"
+        "  return source_image.Load(int3(p, 0));\n"
+        "}\n"
+        "[numthreads(8, 8, 1)]\n"
+        "void main(uint3 tid : SV_DispatchThreadID) {\n"
+        "  if (tid.x >= width || tid.y >= height) return;\n"
+        "  int2 p = int2(tid.xy); int2 s = int2(step_x, step_y);\n"
+        "  int2 q = int2(-step_y, step_x);\n"
+        "  float4 c = load_clamped(p);\n"
+        "  float4 n = load_clamped(p - s); float4 z = load_clamped(p + s);\n"
+        "  float en = edge(c, n); float ez = edge(c, z);\n"
+        "  float continuation = max(\n"
+        "    max(edge(load_clamped(p-q), load_clamped(p-q-s)),\n"
+        "        edge(load_clamped(p+q), load_clamped(p+q-s))) * en,\n"
+        "    max(edge(load_clamped(p-q), load_clamped(p-q+s)),\n"
+        "        edge(load_clamped(p+q), load_clamped(p+q+s))) * ez);\n"
+        "  float4 result = c;\n"
+        "  if (continuation > 0.0) {\n"
+        "    if (en > 0.0 && ez == 0.0) result.rgb = lerp(c.rgb, n.rgb, 0.25);\n"
+        "    else if (ez > 0.0 && en == 0.0) result.rgb = lerp(c.rgb, z.rgb, 0.25);\n"
+        "    else if (en > 0.0 && ez > 0.0) "
+        "result.rgb = lerp(c.rgb, (n.rgb + z.rgb) * 0.5, 0.125);\n"
+        "  }\n"
+        "  destination_image[tid.xy] = result;\n"
+        "}\n";
+    ID3DBlob* shader = NULL;
+    ID3DBlob* errors = NULL;
+    HRESULT hr = D3DCompile(
+        source, sizeof(source) - 1u, "edge12_native_mlaa", NULL, NULL,
+        "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+        &shader, &errors);
+    if (errors)
+        errors->lpVtbl->Release(errors);
+    if (FAILED(hr) || !shader)
+        return -1;
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1u;
+    ranges[0].BaseShaderRegister = 0u;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1u;
+    ranges[1].BaseShaderRegister = 0u;
+    D3D12_ROOT_PARAMETER params[3] = {0};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1u;
+    params[0].DescriptorTable.pDescriptorRanges = &ranges[0];
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1u;
+    params[1].DescriptorTable.pDescriptorRanges = &ranges[1];
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.ShaderRegister = 0u;
+    params[2].Constants.Num32BitValues = 6u;
+    for (u32 i = 0; i < 3u; ++i)
+        params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+    rsd.NumParameters = 3u;
+    rsd.pParameters = params;
+    ID3DBlob* signature = NULL;
+    ID3DBlob* signature_errors = NULL;
+    hr = D3D12SerializeRootSignature(
+        &rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+        &signature, &signature_errors);
+    if (signature_errors)
+        signature_errors->lpVtbl->Release(signature_errors);
+    if (FAILED(hr) || !signature) {
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+    hr = b->dev->lpVtbl->CreateRootSignature(
+        b->dev, 0u, signature->lpVtbl->GetBufferPointer(signature),
+        signature->lpVtbl->GetBufferSize(signature),
+        &IID_ID3D12RootSignature, (void**)&b->image4_mlaa_rootsig);
+    signature->lpVtbl->Release(signature);
+    if (FAILED(hr)) {
+        shader->lpVtbl->Release(shader);
+        return -1;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
+    pipeline.pRootSignature = b->image4_mlaa_rootsig;
+    pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
+    pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
+    hr = b->dev->lpVtbl->CreateComputePipelineState(
+        b->dev, &pipeline, &IID_ID3D12PipelineState,
+        (void**)&b->image4_mlaa_pso);
+    shader->lpVtbl->Release(shader);
+    return FAILED(hr) ? -1 : 0;
 }
 
 static int nrb_resolve_private_depth_sample(
@@ -3760,7 +3898,7 @@ static void nrb_release_texture(void* user, u64 backend_id)
 }
 
 static void nrb_rt_transition(rsx_nr_d3d12* b, nrb_rt* rt,
-                              D3D12_RESOURCE_STATES state)
+                               D3D12_RESOURCE_STATES state)
 {
     if (!rt || rt->color_state == state)
         return;
@@ -3772,6 +3910,95 @@ static void nrb_rt_transition(rsx_nr_d3d12* b, nrb_rt* rt,
     barrier.Transition.StateAfter = state;
     b->list->lpVtbl->ResourceBarrier(b->list, 1, &barrier);
     rt->color_state = state;
+}
+
+static void nrb_image4_temp_transition(
+    rsx_nr_d3d12* b, u32 index, D3D12_RESOURCE_STATES state)
+{
+    if (!b->image4_mlaa_temp[index] ||
+        b->image4_mlaa_temp_state[index] == state)
+        return;
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = b->image4_mlaa_temp[index];
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = b->image4_mlaa_temp_state[index];
+    barrier.Transition.StateAfter = state;
+    b->list->lpVtbl->ResourceBarrier(b->list, 1u, &barrier);
+    b->image4_mlaa_temp_state[index] = state;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE nrb_image4_cpu_handle(
+    rsx_nr_d3d12* b, u32 slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    b->image4_mlaa_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+        b->image4_mlaa_heap, &handle);
+    handle.ptr += (SIZE_T)slot * b->texture_desc_size;
+    return handle;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE nrb_image4_gpu_handle(
+    rsx_nr_d3d12* b, u32 slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    b->image4_mlaa_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
+        b->image4_mlaa_heap, &handle);
+    handle.ptr += (UINT64)slot * b->texture_desc_size;
+    return handle;
+}
+
+static void nrb_image4_release_temps(rsx_nr_d3d12* b)
+{
+    for (u32 i = 0; i < 2u; ++i) {
+        if (b->image4_mlaa_temp[i])
+            b->image4_mlaa_temp[i]->lpVtbl->Release(
+                b->image4_mlaa_temp[i]);
+        b->image4_mlaa_temp[i] = NULL;
+        b->image4_mlaa_temp_state[i] = D3D12_RESOURCE_STATE_COMMON;
+    }
+    b->image4_mlaa_width = 0u;
+    b->image4_mlaa_height = 0u;
+}
+
+static int nrb_image4_ensure_temps(rsx_nr_d3d12* b, nrb_rt* rt)
+{
+    if (!b || !rt || rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        !b->image4_mlaa_heap || !b->image4_mlaa_pso ||
+        !b->image4_mlaa_rootsig)
+        return -1;
+    if (b->image4_mlaa_temp[0] && b->image4_mlaa_temp[1] &&
+        b->image4_mlaa_width == rt->w &&
+        b->image4_mlaa_height == rt->h)
+        return 0;
+    nrb_image4_release_temps(b);
+
+    D3D12_HEAP_PROPERTIES heap = {0};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {0};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = rt->w;
+    desc.Height = rt->h;
+    desc.DepthOrArraySize = 1u;
+    desc.MipLevels = 1u;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1u;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (u32 i = 0; i < 2u; ++i) {
+        if (FAILED(b->dev->lpVtbl->CreateCommittedResource(
+                b->dev, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, NULL,
+                &IID_ID3D12Resource,
+                (void**)&b->image4_mlaa_temp[i]))) {
+            nrb_image4_release_temps(b);
+            return -1;
+        }
+        b->image4_mlaa_temp_state[i] = D3D12_RESOURCE_STATE_COMMON;
+    }
+    b->image4_mlaa_width = rt->w;
+    b->image4_mlaa_height = rt->h;
+    return 0;
 }
 
 static void nrb_depth_transition(rsx_nr_d3d12* b, nrb_depth* depth,
@@ -6628,6 +6855,9 @@ static int nrb_rt_defer_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     nrb_rt_transition(b, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     b->residency_pending = 1;
     b->residency_materialized = 0;
+    b->residency_copy_recorded = 1;
+    b->residency_image4 = 0;
+    b->image4_mlaa_processed = 0;
     if (++b->residency_generation == 0u)
         b->residency_generation = 1u;
     b->residency_dst_space = dst_space;
@@ -6643,6 +6873,90 @@ static int nrb_rt_defer_read_to_guest(rsx_nr_d3d12* b, nrb_rt* rt,
     return 0;
 }
 
+static int nrb_rt_hold_for_image4(rsx_nr_d3d12* b, nrb_rt* rt,
+                                  u8* dst, u32 dst_space,
+                                  u32 dst_offset, u32 dst_pitch)
+{
+    const u32 row_pitch = (rt->w * 4u + 255u) & ~255u;
+    const u64 need64 = (u64)row_pitch * rt->h;
+    if (!b->image4_gpu_mlaa || b->residency_pending || !dst ||
+        rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        dst_pitch < rt->w * 4u || need64 > UINT32_MAX)
+        return -1;
+    /* Atomic fallback boundary: allocate and validate every compute resource
+     * before suppressing the forward readback or consuming a SPURS signal. */
+    if (nrb_image4_ensure_temps(b, rt) != 0)
+        return -1;
+    /* The EDGE handler does not signal its five tasks until the GCM producer
+     * boundary is complete.  The old readback path happened to provide that
+     * boundary through nrb_exec_wait().  Omitting both the copy and the drain
+     * leaves the PPU waiting for producer completion while the RSX FIFO is
+     * already parked on the PPU's following label release.  Retire the
+     * producer list here, but keep the pixels resident: this preserves the
+     * required GPU-before-task ordering without restoring the 3 MiB copy. */
+    if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_OTHER, 0u) != 0)
+        return -1;
+    b->residency_pending = 1;
+    b->residency_materialized = 0;
+    b->residency_copy_recorded = 0;
+    b->residency_image4 = 1;
+    b->image4_mlaa_processed = 0;
+    if (++b->residency_generation == 0u)
+        b->residency_generation = 1u;
+    b->residency_dst_space = dst_space;
+    b->residency_dst_offset = dst_offset;
+    b->residency_dst_pitch = dst_pitch;
+    b->residency_row_pitch = row_pitch;
+    b->residency_need = (u32)need64;
+    b->residency_dst = dst;
+    b->residency_rt = rt;
+    b->residency_writer_fence = b->shared_timeline
+        ? b->shared_recording_fence : b->fence_value + 1u;
+    b->stats.image4_mlaa_holds++;
+    return 0;
+}
+
+static int nrb_record_residency_readback(rsx_nr_d3d12* b)
+{
+    if (!b || !b->residency_pending || !b->residency_rt)
+        return -1;
+    if (b->residency_copy_recorded)
+        return 0;
+    if (!b->readback || b->readback_size < b->residency_need) {
+        if (b->readback)
+            b->readback->lpVtbl->Release(b->readback);
+        b->readback = nrb_make_buffer(
+            b->dev, b->residency_need, D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->readback) {
+            b->readback_size = 0u;
+            return -1;
+        }
+        b->readback_size = b->residency_need;
+    }
+    if (nrb_open_list(b))
+        return -1;
+    nrb_rt_transition(
+        b, b->residency_rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source = {0};
+    source.pResource = b->residency_rt->tex;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION target = {0};
+    target.pResource = b->readback;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    target.PlacedFootprint.Footprint.Format = b->residency_rt->dxgi;
+    target.PlacedFootprint.Footprint.Width = b->residency_rt->w;
+    target.PlacedFootprint.Footprint.Height = b->residency_rt->h;
+    target.PlacedFootprint.Footprint.Depth = 1u;
+    target.PlacedFootprint.Footprint.RowPitch = b->residency_row_pitch;
+    b->list->lpVtbl->CopyTextureRegion(
+        b->list, &target, 0u, 0u, 0u, &source, NULL);
+    nrb_rt_transition(
+        b, b->residency_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    b->residency_copy_recorded = 1;
+    return 0;
+}
+
 int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b, u32 generation)
 {
     if (!b || !b->residency_pending || !generation ||
@@ -6652,6 +6966,8 @@ int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b, u32 generation)
         return 0;
     const u64 attribution_start = nrb_submit_now(b);
     const u64 stall_start = nrb_stall_now(b);
+    if (nrb_record_residency_readback(b) != 0)
+        return -1;
     if (nrb_exec_wait(b, RSX_NR_D3D12_SUBMIT_TRANSFER_READBACK,
                       b->residency_need))
         return -1;
@@ -6680,6 +6996,8 @@ int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b, u32 generation)
     b->stats.transfer_gpu_readbacks++;
     b->stats.residency_materializations++;
     b->stats.residency_materialized_bytes += b->residency_need;
+    if (b->residency_image4)
+        b->stats.image4_mlaa_fallback_materializations++;
     if (b->stall_aggregate)
         b->stats.stall_transfer_readback_bytes += b->residency_need;
     nrb_stall_finish(b, stall_start,
@@ -6700,6 +7018,168 @@ int rsx_nr_d3d12_residency_pending(const rsx_nr_d3d12* b, u32* generation,
     if (writer_fence)
         *writer_fence = b->residency_writer_fence;
     return 1;
+}
+
+int rsx_nr_d3d12_image4_gpu_mlaa_pending(
+    const rsx_nr_d3d12* b, u32* generation, u64* writer_fence,
+    int* materialized)
+{
+    if (!b || !b->image4_gpu_mlaa || !b->residency_pending ||
+        !b->residency_image4)
+        return 0;
+    if (generation)
+        *generation = b->residency_generation;
+    if (writer_fence)
+        *writer_fence = b->residency_writer_fence;
+    if (materialized)
+        *materialized = b->residency_materialized;
+    return 1;
+}
+
+int rsx_nr_d3d12_execute_image4_gpu_mlaa(
+    rsx_nr_d3d12* b, u32 generation,
+    u32 threshold_base, u32 threshold_scale)
+{
+    if (!b || !b->image4_gpu_mlaa || !b->residency_pending ||
+        !b->residency_image4 || b->residency_materialized ||
+        b->residency_copy_recorded || b->image4_mlaa_processed ||
+        generation != b->residency_generation ||
+        threshold_base > 255u || threshold_scale > 255u ||
+        !b->residency_rt || b->residency_rt->w != 1024u ||
+        b->residency_rt->h != 768u ||
+        b->residency_rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return -1;
+    if (!b->image4_mlaa_temp[0] || !b->image4_mlaa_temp[1] ||
+        nrb_open_list(b) != 0) {
+        b->stats.image4_mlaa_failures++;
+        return -1;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1u;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {0};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    b->dev->lpVtbl->CreateShaderResourceView(
+        b->dev, b->residency_rt->tex, &srv,
+        nrb_image4_cpu_handle(b, 0u));
+    b->dev->lpVtbl->CreateUnorderedAccessView(
+        b->dev, b->image4_mlaa_temp[0], NULL, &uav,
+        nrb_image4_cpu_handle(b, 1u));
+    b->dev->lpVtbl->CreateShaderResourceView(
+        b->dev, b->image4_mlaa_temp[0], &srv,
+        nrb_image4_cpu_handle(b, 2u));
+    b->dev->lpVtbl->CreateUnorderedAccessView(
+        b->dev, b->image4_mlaa_temp[1], NULL, &uav,
+        nrb_image4_cpu_handle(b, 3u));
+
+    nrb_rt_transition(
+        b, b->residency_rt,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    nrb_image4_temp_transition(
+        b, 0u, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    nrb_image4_temp_transition(
+        b, 1u, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[1] = { b->image4_mlaa_heap };
+    b->list->lpVtbl->SetDescriptorHeaps(b->list, 1u, heaps);
+    b->list->lpVtbl->SetPipelineState(b->list, b->image4_mlaa_pso);
+    b->list->lpVtbl->SetComputeRootSignature(
+        b->list, b->image4_mlaa_rootsig);
+    if (b->image4_mlaa_query)
+        b->list->lpVtbl->EndQuery(
+            b->list, b->image4_mlaa_query,
+            D3D12_QUERY_TYPE_TIMESTAMP, 0u);
+
+    u32 constants[6] = {
+        b->residency_rt->w, b->residency_rt->h,
+        0u, 1u, threshold_base, threshold_scale
+    };
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 0u, nrb_image4_gpu_handle(b, 0u));
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 1u, nrb_image4_gpu_handle(b, 1u));
+    b->list->lpVtbl->SetComputeRoot32BitConstants(
+        b->list, 2u, 6u, constants, 0u);
+    b->list->lpVtbl->Dispatch(
+        b->list, (constants[0] + 7u) / 8u,
+        (constants[1] + 7u) / 8u, 1u);
+    D3D12_RESOURCE_BARRIER uav_barrier = {0};
+    uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.UAV.pResource = b->image4_mlaa_temp[0];
+    b->list->lpVtbl->ResourceBarrier(b->list, 1u, &uav_barrier);
+
+    nrb_image4_temp_transition(
+        b, 0u, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    constants[2] = 1u;
+    constants[3] = 0u;
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 0u, nrb_image4_gpu_handle(b, 2u));
+    b->list->lpVtbl->SetComputeRootDescriptorTable(
+        b->list, 1u, nrb_image4_gpu_handle(b, 3u));
+    b->list->lpVtbl->SetComputeRoot32BitConstants(
+        b->list, 2u, 6u, constants, 0u);
+    b->list->lpVtbl->Dispatch(
+        b->list, (constants[0] + 7u) / 8u,
+        (constants[1] + 7u) / 8u, 1u);
+    uav_barrier.UAV.pResource = b->image4_mlaa_temp[1];
+    b->list->lpVtbl->ResourceBarrier(b->list, 1u, &uav_barrier);
+
+    nrb_image4_temp_transition(
+        b, 1u, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    nrb_rt_transition(
+        b, b->residency_rt, D3D12_RESOURCE_STATE_COPY_DEST);
+    b->list->lpVtbl->CopyResource(
+        b->list, b->residency_rt->tex, b->image4_mlaa_temp[1]);
+    if (b->image4_mlaa_query && b->image4_mlaa_query_readback) {
+        b->list->lpVtbl->EndQuery(
+            b->list, b->image4_mlaa_query,
+            D3D12_QUERY_TYPE_TIMESTAMP, 1u);
+        b->list->lpVtbl->ResolveQueryData(
+            b->list, b->image4_mlaa_query,
+            D3D12_QUERY_TYPE_TIMESTAMP, 0u, 2u,
+            b->image4_mlaa_query_readback, 0u);
+    }
+    nrb_rt_transition(
+        b, b->residency_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    nrb_note_rt_write(b, b->residency_rt);
+    LARGE_INTEGER wait_start = {0};
+    LARGE_INTEGER wait_end = {0};
+    QueryPerformanceCounter(&wait_start);
+    if (nrb_exec_wait(
+            b, RSX_NR_D3D12_SUBMIT_SEMAPHORE_PUBLICATION, 0u) != 0) {
+        b->stats.image4_mlaa_failures++;
+        return -1;
+    }
+    if (QueryPerformanceCounter(&wait_end) &&
+        wait_end.QuadPart >= wait_start.QuadPart)
+        b->stats.image4_mlaa_fence_wait_ticks +=
+            (u64)(wait_end.QuadPart - wait_start.QuadPart);
+    if (b->image4_mlaa_query_readback) {
+        u64* timestamps = NULL;
+        D3D12_RANGE read = {0u, 2u * sizeof(u64)};
+        if (SUCCEEDED(b->image4_mlaa_query_readback->lpVtbl->Map(
+                b->image4_mlaa_query_readback, 0u, &read,
+                (void**)&timestamps))) {
+            if (timestamps && timestamps[1] >= timestamps[0]) {
+                b->stats.image4_mlaa_gpu_samples++;
+                b->stats.image4_mlaa_gpu_ticks +=
+                    timestamps[1] - timestamps[0];
+            }
+            D3D12_RANGE no_write = {0u, 0u};
+            b->image4_mlaa_query_readback->lpVtbl->Unmap(
+                b->image4_mlaa_query_readback, 0u, &no_write);
+        }
+    }
+    b->image4_mlaa_processed = 1;
+    b->stats.image4_mlaa_dispatches++;
+    b->stats.image4_mlaa_avoided_readbacks++;
+    b->stats.image4_mlaa_avoided_uploads++;
+    b->stats.image4_mlaa_avoided_bytes +=
+        (u64)b->residency_need * 2u;
+    return 0;
 }
 
 static int nrb_rt_upload_from_guest(rsx_nr_d3d12* b, nrb_rt* rt,
@@ -6864,14 +7344,27 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             t->in_w == 1024u && t->in_h == 768u &&
             t->out_w == 1024u && t->out_h == 768u &&
             t->src_pitch == 4096u && t->dst_pitch == 4096u;
+        const int image4_save = b->image4_gpu_mlaa &&
+            b->image4_mlaa_armed && src_rt &&
+            t->src_location == 0u && t->src_offset == 0x01140000u &&
+            t->dst_location == 1u && t->dst_offset == 0x01772D00u &&
+            t->src_format == 3u && t->dst_format == 10u &&
+            t->in_w == 1024u && t->in_h == 768u &&
+            t->out_w == 1024u && t->out_h == 768u &&
+            t->src_pitch == 4096u && t->dst_pitch == 4096u;
+        b->image4_mlaa_armed = 0;
         if (src_rt) {
-            int read_result = residency_save
+            int read_result = image4_save
+                ? nrb_rt_hold_for_image4(
+                      b, src_rt, dst, t->dst_location,
+                      t->dst_offset, t->dst_pitch)
+                : residency_save
                 ? nrb_rt_defer_read_to_guest(
                       b, src_rt, dst, t->dst_location,
                       t->dst_offset, t->dst_pitch)
                 : nrb_rt_read_to_guest(b, src_rt, dst, t->dst_pitch);
-            deferred = residency_save && read_result == 0;
-            if (residency_save && read_result != 0) {
+            deferred = (image4_save || residency_save) && read_result == 0;
+            if ((image4_save || residency_save) && read_result != 0) {
                 /* Exact-route setup is an optimization gate, not a new
                  * correctness dependency.  Preserve the established
                  * synchronous transfer whenever allocation/list ownership
@@ -6907,13 +7400,24 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             t->dst_location == 0u && t->dst_offset == 0x01140000u &&
             t->in_w == 1024u && t->in_h == 768u &&
             t->out_w == 1024u && t->out_h == 768u;
-        if (residency_restore && b->residency_pending &&
+        const int image4_restore = b->image4_gpu_mlaa && dst_rt &&
+            t->src_location == 1u && t->src_offset == 0x01772D00u &&
+            t->dst_location == 0u && t->dst_offset == 0x01140000u &&
+            t->src_format == 3u && t->dst_format == 10u &&
+            t->in_w == 1024u && t->in_h == 768u &&
+            t->out_w == 1024u && t->out_h == 768u &&
+            t->src_pitch == 4096u && t->dst_pitch == 4096u;
+        const int skip_image4_upload = image4_restore &&
+            b->residency_pending && b->residency_image4 &&
+            b->image4_mlaa_processed && !b->residency_materialized;
+        if ((residency_restore || image4_restore) &&
+            b->residency_pending && !skip_image4_upload &&
             rsx_nr_d3d12_materialize_residency(
                 b, b->residency_generation) != 0) {
             b->stats.unsupported_transfers++;
             return -1;
         }
-        if (dst_rt && nrb_rt_upload_from_guest(
+        if (!skip_image4_upload && dst_rt && nrb_rt_upload_from_guest(
                 b, dst_rt, dst, t->dst_pitch) != 0) {
             nrb_report_transfer_rt_failure(
                 b, "destination-upload", t->dst_location, t->dst_offset,
@@ -6921,9 +7425,12 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             b->stats.unsupported_transfers++;
             return -1;
         }
-        if (residency_restore) {
+        if (residency_restore || image4_restore) {
             b->residency_pending = 0;
             b->residency_materialized = 0;
+            b->residency_copy_recorded = 0;
+            b->residency_image4 = 0;
+            b->image4_mlaa_processed = 0;
             b->residency_dst = NULL;
             b->residency_rt = NULL;
         }
@@ -7308,6 +7815,73 @@ int rsx_nr_d3d12_set_native_residency(rsx_nr_d3d12* b, int enabled)
     if (!b || b->stats.transfers || b->stats.draws || b->residency_pending)
         return -1;
     b->native_residency = enabled != 0;
+    return 0;
+}
+
+int rsx_nr_d3d12_set_image4_gpu_mlaa(rsx_nr_d3d12* b, int enabled)
+{
+    if (!b || b->stats.transfers || b->stats.draws || b->residency_pending)
+        return -1;
+    if (!enabled) {
+        b->image4_gpu_mlaa = 0;
+        b->image4_mlaa_armed = 0;
+        return 0;
+    }
+    if (!b->image4_mlaa_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {0};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.NumDescriptors = 4u;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(b->dev->lpVtbl->CreateDescriptorHeap(
+                b->dev, &heap, &IID_ID3D12DescriptorHeap,
+                (void**)&b->image4_mlaa_heap)))
+            return -1;
+    }
+    if ((!b->image4_mlaa_rootsig || !b->image4_mlaa_pso) &&
+        nrb_make_image4_mlaa_pipeline(b) != 0) {
+        if (b->image4_mlaa_pso) {
+            b->image4_mlaa_pso->lpVtbl->Release(b->image4_mlaa_pso);
+            b->image4_mlaa_pso = NULL;
+        }
+        if (b->image4_mlaa_rootsig) {
+            b->image4_mlaa_rootsig->lpVtbl->Release(
+                b->image4_mlaa_rootsig);
+            b->image4_mlaa_rootsig = NULL;
+        }
+        return -1;
+    }
+    if (!b->image4_mlaa_query) {
+        D3D12_QUERY_HEAP_DESC query = {0};
+        query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query.Count = 2u;
+        if (FAILED(b->dev->lpVtbl->CreateQueryHeap(
+                b->dev, &query, &IID_ID3D12QueryHeap,
+                (void**)&b->image4_mlaa_query)))
+            return -1;
+    }
+    if (!b->image4_mlaa_query_readback) {
+        b->image4_mlaa_query_readback = nrb_make_buffer(
+            b->dev, 2u * sizeof(u64), D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!b->image4_mlaa_query_readback)
+            return -1;
+    }
+    b->queue->lpVtbl->GetTimestampFrequency(
+        b->queue, &b->stats.image4_mlaa_gpu_frequency);
+    {
+        LARGE_INTEGER frequency;
+        if (QueryPerformanceFrequency(&frequency))
+            b->stats.image4_mlaa_qpc_frequency = (u64)frequency.QuadPart;
+    }
+    b->image4_gpu_mlaa = 1;
+    return 0;
+}
+
+int rsx_nr_d3d12_arm_image4_gpu_mlaa(rsx_nr_d3d12* b, int armed)
+{
+    if (!b || !b->image4_gpu_mlaa || b->residency_pending)
+        return -1;
+    b->image4_mlaa_armed = armed != 0;
     return 0;
 }
 
@@ -8089,6 +8663,7 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         free(b->watched_host_page_bits[space]);
         free(b->force_draw_input_page_epoch[space]);
     }
+    nrb_image4_release_temps(b);
     if (b->readback)
         b->readback->lpVtbl->Release(b->readback);
     if (b->hana_depth_readback)
@@ -8114,6 +8689,16 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
     if (b->depth_snapshot_rootsig)
         b->depth_snapshot_rootsig->lpVtbl->Release(
             b->depth_snapshot_rootsig);
+    if (b->image4_mlaa_pso)
+        b->image4_mlaa_pso->lpVtbl->Release(b->image4_mlaa_pso);
+    if (b->image4_mlaa_rootsig)
+        b->image4_mlaa_rootsig->lpVtbl->Release(
+            b->image4_mlaa_rootsig);
+    if (b->image4_mlaa_query_readback)
+        b->image4_mlaa_query_readback->lpVtbl->Release(
+            b->image4_mlaa_query_readback);
+    if (b->image4_mlaa_query)
+        b->image4_mlaa_query->lpVtbl->Release(b->image4_mlaa_query);
     if (b->rtv_heap)
         b->rtv_heap->lpVtbl->Release(b->rtv_heap);
     if (b->dsv_heap)
@@ -8124,6 +8709,8 @@ void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
         b->texture_gpu_heap->lpVtbl->Release(b->texture_gpu_heap);
     if (b->depth_snapshot_heap)
         b->depth_snapshot_heap->lpVtbl->Release(b->depth_snapshot_heap);
+    if (b->image4_mlaa_heap)
+        b->image4_mlaa_heap->lpVtbl->Release(b->image4_mlaa_heap);
     if (b->sampler_gpu_heap)
         b->sampler_gpu_heap->lpVtbl->Release(b->sampler_gpu_heap);
     if (b->fence_event)
@@ -8490,6 +9077,30 @@ int rsx_nr_d3d12_residency_pending(const rsx_nr_d3d12* b, u32* generation,
 int rsx_nr_d3d12_materialize_residency(rsx_nr_d3d12* b, u32 generation)
 {
     (void)b; (void)generation;
+    return -1;
+}
+int rsx_nr_d3d12_set_image4_gpu_mlaa(rsx_nr_d3d12* b, int enabled)
+{
+    (void)b; (void)enabled;
+    return -1;
+}
+int rsx_nr_d3d12_arm_image4_gpu_mlaa(rsx_nr_d3d12* b, int armed)
+{
+    (void)b; (void)armed;
+    return -1;
+}
+int rsx_nr_d3d12_image4_gpu_mlaa_pending(
+    const rsx_nr_d3d12* b, u32* generation, u64* writer_fence,
+    int* materialized)
+{
+    (void)b; (void)generation; (void)writer_fence; (void)materialized;
+    return 0;
+}
+int rsx_nr_d3d12_execute_image4_gpu_mlaa(
+    rsx_nr_d3d12* b, u32 generation, u32 threshold_base,
+    u32 threshold_scale)
+{
+    (void)b; (void)generation; (void)threshold_base; (void)threshold_scale;
     return -1;
 }
 int rsx_nr_d3d12_validate_depth_sample_alias(

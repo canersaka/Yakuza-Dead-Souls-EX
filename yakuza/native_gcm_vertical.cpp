@@ -24,6 +24,7 @@
 #include "rsx_nr_residency.h"
 #include "rsx_nr_frame_owner.h"
 #include "rsx_nr_graph.h"
+#include "rsx_image4_mlaa.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_live_draw.h"
 #include "rsx_nir_adapter.h"
@@ -41,6 +42,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+extern "C" uint8_t* vm_base;
 extern "C" const uint8_t* yz_nr_vertical_guest_ptr(uint32_t location,
                                                      uint32_t offset,
                                                      uint32_t min_bytes);
@@ -56,10 +58,23 @@ extern "C" int yz_nr_vertical_space_range_to_ea(uint32_t location,
                                                   uint32_t* out_ea);
 extern "C" void cellSpursSetGuestWriteObserver(
     void (*observer)(uint32_t ea, uint32_t size));
+typedef int (*yz_image4_signal_interceptor)(
+    void* user, uint32_t wid, uint32_t current_task_id,
+    uint32_t task_count, const uint32_t* task_ids,
+    const uint32_t* parameter_eas, uint64_t image_fingerprint,
+    uint32_t image_size, uint32_t entry_pc, int32_t image_id);
+extern "C" void cellSpursSetImage4SignalInterceptor(
+    yz_image4_signal_interceptor interceptor, void* user);
+extern "C" int cellSpursSnapshotImage4Taskset(
+    uint32_t wid, uint32_t task_ids[5], uint32_t parameter_eas[5],
+    uint64_t* image_fingerprint, uint32_t* image_size,
+    uint32_t* entry_pc, int32_t* image_id);
 extern "C" void cellSpursNotifyGuestWrite(uint32_t ea, uint32_t size);
 extern "C" volatile uint64_t g_native_spurs_watch_page_bits[16384];
 extern "C" void yz_drain_trampolines(ppu_context* ctx);
 extern "C" uint32_t yz_nr_vertical_io_to_ea(uint32_t io_offset);
+extern "C" uint32_t yz_nr_vertical_sem_address(
+    uint32_t dma, uint32_t offset);
 extern "C" int yz_rsx_try_release_published_segment_head(
     void* user, uint32_t get, uint32_t put, uint32_t command,
     uint32_t* resume_get);
@@ -523,6 +538,36 @@ struct yz_nr_vertical_active_state {
      * totals and never allocate, take a clock, or emit per-event output. */
     uint32_t residency_audit_enabled;
     uint32_t residency_enabled;
+    uint32_t image4_gpu_mlaa_enabled;
+    SRWLOCK image4_gpu_mlaa_lock;
+    volatile LONG image4_last_user_cause;
+    rsx_image4_mlaa_round image4_round;
+    unsigned long long image4_rounds;
+    unsigned long long image4_signals;
+    unsigned long long image4_duplicate_signals;
+    unsigned long long image4_completed;
+    unsigned long long image4_execute_failures;
+    unsigned long long image4_admission_armed;
+    unsigned long long image4_admission_not_ready;
+    unsigned long long image4_observed_exact_signals;
+    uint32_t image4_observed_label_ea;
+    uint32_t image4_observed_label_value;
+    uint32_t image4_observed_counter_ea;
+    uint32_t image4_admission_stage;
+    uint64_t image4_admission_fingerprint;
+    uint32_t image4_admission_image_size;
+    uint32_t image4_admission_entry_pc;
+    int32_t image4_admission_image_id;
+    uint32_t image4_admission_label_ea;
+    uint32_t image4_admission_label_value;
+    uint32_t image4_admission_counter_ea;
+    uint32_t image4_admission_counter_value;
+    uint32_t image4_admission_cause;
+    volatile LONG64 image4_request_sequence;
+    volatile LONG64 image4_request_completed;
+    volatile LONG image4_request_failed;
+    unsigned long long image4_reject[
+        RSX_IMAGE4_MLAA_REJECT_RESERVED + 1u];
     rsx_nr_residency_slot residency_slot;
     volatile LONG residency_generation;
     volatile LONG64 residency_request_sequence;
@@ -593,6 +638,161 @@ struct yz_nr_vertical_active_state {
 
 static yz_nr_vertical_active_state g_active = {SRWLOCK_INIT};
 
+static bool yz_nr_residency_route_enabled()
+{
+    return g_active.residency_enabled ||
+           g_active.image4_gpu_mlaa_enabled;
+}
+
+static int yz_nr_residency_materialize_wait(uint32_t generation);
+
+static int yz_nr_image4_spurs_fallback(uint32_t generation)
+{
+    if (yz_nr_residency_materialize_wait(generation) == 0)
+        return 0;
+    /* The forward transfer was already suppressed. If exact materialization
+     * cannot restore guest ownership, starting only part of the EDGE taskset
+     * would be unsafe, so fail closed instead of exposing stale pixels. */
+    InterlockedIncrement64(reinterpret_cast<volatile LONG64*>(
+        &g_active.image4_execute_failures));
+    return 1;
+}
+
+static int yz_nr_image4_signal(
+    void*, uint32_t wid, uint32_t current_task_id,
+    uint32_t task_count, const uint32_t* task_ids,
+    const uint32_t* parameter_eas, uint64_t image_fingerprint,
+    uint32_t image_size, uint32_t entry_pc, int32_t image_id)
+{
+    const rsx_image4_mlaa_image image = {
+        image_fingerprint, image_size, entry_pc, image_id
+    };
+    if (!g_active.image4_gpu_mlaa_enabled || wid != 4u ||
+        !vm_base || !g_active.d3d12 ||
+        !InterlockedCompareExchange(&g_active.graphics_ready, 0, 0))
+        return 0;
+
+    uint32_t generation = 0u;
+    unsigned long long writer_fence = 0u;
+    int materialized = 0;
+    const bool pending = rsx_nr_d3d12_image4_gpu_mlaa_pending(
+        g_active.d3d12, &generation, &writer_fence, &materialized) == 1 &&
+        !materialized && generation &&
+        g_active.residency_slot.state.load(std::memory_order_acquire) ==
+            RSX_NR_RESIDENCY_GPU_PENDING;
+    (void)writer_fence;
+    if (task_count != RSX_IMAGE4_MLAA_TASKS || !task_ids ||
+        !parameter_eas || !rsx_image4_mlaa_image_matches(&image))
+        return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+
+    constexpr uint32_t image_bytes =
+        RSX_IMAGE4_MLAA_WIDTH * RSX_IMAGE4_MLAA_HEIGHT * 4u;
+    uint32_t image_ea = 0u;
+    if (yz_nr_vertical_space_range_to_ea(
+            1u, 0x01772D00u, image_bytes, &image_ea) != 0)
+        return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+
+    uint8_t records[RSX_IMAGE4_MLAA_TASKS]
+                   [RSX_IMAGE4_MLAA_RECORD_BYTES];
+    uint32_t current_record = UINT32_MAX;
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i) {
+        if (!parameter_eas[i] ||
+            parameter_eas[i] > UINT32_MAX - RSX_IMAGE4_MLAA_RECORD_BYTES)
+            return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+        memcpy(records[i], vm_base + parameter_eas[i],
+               RSX_IMAGE4_MLAA_RECORD_BYTES);
+        if (task_ids[i] == current_task_id)
+            current_record = i;
+    }
+    if (current_record == UINT32_MAX)
+        return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+
+    rsx_image4_mlaa_contract contract = {};
+    const uint32_t cause = static_cast<uint32_t>(ReadAcquire(
+        &g_active.image4_last_user_cause));
+    uint32_t observed_label_ea = 0u;
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i) {
+        rsx_image4_mlaa_task candidate = {};
+        if (rsx_image4_mlaa_parse_task(records[i], &candidate) != 0)
+            return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+        if (candidate.spu_id == 0u)
+            observed_label_ea = candidate.label_ea;
+    }
+    if (observed_label_ea < 0x10200000u ||
+        observed_label_ea >= 0x10210000u || (observed_label_ea & 3u))
+        return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+    const rsx_image4_mlaa_reject reject = rsx_image4_mlaa_validate(
+        records, image_ea, observed_label_ea, cause, &contract);
+    rsx_image4_mlaa_task current = {};
+    if (reject == RSX_IMAGE4_MLAA_ACCEPT &&
+        rsx_image4_mlaa_parse_task(records[current_record], &current) != 0)
+        return pending ? yz_nr_image4_spurs_fallback(generation) : 0;
+
+    if (reject == RSX_IMAGE4_MLAA_ACCEPT) {
+        g_active.image4_observed_exact_signals++;
+        g_active.image4_observed_label_ea = contract.label_ea;
+        g_active.image4_observed_label_value = contract.label_value;
+        g_active.image4_observed_counter_ea = contract.counter_ea;
+    }
+    if (!pending)
+        return 0;
+
+    AcquireSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    if (reject != RSX_IMAGE4_MLAA_ACCEPT) {
+        g_active.image4_reject[reject]++;
+        const bool partial = rsx_image4_mlaa_round_reject(
+            &g_active.image4_round, generation) != 0;
+        ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        /* Before the first consumed wake, an unknown variant remains wholly
+         * SPURS-owned. Afterwards, never mix one SPU task back into a native
+         * round: consume it and make the exact acquire fail closed. */
+        return partial ? 1 : yz_nr_image4_spurs_fallback(generation);
+    }
+    const rsx_image4_mlaa_offer_result offer =
+        rsx_image4_mlaa_round_offer(
+            &g_active.image4_round, generation, &contract, current.spu_id);
+    const bool ready = offer == RSX_IMAGE4_MLAA_OFFER_READY;
+    if (offer == RSX_IMAGE4_MLAA_OFFER_CONSUMED || ready) {
+        if (g_active.image4_round.signal_mask == (1u << current.spu_id))
+            g_active.image4_rounds++;
+        g_active.image4_signals++;
+    } else if (offer == RSX_IMAGE4_MLAA_OFFER_DUPLICATE) {
+        g_active.image4_duplicate_signals++;
+    } else if (offer == RSX_IMAGE4_MLAA_OFFER_CONFLICT) {
+        g_active.image4_reject[RSX_IMAGE4_MLAA_REJECT_PUBLICATION]++;
+        ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        /* A prior signal from this round has already been replaced. Mixing
+         * the remaining tasks with SPU execution would deadlock the EDGE
+         * barrier, so consume the conflicting wake and leave a fatal state
+         * for the exact acquire instead of pretending fallback is safe. */
+        return 1;
+    } else {
+        ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        return 0;
+    }
+    ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    if (ready) {
+        /* PPU edgePostMlaaWait can wait for tasksReady before the FE0 acquire
+         * itself is decoded. Queue the semantic operation to the existing
+         * RSX owner immediately on the fifth wake; waiting for the acquire
+         * would create a producer/consumer cycle. */
+        InterlockedExchange(&g_active.image4_request_failed, 0);
+        const LONG64 request = InterlockedIncrement64(
+            &g_active.image4_request_sequence);
+        for (;;) {
+            LONG64 done = InterlockedCompareExchange64(
+                &g_active.image4_request_completed, 0, 0);
+            if (done >= request ||
+                ReadAcquire(&g_active.residency_shutdown))
+                break;
+            WaitOnAddress(
+                (volatile VOID*)&g_active.image4_request_completed,
+                &done, sizeof(done), 10u);
+        }
+    }
+    return 1;
+}
+
 static void yz_nr_report_guest_read(
     void*, uint32_t ea, uint32_t size, uint32_t source);
 
@@ -622,6 +822,105 @@ static bool yz_nr_residency_audit_restore(
         t->out_w == 1024u && t->out_h == 768u &&
         t->clip_w == 1024u && t->clip_h == 768u &&
         t->ds_dx == 0x00100000u && t->dt_dy == 0x00100000u;
+}
+
+static bool yz_nr_image4_prepared_producer_contract()
+{
+    uint32_t task_ids[RSX_IMAGE4_MLAA_TASKS] = {};
+    uint32_t parameter_eas[RSX_IMAGE4_MLAA_TASKS] = {};
+    uint64_t fingerprint = 0;
+    uint32_t image_size = 0, entry_pc = 0;
+    int32_t image_id = -1;
+    if (cellSpursSnapshotImage4Taskset(
+            4u, task_ids, parameter_eas, &fingerprint, &image_size,
+            &entry_pc, &image_id) != 1)
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 1u);
+    g_active.image4_admission_fingerprint = fingerprint;
+    g_active.image4_admission_image_size = image_size;
+    g_active.image4_admission_entry_pc = entry_pc;
+    g_active.image4_admission_image_id = image_id;
+    const rsx_image4_mlaa_image image = {
+        fingerprint, image_size, entry_pc, image_id};
+    if (!rsx_image4_mlaa_image_matches(&image))
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 2u);
+
+    uint8_t records[RSX_IMAGE4_MLAA_TASKS]
+                   [RSX_IMAGE4_MLAA_RECORD_BYTES] = {};
+    uint8_t verify[RSX_IMAGE4_MLAA_TASKS]
+                  [RSX_IMAGE4_MLAA_RECORD_BYTES] = {};
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i) {
+        if (!parameter_eas[i] ||
+            parameter_eas[i] > UINT32_MAX - RSX_IMAGE4_MLAA_RECORD_BYTES)
+            return false;
+        memcpy(records[i], vm_base + parameter_eas[i],
+               RSX_IMAGE4_MLAA_RECORD_BYTES);
+    }
+    MemoryBarrier();
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i)
+        memcpy(verify[i], vm_base + parameter_eas[i],
+               RSX_IMAGE4_MLAA_RECORD_BYTES);
+    if (memcmp(records, verify, sizeof(records)) != 0)
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 3u);
+
+    uint32_t expected = 0;
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i) {
+        rsx_image4_mlaa_task task = {};
+        if (rsx_image4_mlaa_parse_task(records[i], &task) != 0)
+            return false;
+        if (task.spu_id == 0u) {
+            expected = task.label_value;
+            g_active.image4_admission_label_ea = task.label_ea;
+            g_active.image4_admission_label_value = task.label_value;
+            g_active.image4_admission_counter_ea = task.counter_ea;
+        }
+    }
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 4u);
+    const uint32_t cause = static_cast<uint32_t>(ReadAcquire(
+        &g_active.image4_last_user_cause));
+    g_active.image4_admission_cause = cause;
+    if (!expected || !cause || expected != cause)
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 5u);
+    rsx_image4_mlaa_contract contract = {};
+    constexpr uint32_t image_bytes =
+        RSX_IMAGE4_MLAA_WIDTH * RSX_IMAGE4_MLAA_HEIGHT * 4u;
+    uint32_t image_ea = 0u;
+    if (yz_nr_vertical_space_range_to_ea(
+            1u, 0x01772D00u, image_bytes, &image_ea) != 0)
+        return false;
+    if (rsx_image4_mlaa_validate(
+            records, image_ea, 0x10200FE0u, cause, &contract) !=
+        RSX_IMAGE4_MLAA_ACCEPT)
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 6u);
+
+    /* The title turns the SDK's boolean tasksReady into the same monotonic
+     * epoch used by its FE0 label.  Before the round both equal labelValue;
+     * task 0 publishes the label and then increments the counter. */
+    MemoryBarrier();
+    const uint32_t counter_value = vm_read32(contract.counter_ea);
+    g_active.image4_admission_counter_value = counter_value;
+    if (!rsx_image4_mlaa_counter_ready(&contract, counter_value))
+        return false;
+    g_active.image4_admission_stage = max(
+        g_active.image4_admission_stage, 7u);
+    MemoryBarrier();
+    for (uint32_t i = 0; i < RSX_IMAGE4_MLAA_TASKS; ++i) {
+        memcpy(verify[i], vm_base + parameter_eas[i],
+               RSX_IMAGE4_MLAA_RECORD_BYTES);
+        if (memcmp(records[i], verify[i], RSX_IMAGE4_MLAA_RECORD_BYTES) != 0)
+            return false;
+    }
+    return true;
 }
 
 static bool yz_nr_residency_audit_overlap(uint32_t ea, uint32_t size)
@@ -771,7 +1070,7 @@ static void yz_nr_residency_audit_access(
 
 static int yz_nr_residency_materialize_direct(uint32_t generation)
 {
-    if (!g_active.residency_enabled || !g_active.d3d12 || !generation ||
+    if (!yz_nr_residency_route_enabled() || !g_active.d3d12 || !generation ||
         ReadAcquire(&g_active.residency_shutdown))
         return -1;
     if (rsx_nr_d3d12_materialize_residency(
@@ -783,7 +1082,7 @@ static int yz_nr_residency_materialize_direct(uint32_t generation)
 
 static void yz_nr_residency_service_requests(void)
 {
-    if (!g_active.residency_enabled)
+    if (!yz_nr_residency_route_enabled())
         return;
     const LONG64 request = InterlockedCompareExchange64(
         &g_active.residency_request_sequence, 0, 0);
@@ -801,7 +1100,7 @@ static void yz_nr_residency_service_requests(void)
 
 static int yz_nr_residency_materialize_wait(uint32_t generation)
 {
-    if (!g_active.residency_enabled || !generation ||
+    if (!yz_nr_residency_route_enabled() || !generation ||
         ReadAcquire(&g_active.residency_shutdown))
         return -1;
     const DWORD consumer = static_cast<DWORD>(
@@ -836,7 +1135,7 @@ static void yz_nr_residency_access(
             user, ea, size, source,
             write == VM_NATIVE_RESIDENCY_WRITE_BEGIN,
             image_id, task_id, pc, command);
-    if (!g_active.residency_enabled)
+    if (!yz_nr_residency_route_enabled())
         return;
     int need_materialize = 0;
     const uint32_t generation = rsx_nr_residency_access(
@@ -987,6 +1286,10 @@ static void yz_nr_exec_reference(void*, uint32_t value)
 
 static void yz_nr_exec_user(void*, uint32_t cause)
 {
+    if (g_active.image4_gpu_mlaa_enabled)
+        InterlockedExchange(
+            &g_active.image4_last_user_cause,
+            static_cast<LONG>(cause));
     yz_nr_vertical_exec_user_command(cause);
 }
 
@@ -1072,9 +1375,85 @@ static int yz_nr_d3d_timeline_flush(void*)
     return result;
 }
 
+static int yz_nr_image4_execute_ready()
+{
+    if (!g_active.image4_gpu_mlaa_enabled || !g_active.d3d12)
+        return -1;
+    rsx_image4_mlaa_contract contract = {};
+    uint32_t generation = 0u;
+    AcquireSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    const uint32_t label_ea = g_active.image4_round.contract.label_ea;
+    const bool execute = rsx_image4_mlaa_round_claim(
+        &g_active.image4_round, label_ea, &contract, &generation) != 0;
+    ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    if (!execute)
+        return -1;
+
+    if (rsx_nr_d3d12_execute_image4_gpu_mlaa(
+            g_active.d3d12, generation,
+            contract.task[0].threshold_base,
+            contract.task[0].threshold_scale) != 0) {
+        AcquireSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        g_active.image4_execute_failures++;
+        g_active.image4_round.phase = RSX_IMAGE4_MLAA_PHASE_FAULTED;
+        ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        return -1;
+    }
+
+    /* EDGE task 0 publishes the label only after all image DMA has
+     * completed, then atomically increments tasksReady. The compute fence
+     * above covers output on the shared D3D12 timeline. */
+    MemoryBarrier();
+    vm_write32(contract.label_ea, contract.label_value);
+    cellSpursNotifyGuestWrite(contract.label_ea, 4u);
+    volatile LONG* const counter = reinterpret_cast<volatile LONG*>(
+        vm_base + contract.counter_ea);
+    LONG prior = InterlockedCompareExchange(counter, 0, 0);
+    for (;;) {
+        const uint32_t guest = _byteswap_ulong(static_cast<uint32_t>(prior));
+        const LONG next = static_cast<LONG>(_byteswap_ulong(guest + 1u));
+        const LONG observed = InterlockedCompareExchange(counter, next, prior);
+        if (observed == prior)
+            break;
+        prior = observed;
+    }
+    cellSpursNotifyGuestWrite(contract.counter_ea, 4u);
+
+    AcquireSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    g_active.image4_completed++;
+    rsx_image4_mlaa_round_complete(&g_active.image4_round);
+    ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+    return 0;
+}
+
+static void yz_nr_image4_service_requests()
+{
+    if (!g_active.image4_gpu_mlaa_enabled)
+        return;
+    const LONG64 request = InterlockedCompareExchange64(
+        &g_active.image4_request_sequence, 0, 0);
+    if (InterlockedCompareExchange64(
+            &g_active.image4_request_completed, 0, 0) >= request)
+        return;
+    const int failed = yz_nr_image4_execute_ready() != 0;
+    InterlockedExchange(&g_active.image4_request_failed, failed ? 1 : 0);
+    InterlockedExchange64(&g_active.image4_request_completed, request);
+    WakeByAddressAll((PVOID)&g_active.image4_request_completed);
+}
+
 static int yz_nr_exec_sem_read(void*, uint32_t dma, uint32_t offset,
                                uint32_t* value)
 {
+    if (g_active.image4_gpu_mlaa_enabled) {
+        const uint32_t address = yz_nr_vertical_sem_address(dma, offset);
+        AcquireSRWLockShared(&g_active.image4_gpu_mlaa_lock);
+        const bool faulted =
+            g_active.image4_round.phase == RSX_IMAGE4_MLAA_PHASE_FAULTED &&
+            address && address == g_active.image4_round.contract.label_ea;
+        ReleaseSRWLockShared(&g_active.image4_gpu_mlaa_lock);
+        if (faulted)
+            return -1;
+    }
     return yz_nr_vertical_sem_read(dma, offset, value);
 }
 
@@ -1296,7 +1675,7 @@ static void yz_nr_report_guest_read(
 
 extern "C" void yz_nr_vertical_service_report_requests(void)
 {
-    if (!g_active.report_defer_enabled && !g_active.residency_enabled)
+    if (!g_active.report_defer_enabled && !yz_nr_residency_route_enabled())
         return;
     /* This entry is called only from the two actual RSX consumer boundaries:
      * strict-owner frame consumption and the legacy FIFO step. The owner can
@@ -1311,6 +1690,7 @@ extern "C" void yz_nr_vertical_service_report_requests(void)
         static_cast<LONG>(GetCurrentThreadId()));
     yz_nr_report_service_requests();
     yz_nr_residency_service_requests();
+    yz_nr_image4_service_requests();
 }
 
 static const uint8_t* yz_nr_d3d_guest_ptr(void*, uint32_t space,
@@ -1408,30 +1788,43 @@ static int yz_nr_gpu_draw(void*, const rsx_nir_pipeline* st,
 }
 
 static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
-                              const rsx_nir_transfer* transfer,
-                              const uint32_t* words)
+                               const rsx_nir_transfer* transfer,
+                               const uint32_t* words)
 {
     if (!g_active.strict_full_native &&
         InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
+    if (g_active.image4_gpu_mlaa_enabled &&
+        yz_nr_residency_audit_save(transfer)) {
+        const bool prepared = yz_nr_image4_prepared_producer_contract();
+        if (prepared)
+            g_active.image4_admission_armed++;
+        else
+            g_active.image4_admission_not_ready++;
+        if (!g_active.d3d12 ||
+            rsx_nr_d3d12_arm_image4_gpu_mlaa(
+                g_active.d3d12, prepared ? 1 : 0) != 0)
+            return -1;
+    }
     int result = g_active.gpu_ops.transfer
         ? g_active.gpu_ops.transfer(g_active.gpu_ops.user, st, transfer,
                                     words) : -1;
     if (!result && yz_nr_residency_audit_restore(transfer)) {
         yz_nr_residency_audit_disarm();
-        if (g_active.residency_enabled) {
+        if (yz_nr_residency_route_enabled()) {
             const uint32_t generation = static_cast<uint32_t>(ReadAcquire(
                 &g_active.residency_generation));
-            if (rsx_nr_residency_finish(
+            if (generation && rsx_nr_residency_finish(
                     &g_active.residency_slot, generation) != 0)
                 result = -1;
             InterlockedExchange(&g_active.residency_generation, 0);
-            vm_native_residency_clear_watches();
+            if (generation)
+                vm_native_residency_clear_watches();
         }
     } else if (!result && yz_nr_residency_audit_save(transfer)) {
         yz_nr_residency_audit_arm();
-        if (g_active.residency_enabled) {
+        if (yz_nr_residency_route_enabled()) {
             uint32_t generation = 0u;
             unsigned long long writer_fence = 0u;
             constexpr uint32_t size = 1024u * 768u * 4u;
@@ -1681,6 +2074,13 @@ static void yz_nr_active_ensure_graphics(void)
             InterlockedExchange(&g_active.graphics_init_failed, 1);
         return;
     }
+    if (rsx_nr_d3d12_set_image4_gpu_mlaa(
+            d3d12, g_active.image4_gpu_mlaa_enabled) != 0) {
+        rsx_nr_d3d12_destroy(d3d12);
+        if (g_active.strict_full_native)
+            InterlockedExchange(&g_active.graphics_init_failed, 1);
+        return;
+    }
     rsx_nr_d3d12_set_watch_page(d3d12, yz_nr_d3d_watch_page, nullptr);
     if (!g_active.strict_full_native)
         rsx_nr_d3d12_set_resource_broker(
@@ -1776,6 +2176,8 @@ static void yz_nr_active_ensure_graphics(void)
             });
     MemoryBarrier();
     InterlockedExchange(&g_active.graphics_ready, 1);
+    if (g_active.image4_gpu_mlaa_enabled)
+        cellSpursSetImage4SignalInterceptor(yz_nr_image4_signal, nullptr);
 }
 
 static int yz_nr_active_init(int graphics)
@@ -3079,6 +3481,8 @@ extern "C" void yz_nr_vertical_init(void)
         const char* const residency_audit =
             getenv("YZ_NR_NATIVE_RESIDENCY_AUDIT");
         const char* const residency = getenv("YZ_NR_NATIVE_RESIDENCY");
+        const char* const image4_gpu_mlaa =
+            getenv("YZ_NR_IMAGE4_GPU_MLAA");
         g_active.report_defer_enabled = strict &&
             ((report_defer && report_defer[0] == '1' &&
               report_defer[1] == '\0') || g_active.graph_islands ||
@@ -3090,6 +3494,11 @@ extern "C" void yz_nr_vertical_init(void)
             residency_audit[0] == '1' && residency_audit[1] == '\0';
         g_active.residency_enabled = strict && residency &&
             residency[0] == '1' && residency[1] == '\0';
+        g_active.image4_gpu_mlaa_enabled = strict && image4_gpu_mlaa &&
+            image4_gpu_mlaa[0] == '1' && image4_gpu_mlaa[1] == '\0';
+        InitializeSRWLock(&g_active.image4_gpu_mlaa_lock);
+        rsx_image4_mlaa_round_init(
+            &g_active.image4_round, g_active.image4_gpu_mlaa_enabled);
         rsx_nr_residency_init(&g_active.residency_slot);
         g_active.draw_primitive_filter = UINT32_MAX;
         if (graphics && !strict) {
@@ -3138,7 +3547,7 @@ extern "C" void yz_nr_vertical_init(void)
                         LONG_MAX);
             }
             if (g_active.residency_audit_enabled ||
-                g_active.residency_enabled) {
+                yz_nr_residency_route_enabled()) {
                 vm_native_residency_clear_watches();
                 vm_native_residency_set_observer(
                     yz_nr_residency_access, nullptr);
@@ -5400,6 +5809,11 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
 extern "C" void yz_nr_vertical_shutdown(void)
 {
     if (InterlockedExchange(&g_vertical.mode_active_basic, 0)) {
+        if (g_active.image4_gpu_mlaa_enabled)
+            cellSpursSetImage4SignalInterceptor(nullptr, nullptr);
+        AcquireSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
+        rsx_image4_mlaa_round_reset(&g_active.image4_round);
+        ReleaseSRWLockExclusive(&g_active.image4_gpu_mlaa_lock);
         InterlockedExchange(&g_vertical.mode_active_present, 0);
         InterlockedExchange(&g_vertical.mode_active_graphics, 0);
         if (g_active.report_defer_enabled)
@@ -5408,6 +5822,12 @@ extern "C" void yz_nr_vertical_shutdown(void)
         WakeByAddressAll((PVOID)&g_active.report_request_completed);
         InterlockedExchange(&g_active.residency_shutdown, 1);
         WakeByAddressAll((PVOID)&g_active.residency_request_completed);
+        InterlockedExchange(&g_active.image4_request_failed, 1);
+        InterlockedExchange64(
+            &g_active.image4_request_completed,
+            InterlockedCompareExchange64(
+                &g_active.image4_request_sequence, 0, 0));
+        WakeByAddressAll((PVOID)&g_active.image4_request_completed);
         rsx_nr_residency_reset(&g_active.residency_slot);
         if (g_active.residency_audit_enabled) {
             if (InterlockedExchange(
@@ -5487,6 +5907,68 @@ extern "C" void yz_nr_vertical_shutdown(void)
                     "[nr-residency-access-overflow count=%lld]\n",
                     InterlockedCompareExchange64(
                         &g_active.residency_audit_key_overflow, 0, 0));
+        }
+        if (g_active.image4_gpu_mlaa_enabled) {
+            rsx_nr_d3d12_stats image4_stats = {};
+            if (g_active.d3d12)
+                rsx_nr_d3d12_get_stats(g_active.d3d12, &image4_stats);
+            fprintf(stderr,
+                    "[nr-image4-gpu-mlaa rounds=%llu signals=%llu "
+                    "duplicate=%llu completed=%llu exec-fail=%llu "
+                    "admit=%llu/%llu "
+                    "observed=%llu/%08X/%08X/%08X "
+                    "stage=%u image=%016llX/%X/%X/%d "
+                    "parameter=%08X/%08X/%08X/%08X/%08X "
+                    "holds=%llu dispatches=%llu backend-fail=%llu "
+                    "fallback-materialize=%llu avoided=%llu/%llu/%llu "
+                    "gpu=%llu/%llu/%llu fence-wait=%llu/%llu "
+                    "reject=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                    "%llu,%llu,%llu,%llu]\n",
+                    g_active.image4_rounds,
+                    g_active.image4_signals,
+                    g_active.image4_duplicate_signals,
+                    g_active.image4_completed,
+                    g_active.image4_execute_failures,
+                    g_active.image4_admission_armed,
+                    g_active.image4_admission_not_ready,
+                    g_active.image4_observed_exact_signals,
+                    g_active.image4_observed_label_ea,
+                    g_active.image4_observed_label_value,
+                    g_active.image4_observed_counter_ea,
+                    g_active.image4_admission_stage,
+                    g_active.image4_admission_fingerprint,
+                    g_active.image4_admission_image_size,
+                    g_active.image4_admission_entry_pc,
+                    g_active.image4_admission_image_id,
+                    g_active.image4_admission_label_ea,
+                    g_active.image4_admission_label_value,
+                    g_active.image4_admission_counter_ea,
+                    g_active.image4_admission_counter_value,
+                    g_active.image4_admission_cause,
+                    image4_stats.image4_mlaa_holds,
+                    image4_stats.image4_mlaa_dispatches,
+                    image4_stats.image4_mlaa_failures,
+                    image4_stats.image4_mlaa_fallback_materializations,
+                    image4_stats.image4_mlaa_avoided_readbacks,
+                    image4_stats.image4_mlaa_avoided_uploads,
+                    image4_stats.image4_mlaa_avoided_bytes,
+                    image4_stats.image4_mlaa_gpu_samples,
+                    image4_stats.image4_mlaa_gpu_ticks,
+                    image4_stats.image4_mlaa_gpu_frequency,
+                    image4_stats.image4_mlaa_fence_wait_ticks,
+                    image4_stats.image4_mlaa_qpc_frequency,
+                    g_active.image4_reject[0],
+                    g_active.image4_reject[1],
+                    g_active.image4_reject[2],
+                    g_active.image4_reject[3],
+                    g_active.image4_reject[4],
+                    g_active.image4_reject[5],
+                    g_active.image4_reject[6],
+                    g_active.image4_reject[7],
+                    g_active.image4_reject[8],
+                    g_active.image4_reject[9],
+                    g_active.image4_reject[10],
+                    g_active.image4_reject[11]);
         }
         vm_native_residency_set_observer(nullptr, nullptr);
         vm_native_residency_clear_watches();

@@ -59,6 +59,125 @@ EXPECTED_CACHE = {
     "YZ_WKL4_CYCLE_DIAGNOSTIC": "OFF",
 }
 
+THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+PDH_MORE_DATA = 0x800007D2
+
+
+class PDH_RAW_COUNTER(ctypes.Structure):
+    _fields_ = [
+        ("CStatus", wintypes.DWORD),
+        ("TimeStamp", wintypes.FILETIME),
+        ("FirstValue", ctypes.c_longlong),
+        ("SecondValue", ctypes.c_longlong),
+        ("MultiCount", wintypes.DWORD),
+    ]
+
+
+def _filetime_value(value):
+    return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+
+def thread_cpu_100ns(thread_id):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenThread.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+    ]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.GetThreadTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetThreadTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenThread(
+        THREAD_QUERY_LIMITED_INFORMATION, False, thread_id
+    )
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetThreadTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_time),
+            ctypes.byref(kernel), ctypes.byref(user)
+        ):
+            return None
+        return _filetime_value(kernel) + _filetime_value(user)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def gpu_running_time_100ns(process_id):
+    """Cumulative exact-process GPU-engine running time via PDH."""
+    pdh = ctypes.WinDLL("pdh", use_last_error=True)
+    pdh.PdhOpenQueryW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)
+    ]
+    pdh.PdhOpenQueryW.restype = wintypes.LONG
+    pdh.PdhExpandWildCardPathW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+    ]
+    pdh.PdhExpandWildCardPathW.restype = wintypes.LONG
+    pdh.PdhAddEnglishCounterW.argtypes = [
+        wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    pdh.PdhAddEnglishCounterW.restype = wintypes.LONG
+    pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+    pdh.PdhCollectQueryData.restype = wintypes.LONG
+    pdh.PdhGetRawCounterValue.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(PDH_RAW_COUNTER),
+    ]
+    pdh.PdhGetRawCounterValue.restype = wintypes.LONG
+    pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+    pdh.PdhCloseQuery.restype = wintypes.LONG
+    wildcard = rf"\GPU Engine(pid_{process_id}_*)\Running Time"
+    size = wintypes.DWORD()
+    status = pdh.PdhExpandWildCardPathW(
+        None, wildcard, None, ctypes.byref(size), 0
+    )
+    if (status & 0xFFFFFFFF) != PDH_MORE_DATA or not size.value:
+        return 0 if status == 0 else None
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if pdh.PdhExpandWildCardPathW(
+        None, wildcard, buffer, ctypes.byref(size), 0
+    ) != 0:
+        return None
+    paths = [path for path in buffer[:size.value].split("\0") if path]
+    if not paths:
+        return 0
+    query = wintypes.HANDLE()
+    if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+        return None
+    try:
+        counters = []
+        for path in paths:
+            counter = wintypes.HANDLE()
+            if pdh.PdhAddEnglishCounterW(
+                query, path, 0, ctypes.byref(counter)
+            ) == 0:
+                counters.append(counter)
+        if not counters or pdh.PdhCollectQueryData(query) != 0:
+            return None
+        total = 0
+        valid = 0
+        for counter in counters:
+            value = PDH_RAW_COUNTER()
+            counter_type = wintypes.DWORD()
+            if (pdh.PdhGetRawCounterValue(
+                counter, ctypes.byref(counter_type), ctypes.byref(value)
+            ) == 0 and value.CStatus == 0):
+                total += value.FirstValue
+                valid += 1
+        return total if valid else None
+    finally:
+        pdh.PdhCloseQuery(query)
+
 WJ_EXPECTATIONS = {
     "expect_wj_gstask": "YZ_SPU_WJ_GSTASK",
     "expect_wj_cri": "YZ_SPU_WJ_CRI",
@@ -1007,6 +1126,8 @@ def run_gun(args):
         yz["YZ_NR_NATIVE_RESIDENCY_AUDIT"] = "1"
     if args.nr_native_residency:
         yz["YZ_NR_NATIVE_RESIDENCY"] = "1"
+    if args.nr_image4_gpu_mlaa:
+        yz["YZ_NR_IMAGE4_GPU_MLAA"] = "1"
     if args.nr_graph_execute:
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
@@ -1079,6 +1200,11 @@ def run_gun(args):
             stderr_path, r"\[config\].*lane=clean", 60, process
         )
         result["runtime_config_line"] = config_match.group(0)
+        tid_match, _ = wait_log(
+            stderr_path, r"\[rsx\].*host_tid=([0-9]+)", 60, process
+        )
+        rsx_tid = int(tid_match.group(1))
+        result["rsx_consumer_thread_id"] = rsx_tid
 
         deadline = time.monotonic() + args.gun_route_timeout
         last_capture_progress = time.monotonic()
@@ -1281,6 +1407,9 @@ def run_gun(args):
         )
         result["status"] = "measuring"
         measurement_cpu_start = process_cpu_seconds(process.pid)
+        measurement_rsx_start = thread_cpu_100ns(rsx_tid)
+        measurement_gpu_start = gpu_running_time_100ns(process.pid)
+        measurement_wall_start = time.monotonic()
         print(
             f"[gun-harness] stable gun scene; measuring {args.hold_seconds}s",
             flush=True,
@@ -1293,9 +1422,25 @@ def run_gun(args):
                 )
             time.sleep(min(0.5, end - time.monotonic()))
 
+        measurement_wall = time.monotonic() - measurement_wall_start
+        measurement_rsx_end = thread_cpu_100ns(rsx_tid)
+        measurement_gpu_end = gpu_running_time_100ns(process.pid)
         result["measurement_process_cpu_seconds"] = round(
             process_cpu_seconds(process.pid) - measurement_cpu_start, 6
         )
+        result["measurement_wall_seconds"] = round(measurement_wall, 6)
+        if measurement_rsx_start is not None and measurement_rsx_end is not None:
+            rsx_100ns = measurement_rsx_end - measurement_rsx_start
+            result["rsx_consumer_cpu_ms"] = round(rsx_100ns / 10000.0, 3)
+            result["rsx_consumer_cpu_percent_one_core"] = round(
+                rsx_100ns / 10_000_000.0 / measurement_wall * 100.0, 3
+            )
+        if measurement_gpu_start is not None and measurement_gpu_end is not None:
+            gpu_100ns = measurement_gpu_end - measurement_gpu_start
+            result["gpu_engine_time_ms"] = round(gpu_100ns / 10000.0, 3)
+            result["gpu_engine_duty_percent"] = round(
+                gpu_100ns / 10_000_000.0 / measurement_wall * 100.0, 3
+            )
         result["status"] = "closing"
         windows = post_close(process.pid)
         result["wm_close_windows"] = windows
@@ -1380,6 +1525,10 @@ def run_gun(args):
         result["nr_native_residency_audit"] = residency_audit_lines
         result["nr_native_residency_access"] = residency_access_lines
         result["nr_native_residency_access_overflow"] = residency_overflow_lines
+        image4_gpu_mlaa_lines = re.findall(
+            r"^\[nr-image4-gpu-mlaa .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_image4_gpu_mlaa"] = image4_gpu_mlaa_lines
         if args.nr_native_residency_audit:
             if len(residency_audit_lines) != 1:
                 raise RuntimeError(
@@ -1397,6 +1546,23 @@ def run_gun(args):
             raise RuntimeError(
                 "native residency audit output was active outside its "
                 "requested lane"
+            )
+        if args.nr_image4_gpu_mlaa:
+            if (len(image4_gpu_mlaa_lines) != 1 or
+                    not re.search(r"completed=([1-9][0-9]*) ",
+                                  image4_gpu_mlaa_lines[0]) or
+                    not re.search(r"dispatches=([1-9][0-9]*) ",
+                                  image4_gpu_mlaa_lines[0]) or
+                    "exec-fail=0" not in image4_gpu_mlaa_lines[0] or
+                    "backend-fail=0" not in image4_gpu_mlaa_lines[0] or
+                    "fallback-materialize=0" not in image4_gpu_mlaa_lines[0]):
+                raise RuntimeError(
+                    "Image-4 GPU route did not close cleanly: "
+                    f"{image4_gpu_mlaa_lines}"
+                )
+        elif image4_gpu_mlaa_lines:
+            raise RuntimeError(
+                "Image-4 GPU route was active outside its requested lane"
             )
         if args.nr_report_audit:
             if len(report_scoreboard_lines) != 1:
@@ -1687,6 +1853,8 @@ def run(args):
         yz["YZ_NR_NATIVE_RESIDENCY_AUDIT"] = "1"
     if args.nr_native_residency:
         yz["YZ_NR_NATIVE_RESIDENCY"] = "1"
+    if args.nr_image4_gpu_mlaa:
+        yz["YZ_NR_IMAGE4_GPU_MLAA"] = "1"
     if args.nr_graph_execute:
         yz["YZ_NR_GRAPH"] = "execute"
     if args.nr_single_pass_graph:
@@ -1758,6 +1926,11 @@ def run(args):
             process,
         )
         result["runtime_config_line"] = config_match.group(0)
+        tid_match, _ = wait_log(
+            stderr_path, r"\[rsx\].*host_tid=([0-9]+)", 60, process
+        )
+        rsx_tid = int(tid_match.group(1))
+        result["rsx_consumer_thread_id"] = rsx_tid
 
         deadline = time.monotonic() + args.route_timeout
         seen = set()
@@ -1958,6 +2131,9 @@ def run(args):
         result["measurement_start_present_id"] = int(stop_match.group(1))
         result["status"] = "measuring"
         measurement_cpu_start = process_cpu_seconds(process.pid)
+        measurement_rsx_start = thread_cpu_100ns(rsx_tid)
+        measurement_gpu_start = gpu_running_time_100ns(process.pid)
+        measurement_wall_start = time.monotonic()
         print(
             f"[akiyama-harness] checkpoint stable; measuring {args.hold_seconds}s",
             flush=True,
@@ -1967,9 +2143,25 @@ def run(args):
             if process.poll() is not None:
                 raise RuntimeError(f"game exited during measurement: {process.returncode}")
             time.sleep(min(0.5, end - time.monotonic()))
+        measurement_wall = time.monotonic() - measurement_wall_start
+        measurement_rsx_end = thread_cpu_100ns(rsx_tid)
+        measurement_gpu_end = gpu_running_time_100ns(process.pid)
         result["measurement_process_cpu_seconds"] = round(
             process_cpu_seconds(process.pid) - measurement_cpu_start, 6
         )
+        result["measurement_wall_seconds"] = round(measurement_wall, 6)
+        if measurement_rsx_start is not None and measurement_rsx_end is not None:
+            rsx_100ns = measurement_rsx_end - measurement_rsx_start
+            result["rsx_consumer_cpu_ms"] = round(rsx_100ns / 10000.0, 3)
+            result["rsx_consumer_cpu_percent_one_core"] = round(
+                rsx_100ns / 10_000_000.0 / measurement_wall * 100.0, 3
+            )
+        if measurement_gpu_start is not None and measurement_gpu_end is not None:
+            gpu_100ns = measurement_gpu_end - measurement_gpu_start
+            result["gpu_engine_time_ms"] = round(gpu_100ns / 10000.0, 3)
+            result["gpu_engine_duty_percent"] = round(
+                gpu_100ns / 10_000_000.0 / measurement_wall * 100.0, 3
+            )
         result["status"] = "closing"
         windows = post_close(process.pid)
         result["wm_close_windows"] = windows
@@ -2073,6 +2265,10 @@ def run(args):
         result["nr_native_residency_audit"] = residency_audit_lines
         result["nr_native_residency_access"] = residency_access_lines
         result["nr_native_residency_access_overflow"] = residency_overflow_lines
+        image4_gpu_mlaa_lines = re.findall(
+            r"^\[nr-image4-gpu-mlaa .*\]$", stderr_text, re.MULTILINE
+        )
+        result["nr_image4_gpu_mlaa"] = image4_gpu_mlaa_lines
         if args.nr_native_residency_audit:
             if len(residency_audit_lines) != 1:
                 raise RuntimeError(
@@ -2090,6 +2286,23 @@ def run(args):
             raise RuntimeError(
                 "native residency audit output was active outside its "
                 "requested lane"
+            )
+        if args.nr_image4_gpu_mlaa:
+            if (len(image4_gpu_mlaa_lines) != 1 or
+                    not re.search(r"completed=([1-9][0-9]*) ",
+                                  image4_gpu_mlaa_lines[0]) or
+                    not re.search(r"dispatches=([1-9][0-9]*) ",
+                                  image4_gpu_mlaa_lines[0]) or
+                    "exec-fail=0" not in image4_gpu_mlaa_lines[0] or
+                    "backend-fail=0" not in image4_gpu_mlaa_lines[0] or
+                    "fallback-materialize=0" not in image4_gpu_mlaa_lines[0]):
+                raise RuntimeError(
+                    "Image-4 GPU route did not close cleanly: "
+                    f"{image4_gpu_mlaa_lines}"
+                )
+        elif image4_gpu_mlaa_lines:
+            raise RuntimeError(
+                "Image-4 GPU route was active outside its requested lane"
             )
         if args.nr_report_audit:
             if len(report_scoreboard_lines) != 1:
@@ -2318,6 +2531,7 @@ def main():
     parser.add_argument("--nr-report-audit", action="store_true")
     parser.add_argument("--nr-native-residency-audit", action="store_true")
     parser.add_argument("--nr-native-residency", action="store_true")
+    parser.add_argument("--nr-image4-gpu-mlaa", action="store_true")
     parser.add_argument(
         "--nr-graph-execute", action="store_true",
         help="execute strict-native FIFO dependency islands through the fixed graph",
@@ -2404,6 +2618,10 @@ def main():
     if args.nr_native_residency and not args.nr_vertical_full_native:
         parser.error(
             "--nr-native-residency requires --nr-vertical-full-native"
+        )
+    if args.nr_image4_gpu_mlaa and not args.nr_vertical_full_native:
+        parser.error(
+            "--nr-image4-gpu-mlaa requires --nr-vertical-full-native"
         )
     if args.nr_graph_execute and not args.nr_vertical_full_native:
         parser.error("--nr-graph-execute requires --nr-vertical-full-native")
