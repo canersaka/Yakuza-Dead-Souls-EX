@@ -143,6 +143,24 @@ typedef struct rsx_nr_frame_flow_origin {
     unsigned long long sequence;
 } rsx_nr_frame_flow_origin;
 
+typedef enum rsx_nr_frame_origin {
+    RSX_NR_FRAME_ORIGIN_SEQUENTIAL = 0,
+    RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT,
+    RSX_NR_FRAME_ORIGIN_CALL_SEGMENT,
+    RSX_NR_FRAME_ORIGIN_DATA_ISLAND,
+    RSX_NR_FRAME_ORIGIN_GENERATED,
+    RSX_NR_FRAME_ORIGIN_STOPPER,
+    RSX_NR_FRAME_ORIGIN_COUNT
+} rsx_nr_frame_origin;
+
+typedef struct rsx_nr_frame_census {
+    unsigned long long entries[RSX_NR_FRAME_ORIGIN_COUNT];
+    unsigned long long packets[RSX_NR_FRAME_ORIGIN_COUNT];
+    unsigned long long methods[RSX_NR_FRAME_ORIGIN_COUNT];
+    unsigned long long draws[RSX_NR_FRAME_ORIGIN_COUNT];
+    unsigned long long steps;
+} rsx_nr_frame_census;
+
 typedef struct rsx_nr_frame_owner_stats {
     unsigned long long steps;
     unsigned long long packets;
@@ -285,6 +303,9 @@ typedef struct rsx_nr_frame_owner {
     unsigned long long tail_tick_frequency;
     rsx_nr_frame_graph_stats graph_stats;
 
+    rsx_nr_frame_census* census;
+    u32 census_origin;
+
     rsx_nr_frame_failure failure;
     rsx_nr_frame_flow_origin flow_origin;
     rsx_nr_frame_breadcrumb breadcrumbs[RSX_NR_FRAME_BREADCRUMB_COUNT];
@@ -333,6 +354,9 @@ void rsx_nr_frame_owner_set_tail_clock(
 void rsx_nr_frame_owner_set_tail_account(
     rsx_nr_frame_owner* owner, rsx_nr_frame_tail_account_fn account,
     void* account_user);
+
+void rsx_nr_frame_owner_set_census(
+    rsx_nr_frame_owner* owner, rsx_nr_frame_census* census);
 
 /* SNAPSHOT mode records immutable draw resources once at the decoder
  * boundary, retains a bounded dependency island, calls the constant-time

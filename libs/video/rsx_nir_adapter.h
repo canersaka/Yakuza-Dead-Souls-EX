@@ -119,6 +119,12 @@ typedef struct rsx_nir_adapter {
      * the FIFO path owns execution of shadowed commands. State-group
      * knowledge stays fresh for the next native action. */
     int shadow_mode;
+
+    /* Register-truth resync (island compiler): while active, the dispatch
+     * execution sink is disconnected so architectural state can be applied
+     * without begin/end/batch/flip/clear side effects. */
+    rsx_dispatch_sink resync_saved_sink;
+    int resync_active;
 } rsx_nir_adapter;
 
 void rsx_nir_adapter_init(rsx_nir_adapter* ad, rsx_nir_stream* out);
@@ -152,6 +158,15 @@ void rsx_nir_adapter_method(rsx_nir_adapter* ad, u32 method, u32 arg);
 int rsx_nir_adapter_method_supported(
     const rsx_nir_adapter* ad, u32 method, u32 arg);
 
+/* Argument dependence of the admissibility decision, for table-driven
+ * scanners (island compiler). NEVER/ALWAYS ignore the boot-era context
+ * image, whose exact-value admissions always take the full check. */
+#define RSX_NIR_SUPPORT_NEVER         0
+#define RSX_NIR_SUPPORT_ALWAYS        1
+#define RSX_NIR_SUPPORT_ARG_DEPENDENT 2
+int rsx_nir_adapter_method_support_class(
+    const rsx_nir_adapter* ad, u32 method);
+
 /* Emit one terminal action from an otherwise shadow-only adapter. State and
  * draw batches must already have been mirrored through the method path. The
  * adapter returns to shadow mode before this call returns. This lets a live
@@ -174,6 +189,35 @@ void rsx_nir_adapter_stage_state(rsx_nir_adapter* ad);
  * then indexes that word, and *stop_word receives it if non-NULL). */
 u32 rsx_nir_adapter_fifo(rsx_nir_adapter* ad, const u32* words, u32 count,
                          u32* stop_word);
+
+/* ---- island-compiler support (docs/HANA_ISLAND_COMPILER.md) ------------ */
+
+/* Derive one state-group op (RSX_NIR_OP_SET_* kind; unit for textures) from
+ * the current register file and append it to `out`. update_shadow keeps the
+ * emitter's last-emitted view coherent when the caller feeds the derived op
+ * to the backend itself. Returns 0, or -1 on refusal. */
+int rsx_nir_adapter_derive_group_op(rsx_nir_adapter* ad, u32 kind, u32 unit,
+                                    rsx_nir_stream* out, int update_shadow);
+
+/* Derive one SET_CONSTANTS op (a single vec4 slot) from the dispatch
+ * constant file. Same shadow contract as above. */
+int rsx_nir_adapter_derive_constant_op(rsx_nir_adapter* ad, u32 slot,
+                                       rsx_nir_stream* out,
+                                       int update_shadow);
+
+/* Register-truth resync: apply methods' architectural effects (register
+ * file, program/constant upload windows, DMA/transfer staging, render-
+ * condition capture) without emitter staging or action emission. Bracket
+ * a run with begin/end so dispatch execution callbacks stay disconnected. */
+void rsx_nir_adapter_resync_begin(rsx_nir_adapter* ad);
+void rsx_nir_adapter_resync_method(rsx_nir_adapter* ad, u32 method, u32 arg);
+void rsx_nir_adapter_resync_end(rsx_nir_adapter* ad);
+
+/* Fill a transfer action's staging-derived fields (the same adapter fields
+ * the emission paths read). SCALED in_x/in_y and the INLINE run shape and
+ * payload belong to the caller. */
+void rsx_nir_adapter_derive_transfer(const rsx_nir_adapter* ad, u32 kind,
+                                     rsx_nir_transfer* t);
 
 #ifdef __cplusplus
 }

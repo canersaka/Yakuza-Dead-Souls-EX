@@ -573,11 +573,42 @@ static int pix_is(u32 x, u32 y, u8 bb, u8 gg, u8 rr)
  * errors, ring faults, or nondeterminism between two identical runs. */
 
 #include "../rsx_nir_adapter.h"
+#include "../rsx_nr_island.h"
 
 typedef struct cap_mem {
     u8* arena[2];
     u32 size[2];
 } cap_mem;
+
+/* Windowed strict-frame / island-compiler lane storage. Static and fixed:
+ * the island compiler performs no allocation after init. */
+#define CAPW_ARENA_BYTES (64u << 20)
+#define CAPW_INDEX_CAP 65536u
+#define CAPW_SCRATCH_OPS 4096u
+#define CAPW_SCRATCH_SIDE 262144u
+#define CAPW_WINDOW_WORDS 16384u
+static rsx_nr_island_compiler g_capw_ic;
+static unsigned char g_capw_arena[CAPW_ARENA_BYTES];
+static u32 g_capw_idx_lo[CAPW_INDEX_CAP];
+static u32 g_capw_idx_hi[CAPW_INDEX_CAP];
+static u32 g_capw_idx_ofs[CAPW_INDEX_CAP];
+static rsx_nir_op g_capw_scratch_ops[CAPW_SCRATCH_OPS];
+static u32 g_capw_scratch_side[CAPW_SCRATCH_SIDE];
+
+static unsigned long long capw_qpc(void* user)
+{
+    LARGE_INTEGER t;
+    (void)user;
+    QueryPerformanceCounter(&t);
+    return (unsigned long long)t.QuadPart;
+}
+
+static unsigned long long capw_qpc_freq(void)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (unsigned long long)f.QuadPart;
+}
 
 static cap_mem g_cap;
 
@@ -755,6 +786,13 @@ typedef struct cap_manifest {
 typedef struct cap_exec_trace {
     rsx_nr_exec_ops inner;
     cap_manifest* manifest;
+    /* YZ_NR_CAPTURE_ABSORB_REFUSALS: count a refused clear/draw/transfer
+     * in the manifest (which the two-run/two-lane comparison includes) but
+     * report success to the executor so full-stream replay can continue.
+     * The strict owner's live fail-closed contract is deliberately not
+     * weakened; this is a replay-harness measurement mode, and both
+     * benchmark lanes absorb identically. */
+    int absorb_refusals;
 } cap_exec_trace;
 
 static void cap_note_target(cap_manifest* m, const rsx_nir_pipeline* st)
@@ -898,7 +936,7 @@ static int cap_trace_clear(void* user, const rsx_nir_pipeline* st,
         cap_note_failure(t, RSX_NIR_OP_CLEAR, rc, st, clear, NULL, NULL);
     else if (clear->mask & 0xF0u)
         cap_note_target(t->manifest, st);
-    return rc;
+    return rc && t->absorb_refusals ? 0 : rc;
 }
 
 static int cap_trace_draw(void* user, const rsx_nir_pipeline* st,
@@ -914,7 +952,7 @@ static int cap_trace_draw(void* user, const rsx_nir_pipeline* st,
         cap_note_failure(t, RSX_NIR_OP_DRAW, rc, st, NULL, draw, NULL);
     else
         cap_note_target(t->manifest, st);
-    return rc;
+    return rc && t->absorb_refusals ? 0 : rc;
 }
 
 static int cap_trace_transfer(void* user, const rsx_nir_pipeline* st,
@@ -930,6 +968,18 @@ static int cap_trace_transfer(void* user, const rsx_nir_pipeline* st,
                          transfer);
     else
         cap_note_transfer(t->manifest, transfer);
+    if (rc && t->absorb_refusals) {
+        fprintf(stderr,
+                "[absorb] transfer rc=%d kind=%u src=%u:%08X f%u "
+                "dst=%u:%08X f%u in=%ux%u out=%ux%u ordinal=%llu\n",
+                rc, transfer->kind, transfer->src_location,
+                transfer->src_offset, transfer->src_format,
+                transfer->dst_location, transfer->dst_offset,
+                transfer->dst_format, transfer->in_w, transfer->in_h,
+                transfer->out_w, transfer->out_h,
+                t->manifest->action_ordinal);
+        return 0;
+    }
     return rc;
 }
 
@@ -947,6 +997,21 @@ static void cap_trace_flush(void* user)
 {
     cap_exec_trace* const t = user;
     if (t->inner.flush)
+        t->inner.flush(t->inner.user);
+}
+
+/* The trace wrapper replaces ops.user with itself, so every callback the
+ * sink populated must be forwarded — flush_reason included. Leaving the
+ * sink's own flush_reason behind the trace user pointer made the first
+ * report/semaphore flush interpret the trace struct as the sink (an
+ * access violation present at checkpoint 07c4ca8; the capture leg had not
+ * been re-run on this branch lineage since flush_reason was added). */
+static void cap_trace_flush_reason(void* user, u32 reason)
+{
+    cap_exec_trace* const t = user;
+    if (t->inner.flush_reason)
+        t->inner.flush_reason(t->inner.user, reason);
+    else if (t->inner.flush)
         t->inner.flush(t->inner.user);
 }
 
@@ -1111,6 +1176,172 @@ static int cap_dump_depth_raw(rsx_nr_d3d12* sink, const char* path,
     return ok ? 0 : -1;
 }
 
+/* GPU-free replay executor (YZ_NR_CAPTURE_NULL_EXEC=1): every action is
+ * consumed into one order-sensitive content hash covering the complete
+ * folded pipeline state (vertex-program words included) plus the action
+ * payload. Two lanes producing the same hash executed identical ordered
+ * commands — the same invariant the WARP leg proves with pixels, but
+ * immune to this machine's adapter resets while a concurrent live boot
+ * session owns the real GPU. */
+typedef struct cap_null_exec {
+    u64 hash;
+    unsigned long long actions;
+    unsigned long long draws;
+    unsigned long long clears;
+    unsigned long long transfers;
+    unsigned long long presents;
+} cap_null_exec;
+
+static u64 capn_fnv(u64 h, const void* data, size_t n)
+{
+    const unsigned char* p = data;
+    if (!h)
+        h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void capn_state(cap_null_exec* x, u32 kind,
+                       const rsx_nir_pipeline* st)
+{
+    rsx_nir_pipeline norm = *st;
+    norm.vertex_program.words_ofs = 0;
+    x->hash = capn_fnv(x->hash, &kind, sizeof(kind));
+    x->hash = capn_fnv(x->hash, &norm, sizeof(norm));
+    x->actions++;
+    if (getenv("YZ_NR_CAPTURE_HASH_TRACE"))
+        fprintf(stderr, "[htrace] %llu kind=%u state=%016llX\n",
+                x->actions, kind,
+                (unsigned long long)capn_fnv(0, &norm, sizeof(norm)));
+}
+
+static int capn_clear(void* user, const rsx_nir_pipeline* st,
+                      const rsx_nir_clear* c)
+{
+    cap_null_exec* const x = user;
+    capn_state(x, RSX_NIR_OP_CLEAR, st);
+    x->hash = capn_fnv(x->hash, c, sizeof(*c));
+    x->clears++;
+    return 0;
+}
+
+static int capn_draw(void* user, const rsx_nir_pipeline* st,
+                     const u32* vp_words, u32 vp_word_count,
+                     const rsx_nir_draw* d, const u32* batches)
+{
+    cap_null_exec* const x = user;
+    capn_state(x, RSX_NIR_OP_DRAW, st);
+    rsx_nir_draw norm = *d;
+    norm.batches_ofs = 0;
+    x->hash = capn_fnv(x->hash, &norm, sizeof(norm));
+    x->hash = capn_fnv(x->hash, batches, (size_t)d->batch_count * 8u);
+    x->hash = capn_fnv(x->hash, vp_words, (size_t)vp_word_count * 4u);
+    x->draws++;
+    return 0;
+}
+
+static int capn_transfer(void* user, const rsx_nir_pipeline* st,
+                         const rsx_nir_transfer* t, const u32* words)
+{
+    cap_null_exec* const x = user;
+    capn_state(x, RSX_NIR_OP_TRANSFER, st);
+    rsx_nir_transfer norm = *t;
+    norm.words_ofs = 0;
+    x->hash = capn_fnv(x->hash, &norm, sizeof(norm));
+    if (t->word_count)
+        x->hash = capn_fnv(x->hash, words, (size_t)t->word_count * 4u);
+    x->transfers++;
+    return 0;
+}
+
+static int capn_present(void* user, u32 buffer)
+{
+    cap_null_exec* const x = user;
+    x->hash = capn_fnv(x->hash, &buffer, sizeof(buffer));
+    x->actions++;
+    x->presents++;
+    return 0;
+}
+
+static void capn_sem_write(void* user, u32 dma, u32 offset, u32 value,
+                           u32 texture_read)
+{
+    cap_null_exec* const x = user;
+    const u32 payload[4] = { dma, offset, value, texture_read };
+    x->hash = capn_fnv(x->hash, payload, sizeof(payload));
+    x->actions++;
+}
+
+static int capn_report(void* user, u32 kind, u32 arg, u32 dma)
+{
+    cap_null_exec* const x = user;
+    const u32 payload[3] = { kind, arg, dma };
+    x->hash = capn_fnv(x->hash, payload, sizeof(payload));
+    x->actions++;
+    return 0;
+}
+
+static void capn_set_reference(void* user, u32 value)
+{
+    cap_null_exec* const x = user;
+    x->hash = capn_fnv(x->hash, &value, sizeof(value));
+    x->actions++;
+}
+
+static void capn_user_command(void* user, u32 cause)
+{
+    cap_null_exec* const x = user;
+    x->hash = capn_fnv(x->hash, &cause, sizeof(cause));
+    x->actions++;
+}
+
+/* Drain the windowed lane toward PUT. Soft mode stops at a publication
+ * wait (an island whose terminal action is still unpublished); hard mode
+ * requires the cursor to reach PUT. Returns 0, -1 on fault. */
+static int capw_flush(rsx_nr_frame_owner* owner, int use_compiler,
+                      u32* get_io, u32 put, int hard,
+                      unsigned long long* wall_ticks)
+{
+    u32 get = *get_io;
+    u32 ret = ~0u;
+    const unsigned long long t0 = capw_qpc(NULL);
+    int rc = 0;
+    for (;;) {
+        if (get == put)
+            break;
+        u32 next_get = get, next_ret = ret;
+        const rsx_nr_frame_step_result r = use_compiler
+            ? rsx_nr_island_compiler_step(&g_capw_ic, get, put, ret,
+                                          &next_get, &next_ret)
+            : rsx_nr_frame_owner_step(owner, get, put, ret,
+                                      &next_get, &next_ret);
+        if (r == RSX_NR_FRAME_ADVANCED) {
+            get = next_get;
+            ret = next_ret;
+            continue;
+        }
+        if (!hard && (r == RSX_NR_FRAME_WAIT_PARTIAL ||
+                      r == RSX_NR_FRAME_WAIT_EMPTY)) {
+            get = next_get;
+            ret = next_ret;
+            break;
+        }
+        fprintf(stderr,
+                "windowed lane fault result=%u get=%08X put=%08X "
+                "owner-kind=%u method=%05X arg=%08X\n",
+                r, get, put, owner->failure.kind, owner->failure.method,
+                owner->failure.argument);
+        rc = -1;
+        break;
+    }
+    *wall_ticks += capw_qpc(NULL) - t0;
+    *get_io = get;
+    return rc;
+}
+
 static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                         size_t stats_size, int dump_outputs,
                         cap_manifest* manifest)
@@ -1140,28 +1371,34 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             return -1;
     }
 
-    rsx_nr_d3d12* sink = rsx_nr_d3d12_create(NULL, g_cap.size[0],
-                                             g_cap.size[1], cap_ptr,
-                                             cap_wptr, NULL);
-    if (!sink) {
-        free(g_cap.arena[0]);
-        free(g_cap.arena[1]);
-        memset(&g_cap, 0, sizeof(g_cap));
-        return -2;                   /* no device                          */
+    const char* const null_text = getenv("YZ_NR_CAPTURE_NULL_EXEC");
+    const int null_exec = null_text && null_text[0] &&
+        strcmp(null_text, "0") != 0;
+    rsx_nr_d3d12* sink = NULL;
+    if (!null_exec) {
+        sink = rsx_nr_d3d12_create(NULL, g_cap.size[0],
+                                   g_cap.size[1], cap_ptr,
+                                   cap_wptr, NULL);
+        if (!sink) {
+            free(g_cap.arena[0]);
+            free(g_cap.arena[1]);
+            memset(&g_cap, 0, sizeof(g_cap));
+            return -2;               /* no device                          */
+        }
+        for (u32 i = 0; i < c->disp_count; ++i) {
+            rsx_nr_d3d12_set_display_buffer(
+                sink, i, RSX_NIR_LOCATION_LOCAL, c->disp[i][3],
+                c->disp[i][0], c->disp[i][1]);
+        }
+        rsx_nr_d3d12_set_render_condition_reader(
+            sink, cap_render_condition_read, NULL);
     }
-    for (u32 i = 0; i < c->disp_count; ++i) {
-        rsx_nr_d3d12_set_display_buffer(
-            sink, i, RSX_NIR_LOCATION_LOCAL, c->disp[i][3],
-            c->disp[i][0], c->disp[i][1]);
-    }
-    rsx_nr_d3d12_set_render_condition_reader(
-        sink, cap_render_condition_read, NULL);
     const char* allow_flow_txl = getenv("YZ_NR_CAPTURE_FLOW_TXL_ORACLE");
     const char* const strict_text = getenv("YZ_NR_CAPTURE_STRICT_FRAME");
     const int strict_frame = strict_text && strict_text[0] &&
         strcmp(strict_text, "0") != 0;
-    if (strict_frame || (allow_flow_txl && allow_flow_txl[0] &&
-        strcmp(allow_flow_txl, "0") != 0))
+    if (sink && (strict_frame || (allow_flow_txl && allow_flow_txl[0] &&
+        strcmp(allow_flow_txl, "0") != 0)))
         CHECK(rsx_nr_d3d12_set_coherent_section_mode(sink, 1) == 0,
               "capture coherent-section mode refused before execution");
 
@@ -1175,14 +1412,41 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     cap_exec_trace trace;
     memset(&trace, 0, sizeof(trace));
     trace.manifest = manifest;
-    rsx_nr_d3d12_get_exec_ops(sink, &trace.inner);
-    ops = trace.inner;
-    ops.user = &trace;
-    ops.clear = cap_trace_clear;
-    ops.draw = cap_trace_draw;
-    ops.transfer = cap_trace_transfer;
-    ops.present = cap_trace_present;
-    ops.flush = cap_trace_flush;
+    {
+        const char* const absorb = getenv("YZ_NR_CAPTURE_ABSORB_REFUSALS");
+        trace.absorb_refusals = absorb && absorb[0] &&
+            strcmp(absorb, "0") != 0;
+    }
+    cap_null_exec null_hash;
+    memset(&null_hash, 0, sizeof(null_hash));
+    const char* const quiet_text = getenv("YZ_NR_CAPTURE_NULL_QUIET");
+    const int null_quiet = null_exec && quiet_text && quiet_text[0] &&
+        strcmp(quiet_text, "0") != 0;
+    if (null_quiet) {
+        /* pure stepping benchmark: every action callback absent (success);
+         * only decode/fold cost remains and both lanes pay zero hash */
+        ops.user = &null_hash;
+    } else if (null_exec) {
+        ops.user = &null_hash;
+        ops.clear = capn_clear;
+        ops.draw = capn_draw;
+        ops.transfer = capn_transfer;
+        ops.present = capn_present;
+        ops.sem_write = capn_sem_write;
+        ops.report = capn_report;
+        ops.set_reference = capn_set_reference;
+        ops.user_command = capn_user_command;
+    } else {
+        rsx_nr_d3d12_get_exec_ops(sink, &trace.inner);
+        ops = trace.inner;
+        ops.user = &trace;
+        ops.clear = cap_trace_clear;
+        ops.draw = cap_trace_draw;
+        ops.transfer = cap_trace_transfer;
+        ops.present = cap_trace_present;
+        ops.flush = cap_trace_flush;
+        ops.flush_reason = cap_trace_flush_reason;
+    }
     rsx_nr_backend be;
     rsx_nr_backend_init(&be, &ring, &tokens, &ops);
 
@@ -1199,7 +1463,23 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
     rsx_nr_frame_owner frame_owner;
     memset(&frame_owner, 0, sizeof(frame_owner));
     u32 frame_get = 0x1000u;
-    if (strict_frame) {
+    /* Windowed lanes (docs/HANA_ISLAND_COMPILER.md): publish whole record
+     * windows into the synthetic ring so dependency islands span packets,
+     * then drain through either the plain strict owner or the island
+     * compiler. "owner" selects the windowed reference lane; any other
+     * non-empty value selects the compiler lane. */
+    const char* const island_env = getenv("YZ_NR_CAPTURE_ISLAND");
+    const int windowed = island_env && island_env[0] &&
+        strcmp(island_env, "0") != 0;
+    const int island_compiler_lane =
+        windowed && strcmp(island_env, "owner") != 0;
+    const char* const tick_env = getenv("YZ_NR_CAPTURE_ISLAND_TICKS");
+    const int attribution_ticks = tick_env && tick_env[0] &&
+        strcmp(tick_env, "0") != 0;
+    unsigned long long capw_wall_ticks = 0;
+    u32 capw_pending_words = 0;
+    u32 capw_put = frame_get;
+    if (strict_frame || windowed) {
         frame_fifo.word_count = 0x800000u / 4u;
         frame_fifo.words = calloc(frame_fifo.word_count, sizeof(u32));
         if (!frame_fifo.words)
@@ -1209,6 +1489,19 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
             NULL, NULL, NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL);
     }
+    if (windowed && island_compiler_lane) {
+        if (rsx_nr_island_compiler_init(
+                &g_capw_ic, &frame_owner, g_capw_arena, CAPW_ARENA_BYTES,
+                g_capw_idx_lo, g_capw_idx_hi, g_capw_idx_ofs,
+                CAPW_INDEX_CAP, g_capw_scratch_ops, CAPW_SCRATCH_OPS,
+                g_capw_scratch_side, CAPW_SCRATCH_SIDE) != 0)
+            return -1;
+        if (attribution_ticks)
+            rsx_nr_island_compiler_set_clock(&g_capw_ic, capw_qpc, NULL);
+    }
+    if (windowed && !island_compiler_lane && attribution_ticks)
+        rsx_nr_frame_owner_set_tail_clock(
+            &frame_owner, capw_qpc, NULL, capw_qpc_freq());
 
     u32 completed_draws = 0;
     u32 stop_after_draw = 0;
@@ -1217,15 +1510,64 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         if (stop && stop[0])
             stop_after_draw = (u32)strtoul(stop, NULL, 0);
     }
+    /* This machine's current WARP intermittently PnP-stops the adapter when
+     * one ExecuteCommandLists carries a large accumulated draw batch (a
+     * TDR-shaped removal at the first big wait; reproduced on the pristine
+     * 07c4ca8 build, so it is an environment property, not a code path).
+     * A bounded periodic flush keeps every submission far below the
+     * deadline. Applied identically to every replay lane, so lane-vs-lane
+     * submission equality remains meaningful under the same cadence. */
+    u32 flush_every_draws = 0;
+    u32 flush_marker = 0;
+    {
+        const char* const every = getenv("YZ_NR_CAPTURE_FLUSH_EVERY_DRAWS");
+        if (every && every[0])
+            flush_every_draws = (u32)strtoul(every, NULL, 0);
+    }
     int ring_fault = 0;
+    /* Repeated-pass replay: pass 2+ re-feeds the identical record stream,
+     * approximating a stationary scene's frame-to-frame repetition (the
+     * warm template path). The context-image admission window reopens per
+     * pass exactly as the values recur. */
+    u32 replay_passes = 1;
+    {
+        const char* const passes = getenv("YZ_NR_CAPTURE_REPLAY_PASSES");
+        if (windowed && passes && passes[0]) {
+            replay_passes = (u32)strtoul(passes, NULL, 0);
+            if (!replay_passes)
+                replay_passes = 1;
+            if (replay_passes > 16u)
+                replay_passes = 16u;
+        }
+    }
+    for (u32 pass = 0; pass < replay_passes && !ring_fault; ++pass) {
+    const unsigned long long pass_wall_before = capw_wall_ticks;
+    if (pass)
+        ad->context_image_open = 1;
     for (u32 i = 0; i < c->n_records; i++) {
         u32 m = c->records[i * 2];
         u32 a = c->records[i * 2 + 1];
         if (m & 0x80000000u) {
-            /* drain so preceding draws see pre-apply bytes, then apply */
-            while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
-                ;
-            cap_apply_block(c, rsx_nr_d3d12_pages(sink), a);
+            if (windowed) {
+                /* Every executed action precedes this write in record
+                 * order; only unexecuted state/payload words may remain
+                 * pending, and those read no guest arena bytes. Nothing
+                 * appended since the previous flush means nothing new can
+                 * execute, so consecutive data records skip the walk. */
+                if (capw_pending_words &&
+                    capw_flush(&frame_owner, island_compiler_lane,
+                               &frame_get, capw_put, 0,
+                               &capw_wall_ticks) != 0) {
+                    ring_fault = 1;
+                    break;
+                }
+                capw_pending_words = 0;
+            } else {
+                /* drain so preceding draws see pre-apply bytes */
+                while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
+                    ;
+            }
+            cap_apply_block(c, sink ? rsx_nr_d3d12_pages(sink) : NULL, a);
             manifest->data_records++;
             continue;
         }
@@ -1250,6 +1592,44 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
                 method->supported++;
             else
                 method->unsupported++;
+        }
+        if (windowed) {
+            /* Two-word packets from an 8-aligned base never place a header
+             * on a reserved segment-tail word, and GET wraps linearly at
+             * the ring end, so windows may cross both boundaries. */
+            frame_fifo.words[capw_put >> 2] = (1u << 18) | m;
+            frame_fifo.words[((capw_put + 4u) & 0x7FFFFCu) >> 2] = a;
+            capw_put = (capw_put + 8u) & 0x7FFFFCu;
+            capw_pending_words += 2u;
+            if (island_compiler_lane)
+                rsx_nr_island_compiler_note_content_write(&g_capw_ic);
+            if (capw_pending_words >= CAPW_WINDOW_WORDS) {
+                if (capw_flush(&frame_owner, island_compiler_lane,
+                               &frame_get, capw_put, 0,
+                               &capw_wall_ticks) != 0) {
+                    ring_fault = 1;
+                    break;
+                }
+                capw_pending_words = 0;
+            }
+            if (m == 0x1808u && a == 0u)
+                completed_draws++;
+            if (flush_every_draws &&
+                completed_draws >= flush_marker + flush_every_draws) {
+                flush_marker = completed_draws;
+                if (capw_flush(&frame_owner, island_compiler_lane,
+                               &frame_get, capw_put, 0,
+                               &capw_wall_ticks) != 0) {
+                    ring_fault = 1;
+                    break;
+                }
+                capw_pending_words = 0;
+                if (trace.inner.flush)
+                    trace.inner.flush(trace.inner.user);
+            }
+            if (stop_after_draw && completed_draws >= stop_after_draw)
+                break;
+            continue;
         }
         if (strict_frame) {
             if (frame_get > 0x7FFFF8u)
@@ -1346,8 +1726,17 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         } else {
             rsx_nir_adapter_method(ad, m, a);
         }
-        if (m == 0x1808u && a == 0u)
+        if (m == 0x1808u && a == 0u) {
             completed_draws++;
+            if (flush_every_draws &&
+                completed_draws >= flush_marker + flush_every_draws) {
+                flush_marker = completed_draws;
+                while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
+                    ;
+                if (trace.inner.flush)
+                    trace.inner.flush(trace.inner.user);
+            }
+        }
         if (rsx_nr_ring_reject_sticky(&ring)) {
             ring_fault = 1;
             break;
@@ -1359,12 +1748,39 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
         if (stop_after_draw && completed_draws >= stop_after_draw)
             break;
     }
+    if (windowed && !ring_fault &&
+        capw_flush(&frame_owner, island_compiler_lane, &frame_get,
+                   capw_put, 1, &capw_wall_ticks) != 0)
+        ring_fault = 1;
+    capw_pending_words = 0;
+    if (windowed && replay_passes > 1u)
+        printf("windowed-%s pass %u wall: %llu ticks hash=%016llX "
+               "actions=%llu\n",
+               island_compiler_lane ? "compiler" : "owner", pass + 1u,
+               capw_wall_ticks - pass_wall_before,
+               (unsigned long long)null_hash.hash, null_hash.actions);
+    }                                    /* replay passes                  */
     rsx_nir_adapter_finish(ad);
     while (rsx_nr_backend_step(&be) == RSX_NR_STEP_EXECUTED)
         ;
 
     rsx_nr_d3d12_stats st;
-    rsx_nr_d3d12_get_stats(sink, &st);
+    memset(&st, 0, sizeof(st));
+    if (null_exec)
+        snprintf(stats_line, stats_size,
+                 "null-exec methods=%llu unique=%u unsupported=%u "
+                 "data=%llu actions=%llu draws=%llu clears=%llu "
+                 "xfers=%llu presents=%llu exec_err=%llu "
+                 "action_hash=%016llX",
+                 manifest->method_records, manifest->unique_methods,
+                 manifest->unique_unsupported_methods,
+                 manifest->data_records, null_hash.actions,
+                 null_hash.draws, null_hash.clears, null_hash.transfers,
+                 null_hash.presents, be.stats.exec_errors,
+                 (unsigned long long)null_hash.hash);
+    else
+        rsx_nr_d3d12_get_stats(sink, &st);
+    if (!null_exec)
     snprintf(stats_line, stats_size,
              "methods=%llu unique=%u unsupported_methods=%u data=%llu "
              "clears=%llu draws=%llu (restart=%llu) batches=%llu "
@@ -1406,8 +1822,66 @@ static int cap_run_once(cap_data* c, u64* rt_hash, char* stats_line,
              st.unsup_rt_format[15], st.unsup_rt_format[16],
              manifest->target_count, manifest->target_overflow,
              manifest->failure_count, manifest->failure_overflow);
+    if (windowed) {
+        /* deterministic lane counters join the compared stats line; wall
+         * and attribution ticks are per-run and printed separately */
+        const size_t used = strlen(stats_line);
+        if (island_compiler_lane) {
+            const rsx_nr_island_stats* const is = &g_capw_ic.stats;
+            snprintf(stats_line + used, stats_size - used,
+                     " island[compiled=%llu hit=%llu genfast=%llu "
+                     "mismatch=%llu owned=%llu avoided=%llu groups=%llu "
+                     "constslots=%llu actions=%llu "
+                     "delegated=%llu/%llu/%llu/%llu/%llu dsteps=%llu "
+                     "templates=%llu arena=%lluKB]",
+                     is->islands_compiled, is->islands_hit,
+                     is->generation_fast_hits, is->validation_mismatches,
+                     is->methods_owned, is->adaptations_avoided,
+                     is->groups_derived, is->constants_slots_patched,
+                     is->actions_executed,
+                     is->islands_delegated[0], is->islands_delegated[1],
+                     is->islands_delegated[2], is->islands_delegated[3],
+                     is->islands_delegated[4], is->delegated_steps,
+                     is->templates_live, is->template_arena_used >> 10);
+        } else {
+            snprintf(stats_line + used, stats_size - used,
+                     " owner-lane[steps=%llu methods=%llu packets=%llu]",
+                     frame_owner.stats.steps, frame_owner.stats.methods,
+                     frame_owner.stats.packets);
+        }
+        const unsigned long long freq = capw_qpc_freq();
+        printf("windowed-%s wall: %llu ticks (%.3f ms) freq=%llu\n",
+               island_compiler_lane ? "compiler" : "owner",
+               capw_wall_ticks,
+               freq ? 1000.0 * (double)capw_wall_ticks / (double)freq : 0.0,
+               freq);
+        if (island_compiler_lane && attribution_ticks) {
+            const rsx_nr_island_stats* const is = &g_capw_ic.stats;
+            printf("island-ticks: scan=%llu validate=%llu resync=%llu "
+                   "derive+patch=%llu execute=%llu compile=%llu\n",
+                   is->ticks_scan, is->ticks_validate, is->ticks_resync,
+                   is->ticks_derive_patch, is->ticks_execute,
+                   is->ticks_compile);
+        }
+        if (!island_compiler_lane && attribution_ticks)
+            printf("owner-ticks: adaptation-calls=%llu "
+                   "adaptation-ticks=%llu\n",
+                   frame_owner.stats.adaptation_calls,
+                   frame_owner.stats.adaptation_ticks);
+    }
 
     *rt_hash = 0;
+    if (null_exec) {
+        /* the action-content hash is this mode's determinism witness */
+        *rt_hash = null_hash.hash ? null_hash.hash : 1u;
+        free(frame_fifo.words);
+        free(ad);
+        rsx_nr_ring_destroy(&ring);
+        free(g_cap.arena[0]);
+        free(g_cap.arena[1]);
+        memset(&g_cap, 0, sizeof(g_cap));
+        return ring_fault ? -1 : 0;
+    }
     int presented_readback = -2;
     u32 oracle_offset = 0;
     int have_oracle_offset = 0;

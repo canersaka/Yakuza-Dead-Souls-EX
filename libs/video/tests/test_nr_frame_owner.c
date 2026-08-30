@@ -1655,9 +1655,71 @@ static int test_stream_backend_resolves_linear_side_payload(void)
     return 0;
 }
 
+static int test_island_origin_census(void)
+{
+    fixture f;
+    fixture_init(&f);
+    rsx_nr_frame_census census;
+    memset(&census, 0, sizeof(census));
+    rsx_nr_frame_owner_set_census(&f.owner, &census);
+    f.adapter.context_image_open = 0;
+
+    const u32 base = 0x1000u;
+    u32 io = base;
+    f.words[(io + 0u) >> 2] = packet(1u, 0x0050u);
+    f.words[(io + 4u) >> 2] = 1u;
+    const u32 seg = 0x2000u;
+    f.words[(io + 8u) >> 2] = 0x20000000u | seg;
+    io = seg;
+    f.words[(io + 0u) >> 2] = packet(1u, 0x1808u);
+    f.words[(io + 4u) >> 2] = 5u;
+    f.words[(io + 8u) >> 2] = 0x40000000u | packet(1u, 0x1814u);
+    f.words[(io + 12u) >> 2] = 0x03000000u;
+    f.words[(io + 16u) >> 2] = packet(1u, 0x1808u);
+    f.words[(io + 20u) >> 2] = 0u;
+    const u32 call_target = 0x3000u;
+    f.words[(io + 24u) >> 2] = call_target | 2u;
+    f.words[call_target >> 2] = packet(1u, 0x0050u);
+    f.words[(call_target + 4u) >> 2] = 2u;
+    f.words[(call_target + 8u) >> 2] = 0x00020000u;
+    f.words[(io + 28u) >> 2] = packet(1u, 0x0050u);
+    f.words[(io + 32u) >> 2] = 3u;
+    const u32 put = io + 36u;
+
+    u32 get = base, ret = ~0u;
+    for (u32 guard = 0; guard < 64u && get != put; ++guard) {
+        u32 next = get, nret = ret;
+        const rsx_nr_frame_step_result r = rsx_nr_frame_owner_step(
+            &f.owner, get, put, ret, &next, &nret);
+        CHECK(r == RSX_NR_FRAME_ADVANCED, "census stream step %u", r);
+        get = next;
+        ret = nret;
+    }
+    CHECK(get == put, "census stream did not complete");
+    CHECK(census.steps > 0, "census liveness witness missing");
+    CHECK(census.packets[RSX_NR_FRAME_ORIGIN_SEQUENTIAL] == 2u &&
+              census.methods[RSX_NR_FRAME_ORIGIN_SEQUENTIAL] == 2u,
+          "sequential attribution wrong");
+    CHECK(census.entries[RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT] == 1u &&
+              census.packets[RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT] == 3u &&
+              census.draws[RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT] == 1u,
+          "jump-segment attribution wrong");
+    CHECK(census.entries[RSX_NR_FRAME_ORIGIN_CALL_SEGMENT] == 1u &&
+              census.packets[RSX_NR_FRAME_ORIGIN_CALL_SEGMENT] == 1u,
+          "call-segment attribution wrong");
+    CHECK(census.entries[RSX_NR_FRAME_ORIGIN_SEQUENTIAL] == 2u &&
+              census.packets[RSX_NR_FRAME_ORIGIN_SEQUENTIAL] +
+                      census.packets[RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT] +
+                      census.packets[RSX_NR_FRAME_ORIGIN_CALL_SEGMENT] == 6u,
+          "census packet totals wrong");
+    CHECK(f.references == 3u, "census stream executed wrong");
+    return 0;
+}
+
 int main(void)
 {
-    if (test_consume_once_and_present() ||
+    if (test_island_origin_census() ||
+        test_consume_once_and_present() ||
         test_semaphore_retry_is_not_retranslated() ||
         test_partial_stopper_and_flow() ||
         test_exact_published_head_stopper_release() ||

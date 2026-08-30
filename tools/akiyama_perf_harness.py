@@ -1134,6 +1134,10 @@ def run_gun(args):
         yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
     if args.nr_single_pass_graph_timing:
         yz["YZ_NR_SINGLE_PASS_GRAPH_TIMING"] = "1"
+    if args.nr_island_census:
+        yz["YZ_NR_ISLAND_CENSUS"] = "1"
+    if args.nr_island_compiler:
+        yz["YZ_NR_ISLAND_COMPILER"] = "1"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -1162,7 +1166,9 @@ def run_gun(args):
             ({"YZ_NR_NATIVE_RESIDENCY_AUDIT": "1"}
              if args.nr_native_residency_audit else {}) |
             ({"YZ_NR_STALL_AGGREGATE": "1"}
-             if args.nr_stall_aggregate else {})
+             if args.nr_stall_aggregate else {}) |
+            ({"YZ_NR_ISLAND_CENSUS": "1"}
+             if args.nr_island_census else {})
         ),
         "gun_reference_dir": str(reference_dir),
         "captures": [],
@@ -1467,6 +1473,9 @@ def run_gun(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        island_compiler_lines = re.findall(
+            r"^\[nr-island-compiler steps=.*\]$", stderr_text, re.MULTILINE
+        )
         single_graph_lines = re.findall(
             r"^\[nr-single-graph .*\]$", stderr_text, re.MULTILINE
         )
@@ -1481,6 +1490,7 @@ def run_gun(args):
         )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_island_compiler"] = island_compiler_lines
         result["nr_single_graph"] = single_graph_lines
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
@@ -1624,6 +1634,17 @@ def run_gun(args):
             if not args.nr_single_pass_graph and single_graph_lines:
                 raise RuntimeError(
                     "single-pass graph was active outside its requested lane"
+                )
+            if args.nr_island_compiler:
+                if (len(island_compiler_lines) != 1 or
+                        "mismatches=0" not in island_compiler_lines[0]):
+                    raise RuntimeError(
+                        "island compiler did not close with one clean aggregate: "
+                        f"{island_compiler_lines}"
+                    )
+            elif island_compiler_lines:
+                raise RuntimeError(
+                    "island compiler was active outside its requested lane"
                 )
         elif full_native_lines:
             raise RuntimeError("strict full-native owner was active in another lane")
@@ -1861,6 +1882,10 @@ def run(args):
         yz["YZ_NR_SINGLE_PASS_GRAPH"] = args.nr_single_pass_graph
     if args.nr_single_pass_graph_timing:
         yz["YZ_NR_SINGLE_PASS_GRAPH_TIMING"] = "1"
+    if args.nr_island_census:
+        yz["YZ_NR_ISLAND_CENSUS"] = "1"
+    if args.nr_island_compiler:
+        yz["YZ_NR_ISLAND_COMPILER"] = "1"
     environment.update(yz)
 
     result = {
@@ -1890,7 +1915,9 @@ def run(args):
             ({"YZ_NR_NATIVE_RESIDENCY_AUDIT": "1"}
              if args.nr_native_residency_audit else {}) |
             ({"YZ_NR_STALL_AGGREGATE": "1"}
-             if args.nr_stall_aggregate else {})
+             if args.nr_stall_aggregate else {}) |
+            ({"YZ_NR_ISLAND_CENSUS": "1"}
+             if args.nr_island_census else {})
         ),
         "reference": str(reference_path),
         "captures": [],
@@ -2207,6 +2234,9 @@ def run(args):
         full_native_d3d = re.findall(
             r"^\[nr-vertical-d3d .*\]$", stderr_text, re.MULTILINE
         )
+        island_compiler_lines = re.findall(
+            r"^\[nr-island-compiler steps=.*\]$", stderr_text, re.MULTILINE
+        )
         single_graph_lines = re.findall(
             r"^\[nr-single-graph .*\]$", stderr_text, re.MULTILINE
         )
@@ -2221,6 +2251,7 @@ def run(args):
         )
         result["nr_full_native"] = full_native_lines
         result["nr_full_native_d3d"] = full_native_d3d
+        result["nr_island_compiler"] = island_compiler_lines
         result["nr_single_graph"] = single_graph_lines
         result["nr_submit_attribution"] = submit_lines
         result["nr_submit_transfer"] = submit_transfer_lines
@@ -2364,6 +2395,17 @@ def run(args):
             if not args.nr_single_pass_graph and single_graph_lines:
                 raise RuntimeError(
                     "single-pass graph was active outside its requested lane"
+                )
+            if args.nr_island_compiler:
+                if (len(island_compiler_lines) != 1 or
+                        "mismatches=0" not in island_compiler_lines[0]):
+                    raise RuntimeError(
+                        "island compiler did not close with one clean aggregate: "
+                        f"{island_compiler_lines}"
+                    )
+            elif island_compiler_lines:
+                raise RuntimeError(
+                    "island compiler was active outside its requested lane"
                 )
         elif full_native_lines:
             raise RuntimeError("strict full-native owner was active in another lane")
@@ -2542,6 +2584,14 @@ def main():
     )
     parser.add_argument("--nr-single-pass-graph-timing", action="store_true")
     parser.add_argument(
+        "--nr-island-census", action="store_true",
+        help="enable the fixed-memory, shutdown-only strict-owner origin census",
+    )
+    parser.add_argument(
+        "--nr-island-compiler", action="store_true",
+        help="enable the fixed-memory strict-owner jump-island compiler",
+    )
+    parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
     )
@@ -2635,6 +2685,12 @@ def main():
         parser.error(
             "--nr-single-pass-graph-timing requires --nr-single-pass-graph"
         )
+    if args.nr_island_census and not args.nr_vertical_full_native:
+        parser.error("--nr-island-census requires --nr-vertical-full-native")
+    if args.nr_island_compiler and not args.nr_vertical_full_native:
+        parser.error("--nr-island-compiler requires --nr-vertical-full-native")
+    if args.nr_island_compiler and args.nr_island_census:
+        parser.error("island compiler and census are mutually exclusive")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

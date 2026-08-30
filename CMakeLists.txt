@@ -574,6 +574,39 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        # Producer-island/pass compiler: template compile/hit equivalence
+        # against the adapter oracle, dynamic-vs-structural identity, atomic
+        # delegation, blocked-acquire resume, invalidation, and inline runs
+        # (docs/HANA_ISLAND_COMPILER.md).
+        add_executable(rsx_nr_island_tests
+            libs/video/tests/test_nr_island.c
+            libs/video/rsx_nr_island.c
+            libs/video/rsx_nr_frame_owner.c
+            libs/video/rsx_nr_graph.c
+            libs/video/rsx_nr_producer_contract.c
+            libs/video/rsx_nir.c
+            libs/video/rsx_nir_emitter.c
+            libs/video/rsx_nir_adapter.c
+            libs/video/rsx_nr_ring.c
+            libs/video/rsx_nr_backend.c
+            libs/video/rsx_dispatch.c
+        )
+        target_include_directories(rsx_nr_island_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_compile_definitions(rsx_nr_island_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        add_test(
+            NAME rsx_nr_island
+            COMMAND rsx_nr_island_tests
+        )
+        set_tests_properties(
+            rsx_nr_island
+            PROPERTIES TIMEOUT 60 LABELS "regression;renderer;native-render"
+        )
+
         add_executable(rsx_nr_report_scoreboard_tests
             libs/video/tests/test_nr_report_scoreboard.c
             libs/video/rsx_nr_report_scoreboard.c
@@ -706,6 +739,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_nir.c
             libs/video/rsx_nir_emitter.c
             libs/video/rsx_nir_adapter.c
+            libs/video/rsx_nr_island.c
             libs/video/rsx_nr_frame_owner.c
             libs/video/rsx_nr_graph.c
             libs/video/rsx_nr_producer_contract.c
