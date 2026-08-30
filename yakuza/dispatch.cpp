@@ -1140,14 +1140,23 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
     if (!addr_readable(mask)) return;
     g_yz_frontier_input_cached = cached;
     g_yz_frontier_input_mask = mask;
+    const bool load_game = getenv("YZ_AUTO_LOAD_GAME") != nullptr;
+    if (load_game) {
+        /* The save selector is entered after this callback disappears.  Keep
+         * the authoritative menu cache so the bounded Confirm cadence can
+         * accept slot 01 and its confirmation page without desktop input. */
+        g_yz_auto_input_cached = cached;
+        g_yz_auto_input_mask = mask;
+    }
 
     const unsigned long long now = GetTickCount64();
     if (!first_seen) {
         first_seen = now;
         fprintf(stderr,
                 "[auto-new-game] live menu input menu=%08X input=%08X cached=%08X mask=%08X"
-                " (title cached=%08X); selecting New Game in 1.5 seconds\n",
-                menu, input, cached, mask, g_yz_auto_input_cached);
+                " (title cached=%08X); selecting %s in 1.5 seconds\n",
+                menu, input, cached, mask, g_yz_auto_input_cached,
+                load_game ? "Load Game" : "New Game");
         fflush(stderr);
         return;
     }
@@ -1155,8 +1164,9 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
         /*
          * A save on disk makes Load Game the initially highlighted row.  The
          * menu keeps its item table at +0x150, count at +0x154, and selected
-         * row at +0x17C.  Item id 0 is New Game.  Find it explicitly so this
-         * remains correct if optional rows change the menu ordering.
+         * row at +0x17C.  Item id 0 is New Game and item id 1 is Load Game.
+         * Find the requested row explicitly so optional rows cannot change
+         * the route.
          */
         const uint32_t count = vm_read32(menu + 0x154u);
         const uint32_t old_selection = vm_read32(menu + 0x17Cu);
@@ -1165,7 +1175,7 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
         if (count > 0u && count < 64u && addr_readable(table)) {
             for (uint32_t i = 0; i < count; ++i) {
                 if (addr_readable(table + i * 4u) &&
-                    vm_read32(table + i * 4u) == 0u) {
+                    vm_read32(table + i * 4u) == (load_game ? 1u : 0u)) {
                     new_selection = i;
                     break;
                 }
@@ -1175,13 +1185,16 @@ static void yz_auto_new_game_menu_input(ppu_context* ctx, uint32_t target)
             vm_write32(menu + 0x17Cu, new_selection);
             fprintf(stderr,
                     "[auto-new-game] menu row %u/%u -> %u/%u"
-                    " (item 0 = New Game)\n",
-                    old_selection, count, new_selection, count);
+                    " (item %u = %s)\n",
+                    old_selection, count, new_selection, count,
+                    load_game ? 1u : 0u,
+                    load_game ? "Load Game" : "New Game");
             fflush(stderr);
         } else {
             fprintf(stderr,
-                    "[auto-new-game] New Game item unavailable"
+                    "[auto-new-game] %s item unavailable"
                     " row=%u count=%u table=%08X\n",
+                    load_game ? "Load Game" : "New Game",
                     old_selection, count, table);
             fflush(stderr);
         }

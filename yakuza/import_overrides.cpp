@@ -26,6 +26,7 @@
 #include "ps3emu/error_codes.h"
 #include "ps3emu/yz_fifo_publication.h"
 #include "ps3emu/yz_fe0_timeline.h"
+#include "ps3emu/yz_frame_dependency_timeline.h"
 #include "ps3emu/yz_wkl4_cycle.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "rsx_null_backend.h"   /* pulls rsx_commands.h: rsx_state, processor */
@@ -4043,6 +4044,8 @@ extern "C" void yz_nr_vertical_exec_present(uint32_t buffer_id)
 
 extern "C" void yz_nr_vertical_exec_present_complete(uint32_t buffer_id)
 {
+    static uint64_t frame_number = 0;
+    yz_frame_dep_frame_complete(buffer_id, ++frame_number);
     /* The native D3D12 sink has already copied/presented its exact scanout.
      * Publish only the guest-visible queue/head packages here. */
     ppu_context sc = {};
@@ -6591,6 +6594,8 @@ extern "C" void yz_rsx_wait_classifier_shutdown_serialized(void)
         yz_rsx_wait_classifier_shutdown();
     if (g_yz_fe0_timeline_enabled)
         yz_fe0_timeline_shutdown();
+    if (g_yz_frame_dependency_timeline_enabled)
+        yz_frame_dependency_timeline_shutdown();
     if (g_yz_wkl4_cycle_enabled)
         yz_wkl4_cycle_shutdown();
     yz_nr_shadow_shutdown();
@@ -8873,7 +8878,12 @@ extern "C" void yz_gcm_fifo_callback(ppu_context* ctx)
 
         vm_write32(cur, 0x20000000u | (next_off & 0x1FFFFFFCu));
         MemoryBarrier();
-        vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);
+        {
+            const uint32_t old_put =
+                vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
+            vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, cur_off);
+            yz_frame_dep_fifo_publish(old_put, cur_off, 2u, 0u);
+        }
         vm_write32(gctx + 0x0, next_begin);
         vm_write32(gctx + 0x4, next_end);
         vm_write32(gctx + 0x8, next_begin);
@@ -9308,6 +9318,7 @@ extern "C" int64_t yz_sys_rsx_context_allocate(ppu_context* ctx)
         yz_nr_vertical_init();
         yz_nr_shadow_init();
         yz_fe0_timeline_init();
+        yz_frame_dependency_timeline_init();
         yz_wkl4_cycle_init();
         if (yz_rsx_wait_classifier_init()) {
             yz_rsx_wait_classifier_set_completed_draw_baseline(
@@ -9434,8 +9445,12 @@ extern "C" int64_t yz_sys_rsx_context_attribute(ppu_context* ctx)
          * mid-advance, and the consumer can't clobber a fresh pkg001 set. */
         yz_rsx_fifo_lock_ensure();
         EnterCriticalSection(&g_rsx_fifo_lock);
+        const uint32_t old_put =
+            vm_read32(RSX_DMA_CONTROL + RSX_DMACTL_PUT);
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_GET, (uint32_t)a3);
         vm_write32(RSX_DMA_CONTROL + RSX_DMACTL_PUT, (uint32_t)a4);
+        yz_frame_dep_fifo_publish(old_put, (uint32_t)a4, 1u,
+                                  (uint32_t)ctx->gpr[3]);
         LeaveCriticalSection(&g_rsx_fifo_lock);
         break;
     }

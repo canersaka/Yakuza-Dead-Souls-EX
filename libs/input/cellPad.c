@@ -377,6 +377,9 @@ static void pad_merge_keyboard(void)
         extern volatile long g_yz_a010_root_active;
         extern volatile long g_yz_auto_new_game_complete;
         static u16 prior_auto_accept = 0;
+        static int load_stop_configured;
+        static unsigned long long next_load_stop_poll;
+        static char load_confirm_stop_file[MAX_PATH * 2];
         /* s_host_state is persistent when the keyboard is the only connected
          * controller.  Remove our previous synthetic bit before evaluating
          * this poll, otherwise the first "pulse" latches as a held button and
@@ -393,6 +396,32 @@ static void pad_merge_keyboard(void)
         }
         if (g_yz_a010_root_active)
             InterlockedExchange(&g_yz_auto_new_game_complete, 1);
+        if (!load_stop_configured) {
+            const char* path = getenv("YZ_AUTO_LOAD_GAME_CONFIRM_STOP_FILE");
+            load_stop_configured = 1;
+            if (path && *path) {
+                strncpy(load_confirm_stop_file, path,
+                        sizeof(load_confirm_stop_file) - 1u);
+                load_confirm_stop_file[
+                    sizeof(load_confirm_stop_file) - 1u] = '\0';
+            }
+        }
+        if (load_confirm_stop_file[0] &&
+            !InterlockedCompareExchange(
+                &g_yz_auto_new_game_complete, 0, 0)) {
+            const unsigned long long now = GetTickCount64();
+            if (now >= next_load_stop_poll) {
+                next_load_stop_poll = now + 100ull;
+                if (GetFileAttributesA(load_confirm_stop_file) !=
+                        INVALID_FILE_ATTRIBUTES) {
+                    InterlockedExchange(&g_yz_auto_new_game_complete, 1);
+                    fprintf(stderr,
+                            "[auto-load-game] menu/save Confirm input "
+                            "stopped after exact save load\n");
+                    fflush(stderr);
+                }
+            }
+        }
         if (g_yz_runtime_config.auto_new_game &&
             g_yz_auto_start_tick &&
             !InterlockedCompareExchange(
@@ -457,7 +486,13 @@ static void pad_merge_keyboard(void)
         static unsigned long long route_input_tick;
         static unsigned long long route_input_delay_ms;
         static unsigned long long next_stop_poll;
+        static unsigned long long next_load_start_poll;
+        static unsigned long long load_start_tick;
+        static int load_game_route;
+        static int load_start_armed;
+        static int load_start_complete;
         static char stop_file[MAX_PATH * 2];
+        static char load_start_file[MAX_PATH * 2];
 
         if (prior_route_start) {
             hs->buttons &= (u16)~CELL_PAD_CTRL_START;
@@ -466,7 +501,9 @@ static void pad_merge_keyboard(void)
         if (g_yz_runtime_config.akiyama_dialogue_route && !configured) {
             const char* path = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
             const char* delay = getenv("YZ_AKIYAMA_ROUTE_START_DELAY_MS");
+            const char* start_path = getenv("YZ_AUTO_LOAD_GAME_START_FILE");
             configured = 1;
+            load_game_route = getenv("YZ_AUTO_LOAD_GAME") != NULL;
             if (delay && *delay) {
                 route_input_delay_ms = _strtoui64(delay, NULL, 10);
                 if (route_input_delay_ms > 120000ull)
@@ -481,17 +518,37 @@ static void pad_merge_keyboard(void)
                         "[akiyama-route] disabled: stop file is required\n");
                 fflush(stderr);
             }
+            if (load_game_route) {
+                if (start_path && *start_path) {
+                    strncpy(load_start_file, start_path,
+                            sizeof(load_start_file) - 1u);
+                    load_start_file[sizeof(load_start_file) - 1u] = '\0';
+                } else {
+                    route_stopped = 1;
+                    fprintf(stderr,
+                            "[auto-load-game] disabled: one-shot Start arm "
+                            "file is required\n");
+                    fflush(stderr);
+                }
+            }
         }
         if (g_yz_runtime_config.akiyama_dialogue_route &&
             !route_stopped) {
             const unsigned long long now = GetTickCount64();
-            if (!route_started && g_yz_a010_root_active) {
+            /* New Game waits for the a010 gameplay root.  The saved-game
+             * route is instead armed from process start and remains inert
+             * until the external visual oracle creates its one-shot Start
+             * file; this avoids assuming the loaded Chapter-2 scene uses the
+             * same a010 root as the opening route. */
+            if (!route_started &&
+                (g_yz_a010_root_active || load_game_route)) {
                 route_started = 1;
                 route_input_tick = now + route_input_delay_ms;
                 next_stop_poll = now;
                 fprintf(stderr,
-                        "[akiyama-route] Start-only cutscene route armed "
-                        "delay_ms=%llu\n", route_input_delay_ms);
+                        "[%s] Start-only cutscene route armed delay_ms=%llu\n",
+                        load_game_route ? "auto-load-game" : "akiyama-route",
+                        route_input_delay_ms);
                 fflush(stderr);
             }
             if (route_started && now >= next_stop_poll) {
@@ -505,12 +562,38 @@ static void pad_merge_keyboard(void)
                     fflush(stderr);
                 }
             }
-            if (route_started && !route_stopped && now >= route_input_tick) {
+            if (route_started && !route_stopped && !load_game_route &&
+                now >= route_input_tick) {
                 const unsigned long long phase =
                     (now - route_input_tick) % 8000ull;
                 if (phase < 250ull) {
                     hs->buttons |= CELL_PAD_CTRL_START;
                     prior_route_start = CELL_PAD_CTRL_START;
+                }
+            }
+            if (route_started && !route_stopped && load_game_route &&
+                !load_start_complete) {
+                if (!load_start_armed && now >= next_load_start_poll) {
+                    next_load_start_poll = now + 100ull;
+                    if (GetFileAttributesA(load_start_file) !=
+                            INVALID_FILE_ATTRIBUTES) {
+                        load_start_armed = 1;
+                        load_start_tick = now;
+                        fprintf(stderr,
+                                "[auto-load-game] positively gated cutscene; "
+                                "one Start edge armed\n");
+                        fflush(stderr);
+                    }
+                }
+                if (load_start_armed && now - load_start_tick < 750ull) {
+                    hs->buttons |= CELL_PAD_CTRL_START;
+                    prior_route_start = CELL_PAD_CTRL_START;
+                } else if (load_start_armed) {
+                    load_start_complete = 1;
+                    fprintf(stderr,
+                            "[auto-load-game] one-shot Start released; no "
+                            "further synthetic cutscene input\n");
+                    fflush(stderr);
                 }
             }
         }

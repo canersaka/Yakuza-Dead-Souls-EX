@@ -34,6 +34,7 @@
 #include "rsx_nr_span_router.h"
 #include "rsx_vp_decompiler.h"
 #include "../runtime/ppu/ppu_guest_read.h"
+#include "ps3emu/yz_frame_dependency_timeline.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -5405,6 +5406,8 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
             &g_active.frame_owner, get, put, fifo_ret,
             &owned_get, &owned_ret);
     }
+    if (result == RSX_NR_FRAME_ADVANCED && owned_get != get)
+        yz_frame_dep_rsx_consume(get, owned_get, put, (uint32_t)result);
     if (next_get)
         *next_get = owned_get;
     if (next_ret)

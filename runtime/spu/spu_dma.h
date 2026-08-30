@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "spu_job_dispatch.h"
 #include "../../include/ps3emu/yz_fe0_timeline.h"
+#include "../../include/ps3emu/yz_frame_dependency_timeline.h"
 #include <stdint.h>
 #include "../ppu/ppu_guest_read.h"
 #include <stdio.h>
@@ -2097,6 +2098,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (mfc_is_put(cmd)) {
             extern void cellSpursNotifyGuestWrite(uint32_t, uint32_t);
             cellSpursNotifyGuestWrite((uint32_t)ea, size);
+            if (g_yz_frame_dependency_timeline_enabled)
+                yz_frame_dep_dma_publish(
+                    (uint32_t)spu->image_id, (uint32_t)spu->spu_id,
+                    spu->pc & SPU_LS_MASK, (uint32_t)ea, size, cmd);
             if (fe0_timeline_put) {
                 const uint8_t* visible = vm_base + 0x10200FE0u;
                 const uint32_t readback =

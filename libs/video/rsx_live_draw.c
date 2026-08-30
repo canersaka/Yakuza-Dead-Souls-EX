@@ -23,6 +23,7 @@
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/yz_wkl4_cycle_interval.h"
+#include "ps3emu/yz_frame_dependency_timeline.h"
 
 #if !defined(_WIN32)
 
@@ -2041,6 +2042,7 @@ static void ld_flush(ld_flush_reason reason)
         g.ready = 0;
         return;
     }
+    yz_frame_dep_submission((uint32_t)reason, g_ld_frames, v);
     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
         if (g_ld_submit_attribution.enabled)
             QueryPerformanceCounter(&attribution_fence_begin);
@@ -8512,6 +8514,7 @@ static int ld_present_external_impl(ID3D12Resource* source, u32 format,
         g.ready = 0;
         return -1;
     }
+    yz_frame_dep_present(buffer_id, g_ld_frames + 1u, 1u);
     ld_present_measure_record(g_ld_frames + 1u);
     g_ld_last_frame_draws = 0;
     g_ld_frames++;
