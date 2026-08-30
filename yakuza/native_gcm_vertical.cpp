@@ -24,6 +24,7 @@
 #include "rsx_nr_residency.h"
 #include "rsx_nr_frame_owner.h"
 #include "rsx_nr_graph.h"
+#include "rsx_nr_island.h"
 #include "rsx_image4_mlaa.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_live_draw.h"
@@ -120,6 +121,18 @@ enum : uint32_t {
     YZ_NR_VERT_VP_TEMPLATE_COUNT = 512,
     YZ_NR_VERT_FP_TEMPLATE_COUNT = 4096,
     YZ_NR_VERT_FP_STRUCTURAL_INDEX_COUNT = 8192,
+};
+
+enum : uint32_t {
+    YZ_NR_ISLAND_ARENA_BYTES = 64u << 20,
+    YZ_NR_ISLAND_INDEX_CAPACITY = 65536u,
+    YZ_NR_ISLAND_SCRATCH_OPS = 4096u,
+    YZ_NR_ISLAND_SCRATCH_SIDE = 262144u,
+    /* Bit 27 is outside the live LOCAL/MAIN RSX-page payload.  It extends
+     * the existing exact guest-page route without adding a second broad
+     * guest-write observer or scanning unrelated writes. */
+    YZ_NR_GUEST_PAGE_ISLAND_BIT = 0x08000000u,
+    YZ_NR_GUEST_PAGE_ROUTE_MASK = 0xF7FFFFFFu,
 };
 
 enum : uint32_t {
@@ -416,6 +429,12 @@ struct yz_nr_vertical_active_state {
     rsx_nr_backend backend;
     rsx_nir_adapter adapter;
     rsx_nr_frame_owner frame_owner;
+    rsx_nr_frame_census island_census;
+    bool island_census_enabled;
+    rsx_nr_island_compiler island_compiler;
+    bool island_compiler_enabled;
+    void* island_compiler_storage;
+    volatile LONG island_content_generation;
     rsx_nr_report_scoreboard report_scoreboard;
     rsx_nr_d3d12* d3d12;
     rsx_nr_exec_ops gpu_ops;
@@ -1723,10 +1742,19 @@ static int yz_nr_d3d_watch_page(void*, uint32_t space, uint32_t page_offset)
     const uint32_t ea_page = ea >> 12;
     const LONG encoded = (LONG)(((space + 1u) << 28) |
                                 (watch_offset >> 12));
-    const LONG prior = InterlockedCompareExchange(
-        &g_active.guest_page_route[ea_page], encoded, 0);
-    if (prior && prior != encoded)
-        return -1; /* one EA page aliased by two RSX offsets: stay legacy */
+    for (;;) {
+        const LONG prior = InterlockedCompareExchange(
+            &g_active.guest_page_route[ea_page], 0, 0);
+        const LONG prior_route =
+            prior & (LONG)YZ_NR_GUEST_PAGE_ROUTE_MASK;
+        if (prior_route && prior_route != encoded)
+            return -1; /* one EA page aliased by two RSX offsets: stay legacy */
+        const LONG desired = encoded |
+            (prior & (LONG)YZ_NR_GUEST_PAGE_ISLAND_BIT);
+        if (InterlockedCompareExchange(
+                &g_active.guest_page_route[ea_page], desired, prior) == prior)
+            break;
+    }
     InterlockedOr64(
         reinterpret_cast<volatile LONG64*>(
             const_cast<uint64_t*>(&g_native_spurs_watch_page_bits[
@@ -1990,7 +2018,60 @@ static int yz_nr_frame_read32(void*, uint32_t io, uint32_t* value)
     const uint32_t ea = yz_nr_vertical_io_to_ea(io);
     if (!ea)
         return -1;
+    if (g_active.island_compiler_enabled && g_active.guest_page_route) {
+        const uint32_t ea_page = ea >> 12;
+        InterlockedOr(
+            &g_active.guest_page_route[ea_page],
+            (LONG)YZ_NR_GUEST_PAGE_ISLAND_BIT);
+        InterlockedOr64(
+            reinterpret_cast<volatile LONG64*>(
+                const_cast<uint64_t*>(&g_native_spurs_watch_page_bits[
+                    ea_page >> 6])),
+            static_cast<LONG64>(1ull << (ea_page & 63u)));
+    }
     *value = vm_read32(ea);
+    return 0;
+}
+
+static int yz_nr_island_compiler_init_live(void)
+{
+    const size_t index_bytes =
+        (size_t)YZ_NR_ISLAND_INDEX_CAPACITY * sizeof(uint32_t);
+    const size_t ops_bytes =
+        (size_t)YZ_NR_ISLAND_SCRATCH_OPS * sizeof(rsx_nir_op);
+    const size_t side_bytes =
+        (size_t)YZ_NR_ISLAND_SCRATCH_SIDE * sizeof(uint32_t);
+    const size_t total = (size_t)YZ_NR_ISLAND_ARENA_BYTES +
+        index_bytes * 3u + ops_bytes + side_bytes + 256u;
+    unsigned char* const storage =
+        static_cast<unsigned char*>(calloc(1u, total));
+    if (!storage)
+        return -1;
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(storage);
+    cursor = (cursor + 63u) & ~(uintptr_t)63u;
+    unsigned char* const arena = reinterpret_cast<unsigned char*>(cursor);
+    cursor += YZ_NR_ISLAND_ARENA_BYTES;
+    uint32_t* const index_lo = reinterpret_cast<uint32_t*>(cursor);
+    cursor += index_bytes;
+    uint32_t* const index_hi = reinterpret_cast<uint32_t*>(cursor);
+    cursor += index_bytes;
+    uint32_t* const index_ofs = reinterpret_cast<uint32_t*>(cursor);
+    cursor += index_bytes;
+    rsx_nir_op* const scratch_ops = reinterpret_cast<rsx_nir_op*>(cursor);
+    cursor += ops_bytes;
+    uint32_t* const scratch_side = reinterpret_cast<uint32_t*>(cursor);
+    if (cursor + side_bytes > reinterpret_cast<uintptr_t>(storage) + total ||
+        rsx_nr_island_compiler_init(
+            &g_active.island_compiler, &g_active.frame_owner,
+            arena, YZ_NR_ISLAND_ARENA_BYTES,
+            index_lo, index_hi, index_ofs, YZ_NR_ISLAND_INDEX_CAPACITY,
+            scratch_ops, YZ_NR_ISLAND_SCRATCH_OPS,
+            scratch_side, YZ_NR_ISLAND_SCRATCH_SIDE) != 0) {
+        free(storage);
+        return -1;
+    }
+    g_active.island_compiler_storage = storage;
+    InterlockedExchange(&g_active.island_content_generation, 0);
     return 0;
 }
 
@@ -2267,6 +2348,42 @@ static int yz_nr_active_init(int graphics)
         &g_active.frame_owner,
         [](void*) -> unsigned long long { return GetTickCount64(); },
         nullptr, 2u, 30000u);
+    {
+        const char* const compiler = getenv("YZ_NR_ISLAND_COMPILER");
+        g_active.island_compiler_enabled = g_active.strict_full_native &&
+            compiler && compiler[0] == '1' && compiler[1] == '\0';
+        if (g_active.island_compiler_enabled &&
+            (g_active.graph_islands || g_active.single_pass_graph ||
+             getenv("YZ_NR_ISLAND_CENSUS") != nullptr)) {
+            fprintf(stderr,
+                    "[nr-island-compiler init=failed incompatible-lane]\n");
+            fflush(stderr);
+            return 0;
+        }
+        if (g_active.island_compiler_enabled) {
+            if (yz_nr_island_compiler_init_live() != 0) {
+                fprintf(stderr,
+                        "[nr-island-compiler init=failed storage]\n");
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr, "[nr-island-compiler armed]\n");
+            fflush(stderr);
+        }
+    }
+    {
+        const char* const census = getenv("YZ_NR_ISLAND_CENSUS");
+        g_active.island_census_enabled =
+            census && census[0] == '1' && census[1] == '\0';
+        if (g_active.island_census_enabled) {
+            memset(&g_active.island_census, 0,
+                   sizeof(g_active.island_census));
+            rsx_nr_frame_owner_set_census(
+                &g_active.frame_owner, &g_active.island_census);
+            fprintf(stderr, "[nr-island-census armed]\n");
+            fflush(stderr);
+        }
+    }
     {
         const char* const tail = getenv("YZ_NR_RSX_TAIL_BREAKDOWN");
         if (tail && tail[0] == '1' && tail[1] == '\0') {
@@ -3592,13 +3709,18 @@ extern "C" void yz_nr_vertical_notify_guest_write(uint32_t ea,
     const uint32_t last = static_cast<uint32_t>(end64 - 1u);
     uint32_t page = ea >> 12;
     const uint32_t last_page = last >> 12;
+    bool island_content_changed = false;
     for (;;) {
         const LONG encoded = InterlockedCompareExchange(
             &g_active.guest_page_route[page], 0, 0);
-        if (encoded) {
-            const uint32_t space = (static_cast<uint32_t>(encoded) >> 28) - 1u;
+        if (encoded & (LONG)YZ_NR_GUEST_PAGE_ISLAND_BIT)
+            island_content_changed = true;
+        const LONG route =
+            encoded & (LONG)YZ_NR_GUEST_PAGE_ROUTE_MASK;
+        if (route) {
+            const uint32_t space = (static_cast<uint32_t>(route) >> 28) - 1u;
             const uint32_t rsx_page =
-                (static_cast<uint32_t>(encoded) & 0x0FFFFFFFu) << 12;
+                (static_cast<uint32_t>(route) & 0x07FFFFFFu) << 12;
             const uint32_t guest_page = page << 12;
             const uint32_t begin = ea > guest_page ? ea : guest_page;
             const uint32_t page_last = guest_page | 0xFFFu;
@@ -3611,6 +3733,8 @@ extern "C" void yz_nr_vertical_notify_guest_write(uint32_t ea,
             break;
         ++page;
     }
+    if (island_content_changed)
+        InterlockedIncrement(&g_active.island_content_generation);
 }
 
 extern "C" int yz_nr_vertical_try_flip(uint32_t context,
@@ -5130,6 +5254,12 @@ extern "C" void yz_nr_vertical_set_movie_mode(int on)
     if (requested == g_active.movie_suppressed)
         return;
 
+    /* The caller holds the serialized FIFO lock. Drop template identities
+     * at the exact whole-timeline handoff, while preserving a blocked
+     * already-executing island exactly as the compiler contract requires. */
+    if (g_active.island_compiler_enabled)
+        rsx_nr_island_compiler_invalidate_all(&g_active.island_compiler);
+
     /* Movie ownership is a whole-timeline handoff. Publish every report whose
      * GPU dependency precedes the handoff before the host movie can reset or
      * reuse the shared list generation. */
@@ -5236,9 +5366,19 @@ extern "C" yz_nr_vertical_frame_result yz_nr_vertical_consume_frame(
 
     uint32_t owned_get = get;
     uint32_t owned_ret = fifo_ret;
-    const rsx_nr_frame_step_result result = rsx_nr_frame_owner_step(
-        &g_active.frame_owner, get, put, fifo_ret,
-        &owned_get, &owned_ret);
+    rsx_nr_frame_step_result result;
+    if (g_active.island_compiler_enabled) {
+        g_active.island_compiler.content_generation =
+            static_cast<uint32_t>(InterlockedCompareExchange(
+                &g_active.island_content_generation, 0, 0));
+        result = rsx_nr_island_compiler_step(
+            &g_active.island_compiler, get, put, fifo_ret,
+            &owned_get, &owned_ret);
+    } else {
+        result = rsx_nr_frame_owner_step(
+            &g_active.frame_owner, get, put, fifo_ret,
+            &owned_get, &owned_ret);
+    }
     if (next_get)
         *next_get = owned_get;
     if (next_ret)
@@ -5808,6 +5948,58 @@ yz_nr_vertical_consume(uint32_t packet_ea, uint32_t* word_count)
 
 extern "C" void yz_nr_vertical_shutdown(void)
 {
+    if (g_active.island_census_enabled) {
+        static const char* const origin_names[RSX_NR_FRAME_ORIGIN_COUNT] = {
+            "sequential", "jump-segment", "call-segment", "data-island",
+            "generated", "stopper",
+        };
+        const rsx_nr_frame_census* const census = &g_active.island_census;
+        fprintf(stderr, "[nr-island-census steps=%llu]\n",
+                (unsigned long long)census->steps);
+        for (unsigned origin = 0; origin < RSX_NR_FRAME_ORIGIN_COUNT;
+             ++origin)
+            fprintf(stderr,
+                    "[nr-island-census origin=%s entries=%llu "
+                    "packets=%llu methods=%llu draws=%llu]\n",
+                    origin_names[origin],
+                    (unsigned long long)census->entries[origin],
+                    (unsigned long long)census->packets[origin],
+                    (unsigned long long)census->methods[origin],
+                    (unsigned long long)census->draws[origin]);
+        fflush(stderr);
+        rsx_nr_frame_owner_set_census(&g_active.frame_owner, nullptr);
+        g_active.island_census_enabled = false;
+    }
+    if (g_active.island_compiler_enabled) {
+        const rsx_nr_island_stats* const s =
+            &g_active.island_compiler.stats;
+        fprintf(stderr,
+                "[nr-island-compiler steps=%llu hit=%llu compiled=%llu "
+                "recompiled=%llu methods-owned=%llu methods-hit=%llu "
+                "adaptations-avoided=%llu actions=%llu templates=%llu "
+                "arena-bytes=%llu generation-fast=%llu mismatches=%llu "
+                "invalidations=%llu delegate=%llu/%llu/%llu/%llu/%llu/%llu "
+                "delegate-steps=%llu]\n",
+                s->steps, s->islands_hit, s->islands_compiled,
+                s->islands_recompiled, s->methods_owned, s->methods_hit,
+                s->adaptations_avoided, s->actions_executed,
+                s->templates_live, s->template_arena_used,
+                s->generation_fast_hits, s->validation_mismatches,
+                s->invalidations,
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_FLOW],
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_UNSUPPORTED],
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_GRAMMAR],
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_CAPACITY],
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_STATE_ONLY],
+                s->islands_delegated[RSX_NR_ISLAND_DELEGATE_VALIDATION],
+                s->delegated_steps);
+        fflush(stderr);
+        /* Shutdown may race process-lifetime workers by design. Publish a
+         * generation change so any already-entered consumer must revalidate;
+         * storage is intentionally left to ExitProcess like the renderer. */
+        InterlockedIncrement(&g_active.island_content_generation);
+        g_active.island_compiler_enabled = false;
+    }
     if (InterlockedExchange(&g_vertical.mode_active_basic, 0)) {
         if (g_active.image4_gpu_mlaa_enabled)
             cellSpursSetImage4SignalInterceptor(nullptr, nullptr);

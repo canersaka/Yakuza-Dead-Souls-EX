@@ -207,129 +207,242 @@ static u32 vp_extent_words(const rsx_dispatch* rsx, u32 start_slot)
     return 0;
 }
 
+/* Per-group decode from the register file. These are the single source of
+ * the register->typed-group mapping: stage_state stages through them, and
+ * the island compiler derives the exact same values for its templates. */
+static void derive_surface(const rsx_nir_adapter* ad, rsx_nir_surface* ns)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    rsx_dsp_surface s;
+    rsx_dsp_get_surface(rsx, &s);
+    memset(ns, 0, sizeof(*ns));
+    ns->color_format = s.color_format;
+    ns->depth_format = s.depth_format;
+    ns->raster_type  = s.raster_type;
+    ns->clip_x = s.clip_x; ns->clip_y = s.clip_y;
+    ns->clip_w = s.clip_w; ns->clip_h = s.clip_h;
+    for (u32 i = 0; i < RSX_NIR_NUM_RENDER_TARGETS; i++) {
+        ns->color_offset[i]   = s.color_offset[i];
+        ns->color_pitch[i]    = s.color_pitch[i];
+        ns->color_location[i] = s.color_location[i];
+    }
+    ns->color_target  = s.color_target;
+    ns->zeta_offset   = s.zeta_offset;
+    ns->zeta_pitch    = s.zeta_pitch;
+    ns->zeta_location = s.zeta_location;
+}
+
+static void derive_viewport(const rsx_nir_adapter* ad, rsx_nir_viewport* nv)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    rsx_dsp_viewport v;
+    rsx_dsp_get_viewport(rsx, &v);
+    memset(nv, 0, sizeof(*nv));
+    nv->x = v.x; nv->y = v.y; nv->w = v.w; nv->h = v.h;
+    memcpy(nv->scale, v.scale, sizeof(nv->scale));
+    memcpy(nv->translate, v.translate, sizeof(nv->translate));
+    u32 cmin = rsx_dsp_reg(rsx, M_CLIP_MIN);
+    u32 cmax = rsx_dsp_reg(rsx, M_CLIP_MAX);
+    memcpy(&nv->clip_min, &cmin, 4);
+    memcpy(&nv->clip_max, &cmax, 4);
+}
+
+static void derive_scissor(const rsx_nir_adapter* ad, rsx_nir_scissor* sc)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(sc, 0, sizeof(*sc));
+    u32 sh = rsx_dsp_reg(rsx, M_SCISSOR_HORIZ);
+    u32 sv = rsx_dsp_reg(rsx, M_SCISSOR_VERT);
+    sc->x = sh & 0xFFFF; sc->w = sh >> 16;
+    sc->y = sv & 0xFFFF; sc->h = sv >> 16;
+}
+
+static void derive_raster(const rsx_nir_adapter* ad, rsx_nir_raster* ra)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(ra, 0, sizeof(*ra));
+    ra->cull_face_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE);
+    ra->cull_face        = rsx_dsp_reg(rsx, M_CULL_FACE);
+    ra->front_face       = rsx_dsp_reg(rsx, M_FRONT_FACE);
+    ra->polygon_offset_point_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_POINT_EN);
+    ra->polygon_offset_line_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_LINE_EN);
+    ra->polygon_offset_fill_enable =
+        rsx_dsp_reg(rsx, M_POLY_OFFSET_FILL_EN);
+    ra->polygon_offset_scale = rsx_dsp_reg(rsx, M_POLY_OFFSET_SCALE);
+    ra->polygon_offset_bias  = rsx_dsp_reg(rsx, M_POLY_OFFSET_BIAS);
+    ra->color_mask       = rsx_dsp_reg(rsx, M_COLOR_MASK);
+    ra->mrt_color_mask   = rsx_dsp_reg(rsx, M_MRT_COLOR_MASK);
+}
+
+static void derive_depth_stencil(const rsx_nir_adapter* ad,
+                                 rsx_nir_depth_stencil* ds)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(ds, 0, sizeof(*ds));
+    ds->depth_test_enable   = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE);
+    ds->depth_func          = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
+    ds->depth_write_enable  = rsx_dsp_reg(rsx, M_DEPTH_WRITE_ENABLE);
+    ds->depth_bounds_test_enable =
+        rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE);
+    ds->depth_bounds_min = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MIN);
+    ds->depth_bounds_max = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MAX);
+    ds->stencil_test_enable = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE);
+    ds->stencil_func        = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
+    ds->stencil_ref         = rsx_dsp_reg(rsx, M_STENCIL_FUNC_REF);
+    ds->stencil_mask        = rsx_dsp_reg(rsx, M_STENCIL_FUNC_MASK);
+    ds->stencil_write_mask  = rsx_dsp_reg(rsx, M_STENCIL_WRITE_MASK);
+    ds->stencil_op_fail     = rsx_dsp_reg(rsx, M_STENCIL_OP_FAIL);
+    ds->stencil_op_zfail    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZFAIL);
+    ds->stencil_op_zpass    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZPASS);
+    ds->two_sided_stencil_enable =
+        rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL);
+    ds->back_stencil_write_mask =
+        rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK);
+    ds->back_stencil_func = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC);
+    ds->back_stencil_ref = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_REF);
+    ds->back_stencil_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK);
+    ds->back_stencil_op_fail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
+    ds->back_stencil_op_zfail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
+    ds->back_stencil_op_zpass = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
+}
+
+static void derive_blend(const rsx_nir_adapter* ad, rsx_nir_blend* bl)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(bl, 0, sizeof(*bl));
+    bl->blend_enable      = rsx_dsp_reg(rsx, M_BLEND_ENABLE);
+    bl->sfactor           = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
+    bl->dfactor           = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
+    bl->equation          = rsx_dsp_reg(rsx, M_BLEND_EQUATION);
+    bl->blend_color       = rsx_dsp_reg(rsx, M_BLEND_COLOR);
+    bl->alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE);
+    bl->alpha_func        = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
+    bl->alpha_ref         = rsx_dsp_reg(rsx, M_ALPHA_REF);
+}
+
+static void derive_fragment_program(const rsx_nir_adapter* ad,
+                                    rsx_nir_fragment_program* fp)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(fp, 0, sizeof(*fp));
+    fp->offset  = rsx_dsp_fragment_program(rsx, &fp->location);
+    fp->control = rsx_dsp_shader_control(rsx);
+    fp->shader_window = rsx_dsp_reg(rsx, M_SHADER_WINDOW);
+    for (u32 unit = 0; unit < 10u; ++unit)
+        fp->texcoord_2d_mask |=
+            (rsx_dsp_reg(rsx, M_TEXCOORD_CONTROL + unit * 4u) & 1u)
+            << unit;
+}
+
+static void derive_vertex_bindings(const rsx_nir_adapter* ad,
+                                   rsx_nir_vertex_bindings* vb)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    memset(vb, 0, sizeof(*vb));
+    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++) {
+        rsx_dsp_vertex_attr a;
+        rsx_dsp_get_vertex_attr(rsx, i, &a);
+        vb->attr[i].type      = a.type;
+        vb->attr[i].size      = a.size;
+        vb->attr[i].stride    = a.stride;
+        vb->attr[i].frequency = a.frequency;
+        vb->attr[i].offset    = a.offset;
+        vb->attr[i].location  = a.location;
+        rsx_dsp_vertex_default(rsx, i, vb->attr[i].def);
+    }
+    vb->base_offset = rsx_dsp_vertex_data_base_offset(rsx);
+    vb->base_index  = rsx_dsp_vertex_data_base_index(rsx);
+    vb->freq_divider_op = rsx_dsp_reg(rsx, M_FREQUENCY_DIVIDER_OP);
+}
+
+static void derive_index_binding(const rsx_nir_adapter* ad,
+                                 rsx_nir_index_binding* ib)
+{
+    const rsx_dispatch* rsx = &ad->rsx;
+    rsx_dsp_index_array ia;
+    rsx_dsp_get_index_array(rsx, &ia);
+    memset(ib, 0, sizeof(*ib));
+    ib->offset         = ia.offset;
+    ib->location       = ia.location;
+    ib->is_u32         = ia.is_u32;
+    ib->restart_enable =
+        (u32)rsx_dsp_restart_index_enabled(rsx, (int)ia.is_u32);
+    ib->restart_index  = rsx_dsp_restart_index(rsx);
+}
+
+static void derive_texture(const rsx_nir_adapter* ad, u32 t,
+                           rsx_nir_texture* nt)
+{
+    rsx_dsp_texture tx;
+    rsx_dsp_get_texture(&ad->rsx, t, &tx);
+    memset(nt, 0, sizeof(*nt));
+    nt->enabled = tx.enabled; nt->offset = tx.offset;
+    nt->location = tx.location; nt->format = tx.format;
+    nt->dimension = tx.dimension; nt->cubemap = tx.cubemap;
+    nt->mipmaps = tx.mipmaps; nt->width = tx.width; nt->height = tx.height;
+    nt->pitch = tx.pitch; nt->depth = tx.depth; nt->wrap = tx.wrap;
+    nt->remap = tx.remap; nt->filter = tx.filter; nt->control0 = tx.control0;
+    nt->border_color = tx.border_color;
+}
+
+static void derive_vertex_texture(const rsx_nir_adapter* ad, u32 t,
+                                  rsx_nir_texture* nt)
+{
+    rsx_dsp_vertex_texture tx;
+    rsx_dsp_get_vertex_texture(&ad->rsx, t, &tx);
+    memset(nt, 0, sizeof(*nt));
+    nt->enabled = tx.enabled; nt->offset = tx.offset;
+    nt->location = tx.location; nt->format = tx.format;
+    nt->dimension = tx.dimension; nt->cubemap = tx.cubemap;
+    nt->mipmaps = tx.mipmaps; nt->width = tx.width; nt->height = tx.height;
+    nt->pitch = tx.pitch; nt->depth = tx.depth; nt->wrap = tx.wrap;
+    nt->filter = tx.filter; nt->control0 = tx.control0;
+    nt->border_color = tx.border_color;
+}
+
 static void stage_state(rsx_nir_adapter* ad)
 {
     const rsx_dispatch* rsx = &ad->rsx;
     rsx_nir_emitter* em = &ad->em;
 
     /* surface */
-    rsx_dsp_surface s;
-    rsx_dsp_get_surface(rsx, &s);
     rsx_nir_surface ns;
-    memset(&ns, 0, sizeof(ns));
-    ns.color_format = s.color_format;
-    ns.depth_format = s.depth_format;
-    ns.raster_type  = s.raster_type;
-    ns.clip_x = s.clip_x; ns.clip_y = s.clip_y;
-    ns.clip_w = s.clip_w; ns.clip_h = s.clip_h;
-    for (u32 i = 0; i < RSX_NIR_NUM_RENDER_TARGETS; i++) {
-        ns.color_offset[i]   = s.color_offset[i];
-        ns.color_pitch[i]    = s.color_pitch[i];
-        ns.color_location[i] = s.color_location[i];
-    }
-    ns.color_target  = s.color_target;
-    ns.zeta_offset   = s.zeta_offset;
-    ns.zeta_pitch    = s.zeta_pitch;
-    ns.zeta_location = s.zeta_location;
+    derive_surface(ad, &ns);
     rsx_nir_em_surface(em, &ns);
 
     /* viewport + depth range */
-    rsx_dsp_viewport v;
-    rsx_dsp_get_viewport(rsx, &v);
     rsx_nir_viewport nv;
-    memset(&nv, 0, sizeof(nv));
-    nv.x = v.x; nv.y = v.y; nv.w = v.w; nv.h = v.h;
-    memcpy(nv.scale, v.scale, sizeof(nv.scale));
-    memcpy(nv.translate, v.translate, sizeof(nv.translate));
-    u32 cmin = rsx_dsp_reg(rsx, M_CLIP_MIN);
-    u32 cmax = rsx_dsp_reg(rsx, M_CLIP_MAX);
-    memcpy(&nv.clip_min, &cmin, 4);
-    memcpy(&nv.clip_max, &cmax, 4);
+    derive_viewport(ad, &nv);
     rsx_nir_em_viewport(em, &nv);
 
     /* scissor */
     rsx_nir_scissor sc;
-    memset(&sc, 0, sizeof(sc));
-    u32 sh = rsx_dsp_reg(rsx, M_SCISSOR_HORIZ);
-    u32 sv = rsx_dsp_reg(rsx, M_SCISSOR_VERT);
-    sc.x = sh & 0xFFFF; sc.w = sh >> 16;
-    sc.y = sv & 0xFFFF; sc.h = sv >> 16;
+    derive_scissor(ad, &sc);
     rsx_nir_em_scissor(em, &sc);
 
     /* raster */
     rsx_nir_raster ra;
-    memset(&ra, 0, sizeof(ra));
-    ra.cull_face_enable = rsx_dsp_reg(rsx, M_CULL_FACE_ENABLE);
-    ra.cull_face        = rsx_dsp_reg(rsx, M_CULL_FACE);
-    ra.front_face       = rsx_dsp_reg(rsx, M_FRONT_FACE);
-    ra.polygon_offset_point_enable =
-        rsx_dsp_reg(rsx, M_POLY_OFFSET_POINT_EN);
-    ra.polygon_offset_line_enable =
-        rsx_dsp_reg(rsx, M_POLY_OFFSET_LINE_EN);
-    ra.polygon_offset_fill_enable =
-        rsx_dsp_reg(rsx, M_POLY_OFFSET_FILL_EN);
-    ra.polygon_offset_scale = rsx_dsp_reg(rsx, M_POLY_OFFSET_SCALE);
-    ra.polygon_offset_bias  = rsx_dsp_reg(rsx, M_POLY_OFFSET_BIAS);
-    ra.color_mask       = rsx_dsp_reg(rsx, M_COLOR_MASK);
-    ra.mrt_color_mask   = rsx_dsp_reg(rsx, M_MRT_COLOR_MASK);
+    derive_raster(ad, &ra);
     rsx_nir_em_raster(em, &ra);
 
     /* Complete front/back stencil state. D3D12 shares read/write masks and
      * the dynamic reference between both faces; draw preflight therefore
      * keeps unequal front/back values on the whole-section legacy path. */
     rsx_nir_depth_stencil ds;
-    memset(&ds, 0, sizeof(ds));
-    ds.depth_test_enable   = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE);
-    ds.depth_func          = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
-    ds.depth_write_enable  = rsx_dsp_reg(rsx, M_DEPTH_WRITE_ENABLE);
-    ds.depth_bounds_test_enable =
-        rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE);
-    ds.depth_bounds_min = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MIN);
-    ds.depth_bounds_max = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_MAX);
-    ds.stencil_test_enable = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE);
-    ds.stencil_func        = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
-    ds.stencil_ref         = rsx_dsp_reg(rsx, M_STENCIL_FUNC_REF);
-    ds.stencil_mask        = rsx_dsp_reg(rsx, M_STENCIL_FUNC_MASK);
-    ds.stencil_write_mask  = rsx_dsp_reg(rsx, M_STENCIL_WRITE_MASK);
-    ds.stencil_op_fail     = rsx_dsp_reg(rsx, M_STENCIL_OP_FAIL);
-    ds.stencil_op_zfail    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZFAIL);
-    ds.stencil_op_zpass    = rsx_dsp_reg(rsx, M_STENCIL_OP_ZPASS);
-    ds.two_sided_stencil_enable =
-        rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL);
-    ds.back_stencil_write_mask =
-        rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK);
-    ds.back_stencil_func = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC);
-    ds.back_stencil_ref = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_REF);
-    ds.back_stencil_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK);
-    ds.back_stencil_op_fail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
-    ds.back_stencil_op_zfail = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
-    ds.back_stencil_op_zpass = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
+    derive_depth_stencil(ad, &ds);
     rsx_nir_em_depth_stencil(em, &ds);
 
     /* blend + alpha test */
     rsx_nir_blend bl;
-    memset(&bl, 0, sizeof(bl));
-    bl.blend_enable      = rsx_dsp_reg(rsx, M_BLEND_ENABLE);
-    bl.sfactor           = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
-    bl.dfactor           = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
-    bl.equation          = rsx_dsp_reg(rsx, M_BLEND_EQUATION);
-    bl.blend_color       = rsx_dsp_reg(rsx, M_BLEND_COLOR);
-    bl.alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE);
-    bl.alpha_func        = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
-    bl.alpha_ref         = rsx_dsp_reg(rsx, M_ALPHA_REF);
+    derive_blend(ad, &bl);
     rsx_nir_em_blend(em, &bl);
     rsx_nir_em_render_condition(em, &ad->render_condition);
 
     /* fragment program */
     rsx_nir_fragment_program fp;
-    memset(&fp, 0, sizeof(fp));
-    fp.offset  = rsx_dsp_fragment_program(rsx, &fp.location);
-    fp.control = rsx_dsp_shader_control(rsx);
-    fp.shader_window = rsx_dsp_reg(rsx, M_SHADER_WINDOW);
-    for (u32 unit = 0; unit < 10u; ++unit)
-        fp.texcoord_2d_mask |=
-            (rsx_dsp_reg(rsx, M_TEXCOORD_CONTROL + unit * 4u) & 1u)
-            << unit;
+    derive_fragment_program(ad, &fp);
     rsx_nir_em_fragment_program(em, &fp);
 
     /* vertex program */
@@ -343,62 +456,23 @@ static void stage_state(rsx_nir_adapter* ad)
 
     /* vertex bindings */
     rsx_nir_vertex_bindings vb;
-    memset(&vb, 0, sizeof(vb));
-    for (u32 i = 0; i < RSX_NIR_NUM_VERTEX_ATTR; i++) {
-        rsx_dsp_vertex_attr a;
-        rsx_dsp_get_vertex_attr(rsx, i, &a);
-        vb.attr[i].type      = a.type;
-        vb.attr[i].size      = a.size;
-        vb.attr[i].stride    = a.stride;
-        vb.attr[i].frequency = a.frequency;
-        vb.attr[i].offset    = a.offset;
-        vb.attr[i].location  = a.location;
-        rsx_dsp_vertex_default(rsx, i, vb.attr[i].def);
-    }
-    vb.base_offset = rsx_dsp_vertex_data_base_offset(rsx);
-    vb.base_index  = rsx_dsp_vertex_data_base_index(rsx);
-    vb.freq_divider_op = rsx_dsp_reg(rsx, M_FREQUENCY_DIVIDER_OP);
+    derive_vertex_bindings(ad, &vb);
     rsx_nir_em_vertex_bindings(em, &vb);
 
     /* index binding */
-    rsx_dsp_index_array ia;
-    rsx_dsp_get_index_array(rsx, &ia);
     rsx_nir_index_binding ib;
-    memset(&ib, 0, sizeof(ib));
-    ib.offset         = ia.offset;
-    ib.location       = ia.location;
-    ib.is_u32         = ia.is_u32;
-    ib.restart_enable = (u32)rsx_dsp_restart_index_enabled(rsx, (int)ia.is_u32);
-    ib.restart_index  = rsx_dsp_restart_index(rsx);
+    derive_index_binding(ad, &ib);
     rsx_nir_em_index_binding(em, &ib);
 
     /* textures */
     for (u32 t = 0; t < RSX_NIR_NUM_TEXTURES; t++) {
-        rsx_dsp_texture tx;
-        rsx_dsp_get_texture(rsx, t, &tx);
         rsx_nir_texture nt;
-        memset(&nt, 0, sizeof(nt));
-        nt.enabled = tx.enabled; nt.offset = tx.offset;
-        nt.location = tx.location; nt.format = tx.format;
-        nt.dimension = tx.dimension; nt.cubemap = tx.cubemap;
-        nt.mipmaps = tx.mipmaps; nt.width = tx.width; nt.height = tx.height;
-        nt.pitch = tx.pitch; nt.depth = tx.depth; nt.wrap = tx.wrap;
-        nt.remap = tx.remap; nt.filter = tx.filter; nt.control0 = tx.control0;
-        nt.border_color = tx.border_color;
+        derive_texture(ad, t, &nt);
         rsx_nir_em_texture(em, t, &nt);
     }
     for (u32 t = 0; t < RSX_NIR_NUM_VERTEX_TEXTURES; t++) {
-        rsx_dsp_vertex_texture tx;
-        rsx_dsp_get_vertex_texture(rsx, t, &tx);
         rsx_nir_texture nt;
-        memset(&nt, 0, sizeof(nt));
-        nt.enabled = tx.enabled; nt.offset = tx.offset;
-        nt.location = tx.location; nt.format = tx.format;
-        nt.dimension = tx.dimension; nt.cubemap = tx.cubemap;
-        nt.mipmaps = tx.mipmaps; nt.width = tx.width; nt.height = tx.height;
-        nt.pitch = tx.pitch; nt.depth = tx.depth; nt.wrap = tx.wrap;
-        nt.filter = tx.filter; nt.control0 = tx.control0;
-        nt.border_color = tx.border_color;
+        derive_vertex_texture(ad, t, &nt);
         rsx_nir_em_vertex_texture(em, t, &nt);
     }
 
@@ -777,6 +851,71 @@ static int title_context_image_method_supported(u32 method, u32 arg)
     return 0;
 }
 
+static int method_supported_base(
+    const rsx_nir_adapter* ad, u32 method, u32 arg);
+
+/* Support classification for table-driven scanners: whether a method's
+ * admissibility depends on its argument. Must stay structurally in step
+ * with rsx_nir_adapter_method_supported below (same file on purpose); the
+ * island compiler's property table asserts agreement at init by probing. */
+int rsx_nir_adapter_method_support_class(
+    const rsx_nir_adapter* ad, u32 method)
+{
+    method &= 0xFFFFCu;
+    if (method < 0x100u) {
+        switch (method) {
+        case M406E_SET_REFERENCE:
+        case M406E_SET_CTX_DMA_SEM:
+        case M406E_SEMAPHORE_OFFSET:
+        case M406E_SEMAPHORE_ACQUIRE:
+        case M406E_SEMAPHORE_RELEASE:
+            return RSX_NIR_SUPPORT_ALWAYS;
+        default:
+            return RSX_NIR_SUPPORT_NEVER;
+        }
+    }
+    switch (method) {
+    case M_SHADER_WINDOW:
+    case M_TWO_SIDED_STENCIL:
+    case M_CONTROL0:
+    case M_DITHER_ENABLE:
+    case M_POINT_PARAMS_ENABLE:
+    case M_ZCULL_STATS_ENABLE:
+    case M_POINT_SPRITE_CONTROL:
+    case M_ZPASS_COUNT_ENABLE:
+    case M_RENDER_ENABLE:
+    case M_ZCULL_CONTROL0:
+    case M_ZCULL_CONTROL1:
+    case M_SCULL_CONTROL:
+    case M_ANTI_ALIAS_CONTROL:
+    case M_WINDOW_OFFSET:
+    case M_DEPTH_BOUNDS_ENABLE:
+    case M_DEPTH_BOUNDS_MIN:
+    case M_DEPTH_BOUNDS_MAX:
+    case M_POLYGON_MODE_FRONT:
+    case M_POLYGON_MODE_BACK:
+    case M_POLY_OFFSET_POINT_EN:
+    case M_POLY_OFFSET_LINE_EN:
+    case M_POLY_OFFSET_FILL_EN:
+    case M_POLY_OFFSET_SCALE:
+    case M_POLY_OFFSET_BIAS:
+    case M3089_CONTEXT_SURFACE:
+    case M3089_COLOR_CONVERSION:
+    case M3089_OPERATION:
+    case M_ZMIN_MAX_CONTROL:
+        return RSX_NIR_SUPPORT_ARG_DEPENDENT;
+    default:
+        break;
+    }
+    /* Probe the arg-independent remainder outside the context-image
+     * window: boot-era exact values must not classify a method as always
+     * admissible. */
+    return method_supported_base(ad, method, 0u) ||
+                   method_supported_base(ad, method, ~0u)
+               ? RSX_NIR_SUPPORT_ALWAYS
+               : RSX_NIR_SUPPORT_NEVER;
+}
+
 int rsx_nir_adapter_method_supported(
     const rsx_nir_adapter* ad, u32 method, u32 arg)
 {
@@ -786,6 +925,12 @@ int rsx_nir_adapter_method_supported(
     if (ad->context_image_open &&
         title_context_image_method_supported(method, arg))
         return 1;
+    return method_supported_base(ad, method, arg);
+}
+
+static int method_supported_base(
+    const rsx_nir_adapter* ad, u32 method, u32 arg)
+{
     if (method < 0x100u) {
         switch (method) {
         case M406E_SET_REFERENCE:
@@ -1228,4 +1373,291 @@ u32 rsx_nir_adapter_fifo(rsx_nir_adapter* ad, const u32* words, u32 count,
     if (stop_word)
         *stop_word = 0;
     return i;
+}
+
+/* ---- island-compiler support (docs/HANA_ISLAND_COMPILER.md) ------------ */
+
+/* Derive one complete state-group op from the current register file and
+ * append it to `out`. When update_shadow is nonzero the emitter's shadow
+ * (what a folding consumer has seen) is updated to the derived value so a
+ * later adapter-decoded action cannot wrongly diff-suppress against state
+ * the caller already delivered to the backend by other means. Returns 0 on
+ * success, -1 on stream refusal or an unknown kind. */
+int rsx_nir_adapter_derive_group_op(rsx_nir_adapter* ad, u32 kind, u32 unit,
+                                    rsx_nir_stream* out, int update_shadow)
+{
+    rsx_nir_op op;
+    memset(&op, 0, sizeof(op));
+    op.kind = kind;
+    op.unit = unit;
+    switch (kind) {
+    case RSX_NIR_OP_SET_SURFACE:
+        derive_surface(ad, &op.u.surface);
+        if (update_shadow)
+            ad->em.shadow.surface = op.u.surface;
+        break;
+    case RSX_NIR_OP_SET_VIEWPORT:
+        derive_viewport(ad, &op.u.viewport);
+        if (update_shadow)
+            ad->em.shadow.viewport = op.u.viewport;
+        break;
+    case RSX_NIR_OP_SET_SCISSOR:
+        derive_scissor(ad, &op.u.scissor);
+        if (update_shadow)
+            ad->em.shadow.scissor = op.u.scissor;
+        break;
+    case RSX_NIR_OP_SET_RASTER:
+        derive_raster(ad, &op.u.raster);
+        if (update_shadow)
+            ad->em.shadow.raster = op.u.raster;
+        break;
+    case RSX_NIR_OP_SET_DEPTH_STENCIL:
+        derive_depth_stencil(ad, &op.u.depth_stencil);
+        if (update_shadow)
+            ad->em.shadow.depth_stencil = op.u.depth_stencil;
+        break;
+    case RSX_NIR_OP_SET_BLEND:
+        derive_blend(ad, &op.u.blend);
+        if (update_shadow)
+            ad->em.shadow.blend = op.u.blend;
+        break;
+    case RSX_NIR_OP_SET_RENDER_CONDITION:
+        op.u.render_condition = ad->render_condition;
+        if (update_shadow)
+            ad->em.shadow.render_condition = op.u.render_condition;
+        break;
+    case RSX_NIR_OP_SET_FRAGMENT_PROGRAM:
+        derive_fragment_program(ad, &op.u.fragment_program);
+        if (update_shadow)
+            ad->em.shadow.fragment_program = op.u.fragment_program;
+        break;
+    case RSX_NIR_OP_SET_VERTEX_PROGRAM: {
+        const rsx_dispatch* rsx = &ad->rsx;
+        const u32 vp_start = rsx_dsp_vp_start(rsx);
+        u32 vp_words = vp_extent_words(rsx, vp_start);
+        if (vp_words > RSX_NIR_VP_MAX_WORDS)
+            vp_words = RSX_NIR_VP_MAX_WORDS;
+        rsx_nir_vertex_program* vp = &op.u.vertex_program;
+        vp->start_slot = vp_start;
+        vp->word_count = vp_words;
+        vp->hash = rsx_nir_hash_words(rsx->vp + vp_start * 4, vp_words);
+        vp->attrib_input_mask = rsx_dsp_reg(rsx, M_VP_ATTRIB_EN);
+        vp->attrib_output_mask = rsx_dsp_reg(rsx, M_VP_RESULT_EN);
+        vp->branch_bits = rsx_dsp_reg(rsx, M_TRANSFORM_BRANCH_BITS);
+        vp->words_ofs = rsx_nir_side_push(out, rsx->vp + vp_start * 4,
+                                          vp_words);
+        if (vp_words && vp->words_ofs == ~0u)
+            return -1;
+        if (update_shadow) {
+            ad->em.shadow.vertex_program = *vp;
+            /* Keep the staged program content coherent with the identity so
+             * a later emitter flush cannot pair the new identity with stale
+             * bytes. */
+            ad->em.pending.vertex_program = *vp;
+            if (vp_words)
+                memcpy(ad->em.vp_words, rsx->vp + vp_start * 4,
+                       (size_t)vp_words * 4u);
+        }
+        break;
+    }
+    case RSX_NIR_OP_SET_VERTEX_BINDINGS:
+        derive_vertex_bindings(ad, &op.u.vertex_bindings);
+        if (update_shadow)
+            ad->em.shadow.vertex_bindings = op.u.vertex_bindings;
+        break;
+    case RSX_NIR_OP_SET_INDEX_BINDING:
+        derive_index_binding(ad, &op.u.index_binding);
+        if (update_shadow)
+            ad->em.shadow.index_binding = op.u.index_binding;
+        break;
+    case RSX_NIR_OP_SET_TEXTURE:
+        if (unit >= RSX_NIR_NUM_TEXTURES)
+            return -1;
+        derive_texture(ad, unit, &op.u.texture);
+        if (update_shadow)
+            ad->em.shadow.textures[unit] = op.u.texture;
+        break;
+    case RSX_NIR_OP_SET_VERTEX_TEXTURE:
+        if (unit >= RSX_NIR_NUM_VERTEX_TEXTURES)
+            return -1;
+        derive_vertex_texture(ad, unit, &op.u.texture);
+        if (update_shadow)
+            ad->em.shadow.vertex_textures[unit] = op.u.texture;
+        break;
+    default:
+        return -1;
+    }
+    return rsx_nir_push(out, &op);
+}
+
+/* Derive one SET_CONSTANTS op (one vec4 slot) from the dispatch constant
+ * file. Shadow update mirrors what an emitter flush of this slot records. */
+int rsx_nir_adapter_derive_constant_op(rsx_nir_adapter* ad, u32 slot,
+                                       rsx_nir_stream* out, int update_shadow)
+{
+    if (slot >= RSX_NIR_NUM_CONSTANTS)
+        return -1;
+    rsx_nir_op op;
+    memset(&op, 0, sizeof(op));
+    op.kind = RSX_NIR_OP_SET_CONSTANTS;
+    op.u.constants.first_slot = slot;
+    op.u.constants.slot_count = 1;
+    op.u.constants.words_ofs =
+        rsx_nir_side_push(out, &ad->rsx.constants[slot][0], 4);
+    if (op.u.constants.words_ofs == ~0u)
+        return -1;
+    if (update_shadow) {
+        memcpy(ad->em.shadow.constants[slot], &ad->rsx.constants[slot][0],
+               16);
+        ad->em.shadow.constants_written[slot] = 1;
+        memcpy(ad->em.pending.constants[slot], &ad->rsx.constants[slot][0],
+               16);
+        ad->em.pending.constants_written[slot] = 1;
+    }
+    return rsx_nir_push(out, &op);
+}
+
+/* Register-truth resync: apply one method's architectural effect (register
+ * file, transform program/constant windows and their load cursors, DMA and
+ * transfer staging, render-condition capture) with NO emitter staging, NO
+ * diffing, and NO action emission. Between begin() and end() the dispatch
+ * execution sink is disconnected so BEGIN/END/batch/flip/clear callbacks
+ * cannot fire. This is what keeps a later adapter-decoded island's pulled
+ * state truthful when the compiler executes islands without adaptation. */
+void rsx_nir_adapter_resync_begin(rsx_nir_adapter* ad)
+{
+    if (ad->resync_active)
+        return;
+    ad->resync_saved_sink = ad->rsx.sink;
+    memset(&ad->rsx.sink, 0, sizeof(ad->rsx.sink));
+    ad->resync_active = 1;
+}
+
+void rsx_nir_adapter_resync_end(rsx_nir_adapter* ad)
+{
+    if (!ad->resync_active)
+        return;
+    ad->rsx.sink = ad->resync_saved_sink;
+    ad->resync_active = 0;
+}
+
+void rsx_nir_adapter_resync_method(rsx_nir_adapter* ad, u32 method, u32 arg)
+{
+    method &= 0xFFFFC;
+    if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4)
+        note_constant_upload(ad, method);
+    rsx_dispatch_method(&ad->rsx, method, arg);
+    switch (method) {
+    case M406E_SET_CTX_DMA_SEM:  ad->fifo_semaphore_dma = arg; break;
+    case M406E_SEMAPHORE_OFFSET: ad->fifo_semaphore_offset = arg; break;
+    case M_RENDER_ENABLE: {
+        const u32 mode = arg >> 24;
+        if (mode == 1u) {
+            memset(&ad->render_condition, 0,
+                   sizeof(ad->render_condition));
+        } else if (mode == 2u) {
+            ad->render_condition.enabled = 1u;
+            ad->render_condition.dma_report =
+                rsx_dsp_reg(&ad->rsx, M_CONTEXT_DMA_REPORT);
+            ad->render_condition.offset = arg & 0x00FFFFFFu;
+        }
+        break;
+    }
+    case M0039_DMA_BUFFER_IN:   ad->m2mf_dma_in = arg; break;
+    case M0039_DMA_BUFFER_OUT:  ad->m2mf_dma_out = arg; break;
+    case M0039_OFFSET_IN:       ad->m2mf_offset_in = arg; break;
+    case M0039_OFFSET_OUT:      ad->m2mf_offset_out = arg; break;
+    case M0039_PITCH_IN:        ad->m2mf_pitch_in = arg; break;
+    case M0039_PITCH_OUT:       ad->m2mf_pitch_out = arg; break;
+    case M0039_LINE_LENGTH_IN:  ad->m2mf_line_length = arg; break;
+    case M0039_LINE_COUNT:      ad->m2mf_line_count = arg; break;
+    case M0039_FORMAT:          ad->m2mf_format = arg; break;
+    case M3062_DMA_IMAGE_SOURCE: ad->s2d_dma_src = arg; break;
+    case M3062_DMA_IMAGE_DESTIN: ad->s2d_dma_dst = arg; break;
+    case M3062_COLOR_FORMAT:     ad->s2d_color_format = arg & 0xFFFFu; break;
+    case M3062_PITCH:            ad->s2d_pitch = arg; break;
+    case M3062_OFFSET_SOURCE:    ad->s2d_offset_src = arg; break;
+    case M3062_OFFSET_DESTIN:    ad->s2d_offset_dst = arg; break;
+    case M308A_POINT:    ad->inline_point = arg; break;
+    case M308A_SIZE_OUT: ad->inline_size_out = arg; break;
+    case M308A_SIZE_IN:  ad->inline_size_in = arg; break;
+    case M3089_DMA_IMAGE:        ad->sif_dma_src = arg; break;
+    case M3089_CONTEXT_SURFACE:  ad->sif_context_surface = arg; break;
+    case M3089_COLOR_CONVERSION: ad->sif_color_conversion = arg; break;
+    case M3089_COLOR_FORMAT: ad->sif_color_format = arg; break;
+    case M3089_OPERATION:    ad->sif_operation = arg; break;
+    case M3089_CLIP_POINT:   ad->sif_clip_point = arg; break;
+    case M3089_CLIP_SIZE:    ad->sif_clip_size = arg; break;
+    case M3089_OUT_POINT:    ad->sif_out_point = arg; break;
+    case M3089_OUT_SIZE:     ad->sif_out_size = arg; break;
+    case M3089_DS_DX:        ad->sif_ds_dx = arg; break;
+    case M3089_DT_DY:        ad->sif_dt_dy = arg; break;
+    case M3089_IN_SIZE:      ad->sif_in_size = arg; break;
+    case M3089_IN_FORMAT:    ad->sif_in_format = arg; break;
+    case M3089_IN_OFFSET:    ad->sif_in_offset = arg; break;
+    default:
+        break;
+    }
+}
+
+/* Fill a transfer action's staging-derived fields from the current adapter
+ * state (the same fields the emission paths read). The caller supplies the
+ * trigger-word values (SCALED in_x/in_y) and inline run shape/payload. */
+void rsx_nir_adapter_derive_transfer(const rsx_nir_adapter* ad, u32 kind,
+                                     rsx_nir_transfer* t)
+{
+    memset(t, 0, sizeof(*t));
+    t->kind = kind;
+    switch (kind) {
+    case RSX_NIR_XFER_BUFFER:
+        t->src_location = dma_location(ad->m2mf_dma_in);
+        t->src_offset   = ad->m2mf_offset_in;
+        t->src_pitch    = ad->m2mf_pitch_in;
+        t->dst_location = dma_location(ad->m2mf_dma_out);
+        t->dst_offset   = ad->m2mf_offset_out;
+        t->dst_pitch    = ad->m2mf_pitch_out;
+        t->src_format   = ad->m2mf_format & 0xFFu;
+        t->dst_format   = ad->m2mf_format >> 8;
+        t->line_length  = ad->m2mf_line_length;
+        t->line_count   = ad->m2mf_line_count;
+        break;
+    case RSX_NIR_XFER_SCALED:
+        t->src_location = dma_location(ad->sif_dma_src);
+        t->src_offset   = ad->sif_in_offset;
+        t->src_pitch    = ad->sif_in_format & 0xFFFFu;
+        t->src_format   = ad->sif_color_format;
+        t->dst_location = dma_location(ad->s2d_dma_dst);
+        t->dst_offset   = ad->s2d_offset_dst;
+        t->dst_pitch    = ad->s2d_pitch >> 16;
+        t->dst_format   = ad->s2d_color_format;
+        t->in_w  = ad->sif_in_size & 0xFFFFu;
+        t->in_h  = ad->sif_in_size >> 16;
+        t->out_x = ad->sif_out_point & 0xFFFFu;
+        t->out_y = ad->sif_out_point >> 16;
+        t->out_w = ad->sif_out_size & 0xFFFFu;
+        t->out_h = ad->sif_out_size >> 16;
+        t->clip_x = ad->sif_clip_point & 0xFFFFu;
+        t->clip_y = ad->sif_clip_point >> 16;
+        t->clip_w = ad->sif_clip_size & 0xFFFFu;
+        t->clip_h = ad->sif_clip_size >> 16;
+        t->ds_dx = ad->sif_ds_dx;
+        t->dt_dy = ad->sif_dt_dy;
+        t->origin       = (ad->sif_in_format >> 16) & 0xFFu;
+        t->interpolator = (ad->sif_in_format >> 24) & 0xFFu;
+        break;
+    case RSX_NIR_XFER_INLINE:
+        t->dst_location = dma_location(ad->s2d_dma_dst);
+        t->dst_offset   = ad->s2d_offset_dst;
+        t->dst_pitch    = ad->s2d_pitch >> 16;
+        t->dst_format   = ad->s2d_color_format;
+        t->point_y      = ad->inline_point >> 16;
+        t->size_w       = ad->inline_size_out & 0xFFFFu;
+        t->size_h       = ad->inline_size_out >> 16;
+        /* point_x = (point & 0xFFFF) + first_index and word_count are run
+         * shape, applied by the caller from its template. */
+        t->point_x      = ad->inline_point & 0xFFFFu;
+        break;
+    default:
+        break;
+    }
 }

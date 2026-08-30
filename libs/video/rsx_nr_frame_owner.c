@@ -216,6 +216,25 @@ void rsx_nr_frame_owner_set_snapshot_record_draw(
         o->graph_record_draw = record_draw;
 }
 
+void rsx_nr_frame_owner_set_census(
+    rsx_nr_frame_owner* o, rsx_nr_frame_census* census)
+{
+    if (!o)
+        return;
+    o->census = census;
+    o->census_origin = RSX_NR_FRAME_ORIGIN_SEQUENTIAL;
+    if (census)
+        census->entries[RSX_NR_FRAME_ORIGIN_SEQUENTIAL]++;
+}
+
+static void frame_census_enter(rsx_nr_frame_owner* o, u32 origin)
+{
+    if (!o->census)
+        return;
+    o->census_origin = origin;
+    o->census->entries[origin]++;
+}
+
 void rsx_nr_frame_owner_set_tail_clock(
     rsx_nr_frame_owner* o, rsx_nr_frame_now_ticks_fn now_ticks,
     void* clock_user, unsigned long long tick_frequency)
@@ -548,6 +567,7 @@ static int frame_try_resolve_generated_jump(
     o->flow_wait_polls = 0u;
     *next_get = resume;
     o->stats.repaired_generated_links++;
+    frame_census_enter(o, RSX_NR_FRAME_ORIGIN_GENERATED);
     frame_record_flow(o, get, repaired, resume, ret, ret);
     return 1;
 }
@@ -616,6 +636,7 @@ static int frame_try_resolve_generated_hole(
     o->flow_wait_polls = 0u;
     *next_get = resume;
     o->stats.repaired_generated_holes++;
+    frame_census_enter(o, RSX_NR_FRAME_ORIGIN_GENERATED);
     frame_record_flow(o, get, word, resume, ret, ret);
     return 1;
 }
@@ -967,6 +988,11 @@ static rsx_nr_frame_step_result frame_resume_packet(
             }
         }
         o->stats.methods++;
+        if (o->census) {
+            o->census->methods[o->census_origin]++;
+            if (method == 0x1808u && argument == 0u)
+                o->census->draws[o->census_origin]++;
+        }
         if (frame_graph_exec_mode(o) &&
             (o->graph_stream->overflow || o->graph_stream->oom))
             return frame_fail(
@@ -1008,6 +1034,8 @@ static rsx_nr_frame_step_result frame_owner_step_once(
     *next_get = get;
     *next_return = call_return;
     o->stats.steps++;
+    if (o->census)
+        o->census->steps++;
     if (o->fatal)
         return RSX_NR_FRAME_FATAL;
     if (o->packet_active)
@@ -1057,6 +1085,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
             o->flow_wait_polls = 0u;
             *next_get = island_resume;
             o->stats.skipped_data_islands++;
+            frame_census_enter(o, RSX_NR_FRAME_ORIGIN_DATA_ISLAND);
             if (island_result == 2)
                 o->stats.recovered_late_island_entries++;
             frame_record_flow(
@@ -1076,6 +1105,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
                         call_return, command, 0u, resume, 0u);
                 *next_get = resume;
                 o->stats.released_stoppers++;
+                frame_census_enter(o, RSX_NR_FRAME_ORIGIN_STOPPER);
                 frame_record_flow(
                     o, get, command, resume, call_return, call_return);
                 return frame_control_advance(
@@ -1106,6 +1136,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
                 o, RSX_NR_FRAME_FAILURE_BAD_FLOW, get, put, call_return,
                 command, 0u, target, 0u);
         }
+        int admitted_generated = 0;
         int target_ready = frame_flow_target_ready(
             o, target, call_return, target_word);
         if (!target_ready &&
@@ -1119,6 +1150,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
              * The target itself is consumed normally on the next step. */
             target_ready = 1;
             o->stats.admitted_released_boundaries++;
+            admitted_generated = 1;
         }
         if (!target_ready) {
             if (call_return == ~0u && target < NR_FRAME_RING_SIZE &&
@@ -1138,6 +1170,9 @@ static rsx_nr_frame_step_result frame_owner_step_once(
         o->flow_wait_target = ~0u;
         o->flow_wait_polls = 0u;
         *next_get = target;
+        frame_census_enter(o, admitted_generated
+                                  ? RSX_NR_FRAME_ORIGIN_GENERATED
+                                  : RSX_NR_FRAME_ORIGIN_JUMP_SEGMENT);
         frame_record_flow(
             o, get, command, target, call_return, call_return);
         return frame_control_advance(o, get, put, call_return, command);
@@ -1185,6 +1220,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
         *next_return = get < NR_FRAME_RING_SIZE
             ? ((get + 4u) & NR_FRAME_RING_MASK) : get + 4u;
         *next_get = target;
+        frame_census_enter(o, RSX_NR_FRAME_ORIGIN_CALL_SEGMENT);
         frame_record_flow(
             o, get, command, target, call_return, *next_return);
         return frame_control_advance(o, get, put, call_return, command);
@@ -1196,6 +1232,7 @@ static rsx_nr_frame_step_result frame_owner_step_once(
                 command, 0u, 0u, 0u);
         *next_get = call_return;
         *next_return = ~0u;
+        frame_census_enter(o, RSX_NR_FRAME_ORIGIN_SEQUENTIAL);
         frame_record_flow(
             o, get, command, call_return, call_return, ~0u);
         return frame_control_advance(o, get, put, call_return, command);
@@ -1255,6 +1292,8 @@ static rsx_nr_frame_step_result frame_owner_step_once(
 
     o->packet_active = 1;
     o->control_streak = 0;
+    if (o->census)
+        o->census->packets[o->census_origin]++;
     o->packet_get = get;
     o->packet_put = put;
     o->packet_ret = call_return;
