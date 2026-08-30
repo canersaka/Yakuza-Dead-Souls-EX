@@ -147,8 +147,10 @@ typedef struct rsx_nr_d3d12_tail_bucket {
     unsigned long long fence_ticks;
     unsigned long long flush_ticks;
     unsigned long long transfer_readback_ticks;
+    unsigned long long transfer_readback_count;
     unsigned long long transfer_readback_bytes;
     unsigned long long transfer_upload_ticks;
+    unsigned long long transfer_upload_count;
     unsigned long long transfer_upload_bytes;
     unsigned long long residency_prepare_ticks;
     unsigned long long residency_stabilize_ticks;
@@ -163,10 +165,31 @@ typedef struct rsx_nr_d3d12_tail_bucket {
     unsigned long long texture_prepare_ticks;
     unsigned long long batch_prepare_ticks;
     unsigned long long command_record_ticks;
+    unsigned long long recording_fence;
+    unsigned long long completed_fence;
+    unsigned long long oldest_incomplete_fence;
+    unsigned long long allocator_waits;
+    unsigned long long allocator_wait_ticks;
+    unsigned long long report_natural_submissions;
+    unsigned long long report_early_submissions;
+    unsigned long long reports_published_early;
+    unsigned long long report_early_consumer_hits;
+    unsigned long long last_block_end_qpc;
+    unsigned long long last_block_ticks;
+    unsigned long long last_block_required_fence;
+    unsigned long long last_block_completed_fence;
+    unsigned int last_block_cause;
+    unsigned int allocator_slot;
+    unsigned int upload_used;
+    unsigned int snapshot_vertex_used;
+    unsigned int descriptor_tables_used;
+    unsigned int retired_texture_count;
     unsigned long long submit_count[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
     unsigned long long submit_cpu_ticks[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
     unsigned long long submit_gpu_ticks[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
     unsigned long long submit_gpu_intervals[RSX_NR_D3D12_SUBMIT_CAUSE_COUNT];
+    unsigned long long gpu_first_tick;
+    unsigned long long gpu_last_tick;
 } rsx_nr_d3d12_tail_bucket;
 
 typedef struct rsx_nr_d3d12_stats {
@@ -658,6 +681,18 @@ int rsx_nr_d3d12_get_tail_bucket(
     rsx_nr_d3d12_tail_bucket* out);
 void rsx_nr_d3d12_tail_note_adaptation(
     rsx_nr_d3d12* b, unsigned long long ticks);
+void rsx_nr_d3d12_tail_note_host_state(
+    rsx_nr_d3d12* b, unsigned long long recording_fence,
+    unsigned long long completed_fence,
+    unsigned long long oldest_incomplete_fence,
+    unsigned long long allocator_waits,
+    unsigned long long allocator_wait_ticks,
+    unsigned int allocator_slot);
+void rsx_nr_d3d12_tail_note_report_state(
+    rsx_nr_d3d12* b, unsigned long long natural_submissions,
+    unsigned long long early_submissions,
+    unsigned long long reports_published_early,
+    unsigned long long early_consumer_hits);
 
 #ifdef __cplusplus
 }

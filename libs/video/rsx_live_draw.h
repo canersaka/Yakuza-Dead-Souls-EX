@@ -54,6 +54,15 @@ typedef struct rsx_live_draw_dispatch_diff {
     u32 first_constant_word;
 } rsx_live_draw_dispatch_diff;
 
+typedef struct rsx_live_draw_timeline_state {
+    u64 recording_fence;
+    u64 completed_fence;
+    u64 oldest_incomplete_fence;
+    u64 allocator_waits;
+    u64 allocator_wait_ticks;
+    u32 allocator_slot;
+} rsx_live_draw_timeline_state;
+
 /* Default-off Hana shadow-resource oracle context.  The vertical section
  * scanner supplies this only for the exact two-map consumer family.  The live
  * renderer owns the bounded GPU readback and emits the first occurrence once
@@ -173,6 +182,8 @@ int rsx_live_draw_present_shared_full_native(
     void* texture, u32 dxgi_format, u32 width, u32 height, u32 buffer_id);
 void rsx_live_draw_set_benchmark_invariants(
     u64 methods, u64 draws, u64 game_updates, u64 image4_rounds);
+int rsx_live_draw_get_timeline_state(
+    rsx_live_draw_timeline_state* state);
 
 /* Shared-resource broker for the vertical renderer. Returned resources carry
  * one COM reference owned by the caller and are left in RENDER_TARGET or

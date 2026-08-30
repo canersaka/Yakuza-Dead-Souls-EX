@@ -455,6 +455,11 @@ def main():
     parser.add_argument(
         "--island-compiler", choices=("on", "off"), default="on"
     )
+    parser.add_argument("--resident-frame", action="store_true")
+    parser.add_argument("--defer-reports", action="store_true")
+    parser.add_argument("--image4-gpu", action="store_true")
+    parser.add_argument("--slow-frame-attribution", action="store_true")
+    parser.add_argument("--gun2-workload-gate", action="store_true")
     parser.add_argument("--finalize-calibration-from", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -537,6 +542,8 @@ def main():
     start_arm = run_dir / "cutscene-start-once.txt"
     target_stop = run_dir / "gun2-target-input-stopped.txt"
     capture_stop = run_dir / "gun2-target-capture-stopped.txt"
+    workload_arm = run_dir / "gun2-workload-gate-arm.txt"
+    workload_ready = run_dir / "gun2-workload-gate-ready.txt"
     result_path = run_dir / "route-result.json"
 
     environment = {k: v for k, v in os.environ.items() if not k.startswith("YZ_")}
@@ -561,6 +568,29 @@ def main():
     }
     if args.island_compiler == "on":
         yz["YZ_NR_ISLAND_COMPILER"] = "1"
+    if args.resident_frame:
+        yz["YZ_NR_RESIDENT_FRAME"] = "1"
+    if args.defer_reports:
+        yz["YZ_NR_DEFER_REPORTS"] = "1"
+    if args.image4_gpu:
+        yz["YZ_NR_NATIVE_RESIDENCY"] = "1"
+        yz["YZ_NR_IMAGE4_GPU_MLAA"] = "1"
+    if args.slow_frame_attribution:
+        yz["YZ_NR_SLOW_FRAME_ATTRIBUTION"] = "1"
+    if args.gun2_workload_gate:
+        yz.update({
+            "YZ_BENCHMARK_WORKLOAD_GATE_ARM_FILE": str(workload_arm),
+            "YZ_BENCHMARK_WORKLOAD_GATE_READY_FILE": str(workload_ready),
+            "YZ_BENCHMARK_WORKLOAD_METHODS_MIN": "247000",
+            "YZ_BENCHMARK_WORKLOAD_METHODS_MAX": "249500",
+            "YZ_BENCHMARK_WORKLOAD_DRAWS_MIN": "1640",
+            "YZ_BENCHMARK_WORKLOAD_DRAWS_MAX": "1642",
+            "YZ_BENCHMARK_WORKLOAD_UPDATES_MIN": "0",
+            "YZ_BENCHMARK_WORKLOAD_UPDATES_MAX": "2",
+            "YZ_BENCHMARK_WORKLOAD_IMAGE4_MIN": "1",
+            "YZ_BENCHMARK_WORKLOAD_IMAGE4_MAX": "1",
+            "YZ_BENCHMARK_WORKLOAD_STREAK": "8",
+        })
     if args.measure:
         yz["YZ_BENCHMARK_INVARIANTS"] = "1"
     if args.timeline:
@@ -581,6 +611,10 @@ def main():
         "configuration": {name: cache.get(name) for name in base.EXPECTED_CACHE},
         "active_yz": yz,
         "island_compiler": args.island_compiler,
+        "resident_frame": args.resident_frame,
+        "defer_reports": args.defer_reports,
+        "image4_gpu": args.image4_gpu,
+        "slow_frame_attribution": args.slow_frame_attribution,
         "save": {
             "directory": "BLUS30826L01",
             "slot": "01",
@@ -783,6 +817,39 @@ def main():
             print(f"[gun2-save] PID {process.pid} remains open for visual confirmation",
                   flush=True)
             return 0
+
+        if args.gun2_workload_gate:
+            workload_arm.write_text(
+                "visual checkpoint accepted; arm workload gate\n",
+                encoding="ascii",
+            )
+            gate_deadline = time.monotonic() + 12.0
+            while not workload_ready.is_file() and time.monotonic() < gate_deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"game exited during workload gate: {process.returncode}"
+                    )
+                time.sleep(0.05)
+            if not workload_ready.is_file():
+                raise RuntimeError(
+                    "gun2 workload gate did not observe eight consecutive "
+                    "1640-1642-draw accepted frames"
+                )
+            result["workload_gate"] = {
+                "status": "accepted",
+                "identity": workload_ready.read_text(
+                    encoding="ascii", errors="replace"
+                ).strip(),
+                "draws": [1640, 1642],
+                "methods": [247000, 249500],
+                "image4_rounds": [1, 1],
+                "required_consecutive_frames": 8,
+            }
+            print(
+                f"[gun2-save] exact workload regime accepted: "
+                f"{result['workload_gate']['identity']}",
+                flush=True,
+            )
 
         result["status"] = "warming-up"
         result_path.write_text(
