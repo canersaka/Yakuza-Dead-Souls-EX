@@ -35,6 +35,8 @@ static _Atomic uint64_t g_dependency_generation;
 static _Atomic uint64_t g_completed_wait_generation;
 static _Atomic uint64_t g_fifo_generation;
 static _Atomic uint64_t g_consumed_fifo_generation;
+static _Atomic uint64_t g_benchmark_game_updates;
+static _Atomic uint64_t g_benchmark_image4_rounds;
 static uint64_t g_frequency;
 static int g_initialized;
 static int g_shutdown;
@@ -45,6 +47,7 @@ static uint64_t g_test_clock_reads;
 #endif
 
 volatile long g_yz_frame_dependency_timeline_enabled;
+volatile long g_yz_benchmark_invariants_enabled;
 
 static uint32_t yz_frame_dep_thread_id(void)
 {
@@ -120,6 +123,8 @@ int yz_frame_dependency_timeline_init(void)
     atomic_store(&g_completed_wait_generation, 0u);
     atomic_store(&g_fifo_generation, 0u);
     atomic_store(&g_consumed_fifo_generation, 0u);
+    atomic_store(&g_benchmark_game_updates, 0u);
+    atomic_store(&g_benchmark_image4_rounds, 0u);
     for (i = 0; i < YZ_FRAME_DEP_WAIT_SLOTS; ++i) {
         atomic_store(&g_waits[i].generation, 0u);
         atomic_store(&g_waits[i].address, 0u);
@@ -130,6 +135,8 @@ int yz_frame_dependency_timeline_init(void)
 #else
     g_frequency = 1000000000ull;
 #endif
+    g_yz_benchmark_invariants_enabled =
+        exact_flag("YZ_BENCHMARK_INVARIANTS") ? 1 : 0;
     if (!exact_flag("YZ_FRAME_DEP_TIMELINE"))
         return 0;
     g_yz_frame_dependency_timeline_enabled = 1;
@@ -140,6 +147,9 @@ uint64_t yz_frame_dep_ppu_update_start(uint32_t function_address,
                                         uint32_t object_ea)
 {
     uint64_t frame;
+    if (g_yz_benchmark_invariants_enabled)
+        atomic_fetch_add_explicit(&g_benchmark_game_updates, 1u,
+                                  memory_order_relaxed);
     if (!g_yz_frame_dependency_timeline_enabled)
         return 0;
     frame = atomic_fetch_add_explicit(&g_frame_generation, 1u,
@@ -147,6 +157,25 @@ uint64_t yz_frame_dep_ppu_update_start(uint32_t function_address,
     emit(YZ_FRAME_DEP_PPU_UPDATE_START, frame, 0u,
          function_address, object_ea, 0u, 0u);
     return frame;
+}
+
+void yz_benchmark_note_image4_round(void)
+{
+    if (g_yz_benchmark_invariants_enabled)
+        atomic_fetch_add_explicit(&g_benchmark_image4_rounds, 1u,
+                                  memory_order_relaxed);
+}
+
+uint64_t yz_benchmark_game_updates(void)
+{
+    return atomic_load_explicit(&g_benchmark_game_updates,
+                                memory_order_relaxed);
+}
+
+uint64_t yz_benchmark_image4_rounds(void)
+{
+    return atomic_load_explicit(&g_benchmark_image4_rounds,
+                                memory_order_relaxed);
 }
 
 void yz_frame_dep_ppu_update_complete(uint64_t frame, uint32_t function_address,

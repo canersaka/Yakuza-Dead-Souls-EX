@@ -171,6 +171,8 @@ int rsx_live_draw_present_shared(void* texture, u32 dxgi_format,
                                  u32 width, u32 height, u32 buffer_id);
 int rsx_live_draw_present_shared_full_native(
     void* texture, u32 dxgi_format, u32 width, u32 height, u32 buffer_id);
+void rsx_live_draw_set_benchmark_invariants(
+    u64 methods, u64 draws, u64 game_updates, u64 image4_rounds);
 
 /* Shared-resource broker for the vertical renderer. Returned resources carry
  * one COM reference owned by the caller and are left in RENDER_TARGET or

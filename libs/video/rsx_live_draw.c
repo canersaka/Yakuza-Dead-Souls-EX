@@ -84,6 +84,9 @@ int rsx_live_draw_present_shared(void* t, u32 f, u32 w, u32 h, u32 b)
 int rsx_live_draw_present_shared_full_native(
     void* t, u32 f, u32 w, u32 h, u32 b)
 { (void)t; (void)f; (void)w; (void)h; (void)b; return -1; }
+void rsx_live_draw_set_benchmark_invariants(
+    u64 m, u64 d, u64 u, u64 i)
+{ (void)m; (void)d; (void)u; (void)i; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
@@ -842,6 +845,10 @@ typedef struct {
     u64 present_thread_kernel_100ns;
     u64 present_thread_user_100ns;
     u32 present_thread_id;
+    u64 methods;
+    u64 draws;
+    u64 game_updates;
+    u64 image4_rounds;
 } ld_present_sample;
 static ld_present_sample g_ld_present_ring[LD_PRESENT_RING_CAP];
 static u64 g_ld_present_total = 0;
@@ -849,6 +856,11 @@ static LONGLONG g_ld_qpc_frequency = 0;
 static int g_ld_present_dumped = 0;
 static int g_ld_clean_stats_dumped = 0;
 static int g_ld_schedule_diag = 0;
+static int g_ld_benchmark_invariants = 0;
+static u64 g_ld_benchmark_methods = 0;
+static u64 g_ld_benchmark_draws = 0;
+static u64 g_ld_benchmark_game_updates = 0;
+static u64 g_ld_benchmark_image4_rounds = 0;
 #if defined(YZ_PPU_SAMPLE)
 static HANDLE g_ld_present_thread_handle = NULL;
 #endif
@@ -873,6 +885,11 @@ static void ld_present_measure_init(void)
     g_ld_present_dumped = 0;
     g_ld_clean_stats_dumped = 0;
     g_ld_schedule_diag = getenv("YZ_SCHEDULE_DIAG") != NULL;
+    {
+        const char* value = getenv("YZ_BENCHMARK_INVARIANTS");
+        g_ld_benchmark_invariants =
+            value && value[0] == '1' && value[1] == '\0';
+    }
     if (QueryPerformanceFrequency(&frequency))
         g_ld_qpc_frequency = frequency.QuadPart;
     else
@@ -903,6 +920,12 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->present_id = present_id;
     sample->guest_frame = guest_frame;
     sample->qpc = now.QuadPart;
+    if (g_ld_benchmark_invariants) {
+        sample->methods = g_ld_benchmark_methods;
+        sample->draws = g_ld_benchmark_draws;
+        sample->game_updates = g_ld_benchmark_game_updates;
+        sample->image4_rounds = g_ld_benchmark_image4_rounds;
+    }
     if (g_ld_schedule_diag) {
         FILETIME creation = {0}, exit = {0}, kernel = {0}, user = {0};
         ULARGE_INTEGER value;
@@ -1001,6 +1024,9 @@ static void ld_present_measure_dump(void)
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
                    "present_thread_user_100ns,present_thread_id\n");
+    } else if (g_ld_benchmark_invariants) {
+        fprintf(f, "present_id,guest_frame,qpc,methods,draws,game_updates,"
+                   "image4_rounds\n");
     } else {
         fprintf(f, "present_id,guest_frame,qpc\n");
     }
@@ -1022,6 +1048,14 @@ static void ld_present_measure_dump(void)
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
                         sample->present_thread_id);
+            } else if (g_ld_benchmark_invariants) {
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu\n",
+                        (unsigned long long)sample->present_id,
+                        sample->guest_frame, sample->qpc,
+                        (unsigned long long)sample->methods,
+                        (unsigned long long)sample->draws,
+                        (unsigned long long)sample->game_updates,
+                        (unsigned long long)sample->image4_rounds);
             } else {
                 fprintf(f, "%llu,%u,%lld\n",
                         (unsigned long long)sample->present_id,
@@ -1034,6 +1068,17 @@ static void ld_present_measure_dump(void)
             "[present-qpc] preserved %llu successful presents at %lld Hz in %s\n",
             (unsigned long long)(g_ld_present_total - first + 1u),
             g_ld_qpc_frequency, path);
+}
+
+void rsx_live_draw_set_benchmark_invariants(
+    u64 methods, u64 draws, u64 game_updates, u64 image4_rounds)
+{
+    if (!g_ld_benchmark_invariants)
+        return;
+    g_ld_benchmark_methods = methods;
+    g_ld_benchmark_draws = draws;
+    g_ld_benchmark_game_updates = game_updates;
+    g_ld_benchmark_image4_rounds = image4_rounds;
 }
 
 static u64 g_ld_texture_cache_full = 0;

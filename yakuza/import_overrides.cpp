@@ -3967,6 +3967,7 @@ static void yz_rsx_exec_user_command(uint32_t method, uint32_t arg)
     }
     vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);
 #ifdef YZ_NATIVE_GCM
+    yz_benchmark_note_image4_round();
     yz_fe0_timeline_emit(YZ_FE0_EVENT_UCMD_DISPATCH, arg, method,
                          yz_rsx_sem_dma_406e, yz_rsx_sem_off_406e,
                          0, 0);
