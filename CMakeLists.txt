@@ -350,6 +350,23 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND fe0_timeline_tests
         )
 
+        add_executable(frame_dependency_timeline_tests
+            tests/frame_dependency_timeline/main.c
+            runtime/diag/yz_frame_dependency_timeline.c
+        )
+        target_include_directories(frame_dependency_timeline_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_compile_definitions(frame_dependency_timeline_tests PRIVATE
+            YZ_FRAME_DEP_TIMELINE_TEST=1
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_compile_options(frame_dependency_timeline_tests PRIVATE
+            /experimental:c11atomics
+        )
+        add_test(NAME frame_dependency_timeline
+                 COMMAND frame_dependency_timeline_tests)
+
         add_executable(wkl4_cycle_tests
             tests/wkl4_cycle/main.c
             runtime/diag/yz_wkl4_cycle.c

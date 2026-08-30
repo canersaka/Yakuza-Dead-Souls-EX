@@ -11,6 +11,7 @@
 #include "../../runtime/memory/vm.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/yz_fe0_timeline.h"
+#include "ps3emu/yz_frame_dependency_timeline.h"
 #if !defined(YZ_SPURS_TEST_GUEST_SIZE)
 #include "../../runtime/syscalls/sys_vm.h"
 #endif
@@ -1609,8 +1610,14 @@ static void task_run(TaskState* task)
         }
     }
 
+    yz_frame_dep_spurs_schedule(1u, (u32)task->image.image_id,
+                                task->owner->wid, task->id);
+    yz_frame_dep_spu_task_start((u32)task->image.image_id, task->spu_num,
+                                task->id, ctx->pc);
     if (!spu_workload_execute(&task->image, ctx))
         task->exit_code = CELL_SPURS_TASK_ERROR_NOEXEC;
+    yz_frame_dep_spu_task_complete((u32)task->image.image_id, task->spu_num,
+                                   task->id, ctx->pc);
     native_spu_context_free(ctx);
 finished:
     if (native_trace_enabled())
@@ -5640,7 +5647,13 @@ static int run_job(JobChainState* jc, u32 descriptor_ea, u32 descriptor_size,
     extern volatile unsigned long g_yz_job_dma_put_bytes;
     const unsigned long job_put_n0 = g_yz_job_dma_put_n;
     const unsigned long job_put_b0 = g_yz_job_dma_put_bytes;
+    yz_frame_dep_spurs_schedule(2u, (u32)image.image_id, jc->wid,
+                                descriptor_ea);
+    yz_frame_dep_spu_job_start((u32)image.image_id, ctx->spu_id, jc->wid,
+                               descriptor_ea);
     int ok = spu_workload_execute(&image, ctx);
+    yz_frame_dep_spu_job_complete((u32)image.image_id, ctx->spu_id, jc->wid,
+                                  descriptor_ea);
     if (parity_motion) {
         static atomic_uint parity_motion_completion_generation;
         const u32 completion_generation =
