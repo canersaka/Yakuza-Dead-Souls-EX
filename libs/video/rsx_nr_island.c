@@ -1101,7 +1101,8 @@ static int island_build_stream(rsx_nr_island_compiler* ic,
     /* The very first action of an adapter's lifetime must observe complete
      * state (the emitter's prime contract); islands after that carry only
      * their own touched groups, untouched state persisting in the backend. */
-    const int prime = !ad->em.primed && t->action_kind != 0u;
+    const int prime = t->action_kind != 0u &&
+        (!ad->em.primed || ic->force_full_state);
     const u32 group_mask = prime
         ? ~0u & ~GBIT(RSX_NIR_OP_SET_CONSTANTS) : t->group_mask;
     const u32 tex_mask = prime ? 0xFFFFu : t->tex_mask;
@@ -1245,7 +1246,224 @@ static int island_build_stream(rsx_nr_island_compiler* ic,
     default:
         return -1;
     }
-    return rsx_nir_push(stream, &op);
+    const int pushed = rsx_nir_push(stream, &op);
+    if (!pushed && ic->force_full_state)
+        ic->force_full_state = 0;
+    return pushed;
+}
+
+enum {
+    ISLAND_ORACLE_ACTION_SHAPE = 1,
+    ISLAND_ORACLE_PIPELINE = 2,
+    ISLAND_ORACLE_ACTION_PAYLOAD = 3,
+    ISLAND_ORACLE_SIDE_PAYLOAD = 4,
+    ISLAND_ORACLE_STREAM_CAPACITY = 5,
+};
+
+/* Build the unchanged adapter's semantic answer in fixed scratch before
+ * the compiler mutates the live adapter.  This is diagnostics-only and is
+ * armed explicitly by the live embedder; no output or clocks occur here. */
+static void island_oracle_prepare(rsx_nr_island_compiler* ic,
+                                  const u32* words, const u32* resync,
+                                  u32 method_count)
+{
+    if (!ic->oracle_adapter)
+        return;
+    rsx_nir_adapter* const oracle = ic->oracle_adapter;
+    const rsx_nir_sink out = oracle->em.out;
+    rsx_nir_stream_reset(&ic->oracle_stream);
+    memcpy(oracle, ic->owner->adapter, sizeof(*oracle));
+    oracle->em.out = out;
+    oracle->resync_active = 0;
+    rsx_nir_adapter_rebind(oracle);
+    for (u32 i = 0; i < method_count; ++i) {
+        const u32 method = resync[i * 2u];
+        const u32 arg = words[resync[i * 2u + 1u]];
+        rsx_nir_adapter_method(oracle, method, arg);
+    }
+    rsx_nir_adapter_finish(oracle);
+}
+
+static const rsx_nir_op* island_oracle_action(
+    const rsx_nir_stream* stream, u32* count)
+{
+    const rsx_nir_op* action = NULL;
+    *count = 0;
+    for (u32 i = 0; i < stream->op_count; ++i)
+        if (rsx_nir_op_is_action(stream->ops[i].kind)) {
+            action = &stream->ops[i];
+            (*count)++;
+        }
+    return action;
+}
+
+static void island_oracle_fold_state(rsx_nir_pipeline* pipeline,
+                                     const rsx_nir_stream* stream)
+{
+    for (u32 i = 0; i < stream->op_count; ++i)
+        rsx_nir_pipeline_apply_op(pipeline, stream, &stream->ops[i]);
+    /* Side offsets are stream-local storage identities, not semantics. */
+    pipeline->vertex_program.words_ofs = 0;
+}
+
+static int island_oracle_compare_side(const rsx_nir_stream* a,
+                                      const rsx_nir_op* ao,
+                                      const rsx_nir_stream* b,
+                                      const rsx_nir_op* bo)
+{
+    if (!ao || !bo || ao->kind != bo->kind)
+        return -1;
+    if (ao->kind == RSX_NIR_OP_DRAW) {
+        const u32 n = ao->u.draw.batch_count * 2u;
+        if (n != bo->u.draw.batch_count * 2u)
+            return -1;
+        const u32* const av = rsx_nir_side(a, ao->u.draw.batches_ofs, n);
+        const u32* const bv = rsx_nir_side(b, bo->u.draw.batches_ofs, n);
+        return (!n || (av && bv && memcmp(av, bv, (size_t)n * 4u) == 0))
+            ? 0 : -1;
+    }
+    if (ao->kind == RSX_NIR_OP_TRANSFER) {
+        const u32 n = ao->u.transfer.word_count;
+        if (n != bo->u.transfer.word_count)
+            return -1;
+        const u32* const av = rsx_nir_side(a, ao->u.transfer.words_ofs, n);
+        const u32* const bv = rsx_nir_side(b, bo->u.transfer.words_ofs, n);
+        return (!n || (av && bv && memcmp(av, bv, (size_t)n * 4u) == 0))
+            ? 0 : -1;
+    }
+    return 0;
+}
+
+static void island_oracle_record_mismatch(rsx_nr_island_compiler* ic,
+                                          u32 get, u32 action,
+                                          u32 reason, u32 method,
+                                          u32 word, u32 expected,
+                                          u32 compiled)
+{
+    rsx_nr_island_oracle_stats* const s = &ic->oracle_stats;
+    s->mismatches++;
+    if (s->mismatches != 1u)
+        return;
+    s->first_get = get;
+    s->first_action = action;
+    s->first_reason = reason;
+    s->first_method = method;
+    s->first_word = word;
+    s->first_expected = expected;
+    s->first_compiled = compiled;
+}
+
+static u32 island_oracle_pipeline_mismatch(
+    const rsx_nir_pipeline* expected, const rsx_nir_pipeline* compiled,
+    u32* word, u32* expected_value, u32* compiled_value)
+{
+#define ISLAND_ORACLE_GROUP(ID, FIELD)                                      \
+    do {                                                                     \
+        if (memcmp(&expected->FIELD, &compiled->FIELD,                        \
+                   sizeof(expected->FIELD)) != 0) {                           \
+            const u32* const ew = (const u32*)(const void*)&expected->FIELD;  \
+            const u32* const cw = (const u32*)(const void*)&compiled->FIELD;  \
+            for (u32 wi = 0; wi < sizeof(expected->FIELD) / 4u; ++wi)         \
+                if (ew[wi] != cw[wi]) {                                      \
+                    *word = wi;                                               \
+                    *expected_value = ew[wi];                                 \
+                    *compiled_value = cw[wi];                                 \
+                    break;                                                    \
+                }                                                            \
+            return 0x100u + (ID);                                             \
+        }                                                                    \
+    } while (0)
+    ISLAND_ORACLE_GROUP(1u, surface);
+    ISLAND_ORACLE_GROUP(2u, viewport);
+    ISLAND_ORACLE_GROUP(3u, scissor);
+    ISLAND_ORACLE_GROUP(4u, raster);
+    ISLAND_ORACLE_GROUP(5u, depth_stencil);
+    ISLAND_ORACLE_GROUP(6u, blend);
+    ISLAND_ORACLE_GROUP(7u, render_condition);
+    ISLAND_ORACLE_GROUP(8u, vertex_program);
+    ISLAND_ORACLE_GROUP(9u, fragment_program);
+    ISLAND_ORACLE_GROUP(10u, constants);
+    ISLAND_ORACLE_GROUP(11u, constants_written);
+    ISLAND_ORACLE_GROUP(12u, vertex_bindings);
+    ISLAND_ORACLE_GROUP(13u, index_binding);
+    ISLAND_ORACLE_GROUP(14u, textures);
+    ISLAND_ORACLE_GROUP(15u, vertex_textures);
+#undef ISLAND_ORACLE_GROUP
+    return 0u;
+}
+
+/* Compare the compiler result against the unchanged adapter at the exact
+ * action boundary, before either answer is executed.  Both streams are
+ * folded over the current backend pipeline so compiler-elided unchanged
+ * state is not mistaken for a semantic difference. */
+static void island_oracle_verify(rsx_nr_island_compiler* ic, u32 get,
+                                 const u32* resync, u32 method_count)
+{
+    if (!ic->oracle_adapter)
+        return;
+    rsx_nir_stream* const oracle = &ic->oracle_stream;
+    rsx_nir_stream* const compiled = &ic->scratch;
+    const u32 last_method = method_count ? resync[(method_count - 1u) * 2u]
+                                         : 0u;
+    u32 oracle_actions = 0, compiled_actions = 0;
+    const rsx_nir_op* const oracle_action =
+        island_oracle_action(oracle, &oracle_actions);
+    const rsx_nir_op* const compiled_action =
+        island_oracle_action(compiled, &compiled_actions);
+    if (oracle->overflow || oracle->oom) {
+        island_oracle_record_mismatch(
+            ic, get, compiled_action ? compiled_action->kind : 0u,
+            ISLAND_ORACLE_STREAM_CAPACITY, last_method, 0u, 0u, 0u);
+        return;
+    }
+    if (!compiled_actions)
+        return;
+    ic->oracle_stats.action_islands_checked++;
+    if (oracle_actions != 1u || compiled_actions != 1u ||
+        !oracle_action || !compiled_action ||
+        oracle_action->kind != compiled_action->kind) {
+        island_oracle_record_mismatch(
+            ic, get, compiled_action ? compiled_action->kind : 0u,
+            ISLAND_ORACLE_ACTION_SHAPE, last_method, 0u,
+            oracle_actions, compiled_actions);
+        return;
+    }
+
+    rsx_nir_pipeline oracle_pipeline = ic->owner->backend->st;
+    rsx_nir_pipeline compiled_pipeline = ic->owner->backend->st;
+    island_oracle_fold_state(&oracle_pipeline, oracle);
+    island_oracle_fold_state(&compiled_pipeline, compiled);
+    u32 mismatch_word = 0, expected_value = 0, compiled_value = 0;
+    const u32 pipeline_reason = island_oracle_pipeline_mismatch(
+        &oracle_pipeline, &compiled_pipeline, &mismatch_word,
+        &expected_value, &compiled_value);
+    if (pipeline_reason) {
+        island_oracle_record_mismatch(
+            ic, get, compiled_action->kind, pipeline_reason,
+            last_method, mismatch_word, expected_value, compiled_value);
+        return;
+    }
+
+    rsx_nir_op oa = *oracle_action;
+    rsx_nir_op ca = *compiled_action;
+    if (oa.kind == RSX_NIR_OP_DRAW) {
+        oa.u.draw.batches_ofs = 0;
+        ca.u.draw.batches_ofs = 0;
+    } else if (oa.kind == RSX_NIR_OP_TRANSFER) {
+        oa.u.transfer.words_ofs = 0;
+        ca.u.transfer.words_ofs = 0;
+    }
+    if (memcmp(&oa, &ca, sizeof(oa)) != 0) {
+        island_oracle_record_mismatch(
+            ic, get, compiled_action->kind, ISLAND_ORACLE_ACTION_PAYLOAD,
+            last_method, 0u, 0u, 0u);
+        return;
+    }
+    if (island_oracle_compare_side(
+            oracle, oracle_action, compiled, compiled_action) != 0)
+        island_oracle_record_mismatch(
+            ic, get, compiled_action->kind, ISLAND_ORACLE_SIDE_PAYLOAD,
+            last_method, 0u, 0u, 0u);
 }
 
 /* Execute the scratch stream from ic->exec_pos. Returns the step result;
@@ -1344,6 +1562,25 @@ void rsx_nr_island_compiler_set_clock(
     ic->clock_user = user;
 }
 
+void rsx_nr_island_compiler_set_oracle(
+    rsx_nr_island_compiler* ic, rsx_nir_adapter* oracle_adapter,
+    rsx_nir_op* oracle_ops, u32 oracle_op_cap,
+    u32* oracle_side, u32 oracle_side_cap)
+{
+    if (!ic || !oracle_adapter || !oracle_ops || !oracle_op_cap ||
+        !oracle_side || !oracle_side_cap)
+        return;
+    ic->oracle_adapter = oracle_adapter;
+    ic->oracle_ops = oracle_ops;
+    ic->oracle_side = oracle_side;
+    ic->oracle_op_cap = oracle_op_cap;
+    ic->oracle_side_cap = oracle_side_cap;
+    rsx_nir_stream_init_fixed(
+        &ic->oracle_stream, oracle_ops, oracle_op_cap,
+        oracle_side, oracle_side_cap);
+    rsx_nir_adapter_init(oracle_adapter, &ic->oracle_stream);
+}
+
 void rsx_nr_island_compiler_invalidate_all(rsx_nr_island_compiler* ic)
 {
     if (!ic)
@@ -1370,6 +1607,32 @@ static int island_owner_idle(const rsx_nr_island_compiler* ic)
     return !o->packet_active && !o->method_inflight &&
            rsx_nr_ring_depth(o->ring) == 0u &&
            !ad->rsx.in_begin_end && !ad->batch_count && !ad->inline_count;
+}
+
+static void island_delegate_begin(rsx_nr_island_compiler* ic)
+{
+    ic->delegate_active = 1;
+    ic->delegate_methods_start = ic->owner->adapter->methods_seen;
+    ic->delegate_actions_start = ic->owner->adapter->actions_seen;
+}
+
+static void island_delegate_maybe_finish(
+    rsx_nr_island_compiler* ic, rsx_nr_frame_step_result result)
+{
+    if (!island_owner_idle(ic) ||
+        (result != RSX_NR_FRAME_ADVANCED &&
+         result != RSX_NR_FRAME_WAIT_EMPTY))
+        return;
+    const rsx_nir_adapter* const ad = ic->owner->adapter;
+    /* A delegated state-only stretch updates architectural registers but
+     * cannot flush them to the backend.  The next compiler-owned action
+     * must therefore carry one complete state catch-up.  Pure flow words
+     * do not increment methods_seen, while a delegated action has already
+     * performed the strict adapter's complete stage/flush itself. */
+    if (ad->methods_seen != ic->delegate_methods_start &&
+        ad->actions_seen == ic->delegate_actions_start)
+        ic->force_full_state = 1;
+    ic->delegate_active = 0;
 }
 
 rsx_nr_frame_step_result rsx_nr_island_compiler_step(
@@ -1409,9 +1672,7 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
         const rsx_nr_frame_step_result r = rsx_nr_frame_owner_step(
             o, get, put, call_return, next_get, next_return);
         ic->stats.delegated_steps++;
-        if (island_owner_idle(ic) &&
-            (r == RSX_NR_FRAME_ADVANCED || r == RSX_NR_FRAME_WAIT_EMPTY))
-            ic->delegate_active = 0;
+        island_delegate_maybe_finish(ic, r);
         return r;
     }
 
@@ -1434,13 +1695,11 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
     }
     if (scan.verdict == ISLAND_SCAN_DELEGATE) {
         ic->stats.islands_delegated[scan.delegate_reason]++;
-        ic->delegate_active = 1;
+        island_delegate_begin(ic);
         const rsx_nr_frame_step_result r = rsx_nr_frame_owner_step(
             o, get, put, call_return, next_get, next_return);
         ic->stats.delegated_steps++;
-        if (island_owner_idle(ic) &&
-            (r == RSX_NR_FRAME_ADVANCED || r == RSX_NR_FRAME_WAIT_EMPTY))
-            ic->delegate_active = 0;
+        island_delegate_maybe_finish(ic, r);
         return r;
     }
 
@@ -1481,14 +1740,11 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
              * either adapter or backend state is touched. */
             ic->stats.islands_delegated[
                 RSX_NR_ISLAND_DELEGATE_VALIDATION]++;
-            ic->delegate_active = 1;
+            island_delegate_begin(ic);
             const rsx_nr_frame_step_result r = rsx_nr_frame_owner_step(
                 o, get, put, call_return, next_get, next_return);
             ic->stats.delegated_steps++;
-            if (island_owner_idle(ic) &&
-                (r == RSX_NR_FRAME_ADVANCED ||
-                 r == RSX_NR_FRAME_WAIT_EMPTY))
-                ic->delegate_active = 0;
+            island_delegate_maybe_finish(ic, r);
             return r;
         }
     }
@@ -1515,13 +1771,11 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
                scratch_ops_bound > ic->scratch_op_cap ||
                scratch_side_bound > ic->scratch_side_cap)) {
         ic->stats.islands_delegated[RSX_NR_ISLAND_DELEGATE_CAPACITY]++;
-        ic->delegate_active = 1;
+        island_delegate_begin(ic);
         const rsx_nr_frame_step_result r = rsx_nr_frame_owner_step(
             o, get, put, call_return, next_get, next_return);
         ic->stats.delegated_steps++;
-        if (island_owner_idle(ic) &&
-            (r == RSX_NR_FRAME_ADVANCED || r == RSX_NR_FRAME_WAIT_EMPTY))
-            ic->delegate_active = 0;
+        island_delegate_maybe_finish(ic, r);
         return r;
     }
 
@@ -1532,6 +1786,13 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
      * this reset, delegated JUMP/CALL packets accumulate across otherwise
      * valid islands and eventually trip a false BAD_FLOW fatal. */
     o->control_streak = 0;
+
+    /* Build the diagnostics-only strict answer before register resync
+     * mutates the live adapter. */
+    island_oracle_prepare(
+        ic, ic->word_buf,
+        t ? island_template_data(t) + t->ofs_resync : ic->resync_list,
+        scan.method_count);
 
     /* register truth (both paths), resolving constant slots on compile */
     island_resync(ic, ic->word_buf,
@@ -1572,6 +1833,9 @@ rsx_nr_frame_step_result rsx_nr_island_compiler_step(
         o->failure.get = get;
         return RSX_NR_FRAME_FATAL;
     }
+    island_oracle_verify(
+        ic, get, island_template_data(t) + t->ofs_resync,
+        scan.method_count);
 
     ic->exec_get = get;
     ic->exec_ret = call_return;

@@ -1050,7 +1050,12 @@ def run_gun(args):
         "YZ_MOVEMENT_PROOF_READY_MIN_SERIAL": "1",
         "YZ_MOVEMENT_PROOF_READY_NONBLACK": "100000",
         "YZ_MOVEMENT_PROOF_READY_HUD_PALE_PPM": "100000",
-        "YZ_MOVEMENT_PROOF_READY_VISIBLE_PROBES": "3",
+        # The exact first Hana prompt is already a required visual gate.  One
+        # subsequent full city-HUD probe is therefore sufficient to stop
+        # Confirm and arm movement; requiring several probes can reopen Hana
+        # dialogue before the controller sees the arm file.  Later movement
+        # legs retain their independent two-probe stability and state gates.
+        "YZ_MOVEMENT_PROOF_READY_VISIBLE_PROBES": "1",
         # Two consecutive positive gameplay probes are required.  At the
         # first city return, authored dialogue obscures the minimap on every
         # third 30-second sample; requiring three uninterrupted minimap
@@ -1138,6 +1143,8 @@ def run_gun(args):
         yz["YZ_NR_ISLAND_CENSUS"] = "1"
     if args.nr_island_compiler:
         yz["YZ_NR_ISLAND_COMPILER"] = "1"
+    if args.nr_island_oracle:
+        yz["YZ_NR_ISLAND_ORACLE"] = "1"
     environment.update(yz)
     result = {
         "tag": args.tag,
@@ -1886,6 +1893,8 @@ def run(args):
         yz["YZ_NR_ISLAND_CENSUS"] = "1"
     if args.nr_island_compiler:
         yz["YZ_NR_ISLAND_COMPILER"] = "1"
+    if args.nr_island_oracle:
+        yz["YZ_NR_ISLAND_ORACLE"] = "1"
     environment.update(yz)
 
     result = {
@@ -2592,6 +2601,10 @@ def main():
         help="enable the fixed-memory strict-owner jump-island compiler",
     )
     parser.add_argument(
+        "--nr-island-oracle", action="store_true",
+        help="compare compiler-owned actions with the strict adapter in fixed memory",
+    )
+    parser.add_argument(
         "--nr-graphics-families",
         help="comma-separated active-graphics rollout: draw,clear,transfer,sync,report",
     )
@@ -2691,6 +2704,8 @@ def main():
         parser.error("--nr-island-compiler requires --nr-vertical-full-native")
     if args.nr_island_compiler and args.nr_island_census:
         parser.error("island compiler and census are mutually exclusive")
+    if args.nr_island_oracle and not args.nr_island_compiler:
+        parser.error("island oracle requires --nr-island-compiler")
 
     root = Path(__file__).resolve().parents[3]
     worktree = Path(__file__).resolve().parents[1]

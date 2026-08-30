@@ -9283,6 +9283,7 @@ static void ld_clean_frontier_visual_probe(const surface_t* surface)
     static char route_stop_file[MAX_PATH * 2];
     static char movement_stop_file[MAX_PATH * 2];
     static int akiyama_route;
+    static int prompt_gated_route;
     static u64 probe_delay_ms;
     static u64 probe_interval_ms;
     static u64 next_probe_tick;
@@ -9293,7 +9294,10 @@ static void ld_clean_frontier_visual_probe(const surface_t* surface)
         const char* directory = getenv("YZ_RSX_VALIDATION_DIR");
         const char* delay = getenv("YZ_MOVEMENT_PROOF_DELAY_MS");
         const char* interval = getenv("YZ_MOVEMENT_PROBE_INTERVAL_MS");
+        const char* dialogue_arm = getenv(
+            "YZ_MOVEMENT_PROOF_DIALOGUE_ARM_FILE");
         akiyama_route = g_yz_runtime_config.akiyama_dialogue_route;
+        prompt_gated_route = dialogue_arm && *dialogue_arm;
         const char* stop = getenv("YZ_AKIYAMA_DIALOGUE_CAPTURE_STOP_FILE");
         if ((!stop || !*stop) && akiyama_route)
             stop = getenv("YZ_AKIYAMA_DIALOGUE_STOP_FILE");
@@ -9324,8 +9328,12 @@ static void ld_clean_frontier_visual_probe(const surface_t* surface)
                 (akiyama_route ? 120000ull : 780000ull);
             probe_interval_ms = interval && *interval
                 ? _strtoui64(interval, NULL, 10) : 30000ull;
-            if (probe_interval_ms < (akiyama_route ? 2000ull : 30000ull))
-                probe_interval_ms = akiyama_route ? 2000ull : 30000ull;
+            {
+                const u64 floor_ms =
+                    (akiyama_route || prompt_gated_route) ? 2000ull : 30000ull;
+                if (probe_interval_ms < floor_ms)
+                    probe_interval_ms = floor_ms;
+            }
         }
     }
     if (probe_enabled && !akiyama_route && movement_stop_file[0]) {
@@ -9954,8 +9962,15 @@ void rsx_live_draw_present(u32 buffer_id)
                     ? _strtoui64(delay, NULL, 10) : 780000ull;
                 probe_interval_ms = interval && *interval
                     ? _strtoui64(interval, NULL, 10) : 0ull;
-                if (probe_interval_ms && probe_interval_ms < 30000ull)
-                    probe_interval_ms = 30000ull;
+                /* The extended Akiyama route intentionally requests a
+                 * short-lived 2-second probe cadence while Confirm is still
+                 * active.  Clamping that request to 30 seconds lets a later
+                 * Confirm pulse reopen Hana's dialogue before the harness
+                 * can arm movement.  This capture path is stopped before
+                 * any clean measurement, so retain only a one-second safety
+                 * floor here and honor the route's requested cadence. */
+                if (probe_interval_ms && probe_interval_ms < 1000ull)
+                    probe_interval_ms = 1000ull;
                 probe_configured = 1;
             }
 

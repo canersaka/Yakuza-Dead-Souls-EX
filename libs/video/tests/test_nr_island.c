@@ -237,6 +237,9 @@ static u32 g_index_lo[TEST_INDEX_CAP], g_index_hi[TEST_INDEX_CAP];
 static u32 g_index_ofs[TEST_INDEX_CAP];
 static rsx_nir_op g_scratch_ops[TEST_SCRATCH_OPS];
 static u32 g_scratch_side[TEST_SCRATCH_SIDE];
+static rsx_nir_adapter g_semantic_oracle_adapter;
+static rsx_nir_op g_semantic_oracle_ops[TEST_SCRATCH_OPS];
+static u32 g_semantic_oracle_side[TEST_SCRATCH_SIDE];
 
 static int compiler_bind(lane* l)
 {
@@ -463,6 +466,10 @@ static int test_equivalence_and_replay(void)
 
     lane_init(s);
     CHECK(compiler_bind(s) == 0, "compiler init failed");
+    rsx_nr_island_compiler_set_oracle(
+        &g_ic, &g_semantic_oracle_adapter,
+        g_semantic_oracle_ops, TEST_SCRATCH_OPS,
+        g_semantic_oracle_side, TEST_SCRATCH_SIDE);
     builder bs;
     b_init(&bs, s, 0x1000u);
     build_frame(&bs, &k);
@@ -495,6 +502,12 @@ static int test_equivalence_and_replay(void)
           "replay did not hit templates (hits=%llu)",
           (unsigned long long)g_ic.stats.islands_hit);
     CHECK(g_ic.stats.adaptations_avoided > 0, "no adaptation avoided");
+    CHECK(g_ic.oracle_stats.action_islands_checked > 0,
+          "semantic oracle did not check action islands");
+    CHECK(g_ic.oracle_stats.mismatches == 0,
+          "semantic oracle found %llu mismatch(es), first reason=%u",
+          g_ic.oracle_stats.mismatches,
+          g_ic.oracle_stats.first_reason);
     CHECK(s->log_count == log_before * 2u, "replay action count");
     for (u32 i = 0; i < log_before; ++i)
         CHECK(memcmp(&s->log[i], &s->log[log_before + i],
@@ -944,6 +957,65 @@ static int test_dynamic_classification_table(void)
     return 0;
 }
 
+static void build_simple_draw(builder* b)
+{
+    b_m1(b, 0x1808u, 5u);
+    b_m1(b, 0x1814u, 0x00000003u);
+    b_m1(b, 0x1808u, 0u);
+}
+
+/* A capacity/grammar delegation may consume ordinary state without an
+ * action. The strict adapter intentionally delays that state until its next
+ * action, while the next action may be compiler-owned. Reproduce the live
+ * RT-height divergence and prove the compiler performs one complete catchup
+ * instead of drawing with the backend's stale surface. */
+static int test_delegated_state_catches_up_before_owned_action(void)
+{
+    lane* const s = &g_subject;
+    lane_init(s);
+    CHECK(compiler_bind(s) == 0, "compiler init failed");
+
+    builder first;
+    b_init(&first, s, 0x1000u);
+    build_simple_draw(&first);
+    b_finish(&first);
+    u32 get = 0x1000u;
+    rsx_nr_frame_step_result r = lane_run(s, 1, &get, 1000u);
+    CHECK(r != RSX_NR_FRAME_FATAL && get == s->put,
+          "initial draw did not compile");
+    CHECK(g_ic.stats.islands_compiled != 0u, "draw template missing");
+
+    /* Force only this new state island through the strict owner. The NOP
+     * closes the state-only extent without adding another adapter method. */
+    g_ic.index_live = (g_ic.index_cap / 4u) * 3u;
+    builder state;
+    b_init(&state, s, 0x4000u);
+    b_m1(&state, 0x0204u, 0x00800000u); /* RT clip height = 128 */
+    b_word(&state, 0u);
+    b_finish(&state);
+    get = 0x4000u;
+    r = lane_run(s, 1, &get, 1000u);
+    CHECK(r != RSX_NR_FRAME_FATAL && get == s->put,
+          "delegated state island did not complete");
+    CHECK(g_ic.force_full_state != 0u,
+          "delegated state did not arm backend catchup");
+
+    builder replay;
+    b_init(&replay, s, 0x8000u);
+    build_simple_draw(&replay);
+    b_finish(&replay);
+    get = 0x8000u;
+    r = lane_run(s, 1, &get, 1000u);
+    CHECK(r != RSX_NR_FRAME_FATAL && get == s->put,
+          "owned replay draw did not complete");
+    CHECK(s->backend.st.surface.clip_h == 128u,
+          "owned draw retained stale RT height %u",
+          s->backend.st.surface.clip_h);
+    CHECK(g_ic.force_full_state == 0u,
+          "successful catchup remained armed");
+    return 0;
+}
+
 int main(void)
 {
     struct {
@@ -962,6 +1034,8 @@ int main(void)
         { "entry-const-pointer", test_entry_const_pointer_identity },
         { "inline-transfer", test_inline_transfer_island },
         { "partial-publication", test_partial_publication_waits },
+        { "delegated-state-catchup",
+          test_delegated_state_catches_up_before_owned_action },
     };
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
         if (tests[i].fn()) {

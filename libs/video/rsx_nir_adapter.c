@@ -1393,43 +1393,59 @@ int rsx_nir_adapter_derive_group_op(rsx_nir_adapter* ad, u32 kind, u32 unit,
     switch (kind) {
     case RSX_NIR_OP_SET_SURFACE:
         derive_surface(ad, &op.u.surface);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.surface = op.u.surface;
+            ad->em.pending.surface = op.u.surface;
+        }
         break;
     case RSX_NIR_OP_SET_VIEWPORT:
         derive_viewport(ad, &op.u.viewport);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.viewport = op.u.viewport;
+            ad->em.pending.viewport = op.u.viewport;
+        }
         break;
     case RSX_NIR_OP_SET_SCISSOR:
         derive_scissor(ad, &op.u.scissor);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.scissor = op.u.scissor;
+            ad->em.pending.scissor = op.u.scissor;
+        }
         break;
     case RSX_NIR_OP_SET_RASTER:
         derive_raster(ad, &op.u.raster);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.raster = op.u.raster;
+            ad->em.pending.raster = op.u.raster;
+        }
         break;
     case RSX_NIR_OP_SET_DEPTH_STENCIL:
         derive_depth_stencil(ad, &op.u.depth_stencil);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.depth_stencil = op.u.depth_stencil;
+            ad->em.pending.depth_stencil = op.u.depth_stencil;
+        }
         break;
     case RSX_NIR_OP_SET_BLEND:
         derive_blend(ad, &op.u.blend);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.blend = op.u.blend;
+            ad->em.pending.blend = op.u.blend;
+        }
         break;
     case RSX_NIR_OP_SET_RENDER_CONDITION:
         op.u.render_condition = ad->render_condition;
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.render_condition = op.u.render_condition;
+            ad->em.pending.render_condition = op.u.render_condition;
+        }
         break;
     case RSX_NIR_OP_SET_FRAGMENT_PROGRAM:
         derive_fragment_program(ad, &op.u.fragment_program);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.fragment_program = op.u.fragment_program;
+            ad->em.pending.fragment_program = op.u.fragment_program;
+        }
         break;
     case RSX_NIR_OP_SET_VERTEX_PROGRAM: {
         const rsx_dispatch* rsx = &ad->rsx;
@@ -1462,27 +1478,35 @@ int rsx_nir_adapter_derive_group_op(rsx_nir_adapter* ad, u32 kind, u32 unit,
     }
     case RSX_NIR_OP_SET_VERTEX_BINDINGS:
         derive_vertex_bindings(ad, &op.u.vertex_bindings);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.vertex_bindings = op.u.vertex_bindings;
+            ad->em.pending.vertex_bindings = op.u.vertex_bindings;
+        }
         break;
     case RSX_NIR_OP_SET_INDEX_BINDING:
         derive_index_binding(ad, &op.u.index_binding);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.index_binding = op.u.index_binding;
+            ad->em.pending.index_binding = op.u.index_binding;
+        }
         break;
     case RSX_NIR_OP_SET_TEXTURE:
         if (unit >= RSX_NIR_NUM_TEXTURES)
             return -1;
         derive_texture(ad, unit, &op.u.texture);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.textures[unit] = op.u.texture;
+            ad->em.pending.textures[unit] = op.u.texture;
+        }
         break;
     case RSX_NIR_OP_SET_VERTEX_TEXTURE:
         if (unit >= RSX_NIR_NUM_VERTEX_TEXTURES)
             return -1;
         derive_vertex_texture(ad, unit, &op.u.texture);
-        if (update_shadow)
+        if (update_shadow) {
             ad->em.shadow.vertex_textures[unit] = op.u.texture;
+            ad->em.pending.vertex_textures[unit] = op.u.texture;
+        }
         break;
     default:
         return -1;
