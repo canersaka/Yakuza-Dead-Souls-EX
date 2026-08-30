@@ -148,6 +148,12 @@ struct yz_nr_vertical_lane {
     unsigned long long sum_hash[YZ_NR_VERT_FAMILY_COUNT];
 };
 
+struct yz_nr_island_oracle_storage {
+    rsx_nir_adapter adapter;
+    rsx_nir_op ops[YZ_NR_ISLAND_SCRATCH_OPS];
+    uint32_t side[YZ_NR_ISLAND_SCRATCH_SIDE];
+};
+
 struct yz_nr_vertical_source {
     uint32_t context;
     uint32_t current_min;
@@ -434,6 +440,7 @@ struct yz_nr_vertical_active_state {
     rsx_nr_island_compiler island_compiler;
     bool island_compiler_enabled;
     void* island_compiler_storage;
+    yz_nr_island_oracle_storage* island_oracle_storage;
     volatile LONG island_content_generation;
     rsx_nr_report_scoreboard report_scoreboard;
     rsx_nr_d3d12* d3d12;
@@ -2071,6 +2078,25 @@ static int yz_nr_island_compiler_init_live(void)
         return -1;
     }
     g_active.island_compiler_storage = storage;
+    {
+        const char* const oracle = getenv("YZ_NR_ISLAND_ORACLE");
+        if (oracle && oracle[0] == '1' && oracle[1] == '\0') {
+            g_active.island_oracle_storage =
+                static_cast<yz_nr_island_oracle_storage*>(
+                    calloc(1u, sizeof(yz_nr_island_oracle_storage)));
+            if (!g_active.island_oracle_storage)
+                return -1;
+            rsx_nr_island_compiler_set_oracle(
+                &g_active.island_compiler,
+                &g_active.island_oracle_storage->adapter,
+                g_active.island_oracle_storage->ops,
+                YZ_NR_ISLAND_SCRATCH_OPS,
+                g_active.island_oracle_storage->side,
+                YZ_NR_ISLAND_SCRATCH_SIDE);
+            fprintf(stderr, "[nr-island-oracle armed]\n");
+            fflush(stderr);
+        }
+    }
     InterlockedExchange(&g_active.island_content_generation, 0);
     return 0;
 }
@@ -5994,6 +6020,20 @@ extern "C" void yz_nr_vertical_shutdown(void)
                 s->islands_delegated[RSX_NR_ISLAND_DELEGATE_VALIDATION],
                 s->delegated_steps);
         fflush(stderr);
+        if (g_active.island_oracle_storage) {
+            const rsx_nr_island_oracle_stats* const os =
+                &g_active.island_compiler.oracle_stats;
+            fprintf(stderr,
+                    "[nr-island-oracle checked=%llu mismatches=%llu "
+                    "first-get=%08X first-action=%u first-reason=%u "
+                    "first-method=%05X first-word=%u expected=%08X "
+                    "compiled=%08X]\n",
+                    os->action_islands_checked, os->mismatches,
+                    os->first_get, os->first_action, os->first_reason,
+                    os->first_method, os->first_word,
+                    os->first_expected, os->first_compiled);
+            fflush(stderr);
+        }
         /* Shutdown may race process-lifetime workers by design. Publish a
          * generation change so any already-entered consumer must revalidate;
          * storage is intentionally left to ExitProcess like the renderer. */

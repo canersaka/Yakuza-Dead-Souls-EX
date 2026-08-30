@@ -81,6 +81,18 @@ typedef struct rsx_nr_island_stats {
     unsigned long long ticks_compile;         /* template construction      */
 } rsx_nr_island_stats;
 
+typedef struct rsx_nr_island_oracle_stats {
+    unsigned long long action_islands_checked;
+    unsigned long long mismatches;
+    u32 first_get;
+    u32 first_action;
+    u32 first_reason;
+    u32 first_method;
+    u32 first_word;
+    u32 first_expected;
+    u32 first_compiled;
+} rsx_nr_island_oracle_stats;
+
 typedef struct rsx_nr_island_template rsx_nr_island_template;
 
 typedef struct rsx_nr_island_compiler {
@@ -119,6 +131,9 @@ typedef struct rsx_nr_island_compiler {
      * wrapped owner until its decode state is idle again, keeping refusal
      * atomic at island granularity. */
     u32 delegate_active;
+    u32 delegate_methods_start;
+    u32 delegate_actions_start;
+    u32 force_full_state;
 
     /* optional content-generation fast path: the embedder bumps this when
      * any byte under the primary ring / generated windows may have changed.
@@ -152,6 +167,17 @@ typedef struct rsx_nr_island_compiler {
     u32 batch_pairs[RSX_NR_ISLAND_MAX_BATCHES * 2u];
     u32 batch_indexed;
 
+    /* Optional live-only semantic oracle. Storage is caller-provided and
+     * fixed for the run; the ordinary compiler path pays one null-pointer
+     * branch and performs no allocation, clock read, or I/O. */
+    rsx_nir_adapter* oracle_adapter;
+    rsx_nir_stream oracle_stream;
+    rsx_nir_op* oracle_ops;
+    u32* oracle_side;
+    u32 oracle_op_cap;
+    u32 oracle_side_cap;
+    rsx_nr_island_oracle_stats oracle_stats;
+
     rsx_nr_island_stats stats;
 } rsx_nr_island_compiler;
 
@@ -167,6 +193,11 @@ int rsx_nr_island_compiler_init(
 void rsx_nr_island_compiler_set_clock(
     rsx_nr_island_compiler* ic, rsx_nr_frame_now_ticks_fn now_ticks,
     void* user);
+
+void rsx_nr_island_compiler_set_oracle(
+    rsx_nr_island_compiler* ic, rsx_nir_adapter* oracle_adapter,
+    rsx_nir_op* oracle_ops, u32 oracle_op_cap,
+    u32* oracle_side, u32 oracle_side_cap);
 
 /* Drop every template and any in-flight island state. Safe (and required)
  * at reset, movie-ownership handoff, and shutdown. The wrapped owner and
