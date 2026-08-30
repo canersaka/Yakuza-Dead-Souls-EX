@@ -1337,6 +1337,14 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                              uint32_t buffer_id)
 {
     int result = 0;
+    const unsigned long long methods =
+        g_active.frame_owner.stats.methods +
+        (g_active.island_compiler_enabled
+             ? g_active.island_compiler.stats.methods_owned : 0ull);
+    rsx_live_draw_set_benchmark_invariants(
+        methods,
+        g_active.backend.stats.executed[RSX_NIR_OP_DRAW],
+        yz_benchmark_game_updates(), yz_benchmark_image4_rounds());
     if (g_active.strict_full_native) {
         result = rsx_live_draw_present_shared_full_native(
             texture, format, width, height, buffer_id);

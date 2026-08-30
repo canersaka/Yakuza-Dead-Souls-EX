@@ -92,7 +92,10 @@ def qpc_metrics_ticks(path: Path, start_tick: int, end_tick: int):
     for row in csv.DictReader(data_lines):
         tick = int(row["qpc"])
         if start_tick <= tick <= end_tick:
-            rows.append((int(row["present_id"]), tick))
+            rows.append({
+                key: int(value) for key, value in row.items()
+                if value is not None and value != ""
+            })
     if frequency is None:
         frequency_value = ctypes.c_longlong()
         if not ctypes.windll.kernel32.QueryPerformanceFrequency(
@@ -109,14 +112,79 @@ def qpc_metrics_ticks(path: Path, start_tick: int, end_tick: int):
     }
     if len(rows) < 2:
         return metrics
-    elapsed = (rows[-1][1] - rows[0][1]) / frequency
-    intervals = sorted(
-        (rows[index][1] - rows[index - 1][1]) * 1000.0 / frequency
+    elapsed = (rows[-1]["qpc"] - rows[0]["qpc"]) / frequency
+    chronological = [
+        (rows[index]["qpc"] - rows[index - 1]["qpc"]) * 1000.0 / frequency
         for index in range(1, len(rows))
+    ]
+    intervals = sorted(chronological)
+    second_buckets = []
+    for second in range(max(1, int((end_tick - start_tick) / frequency + 0.999))):
+        bucket_start = start_tick + second * frequency
+        bucket_end = min(end_tick, bucket_start + frequency)
+        bucket_values = [
+            (rows[index]["qpc"] - rows[index - 1]["qpc"]) * 1000.0 / frequency
+            for index in range(1, len(rows))
+            if bucket_start < rows[index]["qpc"] <= bucket_end
+        ]
+        if not bucket_values:
+            continue
+        duration = (bucket_end - bucket_start) / frequency
+        second_buckets.append({
+            "second": second,
+            "frames": len(bucket_values),
+            "fps": round(len(bucket_values) / duration, 3),
+            "median_ms": round(base.percentile(sorted(bucket_values), 0.50), 3),
+            "p95_ms": round(base.percentile(sorted(bucket_values), 0.95), 3),
+        })
+
+    cluster_a = base.percentile(intervals, 0.25)
+    cluster_b = base.percentile(intervals, 0.75)
+    for _ in range(24):
+        first = [v for v in intervals if abs(v - cluster_a) <= abs(v - cluster_b)]
+        second = [v for v in intervals if abs(v - cluster_a) > abs(v - cluster_b)]
+        if not first or not second:
+            break
+        next_a = sum(first) / len(first)
+        next_b = sum(second) / len(second)
+        if abs(next_a - cluster_a) + abs(next_b - cluster_b) < 0.0001:
+            cluster_a, cluster_b = next_a, next_b
+            break
+        cluster_a, cluster_b = next_a, next_b
+    first = [v for v in intervals if abs(v - cluster_a) <= abs(v - cluster_b)]
+    second = [v for v in intervals if abs(v - cluster_a) > abs(v - cluster_b)]
+    overall_mean = sum(intervals) / len(intervals)
+    total_sse = sum((v - overall_mean) ** 2 for v in intervals)
+    split_sse = (
+        sum((v - cluster_a) ** 2 for v in first) +
+        sum((v - cluster_b) ** 2 for v in second)
     )
+    minimum_share = min(len(first), len(second)) / len(intervals)
+    separation = abs(cluster_b - cluster_a) / max(0.001, base.percentile(intervals, 0.50))
+    sse_reduction = 1.0 - split_sse / total_sse if total_sse > 0 else 0.0
+    bimodal = minimum_share >= 0.10 and separation >= 0.15 and sse_reduction >= 0.40
+    medians = [bucket["median_ms"] for bucket in second_buckets]
+    half = len(medians) // 2
+    half_shift = 0.0
+    if half >= 3:
+        first_half = base.percentile(sorted(medians[:half]), 0.50)
+        second_half = base.percentile(sorted(medians[half:]), 0.50)
+        half_shift = abs(first_half - second_half) / max(
+            0.001, base.percentile(intervals, 0.50)
+        )
+    sustained_shift = 0.0
+    if len(medians) >= 6:
+        for index in range(3, len(medians) - 2):
+            before = sum(medians[index - 3:index]) / 3.0
+            after = sum(medians[index:index + 3]) / 3.0
+            sustained_shift = max(
+                sustained_shift,
+                abs(before - after) / max(0.001, base.percentile(intervals, 0.50)),
+            )
+    regime_change = half_shift >= 0.05 or sustained_shift >= 0.08
     metrics.update({
-        "measurement_first_present_id": rows[0][0],
-        "measurement_last_present_id": rows[-1][0],
+        "measurement_first_present_id": rows[0]["present_id"],
+        "measurement_last_present_id": rows[-1]["present_id"],
         "measurement_qpc_seconds": round(elapsed, 6),
         "fps_mean": round((len(rows) - 1) / elapsed, 3),
         "frame_time_ms": {
@@ -126,7 +194,29 @@ def qpc_metrics_ticks(path: Path, start_tick: int, end_tick: int):
             "p99": round(base.percentile(intervals, 0.99), 3),
             "max": round(intervals[-1], 3),
         },
+        "per_second_frame_buckets": second_buckets,
+        "stability": {
+            "bimodal": bimodal,
+            "regime_change": regime_change,
+            "cluster_centers_ms": [round(cluster_a, 3), round(cluster_b, 3)],
+            "minor_cluster_share": round(minimum_share, 4),
+            "cluster_separation": round(separation, 4),
+            "sse_reduction": round(sse_reduction, 4),
+            "half_shift": round(half_shift, 4),
+            "max_sustained_three_second_shift": round(sustained_shift, 4),
+        },
     })
+    invariant_fields = ("methods", "draws", "game_updates", "image4_rounds")
+    if all(field in rows[0] and field in rows[-1] for field in invariant_fields):
+        frame_count = len(rows) - 1
+        metrics["workload_invariants"] = {
+            f"{field}_delta": rows[-1][field] - rows[0][field]
+            for field in invariant_fields
+        }
+        for field in invariant_fields:
+            metrics["workload_invariants"][f"{field}_per_present"] = round(
+                (rows[-1][field] - rows[0][field]) / frame_count, 6
+            )
     return metrics
 
 
@@ -362,6 +452,9 @@ def main():
     parser.add_argument("--warmup-seconds", type=float, default=10.0)
     parser.add_argument("--hold-seconds", type=float, default=32.0)
     parser.add_argument("--timeline", action="store_true")
+    parser.add_argument(
+        "--island-compiler", choices=("on", "off"), default="on"
+    )
     parser.add_argument("--finalize-calibration-from", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -464,9 +557,12 @@ def main():
         "YZ_MOVEMENT_PROBE_INTERVAL_MS": str(args.capture_interval_ms),
         "YZ_RSX_VALIDATION_DIR": str(capture_dir),
         "YZ_NR_VERTICAL": "full-native",
-        "YZ_NR_ISLAND_COMPILER": "1",
         "YZ_FORCE_VISIBLE": "1",
     }
+    if args.island_compiler == "on":
+        yz["YZ_NR_ISLAND_COMPILER"] = "1"
+    if args.measure:
+        yz["YZ_BENCHMARK_INVARIANTS"] = "1"
     if args.timeline:
         yz["YZ_FRAME_DEP_TIMELINE"] = "1"
         # This is the timeline's asynchronous GPU component.  Query data is
@@ -484,6 +580,7 @@ def main():
         "executable_sha256": base.sha256_file(executable),
         "configuration": {name: cache.get(name) for name in base.EXPECTED_CACHE},
         "active_yz": yz,
+        "island_compiler": args.island_compiler,
         "save": {
             "directory": "BLUS30826L01",
             "slot": "01",
@@ -790,10 +887,14 @@ def main():
         result["nr_full_native"] = full_native
         result["nr_vertical_d3d"] = native_d3d
         result["nr_island_compiler"] = island
+        island_gate = (
+            len(island) == 1 and "mismatches=0" in island[0]
+            if args.island_compiler == "on" else len(island) == 0
+        )
         if (len(full_native) != 1 or "fatal=0" not in full_native[0] or
                 len(native_d3d) != 1 or "legacy-groups=0" not in native_d3d[0] or
                 "fallback=0" not in native_d3d[0] or
-                len(island) != 1 or "mismatches=0" not in island[0]):
+                not island_gate):
             raise RuntimeError(
                 "strict-native/island-compiler shutdown gates failed"
             )
@@ -829,7 +930,10 @@ def main():
                 )
         result["status"] = (
             "passed" if process.returncode == 0 and not forced_close and
-            result["measurement_presents"] >= 10 else "rejected"
+            result["measurement_presents"] >= 10 and
+            "workload_invariants" in result and
+            not result["stability"]["bimodal"] and
+            not result["stability"]["regime_change"] else "rejected"
         )
         result_path.write_text(
             json.dumps(result, indent=2) + "\n", encoding="utf-8"

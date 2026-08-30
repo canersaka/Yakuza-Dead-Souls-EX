@@ -40,6 +40,7 @@ typedef struct yz_frame_dep_record {
 } yz_frame_dep_record;
 
 extern volatile long g_yz_frame_dependency_timeline_enabled;
+extern volatile long g_yz_benchmark_invariants_enabled;
 
 int yz_frame_dependency_timeline_init(void);
 void yz_frame_dependency_timeline_shutdown(void);
@@ -77,6 +78,12 @@ void yz_frame_dep_submission(uint32_t reason, uint64_t frame,
                              uint64_t fence);
 void yz_frame_dep_present(uint32_t buffer_id, uint64_t frame,
                           uint32_t present_kind);
+
+/* Low-overhead clean-benchmark counters. They are independent of the semantic
+ * timeline and enabled only by YZ_BENCHMARK_INVARIANTS=1. */
+void yz_benchmark_note_image4_round(void);
+uint64_t yz_benchmark_game_updates(void);
+uint64_t yz_benchmark_image4_rounds(void);
 
 #if defined(YZ_FRAME_DEP_TIMELINE_TEST)
 void yz_frame_dependency_test_reset(uint64_t frequency, int enabled);
