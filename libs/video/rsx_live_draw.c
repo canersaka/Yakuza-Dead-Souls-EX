@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_nr_resident_frame.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/yz_wkl4_cycle_interval.h"
@@ -87,6 +88,8 @@ int rsx_live_draw_present_shared_full_native(
 void rsx_live_draw_set_benchmark_invariants(
     u64 m, u64 d, u64 u, u64 i)
 { (void)m; (void)d; (void)u; (void)i; }
+int rsx_live_draw_get_timeline_state(rsx_live_draw_timeline_state* s)
+{ if (s) *s = (rsx_live_draw_timeline_state){0}; return -1; }
 void rsx_live_draw_native_clear(u32 m) { (void)m; }
 void rsx_live_draw_native_end(void) {}
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
@@ -354,6 +357,12 @@ typedef struct {
     ID3D12Device*              dev;
     ID3D12CommandQueue*        queue;
     ID3D12CommandAllocator*    alloc;
+    ID3D12CommandAllocator*    alloc_ring[RSX_NR_RESIDENT_ALLOCATORS];
+    rsx_nr_resident_frame      resident;
+    int                        resident_frame;
+    u64                        resident_submissions;
+    u64                        resident_allocator_waits;
+    u64                        resident_allocator_wait_ticks;
     ID3D12GraphicsCommandList* list;
     ID3D12Fence*               fence;
     HANDLE                     fence_event;
@@ -835,6 +844,32 @@ static u64 g_ld_recent_draw_total = 0;
  * swap-chain presents: one QPC call and fixed-ring stores, with no allocation,
  * configuration lookup, sorting, or logging in the presentation path.
  */
+typedef enum {
+    LD_FLUSH_PRESENT = 0,
+    LD_FLUSH_GUEST_REFERENCE,
+    LD_FLUSH_VERTEX_RING,
+    LD_FLUSH_VERTEX_CONSTANT_RING,
+    LD_FLUSH_RETIRE_QUEUE,
+    LD_FLUSH_MOVIE,
+    LD_FLUSH_MOVIE_PRESENT,
+    LD_FLUSH_READBACK,
+    LD_FLUSH_PIXEL_CONSTANT_RING,
+    LD_FLUSH_DESCRIPTOR_RING,
+    LD_FLUSH_SHUTDOWN,
+    LD_FLUSH_REASON_COUNT
+} ld_flush_reason;
+
+typedef struct ld_submit_attribution {
+    int enabled;
+    int dumped;
+    u64 qpc_frequency;
+    u64 submissions[LD_FLUSH_REASON_COUNT];
+    u64 cpu_ticks[LD_FLUSH_REASON_COUNT];
+    u64 fence_ticks[LD_FLUSH_REASON_COUNT];
+} ld_submit_attribution;
+
+static ld_submit_attribution g_ld_submit_attribution;
+
 #define LD_PRESENT_RING_CAP 16384u
 typedef struct {
     u64 present_id;
@@ -849,6 +884,18 @@ typedef struct {
     u64 draws;
     u64 game_updates;
     u64 image4_rounds;
+    u64 rsx_thread_kernel_100ns;
+    u64 rsx_thread_user_100ns;
+    u64 fence_submitted;
+    u64 fence_completed;
+    u64 oldest_incomplete_fence;
+    u64 allocator_waits;
+    u64 allocator_wait_ticks;
+    u32 allocator_slot;
+    u32 live_upload_used;
+    u64 live_submit_count[LD_FLUSH_REASON_COUNT];
+    u64 live_submit_cpu_ticks[LD_FLUSH_REASON_COUNT];
+    u64 live_submit_fence_ticks[LD_FLUSH_REASON_COUNT];
 } ld_present_sample;
 static ld_present_sample g_ld_present_ring[LD_PRESENT_RING_CAP];
 static u64 g_ld_present_total = 0;
@@ -857,10 +904,32 @@ static int g_ld_present_dumped = 0;
 static int g_ld_clean_stats_dumped = 0;
 static int g_ld_schedule_diag = 0;
 static int g_ld_benchmark_invariants = 0;
+static int g_ld_slow_frame_attribution = 0;
 static u64 g_ld_benchmark_methods = 0;
 static u64 g_ld_benchmark_draws = 0;
 static u64 g_ld_benchmark_game_updates = 0;
 static u64 g_ld_benchmark_image4_rounds = 0;
+typedef struct {
+    const char* arm_path;
+    const char* ready_path;
+    u64 methods_min;
+    u64 methods_max;
+    u64 draws_min;
+    u64 draws_max;
+    u64 updates_min;
+    u64 updates_max;
+    u64 image4_min;
+    u64 image4_max;
+    u64 previous_methods;
+    u64 previous_draws;
+    u64 previous_updates;
+    u64 previous_image4;
+    u32 required_streak;
+    u32 streak;
+    int armed;
+    int done;
+} ld_workload_gate;
+static ld_workload_gate g_ld_workload_gate;
 #if defined(YZ_PPU_SAMPLE)
 static HANDLE g_ld_present_thread_handle = NULL;
 #endif
@@ -889,6 +958,56 @@ static void ld_present_measure_init(void)
         const char* value = getenv("YZ_BENCHMARK_INVARIANTS");
         g_ld_benchmark_invariants =
             value && value[0] == '1' && value[1] == '\0';
+    }
+    {
+        const char* value = getenv("YZ_NR_SLOW_FRAME_ATTRIBUTION");
+        g_ld_slow_frame_attribution =
+            value && value[0] == '1' && value[1] == '\0';
+    }
+    memset(&g_ld_workload_gate, 0, sizeof(g_ld_workload_gate));
+    g_ld_workload_gate.arm_path =
+        getenv("YZ_BENCHMARK_WORKLOAD_GATE_ARM_FILE");
+    g_ld_workload_gate.ready_path =
+        getenv("YZ_BENCHMARK_WORKLOAD_GATE_READY_FILE");
+    if (g_ld_workload_gate.arm_path && g_ld_workload_gate.ready_path) {
+#define LD_GATE_U64(name, fallback) \
+        do { \
+            const char* const value = getenv(name); \
+            fallback = value ? (u64)_strtoui64(value, NULL, 10) : 0u; \
+        } while (0)
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_METHODS_MIN",
+                    g_ld_workload_gate.methods_min);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_METHODS_MAX",
+                    g_ld_workload_gate.methods_max);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_DRAWS_MIN",
+                    g_ld_workload_gate.draws_min);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_DRAWS_MAX",
+                    g_ld_workload_gate.draws_max);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_UPDATES_MIN",
+                    g_ld_workload_gate.updates_min);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_UPDATES_MAX",
+                    g_ld_workload_gate.updates_max);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_IMAGE4_MIN",
+                    g_ld_workload_gate.image4_min);
+        LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_IMAGE4_MAX",
+                    g_ld_workload_gate.image4_max);
+        {
+            u64 required = 0u;
+            LD_GATE_U64("YZ_BENCHMARK_WORKLOAD_STREAK", required);
+            g_ld_workload_gate.required_streak =
+                required > 0u && required <= UINT32_MAX
+                    ? (u32)required : 8u;
+        }
+#undef LD_GATE_U64
+        if (g_ld_workload_gate.methods_max <
+                g_ld_workload_gate.methods_min ||
+            g_ld_workload_gate.draws_max <
+                g_ld_workload_gate.draws_min ||
+            g_ld_workload_gate.updates_max <
+                g_ld_workload_gate.updates_min ||
+            g_ld_workload_gate.image4_max <
+                g_ld_workload_gate.image4_min)
+            memset(&g_ld_workload_gate, 0, sizeof(g_ld_workload_gate));
     }
     if (QueryPerformanceFrequency(&frequency))
         g_ld_qpc_frequency = frequency.QuadPart;
@@ -925,6 +1044,98 @@ static void ld_present_measure_record(u32 guest_frame)
         sample->draws = g_ld_benchmark_draws;
         sample->game_updates = g_ld_benchmark_game_updates;
         sample->image4_rounds = g_ld_benchmark_image4_rounds;
+    }
+    if (g_ld_workload_gate.ready_path && !g_ld_workload_gate.done) {
+        if (!g_ld_workload_gate.armed &&
+            GetFileAttributesA(g_ld_workload_gate.arm_path) !=
+                INVALID_FILE_ATTRIBUTES) {
+            g_ld_workload_gate.armed = 1;
+            g_ld_workload_gate.previous_methods = g_ld_benchmark_methods;
+            g_ld_workload_gate.previous_draws = g_ld_benchmark_draws;
+            g_ld_workload_gate.previous_updates =
+                g_ld_benchmark_game_updates;
+            g_ld_workload_gate.previous_image4 =
+                g_ld_benchmark_image4_rounds;
+        } else if (g_ld_workload_gate.armed) {
+            const u64 methods = g_ld_benchmark_methods -
+                g_ld_workload_gate.previous_methods;
+            const u64 draws = g_ld_benchmark_draws -
+                g_ld_workload_gate.previous_draws;
+            const u64 updates = g_ld_benchmark_game_updates -
+                g_ld_workload_gate.previous_updates;
+            const u64 image4 = g_ld_benchmark_image4_rounds -
+                g_ld_workload_gate.previous_image4;
+            const int match =
+                methods >= g_ld_workload_gate.methods_min &&
+                methods <= g_ld_workload_gate.methods_max &&
+                draws >= g_ld_workload_gate.draws_min &&
+                draws <= g_ld_workload_gate.draws_max &&
+                updates >= g_ld_workload_gate.updates_min &&
+                updates <= g_ld_workload_gate.updates_max &&
+                image4 >= g_ld_workload_gate.image4_min &&
+                image4 <= g_ld_workload_gate.image4_max;
+            g_ld_workload_gate.streak = match
+                ? g_ld_workload_gate.streak + 1u : 0u;
+            g_ld_workload_gate.previous_methods = g_ld_benchmark_methods;
+            g_ld_workload_gate.previous_draws = g_ld_benchmark_draws;
+            g_ld_workload_gate.previous_updates =
+                g_ld_benchmark_game_updates;
+            g_ld_workload_gate.previous_image4 =
+                g_ld_benchmark_image4_rounds;
+            if (g_ld_workload_gate.streak >=
+                    g_ld_workload_gate.required_streak) {
+                FILE* const ready =
+                    fopen(g_ld_workload_gate.ready_path, "wb");
+                if (ready) {
+                    fprintf(ready,
+                            "methods=%llu draws=%llu updates=%llu "
+                            "image4=%llu streak=%u\n",
+                            (unsigned long long)methods,
+                            (unsigned long long)draws,
+                            (unsigned long long)updates,
+                            (unsigned long long)image4,
+                            g_ld_workload_gate.streak);
+                    fclose(ready);
+                    g_ld_workload_gate.done = 1;
+                }
+            }
+        }
+    }
+    if (g_ld_slow_frame_attribution) {
+        FILETIME creation = {0}, exit = {0}, kernel = {0}, user = {0};
+        ULARGE_INTEGER value;
+        if (GetThreadTimes(GetCurrentThread(), &creation, &exit,
+                           &kernel, &user)) {
+            value.LowPart = kernel.dwLowDateTime;
+            value.HighPart = kernel.dwHighDateTime;
+            sample->rsx_thread_kernel_100ns = value.QuadPart;
+            value.LowPart = user.dwLowDateTime;
+            value.HighPart = user.dwHighDateTime;
+            sample->rsx_thread_user_100ns = value.QuadPart;
+        }
+        sample->fence_submitted = g.fence_value;
+        sample->fence_completed =
+            g.fence ? g.fence->lpVtbl->GetCompletedValue(g.fence) : 0u;
+        sample->allocator_slot = g.resident.allocator_slot;
+        sample->allocator_waits = g.resident_allocator_waits;
+        sample->allocator_wait_ticks = g.resident_allocator_wait_ticks;
+        sample->live_upload_used = g.upload_used;
+        for (u32 i = 0; i < RSX_NR_RESIDENT_ALLOCATORS; ++i) {
+            const u64 fence = g.resident.allocator_fence[i];
+            if (fence > sample->fence_completed &&
+                (!sample->oldest_incomplete_fence ||
+                 fence < sample->oldest_incomplete_fence))
+                sample->oldest_incomplete_fence = fence;
+        }
+        memcpy(sample->live_submit_count,
+               g_ld_submit_attribution.submissions,
+               sizeof(sample->live_submit_count));
+        memcpy(sample->live_submit_cpu_ticks,
+               g_ld_submit_attribution.cpu_ticks,
+               sizeof(sample->live_submit_cpu_ticks));
+        memcpy(sample->live_submit_fence_ticks,
+               g_ld_submit_attribution.fence_ticks,
+               sizeof(sample->live_submit_fence_ticks));
     }
     if (g_ld_schedule_diag) {
         FILETIME creation = {0}, exit = {0}, kernel = {0}, user = {0};
@@ -1024,6 +1235,22 @@ static void ld_present_measure_dump(void)
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
                    "present_thread_user_100ns,present_thread_id\n");
+    } else if (g_ld_slow_frame_attribution) {
+        static const char* const names[LD_FLUSH_REASON_COUNT] = {
+            "present", "guest_reference", "vertex_ring",
+            "vertex_constant_ring", "retire_queue", "movie",
+            "movie_present", "readback", "pixel_constant_ring",
+            "descriptor_ring", "shutdown"
+        };
+        fprintf(f, "present_id,guest_frame,qpc,methods,draws,game_updates,"
+                   "image4_rounds,rsx_thread_kernel_100ns,"
+                   "rsx_thread_user_100ns,fence_submitted,fence_completed,"
+                   "oldest_incomplete_fence,allocator_slot,allocator_waits,"
+                   "allocator_wait_ticks,live_upload_used");
+        for (u32 i = 0; i < LD_FLUSH_REASON_COUNT; ++i)
+            fprintf(f, ",%s_count,%s_cpu_ticks,%s_fence_ticks",
+                    names[i], names[i], names[i]);
+        fputc('\n', f);
     } else if (g_ld_benchmark_invariants) {
         fprintf(f, "present_id,guest_frame,qpc,methods,draws,game_updates,"
                    "image4_rounds\n");
@@ -1048,6 +1275,34 @@ static void ld_present_measure_dump(void)
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
                         sample->present_thread_id);
+            } else if (g_ld_slow_frame_attribution) {
+                fprintf(f,
+                        "%llu,%u,%lld,%llu,%llu,%llu,%llu,%llu,%llu,"
+                        "%llu,%llu,%llu,%u,%llu,%llu,%u",
+                        (unsigned long long)sample->present_id,
+                        sample->guest_frame, sample->qpc,
+                        (unsigned long long)sample->methods,
+                        (unsigned long long)sample->draws,
+                        (unsigned long long)sample->game_updates,
+                        (unsigned long long)sample->image4_rounds,
+                        (unsigned long long)sample->rsx_thread_kernel_100ns,
+                        (unsigned long long)sample->rsx_thread_user_100ns,
+                        (unsigned long long)sample->fence_submitted,
+                        (unsigned long long)sample->fence_completed,
+                        (unsigned long long)sample->oldest_incomplete_fence,
+                        sample->allocator_slot,
+                        (unsigned long long)sample->allocator_waits,
+                        (unsigned long long)sample->allocator_wait_ticks,
+                        sample->live_upload_used);
+                for (u32 i = 0; i < LD_FLUSH_REASON_COUNT; ++i)
+                    fprintf(f, ",%llu,%llu,%llu",
+                            (unsigned long long)
+                                sample->live_submit_count[i],
+                            (unsigned long long)
+                                sample->live_submit_cpu_ticks[i],
+                            (unsigned long long)
+                                sample->live_submit_fence_ticks[i]);
+                fputc('\n', f);
             } else if (g_ld_benchmark_invariants) {
                 fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu\n",
                         (unsigned long long)sample->present_id,
@@ -1347,32 +1602,6 @@ static u64 g_ld_shader_disk_rejects = 0;
  * heartbeat; the orphanage window is therefore visible without turning the
  * log itself into a benchmark cost.
  */
-typedef enum {
-    LD_FLUSH_PRESENT = 0,
-    LD_FLUSH_GUEST_REFERENCE,
-    LD_FLUSH_VERTEX_RING,
-    LD_FLUSH_VERTEX_CONSTANT_RING,
-    LD_FLUSH_RETIRE_QUEUE,
-    LD_FLUSH_MOVIE,
-    LD_FLUSH_MOVIE_PRESENT,
-    LD_FLUSH_READBACK,
-    LD_FLUSH_PIXEL_CONSTANT_RING,
-    LD_FLUSH_DESCRIPTOR_RING,
-    LD_FLUSH_SHUTDOWN,
-    LD_FLUSH_REASON_COUNT
-} ld_flush_reason;
-
-typedef struct ld_submit_attribution {
-    int enabled;
-    int dumped;
-    u64 qpc_frequency;
-    u64 submissions[LD_FLUSH_REASON_COUNT];
-    u64 cpu_ticks[LD_FLUSH_REASON_COUNT];
-    u64 fence_ticks[LD_FLUSH_REASON_COUNT];
-} ld_submit_attribution;
-
-static ld_submit_attribution g_ld_submit_attribution;
-
 #if defined(YZ_PERF_PROFILE)
 typedef enum {
     LD_REJECT_WORLD = 0,
@@ -2046,7 +2275,7 @@ static void ld_shadow_oracle_dump(void);
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
  * -----------------------------------------------------------------------*/
-static void ld_flush(ld_flush_reason reason)
+static void ld_flush_mode(ld_flush_reason reason, int allow_async)
 {
     LARGE_INTEGER attribution_begin = {0};
     LARGE_INTEGER attribution_fence_begin = {0};
@@ -2088,7 +2317,9 @@ static void ld_flush(ld_flush_reason reason)
         return;
     }
     yz_frame_dep_submission((uint32_t)reason, g_ld_frames, v);
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+    const int asynchronous = allow_async && g.resident_frame;
+    if (!asynchronous &&
+        g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
         if (g_ld_submit_attribution.enabled)
             QueryPerformanceCounter(&attribution_fence_begin);
 #if defined(YZ_PERF_PROFILE)
@@ -2137,13 +2368,48 @@ static void ld_flush(ld_flush_reason reason)
      * earlier draw in this command list still references the old one.  The
      * fence above is the first safe point at which those old resources may be
      * released. */
-    for (u32 i = 0; i < g.n_retired_textures; i++)
-        g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
-    g.n_retired_textures = 0;
-    g.alloc->lpVtbl->Reset(g.alloc);
-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    if (!asynchronous) {
+        for (u32 i = 0; i < g.n_retired_textures; i++)
+            g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+        g.n_retired_textures = 0;
+        g.alloc->lpVtbl->Reset(g.alloc);
+        g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+        g.upload_used = 0;
+    } else {
+        /* Resetting a command allocator before its exact submission fence is
+         * complete is illegal. Rotate through a fixed pool and wait only
+         * when the allocator selected for reuse is still GPU-owned. */
+        const u64 reuse_fence =
+            rsx_nr_resident_frame_submit(&g.resident, v);
+        g.alloc = g.alloc_ring[g.resident.allocator_slot];
+        if (reuse_fence &&
+            g.fence->lpVtbl->GetCompletedValue(g.fence) < reuse_fence) {
+            LARGE_INTEGER allocator_wait_begin = {0};
+            if (g_ld_slow_frame_attribution)
+                QueryPerformanceCounter(&allocator_wait_begin);
+            if (SUCCEEDED(g.fence->lpVtbl->SetEventOnCompletion(
+                    g.fence, reuse_fence, g.fence_event))) {
+                WaitForSingleObject(g.fence_event, INFINITE);
+                g.resident_allocator_waits++;
+                if (allocator_wait_begin.QuadPart) {
+                    LARGE_INTEGER allocator_wait_end;
+                    if (QueryPerformanceCounter(&allocator_wait_end) &&
+                        allocator_wait_end.QuadPart >=
+                            allocator_wait_begin.QuadPart)
+                        g.resident_allocator_wait_ticks +=
+                            (u64)(allocator_wait_end.QuadPart -
+                                  allocator_wait_begin.QuadPart);
+                }
+            } else {
+                g.ready = 0;
+                return;
+            }
+        }
+        g.alloc->lpVtbl->Reset(g.alloc);
+        g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+        g.resident_submissions++;
+    }
     g.list_generation++;
-    g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
     g_ld_profile.total.flush_qpc += flush_ticks;
@@ -2161,6 +2427,11 @@ static void ld_flush(ld_flush_reason reason)
                 attribution_fence_ticks;
         }
     }
+}
+
+static void ld_flush(ld_flush_reason reason)
+{
+    ld_flush_mode(reason, 0);
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -7518,10 +7789,17 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     memset(&g_ld_shadow_oracle, 0, sizeof(g_ld_shadow_oracle));
     memset(&g_ld_submit_attribution, 0, sizeof(g_ld_submit_attribution));
     {
+        const char* const resident = getenv("YZ_NR_RESIDENT_FRAME");
+        g.resident_frame = resident && strcmp(resident, "1") == 0;
+        rsx_nr_resident_frame_init(&g.resident, g.resident_frame);
+    }
+    {
         const char* const requested = getenv("YZ_NR_SUBMIT_ATTRIBUTION");
+        const char* const slow = getenv("YZ_NR_SLOW_FRAME_ATTRIBUTION");
         LARGE_INTEGER frequency;
-        g_ld_submit_attribution.enabled = requested &&
-            strcmp(requested, "1") == 0;
+        g_ld_submit_attribution.enabled =
+            (requested && strcmp(requested, "1") == 0) ||
+            (slow && strcmp(slow, "1") == 0);
         if (g_ld_submit_attribution.enabled &&
             QueryPerformanceFrequency(&frequency))
             g_ld_submit_attribution.qpc_frequency = (u64)frequency.QuadPart;
@@ -7695,8 +7973,14 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     ld_open_info_queue();
     D3D12_COMMAND_QUEUE_DESC qd = {0};
     g.dev->lpVtbl->CreateCommandQueue(g.dev, &qd, &IID_ID3D12CommandQueue, (void**)&g.queue);
-    g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                          &IID_ID3D12CommandAllocator, (void**)&g.alloc);
+    const u32 allocator_count = g.resident_frame
+        ? RSX_NR_RESIDENT_ALLOCATORS
+        : 1u;
+    for (u32 i = 0; i < allocator_count; ++i)
+        g.dev->lpVtbl->CreateCommandAllocator(
+            g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void**)&g.alloc_ring[i]);
+    g.alloc = g.alloc_ring[0];
     g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc, NULL,
                                      &IID_ID3D12GraphicsCommandList, (void**)&g.list);
     g.list_generation = 1u;
@@ -8495,7 +8779,8 @@ int rsx_live_draw_resolve_depth_sample(u32 location, u32 offset,
 
 static int ld_present_external_impl(ID3D12Resource* source, u32 format,
                                     u32 width, u32 height, u32 buffer_id,
-                                    int source_on_current_list)
+                                    int source_on_current_list,
+                                    int resident_present)
 {
     if (!g.ready || !source || format != DXGI_FORMAT_R8G8B8A8_UNORM ||
         width != g.width || height != g.height)
@@ -8549,7 +8834,7 @@ static int ld_present_external_impl(ID3D12Resource* source, u32 format,
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
-    ld_flush(LD_FLUSH_PRESENT);
+    ld_flush_mode(LD_FLUSH_PRESENT, resident_present);
     if (!g.ready)
         return -1;
 
@@ -8592,7 +8877,7 @@ int rsx_live_draw_present_external(void* texture, u32 format,
      * chain. Native gameplay takes it once per present, never per draw. */
     AcquireSRWLockExclusive(&g_ld_access_lock);
     result = ld_present_external_impl(
-        (ID3D12Resource*)texture, format, width, height, buffer_id, 0);
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 0, 0);
     ReleaseSRWLockExclusive(&g_ld_access_lock);
     return result;
 }
@@ -8610,7 +8895,7 @@ int rsx_live_draw_present_shared(void* texture, u32 format,
     (void)recording;
     (void)completed;
     const int result = ld_present_external_impl(
-        (ID3D12Resource*)texture, format, width, height, buffer_id, 1);
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 1, 0);
     rsx_live_draw_timeline_release();
     return result;
 }
@@ -8628,9 +8913,29 @@ int rsx_live_draw_present_shared_full_native(
     (void)recording;
     (void)completed;
     const int result = ld_present_external_impl(
-        (ID3D12Resource*)texture, format, width, height, buffer_id, 1);
+        (ID3D12Resource*)texture, format, width, height, buffer_id, 1, 1);
     rsx_live_draw_timeline_release();
     return result;
+}
+
+int rsx_live_draw_get_timeline_state(rsx_live_draw_timeline_state* state)
+{
+    if (!state || !g.ready || !g.fence)
+        return -1;
+    memset(state, 0, sizeof(*state));
+    state->recording_fence = g.fence_value;
+    state->completed_fence = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    state->allocator_slot = g.resident.allocator_slot;
+    state->allocator_waits = g.resident_allocator_waits;
+    state->allocator_wait_ticks = g.resident_allocator_wait_ticks;
+    for (u32 i = 0; i < RSX_NR_RESIDENT_ALLOCATORS; ++i) {
+        const u64 fence = g.resident.allocator_fence[i];
+        if (fence > state->completed_fence &&
+            (!state->oldest_incomplete_fence ||
+             fence < state->oldest_incomplete_fence))
+            state->oldest_incomplete_fence = fence;
+    }
+    return 0;
 }
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
@@ -8745,6 +9050,16 @@ void rsx_live_draw_dump_present_samples(void)
                 (unsigned long long)g_ld_stats.groups_executed,
                 (unsigned long long)g_ld_stats.clears,
                 (unsigned long long)g.fence_value);
+        fflush(stderr);
+    }
+    if (g.resident_frame) {
+        fprintf(stderr,
+                "[resident-frame submissions=%llu allocator-waits=%llu "
+                "allocator-wait-ticks=%llu qpc=%lld]\n",
+                (unsigned long long)g.resident_submissions,
+                (unsigned long long)g.resident_allocator_waits,
+                (unsigned long long)g.resident_allocator_wait_ticks,
+                g_ld_qpc_frequency);
         fflush(stderr);
     }
     ld_present_measure_dump();

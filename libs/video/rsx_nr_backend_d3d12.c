@@ -10,6 +10,7 @@
  * optimization of this same structure.
  */
 #include "rsx_nr_backend_d3d12.h"
+#include "rsx_nr_resident_frame.h"
 
 #include <string.h>
 #include <limits.h>
@@ -357,6 +358,7 @@ struct rsx_nr_d3d12 {
     int list_open;
     int depth_bounds_supported;
     int shared_timeline;
+    int resident_frame;
     int timeline_leased;
     int timeline_fault;
     rsx_nr_d3d12_timeline_acquire_fn timeline_acquire;
@@ -478,7 +480,9 @@ struct rsx_nr_d3d12 {
     int stall_aggregate;
     int submit_attribution;
     int tail_breakdown;
+    int slow_frame_attribution;
     int tail_finalized;
+    int tail_finalizing;
     ID3D12QueryHeap* tail_query_heap;
     ID3D12Resource* tail_query_readback;
     u32 tail_query_count;
@@ -490,6 +494,25 @@ struct rsx_nr_d3d12 {
     u64 tail_bucket_count;
     u64 tail_adaptation_calls;
     u64 tail_adaptation_ticks;
+    u64 tail_host_recording_fence;
+    u64 tail_host_completed_fence;
+    u64 tail_host_oldest_incomplete_fence;
+    u64 tail_host_allocator_waits;
+    u64 tail_host_allocator_wait_ticks;
+    u64 tail_report_natural_submissions;
+    u64 tail_report_early_submissions;
+    u64 tail_reports_published_early;
+    u64 tail_report_early_consumer_hits;
+    u64 tail_last_block_end_qpc;
+    u64 tail_last_block_ticks;
+    u64 tail_last_block_required_fence;
+    u64 tail_last_block_completed_fence;
+    u32 tail_last_block_cause;
+    u32 tail_host_allocator_slot;
+    u32 tail_present_upload_used;
+    u32 tail_present_snapshot_vertex_used;
+    u32 tail_present_descriptor_tables_used;
+    u32 tail_present_retired_texture_count;
     u64 submit_retired_draws;
     u64 submit_retired_batches;
     u32 coherent_vp_options;
@@ -619,7 +642,7 @@ static u64 nrb_submit_now(const rsx_nr_d3d12* b)
     return (u64)now.QuadPart;
 }
 
-static void nrb_submit_finish(
+static u64 nrb_submit_finish(
     rsx_nr_d3d12* b, rsx_nr_d3d12_submit_cause cause, u64 start,
     u32 descriptor_tables, u32 upload_bytes, u64 readback_bytes)
 {
@@ -627,7 +650,7 @@ static void nrb_submit_finish(
     if (!b->submit_attribution || cause >= RSX_NR_D3D12_SUBMIT_CAUSE_COUNT ||
         !start || !QueryPerformanceCounter(&now) ||
         (u64)now.QuadPart < start)
-        return;
+        return 0u;
     rsx_nr_d3d12_submit_cause_stats* const out =
         &b->stats.submit_cause[cause];
     out->submissions++;
@@ -639,6 +662,21 @@ static void nrb_submit_finish(
     out->readback_bytes += readback_bytes;
     b->submit_retired_draws = b->stats.draws;
     b->submit_retired_batches = b->stats.draw_batches;
+    return (u64)now.QuadPart;
+}
+
+static void nrb_tail_note_block(
+    rsx_nr_d3d12* b, rsx_nr_d3d12_submit_cause cause,
+    u64 begin, u64 end, u64 required_fence, u64 completed_fence)
+{
+    if (!b->tail_breakdown || !begin || end < begin ||
+        cause >= RSX_NR_D3D12_SUBMIT_CAUSE_COUNT)
+        return;
+    b->tail_last_block_cause = (u32)cause;
+    b->tail_last_block_end_qpc = end;
+    b->tail_last_block_ticks = end - begin;
+    b->tail_last_block_required_fence = required_fence;
+    b->tail_last_block_completed_fence = completed_fence;
 }
 
 static void nrb_submit_transfer_finish(rsx_nr_d3d12* b, u64 start,
@@ -741,21 +779,29 @@ static int nrb_acquire_shared_list(rsx_nr_d3d12* b)
     }
 
     if (b->shared_generation && generation != b->shared_generation) {
-        /* A generation may change only after the host synchronously retired
-         * the fence promised for the old borrowed list.  Refuse a broker
-         * which resets an allocator while native uploads are still live. */
-        if (completed_fence < b->shared_recording_fence) {
+        /* Synchronous mode preserves the original one-generation contract.
+         * Resident mode may advance the host allocator while native transient
+         * resources from the preceding list are still GPU-owned.  In that
+         * case retain monotonically increasing upload/descriptor cursors and
+         * their lookup tables; recycle them only after the exact recording
+         * fence covering every earlier reference is complete. */
+        const int retired = rsx_nr_resident_frame_can_recycle(
+            b->shared_recording_fence, completed_fence);
+        if (!retired && !b->resident_frame) {
             nrb_release_timeline_lease(b);
             b->timeline_fault = 1;
             return -1;
         }
-        nrb_release_retired_textures(b);
-        b->upload_used = 0;
-        b->snapshot_vertex_used = 0;
-        b->srv_tables_used = 0;
-        b->sampler_tables_used = 0;
-        memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
-        memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
+        if (retired) {
+            nrb_release_retired_textures(b);
+            b->upload_used = 0;
+            b->snapshot_vertex_used = 0;
+            b->srv_tables_used = 0;
+            b->sampler_tables_used = 0;
+            memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
+            memset(b->sampler_table_index, 0,
+                   sizeof(b->sampler_table_index));
+        }
         b->list_open = 0;
         b->stats.shared_timeline_generations++;
     }
@@ -789,7 +835,8 @@ static int nrb_open_list(rsx_nr_d3d12* b)
     memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
     memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
 opened:
-    if (b->tail_breakdown && !b->tail_query_open &&
+    if (b->tail_breakdown && !b->tail_finalizing &&
+        !b->tail_query_open &&
         b->tail_query_count < NRB_TAIL_GPU_INTERVALS) {
         const u32 query = b->tail_query_count * 2u;
         b->list->lpVtbl->EndQuery(
@@ -805,6 +852,13 @@ static void nrb_tail_close_gpu_interval(
 {
     if (!b->tail_breakdown || !b->tail_query_open)
         return;
+    /* Low-overhead slow-frame attribution needs the full queue span of one
+     * presented frame, not a timestamp pair (and Resolve) for every small
+     * report/readback submission.  Keep the first timestamp open across the
+     * ordered shared-timeline submissions and close it only at Present. */
+    if (b->slow_frame_attribution &&
+        cause != RSX_NR_D3D12_SUBMIT_PRESENT)
+        return;
     if (b->tail_query_count >= NRB_TAIL_GPU_INTERVALS) {
         b->stats.tail_gpu_intervals_dropped++;
         b->tail_query_open = 0;
@@ -815,13 +869,14 @@ static void nrb_tail_close_gpu_interval(
     b->list->lpVtbl->EndQuery(
         b->list, b->tail_query_heap,
         D3D12_QUERY_TYPE_TIMESTAMP, query + 1u);
-    b->list->lpVtbl->ResolveQueryData(
-        b->list, b->tail_query_heap,
-        D3D12_QUERY_TYPE_TIMESTAMP, query, 2u,
-        b->tail_query_readback, (u64)slot * 2u * sizeof(u64));
     b->tail_query_cause[slot] = (u8)cause;
     b->tail_query_frame[slot] = (u32)(b->stats.presents + 1u);
     b->tail_query_count++;
+    if (!b->slow_frame_attribution)
+        b->list->lpVtbl->ResolveQueryData(
+            b->list, b->tail_query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP, query, 2u,
+            b->tail_query_readback, (u64)slot * 2u * sizeof(u64));
     b->tail_query_open = 0;
 }
 
@@ -841,6 +896,9 @@ static int nrb_exec_wait(rsx_nr_d3d12* b,
         b->srv_tables_used + b->sampler_tables_used;
     const u32 attributed_upload = b->upload_used;
     const u64 attribution_start = nrb_submit_now(b);
+    const u64 required_fence = b->shared_timeline
+        ? b->shared_recording_fence
+        : b->fence_value + 1u;
     const u64 stall_start = nrb_stall_now(b);
     nrb_tail_close_gpu_interval(b, cause);
     int result = 0;
@@ -878,8 +936,14 @@ static int nrb_exec_wait(rsx_nr_d3d12* b,
     nrb_release_retired_textures(b);
     b->stats.queue_submissions++;
 done:
-    nrb_submit_finish(b, cause, attribution_start, attributed_descriptors,
-                      attributed_upload, readback_bytes);
+    {
+        const u64 attribution_end = nrb_submit_finish(
+            b, cause, attribution_start, attributed_descriptors,
+            attributed_upload, readback_bytes);
+        nrb_tail_note_block(
+            b, cause, attribution_start, attribution_end,
+            required_fence, result == 0 ? required_fence : 0u);
+    }
     nrb_stall_finish(b, stall_start,
                      &b->stats.stall_fence_drain_count,
                      &b->stats.stall_fence_drain_ticks);
@@ -6660,6 +6724,14 @@ static int nrb_transfer_rt_format_ok(const nrb_rt* rt)
                   rt->dxgi == DXGI_FORMAT_B8G8R8A8_UNORM);
 }
 
+/* Capture-proven local Image-4 surfaces.  Hana/earlier routes use
+ * 0x01140000; gun-tutorial-2/save uses 0x00E40000.  Keep this exact
+ * allow-list separate from generic residency. */
+static int nrb_image4_local_surface(u32 offset)
+{
+    return offset == 0x01140000u || offset == 0x00E40000u;
+}
+
 /* Locate the exact full-surface identity used by the capture-observed 1:1
  * transfer. Source selection follows the latest GPU writer. Destination
  * selection also permits an allocated-but-unwritten exact identity because
@@ -7346,7 +7418,8 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             t->src_pitch == 4096u && t->dst_pitch == 4096u;
         const int image4_save = b->image4_gpu_mlaa &&
             b->image4_mlaa_armed && src_rt &&
-            t->src_location == 0u && t->src_offset == 0x01140000u &&
+            t->src_location == 0u &&
+            nrb_image4_local_surface(t->src_offset) &&
             t->dst_location == 1u && t->dst_offset == 0x01772D00u &&
             t->src_format == 3u && t->dst_format == 10u &&
             t->in_w == 1024u && t->in_h == 768u &&
@@ -7402,7 +7475,8 @@ static int nrb_transfer(void* user, const rsx_nir_pipeline* st,
             t->out_w == 1024u && t->out_h == 768u;
         const int image4_restore = b->image4_gpu_mlaa && dst_rt &&
             t->src_location == 1u && t->src_offset == 0x01772D00u &&
-            t->dst_location == 0u && t->dst_offset == 0x01140000u &&
+            t->dst_location == 0u &&
+            nrb_image4_local_surface(t->dst_offset) &&
             t->src_format == 3u && t->dst_format == 10u &&
             t->in_w == 1024u && t->in_h == 768u &&
             t->out_w == 1024u && t->out_h == 768u &&
@@ -7455,9 +7529,12 @@ static void nrb_tail_capture_cumulative(
     out->flush_ticks = b->stats.stall_flush_ticks;
     out->transfer_readback_ticks =
         b->stats.stall_transfer_readback_ticks;
+    out->transfer_readback_count =
+        b->stats.submit_transfer_readback_count;
     out->transfer_readback_bytes =
         b->stats.stall_transfer_readback_bytes;
     out->transfer_upload_ticks = b->stats.stall_transfer_upload_ticks;
+    out->transfer_upload_count = b->stats.submit_transfer_upload_count;
     out->transfer_upload_bytes = b->stats.stall_transfer_upload_bytes;
     out->residency_prepare_ticks = b->stats.stall_residency_prepare_ticks;
     out->residency_stabilize_ticks =
@@ -7475,6 +7552,31 @@ static void nrb_tail_capture_cumulative(
     out->texture_prepare_ticks = b->stats.stall_texture_prepare_ticks;
     out->batch_prepare_ticks = b->stats.stall_batch_prepare_ticks;
     out->command_record_ticks = b->stats.stall_command_record_ticks;
+    out->recording_fence = b->tail_host_recording_fence;
+    out->completed_fence = b->tail_host_completed_fence;
+    out->oldest_incomplete_fence =
+        b->tail_host_oldest_incomplete_fence;
+    out->allocator_waits = b->tail_host_allocator_waits;
+    out->allocator_wait_ticks = b->tail_host_allocator_wait_ticks;
+    out->allocator_slot = b->tail_host_allocator_slot;
+    out->report_natural_submissions =
+        b->tail_report_natural_submissions;
+    out->report_early_submissions = b->tail_report_early_submissions;
+    out->reports_published_early = b->tail_reports_published_early;
+    out->report_early_consumer_hits =
+        b->tail_report_early_consumer_hits;
+    out->last_block_end_qpc = b->tail_last_block_end_qpc;
+    out->last_block_ticks = b->tail_last_block_ticks;
+    out->last_block_required_fence =
+        b->tail_last_block_required_fence;
+    out->last_block_completed_fence =
+        b->tail_last_block_completed_fence;
+    out->last_block_cause = b->tail_last_block_cause;
+    out->upload_used = b->tail_present_upload_used;
+    out->snapshot_vertex_used = b->tail_present_snapshot_vertex_used;
+    out->descriptor_tables_used =
+        b->tail_present_descriptor_tables_used;
+    out->retired_texture_count = b->tail_present_retired_texture_count;
     for (u32 cause = 0; cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT; ++cause) {
         out->submit_count[cause] =
             b->stats.submit_cause[cause].submissions;
@@ -7501,8 +7603,10 @@ static void nrb_tail_record_present(rsx_nr_d3d12* b)
     NRB_TAIL_DELTA(fence_ticks);
     NRB_TAIL_DELTA(flush_ticks);
     NRB_TAIL_DELTA(transfer_readback_ticks);
+    NRB_TAIL_DELTA(transfer_readback_count);
     NRB_TAIL_DELTA(transfer_readback_bytes);
     NRB_TAIL_DELTA(transfer_upload_ticks);
+    NRB_TAIL_DELTA(transfer_upload_count);
     NRB_TAIL_DELTA(transfer_upload_bytes);
     NRB_TAIL_DELTA(residency_prepare_ticks);
     NRB_TAIL_DELTA(residency_stabilize_ticks);
@@ -7517,6 +7621,19 @@ static void nrb_tail_record_present(rsx_nr_d3d12* b)
     NRB_TAIL_DELTA(texture_prepare_ticks);
     NRB_TAIL_DELTA(batch_prepare_ticks);
     NRB_TAIL_DELTA(command_record_ticks);
+    NRB_TAIL_DELTA(allocator_waits);
+    NRB_TAIL_DELTA(allocator_wait_ticks);
+    NRB_TAIL_DELTA(report_natural_submissions);
+    NRB_TAIL_DELTA(report_early_submissions);
+    NRB_TAIL_DELTA(reports_published_early);
+    NRB_TAIL_DELTA(report_early_consumer_hits);
+    if (delta.last_block_end_qpc <= b->tail_previous.end_qpc) {
+        delta.last_block_end_qpc = 0u;
+        delta.last_block_ticks = 0u;
+        delta.last_block_required_fence = 0u;
+        delta.last_block_completed_fence = 0u;
+        delta.last_block_cause = RSX_NR_D3D12_SUBMIT_CAUSE_COUNT;
+    }
     for (u32 cause = 0; cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT; ++cause) {
         delta.submit_count[cause] -=
             b->tail_previous.submit_count[cause];
@@ -7577,6 +7694,10 @@ static int nrb_present(void* user, u32 buffer)
         const u32 attributed_descriptors =
             b->srv_tables_used + b->sampler_tables_used;
         const u32 attributed_upload = b->upload_used;
+        b->tail_present_upload_used = b->upload_used;
+        b->tail_present_snapshot_vertex_used = b->snapshot_vertex_used;
+        b->tail_present_descriptor_tables_used = attributed_descriptors;
+        b->tail_present_retired_texture_count = b->retired_texture_count;
         const u64 attribution_start = nrb_submit_now(b);
         /* The shared presenter retires and resets this borrowed list inside
          * the callback. Close/resolve the asynchronous native GPU interval
@@ -7590,23 +7711,38 @@ static int nrb_present(void* user, u32 buffer)
             nrb_note_present_failure(b, 2u, buffer, scanout);
             return -1;
         }
-        if (b->shared_timeline)
-            nrb_submit_finish(
+        if (b->shared_timeline) {
+            const u64 attribution_end = nrb_submit_finish(
                 b, RSX_NR_D3D12_SUBMIT_PRESENT, attribution_start,
                 attributed_descriptors, attributed_upload, 0u);
+            if (!b->resident_frame)
+                nrb_tail_note_block(
+                    b, RSX_NR_D3D12_SUBMIT_PRESENT,
+                    attribution_start, attribution_end,
+                    b->shared_recording_fence,
+                    b->shared_recording_fence);
+        }
     }
     if (scanout && b->scanout_provenance)
         scanout->present_count++;
     if (b->shared_timeline) {
-        /* The shared presenter appended its copy to this exact list and
-         * synchronously retired/reset the generation. */
+        /* The shared presenter appended its copy to this exact list.  The
+         * default path synchronously retires it and preserves the historical
+         * immediate recycle.  Resident Present returns a fence token instead:
+         * the next acquire performs exact completed-fence revalidation before
+         * releasing textures or rewinding any transient arena. */
         b->list_open = 0;
-        nrb_release_retired_textures(b);
-        b->upload_used = 0;
-        b->srv_tables_used = 0;
-        b->sampler_tables_used = 0;
-        memset(b->srv_table_index, 0, sizeof(b->srv_table_index));
-        memset(b->sampler_table_index, 0, sizeof(b->sampler_table_index));
+        if (!b->resident_frame) {
+            nrb_release_retired_textures(b);
+            b->upload_used = 0;
+            b->snapshot_vertex_used = 0;
+            b->srv_tables_used = 0;
+            b->sampler_tables_used = 0;
+            memset(b->srv_table_index, 0,
+                   sizeof(b->srv_table_index));
+            memset(b->sampler_table_index, 0,
+                   sizeof(b->sampler_table_index));
+        }
     }
     rsx_nr_res_next_frame(&b->textures);
     if ((b->textures.frame & 127u) == 0u)
@@ -7971,12 +8107,20 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
     }
     {
         const char* const tail = getenv("YZ_NR_RSX_TAIL_BREAKDOWN");
-        b->tail_breakdown = tail && strcmp(tail, "1") == 0;
+        const char* const slow =
+            getenv("YZ_NR_SLOW_FRAME_ATTRIBUTION");
+        b->slow_frame_attribution =
+            slow && strcmp(slow, "1") == 0 &&
+            !(tail && strcmp(tail, "1") == 0);
+        b->tail_breakdown =
+            (tail && strcmp(tail, "1") == 0) ||
+            b->slow_frame_attribution;
     }
     {
         const char* const aggregate = getenv("YZ_NR_STALL_AGGREGATE");
         LARGE_INTEGER frequency;
-        b->stall_aggregate = b->tail_breakdown ||
+        b->stall_aggregate =
+            (b->tail_breakdown && !b->slow_frame_attribution) ||
             (aggregate && strcmp(aggregate, "1") == 0);
         if (b->stall_aggregate && QueryPerformanceFrequency(&frequency))
             b->stats.stall_qpc_frequency = (u64)frequency.QuadPart;
@@ -7994,6 +8138,10 @@ rsx_nr_d3d12* rsx_nr_d3d12_create(void* device, u32 local_size, u32 main_size,
                 (u64)frequency.QuadPart;
         else
             b->submit_attribution = 0;
+    }
+    {
+        const char* const resident = getenv("YZ_NR_RESIDENT_FRAME");
+        b->resident_frame = resident && strcmp(resident, "1") == 0;
     }
 
     if (device) {
@@ -8541,9 +8689,28 @@ int rsx_nr_d3d12_finalize_tail_breakdown(rsx_nr_d3d12* b)
         return 0;
     if (b->tail_finalized)
         return 0;
-    if (b->list_open && nrb_exec_wait(
-            b, RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET, 0u) != 0)
+    if (b->slow_frame_attribution && b->tail_query_count) {
+        /* Query values are consumed only here. Resolve the complete fixed
+         * frame-span range once during normal teardown so the measurement
+         * path records no per-frame GPU-to-readback copy commands. */
+        b->tail_finalizing = 1;
+        if (!b->list_open && nrb_open_list(b) != 0) {
+            b->tail_finalizing = 0;
+            return -1;
+        }
+        b->list->lpVtbl->ResolveQueryData(
+            b->list, b->tail_query_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+            0u, b->tail_query_count * 2u, b->tail_query_readback, 0u);
+        if (nrb_exec_wait(
+                b, RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET, 0u) != 0) {
+            b->tail_finalizing = 0;
+            return -1;
+        }
+        b->tail_finalizing = 0;
+    } else if (b->list_open && nrb_exec_wait(
+                   b, RSX_NR_D3D12_SUBMIT_SHUTDOWN_RESET, 0u) != 0) {
         return -1;
+    }
     if (!b->tail_query_count || !b->tail_query_readback) {
         b->tail_finalized = 1;
         return 0;
@@ -8575,6 +8742,10 @@ int rsx_nr_d3d12_finalize_tail_breakdown(rsx_nr_d3d12* b)
                 continue;
             bucket->submit_gpu_ticks[cause] += end - begin;
             bucket->submit_gpu_intervals[cause]++;
+            if (!bucket->gpu_first_tick || begin < bucket->gpu_first_tick)
+                bucket->gpu_first_tick = begin;
+            if (end > bucket->gpu_last_tick)
+                bucket->gpu_last_tick = end;
             break;
         }
     }
@@ -8614,6 +8785,33 @@ void rsx_nr_d3d12_tail_note_adaptation(
         return;
     b->tail_adaptation_calls++;
     b->tail_adaptation_ticks += ticks;
+}
+
+void rsx_nr_d3d12_tail_note_host_state(
+    rsx_nr_d3d12* b, u64 recording_fence, u64 completed_fence,
+    u64 oldest_incomplete_fence, u64 allocator_waits,
+    u64 allocator_wait_ticks, u32 allocator_slot)
+{
+    if (!b || !b->tail_breakdown)
+        return;
+    b->tail_host_recording_fence = recording_fence;
+    b->tail_host_completed_fence = completed_fence;
+    b->tail_host_oldest_incomplete_fence = oldest_incomplete_fence;
+    b->tail_host_allocator_waits = allocator_waits;
+    b->tail_host_allocator_wait_ticks = allocator_wait_ticks;
+    b->tail_host_allocator_slot = allocator_slot;
+}
+
+void rsx_nr_d3d12_tail_note_report_state(
+    rsx_nr_d3d12* b, u64 natural_submissions, u64 early_submissions,
+    u64 reports_published_early, u64 early_consumer_hits)
+{
+    if (!b || !b->tail_breakdown)
+        return;
+    b->tail_report_natural_submissions = natural_submissions;
+    b->tail_report_early_submissions = early_submissions;
+    b->tail_reports_published_early = reports_published_early;
+    b->tail_report_early_consumer_hits = early_consumer_hits;
 }
 
 void rsx_nr_d3d12_destroy(rsx_nr_d3d12* b)
@@ -8982,6 +9180,15 @@ int rsx_nr_d3d12_get_tail_bucket(
 void rsx_nr_d3d12_tail_note_adaptation(
     rsx_nr_d3d12* b, unsigned long long ticks)
 { (void)b; (void)ticks; }
+void rsx_nr_d3d12_tail_note_host_state(
+    rsx_nr_d3d12* b, unsigned long long r, unsigned long long c,
+    unsigned long long o, unsigned long long w,
+    unsigned long long t, unsigned int s)
+{ (void)b; (void)r; (void)c; (void)o; (void)w; (void)t; (void)s; }
+void rsx_nr_d3d12_tail_note_report_state(
+    rsx_nr_d3d12* b, unsigned long long n, unsigned long long e,
+    unsigned long long p, unsigned long long h)
+{ (void)b; (void)n; (void)e; (void)p; (void)h; }
 rsx_guest_pages* rsx_nr_d3d12_pages(rsx_nr_d3d12* b) { (void)b; return 0; }
 int rsx_nr_d3d12_set_content_cache(
     rsx_nr_d3d12* b, rsx_nr_d3d12_compile_shader_fn c,

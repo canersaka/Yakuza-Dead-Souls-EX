@@ -650,6 +650,18 @@ if(PS3RECOMP_BUILD_TESTS)
             PROPERTIES TIMEOUT 30 LABELS "regression;renderer;native-render"
         )
 
+        add_executable(rsx_nr_resident_frame_tests
+            libs/video/tests/test_nr_resident_frame.c
+            libs/video/rsx_nr_resident_frame.c
+        )
+        target_include_directories(rsx_nr_resident_frame_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        add_test(NAME rsx_nr_resident_frame
+                 COMMAND rsx_nr_resident_frame_tests)
+        set_tests_properties(rsx_nr_resident_frame PROPERTIES
+            TIMEOUT 30 LABELS "regression;renderer;native-render")
+
         add_executable(rsx_nr_residency_tests
             libs/video/tests/test_nr_residency.c
             libs/video/rsx_nr_residency.c
@@ -763,6 +775,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/video/rsx_nr_ring.c
             libs/video/rsx_nr_backend.c
             libs/video/rsx_nr_backend_d3d12.c
+            libs/video/rsx_nr_resident_frame.c
             libs/video/rsx_nr_resources.c
             libs/video/rsx_guest_pages.c
             libs/video/rsx_gpu_mirror.c

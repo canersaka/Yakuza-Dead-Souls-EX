@@ -458,6 +458,7 @@ struct yz_nr_vertical_active_state {
     uint32_t graph_islands;
     uint32_t single_pass_graph;
     uint32_t strict_full_native;
+    uint32_t slow_frame_attribution;
     uint32_t movie_suppressed;
     uint32_t movie_snapshot_valid;
     rsx_nir_adapter movie_render_snapshot;
@@ -843,6 +844,38 @@ static bool yz_nr_residency_audit_restore(
     return t && t->kind == RSX_NIR_XFER_SCALED &&
         t->src_location == 1u && t->src_offset == 0x01772D00u &&
         t->dst_location == 0u && t->dst_offset == 0x01140000u &&
+        t->src_pitch == 4096u && t->dst_pitch == 4096u &&
+        t->src_format == 3u && t->dst_format == 10u &&
+        t->in_w == 1024u && t->in_h == 768u &&
+        t->out_w == 1024u && t->out_h == 768u &&
+        t->clip_w == 1024u && t->clip_h == 768u &&
+        t->ds_dx == 0x00100000u && t->dt_dy == 0x00100000u;
+}
+
+/* Exact Image-4 producer identities observed in accepted captures.  The
+ * original 0x01140000 surface is used by Hana/earlier routes; the saved
+ * second gun tutorial uses the otherwise identical 0x00E40000 surface.
+ * This allow-list deliberately does not broaden generic native residency. */
+static bool yz_nr_image4_transfer_save(const rsx_nir_transfer* t)
+{
+    return t && t->kind == RSX_NIR_XFER_SCALED &&
+        t->src_location == 0u &&
+        (t->src_offset == 0x01140000u || t->src_offset == 0x00E40000u) &&
+        t->dst_location == 1u && t->dst_offset == 0x01772D00u &&
+        t->src_pitch == 4096u && t->dst_pitch == 4096u &&
+        t->src_format == 3u && t->dst_format == 10u &&
+        t->in_w == 1024u && t->in_h == 768u &&
+        t->out_w == 1024u && t->out_h == 768u &&
+        t->clip_w == 1024u && t->clip_h == 768u &&
+        t->ds_dx == 0x00100000u && t->dt_dy == 0x00100000u;
+}
+
+static bool yz_nr_image4_transfer_restore(const rsx_nir_transfer* t)
+{
+    return t && t->kind == RSX_NIR_XFER_SCALED &&
+        t->src_location == 1u && t->src_offset == 0x01772D00u &&
+        t->dst_location == 0u &&
+        (t->dst_offset == 0x01140000u || t->dst_offset == 0x00E40000u) &&
         t->src_pitch == 4096u && t->dst_pitch == 4096u &&
         t->src_format == 3u && t->dst_format == 10u &&
         t->in_w == 1024u && t->in_h == 768u &&
@@ -1372,6 +1405,23 @@ static int yz_nr_d3d_present(void*, void* texture, uint32_t format,
                 &g_active.report_scoreboard, completed, completed, 1);
         }
     }
+    if (!result && g_active.slow_frame_attribution && g_active.d3d12) {
+        rsx_live_draw_timeline_state host = {};
+        if (rsx_live_draw_get_timeline_state(&host) == 0)
+            rsx_nr_d3d12_tail_note_host_state(
+                g_active.d3d12, host.recording_fence,
+                host.completed_fence, host.oldest_incomplete_fence,
+                host.allocator_waits, host.allocator_wait_ticks,
+                host.allocator_slot);
+        rsx_nr_report_scoreboard_stats reports = {};
+        rsx_nr_report_scoreboard_get_stats(
+            &g_active.report_scoreboard, &reports);
+        rsx_nr_d3d12_tail_note_report_state(
+            g_active.d3d12, reports.natural_submissions,
+            reports.early_submissions,
+            reports.reports_published_early,
+            reports.early_consumer_hits);
+    }
     return result;
 }
 
@@ -1839,8 +1889,11 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
         InterlockedExchange(&g_active.renderer_owner, 1) == 0 &&
         !InterlockedCompareExchange(&g_active.shared_timeline, 0, 0))
         rsx_live_draw_flush();
-    if (g_active.image4_gpu_mlaa_enabled &&
-        yz_nr_residency_audit_save(transfer)) {
+    const bool image4_save = g_active.image4_gpu_mlaa_enabled &&
+        yz_nr_image4_transfer_save(transfer);
+    const bool image4_restore = g_active.image4_gpu_mlaa_enabled &&
+        yz_nr_image4_transfer_restore(transfer);
+    if (image4_save) {
         const bool prepared = yz_nr_image4_prepared_producer_contract();
         if (prepared)
             g_active.image4_admission_armed++;
@@ -1854,7 +1907,8 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
     int result = g_active.gpu_ops.transfer
         ? g_active.gpu_ops.transfer(g_active.gpu_ops.user, st, transfer,
                                     words) : -1;
-    if (!result && yz_nr_residency_audit_restore(transfer)) {
+    if (!result &&
+        (yz_nr_residency_audit_restore(transfer) || image4_restore)) {
         yz_nr_residency_audit_disarm();
         if (yz_nr_residency_route_enabled()) {
             const uint32_t generation = static_cast<uint32_t>(ReadAcquire(
@@ -1866,7 +1920,8 @@ static int yz_nr_gpu_transfer(void*, const rsx_nir_pipeline* st,
             if (generation)
                 vm_native_residency_clear_watches();
         }
-    } else if (!result && yz_nr_residency_audit_save(transfer)) {
+    } else if (!result &&
+               (yz_nr_residency_audit_save(transfer) || image4_save)) {
         yz_nr_residency_audit_arm();
         if (yz_nr_residency_route_enabled()) {
             uint32_t generation = 0u;
@@ -2421,6 +2476,11 @@ static int yz_nr_active_init(int graphics)
     }
     {
         const char* const tail = getenv("YZ_NR_RSX_TAIL_BREAKDOWN");
+        const char* const slow =
+            getenv("YZ_NR_SLOW_FRAME_ATTRIBUTION");
+        g_active.slow_frame_attribution =
+            (tail && tail[0] == '1' && tail[1] == '\0') ||
+            (slow && slow[0] == '1' && slow[1] == '\0');
         if (tail && tail[0] == '1' && tail[1] == '\0') {
             LARGE_INTEGER frequency = {};
             if (QueryPerformanceFrequency(&frequency))
@@ -7117,9 +7177,13 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.submit_transfer_upload_bytes,
                         d3d_stats.submit_transfer_upload_ticks);
             }
-            if (d3d_stats.stall_qpc_frequency) {
+            if (d3d_stats.stall_qpc_frequency ||
+                (g_active.slow_frame_attribution &&
+                 d3d_stats.submit_attribution_qpc_frequency)) {
                 const unsigned long long frequency =
-                    d3d_stats.stall_qpc_frequency;
+                    d3d_stats.stall_qpc_frequency
+                        ? d3d_stats.stall_qpc_frequency
+                        : d3d_stats.submit_attribution_qpc_frequency;
                 const auto to_us = [frequency](unsigned long long ticks) {
                     return ticks <= ULLONG_MAX / 1000000ull
                         ? ticks * 1000000ull / frequency
@@ -7219,12 +7283,16 @@ extern "C" void yz_nr_vertical_shutdown(void)
                         d3d_stats.mirror_resyncs,
                         d3d_stats.mirror_rollovers,
                         d3d_stats.mirror_exact_patch_retries);
-                if (g_active.frame_owner.tail_tick_frequency) {
+                const unsigned long long tail_qpc_frequency =
+                    g_active.frame_owner.tail_tick_frequency
+                        ? g_active.frame_owner.tail_tick_frequency
+                        : d3d_stats.submit_attribution_qpc_frequency;
+                if (tail_qpc_frequency) {
                     fprintf(stderr,
                             "[nr-rsx-tail qpc=%llu adaptation=%llu/%llu "
                             "gpu-frequency=%llu gpu-recorded=%llu "
                             "gpu-dropped=%llu]\n",
-                            g_active.frame_owner.tail_tick_frequency,
+                            tail_qpc_frequency,
                             g_active.frame_owner.stats.adaptation_calls,
                             g_active.frame_owner.stats.adaptation_ticks,
                             d3d_stats.tail_gpu_frequency,
@@ -7250,20 +7318,28 @@ extern "C" void yz_nr_vertical_shutdown(void)
                                 "[nr-rsx-tail-frame qpc=%llu gpu-frequency=%llu "
                                 "present=%llu end=%llu adaptation=%llu/%llu "
                                 "draws=%llu "
-                                "fence=%llu flush=%llu readback=%llu/%llu "
-                                "upload=%llu/%llu residency=%llu/%llu "
+                                "fence=%llu flush=%llu "
+                                "readback=%llu/%llu/%llu "
+                                "upload=%llu/%llu/%llu "
+                                "residency=%llu/%llu "
                                 "preflight=%llu draw=%llu fp=%llu "
                                 "pso=%llu/%llu/%llu/%llu/%llu "
-                                "texture=%llu batch=%llu record=%llu]\n",
-                                g_active.frame_owner.tail_tick_frequency,
+                                "texture=%llu batch=%llu record=%llu "
+                                "queue=%llu/%llu/%llu allocator=%u/%llu/%llu "
+                                "arena=%u/%u/%u/%u reports=%llu/%llu/%llu/%llu "
+                                "last-block=%u/%llu/%llu/%llu/%llu "
+                                "gpu-span=%llu/%llu]\n",
+                                tail_qpc_frequency,
                                 d3d_stats.tail_gpu_frequency,
                                 bucket.present_sequence, bucket.end_qpc,
                                 bucket.adaptation_calls,
                                 bucket.adaptation_ticks, bucket.draws,
                                 bucket.fence_ticks,
                                 bucket.flush_ticks,
+                                bucket.transfer_readback_count,
                                 bucket.transfer_readback_ticks,
                                 bucket.transfer_readback_bytes,
+                                bucket.transfer_upload_count,
                                 bucket.transfer_upload_ticks,
                                 bucket.transfer_upload_bytes,
                                 bucket.residency_prepare_ticks,
@@ -7277,7 +7353,28 @@ extern "C" void yz_nr_vertical_shutdown(void)
                                 bucket.driver_pso_ticks,
                                 bucket.texture_prepare_ticks,
                                 bucket.batch_prepare_ticks,
-                                bucket.command_record_ticks);
+                                bucket.command_record_ticks,
+                                bucket.recording_fence,
+                                bucket.completed_fence,
+                                bucket.oldest_incomplete_fence,
+                                bucket.allocator_slot,
+                                bucket.allocator_waits,
+                                bucket.allocator_wait_ticks,
+                                bucket.upload_used,
+                                bucket.snapshot_vertex_used,
+                                bucket.descriptor_tables_used,
+                                bucket.retired_texture_count,
+                                bucket.report_natural_submissions,
+                                bucket.report_early_submissions,
+                                bucket.reports_published_early,
+                                bucket.report_early_consumer_hits,
+                                bucket.last_block_cause,
+                                bucket.last_block_end_qpc,
+                                bucket.last_block_ticks,
+                                bucket.last_block_required_fence,
+                                bucket.last_block_completed_fence,
+                                bucket.gpu_first_tick,
+                                bucket.gpu_last_tick);
                         for (uint32_t cause = 0;
                              cause < RSX_NR_D3D12_SUBMIT_CAUSE_COUNT;
                              ++cause) {

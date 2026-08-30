@@ -2810,6 +2810,7 @@ static void test_submit_attribution_gate(void)
 
     _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "");
     _putenv_s("YZ_NR_RSX_TAIL_BREAKDOWN", "");
+    _putenv_s("YZ_NR_SLOW_FRAME_ATTRIBUTION", "");
     rsx_nr_d3d12* sink = rsx_nr_d3d12_create(
         NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
     CHECK(sink != NULL, "default-off attribution sink creation failed");
@@ -2871,6 +2872,52 @@ static void test_submit_attribution_gate(void)
         rsx_nr_d3d12_destroy(sink);
     }
     _putenv_s("YZ_NR_RSX_TAIL_BREAKDOWN", "");
+
+    _putenv_s("YZ_NR_SLOW_FRAME_ATTRIBUTION", "1");
+    sink = rsx_nr_d3d12_create(
+        NULL, LOCAL_SIZE, MAIN_SIZE, arena_ptr, arena_wptr, NULL);
+    CHECK(sink != NULL, "slow-frame attribution sink creation failed");
+    if (sink) {
+        rsx_nr_exec_ops ops;
+        rsx_nr_d3d12_stats stats;
+        memset(&ops, 0, sizeof(ops));
+        rsx_nr_d3d12_get_exec_ops(sink, &ops);
+        CHECK(ops.clear(ops.user, &state, &clear) == 0,
+              "slow-frame attribution clear failed");
+        ops.flush_reason(ops.user, RSX_NR_FLUSH_REFERENCE);
+        CHECK(ops.clear(ops.user, &state, &clear) == 0,
+              "slow-frame attribution post-flush clear failed");
+        rsx_nr_d3d12_tail_note_host_state(
+            sink, 9u, 7u, 8u, 3u, 101u, 2u);
+        rsx_nr_d3d12_tail_note_report_state(
+            sink, 4u, 2u, 2u, 2u);
+        CHECK(ops.present(ops.user, 0u) == 0,
+              "slow-frame attribution present failed");
+        CHECK(rsx_nr_d3d12_finalize_tail_breakdown(sink) == 0,
+              "slow-frame attribution resolve failed");
+        rsx_nr_d3d12_get_stats(sink, &stats);
+        rsx_nr_d3d12_tail_bucket bucket;
+        memset(&bucket, 0, sizeof(bucket));
+        CHECK(stats.submit_attribution_qpc_frequency != 0u &&
+                  stats.stall_qpc_frequency == 0u &&
+                  stats.tail_gpu_intervals_recorded == 1u &&
+                  rsx_nr_d3d12_tail_bucket_count(sink) == 1u &&
+                  rsx_nr_d3d12_get_tail_bucket(sink, 0u, &bucket) == 0 &&
+                  bucket.submit_count[
+                      RSX_NR_D3D12_SUBMIT_REFERENCE_PUBLICATION] == 1u &&
+                  bucket.recording_fence == 9u &&
+                  bucket.completed_fence == 7u &&
+                  bucket.oldest_incomplete_fence == 8u &&
+                  bucket.allocator_waits == 3u &&
+                  bucket.report_early_submissions == 2u &&
+                  bucket.report_early_consumer_hits == 2u,
+              "slow-frame gate submit-qpc=%llu stall-qpc=%llu gpu=%llu",
+              stats.submit_attribution_qpc_frequency,
+              stats.stall_qpc_frequency,
+              stats.tail_gpu_intervals_recorded);
+        rsx_nr_d3d12_destroy(sink);
+    }
+    _putenv_s("YZ_NR_SLOW_FRAME_ATTRIBUTION", "");
 
     _putenv_s("YZ_NR_SUBMIT_ATTRIBUTION", "1");
     sink = rsx_nr_d3d12_create(
@@ -3268,10 +3315,9 @@ static u8* image4_arena_wptr(
     return (u8*)image4_arena_ptr(user, space, offset, min_bytes);
 }
 
-static void test_image4_gpu_mlaa_path(void)
+static void test_image4_gpu_mlaa_path(u32 image4_local)
 {
     enum {
-        IMAGE4_LOCAL = 0x01140000u,
         IMAGE4_MAIN = 0x01772D00u,
         IMAGE4_W = 1024u,
         IMAGE4_H = 768u,
@@ -3326,7 +3372,7 @@ static void test_image4_gpu_mlaa_path(void)
     surface.raster_type = 1u;
     surface.clip_w = IMAGE4_W;
     surface.clip_h = IMAGE4_H;
-    surface.color_offset[0] = IMAGE4_LOCAL;
+    surface.color_offset[0] = image4_local;
     surface.color_pitch[0] = IMAGE4_PITCH;
     surface.color_location[0] = RSX_NIR_LOCATION_LOCAL;
     surface.color_target = 1u;
@@ -3365,7 +3411,7 @@ static void test_image4_gpu_mlaa_path(void)
     transfer.src_pitch = IMAGE4_PITCH;
     transfer.src_format = 3u;
     transfer.dst_location = RSX_NIR_LOCATION_LOCAL;
-    transfer.dst_offset = IMAGE4_LOCAL;
+    transfer.dst_offset = image4_local;
     transfer.dst_pitch = IMAGE4_PITCH;
     transfer.dst_format = 10u;
     transfer.in_w = transfer.out_w = transfer.clip_w = IMAGE4_W;
@@ -3379,7 +3425,7 @@ static void test_image4_gpu_mlaa_path(void)
     rsx_nr_d3d12_stats before, after;
     rsx_nr_d3d12_get_stats(sink, &before);
     transfer.src_location = RSX_NIR_LOCATION_LOCAL;
-    transfer.src_offset = IMAGE4_LOCAL;
+    transfer.src_offset = image4_local;
     transfer.dst_location = RSX_NIR_LOCATION_MAIN;
     transfer.dst_offset = IMAGE4_MAIN;
     CHECK(rsx_nr_d3d12_arm_image4_gpu_mlaa(sink, 1) == 0,
@@ -3401,7 +3447,7 @@ static void test_image4_gpu_mlaa_path(void)
     transfer.src_location = RSX_NIR_LOCATION_MAIN;
     transfer.src_offset = IMAGE4_MAIN;
     transfer.dst_location = RSX_NIR_LOCATION_LOCAL;
-    transfer.dst_offset = IMAGE4_LOCAL;
+    transfer.dst_offset = image4_local;
     rsx_nir_em_transfer(&emitter, &transfer, NULL);
     rsx_nr_backend_run(&backend, 0u);
     fprintf(stderr, "[image4-test] restore-consumed\n");
@@ -3432,7 +3478,7 @@ static void test_image4_gpu_mlaa_path(void)
     u8* pixels = (u8*)malloc(IMAGE4_BYTES);
     CHECK(pixels != NULL, "image4 output allocation failed");
     if (pixels && rsx_nr_d3d12_read_rt(
-            sink, RSX_NIR_LOCATION_LOCAL, IMAGE4_LOCAL,
+            sink, RSX_NIR_LOCATION_LOCAL, image4_local,
             IMAGE4_W, IMAGE4_H, pixels) == 0) {
         const u8* left = pixels + ((size_t)384u * IMAGE4_W + 100u) * 4u;
         const u8* edge_l = pixels +
@@ -3462,7 +3508,8 @@ int main(int argc, char** argv)
 {
     const char* const image4_only = getenv("YZ_NR_IMAGE4_ONLY");
     if (image4_only && image4_only[0] == '1' && image4_only[1] == '\0') {
-        test_image4_gpu_mlaa_path();
+        test_image4_gpu_mlaa_path(0x01140000u);
+        test_image4_gpu_mlaa_path(0x00E40000u);
         if (g_failures)
             return 1;
         printf("rsx_nr_backend_d3d12 image4: PASS\n");
@@ -5158,7 +5205,8 @@ int main(int argc, char** argv)
     rsx_nr_ring_destroy(&ring);
     rsx_nr_d3d12_destroy(sink);
 
-    test_image4_gpu_mlaa_path();
+    test_image4_gpu_mlaa_path(0x01140000u);
+    test_image4_gpu_mlaa_path(0x00E40000u);
     test_submit_attribution_gate();
     test_broker_actual_color_format();
     test_shared_timeline();
