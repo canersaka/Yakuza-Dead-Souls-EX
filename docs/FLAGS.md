@@ -1,15 +1,15 @@
-# FLAGS.md â€” registry of `YZ_*` environment flags
+# FLAGS.md — registry of `YZ_*` environment flags
 
-Rule: every flag added to the runtime/runner gets a row here â€” purpose,
+Rule: every flag added to the runtime/runner gets a row here — purpose,
 default, category, and (for band-aids) the retirement condition. Update this file in the same
 change that adds/retires a flag. Categories:
 
-- **load-bearing** â€” default behavior depends on it; removing it changes the default boot.
-- **kill-switch** â€” turns OFF a committed fix, for A/B verification. Default: fix ON.
-- **lever** â€” opt-in experiment/force for diagnosis. Default OFF. Never load-bearing.
-- **config** â€” address/size overrides for the memory map. Stable.
-- **diag** â€” logging/tracing/watch probes. Default OFF, must be side-effect-free when unset.
-- **RETIRED/refuted** â€” kept only until deleted; do not re-enable (see archive ledgers).
+- **load-bearing** — default behavior depends on it; removing it changes the default boot.
+- **kill-switch** — turns OFF a committed fix, for A/B verification. Default: fix ON.
+- **lever** — opt-in experiment/force for diagnosis. Default OFF. Never load-bearing.
+- **config** — address/size overrides for the memory map. Stable.
+- **diag** — logging/tracing/watch probes. Default OFF, must be side-effect-free when unset.
+- **RETIRED/refuted** — kept only until deleted; do not re-enable (see archive ledgers).
 
 Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 
@@ -18,24 +18,24 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | Flag | Where | Meaning |
 |---|---|---|
 | `YZ_FLOWCTL` | yakuza/main.cpp ~1788 | **RETIRED AGAIN 2026-07-02 (default OFF; this flag opts back IN for A/B).** The race the lever covered is root-caused: OUR deferred-release applier raced Sony's real journal consumer (see `YZ_APPLY_REL`). With both off, 12/12 boots show zero type-1 wedges (state-classified, not lucky-window: 2 slow-but-healthy under compile load; 1 instance of the separate pre-existing late audio race). Evidence scratch/{bad1,cfgA*,cfgB*,val*}.err. Delete with `YZ_APPLY_REL` after a quiet stretch of boots. |
-| `YZ_APPLY_REL` | import_overrides.cpp ~1216 | **RETIRED 2026-07-02 (default OFF; opts the old deferred-release applier back IN for A/B).** The applier (f8d0386) was correct scaffolding while the real consumer couldn't run; post il/SPU_RET/backoff, gs_task does the whole journal job itself (measured [gs-put]: patch PUTs pc 0xB60C, FENCED release PUTs pc 0x5F00; GET never met an unpatched stopper in 12 applier-off boots). Leaving it on RACES Sony's consumer â€” releases land without the preceding patches: 3/3 applier-on boots wedged t1 at ~+6 s, 0/12 off. Default = faithful memwatch spin at stoppers. Delete with `YZ_FLOWCTL` after a quiet stretch of boots. |
-| `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~951 | Kill-switch for the throttle nudge â€” lives INSIDE the (now opt-in) yz_flip_advance thread, so it's inert unless `YZ_FLOWCTL=1`. Retires with the band-aid code. |
-| `YZ_NO_APPLY_REL` | (gone) | **Flag retired 2026-07-02** â€” the applier it disabled is now default-OFF; the polarity inverted into `YZ_APPLY_REL` (see above). |
-| `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** â€” when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED and now MOOT (2026-07-02 late): reachable only via the retired `YZ_APPLY_REL` path, and the real consumer (gs_task) both applies and retires the journal itself â€” delete with the applier. Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries â€” it re-reads its own entries). |
+| `YZ_APPLY_REL` | import_overrides.cpp ~1216 | **RETIRED 2026-07-02 (default OFF; opts the old deferred-release applier back IN for A/B).** The applier (f8d0386) was correct scaffolding while the real consumer couldn't run; post il/SPU_RET/backoff, gs_task does the whole journal job itself (measured [gs-put]: patch PUTs pc 0xB60C, FENCED release PUTs pc 0x5F00; GET never met an unpatched stopper in 12 applier-off boots). Leaving it on RACES Sony's consumer — releases land without the preceding patches: 3/3 applier-on boots wedged t1 at ~+6 s, 0/12 off. Default = faithful memwatch spin at stoppers. Delete with `YZ_FLOWCTL` after a quiet stretch of boots. |
+| `YZ_NO_THR_NUDGE` | yakuza/main.cpp ~951 | Kill-switch for the throttle nudge — lives INSIDE the (now opt-in) yz_flip_advance thread, so it's inert unless `YZ_FLOWCTL=1`. Retires with the band-aid code. |
+| `YZ_NO_APPLY_REL` | (gone) | **Flag retired 2026-07-02** — the applier it disabled is now default-OFF; the polarity inverted into `YZ_APPLY_REL` (see above). |
+| `YZ_JRNL` | import_overrides.cpp (yz_jrnl_retire_through) | OPT-IN EXPERIMENT (2026-07-02): journal **retirement sweep** — when GET applies a deferred release, zero the journal entry tags behind it (the game's GPU-progress ledger; the EDGE consumer's contract per the RPCS3 oracle). UNVALIDATED and now MOOT (2026-07-02 late): reachable only via the retired `YZ_APPLY_REL` path, and the real consumer (gs_task) both applies and retires the journal itself — delete with the applier. Five sibling designs tested + refuted 2026-07-02: eager apply (GET escapes into unbuilt lists), eager release (GET outruns producer), consume-once pending set, zero-all with/without lag-by-one (producer freezes at ~24 entries — it re-reads its own entries). |
 | `YZ_NO_LAUNCH_UNWIND` | spu_channels.c ~946 | Kill-switch for the SPU task launch-unwind (5882fe4). Keep. |
 | `YZ_NO_DMAGUARD` | runtime/spu/spu_dma.h (mfc_submit atomic leg, after the [dma-null] diag) | **Kill-switch for the s31 §13 NULL-PAGE ATOMIC GUARD (fix DEFAULT ON, ledger #74).** The recurring fatal "t1 crash" (s17 family, 5+ sightings, killed s31roll3/cure3) was an SPU host thread's lock-line atomic against guest EA 0 -- the unguarded 128-byte copies AV'd the process; "tid=1" was the threads.cpp s_cur_tid TLS fallback (tramp_idx=0 = the tell) and the [crash-t1] dump was the HEALTHY main thread. The guard completes the op benignly (GETLLAR reads zeros/no reservation, PUTLLC fails -- the faithful no-valid-reservation result, PUTLLUC dropped) with a loud [dma-guard] line; the [dma-null] issuer dump still fires first, so the null-EA producer (the yield-resume register-loss class) keeps its signal. On the console EA 0 is mapped kernel memory -- an SPU atomic there never halts the machine; the fatal AV was our uncommitted-page artifact. `=1` restores the fatal proceed for A/B. Retire with the null-EA producer fix. |
 | `YZ_NO_TASKRELOAD` | spu_channels.c (yz_task_segment_guard, called at the natural-launch adoption point) | **Kill-switch for the s31 §12 TASK-IMAGE RO-SEGMENT GUARD (fix DEFAULT ON, ledger #72/#34).** The real SPURS resume re-DMAs the task ELF's read-only segments on EVERY resume (RPCS3 cellSpursSpu.cpp:1815-1830, LoadElf skipWriteableSegments=true) because rotation legitimately deploys other workloads over the task region; our resumes measurably did not (s31roll2.err: gs_task's static vtable at LS 0xBA88 -- TEXT/RODATA -- all zeros at dispatch = the #34 death's second flavor; pre-rotation the same class fired via the image-0 wildcard on SPUs that never held the image, ledger #24). The guard parses the task's guest ELF at taskInfo.elf and memcmp-verifies + redeploys each non-writable PT_LOAD at every branch into the task region (race-free: task not yet executing; idempotent; [task-reload] log, first 16 + every 64th). Writable/BSS state deliberately untouched -- that is the ctxsave/ls_pattern leg; if the roll1 BSS-husk flavor persists with this guard live, the save/restore leg is the named residual. `=1` disables for A/B. Retire when the #34 race is closed end-to-end. |
 | `YZ_NO_CTXRESTORE` | spu_channels.c (yz_task_ctx_restore, at the natural-launch adoption after the RO guard) | **Kill-switch for the s32 FINAL RESUME-CONTRACT LEG (fix DEFAULT ON — closes the #34 family end-to-end with the RO guard + module guard).** Boot 9 named the wiper ([ls-wipe]: pool-task img-4 work fetches, 0x1000-byte all-zero GETs into LS 0xB880 from unwritten work regions 0x41Bxxxxx — LEGAL foreign-era writes overlaying the parked consumer's state; the census, scratch/s32_flavor_census.md, proved all death flavors = different unresurrected zeroed spans meeting their first reader). The fix completes Sony's dispatch resume (RPCS3 cellSpursSpu.cpp:1823-1846): restore the 0x380 context header (LS 0x2C80) + the ls_pattern windows (LS 0x40000-blocks*0x800 ..) from the GUEST ctxsave at the adoption boundary. Safe vs the iteration-4 rollback class: source = guest ctxsave (populated by Sony's own saves since the seam fix — always current for a parked task), gated resume-only + foreign-era-or-RO-stale, never from virgin (loud [ctx-restore] WARN instead). Pre-committed failure shape: [jrnl-cur] cursor regression right after a [ctx-restore] = rollback, revisit the gate. `=1` disables for A/B. |
 | `YZ_CTXSHADOW` (+`YZ_NO_CTXSHADOW` honored as off) | spu_channels.c (yz_ctx_shadow_save/restore; save at the image-2 exit-unwind + the legacy seam, restore after yz_task_segment_guard) | **s32 TASK WRITABLE-CONTEXT SHADOW — DEMOTED TO OPT-IN (default OFF) the same day it was built.** The contract decode (scratch/s32_pollswitch_contract.md) (decoded from the lifted firmware binaries + the RPCS3 oracle) established every legitimate kernel crossing happens AFTER Sony's own save path ran (three-door rule; TaskPoll switch-free), so the guest machinery is self-sufficient when the seam stops lying; the shadow's forced restores measurably CAUSED a rollback death (s32ctxsh4: snapshot ~79k polls stale restored over live state). Kept as an evidence tool/contingency for the [exit-unsaved] probe's findings. Original rationale below. MEASURED s32ctxw1.err: gs_task's guest ctxsave register block keeps its task-START hash through every healthy resume (Sony's SaveTaskContext leg never runs on our side — the coret seam bypasses the policy's post-poll save), and the one pre-death write delivered byte-SHIFTED content (the death forensics' off-by-N object/vtable bytes). The shadow snapshots ground-truth LS (savedContext block 0x2C80-0x3000 + task region 0x3000+allocLsBlocks*0x800) at the switch-away doors — AND (iter 3, the decisive leg) writes it through to the GUEST ctxsave area in Sony's own layout (regblock at +0, LS blocks position-keyed at +0x400), because the guest RESTORE leg measurably RUNS on our side (s32ctxsh2.err:3625: policy pc=0x25CC GETs from ctxsave, hash = the virgin-zero value → restored zeros over live LS → savedContextLr=0 → the branch-to-LS-0 death) while the guest SAVE leg never does. Host-side restore at re-adoption stays as the second belt (fires when a foreign owner used the region, or RO-staleness proves foreign presence; fresh starts just take ownership — Sony's isWaiting=0 leg loads fresh). Content-equivalent to RPCS3 cellSpursSpu.cpp:1683-1864; guest ctxsave stays untouched (deviation: nothing PPU-side reads it). [ctxsh] SAVE/RESTORE log, first 16 + every 64th. Pre-committed residual: job workloads (img 13-15) DMA into the task region with no adoption event (invisible to owner tracking) — a death following [job-launch] with no foreign ADOPTION between is the next leg. `=1` disables for A/B. Retire when #34 is closed end-to-end (with YZ_NO_TASKRELOAD). |
 | `YZ_CORET_LEGACY` | spu_channels.c (spu_indirect_branch: the legacy 0x838/0x231C special-case + the s31 exit-unwind block) | **Kill-switch, two eras. s32 UPDATE (contract correction): LS 0x2308's `bisl 0x838` (link 0x231C) is cellSpursModuleExit's stub, NOT a poll — the real pollStatus (0x2320) never enters the kernel (TaskPoll spec-guaranteed switch-free). The entire 0x231C special-case (the gpr3=0 fake "poll resume" + the wcl==2 real-kernel branch, both of which modeled a coroutine seam that does not exist on silicon) now runs ONLY under this flag =1; default routes every 0x838 entry through the general exit-unwind (total workload death, fresh 0xA00 re-entry — the decoded contract). Also gates (as before) the pre-s31 nested-exit behavior.** Original s31 rationale: **Kill-switch for the REAL module-exit -> kernel transition (s31, ledger #71 -- fix DEFAULT ON).** cellSpursModuleExit's one-way jump to kernel 0x838 used to run the kernel's select/contention/dispatch chain NESTED in the exited workload's dead host frames -- the seam that permanently killed wid2 (the gcm journal consumer's taskset) at its first contended workload switch, at the CRI bring-up (85/85 boots, one `[yz-coret] wcl=2` each, then zero wid2 dispatches ever; scratch/s31_consumer_death.md). The fix unwinds the host stack to the driver (same context-replacement mechanism as the task launch-unwind / acfccf6 class) and re-dispatches the lifted kernel at 0x838 on a fresh top-level stack; the POLL yield (bisl link 0x231C) keeps the clean-coroutine return, which the oracle proves synchronous (RPCS3 cellSpursSpu.cpp:97-119). `=1` restores the pre-s31 behavior for A/B (BOTH legs: the fake synchronous poll AND nested exits). s31 iteration 2 (after scratch/s31cure1.err measured the fake leaving wklCurrentContention[2] stuck at max with SPU4 spinning the policy select-verify loop): the wcl==2 POLL yield now ALSO runs the real lifted kernel 0x838 via the same depth-0 unwind -- the kernel-mode select's claim-subtract/commit/dispatch is the only mechanism that performs the switch the policy's verify loop waits for; the fake is retained only for image 13/coret_gen (measured zero hits) and under this flag. Retirement: after the journal consumer survives the CRI transition across a quiet stretch of validated boots (`[jrnl-cur]` continuing past the CRI window, park-rel applies ~0), fold the unwind in as unconditional and delete the flag. |
-| `YZ_JOB_WILDCARD_OK` | spu_channels.c (spu_lookup) | **Kill-switch for the jobchain-family wildcard REFUSAL (2026-07-08, guard DEFAULT ON).** ROOT (MEASURED, scratch/idboot.err + 3 prior boots): the jobchain loads its job binaries into descriptor-assigned LS slots (round-1 loads jobB/0x01275A00 at LS 0x4C00 â€” head bytes 43 49 4E verified resident) but the job lifts were fixed-base, so `spu_lookup`'s image-0 wildcard silently served **gs_task's** `spu_func_00004C00` at the job site â€” the notify job never ran, the IWL event flag never set, zero spup17 (the s19 wall, DONT_RECHASE #23/#24). Fix = each job binary lifted at BOTH slot bases + refuse cross-image wildcard for images 13-15 at job-span addresses (>=0x4880). `=1` restores the old silent substitution for A/B. âš  **A registry-only GENERALIZATION of this guard (refuse any contested address, no game constants) was tried and REFUTED BY MEASUREMENT the same day (scratch/genboot.err): dormant task images (spuimg_06 = img 9) register spans overlapping the RESIDENT kernel's (0x290), so the serviceâ†’kernel yield got falsely refused â€” a context-free registry cannot distinguish "kernel resident, img 9 dormant" from "jobB resident, gs_task dormant". A sound general guard needs RESIDENCY tracking (which binary actually landed where, per context â€” the DMA recorder generalized) or a clean image-0-is-only-the-kernel taxonomy (ours conflates kernel+gs_task under image 0 by design). Do not re-try the registry-only version.** |
+| `YZ_JOB_WILDCARD_OK` | spu_channels.c (spu_lookup) | **Kill-switch for the jobchain-family wildcard REFUSAL (2026-07-08, guard DEFAULT ON).** ROOT (MEASURED, scratch/idboot.err + 3 prior boots): the jobchain loads its job binaries into descriptor-assigned LS slots (round-1 loads jobB/0x01275A00 at LS 0x4C00 — head bytes 43 49 4E verified resident) but the job lifts were fixed-base, so `spu_lookup`'s image-0 wildcard silently served **gs_task's** `spu_func_00004C00` at the job site — the notify job never ran, the IWL event flag never set, zero spup17 (the s19 wall, DONT_RECHASE #23/#24). Fix = each job binary lifted at BOTH slot bases + refuse cross-image wildcard for images 13-15 at job-span addresses (>=0x4880). `=1` restores the old silent substitution for A/B. ⚠ **A registry-only GENERALIZATION of this guard (refuse any contested address, no game constants) was tried and REFUTED BY MEASUREMENT the same day (scratch/genboot.err): dormant task images (spuimg_06 = img 9) register spans overlapping the RESIDENT kernel's (0x290), so the service→kernel yield got falsely refused — a context-free registry cannot distinguish "kernel resident, img 9 dormant" from "jobB resident, gs_task dormant". A sound general guard needs RESIDENCY tracking (which binary actually landed where, per context — the DMA recorder generalized) or a clean image-0-is-only-the-kernel taxonomy (ours conflates kernel+gs_task under image 0 by design). Do not re-try the registry-only version.** |
 | `YZ_KERN_WILDCARD_OK` | spu_channels.c (spu_lookup_apply_job_guard + the foreign-resident adopter) | **Kill-switch for the KERNEL-context wildcard/adoption refusal (s24 4881ef0, extended s25 to the foreign-resident adopter; guard DEFAULT ON).** A context tagged image 16 (SPURS kernel) whose computed branch misses every kernel registration is a wild branch by definition (legitimate kernel exits switch images before entering foreign code); serving it from the image-0 wildcard — or, the s25 close, the foreign-resident adopter — executed gs_task's code in kernel era and mis-attributed the tid-0x2004 death for weeks (ledger #34/#49/#51). `=1` restores the old silent substitution for A/B. |
 | `YZ_NO_EV_RETRY` | import_overrides.cpp (yz_rsx_ev_send) | **Kill-switch for the GENERALIZED lossless RSX-event latch (s25, post notification-surface audit — DEFAULT ON).** Any failed sys_event_port_send to the RSX port (user-cmd 0x80, queue event 0x20<<head, future bits) ORs its cause bits into one pending mask retried at the consumer top; covers audit risks #1/#2 with the ride-validated ucmd mechanism. `YZ_NO_UCMD_RETRY` is honored as an alias for off. |
 | `YZ_NO_THROW_RETRY` | spu_channels.c (yz_throw_latch_add/yz_throw_retry_flush) + import_overrides.cpp (vblank flush) | **Kill-switch for the SPU throw_event loss latch (s25, audit risk #3 — DEFAULT ON).** WrOutIntrMbox codes 64-127 are fire-and-forget by protocol: a full destination queue loses the event with no guest signal (the CRI doorbell wall's mechanism class). Failed throws latch into a 16-entry ring and redeliver from the vblank tick (~16 ms); loud [throw-lat] log per latch so firings are visible; latch overflow drops (the faithful behavior). `=1` restores the pure drop. |
 | `YZ_NO_UCMD_RETRY` | import_overrides.cpp (yz_rsx_method 0xEB00 + yz_ucmd_retry_pending) | **Kill-switch for LOSSLESS user-interrupt delivery (s25, DEFAULT ON — the round-25 stall root, ledger #52).** MEASURED (scratch/s25ride.err): the game coalesces its ucmd cause counter (1..21 then 25, a documented rapid-user-command coalescing behavior) and the single coalesced send hit a momentarily full RSX event queue — sys_event_port_send returned 0x8001000A EBUSY and the fire-and-forget path lost it; the wid4 pool never published rounds 22-25 and the stream parked forever on SEMAPHORE_ACQUIRE want=25. Fix mirrors lv1's single pending-cause register: latch the undelivered cause, retry at the top of the consumer loop until the queue drains (userCmdParam already carries the latest arg). `=1` restores fire-and-forget for A/B. |
 | `YZ_NO_IMGSTACK` | spu_channels.c (spu_img_restore + adopt-on-serve in spu_indirect_branch) | **Kill-switch for the s25 adopt-on-serve + restore-on-host-return image model (ledger #51's designed fix; DEFAULT ON).** Lifted brsl/bisl brackets save/restore ctx->image_id across nested host calls (the host C stack of bracket locals = the shadow image stack); the dispatcher adopts the image whose registration serves each lookup; pc==0xA00 re-adopts the DMA-recorded resident module (ctx->module_img_a00, spu_dma.h). `=1` reverts to the old sticky-image behavior AND disables adopt-on-serve with it (only safe together — adoption without brackets is the ledger-#51 mislabel trap). Keep permanently for regression bisection. |
-| `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause â†’ scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5Ã—~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. Note: setting this (disable backoff) ALSO breaks the SPURS dispatch livelock (SPU polls hot, catches the transient workload signal) â€” it was the discovery lever for `YZ_NO_LRWAKE`'s fix. |
-| `YZ_NO_LRWAKE` | spu_dma.h (GETLLAR mgmt line) | **Kill-switch for the SPURS dispatch LOST-WAKEUP FIX (2026-07-05, DEFAULT ON).** ROOT (MEASURED): the backed-off SPURS kernel misses the PPU-side wklSignal/readyCount workload-submit (that write doesn't raise the kernel's SPU_EVENT_LR â€” it bypasses the coherence write-generation path), so the transient signal lands in a poll gap and the workload that the main thread's `cellSpursEventFlagWait` on 0x4019C680 bit0 depends on is never dispatched â†’ boot livelocks (the long-standing dispatch gate). The fix delivers the missed HW edge: on a GETLLAR of the mgmt line 0x40197C80 that still carries a pending wklSignal1 (+0x70 != 0), raise LR so the kernel re-enters selection + dispatches. Faithful (re-derives a dropped cross-processor wakeup, not a game-logic force; self-limits once dispatched). `=1` disables for A/B. MEASURED: default boot now progresses into rendering (~520-560 set_render_target, stable, no crash) where before it livelocked. |
+| `YZ_NO_SPUBACKOFF` | spu_dma.h (GETLLAR) | Kill-switch for the **SPU idle-poll host-yield backoff** (2026-07-03): same-line GETLLARs with an unchanged write-generation escalate cpu-pause → scheduler-yield, so 5 spinning SPURS kernels stop saturating the global lock-line lock (measured 5×~97% core + boot-pacing collapse without it). Faithful (polling continues; ladder resets on any observed write). Keep. Note: setting this (disable backoff) ALSO breaks the SPURS dispatch livelock (SPU polls hot, catches the transient workload signal) — it was the discovery lever for `YZ_NO_LRWAKE`'s fix. |
+| `YZ_NO_LRWAKE` | spu_dma.h (GETLLAR mgmt line) | **Kill-switch for the SPURS dispatch LOST-WAKEUP FIX (2026-07-05, DEFAULT ON).** ROOT (MEASURED): the backed-off SPURS kernel misses the PPU-side wklSignal/readyCount workload-submit (that write doesn't raise the kernel's SPU_EVENT_LR — it bypasses the coherence write-generation path), so the transient signal lands in a poll gap and the workload that the main thread's `cellSpursEventFlagWait` on 0x4019C680 bit0 depends on is never dispatched → boot livelocks (the long-standing dispatch gate). The fix delivers the missed HW edge: on a GETLLAR of the mgmt line 0x40197C80 that still carries a pending wklSignal1 (+0x70 != 0), raise LR so the kernel re-enters selection + dispatches. Faithful (re-derives a dropped cross-processor wakeup, not a game-logic force; self-limits once dispatched). `=1` disables for A/B. MEASURED: default boot now progresses into rendering (~520-560 set_render_target, stable, no crash) where before it livelocked. |
 | `YZ_RSX_DRAW` | libs/video/rsx_live_draw.c (`rsx_live_draw_enabled`) | **Kill-switch for the Track B live NV4097 draw path (2026-07-03, Track B stage 5 B2).** Default ON; `=0` makes the live-draw engine inert so the runtime keeps its existing (null/clear-color) present. The engine is the validated capture-replay D3D12 pipeline (rsx_dispatch + NV40 VP/FP decompilers + PSO/sampler/mip engine) driven by the live FIFO consumer. **WIRED 2026-07-04** into yakuza/import_overrides.cpp: `rsx_live_draw_method(method,arg)` fed at the top of `yz_rsx_method` (full stream), engine self-presents on the 0xE944 flip; `rsx_live_draw_init` runs on the window thread bound to the null backend's HWND (`rsx_null_backend_get_hwnd`) and suppresses the null GDI present on success (`rsx_null_backend_suppress_present`). Boot-verified: `[rsx] live-draw engine up (D3D12)`, 12 flips presented, zero crashes. |
 | `YZ_FP_CTRL_AUTO` | libs/video/rsx_live_draw.c (get_pso) | **Kill-switch for feeding the real SHADER_CONTROL word to the live-path FP decompiler (s25; DEFAULT = real ctrl word).** The s24 replay-harness root cause applied to the live path: NV40 selects the fragment output register via SHADER_CONTROL bit 0x40 (clear ⇒ h0/fp16, set ⇒ r0/fp32); the old AUTO heuristic returned stale fp32 scratch for h0-writing materials (flat/black colors). The live path now passes `rsx_dsp_shader_control()` and folds bit 0x40 into the PSO cache key, mirroring replay_main.c. `=1` restores the AUTO heuristic for A/B. |
 | `YZ_RSX_DUMP` | libs/video/rsx_live_draw.c (`rsx_live_draw_present`) | **DIAG (default OFF): dump the live-draw framebuffer.** When set, writes the presented color surface of the first 8 frames to `scratch/ld_frame_NN.ppm` (self-contained D3D12 readback). The per-frame `[live-draw]` line is always on for the first 32 frames and then every 32nd frame. It reports independently balanced packet and BEGIN/END-group ledgers so coalesced DRAW packets are not mistaken for dropped D3D draws. Remove when the render path is stable. |
@@ -46,51 +46,51 @@ Last full audit: 2026-06-29 (STATUS archive); inventory refreshed 2026-07-01.
 | `YZ_STARTTASK_HOOK` | spu_channels.c (spu_task_launch_check + prof path) | **RETIRED-to-opt-in 2026-07-02**: re-enables the legacy "LS 0x1CC0 = StartTask" launch hijack for A/B. LS 0x1CC0 is actually the taskset-SYSCALL switch (`bi $r2`, jump table at 0x1CC4); the hijack turned every WAIT_SIGNAL/YIELD of the matched elfs into a bogus instant relaunch and skipped Sony's context save. Default OFF = Sony's case handlers + dispatch run lifted. Delete after a quiet stretch of boots. |
 | `YZ_XF_IEEE` | runtime/spu/spu_helpers.h (spu_fa/spu_fs/spu_fm/spu_fma/spu_fms/spu_fnms, and since the same day's s43 review also spu_fceq/spu_fcgt/spu_fcmeq/spu_fcmgt) | **Kill-switch for SPU-accurate extended-range float ("xfloat") semantics (2026-07-17, fix DEFAULT ON = SPU-accurate active).** fa/fs/fm/fma/fms/fnms previously used native IEEE 754 math (`+`/`-`/`*`/`fmaf`), which is wrong per ORACLE(SPU_ISA_v1.2_27Jan2007_pub.pdf p195-196, 202-212): SPU single precision has no NaN/Inf (an exponent field of 0xFF is a normal extended-range value up to Smax=0x7FFFFFFF, ~6.8e38), no denormals (an operand or result that would be denormal is treated as/flushed to unsigned +0.0), truncation-only rounding, and results beyond Smax saturate to Smax with the operation's sign instead of overflowing to infinity. Default path decodes each operand's bit pattern to a `double` (flushing an exponent-field-0 operand to +0.0), does the arithmetic in double, and encodes the result back to an SPU-shaped bit pattern (truncate to 23 fraction bits, flush sub-Smin to +0.0, saturate beyond-Smax to Smax). ACCURACY (INFERRED, s43 review-corrected): fm's normal case is bit-exact; fa/fs/fma/fms/fnms are NOT proven bit-exact vs RPCS3's precise interpreter (double rounds to nearest before the final truncate -- up to 1 ULP off toward-zero single arithmetic at wide exponent gaps -- and RPCS3's extended-range 1-ULP borrow/exponent-gap special cases are approximated, not replicated); flush/saturate CLASS decisions and saturation magnitudes do match. A measured RPCS3 float A/B is queued before treating SPU float register values as oracle-parity. Semantics-verified (read-only, GPLv2, semantics only) against rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's precise FA_FS/FM/FMA: the ISA text does not state a sign for the single-precision denormal-OPERAND-flush case (only the double-precision analog on p198 says "preserve the sign"); RPCS3 flushes unconditionally to unsigned +0.0 in that case too, and this implementation follows RPCS3 (the project's trace-diff oracle) there. **UPDATE (2026-07-17, s43 review, FIX 2): the compare family joined this gate.** `fceq`/`fcgt`/`fcmeq`/`fcmgt` previously compared via plain host-float `==`/`>`/`fabsf`, which is wrong for the same reason as the arithmetic family: RPCS3's precise FCEQ/FCGT/FCMEQ/FCMGT (SPUInterpreter.cpp) special-case any operand with |bits| < Smin as zero before comparing, and compare extended-range magnitudes by their true SPU-defined value rather than through the host float type (where an extended-range bit pattern like Smax=0x7FFFFFFF IS a QNaN shape, making a host compare against it backwards). Default path now decodes both operands via the same `spu_xf_decode` helper the arithmetic family uses (bit pattern -> double, flushing exponent-field-0 to +0.0, never through `float`) and compares the doubles; `fcmeq`/`fcmgt` take `fabs` of the decoded value (equivalent to decoding the magnitude bits directly, since sign only flips the final sign). Unlike the arithmetic family this has no rounding step, so the result is an exact class match to RPCS3's special-cased compare, not an approximation. `=1` restores the old native-IEEE path verbatim, now for all ten functions. Env read once and cached. Sanity-tested standalone (denorm-input flush, overflow saturate, an inf*0-shaped IEEE-NaN case landing on the SPU-defined saturated result instead of NaN, the compare-family denorm/extended-range/kill-switch cases, and the YZ_XF_IEEE=1 legacy-path restore) -- see the change's report for the exact test output. Retirement: delete after a full-boot A/B shows no regression. |
 
-## Config (memory-map overrides â€” stable)
+## Config (memory-map overrides — stable)
 
 `YZ_TLS_BASE`, `YZ_HEAP_BASE`, `YZ_HEAP_END`, `YZ_LIBSRE_BASE`, `YZ_LIBGCM_BASE`,
 `YZ_IMPORT_OPD_BASE`, `YZ_IMPORT_FAKE_BASE`, `YZ_GCM_CTX_ADDR`, `YZ_GCM_CB_OPD_ADDR`,
 `YZ_GCM_CTRL_ADDR`, `YZ_GCM_LABELS_ADDR`, `YZ_GCM_CB_FAKE_KEY`, `YZ_GCM_LOCAL_BASE`,
 `YZ_GCM_LOCAL_SIZE` (import_overrides.cpp / yakuza_runner.h).
 
-## Levers (opt-in, default OFF â€” for diagnosis only)
+## Levers (opt-in, default OFF — for diagnosis only)
 
 | Flag | Where | Meaning |
 |---|---|---|
 | `YZ_FORCE_CODEC` | import_overrides.cpp ~1924 | Force the CRI codec task path (blocker-#22 lever). |
 | `YZ_RSX_INLINE` | import_overrides.cpp / shims.cpp / sys_timer.c | Run the FIFO consumer inline with the producer (tested: does NOT fix the pacing wall by itself). |
 | `YZ_RSX_FENCE_SYNC` | import_overrides.cpp (yz_rsx_method NV406E_SET_REFERENCE) + libs/video/rsx_live_draw.c (`rsx_live_draw_flush`) | **RSX fence-timing fidelity A/B (2026-07-06, opt-in, default OFF).** On NV406E_SET_REFERENCE, flush + wait the D3D12 backend (a real GPU fence, `ld_flush`) BEFORE writing REF, mirroring RPCS3 `nv406e::set_reference`'s `sync()`. Rationale (MEASURED via the PPU trace-diff at func_00EBBFB4, ours vs RPCS3 armed at 0xEB3238): our async consumer writes REF instantly and races ahead of real GPU time, so the game's REF poll (usleep-30 loop) skips the wait RPCS3 performs; this paces the consumer to actual GPU completion. A/B verdict (2026-07-06): INERT on the boot stall (the CRI-phase re-lock persists with it on); kept opt-in as a fidelity lever for later pacing work. |
-| `YZ_SURMIXER_SYNC` | libs/audio/cellAudio.c (`cellAudioSetNotifyEventQueue`) | **CRI surmixer notify-queue sync A/B (2026-07-06, opt-in, default OFF).** Mirrors RPCS3 `AudioSetNotifyEventQueue` (cellAudio.cpp:1671-1719 + merged fix #18857): when the surmixer registers its notify queue (key `c_mxr000`=0x8000CAFE02460300 or 0) and a `_cellsurMixerMain` thread exists, BLOCK (poll up to 100x50ms) until that thread has created the `c_mxr000` lv2 event queue, then correct key==0 -> c_mxr000. RPCS3 issue #18852 (cellSurMixer NULL-deref/hang on SEGA AM2/CRI titles) hinges on this. MEASURED CONTEXT: our boot reaches the CRI audio phase at ~200s (mixer tid=10 + cri_dlg/CriSr t9-t25), the c_mxr000 queue IS created and SetNotifyEventQueue IS called (via YZ_AUDIO_FORCE), but ours registers with no wait. A/B verdict (2026-07-06): FIRES (`surmixer-sync: c_mxr000 queue found after wait`) but INERT on the stall â€” the wall is the CRI SPU job chain a layer below; kept opt-in. NOTE requires >=250s boots to reach the CRI phase. |
+| `YZ_SURMIXER_SYNC` | libs/audio/cellAudio.c (`cellAudioSetNotifyEventQueue`) | **CRI surmixer notify-queue sync A/B (2026-07-06, opt-in, default OFF).** Mirrors RPCS3 `AudioSetNotifyEventQueue` (cellAudio.cpp:1671-1719 + merged fix #18857): when the surmixer registers its notify queue (key `c_mxr000`=0x8000CAFE02460300 or 0) and a `_cellsurMixerMain` thread exists, BLOCK (poll up to 100x50ms) until that thread has created the `c_mxr000` lv2 event queue, then correct key==0 -> c_mxr000. RPCS3 issue #18852 (cellSurMixer NULL-deref/hang on SEGA AM2/CRI titles) hinges on this. MEASURED CONTEXT: our boot reaches the CRI audio phase at ~200s (mixer tid=10 + cri_dlg/CriSr t9-t25), the c_mxr000 queue IS created and SetNotifyEventQueue IS called (via YZ_AUDIO_FORCE), but ours registers with no wait. A/B verdict (2026-07-06): FIRES (`surmixer-sync: c_mxr000 queue found after wait`) but INERT on the stall — the wall is the CRI SPU job chain a layer below; kept opt-in. NOTE requires >=250s boots to reach the CRI phase. |
 | `YZ_TIGHT` | import_overrides.cpp ~1032 | Tight-poll consumer (tested-negative as a fix). |
 | `YZ_AUDIO_FORCE` | libs/audio/cellAudio.c ~730 | **OBSOLETE s23 (2026-07-09, DONT_RECHASE #36): drop from the baseline.** pt30-era force (port running at open + hardcoded mixer-queue registration); s23boot4 measured the game calling cellAudioPortStart + SetNotifyEventQueue ITSELF, wall unchanged without it. |
-| `YZ_SKIP_VOICE` | yakuza/shims.cpp ~218 | Skip the CRI intro-voice path â€” useful as a RECON probe past the movie gate, not a shipping path. |
-| `YZ_MOVIE_TEST` | yakuza/import_overrides.cpp (yz_window_thread) | `=<path.sfd>`: standalone proof of the host movie path â€” decode the .sfd with FFmpeg (libs/codec/movie_ffmpeg.c) and present it straight to the D3D12 window via `rsx_live_draw_present_rgba` (movie mode gates the guest's draws off). Verified 2026-07-04: plays hd_sega_logo_us1012.sfd end-to-end, 100 frames, no crash. NOT the game hook â€” just proves decodeâ†’present in-process. Needs YZ_RSX_DRAW on. |
+| `YZ_SKIP_VOICE` | yakuza/shims.cpp ~218 | Skip the CRI intro-voice path — useful as a RECON probe past the movie gate, not a shipping path. |
+| `YZ_MOVIE_TEST` | yakuza/import_overrides.cpp (yz_window_thread) | `=<path.sfd>`: standalone proof of the host movie path — decode the .sfd with FFmpeg (libs/codec/movie_ffmpeg.c) and present it straight to the D3D12 window via `rsx_live_draw_present_rgba` (movie mode gates the guest's draws off). Verified 2026-07-04: plays hd_sega_logo_us1012.sfd end-to-end, 100 frames, no crash. NOT the game hook — just proves decode→present in-process. Needs YZ_RSX_DRAW on. |
 | `YZ_MOVIE_COMPOSITE_UI` | libs/video/rsx_live_draw.c (`rsx_live_draw_set_movie_mode`, `sink_flip`, `rsx_live_draw_present_rgba`) | **Temporary host-movie subtitle bridge (2026-07-24, opt-in, default OFF).** Keeps decoded SFD video presentation on the host's real-time path while allowing the game to render captions into its normal offscreen RSX surface. Because that guest target can be opaque or contain a complete auth scene, guest flips extract only low-saturation bright glyphs from the lower caption band; they never replace host video. Host frames have lock priority, normal non-movie RSX dispatch bypasses the compositor lock, movie entry clears stale surfaces, and exit clears intermediate auth state to black. This is an acceptance bridge, not the final native render architecture: the long-term path is decoded-frame injection into the game's movie surface followed by its ordinary RSX/UI composition. |
-| `YZ_ADX_RELEASE_TEST` | libs/filesystem/cellFs.c (`yz_adx_release_test_tick`) | **2026-07-04, decisive control-flow experiment (default OFF), independent of `YZ_ADX_HLE`.** Fires the SAME two calls a real ADX decode batch would (`yz_adx_hle_advance_adxm` + `yz_adx_hle_release_spurs_waiter`, i.e. advance ADXM `0x01613368+0x294/+298/+29C` to a fabricated monotonic "N blocks decoded" value, then call the guest's real `cellSpursEventFlagSet` on `0x63D61720` with all bits set) UNCONDITIONALLY on every `.cvm`/voice-stream `cellFsRead`, with NO real decode (silent/zero PCM â€” tests the control-flow release only, not audio). Purpose: settle whether the SPURS-release lever is even the right one BEFORE building an AHX/MPEG-Layer-II decoder (YZ_ADX_HLE was measured inert on the real stream â€” it's AHX not ADX). REMOVE once the SPURS-release question is settled either way. |
-| `YZ_ADX_HLE` | libs/filesystem/cellFs.c (`yz_adx_hle_on_read` + helpers) | **2026-07-04, opt-in experiment (default OFF). MEASURED INERT on the real stream â€” see below.** Clean-room host ADX decode (libs/codec/adx_decode.{c,h}, written from the public ADX spec only) of the CRI intro-voice stream, intended to bypass the LLE `cri_audio` SPU codec (measured dead: launches, never advances the ADXM progress fields). Hooks `cellFsRead` on `adv_voice_talk.cvm`/`*.cvm` paths: mirrors read bytes into a host shadow buffer by file offset, scans for a valid ADX header, decodes every complete block, advances the ADXM progress object `0x01613368+0x294/+298/+29C`, and calls the guest's real `cellSpursEventFlagSet` (libsre 0x02016010) on the measured SPURS poll object `0x63D61720` with an all-bits-set release (UNPROVEN which bits t1's `cellSpursEventFlagWait` call actually waits on). **BOOT-TESTED 2026-07-04 (YZ_AUDIO_FORCE=1 YZ_ADX_HLE=1, scratch/adx_hle_boot2.{out,err}): zero `[adx-hle]` log lines â€” the decoder never fires.** Root cause (parsed the container's real ISO9660 directory, scratch investigation not yet a committed tool): `adv_voice_talk.cvm` holds `*.AHX` files, not `*.ADX` â€” AHX is a DIFFERENT CRI codec (ADX-shaped header + MPEG-1 Layer II payload, confirmed via the MPEG sync word right after the copyright tag), which `adx_open()` correctly rejects (encoding_type != 2/3). The SPURS-release/ADXM-advance machinery is therefore UNEXERCISED against the live boot. REMOVE or extend to AHX (MPEG Layer II) decode when the CRI-voice frontier is next picked up. |
+| `YZ_ADX_RELEASE_TEST` | libs/filesystem/cellFs.c (`yz_adx_release_test_tick`) | **2026-07-04, decisive control-flow experiment (default OFF), independent of `YZ_ADX_HLE`.** Fires the SAME two calls a real ADX decode batch would (`yz_adx_hle_advance_adxm` + `yz_adx_hle_release_spurs_waiter`, i.e. advance ADXM `0x01613368+0x294/+298/+29C` to a fabricated monotonic "N blocks decoded" value, then call the guest's real `cellSpursEventFlagSet` on `0x63D61720` with all bits set) UNCONDITIONALLY on every `.cvm`/voice-stream `cellFsRead`, with NO real decode (silent/zero PCM — tests the control-flow release only, not audio). Purpose: settle whether the SPURS-release lever is even the right one BEFORE building an AHX/MPEG-Layer-II decoder (YZ_ADX_HLE was measured inert on the real stream — it's AHX not ADX). REMOVE once the SPURS-release question is settled either way. |
+| `YZ_ADX_HLE` | libs/filesystem/cellFs.c (`yz_adx_hle_on_read` + helpers) | **2026-07-04, opt-in experiment (default OFF). MEASURED INERT on the real stream — see below.** Clean-room host ADX decode (libs/codec/adx_decode.{c,h}, written from the public ADX spec only) of the CRI intro-voice stream, intended to bypass the LLE `cri_audio` SPU codec (measured dead: launches, never advances the ADXM progress fields). Hooks `cellFsRead` on `adv_voice_talk.cvm`/`*.cvm` paths: mirrors read bytes into a host shadow buffer by file offset, scans for a valid ADX header, decodes every complete block, advances the ADXM progress object `0x01613368+0x294/+298/+29C`, and calls the guest's real `cellSpursEventFlagSet` (libsre 0x02016010) on the measured SPURS poll object `0x63D61720` with an all-bits-set release (UNPROVEN which bits t1's `cellSpursEventFlagWait` call actually waits on). **BOOT-TESTED 2026-07-04 (YZ_AUDIO_FORCE=1 YZ_ADX_HLE=1, scratch/adx_hle_boot2.{out,err}): zero `[adx-hle]` log lines — the decoder never fires.** Root cause (parsed the container's real ISO9660 directory, scratch investigation not yet a committed tool): `adv_voice_talk.cvm` holds `*.AHX` files, not `*.ADX` — AHX is a DIFFERENT CRI codec (ADX-shaped header + MPEG-1 Layer II payload, confirmed via the MPEG sync word right after the copyright tag), which `adx_open()` correctly rejects (encoding_type != 2/3). The SPURS-release/ADXM-advance machinery is therefore UNEXERCISED against the live boot. REMOVE or extend to AHX (MPEG Layer II) decode when the CRI-voice frontier is next picked up. |
 | `YZ_FIFO_RECOVER_RET` | yakuza/import_overrides.cpp (`yz_rsx_fifo_step`, CALL and RETURN branches, ~line 1577-1638 helpers + the two call sites) | **2026-07-10, opt-in behavior change (default OFF), NOT yet A/B'd against a live boot.** Per scratch/s29_terminal_park_re.md (Q4): RPCS3 (RSXFIFO.cpp) treats a nested CALL (a second CALL before the pending one RETURNs) and a RETURN with no pending CALL as FIFO_ERROR and calls `recover_fifo()` -- checkpoint/retry, escalating to a fatal abort after 20 recoveries inside a 2s window. Our port used to silently clobber the one-level `g_fifo_ret` return slot on a nested CALL, and idle completely silently forever (after one one-ever warning) on a RETURN-without-CALL -- the MEASURED s28m10 terminal park at GET=0x011001EC and the s28m4 park at GET=0x0000098C. Loud detection logging (`[rsx] CALL inside subroutine ...`) is now UNCONDITIONAL (zero behavior change) at both sites. With the flag SET, both states additionally get the recovery analog: no valid rewind target exists in either case (GET never advanced into the bad word), so "restore to checkpoint" is a same-position retry, rate-limited to ~1 attempt/50ms (substituting our poll loop's SwitchToThread cadence for RPCS3's blocking 2ms sleep), logged `[fifo-rec-ret]`, escalating to one latched `[fifo-rec-ret] FATAL` print + a permanent, loud park after 20 strikes in a rolling 2s window (does not tear down the process, unlike RPCS3's hard exception -- the FIFO consumer just parks with a clear diagnostic instead of silently). Armed banner `[fifo-rec-ret] ARMED (YZ_FIFO_RECOVER_RET)` prints once, on first use of either recovery path. Default OFF preserves the exact pre-existing default-boot behavior (now logged instead of silent). Retirement: fold into the default path once a live A/B boot confirms the recovery doesn't regress a healthy boot and the s28-class terminal park is either avoided or at least loudly diagnosed instead of silently pinned. |
 | `YZ_BOUNDARY_DRAIN` (+ `YZ_BDRAIN_DWELL_MS`, `YZ_BDRAIN_CAP`) | yakuza/import_overrides.cpp (park-time fire at the FIFO-consumer [stop-jrnl] site) + runtime/spu/spu_channels.c (`yz_bdrain_fire_ea`) | **s42 boundary drain, iteration C — PARK-TIME FIRE (default OFF). Design: this card's park-time redesign, per the iteration-B postmortem scratch/s42_drainB_postmortem.md.** A faithfulness-restoring MITIGATION for the release-engine wall: post-transition our engine stops applying journaled RSX-FIFO stopper releases, so the GPU strands ("parks") on a jump-to-self stopper forever. When the host FIFO consumer has been parked on the SAME stopper EA past `YZ_BDRAIN_DWELL_MS` (default 3000ms), it fires the drain's guarded release write for THAT stopper only: `0x20000000 \| ((io_off+4) & 0x1FFFFFFC)` written big-endian to the guest RSX-FIFO word (mirrors the SPU's own MFC PUT), gated by a read-guard that writes only while the word still holds its JTS self-jump `0x20000000 \| (io_off & 0x1FFFFFFC)` and an RSX-arena window check (`0x40400000..0x40C00000`) — idempotent (a re-fire finds the release word and skips) and content-preserving. Re-fire is allowed per NEW distinct park (the EA changes), capped at `YZ_BDRAIN_CAP` (default 64) writes/boot. **NO host LS writes:** the iteration-B neutralize half and cross-thread LS mutation are RETIRED; the engine's own machinery is left untouched. Witnesses: `[bdrain] ARMED` banner (env config echoed), `[bdrain] FIRE:`/`[bdrain] SUMMARY:` per fire, and `[bdrain] NOTE: past-wall territory` once per fire. Kill = unset `YZ_BOUNDARY_DRAIN` (zero footprint). **HONEST FRAMING:** this is a BRIDGE — the retired park-release lever's fire-point married to the drain's guarded faithful write; WHY our engine stops applying releases post-storm remains OPEN (durable road = block-lift gs_task). Iteration B v2 measured that crossing the wall exposes a downstream guest fault (a `0x23C786AD` read on tid=18/func_022001B4), so expect NEW crash flavors past the wall — that is progress, not a drain failure (unless the faulting access is the drain's own write). **Retirement:** delete when the tag-2 producer is suppressed OR gs_task is block-lifted. **HISTORY (iteration B, superseded):** the original design fired at the gs_task 0x352C consumer-reinit sweep and walked the mgr+0xE0 release table (neutralize + fire-all-pending). Postmortem verdict: the fire mechanism was PROVEN (v2's fired release advanced GET past all four fired stoppers) but the 0x352C SITE is unreachable once the wedge parks the consumer at the 0x4C24 stopper upstream of reinit (only 1 of 5 matrix boots ever fired). Iteration B code (`yz_bdrain_maybe`, the ximg-storm arm, the gs_task.c 0x352C hook) is retained commented/disabled; `yz_bdrain_fire_ea` reuses its guarded write path verbatim. |
 
 ## Diagnostics (default OFF; side-effect-free when unset)
 
-**Permanent generic probes (2026-07-02 â€” prefer these over new hardcoded ones):**
+**Permanent generic probes (2026-07-02 — prefer these over new hardcoded ones):**
 `YZ_DUMP_AT=<seconds>` (main.cpp: fire yz_dump_all_threads ONCE at +N s regardless of
-watchdog state â€” reads a healthy-but-parked boot at a chosen instant; pair with YZ_L1SNAP
+watchdog state — reads a healthy-but-parked boot at a chosen instant; pair with YZ_L1SNAP
 for the invasive sub-dumps; don't use dump-armed runs for pass/fail rates);
 `YZ_PEEK=ea1,ea2,...` (main.cpp: change-triggered 4-word dumps of up to 16 hex guest EAs,
-VirtualQuery-guarded â€” moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
-(dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses â€”
+VirtualQuery-guarded — moves a memory probe with no rebuild); `YZ_HOOK=addr1,...`
+(dispatch.cpp: log args+lr on every INDIRECT call to up to 8 guest code/OPD addresses —
 direct `bl` calls are invisible; libsre names in scratch/libsre_lle_map.txt. **Updated
 2026-07-09 s23:** now prints an armed banner listing every hooked address at first dispatch
-(probe-liveness rule); note the OPD-vs-code-address trap â€” a guest function has TWO
+(probe-liveness rule); note the OPD-vs-code-address trap — a guest function has TWO
 addresses (its code entry and its OPD/function-descriptor slot) and indirect callers may
 dispatch through either, so hook BOTH or a live target reads as dead. s23boot12 measured
 `0x00DDDA6C` receiving ZERO indirect calls by either address while the round driver ran,
 i.e. it is reached some other way (direct `bl` or a different dispatch table entry), not
 proof the function is unused.);
-`YZ_TASKARG` (spu_channels.c, 2026-07-03: log every SPURS task launch â€” the pc-0x3050
-entry branch â€” with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
-only launch args are needed â€” PROF's per-branch overhead crawls the whole boot).
+`YZ_TASKARG` (spu_channels.c, 2026-07-03: log every SPURS task launch — the pc-0x3050
+entry branch — with gpr3/gpr4 args, cap 400; the lean replacement for YZ_SPU_PROF when
+only launch args are needed — PROF's per-branch overhead crawls the whole boot).
 
 `YZ_MASK_SEAL` (spu_channels.c `yz_mask_seal_arm`/`yz_ms_read`/`yz_ms_write` + hooks in
 spu_context.h `spu_ls_read128` and `spu_ls_write128`, 2026-07-20 s49, diag, default OFF):
@@ -148,9 +148,9 @@ the code): last-function tail beyond its first quad, host-side spu_elf_load_to_l
 (pre-execution), PPU LS-window writes. Retire or promote to a guard if a real PATCH hit
 ever shows; keep as the standing answer to "does this title self-modify SPU code."
 
-`YZ_INTRMBOX_LOG` (spu_channels.c, `SPU_WrOutIntrMbox` handler, 2026-07-04, diag â€” pure
+`YZ_INTRMBOX_LOG` (spu_channels.c, `SPU_WrOutIntrMbox` handler, 2026-07-04, diag — pure
 diagnosis for the t1 event-flag wedge): logs EVERY SPU class-2 doorbell write
-UNCONDITIONALLY, before any routing decision â€” raw value, decoded code/port(spup), the
+UNCONDITIONALLY, before any routing decision — raw value, decoded code/port(spup), the
 `spu_group_spup_queue` resolution (0 = no binding, i.e. would-be-dropped), and which path
 the existing routing logic takes (send_event/throw_event routed, dropped, eflag_set_bit,
 unrouted/buffered). Cap 200. Answers whether the SPU ever targets port 17 / queue 2 (t1's
@@ -169,13 +169,13 @@ gated -- they run unconditionally regardless of this flag, same as before. Perma
 (prefer this over re-adding unconditional syscall prints); keep.
 
 **PPU differential trace group (shims.cpp `ppu_trace_pc`, emitted before EVERY instruction by
-the `--trace` lifter build only â€” inert in a normal build):**
+the `--trace` lifter build only — inert in a normal build):**
 `YZ_PPU_TRACE=1` (enable) + `YZ_PPU_TRACE_TID=<n>` (gate to one guest tid, default 1) +
 `YZ_PPU_TRACE_ARM=0xADDR` (start logging on the first hit of this PC, default = from start) +
-`YZ_PPU_TRACE_N=<count>` (budget, default 3M) â†’ one hex PC/line to scratch/ppu_trace.txt (the
+`YZ_PPU_TRACE_N=<count>` (budget, default 3M) → one hex PC/line to scratch/ppu_trace.txt (the
 format tools/tracediff.py + the RPCS3 emitter both use; driver
 tools/ppu_diverge.ps1).
-`YZ_ARM_PC=0xADDR` (shims.cpp `ppu_trace_pc`, added 2026-07-05, diag) â€” on the --trace build
+`YZ_ARM_PC=0xADDR` (shims.cpp `ppu_trace_pc`, added 2026-07-05, diag) — on the --trace build
 ONLY: when ANY thread executes the target PC, prints `[arm-pc] #N pc=... tid=... r3=... r5=...
 pos=... len=... callers:<guest back-chain>` (r3/r5 = the GPRs at that PC; pos/len =
 vm_read64(r5+0x10 / +0x18), meaningful only when r5 points at the 00EEFC2C-style request record).
@@ -247,40 +247,40 @@ on 0x4019C680 bit 0x1 depends on. Logs `[force-wid0]`/
 confirmed and the faithful fix (the real readyCount/signal producer) lands.
 
 `YZ_T1SPIN` (yakuza/shims.cpp): logs t1's caller + working regs when it signals
-cond-4 at the CRI movie gate (the clean-binary spin loop) â€” used 2026-07-04 to show t1 is
+cond-4 at the CRI movie gate (the clean-binary spin loop) — used 2026-07-04 to show t1 is
 deep in the CRI player's server loop with an empty work queue (lr=0, trampoline-dispatched;
-so no single poke â€” the movie needs real decode output to advance). REMOVE with the CRI frontier.
+so no single poke — the movie needs real decode output to advance). REMOVE with the CRI frontier.
 
 `YZ_MWPLY_PROBE` (yakuza/dispatch.cpp, `ps3_indirect_call` + `yz_tramp_guard`, 2026-07-04):
 dynamic-ABI probe for the mwPly (CRI Sofdec) player leaf calls
 (func_00F4D0A8=mwPlyIsNextFrmReady, func_00F4DA90=mwPlyGetFrm,
-func_00F48E48=mwPlyGetAudioPcmData_PS3 â€” see scratch/MWPLY_RESOLVE.md). Two hook sites are
+func_00F48E48=mwPlyGetAudioPcmData_PS3 — see scratch/MWPLY_RESOLVE.md). Two hook sites are
 needed for full coverage: `ps3_indirect_call` gets a full entry+exit+out-param-dump
 pass-through wrap for the genuinely-indirect (bctr) path; `yz_tramp_guard` gets an
 entry-args-only log for the same-chunk direct-tail-branch path (func_00F48E48 is reached
-that way too â€” `g_trampoline_fn = func_00F48E48; return;` inside another lifted function
-â€” which never reaches ps3_indirect_call; DRAIN_TRAMPOLINE captures the callee before any
+that way too — `g_trampoline_fn = func_00F48E48; return;` inside another lifted function
+— which never reaches ps3_indirect_call; DRAIN_TRAMPOLINE captures the callee before any
 hook runs and calls it unconditionally, so a post-call wrapper can't be spliced in there
 without editing generated code). Volume-bounded (first 40 calls of each
 target, then 1-in-500). MEASURED 2026-07-04 (2 boots, ~100s each, reaching the healthy
-32-frame live-draw render state): ZERO hits on either hook site â€” the mwPly cluster is not
+32-frame live-draw render state): ZERO hits on either hook site — the mwPly cluster is not
 dispatched at all yet at this point in boot. REMOVE with the CRI/mwPly frontier.
 
 `YZ_MWPLY_FORCEREADY` (yakuza/dispatch.cpp, the `ps3_indirect_call` mwPly wrap): diagnostic
-force, default OFF â€” when the poll gate func_00F4D0A8 IS dispatched, skip the real call and
+force, default OFF — when the poll gate func_00F4D0A8 IS dispatched, skip the real call and
 return 1 ("ready") to see whether the player advances into calling the getters. Only fires
 inside the mwPly wrap, so it's a no-op until that wrap is ever reached (measured 2026-07-04:
-never reached in a 100s boot â€” see YZ_MWPLY_PROBE). REMOVE with the CRI/mwPly frontier.
+never reached in a 100s boot — see YZ_MWPLY_PROBE). REMOVE with the CRI/mwPly frontier.
 
 `YZ_T1_UNBLOCK` (runtime/syscalls/sys_semaphore.c `sys_semaphore_wait`, runtime/syscalls/sys_event.c
-`sys_event_queue_receive`, 2026-07-04, DIAGNOSTIC ONLY): companion to `YZ_EVFLAG_FORCE` â€” scopes
+`sys_event_queue_receive`, 2026-07-04, DIAGNOSTIC ONLY): companion to `YZ_EVFLAG_FORCE` — scopes
 how deep t1's CHAIN of SPURS waits goes by making t1's (tid==1 only) blocking waits in this stuck
 phase return CELL_OK immediately instead of parking: `sys_semaphore_wait` (syscall 92) returns
 CELL_OK without decrementing/consuming when the semaphore value is <=0 (logs `[t1-unblock] sem_wait
 id=%u forced`); `sys_event_queue_receive` (syscall 130) returns CELL_OK with a zeroed event
 (gpr4-7 and the out-buffer all 0) when the queue is empty instead of blocking (logs `[t1-unblock]
 eq_recv q=%u forced`). Logging capped at the first 100 hits per syscall; the forcing itself is
-unbounded. Heavy hammer â€” deliberately breaks the real wait semantics (a real producer's payload
+unbounded. Heavy hammer — deliberately breaks the real wait semantics (a real producer's payload
 is never delivered) to let t1 barrel through every wait in the chain and reveal whether the boot
 wall is finite (t1 reaches new state) or bottomless (endless waits, no progress). Diagnostic-only
 Diagnostic-only, NOT a shipping fix. REMOVE with the t1-wedge frontier.
@@ -302,42 +302,42 @@ backtrace resolved to guest addresses via the existing `yz_guest_addr_from_host`
 as `yz_watch_bd`) plus a trampoline-ring line (reliable across memcpy/data-lr hops the raw
 host back-chain mis-symbolizes). Writes that land on a watched PAGE but not a watched DWORD
 are counted silently and reported once per 4096 (`[watch-wr] N same-page-other-dword writes
-so far`). Diagnostic-only, permanent kit â€” retirement: superseded-by-nothing.
+so far`). Diagnostic-only, permanent kit — retirement: superseded-by-nothing.
 Built to answer who arms cri_dlg's work flag `0x01661474`.
 
 Tracing/watches: `YZ_SPU_PROF`, `YZ_SPU_TRACE`, `YZ_SPU_TRACE_IMG`, `YZ_SPU_TRACE_N`
 (instruction budget for YZ_SPU_TRACE, default 600000; output is unbuffered so a crashing SPU
-keeps its trace tail â€” added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
-SPU id instead of first-seen; `any` disables the SPU filter for PC and rt lines â€” added
-2026-07-02), `YZ_SPU_TRACE_EVARM` (hold trace arming until an event site fires â€” the 0xA70
+keeps its trace tail — added 2026-07-01), `YZ_SPU_TRACE_SPU` (lock the tracer to a specific
+SPU id instead of first-seen; `any` disables the SPU filter for PC and rt lines — added
+2026-07-02), `YZ_SPU_TRACE_EVARM` (hold trace arming until an event site fires — the 0xA70
 taskset-syscall probe or the CRI request-queue GETLLAR in spu_dma.h; added 2026-07-02),
-`YZ_QLINE` (spu_context.h: log lifted image-3 stores to the GETLLAR line copy at LS 0x80 â€”
+`YZ_QLINE` (spu_context.h: log lifted image-3 stores to the GETLLAR line copy at LS 0x80 —
 2026-07-02, REMOVE with the frontier),
 `YZ_CTXSAVE_WATCH` (DMA + syscall-entry watch on the task context-save protocol: logs
-transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA70 syscall â€”
+transfers touching LS [0x2C80,0x3000) and the three save-bail checks at the 0xA70 syscall —
 added 2026-07-02, REMOVE when the codec frontier closes), `YZ_CODEC_PUT` (PUT-class DMAs +
 line atomics with pc from task images 3/4; dumps the LS line for atomics on the CRI queues;
-its request-line GETLLAR releases YZ_SPU_TRACE_EVARM â€” 2026-07-02, REMOVE with the
+its request-line GETLLAR releases YZ_SPU_TRACE_EVARM — 2026-07-02, REMOVE with the
 frontier), `YZ_OVL`
-(spu_dma.h: the entry-7 gate probe â€” [ovl] logs code-sized GETs into LS â‰¥0x10000 per image
+(spu_dma.h: the entry-7 gate probe — [ovl] logs code-sized GETs into LS ≥0x10000 per image
 (the image-5 runtime overlay load's source EA + size; image-5 sources also dumped to
 scratch\ovl_&lt;ea&gt;_&lt;lsa&gt;.bin, first 16) and [job-rd] logs GET/GETLLAR reads of the published
 shader-stream job block [0x40197100,0x40197400) to name the consumer, and [job-bin] logs
 image-13 (job module) code-sized GETs past its own end = runtime-loaded JOB BINARIES
-(source EA + LS base, the next lift target) â€” added 2026-07-03,
+(source EA + LS base, the next lift target) — added 2026-07-03,
 REMOVE when the jobchain frontier closes. Later additions under the same flag:
 [job-io] = every DMA issued by jobchain images 13-15 (pc discriminates module vs job code),
 [job-cmd] = command-stream/descriptor fetches with the fetched u64 (change-triggered per
-ea, incl. GETLLAR â€” shows every DISTINCT command the module decodes), [job-cas] = jobchain
+ea, incl. GETLLAR — shows every DISTINCT command the module decodes), [job-cas] = jobchain
 header PUTLLC commits with pc + the +0x20..0x2F mask bytes (change-triggered, grab latch
 +0x29 masked out); the always-on [dma-null] EA-0 atomic diag now also dumps gpr2-5,
-gpr80-82/126/127, the r3 object quads and the taskInfo quads â€” all REMOVE with the
+gpr80-82/126/127, the r3 object quads and the taskInfo quads — all REMOVE with the
 jobchain/pxd-dispatch frontier), `YZ_TS_PEEK`
-(spu_dma.h GETLLAR: change-triggered snapshot of the pxd taskset bitset line 0x40199D00 â€”
+(spu_dma.h GETLLAR: change-triggered snapshot of the pxd taskset bitset line 0x40199D00 —
 [ts-peek] prints word0 of running/ready/pending_ready/enabled/signalled/waiting with the
 reader's img+pc. The wid-0 policy fork discriminator: img 2 sees pend=0x80000000 yet never
-launches â‡’ the policy's SELECT_TASK lift; bitsets all-zero while the PPU create-CAS commits
-â‡’ lost write/visibility â€” added 2026-07-03, REMOVE with the pxd-dispatch frontier),
+launches ⇒ the policy's SELECT_TASK lift; bitsets all-zero while the PPU create-CAS commits
+⇒ lost write/visibility — added 2026-07-03, REMOVE with the pxd-dispatch frontier),
 `YZ_W2LIFE`
 (spu_channels.c yz_w2life_dump + per-SPU hop census; callers import_overrides.cpp park-rel apply +
 main.cpp stall watchdog + the coret/exit-unwind sites, s31 ledger #71: SPURS wid accounting
@@ -392,20 +392,20 @@ until then), one save per residency era; the restore's same-era skip now keys on
 RESIDENT record instead of the broken owner slot. Set YZ_NO_CTXSAVE=1 to get the old
 frozen-ctxsave behavior for A/B. Design scratch/s40_ctxsave_fix_design.md + the adversarial
 review s40_ctxsave_design_review.md), `YZ_JRNL_WATCH`
-(spu_dma.h: the LAYER-1 consumer discriminator â€” logs every DMA/atomic touching the gcm
+(spu_dma.h: the LAYER-1 consumer discriminator — logs every DMA/atomic touching the gcm
 journal HEAD lines 0x41F00080/0x42100080 (with a 32-byte line dump = entry-0 tag+ea) and
 every PUT-class into the journal arena [0x41F00000,0x42110000); first 80 hits full, then
 every 4096th; also [jrnl-cur] = the consumer's walking-cursor GETLLARs caught by LSA
 0x37780 at any EA, and an event-arm release for YZ_SPU_TRACE_EVARM at the journal-head
-GETLLAR â€” 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_COND_TRACE`
+GETLLAR — 2026-07-02, REMOVE when the producer-side journal frontier closes), `YZ_COND_TRACE`
 (sys_cond.c + sys_mutex.c: logs WAIT-enter/exit pairs and any SIGNAL that blocks acquiring
-the mutex CS on low-id conds, plus recursive-trylock re-entries â€” the boot-stall hunt's
+the mutex CS on low-id conds, plus recursive-trylock re-entries — the boot-stall hunt's
 sync-layer x-ray; 2026-07-02, retire with the stall frontier), `YZ_GSPUT`
-(spu_dma.h: logs every put-class DMA issued under SPU image 0 with pc+ea+size â€” the probe
+(spu_dma.h: logs every put-class DMA issued under SPU image 0 with pc+ea+size — the probe
 that proved gs_task's back half applies journal patches (plain PUTs, pc 0xB60C) and issues
 FENCED stopper-release PUTs (pc 0x5F00); 2026-07-02, retire with `YZ_JRNL_WATCH`), `YZ_SIGCALL`
 (dispatch.cpp: log indirect calls into the libsre LLE signal/queue family, addresses in
-scratch/libsre_lle_map.txt â€” 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
+scratch/libsre_lle_map.txt — 2026-07-02, REMOVE with the frontier), `YZ_IMGLOG`, `YZ_SIGW`,
 `YZ_SIGCNT`, `YZ_LRWAKE`, `YZ_LS_DUMP`, `YZ_WID01`
 (spu_dma.h ~1071-1112, 2026-07-04: extends the existing wid2/wid3 SELECT-gate probe
 under `[spu-ls]` to wid0/wid1 -- new `[spu-ls01]` line, same formula (run/prio/maxContention/
@@ -418,7 +418,7 @@ to LS 0xA70 (the taskset-syscall handler entry), if the resident taskset pointer
 is wid0/pxd's 0x40199D00 or the captured wid2/gs_task taskset EA, logs `[wid0-req]`: the
 request code (gpr3, signed+hex), and the 6 tempAreaTaskset bitset words (running/ready/
 pending_ready/enabled/signalled/waiting @ LS 0x2700/10/20/30/40/50) the policy just loaded.
-Side-by-side wid0-vs-wid2 request-path compare â€” does wid0 ever issue SELECT_TASK(5)? Retire
+Side-by-side wid0-vs-wid2 request-path compare — does wid0 ever issue SELECT_TASK(5)? Retire
 with the wid0-dispatch frontier.),
 `YZ_HALT_LOG`, `YZ_POLTRACE`, `YZ_POLHOP`,
 `YZ_DISP_TRACE`, `YZ_TRACE_CODEC`, `YZ_CODEC_WATCH`, `YZ_ELF_WATCH`, `YZ_PUT_WATCH`,
@@ -426,15 +426,15 @@ with the wid0-dispatch frontier.),
 `YZ_PHASE`, `YZ_FIFO_TRACE`, `YZ_TRACE_RSX`, `YZ_TRACE_DEFER`, `YZ_LOG_FIFOSET`,
 `YZ_DUMP_BUFDESC`, `YZ_DUMP_SEG`, `YZ_WATCH_LIST`, `YZ_WATCH_DLEA`, `YZ_WATCH_OPLIST`,
 `YZ_WATCH_300`, `YZ_WATCH_FENCE`, `YZ_WATCH_EA`, `YZ_WATCH_READ`, `YZ_WATCH_DLIST`,
-`YZ_WATCH_FLAG`, `YZ_WATCH_BD`, `YZ_L1SNAP` (**gates ALL invasive watchdog dumps** â€” the
+`YZ_WATCH_FLAG`, `YZ_WATCH_BD`, `YZ_L1SNAP` (**gates ALL invasive watchdog dumps** — the
 all-threads snapshot's serial thread-suspend + stack walks take 60+ s and froze the guest
-+30sâ†’+90s when made always-on 2026-07-02, invalidating four validation loops; even the
++30s→+90s when made always-on 2026-07-02, invalidating four validation loops; even the
 t1-only host-stack/spin dumps suspend t1 in the PortStart window and flipped a ~3/4 baseline
-to 0/3 â€” a diagnostic must never perturb the system it measures), `YZ_GCMCTX_BISECT`,
+to 0/3 — a diagnostic must never perturb the system it measures), `YZ_GCMCTX_BISECT`,
 `YZ_GUARD`, `YZ_GUARD_FULL`,
-`YZ_GUEST_ADDR`, `YZ_ARG`, `YZ_VSYNC_PRECISE`, `YZ_THROTTLE_DIAG` (sys_timer.c â€” REVERT
+`YZ_GUEST_ADDR`, `YZ_ARG`, `YZ_VSYNC_PRECISE`, `YZ_THROTTLE_DIAG` (sys_timer.c — REVERT
 before commit per STATUS). (Removed 2026-07-02 with the geometry root fixed: `YZ_GEO_PROBE`,
-`YZ_GEO_SKIPNULL`, `YZ_LSWATCH`, `YZ_LSWRITE` â€” stripped from the code; re-derive fresh
+`YZ_GEO_SKIPNULL`, `YZ_LSWATCH`, `YZ_LSWRITE` — stripped from the code; re-derive fresh
 probes if a new LS-provenance question comes up rather than resurrecting these ranges.)
 
 ## RETIRED / refuted (do not re-enable; delete when convenient)
@@ -443,7 +443,7 @@ probes if a new LS-provenance question comes up rather than resurrecting these r
 |---|---|
 | `YZ_FLIPADV` | Band-aid retired by the faithful flip lifecycle (6fbc3c6). |
 | `YZ_FORCE_START` | Retired bc8efa6 (superseded by the 5882fe4 image-match fix). |
-| `YZ_FRC`, `YZ_FRC3` | readyCount force â€” superseded by the real poll-status path. |
+| `YZ_FRC`, `YZ_FRC3` | readyCount force — superseded by the real poll-status path. |
 | `YZ_CLEARRUN`, `YZ_CLEARRUN3`, `YZ_FIXRUN`, `YZ_FIXEXIT`, `YZ_FORCE_TASK`, `YZ_POLLFORCE`, `YZ_NOLAUNCH`, `YZ_NO_MGMT`, `YZ_NOHELPRET`, `YZ_CORET_GEN` | SPURS-dispatch-era forces; the dispatch now works via the real path. |
 | `YZ_IMM_REL`, `YZ_NO_DEFER`, `YZ_ONESEG`, `YZ_SEGBIG`, `YZ_BIG_SEG` | FIFO/stopper experiment forces; refuted or superseded by f8d0386 (see archive tested-negative ledgers). |
 | `YZ_WKLSIG` | Signal-era probe/force; machinery proven healthy. |
@@ -451,22 +451,22 @@ probes if a new LS-provenance question comes up rather than resurrecting these r
 ## Diagnostics backfill (2026-07-05)
 
 `YZ_B1_BLEND` / `YZ_B1_CULL` / `YZ_B1_DEPTH` / `YZ_B1_SAMP` (libs/video/tests/replay_main.c
-`b1_read_env`): the Track B replay tool's B1 state-group kill switches â€” set any one to `"0"`
+`b1_read_env`): the Track B replay tool's B1 state-group kill switches — set any one to `"0"`
 to disable that decoded-state group (blend, cull, depth, sampler) in the PSO build, all
 default ON. Used to bisect Track B render regressions by state group. `YZ_B1_TEXLOG`
 (same file, the texture-decode path): when set (any value), prints one `[texlog]` line per
-decoded texture (offset/format/dimensions/mips/filter min-mag/fallback-or-ok) â€” a diagnostic
+decoded texture (offset/format/dimensions/mips/filter min-mag/fallback-or-ok) — a diagnostic
 dump, not a kill switch.
 
 `YZ_CRIDLG` (yakuza/shims.cpp, the `num == 107` cond_wait hook, 2026-07-05): logs cri_dlg's
-(tid 11/12, the CRI asset-load dispatcher) control-block state at each `cellCond`-style wait â€”
+(tid 11/12, the CRI asset-load dispatcher) control-block state at each `cellCond`-style wait —
 ctrl address, the work-flag at `+4`, the callback/arg at `+0x40/+0x44`, run state at `+0x50`,
 cond byte at `+0x14` (first 12 hits, then every 250th). Forks whether the stall is a producer
 bug (work never queued) or a callback bug (work queued but never dispatched); see the comment
-citing RPCS3's scenario.bin â†’ player_pos.bin â†’ all_csb.par â†’ movie load sequence.
+citing RPCS3's scenario.bin → player_pos.bin → all_csb.par → movie load sequence.
 
 `YZ_EVFLAG_BT` (yakuza/dispatch.cpp, inside the `YZ_EVFLAG_WATCH` wait-log block, 2026-07-04):
-companion to `YZ_EVFLAG_WATCH` â€” walks the guest PPC64 back-chain (r1 â†’ saved caller sp/LR)
+companion to `YZ_EVFLAG_WATCH` — walks the guest PPC64 back-chain (r1 → saved caller sp/LR)
 to name the real game function(s) that called into `cellSpursEventFlagWait`, since the
 immediate `ctx->lr` at the hook site is 0 (fired inside the trampoline hop, not the real
 caller). Fires only for `ea==0x4019C680` (the measured t1-wedge object), capped at the first
@@ -475,27 +475,27 @@ caller). Fires only for `ea==0x4019C680` (the measured t1-wedge object), capped 
 `YZ_FORCE_RC` (yakuza/import_overrides.cpp, the vblank coherence-test block, ~line 2068): every
 vblank, bumps the SPURS taskset's `wklReadyCount1[wid]` to 1 directly inside the SPU lock-line
 (so it survives the kernel's own PUTLLC), when a taskset pointer is known. Tests whether the
-missing bootstrap step is the coherent readyCount bump that `CreateTask2` should have done â€”
+missing bootstrap step is the coherent readyCount bump that `CreateTask2` should have done —
 confirms/refutes by whether the kernel then schedules the wid and runs gs_task.
 
 `YZ_FS_TRACE` (libs/filesystem/cellFs.c, the read/Lseek/Fstat path, 2026-07-03): logs EVERY
 `cellFsRead`/`Lseek`/`Fstat` call (path, offset, resulting position/size), not just the
 stream-container heuristic (`.cvm`/`.sfd`/`/stream/`/`/movie/` paths) the code already applies
-by default â€” the pxd spurious-completion probe, added because some boundary streams read an
+by default — the pxd spurious-completion probe, added because some boundary streams read an
 archive fd whose path misses the built-in stream-path filters.
 
 `YZ_MGMT_CAS` (yakuza/shims.cpp, the SPU-mgmt-line `stwcx` path, 2026-07-03): logs every PPU
-`stwcx` (CAS) onto the SPURS mgmt line `0x40197C80` with old/new/ok â€” the wid-0 fork
+`stwcx` (CAS) onto the SPURS mgmt line `0x40197C80` with old/new/ok — the wid-0 fork
 discriminator: if readyCount commits land here but wid 0 never dispatches, the bug is in the
 kernel select's wid-0 path; if no commit ever targets readyCount[0], the signal path bails
 before its CAS. The wid-0 wklSignal bit at `+0x70` (`0x40197CF0`) is logged uncapped (rare);
 everything else is per-word capped. Extended 2026-07-06: the 8-byte `stdcx` path counts mgmt-line
-CAS too (`[mgmt-cas8]`, first 40 + every 997th) â€” the 4-byte-only probe undercounted any mixer
+CAS too (`[mgmt-cas8]`, first 40 + every 997th) — the 4-byte-only probe undercounted any mixer
 heartbeat committed via 8-byte CAS.
 
 `YZ_WIDSIG_ALL` (yakuza/shims.cpp, the SPU-mgmt-line `stwcx` path, 2026-07-06): UNCAPPED census of
 every PPU commit that RAISES a wid signal bit on the wklSignal1 word (`0x40197CF0`), per-wid running
-counts (`[widsig]` lines) â€” built to measure the CRI-phase re-arm frequency of wid1 past
+counts (`[widsig]` lines) — built to measure the CRI-phase re-arm frequency of wid1 past
 `YZ_MGMT_CAS`'s per-word cap. This measured the current frontier fact: the guest producer raises
 wid1's bit exactly ONCE per boot (vs continuous re-kicks in RPCS3). Purely observational.
 
@@ -508,21 +508,21 @@ auto-resets and waits correctly; the wall = the producer never notifying again. 
 producer frontier.
 
 `YZ_JOBTRACE` (runtime/spu/spu_channels.c `spu_indirect_branch`, 2026-07-08, capped 400, armed
-banner): computed-branch trail of the jobchain JOB binaries (images 14/15) â€” pc, link, r3 per
+banner): computed-branch trail of the jobchain JOB binaries (images 14/15) — pc, link, r3 per
 dispatch. Verdict obtained same day: round-1 jobB enters 0x4C00 with the correct job ABI
 (r3=0x4940), returns to the module, module polls kernel (0x290) and exits (0x838). Retire with
 the jobchain frontier.
 
 `YZ_FLAGCAS` (runtime/spu/spu_dma.h PUTLLC path, 2026-07-08, uncapped, armed banner): every SPU
 PUTLLC ATTEMPT on the IWL event-flag line 0x4019C680 (the flag t1 waits on, bit 0x1), logged
-BEFORE the success test with a COMMIT/FAIL verdict + oldâ†’new bits. Verdict obtained same day:
-ZERO attempts the whole boot â€” round-1 jobB never reaches its flag-set stretch (RPCS3's
-jobB@slot0 PUTLLCs it at LS pc 0x520C) â‡’ early-exit on staged input data. Retire with the
+BEFORE the success test with a COMMIT/FAIL verdict + old→new bits. Verdict obtained same day:
+ZERO attempts the whole boot — round-1 jobB never reaches its flag-set stretch (RPCS3's
+jobB@slot0 PUTLLCs it at LS pc 0x520C) ⇒ early-exit on staged input data. Retire with the
 jobchain frontier.
 
 `YZ_JOBDESC` (runtime/spu/spu_dma.h GET path, 2026-07-08, capped 96, armed banner): payload hex
 dump (first 64 B) of every SPU GET from the CRI jobchain object area [0x40190000,0x401A0000),
-size â‰¤ 0x400 â€” the header/command/JOB-DESCRIPTOR bytes the module stages before calling a job.
+size ≤ 0x400 — the header/command/JOB-DESCRIPTOR bytes the module stages before calling a job.
 Twin probe added to the RPCS3 build (same format) for a byte diff; guest EAs are identical. Retire
 with the jobchain frontier.
 
@@ -581,7 +581,7 @@ measurement instead of a PC inference. Verdict already obtained (the flag toggle
 notifier is exonerated); retire once the CRI producer root is fixed.
 
 `YZ_NO_CONSUMER` (yakuza/import_overrides.cpp, ~line 1802, marked "TEMP: isolate consumer vs
-libgcm"): kill switch for the RSX FIFO consumer thread â€” when set, the async consumer thread
+libgcm"): kill switch for the RSX FIFO consumer thread — when set, the async consumer thread
 (`yz_rsx_consumer`) is never created (only takes effect when `YZ_RSX_INLINE` isn't already
 running the FIFO inline). Used to isolate whether a symptom comes from the consumer thread or
 from libgcm's own producer-side behavior.
