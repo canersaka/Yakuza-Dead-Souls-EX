@@ -1495,7 +1495,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              * a job. Round-1 jobB (dual-base fix) runs its REAL code but
              * early-exits without attempting the flag PUTLLC (fixboot3: jobtrace
              * armed, flagcas armed, 0 attempts) — so the deciding values are in
-             * these staged bytes. Guest EAs match RPCS3; the rpcs3clone twin
+             * these staged bytes. Guest EAs match RPCS3; the RPCS3-side twin
              * probe dumps the same GETs for a byte diff. */
             { static int jd = -1;
               if (jd < 0) { jd = getenv("YZ_JOBDESC") ? 1 : 0;

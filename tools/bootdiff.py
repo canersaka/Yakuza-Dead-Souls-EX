@@ -63,8 +63,8 @@ line to add a new event type or a new log-line shape for an existing type.
 USAGE
 -----
   py -3 tools\\bootdiff.py --ours-err scratch\\s25ride.err --ours-out scratch\\s25ride.out ^
-      --ref "C:\\Users\\csaka\\Downloads\\rpcs3clone\\rpcs3\\bin\\log\\RPCS3.log:rpcs3log" ^
-      --ref "C:\\Users\\csaka\\Downloads\\rpcs3clone\\rpcs3\\bin\\yz_rounddriver_oracle.log:probelog" ^
+      --ref "<rpcs3-checkout>\\rpcs3\\bin\\log\\RPCS3.log:rpcs3log" ^
+      --ref "<rpcs3-checkout>\\rpcs3\\bin\\yz_rounddriver_oracle.log:probelog" ^
       --context 20
 
 See CHEATSHEET.md's "boot-choreography differential" section for the full

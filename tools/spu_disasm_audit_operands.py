@@ -85,8 +85,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from elf_parser import ELFFile, PT_LOAD  # noqa: E402
 from spu_disasm import spu_decode  # noqa: E402
 
-DEFAULT_ORACLE_EXE = (
-    r"C:\Users\csaka\Downloads\rpcs3clone\rpcs3\build\bin\Release-x64\spu_dump_tool.exe"
+DEFAULT_ORACLE_EXE = os.environ.get(
+    "YZ_SPU_DUMP_TOOL",
+    r"<rpcs3-checkout>\rpcs3\build\bin\Release-x64\spu_dump_tool.exe",
 )
 DEFAULT_WHITELIST = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

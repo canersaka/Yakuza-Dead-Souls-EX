@@ -4,8 +4,8 @@ SPU decode cross-check: tools/spu_disasm.py vs RPCS3's SPUDisAsm used as an
 OUTPUT-ONLY oracle.
 
 Clean-room posture: RPCS3 is GPLv2. The oracle is a tiny standalone dump
-harness that lives ENTIRELY inside the rpcs3clone tree
-(C:\\Users\\csaka\\Downloads\\rpcs3clone\\rpcs3\\rpcs3\\tools\\spu_dump_tool\\)
+harness that lives ENTIRELY inside the instrumented RPCS3 checkout
+(<rpcs3-checkout>\\rpcs3\\rpcs3\\tools\\spu_dump_tool\\)
 and links RPCS3's own SPUDisAsm class. No RPCS3 source is copied here; this
 script only invokes that already-built .exe and diffs its plain-text stdout
 against our own decoder's output. See that harness's main.cpp for the build
@@ -54,12 +54,13 @@ from elf_parser import ELFFile, PT_LOAD  # noqa: E402
 from spu_disasm import spu_decode  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Oracle harness location (lives entirely in the rpcs3clone tree; never
+# Oracle harness location (lives entirely in the RPCS3 checkout; never
 # copied here -- see the harness's own main.cpp for the clean-room
-# rationale).
+# rationale).  Point YZ_SPU_DUMP_TOOL at the built spu_dump_tool.exe.
 # ---------------------------------------------------------------------------
-DEFAULT_ORACLE_EXE = (
-    r"C:\Users\csaka\Downloads\rpcs3clone\rpcs3\build\bin\Release-x64\spu_dump_tool.exe"
+DEFAULT_ORACLE_EXE = os.environ.get(
+    "YZ_SPU_DUMP_TOOL",
+    r"<rpcs3-checkout>\rpcs3\build\bin\Release-x64\spu_dump_tool.exe",
 )
 
 PF_X = 0x1  # ELF program header "executable" flag bit
@@ -96,9 +97,9 @@ def find_oracle_exe(explicit: str | None) -> str:
         raise SystemExit(
             f"error: oracle harness not found at '{path}'.\n"
             "Build it first: the harness project is "
-            "tools/spu_dump_tool.vcxproj under the rpcs3clone tree; build "
+            "tools/spu_dump_tool.vcxproj under the RPCS3 checkout; build "
             "with msbuild against that .vcxproj "
-            "(/p:SolutionDir=<rpcs3clone>\\rpcs3\\)."
+            "(/p:SolutionDir=<rpcs3-checkout>\\rpcs3\\)."
         )
     return path
 
@@ -138,7 +139,7 @@ def decode_ours(code: bytes, vaddr: int) -> dict[int, str]:
 
 
 def decode_oracle(oracle_exe: str, code: bytes, vaddr: int) -> dict[int, str]:
-    """offset -> mnemonic, by shelling out to the rpcs3clone harness."""
+    """offset -> mnemonic, by shelling out to the RPCS3 dump harness."""
     # SPU local store is 256 KiB (SPU_LS_SIZE); the harness requires
     # base + len(code) <= 0x40000. Our lifted images' vaddrs (e.g. gs_task's
     # 0x3000) already satisfy this -- if a future image doesn't, mask to the
@@ -217,7 +218,7 @@ def audit_one(image_path: str, oracle_exe: str, samples: int) -> tuple[Counter, 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("images", nargs="+", help="lifted SPU image ELF(s), e.g. scratch\\spu_imgs\\spu_0003_at_0126A580.elf")
-    ap.add_argument("--oracle-exe", default=None, help="path to the rpcs3clone spu_dump_tool.exe")
+    ap.add_argument("--oracle-exe", default=None, help="path to the RPCS3 spu_dump_tool.exe (or set YZ_SPU_DUMP_TOOL)")
     ap.add_argument("--samples", type=int, default=3, help="sample addresses per mismatch pair (default 3)")
     args = ap.parse_args()
 

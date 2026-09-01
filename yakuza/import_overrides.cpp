@@ -6018,7 +6018,7 @@ extern "C" void yz_frontier_fifo_snapshot(uint32_t get, uint32_t put)
  *
  * Two Windows-side adaptations of the Mac design, both measured-evidence:
  *  - release VALUE: the SPU consumer clears a stopper with a gcm jump-FORWARD
- *    word (top byte 0x20; rpcs3clone oracle census + the lever below), never
+ *    word (top byte 0x20; RPCS3 oracle census + the lever below), never
  *    zero -- so the release goes through yz_jrnl_hle_release, not write32(0).
  *  - takeover CURSOR: bootstrapped from the real consumer's own poll cursor
  *    (g_yz_jrnl_cur_ea, maintained on every GETLLAR poll), sampled at its

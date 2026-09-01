@@ -523,7 +523,7 @@ jobchain frontier.
 `YZ_JOBDESC` (runtime/spu/spu_dma.h GET path, 2026-07-08, capped 96, armed banner): payload hex
 dump (first 64 B) of every SPU GET from the CRI jobchain object area [0x40190000,0x401A0000),
 size â‰¤ 0x400 â€” the header/command/JOB-DESCRIPTOR bytes the module stages before calling a job.
-Twin probe added to rpcs3clone (same format) for a byte diff; guest EAs are identical. Retire
+Twin probe added to the RPCS3 build (same format) for a byte diff; guest EAs are identical. Retire
 with the jobchain frontier.
 
 `YZ_WIDSIG_BT` (yakuza/shims.cpp, inside the `YZ_WIDSIG_ALL` block, 2026-07-08): on a wid1 (bit
