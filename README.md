@@ -7,7 +7,7 @@ The project translates the game’s PowerPC PPU code, Cell SPU programs, and NVI
 > This is an experimental preservation and engineering project. It is not currently a finished or fully playable port.
 
 ## Current Status
-<iframe width="560" height="315" src="https://www.youtube.com/watch?v=Y3LBx3jeiLc" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+[![Current Video Showcase](https://img.youtube.com/vi/Y3LBx3jeiLc/maxresdefault.jpg)](https://www.youtube.com/watch?v=Y3LBx3jeiLc)
 
 
 Development began on June 9, 2026, the fifteenth anniversary of the original 
