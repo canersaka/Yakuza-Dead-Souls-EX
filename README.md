@@ -7,6 +7,12 @@ The project translates the game’s PowerPC PPU code, Cell SPU programs, and NVI
 > This is an experimental preservation and engineering project. It is not currently a finished or fully playable port.
 
 ## Current Status
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=Y3LBx3jeiLc">
+    <img src="https://img.youtube.com/vi/Y3LBx3jeiLc/maxresdefault.jpg" width="600">
+  </a>
+</p>
+
 
 Development began on June 9, 2026, the fifteenth anniversary of the original 
 Japanese release of *Ryū ga Gotoku: Of the End*.
