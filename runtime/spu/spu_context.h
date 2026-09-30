@@ -11,14 +11,11 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
-#include "spu_fltrec.h"    /* s41 flight recorder (env YZ_FLTREC, default off) */
-#include "spu_lockstep.h"  /* s42 YZ_SPU_LOCKSTEP round-robin token (default off) */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdatomic.h>     /* FIX 2 (2026-07-17): channel/event cross-thread atomics */
-#include "ps3emu/yz_runtime_config.h"
+#include <stdatomic.h>     /* channel/event cross-thread atomics */
 
 #if defined(_MSC_VER)
 #include <tmmintrin.h>
@@ -28,33 +25,13 @@
 #define YZ_SPU_SIMD_LS128 0
 #endif
 
-/*
- * Profiling itself is observation-only and disappears from clean lanes.
- * Do not redefine getenv here: this header also reaches behavior/repair
- * controls, which must retain their startup-selected semantics.
- */
-#if defined(YZ_PERF_CLEAN)
-#  define YZ_SPU_PROF_ACTIVE() 0
-#else
-#  define YZ_SPU_PROF_ACTIVE() (g_spu_prof_on)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Scene marker owned by the Yakuza auth instrumentation. */
-extern volatile long g_yz_a010_root_active;
-struct spu_context;
-void yz_tagread_repair_fetch(
-    struct spu_context* ctx, uint32_t lsa,
-    unsigned long long ea, uint32_t size);
-void yz_tagread_repair_read(
-    struct spu_context* ctx, uint32_t lsa, uint32_t* value);
-void yz_a010_reltrace_gate(
-    uint32_t spu_id, uint32_t code, uint32_t key,
-    uint32_t witness, uint32_t descriptor,
-    uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+/* Context of the SPU that consumes the command journal; recorded by
+ * mfc_submit (spu_dma.h), defined in spu_channels.c. */
+extern volatile void* g_yz_consumer_ctx;
 
 /* Portable 16-byte alignment (MSVC __declspec vs GCC/clang __attribute__). */
 #if defined(_MSC_VER)
@@ -66,9 +43,6 @@ void yz_a010_reltrace_gate(
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
-
-/* Maximum number of MFC tag groups */
-#define SPU_MFC_MAX_TAGS    32
 
 /* Mailbox / signal capacities */
 #define SPU_MBOX_DEPTH      1    /* SPU write outbound mailbox depth */
@@ -128,14 +102,14 @@ void yz_a010_reltrace_gate(
 #define MFC_EIEIO_CMD       0xC8
 #define MFC_SYNC_CMD        0xCC
 
-/* Lock-line (128-byte cache line) atomics — the SPURS kernel scheduler
+/* Lock-line (128-byte cache line) atomics: the SPURS kernel scheduler
  * claims workloads with GETLLAR/PUTLLC loops. */
 #define MFC_PUTLLC_CMD      0xB4
 #define MFC_PUTLLUC_CMD     0xB0
 #define MFC_PUTQLLUC_CMD    0xB8
 #define MFC_GETLLAR_CMD     0xD0
 
-/* MFC_RdAtomicStat result values (RPCS3 MFC.h, CBEA ch. 9) */
+/* MFC_RdAtomicStat result values */
 #define MFC_PUTLLC_SUCCESS  0
 #define MFC_PUTLLC_FAILURE  1
 #define MFC_PUTLLUC_SUCCESS 2
@@ -144,32 +118,31 @@ void yz_a010_reltrace_gate(
 /* ---------------------------------------------------------------------------
  * Channel state
  *
- * `count` is a C11 atomic (2026-07-17, spu_channels.c FIX 2). RdInMbox,
- * RdSigNotify1/2 and RdEventStat's underlying storage (this field, and
- * event_status below) have a real or intended cross-thread producer -- the
- * PPU (sys_spu_thread_write_snr) or another SPU (the coherence-loss LR raise)
- * writes it while the owning SPU host thread polls/blocks on it in
- * spu_ch_ready/spu_ch_wait (spu_channels.c). Plain uint32_t reads/writes were
- * previously justified by x86 TSO (a producer's plain store is globally
- * visible, and the 10 ms spu_ch_wait re-poll is a missed-wake safety net) --
- * that argument covers cross-CPU VISIBILITY latency but not the compiler's
- * freedom to cache/reorder a plain load across loop iterations, which _Atomic
- * plus an explicit memory_order closes without weakening the existing
+ * `count` is a C11 atomic. RdInMbox, RdSigNotify1/2 and RdEventStat's
+ * underlying storage (this field, and event_status below) have a real or
+ * intended cross-thread producer: the PPU (sys_spu_thread_write_snr) or
+ * another SPU (the coherence-loss LR raise) writes it while the owning SPU
+ * host thread polls/blocks on it in spu_ch_ready/spu_ch_wait
+ * (spu_channels.c). x86 TSO alone would make a producer's plain store
+ * globally visible (and the 10 ms spu_ch_wait re-poll is a missed-wake
+ * safety net), but that covers cross-CPU visibility latency, not the
+ * compiler's freedom to cache/reorder a plain load across loop iterations.
+ * _Atomic plus an explicit memory_order closes that without weakening the
  * TSO/relaxed-visibility model (relaxed is still used wherever that argument
  * applies). `count` is used as a ready-flag guarding `value` (message-passing
  * idiom): the producer stores value then releases count; the consumer
- * acquire-loads count and, only once it observes nonzero, reads value -- so
+ * acquire-loads count and, only once it observes nonzero, reads value, so
  * `value` itself does not need to be atomic. spu_channel is shared by all
  * four mailbox/signal instances (ch_out_mbox and ch_out_intr_mbox are
- * same-thread only per spu_wrch's own comments) -- one struct definition, so
- * they get the same atomic field; harmless for the same-thread instances
- * (default sequentially-consistent ops on a single-thread-owned atomic are
- * just a locked no-op on x86, never a behavior change). */
+ * same-thread only per spu_wrch's own comments) with one struct definition,
+ * so they get the same atomic field; that is harmless for the same-thread
+ * instances (default sequentially-consistent ops on a single-thread-owned
+ * atomic are just a locked no-op on x86, never a behavior change). */
 typedef struct spu_channel {
     uint32_t          value;
     _Atomic uint32_t  count;   /* number of valid entries (0 or 1 for most channels) */
 } spu_channel;
-/* Struct-layout guard (spu_context's APPEND-ONLY rule, see below): atomic_uint
+/* Struct-layout guard (spu_context's append-only rule, see below): atomic_uint
  * is guaranteed lock-free and same size/alignment as uint32_t on every target
  * this project builds for (x86-64 MSVC/clang/gcc); this assertion makes that
  * assumption load-bearing and checked, not just assumed. */
@@ -195,13 +168,12 @@ typedef struct spu_context {
     #define SPU_STATUS_STOPPED_BY_STOP  0x2
     #define SPU_STATUS_STOPPED_BY_HALT  0x4
     #define SPU_STATUS_WAITING_CHANNEL  0x8
-    #define SPU_STATUS_SINGLE_STEP  0x10
 
     /* 14-bit stop-and-signal code from the last stop/stopd (insn bits 18:31,
      * & 0x3FFF; stopd is fixed at 0x3FFF). Set by lifted stop/stopd codegen so
      * lv2 can dispatch the SYS_SPU_THREAD_STOP_* protocol (0x101 GROUP_EXIT /
      * 0x102 THREAD_EXIT pop the OutMbox for the guest-written exit status,
-     * 0x110 RECEIVE_EVENT, ...). CBEA v1.02 p97 SPU_Status.StopCode. specaudit F18. */
+     * 0x110 RECEIVE_EVENT, ...). Mirrors SPU_Status.StopCode. */
     uint32_t stop_code;
 
     /* SPU thread identification */
@@ -214,64 +186,22 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
-    /* Runtime LS bases for the first five EBOOT-resident SPURS job binaries
-     * on the path to gameplay. mfc_do_transfer records descriptor eaBinary
-     * loads here; spu_indirect_branch uses the recorded residency to select
-     * the matching lifted placement. Zero means that binary is not resident.
-     * This legacy array cannot grow without moving generated-code-visible
-     * fields; later family slots therefore live in the append-only extension
-     * at the end of this structure and are accessed through the helpers below. */
-    uint32_t job_bin_base[5];
-
-    /*
-     * Focused Sunshine-orphanage Job A accounting.  The job-module entry
-     * snapshots which static-stage mesh record a descriptor consumes;
-     * mfc_do_transfer accumulates that job's GET/PUT traffic until the binary
-     * returns to the module.  Diagnostic only, armed by
-     * YZ_A010_JOB_OUTPUT_MAP.
-     */
-    uint32_t a010_job_active;
-    uint32_t a010_job_stage_object;
-    uint32_t a010_job_stage_input;
-    uint32_t a010_job_desc_kind;
-    uint32_t a010_job_record;
-    uint32_t a010_job_get_count;
-    uint32_t a010_job_get_bytes;
-    uint32_t a010_job_put_count;
-    uint32_t a010_job_put_bytes;
-    uint32_t a010_job_first_put_ea;
-    uint32_t a010_job_last_put_ea;
-
-    /* Dynamic a010 stage-record consumption map for gs_task (image 0). */
-    uint32_t a010_stage_generation;
-    uint32_t a010_stage_fetch_mask;
-    uint32_t a010_stage_get_count;
-    uint32_t a010_stage_get_bytes;
-    uint32_t a010_stage_put_count;
-    uint32_t a010_stage_put_bytes;
-    uint32_t a010_stage_first_put_ea;
-    uint32_t a010_stage_last_put_ea;
-
-    /* Decrementer (a free-running down counter) */
-    uint32_t decrementer;
-
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask. event_status is a C11 atomic (FIX 2, 2026-07-17):
-     * it has TWO writer classes -- the owning SPU thread itself (WrEventAck's
-     * clear, and the MFC engine's own SN/LR self-raises in spu_dma.h) and a
-     * genuinely cross-thread writer (spu_coh_notify_write's LR raise, called
-     * from the PPU coherence-write path in another thread). Both `|=`/`&=`
-     * writer sites now go through atomic_fetch_or_explicit/
-     * atomic_fetch_and_explicit so the read-modify-write itself is a single
-     * atomic op (closing a possible lost-update between the two writer
-     * classes) in addition to the pre-existing spu_lockline_lock serialization
-     * (see SPU_WrEventAck in spu_channels.c) -- belt-and-suspenders, not a
-     * replacement for the lock. event_mask has exactly one writer, the owning
-     * SPU thread's own WrEventMask (spu_channels.c), so it stays plain
-     * uint32_t per the conservative fix scope (only fields with a real
-     * cross-thread writer get promoted). */
+    /* Event status / mask. event_status is a C11 atomic: it has two writer
+     * classes, the owning SPU thread itself (WrEventAck's clear, and the MFC
+     * engine's own SN/LR self-raises in spu_dma.h) and a genuinely
+     * cross-thread writer (spu_coh_notify_write's LR raise, called from the
+     * PPU coherence-write path in another thread). Both `|=`/`&=` writer
+     * sites go through atomic_fetch_or_explicit/atomic_fetch_and_explicit so
+     * the read-modify-write itself is a single atomic op (closing a possible
+     * lost-update between the two writer classes) in addition to the
+     * spu_lockline_lock serialization (see SPU_WrEventAck in spu_channels.c);
+     * belt-and-suspenders, not a replacement for the lock. event_mask has
+     * exactly one writer, the owning SPU thread's own WrEventMask
+     * (spu_channels.c), so it stays a plain uint32_t (only fields with a real
+     * cross-thread writer are atomic). */
     _Atomic uint32_t event_status;
     uint32_t         event_mask;
 
@@ -301,83 +231,42 @@ typedef struct spu_context {
      * live host frame, so a C return cannot reach it. */
     uint32_t host_depth;
 
-    /* ---- Fields below this line were appended 2026-07-03 (SPU-runtime slice:
-     * decrementer, DMA-list stall-and-notify). Struct layout rule: APPEND ONLY --
-     * lifted code and any generated mirror depend on the offsets of the fields
-     * above, so nothing above this comment may move or change size. ---- */
+    /* ---- Fields below this line were appended (decrementer, DMA-list
+     * stall-and-notify). Struct layout rule: append only; nothing above this
+     * comment may move or change size. ---- */
 
-    /* Decrementer (CBEA v1.02 Section 9.7 p145-146; RPCS3 SPUThread.cpp:1313-1315).
-     * The decrementer is a free-running 32-bit down counter at the PPE timebase
-     * rate (79.8 MHz on PS3) that STARTS COUNTING AT SPU THREAD CREATION, not at
-     * the first `wrch SPU_WrDec` -- confirmed live-exposure fact (specaudit_spu.md
-     * F21): all 13 measured `rdch SPU_RdDec` sites in the lifted images have ZERO
-     * matching `wrch SPU_WrDec` sites, so a WrDec-triggered-only model would leave
-     * every read frozen forever. dec_running is set at spu_context_init() (mirrors
-     * RPCS3's cpu_init/thread-constructor start) and again on any `wrch SPU_WrDec`
-     * (CBEA p145: "the decrementer... starts... when a wrch instruction targets
-     * SPU_WrDec"). dec_start_tb is the guest timebase (ppu_timebase_now(), the
-     * same 79.8 MHz clock as the PPU decrementer/mftb -- CBEA Section 9.7 ties the
-     * SPU decrementer to "the same rate as the PPE decrementer") sampled at the
-     * moment dec_value was last set; SpuRdDec computes
-     * `dec_value - (ppu_timebase_now() - dec_start_tb)` (see spu_channels.c
-     * SPU_RdDec / SPU_WrDec). dec_running (0 = frozen) models CBEA Section
-     * 9.11.2 p158's ack-while-masked stop rule (WrEventAck of the Tm bit while
+    /* Decrementer. It is a free-running 32-bit down counter at the PPE
+     * timebase rate (79.8 MHz on PS3) that starts counting at SPU thread
+     * creation, not at the first `wrch SPU_WrDec`: the lifted images read
+     * `rdch SPU_RdDec` at many sites with no matching `wrch SPU_WrDec`, so a
+     * WrDec-triggered-only model would leave every read frozen forever.
+     * dec_running is set at spu_context_init() and again on any
+     * `wrch SPU_WrDec`. dec_start_tb is the guest timebase
+     * (ppu_timebase_now(), the same 79.8 MHz clock as the PPU
+     * decrementer/mftb) sampled at the moment dec_value was last set;
+     * SpuRdDec computes `dec_value - (ppu_timebase_now() - dec_start_tb)`
+     * (see spu_channels.c SPU_RdDec / SPU_WrDec). dec_running (0 = frozen)
+     * models the ack-while-masked stop rule (WrEventAck of the Tm bit while
      * Tm is disabled in the event mask stops the count; re-armed by the next
-     * WrDec). Decrementer
-     * EVENT generation (Tm, status bit 0x20, MSb 0->1 edge, CBEA Section 9.12.5
-     * p166) is intentionally NOT implemented -- see the note at SPU_RdDec in
-     * spu_channels.c; this is a documented remaining gap, not an oversight. */
+     * WrDec). Decrementer event generation (Tm, status bit 0x20, MSb 0->1
+     * edge) is intentionally not implemented; see the note at SPU_RdDec in
+     * spu_channels.c. */
     uint64_t dec_start_tb;   /* guest timebase (ppu_timebase_now()) at the last WrDec/thread-start */
     uint32_t dec_value;      /* value written (or the POR initial value at thread start) */
-    int      dec_running;    /* 0 = frozen (stopped by ack-while-masked, CBEA p158 Section 9.11.2) */
+    int      dec_running;    /* 0 = frozen (stopped by ack-while-masked) */
 
-    /* Which workload-module image is RESIDENT at LS 0xA00 in this context
-     * (1=service, 2=taskset policy, 13=job module), recorded by the DMA layer
-     * at the kernel's module load (spu_dma.h LS-0xA00 switch). Ground truth
-     * for dispatch: the bracket restore (spu_img_restore) can undo a DMA-time
-     * image_id switch when the kernel loads the module inside a subroutine
-     * that returns before the dispatch branch, so spu_indirect_branch
-     * re-adopts this recorded image at every pc==0xA00 entry. 0 = nothing
-     * recorded yet (s24 adopt-on-serve model, ledger #51). */
-    int32_t  module_img_a00;
-
-    /* s32: the LS-0xA00 module's SOURCE (guest EA + byte size), recorded at
-     * the same kernel module load as module_img_a00. Ground truth for the
-     * module-image staleness guard at the 0xA00 entry (the s32coop1 death:
-     * the policy's syscall jump table at LS 0x1CC8 read as zeros mid-boot --
-     * the workload-level sibling of the #34 task-segment class; the
-     * module-entry contract makes fresh redelivery always-safe: modules
-     * rebuild their working state at entry, measured + RPCS3 dispatch). 0 = none. */
-    uint32_t module_src_ea;
-    uint32_t module_src_size;
-
-    /* s39 (2026-07-15) faithful channel-stall contract: per-SPU wake mechanism
-     * for the blocking rdch path (spu_ch_wait/spu_ch_wake, spu_channels.c).
-     * Storage for a Win32 CONDITION_VARIABLE + SRWLOCK -- each is a single
-     * pointer-sized struct whose all-zero state IS the documented INIT value
+    /* Channel-stall contract: per-SPU wake mechanism for the blocking rdch
+     * path (spu_ch_wait/spu_ch_wake, spu_channels.c). Storage for a Win32
+     * CONDITION_VARIABLE + SRWLOCK; each is a single pointer-sized struct
+     * whose all-zero state is the documented init value
      * (CONDITION_VARIABLE_INIT / SRWLOCK_INIT == {0}), so the spu_context_init /
      * lv2_register calloc+memset zero-init is a valid initialization and no
      * explicit Init call is needed. Declared as void* to keep <windows.h> out of
      * this shared header (the helpers in spu_channels.c cast &field). On non-
      * Windows these stay unused (the POSIX wait path polls). Appended per the
-     * struct's APPEND-ONLY rule -- nothing above moves. */
+     * struct's append-only rule; nothing above moves. */
     void* ch_wait_cv;     /* CONDITION_VARIABLE */
     void* ch_wait_lock;   /* SRWLOCK */
-
-    /* s42 YZ_SPU_LOCKSTEP (diagnostic, default OFF; runtime/spu/spu_lockstep.c):
-     * per-context state for the round-robin SPU run token.
-     * lockstep_quantum_ctr counts drain-ticks/getllars since this ctx's last
-     * token-pass check. lockstep_release_tb is the guest timebase
-     * (ppu_timebase_now()) at which this ctx most recently stopped holding
-     * the token (or was registered, if it never held it yet); consumed at
-     * the next acquire to advance dec_start_tb by exactly the paused
-     * wall-clock span, so RdDec only drains while this SPU actually holds
-     * the token (review change C, scratch/s42_lockstep_review.md Attack 4) --
-     * the RdDec/WrDec formulas in spu_channels.c are UNCHANGED. Both fields
-     * are inert (never written) when YZ_SPU_LOCKSTEP is unset. Appended per
-     * the struct's APPEND-ONLY rule -- nothing above moves. */
-    uint32_t lockstep_quantum_ctr;
-    uint64_t lockstep_release_tb;
 
     /* Floating-point status/control state. Arithmetic helpers currently use
      * fixed execution rules, but task save/restore code still relies on these
@@ -398,106 +287,13 @@ typedef struct spu_context {
      * slot and let a racing channel operation create a second one. */
     _Atomic uint32_t mfc_retiring;
 
-    /* Focused native-SPURS motion parity diagnostic.  run_job sets this only
-     * for the title's motion ticket kind (descriptor +0x10 == 7).  The DMA
-     * layer then records only that job's output transfers into the fixed
-     * parity ring; zero means completely inert.  Appended per the context
-     * layout rule above. */
-    uint32_t parity_motion_generation;
-
-    /* Native job provenance for terminal fault diagnostics.  run_job owns
-     * these fields for the lifetime of its private context.  Keeping the
-     * acquired descriptor/IO placement on the architectural context lets a
-     * DMA exception report the exact immutable job generation that issued
-     * it, rather than re-reading a descriptor arena the PPU may already have
-     * recycled.  Zero means the context is not executing a native job. */
-    uint32_t native_job_descriptor_ea;
-    uint32_t native_job_binary_ea;
-    uint32_t native_job_descriptor_ls;
-    uint32_t native_job_descriptor_size;
-    uint32_t native_job_context_ls;
-    uint32_t native_job_io_ls;
-    uint32_t native_job_io_size;
-
-#if defined(YZ_PERF_PROFILE)
-    /*
-     * Aggregate-only profile lane counters. Each context is driven by one SPU
-     * host thread, so its hot-path increments require no atomics. The exit dump
-     * may observe a counter between increments, which is acceptable for a
-     * terminal diagnostic snapshot and avoids perturbing the benchmark.
-     */
-    volatile uint64_t perf_hops[32];
-    volatile uint64_t perf_dma_get[32];
-    volatile uint64_t perf_dma_put[32];
-    volatile uint64_t perf_dma_atomic[32];
-    volatile uint64_t perf_getllar_fast[32];
-    volatile uint64_t perf_getllar_locked[32];
-    volatile uint64_t perf_ch_read[32];
-    volatile uint64_t perf_ch_write[32];
-    volatile uint64_t perf_ch_count[32];
-    volatile uint64_t perf_wait_count[32];
-    volatile uint64_t perf_wait_qpc[32];
-    volatile uint64_t perf_reservation_invalidations;
-    volatile uint64_t perf_compact_lookup_qpc;
-    volatile uint64_t perf_compact_submit_qpc;
-    volatile uint64_t perf_compact_samples;
-    uint32_t perf_compact_sample_counter;
-#endif
-
-    /* Extra job-family residency slots. Keep this at the physical end of the
-     * context so adding a sixth family does not violate the append-only layout
-     * contract above. The spare entries avoid another ABI change for the next
-     * two discovered families. */
-    uint32_t job_bin_extra_base[3];
-
-    /* Exact source PC for focused computed-tail diagnostics.  Generated Job E
-     * probes set this immediately before their three data-dependent `bi`
-     * sites; ordinary images leave it zero.  Keep it at the physical end to
-     * preserve the generated-code-visible historical prefix. */
-    uint32_t debug_indirect_source_pc;
-
-    /* Default-off FE0 semantic timeline correlation.  A native-SPURS image-4
-     * signal carries the originating user-command cause/epoch through the
-     * task handoff and into its DMA publication.  Append-only by contract. */
-    uint32_t fe0_timeline_cause;
-    uint32_t fe0_timeline_epoch;
-    uint32_t fe0_timeline_task;
 
 } spu_context;
 
-enum {
-    SPU_JOB_BIN_LEGACY_COUNT = 5,
-    SPU_JOB_BIN_EXTRA_COUNT = 3,
-    SPU_JOB_BIN_CAPACITY = SPU_JOB_BIN_LEGACY_COUNT + SPU_JOB_BIN_EXTRA_COUNT
-};
-
-static inline uint32_t spu_job_bin_base_get(
-    const spu_context* ctx, int slot)
-{
-    if (slot < 0 || slot >= SPU_JOB_BIN_CAPACITY)
-        return 0;
-    return slot < SPU_JOB_BIN_LEGACY_COUNT
-        ? ctx->job_bin_base[slot]
-        : ctx->job_bin_extra_base[slot - SPU_JOB_BIN_LEGACY_COUNT];
-}
-
-static inline void spu_job_bin_base_set(
-    spu_context* ctx, int slot, uint32_t base)
-{
-    if (slot < 0 || slot >= SPU_JOB_BIN_CAPACITY)
-        return;
-    if (slot < SPU_JOB_BIN_LEGACY_COUNT)
-        ctx->job_bin_base[slot] = base;
-    else
-        ctx->job_bin_extra_base[slot - SPU_JOB_BIN_LEGACY_COUNT] = base;
-}
-
 /* Guest timebase clock (runtime/syscalls/sys_timer.c), 79.8 MHz, the same
- * clock the PPU decrementer/mftb use -- CBEA v1.02 Section 9.7 p145 ties the
- * SPU decrementer to this rate ("run at the same rate as the PPE
- * decrementer"). Declared here (not spu_dma.h) since spu_context_init needs
- * it to start the decrementer at thread creation (RPCS3 SPUThread.cpp:1313,
- * F21's fix). */
+ * clock the PPU decrementer/mftb use; the SPU decrementer runs at this rate.
+ * Declared here (not spu_dma.h) since spu_context_init needs it to start the
+ * decrementer at thread creation. */
 uint64_t ppu_timebase_now(void);
 
 /* ---------------------------------------------------------------------------
@@ -510,13 +306,11 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     ctx->status = SPU_STATUS_STOPPED;
 
     /* Decrementer starts running at SPU thread creation, not at the first
-     * WrDec (F21; RPCS3 SPUThread.cpp:1313-1315 cpu_init starts
-     * ch_dec_start_timestamp/ch_dec_value here unconditionally). POR initial
-     * value: RPCS3 sets ch_dec_value=0 unless SYS_SPU_THREAD_OPTION_DEC_SYNC_TB_
-     * ENABLE was requested at thread creation (ch_dec_value = ~(u32)start_ts) --
-     * that option is a per-thread create flag our sys_spu_thread_create path
-     * does not currently plumb through, so we take the POR-default branch
-     * (value 0) here, matching the common case. */
+     * WrDec. Power-on initial value is 0 unless
+     * SYS_SPU_THREAD_OPTION_DEC_SYNC_TB_ENABLE was requested at thread
+     * creation; that option is a per-thread create flag our
+     * sys_spu_thread_create path does not currently plumb through, so the
+     * default (value 0) is used, matching the common case. */
     ctx->dec_value     = 0;
     ctx->dec_start_tb  = ppu_timebase_now();
     ctx->dec_running   = 1;
@@ -525,11 +319,6 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 /* ---------------------------------------------------------------------------
  * Local store access helpers
  * -----------------------------------------------------------------------*/
-static inline uint8_t* spu_ls_ptr(spu_context* ctx, uint32_t lsa)
-{
-    return &ctx->ls[lsa & SPU_LS_MASK];
-}
-
 static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 {
     lsa &= SPU_LS_MASK;
@@ -542,11 +331,6 @@ static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 {
     lsa &= SPU_LS_MASK;
-    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
-     * No lifted SPU code currently calls this path (the ISA has no scalar
-     * LS store -- see spu_fltrec.h), but it is hooked for completeness /
-     * any future host-side scalar writer. */
-    if (yz_fltrec_hot(ctx)) yz_fltrec_store32(ctx, lsa, val);
     uint8_t* p = &ctx->ls[lsa];
     p[0] = (uint8_t)(val >> 24);
     p[1] = (uint8_t)(val >> 16);
@@ -558,8 +342,8 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  *
  * LS bytes are big-endian (the SPU's native order); registers in our
  * model are stored in native (little-endian on x86) order so that
- * `_u32[i]` directly gives lane i's value and `spu_preferred_u32(r)`
- * == `r._u32[0]`. The byte-swap below converts between the two on
+ * `_u32[i]` directly gives lane i's value and the preferred word is
+ * `r._u32[0]`. The byte-swap below converts between the two on
  * every quadword load/store, mirroring what `spu_ls_read32` already
  * does explicitly. Doing the swap here (rather than in every channel
  * extractor) keeps the per-word `_u32[i]` semantics that the lifter
@@ -587,459 +371,12 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
                     (uint32_t)p[i*4 + 3];
     }
 #endif
-    yz_tagread_repair_read((spu_context*)ctx, lsa, v._u32);
-#if defined(YZ_PERF_CLEAN)
-    return v;
-#else
-    /* s38 arm-gate witness read-watch (env YZ_ARMGATE). The gs_task release state
-     * machine apply_entry (LS 0xB088) emits a stopper release (0xB170->0x5EB8->0x5F00)
-     * for a CODE==0 descriptor ONLY if LS[0xBD70]==key(r11) at the gate 0xB0C4/0xB0CC
-     * (recomp_prx/gs_task.c:41037-41062). LS[0xBD70] is READ here (0xB0C4) but has NO
-     * literal-address writer in the whole image -> the arm-gate witness. Log every
-     * gate read: CODE(r3), key(r11), the witness value, the descriptor(r80) + its
-     * first quad, and whether they MATCH -- so one boot shows whether the witness ever
-     * equals the stuck stopper's key (and thus whether the descriptor can ever arm). */
-    { static int ag = -1;
-      if (ag < 0) { ag = getenv("YZ_ARMGATE") ? 1 : 0;
-          if (ag) { fprintf(stderr, "[armgate] ARMED (LS 0xBD70 gate read/write watch, img0)\n"); fflush(stderr); } }
-      if (ag && ctx->image_id == 0 && lsa == 0xBD70u) {
-          static unsigned long agn = 0;
-          if (agn < 3000) { agn++;
-              uint32_t desc = ctx->gpr[80]._u32[0] & (SPU_LS_MASK & ~0xFu);
-              const uint8_t* d = &ctx->ls[desc];
-              uint32_t d0=((uint32_t)d[0]<<24)|((uint32_t)d[1]<<16)|((uint32_t)d[2]<<8)|d[3];
-              uint32_t d1=((uint32_t)d[4]<<24)|((uint32_t)d[5]<<16)|((uint32_t)d[6]<<8)|d[7];
-              uint32_t d2=((uint32_t)d[8]<<24)|((uint32_t)d[9]<<16)|((uint32_t)d[10]<<8)|d[11];
-              uint32_t d3=((uint32_t)d[12]<<24)|((uint32_t)d[13]<<16)|((uint32_t)d[14]<<8)|d[15];
-              fprintf(stderr, "[armgate] pc=%05X code=%08X key=%08X witness=%08X desc=%05X dq=%08X_%08X_%08X_%08X %s\n",
-                      ctx->pc, ctx->gpr[3]._u32[0], ctx->gpr[11]._u32[0], v._u32[0], desc, d0, d1, d2, d3,
-                      (v._u32[0]==ctx->gpr[11]._u32[0]) ? "MATCH" : "nomatch");
-              fflush(stderr);
-          }
-      } }
-    /* Low-overhead clean-lane root catcher: only the exact gs_task journal
-     * record load and tag 0x7F cross into the host recorder. */
-    extern volatile long g_yz_a010_release_scene_active;
-    if (g_yz_a010_release_scene_active != 0 && ctx->image_id == 0 &&
-        v._u32[0] == 0x7Fu) {
-        const uint32_t tpc = ctx->pc & SPU_LS_MASK;
-        extern void yz_a010_reltrace_dispatch(
-            uint32_t, uint32_t, const uint32_t*);
-        yz_a010_reltrace_dispatch(ctx->spu_id, tpc, v._u32);
-    }
-#if !defined(YZ_PERF_CLEAN)
-    /* s49 MASK-SEAL read leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_read):
-     * the gs_task pending-DMA-tag mask gate. pc 0x624C is the `lqd $r2,0xB0($r3)`
-     * immediately before the `biz $r2,$r0` early return at 0x6254, so this fires
-     * exactly once per gate entry with the freshly-loaded quad in hand. */
-    { extern volatile int g_yz_ms_on;
-      extern int yz_mask_seal_arm(void);
-      extern void yz_ms_read(spu_context*, uint32_t, const uint32_t*);
-      int msr = g_yz_ms_on; if (msr < 0) msr = yz_mask_seal_arm();
-      if (msr) yz_ms_read((spu_context*)ctx, lsa, v._u32); }
-    /* s49 TAG-READ probe (env YZ_TAGREAD, spu_channels.c). Two read-side legs:
-     * pc 0x65E4 = the publish-by-tag read `lq(r11+0x60)` whose value the flight
-     * recorder cannot store (BRANCH record, no operand field), and pc 0x624C =
-     * the pending-tag-mask load whose lane-8 word IS the 0x6254 biz predicate,
-     * so mask!=0 here means control reaches the 12x fall-through at 0x6258. */
-    { extern volatile int g_yz_tr_on;
-      extern int yz_tagread_arm(void);
-      extern void yz_tr_read(spu_context*, uint32_t, const uint32_t*);
-      extern void yz_tr_tag(spu_context*, uint32_t, const uint32_t*);
-      extern void yz_tr_record(spu_context*, uint32_t, const uint32_t*);
-      extern volatile long g_yz_a010_stage_generation;
-      int trr = g_yz_tr_on; if (trr < 0) trr = yz_tagread_arm();
-      if (trr) {
-          uint32_t tpc = ctx->pc & SPU_LS_MASK;
-          /*
-           * DIAG keeps the precise instruction PC. FAST keeps the containing
-           * region entry in ctx->pc, so qualify its read by the decoded
-           * effective address to recover the same exact instruction.
-           */
-          if (tpc == 0x65E4u ||
-              ((tpc == 0x6550u || tpc == 0x6568u) &&
-               (lsa & (SPU_LS_MASK & ~0xFu)) ==
-                   ((ctx->gpr[11]._u32[0] + 0x60u) &
-                    (SPU_LS_MASK & ~0xFu))))
-              yz_tr_read((spu_context*)ctx, lsa, v._u32);
-          else if (tpc == 0x624Cu ||
-                   (tpc == 0x6248u &&
-                    (lsa & (SPU_LS_MASK & ~0xFu)) ==
-                        ((ctx->gpr[3]._u32[0] + 0xB0u) &
-                         (SPU_LS_MASK & ~0xFu))))
-              yz_tr_tag((spu_context*)ctx, lsa, v._u32);
-          /*
-           * The internal 0x776C record load executes immediately after the
-           * inlined memset helper at 0xB3D8.  SPU_RET writes that helper's
-           * link target (0x7740) to ctx->pc; no later operation changes it
-           * before the load.  The record pointer in r82 disambiguates it.
-           */
-          else if (tpc == 0x776Cu ||
-                   (tpc == 0x7740u &&
-                    (lsa & (SPU_LS_MASK & ~0xFu)) ==
-                        (ctx->gpr[82]._u32[0] &
-                         (SPU_LS_MASK & ~0xFu))))
-              yz_tr_record((spu_context*)ctx, lsa, v._u32);
-      } else if (g_yz_a010_stage_generation != 0) {
-          /*
-           * The focused a010 stage witness deliberately runs without the
-           * broad TAGREAD diagnostic.  Preserve only its exact record-load
-           * callback; otherwise the stage address map can be populated while
-           * the dispatch witness itself remains unreachable.
-           */
-          const uint32_t tpc = ctx->pc & SPU_LS_MASK;
-          if (tpc == 0x776Cu ||
-              (tpc == 0x7740u &&
-               (lsa & (SPU_LS_MASK & ~0xFu)) ==
-                   (ctx->gpr[82]._u32[0] &
-                    (SPU_LS_MASK & ~0xFu))))
-              yz_tr_record((spu_context*)ctx, lsa, v._u32);
-      } }
-    if (ctx->image_id == 0 && lsa == 0xBD70u &&
-        g_yz_a010_root_active != 0) {
-        const uint32_t desc =
-            ctx->gpr[80]._u32[0] & (SPU_LS_MASK & ~0xFu);
-        const uint8_t* const d = &ctx->ls[desc];
-        const uint32_t d0 =
-            ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
-            ((uint32_t)d[2] << 8) | (uint32_t)d[3];
-        const uint32_t d1 =
-            ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
-            ((uint32_t)d[6] << 8) | (uint32_t)d[7];
-        const uint32_t d2 =
-            ((uint32_t)d[8] << 24) | ((uint32_t)d[9] << 16) |
-            ((uint32_t)d[10] << 8) | (uint32_t)d[11];
-        const uint32_t d3 =
-            ((uint32_t)d[12] << 24) | ((uint32_t)d[13] << 16) |
-            ((uint32_t)d[14] << 8) | (uint32_t)d[15];
-        yz_a010_reltrace_gate(
-            ctx->spu_id, ctx->gpr[3]._u32[0],
-            ctx->gpr[11]._u32[0], v._u32[0], desc,
-            d0, d1, d2, d3);
-    }
-#endif
-    /*
-     * Focused a010 post-dispatch witness.  A type-0x0E environment record is
-     * rewritten to the internal 0xBA68 layout before being queued.  Catch its
-     * first later LS read so the trace distinguishes a locally committed
-     * record from one that is never consumed or published.
-     */
-    { static int a010_ba68_read = -1;
-      if (a010_ba68_read < 0)
-          a010_ba68_read = getenv("YZ_A010_STAGE_BA68") ? 1 : 0;
-      if (a010_ba68_read && ctx->image_id == 0 &&
-          g_yz_a010_root_active != 0 &&
-          (v._u32[0] & 0x7FFFFFFFu) == 0x0000BA68u) {
-          extern void yz_a010_stage_ba68(
-              spu_context*, const char*, uint32_t, const uint32_t*,
-              uint32_t, uint32_t);
-          yz_a010_stage_ba68((spu_context*)ctx, "READ", lsa, v._u32, 0u, 0u);
-      } }
-#endif
     return v;
 }
 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-#if !defined(YZ_PERF_CLEAN)
-    /*
-     * Write leg of the focused a010 0xBA68 witness.  At handler pc 0x4B70
-     * word 0 first becomes 0xBA68; the later 0x4B84 write fills word 2 with
-     * the original static-stage payload EA.
-     */
-    { static int a010_ba68_write = -1;
-      if (a010_ba68_write < 0)
-          a010_ba68_write = getenv("YZ_A010_STAGE_BA68") ? 1 : 0;
-      if (a010_ba68_write && ctx->image_id == 0 &&
-          g_yz_a010_root_active != 0 &&
-          (val._u32[0] & 0x7FFFFFFFu) == 0x0000BA68u) {
-          extern void yz_a010_stage_ba68(
-              spu_context*, const char*, uint32_t, const uint32_t*,
-              uint32_t, uint32_t);
-          yz_a010_stage_ba68(ctx, "WRITE", lsa, val._u32, 0u, 0u);
-      } }
-    /* Focused geometry-job sentinel witness.  Job A's built-in DMA-list
-     * terminator lives in its relocated tail at LS 0xE120..0xE13F.  A later
-     * invocation sometimes observes that tail as ordinary descriptor data
-     * and walks off the list, so record the first lifted stores that can
-     * replace it.  The trace is opt-in and bounded; no behavior changes. */
-    { static int a010_job_tail = -1;
-      if (a010_job_tail < 0)
-          a010_job_tail = getenv("YZ_A010_JOBTRACE") ? 1 : 0;
-      if (a010_job_tail && g_yz_a010_root_active != 0 &&
-          lsa >= 0x0E100u && lsa < 0x0E140u) {
-          static unsigned long n = 0;
-          if (n < 128u) {
-              n++;
-              fprintf(stderr,
-                      "[a010-job14-tail-store] n=%lu spu=%X img=%d pc=0x%05X "
-                      "lsa=0x%05X value=%08X_%08X_%08X_%08X\n",
-                      n, ctx->spu_id, ctx->image_id,
-                      ctx->pc & SPU_LS_MASK, lsa,
-                      val._u32[0], val._u32[1],
-                      val._u32[2], val._u32[3]);
-              fflush(stderr);
-          }
-      } }
-    /* s41 FLIGHT RECORDER (env YZ_FLTREC, consumer ctx only; spu_fltrec.h).
-     * SPU LS stores are quadword-only (no scalar LS store in the ISA), so
-     * this is the dominant STORE event source -- logged as 4 fixed-size
-     * lane records (see spu_fltrec.h's header comment). */
-    if (yz_fltrec_hot(ctx))
-        yz_fltrec_store128(ctx, lsa, val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
-    /* s41 FLIGHT RECORDER dump trigger B (env YZ_FLTREC_DUMP_ON_SWEEP): fire
-     * yz_fltrec_dump once on the first write to the static-vtable band
-     * [0xBA00,0xBC00) from guest pcs 0x3520-0x3560 (the reinit sweep),
-     * consumer ctx only. Independent of YZ_FLTREC being armed for general
-     * recording -- either trigger can fire the dump. */
-    { static int swd = -1;
-      if (swd < 0) swd = getenv("YZ_FLTREC_DUMP_ON_SWEEP") ? 1 : 0;
-      if (swd == 1 && ctx == (spu_context*)g_yz_consumer_ctx
-          && lsa >= 0xBA00u && lsa < 0xBC00u
-          && ctx->pc >= 0x3520u && ctx->pc <= 0x3560u) {
-          swd = 2;   /* fire once */
-          yz_fltrec_dump("sweep-write");
-      } }
-    /* Queue-line-copy write watch (env YZ_QLINE, 2026-07-02, diag — REMOVE with
-     * the voice frontier): the codec's SpursQueue push commits {front=1,...}
-     * where front must stay 0; log every lifted store to the GETLLAR line copy
-     * at LS 0x80 (image 3) with pc + value to name the word-0 corruptor. */
-    { static int qw = -1;
-      if (qw < 0) qw = getenv("YZ_QLINE") ? 1 : 0;
-      if (qw && lsa == 0x80u && ctx->image_id == 3) {
-          static int qn = 0;
-          if (qn < 40) { qn++;
-              fprintf(stderr, "[qline] pc=0x%05X LS80 <= %08X %08X %08X %08X\n",
-                      ctx->pc, val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
-              fflush(stderr);
-          }
-      } }
-    /* s38 arm-gate witness WRITE-watch (env YZ_ARMGATE): catch any lifted store to
-     * LS 0xBD70 (the apply_entry arm-gate witness read at 0xB0C4). If ZERO hits across
-     * a boot AND the DMA watch is also silent, the witness is never written by the code
-     * (stuck at init -> only descriptors whose key==init ever arm). If hit, this names
-     * the writer pc + old->new so we can see whether it ever advances to the stuck key. */
-    { static int agw = -1;
-      if (agw < 0) agw = getenv("YZ_ARMGATE") ? 1 : 0;
-      if (agw && ctx->image_id == 0 && lsa == 0xBD70u) {
-          static unsigned long agwn = 0;
-          if (agwn < 400) { agwn++;
-              const uint8_t* q = &ctx->ls[lsa];
-              uint32_t ow0=((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
-              fprintf(stderr, "[armgate-wr] pc=%05X old=%08X new=%08X\n", ctx->pc, ow0, val._u32[0]);
-              fflush(stderr);
-          }
-      } }
-    /* s40 item-slot zero-store watch (env YZ_ZSLOT): the gs_task item-slot region
-     * LS [0xBF00,0xC400) (image 0) holds the journal work items + their sub-objects;
-     * two verified failure modes both start with quads in this region reading zero
-     * (husk-dispatch crash / silent release loss — scratch/s40_evidence.md). The old
-     * [ls-wipe] watch is blind here (window ends 0xBE00, DMA-only, >=64B-only). Log
-     * every LIFTED store of an ALL-ZERO quad into the region with writer pc + spu.
-     * A zero from game code doing legal retirement names the pc just the same —
-     * the pc discriminates wiper vs legit retire. */
-    { static int zs = -1;
-      if (zs < 0) { zs = getenv("YZ_ZSLOT") ? 1 : 0;
-          if (zs) { fprintf(stderr, "[z-slot] ARMED (zero-quad stores into LS [0xBF00,0xC400) img0)\n"); fflush(stderr); } }
-      /* s40 late: lower bound extended 0xBF00 -> 0xB800 (s40_husk_residual.md — the
-       * static vtables at 0xBA88/0xBAA8 live in [0xB800,0xBC00) and one got zeroed). */
-      if (zs && ctx->image_id == 0 && lsa >= 0xB800u && lsa < 0xC400u
-          && val._u32[0] == 0 && val._u32[1] == 0 && val._u32[2] == 0 && val._u32[3] == 0) {
-          static unsigned long zn = 0; zn++;
-          if (zn <= 4000 || (zn & 63) == 0) {
-              fprintf(stderr, "[z-slot] st pc=%05X lsa=0x%05X spu=%X n=%lu\n",
-                      ctx->pc, lsa, ctx->spu_id, zn);
-              fflush(stderr);
-          }
-      } }
-    /* s40 singleton-slot rotation watch (env YZ_BD70W): LS 0xBD70 (image 0 = gs_task)
-     * caches the ONE item-slot address whose stage-2 release path may fire (0xB088's
-     * identity gate). The s39 stg2 probe measured items retrying as no-ops until the
-     * cache rotates to them. This watch is UNCAPPED change-only (the old YZ_ARMGATE
-     * watch above caps at 400 — useless at the minutes-in wedge, LESSONS #6d):
-     * logs every old!=new write (decimated 1/16 after 20000) + a heartbeat with the
-     * current value + total write count every 4096 writes, so a FROZEN rotation at
-     * the wedge is measurable, not inferred from silence. */
-    /* s40b [anch-wr]: lifted-store watch on the journal-consumer poll-EA home
-     * (obj+0x1C, published at runtime by the [anch] probe at gs_task 0x6380 --
-     * 0 until discovered). Logs pc + old/new word; ALWAYS when either is zero
-     * (the wipe / the rebuild), sampled otherwise (the cursor advance rewrites
-     * it once per consumed line). Rides YZ_BD70W. */
-    { static int aw = -1;
-      extern uint32_t g_yz_anch_home;
-      if (aw < 0) aw = getenv("YZ_BD70W") ? 1 : 0;
-      if (aw && ctx->image_id == 0 && g_yz_anch_home &&
-          lsa <= g_yz_anch_home && g_yz_anch_home + 4u <= lsa + 16u) {
-          const uint8_t* op = &ctx->ls[g_yz_anch_home];
-          uint32_t oldw = ((uint32_t)op[0]<<24)|((uint32_t)op[1]<<16)|((uint32_t)op[2]<<8)|op[3];
-          uint32_t bo = g_yz_anch_home - lsa;
-          uint32_t neww = val._u32[bo >> 2];
-          if (oldw != neww) {
-              static unsigned long awn = 0; awn++;
-              if (oldw == 0 || neww == 0 || awn <= 64 || (awn & 63u) == 0) {
-                  fprintf(stderr, "[anch-wr] pc=%05X old=%08X new=%08X spu=%X n=%lu\n",
-                          ctx->pc, oldw, neww, ctx->spu_id, awn);
-                  fflush(stderr);
-              }
-          }
-      } }
-    /* s40b iter-6 [vtbl-wr]: ALL lifted stores into the static-vtable cells
-     * [0xBA80,0xBAC0) with pc + first word — the sweep (zeros) and the rebuild
-     * (nonzero) both visible, so the death's last-writer is attributable.
-     * Rides YZ_BD70W. */
-    { static int vw = -1;
-      if (vw < 0) vw = getenv("YZ_BD70W") ? 1 : 0;
-      if (vw && ctx->image_id == 0 && lsa >= 0xBA80u && lsa < 0xBAC0u) {
-          static unsigned long vwn = 0; vwn++;
-          if (vwn <= 400 || (vwn & 31) == 0) {
-              fprintf(stderr, "[vtbl-wr] pc=%05X lsa=0x%05X w0=%08X%s spu=%X n=%lu\n",
-                      ctx->pc, lsa, val._u32[0],
-                      (val._u32[0]|val._u32[1]|val._u32[2]|val._u32[3]) == 0 ? " ZERO" : "",
-                      ctx->spu_id, vwn);
-              fflush(stderr);
-          }
-      } }
-    /* s40b iter-5 [feed-wr]: the rotation's FEEDSTOCK list at mgr+0x110
-     * (LS 0xBDA0..0xBDD0). c7AC4 POPS it (zeroing cells) and halts at n~5,500
-     * every boot — who PUSHES into it, and why does that stop at the phase
-     * transition? Log every write that lands a NONZERO word in the range
-     * (pushes), change-only per cell; zero-writes (pops) counted only.
-     * Rides YZ_BD70W. */
-    { static int fw = -1;
-      if (fw < 0) { fw = getenv("YZ_BD70W") ? 1 : 0;
-          if (fw) { fprintf(stderr, "[feed-wr] ARMED (mgr+0x110 push witness)\n"); fflush(stderr); } }
-      if (fw && ctx->image_id == 0 && lsa >= 0xBDA0u && lsa < 0xBDD0u) {
-          static unsigned long fwn = 0, fzn = 0;
-          int nz = (val._u32[0] | val._u32[1] | val._u32[2] | val._u32[3]) != 0;
-          if (nz) { fwn++;
-              if (fwn <= 200 || (fwn & 63) == 0) {
-                  fprintf(stderr, "[feed-wr] pc=%05X lsa=0x%05X q=%08X %08X %08X %08X n=%lu z=%lu spu=%X\n",
-                          ctx->pc, lsa, val._u32[0], val._u32[1], val._u32[2], val._u32[3],
-                          fwn, fzn, ctx->spu_id);
-                  fflush(stderr);
-              }
-          } else { fzn++;
-              if ((fzn & 511) == 0) {
-                  fprintf(stderr, "[feed-wr] zero-writes n=%lu (pushes=%lu) spu=%X\n", fzn, fwn, ctx->spu_id);
-                  fflush(stderr);
-              } } } }
-    { static int bw = -1;
-      if (bw < 0) { bw = getenv("YZ_BD70W") ? 1 : 0;
-          if (bw) { fprintf(stderr, "[bd70-wr] ARMED (uncapped change-only + hb4096)\n"); fflush(stderr); } }
-      if (bw && ctx->image_id == 0 && lsa == 0xBD70u) {
-          static unsigned long bwn = 0, bwch = 0;
-          const uint8_t* q = &ctx->ls[lsa];
-          uint32_t ow0=((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
-          bwn++;
-          if (ow0 != val._u32[0]) {
-              bwch++;
-              if (bwch <= 20000 || (bwch & 15) == 0) {
-                  fprintf(stderr, "[bd70-wr] pc=%05X old=%08X new=%08X n=%lu ch=%lu\n",
-                          ctx->pc, ow0, val._u32[0], bwn, bwch);
-                  fflush(stderr);
-              }
-              /* s40b review-1's missing measurement: the compaction's ELECTION
-               * INPUT at front changes — all 12 item word0 markers + the mgr
-               * counts (+0xB4 pool, +0xC0 work). Every 64th change (~40/boot);
-               * diffing the last healthy election vs the freeze names whether
-               * the input is legitimate-but-strandable or corrupt. */
-              if ((bwch & 63) == 0 || bwch <= 8) {
-                  char eb[220]; int ep = 0;
-                  for (int ei = 0; ei < 12; ei++) {
-                      uint32_t a2 = 0xBDD0u + (uint32_t)ei*0x80u;
-                      uint32_t w2 = ((uint32_t)ctx->ls[a2]<<24)|((uint32_t)ctx->ls[a2+1]<<16)|((uint32_t)ctx->ls[a2+2]<<8)|ctx->ls[a2+3];
-                      ep += snprintf(eb + ep, sizeof(eb) - ep, " %08X", w2);
-                  }
-                  fprintf(stderr, "[elect] ch=%lu new=%08X w0:%s poolcnt=%02X workcnt=%02X\n",
-                          bwch, val._u32[0], eb, ctx->ls[0xBD47], ctx->ls[0xBD53]);
-                  fflush(stderr);
-              }
-          }
-          if ((bwn & 4095) == 0) {
-              fprintf(stderr, "[bd70-hb] cur=%08X n=%lu ch=%lu\n", val._u32[0], bwn, bwch);
-              fflush(stderr);
-          }
-      } }
-    /* s38 window-LIMIT write-watch (env YZ_ARMGATE): the consumer's poll-loop
-     * advance (gs_task.c ~0x64E0) preserves cb1.word0/1/2 and only rewrites
-     * cb1.word3 (curEA), so the window LIMIT = cb1.word2 (@LS 0xBCA0+8) is set
-     * ELSEWHERE and gates the whole ring-slide (measured stuck at 0x41F12880 while
-     * the producer head is ~52 lines ahead). Log every CHANGE to cb1.word2 (its
-     * writer pc + old->new) so the last one names the stale-limit setter = the fix
-     * locus (is it a once-only init, or a head-read that returns stale?). */
-    { static int lw = -1;
-      if (lw < 0) lw = getenv("YZ_ARMGATE") ? 1 : 0;
-      if (lw && ctx->image_id == 0 && lsa == 0xBCA0u) {
-          const uint8_t* q = &ctx->ls[lsa];
-          uint32_t ow2 = ((uint32_t)q[8]<<24)|((uint32_t)q[9]<<16)|((uint32_t)q[10]<<8)|q[11];
-          if (ow2 != val._u32[2]) {
-              static unsigned long lwn = 0;
-              if (lwn < 400) { lwn++;
-                  fprintf(stderr, "[limwatch] pc=%05X cb1.word2(limit) %08X -> %08X (w0=%08X w1=%08X w3=%08X)\n",
-                          ctx->pc, ow2, val._u32[2], val._u32[0], val._u32[1], val._u32[3]);
-                  fflush(stderr); }
-          }
-      } }
-    /* s34 CB-write watchpoint (env YZ_CBWATCH): gs_task's journal-consumer
-     * control block sits at LS 0xBC90 (cb0: w1=walkctr) and 0xBCB0 (cb2:
-     * w0=segment base, w1=counter2 = the real cursor index). At the wedge the
-     * base advanced 7 segments then pinned at 0x41F30080 with counter2 stuck
-     * BELOW 128 while advance() runs 82k+ times; the CB is NEVER DMA-reloaded
-     * (measured), so a single-thread SPU store must revert the counter. This
-     * catches the WRITER pc with zero assumptions: log every store to the CB
-     * quads in the FREEZE window (g_yz_cadv > 45000), old vs new, capped. A pc
-     * NOT in {064EC,064F4,064F8,06500,06528} that writes the counter DOWN is
-     * the root. Reads ctx->ls BEFORE the store below (old value). */
-    { static int cbw = -1;
-      extern volatile unsigned long g_yz_cadv;
-      if (cbw < 0) cbw = getenv("YZ_CBWATCH") ? 1 : 0;
-      if (cbw && ctx->image_id == 0 && ctx->pc == 0x32BCu && lsa == 0xBCB0u) {
-          static unsigned long cbn = 0;
-          if (cbn < 400) { cbn++;
-              const uint8_t* q = &ctx->ls[lsa];
-              uint32_t ow0 = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
-              uint32_t ow1 = ((uint32_t)q[4]<<24)|((uint32_t)q[5]<<16)|((uint32_t)q[6]<<8)|q[7];
-              fprintf(stderr, "[cbw] pc=%05X lsa=%05X old=%08X_%08X new=%08X_%08X r3=%08X r7=%08X r8=%08X r16=%08X cadv=%lu\n",
-                      ctx->pc, lsa, ow0, ow1, val._u32[0], val._u32[1],
-                      ctx->gpr[3]._u32[0], ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[16]._u32[0], g_yz_cadv);
-              fflush(stderr);
-          }
-      } }
-#if !defined(YZ_PERF_CLEAN)
-    /* s48 LS-CODE-WATCH store leg (env YZ_LS_CODE_WATCH, spu_channels.c
-     * yz_lscw_check): the self-modifying-code tripwire -- flags lifted stores
-     * that CHANGE bytes inside the resident image's registry-derived text
-     * extent. Must run BEFORE the store below (old bytes still readable). */
-    { extern volatile int g_yz_lscw_on;
-      extern int yz_lscw_arm(void);
-      extern void yz_lscw_check(spu_context*, uint32_t, uint32_t, const uint8_t*,
-                                unsigned long long, const char*);
-      int lcw = g_yz_lscw_on; if (lcw < 0) lcw = yz_lscw_arm();
-      if (lcw) {
-          uint8_t nb[16];
-          for (int ni = 0; ni < 4; ni++) {
-              uint32_t w = val._u32[ni];
-              nb[ni*4]     = (uint8_t)(w >> 24);
-              nb[ni*4 + 1] = (uint8_t)(w >> 16);
-              nb[ni*4 + 2] = (uint8_t)(w >>  8);
-              nb[ni*4 + 3] = (uint8_t)w;
-          }
-          yz_lscw_check(ctx, lsa, 16, nb, 0, "st");
-      } }
-#endif
-    /* s49 MASK-SEAL write leg (env YZ_MASK_SEAL, spu_channels.c yz_ms_write):
-     * records the last writer pc/value of every gs_task *(OBJ+0xB0) quad (the
-     * lane-8 word is the pending-DMA-tag mask). Must run BEFORE the store so the
-     * old mask is still readable for the old->new report. */
-#if !defined(YZ_PERF_CLEAN)
-    { extern volatile int g_yz_ms_on;
-      extern int yz_mask_seal_arm(void);
-      extern void yz_ms_write(spu_context*, uint32_t, const uint32_t*);
-      int msw = g_yz_ms_on; if (msw < 0) msw = yz_mask_seal_arm();
-      if (msw) yz_ms_write(ctx, lsa, val._u32); }
-#endif
-#endif
     uint8_t* p = &ctx->ls[lsa];
 #if YZ_SPU_SIMD_LS128 && (defined(_MSC_VER) || defined(__SSSE3__))
     const __m128i words = _mm_loadu_si128(
@@ -1058,60 +395,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-#if !defined(YZ_PERF_CLEAN)
-    /* DIAG (YZ_SPU_PROF): watch ActivateWorkload's write to the kernel-context
-     * wklRunnable1 field (LS 0x1EC, word2 of the 0x1E0 quadword). Logs when the
-     * rebuilt runnable mask is nonzero -- proves whether the rebuild produced
-     * the expected 0xE0000000 (wids 0,1,2). */
-    extern int g_spu_prof_on;
-    /* DIAG: ActivateWorkload's wklStatus1 writeback (LS 0x2D90) is rare and
-     * unique to ActivateWorkload. Dump the wklState1 line (0x2D80) it sees and
-     * the status it computes, to tell whether it saw RUNNABLE(2) and rebuilt. */
-    if (YZ_SPU_PROF_ACTIVE() && lsa == 0x2D90u) {
-        extern unsigned long g_spu_wrun_log;
-        if (g_spu_wrun_log < 40) {
-            g_spu_wrun_log++;
-            const uint8_t* st = &ctx->ls[0x2D80];   /* wklState1[0..15] copy */
-            const uint8_t* nv = (const uint8_t*)&val; /* new wklStatus1[0..15] */
-            fprintf(stderr, "[spu-aw] spu=%X state[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X "
-                    "newStatus(host bytes)=%02X%02X%02X%02X%02X%02X%02X%02X\n",
-                    ctx->spu_id, st[0],st[1],st[2],st[3],st[4],st[5],st[6],st[7],
-                    nv[0],nv[1],nv[2],nv[3],nv[4],nv[5],nv[6],nv[7]);
-            fflush(stderr);
-        }
-    }
-#endif
 }
 
-/* ---------------------------------------------------------------------------
- * Preferred slot extraction
- *
- * SPU instructions operate on the "preferred slot" of a 128-bit register,
- * which is the leftmost (highest-address in big-endian) element.
- * For word operations, preferred slot = element 0 of the _u32 array
- * (since our u128 stores big-endian element order).
- * -----------------------------------------------------------------------*/
-static inline uint32_t spu_preferred_u32(const u128* reg)
-{
-    return reg->_u32[0];
-}
-
-static inline int32_t spu_preferred_s32(const u128* reg)
-{
-    return reg->_s32[0];
-}
-
-static inline float spu_preferred_f32(const u128* reg)
-{
-    return reg->_f32[0];
-}
-
-static inline uint64_t spu_preferred_u64(const u128* reg)
-{
-    return reg->_u64[0];
-}
-
-/* Create a register with a value splatted to the preferred word slot */
+/* Create a register with a value in the preferred word slot (element 0 of
+ * the _u32 array) and zero in the other lanes. */
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {
     u128 r;
@@ -1123,15 +410,15 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 /* ---------------------------------------------------------------------------
  * Channel read/write helpers
  *
- * FIX 2 (2026-07-17): `count` is the ready-flag guarding `value` (see the
- * spu_channel comment above) -- release-store count AFTER value is written,
- * so a consumer's acquire-load of count that observes the new count also
- * observes the new value (message-passing / "release sequence" idiom, C11
- * 5.1.2.4p16-17). `value` itself stays a plain access; it never needs to be
- * atomic on its own; only ordering relative to `count` matters. Callers that
- * are same-thread-only (ch_out_mbox/ch_out_intr_mbox, per spu_wrch's own
- * comments) get the same ordering for free -- release/acquire on a variable
- * only that thread touches is a same-cost no-op on x86.
+ * `count` is the ready-flag guarding `value` (see the spu_channel comment
+ * above): release-store count after value is written, so a consumer's
+ * acquire-load of count that observes the new count also observes the new
+ * value (message-passing / "release sequence" idiom). `value` itself stays a
+ * plain access; it never needs to be atomic on its own; only ordering
+ * relative to `count` matters. Callers that are same-thread-only
+ * (ch_out_mbox/ch_out_intr_mbox, per spu_wrch's own comments) get the same
+ * ordering for free; release/acquire on a variable only that thread touches
+ * is a same-cost no-op on x86.
  * -----------------------------------------------------------------------*/
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
@@ -1144,14 +431,6 @@ static inline uint32_t spu_channel_read(spu_channel* ch)
     uint32_t val = ch->value;
     atomic_store_explicit(&ch->count, 0u, memory_order_release);
     return val;
-}
-
-static inline int spu_channel_has_data(const spu_channel* ch)
-{
-    /* Cast away const to call atomic_load_explicit: reading is non-mutating,
-     * but the C11 atomic_load API's `object` parameter is `volatile A*`
-     * (never `const`-qualified), same as any other atomic accessor here. */
-    return atomic_load_explicit((_Atomic uint32_t*)&ch->count, memory_order_acquire) > 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1174,33 +453,13 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 
-/* s47 SENTINEL-GUARD (YZ_SENTINEL_GUARD, default OFF -- FLAGS.md; ledger #109
- * fix fork 2). g_yz_sguard_on: -1 until the first check performs the one-time
- * env init (so the drain-leg gate below is self-arming), then 0/1. The helper
- * returns 1 when it deferred a sentinel-less state-5 Driver-B walk and has
- * already set ctx->pc + g_spu_trampoline_fn per SPU_RET semantics -- the
- * drain leg must `continue`, the indirect leg must `return`. */
-extern int g_yz_sguard_on;
-int yz_sguard_check(spu_context* ctx, void* tf);
-/* Current ctx of the SPU thread inside SPU_DRAIN -- lets spu_prof_hop() read LS
- * for targeted gate diagnostics (e.g. dumping a polled flag). Diagnostic only. */
+/* The SPU context running on this host thread, kept for crash attribution. */
 extern SPU_THREAD_LOCAL spu_context* g_spu_cur_ctx;
 
-/* Function-level spin profiler (spu_channels.c, env YZ_SPU_PROF). When the
- * gate is set, each trampoline re-entry is histogrammed by target LS address
- * so we can see which lifted SPURS functions the SPU threads spin in. Off by
- * default -- one predicted-not-taken branch per hop. */
-extern int g_spu_prof_on;
-void spu_prof_hop(void* fn);
-/* Default-boot SPU taskset task launcher (spu_channels.c). On the non-prof path
- * it intercepts the policy's StartTask hop so cri_audio/gs_task launch without
- * YZ_SPU_PROF. Cheap: early-out unless the SPU's active image is the policy (2). */
-void spu_task_launch_check(spu_context* ctx, uint32_t pc);
-void spu_task_launch_behavior_check(spu_context* ctx, uint32_t pc);
 /* Stop the SPU (spu_channels.c): sets ctx->status and longjmps to the host
  * thread driver's setjmp target, fully unwinding the lifted call stack. Used by
  * the lifter for self-loop traps (`br .`/`brsl .`), which hang the SPU forever
- * on real hardware. Logs under env YZ_HALT_LOG. */
+ * on real hardware. */
 void spu_halt(spu_context* ctx, int status);
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the context's active image and runs it. Referenced by SPU_RET. */
@@ -1214,10 +473,10 @@ static inline int spu_return_needs_dispatch(const spu_context* ctx)
     return ctx->host_depth == 0;
 }
 
-/* s39 channel-stall wake (spu_channels.c): signal the per-SPU wait CV so a
+/* Channel-stall wake (spu_channels.c): signal the per-SPU wait CV so a
  * host thread blocked in spu_rdch (RdInMbox / RdSigNotify1/2 / RdEventStat)
- * re-checks its predicate immediately. MUST be called by every PPU/SPU-side
- * producer AFTER it makes such a predicate true (in-mbox/signal writes, event
+ * re-checks its predicate immediately. Every PPU/SPU-side producer must call
+ * it after making such a predicate true (in-mbox/signal writes, event
  * status raises). The blocking waiter also re-polls every 10 ms, so a missed
  * wake only costs latency, never a permanent hang. No-op on non-Windows. */
 void spu_ch_wake(spu_context* ctx);
@@ -1231,8 +490,8 @@ void spu_mfc_context_switch(spu_context* ctx);
 
 /* Issue one fully specified MFC command without five separate host calls for
  * its parameter-channel writes.  This is architecturally equivalent to
- * MFC_LSA/EAH/EAL/Size/TagID followed by MFC_Cmd; the runtime keeps channel
- * profiling and optional recorder PCs intact.  `channel_pcs` may be NULL. */
+ * MFC_LSA/EAH/EAL/Size/TagID followed by MFC_Cmd.  `channel_pcs` is not used
+ * and may be NULL. */
 void spu_mfc_issue_compact(spu_context* ctx,
                            uint32_t lsa, uint32_t eah, uint32_t eal,
                            uint32_t size, uint32_t tag, uint32_t cmd,
@@ -1249,82 +508,32 @@ uint64_t spu_mfc_read_atomic_status_compact(spu_context* ctx);
  * for every tag group through the same channel path used by lifted SPU code. */
 void spu_task_wait_all_dma(spu_context* ctx);
 
-/* Restore-on-host-return (s24 adopt-on-serve image model, ledger #51): the
- * lifted brsl/bisl call brackets save image_id in a call-site local and hand
- * it back here after the nested call + drain complete, so an image adopted
- * inside the callee (dispatcher wildcard serve, foreign-resident adoption,
- * tail-chain hops) cannot leak into the caller's continuation. The host C
- * stack of these locals IS the shadow image stack. Persistent switches the
- * restore would undo (the LS-0xA00 workload-module DMA) are re-applied at
- * dispatch time from ctx->module_img_a00. Kill-switch: YZ_NO_IMGSTACK. */
+/* Restore image_id after a nested call. The lifted brsl/bisl call brackets
+ * save image_id in a call-site local and hand it back here once the callee and
+ * its drain complete, so an image adopted inside the callee cannot leak into
+ * the caller's continuation. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 
-#if defined(YZ_PERF_PROFILE)
-#  define YZ_PERF_NOTE_HOP(ctx) do {                            \
-        const int _pi = (ctx)->image_id;                        \
-        if ((unsigned)_pi < 32u) (ctx)->perf_hops[_pi]++;       \
-    } while (0)
-#else
-#  define YZ_PERF_NOTE_HOP(ctx) ((void)0)
-#endif
-
-#if defined(YZ_PERF_CLEAN)
 #define SPU_DRAIN(ctx) do {                                   \
         while (g_spu_trampoline_fn) {                          \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
             g_spu_trampoline_fn = 0;                           \
-            /* Aggregate only: no target lookup and no timestamp per hop. */ \
-            /* The profile definition disappears entirely in the fast lane. */ \
-            YZ_PERF_NOTE_HOP(ctx);                              \
-            if (g_yz_runtime_config.spu_lockstep)                \
-                yz_lockstep_tick(ctx);                           \
-            spu_task_launch_behavior_check((ctx), (ctx)->pc);   \
-            if (g_yz_runtime_config.sentinel_guard &&            \
-                yz_sguard_check((ctx), (void*)_tf)) continue;    \
             _tf(ctx);                                          \
         }                                                     \
     } while (0)
-#else
-#define SPU_DRAIN(ctx) do {                                   \
-        while (g_spu_trampoline_fn) {                          \
-            void (*_tf)(spu_context*) = g_spu_trampoline_fn;   \
-            g_spu_trampoline_fn = 0;                           \
-            /* s41 FLIGHT RECORDER: this re-entry is a cross-function tail   \
-             * branch; (ctx)->pc already holds the target (every trampoline \
-             * setter assigns ctx->pc before g_spu_trampoline_fn -- see the  \
-             * cri_audio.c-style setters). This is the ONE central pc-level \
-             * hook site (function/tail-call granularity, not per intra-     \
-             * function branch instruction -- see spu_fltrec.h). */         \
-            if (yz_fltrec_hot(ctx)) yz_fltrec_branch((ctx), (ctx)->pc);      \
-            /* s42 YZ_SPU_LOCKSTEP gate site (★REVIEW B): SPU_DRAIN, not      \
-             * spu_indirect_branch -- see spu_lockstep.h. No-op when unset. */ \
-            yz_lockstep_tick(ctx);                                          \
-            if (g_spu_prof_on) { g_spu_cur_ctx = (ctx); spu_prof_hop((void*)_tf); } \
-            else spu_task_launch_check((ctx), (ctx)->pc);      \
-            /* s47 SENTINEL-GUARD drain leg (direct tail-chains never reach   \
-             * spu_indirect_branch): on defer the helper set pc+trampoline    \
-             * per SPU_RET semantics -- re-loop (dispatches the return, or    \
-             * exits on the plain-return path). Self-arming via -1.  */      \
-            if (g_yz_sguard_on && yz_sguard_check((ctx), (void*)_tf)) continue; \
-            _tf(ctx);                                          \
-        }                                                     \
-    } while (0)
-#endif
 
 /* Depth-aware SPU link return (`bi $r0` / conditional `biz $r0` family).
  * $r0 is the ABI link register; the lifter models a matched brsl/bisl call as
  * a nested host C call, so the common return is a host `return` (cheap, keeps
  * loops iterative). That is only sound while the SPU-logical caller's host
  * frame is live. Two runtime mechanisms legally destroy those frames under a
- * still-running SPU: a cross-context task RESUME (yield -> context saved to
+ * still-running SPU: a cross-context task resume (yield -> context saved to
  * main memory -> re-dispatched later on a fresh top-level stack, possibly on
  * another SPU) and the host-call-depth restack unwind. After either, a bare
- * `return` surfaces at a dispatch drain that treats it as end-of-execution
- * (measured 2026-07-03: the CRI codec's resumed queue-pop died at its final
- * `bi $r0`, LS 0x20A40 -> [SPU] tid=0x2002 stopped, r0=0xA388 discarded).
+ * `return` surfaces at a dispatch drain that treats it as end-of-execution.
  * host_depth counts the live lifted call frames: 0 => no frame can satisfy
- * this return -> dispatch to the link register instead, faithful to CBEA
- * `bi` semantics (branch to word 0 of RA; RPCS3 SPUThread BI does the same).
+ * this return -> dispatch to the link register instead, faithful to the
+ * architectural `bi` semantics (branch to word 0 of RA).
  * ctx->pc is set unconditionally so the continuation is always visible to
  * the dispatch machinery. */
 #define SPU_RET(ctx) do {                                      \

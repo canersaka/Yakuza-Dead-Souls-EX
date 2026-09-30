@@ -1,11 +1,11 @@
 /*
- * ps3emu/spu_fallback.h — PPU-side SPU job fallback registry
+ * ps3emu/spu_fallback.h: PPU-side SPU job fallback registry
  *
  * ps3recomp doesn't execute SPU code (no JIT for SPU ISA, no SPU LS model).
- * For most games this is fine — SPU jobs that produce side-effects only the
+ * For most games this is fine: SPU jobs that produce side-effects only the
  * PPU later checks for can be no-ops and the title still progresses.
  *
- * Some games REQUIRE SPU output: PhyreEngine asset decompressors, audio
+ * Some games depend on SPU output: PhyreEngine asset decompressors, audio
  * mixers, particle simulations, etc. write back data the PPU then reads.
  * Stubbing those silently leaves the PPU reading garbage.
  *
@@ -44,10 +44,10 @@ extern "C" {
 
 /*
  * Handler signature for an SPU job's PPU equivalent.
- *   tid       — the synthesized SPU thread id assigned by sys_spu_thread_initialize
- *   args_ea   — guest EA of the args block passed via sys_spu_thread_set_argument
- *   args_size — size in bytes of the args block (or 0 if unknown)
- *   user      — opaque pointer supplied at registration time
+ *   tid       - the synthesized SPU thread id assigned by sys_spu_thread_initialize
+ *   args_ea   - guest EA of the args block passed via sys_spu_thread_set_argument
+ *   args_size - size in bytes of the args block (or 0 if unknown)
+ *   user      - opaque pointer supplied at registration time
  *
  * The handler runs on a host thread spawned by sys_spu_thread_group_start.
  * It should write any side-effects to guest memory via vm_write*() helpers.
@@ -82,7 +82,7 @@ spu_ppu_fallback_fn spu_lookup_ppu_fallback(uint32_t entry_point,
  * Get a pointer to a SPU thread's virtual local store (256 KB). Lazily
  * allocated on first read/write. Returns NULL if tid is unknown.
  *
- * Safe to call from a PPU fallback handler — typical usage is a job that
+ * Safe to call from a PPU fallback handler. Typical usage is a job that
  * the PPU populated via sys_spu_thread_write_ls before group_start, so
  * the fallback reads its inputs from LS, computes results, and writes
  * outputs back. The PPU then reads them via sys_spu_thread_read_ls.

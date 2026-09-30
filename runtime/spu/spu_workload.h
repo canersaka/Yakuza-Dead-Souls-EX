@@ -1,21 +1,22 @@
-/* spu_workload.h — SPU workload / task dispatch registry.
+/* spu_workload.h: SPU workload / task dispatch registry.
  *
  * The bridge cellSpurs needs: when a title registers a SPURS workload
  * (cellSpursAddWorkload, a "policy module" SPU binary) or a SPURS task
  * (cellSpursCreateTask, a task ELF), the runtime must actually RUN that SPU
- * program. We do not interpret SPU ELFs at runtime — we statically lift each
- * title's SPU binaries ahead of time (spu_lifter -> a native entry fn). This
+ * program. We do not interpret SPU ELFs at runtime; we statically lift each
+ * title's SPU binaries ahead of time (spu_lifter). This
  * layer maps an exact registered SPU image identity (content fingerprint plus
  * byte size) to its pre-lifted native entry, loads the image into a fresh
  * 256 KB local store, and runs it with the SPURS task/job ABI.
  *
  * Flow:
- *   1) At init, the title's generated registration code calls
- *      spu_workload_register_direct() or spu_workload_register_image() once per
- *      lifted SPU binary. Identity is the exact pair (FNV-1a fingerprint, image
- *      byte size), computed identically here and by the offline extractor.
- *   2) Native SPURS resolves that exact identity, prepares local store and ABI
- *      state, and invokes the matching lifted entry.
+ *   1) At init, the title registers each lifted SPU binary once, normally with
+ *      spu_workload_register_image_bytes(). Identity is the exact pair (FNV-1a
+ *      fingerprint, image byte size), computed identically here and by the
+ *      offline extractor.
+ *   2) Native SPURS calls spu_workload_resolve() on the image it is handed to
+ *      find that exact identity, prepares local store and ABI state, and runs
+ *      the matching lifted entry with spu_workload_execute().
  *
  * This is title-agnostic ps3recomp runtime: the registry is populated by the
  * title's lifted SPU set; the dispatch mechanism is generic.
@@ -48,13 +49,10 @@ typedef struct spu_workload_image {
  * title passes to cellSpurs line up. */
 uint64_t spu_workload_fingerprint(const void* data, size_t n);
 
-/* Register one lifted SPU binary under its image fingerprint. `name` is borrowed
- * (kept by pointer for logging — pass a string literal / static). Idempotent on
- * fingerprint: a second register of the same fp updates the entry. */
-void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                           const char* name);
-/* Native SPURS never resolves the legacy registration above: callers must
- * supply an exact image size through one of the two APIs below. */
+/* Register one lifted SPU binary under its exact identity (fingerprint plus
+ * image size) with a direct native entry function. `name` is borrowed (kept by
+ * pointer for logging; pass a string literal / static). Registering the same
+ * identity again updates the entry. */
 int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
                                  spu_lifted_entry_fn fn, const char* name);
 
@@ -78,9 +76,6 @@ int spu_workload_resolve(const void* image, uint32_t image_size,
                          spu_workload_image* out);
 int spu_workload_execute(const spu_workload_image* image, spu_context* ctx);
 
-/* Look up a lifted entry by fingerprint; NULL if none registered. */
-spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
-
 /* Load a 32-bit big-endian SPU ELF image into a 256 KB local store: each PT_LOAD
  * segment is copied to its p_vaddr (BSS zero-filled). Returns 1 on success and
  * writes the entry vaddr (e_entry, which may legitimately be 0) to *entry_out;
@@ -97,15 +92,6 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
  * case the header is corrupt; returns 0 if `image` is not a valid SPU ELF. */
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail);
 
-/* Dispatch a registered SPU image: fingerprint `image`, find its lifted entry,
- * load it into a fresh local store, and run it with `args_ea` in r3 (SPURS task
- * ABI). Returns 1 if an image matched and ran, 0 if no lifted entry is
- * registered for it (caller may fall back to logging/stubbing). */
-int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
-                          uint32_t args_ea);
-
-/* Number of currently registered lifted SPU binaries (diagnostics/tests). */
-unsigned spu_workload_count(void);
 void spu_workload_reset(void);
 
 #ifdef __cplusplus

@@ -51,15 +51,13 @@ static inline int spu_clz32(uint32_t x) {
 static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 #endif
 
-/* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
- * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
- * channel accesses before later ones; LS must be consistent "if it were
- * observed by another entity" (Table 13-6 is exactly this runtime's
- * host-thread producer -> SPU consumer handoff). A no-op is neither a
- * compiler nor a CPU barrier -- MSVC at /O2 may reorder plain LS accesses
- * across an empty statement (the PPU twin of this bug is LESSONS #11d). A
- * full fence: the locked exchange forces total order and is opaque to the
- * optimizer. */
+/* Architectural SPU barrier: the lifted `sync`/`dsync`/`syncc` emission.
+ * It orders all earlier LS and channel accesses before later ones, and LS must
+ * be consistent when observed by another entity (this runtime's host-thread
+ * producer -> SPU consumer handoff). A no-op is neither a compiler nor a CPU
+ * barrier: MSVC at /O2 may reorder plain LS accesses across an empty
+ * statement. This is a full fence: the locked exchange forces total order and
+ * is opaque to the optimizer. */
 #ifdef _MSC_VER
 static inline void spu_arch_fence(void) { long spu_fence_tmp = 0; _InterlockedExchange(&spu_fence_tmp, 1); }
 #else
@@ -67,7 +65,7 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
 #endif
 
 /* SPU byte position -> our _u8 index.
- * Our u128 is HOST-NATIVE little-endian (_u32[i]=SPU word i as a value via
+ * Our u128 is host-native little-endian (_u32[i]=SPU word i as a value via
  * spu_ls_read128's big-endian load), so within each 4-byte word the _u8[]
  * bytes are reversed vs SPU big-endian byte order. Any op defined in terms of
  * SPU *byte positions* (quadword byte rotates/shifts, gen-controls, shuffle
@@ -80,17 +78,15 @@ static inline u128 spu_splat_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=v; r._u32[2]=v; r._u32[3]=v; return r;
 }
 /* Link register value for brsl/bisl/bisled: the SPU writes the return address
- * into the PREFERRED word (word 0) and ZEROS the other three slots (matches
- * RPCS3 v128::from32r, SPUInterpreter.cpp BRSL). Splatting it (the old bug)
- * corrupts any code that saves/reloads/operates on the full 128-bit link --
- * caught by the SPU trace-diff vs RPCS3 (gs_task lqd r0 @LS 0x3028). */
+ * into the preferred word (word 0) and zeroes the other three slots. Splatting
+ * it would corrupt any code that saves, reloads or operates on the full
+ * 128-bit link. */
 static inline u128 spu_link(uint32_t addr) {
     u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
-/* Preferred-slot scalar: value in word 0, remaining slots ZERO. CBEA's scalar
- * channel convention -- rchcnt returns the count this way (RPCS3 measured
- * r4={1,0,0,0} at gs_task LS 0x655C where the old splat gave {1,1,1,1}).
- * Same bug class as spu_link. */
+/* Preferred-slot scalar: value in word 0, remaining slots zero. This is the
+ * CBEA scalar channel convention; rchcnt returns the count this way (for
+ * example {1,0,0,0}, not a splat). Same layout as spu_link. */
 static inline u128 spu_pref_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
@@ -112,63 +108,26 @@ static inline u128 spu_ahi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r.
 static inline u128 spu_sfi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)imm-a._u32[i]; return r; }
 static inline u128 spu_sfhi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
 
-/* ---- multiply (low halfword of each word × ... -> 32-bit, per SPU mpy) ----
+/* ---- multiply (low halfword of each word x ... -> 32-bit, per SPU mpy) ----
  * Sub-lane indexing assumes a little-endian host (matches the recompiler's
  * target). The "low halfword of word i" in SPU BE semantics is _s16[2i] on
- * an LE host (NOT _s16[2i+1], which would be correct on a BE host). */
+ * an LE host (not _s16[2i+1], which would be correct on a BE host). */
 static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]; return r; }
 /* mpya: 16x16 signed multiply of low halves + add rc (per word, RRR form). */
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
-/* fi: floating interpolate. RB is disassembled per the Floating Reciprocal
- * Estimate encoding (SPU_ISA_v1.2_27Jan2007_pub.pdf, "Floating Reciprocal
- * Estimate" p.214, "Floating Reciprocal Absolute Square Root Estimate"
- * p.216 -- same base/step field layout in both): sign(1) | biased
- * exponent(8) | base fraction(13) | step fraction(10). RA bits 13:31 (its
- * low 19 bits) supply the interpolation fraction Y = (RA & 0x7FFFF) / 2^19.
- * Per ISA "Floating Interpolate" p.219:
+/* fi: floating interpolate. RB is decoded per the Floating Reciprocal
+ * Estimate encoding (the reciprocal absolute square root estimate uses the
+ * same base/step field layout): sign(1) | biased exponent(8) | base
+ * fraction(13) | step fraction(10). RA bits 13:31 (its low 19 bits) supply
+ * the interpolation fraction Y = (RA & 0x7FFFF) / 2^19.
  *   RT = (-1)^S * (1.BaseFraction - 0.000_StepFraction * Y) * 2^(exp-127)
  * sign|exp|BaseFraction (RB's top 22 bits) is already a valid IEEE-754 bit
  * pattern for the Base term, so `RB & 0xFFFFFC00` reinterpreted as float
  * gives Base directly; StepFraction has 3 implicit leading zero bits ahead
  * of its own 10 bits (the "0.000" prefix), i.e. Step = StepFrac*2^(exp-127-13),
- * same sign as Base.
- *
- * Verified bit-exact against RPCS3's ASMJIT recompiler
- * (rpcs3/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp, spu_recompiler::FI,
- * lines 3997-4044) by transcribing its integer bit-manipulation sequence
- * and comparing outputs across 500,000 random 32-bit RA/RB patterns (zero
- * mismatches > 1e-6 relative) plus 300,000 realistic reciprocal-shaped
- * patterns (zero mismatches).
- *
- * ORACLE TRAP: RPCS3's *interpreter* FI (SPUInterpreter.cpp:2679-2684) is
- * an unimplemented stub -- `spu.gpr[op.rt] = spu.gpr[op.rb]; return true;`
- * with a `// TODO` comment. Do NOT use it as an oracle; only the ASMJIT
- * recompiler (or LLVM recompiler, if checked) has real fi semantics.
- *
- * Old code (`y*(2.0f-a*b*y)`, a generic self-contained Newton-Raphson step)
- * never decoded RB's base/step bit-fields at all -- confirmed wrong, not
- * merely imprecise:
- *
- *   Example 1: x=5.331123525209338
- *     RA(bits)=0x40aa9890  RB(bits)=0x3e401460
- *     true 1/x            = 0.18757772076960696
- *     correct fi (ISA)    = 0.18710096180438995   (RPCS3 ASMJIT: same)
- *     old spu_fi output   = 0.3399700402100933    (~2x off)
- *
- *   Example 2: x=-76.91874321984837
- *     RA(bits)=0xc299d666  RB(bits)=0xbc550106
- *     true 1/x            = -0.013000732437109771
- *     correct fi (ISA)    = -0.012943098139658105 (RPCS3 ASMJIT: -0.01294309739023447)
- *     old spu_fi output   = -0.026170483918120862  (~2x off)
- *
- *   Example 3: x=10.859253470350062
- *     RA(bits)=0x412dbf81  RB(bits)=0x3dbc984c
- *     true 1/x            = 0.09208736150513334
- *     correct fi (ISA)    = 0.09167017677100375   (RPCS3 ASMJIT: 0.09167017042636871)
- *     old spu_fi output   = 0.17569464086128958    (~2x off)
- */
+ * same sign as Base. */
 static inline u128 spu_fi(u128 a, u128 b) {
     u128 r;
     for (int i = 0; i < 4; i++) {
@@ -242,8 +201,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
      *
      * SPU's special selectors need one extra mask pass:
      *   80..BF -> 00, C0..DF -> FF, E0..FF -> 80.
-     * Keeping this branch-free is important: this helper is the largest
-     * named exclusive image-4 cost in the production Akiyama sample.
+     * This path is kept branch-free because shufb is very hot.
      */
     const __m128i va = _mm_loadu_si128((const __m128i*)(const void*)&a);
     const __m128i vb = _mm_loadu_si128((const __m128i*)(const void*)&b);
@@ -306,9 +264,47 @@ static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(
 static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
 static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
 static inline u128 spu_shlqbyi(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
-static inline u128 spu_rotqbyi(u128 a, int sh) { u128 r; sh&=0x0F; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
-/* Bit-level quadword shifts/rotates operate on the WHOLE 128-bit big-endian
- * value. Our _u64[0]/_u64[1] are word-SCRAMBLED (host-LE: _u64[0] = word0 |
+/* Host byte i is architectural byte i^3. The mask maps the rotated
+ * architectural source back to host order; every lane is in [0,15]. */
+static inline u128 spu_rotqby_bytes(u128 value, unsigned shift)
+{
+#if (!defined(YZ_SPU_SIMD_ROTQBY) || YZ_SPU_SIMD_ROTQBY) && \
+    (defined(_MSC_VER) || defined(__SSSE3__))
+    static const unsigned char masks[16][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {7, 0, 1, 2, 11, 4, 5, 6, 15, 8, 9, 10, 3, 12, 13, 14},
+    {6, 7, 0, 1, 10, 11, 4, 5, 14, 15, 8, 9, 2, 3, 12, 13},
+    {5, 6, 7, 0, 9, 10, 11, 4, 13, 14, 15, 8, 1, 2, 3, 12},
+    {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3},
+    {11, 4, 5, 6, 15, 8, 9, 10, 3, 12, 13, 14, 7, 0, 1, 2},
+    {10, 11, 4, 5, 14, 15, 8, 9, 2, 3, 12, 13, 6, 7, 0, 1},
+    {9, 10, 11, 4, 13, 14, 15, 8, 1, 2, 3, 12, 5, 6, 7, 0},
+    {8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7},
+    {15, 8, 9, 10, 3, 12, 13, 14, 7, 0, 1, 2, 11, 4, 5, 6},
+    {14, 15, 8, 9, 2, 3, 12, 13, 6, 7, 0, 1, 10, 11, 4, 5},
+    {13, 14, 15, 8, 1, 2, 3, 12, 5, 6, 7, 0, 9, 10, 11, 4},
+    {12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+    {3, 12, 13, 14, 7, 0, 1, 2, 11, 4, 5, 6, 15, 8, 9, 10},
+    {2, 3, 12, 13, 6, 7, 0, 1, 10, 11, 4, 5, 14, 15, 8, 9},
+    {1, 2, 3, 12, 5, 6, 7, 0, 9, 10, 11, 4, 13, 14, 15, 8}
+    };
+    const __m128i input = _mm_loadu_si128((const __m128i*)(const void*)&value);
+    const __m128i mask = _mm_loadu_si128((const __m128i*)(const void*)masks[shift&15u]);
+    u128 result;
+    _mm_storeu_si128((__m128i*)(void*)&result, _mm_shuffle_epi8(input,mask));
+    return result;
+#else
+    u128 result;
+    shift &= 15u;
+    for (unsigned i=0; i<16; ++i)
+        result._u8[SPU_W(i)] = value._u8[SPU_W((i+shift)&15u)];
+    return result;
+#endif
+}
+
+static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqby_bytes(a,(unsigned)sh); }
+/* Bit-level quadword shifts/rotates operate on the whole 128-bit big-endian
+ * value. Our _u64[0]/_u64[1] are word-scrambled (host-LE: _u64[0] = word0 |
  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
  * corrupt any bits crossing a 32-bit boundary. Assemble the logical hi/lo halves
  * with _u32[0] as most-significant, shift, then disassemble. */
@@ -323,99 +319,69 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
 
 /* ---- single-precision float (4 lanes) ----
  *
- * FIX 3 (2026-07-17): SPU-accurate extended-range ("xfloat") semantics for
- * fa/fs/fm/fma/fms/fnms, replacing the native-IEEE math this file used
- * before. ORACLE(SPU_ISA_v1.2_27Jan2007_pub.pdf p195-196, 202/204/206/208/
- * 210/212) + cross-verified (read-only, GPLv2 -- semantics only, no code or
- * comments copied) against rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's
- * precise-mode FA_FS/FM/FMA.
+ * SPU extended-range ("xfloat") semantics for fa/fs/fm/fma/fms/fnms.
  *
  * SPU single precision differs from IEEE 754 single precision:
  *   - Register range is extended: an 8-bit exponent field of 0xFF is a
- *     NORMAL value here (magnitude up to Smax), never Inf/NaN (Table 9-1,
- *     p195). Smin bit pattern = 0x00800000, Smax bit pattern = 0x7FFFFFFF
- *     (Table 9-1 "Register Value" row -- confirms the task's stated Smax
- *     pattern).
- *   - No NaN, no Inf are ever produced. A result whose magnitude would
- *     exceed Smax instead SATURATES to Smax with the operation's sign
- *     (p202 fa, p204 fs, p206 fm, p208 fma, p210 fnms, p212 fms, all
- *     identical wording).
- *   - Denormals are not supported: "an operation that would generate a
- *     denorm under IEEE rules instead generates a positive zero. If a
- *     denorm is used as an operand, it is treated as a zero" (p196). The
- *     ISA text does not state a sign for the single-precision operand-flush
- *     case (only the double-precision analog on p198 explicitly says
- *     "preserve the sign"); RPCS3's precise interpreter resolves this by
- *     flushing BOTH denormal operands and denormal/zero results to
- *     UNSIGNED +0.0f unconditionally (SPUInterpreter.cpp FA_FS/FM/FMA) --
- *     this is the one place this implementation's ISA reading and RPCS3
- *     disagree/are ambiguous, and per this project's convention RPCS3 (the
- *     trace-diff oracle) is followed: every flush here, operand or result,
- *     is unsigned +0.0, matching "a zero result is always a positive zero"
- *     (p195) exactly and extending it to operands too.
- *   - Only rounding mode: truncation toward zero (p196).
- *   - fma/fms/fnms's multiply is EXACT and unbounded in range before the
- *     add/subtract -- only the FINAL (post add/subtract) result is checked
- *     against Smax/Smin (p208/210/212: "the multiplication is exact and not
- *     subject to limits on its range... If the magnitude of the RESULT OF
- *     THE ADDITION is greater than Smax...").
+ *     normal value here (magnitude up to Smax), never Inf/NaN. Smin bit
+ *     pattern = 0x00800000, Smax bit pattern = 0x7FFFFFFF.
+ *   - No NaN or Inf is ever produced. A result whose magnitude would exceed
+ *     Smax saturates to Smax with the operation's sign.
+ *   - Denormals are not supported: an operation that would generate a denorm
+ *     under IEEE rules generates a positive zero, and a denorm operand is
+ *     treated as a zero. The ISA does not state a sign for the
+ *     single-precision operand flush, so every flush here, operand or
+ *     result, is unsigned +0.0.
+ *   - The only rounding mode is truncation toward zero.
+ *   - The multiply in fma/fms/fnms is exact and unbounded in range before
+ *     the add/subtract; only the final (post add/subtract) result is checked
+ *     against Smax/Smin.
  *
- * Implementation: decode each SPU-shaped f32 BIT PATTERN (never through the
- * host `float` type -- an extended-range SPU value's bits, read as IEEE
- * binary32, literally ARE an Inf/NaN pattern, e.g. Smax=0x7FFFFFFF is a
- * QNaN bit pattern; touching that through a real float/double add/compare
- * would invoke the host FPU's Inf/NaN rules, which is exactly wrong) into a
- * double (flushing an exponent-field-0 operand to +0.0 first), do the
- * requested arithmetic in double, then encode the double result back to an
- * SPU-shaped f32 bit pattern: truncate the mantissa to 23 bits, flush a
- * sub-Smin magnitude to +0.0, saturate a magnitude beyond Smax to Smax with
- * the result's sign.
+ * Implementation: decode each SPU-shaped f32 bit pattern (never through the
+ * host `float` type: an extended-range SPU value's bits, read as IEEE
+ * binary32, are an Inf/NaN pattern, e.g. Smax=0x7FFFFFFF is a QNaN bit
+ * pattern, and a real float/double add/compare would apply the host FPU's
+ * Inf/NaN rules) into a double (flushing an exponent-field-0 operand to +0.0
+ * first), do the requested arithmetic in double, then encode the double
+ * result back to an SPU-shaped f32 bit pattern: truncate the mantissa to 23
+ * bits, flush a sub-Smin magnitude to +0.0, saturate a magnitude beyond Smax
+ * to Smax with the result's sign.
  *
- * ACCURACY (MEASURED, s43 A/B vs the RPCS3 precise interpreter — full
- * numbers in scratch/s43_float_ab.md): fm is BIT-EXACT (0 mismatches in
- * 2.36M samples, every condition). fa/fs/fma/fms/fnms currently diverge
- * because of the AMBIENT ROUNDING MODE, not the algorithm: RPCS3 forces
- * FE_TOWARDZERO around every float op while this runtime never calls
- * fesetround anywhere, so the double arithmetic here rounds to nearest
- * before the final truncate — 31% of fa/fs pairs and 17-19% of fma-family
- * triples differ by >=1 ULP on random data, and near the Smin flush
- * boundary the fma family can misclassify flush-vs-normal outright.
- * With ambient rounding set toward zero the residual drops to genuine
- * 1-ULP corners (0.002%-0.16%, RPCS3's own extended-range special cases).
- * FIX CANDIDATE (awaiting user confirm, verify-then-implement):
- * fesetround(FE_TOWARDZERO) at SPU exec-thread entry. Until it lands, SPU
- * float register values are NOT oracle-parity in trace-diffs.
- *
- * Kill switch YZ_XF_IEEE=1 restores the previous native-IEEE path (+, -, *,
- * fmaf) below -- see docs/FLAGS.md. Default OFF (SPU-accurate active). The
- * environment is read once and cached; <stdlib.h> supplies the CRT-correct
- * getenv declaration for static and dynamic MSVC runtime builds alike. */
-static inline int yz_xf_ieee(void)
-{
-    return g_yz_runtime_config.xf_ieee;
-}
+ * Accuracy: fm is bit-exact. For fa/fs/fma/fms/fnms the rounding of the double
+ * arithmetic follows the calling thread's MXCSR rounding mode before the final
+ * truncate. Threads that ran spu_xfloat_simd_thread_enter() on a machine with
+ * the packed path available use round-toward-zero; other threads keep the host
+ * default (round to nearest) and can differ from hardware by 1 ULP. Near the
+ * Smin flush boundary the fma family can misclassify flush versus normal.
+ */
 
 #define SPU_XF_SMAX_MAG   0x7FFFFFFFu   /* Smax magnitude bits (sign OR'd in by the caller) */
 
 /* SPU-shaped f32 bits -> double. Flushes an exponent-field-0 operand
- * (true zero OR IEEE-denormal-shaped) to unsigned +0.0; any other exponent
+ * (true zero or IEEE-denormal-shaped) to unsigned +0.0; any other exponent
  * (including 0xFF, "extended") decodes as a genuine 1.fraction * 2^(exp-127)
- * magnitude -- never routed through the host `float` type. */
+ * magnitude, never routed through the host `float` type. */
 static inline double spu_xf_decode(uint32_t bits)
 {
     uint32_t exp  = (bits >> 23) & 0xFFu;
     if (exp == 0) return 0.0;
-    uint32_t sign = bits >> 31;
-    uint32_t frac = bits & 0x7FFFFFu;
-    double mant = 1.0 + (double)frac / 8388608.0;   /* / 2^23 */
-    double val  = ldexp(mant, (int)exp - 127);
-    return sign ? -val : val;
+    /* Every nonzero SPU exponent is a normal finite binary64 value. Move
+     * the exact sign/fraction bits and rebase the exponent; exponent 255
+     * remains an extended finite SPU value rather than an IEEE float NaN.
+     * This is the same exact value as ldexp(1+fraction/2^23, exp-127),
+     * without a floating-point conversion or math-library call. */
+    const uint64_t encoded = ((uint64_t)(bits & 0x80000000u) << 32) |
+        ((uint64_t)(exp + (1023u - 127u)) << 52) |
+        ((uint64_t)(bits & 0x7FFFFFu) << 29);
+    double value;
+    memcpy(&value, &encoded, sizeof(value));
+    return value;
 }
 
 /* double -> SPU-shaped f32 bits. Zero (either sign) and any magnitude below
- * Smin flush to unsigned +0.0 (p195/196; RPCS3 matches). A magnitude beyond
- * Smax saturates to Smax with the value's sign (p202 et al). Otherwise
- * truncates (never rounds) the mantissa to 23 fraction bits (p196). */
+ * Smin flush to unsigned +0.0. A magnitude beyond Smax saturates to Smax with
+ * the value's sign. Otherwise truncates (never rounds) the mantissa to 23
+ * fraction bits. */
 static inline uint32_t spu_xf_encode(double val)
 {
     if (val == 0.0) return 0u;
@@ -444,7 +410,6 @@ static inline u128 spu_xf_scalar_fa(u128 a, u128 b)
 static inline u128 spu_fa(u128 a, u128 b)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] + b._f32[i]; return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fa(&r, &a, &b)) return r;
 #endif
@@ -460,31 +425,27 @@ static inline u128 spu_xf_scalar_fs(u128 a, u128 b)
 static inline u128 spu_fs(u128 a, u128 b)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] - b._f32[i]; return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fs(&r, &a, &b)) return r;
 #endif
     return spu_xf_scalar_fs(a, b);
 }
 
-/* Float<->int conversions with scale (RI8). HW/RPCS3 semantics (verified vs
- * SPUInterpreter.cpp precise CFLTS=ldexp(a,173-i8) + SPUASMJITRecompiler.cpp):
+/* Float<->int conversions with scale (RI8):
  *   cflts/cfltu: result = (int)(a * 2^(173-i8))   -- i8=173 is the identity
  *   csflt/cuflt: result = (float)int * 2^(i8-155) -- i8=155 is the identity
- * (Prior code applied a spurious -155 table offset -> off by 2^155; canonical
- * conversions collapsed to ~0. f computed in double so 2^173 doesn't overflow.) */
-/* NOTE (SPUF-1 fix): decode through spu_xf_decode(), NOT (double)a._f32[i].
- * The SPU has no NaN/Inf; every f32 bit pattern -- including ones that look
- * like a host QNaN/Inf (exponent field 0xFF) -- is a genuine extended-range
- * FINITE value per the xfloat model documented above spu_xf_decode/encode.
- * Going through the native `float` member instead would route those bit
- * patterns through the host FPU's NaN/Inf comparison and cast rules: both
- * saturation compares below would be false for a NaN operand and the final
+ * The scale factor is computed in double so 2^173 doesn't overflow. */
+/* The operand is decoded through spu_xf_decode(), not (double)a._f32[i].
+ * The SPU has no NaN/Inf; every f32 bit pattern, including ones that look
+ * like a host QNaN/Inf (exponent field 0xFF), is a genuine extended-range
+ * finite value per the xfloat model documented above spu_xf_decode/encode.
+ * Going through the native `float` member would route those bit patterns
+ * through the host FPU's NaN/Inf comparison and cast rules: both saturation
+ * compares below would be false for a NaN operand and the final
  * (int32_t)v / (uint32_t)v cast would be UB on a NaN double. Decoding via
- * spu_xf_decode always yields a finite double, so the existing saturate-then-
- * truncate logic (scale unchanged) is well-defined for every input bit
- * pattern and matches CFLTS/CFLTU's documented ldexp(a,173-i8)-style scale
- * with deterministic saturation at the int32/uint32 boundary. */
+ * spu_xf_decode always yields a finite double, so the saturate-then-truncate
+ * logic is well-defined for every input bit pattern, with deterministic
+ * saturation at the int32/uint32 boundary. */
 static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=spu_xf_decode(a._u32[i])*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
@@ -503,25 +464,17 @@ static inline u128 spu_xf_scalar_fm(u128 a, u128 b)
 static inline u128 spu_fm(u128 a, u128 b)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = a._f32[i] * b._f32[i]; return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fm(&r, &a, &b)) return r;
 #endif
     return spu_xf_scalar_fm(a, b);
 }
-/* fma/fms/fnms: the SPU multiply is EXACT (single final rounding = true fused
- * multiply-add), ISA v1.2 p208/210/212 "the multiplication is exact and not
- * subject to limits on its range" -- see the xfloat block comment above
- * spu_fa for the full derivation. The YZ_XF_IEEE=1 legacy path keeps the old
- * native-IEEE fmaf() model: fms = a*b - c => fmaf(a,b,-c); fnms = c - a*b =>
- * fmaf(a,-b,c) (negate BEFORE the FMA so the one rounding lands on the full
- * expression); on a build without /arch:AVX2, MSVC lowers fmaf to a CRT
- * software-FMA call (correctness over a 2-instruction product; RPCS3 pays
- * the same cost). The default (SPU-accurate) path computes the product and
- * accumulate entirely in double (exact, per the xfloat block comment) and
- * encodes once at the end -- the same "exact multiply, one final rounding"
- * property, but in the SPU's own extended-range/no-NaN/no-Inf format rather
- * than IEEE. */
+/* fma/fms/fnms: the SPU multiply is exact (single final rounding = true fused
+ * multiply-add); see the xfloat block comment above spu_fa. The product and
+ * accumulate are computed entirely in double (exact, per the xfloat block
+ * comment) and encoded once at the end: the same "exact multiply, one final
+ * rounding" property, but in the SPU's own extended-range/no-NaN/no-Inf
+ * format rather than IEEE. */
 static inline u128 spu_xf_scalar_fma(u128 a, u128 b, u128 c)
 {
     u128 r;
@@ -532,7 +485,6 @@ static inline u128 spu_xf_scalar_fma(u128 a, u128 b, u128 c)
 static inline u128 spu_fma(u128 a, u128 b, u128 c)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fma(&r, &a, &b, &c)) return r;
 #endif
@@ -548,7 +500,6 @@ static inline u128 spu_xf_scalar_fms(u128 a, u128 b, u128 c)
 static inline u128 spu_fms(u128 a, u128 b, u128 c)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fms(&r, &a, &b, &c)) return r;
 #endif
@@ -564,47 +515,30 @@ static inline u128 spu_xf_scalar_fnms(u128 a, u128 b, u128 c)
 static inline u128 spu_fnms(u128 a, u128 b, u128 c)
 {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._f32[i] = fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
 #if YZ_SPU_SIMD_XFLOAT
     if (g_spu_xfloat_simd_enabled && spu_xfloat_simd_fnms(&r, &a, &b, &c)) return r;
 #endif
     return spu_xf_scalar_fnms(a, b, c);
 }
-/* FIX 2 -- compare family (2026-07-17, s43 review -- closes the gap the FIX 3
- * scope note above used to leave open; distinct from the OTHER "FIX 2" used
- * elsewhere in this file/spu_channels.c/spu_dma.h/spu_context.h for the
- * count/event_status atomic promotion -- same date, same review batch,
- * unrelated change, numbered per the task that requested this one).
- * fceq/fcgt joined YZ_XF_IEEE. ORACLE(SPU_ISA_v1.2_
- * 27Jan2007_pub.pdf p195-196; also see the xfloat block comment above
- * spu_fa) + cross-checked (read-only, GPLv2 -- semantics only, no code
- * copied) against rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's precise-mode
- * FCEQ/FCGT/FCMEQ/FCMGT: both special-case any operand with |bits| < Smin
- * (0x00800000 -- zero AND every denormal-shaped pattern) as zero before
- * comparing, and compare extended-range magnitudes (exponent field 0xFF,
- * an IEEE Inf/NaN bit shape here) by their true SPU-defined magnitude, not
- * by routing through the host float type (where 0x7FFFFFFF IS a QNaN
- * pattern and a host `>`/`==` against it is false unconditionally --
- * exactly backwards from the SPU's own compare result). Reuses
- * spu_xf_decode (above) for both requirements at once: it already flushes
- * an exponent-field-0 operand to unsigned +0.0 and decodes exp==0xFF as a
- * genuine ~Smax-magnitude double, never through `float`. Default (SPU-
- * accurate) path decodes both operands and compares the doubles;
- * YZ_XF_IEEE=1 restores the previous plain host-float `==`/`>` verbatim.
- * ACCURACY: exact class match (decode is a lossless bit-pattern-to-double
- * widening, so the comparison result is bit-for-bit the same decision
- * RPCS3's special-cased compare makes) -- unlike fa/fs/fma/fms/fnms this
- * family has no rounding step, so there is no double-rounding caveat. */
+/* Float compare family (see the xfloat block comment above spu_fa). Any
+ * operand with |bits| < Smin (0x00800000: zero and every denormal-shaped
+ * pattern) compares as zero, and extended-range magnitudes (exponent field
+ * 0xFF, an IEEE Inf/NaN bit shape here) compare by their true SPU magnitude,
+ * not through the host float type (where 0x7FFFFFFF is a QNaN pattern and a
+ * host `>`/`==` against it is false unconditionally). spu_xf_decode covers
+ * both requirements at once: it flushes an exponent-field-0 operand to
+ * unsigned +0.0 and decodes exp==0xFF as a genuine ~Smax-magnitude double.
+ * The default path decodes both operands and compares the doubles. Decode is
+ * a lossless bit-pattern-to-double widening and there is no rounding step,
+ * so the result is exact. */
 static inline u128 spu_fceq(u128 a, u128 b) {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._u32[i] = (a._f32[i] == b._f32[i]) ? 0xFFFFFFFFu : 0; return r; }
     for (int i = 0; i < 4; i++)
         r._u32[i] = (spu_xf_decode(a._u32[i]) == spu_xf_decode(b._u32[i])) ? 0xFFFFFFFFu : 0;
     return r;
 }
 static inline u128 spu_fcgt(u128 a, u128 b) {
     u128 r;
-    if (yz_xf_ieee()) { for (int i = 0; i < 4; i++) r._u32[i] = (a._f32[i] > b._f32[i]) ? 0xFFFFFFFFu : 0; return r; }
     for (int i = 0; i < 4; i++)
         r._u32[i] = (spu_xf_decode(a._u32[i]) > spu_xf_decode(b._u32[i])) ? 0xFFFFFFFFu : 0;
     return r;
@@ -612,7 +546,7 @@ static inline u128 spu_fcgt(u128 a, u128 b) {
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
- * two words. Semantics from RPCS3 SPUInterpreter (DFASM / DFMA / FESD / FRDS). ---- */
+ * two words. ---- */
 static inline double spu__dget(u128 r, int i) {
     uint64_t u = ((uint64_t)r._u32[i*2] << 32) | r._u32[i*2+1];
     double d; memcpy(&d, &u, sizeof d); return d;
@@ -629,24 +563,22 @@ static inline u128 spu_dfma(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<2;i
 static inline u128 spu_dfms(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<2;i++) spu__dset(&r,i, spu__dget(a,i)*spu__dget(b,i)-spu__dget(t,i)); return r; }
 static inline u128 spu_dfnms(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<2;i++) spu__dset(&r,i, spu__dget(t,i)-spu__dget(a,i)*spu__dget(b,i)); return r; }
 static inline u128 spu_dfnma(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<2;i++) spu__dset(&r,i, -(spu__dget(a,i)*spu__dget(b,i)+spu__dget(t,i))); return r; }
-/* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
+/* double compares -> per-lane 64-bit mask. */
 static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 /* fesd: extend single from the LEFT/first word of each dword pair (slots 0,2)
  * -> double (dwords 0,1). frds: round double -> single into slots 0,2, zero
- * slots 1,3. ISA v1.2 p224/225 "single-precision value in the left slot...
- * right word slot ignored" / "placed in the left word slot... zeros in the
- * right". (Was reading slots 1,3 -- the wrong lane; RPCS3 precise FESD/FRDS
- * confirm the left word = 2i.) */
+ * slots 1,3. The single lives in the left word slot of each pair (word 2i)
+ * and the right word slot is ignored on input and zeroed on output. */
 static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2]); return r; }
 static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2]=(float)spu__dget(a,i); return r; }
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
-/* cgx: extended carry-generate, carry-in = low bit of old rt (RPCS3 CGX). */
+/* cgx: extended carry-generate, carry-in = low bit of old rt. */
 static inline u128 spu_cgx(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)(t._u32[i]&1u)+a._u32[i]+b._u32[i])>>32); return r; }
 
-/* ---- remaining SPU ISA ops (RPCS3 SPUInterpreter: EQV/ABSDB/AVGB/MPYHHA/
- * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
+/* ---- remaining SPU ISA ops (eqv/absdb/avgb/mpyhha/mpyhhau/dfcgt/dfcmgt/
+ * xorbi/dftsv) ---- */
 static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
 static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
 static inline u128 spu_absdb(u128 a, u128 b)  {
@@ -669,16 +601,16 @@ static inline u128 spu_absdb(u128 a, u128 b)  {
 #endif
 }
 static inline u128 spu_avgb(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
-/* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
+/* mpyhha/mpyhhau: high-16 x high-16, accumulate into rt (3-register). */
 static inline u128 spu_mpyhha(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpyhhau(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
-/* double compare greater (RPCS3 stubs these; sane impl) -> per-lane mask. */
+/* double compare greater -> per-lane mask. */
 static inline u128 spu_dfcgt(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-/* dftsv: double test special value -- RPCS3 stubs (fatal); 0 = no special. */
+/* dftsv: double test special value; not modeled, 0 = no special. */
 static inline u128 spu_dftsv(u128 a, int32_t imm){ (void)a; (void)imm; u128 r; memset(&r,0,sizeof r); return r; }
 
-/* ---- Phase 2: register-variable shifts/rotates ---- */
+/* ---- register-variable shifts/rotates ---- */
 static inline u128 spu_shl(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
 static inline u128 spu_shlh(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
 static inline u128 spu_rot(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
@@ -692,14 +624,14 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 static inline u128 spu_shlqby(u128 a, u128 b){ int sh=b._u32[0]&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
-static inline u128 spu_rotqby(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+static inline u128 spu_rotqby(u128 a, u128 b){ return spu_rotqby_bytes(a,b._u32[0]&0x0F); }
 static inline u128 spu_shlqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
-static inline u128 spu_rotqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+static inline u128 spu_rotqbybi(u128 a, u128 b){ return spu_rotqby_bytes(a,(b._u32[0]>>3)&0x0F); }
 
-/* ---- Phase 2: rotmahi ---- */
+/* ---- rotmahi ---- */
 static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
 
-/* ---- Phase 2: byte/half immediate compares ---- */
+/* ---- byte/half immediate compares ---- */
 static inline u128 spu_ceqbi(u128 a, int32_t imm)  { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==v)?0xFFu:0; return r; }
 static inline u128 spu_ceqhi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]==v)?0xFFFFu:0; return r; }
 static inline u128 spu_clgtbi(u128 a, int32_t imm) { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>v)?0xFFu:0; return r; }
@@ -707,7 +639,7 @@ static inline u128 spu_clgthi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_
 static inline u128 spu_cgthi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>v)?0xFFFFu:0; return r; }
 static inline u128 spu_cgtbi(u128 a, int32_t imm)  { u128 r; int8_t v=(int8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>v)?0xFFu:0; return r; }
 
-/* ---- Phase 2: misc one-offs ---- */
+/* ---- misc one-offs ---- */
 static inline u128 spu_fscrrd(const spu_context* ctx) { return ctx->fpscr; }
 static inline void spu_fscrwr(spu_context* ctx, u128 value) { ctx->fpscr = value; }
 static inline u128 spu_gb(u128 a) {
@@ -729,7 +661,7 @@ static inline u128 spu_gbb(u128 a) {
 static inline u128 spu_cg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)a._u32[i]+(uint64_t)b._u32[i])>>32); return r; }
 /* sumb: sum the 4 bytes of each word. Per CBEA, RT halfword 2i (the HIGH half of
  * word i) = sum of RB's 4 bytes of word i; halfword 2i+1 (LOW half) = sum of RA's
- * 4 bytes of word i. Computed on word VALUES so byte order is irrelevant. */
+ * 4 bytes of word i. Computed on word values so byte order is irrelevant. */
 static inline u128 spu_sumb(u128 a, u128 b) {
     u128 r;
     for(int i=0;i<4;i++) {
@@ -749,7 +681,7 @@ static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
-/* FIX 2 -- compare family (2026-07-17): same YZ_XF_IEEE gate + spu_xf_decode
+/* Compare family: same spu_xf_decode
  * reuse as fceq/fcgt above (see that comment) -- the magnitude compare here is
  * `fabs` of the decoded double rather than of the raw bit pattern, which
  * is equivalent (decode's sign bit only flips the final sign, so
@@ -757,162 +689,56 @@ static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++)
  * decode helper. */
 static inline u128 spu_fcmeq(u128 a, u128 b){
     u128 r;
-    if (yz_xf_ieee()) { for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
     for(int i=0;i<4;i++){ double fa=fabs(spu_xf_decode(a._u32[i])), fb=fabs(spu_xf_decode(b._u32[i])); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; }
     return r;
 }
 static inline u128 spu_fcmgt(u128 a, u128 b){
     u128 r;
-    if (yz_xf_ieee()) { for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
     for(int i=0;i<4;i++){ double fa=fabs(spu_xf_decode(a._u32[i])), fb=fabs(spu_xf_decode(b._u32[i])); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; }
     return r;
 }
 /* spu_frest / spu_frsqest: floating reciprocal estimate / floating reciprocal
- * absolute square root estimate. Both must emit the packed base+step encoding
- * that spu_fi (above) decodes -- NOT a plain full-precision 1/x or 1/sqrt(x)
- * float. This is the second half of the fi/frest/frsqest COUPLED fix: fi
- * alone was already wrong (fixed), but fi is a no-op-shaped bug generator
- * unless its *inputs* are also HW-shaped.
+ * absolute square root estimate. Both emit the packed base+step encoding that
+ * spu_fi (above) decodes, not a plain full-precision 1/x or 1/sqrt(x) float;
+ * the estimate is only meaningful as input to fi.
  *
- * ---- Sources ----
- * ISA: SPU_ISA_v1.2_27Jan2007_pub.pdf
- *   "Floating Reciprocal Estimate" p.214-215 (frest)
- *   "Floating Reciprocal Absolute Square Root Estimate" p.216-217 (frsqest)
- * Result format (both instructions, same layout fi already assumes):
+ * Result format (both instructions, same layout fi assumes):
  *   S(1) | BiasedExponent(8) | BaseFraction(13) | StepFraction(10)
  *   Base = S 1.BaseFraction * 2^(BiasedExponent-127)
  *   Step = 0.000 StepFraction * 2^(BiasedExponent-127)   (frest: sign of Base;
- *          frsqest: sign always 0 per ISA p.216 "The sign bit (S) will be zero")
- * ISA text documents the FIELD LAYOUT but does NOT print the lookup-table
- * CONSTANTS (they are silicon facts, not derivable from the prose) -- those
- * come from the oracle below.
+ *          frsqest: sign always 0)
  *
- * ORACLE = RPCS3's ASMJIT recompiler tables + logic, NOT the interpreter:
- *   rpcs3/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp
- *     FREST   lines 2753-2797 (fraction_lut + exponent_lut, both gathered by index)
- *     FRSQEST lines 2799-2836 (fraction_lut gathered by index; exponent computed
- *              inline: "(exponent==0)? 0xFF : 190 - (exponent + 1) / 2", integer div)
- *   Raw LUT constants: rpcs3/rpcs3/Emu/Cell/SPUThread.cpp lines 51-105
- *     spu_frest_fraction_lut[32], spu_frest_exponent_lut[256],
- *     spu_frsqest_fraction_lut[64], spu_frsqest_exponent_lut[256]
- *   Independent second source: rpcs3/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
- *     FREST lines 7389-7427, FRSQEST lines 7435-7461 -- a SEPARATE recompiler
- *     backend using the same fraction LUTs and an equivalent (algebraically
- *     verified, see below) inline exponent formula for frest:
- *       r_exponent = saturating(0x7E80 - a_exponent_u16lane), else 0x7F800000
- *     ASMJIT and LLVM formulas independently agree with the raw 256-entry
- *     tables (below) -- three-source cross-check.
- *
- * ORACLE TRAP (same class as fi's, confirmed here too): RPCS3's *interpreter*
- * FREST/FRSQEST (SPUInterpreter.cpp:2194-2238, spu_interpreter_precise::FREST/
- * FRSQEST) are ALSO not the packed encoding -- they call _mm_rcp_ps / std::sqrt
- * and store a plain full-precision reciprocal / rsqrt into rt. This is the
- * SAME approximation our current (wrong) spu_frest/spu_frsqest already use --
- * i.e. our bug independently reproduces RPCS3's interpreter-stub bug. Do NOT
- * use the interpreter as an oracle for these two instructions; only the
- * ASMJIT or LLVM recompiler paths implement real hardware semantics.
- *
- * ---- Closed-form verification of the exponent fields ----
- * The two 256-entry *exponent* LUTs (SPUThread.cpp lines 59-77, 87-105) were
- * checked by exhaustive Python cross-check (all 256 entries each) against:
+ * The exponent fields are closed-form and computed directly:
  *   frest:   rexp = (exp==0) ? 0xFF : ( (253-exp)>0 ? (253-exp) : 0 )
  *   frsqest: rexp = (exp==0) ? 0xFF : (190 - (exp+1)/2)          [int div]
- * Result: frsqest formula matched the raw table on 256/256 entries with ZERO
- * mismatches. frest formula matched 254/256 directly (idx 0..253); the
- * remaining 2 (idx 254,255, i.e. input exponent so large that the reciprocal
- * exponent would go negative) resolve to 0 in the raw table, i.e. reciprocal
- * underflow-to-zero -- exactly the ISA's documented "Big: if |x|>=2^126, 1/x
- * underflows to zero" rule (p.215) -- and the clamped formula then matches
- * 256/256. Because these two fields are provably closed-form, this file does
- * NOT embed either 256-entry exponent table; it computes them directly,
- * which is simpler and removes 512 magic constants. The two *fraction* LUTs
- * (32 and 64 entries) have NO closed form (verified: not an arithmetic or
- * simple bit-derived sequence) -- they are genuine hardware lookup tables and
- * ARE reproduced verbatim below (hardware facts, not GPL'd code -- only the
- * numeric constants are taken; all surrounding C is original).
+ * For frest, an input exponent of 254 or 255 would make the reciprocal
+ * exponent negative; the result underflows to zero (|x| >= 2^126, 1/x
+ * underflows). The two fraction tables (32 and 64 entries) have no closed
+ * form; they are hardware lookup tables reproduced verbatim below. Repeated
+ * adjacent pairs in them (frest indices 20/21 ... 30/31, and many pairs in
+ * frsqest) are part of the hardware tables, not transcription errors.
  *
- * ---- Pipeline validation (hand/script-verified, not fuzzed --
- * frest/frsqest ISA specs are error-bound-only, so single-instruction fuzzing
- * has no ground truth; the PIPELINE has one) ----
- * Reciprocal pipeline (ISA p.215): FREST y0,x / FI y1,x,y0 /
- *   FNMS t1,x,y1,ONE / FMA y2,t1,y1,y1
- * Rsqrt pipeline (ISA p.217): FRSQEST y0,x / AND ax,x,mask / FI y1,ax,y0 /
- *   FM t1,ax,y1 / FM t2,y1,HALF / FNMS t1,t1,y1,ONE / FMA y2,t1,t2,y1
- * Both pipelines were run in Python (float32-rounded at each step) using
- * THIS file's frest/frsqest bit-packing plus scratch/fix_fi_spu.c's fi
- * decode, across: two of fix_fi_spu.c's own worked examples, a third
- * representative value, 1.0 (identity), and 2^+-100 (extreme exponents
- * exercising the exponent-field arithmetic far from the biased-127 center):
- *
- *   x=5.331123525209338      y2=0.187577724   true 1/x=0.187577721   rel~2.0e-8
- *   x=-76.91874321984837     y2=-0.0130007323 true 1/x=-0.0130007324 rel~1.1e-8
- *   x=10.859253470350062     y2=0.0920873582  true 1/x=0.0920873615  rel~3.6e-8
- *   x=1.0                    y2=1.0           true 1/x=1.0           exact
- *   x=2^-100                 y2=2^100         true 1/x=2^100         exact
- *   x=2^100                  y2=2^-100        true 1/x=2^-100        exact
- *
- *   x=5.331123525209338  rsqrt y2=0.433102429 true=0.433102437 rel~1.8e-8
- *   x=76.91874321984837  rsqrt y2=0.114020757 true=0.114020754 rel~2.6e-8
- *   x=10.859253470350062 rsqrt y2=0.303458989 true=0.303458995 rel~2.0e-8
- *   x=1.0                rsqrt y2=1.0          true=1.0         exact
- *   x=2^-100 / 2^100      rsqrt exact to displayed precision
- *
- * All within ~1e-8 relative error (a handful of float32 ULPs) after the
- * documented one-Newton-Raphson-step refine, matching the ISA's claim of
- * "within 1 ulp of the IEEE single-precision reciprocal" (p.215) and
- * "sufficient to produce an IEEE single-precision reciprocal" for rsqrt
- * (p.217). Edge cases checked separately:
- *   - x=0.0 (and -0.0): input exponent field is 0 -> frest returns the ISA's
- *     documented special "maximum sfp" pattern sign|0x7FFFFF... i.e. bits
- *     sign|0xFF800000|0x7FFFFF = 0x7FFFFFFF (or 0xFFFFFFFF for -0.0) exactly
- *     matching ISA p.215 "1/0 is defined to give ... x`7FFF FFFF' (1.999*2^128)".
- *   - True denormals (smallest float32 subnormal, bits=0x1): biased exponent
- *     field is also 0, so they fall into the SAME special-case bucket as
- *     zero (matches HW: SPU treats a zero-exponent operand as the
- *     divide-by-zero-flagged case regardless of a nonzero mantissa).
- *   - Powers of 2 (tested above via 2^+-100): exercise the exponent-field
- *     arithmetic away from the fraction-LUT boundary; StepFraction happens to
- *     be at its max-magnitude-relative-to-exponent case for the fraction
- *     index that borders LUT rows 20-31/54-63 (identical adjacent entries in
- *     both fraction tables -- see NOTE below); no mismatch found.
- *
- * NOTE on the fraction LUTs' repeated-adjacent-pairs: spu_frest_fraction_lut
- * indices 20/21, 22/23, ..., 30/31 are IDENTICAL pairs, and
- * spu_frsqest_fraction_lut has many repeated adjacent pairs too. This is a
- * real hardware artifact (the table has fewer effective ulps of index
- * resolution at small fraction-index values) -- reproduced verbatim, not a
- * transcription bug (cross-checked against the LLVM recompiler's identical
- * constant arrays, SPULLVMRecompiler.cpp lines 1623-1624 referencing the same
- * spu_frest_fraction_lut / spu_frsqest_fraction_lut symbols).
- *
- * ---- Consistency with spu_fi (above) ----
- * spu_fi decodes RB as:
+ * Layout consistency with spu_fi: spu_fi decodes RB as
  *   exp        = (rb>>23) & 0xFF
  *   base_bits  = rb & 0xFFFFFC00        (sign(1)+exp(8)+basefrac(13), verbatim IEEE bits)
  *   step_frac  = rb & 0x3FF             (10 bits)
  *   step       = ldexp((float)step_frac, exp-127-13), sign-matched to base
- * This file's spu_frest/spu_frsqest PRODUCE exactly that layout: sign in bit
- * 31 (frest only; frsqest forces 0), exponent in bits 23-30, a 13-bit base
- * fraction in bits 10-22 (bits 5-17 of the LUT constant, which is already
- * pre-shifted so it can be OR'd straight into bits 0-22 alongside the 8-bit
- * exponent -- verified: every fraction_lut constant here is < 0x800000, i.e.
- * occupies only bits 0-22, so `exponent_field | fraction_field` cannot
- * collide), and the low 10 bits as StepFraction. CONFIRMED CONSISTENT: no
- * mismatch between what this file emits and what spu_fi consumes.
+ * spu_frest/spu_frsqest produce exactly that layout: sign in bit 31 (frest
+ * only; frsqest forces 0), exponent in bits 23-30, a 13-bit base fraction in
+ * bits 10-22, and the low 10 bits as StepFraction. Each fraction table
+ * constant is already pre-shifted and below 0x800000 (bits 0-22 only), so
+ * `exponent_field | fraction_field` cannot collide.
  *
- * Old code (bug, same class in both instructions): full-precision 1/x or
- * 1/sqrt(x) as a plain IEEE float, none of the base/step field structure --
- * confirmed wrong the same way old spu_fi was, and independently matches
- * RPCS3's interpreter-stub bug (see ORACLE TRAP above), which is presumably
- * how it entered this codebase (an early port likely used the interpreter as
- * its reference before a later ASMJIT-recompiler cross-check).
+ * The estimates feed the usual Newton-Raphson refinements:
+ *   reciprocal: frest y0,x / fi y1,x,y0 / fnms t1,x,y1,one / fma y2,t1,y1,y1
+ *   rsqrt: frsqest y0,x / and ax,x,mask / fi y1,ax,y0 / fm t1,ax,y1 /
+ *          fm t2,y1,half / fnms t1,t1,y1,one / fma y2,t1,t2,y1
+ * which land within about 1e-8 relative error of the true result.
  */
 
-/* ---- hardware lookup tables (RPCS3 SPUThread.cpp:51-57, 79-85) ----
+/* ---- hardware lookup tables ----
  * Pre-shifted 23-bit BaseFraction|StepFraction fields, indexed by the top 5
- * (frest) or 6 (frsqest) bits of RA's IEEE fraction. No closed form exists
- * for these (verified not to follow an arithmetic sequence); they are
- * hardware facts reproduced verbatim, cited from RPCS3, not copied logic. */
+ * (frest) or 6 (frsqest) bits of RA's IEEE fraction. */
 static const uint32_t spu_frest_fraction_lut[32] = {
     0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
     0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
@@ -932,10 +758,7 @@ static const uint32_t spu_frsqest_fraction_lut[64] = {
 };
 
 /* frest: floating reciprocal estimate. Produces the packed base+step encoding
- * consumed by spu_fi (above), NOT a plain 1/x float.
- * ISA "Floating Reciprocal Estimate" p.214-215; RPCS3 ASMJIT recompiler
- * SPUASMJITRecompiler.cpp:2753-2797 + LLVM recompiler
- * SPULLVMRecompiler.cpp:7389-7427 (independent cross-check). */
+ * consumed by spu_fi (above), not a plain 1/x float. */
 static inline u128 spu_frest(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
@@ -945,17 +768,16 @@ static inline u128 spu_frest(u128 a) {
         uint32_t frac_idx = (bits >> 18) & 0x1Fu;
         uint32_t out;
         if (exp == 0u) {
-            /* zero or denormal operand: ISA p.215 "1/0 is defined to give the
-             * maximum SPU single-precision extended-range fp number", sign of
-             * the (zero) input preserved. Same bucket for true denormals
+            /* zero or denormal operand: 1/0 is defined to give the maximum
+             * SPU single-precision extended-range fp number (0x7FFFFFFF), sign
+             * of the (zero) input preserved. Same bucket for true denormals
              * (their biased exponent field is also 0). */
             out = sign | 0x7FFFFFFFu;
         } else {
             /* result biased exponent = 253 - input biased exponent (253 =
              * 2*127-1, i.e. reciprocal negates the unbiased exponent),
-             * clamped to 0 on underflow (ISA p.215 "Big: if |x|>=2^126,
-             * 1/x underflows to zero"). Verified bit-exact against RPCS3's
-             * raw 256-entry spu_frest_exponent_lut for all 256 inputs. */
+             * clamped to 0 on underflow (|x| >= 2^126, 1/x underflows to
+             * zero). */
             uint32_t rexp = (exp >= 253u) ? 0u : (253u - exp);
             uint32_t fraction = spu_frest_fraction_lut[frac_idx];
             out = sign | (rexp << 23) | (fraction & 0x7FFFFFu);
@@ -966,15 +788,10 @@ static inline u128 spu_frest(u128 a) {
 }
 
 /* frsqest: floating reciprocal absolute square-root estimate. Produces the
- * packed base+step encoding consumed by spu_fi; sign bit is ALWAYS 0 per
- * ISA ("The sign bit (S) will be zero", p.216) -- frsqest(x) estimates
- * 1/sqrt(|x|), always positive.
- * ISA "Floating Reciprocal Absolute Square Root Estimate" p.216-217; RPCS3
- * ASMJIT recompiler SPUASMJITRecompiler.cpp:2799-2836 (exponent computed
- * inline: "(exponent==0)? 0xFF : 190-(exponent+1)/2", integer division) +
- * LLVM recompiler SPULLVMRecompiler.cpp:7435-7461 (independent formula,
- * algebraically identical). Verified bit-exact against RPCS3's raw 256-entry
- * spu_frsqest_exponent_lut for ALL 256 inputs (zero mismatches). */
+ * packed base+step encoding consumed by spu_fi; the sign bit is always 0
+ * because frsqest(x) estimates 1/sqrt(|x|), always positive. The exponent is
+ * computed inline as (exponent==0) ? 0xFF : 190-(exponent+1)/2 (integer
+ * division). */
 static inline u128 spu_frsqest(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
@@ -989,23 +806,19 @@ static inline u128 spu_frsqest(u128 a) {
     return r;
 }
 
-/* ---- Phase 3: sign extension ----
+/* ---- sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
  * at the *lower* storage address). Same caveat as the mpy family. */
 static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
-/* xswd (ISA v1.2 p96): per doubleword, sign-extend the word in the RIGHT
- * slot -- the value stays in the right word, the sign fill goes in the left.
- * LANE CAVEAT, and why this helper keeps regressing: the sub-lane rule at
- * lines 866-867 applies to sub-lanes WITHIN one host-endian value (bytes in
- * a halfword, halfwords in a word). WORDS are not sub-lanes: u128 stores
- * _u32[i] = SPU word i in SPU order, so the RIGHT word of doubleword i is
- * _u32[2*i+1] (the HIGHER index), and the left/sign-fill word is _u32[2*i].
- * The lifter conformance suite (extend family, cases derived from the ISA
- * vectors) is the authority here; test_spu_helpers.c's earlier expectation
- * was built with make128()'s host-endian u64 packing, which scrambles word
- * lanes for asymmetric vectors and briefly "justified" the swapped form on
- * 2026-08-03. */
+/* xswd: per doubleword, sign-extend the word in the right slot; the value
+ * stays in the right word, the sign fill goes in the left.
+ * Lane caveat: the sub-lane rule above applies to sub-lanes within one
+ * host-endian value (bytes in a halfword, halfwords in a word). Words are not
+ * sub-lanes: u128 stores _u32[i] = SPU word i in SPU order, so the right word
+ * of doubleword i is _u32[2*i+1] (the higher index), and the left/sign-fill
+ * word is _u32[2*i]. Test vectors built with host-endian u64 packing scramble
+ * word lanes for asymmetric values and would suggest the swapped form. */
 static inline u128 spu_xswd(u128 a) {
     u128 r;
     for (int i = 0; i < 2; i++) {
@@ -1015,14 +828,14 @@ static inline u128 spu_xswd(u128 a) {
     return r;
 }
 
-/* ---- Phase 3: OR across ---- */
+/* ---- OR across ---- */
 static inline u128 spu_orx(u128 a) {
     u128 r = spu_zero();
     r._u32[0] = a._u32[0] | a._u32[1] | a._u32[2] | a._u32[3];
     return r;
 }
 
-/* ---- Phase 3: form-select mask from bits ---- */
+/* ---- form-select mask from bits ---- */
 static inline u128 spu_fsm(u128 a) {
     u128 r; uint32_t v = a._u32[0] & 0xF;
     for(int i=0;i<4;i++) r._u32[i] = ((v>>(3-i))&1) ? 0xFFFFFFFFu : 0;
@@ -1054,15 +867,15 @@ static inline u128 spu_fsmbi(int32_t imm) {
     return r;
 }
 
-/* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
-/* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
- * SPU-byte-correct) shufb. Each builds a control in TRUE SPU byte order: the
+/* ---- constant generators (insertion shuffle patterns) ---- */
+/* Generate-controls (cbd/chd/cwd/cdd): insertion selectors for shufb. Each
+ * builds a control in true SPU byte order: the
  * base selects b's SPU byte t at result SPU byte t (selector 0x10+t), and the
  * insert positions select a's preferred scalar bytes -- SPU byte 3 for a byte
  * (selector 0x03), SPU bytes 2,3 for a halfword (0x02,0x03), SPU bytes 0..3 for
  * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
- * the right host index. Verified to compose correctly with the fixed shufb for
- * both cbd-generated and immediate/LS-constant controls. */
+ * the right host index. They compose correctly with shufb for both
+ * cbd-generated and immediate/LS-constant controls. */
 static inline u128 spu_cbd_pos(int pos) {
     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
     r._u8[SPU_W(pos & 0xF)] = 0x03;                 /* a's preferred byte = SPU byte 3 */
@@ -1096,7 +909,7 @@ static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b
 static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
 
-/* ---- Phase 3: rotate-and-mask family ---- */
+/* ---- rotate-and-mask family ---- */
 static inline u128 spu_rotm(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
 static inline u128 spu_rotma(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
 static inline u128 spu_rothm(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); } return r; }
@@ -1114,14 +927,14 @@ static inline u128 spu_rotqmbii(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) retu
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 static inline u128 spu_rotqmbyi(u128 a, int i7)  { int sh=(0-i7)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 
-/* ---- Phase 3: halfword/byte immediate logic ---- */
+/* ---- halfword/byte immediate logic ---- */
 static inline u128 spu_andhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]&v; return r; }
 static inline u128 spu_andbi(u128 a, int32_t imm) { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]&v;   return r; }
 static inline u128 spu_orhi(u128 a, int32_t imm)  { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]|v; return r; }
 static inline u128 spu_orbi(u128 a, int32_t imm)  { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]|v;   return r; }
 static inline u128 spu_xorhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]^v; return r; }
 
-/* ---- Phase 3: borrow-generate extended ---- */
+/* ---- borrow-generate extended ---- */
 static inline u128 spu_bgx(u128 a, u128 b, u128 t) {
     u128 r;
     for(int i=0;i<4;i++) {
@@ -1131,7 +944,7 @@ static inline u128 spu_bgx(u128 a, u128 b, u128 t) {
     return r;
 }
 
-/* ---- Phase 3: mfspr stub ---- */
+/* ---- mfspr stub ---- */
 static inline u128 spu_mfspr(u128 a) { (void)a; return spu_zero(); }
 
 /* ---- immediate loaders ---- */

@@ -1,9 +1,9 @@
-/* spu_workload.c — SPU workload / task dispatch registry (see spu_workload.h).
+/* spu_workload.c: SPU workload / task dispatch registry (see spu_workload.h).
  *
- * Maps a registered SPU image (by FNV-1a-64 content fingerprint) to its
- * pre-lifted native entry, loads the image into a 256 KB local store, and runs
- * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
- * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+ * Maps a registered SPU image (by FNV-1a-64 content fingerprint and byte size)
+ * to its pre-lifted native entry. cellSpurs's AddWorkload/CreateTask resolve
+ * the image they are handed with spu_workload_resolve() and run it with
+ * spu_workload_execute(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
 #include <stdio.h>
@@ -49,28 +49,6 @@ typedef struct {
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
 static spu_workload_image_executor_fn s_image_executor = NULL;
-
-void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                           const char* name)
-{
-    if (!fn) return;
-    for (unsigned i = 0; i < s_registry_count; i++) {
-        if (s_registry[i].fp == fingerprint && s_registry[i].image_size == 0) {
-            s_registry[i].fn   = fn;
-            s_registry[i].name = name;
-            return;
-        }
-    }
-    if (s_registry_count >= SPU_WORKLOAD_MAX) {
-        fprintf(stderr, "[spu_workload] registry full (%u); dropping '%s'\n",
-                SPU_WORKLOAD_MAX, name ? name : "?");
-        return;
-    }
-    s_registry[s_registry_count].fp   = fingerprint;
-    s_registry[s_registry_count].fn   = fn;
-    s_registry[s_registry_count].name = name;
-    s_registry_count++;
-}
 
 int spu_workload_register_direct(uint64_t fingerprint, uint32_t image_size,
                                  spu_lifted_entry_fn fn, const char* name)
@@ -176,7 +154,7 @@ int spu_workload_resolve(const void* image, uint32_t image_size,
     if (!image || !image_size || !out) return 0;
 #if YZ_SPU_EXACT_IMAGE_BYTES
     /* Exact size is checked before touching the retained bytes.  memcmp is an
-     * identity proof, not a hash shortcut: a modified/reused guest range can
+     * identity check, not a hash shortcut: a modified/reused guest range can
      * never return a stale registered image from this path. */
     for (unsigned i = 0; i < s_registry_count; i++) {
         const spu_workload_entry* e = &s_registry[i];
@@ -227,15 +205,6 @@ int spu_workload_execute(const spu_workload_image* image, spu_context* ctx)
     return s_image_executor(ctx, image->image_id, image->entry_pc);
 }
 
-spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
-{
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fingerprint)
-            return s_registry[i].fn;
-    return NULL;
-}
-
-unsigned spu_workload_count(void) { return s_registry_count; }
 void spu_workload_reset(void)
 {
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -332,51 +301,4 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
     }
     if (end > max_avail) end = max_avail;
     return (size_t)end;
-}
-
-/* ---- dispatch ---------------------------------------------------------- */
-
-int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
-                          uint32_t args_ea)
-{
-    if (!image || image_size == 0) return 0;
-
-    spu_workload_image registered;
-    if (!spu_workload_resolve(image, image_size, &registered)) {
-        return 0;
-    }
-
-    /* Load the SPU ELF into a fresh local store, then run the lifted entry with
-     * the task arg in r3. 256 KB is heap-allocated (too large for the stack,
-     * and spu_run_lifted_job already builds a full spu_context on its stack). */
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return 0;
-
-    uint32_t entry = 0;
-    if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
-        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: invalid SPU ELF\n",
-                (unsigned long long)registered.fingerprint);
-        free(ls);
-        return 0;
-    }
-
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X -> running\n",
-        (unsigned long long)registered.fingerprint, entry, args_ea);
-
-    spu_context* ctx = (spu_context*)malloc(sizeof(*ctx));
-    if (!ctx) {
-        free(ls);
-        return 0;
-    }
-    spu_context_init(ctx, 0);
-    memcpy(ctx->ls, ls, SPU_LS_SIZE);
-    ctx->gpr[3]._u32[0] = args_ea;
-    int ok = spu_workload_execute(&registered, ctx);
-    memcpy(ls, ctx->ls, SPU_LS_SIZE);
-    spu_mfc_unregister(ctx);
-    free(ctx);
-
-    free(ls);
-    return ok;
 }
