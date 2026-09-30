@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "Optimized runner with PDB and map for crash reports and profilers. Pass -DYZ_FFMPEG_DIR=<ffmpeg dev package> for movie decode.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build_release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS_RELEASE": "/O2 /Ob2 /DNDEBUG /Zi",
+        "CMAKE_CXX_FLAGS_RELEASE": "/O2 /Ob2 /DNDEBUG /Zi",
+        "CMAKE_EXE_LINKER_FLAGS_RELEASE": "/DEBUG:FULL /INCREMENTAL:NO /OPT:REF /OPT:NOICF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "targets": [
+        "yakuza_recomp"
+      ]
+    }
+  ]
+}

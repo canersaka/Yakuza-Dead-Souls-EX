@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate func_table_gen.cpp from the declarations in the lifted headers.
+Generate func_table_gen.cpp, the dispatcher's address -> function table.
 
-Stopgap for the current lift: the function table emitted inside ppu_recomp.c
-is `static` (file-local), so the dispatcher can't link against it. This tool
-rebuilds the same addr->func mapping from the headers' declarations, which
-all have external linkage. Once a relift with the fixed lifter lands (table
-emitted non-static + declared in the header), this generator and its output
-can be dropped in favor of `function_table` directly.
+Each lifted object has its own function table; the dispatcher needs one table
+across all of them. This tool builds it from the func_XXXXXXXX declarations
+in the lifted headers (the game and its shader PRX). Only the first header is
+#included in the output (the generated headers each redefine ppu_context and
+cannot coexist in one TU); functions declared only in later headers get their
+own extern "C" declarations emitted directly.
 
-Multiple headers are merged into one table (the game lift + LLE-lifted
-firmware PRX modules such as libsre). Only the first header is #included in
-the output (the generated headers each redefine ppu_context and cannot
-coexist in one TU); functions declared only in later headers get their own
-extern "C" declarations emitted directly.
-
-Usage:  py -3 gen_func_table.py [header ...] [-o out.cpp]
-        (defaults: ../recomp/ppu_recomp.h ../recomp_prx/libsre_recomp.h)
+Usage:  py -3 gen_func_table.py header [header ...] [-o out.cpp]
 """
 
 import re
@@ -38,9 +31,7 @@ def main():
         del args[i:i + 2]
     headers = args or [
         os.path.join(here, "..", "recomp", "ppu_recomp.h"),
-        os.path.join(here, "..", "recomp_prx", "libsre_recomp.h"),
-        os.path.join(here, "..", "recomp_prx", "libgcm_sys_recomp.h"),
-        os.path.join(here, "..", "recomp_prx", "pxd_shader_recomp.h"),
+        os.path.join(here, "..", "recomp", "prx", "pxd_shader_recomp.h"),
     ]
     headers = [h for h in headers if os.path.exists(h)] or sys.exit("no headers found")
 

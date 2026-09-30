@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 project(YakuzaRecomp
     VERSION 0.1.0
     LANGUAGES C CXX
@@ -16,50 +16,18 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
-set(YZ_SPURS_BACKEND "LLE" CACHE STRING "SPURS backend: LLE (default) or NATIVE")
-set_property(CACHE YZ_SPURS_BACKEND PROPERTY STRINGS LLE NATIVE)
-string(TOUPPER "${YZ_SPURS_BACKEND}" YZ_SPURS_BACKEND)
-if(NOT YZ_SPURS_BACKEND STREQUAL "LLE" AND
-   NOT YZ_SPURS_BACKEND STREQUAL "NATIVE")
-    message(FATAL_ERROR "YZ_SPURS_BACKEND must be LLE or NATIVE")
-endif()
-string(TOLOWER "${YZ_SPURS_BACKEND}" _yz_spurs_backend_arg)
-
-# Keep the historical coupled default, but allow the oracle to vary the GCM
-# driver independently from SPURS.  Without this split an LLE-vs-native result
-# cannot attribute a rendering difference to either subsystem.
-set(YZ_GCM_BACKEND "${YZ_SPURS_BACKEND}" CACHE STRING
-    "GCM backend: LLE (Sony oracle) or NATIVE (host implementation)")
-set_property(CACHE YZ_GCM_BACKEND PROPERTY STRINGS LLE NATIVE)
-string(TOUPPER "${YZ_GCM_BACKEND}" YZ_GCM_BACKEND)
-if(NOT YZ_GCM_BACKEND STREQUAL "LLE" AND
-   NOT YZ_GCM_BACKEND STREQUAL "NATIVE")
-    message(FATAL_ERROR "YZ_GCM_BACKEND must be LLE or NATIVE")
-endif()
-string(TOLOWER "${YZ_GCM_BACKEND}" _yz_gcm_backend_arg)
-
-# A separate worktree can use the original tree's decrypted, untracked game
-# and firmware inputs while compiling the current branch's tracked lifts.
+# YZ_GAME_INPUT_DIR points at the directory containing game/ (the decrypted
+# EBOOT.elf) and the other decrypted game inputs.
 set(YZ_GAME_INPUT_DIR "${PS3RECOMP_DIR}" CACHE PATH
-    "Tree containing game/, recomp_prx/, and other decrypted Yakuza inputs")
+    "Tree containing game/ and the other decrypted Yakuza inputs")
 set(YZ_RECOMP_DIR "${PS3RECOMP_DIR}/recomp")
 set(YZ_RECOMP_PRX_DIR "${PS3RECOMP_DIR}/recomp/prx")
-set(YZ_FIRMWARE_DIR "${YZ_GAME_INPUT_DIR}/recomp_prx")
 
-option(YZ_PERF_FAST
-    "Build the clean benchmark lane: compile normal-path diagnostics and hot-path environment queries out."
-    OFF)
-option(YZ_PERF_PROFILE
-    "Build the symbolized aggregate-profile lane with the same diagnostic cleanup as the fast lane."
-    OFF)
-option(YZ_PPU_SAMPLE
-    "Add the low-noise, fixed-window main-PPU instruction sampler."
-    OFF)
-option(YZ_FRONTIER_VISUAL_PROBE
-    "Allow sparse renderer-owned frontier screenshots in a PERF_CLEAN diagnostic build."
-    OFF)
 option(YZ_SPU_SIMD_SHUFB
     "Use the bit-exact SSSE3 SPU shufb helper; OFF selects its scalar reference twin."
+    ON)
+option(YZ_SPU_SIMD_ROTQBY
+    "Use exact SSSE3 byte rotations; OFF selects the scalar instruction reference."
     ON)
 option(YZ_SPU_SIMD_LS128
     "Use bit-exact SSSE3 word-byte conversion for SPU 128-bit local-store accesses."
@@ -70,43 +38,15 @@ option(YZ_SPU_SIMD_ABSDB
 option(YZ_SPU_SIMD_XFLOAT
     "Use the bit-exact AVX2 ordinary-lane fast path for SPU xfloat arithmetic."
     ON)
-option(YZ_WKL4_CYCLE_DIAGNOSTIC
-    "Compile the default-off, fixed-memory image-4 hot-region cycle classifier."
-    OFF)
 option(YZ_SPU_EXACT_IMAGE_BYTES
     "Resolve registered SPU images with an owned exact-byte reference before the legacy fingerprint fallback."
     ON)
-if(YZ_PERF_FAST AND YZ_PERF_PROFILE)
-    message(FATAL_ERROR "YZ_PERF_FAST and YZ_PERF_PROFILE are distinct lanes; enable only one.")
-endif()
-if(YZ_PERF_FAST OR YZ_PERF_PROFILE)
-    list(APPEND YZ_PERF_DEFINITIONS YZ_PERF_CLEAN=1)
-endif()
-if(YZ_PERF_PROFILE)
-    list(APPEND YZ_PERF_DEFINITIONS YZ_PERF_PROFILE=1)
-    if(MSVC)
-        # Optimized, symbolized sampling lane. Keep functions distinct so
-        # profiler samples resolve to the actual lifted/runtime function.
-        add_compile_options(/Zi)
-        add_link_options(/DEBUG:FULL /OPT:REF /OPT:NOICF /INCREMENTAL:NO)
-    endif()
-endif()
 # Build the runtime library in this tree (with the CRT setting above).
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_FROM_ALL)
-if(YZ_PERF_DEFINITIONS)
-    target_compile_definitions(ps3recomp_runtime PRIVATE ${YZ_PERF_DEFINITIONS})
-endif()
-if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
-    # Runtime/HLE bulk writers must use the same sparse watched-page route as
-    # generated PPU stores.  Without this, memcpy/memset/file reads can mutate
-    # resident native graphics resources without advancing their generations.
-    target_compile_definitions(ps3recomp_runtime PRIVATE
-        PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
-endif()
-if(YZ_GCM_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(ps3recomp_runtime PRIVATE
-        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
-endif()
+# Runtime/HLE bulk writers must use the same sparse watched-page route as
+# generated PPU stores so native SPURS waiters see every guest write.
+target_compile_definitions(ps3recomp_runtime PRIVATE
+    PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
 if(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
         $<$<CONFIG:Release>:/O2>
@@ -114,23 +54,13 @@ if(MSVC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         $<$<CONFIG:Release>:NDEBUG>)
 endif()
-target_include_directories(ps3recomp_runtime PRIVATE
-    "${PS3RECOMP_DIR}/yakuza/generated")
 target_compile_definitions(ps3recomp_runtime PRIVATE
-    PS3RECOMP_SPU_IMAGE_TABLE_HEADER="spu_image_table.h"
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
+    YZ_SPU_SIMD_ROTQBY=$<BOOL:${YZ_SPU_SIMD_ROTQBY}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
     YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
     YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>
     YZ_SPU_EXACT_IMAGE_BYTES=$<BOOL:${YZ_SPU_EXACT_IMAGE_BYTES}>)
-if(YZ_WKL4_CYCLE_DIAGNOSTIC)
-    target_compile_definitions(ps3recomp_runtime PRIVATE
-        YZ_WKL4_CYCLE_DIAGNOSTIC=1)
-endif()
-if(YZ_FRONTIER_VISUAL_PROBE)
-    target_compile_definitions(ps3recomp_runtime PRIVATE
-        YZ_FRONTIER_VISUAL_PROBE=1)
-endif()
 
 # The lifted PPU code is split into ppu_recomp_NNN.cpp chunks (one giant file
 # exceeds the MSVC source-line limit). The chunks go into their own object
@@ -146,46 +76,39 @@ if(NOT RECOMP_CHUNKS)
     message(FATAL_ERROR "No recomp/ppu_recomp_*.cpp chunks found -- run the lifter first.")
 endif()
 
-# The game-owned shader PRX is common to both lanes. Firmware PRX lifts are
-# confined to the LLE oracle lane; the native lane resolves those imports to
-# independent host implementations and never compiles their lifted images.
+# The game-owned shader PRX is lifted alongside the EBOOT. Firmware modules are
+# never lifted: their imports resolve to the host implementations.
 file(GLOB PRX_CHUNKS CONFIGURE_DEPENDS
     "${YZ_RECOMP_PRX_DIR}/pxd_shader_recomp_*.cpp")
-if(YZ_SPURS_BACKEND STREQUAL "LLE")
-    file(GLOB _YZ_FIRMWARE_CHUNKS CONFIGURE_DEPENDS
-        "${YZ_RECOMP_PRX_DIR}/libsre_recomp_*.cpp")
-    list(APPEND PRX_CHUNKS ${_YZ_FIRMWARE_CHUNKS})
-endif()
-if(YZ_GCM_BACKEND STREQUAL "LLE")
-    file(GLOB _YZ_GCM_FIRMWARE_CHUNKS CONFIGURE_DEPENDS
-        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp_*.cpp")
-    list(APPEND PRX_CHUNKS ${_YZ_GCM_FIRMWARE_CHUNKS})
-endif()
 
 add_library(ppu_recomp_objs OBJECT ${RECOMP_CHUNKS} ${PRX_CHUNKS})
 set_target_properties(ppu_recomp_objs PROPERTIES JOB_POOL_COMPILE recomp_pool)
-if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(ppu_recomp_objs PRIVATE
-        PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
-endif()
-if(YZ_GCM_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(ppu_recomp_objs PRIVATE
-        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
-endif()
+target_compile_definitions(ppu_recomp_objs PRIVATE
+    PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1)
 target_include_directories(ppu_recomp_objs PRIVATE
     "${YZ_RECOMP_DIR}"
     "${YZ_RECOMP_PRX_DIR}")
 option(YZ_RECOMP_OPT
-    "Optimize the lifted recomp chunks (/O1). Costly compile; default OFF keeps the fast-iteration /Od build. s31: /Od measured as a prime suspect in the guest-code slowness that loses the boot-preload race (STATUS ⚡2)."
+    "Optimize the lifted PPU chunks. OFF builds them at /Od: much faster to compile, much slower to run."
+    ON)
+option(YZ_PPU_WHOLE_PROGRAM_LTCG
+    "Compile the lifted PPU chunks with /O2 and link-time code generation (MSVC; requires YZ_RECOMP_OPT)."
+    ON)
+option(YZ_INCREMENTAL_LTCG
+    "Use incremental link-time code generation for faster relinks (MSVC; requires YZ_PPU_WHOLE_PROGRAM_LTCG)."
     OFF)
-option(YZ_A010_FUNC_TRACE
-    "Instrument the AUTH renderer chunk with MSVC /Gh for YZ_A010_MODELREAD diagnostics."
-    OFF)
+if(YZ_INCREMENTAL_LTCG AND (NOT MSVC OR NOT YZ_PPU_WHOLE_PROGRAM_LTCG))
+    message(FATAL_ERROR "YZ_INCREMENTAL_LTCG requires MSVC and YZ_PPU_WHOLE_PROGRAM_LTCG=ON")
+endif()
 if(MSVC)
+    if(YZ_PPU_WHOLE_PROGRAM_LTCG AND NOT YZ_RECOMP_OPT)
+        message(FATAL_ERROR
+            "YZ_PPU_WHOLE_PROGRAM_LTCG requires YZ_RECOMP_OPT=ON")
+    endif()
     if(YZ_RECOMP_OPT)
-        # /O1 not /O2: MSVC on 400k-line machine-generated TUs — favor-size
-        # optimizes far cheaper than /O2 and captures most of the win vs /Od
-        # (inlining the vm helpers is the bulk of it).
+        # /O1 not /O2: on 400k-line machine-generated TUs MSVC's favor-size
+        # optimization is far cheaper than /O2 and captures most of the win
+        # vs /Od (inlining the vm helpers is the bulk of it).
         target_compile_options(ppu_recomp_objs PRIVATE /O1 /bigobj /W0)
 
         # Chunk 000 owns the orphanage worker's periodic cleanup/update path.
@@ -195,224 +118,27 @@ if(MSVC)
         set_source_files_properties(
             "${YZ_RECOMP_DIR}/ppu_recomp_000.cpp"
             PROPERTIES COMPILE_OPTIONS "/O2;/Oi")
+
+        if(YZ_PPU_WHOLE_PROGRAM_LTCG)
+            # LTCG covers only the lifted PPU objects; the runtime, renderer
+            # and SPU lifts keep their own flags.
+            target_compile_options(ppu_recomp_objs PRIVATE
+                /O2 /Ob3 /Oi /Ot /GL)
+        endif()
     else()
         # /Od: fast iteration; optimizing costs minutes and gigabytes per chunk.
         target_compile_options(ppu_recomp_objs PRIVATE /Od /bigobj /W0)
     endif()
-
-    # a010 orphanage render-path probe. Instrument only diagnostic builds:
-    # even an immediately-returning _penter call on every generated function
-    # is measurable in the normal renderer.
-    if(YZ_A010_FUNC_TRACE)
-        set_source_files_properties(
-            "${PS3RECOMP_DIR}/recomp/ppu_recomp_000.cpp"
-            PROPERTIES COMPILE_OPTIONS "/Gh")
-    endif()
 endif()
 
-# s41/s50 SPU REGION LIFT: per-family opt-in FAST (region-lifted) source
-# selection. Every family defaults to the per-instruction DIAG lift; turning a
-# family's flag ON builds the tracked yakuza/generated/fast/<stem>_fast.c twins generated by
-# tools/gen_spu_regions.py from tools/spu_region_manifest.json (s50 mass
-# region lift). Both twins of a stem export the same
-# register symbol, so every swap is drop-in. YZ_SPU_FAST keeps its original
-# s41 meaning (gs_task only, the validated pilot). All flags default OFF; the
-# instruction-mode sources remain the correctness twins.
-option(YZ_SPU_FAST "Build gs_task from the region-lifted FAST source instead of the per-instruction DIAG source." OFF)
-option(YZ_SPU_FAST_CRI "cri_audio from the region-lifted FAST source." OFF)
-option(YZ_SPU_FAST_WKL4 "wkl4_task from the region-lifted FAST source." OFF)
-option(YZ_SPU_FAST_SPUIMG "spuimg_* task images from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_JOB_A "every Job A placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_JOB_B "every Job B placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_JOB_C "every Job C placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_JOB_D "every Job D placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_JOB_E "every frontier Job E placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_ORPHANAGE "every orphanage-worker placement from region-lifted FAST sources." OFF)
-option(YZ_SPU_FAST_SPURS_EXPERIMENTAL "EXPERIMENTAL: the five libsre SPURS payloads (kernel2/sysservice/policy/job_module/ts_exit) from region-lifted FAST sources -- an LLE oracle/fallback lane for the native-HLE track, not its destination." OFF)
-option(YZ_SPU_FAST_SPURS_KERNEL2 "Bisect override: region-lift only spurs_kernel2." OFF)
-option(YZ_SPU_FAST_SPURS_SYSSERVICE "Bisect override: region-lift only spurs_sysservice." OFF)
-option(YZ_SPU_FAST_SPURS_POLICY "Bisect override: region-lift only policy_module." OFF)
-option(YZ_SPU_FAST_SPURS_JOB_MODULE "Bisect override: region-lift only job_module." OFF)
-option(YZ_SPU_FAST_SPURS_TS_EXIT "Bisect override: region-lift only ts_exit." OFF)
-
-if(YZ_SPU_FAST_SPURS_EXPERIMENTAL)
-    set(YZ_SPU_FAST_SPURS_KERNEL2 ON)
-    set(YZ_SPU_FAST_SPURS_SYSSERVICE ON)
-    set(YZ_SPU_FAST_SPURS_POLICY ON)
-    set(YZ_SPU_FAST_SPURS_JOB_MODULE ON)
-    set(YZ_SPU_FAST_SPURS_TS_EXIT ON)
+# Lifted SPU programs: tools/gen_spu_images.py writes one region-lifted twin
+# per placement in yakuza/spu_images.json, plus the tables that register them.
+file(GLOB SPU_KERNELS CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/yakuza/generated/spu/*.c")
+if(NOT SPU_KERNELS)
+    message(FATAL_ERROR "No yakuza/generated/spu sources found -- run tools/gen_spu_images.py first.")
 endif()
-
-# WB (whole-block SPU backend, docs/SPU_WB_BACKEND.md): third source lane
-# per family. A WB flag links BOTH the FAST region twin (its register symbol
-# renamed to <register>_fastbase at compile, so it stays the per-block
-# fallback surface) AND the AVX2-compiled WB twin, whose registration table
-# routes every pc. All default OFF; with every WB flag OFF nothing changes.
-option(YZ_SPU_WB_GSTASK "gs_task: whole-block backend (FAST twin linked as fallback)." OFF)
-option(YZ_SPU_WB_CRI "cri_audio: whole-block backend." OFF)
-option(YZ_SPU_WB_WKL4 "wkl4_task: whole-block backend." OFF)
-option(YZ_SPU_WB_SPUIMG "spuimg_* task images: whole-block backend." OFF)
-option(YZ_SPU_WB_JOB_A "Job A placements: whole-block backend." OFF)
-option(YZ_SPU_WB_JOB_B "Job B placements: whole-block backend." OFF)
-option(YZ_SPU_WB_JOB_C "Job C placements: whole-block backend." OFF)
-option(YZ_SPU_WB_JOB_D "Job D placements: whole-block backend." OFF)
-option(YZ_SPU_WB_JOB_E "Job E placements: whole-block backend." OFF)
-option(YZ_SPU_WB_ORPHANAGE "orphanage-worker placements: whole-block backend." OFF)
-
-# WJ (whole-job native compiler, stage 2): guest registers retained across
-# blocks and loops inside whole-job compile groups; same FAST-twin fallback
-# contract. Mutually exclusive with the WB flag of the same family (both
-# lanes define the family's register symbols).
-option(YZ_SPU_WJ_GSTASK "gs_task: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_CRI "cri_audio: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_WKL4 "wkl4_task: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_SPUIMG "spuimg_* task images: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_JOB_A "Job A placements: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_JOB_B "Job B placements: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_JOB_C "Job C placements: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_JOB_D "Job D placements: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_JOB_E "Job E placements: whole-job native compiler." OFF)
-option(YZ_SPU_WJ_ORPHANAGE "orphanage-worker placements: whole-job native compiler." OFF)
-
-# _yz_spu_pick(<listvar> <fast_flag> <diag_path> <stem>): append either the
-# instruction-lifted DIAG source or its tracked region-lifted twin.
-function(_yz_spu_pick outvar fast diag stem)
-    if(${fast})
-        list(APPEND ${outvar} "${PS3RECOMP_DIR}/yakuza/generated/fast/${stem}_fast.c")
-    else()
-        list(APPEND ${outvar} "${diag}")
-    endif()
-    set(${outvar} "${${outvar}}" PARENT_SCOPE)
-endfunction()
-
-# _yz_spu_pick4(<listvar> <wj_flag> <wb_flag> <fast_flag> <diag_path> <stem>):
-# whole-job/whole-block lane on top of the DIAG/FAST swap. The selected lane's
-# header is the single source of truth for the FAST fallback register symbol.
-function(_yz_spu_pick4 outvar wj wb fast diag stem)
-    if(${wj} AND ${wb})
-        message(FATAL_ERROR
-            "${stem}: YZ_SPU_WJ and YZ_SPU_WB lanes cannot both be enabled")
-    endif()
-    if(${wj} OR ${wb})
-        if(${wj})
-            set(_lane "wj")
-        else()
-            set(_lane "wb")
-        endif()
-        set(_wb_c "${PS3RECOMP_DIR}/yakuza/generated/${_lane}/${stem}_${_lane}.c")
-        set(_wb_h "${PS3RECOMP_DIR}/yakuza/generated/${_lane}/${stem}_${_lane}.h")
-        set(_fast_c "${PS3RECOMP_DIR}/yakuza/generated/fast/${stem}_fast.c")
-        if(NOT EXISTS "${_wb_c}")
-            message(FATAL_ERROR
-                "${_lane} lane requested but ${_wb_c} is missing -- run "
-                "tools/gen_spu_wb.py --lane ${_lane} --only ${stem}")
-        endif()
-        file(STRINGS "${_wb_h}" _fb_line REGEX "_fastbase\\(void\\)")
-        string(REGEX REPLACE ".*void ([A-Za-z0-9_]+)_fastbase.*" "\\1"
-               _reg "${_fb_line}")
-        set_source_files_properties("${_fast_c}" PROPERTIES
-            COMPILE_DEFINITIONS "${_reg}=${_reg}_fastbase")
-        if(MSVC)
-            # /d2SSAOptimizer-: MSVC 19.51.36248's SSA optimizer miscompiles
-            # the lane-TU code shape (huge function, many __m128i locals,
-            # goto web); differential evidence in tools/spu_wb_diff.py at
-            # WB_EXTRA. Keep this list identical to WB_EXTRA there.
-            set_source_files_properties("${_wb_c}" PROPERTIES
-                COMPILE_OPTIONS "/arch:AVX2;/d2SSAOptimizer-"
-                COMPILE_DEFINITIONS "YZ_SPU_SIMD_LS128=1;YZ_SPU_SIMD_SHUFB=1")
-        endif()
-        list(APPEND ${outvar} "${_fast_c}" "${_wb_c}")
-    elseif(${fast})
-        list(APPEND ${outvar} "${PS3RECOMP_DIR}/yakuza/generated/fast/${stem}_fast.c")
-    else()
-        list(APPEND ${outvar} "${diag}")
-    endif()
-    set(${outvar} "${${outvar}}" PARENT_SCOPE)
-endfunction()
-
-# Lifted SPU images. spurs_kernel1 is excluded (unused; its register fn would
-# collide); each image has a distinct --register-name/--func-prefix. The job
-# placement set below is the FULL active inventory (matches the
-# a010-performance build; image ids in tools/spu_region_manifest.json).
-set(SPU_KERNELS "")
-if(YZ_SPURS_BACKEND STREQUAL "LLE")
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_KERNEL2 "${PS3RECOMP_DIR}/yakuza/generated/diag/spurs_kernel2.c" spurs_kernel2)
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_SYSSERVICE "${PS3RECOMP_DIR}/yakuza/generated/diag/spurs_sysservice.c" spurs_sysservice)
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_POLICY "${PS3RECOMP_DIR}/yakuza/generated/diag/policy_module.c" policy_module)
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_JOB_MODULE "${PS3RECOMP_DIR}/yakuza/generated/diag/job_module.c" job_module)
-    _yz_spu_pick(SPU_KERNELS YZ_SPU_FAST_SPURS_TS_EXIT "${PS3RECOMP_DIR}/yakuza/generated/diag/ts_exit.c" ts_exit)
-endif()
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_GSTASK YZ_SPU_WB_GSTASK YZ_SPU_FAST "${PS3RECOMP_DIR}/yakuza/generated/diag/gs_task.c" gs_task)          # game render task, EBOOT img #3 @0x0127A580, image 0
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_CRI YZ_SPU_WB_CRI YZ_SPU_FAST_CRI "${PS3RECOMP_DIR}/yakuza/generated/diag/cri_audio.c" cri_audio)  # SOFDEC/ADX codec task, image 3
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_WKL4 YZ_SPU_WB_WKL4 YZ_SPU_FAST_WKL4 "${PS3RECOMP_DIR}/yakuza/generated/diag/wkl4_task.c" wkl4_task) # 4-task worker pool, image 4
-foreach(stem spuimg_00 spuimg_01 spuimg_02 spuimg_04 spuimg_06 spuimg_08 spuimg_09)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_SPUIMG YZ_SPU_WB_SPUIMG YZ_SPU_FAST_SPUIMG "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-foreach(stem job_bin_a job_bin_a_e400 job_bin_a_c400 job_bin_a_24400 job_bin_a_2a400)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_A YZ_SPU_WB_JOB_A YZ_SPU_FAST_JOB_A "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-foreach(stem job_bin_b job_bin_b_4c00 job_bin_b_6c00 job_bin_b_15400 job_bin_b_15800
-        job_bin_b_1ec00 job_bin_b_37c00 job_bin_b_39c00 job_bin_b_3b000 job_bin_b_3bc00
-        job_bin_b_3dc00)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_B YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_B YZ_SPU_WB_JOB_B YZ_SPU_FAST_JOB_B "${PS3RECOMP_DIR}/yakuza/generated/job_bin_b_3d000.c" job_bin_b_3d000)
-foreach(stem job_bin_c_4c00 job_bin_c_e400 job_bin_c_15800 job_bin_c_17800 job_bin_c_1a800
-        job_bin_c_1ac00 job_bin_c_1b800 job_bin_c_1d800 job_bin_c_1e800)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_C YZ_SPU_WB_JOB_C YZ_SPU_FAST_JOB_C "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-foreach(stem job_bin_d_4c00 job_bin_d_5000 job_bin_d_e400 job_bin_d_15800
-        job_bin_d_20c00 job_bin_d_23000 job_bin_d_27400
-        job_bin_d_2a800 job_bin_d_2b400
-        job_bin_d_2c400 job_bin_d_2d400 job_bin_d_2e400 job_bin_d_2e800)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-# These later placement lifts predate the diag/fast directory split.  Their
-# instruction-mode correctness twins remain in generated/ rather than
-# generated/diag; keep both selector positions buildable.
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_15c00.c" job_bin_d_15c00)
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_2b800.c" job_bin_d_2b800)
-_yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_D YZ_SPU_WB_JOB_D YZ_SPU_FAST_JOB_D "${PS3RECOMP_DIR}/yakuza/generated/job_bin_d_c400.c" job_bin_d_c400)
-foreach(stem job_bin_e_e400 job_bin_e_4c00)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_JOB_E YZ_SPU_WB_JOB_E YZ_SPU_FAST_JOB_E "${PS3RECOMP_DIR}/yakuza/generated/diag/${stem}.c" "${stem}")
-endforeach()
-foreach(stem job_bin_orphanage job_bin_orphanage_e400 job_bin_orphanage_2d800
-        job_bin_orphanage_37c00 job_bin_orphanage_3b000 job_bin_orphanage_3bc00
-        job_bin_orphanage_3c000 job_bin_orphanage_3cc00)
-    _yz_spu_pick4(SPU_KERNELS YZ_SPU_WJ_ORPHANAGE YZ_SPU_WB_ORPHANAGE YZ_SPU_FAST_ORPHANAGE "${PS3RECOMP_DIR}/yakuza/generated/${stem}.c" "${stem}")
-endforeach()
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
-
-# Inventory every EBOOT-resident SPU payload before compiling the runner.  A
-# CellSpurs job descriptor may be assembled only at runtime, so the gate also
-# verifies dense-section coverage: a missing raw job leaves a large unexplained
-# hole even when no finished descriptor exists in the executable.  The JSON
-# report is a build artifact suitable for attaching to a devlog/release.
-set(YZ_SPU_INVENTORY_REPORT
-    "${CMAKE_CURRENT_BINARY_DIR}/spu_inventory.json")
-set(YZ_SPU_RUNTIME_EVIDENCE
-    "${YZ_GAME_INPUT_DIR}/spu_unknown_jobs.jsonl" CACHE FILEPATH
-    "Append-only unknown native-SPURS jobs captured by boot runs")
-add_custom_target(yz_spu_inventory ALL
-    COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/spu_inventory.py"
-            --input "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
-            --manifest "${PS3RECOMP_DIR}/tools/spu_region_manifest.json"
-            --artifact-root "${PS3RECOMP_DIR}"
-            --artifact-root "${YZ_GAME_INPUT_DIR}"
-            --max-padding 0x400
-            --runtime-evidence "${YZ_SPU_RUNTIME_EVIDENCE}"
-            --report "${YZ_SPU_INVENTORY_REPORT}"
-            --strict
-    BYPRODUCTS "${YZ_SPU_INVENTORY_REPORT}"
-    DEPENDS
-        "${PS3RECOMP_DIR}/tools/spu_inventory.py"
-        "${PS3RECOMP_DIR}/tools/spu_region_manifest.json"
-        "${PS3RECOMP_DIR}/tools/elf_parser.py"
-        "${PS3RECOMP_DIR}/tools/extract_spu_images.py"
-        "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
-    COMMENT "Verifying complete EBOOT SPU payload inventory"
-    VERBATIM)
 
 set(YZ_IMPORT_BRIDGES "${CMAKE_CURRENT_BINARY_DIR}/import_bridges_gen.cpp")
 # Import binding is derived from function definitions across the independent
@@ -422,32 +148,23 @@ set(YZ_IMPORT_BRIDGES "${CMAKE_CURRENT_BINARY_DIR}/import_bridges_gen.cpp")
 file(GLOB_RECURSE _YZ_IMPORT_IMPL_SOURCES CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/libs/*.c"
     "${PS3RECOMP_DIR}/libs/*.cpp"
+    "${PS3RECOMP_DIR}/libs/*.inc"
     "${PS3RECOMP_DIR}/runtime/*.c"
-    "${PS3RECOMP_DIR}/runtime/*.cpp")
+    "${PS3RECOMP_DIR}/runtime/*.cpp"
+    "${PS3RECOMP_DIR}/runtime/*.inc")
 list(FILTER _YZ_IMPORT_IMPL_SOURCES EXCLUDE REGEX "/tests/")
 add_custom_command(
     OUTPUT "${YZ_IMPORT_BRIDGES}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/gen_imports.py"
-            --spurs-backend "${_yz_spurs_backend_arg}"
-            --gcm-backend "${_yz_gcm_backend_arg}"
             --elf "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
-            --firmware-dir "${YZ_FIRMWARE_DIR}"
             --output "${YZ_IMPORT_BRIDGES}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_imports.py"
             "${YZ_GAME_INPUT_DIR}/game/EBOOT.elf"
             ${_YZ_IMPORT_IMPL_SOURCES}
     VERBATIM)
 
-set(_YZ_FUNC_HEADERS "${YZ_RECOMP_DIR}/ppu_recomp.h")
-if(YZ_SPURS_BACKEND STREQUAL "LLE")
-    list(APPEND _YZ_FUNC_HEADERS
-        "${YZ_RECOMP_PRX_DIR}/libsre_recomp.h")
-endif()
-if(YZ_GCM_BACKEND STREQUAL "LLE")
-    list(APPEND _YZ_FUNC_HEADERS
-        "${YZ_RECOMP_PRX_DIR}/libgcm_sys_recomp.h")
-endif()
-list(APPEND _YZ_FUNC_HEADERS
+set(_YZ_FUNC_HEADERS
+    "${YZ_RECOMP_DIR}/ppu_recomp.h"
     "${YZ_RECOMP_PRX_DIR}/pxd_shader_recomp.h")
 set(YZ_FUNC_TABLE "${CMAKE_CURRENT_BINARY_DIR}/func_table_gen.cpp")
 add_custom_command(
@@ -460,52 +177,52 @@ add_custom_command(
 add_executable(yakuza_recomp
     main.cpp
     app.rc
-    runtime_config.cpp
     dispatch.cpp
-    stage_render_checkpoint.cpp
     mwply_hle.cpp
     presentation_clock_hle.cpp
-    auth_clock_probe.cpp
-    native_gcm_vertical.cpp
+    native_scene_jobs.c
+    native_scene_pose_job.c
+    native_pose_generate.c
+    native_visibility.c
     shims.cpp
     threads.cpp
     "${YZ_FUNC_TABLE}"
     "${YZ_IMPORT_BRIDGES}"
     import_overrides.cpp
-    edge_journal_hle.cpp
-    rsx_wait_classifier.cpp
     ${SPU_KERNELS}
     $<TARGET_OBJECTS:ppu_recomp_objs>
 )
-add_dependencies(yakuza_recomp yz_spu_inventory)
-if(YZ_PPU_SAMPLE)
-    target_compile_definitions(yakuza_recomp PRIVATE YZ_PPU_SAMPLE=1)
-    target_compile_definitions(ps3recomp_runtime PRIVATE YZ_PPU_SAMPLE=1)
-    if(MSVC)
-        target_compile_options(yakuza_recomp PRIVATE /Zi)
-        target_link_options(yakuza_recomp PRIVATE
-            /DEBUG:FULL /OPT:REF /OPT:NOICF /INCREMENTAL:NO)
-    endif()
+if(MSVC)
+    set_source_files_properties(native_pose_generate.c PROPERTIES COMPILE_OPTIONS "/fp:strict")
 endif()
-if(YZ_PERF_DEFINITIONS)
-    target_compile_definitions(yakuza_recomp PRIVATE ${YZ_PERF_DEFINITIONS})
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_sources(yakuza_recomp PRIVATE native_visibility_avx2.c)
+    set_source_files_properties(native_visibility_avx2.c PROPERTIES
+        COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+    set_source_files_properties(native_visibility.c PROPERTIES
+        COMPILE_DEFINITIONS "YZ_NATIVE_VISIBILITY_AVX2_AVAILABLE=1")
 endif()
 target_compile_definitions(yakuza_recomp PRIVATE
+    PS3RECOMP_NATIVE_SPURS_PPU_WATCH=1
     YZ_SPU_SIMD_SHUFB=$<BOOL:${YZ_SPU_SIMD_SHUFB}>
+    YZ_SPU_SIMD_ROTQBY=$<BOOL:${YZ_SPU_SIMD_ROTQBY}>
     YZ_SPU_SIMD_LS128=$<BOOL:${YZ_SPU_SIMD_LS128}>
     YZ_SPU_SIMD_ABSDB=$<BOOL:${YZ_SPU_SIMD_ABSDB}>
     YZ_SPU_SIMD_XFLOAT=$<BOOL:${YZ_SPU_SIMD_XFLOAT}>
     YZ_SPU_EXACT_IMAGE_BYTES=$<BOOL:${YZ_SPU_EXACT_IMAGE_BYTES}>)
-if(YZ_WKL4_CYCLE_DIAGNOSTIC)
-    target_compile_definitions(yakuza_recomp PRIVATE
-        YZ_WKL4_CYCLE_DIAGNOSTIC=1)
-endif()
 if(MSVC)
     target_compile_options(yakuza_recomp PRIVATE
         $<$<CONFIG:Release>:/O2>
         $<$<CONFIG:Release>:/Ob2>)
     target_compile_definitions(yakuza_recomp PRIVATE
         $<$<CONFIG:Release>:NDEBUG>)
+    if(YZ_PPU_WHOLE_PROGRAM_LTCG)
+        if(YZ_INCREMENTAL_LTCG)
+            target_link_options(yakuza_recomp PRIVATE /LTCG:INCREMENTAL)
+        else()
+            target_link_options(yakuza_recomp PRIVATE /LTCG)
+        endif()
+    endif()
 endif()
 
 target_include_directories(yakuza_recomp PRIVATE
@@ -521,22 +238,14 @@ target_include_directories(yakuza_recomp PRIVATE
 # dbghelp: crash-handler symbol resolution (SymFromAddr against the PDB)
 # user32/gdi32: the null RSX backend opens a Win32 window + GDI present
 target_link_libraries(yakuza_recomp PRIVATE ps3recomp_runtime dbghelp user32 gdi32)
-if(YZ_SPURS_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(yakuza_recomp PRIVATE YZ_NATIVE_SPURS=1)
-endif()
-if(YZ_GCM_BACKEND STREQUAL "NATIVE")
-    target_compile_definitions(yakuza_recomp PRIVATE
-        YZ_NATIVE_GCM=1
-        PS3RECOMP_NATIVE_REPORT_READ_WATCH=1)
-endif()
 
-# FFmpeg (host movie decode) creates a load-time DLL dependency on the exe.
-# Copy the runtime DLLs next to it from an in-repo RPCS3 install, if present.
-# Harmless no-op when FFmpeg wasn't linked (movie support stubbed).
+# A shared FFmpeg build creates a load-time DLL dependency on the exe. Copy
+# its DLLs next to the exe when the package has them; static builds and
+# stubbed movie support need nothing.
 file(GLOB _yz_ff_dlls
-    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avcodec-*.dll"  "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avformat-*.dll"
-    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/avutil-*.dll"   "${YZ_GAME_INPUT_DIR}/rpcs3-v*/swscale-*.dll"
-    "${YZ_GAME_INPUT_DIR}/rpcs3-v*/swresample-*.dll")
+    "${YZ_FFMPEG_DIR}/bin/avcodec-*.dll"  "${YZ_FFMPEG_DIR}/bin/avformat-*.dll"
+    "${YZ_FFMPEG_DIR}/bin/avutil-*.dll"   "${YZ_FFMPEG_DIR}/bin/swscale-*.dll"
+    "${YZ_FFMPEG_DIR}/bin/swresample-*.dll")
 if(_yz_ff_dlls)
     add_custom_command(TARGET yakuza_recomp POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_yz_ff_dlls} $<TARGET_FILE_DIR:yakuza_recomp>
@@ -548,22 +257,15 @@ if(MSVC)
         /W3 /wd4100 /wd4244 /wd4267
         /bigobj
         /Zc:__cplusplus
-        # C sources only: the SPU PRX TUs include spu_context.h, which carries
-        # _Atomic fields (s43 channel-atomicity fix); C++ never sees _Atomic.
+        # C sources only: the generated SPU sources include spu_context.h, which carries
+        # _Atomic fields; C++ never sees _Atomic.
         $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
     )
     target_compile_definitions(yakuza_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
-    # /MAP: symbol->RVA listing so crash-handler RVAs resolve to functions.
-    # /OPT:NOICF: do NOT fold identical functions -- the many empty/nop SPU
-    # functions (e.g. gs_task 0x7444/0xB770) would otherwise collapse to shared
-    # addresses and the SPU spin profiler would mis-attribute hops to them.
+    # /MAP: symbol listing next to the exe, for reading crash-report addresses.
+    # /OPT:NOICF: do not fold identical functions. Many lifted SPU functions
+    # are empty and would otherwise share an address, which confuses crash
+    # reports and the map file.
     target_link_options(yakuza_recomp PRIVATE /INCREMENTAL:NO /OPT:NOICF
         /MAP:${CMAKE_BINARY_DIR}/yakuza_recomp.map)
-endif()
-
-message(STATUS "Yakuza SPURS backend: ${YZ_SPURS_BACKEND}")
-message(STATUS "Yakuza GCM backend: ${YZ_GCM_BACKEND}")
-if(YZ_SPURS_BACKEND STREQUAL "NATIVE" AND
-   YZ_GCM_BACKEND STREQUAL "NATIVE")
-    message(STATUS "  firmware-free: SPURS and GCM firmware PPU/SPU payloads excluded")
 endif()

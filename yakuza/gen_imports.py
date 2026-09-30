@@ -2,7 +2,7 @@
 """
 Generate import_bridges_gen.cpp from the EBOOT's PRX import stubs.
 
-The EBOOT imports firmware functions through sce stubs:
+The EBOOT imports system-library functions through sce stubs:
 
     li r12,0; oris r12,r12,HI; lwz r12,LO(r12)   ; r12 = [slot]
     std r2,0x28(r1)
@@ -17,14 +17,14 @@ This generator reads the PROC_PRX_PARAM segment (p_type 0x60000002), walks
 the scelibstub records, resolves NIDs to names, and emits:
   - one host bridge per imported function (calls the HLE implementation in
     libs/ with args from gpr[3..10] when the name is implemented; otherwise
-    a first-call-logging stub returning CELL_OK), and
+    a first-call-logging stub returning CELL_ENOSYS), and
   - yz_install_imports(): writes a synthetic OPD per import into guest
     scratch memory (YZ_IMPORT_OPD_BASE), points each slot at it, and the
     fake code addresses (YZ_IMPORT_FAKE_BASE + i*4) route ps3_indirect_call
     to the bridges.
 
 Implemented-name detection scans libs/ + runtime/ sources for a function
-definition `name(`. Bridges are signature-aware (2026-08-05): float/double
+definition `name(`. Bridges are signature-aware: float/double
 params read ctx->fpr[1..13] (PPU ABI: fp args travel in FPRs; every param
 still consumes a GPR slot) and are declared in-position so x64 passes them
 in xmmN; float/double returns write ctx->fpr[1]; u32 returns zero-extend,
@@ -32,7 +32,7 @@ s32 returns sign-extend, 64-bit returns pass through. Signature-less names
 fall back to the legacy 8 x u64 prototype with (int32_t) narrowing. No HLE
 import returns a vector today; a vr[2] return lane is unimplemented.
 
-Usage:  py -3 gen_imports.py
+Usage:  py -3 gen_imports.py [--elf EBOOT.elf] [--output import_bridges_gen.cpp]
 """
 
 import argparse
@@ -46,31 +46,10 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 from nid_database import get_default_db, compute_nid
+from source_parts import read_source
 
 ELF = os.path.join(ROOT, "game", "EBOOT.elf")
 OUT = os.path.join(HERE, "import_bridges_gen.cpp")
-
-# LLE-lifted firmware modules (tools/lift_prx.py + the lifter). Exports here
-# WIN over HLE bridges: the game's import slots are pointed at Sony's real
-# OPDs instead of synthetic bridge OPDs. The module's own imports are
-# appended to the bridge table (their stubs share the sce li/oris/lwz shape,
-# so the installer's slot extraction works unchanged).
-#   - libsre:     cellSpurs/cellSync/cellDaisy/cellSheap/cellOvis (SPURS).
-#   - libgcm_sys: cellGcmSys (the RSX driver) -- drives sys_rsx (668-677).
-# Each pair is (exports.json, imports.json) under recomp_prx/. Exports from all
-# modules merge into one (lib, nid) -> OPD map; imports from all modules are
-# appended after the game's own imports (LLE binding still wins over OVERRIDES).
-LLE_SPURS_MODULES = [
-    ("libsre_exports.json",     "libsre_imports.json"),
-]
-LLE_GCM_MODULES = [
-    # libgcm_sys: RE-ADDED 2026-06-14g -- RPCS3.log PROVES RPCS3 renders this game
-    # with LLE cellGcmSys (Sony's real code in liblv2 @0x019xxxx), so HLE was
-    # BACKWARDS. The gcm layer is not the problem; our RSX consumer's control plane
-    # is. Back on LLE (matching RPCS3) to find the real divergence. The HLE overrides
-    # in import_overrides.cpp go inert (LLE binding wins).
-    ("libgcm_sys_exports.json", "libgcm_sys_imports.json"),
-]
 
 PT_PROC_PRX_PARAM = 0x60000002
 
@@ -82,26 +61,10 @@ def be64(b, o): return struct.unpack_from(">Q", b, o)[0]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spurs-backend", choices=("lle", "native"),
-                        default=os.environ.get("YZ_SPURS_BACKEND", "lle").lower())
-    parser.add_argument("--gcm-backend", choices=("lle", "native"), default=None)
     parser.add_argument("--elf", default=ELF)
-    parser.add_argument("--firmware-dir", default=os.path.join(ROOT, "recomp_prx"))
     parser.add_argument("--output", default=OUT)
-    parser.add_argument("--audit", action="store_true")
     opts = parser.parse_args()
     data = open(opts.elf, "rb").read()
-    # The native lane is firmware-free: no export table or import list from a
-    # firmware image participates in bridge generation. The LLE lane remains
-    # the untouched behavioral oracle.
-    gcm_backend = opts.gcm_backend or os.environ.get(
-        "YZ_GCM_BACKEND", opts.spurs_backend).lower()
-    lle_modules = []
-    if opts.spurs_backend == "lle":
-        lle_modules.extend(LLE_SPURS_MODULES)
-    if gcm_backend == "lle":
-        lle_modules.extend(LLE_GCM_MODULES)
-
     e_phoff = be64(data, 32)
     e_phentsize = be16(data, 54)
     e_phnum = be16(data, 56)
@@ -136,8 +99,8 @@ def main():
     libstubend = be32(data, prx_param_off + 28)
 
     # ---- candidate names -> NID map ------------------------------------
-    # Sources: builtin nid db, function definitions in libs/ + runtime/,
-    # and REG_FUNC names from the RPCS3 reference tree (names only).
+    # Sources: the builtin NID database and the function definitions in
+    # libs/ and runtime/.
     db = get_default_db()
     candidates = {e[1] if isinstance(e, tuple) else e.name
                   for e in db.all_entries()} if hasattr(db, "all_entries") else set()
@@ -147,32 +110,21 @@ def main():
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, top)):
             for fn in files:
                 if fn.endswith((".c", ".cpp")):
-                    src_blobs.append(open(os.path.join(dirpath, fn), encoding="utf-8",
-                                          errors="replace").read())
+                    src_blobs.append(read_source(os.path.join(dirpath, fn)))
     libs_blob = "\n".join(src_blobs)
     defined = set(re.findall(r"^(?:[A-Za-z_][\w]*[\s\*]+)+([A-Za-z_]\w+)\s*\([^;]*$",
                              libs_blob, re.M))
     candidates |= defined
 
-    emu_modules = os.path.join(ROOT, "Emu", "Cell", "Modules")
-    if os.path.isdir(emu_modules):
-        for fn in os.listdir(emu_modules):
-            if fn.endswith(".cpp"):
-                text = open(os.path.join(emu_modules, fn), encoding="utf-8",
-                            errors="replace").read()
-                candidates |= set(re.findall(r"REG_FUNC\(\s*\w+\s*,\s*(\w+)\s*\)", text))
-
     nid2name = {}
     for n in candidates:
         nid2name[compute_nid(n)] = n
-    # SDK 4.75's cellGcmSys stub archive names this internal entry, while the
-    # public headers omit it. Keep the factual NID/name mapping here so the
-    # firmware-free bridge can bind its independent context-aware contract.
+    # This cellGcmSys entry has no public name; bind its NID explicitly so the
+    # context-aware override in import_overrides.cpp resolves.
     nid2name[0x3A33C1FD] = "_cellGcmFunc15"
 
     # sys_net exports its BSD socket entry points under the classic bare
-    # names (REG_FNID(sys_net, "socket", ...), "bind", "connect", ... -- see
-    # RPCS3 Emu/Cell/Modules/sys_net_.cpp), so the game's import NIDs hash
+    # names ("socket", "bind", "connect", ...), so the game's import NIDs hash
     # those literal strings. Our host implementation in
     # libs/network/sysNet.c instead uses a sys_net_bnet_* prefix (matching
     # LV2's internal syscall names) to avoid colliding with the platform
@@ -222,44 +174,13 @@ def main():
             imports.append((module, nid, nid2name.get(nid), slot))
         off += structsize
 
-    # ---- LLE module exports/imports -------------------------------------
-    import json
-    lle_opds = {}      # (lib, nid) -> export OPD guest addr
-    for exp_name, _imp_name in lle_modules:
-        path = os.path.join(opts.firmware_dir, exp_name)
-        if not os.path.exists(path):
-            print(f"WARNING: {path} missing -- generating without its LLE binding")
-            continue
-        ex = json.load(open(path))
-        for lib, funcs in ex["exports"].items():
-            for nid_s, opd_s in funcs.items():
-                lle_opds[(lib, int(nid_s, 16))] = int(opd_s, 16)
-        print(f"LLE exports loaded from {ex['module']}: "
-              f"{sum(len(v) for v in ex['exports'].values())} funcs "
-              f"({', '.join(ex['exports'])})")
-
-    lle_first = None   # index of the first LLE-module import entry
-    for _exp_name, imp_name in lle_modules:
-        path = os.path.join(opts.firmware_dir, imp_name)
-        if not os.path.exists(path):
-            continue
-        lle_imp = json.load(open(path))
-        if lle_first is None:
-            lle_first = len(imports)
-        n0 = len(imports)
-        for lib, funcs in lle_imp.items():
-            for nid_s, stub_s in funcs.items():
-                nid = int(nid_s, 16)
-                imports.append((lib, nid, nid2name.get(nid), int(stub_s, 16)))
-        print(f"LLE module imports appended from {imp_name}: {len(imports) - n0}")
-
     def implemented(name):
         return name in defined
 
     # ---- signature parsing (libs HLE convention) ------------------------
     # HLE functions take HOST pointers for memory args (the bridge must
     # translate guest->host), but callback function pointers and their
-    # opaque userdata stay RAW guest values (see cellSysutil.c:82). Pointer
+    # opaque userdata stay raw guest values (see cellSysutil.c). Pointer
     # returns are host pointers that must be translated back to guest.
     def signature_of(name):
         m = re.search(rf"^([A-Za-z_][\w \t\*]*?)\b{re.escape(name)}\s*\(([^)]*)\)",
@@ -277,16 +198,16 @@ def main():
     def param_kind(p, prev_kind=None):
         """Classify one parameter: 'float' | 'double' | 'ptr' | 'raw' | 'cb'.
 
-        Order matters (2026-08-05, doc-conformance audit systemic finding):
-        the old classifier tested "Callback" in the TYPE NAME before "*", so
-        a pointer TO a callback-named struct (CellOskDialogCallbackReturnParam*)
-        was passed as a raw guest EA to an HLE function that dereferences it
-        as a host pointer -- the wild-write class. A '*' now means
-        guest->host translation EXCEPT for the opaque user-token idiom: a
-        void* named like a user token, or a void* immediately following a
-        callback-typedef param (the SDK's (cb, cbArg) pair convention),
-        travels back to a guest callback verbatim and must stay raw.
-        'cb' is a raw starless callback typedef (returned so the NEXT
+        Order matters: the '*' test comes before the "Callback" type-name
+        test, so a pointer to a callback-named struct
+        (CellOskDialogCallbackReturnParam*) is translated to a host pointer
+        rather than passed as a raw guest EA to an HLE function that
+        dereferences it. A '*' means guest->host translation except for the
+        opaque user-token idiom: a void* named like a user token, or a void*
+        immediately following a callback-typedef param (the SDK's
+        (cb, cbArg) pair convention), travels back to a guest callback
+        verbatim and must stay raw.
+        'cb' is a raw starless callback typedef (returned so the next
         param's classification can see it).
         """
         if p == "...":
@@ -296,7 +217,7 @@ def main():
             return "cb"            # explicit function-pointer syntax
         if name_tok.lower().startswith(("userdata", "userarg", "callbackarg",
                                         "cbarg")):
-            return "raw"           # opaque guest token (cellSysutil.c:82)
+            return "raw"           # opaque guest token (cellSysutil.c)
         if "*" in p:
             if prev_kind == "cb" and re.match(r"^\s*(const\s+)?void\s*\*", p):
                 return "raw"       # the (callback, void* arg) pair idiom
@@ -310,9 +231,9 @@ def main():
         return "raw"
 
     def ret_kind(ret):
-        """Classify a return type for bridge marshalling (audit finding:
-        unconditional (int32_t) narrowing corrupted u32 returns >= 0x80000000
-        and truncated 64-bit returns; float returns never reached fpr[1])."""
+        """Classify a return type for bridge marshalling: u32 returns must
+        zero-extend, 64-bit returns must not be narrowed to int32_t, and float
+        returns go to fpr[1]."""
         if "*" in ret:
             return "ptr"
         if re.match(r"^void\b", ret):
@@ -334,7 +255,7 @@ def main():
         parameter consumes one 64-bit GPR slot (r3..r10) whether or not it
         is floating point; float/double values travel in f1..f13 in order
         of appearance. On the host side the extern declaration must carry
-        float/double in the right POSITIONS (x64 passes by position into
+        float/double in the right positions (x64 passes by position into
         xmmN) while everything else stays u64."""
         sig = signature_of(name)
         if not sig:
@@ -381,6 +302,7 @@ def main():
     # Imports that need ppu_context access -> hand-written bridges in
     # import_overrides.cpp. These take precedence over libs/ implementations.
     OVERRIDES = {
+        "sys_lwcond_wait",  # forwards the wait with the lwcond pointer translated to a host pointer
         # runtime PRX loading of the game's own engine modules (pxd_shader):
         # load -> handle, start -> run the module's module_start (inits the
         # shader subsystem the render thread spin-waits on). See import_overrides.cpp.
@@ -390,10 +312,10 @@ def main():
         "sys_prx_unload_module",
         "sys_prx_register_library",
         # DRM availability: disc content -> report OK so the title sequence doesn't
-        # take the DRM/trophy error path (cellMsgDialog). pt26 stub-fix test.
+        # take the DRM/trophy error path (cellMsgDialog).
         "sceNpDrmIsAvailable",
         # audio output: the engine's early init spin-polls GetState until ENABLED+OK
-        # (THE post-frame-3 black-screen gate, t1.ctr=0xFE00018C). Report a ready
+        # (the render path stays black until it succeeds). Report a ready
         # stereo/48kHz LPCM output + accept Configure. See import_overrides.cpp.
         "cellAudioOutGetState",
         "cellAudioOutConfigure",
@@ -417,7 +339,7 @@ def main():
         # ctx-aware bridge also routes this legacy API through the implemented
         # FixedLoad2 callback flow instead of returning CELL_ENOSYS.
         "cellSaveDataListAutoLoad",
-        # gcm init: must build GUEST-side context/control structures (the
+        # gcm init: must build guest-side context/control structures (the
         # game's SDK-inline gcm code walks them in guest memory directly).
         "_cellGcmInitBody",
         "cellGcmGetControlRegister",
@@ -429,29 +351,23 @@ def main():
         "cellGcmGetTiledPitchSize",
         "cellGcmGetTimeStampLocation",
         "cellGcmGetLabelAddress",
-        # io map: must populate the CONSUMER's iomap (g_rsx_iomap_ea), not the
-        # libs offset table (HLE gcm root-cause fix, 2026-06-14f).
+        # io map: must populate the consumer's iomap (g_rsx_iomap_ea), not the
+        # libs offset table.
         "cellGcmMapEaIoAddress",
         "cellGcmUnmapEaIoAddress",
-        # SDK-internal flip entries take (ctx, id, ...) — libs versions
+        # SDK-internal flip entries take (ctx, id, ...); libs versions
         # lack the leading context arg.
         "_cellGcmSetFlipCommand",
         "_cellGcmSetFlipCommandWithWaitLabel",
-        # SPU image loading (LLE libsre imports the embedded SPURS kernels):
-        # parses the SPU ELF in guest memory, writes BE guest structs.
+        # SPU image loading: parses the SPU ELF in guest memory and writes
+        # big-endian guest structs.
         "sys_spu_image_import",
         "sys_spu_image_close",
-        # printf family: guest varargs need format-driven %s/%p translation
-        # (raw guest pointers fault when host vprintf dereferences them).
-        "_sys_printf",
-        "_sys_sprintf",
-        "_sys_snprintf",
     }
-    if opts.spurs_backend == "native":
-        # Fourteen-argument SDK ABI: args 9-14 live in the guest parameter
-        # save area and cannot pass through the generic r3-r10 bridge.
-        OVERRIDES.add("_cellSpursJobChainAttributeInitialize")
-        OVERRIDES.add("_cellGcmFunc15")
+    # Fourteen-argument ABI: arguments 9-14 live in the guest parameter save
+    # area and cannot pass through the generic r3-r10 bridge.
+    OVERRIDES.add("_cellSpursJobChainAttributeInitialize")
+    OVERRIDES.add("_cellGcmFunc15")
 
     # Several context-aware overrides live in yakuza/*.cpp rather than the
     # libs/ and runtime/ trees scanned above.  Resolve their NIDs explicitly
@@ -464,68 +380,9 @@ def main():
         for module, nid, name, slot in imports
     ]
 
-    # cellSpurs functions to HLE as CELL_OK no-ops EVEN THOUGH libsre exports
-    # them (LLE). This mirrors RPCS3 exactly: it runs the real SPURS SPU
-    # kernel but leaves these PPU-side entries as UNIMPLEMENTED_FUNC stubs
-    # returning CELL_OK (emu/Cell/Modules/cellSpurs.cpp). Sony's real LLE
-    # versions need the full task pipeline operational and error otherwise
-    # (Yakuza crashed in cellSpursCreateTask2WithBinInfo). Stubbing the same
-    # set RPCS3 stubs lets the boot proceed; the offloaded SPU task work does
-    # not run (same tradeoff RPCS3 makes). Revisit for correctness later.
-    # 2026-06-16b: UN-STUB the task lifecycle the game uses for its render SPU
-    # task (CreateTask2WithBinInfo + Join/TryJoin) -> bind to LLE libsre so Sony's
-    # real task creation runs on the already-running SPURS kernel. The render
-    # deadlock at frame 3 fires right after this CALL is stubbed; RPCS3 runs it
-    # (LLE libsre). Expect to hit the old crash here -> that's the 1f entry to fix,
-    # NOT a reason to stub. (Set YZ_RESTUB to A/B if it regresses early.)
-    # 2026-06-20: UN-STUB the Queue / LFQueue / Semaphore DATA-FLOW primitives.
-    # These were stubbed as CELL_OK no-ops on the false premise that "RPCS3
-    # mirrors this" -- but RPCS3 LLE-loads libsre for BLUS30826 and runs the REAL
-    # versions. The game's gs_task (Edge geometry) job is pushed via
-    # cellSpursQueuePushBody onto the SPURS queue at EA 0x40197180; our no-op
-    # returned OK and wrote NOTHING, so gs_task polled an empty queue forever and
-    # never produced frame-3 geometry (io 0x1104D00 stayed stale -> the render
-    # wall). Binding these to LLE libsre makes the push actually write the queue.
-    # 2026-06-20 STUB AUDIT (run with --audit): EVERY remaining force-stubbed entry
-    # the game imports has real libsre code behind it ("CELL_OK stub, no LLE code" = 0).
-    # So shadowing them with no-ops is pure correctness debt. Emptied -> all bind to
-    # Sony's real lifted code (LLE). The movie phase never reaches task-lifecycle calls,
-    # so this is risk-free there; for gameplay it's the correct LLE behavior. If any one
-    # regresses an early boot, re-add ONLY that name here (the boot log will name it).
-    FORCE_HLE_OK = set()
-
-    if opts.audit:
-        # Stub audit: for every function the GAME imports, classify how we bind
-        # it and flag the dangerous class -- stubs that SHADOW real lifted
-        # firmware code (LLE export exists but a CELL_OK/ENOSYS stub hides it).
-        lle_groups = {lib for (lib, _n) in lle_opds}
-        shadowed, hle_ok_nocode, missing_lle, enosys_other = [], [], [], []
-        for (module, nid, name, _slot) in imports:
-            in_lle = (module, nid) in lle_opds
-            in_hle_ok = bool(name) and name in FORCE_HLE_OK
-            is_host = bool(name) and (name in OVERRIDES or implemented(name))
-            label = name or f"0x{nid:08X}"
-            if in_hle_ok and in_lle:
-                shadowed.append(f"{module}::{label}")          # un-stub: real code exists
-            elif in_hle_ok and not in_lle:
-                hle_ok_nocode.append(f"{module}::{label}")     # CELL_OK stub, no LLE code
-            elif not in_lle and not is_host:
-                (missing_lle if module in lle_groups else enosys_other).append(f"{module}::{label}")
-        def dump(title, items):
-            print(f"\n[{title}] ({len(items)})")
-            for s in sorted(items):
-                print(f"    {s}")
-        print("===== STUB AUDIT (game imports) =====")
-        dump("SHADOWED -- stubbed but LLE firmware code EXISTS -> UN-STUB", shadowed)
-        dump("CELL_OK stub, no LLE code (intentional; verify game tolerates)", hle_ok_nocode)
-        dump("ENOSYS stub from an LLE module -- lift/export GAP (cellSpurs/cellGcm/...)", missing_lle)
-        dump("ENOSYS stub from non-LLE modules (HLE gap; need impl if game relies)", enosys_other)
-        sys.exit(0)
-
     resolved, implemented_n = 0, 0
     lines = []
     lines.append("/* Auto-generated by gen_imports.py -- do not edit. */")
-    lines.append(f"/* SPURS backend: {opts.spurs_backend}. */")
     lines.append('#include "ppu_recomp.h"')
     lines.append('#include "yakuza_runner.h"')
     lines.append("#include <cstdio>")
@@ -539,13 +396,6 @@ def main():
     lines.append('extern "C" {')
     seen_decl = set()
     for module, nid, name, slot in imports:
-        if name in FORCE_HLE_OK:
-            resolved += 1   # self-contained CELL_OK stub; no decl needed
-            continue
-        if (module, nid) in lle_opds:
-            if name:
-                resolved += 1
-            continue   # LLE-bound: no host bridge needed
         if name:
             resolved += 1
             if name in OVERRIDES:
@@ -563,31 +413,9 @@ def main():
     lines.append("}")
     lines.append("")
 
-    bridges = []   # c identifiers (or None = LLE-bound), one per import, in order
-    lle_bound = 0
-    lle_libs = {lib for (lib, _nid) in lle_opds}
+    bridges = []   # C identifiers, one per import, in order
     emitted = set()
-    hle_ok = 0
     for module, nid, name, slot in imports:
-        if name in FORCE_HLE_OK:
-            hle_ok += 1
-            ident = f"yz_hle_ok_{module}_{nid:08X}"
-            if ident not in emitted:
-                emitted.add(ident)
-                lines.append(f"static void {ident}(ppu_context* ctx) {{")
-                lines.append(f"    static int w = 0;")
-                lines.append(f'    if (!w) {{ w = 1; fprintf(stderr, "[hle-ok] {module}::{name} -> CELL_OK (RPCS3-style stub)\\n"); }}')
-                lines.append(f"    ctx->gpr[3] = 0; /* CELL_OK */")
-                lines.append("}")
-            bridges.append(ident)
-            continue
-        if (module, nid) in lle_opds:
-            lle_bound += 1
-            bridges.append(None)
-            continue
-        if module in lle_libs:
-            print(f"WARNING: {module}::{name or f'0x{nid:08X}'} not exported by "
-                  f"the LLE module -- falling back to HLE/stub")
         if name and name in OVERRIDES:
             implemented_n += 1
             ident = f"yz_ovr_{name}"
@@ -611,7 +439,7 @@ def main():
                 if rk == "void":
                     # void-returning guest function: no r3 value to marshal back;
                     # leave ctx->gpr[3] whatever it already was (CELL_OK convention
-                    # doesn't apply -- callers of a void SDK function don't read r3).
+                    # doesn't apply: callers of a void SDK function don't read r3).
                     lines.append(f"    {call};")
                 elif rk in ("float", "double"):
                     # PPU ABI: fp returns travel in f1 only; r3 is not written.
@@ -621,8 +449,8 @@ def main():
                 elif rk == "i64":
                     lines.append(f"    ctx->gpr[3] = (uint64_t){call};")
                 elif rk == "u32":
-                    # zero-extend: the old unconditional (int32_t) narrowing
-                    # sign-poisoned u32 returns >= 0x80000000
+                    # zero-extend: an (int32_t) narrowing would sign-extend
+                    # u32 returns >= 0x80000000
                     lines.append(f"    ctx->gpr[3] = (uint64_t)(uint32_t){call};")
                 else:
                     lines.append(f"    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t){call};")
@@ -644,54 +472,39 @@ def main():
         bridges.append(ident)
     lines.append("")
 
-    lines.append("/* lle_opd != 0: import binds to a lifted firmware module's real export")
-    lines.append(" * OPD (Sony's code) instead of a host bridge; fn is unused. */")
-    lines.append("struct yz_import_entry { uint32_t slot; yz_ppu_fn fn; uint32_t lle_opd; };")
+    lines.append("struct yz_import_entry { uint32_t slot; yz_ppu_fn fn; };")
     lines.append("static const yz_import_entry yz_imports[] = {")
     for (module, nid, name, slot), ident in zip(imports, bridges):
         comment = f"{module}::{name if name else f'0x{nid:08X}'}"
-        if ident is None:
-            opd = lle_opds[(module, nid)]
-            lines.append(f"    {{ 0x{slot:08X}u, nullptr, 0x{opd:08X}u }}, /* {comment} -> LLE */")
-        else:
-            lines.append(f"    {{ 0x{slot:08X}u, {ident}, 0 }}, /* {comment} */")
+        lines.append(f"    {{ 0x{slot:08X}u, {ident} }}, /* {comment} */")
     lines.append("};")
     lines.append(f"const unsigned g_yz_import_count = {len(imports)}u;")
     lines.append("yz_ppu_fn g_yz_import_bridges[{0}];".format(len(imports)))
     lines.append("")
-    lines.append("/* Import names (diagnostics) + index of the first LLE-module entry")
-    lines.append(" * (dispatch traces calls made by the LLE firmware module). */")
+    lines.append("/* Import names, for diagnostics. */")
     lines.append("const char* const g_yz_import_names[] = {")
     for module, nid, name, slot in imports:
         label = name if name else f"0x{nid:08X}"
         lines.append(f'    "{module}::{label}",')
     lines.append("};")
-    first = lle_first if lle_first is not None else len(imports)
-    lines.append(f"const unsigned g_yz_lle_import_first = {first}u;")
     lines.append("")
     lines.append("extern \"C\" void yz_install_imports(void) {")
     lines.append("    for (unsigned i = 0; i < g_yz_import_count; i++) {")
     lines.append("        uint32_t opd  = YZ_IMPORT_OPD_BASE + i * 8;")
     lines.append("        uint32_t stub = yz_imports[i].slot;  /* stub CODE address */")
-    lines.append("        if (yz_imports[i].lle_opd) {")
-    lines.append("            opd = yz_imports[i].lle_opd;   /* Sony's real OPD */")
-    lines.append("        } else {")
-    lines.append("            vm_write32(opd,     YZ_IMPORT_FAKE_BASE + i * 4);")
-    lines.append("            vm_write32(opd + 4, 0);  /* TOC unused by host bridges */")
-    lines.append("        }")
+    lines.append("        vm_write32(opd,     YZ_IMPORT_FAKE_BASE + i * 4);")
+    lines.append("        vm_write32(opd + 4, 0);  /* TOC unused by host bridges */")
     lines.append("        /* The real data slot is encoded in the stub:")
     lines.append("         *   li r12,0; oris r12,r12,HI; lwz r12,LO(r12); ... */")
     lines.append("        uint32_t w1 = vm_read32(stub + 4), w2 = vm_read32(stub + 8);")
     lines.append("        if ((w1 >> 16) == 0x658Cu && (w2 >> 16) == 0x818Cu) {")
     lines.append("            uint32_t slot = ((w1 & 0xFFFFu) << 16) + (uint32_t)(int32_t)(int16_t)(w2 & 0xFFFFu);")
     lines.append("            vm_write32(slot, opd);")
-    lines.append("        } else if (!yz_imports[i].lle_opd) {")
+    lines.append("        } else {")
     lines.append("            /* unexpected stub shape: plant the descriptor over the")
     lines.append("             * stub bytes (slots self-point at the stub) */")
     lines.append("            vm_write32(stub,     YZ_IMPORT_FAKE_BASE + i * 4);")
     lines.append("            vm_write32(stub + 4, 0);")
-    lines.append("        } else {")
-    lines.append('            fprintf(stderr, "[imports] LLE entry %u: unexpected stub shape at 0x%08X\\n", i, stub);')
     lines.append("        }")
     lines.append("        g_yz_import_bridges[i] = yz_imports[i].fn;")
     lines.append("    }")
@@ -702,12 +515,10 @@ def main():
         f.write("\n".join(lines))
 
     print(f"{len(imports)} imported funcs across modules; "
-          f"{resolved} NIDs resolved to names; {lle_bound} LLE-bound; "
-          f"{hle_ok} forced HLE CELL_OK (RPCS3-style SPURS task stubs); "
+          f"{resolved} NIDs resolved to names; "
           f"{implemented_n} have host impls; "
-          f"{len(imports) - implemented_n - lle_bound - hle_ok} stubbed. "
+          f"{len(imports) - implemented_n} stubbed. "
           f"{nvar_total} variable imports (NOT handled).")
-    print(f"SPURS backend: {opts.spurs_backend}")
     print(f"wrote {opts.output}")
 
 

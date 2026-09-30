@@ -1,56 +1,18 @@
-# Game-owned PPU override set. The mwPly entries form the Route 1 video-HLE
-# vertical slice. The native-GCM entries form the first correctness-only
-# graphics producer slice; their handwritten wrappers are pass-through unless
-# YZ_NR_VERTICAL=shadow is explicitly selected.
-# Passed to tools/ppu_lifter.py via --override-funcs: these guest functions are
-# emitted as func_XXXXXXXX_lifted bodies + extern func_XXXXXXXX declarations;
-# yakuza/mwply_hle.cpp owns the plain symbols (pass-through until armed).
-# Addresses from the verified movie symbol map.
-0x00F4E720  # mwPlyStartFname       (observe: session open, fname in r4)
-0x00F51658  # mwPlyStartFnameLp     (observe: loop variant)
+# Guest functions the game project replaces with handwritten code.
+# tools/ppu_lifter.py --override-funcs emits each one as func_XXXXXXXX_lifted
+# plus an extern func_XXXXXXXX declaration; the replacement defines the plain
+# symbol and may call the lifted body. The mwPly entries are implemented in
+# yakuza/mwply_hle.cpp, the presentation clock in presentation_clock_hle.cpp.
+0x00F4E720  # mwPlyStartFname       (lifecycle: session open, fname in r4)
+0x00F51658  # mwPlyStartFnameLp     (lifecycle: loop variant)
 0x00F4D0A8  # mwPlyIsNextFrmReady   (HLE target: frame-ready predicate)
 0x00F4DA90  # mwPlyGetFrm           (HLE target; zero static callers, indirect only)
 0x00F4D878  # mwPlyGetCurFrm        (HLE target: the live frame fetch)
 0x00F4D134  # mwPlyRelCurFrm        (HLE target: 1-deep release)
 0x00F4D210  # mwPlyRelFrm           (HLE target: asymmetric release)
-0x00F4ED44  # mwPlyStop             (observe: game-owned teardown)
-0x00F4E608  # mwPlyRequestStop      (observe: shared stop-signal primitive)
-0x00F4A9AC  # mwPlyDestroy          (observe: session close; 78 direct callers)
+0x00F4ED44  # mwPlyStop             (lifecycle: game-owned teardown)
+0x00F4E608  # mwPlyRequestStop      (lifecycle: shared stop-signal primitive)
+0x00F4A9AC  # mwPlyDestroy          (lifecycle: session close)
 0x00F4FD3C  # GetStat wrapper       (direct HLE: PREP/PLAYING/PLAYEND)
 0x00F4F8D0  # mwPlyGetTime         (direct HLE: displayed-frame clock)
 0x00AFC178  # shared presentation clock (reject invalid audio-position jumps)
-0x00C970D4  # AUTH object update aggregation (a010 timeline diagnostic)
-0x00C97CE0  # AUTH presentation-clock update (a010 timeline diagnostic)
-0x00C98028  # AUTH state-16 update (a010 timeline diagnostic)
-0x00E7E1EC  # final camera-matrix consumer (a010 CMT camera repair)
-0x00EBC034  # GCM SetReferenceCommand producer boundary
-0x00EBC330  # GCM WaitLabel producer boundary
-0x00EBD6FC  # GCM SetUserCommand producer boundary
-0x00EBC488  # direct state setter: 0x1D8C
-0x00EBC51C  # direct state setter: 0x1830
-0x00EBC664  # direct state setter: 0x1834
-0x00EBC6F8  # direct state setter: 0x03B8
-0x00EBC790  # direct state setter: 0x03BC
-0x00EBC824  # direct state setter: 0x1DB4
-0x00EBC8B8  # direct state setter: 0x0378
-0x00EBCA00  # direct state setter: 0x1838
-0x00EBCA94  # direct state setter: 0x147C
-0x00EBCB28  # direct state setter: 0x1828
-0x00EBCBBC  # direct state setter: 0x182C
-0x00EBCC50  # direct state setter: 0x032C
-0x00EBCCE4  # direct state setter: 0x034C
-0x00EBCD78  # direct state setter: 0x183C
-0x00EBCE0C  # direct state setter: 0x0380
-0x00EBCEA0  # direct state setter: 0x0A68
-0x00EBCF34  # direct state setter: 0x1DAC
-0x00EBCFC8  # direct state setter: 0x1DB0
-0x00EBD05C  # direct state setter: 0x1FC0
-0x00EBD0F4  # direct state setter: 0x1FF8
-0x00EBD188  # direct state setter: 0x1FF0
-0x00EBD220  # direct state setter: 0x1FEC
-0x00EBD3F8  # direct state setter: 0x17CC
-0x00EBD48C  # direct state setter: 0x17C8
-0x00EBD5CC  # direct state setter: 0x1804
-0x00EBD92C  # full transform-program producer ABI entry (not 00EBD968 continuation)
-0x00EB0D90  # fragment-package producer ABI entry; reusable shader template builder
-0x00EBEA48  # thin DrawArrays producer: ctx, primitive, first, count

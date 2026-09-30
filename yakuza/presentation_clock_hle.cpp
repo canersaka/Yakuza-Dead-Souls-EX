@@ -2,7 +2,8 @@
  * The title's shared presentation clock normally derives a 30 Hz timeline
  * from an audio voice position.  A backend that reports success without
  * producing a valid position leaves the guest conversion with an enormous
- * (~2^62) float.  AUTH then treats every scene as already complete.
+ * (~2^62) float.  The game's scripted-scene player (AUTH) then treats every
+ * scene as already complete.
  *
  * Keep the original routine for valid clocks.  If it produces an impossible
  * frame position, continue from its previous value using a host monotonic
@@ -13,7 +14,6 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -100,9 +100,10 @@ void func_00AFC178(ppu_context* ctx)
     }
 
     /*
-     * The a010 voice is 1156 presentation frames long, while the AUTH has a
-     * short authored tail after that point.  The CRI position callback keeps
-     * returning the finite final frame, so the generic validity check above
+     * The orphanage scene (package a010) has a voice 1156 presentation
+     * frames long, followed by a short authored tail.  The CRI position
+     * callback keeps returning the finite final frame, so the generic
+     * validity check above
      * cannot distinguish end-of-voice from a healthy clock.  Continue only
      * after the late a010 position has remained bit-stable for two seconds.
      * This preserves the entire audio-synchronized portion and lets the
@@ -140,21 +141,6 @@ void func_00AFC178(ppu_context* ctx)
         fallback.sampled = now;
         fallback.active = true;
         fallback.stalled_source = stalled_a010_position;
-        if (stalled_a010_position) {
-            fprintf(stderr,
-                    "[present-clock] a010 audio position stalled at %.3f "
-                    "object=%08X source=%08X; continuing silent AUTH tail "
-                    "with monotonic 30 Hz fallback\n",
-                    (double)reported, object, vm_read32(object + 0x120u));
-        } else {
-            fprintf(stderr,
-                    "[present-clock] rejected invalid position object=%08X "
-                    "reported=%g previous=%g source=%08X mode=%08X; "
-                    "using monotonic 30 Hz fallback\n",
-                    object, (double)reported, (double)previous,
-                    vm_read32(object + 0x120u), vm_read32(object + 0x04u));
-        }
-        fflush(stderr);
     } else {
         const double elapsed =
             std::chrono::duration<double>(now - fallback.sampled).count();
